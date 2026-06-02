@@ -1,0 +1,43 @@
+
+# Chrome Extension Workflow Prompt
+
+## 🎯 Objective
+Build a Chrome extension that integrates with a backend system to manage **Client, Case, and Screening records**, and display embedded forms from a website.
+lets put all the extension code in a folder called "extension"
+
+---
+
+## 🧾 Functional Requirements
+
+### 1. 🌐 URL-Based Trigger
+- The extension should activate ONLY when the user is on a specific webpage.
+we need to be able to capture the client id from the url.
+client id example:
+- client_id: "8192ef64-9c6f-4f13-8f41-bf7ed670cc18"
+- Example:
+  - Client page URL pattern: `https://app.uniteus.io/facesheet/<client_id>`
+
+---
+
+### 2. 📄 Display Existing Forms
+- embed existing form from the website UI. "https://scnlp.metcouncil.org/agentforms/screening-and-eligibility"
+- This forms should:
+  - Be rendered inside the extension (popup, sidebar, or injected UI)
+  - on the Enrollment Platform Member ID field we need to populate the client id from the url.
+
+---
+
+### 3. 🧠 Client Validation Flow
+
+When the extension loads on the target page:
+
+#### Step 1: Extract Client Info
+- Extract client identifiers from the page (e.g., `client_id`, name, DOB)
+
+#### Step 2: Validate in Backend
+- Call API:
+
+## 4. 📊 Display Results
+- Show validation status in the extension UI:
+  - ✅ Valid: Display client info and allow form access to form 2 and 3,  i will provide later the urls for form 2 and 3
+  - ❌ Invalid: Show error message and prevent form access

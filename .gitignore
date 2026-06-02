@@ -22,8 +22,9 @@ staticfiles/
 media/
 
 # Scraper output / sensitive data exports
-output/
+output/*
 *.csv
+data/*
 
 # OS / IDE
 .DS_Store

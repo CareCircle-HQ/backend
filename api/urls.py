@@ -1,11 +1,30 @@
-from django.urls import path
+from django.urls import include, path
+from rest_framework.routers import DefaultRouter
 from rest_framework_simplejwt.views import (
     TokenObtainPairView,
     TokenRefreshView,
     TokenVerifyView,
 )
 
-from .views import HealthView, MeView, RegisterView
+from .views import (
+    CaseViewSet,
+    ClientViewSet,
+    HealthView,
+    ImportBatchViewSet,
+    MeView,
+    ProgramViewSet,
+    ProviderViewSet,
+    RegisterView,
+    ScreeningViewSet,
+)
+
+router = DefaultRouter()
+router.register("clients", ClientViewSet, basename="client")
+router.register("cases", CaseViewSet, basename="case")
+router.register("screenings", ScreeningViewSet, basename="screening")
+router.register("providers", ProviderViewSet, basename="provider")
+router.register("programs", ProgramViewSet, basename="program")
+router.register("import-batches", ImportBatchViewSet, basename="import-batch")
 
 urlpatterns = [
     # Auth
@@ -17,4 +36,6 @@ urlpatterns = [
     path("me/", MeView.as_view(), name="me"),
     # Misc
     path("health/", HealthView.as_view(), name="health"),
+    # Domain resources
+    path("", include(router.urls)),
 ]
