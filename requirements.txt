@@ -1,0 +1,15 @@
+# Django REST API
+Django==6.0.5
+djangorestframework==3.17.1
+djangorestframework_simplejwt==5.5.1
+django-cors-headers==4.9.0
+
+# Config / environment
+python-dotenv==1.2.2
+
+# CRM integration (GoHighLevel)
+gohighlevel-api-client==1.0.0b1
+
+# Data scraping / HTTP
+requests==2.34.2
+playwright==1.60.0
