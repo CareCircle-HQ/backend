@@ -45,7 +45,15 @@ class ClientAdmin(admin.ModelAdmin):
         "consent_status",
         "crm_contact_id",
     )
-    list_filter = ("is_active", "consent_status", "enrollment_from")
+    list_filter = (
+        "is_active",
+        "consent_status",
+        "enrollment_from",
+        "is_family",
+        "attestation_needed",
+        "different_delivery_address",
+        "call_transfer_answered",
+    )
     search_fields = (
         "client_id",
         "first_name",
@@ -53,6 +61,8 @@ class ClientAdmin(admin.ModelAdmin):
         "client_email_address",
         "client_phone_number",
         "crm_contact_id",
+        "agent_code",
+        "lead_source",
     )
     inlines = [MilitaryProfileInline, AddressInline, InsuranceInline]
 

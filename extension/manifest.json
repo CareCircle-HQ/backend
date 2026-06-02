@@ -1,0 +1,53 @@
+{
+  "manifest_version": 3,
+  "name": "Unite Us Client Workflow",
+  "version": "0.1.0",
+  "description": "Captures the client ID from the Unite Us facesheet, validates it against the backend, and embeds the agent forms with the member ID pre-filled.",
+  "permissions": [
+    "storage",
+    "sidePanel",
+    "scripting",
+    "declarativeNetRequest"
+  ],
+  "host_permissions": [
+    "https://app.uniteus.io/*",
+    "https://scnlp.metcouncil.org/*",
+    "https://links.carecirclecs.com/*",
+    "http://127.0.0.1:8000/*",
+    "http://localhost:8000/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_title": "Open Client Workflow"
+  },
+  "side_panel": {
+    "default_path": "sidepanel/sidepanel.html"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://app.uniteus.io/*"],
+      "js": ["content/uniteus.js"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "https://scnlp.metcouncil.org/agentforms/*",
+        "https://links.carecirclecs.com/widget/form/*"
+      ],
+      "js": ["content/formfill.js"],
+      "run_at": "document_idle",
+      "all_frames": true
+    }
+  ],
+  "declarative_net_request": {
+    "rule_resources": [
+      {
+        "id": "allow_iframe",
+        "enabled": true,
+        "path": "rules/rules.json"
+      }
+    ]
+  }
+}

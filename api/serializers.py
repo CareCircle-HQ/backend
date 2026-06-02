@@ -4,10 +4,12 @@ from django.db import transaction
 from rest_framework import serializers
 
 from .models import (
+    WEEKDAYS,
     Address,
     Answer,
     Case,
     Client,
+    CommunicationTimeOfDay,
     IdentifiedSocialNeed,
     ImportBatch,
     Insurance,
@@ -18,6 +20,7 @@ from .models import (
     QuestionOption,
     ScreenTemplate,
     Screening,
+    ServiceType,
     VerifiedSocialNeed,
 )
 
@@ -141,6 +144,57 @@ class ClientSerializer(serializers.ModelSerializer):
     class Meta:
         model = Client
         fields = "__all__"
+
+    def _validate_services(self, value, field_name):
+        if value in (None, ""):
+            return []
+        if not isinstance(value, list):
+            raise serializers.ValidationError(
+                f"{field_name} must be a list of service codes."
+            )
+        valid = set(ServiceType.values)
+        invalid = [v for v in value if v not in valid]
+        if invalid:
+            raise serializers.ValidationError(
+                f"Invalid {field_name} values: {invalid}. "
+                f"Allowed: {sorted(valid)}"
+            )
+        return value
+
+    def validate_eligible_for(self, value):
+        return self._validate_services(value, "eligible_for")
+
+    def validate_referred_for(self, value):
+        return self._validate_services(value, "referred_for")
+
+    def validate_preferred_communication_time_of_day(self, value):
+        if value in (None, ""):
+            return {day: [] for day in WEEKDAYS}
+        if not isinstance(value, dict):
+            raise serializers.ValidationError(
+                "Must be an object mapping weekdays to lists of windows."
+            )
+        valid_days = set(WEEKDAYS)
+        valid_windows = set(CommunicationTimeOfDay.values)
+        normalized = {day: [] for day in WEEKDAYS}
+        for day, windows in value.items():
+            if day not in valid_days:
+                raise serializers.ValidationError(f"Unknown day: {day}")
+            if windows is None:
+                windows = []
+            if not isinstance(windows, list):
+                raise serializers.ValidationError(
+                    f"{day} must be a list of windows (e.g. ['morning', 'evening'])."
+                )
+            invalid = [w for w in windows if w not in valid_windows]
+            if invalid:
+                raise serializers.ValidationError(
+                    f"Invalid windows for {day}: {invalid}. "
+                    f"Allowed: {sorted(valid_windows)}"
+                )
+            # de-duplicate while preserving order
+            normalized[day] = list(dict.fromkeys(windows))
+        return normalized
 
     @transaction.atomic
     def create(self, validated_data):

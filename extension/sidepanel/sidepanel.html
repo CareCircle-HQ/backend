@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Client Workflow</title>
+    <link rel="stylesheet" href="sidepanel.css" />
+  </head>
+  <body>
+    <header class="app-header">
+      <h1>Client Workflow</h1>
+    </header>
+
+    <!-- Tab bar -->
+    <nav class="tabs" id="tabs">
+      <button class="tab active" data-tab="client">Detected Client</button>
+      <button class="tab" data-tab="eligibility">Eligibility</button>
+      <button class="tab locked" data-tab="verification" disabled>
+        Verification &#128274;
+      </button>
+      <button class="tab locked" data-tab="form4" disabled>
+        Form 4 &#128274;
+      </button>
+    </nav>
+
+    <main class="panels">
+      <!-- Tab 1: Detected client + validation -->
+      <section class="panel active" data-panel="client">
+        <h2>Detected Client</h2>
+        <div id="context" class="context">
+          <p class="muted">Open a Unite Us facesheet page to detect a client.</p>
+        </div>
+
+        <h2>Required Information</h2>
+        <ul id="checklist" class="checklist"></ul>
+
+        <div class="row">
+          <button id="validateBtn" class="primary" disabled>Validate Client</button>
+          <span id="validationStatus" class="badge"></span>
+        </div>
+        <p id="reqHint" class="hint muted"></p>
+      </section>
+
+      <!-- Tab 2: Eligibility form -->
+      <section class="panel" data-panel="eligibility">
+        <iframe class="form-frame" id="frame-eligibility" title="Eligibility Form"></iframe>
+        <div class="placeholder hidden" id="ph-eligibility"></div>
+      </section>
+
+      <!-- Tab 3: Verification form -->
+      <section class="panel" data-panel="verification">
+        <iframe class="form-frame" id="frame-verification" title="Verification Form"></iframe>
+        <div class="placeholder hidden" id="ph-verification">
+          Verification form URL not configured yet.
+        </div>
+      </section>
+
+      <!-- Tab 4: Additional form -->
+      <section class="panel" data-panel="form4">
+        <iframe class="form-frame" id="frame-form4" title="Form 4"></iframe>
+        <div class="placeholder hidden" id="ph-form4">
+          Form 4 URL not configured yet.
+        </div>
+      </section>
+    </main>
+
+    <script src="../config.js"></script>
+    <script src="sidepanel.js"></script>
+  </body>
+</html>

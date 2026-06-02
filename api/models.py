@@ -49,6 +49,7 @@ class PhoneType(models.TextChoices):
 class AddressType(models.TextChoices):
     CURRENT = "current", "Current"
     MAILING = "mailing", "Mailing"
+    DELIVERY = "delivery", "Delivery"
 
 
 class USState(models.TextChoices):
@@ -150,17 +151,71 @@ class RecordStatus(models.TextChoices):
     EXPIRED = "expired", "Expired"
 
 
+class ServiceType(models.TextChoices):
+    """Services a client may be eligible for / referred for (multi-select)."""
+
+    COOKING_SUPPLIES = "cooking_supplies", "Cooking Supplies"
+    SOW_DEVELOPMENT = "sow_development", "SOW Development"
+    FRESH_PRODUCE_GROCERIES = (
+        "fresh_produce_groceries",
+        "Fresh Produce and Nonperishable Groceries",
+    )
+    HOME_ACCESSIBILITY = "home_accessibility", "Home Accessibility"
+    HOME_REMEDIATION = "home_remediation", "Home Remediation"
+    MTNA_FOOD_RX_BOXES = "mtna_food_rx_boxes", "MTNA Food Prescription Boxes"
+    MTNA_FOOD_RX_VOUCHER = "mtna_food_rx_voucher", "MTNA Food Prescriptions Voucher"
+    NUTRITIONAL_COUNSELING = (
+        "nutritional_counseling_education",
+        "Nutritional Counseling and Education",
+    )
+    REAUTHORIZATION = "reauthorization", "Reauthorization"
+    CLINICALLY_APPROPRIATE_MEALS = (
+        "clinically_appropriate_meals",
+        "Clinically Appropriate Meals",
+    )
+    FOOD_PANTRY = "food_pantry", "Food Pantry"
+    GROCERIES_TO_GO = "groceries_to_go", "Groceries to Go"
+    HEALTH_HOME_ADULT_CARE = "health_home_adult_care", "Health Home Adult Care"
+    HOUSING_TRANSITION = "housing_transition", "Housing Transition"
+    MEDICALLY_TAILORED_MEALS = "medically_tailored_meals", "Medically Tailored Meals (MTM)"
+    OTHER = "other", "Other"
+    SNAP = "snap", "SNAP"
+    TENANCY = "tenancy", "Tenancy"
+    TRANSPORTATION = "transportation", "Transportation"
+    NONE = "none", "None"
+
+
+class CommunicationTimeOfDay(models.TextChoices):
+    MORNING = "morning", "Morning (9am - 12pm)"
+    EARLY_AFTERNOON = "early_afternoon", "Early Afternoon (12pm - 3pm)"
+    LATE_AFTERNOON = "late_afternoon", "Late Afternoon (3pm - 6pm)"
+    EVENING = "evening", "Evening (6pm - 8pm)"
+
+
+class CallTransferStatus(models.TextChoices):
+    TRANSFER_SUCCESSFUL = (
+        "transfer_successful",
+        "Transfer Successful (Verification Agent Answered)",
+    )
+    TRANSFER_FAILED = "transfer_failed", "Transfer Failed (No Answer)"
+    NO_VERIFICATION_NEEDED = "no_verification_needed", "No Verification Needed"
+
+
+WEEKDAYS = (
+    "monday",
+    "tuesday",
+    "wednesday",
+    "thursday",
+    "friday",
+    "saturday",
+    "sunday",
+)
+
+
 def default_communication_time_of_day():
-    """Per-day preferred contact window: morning | afternoon | evening."""
-    return {
-        "monday": None,
-        "tuesday": None,
-        "wednesday": None,
-        "thursday": None,
-        "friday": None,
-        "saturday": None,
-        "sunday": None,
-    }
+    """Per-day preferred contact windows. Each day holds a list of values from
+    CommunicationTimeOfDay (e.g. ["morning", "evening"])."""
+    return {day: [] for day in WEEKDAYS}
 
 
 # ---------------------------------------------------------------------------
@@ -204,6 +259,31 @@ class Client(models.Model):
     citizenship = models.CharField(max_length=100, blank=True)
     time_zone = models.CharField(max_length=64, default="America/New_York")
     enrollment_from = models.CharField(max_length=120, default="Unite Us")
+    lead_source = models.CharField(max_length=120, blank=True)
+
+    # --- Program Eligibility & Referral (multi-select) ---
+    # Lists of ServiceType values; validated in the serializer.
+    eligible_for = models.JSONField(default=list, blank=True)
+    referred_for = models.JSONField(default=list, blank=True)
+
+    # --- Family / Household flags ---
+    is_family = models.BooleanField(default=False)
+    total_family_members = models.PositiveIntegerField(
+        null=True, blank=True
+    )  # includes the primary client
+
+    # --- Attestation & Delivery ---
+    attestation_needed = models.BooleanField(default=False)
+    different_delivery_address = models.BooleanField(default=False)
+
+    # --- Agent / Call Tracking ---
+    agent_code = models.CharField(max_length=64, blank=True, db_index=True)
+    call_duration_minutes = models.PositiveIntegerField(
+        null=True, blank=True
+    )  # length of the eligibility phone call, in minutes
+    call_transfer_answered = models.CharField(
+        max_length=30, choices=CallTransferStatus.choices, blank=True
+    )
 
     # --- Consent ---
     consent_status = models.CharField(
