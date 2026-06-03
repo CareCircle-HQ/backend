@@ -48,17 +48,14 @@ const cleanText = (s) => (s || "").replace(/\s+/g, " ").trim();
 // Facesheet navigation tabs we walk to reveal hidden sections. These are safe,
 // read-only views. We intentionally do NOT click arbitrary aria-expanded toggles
 // because on Unite Us those include action buttons (Upload, Assign, Take Action)
-// that must never be triggered automatically.
+// that must never be triggered automatically. We only walk the data tabs we
+// extract from; Forms, Uploads, Referrals and Resources are skipped.
 const FACESHEET_TABS = [
   "Overview",
   "Profile",
   "Cases",
   "Screenings",
   "Eligibility Assessments",
-  "Forms",
-  "Uploads",
-  "Referrals",
-  "Resources",
 ];
 
 // Facesheet tabs that render a table of records, mapped to our record type.

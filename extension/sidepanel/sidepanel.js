@@ -919,9 +919,8 @@ function setBtnBusy(btn, busy) {
   btn.classList.toggle("busy", busy);
 }
 
-async function rescan(ev) {
-  const btn = (ev && ev.currentTarget) || $("rescanBtn");
-  setBtnBusy(btn, true);
+// Deep profile/overview/records scrape (awaitable; walks data tabs in-place).
+async function deepScrape() {
   try {
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
     if (tab && tab.id != null) {
@@ -929,8 +928,79 @@ async function rescan(ev) {
     }
   } catch (_) {
     // content script may not be present on this tab
+  }
+}
+
+const SCAN_MAX_MS = 5 * 60 * 1000; // give each auto-walk up to 5 min
+
+// Resolve once the given storage key reports the scan finished (status==="done").
+function waitForScanDone(key, timeoutMs) {
+  return new Promise((resolve) => {
+    const deadline = Date.now() + timeoutMs;
+    const check = async () => {
+      const obj = (await chrome.storage.local.get(key))[key];
+      if (obj && obj.status === "done") return resolve(true);
+      if (Date.now() > deadline) return resolve(false);
+      setTimeout(check, 500);
+    };
+    check();
+  });
+}
+
+// Kick off one auto-walk (screening / eligibility / cases) and wait for it to
+// finish. Retries the start message because the tab may be mid-navigation when
+// the previous walk hands back control.
+async function runScanToCompletion(type) {
+  const map = {
+    screening: { msg: "SCREENING_RESCRAPE", key: "uw_screenings", started: scanStarted, status: setScrStatus },
+    eligibility: { msg: "ELIGIBILITY_RESCRAPE", key: "uw_eligibility", started: eligScanStarted, status: setEligStatus },
+    cases: { msg: "CASE_RESCRAPE", key: "uw_cases", started: caseScanStarted, status: setCaseStatus },
+  }[type];
+  if (!map) return false;
+
+  const clientId = currentContext && currentContext.client_id;
+  const startDeadline = Date.now() + 20000;
+  let started = false;
+  while (Date.now() < startDeadline && !started) {
+    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    if (tab && tab.id != null && /app\.uniteus\.io/.test(tab.url || "")) {
+      const sentAt = Date.now();
+      try {
+        await chrome.tabs.sendMessage(tab.id, { type: map.msg, clientId });
+      } catch (_) {}
+      started = await map.started(sentAt, 2000);
+    }
+    if (!started) await new Promise((r) => setTimeout(r, 500));
+  }
+  if (!started) {
+    map.status("err", "Couldn't start \u2014 reload the Unite Us tab (F5), then retry");
+    return false;
+  }
+  map.status("warn", "Walking\u2026 keep this tab open");
+  return waitForScanDone(map.key, SCAN_MAX_MS);
+}
+
+// Profile reload = grab everything: deep scrape + all three auto-walks. The
+// walks navigate the tab, so they must run one after another, not concurrently.
+async function rescan(ev) {
+  const btn = (ev && ev.currentTarget) || $("rescanBtn");
+  const otherBtn = btn === $("rescanBtn") ? $("rescanBtn2") : $("rescanBtn");
+  setBtnBusy(btn, true);
+  setBtnBusy(otherBtn, true);
+  try {
+    await deepScrape();
+    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    const hasClient = currentContext && currentContext.client_id;
+    if (hasClient && tab && /app\.uniteus\.io/.test(tab.url || "")) {
+      await runScanToCompletion("screening");
+      await runScanToCompletion("eligibility");
+      await runScanToCompletion("cases");
+    }
+  } catch (_) {
+    // best-effort; per-tab reload buttons remain available
   } finally {
     setBtnBusy(btn, false);
+    setBtnBusy(otherBtn, false);
   }
 }
 
