@@ -916,18 +916,81 @@ function harvestScreeningDetail() {
     items.push({ q, a });
   });
 
-  // Fallback: Try the label/value extraction pattern (from diagnostic's labelValueSample)
+  // Fallback 1: Use all div/span/p elements like the diagnostic does
+  if (items.length === 0) {
+    const allElements = [...document.querySelectorAll("div, span, p")];
+    for (let i = 0; i < allElements.length; i++) {
+      const el = allElements[i];
+      const text = cleanText(el.innerText);
+      if (!text || text.length > 300) continue;
+
+      // Look for elements that look like questions (contain ? or are statements like "Within the past...")
+      const looksLikeQuestion = text.endsWith("?") ||
+        /^(within the past|in the past|think about|do you want|does the member|is the client|was an|which language|who responded|screening modality)/i.test(text);
+
+      if (!looksLikeQuestion) continue;
+      if (/screening duration/i.test(text)) continue;
+
+      // Find answer - look for next sibling or parent's next sibling
+      let answerEl = el.nextElementSibling;
+      if (!answerEl && el.parentElement) {
+        answerEl = el.parentElement.nextElementSibling;
+      }
+
+      // If still no answer, look in DOM order
+      if (!answerEl) {
+        for (let j = i + 1; j < allElements.length && j < i + 5; j++) {
+          const nextEl = allElements[j];
+          const nextText = cleanText(nextEl.innerText);
+          if (!nextText || nextText.length > 200) continue;
+          // Stop if we hit another question-like element
+          if (nextText.endsWith("?") || /^(within the past|in the past|think about|do you want)/i.test(nextText)) break;
+          answerEl = nextEl;
+          break;
+        }
+      }
+
+      if (answerEl) {
+        const answer = cleanText(answerEl.innerText);
+        if (answer && answer !== text && answer.length < 400) {
+          const key = text.toLowerCase();
+          if (!seen.has(key)) {
+            seen.add(key);
+            items.push({ q: text, a: answer });
+          }
+        }
+      }
+    }
+  }
+
+  // Fallback 2: Line-by-line text extraction from body
   if (items.length === 0) {
     const allText = document.body.innerText || "";
     const lines = allText.split(/\n/).map(l => cleanText(l)).filter(Boolean);
+    const questionPatterns = [
+      /\?$/,  // ends with ?
+      /^within the past/i,
+      /^in the past/i,
+      /^think about/i,
+      /^do you want/i,
+      /^does the member/i,
+      /^is the client/i,
+      /^was an/i,
+      /^which language/i,
+      /^who responded/i,
+      /^screening modality/i
+    ];
 
     for (let i = 0; i < lines.length - 1; i++) {
       const line = lines[i];
-      if (!line.endsWith("?")) continue;
+      const isQuestion = questionPatterns.some(p => p.test(line));
+      if (!isQuestion) continue;
       if (/screening duration/i.test(line)) continue;
 
       const nextLine = lines[i + 1];
-      if (!nextLine || nextLine.endsWith("?")) continue;
+      if (!nextLine) continue;
+      // Skip if next line is also a question
+      if (questionPatterns.some(p => p.test(nextLine))) continue;
 
       const key = line.toLowerCase();
       if (seen.has(key)) continue;
