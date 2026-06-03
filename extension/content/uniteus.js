@@ -1086,18 +1086,16 @@ async function startScreeningScan(msg) {
   await saveScan(scan);
   publishScreenings(scan);
 
-  // Fast path: already on this client's facesheet -> switch to Screenings tab
-  // (in-app, no reload) and harvest once the rows have rendered.
-  const onClient = parseIdsFromUrl().client_id === clientId;
-  if (onClient && getFacesheetTabs().length) {
-    clickTabByLabel("Screenings");
-    if (await waitFor(() => screeningTableReady(), 9000)) {
-      await beginScreeningWalk(scan);
-      return { ok: true, count: scan.total };
-    }
+  // Already on the screenings list URL -> harvest in place (no reload).
+  // We deliberately do NOT switch tabs in-app: an in-app tab click doesn't
+  // update the URL, which leaves returnUrl pointing at the wrong view and the
+  // walk can't resume after the first detail. Navigating to the canonical list
+  // URL keeps the flow identical to the eligibility / case crawlers.
+  if (/\/facesheet\/[^/]+\/screenings\b/.test(location.pathname) &&
+      (await waitFor(() => screeningTableReady(), 9000))) {
+    await beginScreeningWalk(scan);
+    return { ok: true, count: scan.total };
   }
-  // Otherwise (or if the table didn't appear) load the list URL; the crawler
-  // resumes and harvests on the next page load.
   location.assign(`${location.origin}/facesheet/${clientId}/screenings`);
   return { ok: true, count: null };
 }
@@ -1112,7 +1110,7 @@ async function beginScreeningWalk(scan) {
   scan.index = 0;
   scan.details = [];
   scan.phase = "detail";
-  scan.returnUrl = location.href;
+  scan.returnUrl = `${location.origin}/facesheet/${scan.clientId}/screenings`;
   scan.note = list.length ? "" : "No Met Council - SCN - PHS screenings in the list.";
   await saveScan(scan);
   publishScreenings(scan);
