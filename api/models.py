@@ -1149,12 +1149,33 @@ class ScreeningForm(models.Model):
 
 
 class Questionnaire(models.Model):
-    screening_class = models.OneToOneField(
+    screening = models.OneToOneField(
         ScreeningForm,
         on_delete=models.CASCADE,
-        related_name="questionnaire"
+        related_name="screening_questionnaire"
     )
     title = models.CharField(max_length=255)
 
     def __str__(self):
-        return f"{self.title} ({self.screening_class.name})"
+        return f"{self.title} ({self.screening.name})"
+
+
+class Assessment(models.Model):
+    name = models.CharField(max_length=255)
+    description = models.TextField(blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    def __str__(self):
+        return self.name
+
+
+class AssessmentQuestionnaire(models.Model):
+    assessment = models.OneToOneField(
+        Assessment,
+        on_delete=models.CASCADE,
+        related_name="assessment_questionnaire"
+    )
+    title = models.CharField(max_length=255)
+
+    def __str__(self):
+        return f"{self.title} ({self.assessment.name})"

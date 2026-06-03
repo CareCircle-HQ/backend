@@ -443,6 +443,14 @@ textarea.diag {
   color: var(--muted);
   margin-bottom: 5px;
 }
+.scr-qa-h {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text);
+  margin: 12px 0 8px;
+  padding-bottom: 6px;
+  border-bottom: 1px solid var(--border);
+}
 .chip {
   display: inline-block;
   background: #eff6ff;

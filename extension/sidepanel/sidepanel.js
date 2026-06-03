@@ -702,11 +702,62 @@ function inspectPageFn() {
       }
       return (c.outerHTML || "").slice(0, 9000);
     };
+
+    // Extract all Q&A pairs for debugging (same logic as harvestScreeningDetail)
+    const qaPairs = [];
+    const allElements = [...document.querySelectorAll("div, span, p, h1, h2, h3, h4, h5, h6")];
+    for (let i = 0; i < allElements.length; i++) {
+      const el = allElements[i];
+      const text = clean(el.innerText);
+      if (!text || text.length > 300) continue;
+      if (!text.endsWith("?")) continue;
+      // Skip section headers
+      if (text.toLowerCase().includes("screening")) continue;
+
+      let answerEl = null;
+      if (el.nextElementSibling) answerEl = el.nextElementSibling;
+      else if (el.parentElement && el.parentElement.nextElementSibling) {
+        answerEl = el.parentElement.nextElementSibling;
+      } else {
+        for (let j = i + 1; j < allElements.length && j < i + 5; j++) {
+          const nextEl = allElements[j];
+          const nextText = clean(nextEl.innerText);
+          if (!nextText || nextText.endsWith("?")) break;
+          if (nextText.toLowerCase().includes("screening")) break;
+          if (nextText && nextText.length < 200) {
+            answerEl = nextEl;
+            break;
+          }
+        }
+      }
+
+      if (answerEl) {
+        const answer = clean(answerEl.innerText);
+        if (answer && answer !== text && answer.length < 400) {
+          qaPairs.push({ q: text.slice(0, 100), a: answer.slice(0, 100) });
+        }
+      }
+    }
+
+    // Extract all leaf nodes that might be results (for debugging over-capture)
+    const allLeafTexts = [];
+    document.querySelectorAll("*").forEach((el) => {
+      if (el.children.length === 0) {
+        const t = clean(el.innerText);
+        if (t && t.length > 2 && t.length < 80) {
+          allLeafTexts.push(t);
+        }
+      }
+    });
+
     return {
       onDetail: true,
       questionsHtml: grabAround(/^screening questions/i),
       resultsHtml: grabAround(/^screening results/i),
       detailsHtml: grabAround(/^screening details/i),
+      qaPairsFound: qaPairs.length,
+      qaPairsSample: qaPairs.slice(0, 20),
+      allLeafTextsSample: allLeafTexts.slice(0, 50),
     };
   })();
 
@@ -849,37 +900,42 @@ function renderScreeningAccordion(s, i) {
   if (!d) {
     body = '<p class="muted">Detail not captured yet \u2014 re-scan to fetch its answers.</p>';
   } else {
-    const isDuration = (q) => /screening duration/i.test(q || "");
-    const dur = (d.items.find((it) => isDuration(it.q)) || {}).a || "";
+    // Duration is now extracted separately; fallback to finding it in items if not present
+    let dur = d.duration || "";
+    if (!dur) {
+      const durItem = d.items.find((it) => /screening duration/i.test(it.q || ""));
+      if (durItem) dur = durItem.a;
+    }
     const results = d.results || [];
+    const hasQA = d.items && d.items.length > 0;
 
     let html = `<div class="scr-meta">`;
     html += `<div><span class="sum-k">Submitter</span>${escapeHtml(s.submitter || "\u2014")}</div>`;
     html += `<div><span class="sum-k">Status</span>${escapeHtml(statusDate || "\u2014")}</div>`;
     if (dur)
       html += `<div class="scr-duration"><span class="sum-k">Screening Duration</span><strong>${escapeHtml(
-        dur
+        dur + (dur === "1" ? " Minute" : " Minutes")
       )}</strong></div>`;
     html += `</div>`;
 
     if (results.length) {
       html +=
-        `<div class="scr-results"><div class="scr-results-h">Screening Results</div>` +
+        `<div class="scr-results"><div class="scr-results-h">Screening Results (${results.length} needs identified)</div>` +
         results.map((r) => `<span class="chip">${escapeHtml(r)}</span>`).join("") +
         `</div>`;
     }
 
-    html +=
-      `<table class="qa-table"><tbody>` +
-      d.items
-        .map((it) => {
-          const hl = isDuration(it.q) ? " hl" : "";
-          return `<tr class="qa${hl}"><th>${escapeHtml(it.q)}</th><td>${escapeHtml(
-            it.a
-          )}</td></tr>`;
-        })
-        .join("") +
-      `</tbody></table>`;
+    if (hasQA) {
+      html +=
+        `<div class="scr-qa-h">Screening Questions</div>` +
+        `<table class="qa-table"><tbody>` +
+        d.items
+          .map((it) => `<tr class="qa"><th>${escapeHtml(it.q)}</th><td>${escapeHtml(it.a)}</td></tr>`)
+          .join("") +
+        `</tbody></table>`;
+    } else {
+      html += `<p class="muted">No Q&A captured. Use Inspect tool on the screening detail page to debug.</p>`;
+    }
     body = html;
   }
   return `<div class="acc${i === 0 ? " open" : ""}">${head}<div class="acc-body">${body}</div></div>`;

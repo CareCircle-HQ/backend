@@ -824,31 +824,41 @@ function harvestScreeningList() {
   return out;
 }
 
-// Best-effort: capture the "Screening Results" section's domain items.
-function harvestScreeningResults(root) {
-  const trigger = [...document.querySelectorAll("[aria-expanded]")].find((el) =>
-    cleanText(el.innerText).toLowerCase().startsWith("screening results")
-  );
-  if (!trigger) return [];
-  let panel = null;
-  const controls = trigger.getAttribute("aria-controls");
-  if (controls) panel = document.getElementById(controls);
-  if (!panel) panel = trigger.nextElementSibling;
-  if (!panel) panel = trigger.parentElement;
-  if (!panel) return [];
+// Allowed screening results (case-insensitive match)
+const ALLOWED_NEEDS = [
+  "housing",
+  "social support",
+  "food",
+  "transportation",
+  "unemployment"
+];
 
+function normalizeNeed(text) {
+  return cleanText(text).toLowerCase().replace(/[^a-z]/g, "");
+}
+
+function isAllowedNeed(text) {
+  const normalized = normalizeNeed(text);
+  return ALLOWED_NEEDS.some(need => normalized.includes(need.replace(/[^a-z]/g, "")));
+}
+
+// Best-effort: capture the "Screening Results" section's need cards.
+function harvestScreeningResults() {
   const out = [];
   const seen = new Set();
-  panel.querySelectorAll("*").forEach((el) => {
-    if (el.children.length) return; // leaf nodes only
+
+  // Look for need cards with the specific class structure from diagnostic
+  document.querySelectorAll(".need-card .need-card__name").forEach((el) => {
     const t = cleanText(el.innerText);
     if (!t || t.length > 80) return;
+    if (!isAllowedNeed(t)) return; // only keep the 5 allowed needs
     const low = t.toLowerCase();
-    if (low === "screening results" || seen.has(low)) return;
+    if (seen.has(low)) return;
     seen.add(low);
     out.push(t);
   });
-  return out.slice(0, 40);
+
+  return out;
 }
 
 // Capture one screening detail page: ordered question/answer pairs (excluding
@@ -857,32 +867,73 @@ function harvestScreeningDetail() {
   const m = location.href.match(new RegExp(`submission/(${UUID_RE.source})`, "i"));
   const id = m ? m[1].toLowerCase() : null;
 
-  const root = document.querySelector(".screening-detail") || document.body;
-  const exclude = [
-    ...root.querySelectorAll(".screening-detail__requestor, .client-summary"),
-  ];
-  const inExcluded = (el) => exclude.some((r) => r.contains(el));
-
   const items = [];
   const seen = new Set();
-  root
-    .querySelectorAll("[class*='label'], [data-testid*='label']")
-    .forEach((lab) => {
-      if (inExcluded(lab)) return;
-      if (lab.tagName === "H3") return; // client-summary labels are <h3>
-      const q = cleanText(lab.innerText);
-      const next = lab.nextElementSibling;
-      if (!next) return;
-      const a = cleanText(next.innerText);
-      if (!q || !a || q === a) return;
-      if (q.length > 200 || a.length > 400) return;
-      const key = q.toLowerCase();
-      if (seen.has(key)) return;
-      seen.add(key);
-      items.push({ q, a });
-    });
 
-  return { id, items, results: harvestScreeningResults(root) };
+  // Primary strategy: Use the specific class selectors from diagnostic data
+  // .ui-form-renderer-question-display contains .__label (question) and .__value (answer)
+  document.querySelectorAll(".ui-form-renderer-question-display").forEach((container) => {
+    const labelEl = container.querySelector(".ui-form-renderer-question-display__label");
+    const valueEl = container.querySelector(".ui-form-renderer-question-display__value");
+
+    if (!labelEl) return;
+
+    const q = cleanText(labelEl.innerText);
+    // Skip section headers (don't end with ?)
+    if (!q || !q.endsWith("?")) return;
+    // Skip the "Screening Duration" question - we handle that separately
+    if (/screening duration/i.test(q)) return;
+
+    const a = valueEl ? cleanText(valueEl.innerText) : "";
+    if (!a) return;
+
+    const key = q.toLowerCase();
+    if (seen.has(key)) return;
+    seen.add(key);
+    items.push({ q, a });
+  });
+
+  // Fallback: Try the label/value extraction pattern (from diagnostic's labelValueSample)
+  if (items.length === 0) {
+    const allText = document.body.innerText || "";
+    const lines = allText.split(/\n/).map(l => cleanText(l)).filter(Boolean);
+
+    for (let i = 0; i < lines.length - 1; i++) {
+      const line = lines[i];
+      if (!line.endsWith("?")) continue;
+      if (/screening duration/i.test(line)) continue;
+
+      const nextLine = lines[i + 1];
+      if (!nextLine || nextLine.endsWith("?")) continue;
+
+      const key = line.toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      items.push({ q: line, a: nextLine });
+    }
+  }
+
+  // Extract Screening Duration - look for the number near "Screening Duration" label
+  let duration = null;
+  document.querySelectorAll(".ui-form-renderer-question-display").forEach((container) => {
+    const labelEl = container.querySelector(".ui-form-renderer-question-display__label");
+    if (!labelEl) return;
+    const labelText = cleanText(labelEl.innerText);
+    if (!/screening duration/i.test(labelText)) return;
+
+    // Look for a number in the container text
+    const containerText = cleanText(container.innerText);
+    const match = containerText.match(/(\d+)/);
+    if (match) duration = match[1];
+  });
+
+  // Fallback duration extraction
+  if (!duration) {
+    const durationMatch = document.body.innerText.match(/Screening Duration\s*(\d+)/i);
+    if (durationMatch) duration = durationMatch[1];
+  }
+
+  return { id, items, results: harvestScreeningResults(), duration };
 }
 
 function saveScan(scan) {
@@ -1027,6 +1078,7 @@ async function maybeContinueScreeningScan() {
       id: m[1].toLowerCase(),
       items: detail.items,
       results: detail.results,
+      duration: detail.duration,
       capturedAt: new Date().toISOString(),
     };
     scan.index += 1;

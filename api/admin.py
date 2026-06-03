@@ -3,6 +3,8 @@ from django.contrib import admin
 from .models import (
     Address,
     Answer,
+    Assessment,
+    AssessmentQuestionnaire,
     Case,
     Client,
     Eligibility,
@@ -13,9 +15,11 @@ from .models import (
     Program,
     Provider,
     Question,
+    Questionnaire,
     QuestionOption,
     ScreenTemplate,
     Screening,
+    ScreeningForm,
     VerifiedSocialNeed,
 )
 
@@ -224,3 +228,29 @@ class ImportBatchAdmin(admin.ModelAdmin):
     list_filter = ("source", "status")
     search_fields = ("file_name",)
     readonly_fields = ("imported_at",)
+
+
+@admin.register(ScreeningForm)
+class ScreeningFormAdmin(admin.ModelAdmin):
+    list_display = ("name", "created_at")
+    search_fields = ("name",)
+
+
+@admin.register(Questionnaire)
+class QuestionnaireAdmin(admin.ModelAdmin):
+    list_display = ("title", "screening")
+    search_fields = ("title", "screening__name")
+    autocomplete_fields = ("screening",)
+
+
+@admin.register(Assessment)
+class AssessmentAdmin(admin.ModelAdmin):
+    list_display = ("name", "created_at")
+    search_fields = ("name",)
+
+
+@admin.register(AssessmentQuestionnaire)
+class AssessmentQuestionnaireAdmin(admin.ModelAdmin):
+    list_display = ("title", "assessment")
+    search_fields = ("title", "assessment__name")
+    autocomplete_fields = ("assessment",)
