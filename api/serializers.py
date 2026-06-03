@@ -236,7 +236,15 @@ class ClientSerializer(serializers.ModelSerializer):
                         client=client, insurance_id=key, defaults=ins
                     )
                 else:
-                    Insurance.objects.create(client=client, **ins)
+                    # No external insurance_id (e.g. records scraped from the
+                    # Unite Us page): dedupe by plan + member id so repeated
+                    # syncs update the same row instead of creating duplicates.
+                    Insurance.objects.update_or_create(
+                        client=client,
+                        plan_name=ins.get("plan_name", ""),
+                        external_member_id=ins.get("external_member_id", ""),
+                        defaults=ins,
+                    )
 
         return client
 

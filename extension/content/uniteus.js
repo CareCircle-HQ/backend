@@ -224,6 +224,220 @@ function harvestTableRecords(type, into) {
   });
 }
 
+// ---------------------------------------------------------------------------
+// Profile tab: extract clean, structured field values keyed by backend field
+// names. The profile page exposes read-only "<field>-display" elements
+// (data-test-element) plus well-labeled sections, which are far more reliable
+// than the generic label/value harvest (that one also picks up edit-mode
+// dropdown option lists). Returns { client, address, insurance } or null when
+// the profile content isn't present (so other pages don't clobber the cache).
+// ---------------------------------------------------------------------------
+function displayValue(name) {
+  const el = document.querySelector(`[data-test-element="${name}"]`);
+  return el ? cleanText(el.innerText) : "";
+}
+
+function sectionTextByTitle(title) {
+  const h = [...document.querySelectorAll("h1,h2,h3,h4")].find(
+    (el) => cleanText(el.innerText) === title
+  );
+  if (!h) return "";
+  const c = h.closest("section,article,div") || h.parentElement;
+  return c ? cleanText(c.innerText) : "";
+}
+
+function harvestProfile() {
+  const hasProfile =
+    document.querySelector('[data-test-element="fname-display"]') ||
+    [...document.querySelectorAll("h2,h3")].some(
+      (h) => cleanText(h.innerText) === "Personal Information"
+    );
+  if (!hasProfile) return null;
+
+  // "--" is the page's placeholder for an empty value.
+  const norm = (v) => {
+    v = cleanText(v);
+    return v === "--" ? "" : v;
+  };
+
+  const client = {};
+  client.first_name = norm(displayValue("fname-display"));
+  client.last_name = norm(displayValue("lname-display"));
+  client.middle_name = norm(displayValue("mname-display"));
+  client.date_of_birth = parseDob(displayValue("dob-display"));
+  client.citizenship = norm(displayValue("citizenship-display"));
+  client.race = norm(displayValue("race-display"));
+  client.ethnicity = norm(displayValue("ethnicity-display"));
+  client.gender = norm(displayValue("gender-display"));
+  client.sexuality = norm(displayValue("sexuality-display"));
+  client.sexuality_other = norm(displayValue("sexuality-other-display"));
+  client.marital_status = norm(displayValue("marital-display"));
+  client.gross_monthly_income = norm(displayValue("monthly-income-display"));
+  // Fields below have no dedicated display element. We still declare them (""),
+  // which suppresses the edit-mode garbage the generic harvester surfaces, then
+  // fill from the labeled section text where possible.
+  client.suffix = "";
+  client.household_size = "";
+  client.consent_status = "";
+  client.consented_at = "";
+  client.preferred_spoken_language = "";
+  client.preferred_written_language = "";
+  client.client_phone_number = "";
+  client.phone_type = "";
+  client.client_email_address = "";
+  client.care_coordinator = "";
+
+  let m;
+  // Contact Requirements: "Preferred Languages Spoken: English Written: English"
+  const contact = sectionTextByTitle("Contact Requirements");
+  m = contact.match(/Spoken:\s*([A-Za-z ,]+?)\s*(?:Written:|Methods|Times|Contact Notes|$)/i);
+  if (m) client.preferred_spoken_language = cleanText(m[1]);
+  m = contact.match(/Written:\s*([A-Za-z ,]+?)\s*(?:Methods|Times|Contact Notes|$)/i);
+  if (m) client.preferred_written_language = cleanText(m[1]);
+
+  // Informed Consent: "Consent Status Consent Accepted ... Received on 10/17/2025"
+  const consent = sectionTextByTitle("Informed Consent");
+  m = consent.match(/Consent Status\s*(.+?)\s*(?:Download|Received on|$)/i);
+  if (m) client.consent_status = cleanText(m[1]);
+  m = consent.match(/Received on\s*([0-9/\-]+)/i);
+  if (m) client.consented_at = cleanText(m[1]);
+
+  // Household Information: "Household Size <n> ..."
+  const household = sectionTextByTitle("Household Information");
+  m = household.match(/Household Size\s*(\d+)/i);
+  if (m) client.household_size = m[1];
+
+  // Contact Information: primary phone / email / primary address.
+  const ci = sectionTextByTitle("Contact Information");
+  m = ci.match(/([\w.+-]+@[\w.-]+\.[A-Za-z]{2,})/);
+  if (m) client.client_email_address = m[1];
+  m = ci.match(/Phone\s+(\w+)\s*\([^)]*primary[^)]*\)\s*([\d()+\-. ]{7,})/i);
+  if (m) {
+    client.phone_type = cleanText(m[1]);
+    client.client_phone_number = cleanText(m[2]);
+  }
+
+  // Care Coordinator (Care Team section): name follows the "Edit" affordance.
+  const careTeam =
+    sectionTextByTitle("Care Team") || sectionTextByTitle("Care Coordinator");
+  m = careTeam.match(/Care Coordinator\s*Edit\s*([A-Za-z'.-]+(?:\s+[A-Za-z'.-]+){1,2})/);
+  if (m && !/None Assigned/i.test(m[1])) client.care_coordinator = cleanText(m[1]);
+
+  // Primary address from Contact Information:
+  //   "Address mailing (primary) 8-13 ASTORIA BLVD ASTORIA, NY 11102 county Queens County ..."
+  const address = {
+    address_type: "", line1: "", line2: "", city: "",
+    county: "", state: "", postal_code: "",
+  };
+  const am = ci.match(
+    /Address\s+(\w+)\s*\([^)]*primary[^)]*\)\s*(.+?)\s+county\s+([A-Za-z ]+County)/i
+  );
+  if (am) {
+    address.address_type = cleanText(am[1]);
+    address.county = cleanText(am[3]);
+    const chunk = cleanText(am[2]); // "8-13 ASTORIA BLVD ASTORIA, NY 11102"
+    const cm = chunk.match(/^(.+)\s+([A-Za-z.'-]+),\s*([A-Z]{2})\s+(\d{5}(?:-\d{4})?)/);
+    if (cm) {
+      address.line1 = cleanText(cm[1]);
+      address.city = cleanText(cm[2]);
+      address.state = cm[3];
+      address.postal_code = cm[4];
+    } else {
+      address.line1 = chunk;
+    }
+  }
+
+  return { client, address, insurance: harvestInsurance() };
+}
+
+// Insurance Information + Social Care Coverage. Each saved record renders as a
+// repeated card:
+//   - Insurance:            div[data-testid="payments-profile-view"]
+//   - Social Care Coverage: div[data-testid="social-insurance-profile-view"]
+// Plan Name / Start Date / End Date have value-level testids; Member ID and
+// Group ID are label <p> + value <p> pairs; SCC Status is its own testid.
+// We keep only the records the workflow cares about:
+//   - Insurance:            End Date >= today OR "--" (no expiration).
+//   - Social Care Coverage: Status == Enrolled AND (End Date >= today OR "--").
+function harvestInsurance() {
+  const out = [];
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+
+  const endDateOk = (raw) => {
+    const v = cleanText(raw);
+    if (!v || v === "--") return true; // no expiration
+    const d = new Date(v);
+    return isNaN(d.getTime()) ? false : d >= today;
+  };
+
+  // Read the value testid's text.
+  const valOf = (root, testid) => {
+    const el = root.querySelector(`[data-testid="${testid}"]`);
+    return el ? cleanText(el.textContent) : "";
+  };
+
+  // Member ID / Group ID have no value-level testid: they render as a caption
+  // <p> (the "italic" label style) followed by a value <p>. We match the label,
+  // then take the value from (1) the next <p> sibling, or (2) the non-label <p>
+  // within the same container — whichever exists.
+  const labelValue = (root, label) => {
+    const ps = [...root.querySelectorAll("p")];
+    for (const p of ps) {
+      if (cleanText(p.textContent).toLowerCase() !== label.toLowerCase()) continue;
+      const next = p.nextElementSibling;
+      if (next && next.tagName === "P") {
+        const v = cleanText(next.textContent);
+        if (v) return v;
+      }
+      const parent = p.parentElement;
+      if (parent) {
+        const valEl = [...parent.querySelectorAll("p")].find(
+          (x) => x !== p && !/italic/.test(x.className || "") && cleanText(x.textContent)
+        );
+        if (valEl) return cleanText(valEl.textContent);
+      }
+    }
+    return "";
+  };
+
+  // Insurance records.
+  [...document.querySelectorAll('[data-testid="payments-profile-view"]')].forEach(
+    (root) => {
+      const rec = {
+        group: "insurance",
+        plan_name: valOf(root, "insPlanNameValue"),
+        member_id: labelValue(root, "Member ID"),
+        group_id: labelValue(root, "Group ID"),
+        start_date: valOf(root, "insPlanStartDateValue"),
+        end_date: valOf(root, "insPlanEndDateValue"),
+        status: "",
+      };
+      if (rec.plan_name && endDateOk(rec.end_date)) out.push(rec);
+    }
+  );
+
+  // Social Care Coverage records.
+  [...document.querySelectorAll('[data-testid="social-insurance-profile-view"]')].forEach(
+    (root) => {
+      const rec = {
+        group: "social_care_coverage",
+        plan_name: valOf(root, "sccPlanNameValue"),
+        member_id: labelValue(root, "Member ID"),
+        group_id: labelValue(root, "Group ID"),
+        start_date: valOf(root, "sccPlanStartDateValue"),
+        end_date: valOf(root, "sccPlanEndDateValue"),
+        status: valOf(root, "sccEnrollStatus"),
+      };
+      if (rec.plan_name && /^enrolled$/i.test(rec.status) && endDateOk(rec.end_date)) {
+        out.push(rec);
+      }
+    }
+  );
+
+  return out;
+}
+
 // Light scrape harvests whatever is currently visible (Overview header gives
 // name/DOB/TEL/ADDRESS). Deep scrape additionally walks each facesheet tab and
 // collects every case / screening / eligibility record it finds.
@@ -232,7 +446,8 @@ async function scrapePage(deep) {
   const recordMap = new Map();
   harvestFields(pairs);
   collectRecords(recordMap);
-  if (!deep) return { pairs, records: [...recordMap.values()] };
+  let captured = harvestProfile();
+  if (!deep) return { pairs, records: [...recordMap.values()], captured };
 
   const labels = getFacesheetTabs().map((t) => cleanText(t.innerText));
   for (const label of labels) {
@@ -240,6 +455,10 @@ async function scrapePage(deep) {
     if (!clickTabByLabel(label)) continue;
     await sleep(700); // let the tab's content load
     harvestFields(pairs);
+    if (label === "Profile") {
+      const c = harvestProfile();
+      if (c) captured = c;
+    }
 
     const type = TAB_RECORD_TYPE[label];
     if (type) {
@@ -258,7 +477,7 @@ async function scrapePage(deep) {
   clickTabByLabel("Overview");
   await sleep(150);
   collectRecords(recordMap);
-  return { pairs, records: [...recordMap.values()] };
+  return { pairs, records: [...recordMap.values()], captured };
 }
 
 // Strip UI affordance text that gets concatenated into the link's innerText
@@ -337,7 +556,91 @@ function deriveKnownFields(pairs) {
 let lastSerialized = "";
 let scraping = false;
 let lastPublished = null;
-let lastRecords = { clientId: null, list: [] };
+
+// Per-client accumulator. As the user navigates the facesheet sub-pages
+// (Overview, Profile, Cases, Screenings, ...) we union everything captured so
+// far for the SAME client_id, so the comparison shows the full picture instead
+// of only what's visible on the current page. It is reset when the client_id
+// changes and persisted to storage so it survives a full page reload.
+let accum = { clientId: null, pairs: {}, records: new Map(), captured: { client: {}, address: {} }, insurance: [] };
+
+function recordKey(r) {
+  return `${r.type}:${r.id || r.summary || ""}`;
+}
+
+function resetAccum(clientId) {
+  accum = { clientId, pairs: {}, records: new Map(), captured: { client: {}, address: {} }, insurance: [] };
+}
+
+// Merge a fresh scrape into the accumulator without clobbering existing data.
+function mergeIntoAccum(clientId, pairs, records, captured) {
+  if (accum.clientId !== clientId) resetAccum(clientId);
+  // Fields: keep the first non-empty value; let new scrapes fill gaps and
+  // upgrade values that were previously empty/shorter.
+  for (const [k, v] of Object.entries(pairs)) {
+    if (!v) continue;
+    const prev = accum.pairs[k];
+    if (!prev || (v.length > prev.length && v.includes(prev))) accum.pairs[k] = v;
+  }
+  // Records: keep richest version (one with parsed table fields wins).
+  records.forEach((r) => {
+    const key = recordKey(r);
+    const prev = accum.records.get(key);
+    if (!prev) accum.records.set(key, r);
+    else if (r.fields && Object.keys(r.fields).length &&
+             !(prev.fields && Object.keys(prev.fields).length)) {
+      accum.records.set(key, { ...prev, ...r });
+    }
+  });
+  // Structured captured profile data: only present when the profile page was
+  // scraped. Keep previously-captured non-empty values; declare empty keys so
+  // the comparison suppresses edit-mode garbage for fields we explicitly read.
+  if (captured) {
+    ["client", "address"].forEach((part) => {
+      const src = captured[part] || {};
+      const dst = accum.captured[part] || (accum.captured[part] = {});
+      for (const [k, v] of Object.entries(src)) {
+        if (v) dst[k] = v;
+        else if (!(k in dst)) dst[k] = "";
+      }
+    });
+    if (Array.isArray(captured.insurance) && captured.insurance.length) {
+      accum.insurance = captured.insurance;
+    }
+  }
+}
+
+function persistAccum() {
+  chrome.storage.local.set({
+    uw_accum: {
+      clientId: accum.clientId,
+      pairs: accum.pairs,
+      records: [...accum.records.values()],
+      captured: accum.captured,
+      insurance: accum.insurance,
+    },
+  });
+}
+
+// Restore the accumulator from storage (e.g. after a full page reload) so we
+// don't lose what was captured on previously-visited sub-pages of this client.
+async function restoreAccum(clientId) {
+  if (accum.clientId === clientId) return;
+  try {
+    const { uw_accum } = await chrome.storage.local.get("uw_accum");
+    if (uw_accum && uw_accum.clientId === clientId) {
+      accum = {
+        clientId,
+        pairs: { ...uw_accum.pairs },
+        records: new Map((uw_accum.records || []).map((r) => [recordKey(r), r])),
+        captured: uw_accum.captured || { client: {}, address: {} },
+        insurance: uw_accum.insurance || [],
+      };
+      return;
+    }
+  } catch (_) {}
+  resetAccum(clientId);
+}
 
 async function publishContext(deep = false) {
   const ids = parseIdsFromUrl();
@@ -345,17 +648,14 @@ async function publishContext(deep = false) {
   if (scraping) return;
   scraping = true;
   try {
-    const { pairs, records } = await scrapePage(deep);
-    const known = deriveKnownFields(pairs);
+    await restoreAccum(ids.client_id);
+    const { pairs, records, captured } = await scrapePage(deep);
+    mergeIntoAccum(ids.client_id, pairs, records, captured);
+    persistAccum();
 
-    // Preserve records gathered by a previous deep scan on the same client so a
-    // later light scrape doesn't wipe them.
-    let finalRecords = records;
-    if (finalRecords.length) {
-      lastRecords = { clientId: ids.client_id, list: finalRecords };
-    } else if (lastRecords.clientId === ids.client_id) {
-      finalRecords = lastRecords.list;
-    }
+    const mergedPairs = accum.pairs;
+    const finalRecords = [...accum.records.values()];
+    const known = deriveKnownFields(mergedPairs);
     const idsByType = (t) =>
       finalRecords.filter((r) => r.type === t).map((r) => r.id);
 
@@ -369,8 +669,10 @@ async function publishContext(deep = false) {
       case_ids: idsByType("case"),
       screening_ids: idsByType("screening"),
       eligibility_ids: idsByType("eligibility"),
-      scraped: pairs,
-      scraped_count: Object.keys(pairs).length,
+      scraped: mergedPairs,
+      scraped_count: Object.keys(mergedPairs).length,
+      captured: accum.captured,
+      insurance: accum.insurance,
       source_url: location.href,
       captured_at: new Date().toISOString(),
     };
