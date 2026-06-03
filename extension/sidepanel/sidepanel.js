@@ -789,6 +789,62 @@ function inspectPageFn() {
     };
   })();
 
+  // Case DETAIL page (/dashboard/cases/.../contact/...): dump structure so we
+  // can map the visible fields (service type, status, dates, provider, program,
+  // worker, description, outcome, service authorization, etc.) to the Case model.
+  const caseDetail = (() => {
+    if (!/\/dashboard\/cases\//i.test(location.href)) return { onDetail: false };
+    // Label/value pairs: a label element whose next sibling holds the value.
+    const lv = {};
+    const addLV = (k, v) => {
+      k = clean(k);
+      v = clean(v);
+      if (k && v && k !== v && !(k in lv)) lv[k] = v;
+    };
+    document
+      .querySelectorAll("[class*='label'], [data-testid*='label'], dt, label, h3, h4, strong")
+      .forEach((l) => {
+        if (l.children.length) return;
+        const sib = l.nextElementSibling;
+        if (sib) addLV(l.innerText, sib.innerText);
+        else if (l.parentElement) {
+          const t = clean(l.parentElement.innerText);
+          const k = clean(l.innerText);
+          if (t.startsWith(k) && t.length > k.length) addLV(k, t.slice(k.length));
+        }
+      });
+    // Distinct label-ish class names (leaf text ending with ':' or short bold).
+    const classSet = new Set();
+    document.querySelectorAll("div, span, p, dt, label").forEach((el) => {
+      if (el.children.length) return;
+      const t = clean(el.innerText);
+      if (t && t.length < 60 && /:$/.test(t)) {
+        const cls = (el.className || "").toString().slice(0, 120);
+        if (cls) classSet.add(cls);
+      }
+    });
+    // Section headings + their container text within the case content area.
+    const sections = [...document.querySelectorAll("h1, h2, h3, h4, h5")]
+      .map((h) => {
+        const title = clean(h.innerText);
+        if (!title) return null;
+        const c = h.closest("section, article, div") || h.parentElement;
+        const text = c ? (c.innerText || "").replace(/\s+/g, " ").trim().slice(0, 1500) : "";
+        return { title, text };
+      })
+      .filter((s) => s && s.text)
+      .slice(0, 40);
+    const main =
+      document.querySelector("main, [class*='case'], [class*='content']") || document.body;
+    return {
+      onDetail: true,
+      labelValuePairs: lv,
+      labelClassesSample: [...classSet].slice(0, 25),
+      sections,
+      mainHtml: (main.outerHTML || "").slice(0, 14000),
+    };
+  })();
+
   return {
     url: location.href,
     title: document.title,
@@ -802,6 +858,7 @@ function inspectPageFn() {
     screeningRows,
     screeningDetail,
     eligibilityDetail,
+    caseDetail,
     coverageSections,
     sectionTexts,
     counts: {
