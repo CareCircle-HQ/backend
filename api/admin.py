@@ -5,6 +5,7 @@ from .models import (
     Answer,
     Case,
     Client,
+    Eligibility,
     IdentifiedSocialNeed,
     ImportBatch,
     Insurance,
@@ -45,7 +46,15 @@ class ClientAdmin(admin.ModelAdmin):
         "consent_status",
         "crm_contact_id",
     )
-    list_filter = ("is_active", "consent_status", "enrollment_from")
+    list_filter = (
+        "is_active",
+        "consent_status",
+        "enrollment_from",
+        "is_family",
+        "attestation_needed",
+        "different_delivery_address",
+        "call_transfer_answered",
+    )
     search_fields = (
         "client_id",
         "first_name",
@@ -53,6 +62,8 @@ class ClientAdmin(admin.ModelAdmin):
         "client_email_address",
         "client_phone_number",
         "crm_contact_id",
+        "agent_code",
+        "lead_source",
     )
     inlines = [MilitaryProfileInline, AddressInline, InsuranceInline]
 
@@ -146,6 +157,26 @@ class ScreeningAdmin(admin.ModelAdmin):
     )
     autocomplete_fields = ("client", "case", "template", "parent_screen", "related_screen")
     inlines = [AnswerInline, IdentifiedSocialNeedInline, VerifiedSocialNeedInline]
+
+
+@admin.register(Eligibility)
+class EligibilityAdmin(admin.ModelAdmin):
+    list_display = (
+        "eligibility_id",
+        "client",
+        "screen_status",
+        "screen_type",
+        "eligible_status",
+        "screen_created_at",
+    )
+    list_filter = ("screen_status", "screen_type", "eligible_status")
+    search_fields = (
+        "eligibility_id",
+        "subject_id",
+        "client__last_name",
+        "client_last_name",
+    )
+    autocomplete_fields = ("client", "case")
 
 
 class QuestionOptionInline(admin.TabularInline):

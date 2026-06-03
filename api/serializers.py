@@ -4,10 +4,13 @@ from django.db import transaction
 from rest_framework import serializers
 
 from .models import (
+    WEEKDAYS,
     Address,
     Answer,
     Case,
     Client,
+    CommunicationTimeOfDay,
+    Eligibility,
     IdentifiedSocialNeed,
     ImportBatch,
     Insurance,
@@ -18,6 +21,7 @@ from .models import (
     QuestionOption,
     ScreenTemplate,
     Screening,
+    ServiceType,
     VerifiedSocialNeed,
 )
 
@@ -142,6 +146,57 @@ class ClientSerializer(serializers.ModelSerializer):
         model = Client
         fields = "__all__"
 
+    def _validate_services(self, value, field_name):
+        if value in (None, ""):
+            return []
+        if not isinstance(value, list):
+            raise serializers.ValidationError(
+                f"{field_name} must be a list of service codes."
+            )
+        valid = set(ServiceType.values)
+        invalid = [v for v in value if v not in valid]
+        if invalid:
+            raise serializers.ValidationError(
+                f"Invalid {field_name} values: {invalid}. "
+                f"Allowed: {sorted(valid)}"
+            )
+        return value
+
+    def validate_eligible_for(self, value):
+        return self._validate_services(value, "eligible_for")
+
+    def validate_referred_for(self, value):
+        return self._validate_services(value, "referred_for")
+
+    def validate_preferred_communication_time_of_day(self, value):
+        if value in (None, ""):
+            return {day: [] for day in WEEKDAYS}
+        if not isinstance(value, dict):
+            raise serializers.ValidationError(
+                "Must be an object mapping weekdays to lists of windows."
+            )
+        valid_days = set(WEEKDAYS)
+        valid_windows = set(CommunicationTimeOfDay.values)
+        normalized = {day: [] for day in WEEKDAYS}
+        for day, windows in value.items():
+            if day not in valid_days:
+                raise serializers.ValidationError(f"Unknown day: {day}")
+            if windows is None:
+                windows = []
+            if not isinstance(windows, list):
+                raise serializers.ValidationError(
+                    f"{day} must be a list of windows (e.g. ['morning', 'evening'])."
+                )
+            invalid = [w for w in windows if w not in valid_windows]
+            if invalid:
+                raise serializers.ValidationError(
+                    f"Invalid windows for {day}: {invalid}. "
+                    f"Allowed: {sorted(valid_windows)}"
+                )
+            # de-duplicate while preserving order
+            normalized[day] = list(dict.fromkeys(windows))
+        return normalized
+
     @transaction.atomic
     def create(self, validated_data):
         return self._upsert(validated_data)
@@ -181,7 +236,15 @@ class ClientSerializer(serializers.ModelSerializer):
                         client=client, insurance_id=key, defaults=ins
                     )
                 else:
-                    Insurance.objects.create(client=client, **ins)
+                    # No external insurance_id (e.g. records scraped from the
+                    # Unite Us page): dedupe by plan + member id so repeated
+                    # syncs update the same row instead of creating duplicates.
+                    Insurance.objects.update_or_create(
+                        client=client,
+                        plan_name=ins.get("plan_name", ""),
+                        external_member_id=ins.get("external_member_id", ""),
+                        defaults=ins,
+                    )
 
         return client
 
@@ -443,3 +506,37 @@ class ScreeningSerializer(serializers.ModelSerializer):
                 )
 
         return screening
+
+
+# ===========================================================================
+# Eligibility domain
+# ===========================================================================
+class EligibilitySerializer(serializers.ModelSerializer):
+    eligibility_id = serializers.UUIDField()
+    subject_id = serializers.UUIDField()
+    case_id = serializers.UUIDField(required=False, allow_null=True)
+
+    class Meta:
+        model = Eligibility
+        exclude = ("client", "case", "import_batch")
+
+    @transaction.atomic
+    def create(self, validated_data):
+        return self._upsert(validated_data)
+
+    @transaction.atomic
+    def update(self, instance, validated_data):
+        return self._upsert(validated_data)
+
+    def _upsert(self, validated_data):
+        eid = validated_data.pop("eligibility_id")
+        subject_id = validated_data.get("subject_id")
+        case_id = validated_data.pop("case_id", None)
+        validated_data["client"] = Client.objects.filter(pk=subject_id).first()
+        validated_data["case"] = (
+            Case.objects.filter(pk=case_id).first() if case_id else None
+        )
+        obj, _ = Eligibility.objects.update_or_create(
+            eligibility_id=eid, defaults=validated_data
+        )
+        return obj

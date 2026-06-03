@@ -1,0 +1,1230 @@
+// Side panel logic: client detection, required-info gating, backend validation,
+// and tabbed embedded forms. Auth is transparent via the baked service token.
+
+// Form URLs per tab. Leave a value empty ("") to show a "not configured" notice.
+const FORMS = {
+  eform: "https://links.carecirclecs.com/widget/form/fg6YKsPnZCb4qOtzZ1GU",
+  nform: "", // TODO: set N-Form URL
+  vform: "", // TODO: set V-Form URL
+};
+// Tabs that stay locked until the client is validated.
+const GATED_TABS = ["eform", "nform", "vform"];
+
+// Information that must be scraped before we allow validation.
+const REQUIRED_FIELDS = [
+  { key: "client_id", label: "Client ID" },
+  { key: "client_name", label: "Name" },
+  { key: "client_dob", label: "Date of Birth" },
+];
+
+const BAKED = (typeof window !== "undefined" && window.EXT_CONFIG) || {};
+const DEFAULT_BACKEND = BAKED.backendUrl || "http://127.0.0.1:8000";
+
+const $ = (id) => document.getElementById(id);
+let currentContext = null;
+let isValidated = false;
+const loadedFrames = new Set();
+
+// ---------- Config (transparent auth) ----------
+async function getConfig() {
+  const { uw_config } = await chrome.storage.local.get("uw_config");
+  const stored = uw_config || {};
+  return {
+    backendUrl: stored.backendUrl || DEFAULT_BACKEND,
+    token: stored.token || BAKED.apiToken || "",
+    scheme: stored.scheme || BAKED.authScheme || "Token",
+  };
+}
+
+function authHeader(cfg) {
+  return { Authorization: `${cfg.scheme} ${cfg.token}` };
+}
+
+// ---------- Client context + required fields ----------
+function fieldPresent(ctx, key) {
+  return !!(ctx && ctx[key] && String(ctx[key]).trim());
+}
+
+function requiredMet(ctx) {
+  return REQUIRED_FIELDS.every((f) => fieldPresent(ctx, f.key));
+}
+
+function renderContext(ctx) {
+  const box = $("context");
+  if (!ctx || !ctx.client_id) {
+    box.innerHTML =
+      '<p class="muted">Open a Unite Us facesheet page to detect a client.</p>';
+    return;
+  }
+  const rows = [
+    ["Client ID", ctx.client_id],
+    ["Name", ctx.client_name || "—"],
+    ["DOB", ctx.client_dob || "—"],
+    ["Phone", ctx.client_phone || "—"],
+    ["Address", ctx.client_address || "—"],
+    ["Case ID", ctx.case_id || "—"],
+    ["Screening ID", ctx.screening_id || "—"],
+  ];
+  box.innerHTML =
+    "<dl>" +
+    rows
+      .map(([k, v]) => `<dt>${k}</dt><dd>${escapeHtml(v)}</dd>`)
+      .join("") +
+    "</dl>";
+}
+
+function escapeHtml(s) {
+  return String(s)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
+
+// ---------------------------------------------------------------------------
+// Schema-driven Captured-vs-CRM comparison
+// ---------------------------------------------------------------------------
+// Each field: key = backend/CRM field name, label = display, aliases = lowercase
+// substrings used to match the labels scraped from the Unite Us page.
+const SCHEMA = {
+  client: {
+    title: "Client",
+    fields: [
+      { key: "first_name", label: "First Name", aliases: ["first name", "legal first"] },
+      { key: "middle_name", label: "Middle Initial", aliases: ["middle name", "middle initial", "middle"] },
+      { key: "last_name", label: "Last Name", aliases: ["last name", "legal last"] },
+      { key: "suffix", label: "Suffix", aliases: ["suffix"] },
+      { key: "date_of_birth", label: "Date of Birth", aliases: ["date of birth", "dob", "birth"] },
+      { key: "gender", label: "Gender", aliases: ["gender", "sex assigned", "sex"] },
+      { key: "sexuality", label: "Sexuality", aliases: ["sexuality", "sexual orientation"] },
+      { key: "race", label: "Race", aliases: ["race"] },
+      { key: "ethnicity", label: "Ethnicity", aliases: ["ethnicity"] },
+      { key: "marital_status", label: "Marital Status", aliases: ["marital"] },
+      { key: "citizenship", label: "Citizenship", aliases: ["citizen"] },
+      { key: "client_phone_number", label: "Phone", aliases: ["phone", "tel", "mobile"] },
+      { key: "phone_type", label: "Phone Type", aliases: ["phone type"] },
+      { key: "client_email_address", label: "Email", aliases: ["email", "e-mail"] },
+      { key: "preferred_spoken_language", label: "Spoken Language", aliases: ["spoken language", "language"] },
+      { key: "preferred_written_language", label: "Written Language", aliases: ["written language"] },
+      { key: "preferred_communication_method", label: "Contact Method", aliases: ["communication method", "preferred contact", "contact method"] },
+      { key: "lead_source", label: "Lead Source", aliases: ["lead source", "source"] },
+      { key: "enrollment_from", label: "Enrollment From", aliases: ["enrollment from", "enrolled from"] },
+      { key: "consent_status", label: "Consent", aliases: ["consent"] },
+      { key: "consented_at", label: "Consent Received", aliases: ["received on", "consent received"] },
+      { key: "eligible_for", label: "Eligible For", aliases: ["eligible for", "eligible services"] },
+      { key: "referred_for", label: "Referred For", aliases: ["referred for"] },
+      { key: "is_family", label: "Is Family", aliases: ["is family", "family"] },
+      { key: "total_family_members", label: "Family Members", aliases: ["family members", "household members"] },
+      { key: "gross_monthly_income", label: "Monthly Income", aliases: ["monthly income", "gross income", "income"] },
+      { key: "household_size", label: "Household Size", aliases: ["household size"] },
+      { key: "adults_in_household", label: "Adults in Household", aliases: ["adults"] },
+      { key: "children_in_household", label: "Children in Household", aliases: ["children"] },
+      { key: "care_coordinator", label: "Care Coordinator", aliases: ["care coordinator", "coordinator"] },
+      { key: "agent_code", label: "Agent Code", aliases: ["agent code", "agent"] },
+    ],
+  },
+  address: {
+    title: "Address",
+    nested: "addresses",
+    fields: [
+      { key: "address_type", label: "Type", aliases: ["address type"] },
+      { key: "line1", label: "Street", aliases: ["address", "street", "line 1"] },
+      { key: "line2", label: "Street 2", aliases: ["line 2", "apt", "unit", "suite"] },
+      { key: "city", label: "City", aliases: ["city"] },
+      { key: "county", label: "County", aliases: ["county"] },
+      { key: "state", label: "State", aliases: ["state"] },
+      { key: "postal_code", label: "ZIP", aliases: ["zip", "postal"] },
+    ],
+  },
+  // capKey = key in the page-captured coverage record; key = CRM field name.
+  insurance: {
+    title: "Insurance",
+    nested: "insurances",
+    fields: [
+      { key: "plan_name", capKey: "plan_name", label: "Plan Name" },
+      { key: "external_member_id", capKey: "member_id", label: "Member ID" },
+      { key: "external_group_id", capKey: "group_id", label: "Group ID" },
+      { key: "enrolled_at", capKey: "start_date", label: "Start Date" },
+      { key: "expired_at", capKey: "end_date", label: "End Date" },
+    ],
+  },
+  social_care_coverage: {
+    title: "Social Care Coverage",
+    fields: [
+      { key: "plan_name", capKey: "plan_name", label: "Plan Name" },
+      { key: "external_member_id", capKey: "member_id", label: "Member ID" },
+      { key: "external_group_id", capKey: "group_id", label: "Group ID" },
+      { key: "enrolled_at", capKey: "start_date", label: "Start Date" },
+      { key: "expired_at", capKey: "end_date", label: "End Date" },
+      { key: "status", capKey: "status", label: "Status" },
+    ],
+  },
+  case: {
+    title: "Cases",
+    record: true,
+    fields: [
+      { key: "service_type", label: "Service Type", aliases: ["service type"] },
+      { key: "service_subtype", label: "Service Subtype", aliases: ["subtype", "service type"] },
+      { key: "case_status", label: "Status", aliases: ["status"] },
+      { key: "provider_name", label: "Provider", aliases: ["provider"] },
+      { key: "program_name", label: "Program", aliases: ["program"] },
+      { key: "network_name", label: "Network", aliases: ["network"] },
+      { key: "primary_worker_name", label: "Worker", aliases: ["worker", "navigator"] },
+      { key: "created_at", label: "Created", aliases: ["created", "opened", "date"] },
+      { key: "updated_at", label: "Updated", aliases: ["updated", "last updated"] },
+    ],
+  },
+  screening: {
+    title: "Screenings",
+    record: true,
+    fields: [
+      { key: "screen_type", label: "Type", aliases: ["type"] },
+      { key: "screen_status", label: "Status", aliases: ["status"] },
+      { key: "provider_name", label: "Provider", aliases: ["provider"] },
+      { key: "language", label: "Language", aliases: ["language"] },
+      { key: "consent", label: "Consent", aliases: ["consent"] },
+      { key: "screen_created_at", label: "Created", aliases: ["created", "date"] },
+    ],
+  },
+  eligibility: {
+    title: "Eligibility",
+    record: true,
+    fields: [
+      { key: "screen_type", label: "Type", aliases: ["type"] },
+      { key: "screen_status", label: "Status", aliases: ["status"] },
+      { key: "eligible_status", label: "Eligible", aliases: ["eligible"] },
+      { key: "provider_name", label: "Provider", aliases: ["provider"] },
+      { key: "screen_created_at", label: "Created", aliases: ["created", "date"] },
+    ],
+  },
+};
+
+// Format any CRM/captured value for display ("" when empty).
+function fmtValue(v) {
+  if (v === null || v === undefined) return "";
+  if (typeof v === "boolean") return v ? "Yes" : "No";
+  if (Array.isArray(v)) return v.filter(Boolean).join(", ");
+  if (typeof v === "object") {
+    // e.g. preferred_communication_time_of_day {monday:[...], ...}
+    const parts = Object.entries(v)
+      .filter(([, val]) => Array.isArray(val) && val.length)
+      .map(([day, val]) => `${day}: ${val.join("/")}`);
+    return parts.join("; ");
+  }
+  return String(v).trim();
+}
+
+// Build a searchable index of label->value pairs captured from the page.
+function buildCapturedIndex(pairs) {
+  return Object.entries(pairs || {}).map(([label, value]) => ({
+    l: label.toLowerCase(),
+    value: String(value || ""),
+  }));
+}
+
+// Find the best captured value for a schema field using its aliases.
+function findCaptured(index, field) {
+  for (const alias of field.aliases || []) {
+    const hit = index.find((e) => !e.l.includes("user") && e.l.includes(alias));
+    if (hit && hit.value) return hit.value;
+  }
+  return "";
+}
+
+// One comparison row: status dot + field + captured + crm.
+function compareRow(label, captured, crm) {
+  const cap = fmtValue(captured);
+  const cr = fmtValue(crm);
+  let cls = "empty";
+  if (cap && cr) cls = "both";
+  else if (cap) cls = "cap-only";
+  else if (cr) cls = "crm-only";
+  const cell = (val) =>
+    val ? escapeHtml(val) : '<span class="miss">\u2014</span>';
+  return (
+    `<tr class="cmp ${cls}"><td class="dot"></td>` +
+    `<th>${escapeHtml(label)}</th>` +
+    `<td>${cell(cap)}</td><td>${cell(cr)}</td></tr>`
+  );
+}
+
+function compareTable(rows, capturedN, crmN, total) {
+  return (
+    `<table class="cmp-table">` +
+    `<thead><tr><th class="dot"></th><th>Field</th>` +
+    `<th>Captured <span class="cnt">${capturedN}/${total}</span></th>` +
+    `<th>CRM <span class="cnt">${crmN}/${total}</span></th></tr></thead>` +
+    `<tbody>${rows}</tbody></table>`
+  );
+}
+
+// Render a flat (single-object) section: client / address / insurance(one).
+// capturedObj is the structured page-captured object keyed by field key/capKey;
+// when a field key is present there (even if ""), it is authoritative and we do
+// NOT fall back to fuzzy label matching (which can surface edit-mode garbage).
+function renderObjectSection(def, capturedObj, capturedPairs, crmObj) {
+  const index = buildCapturedIndex(capturedPairs);
+  capturedObj = capturedObj || {};
+  let capN = 0;
+  let crmN = 0;
+  const rows = def.fields
+    .map((f) => {
+      const ck = f.capKey || f.key;
+      const cap = ck in capturedObj ? capturedObj[ck] : findCaptured(index, f);
+      const crm = crmObj ? crmObj[f.key] : "";
+      if (fmtValue(cap)) capN++;
+      if (fmtValue(crm)) crmN++;
+      return compareRow(f.label, cap, crm);
+    })
+    .join("");
+  return compareTable(rows, capN, crmN, def.fields.length);
+}
+
+// Render a record-type section (cases/screenings/eligibility): union by id.
+function renderRecordSection(def, type, ctx) {
+  const pageRecs = (ctx && ctx.records ? ctx.records : []).filter(
+    (r) => r.type === type
+  );
+  const crmRecs = crm[type] || [];
+  const idKey = { case: "case_id", screening: "enhanced_screen_id", eligibility: "eligibility_id" }[type];
+
+  // Union of ids (plus page records without an id).
+  const byId = new Map();
+  crmRecs.forEach((c) => byId.set(String(c[idKey]), { crm: c, page: null }));
+  pageRecs.forEach((p, i) => {
+    const id = p.id ? String(p.id) : `pg:${i}`;
+    if (byId.has(id)) byId.get(id).page = p;
+    else byId.set(id, { crm: null, page: p });
+  });
+
+  if (!byId.size) {
+    return '<p class="muted">None detected or imported yet.</p>';
+  }
+
+  let html = "";
+  let n = 0;
+  byId.forEach(({ crm: crmObj, page }, id) => {
+    n++;
+    const index = buildCapturedIndex(page && page.fields ? page.fields : {});
+    let capN = 0;
+    let crmN = 0;
+    const rows = def.fields
+      .map((f) => {
+        const cap = findCaptured(index, f);
+        const crmVal = crmObj ? crmObj[f.key] : "";
+        if (fmtValue(cap)) capN++;
+        if (fmtValue(crmVal)) crmN++;
+        return compareRow(f.label, cap, crmVal);
+      })
+      .join("");
+    const tags =
+      (page ? '<span class="tag det">Detected</span>' : "") +
+      (crmObj ? '<span class="tag imp">In CRM</span>' : "");
+    html +=
+      `<div class="rec-block"><div class="rec-head">` +
+      `<span class="rec-n">${def.title.replace(/s$/, "")} ${n}</span> ${tags}</div>` +
+      (id.startsWith("pg:") ? "" : `<div class="rec-id">${escapeHtml(id)}</div>`) +
+      compareTable(rows, capN, crmN, def.fields.length) +
+      `</div>`;
+  });
+  return html;
+}
+
+// Render a coverage group (insurance / social care coverage): union of the
+// page-captured records for that group (already filtered by the content script
+// per the workflow rules) and any matching CRM insurances, matched best-effort
+// by plan name. Falls back to a single empty schema table.
+function renderCoverageSection(ctx, group, def, crmList) {
+  const capList = (ctx && Array.isArray(ctx.insurance) ? ctx.insurance : []).filter(
+    (c) => (c.group || "insurance") === group
+  );
+  crmList = crmList || [];
+  if (!capList.length && !crmList.length) {
+    return renderObjectSection(def, {}, {}, null);
+  }
+  const norm = (s) => String(s || "").trim().toLowerCase();
+  const usedCap = new Set();
+  const blocks = [];
+  crmList.forEach((crmObj, i) => {
+    const capIdx = capList.findIndex(
+      (c, idx) => !usedCap.has(idx) && norm(c.plan_name) && norm(c.plan_name) === norm(crmObj.plan_name)
+    );
+    let capObj = {};
+    if (capIdx >= 0) {
+      capObj = capList[capIdx];
+      usedCap.add(capIdx);
+    }
+    blocks.push({ capObj, crmObj, label: crmObj.plan_name || `${def.title} ${i + 1}` });
+  });
+  capList.forEach((c, idx) => {
+    if (usedCap.has(idx)) return;
+    blocks.push({ capObj: c, crmObj: null, label: c.plan_name || def.title });
+  });
+  return blocks
+    .map((b) => {
+      const tags =
+        (b.capObj && Object.keys(b.capObj).length ? '<span class="tag det">Detected</span>' : "") +
+        (b.crmObj ? '<span class="tag imp">In CRM</span>' : "");
+      return (
+        `<div class="rec-block"><div class="rec-head">` +
+        `<span class="rec-n">${escapeHtml(b.label)}</span> ${tags}</div>` +
+        renderObjectSection(def, b.capObj, {}, b.crmObj) +
+        `</div>`
+      );
+    })
+    .join("");
+}
+
+// Compact summary card at the top of the Profile tab, populated from the data
+// we already capture (falling back to the derived header fields).
+function buildClientSummaryHtml(ctx) {
+  const cap = (ctx.captured && ctx.captured.client) || {};
+  const addr = (ctx.captured && ctx.captured.address) || {};
+
+  const fullName =
+    [cap.first_name, cap.middle_name, cap.last_name].filter(Boolean).join(" ") ||
+    ctx.client_name ||
+    "";
+  const dob = cap.date_of_birth || ctx.client_dob || "";
+  const phone = cap.client_phone_number || ctx.client_phone || "";
+
+  let fullAddress = "";
+  const cityLine = [addr.city, addr.state].filter(Boolean).join(", ");
+  const addrParts = [addr.line1, [cityLine, addr.postal_code].filter(Boolean).join(" ").trim()]
+    .filter(Boolean)
+    .join(", ");
+  fullAddress = addrParts || ctx.client_address || "";
+
+  const row = (label, val) =>
+    `<div class="sum-row"><span class="sum-k">${label}</span>` +
+    `<span class="sum-v">${val ? escapeHtml(val) : '<span class="miss">\u2014</span>'}</span></div>`;
+
+  return (
+    `<div class="client-summary">` +
+    row("Client ID", ctx.client_id) +
+    row("Full Name", fullName) +
+    row("DOB", dob) +
+    row("Phone", phone) +
+    row("Full Address", fullAddress) +
+    `</div>`
+  );
+}
+
+// Profile view = Client + Address + Insurance comparison.
+function buildProfileHtml(ctx) {
+  const pairs = ctx.scraped || {};
+  const captured = ctx.captured || { client: {}, address: {} };
+  const crmClient = crm.client;
+  let html = buildClientSummaryHtml(ctx);
+
+  // Client: structured captured profile data wins; pairs are only a fallback.
+  const clientPairs = {
+    ...pairs,
+    "date of birth": ctx.client_dob || pairs["DOB"] || "",
+    phone: ctx.client_phone || "",
+  };
+  html += `<h3>${SCHEMA.client.title}</h3>`;
+  html += renderObjectSection(SCHEMA.client, captured.client, clientPairs, crmClient);
+
+  // Address (current/primary): first CRM address vs captured primary address.
+  const addr = crmClient && (crmClient.addresses || [])[0];
+  const addrPairs = { ...pairs, address: ctx.client_address || pairs["ADDRESS"] || "" };
+  html += `<h3>${SCHEMA.address.title}</h3>`;
+  html += renderObjectSection(SCHEMA.address, captured.address, addrPairs, addr);
+
+  // Insurance + Social Care Coverage: captured records (filtered per the
+  // workflow rules) unioned with CRM insurances, matched best-effort by plan
+  // name. Both groups persist to the single CRM Insurance table, so we route
+  // each stored plan to the section whose captured plan name it matches.
+  const crmInsurances = (crmClient && crmClient.insurances) || [];
+  const norm = (s) => String(s || "").trim().toLowerCase();
+  const sccNames = new Set(
+    (Array.isArray(ctx.insurance) ? ctx.insurance : [])
+      .filter((c) => (c.group || "insurance") === "social_care_coverage")
+      .map((c) => norm(c.plan_name))
+      .filter(Boolean)
+  );
+  const crmScc = crmInsurances.filter((c) => sccNames.has(norm(c.plan_name)));
+  const crmIns = crmInsurances.filter((c) => !sccNames.has(norm(c.plan_name)));
+  html += `<h3>${SCHEMA.insurance.title}</h3>`;
+  html += renderCoverageSection(ctx, "insurance", SCHEMA.insurance, crmIns);
+  html += `<h3>${SCHEMA.social_care_coverage.title}</h3>`;
+  html += renderCoverageSection(ctx, "social_care_coverage", SCHEMA.social_care_coverage, crmScc);
+  return html;
+}
+
+// One record type comparison (cases / screenings / eligibility).
+function buildRecordHtml(type, ctx) {
+  return renderRecordSection(SCHEMA[type], type, ctx);
+}
+
+function renderComparison(ctx) {
+  const empty = !ctx || !ctx.client_id;
+  const fill = (id, html, emptyMsg) => {
+    const el = $(id);
+    if (el) el.innerHTML = empty ? `<p class="muted">${emptyMsg}</p>` : html;
+  };
+  const openMsg = "Open a Unite Us facesheet page to begin capturing data.";
+
+  const profileHtml = empty ? "" : buildProfileHtml(ctx);
+  const caseHtml = empty ? "" : buildRecordHtml("case", ctx);
+  const screeningHtml = empty ? "" : buildRecordHtml("screening", ctx);
+  const eligibilityHtml = empty ? "" : buildRecordHtml("eligibility", ctx);
+
+  // Per-tab views.
+  fill("cmp-profile", profileHtml, openMsg);
+  fill("cmp-screening", screeningHtml, "No screenings detected or imported yet.");
+  fill("cmp-eligibility", eligibilityHtml, "No eligibility records detected or imported yet.");
+  fill("cmp-cases", caseHtml, "No cases detected or imported yet.");
+
+  // Full comparison on the Data tab.
+  fill(
+    "comparison",
+    profileHtml +
+      `<h3>${SCHEMA.case.title}</h3>${caseHtml}` +
+      `<h3>${SCHEMA.screening.title}</h3>${screeningHtml}` +
+      `<h3>${SCHEMA.eligibility.title}</h3>${eligibilityHtml}`,
+    openMsg
+  );
+
+  // Profile-tab save controls + last-updated line.
+  const saveBtn = $("saveBtn");
+  if (saveBtn) saveBtn.disabled = empty;
+  renderProfileMeta();
+}
+
+// This function is serialized and injected into the page by executeScript,
+// so it must be fully self-contained (no references to outer scope).
+function inspectPageFn() {
+  const clean = (s) => (s || "").replace(/\s+/g, " ").trim().slice(0, 120);
+  const uniq = (a) => [...new Set(a.filter(Boolean))];
+
+  const tabSelectors = [
+    '[role="tab"]',
+    '[role="tablist"] button',
+    '[role="tablist"] a',
+    '[class*="tab"]',
+    '[data-testid*="tab"]',
+    'nav button',
+    '[class*="Tab"]',
+  ];
+  const tabs = uniq(
+    [...document.querySelectorAll(tabSelectors.join(","))].map((el) =>
+      clean(el.innerText || el.getAttribute("aria-label"))
+    )
+  ).slice(0, 40);
+
+  const expandables = [...document.querySelectorAll("[aria-expanded]")]
+    .map((el) => ({
+      text: clean(el.innerText),
+      expanded: el.getAttribute("aria-expanded"),
+    }))
+    .filter((x) => x.text)
+    .slice(0, 40);
+
+  const testids = uniq(
+    [...document.querySelectorAll("[data-testid]")].map((el) =>
+      el.getAttribute("data-testid")
+    )
+  ).slice(0, 80);
+  const dataTestElems = uniq(
+    [...document.querySelectorAll("[data-test-element]")].map((el) =>
+      el.getAttribute("data-test-element")
+    )
+  ).slice(0, 80);
+
+  const pairs = {};
+  const add = (k, v) => {
+    k = clean(k);
+    v = clean(v);
+    if (k && v && k !== v && !(k in pairs)) pairs[k] = v;
+  };
+  document.querySelectorAll("dl").forEach((dl) => {
+    const dt = dl.querySelectorAll("dt");
+    const dd = dl.querySelectorAll("dd");
+    dt.forEach((d, i) => dd[i] && add(d.innerText, dd[i].innerText));
+  });
+  document.querySelectorAll("tr").forEach((tr) => {
+    const th = tr.querySelector("th");
+    const td = tr.querySelector("td");
+    if (th && td) add(th.innerText, td.innerText);
+  });
+  document
+    .querySelectorAll("[class*='label'],[data-testid*='label']")
+    .forEach((l) => {
+      if (l.nextElementSibling) add(l.innerText, l.nextElementSibling.innerText);
+    });
+
+  const headings = uniq(
+    [...document.querySelectorAll("h1,h2,h3")].map((h) => clean(h.innerText))
+  ).slice(0, 30);
+
+  // Full dump of every visible table (headers + rows) so we can see the exact
+  // column layout for things like the Insurance / Social Care Coverage grids.
+  const cellText = (s) => (s || "").replace(/\s+/g, " ").trim().slice(0, 80);
+  const tables = [...document.querySelectorAll("table")]
+    .filter((t) => t.offsetParent !== null)
+    .slice(0, 12)
+    .map((table) => {
+      let headerCells = [...table.querySelectorAll("thead th")];
+      if (!headerCells.length) headerCells = [...table.querySelectorAll("tr th")];
+      const tHeaders = headerCells.map((th) => cellText(th.innerText));
+      let rowEls = [...table.querySelectorAll("tbody tr")];
+      if (!rowEls.length) rowEls = [...table.querySelectorAll("tr")];
+      const rows = rowEls
+        .slice(0, 25)
+        .map((tr) =>
+          [...tr.children]
+            .filter((c) => c.tagName === "TD")
+            .map((td) => cellText(td.innerText))
+        )
+        .filter((r) => r.length);
+      return { headers: tHeaders, rows };
+    });
+
+  // Focused structural dump of the coverage sections so we can build accurate
+  // parsers. Emits a compact element outline (tag + data-test attrs + leaf text)
+  // plus a trimmed outerHTML fallback.
+  const coverageDump = (title) => {
+    const h = [...document.querySelectorAll("h1,h2,h3,h4,h5")].find(
+      (el) => clean(el.innerText).toLowerCase() === title.toLowerCase()
+    );
+    if (!h) return { title, found: false };
+    // The heading lives in a "header" wrapper; the actual records render as
+    // SIBLINGS of that wrapper. Climb to the parent section and keep climbing
+    // until the container holds more than just the title + "Add" button.
+    let root = h.closest('[data-testid$="header"],[class*="header"]') || h.parentElement;
+    for (let i = 0; i < 4; i++) {
+      const up = root.parentElement;
+      if (!up) break;
+      root = up;
+      const t = (root.innerText || "").replace(/\s+/g, " ").trim();
+      if (t.length > clean(title).length + 40) break;
+    }
+    const lines = [];
+    const walk = (el, depth) => {
+      if (lines.length > 400 || depth > 16) return;
+      const tag = el.tagName.toLowerCase();
+      const id = el.id ? ` #${el.id}` : "";
+      const dte = el.getAttribute("data-test-element");
+      const dti = el.getAttribute("data-testid");
+      const own = el.children.length
+        ? ""
+        : (el.textContent || "").replace(/\s+/g, " ").trim().slice(0, 80);
+      const attrs = (dte ? ` dte=${dte}` : "") + (dti ? ` dti=${dti}` : "");
+      if (id || attrs || own) {
+        lines.push("  ".repeat(depth) + tag + id + attrs + (own ? ` "${own}"` : ""));
+      }
+      [...el.children].forEach((c) => walk(c, depth + 1));
+    };
+    walk(root, 0);
+    return {
+      title,
+      found: true,
+      text: (root.innerText || "").replace(/\s+/g, " ").trim().slice(0, 4000),
+      outline: lines,
+      html: (root.outerHTML || "").slice(0, 12000),
+    };
+  };
+  const coverageSections = [
+    coverageDump("Insurance Information"),
+    coverageDump("Social Care Coverage"),
+  ];
+
+  // For each section heading, capture the raw text of its container so we can
+  // see how insurance cards / labeled rows are structured even without tables.
+  const sectionTexts = [...document.querySelectorAll("h1,h2,h3,h4")]
+    .map((h) => {
+      const title = clean(h.innerText);
+      if (!title) return null;
+      const container = h.closest("section,article,div") || h.parentElement;
+      const text = container
+        ? (container.innerText || "").replace(/\s+/g, " ").trim().slice(0, 1200)
+        : "";
+      return { title, text };
+    })
+    .filter((s) => s && s.text)
+    .slice(0, 40);
+
+  return {
+    url: location.href,
+    title: document.title,
+    headings,
+    tabsFound: tabs,
+    expandablesSample: expandables,
+    dataTestIds: testids,
+    dataTestElements: dataTestElems,
+    labelValueSample: pairs,
+    tables,
+    coverageSections,
+    sectionTexts,
+    counts: {
+      dl: document.querySelectorAll("dl").length,
+      tables: document.querySelectorAll("table").length,
+      ariaTabs: document.querySelectorAll('[role="tab"]').length,
+      ariaExpanded: document.querySelectorAll("[aria-expanded]").length,
+      inputs: document.querySelectorAll("input,select,textarea").length,
+    },
+  };
+}
+
+async function runDiagnostic() {
+  const btn = $("diagnosticBtn");
+  const out = $("diagnosticOut");
+  const copyBtn = $("copyReportBtn");
+  btn.disabled = true;
+  btn.textContent = "Inspecting...";
+  try {
+    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    if (!tab || tab.id == null) throw new Error("No active tab");
+    const results = await chrome.scripting.executeScript({
+      target: { tabId: tab.id },
+      func: inspectPageFn,
+    });
+    const report = results && results[0] && results[0].result;
+    out.value = JSON.stringify(report, null, 2);
+    out.classList.remove("hidden");
+    copyBtn.classList.remove("hidden");
+  } catch (err) {
+    out.value =
+      "Could not inspect this tab. Make sure you are on a Unite Us page " +
+      "(app.uniteus.io).\n\n" +
+      (err && err.message ? err.message : String(err));
+    out.classList.remove("hidden");
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "Inspect Page";
+  }
+}
+
+async function copyReport() {
+  const out = $("diagnosticOut");
+  const copyBtn = $("copyReportBtn");
+  try {
+    await navigator.clipboard.writeText(out.value);
+    copyBtn.textContent = "Copied!";
+    setTimeout(() => (copyBtn.textContent = "Copy report"), 1500);
+  } catch (_) {
+    out.select();
+  }
+}
+
+// Toggle a button's busy state without destroying its icon markup. Text
+// buttons keep their label; icon buttons spin via the .busy CSS rule.
+function setBtnBusy(btn, busy) {
+  if (!btn) return;
+  btn.disabled = busy;
+  btn.classList.toggle("busy", busy);
+}
+
+async function rescan(ev) {
+  const btn = (ev && ev.currentTarget) || $("rescanBtn");
+  setBtnBusy(btn, true);
+  try {
+    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    if (tab && tab.id != null) {
+      await chrome.tabs.sendMessage(tab.id, { type: "RESCRAPE" });
+    }
+  } catch (_) {
+    // content script may not be present on this tab
+  } finally {
+    setBtnBusy(btn, false);
+  }
+}
+
+// ---------- Save / upsert captured client to the CRM ----------
+// The backend ClientViewSet upserts on client_id, so a POST creates the client
+// if missing and updates it (plus nested address / insurances) if it exists.
+
+// Allowed enum values -> lowercase aliases used to match the page's labels.
+const ENUMS = {
+  gender: [
+    ["male", "male"], ["female", "female"], ["nonbinary", "non-binary", "nonbinary"],
+    ["transgender", "transgender"], ["declined", "declined"], ["unknown", "unknown"],
+    ["other", "other"],
+  ],
+  marital_status: [
+    ["single", "single"], ["married", "married"], ["partnered", "partner"],
+    ["separated", "separated"], ["divorced", "divorced"], ["widowed", "widow"],
+    ["unknown", "unknown"],
+  ],
+  consent_status: [
+    ["accepted", "accept"], ["pending", "pending"], ["declined", "declin"],
+    ["revoked", "revok"], ["expired", "expir"],
+  ],
+  phone_type: [
+    ["mobile", "mobile", "cell"], ["home", "home"], ["work", "work"],
+  ],
+  // Maps coverage status (incl. social care "Enrolled") -> Insurance.status.
+  coverage_status: [
+    ["active", "active", "enrolled"],
+    ["pending", "pending"],
+    ["inactive", "inactive", "disenroll", "not enrolled"],
+    ["expired", "expired", "expir"],
+  ],
+};
+
+function toEnum(val, choices) {
+  const v = String(val || "").trim().toLowerCase();
+  if (!v) return "";
+  for (const [value, ...aliases] of choices) {
+    if (v === value || aliases.some((a) => v.includes(a))) return value;
+  }
+  return ""; // unknown -> omit so the backend keeps its default
+}
+
+// "MM/DD/YYYY" or ISO -> "YYYY-MM-DD"; "" / "--" / unparseable -> null.
+function toIsoDate(s) {
+  s = String(s || "").trim();
+  if (!s || s === "--") return null;
+  let m = s.match(/^(\d{1,2})[\/-](\d{1,2})[\/-](\d{4})$/);
+  if (m) return `${m[3]}-${m[1].padStart(2, "0")}-${m[2].padStart(2, "0")}`;
+  m = s.match(/^(\d{4})-(\d{1,2})-(\d{1,2})/);
+  if (m) return `${m[1]}-${m[2].padStart(2, "0")}-${m[3].padStart(2, "0")}`;
+  return null;
+}
+
+function toIsoDateTime(s) {
+  const d = toIsoDate(s);
+  return d ? `${d}T00:00:00Z` : null;
+}
+
+// Build the upsert payload from the captured (page) data only. Empty values are
+// omitted so we never overwrite CRM data with blanks.
+function buildClientPayload(ctx) {
+  const cap = (ctx.captured && ctx.captured.client) || {};
+  const addr = (ctx.captured && ctx.captured.address) || {};
+  const payload = { client_id: ctx.client_id };
+  const set = (k, v) => {
+    if (v !== "" && v !== null && v !== undefined) payload[k] = v;
+  };
+
+  set("first_name", cap.first_name);
+  set("last_name", cap.last_name);
+  set("middle_name", cap.middle_name);
+  set("suffix", cap.suffix);
+  set("date_of_birth", toIsoDate(cap.date_of_birth));
+  set("citizenship", cap.citizenship);
+  set("race", cap.race);
+  set("ethnicity", cap.ethnicity);
+  set("sexuality", cap.sexuality);
+  set("sexuality_other", cap.sexuality_other);
+  set("gender", toEnum(cap.gender, ENUMS.gender));
+  set("marital_status", toEnum(cap.marital_status, ENUMS.marital_status));
+  set("consent_status", toEnum(cap.consent_status, ENUMS.consent_status));
+  set("consented_at", toIsoDateTime(cap.consented_at));
+  set("preferred_spoken_language", cap.preferred_spoken_language);
+  set("preferred_written_language", cap.preferred_written_language);
+  set("client_phone_number", cap.client_phone_number);
+  set("phone_type", toEnum(cap.phone_type, ENUMS.phone_type));
+  set("client_email_address", cap.client_email_address);
+  set("care_coordinator", cap.care_coordinator);
+  const income = String(cap.gross_monthly_income || "").replace(/[^0-9.]/g, "");
+  set("gross_monthly_income", income);
+  const hh = String(cap.household_size || "").replace(/[^0-9]/g, "");
+  if (hh) payload.household_size = Number(hh);
+
+  // Primary address (only when we captured something locatable).
+  const a = {};
+  const aset = (k, v) => { if (v) a[k] = v; };
+  aset("address_type", String(addr.address_type || "current").toLowerCase());
+  aset("line1", addr.line1);
+  aset("line2", addr.line2);
+  aset("city", addr.city);
+  aset("county", addr.county);
+  aset("state", String(addr.state || "").toUpperCase());
+  aset("postal_code", addr.postal_code);
+  if (a.line1 || a.city || a.postal_code) payload.addresses = [a];
+
+  // Insurance + Social Care Coverage both persist to the CRM Insurance table
+  // (the only coverage model). Map capKey -> field.
+  const ins = (Array.isArray(ctx.insurance) ? ctx.insurance : [])
+    .filter((c) => c.plan_name)
+    .map((c) => {
+      const o = { plan_name: c.plan_name };
+      if (c.member_id) o.external_member_id = c.member_id;
+      if (c.group_id) o.external_group_id = c.group_id;
+      const en = toIsoDateTime(c.start_date);
+      if (en) o.enrolled_at = en;
+      const ex = toIsoDateTime(c.end_date);
+      if (ex) o.expired_at = ex;
+      const st = toEnum(c.status, ENUMS.coverage_status);
+      if (st) o.status = st;
+      return o;
+    });
+  if (ins.length) payload.insurances = ins;
+
+  return payload;
+}
+
+// Flatten a DRF error object into a short readable string.
+function summarizeErrors(obj) {
+  if (!obj || typeof obj !== "object") return "";
+  const parts = [];
+  for (const [k, v] of Object.entries(obj)) {
+    const msg = Array.isArray(v) ? v.join(" ") : typeof v === "object" ? summarizeErrors(v) : String(v);
+    parts.push(k === "detail" ? msg : `${k}: ${msg}`);
+  }
+  return parts.slice(0, 4).join(" | ");
+}
+
+function setSaveStatus(state, message) {
+  const badge = $("saveStatus");
+  if (!badge) return;
+  badge.className = "badge " + (state || "");
+  badge.textContent = message || "";
+}
+
+async function saveClient(ev) {
+  const btn = (ev && ev.currentTarget) || $("saveBtn");
+  const ctx = currentContext;
+  if (!ctx || !ctx.client_id) {
+    setSaveStatus("err", "No client detected");
+    return;
+  }
+  const cfg = await getConfig();
+  if (!cfg.token) {
+    setSaveStatus("err", "No API token configured");
+    return;
+  }
+  const payload = buildClientPayload(ctx);
+  if (!payload.first_name || !payload.last_name) {
+    setSaveStatus("err", "Need first and last name before saving");
+    return;
+  }
+
+  setBtnBusy(btn, true);
+  setSaveStatus("warn", "Saving...");
+  try {
+    const res = await fetch(`${cfg.backendUrl}/api/clients/`, {
+      method: "POST",
+      headers: { ...authHeader(cfg), "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    if (res.ok) {
+      setSaveStatus("ok", "Saved \u2713");
+      setClientImported(true);
+      await fetchCrm(cfg, ctx.client_id); // refresh CRM column + last-updated
+    } else if (res.status === 401 || res.status === 403) {
+      setSaveStatus("err", "Auth error");
+    } else {
+      let detail = `Error ${res.status}`;
+      try {
+        detail = summarizeErrors(await res.json()) || detail;
+      } catch (_) {}
+      setSaveStatus("err", detail);
+    }
+  } catch (_) {
+    setSaveStatus("err", "Network error");
+  } finally {
+    setBtnBusy(btn, false);
+  }
+}
+
+// Show when this client was last written to the CRM (auto-updated server-side).
+function renderProfileMeta() {
+  const el = $("profileUpdated");
+  if (!el) return;
+  const c = crm.client;
+  if (c && c.last_synced_at) {
+    const dt = new Date(c.last_synced_at);
+    el.textContent =
+      "Last updated in CRM: " +
+      (isNaN(dt.getTime()) ? c.last_synced_at : dt.toLocaleString());
+  } else if (currentContext && currentContext.client_id) {
+    el.textContent = "Not saved to the CRM yet.";
+  } else {
+    el.textContent = "";
+  }
+}
+
+// CRM import status. null = unknown/pending, true = imported (exists in CRM),
+// false = not imported.
+let importStatus = { client: null };
+// Compact record labels for the CRM status table (keyed by type).
+let backendRecords = { case: [], screening: [], eligibility: [] };
+// Full CRM objects for the field-by-field comparison. client is the full
+// client (with nested addresses/insurances) or null when not in the CRM yet.
+let crm = { client: null, case: [], screening: [], eligibility: [] };
+
+function resetCrm() {
+  backendRecords = { case: [], screening: [], eligibility: [] };
+  crm = { client: null, case: [], screening: [], eligibility: [] };
+}
+
+function statusMark(state) {
+  if (state === true) return '<span class="smark ok">\u2705</span>';
+  if (state === false) return '<span class="smark missing">\u274C</span>';
+  return '<span class="smark pending">\u2014</span>';
+}
+
+function setClientImported(state) {
+  importStatus.client = state;
+  renderCrmStatus(currentContext);
+}
+
+function asList(payload) {
+  if (Array.isArray(payload)) return payload;
+  if (payload && Array.isArray(payload.results)) return payload.results;
+  return [];
+}
+
+// Pull the full client (with nested addresses/insurances) plus all cases,
+// screenings, and eligibility assessments from the backend. Feeds both the CRM
+// status table and the field-by-field comparison. A missing client (404) is
+// fine: the comparison then shows the captured column with an empty CRM column.
+async function fetchCrm(cfg, clientId) {
+  try {
+    const headers = authHeader(cfg);
+    const [clientRes, casesRes, scrRes, eligRes] = await Promise.all([
+      fetch(`${cfg.backendUrl}/api/clients/${clientId}/`, { headers }),
+      fetch(`${cfg.backendUrl}/api/cases/?client=${clientId}`, { headers }),
+      fetch(`${cfg.backendUrl}/api/screenings/?client=${clientId}`, { headers }),
+      fetch(`${cfg.backendUrl}/api/eligibility/?client=${clientId}`, { headers }),
+    ]);
+    crm = {
+      client: clientRes.ok ? await clientRes.json() : null,
+      case: casesRes.ok ? asList(await casesRes.json()) : [],
+      screening: scrRes.ok ? asList(await scrRes.json()) : [],
+      eligibility: eligRes.ok ? asList(await eligRes.json()) : [],
+    };
+    backendRecords = {
+      case: crm.case.map((c) => ({
+        id: String(c.case_id),
+        // Use the subtype to match what the Unite Us cases table displays.
+        label: c.service_subtype || c.service_type || String(c.case_id),
+      })),
+      screening: crm.screening.map((s) => ({
+        id: String(s.enhanced_screen_id),
+        label: s.screen_type || String(s.enhanced_screen_id),
+      })),
+      eligibility: crm.eligibility.map((e) => ({
+        id: String(e.eligibility_id),
+        label: e.screen_type || e.eligible_status || String(e.eligibility_id),
+      })),
+    };
+  } catch (_) {
+    resetCrm();
+  }
+  renderCrmStatus(currentContext);
+  renderComparison(currentContext);
+}
+
+// Merge page-detected records (ctx.records) with backend-imported records,
+// keyed by id so the same record shows ticks in both columns.
+function mergedRecords(ctx, type) {
+  const map = new Map();
+  (ctx && ctx.records ? ctx.records : [])
+    .filter((r) => r.type === type)
+    .forEach((r, i) => {
+      const key = r.id || `pg:${type}:${i}`;
+      const label =
+        r.id ||
+        (r.fields && (r.fields["Service Type"] || r.fields["Column 1"])) ||
+        (r.summary || "").slice(0, 40) ||
+        `${type} ${i + 1}`;
+      map.set(key, { label, detected: true, imported: false });
+    });
+  (backendRecords[type] || []).forEach((b) => {
+    if (map.has(b.id)) map.get(b.id).imported = true;
+    else map.set(b.id, { label: b.label, detected: false, imported: true });
+  });
+  return [...map.values()];
+}
+
+function renderCrmStatus(ctx) {
+  const box = $("crmStatus");
+  const met = requiredMet(ctx);
+  $("validateBtn").disabled = !met;
+  $("reqHint").textContent = met
+    ? ""
+    : "Waiting for required client info (ID, name, DOB) to be detected...";
+
+  if (!ctx || !ctx.client_id) {
+    box.innerHTML = '<p class="muted">No client detected yet.</p>';
+    return;
+  }
+
+  const clientRow =
+    `<tr><th>${escapeHtml(ctx.client_name || "Client")}</th>` +
+    `<td>${statusMark(true)}</td>` +
+    `<td>${statusMark(importStatus.client)}</td></tr>`;
+
+  const section = (title, type) => {
+    const list = mergedRecords(ctx, type);
+    if (!list.length) return "";
+    let h = `<tr class="section"><th colspan="3">${title} (${list.length})</th></tr>`;
+    list.forEach((r) => {
+      h +=
+        `<tr><th class="rec-row" title="${escapeHtml(r.label)}">${escapeHtml(
+          r.label
+        )}</th>` +
+        `<td>${statusMark(r.detected || null)}</td>` +
+        `<td>${statusMark(r.imported || null)}</td></tr>`;
+    });
+    return h;
+  };
+
+  box.innerHTML =
+    '<table class="status-table">' +
+    "<thead><tr><th></th><th>Detected</th><th>Imported</th></tr></thead>" +
+    "<tbody>" +
+    clientRow +
+    section("Cases", "case") +
+    section("Screenings", "screening") +
+    section("Eligibility", "eligibility") +
+    "</tbody></table>";
+}
+
+async function loadContext() {
+  const { uw_context } = await chrome.storage.local.get("uw_context");
+  currentContext = uw_context || null;
+  renderContext(currentContext);
+  renderCrmStatus(currentContext);
+  renderComparison(currentContext);
+  await maybeAutoValidate();
+}
+
+// Validate automatically once required info is present (service token = no login).
+async function maybeAutoValidate() {
+  if (!requiredMet(currentContext)) return;
+  const cfg = await getConfig();
+  if (cfg.token) validateClient();
+}
+
+// ---------- Validation ----------
+function setValidation(state, message) {
+  const badge = $("validationStatus");
+  badge.className = "badge " + (state || "");
+  badge.textContent = message || "";
+}
+
+function setFormsUnlocked(unlocked) {
+  isValidated = unlocked;
+  document.querySelectorAll(".tab").forEach((tab) => {
+    if (GATED_TABS.includes(tab.dataset.tab)) {
+      tab.disabled = !unlocked;
+      tab.classList.toggle("locked", !unlocked);
+    }
+  });
+}
+
+async function validateClient() {
+  if (!requiredMet(currentContext)) return;
+  const cfg = await getConfig();
+  if (!cfg.token) {
+    setValidation("err", "No API token configured");
+    return;
+  }
+  setValidation("warn", "Checking...");
+  try {
+    const res = await fetch(
+      `${cfg.backendUrl}/api/clients/${currentContext.client_id}/`,
+      { headers: authHeader(cfg) }
+    );
+    if (res.status === 200) {
+      setValidation("ok", "Valid \u2713");
+      setFormsUnlocked(true);
+      setClientImported(true);
+      fetchCrm(cfg, currentContext.client_id);
+    } else if (res.status === 404) {
+      setValidation("err", "Client not found");
+      setFormsUnlocked(false);
+      setClientImported(false);
+      // Not in the CRM yet: show captured data against an empty CRM column.
+      resetCrm();
+      renderComparison(currentContext);
+    } else if (res.status === 401 || res.status === 403) {
+      setValidation("err", "Auth error");
+      setFormsUnlocked(false);
+      setClientImported(null);
+    } else {
+      setValidation("err", `Error ${res.status}`);
+      setFormsUnlocked(false);
+      setClientImported(null);
+    }
+  } catch (err) {
+    setValidation("err", "Network error");
+    setFormsUnlocked(false);
+    setClientImported(null);
+  }
+}
+
+// ---------- Tabs / panels ----------
+function loadFrame(name) {
+  if (loadedFrames.has(name)) return;
+  const url = FORMS[name];
+  const frame = $(`frame-${name}`);
+  const placeholder = $(`ph-${name}`);
+  if (!frame) return;
+  if (url) {
+    frame.src = url;
+    frame.classList.remove("hidden");
+    if (placeholder) placeholder.classList.add("hidden");
+    loadedFrames.add(name);
+  } else {
+    frame.classList.add("hidden");
+    if (placeholder) placeholder.classList.remove("hidden");
+  }
+}
+
+function activateTab(name) {
+  document.querySelectorAll(".tab").forEach((t) =>
+    t.classList.toggle("active", t.dataset.tab === name)
+  );
+  document.querySelectorAll(".panel").forEach((p) =>
+    p.classList.toggle("active", p.dataset.panel === name)
+  );
+  if (name in FORMS) loadFrame(name);
+}
+
+function initTabs() {
+  document.querySelectorAll(".tab").forEach((tab) => {
+    tab.addEventListener("click", () => {
+      if (tab.disabled) return;
+      activateTab(tab.dataset.tab);
+    });
+  });
+  activateTab("profile"); // open by default
+}
+
+// ---------- Wire up ----------
+function init() {
+  initTabs();
+  setFormsUnlocked(false);
+  loadContext();
+
+  $("validateBtn").addEventListener("click", validateClient);
+  $("rescanBtn").addEventListener("click", rescan);
+  $("rescanBtn2").addEventListener("click", rescan);
+  $("saveBtn").addEventListener("click", saveClient);
+  $("diagnosticBtn").addEventListener("click", runDiagnostic);
+  $("copyReportBtn").addEventListener("click", copyReport);
+
+  // Live-update when the content script captures a new/changed client.
+  chrome.storage.onChanged.addListener((changes, area) => {
+    if (area === "local" && changes.uw_context) {
+      const prev = currentContext;
+      currentContext = changes.uw_context.newValue;
+      const clientChanged =
+        !prev ||
+        prev.client_id !== (currentContext && currentContext.client_id);
+      if (clientChanged) {
+        importStatus = { client: null };
+        resetCrm();
+      }
+      renderContext(currentContext);
+      renderCrmStatus(currentContext);
+      renderComparison(currentContext);
+      // Only reset gating/tab when a different client is detected, so a Re-scan
+      // of the same client doesn't pull the user off the current tab.
+      if (clientChanged) {
+        setValidation("", "");
+        setFormsUnlocked(false);
+        activateTab("profile");
+      }
+      maybeAutoValidate();
+    }
+  });
+}
+
+document.addEventListener("DOMContentLoaded", init);
