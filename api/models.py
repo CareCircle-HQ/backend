@@ -908,6 +908,9 @@ class Eligibility(models.Model):
     # --- Eligibility ---
     eligible_status = models.CharField(max_length=50, blank=True)
     eligible_services = models.JSONField(default=list, blank=True)
+    # Captured assessment question/answer pairs (the model has no normalized
+    # Answer relation like Screening, so responses are stored inline).
+    responses = models.JSONField(default=list, blank=True)
 
     # --- Verification ---
     verified_at = models.DateTimeField(null=True, blank=True)

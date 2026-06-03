@@ -474,8 +474,9 @@ function renderComparison(ctx) {
   // captured screening detail (renderScreenings); screeningHtml below feeds only
   // the full CRM comparison on the Data tab.
   fill("cmp-profile", profileHtml, openMsg);
-  fill("cmp-eligibility", eligibilityHtml, "No eligibility records detected or imported yet.");
   fill("cmp-cases", caseHtml, "No cases detected or imported yet.");
+  // Note: cmp-eligibility now hosts the captured eligibility accordion
+  // (renderEligibility); the eligibility CRM comparison lives on the Data tab.
 
   // Full comparison on the Data tab.
   fill(
@@ -1208,6 +1209,280 @@ async function saveScreenings(ev) {
   }
 }
 
+// ---------- Eligibility tab (Met Council - SCN - PHS) ----------
+// Captured by the content-script auto-walk and published to uw_eligibility.
+let eligibilityData = null;
+
+function setEligStatus(state, message) {
+  const badge = $("eligStatus");
+  if (!badge) return;
+  badge.className = "badge " + (state || "");
+  badge.textContent = message || "";
+}
+
+function renderEligMeta() {
+  const el = $("eligMeta");
+  if (!el) return;
+  const d = eligibilityData;
+  if (!d || !d.eligibilities) {
+    el.textContent = "";
+    return;
+  }
+  if (d.note) {
+    el.textContent = d.note;
+    return;
+  }
+  const p = d.progress || { done: 0, total: 0 };
+  if (d.status === "running") {
+    el.textContent = `Scanning ${p.done}/${p.total}\u2026`;
+  } else if (d.finishedAt) {
+    const dt = new Date(d.finishedAt);
+    el.textContent =
+      `${d.eligibilities.length} assessment(s) \u00b7 last scanned ` +
+      (isNaN(dt.getTime()) ? d.finishedAt : dt.toLocaleString());
+  } else {
+    el.textContent = `${d.eligibilities.length} assessment(s) found`;
+  }
+}
+
+// One collapsible eligibility panel: header = form + status/date; body = meta,
+// eligible-program chips, ordered Q&A.
+function renderEligibilityAccordion(s, i) {
+  const d = s.detail;
+  const statusLabel = /complete/i.test(s.status || "") ? "Complete" : s.status || "";
+  const statusDate = [statusLabel, s.date].filter(Boolean).join(" ");
+  const head =
+    `<div class="acc-head"><span class="acc-title">${escapeHtml(
+      s.form || `Eligibility ${i + 1}`
+    )}</span>` + `<span class="acc-sub">${escapeHtml(statusDate)}</span></div>`;
+
+  let body;
+  if (!d) {
+    body = '<p class="muted">Detail not captured yet \u2014 re-scan to fetch its answers.</p>';
+  } else {
+    const results = d.results || [];
+    const hasQA = d.items && d.items.length > 0;
+
+    let html = `<div class="scr-meta">`;
+    html += `<div><span class="sum-k">Submitter</span>${escapeHtml(s.submitter || "\u2014")}</div>`;
+    html += `<div><span class="sum-k">Status</span>${escapeHtml(statusDate || "\u2014")}</div>`;
+    html += `<div><span class="sum-k">Organization</span>${escapeHtml(s.org || "\u2014")}</div>`;
+    html += `</div>`;
+
+    if (results.length) {
+      html +=
+        `<div class="scr-results"><div class="scr-results-h">Client May Be Eligible (${results.length})</div>` +
+        results.map((r) => `<span class="chip">${escapeHtml(r)}</span>`).join("") +
+        `</div>`;
+    }
+
+    if (hasQA) {
+      html +=
+        `<div class="scr-qa-h">Assessment Questions</div>` +
+        `<table class="qa-table"><tbody>` +
+        d.items
+          .map((it) => `<tr class="qa"><th>${escapeHtml(it.q)}</th><td>${escapeHtml(it.a)}</td></tr>`)
+          .join("") +
+        `</tbody></table>`;
+    } else {
+      html += `<p class="muted">No Q&A captured.</p>`;
+    }
+    body = html;
+  }
+  return `<div class="acc${i === 0 ? " open" : ""}">${head}<div class="acc-body">${body}</div></div>`;
+}
+
+function renderEligibility() {
+  const box = $("cmp-eligibility");
+  if (!box) return;
+  renderEligMeta();
+  const d = eligibilityData;
+  const matchesClient =
+    d && (!currentContext || !currentContext.client_id || d.clientId === currentContext.client_id);
+
+  if (!d || !matchesClient || !d.eligibilities || !d.eligibilities.length) {
+    box.innerHTML =
+      '<p class="muted">No Met Council eligibility assessments captured yet. Open a Unite Us facesheet and click Re-scan.</p>';
+    updateEligSaveBtn();
+    return;
+  }
+  box.innerHTML = d.eligibilities.map((s, i) => renderEligibilityAccordion(s, i)).join("");
+  box.querySelectorAll(".acc-head").forEach((h) => {
+    h.addEventListener("click", () => h.parentElement.classList.toggle("open"));
+  });
+  updateEligSaveBtn();
+}
+
+// Enable the Save button only when there are captured assessments (with details).
+function updateEligSaveBtn() {
+  const btn = $("eligSaveBtn");
+  if (!btn) return;
+  btn.disabled = !eligibilitySaveable();
+  btn.title = btn.disabled
+    ? "Re-scan to capture eligibility assessments before saving"
+    : "Save eligibility assessments to the CRM (client must exist first)";
+}
+
+// Confirm the content script started the eligibility scan (writes uw_eligibility).
+async function eligScanStarted(sinceMs, timeout) {
+  const start = Date.now();
+  while (Date.now() - start < timeout) {
+    const { uw_eligibility } = await chrome.storage.local.get("uw_eligibility");
+    if (
+      uw_eligibility &&
+      uw_eligibility.scannedAt &&
+      new Date(uw_eligibility.scannedAt).getTime() >= sinceMs - 1500
+    ) {
+      return true;
+    }
+    await new Promise((r) => setTimeout(r, 200));
+  }
+  return false;
+}
+
+async function eligRescan(ev) {
+  const btn = (ev && ev.currentTarget) || $("eligRescanBtn");
+  setBtnBusy(btn, true);
+  setEligStatus("warn", "Starting\u2026");
+  const sentAt = Date.now();
+  try {
+    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    if (!tab || tab.id == null || !/app\.uniteus\.io/.test(tab.url || "")) {
+      setEligStatus("err", "Open a Unite Us facesheet tab first");
+      return;
+    }
+    const clientId = currentContext && currentContext.client_id;
+    chrome.tabs
+      .sendMessage(tab.id, { type: "ELIGIBILITY_RESCRAPE", clientId })
+      .catch(() => {});
+    if (await eligScanStarted(sentAt, 3000)) {
+      setEligStatus("warn", "Walking assessments\u2026 keep this tab open");
+    } else {
+      setEligStatus("err", "Couldn't reach the page \u2014 reload the Unite Us tab (F5), then retry");
+    }
+  } catch (_) {
+    setEligStatus("err", "Reload the Unite Us tab (F5), then retry");
+  } finally {
+    setBtnBusy(btn, false);
+  }
+}
+
+// ---------- Save captured eligibility assessments to the CRM ----------
+// Upserts on eligibility_id (the /view/<id> UUID). The Eligibility model has no
+// nested answers relation, so captured Q&A is stored inline in `responses` and
+// the eligible-program chips go to `eligible_services`. Client must exist first.
+
+function eligibilitySaveable() {
+  const d = eligibilityData;
+  if (!d || !Array.isArray(d.eligibilities)) return false;
+  if (currentContext && currentContext.client_id && d.clientId !== currentContext.client_id) {
+    return false;
+  }
+  return d.eligibilities.some(
+    (s) => s.detail && Array.isArray(s.detail.items) && s.detail.items.length > 0
+  );
+}
+
+function buildEligibilityPayloads(d, clientId) {
+  const payloads = [];
+  for (const s of d.eligibilities) {
+    const det = s.detail;
+    if (!det || !Array.isArray(det.items) || !det.items.length) continue;
+    const eligId = det.id || s.id;
+    if (!eligId) continue;
+
+    const payload = {
+      eligibility_id: eligId,
+      subject_id: clientId,
+      performing_organization_name: s.org || "",
+      screen_source: s.form || "",
+      responses: det.items.map((it) => ({ q: it.q, a: it.a })),
+      eligible_services: Array.isArray(det.results) ? det.results : [],
+    };
+    if (/complete/i.test(s.status || "")) payload.eligible_status = "eligible";
+    payloads.push(payload);
+  }
+  return payloads;
+}
+
+async function saveEligibility(ev) {
+  const btn = (ev && ev.currentTarget) || $("eligSaveBtn");
+  const ctx = currentContext;
+  const d = eligibilityData;
+
+  if (!ctx || !ctx.client_id) {
+    setEligStatus("err", "No client detected");
+    return;
+  }
+  if (!eligibilitySaveable()) {
+    setEligStatus("err", "Nothing to save \u2014 re-scan first");
+    return;
+  }
+  const cfg = await getConfig();
+  if (!cfg.token) {
+    setEligStatus("err", "No API token configured");
+    return;
+  }
+
+  setBtnBusy(btn, true);
+  setEligStatus("warn", "Checking client\u2026");
+  try {
+    // Guard: the client must already exist in the CRM (FK requirement).
+    const clientRes = await fetch(
+      `${cfg.backendUrl}/api/clients/${ctx.client_id}/`,
+      { headers: authHeader(cfg) }
+    );
+    if (clientRes.status === 404) {
+      setEligStatus("err", "Client not in CRM \u2014 save it on the Profile tab first");
+      setClientImported(false);
+      return;
+    }
+    if (clientRes.status === 401 || clientRes.status === 403) {
+      setEligStatus("err", "Auth error");
+      return;
+    }
+    if (!clientRes.ok) {
+      setEligStatus("err", `Client check failed (${clientRes.status})`);
+      return;
+    }
+    setClientImported(true);
+
+    setEligStatus("warn", "Saving assessments\u2026");
+    const payloads = buildEligibilityPayloads(d, ctx.client_id);
+    if (!payloads.length) {
+      setEligStatus("err", "Nothing to save \u2014 re-scan first");
+      return;
+    }
+    const res = await fetch(`${cfg.backendUrl}/api/eligibility/bulk/`, {
+      method: "POST",
+      headers: { ...authHeader(cfg), "Content-Type": "application/json" },
+      body: JSON.stringify(payloads),
+    });
+    if (res.ok || res.status === 207) {
+      let body = {};
+      try { body = await res.json(); } catch (_) {}
+      const ok = body.succeeded != null ? body.succeeded : payloads.length;
+      const failed = body.failed || 0;
+      if (failed) {
+        setEligStatus("warn", `Saved ${ok}, ${failed} failed`);
+      } else {
+        setEligStatus("ok", `Saved ${ok} assessment(s) \u2713`);
+      }
+      await fetchCrm(cfg, ctx.client_id);
+    } else if (res.status === 401 || res.status === 403) {
+      setEligStatus("err", "Auth error");
+    } else {
+      let detail = `Error ${res.status}`;
+      try { detail = summarizeErrors(await res.json()) || detail; } catch (_) {}
+      setEligStatus("err", detail);
+    }
+  } catch (_) {
+    setEligStatus("err", "Network error");
+  } finally {
+    setBtnBusy(btn, false);
+  }
+}
+
 // ---------- Save / upsert captured client to the CRM ----------
 // The backend ClientViewSet upserts on client_id, so a POST creates the client
 // if missing and updates it (plus nested address / insurances) if it exists.
@@ -1553,16 +1828,19 @@ function renderCrmStatus(ctx) {
 }
 
 async function loadContext() {
-  const { uw_context, uw_screenings } = await chrome.storage.local.get([
+  const { uw_context, uw_screenings, uw_eligibility } = await chrome.storage.local.get([
     "uw_context",
     "uw_screenings",
+    "uw_eligibility",
   ]);
   currentContext = uw_context || null;
   screeningData = uw_screenings || null;
+  eligibilityData = uw_eligibility || null;
   renderContext(currentContext);
   renderCrmStatus(currentContext);
   renderComparison(currentContext);
   renderScreenings();
+  renderEligibility();
   await maybeAutoValidate();
 }
 
@@ -1681,6 +1959,8 @@ function init() {
   $("saveBtn").addEventListener("click", saveClient);
   $("scrRescanBtn").addEventListener("click", scrRescan);
   $("scrSaveBtn").addEventListener("click", saveScreenings);
+  $("eligRescanBtn").addEventListener("click", eligRescan);
+  $("eligSaveBtn").addEventListener("click", saveEligibility);
   $("diagnosticBtn").addEventListener("click", runDiagnostic);
   $("copyReportBtn").addEventListener("click", copyReport);
 
@@ -1719,6 +1999,18 @@ function init() {
         setScrStatus("warn", `Walking ${p.done}/${p.total}\u2026`);
       }
       renderScreenings();
+    }
+    // Eligibility auto-walk progress / results.
+    if (area === "local" && changes.uw_eligibility) {
+      eligibilityData = changes.uw_eligibility.newValue;
+      const d = eligibilityData;
+      if (d && d.status === "done") {
+        setEligStatus("ok", `Done \u2014 ${d.eligibilities.length} assessment(s)`);
+      } else if (d && d.status === "running") {
+        const p = d.progress || { done: 0, total: 0 };
+        setEligStatus("warn", `Walking ${p.done}/${p.total}\u2026`);
+      }
+      renderEligibility();
     }
   });
 }

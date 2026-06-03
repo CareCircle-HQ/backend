@@ -1253,6 +1253,266 @@ async function _maybeContinueScreeningScan() {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Eligibility auto-walk crawler. Mirrors the screening crawler: it filters the
+// eligibility list by the target org, then visits each assessment detail page
+// (/facesheet/<client>/eligibility/view/<id>) to capture the ordered Q&A and the
+// "Client May Be Eligible" programs. State lives in uw_elig_scan so the flow
+// survives full page reloads. The list table has the same columns as the
+// screening list, so we reuse findScreeningTable / screeningTableReady /
+// getFilteredScreeningRows / harvestScreeningList.
+// ---------------------------------------------------------------------------
+const ELIGIBILITY_SCAN_TTL_MS = SCREENING_SCAN_TTL_MS;
+
+// Capture the "Client May Be Eligible" programs list. We slice the visible text
+// between the section's intro line and the "Add Social Care Coverage" action.
+function harvestEligibilityResults() {
+  const out = [];
+  const seen = new Set();
+  const push = (t) => {
+    t = cleanText(t);
+    if (!t || t.length > 160) return;
+    const low = t.toLowerCase();
+    if (low === "add social care coverage") return;
+    if (seen.has(low)) return;
+    seen.add(low);
+    out.push(t);
+  };
+  const body = document.body ? document.body.innerText : "";
+  const m = body.match(
+    /connect them with these resources\.?\s*([\s\S]*?)\s*Add Social Care Coverage/i
+  );
+  if (m) {
+    m[1].split(/\n/).forEach((line) => push(line));
+  }
+  return out;
+}
+
+// Capture one eligibility detail page: ordered question/answer pairs (skipping
+// section headers) plus the eligible-programs results. Unlike screenings,
+// colon-suffixed labels (e.g. "Modality of Outreach 1:") are real questions, so
+// we do NOT drop them; multi-select answers are joined with "; ".
+function harvestEligibilityDetail() {
+  const m = location.href.match(
+    new RegExp(`eligibility/view/(${UUID_RE.source})`, "i")
+  );
+  const id = m ? m[1].toLowerCase() : null;
+
+  const items = [];
+  const seen = new Set();
+  document.querySelectorAll(".ui-form-renderer-question-display").forEach((container) => {
+    const labelEl = container.querySelector(".ui-form-renderer-question-display__label");
+    if (!labelEl) return;
+    // Section headers render as <h3 class="ui-form-renderer-section">.
+    if (labelEl.tagName === "H3" || labelEl.classList.contains("ui-form-renderer-section")) {
+      return;
+    }
+    const q = cleanText(labelEl.innerText);
+    if (!q || q.length > 300) return;
+
+    const valueEls = container.querySelectorAll(".ui-form-renderer-question-display__value");
+    const a = [...valueEls]
+      .map((v) => cleanText(v.innerText))
+      .filter(Boolean)
+      .join("; ");
+    if (!a || a === q) return;
+
+    const key = q.toLowerCase();
+    if (seen.has(key)) return;
+    seen.add(key);
+    items.push({ q, a });
+  });
+
+  return { id, items, results: harvestEligibilityResults() };
+}
+
+function saveEligScan(scan) {
+  return chrome.storage.local.set({ uw_elig_scan: scan });
+}
+
+// Publish the panel-facing view: list rows joined with any captured details.
+function publishEligibility(scan) {
+  const eligibilities = scan.list.map((x, i) => ({
+    ...x,
+    detail: (scan.details && scan.details[i]) || null,
+  }));
+  chrome.storage.local.set({
+    uw_eligibility: {
+      clientId: scan.clientId,
+      org: SCREENING_ORG,
+      eligibilities,
+      status: scan.status,
+      phase: scan.phase || null,
+      note: scan.note || "",
+      scannedAt: scan.startedAt,
+      finishedAt: scan.finishedAt || null,
+      progress: { done: scan.index, total: scan.total || scan.list.length },
+    },
+  });
+}
+
+async function startEligibilityScan(msg) {
+  const clientId = (msg && msg.clientId) || parseIdsFromUrl().client_id;
+  if (!clientId) return { ok: false, error: "Open the client's facesheet first" };
+
+  const scan = {
+    clientId,
+    status: "running",
+    phase: "list",
+    note: "Loading eligibility assessments\u2026",
+    startedAt: new Date().toISOString(),
+    finishedAt: null,
+    list: [],
+    total: 0,
+    index: 0,
+    details: [],
+    returnUrl: null,
+  };
+  await saveEligScan(scan);
+  publishEligibility(scan);
+
+  // Already on the eligibility list -> harvest in place (no reload).
+  if (/\/eligibility\/all/.test(location.pathname) &&
+      (await waitFor(() => screeningTableReady(), 9000))) {
+    await beginEligibilityWalk(scan);
+    return { ok: true, count: scan.total };
+  }
+  // Otherwise load the list URL; the crawler resumes on the next page load.
+  location.assign(`${location.origin}/facesheet/${clientId}/eligibility/all`);
+  return { ok: true, count: null };
+}
+
+async function beginEligibilityWalk(scan) {
+  await waitFor(() => screeningTableReady(), 12000);
+  const list = harvestScreeningList(); // same columns + org filter
+  scan.list = list;
+  scan.total = list.length;
+  scan.index = 0;
+  scan.details = [];
+  scan.phase = "detail";
+  scan.returnUrl = location.href;
+  scan.note = list.length ? "" : "No Met Council - SCN - PHS eligibility assessments in the list.";
+  await saveEligScan(scan);
+  publishEligibility(scan);
+
+  if (!list.length) return finishEligibilityScan(scan);
+  visitEligibilityIndex(scan);
+}
+
+// On the list page: open the index-th filtered row. Prefer a detail link if the
+// row exposes one, otherwise click the row (full navigation).
+async function visitEligibilityIndex(scan) {
+  if (scan.index >= scan.total) return finishEligibilityScan(scan);
+  if (!(await waitFor(() => screeningTableReady(), 9000))) return;
+  const row = getFilteredScreeningRows()[scan.index];
+  if (!row) {
+    scan.index += 1;
+    await saveEligScan(scan);
+    return visitEligibilityIndex(scan);
+  }
+  row.scrollIntoView({ block: "center" });
+  const link = row.querySelector('a[href*="/eligibility/view/"]');
+  (link || row).click();
+}
+
+async function finishEligibilityScan(scan) {
+  scan.status = "done";
+  scan.finishedAt = new Date().toISOString();
+  await saveEligScan(scan);
+  publishEligibility(scan);
+  if (scan.returnUrl && location.href !== scan.returnUrl) {
+    location.assign(scan.returnUrl);
+  }
+}
+
+let eligibilityScanBusy = false;
+
+async function maybeContinueEligibilityScan() {
+  if (eligibilityScanBusy) return;
+  eligibilityScanBusy = true;
+  try {
+    await _maybeContinueEligibilityScan();
+  } finally {
+    eligibilityScanBusy = false;
+  }
+}
+
+async function _maybeContinueEligibilityScan() {
+  const { uw_elig_scan: scan } = await chrome.storage.local.get("uw_elig_scan");
+  if (!scan || scan.status !== "running") return;
+  if (Date.now() - new Date(scan.startedAt).getTime() > ELIGIBILITY_SCAN_TTL_MS) {
+    scan.status = "done";
+    await saveEligScan(scan);
+    return;
+  }
+  const ids = parseIdsFromUrl();
+  if (ids.client_id && scan.clientId && ids.client_id !== scan.clientId) return;
+
+  // Phase 1: navigated to the list URL; harvest it.
+  if (scan.phase === "list") {
+    if (await waitFor(() => screeningTableReady(), 12000)) {
+      await beginEligibilityWalk(scan);
+    }
+    return;
+  }
+
+  // On an eligibility detail page: capture it, then return to the list.
+  const m = location.href.match(
+    new RegExp(`eligibility/view/(${UUID_RE.source})`, "i")
+  );
+  if (m) {
+    if (scan.index >= scan.total) return;
+
+    // Wait until the captured question count stabilizes (form fully rendered).
+    let detail = { id: null, items: [], results: [] };
+    const deadline = Date.now() + 25000;
+    let lastCount = -1;
+    let stableTicks = 0;
+    while (Date.now() < deadline) {
+      detail = harvestEligibilityDetail();
+      const count = (detail.items || []).length;
+      if (count === lastCount && count >= 1) {
+        stableTicks += 1;
+        if (stableTicks >= 2) break;
+      } else {
+        stableTicks = 0;
+      }
+      lastCount = count;
+      await sleep(400);
+    }
+
+    if (!detail.items || detail.items.length === 0) {
+      scan.note = "Waiting for eligibility questions to load\u2026";
+      await saveEligScan(scan);
+      publishEligibility(scan);
+      return;
+    }
+
+    scan.note = "";
+    scan.details[scan.index] = {
+      id: m[1].toLowerCase(),
+      items: detail.items,
+      results: detail.results,
+      capturedAt: new Date().toISOString(),
+    };
+    scan.index += 1;
+    await saveEligScan(scan);
+    publishEligibility(scan);
+    if (scan.index >= scan.total) {
+      await finishEligibilityScan(scan);
+    } else if (scan.returnUrl) {
+      location.assign(scan.returnUrl);
+    }
+    return;
+  }
+
+  // Back on the list with assessments still to visit -> open the next row.
+  if (screeningTableReady()) {
+    if (scan.index < scan.total) visitEligibilityIndex(scan);
+    else finishEligibilityScan(scan);
+  }
+}
+
 // Allow the side panel to trigger a fresh scrape on demand.
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg && msg.type === "RESCRAPE") {
@@ -1262,6 +1522,12 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
   if (msg && msg.type === "SCREENING_RESCRAPE") {
     startScreeningScan(msg).then((r) => sendResponse(r)).catch((e) =>
+      sendResponse({ ok: false, error: String(e) })
+    );
+    return true;
+  }
+  if (msg && msg.type === "ELIGIBILITY_RESCRAPE") {
+    startEligibilityScan(msg).then((r) => sendResponse(r)).catch((e) =>
       sendResponse({ ok: false, error: String(e) })
     );
     return true;
@@ -1290,8 +1556,10 @@ function scheduleLightScrapes() {
 // Initial run: light header scrape (no tab walking) so validation can proceed.
 publishIdsOnly();
 scheduleLightScrapes();
-// Resume an in-progress screening auto-walk if one survived a page navigation.
+// Resume an in-progress screening / eligibility auto-walk if one survived a
+// page navigation.
 maybeContinueScreeningScan();
+maybeContinueEligibilityScan();
 
 // Re-scan on SPA navigation (Unite Us is a single-page app).
 let lastHref = location.href;
@@ -1303,5 +1571,6 @@ setInterval(() => {
     publishIdsOnly();
     scheduleLightScrapes();
     maybeContinueScreeningScan(); // resume the walk on in-app route changes too
+    maybeContinueEligibilityScan();
   }
 }, 1000);
