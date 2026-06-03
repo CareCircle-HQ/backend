@@ -1264,6 +1264,70 @@ async function _maybeContinueScreeningScan() {
 // ---------------------------------------------------------------------------
 const ELIGIBILITY_SCAN_TTL_MS = SCREENING_SCAN_TTL_MS;
 
+// Parse the eligibility list (same columns as screenings) for the target org,
+// AND capture each row's assessment id/href so we can navigate to the detail
+// page by URL (the rows don't reliably navigate on click).
+function harvestEligibilityList() {
+  const table = findScreeningTable();
+  if (!table) return [];
+  let headers = [...table.querySelectorAll("thead th")].map((th) => cleanText(th.innerText));
+  if (!headers.length) {
+    headers = [...table.querySelectorAll("tr th")].map((th) => cleanText(th.innerText));
+  }
+  const col = (name) => headers.findIndex((h) => h.toUpperCase() === name);
+  const iForm = col("FORM");
+  const iSub = col("SUBMITTER");
+  const iStatus = col("STATUS");
+  const iOrg = col("ORGANIZATION");
+  const iDate = col("LAST UPDATED");
+
+  let rows = [...table.querySelectorAll("tbody tr")];
+  if (!rows.length) {
+    rows = [...table.querySelectorAll("tr")].filter((r) => r.querySelector("td"));
+  }
+  const norm = (s) => cleanText(s).toLowerCase();
+  const viewRe = new RegExp(`eligibility/view/(${UUID_RE.source})`, "i");
+
+  const out = [];
+  rows.forEach((tr) => {
+    const cells = [...tr.children].filter((c) => c.tagName === "TD");
+    if (!cells.length) return;
+    const cell = (i) => (i >= 0 && cells[i] ? cleanText(cells[i].innerText) : "");
+    const rowMatches = iOrg >= 0
+      ? norm(cell(iOrg)).includes(norm(SCREENING_ORG))
+      : norm(tr.innerText).includes(norm(SCREENING_ORG));
+    if (!rowMatches) return;
+
+    // Find the assessment id from a detail link or any UUID in the row markup.
+    let id = null;
+    let href = null;
+    const a =
+      tr.querySelector('a[href*="/eligibility/view/"]') ||
+      tr.querySelector('a[href*="eligibility"]') ||
+      tr.querySelector("a[href]");
+    if (a) {
+      href = a.getAttribute("href");
+      const mm = (href || "").match(viewRe);
+      if (mm) id = mm[1].toLowerCase();
+    }
+    if (!id) {
+      const mm = (tr.outerHTML || "").match(viewRe);
+      if (mm) id = mm[1].toLowerCase();
+    }
+
+    out.push({
+      form: cell(iForm),
+      submitter: cell(iSub),
+      status: cell(iStatus),
+      org: cell(iOrg),
+      date: cell(iDate),
+      id,
+      href,
+    });
+  });
+  return out;
+}
+
 // Capture the "Client May Be Eligible" programs list. We slice the visible text
 // between the section's intro line and the "Add Social Care Coverage" action.
 function harvestEligibilityResults() {
@@ -1425,7 +1489,7 @@ async function startEligibilityScan(msg) {
 
 async function beginEligibilityWalk(scan) {
   await waitFor(() => screeningTableReady(), 12000);
-  const list = harvestScreeningList(); // same columns + org filter
+  const list = harvestEligibilityList(); // captures per-row assessment id
   scan.list = list;
   scan.total = list.length;
   scan.index = 0;
@@ -1440,11 +1504,22 @@ async function beginEligibilityWalk(scan) {
   visitEligibilityIndex(scan);
 }
 
-// On the list page: open the index-th filtered row. Prefer a detail link if the
-// row exposes one, otherwise click the row (full navigation).
+// Open the index-th assessment's detail page. We navigate by URL using the
+// captured assessment id (deterministic); only if we have no id do we fall back
+// to clicking the row / its link.
 async function visitEligibilityIndex(scan) {
   if (scan.index >= scan.total) return finishEligibilityScan(scan);
   if (!(await waitFor(() => screeningTableReady(), 9000))) return;
+  const item = scan.list[scan.index];
+
+  if (item && item.id) {
+    location.assign(
+      `${location.origin}/facesheet/${scan.clientId}/eligibility/view/${item.id}`
+    );
+    return;
+  }
+
+  // No id captured -> fall back to clicking the row or its detail link.
   const row = getFilteredScreeningRows()[scan.index];
   if (!row) {
     scan.index += 1;
