@@ -759,6 +759,16 @@ function screeningTableReady() {
   return rows.some((r) => r.querySelector("td"));
 }
 
+// Reveal the screenings list. The list lives behind the "Screenings" facesheet
+// tab, whose state is NOT reliably deep-linkable, so we don't navigate to a
+// list URL; instead we ensure we're on the facesheet and click the tab in-app.
+// Works both on first start and when returning between rows.
+async function ensureScreeningList(timeout = 12000) {
+  if (screeningTableReady()) return true;
+  clickTabByLabel("Screenings");
+  return waitFor(() => screeningTableReady(), timeout);
+}
+
 // The data rows for the target org. Rows are clickable (<tr role="button">) and
 // carry no link/id, so navigation is by clicking the row; we track by index.
 function getFilteredScreeningRows() {
@@ -1086,31 +1096,34 @@ async function startScreeningScan(msg) {
   await saveScan(scan);
   publishScreenings(scan);
 
-  // Already on the screenings list URL -> harvest in place (no reload).
-  // We deliberately do NOT switch tabs in-app: an in-app tab click doesn't
-  // update the URL, which leaves returnUrl pointing at the wrong view and the
-  // walk can't resume after the first detail. Navigating to the canonical list
-  // URL keeps the flow identical to the eligibility / case crawlers.
-  if (/\/facesheet\/[^/]+\/screenings\b/.test(location.pathname) &&
-      (await waitFor(() => screeningTableReady(), 9000))) {
-    await beginScreeningWalk(scan);
-    return { ok: true, count: scan.total };
+  // Fast path: already on this client's facesheet -> reveal the Screenings tab
+  // (in-app) and harvest once rows render. The list isn't reliably deep-linkable,
+  // so when we're NOT on the facesheet we navigate to it (a real, reloadable URL)
+  // and the crawler resumes + clicks the tab on the next page load.
+  const onClient = parseIdsFromUrl().client_id === clientId;
+  if (onClient && getFacesheetTabs().length) {
+    if (await ensureScreeningList(9000)) {
+      await beginScreeningWalk(scan);
+      return { ok: true, count: scan.total };
+    }
   }
-  location.assign(`${location.origin}/facesheet/${clientId}/screenings`);
+  location.assign(`${location.origin}/facesheet/${clientId}`);
   return { ok: true, count: null };
 }
 
 // Harvest the filtered list, then start visiting each screening by clicking its
 // row (rows are clickable <tr role="button"> with no link/id).
 async function beginScreeningWalk(scan) {
-  await waitFor(() => screeningTableReady(), 12000);
+  await ensureScreeningList(12000);
   const list = harvestScreeningList();
   scan.list = list;
   scan.total = list.length;
   scan.index = 0;
   scan.details = [];
   scan.phase = "detail";
-  scan.returnUrl = `${location.origin}/facesheet/${scan.clientId}/screenings`;
+  // Return to the facesheet (a real, reloadable URL); the resume logic re-opens
+  // the Screenings tab there before clicking the next row.
+  scan.returnUrl = `${location.origin}/facesheet/${scan.clientId}`;
   scan.note = list.length ? "" : "No Met Council - SCN - PHS screenings in the list.";
   await saveScan(scan);
   publishScreenings(scan);
@@ -1122,7 +1135,7 @@ async function beginScreeningWalk(scan) {
 // On the list page: click the index-th filtered row to open its detail page.
 async function visitScreeningIndex(scan) {
   if (scan.index >= scan.total) return finishScan(scan);
-  if (!(await waitFor(() => screeningTableReady(), 9000))) return;
+  if (!(await ensureScreeningList(12000))) return;
   const row = getFilteredScreeningRows()[scan.index];
   if (!row) {
     scan.index += 1; // can't find it; skip ahead
@@ -1169,9 +1182,9 @@ async function _maybeContinueScreeningScan() {
   const ids = parseIdsFromUrl();
   if (ids.client_id && scan.clientId && ids.client_id !== scan.clientId) return;
 
-  // Phase 1: we navigated to the list URL and need to harvest it.
+  // Phase 1: we navigated to the facesheet and need to reveal + harvest the list.
   if (scan.phase === "list") {
-    if (await waitFor(() => screeningTableReady(), 12000)) {
+    if (await ensureScreeningList(12000)) {
       await beginScreeningWalk(scan);
     }
     return;
@@ -1241,11 +1254,10 @@ async function _maybeContinueScreeningScan() {
     return;
   }
 
-  // Back on the list with screenings still to visit -> click the next row.
-  if (screeningTableReady()) {
-    if (scan.index < scan.total) visitScreeningIndex(scan);
-    else finishScan(scan);
-  }
+  // Back on the facesheet with screenings still to visit -> re-open the list
+  // tab and click the next row (visitScreeningIndex calls ensureScreeningList).
+  if (scan.index < scan.total) visitScreeningIndex(scan);
+  else finishScan(scan);
 }
 
 // ---------------------------------------------------------------------------
