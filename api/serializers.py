@@ -10,6 +10,7 @@ from .models import (
     Case,
     Client,
     CommunicationTimeOfDay,
+    Eligibility,
     IdentifiedSocialNeed,
     ImportBatch,
     Insurance,
@@ -497,3 +498,37 @@ class ScreeningSerializer(serializers.ModelSerializer):
                 )
 
         return screening
+
+
+# ===========================================================================
+# Eligibility domain
+# ===========================================================================
+class EligibilitySerializer(serializers.ModelSerializer):
+    eligibility_id = serializers.UUIDField()
+    subject_id = serializers.UUIDField()
+    case_id = serializers.UUIDField(required=False, allow_null=True)
+
+    class Meta:
+        model = Eligibility
+        exclude = ("client", "case", "import_batch")
+
+    @transaction.atomic
+    def create(self, validated_data):
+        return self._upsert(validated_data)
+
+    @transaction.atomic
+    def update(self, instance, validated_data):
+        return self._upsert(validated_data)
+
+    def _upsert(self, validated_data):
+        eid = validated_data.pop("eligibility_id")
+        subject_id = validated_data.get("subject_id")
+        case_id = validated_data.pop("case_id", None)
+        validated_data["client"] = Client.objects.filter(pk=subject_id).first()
+        validated_data["case"] = (
+            Case.objects.filter(pk=case_id).first() if case_id else None
+        )
+        obj, _ = Eligibility.objects.update_or_create(
+            eligibility_id=eid, defaults=validated_data
+        )
+        return obj

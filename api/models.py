@@ -829,6 +829,113 @@ class Screening(models.Model):
         return f"Screening {self.enhanced_screen_id} ({self.screen_status})"
 
 
+class Eligibility(models.Model):
+    """An eligibility assessment for a subject (client).
+
+    Structurally the same shape as a Screening, but stored separately because
+    eligibility assessments are a distinct record type. Import routing uses the
+    source ``screen_type`` to decide between Screening and Eligibility.
+    """
+
+    # source enhanced_screen_id of the assessment
+    eligibility_id = models.UUIDField(primary_key=True, editable=False)
+    subject_id = models.UUIDField(db_index=True)  # source client reference
+    subject_type = models.CharField(max_length=50, blank=True)
+    client = models.ForeignKey(
+        Client, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="eligibilities",
+    )  # mapped from subject_id during import
+    case = models.ForeignKey(
+        Case, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="eligibilities",
+    )
+    active_screen = models.BooleanField(default=True)
+    assigned_at = models.DateTimeField(null=True, blank=True)
+    assigned_to_id = models.UUIDField(null=True, blank=True)
+    screen_created_at = models.DateTimeField(null=True, blank=True)
+    screen_updated_at = models.DateTimeField(null=True, blank=True)
+    screen_status = models.CharField(
+        max_length=20, choices=ScreenStatus.choices, blank=True
+    )
+    screen_status_at = models.DateTimeField(null=True, blank=True)
+    screen_type = models.CharField(
+        max_length=20, choices=ScreenType.choices, blank=True
+    )
+    screen_source = models.CharField(max_length=120, blank=True)
+
+    # --- Client Snapshot ---
+    client_first_name = models.CharField(max_length=120, blank=True)
+    client_last_name = models.CharField(max_length=120, blank=True)
+    client_dob = models.DateField(null=True, blank=True)  # PII/PHI
+
+    # --- Timing & Activity ---
+    duration = models.PositiveIntegerField(null=True, blank=True)
+    facilitator_id = models.UUIDField(null=True, blank=True)
+    facilitator_type = models.CharField(max_length=50, blank=True)
+    provider_id = models.UUIDField(null=True, blank=True)
+    provider_name = models.CharField(max_length=255, blank=True)
+    performing_organization_name = models.CharField(max_length=255, blank=True)
+    outreach_count = models.PositiveIntegerField(default=0)
+    outreach_status = models.CharField(
+        max_length=20, choices=OutreachStatus.choices, blank=True
+    )
+
+    # --- Decline / Outreach ---
+    decline_note = models.TextField(blank=True)
+    decline_reason_id = models.UUIDField(null=True, blank=True)
+    decline_primary_text = models.CharField(max_length=255, blank=True)
+    decline_secondary_text = models.CharField(max_length=255, blank=True)
+    decline_reason_key = models.CharField(max_length=120, blank=True)
+
+    # --- Communication & Interpreter ---
+    interpreter_id = models.UUIDField(null=True, blank=True)
+    interpreter_type = models.CharField(max_length=50, blank=True)
+    language = models.CharField(max_length=80, blank=True)
+
+    # --- Consent & Risk Scoring ---
+    consent = models.BooleanField(null=True, blank=True)
+    consent_code = models.CharField(max_length=80, blank=True)
+    interpersonal_safety_riskscore = models.FloatField(null=True, blank=True)  # PHI
+    interpersonal_safety_interpretation = models.CharField(max_length=255, blank=True)
+
+    # --- Clinical Coding ---
+    screen_snomed_codes = models.JSONField(default=list, blank=True)
+    screen_icd10_codes = models.JSONField(default=list, blank=True)
+    clinical_code_classification = models.CharField(max_length=120, blank=True)
+    verified_clinical_code = models.CharField(max_length=50, blank=True)
+    verified_clinical_code_description = models.CharField(max_length=255, blank=True)
+
+    # --- Eligibility ---
+    eligible_status = models.CharField(max_length=50, blank=True)
+    eligible_services = models.JSONField(default=list, blank=True)
+
+    # --- Verification ---
+    verified_at = models.DateTimeField(null=True, blank=True)
+    verified_by_id = models.UUIDField(null=True, blank=True)
+    verified_by_type = models.CharField(max_length=50, blank=True)
+
+    # --- Sensitivity & Metadata ---
+    is_case_sensitive = models.BooleanField(default=False)
+    filter_date = models.DateField(null=True, blank=True)
+    import_batch = models.ForeignKey(
+        "ImportBatch", on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="eligibilities",
+    )
+
+    class Meta:
+        ordering = ["-screen_created_at"]
+        verbose_name_plural = "eligibilities"
+        indexes = [
+            models.Index(fields=["subject_id"]),
+            models.Index(fields=["client", "screen_status"]),
+            models.Index(fields=["case"]),
+            models.Index(fields=["eligible_status"]),
+        ]
+
+    def __str__(self):
+        return f"Eligibility {self.eligibility_id} ({self.eligible_status})"
+
+
 class Question(models.Model):
     """Normalized screening question (belongs to a template)."""
 

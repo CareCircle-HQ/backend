@@ -21,6 +21,7 @@
       <button class="tab locked" data-tab="form4" disabled>
         Form 4 &#128274;
       </button>
+      <button class="tab" data-tab="data">Detected Data</button>
     </nav>
 
     <main class="panels">
@@ -31,12 +32,13 @@
           <p class="muted">Open a Unite Us facesheet page to detect a client.</p>
         </div>
 
-        <h2>Required Information</h2>
-        <ul id="checklist" class="checklist"></ul>
-
+        <h2>CRM Status</h2>
         <div class="row">
           <button id="validateBtn" class="primary" disabled>Validate Client</button>
           <span id="validationStatus" class="badge"></span>
+        </div>
+        <div id="crmStatus" class="crm-status">
+          <p class="muted">No client detected yet.</p>
         </div>
         <p id="reqHint" class="hint muted"></p>
       </section>
@@ -61,6 +63,32 @@
         <div class="placeholder hidden" id="ph-form4">
           Form 4 URL not configured yet.
         </div>
+      </section>
+
+      <!-- Tab 5: All detected data + records -->
+      <section class="panel" data-panel="data">
+        <div class="row spread">
+          <h2>Records</h2>
+          <button id="rescanBtn" class="ghost" title="Deep scan: walk all tabs">Re-scan</button>
+        </div>
+        <div id="records" class="records">
+          <p class="muted">Click Re-scan to gather all cases, screenings, and eligibility records.</p>
+        </div>
+
+        <h2>All Detected Data <span id="scrapeCount" class="muted"></span></h2>
+        <div id="scraped" class="scraped">
+          <p class="muted">No data scraped yet.</p>
+        </div>
+
+        <h2>Developer Tools</h2>
+        <div class="row spread">
+          <button id="diagnosticBtn" class="ghost" title="Run page inspection">Inspect Page</button>
+          <button id="copyReportBtn" class="ghost hidden">Copy report</button>
+        </div>
+        <p class="hint muted">
+          Runs a structure scan on the active Unite Us tab. Copy the report and send it back for tuning.
+        </p>
+        <textarea id="diagnosticOut" class="diag hidden" readonly></textarea>
       </section>
     </main>
 

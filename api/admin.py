@@ -5,6 +5,7 @@ from .models import (
     Answer,
     Case,
     Client,
+    Eligibility,
     IdentifiedSocialNeed,
     ImportBatch,
     Insurance,
@@ -156,6 +157,26 @@ class ScreeningAdmin(admin.ModelAdmin):
     )
     autocomplete_fields = ("client", "case", "template", "parent_screen", "related_screen")
     inlines = [AnswerInline, IdentifiedSocialNeedInline, VerifiedSocialNeedInline]
+
+
+@admin.register(Eligibility)
+class EligibilityAdmin(admin.ModelAdmin):
+    list_display = (
+        "eligibility_id",
+        "client",
+        "screen_status",
+        "screen_type",
+        "eligible_status",
+        "screen_created_at",
+    )
+    list_filter = ("screen_status", "screen_type", "eligible_status")
+    search_fields = (
+        "eligibility_id",
+        "subject_id",
+        "client__last_name",
+        "client_last_name",
+    )
+    autocomplete_fields = ("client", "case")
 
 
 class QuestionOptionInline(admin.TabularInline):

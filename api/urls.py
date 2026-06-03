@@ -9,6 +9,7 @@ from rest_framework_simplejwt.views import (
 from .views import (
     CaseViewSet,
     ClientViewSet,
+    EligibilityViewSet,
     HealthView,
     ImportBatchViewSet,
     MeView,
@@ -22,6 +23,7 @@ router = DefaultRouter()
 router.register("clients", ClientViewSet, basename="client")
 router.register("cases", CaseViewSet, basename="case")
 router.register("screenings", ScreeningViewSet, basename="screening")
+router.register("eligibility", EligibilityViewSet, basename="eligibility")
 router.register("providers", ProviderViewSet, basename="provider")
 router.register("programs", ProgramViewSet, basename="program")
 router.register("import-batches", ImportBatchViewSet, basename="import-batch")

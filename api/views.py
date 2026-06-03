@@ -5,10 +5,19 @@ from rest_framework.views import APIView
 from rest_framework.decorators import action
 from rest_framework import status
 
-from .models import Case, Client, ImportBatch, Program, Provider, Screening
+from .models import (
+    Case,
+    Client,
+    Eligibility,
+    ImportBatch,
+    Program,
+    Provider,
+    Screening,
+)
 from .serializers import (
     CaseSerializer,
     ClientSerializer,
+    EligibilitySerializer,
     ImportBatchSerializer,
     ProgramSerializer,
     ProviderSerializer,
@@ -95,6 +104,13 @@ class CaseViewSet(BulkUpsertMixin, viewsets.ModelViewSet):
     )
     serializer_class = CaseSerializer
 
+    def get_queryset(self):
+        qs = super().get_queryset()
+        client = self.request.query_params.get("client")
+        if client:
+            qs = qs.filter(client_id=client)
+        return qs
+
 
 class ScreeningViewSet(BulkUpsertMixin, viewsets.ModelViewSet):
     """CRUD + upsert for screenings (keyed on enhanced_screen_id UUID)."""
@@ -103,6 +119,27 @@ class ScreeningViewSet(BulkUpsertMixin, viewsets.ModelViewSet):
         "answers", "identified_social_needs", "verified_social_needs"
     )
     serializer_class = ScreeningSerializer
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        client = self.request.query_params.get("client")
+        if client:
+            qs = qs.filter(client_id=client)
+        return qs
+
+
+class EligibilityViewSet(BulkUpsertMixin, viewsets.ModelViewSet):
+    """CRUD + upsert for eligibility assessments (keyed on eligibility_id UUID)."""
+
+    queryset = Eligibility.objects.select_related("client", "case")
+    serializer_class = EligibilitySerializer
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        client = self.request.query_params.get("client")
+        if client:
+            qs = qs.filter(client_id=client)
+        return qs
 
 
 class ProviderViewSet(viewsets.ReadOnlyModelViewSet):
