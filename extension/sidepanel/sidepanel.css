@@ -399,6 +399,76 @@ textarea.diag {
   white-space: pre;
 }
 
+/* Screening accordion */
+.acc {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--card);
+  margin-bottom: 8px;
+  overflow: hidden;
+}
+.acc-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 10px 12px;
+  cursor: pointer;
+  user-select: none;
+}
+.acc-head:hover { background: #f8fafc; }
+.acc-title { font-weight: 600; font-size: 12.5px; }
+.acc-sub { font-size: 11px; color: var(--muted); white-space: nowrap; }
+.acc-head::after {
+  content: "\25BC";
+  font-size: 9px;
+  color: var(--muted);
+  transition: transform 0.15s;
+  margin-left: 4px;
+}
+.acc:not(.open) .acc-head::after { transform: rotate(-90deg); }
+.acc-body { display: none; padding: 10px 12px 12px; border-top: 1px solid var(--border); }
+.acc.open .acc-body { display: block; }
+
+.scr-meta { font-size: 12px; margin-bottom: 8px; }
+.scr-meta > div { margin-bottom: 3px; }
+.scr-meta .sum-k { color: var(--muted); margin-right: 6px; }
+.scr-duration strong { color: var(--warn); }
+
+.scr-results { margin: 8px 0 10px; }
+.scr-results-h {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--muted);
+  margin-bottom: 5px;
+}
+.chip {
+  display: inline-block;
+  background: #eff6ff;
+  color: var(--primary);
+  border: 1px solid #dbeafe;
+  border-radius: 999px;
+  font-size: 11px;
+  padding: 2px 9px;
+  margin: 0 4px 4px 0;
+}
+
+.qa-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+.qa-table tr.qa { border-top: 1px solid var(--border); }
+.qa-table tr.qa:first-child { border-top: none; }
+.qa-table th {
+  text-align: left;
+  font-weight: 500;
+  color: var(--text);
+  padding: 6px 8px 6px 0;
+  vertical-align: top;
+  width: 60%;
+}
+.qa-table td { padding: 6px 0; vertical-align: top; color: var(--muted); font-weight: 600; }
+.qa-table tr.hl { background: #fffbeb; }
+.qa-table tr.hl th, .qa-table tr.hl td { color: var(--warn); }
+
 /* Form iframes fill their panel */
 .form-frame { flex: 1; width: 100%; border: none; display: block; }
 .placeholder {

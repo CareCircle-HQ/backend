@@ -470,9 +470,10 @@ function renderComparison(ctx) {
   const screeningHtml = empty ? "" : buildRecordHtml("screening", ctx);
   const eligibilityHtml = empty ? "" : buildRecordHtml("eligibility", ctx);
 
-  // Per-tab views.
+  // Per-tab views. The dedicated Screening tab is rendered separately from the
+  // captured screening detail (renderScreenings); screeningHtml below feeds only
+  // the full CRM comparison on the Data tab.
   fill("cmp-profile", profileHtml, openMsg);
-  fill("cmp-screening", screeningHtml, "No screenings detected or imported yet.");
   fill("cmp-eligibility", eligibilityHtml, "No eligibility records detected or imported yet.");
   fill("cmp-cases", caseHtml, "No cases detected or imported yet.");
 
@@ -645,6 +646,70 @@ function inspectPageFn() {
     .filter((s) => s && s.text)
     .slice(0, 40);
 
+  // Screenings list: how each row links to its detail page, so we can drive the
+  // auto-walk (anchor href / role=link / button / data-* / onclick).
+  const screeningRows = (() => {
+    const table = [...document.querySelectorAll("table")].find((t) => {
+      const heads = [...t.querySelectorAll("th")].map((th) =>
+        clean(th.innerText).toUpperCase()
+      );
+      return heads.includes("FORM") && heads.includes("ORGANIZATION");
+    });
+    if (!table) return { found: false };
+    let rows = [...table.querySelectorAll("tbody tr")];
+    if (!rows.length) {
+      rows = [...table.querySelectorAll("tr")].filter((r) => r.querySelector("td"));
+    }
+    const sample = rows.slice(0, 2).map((tr) => ({
+      text: clean(tr.innerText),
+      anchors: [...tr.querySelectorAll("a[href]")].map((a) => a.getAttribute("href")),
+      roleLinks: [...tr.querySelectorAll('[role="link"],[role="button"]')].map((e) =>
+        clean(e.innerText)
+      ),
+      buttons: [...tr.querySelectorAll("button")].map((b) =>
+        clean(b.innerText || b.getAttribute("aria-label"))
+      ),
+      dataAttrs: [...tr.querySelectorAll("[data-testid],[data-test-element],[data-id]")]
+        .slice(0, 16)
+        .map(
+          (e) =>
+            e.getAttribute("data-testid") ||
+            e.getAttribute("data-test-element") ||
+            e.getAttribute("data-id")
+        ),
+      html: (tr.outerHTML || "").slice(0, 3000),
+    }));
+    return { found: true, rowCount: rows.length, sample };
+  })();
+
+  // Screening DETAIL page: dump the HTML around the Questions and Results areas
+  // so we can write reliable Q&A / result selectors.
+  const screeningDetail = (() => {
+    if (!/submission\//i.test(location.href)) return { onDetail: false };
+    const grabAround = (re) => {
+      const el = [
+        ...document.querySelectorAll("h1,h2,h3,h4,h5,p,div,span,strong,label"),
+      ].find((e) => {
+        const t = clean(e.innerText);
+        return t && t.length < 50 && re.test(t);
+      });
+      if (!el) return null;
+      let c = el;
+      for (let i = 0; i < 5; i++) {
+        if (!c.parentElement) break;
+        c = c.parentElement;
+        if ((c.innerText || "").length > 500) break;
+      }
+      return (c.outerHTML || "").slice(0, 9000);
+    };
+    return {
+      onDetail: true,
+      questionsHtml: grabAround(/^screening questions/i),
+      resultsHtml: grabAround(/^screening results/i),
+      detailsHtml: grabAround(/^screening details/i),
+    };
+  })();
+
   return {
     url: location.href,
     title: document.title,
@@ -655,6 +720,8 @@ function inspectPageFn() {
     dataTestElements: dataTestElems,
     labelValueSample: pairs,
     tables,
+    screeningRows,
+    screeningDetail,
     coverageSections,
     sectionTexts,
     counts: {
@@ -726,6 +793,160 @@ async function rescan(ev) {
     }
   } catch (_) {
     // content script may not be present on this tab
+  } finally {
+    setBtnBusy(btn, false);
+  }
+}
+
+// ---------- Screenings tab (Met Council - SCN - PHS) ----------
+// Captured by the content-script auto-walk and published to uw_screenings.
+let screeningData = null;
+
+function setScrStatus(state, message) {
+  const badge = $("scrStatus");
+  if (!badge) return;
+  badge.className = "badge " + (state || "");
+  badge.textContent = message || "";
+}
+
+function renderScrMeta() {
+  const el = $("scrMeta");
+  if (!el) return;
+  const d = screeningData;
+  if (!d || !d.screenings) {
+    el.textContent = "";
+    return;
+  }
+  if (d.note) {
+    el.textContent = d.note;
+    return;
+  }
+  const p = d.progress || { done: 0, total: 0 };
+  if (d.status === "running") {
+    el.textContent = `Scanning ${p.done}/${p.total}\u2026`;
+  } else if (d.finishedAt) {
+    const dt = new Date(d.finishedAt);
+    el.textContent =
+      `${d.screenings.length} screening(s) \u00b7 last scanned ` +
+      (isNaN(dt.getTime()) ? d.finishedAt : dt.toLocaleString());
+  } else {
+    el.textContent = `${d.screenings.length} screening(s) found`;
+  }
+}
+
+// One collapsible screening panel: header = form + status/date; body = meta,
+// highlighted Screening Duration, screening-result chips, ordered Q&A.
+function renderScreeningAccordion(s, i) {
+  const d = s.detail;
+  const statusLabel = /complete/i.test(s.status || "") ? "Completed" : s.status || "";
+  const statusDate = [statusLabel, s.date].filter(Boolean).join(" ");
+  const head =
+    `<div class="acc-head"><span class="acc-title">${escapeHtml(
+      s.form || `Screening ${i + 1}`
+    )}</span>` + `<span class="acc-sub">${escapeHtml(statusDate)}</span></div>`;
+
+  let body;
+  if (!d) {
+    body = '<p class="muted">Detail not captured yet \u2014 re-scan to fetch its answers.</p>';
+  } else {
+    const isDuration = (q) => /screening duration/i.test(q || "");
+    const dur = (d.items.find((it) => isDuration(it.q)) || {}).a || "";
+    const results = d.results || [];
+
+    let html = `<div class="scr-meta">`;
+    html += `<div><span class="sum-k">Submitter</span>${escapeHtml(s.submitter || "\u2014")}</div>`;
+    html += `<div><span class="sum-k">Status</span>${escapeHtml(statusDate || "\u2014")}</div>`;
+    if (dur)
+      html += `<div class="scr-duration"><span class="sum-k">Screening Duration</span><strong>${escapeHtml(
+        dur
+      )}</strong></div>`;
+    html += `</div>`;
+
+    if (results.length) {
+      html +=
+        `<div class="scr-results"><div class="scr-results-h">Screening Results</div>` +
+        results.map((r) => `<span class="chip">${escapeHtml(r)}</span>`).join("") +
+        `</div>`;
+    }
+
+    html +=
+      `<table class="qa-table"><tbody>` +
+      d.items
+        .map((it) => {
+          const hl = isDuration(it.q) ? " hl" : "";
+          return `<tr class="qa${hl}"><th>${escapeHtml(it.q)}</th><td>${escapeHtml(
+            it.a
+          )}</td></tr>`;
+        })
+        .join("") +
+      `</tbody></table>`;
+    body = html;
+  }
+  return `<div class="acc${i === 0 ? " open" : ""}">${head}<div class="acc-body">${body}</div></div>`;
+}
+
+function renderScreenings() {
+  const box = $("cmp-screening");
+  if (!box) return;
+  renderScrMeta();
+  const d = screeningData;
+  const matchesClient =
+    d && (!currentContext || !currentContext.client_id || d.clientId === currentContext.client_id);
+
+  if (!d || !matchesClient || !d.screenings || !d.screenings.length) {
+    box.innerHTML =
+      '<p class="muted">No Met Council screenings captured yet. Open a Unite Us facesheet and click Re-scan.</p>';
+    return;
+  }
+  box.innerHTML = d.screenings.map((s, i) => renderScreeningAccordion(s, i)).join("");
+  box.querySelectorAll(".acc-head").forEach((h) => {
+    h.addEventListener("click", () => h.parentElement.classList.toggle("open"));
+  });
+}
+
+// Poll storage to confirm the content script actually started the scan (it
+// writes uw_screenings immediately). Detects an orphaned/old content script.
+async function scanStarted(sinceMs, timeout) {
+  const start = Date.now();
+  while (Date.now() - start < timeout) {
+    const { uw_screenings } = await chrome.storage.local.get("uw_screenings");
+    if (
+      uw_screenings &&
+      uw_screenings.scannedAt &&
+      new Date(uw_screenings.scannedAt).getTime() >= sinceMs - 1500
+    ) {
+      return true;
+    }
+    await new Promise((r) => setTimeout(r, 200));
+  }
+  return false;
+}
+
+async function scrRescan(ev) {
+  const btn = (ev && ev.currentTarget) || $("scrRescanBtn");
+  setBtnBusy(btn, true);
+  setScrStatus("warn", "Starting\u2026");
+  const sentAt = Date.now();
+  try {
+    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    if (!tab || tab.id == null || !/app\.uniteus\.io/.test(tab.url || "")) {
+      setScrStatus("err", "Open a Unite Us facesheet tab first");
+      return;
+    }
+    const clientId = currentContext && currentContext.client_id;
+    // The page navigates during the walk, so the response may never arrive;
+    // progress is reported via storage (uw_screenings) instead.
+    chrome.tabs
+      .sendMessage(tab.id, { type: "SCREENING_RESCRAPE", clientId })
+      .catch(() => {});
+    // Confirm the content script picked it up; if not, it's the stale-script case.
+    if (await scanStarted(sentAt, 3000)) {
+      setScrStatus("warn", "Walking screenings\u2026 keep this tab open");
+    } else {
+      setScrStatus("err", "Couldn't reach the page \u2014 reload the Unite Us tab (F5), then retry");
+    }
+  } catch (_) {
+    setScrStatus("err", "Reload the Unite Us tab (F5), then retry");
   } finally {
     setBtnBusy(btn, false);
   }
@@ -1076,11 +1297,16 @@ function renderCrmStatus(ctx) {
 }
 
 async function loadContext() {
-  const { uw_context } = await chrome.storage.local.get("uw_context");
+  const { uw_context, uw_screenings } = await chrome.storage.local.get([
+    "uw_context",
+    "uw_screenings",
+  ]);
   currentContext = uw_context || null;
+  screeningData = uw_screenings || null;
   renderContext(currentContext);
   renderCrmStatus(currentContext);
   renderComparison(currentContext);
+  renderScreenings();
   await maybeAutoValidate();
 }
 
@@ -1197,6 +1423,7 @@ function init() {
   $("rescanBtn").addEventListener("click", rescan);
   $("rescanBtn2").addEventListener("click", rescan);
   $("saveBtn").addEventListener("click", saveClient);
+  $("scrRescanBtn").addEventListener("click", scrRescan);
   $("diagnosticBtn").addEventListener("click", runDiagnostic);
   $("copyReportBtn").addEventListener("click", copyReport);
 
@@ -1223,6 +1450,18 @@ function init() {
         activateTab("profile");
       }
       maybeAutoValidate();
+    }
+    // Screening auto-walk progress / results.
+    if (area === "local" && changes.uw_screenings) {
+      screeningData = changes.uw_screenings.newValue;
+      const d = screeningData;
+      if (d && d.status === "done") {
+        setScrStatus("ok", `Done \u2014 ${d.screenings.length} screening(s)`);
+      } else if (d && d.status === "running") {
+        const p = d.progress || { done: 0, total: 0 };
+        setScrStatus("warn", `Walking ${p.done}/${p.total}\u2026`);
+      }
+      renderScreenings();
     }
   });
 }

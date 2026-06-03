@@ -52,11 +52,26 @@
         </div>
       </section>
 
-      <!-- Tab 2: Screening comparison -->
+      <!-- Tab 2: Screenings (Met Council - SCN - PHS only) -->
       <section class="panel" data-panel="screening">
-        <h2>Screenings</h2>
+        <div class="row spread">
+          <h2>Screenings</h2>
+          <div class="actions">
+            <button id="scrRescanBtn" class="act-btn" title="Re-scan: auto-walk Met Council screenings" aria-label="Re-scan screenings">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5"/></svg>
+            </button>
+            <button id="scrSaveBtn" class="act-btn save" title="Save screenings to CRM (coming soon)" aria-label="Save screenings" disabled>
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><path d="M17 21v-8H7v8"/><path d="M7 3v5h8"/></svg>
+            </button>
+          </div>
+        </div>
+        <p class="hint muted">Only screenings from <strong>Met Council - SCN - PHS</strong> are captured. Re-scan opens each one to capture its answers.</p>
+        <div class="profile-meta">
+          <span id="scrMeta" class="muted"></span>
+          <span id="scrStatus" class="badge"></span>
+        </div>
         <div id="cmp-screening" class="comparison">
-          <p class="muted">No screenings detected or imported yet.</p>
+          <p class="muted">No screenings captured yet. Open a Unite Us facesheet and click Re-scan.</p>
         </div>
       </section>
 

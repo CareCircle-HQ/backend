@@ -709,12 +709,356 @@ function publishIdsOnly() {
   });
 }
 
+// ---------------------------------------------------------------------------
+// Screenings: filtered list + per-screening detail capture.
+//
+// The screening detail page lives on a different app bundle
+// (/screenings/v2/...), so visiting it is a FULL page navigation rather than an
+// in-app route change. We therefore implement the "auto-walk" as a resumable
+// crawler whose state lives in chrome.storage.local (uw_scr_scan): each page
+// load checks whether a scan is in progress and, if so, harvests the current
+// detail page and navigates to the next one until the queue is drained.
+// ---------------------------------------------------------------------------
+const SCREENING_ORG = "Met Council - SCN - PHS";
+const SCREENING_SCAN_TTL_MS = 5 * 60 * 1000; // abandon stale scans
+
+async function waitFor(pred, timeout = 8000, step = 200) {
+  const start = Date.now();
+  while (Date.now() - start < timeout) {
+    try {
+      if (pred()) return true;
+    } catch (_) {}
+    await sleep(step);
+  }
+  return false;
+}
+
+const absUrl = (href) => {
+  try {
+    return new URL(href, location.origin).href;
+  } catch (_) {
+    return href;
+  }
+};
+
+// The visible screenings table on /facesheet/<id>/screenings.
+function findScreeningTable() {
+  return [...document.querySelectorAll("table")].find((t) => {
+    if (t.offsetParent === null) return false;
+    const heads = [...t.querySelectorAll("th")].map((th) =>
+      cleanText(th.innerText).toUpperCase()
+    );
+    return heads.includes("FORM") && heads.includes("ORGANIZATION");
+  });
+}
+
+// The table renders its header before its data rows arrive, so we must wait for
+// at least one data row before harvesting (otherwise we capture 0 screenings).
+function screeningTableReady() {
+  const t = findScreeningTable();
+  if (!t) return false;
+  let rows = [...t.querySelectorAll("tbody tr")];
+  if (!rows.length) rows = [...t.querySelectorAll("tr")];
+  return rows.some((r) => r.querySelector("td"));
+}
+
+// The data rows for the target org. Rows are clickable (<tr role="button">) and
+// carry no link/id, so navigation is by clicking the row; we track by index.
+function getFilteredScreeningRows() {
+  const table = findScreeningTable();
+  if (!table) return [];
+  let rows = [...table.querySelectorAll("tbody tr")];
+  if (!rows.length) {
+    rows = [...table.querySelectorAll("tr")].filter((r) => r.querySelector("td"));
+  }
+  const norm = (s) => cleanText(s).toLowerCase();
+  return rows.filter((r) => norm(r.innerText).includes(norm(SCREENING_ORG)));
+}
+
+// Parse the screenings table, keeping only rows for the target organization.
+function harvestScreeningList() {
+  const table = findScreeningTable();
+  if (!table) return [];
+  let headers = [...table.querySelectorAll("thead th")].map((th) =>
+    cleanText(th.innerText)
+  );
+  if (!headers.length) {
+    headers = [...table.querySelectorAll("tr th")].map((th) =>
+      cleanText(th.innerText)
+    );
+  }
+  const col = (name) => headers.findIndex((h) => h.toUpperCase() === name);
+  const iForm = col("FORM");
+  const iSub = col("SUBMITTER");
+  const iStatus = col("STATUS");
+  const iOrg = col("ORGANIZATION");
+  const iDate = col("LAST UPDATED");
+
+  let rows = [...table.querySelectorAll("tbody tr")];
+  if (!rows.length) {
+    rows = [...table.querySelectorAll("tr")].filter((r) => r.querySelector("td"));
+  }
+
+  const out = [];
+  rows.forEach((tr) => {
+    const cells = [...tr.children].filter((c) => c.tagName === "TD");
+    if (!cells.length) return;
+    const cell = (i) => (i >= 0 && cells[i] ? cleanText(cells[i].innerText) : "");
+    const norm = (s) => cleanText(s).toLowerCase();
+    const org = cell(iOrg);
+    // Keep only the target org. Match the dedicated column when we found it,
+    // otherwise fall back to scanning the whole row text.
+    const rowMatches = iOrg >= 0
+      ? norm(org).includes(norm(SCREENING_ORG))
+      : norm(tr.innerText).includes(norm(SCREENING_ORG));
+    if (!rowMatches) return;
+
+    out.push({
+      form: cell(iForm),
+      submitter: cell(iSub),
+      status: cell(iStatus),
+      org: cell(iOrg),
+      date: cell(iDate),
+    });
+  });
+  return out;
+}
+
+// Best-effort: capture the "Screening Results" section's domain items.
+function harvestScreeningResults(root) {
+  const trigger = [...document.querySelectorAll("[aria-expanded]")].find((el) =>
+    cleanText(el.innerText).toLowerCase().startsWith("screening results")
+  );
+  if (!trigger) return [];
+  let panel = null;
+  const controls = trigger.getAttribute("aria-controls");
+  if (controls) panel = document.getElementById(controls);
+  if (!panel) panel = trigger.nextElementSibling;
+  if (!panel) panel = trigger.parentElement;
+  if (!panel) return [];
+
+  const out = [];
+  const seen = new Set();
+  panel.querySelectorAll("*").forEach((el) => {
+    if (el.children.length) return; // leaf nodes only
+    const t = cleanText(el.innerText);
+    if (!t || t.length > 80) return;
+    const low = t.toLowerCase();
+    if (low === "screening results" || seen.has(low)) return;
+    seen.add(low);
+    out.push(t);
+  });
+  return out.slice(0, 40);
+}
+
+// Capture one screening detail page: ordered question/answer pairs (excluding
+// the client-summary header), plus the screening-results domains.
+function harvestScreeningDetail() {
+  const m = location.href.match(new RegExp(`submission/(${UUID_RE.source})`, "i"));
+  const id = m ? m[1].toLowerCase() : null;
+
+  const root = document.querySelector(".screening-detail") || document.body;
+  const exclude = [
+    ...root.querySelectorAll(".screening-detail__requestor, .client-summary"),
+  ];
+  const inExcluded = (el) => exclude.some((r) => r.contains(el));
+
+  const items = [];
+  const seen = new Set();
+  root
+    .querySelectorAll("[class*='label'], [data-testid*='label']")
+    .forEach((lab) => {
+      if (inExcluded(lab)) return;
+      if (lab.tagName === "H3") return; // client-summary labels are <h3>
+      const q = cleanText(lab.innerText);
+      const next = lab.nextElementSibling;
+      if (!next) return;
+      const a = cleanText(next.innerText);
+      if (!q || !a || q === a) return;
+      if (q.length > 200 || a.length > 400) return;
+      const key = q.toLowerCase();
+      if (seen.has(key)) return;
+      seen.add(key);
+      items.push({ q, a });
+    });
+
+  return { id, items, results: harvestScreeningResults(root) };
+}
+
+function saveScan(scan) {
+  return chrome.storage.local.set({ uw_scr_scan: scan });
+}
+
+// Publish the panel-facing view: list rows joined with any captured details.
+function publishScreenings(scan) {
+  const screenings = scan.list.map((x, i) => ({
+    ...x,
+    detail: (scan.details && scan.details[i]) || null,
+  }));
+  chrome.storage.local.set({
+    uw_screenings: {
+      clientId: scan.clientId,
+      org: SCREENING_ORG,
+      screenings,
+      status: scan.status,
+      phase: scan.phase || null,
+      note: scan.note || "",
+      scannedAt: scan.startedAt,
+      finishedAt: scan.finishedAt || null,
+      progress: { done: scan.index, total: scan.total || scan.list.length },
+    },
+  });
+}
+
+// Kick off a scan. The Screenings list may not be the current view, so we first
+// ensure we're on it (switch tab if on the facesheet, otherwise navigate to the
+// list URL). Harvesting + the per-detail walk are driven by
+// maybeContinueScreeningScan, which makes the whole flow survive page reloads.
+async function startScreeningScan(msg) {
+  const clientId = (msg && msg.clientId) || parseIdsFromUrl().client_id;
+  if (!clientId) return { ok: false, error: "Open the client's facesheet first" };
+
+  const scan = {
+    clientId,
+    status: "running",
+    phase: "list",
+    note: "Loading screenings\u2026",
+    startedAt: new Date().toISOString(),
+    finishedAt: null,
+    list: [],
+    total: 0,
+    index: 0,
+    details: [],
+    returnUrl: null,
+  };
+  await saveScan(scan);
+  publishScreenings(scan);
+
+  // Fast path: already on this client's facesheet -> switch to Screenings tab
+  // (in-app, no reload) and harvest once the rows have rendered.
+  const onClient = parseIdsFromUrl().client_id === clientId;
+  if (onClient && getFacesheetTabs().length) {
+    clickTabByLabel("Screenings");
+    if (await waitFor(() => screeningTableReady(), 9000)) {
+      await beginScreeningWalk(scan);
+      return { ok: true, count: scan.total };
+    }
+  }
+  // Otherwise (or if the table didn't appear) load the list URL; the crawler
+  // resumes and harvests on the next page load.
+  location.assign(`${location.origin}/facesheet/${clientId}/screenings`);
+  return { ok: true, count: null };
+}
+
+// Harvest the filtered list, then start visiting each screening by clicking its
+// row (rows are clickable <tr role="button"> with no link/id).
+async function beginScreeningWalk(scan) {
+  await waitFor(() => screeningTableReady(), 12000);
+  const list = harvestScreeningList();
+  scan.list = list;
+  scan.total = list.length;
+  scan.index = 0;
+  scan.details = [];
+  scan.phase = "detail";
+  scan.returnUrl = location.href;
+  scan.note = list.length ? "" : "No Met Council - SCN - PHS screenings in the list.";
+  await saveScan(scan);
+  publishScreenings(scan);
+
+  if (!list.length) return finishScan(scan);
+  visitScreeningIndex(scan); // clicks the row -> full navigation
+}
+
+// On the list page: click the index-th filtered row to open its detail page.
+async function visitScreeningIndex(scan) {
+  if (scan.index >= scan.total) return finishScan(scan);
+  if (!(await waitFor(() => screeningTableReady(), 9000))) return;
+  const row = getFilteredScreeningRows()[scan.index];
+  if (!row) {
+    scan.index += 1; // can't find it; skip ahead
+    await saveScan(scan);
+    return visitScreeningIndex(scan);
+  }
+  row.scrollIntoView({ block: "center" });
+  row.click(); // navigates to /screenings/v2/.../submission/<id> (full load)
+}
+
+async function finishScan(scan) {
+  scan.status = "done";
+  scan.finishedAt = new Date().toISOString();
+  await saveScan(scan);
+  publishScreenings(scan);
+  if (scan.returnUrl && location.href !== scan.returnUrl) {
+    location.assign(scan.returnUrl);
+  }
+}
+
+// Runs on every page load: if a scan is in progress and we've landed on the
+// expected detail page, harvest it and move on.
+async function maybeContinueScreeningScan() {
+  const { uw_scr_scan: scan } = await chrome.storage.local.get("uw_scr_scan");
+  if (!scan || scan.status !== "running") return;
+  if (Date.now() - new Date(scan.startedAt).getTime() > SCREENING_SCAN_TTL_MS) {
+    scan.status = "done";
+    await saveScan(scan);
+    return; // stale scan; abandon
+  }
+  const ids = parseIdsFromUrl();
+  if (ids.client_id && scan.clientId && ids.client_id !== scan.clientId) return;
+
+  // Phase 1: we navigated to the list URL and need to harvest it.
+  if (scan.phase === "list") {
+    if (await waitFor(() => screeningTableReady(), 12000)) {
+      await beginScreeningWalk(scan);
+    }
+    return;
+  }
+
+  // On a screening detail page: capture it, then return to the list.
+  const m = location.href.match(new RegExp(`submission/(${UUID_RE.source})`, "i"));
+  if (m) {
+    if (scan.index >= scan.total) return; // nothing pending
+    await waitFor(
+      () => /Screening Duration|Screening Results/i.test(document.body.innerText),
+      12000
+    );
+    const detail = harvestScreeningDetail();
+    scan.details[scan.index] = {
+      id: m[1].toLowerCase(),
+      items: detail.items,
+      results: detail.results,
+      capturedAt: new Date().toISOString(),
+    };
+    scan.index += 1;
+    await saveScan(scan);
+    publishScreenings(scan);
+    if (scan.index >= scan.total) {
+      await finishScan(scan);
+    } else if (scan.returnUrl) {
+      location.assign(scan.returnUrl); // back to the list to click the next row
+    }
+    return;
+  }
+
+  // Back on the list with screenings still to visit -> click the next row.
+  if (screeningTableReady()) {
+    if (scan.index < scan.total) visitScreeningIndex(scan);
+    else finishScan(scan);
+  }
+}
+
 // Allow the side panel to trigger a fresh scrape on demand.
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg && msg.type === "RESCRAPE") {
     lastSerialized = ""; // force re-publish
     publishContext(true).then(() => sendResponse({ ok: true }));
     return true; // async response (deep scrape walks all tabs)
+  }
+  if (msg && msg.type === "SCREENING_RESCRAPE") {
+    startScreeningScan(msg).then((r) => sendResponse(r)).catch((e) =>
+      sendResponse({ ok: false, error: String(e) })
+    );
+    return true;
   }
 });
 
@@ -740,6 +1084,8 @@ function scheduleLightScrapes() {
 // Initial run: light header scrape (no tab walking) so validation can proceed.
 publishIdsOnly();
 scheduleLightScrapes();
+// Resume an in-progress screening auto-walk if one survived a page navigation.
+maybeContinueScreeningScan();
 
 // Re-scan on SPA navigation (Unite Us is a single-page app).
 let lastHref = location.href;
@@ -750,5 +1096,6 @@ setInterval(() => {
     lastPublished = null;
     publishIdsOnly();
     scheduleLightScrapes();
+    maybeContinueScreeningScan(); // resume the walk on in-app route changes too
   }
 }, 1000);
