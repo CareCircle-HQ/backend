@@ -964,6 +964,18 @@ function renderScreenings() {
   box.querySelectorAll(".acc-head").forEach((h) => {
     h.addEventListener("click", () => h.parentElement.classList.toggle("open"));
   });
+  updateScrSaveBtn();
+}
+
+// Enable the Save button only when there are captured screenings (with details)
+// for the current client.
+function updateScrSaveBtn() {
+  const btn = $("scrSaveBtn");
+  if (!btn) return;
+  btn.disabled = !screeningsSaveable();
+  btn.title = btn.disabled
+    ? "Re-scan to capture screenings before saving"
+    : "Save screenings to the CRM (client must exist first)";
 }
 
 // Poll storage to confirm the content script actually started the scan (it
@@ -1009,6 +1021,188 @@ async function scrRescan(ev) {
     }
   } catch (_) {
     setScrStatus("err", "Reload the Unite Us tab (F5), then retry");
+  } finally {
+    setBtnBusy(btn, false);
+  }
+}
+
+// ---------- Save captured screenings to the CRM ----------
+// The backend ScreeningViewSet upserts on enhanced_screen_id (the submission
+// UUID we captured). We generate deterministic UUIDv5 ids for the nested
+// questions/answers/needs so repeated saves update in place instead of
+// creating duplicates. A screening can only be saved once its client exists
+// in the CRM (the Screening.subject_id -> Client FK requires it).
+
+// Fixed fallback namespace (random UUID) used when a screening id is missing.
+const SCR_NS_FALLBACK = "6f1d3c2a-8b4e-4f7a-9c1d-2e5a7b8c9d0e";
+
+function uuidToBytes(uuid) {
+  const hex = String(uuid || "").replace(/[^0-9a-f]/gi, "");
+  if (hex.length < 32) return uuidToBytes(SCR_NS_FALLBACK);
+  const bytes = new Uint8Array(16);
+  for (let i = 0; i < 16; i++) bytes[i] = parseInt(hex.substr(i * 2, 2), 16);
+  return bytes;
+}
+
+// Deterministic UUIDv5 (SHA-1) namespaced by the screening id.
+async function uuidv5(namespaceUuid, name) {
+  const nsBytes = uuidToBytes(namespaceUuid);
+  const nameBytes = new TextEncoder().encode(name);
+  const data = new Uint8Array(nsBytes.length + nameBytes.length);
+  data.set(nsBytes, 0);
+  data.set(nameBytes, nsBytes.length);
+  const hashBuf = await crypto.subtle.digest("SHA-1", data);
+  const h = new Uint8Array(hashBuf).slice(0, 16);
+  h[6] = (h[6] & 0x0f) | 0x50; // version 5
+  h[8] = (h[8] & 0x3f) | 0x80; // RFC 4122 variant
+  const hx = [...h].map((b) => b.toString(16).padStart(2, "0")).join("");
+  return `${hx.slice(0, 8)}-${hx.slice(8, 12)}-${hx.slice(12, 16)}-${hx.slice(16, 20)}-${hx.slice(20)}`;
+}
+
+const isDurationQ = (q) => /screening duration/i.test(q || "");
+
+// Are there any captured screenings with detail items ready to save?
+function screeningsSaveable() {
+  const d = screeningData;
+  if (!d || !Array.isArray(d.screenings)) return false;
+  if (currentContext && currentContext.client_id && d.clientId !== currentContext.client_id) {
+    return false;
+  }
+  return d.screenings.some(
+    (s) => s.detail && Array.isArray(s.detail.items) && s.detail.items.length > 0
+  );
+}
+
+// Build the array of screening upsert payloads from captured data.
+async function buildScreeningPayloads(d, clientId) {
+  const payloads = [];
+  for (const s of d.screenings) {
+    const det = s.detail;
+    if (!det || !Array.isArray(det.items) || !det.items.length) continue;
+    // enhanced_screen_id: prefer the detail submission UUID, fall back to row id.
+    const screenId = det.id || s.id;
+    if (!screenId) continue;
+
+    const payload = {
+      enhanced_screen_id: screenId,
+      subject_id: clientId,
+      performing_organization_name: s.org || "",
+      screen_source: s.form || "",
+    };
+
+    // Duration captured as minutes in the UI; store seconds in the model.
+    if (det.duration && /^\d+$/.test(String(det.duration))) {
+      payload.duration = parseInt(det.duration, 10) * 60;
+    }
+
+    // Answers (one per non-duration Q&A item), with a deterministic question.
+    const answers = [];
+    for (const it of det.items) {
+      if (isDurationQ(it.q)) continue;
+      const q = (it.q || "").trim();
+      const a = (it.a || "").trim();
+      if (!q) continue;
+      const questionId = await uuidv5(screenId, "q|" + q);
+      const answerId = await uuidv5(screenId, "a|" + q);
+      answers.push({
+        answer_id: answerId,
+        answer_value: a,
+        value_string: a,
+        question: { question_id: questionId, question_primary_text: q },
+      });
+    }
+    if (answers.length) payload.answers = answers;
+
+    // Identified needs from the screening results chips.
+    const results = Array.isArray(det.results) ? det.results : [];
+    const needs = [];
+    for (const name of results) {
+      const n = (name || "").trim();
+      if (!n) continue;
+      const needId = await uuidv5(screenId, "n|" + n);
+      needs.push({ identified_social_need_id: needId, identified_social_need_name: n });
+    }
+    if (needs.length) payload.identified_social_needs = needs;
+
+    payloads.push(payload);
+  }
+  return payloads;
+}
+
+async function saveScreenings(ev) {
+  const btn = (ev && ev.currentTarget) || $("scrSaveBtn");
+  const ctx = currentContext;
+  const d = screeningData;
+
+  if (!ctx || !ctx.client_id) {
+    setScrStatus("err", "No client detected");
+    return;
+  }
+  if (!screeningsSaveable()) {
+    setScrStatus("err", "Nothing to save \u2014 re-scan first");
+    return;
+  }
+  const cfg = await getConfig();
+  if (!cfg.token) {
+    setScrStatus("err", "No API token configured");
+    return;
+  }
+
+  setBtnBusy(btn, true);
+  setScrStatus("warn", "Checking client\u2026");
+  try {
+    // Guard: the client must already exist in the CRM (FK requirement).
+    const clientRes = await fetch(
+      `${cfg.backendUrl}/api/clients/${ctx.client_id}/`,
+      { headers: authHeader(cfg) }
+    );
+    if (clientRes.status === 404) {
+      setScrStatus("err", "Client not in CRM \u2014 save it on the Profile tab first");
+      setClientImported(false);
+      return;
+    }
+    if (clientRes.status === 401 || clientRes.status === 403) {
+      setScrStatus("err", "Auth error");
+      return;
+    }
+    if (!clientRes.ok) {
+      setScrStatus("err", `Client check failed (${clientRes.status})`);
+      return;
+    }
+    setClientImported(true);
+
+    // Client exists -> build and upsert the screenings in one batch.
+    setScrStatus("warn", "Saving screenings\u2026");
+    const payloads = await buildScreeningPayloads(d, ctx.client_id);
+    if (!payloads.length) {
+      setScrStatus("err", "Nothing to save \u2014 re-scan first");
+      return;
+    }
+    const res = await fetch(`${cfg.backendUrl}/api/screenings/bulk/`, {
+      method: "POST",
+      headers: { ...authHeader(cfg), "Content-Type": "application/json" },
+      body: JSON.stringify(payloads),
+    });
+    if (res.ok || res.status === 207) {
+      let body = {};
+      try { body = await res.json(); } catch (_) {}
+      const ok = body.succeeded != null ? body.succeeded : payloads.length;
+      const failed = body.failed || 0;
+      if (failed) {
+        setScrStatus("warn", `Saved ${ok}, ${failed} failed`);
+      } else {
+        setScrStatus("ok", `Saved ${ok} screening(s) \u2713`);
+      }
+      await fetchCrm(cfg, ctx.client_id); // refresh CRM status
+    } else if (res.status === 401 || res.status === 403) {
+      setScrStatus("err", "Auth error");
+    } else {
+      let detail = `Error ${res.status}`;
+      try { detail = summarizeErrors(await res.json()) || detail; } catch (_) {}
+      setScrStatus("err", detail);
+    }
+  } catch (_) {
+    setScrStatus("err", "Network error");
   } finally {
     setBtnBusy(btn, false);
   }
@@ -1486,6 +1680,7 @@ function init() {
   $("rescanBtn2").addEventListener("click", rescan);
   $("saveBtn").addEventListener("click", saveClient);
   $("scrRescanBtn").addEventListener("click", scrRescan);
+  $("scrSaveBtn").addEventListener("click", saveScreenings);
   $("diagnosticBtn").addEventListener("click", runDiagnostic);
   $("copyReportBtn").addEventListener("click", copyReport);
 
