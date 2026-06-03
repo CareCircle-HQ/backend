@@ -1187,21 +1187,40 @@ async function _maybeContinueScreeningScan() {
   if (m) {
     if (scan.index >= scan.total) return; // nothing pending
 
-    // Keep harvesting until we actually get questions. The form renders
-    // asynchronously after the "Screening Results" header, so we poll the
-    // harvester itself (not just a text check) and only proceed once it
-    // returns Q&A items. Give it a generous window.
+    // Keep harvesting until the form has fully rendered. The questions load
+    // asynchronously AFTER the duration/results paint, so breaking on the first
+    // item would capture only the duration. Instead we wait until the captured
+    // item count STABILIZES (same value across consecutive polls) and we have
+    // more than just the duration row.
     let detail = { id: null, items: [], results: [], duration: null };
     const deadline = Date.now() + 25000;
+    let lastCount = -1;
+    let stableTicks = 0;
     while (Date.now() < deadline) {
       detail = harvestScreeningDetail();
-      if (detail.items && detail.items.length > 0) break;
+      const count = (detail.items || []).length;
+      // Count real questions (exclude the Screening Duration row)
+      const realQs = (detail.items || []).filter(
+        (it) => !/screening duration/i.test(it.q || "")
+      ).length;
+
+      if (count === lastCount && realQs >= 1) {
+        stableTicks += 1;
+        // Two consecutive identical counts = form has finished rendering
+        if (stableTicks >= 2) break;
+      } else {
+        stableTicks = 0;
+      }
+      lastCount = count;
       await new Promise((r) => setTimeout(r, 400));
     }
 
-    // If we STILL have nothing, don't advance/navigate away — leave the page
-    // open and let the next tick retry, so the user can see what's happening.
-    if (!detail.items || detail.items.length === 0) {
+    // Require at least one real question (not just the duration). If we only
+    // got the duration or nothing, leave the page open and retry next tick.
+    const realQCount = (detail.items || []).filter(
+      (it) => !/screening duration/i.test(it.q || "")
+    ).length;
+    if (realQCount === 0) {
       scan.note = "Waiting for screening questions to load\u2026";
       await saveScan(scan);
       publishScreenings(scan);
