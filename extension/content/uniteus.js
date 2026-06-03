@@ -1356,6 +1356,40 @@ function harvestEligibilityResults() {
 // section headers) plus the eligible-programs results. Unlike screenings,
 // colon-suffixed labels (e.g. "Modality of Outreach 1:") are real questions, so
 // we do NOT drop them; multi-select answers are joined with "; ".
+// Eligibility questions render as bold dark-blue labels (no form-renderer
+// classes like screenings). Each question's answer follows it in the same
+// per-question wrapper.
+const ELIG_Q_SELECTOR = "[class*='text-dark-blue'][class*='font-black']";
+
+// Labels that are section/structure headers, not real questions.
+const ELIG_SKIP_LABELS = [
+  /^client may be eligible/i,
+  /^enhanced populations?$/i,
+  /^clinical criteria$/i,
+  /^relationships$/i,
+  /^care team$/i,
+  /^care coordinator$/i,
+  /^family members$/i,
+  /^messages$/i,
+  /^notes$/i,
+];
+
+// The eligibility assessment content lives in its own column. Scope harvesting
+// to the container that holds the "Eligibility Assessment for ..." heading so we
+// don't pull in the Care Team / Relationships sidebar labels.
+function eligibilityContentRoot() {
+  const h = [...document.querySelectorAll("h1, h2, h3, h4, div, span")].find((el) => {
+    const t = cleanText(el.innerText);
+    return t && el.children.length === 0 && /^Eligibility Assessment for /i.test(t);
+  });
+  let c = h ? h.parentElement : null;
+  for (let i = 0; i < 8 && c; i++) {
+    if (c.querySelector(ELIG_Q_SELECTOR)) return c;
+    c = c.parentElement;
+  }
+  return document.body;
+}
+
 function harvestEligibilityDetail() {
   const m = location.href.match(
     new RegExp(`eligibility/view/(${UUID_RE.source})`, "i")
@@ -1368,65 +1402,53 @@ function harvestEligibilityDetail() {
     q = cleanText(q);
     a = cleanText(a);
     if (!q || !a || q === a) return;
-    if (q.length > 300 || a.length > 800) return;
+    if (q.length > 400 || a.length > 1000) return;
+    if (ELIG_SKIP_LABELS.some((re) => re.test(q))) return;
     const key = q.toLowerCase();
     if (seen.has(key)) return;
     seen.add(key);
     items.push({ q, a });
   };
-  const isSectionEl = (el) =>
-    el.tagName === "H3" ||
-    el.tagName === "H2" ||
-    /section|heading/i.test(el.className || "");
 
-  // Strategy A: the form-renderer question displays (same as screenings).
-  document.querySelectorAll(".ui-form-renderer-question-display").forEach((container) => {
-    const labelEl = container.querySelector(".ui-form-renderer-question-display__label");
-    if (!labelEl || isSectionEl(labelEl)) return;
-    const valueEls = container.querySelectorAll(".ui-form-renderer-question-display__value");
-    const a = [...valueEls].map((v) => cleanText(v.innerText)).filter(Boolean).join("; ");
-    addQA(labelEl.innerText, a);
-  });
+  const root = eligibilityContentRoot();
+  const labels = [...root.querySelectorAll(ELIG_Q_SELECTOR)];
 
-  // Strategy B: generic label/value class pairs anywhere on the page (in case
-  // the eligibility renderer uses a different but related class naming).
-  if (!items.length) {
-    document
-      .querySelectorAll("[class*='question-display'], [class*='form-renderer'], [class*='field']")
-      .forEach((container) => {
-        const labelEl = container.querySelector("[class*='label']");
-        const valueEls = container.querySelectorAll("[class*='value']");
-        if (!labelEl || !valueEls.length || isSectionEl(labelEl)) return;
-        const a = [...valueEls].map((v) => cleanText(v.innerText)).filter(Boolean).join("; ");
-        addQA(labelEl.innerText, a);
-      });
-  }
+  labels.forEach((labelEl) => {
+    const q = cleanText(labelEl.innerText);
+    if (!q) return;
 
-  // Strategy C: structural pairing — a label element directly followed by a
-  // value/sibling element. Walk leaf-ish blocks under the main content.
-  if (!items.length) {
-    const blocks = [...document.querySelectorAll("dl, .ui-form-renderer, [class*='renderer'], main, section, article")];
-    const root = blocks.find((b) => /eligibility|outreach|assessment/i.test(b.innerText || "")) || document.body;
-    const kids = [...root.querySelectorAll("div, dt, dd, span, p, label")];
-    for (let i = 0; i < kids.length - 1; i++) {
-      const el = kids[i];
-      if (el.children.length) continue; // leaf only
-      const q = cleanText(el.innerText);
-      if (!q || q.length < 4 || q.length > 300) continue;
-      // Heuristic: a question ends with ? or :, or is a known statement style.
-      if (!/[?:]$/.test(q)) continue;
-      // Find the next non-empty leaf as the answer.
-      for (let j = i + 1; j < kids.length && j < i + 4; j++) {
-        const nx = kids[j];
-        if (nx.children.length) continue;
-        const a = cleanText(nx.innerText);
-        if (!a) continue;
-        if (/[?:]$/.test(a)) break; // next question; no answer
-        addQA(q, a);
-        break;
+    // Prefer the smallest wrapper that contains exactly this one question; the
+    // answer is then the wrapper's text minus the question text.
+    let answer = "";
+    let wrap = labelEl.parentElement;
+    for (let i = 0; i < 4 && wrap && wrap !== root; i++) {
+      if (wrap.querySelectorAll(ELIG_Q_SELECTOR).length === 1) {
+        const full = cleanText(wrap.innerText);
+        const idx = full.indexOf(q);
+        const rest = idx >= 0 ? full.slice(idx + q.length) : full;
+        const cand = cleanText(rest);
+        if (cand) {
+          answer = cand;
+          break;
+        }
       }
+      wrap = wrap.parentElement;
     }
-  }
+
+    // Fallback: collect following sibling blocks until the next question label.
+    if (!answer) {
+      const parts = [];
+      let sib = labelEl.nextElementSibling;
+      while (sib && !sib.matches(ELIG_Q_SELECTOR) && !sib.querySelector(ELIG_Q_SELECTOR)) {
+        const t = cleanText(sib.innerText);
+        if (t) parts.push(t);
+        sib = sib.nextElementSibling;
+      }
+      answer = parts.join("; ");
+    }
+
+    addQA(q, answer);
+  });
 
   return { id, items, results: harvestEligibilityResults() };
 }
