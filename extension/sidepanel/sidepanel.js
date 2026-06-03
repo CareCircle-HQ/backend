@@ -1768,12 +1768,6 @@ function parseUSDate(s) {
   return `${yy}-${mm.padStart(2, "0")}-${dd.padStart(2, "0")}`;
 }
 
-// "$8,736.00" -> "8736.00"
-function parseMoney(s) {
-  const cleaned = String(s || "").replace(/[^0-9.]/g, "");
-  return cleaned || null;
-}
-
 const CASE_STATUS_MAP = {
   OPEN: "open",
   CLOSED: "closed",
@@ -1827,8 +1821,7 @@ function buildCasePayloads(d, clientId) {
     if (authStatus) payload.service_authorization_status = authStatus;
     if (f["AUTHORIZATION STATUS"]) payload.service_authorization_status_label = f["AUTHORIZATION STATUS"];
 
-    const amount = parseMoney(f["AUTHORIZED AMOUNT"]);
-    if (amount) payload.authorized_amount = amount;
+    if (f["AUTHORIZED AMOUNT"]) payload.authorized_amount = f["AUTHORIZED AMOUNT"];
 
     const sd = f["AUTHORIZED SERVICE DELIVERY DATE(S)"];
     if (sd) {

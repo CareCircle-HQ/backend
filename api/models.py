@@ -621,9 +621,9 @@ class Case(models.Model):
     service_authorization_approval_starts_at = models.DateTimeField(null=True, blank=True)
     service_authorization_approval_ends_at = models.DateTimeField(null=True, blank=True)
     unite_us_authorization_id = models.CharField(max_length=80, blank=True)
-    authorized_amount = models.DecimalField(
-        max_digits=12, decimal_places=2, null=True, blank=True
-    )
+    # Free text: usually a dollar amount (e.g. "$8,736.00") but can also be a
+    # unit/time description (e.g. "20 units (293-307 minutes)").
+    authorized_amount = models.CharField(max_length=120, blank=True)
     program_cap = models.TextField(blank=True)
     authorization_note = models.TextField(blank=True)
 
