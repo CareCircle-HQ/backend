@@ -762,6 +762,33 @@ function inspectPageFn() {
     };
   })();
 
+  // Eligibility DETAIL page (/eligibility/view/<id>): dump the structure so we
+  // can write reliable Q&A selectors when the form-renderer classes differ.
+  const eligibilityDetail = (() => {
+    if (!/\/eligibility\/view\//i.test(location.href)) return { onDetail: false };
+    const formRenderer = document.querySelectorAll(".ui-form-renderer-question-display").length;
+    // Distinct class names of elements that contain visible label-like text.
+    const classSet = new Set();
+    document.querySelectorAll("div, span, p, dt, dd, label").forEach((el) => {
+      if (el.children.length) return;
+      const t = clean(el.innerText);
+      if (t && t.length < 200 && /[?:]$/.test(t)) {
+        const cls = (el.className || "").toString().slice(0, 120);
+        if (cls) classSet.add(cls);
+      }
+    });
+    // First 4000 chars of the main content HTML for selector inspection.
+    const main =
+      document.querySelector("main, [class*='renderer'], [class*='eligibility']") ||
+      document.body;
+    return {
+      onDetail: true,
+      formRendererCount: formRenderer,
+      labelClassesSample: [...classSet].slice(0, 25),
+      mainHtml: (main.outerHTML || "").slice(0, 9000),
+    };
+  })();
+
   return {
     url: location.href,
     title: document.title,
@@ -774,6 +801,7 @@ function inspectPageFn() {
     tables,
     screeningRows,
     screeningDetail,
+    eligibilityDetail,
     coverageSections,
     sectionTexts,
     counts: {

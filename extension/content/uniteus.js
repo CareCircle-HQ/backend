@@ -1300,28 +1300,69 @@ function harvestEligibilityDetail() {
 
   const items = [];
   const seen = new Set();
-  document.querySelectorAll(".ui-form-renderer-question-display").forEach((container) => {
-    const labelEl = container.querySelector(".ui-form-renderer-question-display__label");
-    if (!labelEl) return;
-    // Section headers render as <h3 class="ui-form-renderer-section">.
-    if (labelEl.tagName === "H3" || labelEl.classList.contains("ui-form-renderer-section")) {
-      return;
-    }
-    const q = cleanText(labelEl.innerText);
-    if (!q || q.length > 300) return;
-
-    const valueEls = container.querySelectorAll(".ui-form-renderer-question-display__value");
-    const a = [...valueEls]
-      .map((v) => cleanText(v.innerText))
-      .filter(Boolean)
-      .join("; ");
-    if (!a || a === q) return;
-
+  const addQA = (q, a) => {
+    q = cleanText(q);
+    a = cleanText(a);
+    if (!q || !a || q === a) return;
+    if (q.length > 300 || a.length > 800) return;
     const key = q.toLowerCase();
     if (seen.has(key)) return;
     seen.add(key);
     items.push({ q, a });
+  };
+  const isSectionEl = (el) =>
+    el.tagName === "H3" ||
+    el.tagName === "H2" ||
+    /section|heading/i.test(el.className || "");
+
+  // Strategy A: the form-renderer question displays (same as screenings).
+  document.querySelectorAll(".ui-form-renderer-question-display").forEach((container) => {
+    const labelEl = container.querySelector(".ui-form-renderer-question-display__label");
+    if (!labelEl || isSectionEl(labelEl)) return;
+    const valueEls = container.querySelectorAll(".ui-form-renderer-question-display__value");
+    const a = [...valueEls].map((v) => cleanText(v.innerText)).filter(Boolean).join("; ");
+    addQA(labelEl.innerText, a);
   });
+
+  // Strategy B: generic label/value class pairs anywhere on the page (in case
+  // the eligibility renderer uses a different but related class naming).
+  if (!items.length) {
+    document
+      .querySelectorAll("[class*='question-display'], [class*='form-renderer'], [class*='field']")
+      .forEach((container) => {
+        const labelEl = container.querySelector("[class*='label']");
+        const valueEls = container.querySelectorAll("[class*='value']");
+        if (!labelEl || !valueEls.length || isSectionEl(labelEl)) return;
+        const a = [...valueEls].map((v) => cleanText(v.innerText)).filter(Boolean).join("; ");
+        addQA(labelEl.innerText, a);
+      });
+  }
+
+  // Strategy C: structural pairing — a label element directly followed by a
+  // value/sibling element. Walk leaf-ish blocks under the main content.
+  if (!items.length) {
+    const blocks = [...document.querySelectorAll("dl, .ui-form-renderer, [class*='renderer'], main, section, article")];
+    const root = blocks.find((b) => /eligibility|outreach|assessment/i.test(b.innerText || "")) || document.body;
+    const kids = [...root.querySelectorAll("div, dt, dd, span, p, label")];
+    for (let i = 0; i < kids.length - 1; i++) {
+      const el = kids[i];
+      if (el.children.length) continue; // leaf only
+      const q = cleanText(el.innerText);
+      if (!q || q.length < 4 || q.length > 300) continue;
+      // Heuristic: a question ends with ? or :, or is a known statement style.
+      if (!/[?:]$/.test(q)) continue;
+      // Find the next non-empty leaf as the answer.
+      for (let j = i + 1; j < kids.length && j < i + 4; j++) {
+        const nx = kids[j];
+        if (nx.children.length) continue;
+        const a = cleanText(nx.innerText);
+        if (!a) continue;
+        if (/[?:]$/.test(a)) break; // next question; no answer
+        addQA(q, a);
+        break;
+      }
+    }
+  }
 
   return { id, items, results: harvestEligibilityResults() };
 }
