@@ -1155,10 +1155,23 @@ async function maybeContinueScreeningScan() {
   const m = location.href.match(new RegExp(`submission/(${UUID_RE.source})`, "i"));
   if (m) {
     if (scan.index >= scan.total) return; // nothing pending
-    await waitFor(
-      () => /Screening Duration|Screening Results/i.test(document.body.innerText),
-      12000
-    );
+    // Wait for the actual Q&A question-display elements to render (not just the
+    // "Screening Results" header which appears early). We need enough containers
+    // with both a label and value to be confident the form has loaded.
+    await waitFor(() => {
+      const containers = document.querySelectorAll(".ui-form-renderer-question-display");
+      if (containers.length < 3) return false;
+      // Confirm at least a few have both label + value populated
+      let populated = 0;
+      containers.forEach((c) => {
+        const lab = c.querySelector(".ui-form-renderer-question-display__label");
+        const val = c.querySelector(".ui-form-renderer-question-display__value");
+        if (lab && val && cleanText(val.innerText)) populated += 1;
+      });
+      return populated >= 3;
+    }, 15000);
+    // Small settle delay to let any remaining questions paint
+    await new Promise((r) => setTimeout(r, 600));
     const detail = harvestScreeningDetail();
     scan.details[scan.index] = {
       id: m[1].toLowerCase(),
