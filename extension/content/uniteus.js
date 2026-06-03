@@ -762,11 +762,16 @@ function screeningTableReady() {
 // Reveal the screenings list. The list lives behind the "Screenings" facesheet
 // tab, whose state is NOT reliably deep-linkable, so we don't navigate to a
 // list URL; instead we ensure we're on the facesheet and click the tab in-app.
-// Works both on first start and when returning between rows.
+// On a fresh page load the facesheet tabs render asynchronously, so we keep
+// retrying the click (it's a no-op until the tab exists) until the table shows.
 async function ensureScreeningList(timeout = 12000) {
-  if (screeningTableReady()) return true;
-  clickTabByLabel("Screenings");
-  return waitFor(() => screeningTableReady(), timeout);
+  const deadline = Date.now() + timeout;
+  while (Date.now() < deadline) {
+    if (screeningTableReady()) return true;
+    clickTabByLabel("Screenings"); // no-op while the tab hasn't rendered yet
+    await sleep(400);
+  }
+  return screeningTableReady();
 }
 
 // The data rows for the target org. Rows are clickable (<tr role="button">) and
@@ -1182,6 +1187,17 @@ async function _maybeContinueScreeningScan() {
   const ids = parseIdsFromUrl();
   if (ids.client_id && scan.clientId && ids.client_id !== scan.clientId) return;
 
+  // Don't act on a sibling crawler's pages. The eligibility list shares the same
+  // table shape (FORM + ORGANIZATION) as screenings, so without this guard a
+  // still-running screening scan would hijack the eligibility/case list rows.
+  const onScreeningDetail = new RegExp(`submission/(${UUID_RE.source})`, "i").test(location.href);
+  if (!onScreeningDetail &&
+      (/\/eligibility(\/|$)/.test(location.pathname) ||
+       /\/cases(\/|$)/.test(location.pathname) ||
+       /\/dashboard\/cases\//.test(location.pathname))) {
+    return;
+  }
+
   // Phase 1: we navigated to the facesheet and need to reveal + harvest the list.
   if (scan.phase === "list") {
     if (await ensureScreeningList(12000)) {
@@ -1592,6 +1608,10 @@ async function _maybeContinueEligibilityScan() {
   }
   const ids = parseIdsFromUrl();
   if (ids.client_id && scan.clientId && ids.client_id !== scan.clientId) return;
+
+  // Only act on eligibility pages. The list (/eligibility/all) shares the screening
+  // table shape, so without this guard we'd misfire on the screenings list.
+  if (!/\/eligibility(\/|$)/.test(location.pathname)) return;
 
   // Phase 1: navigated to the list URL; harvest it.
   if (scan.phase === "list") {
