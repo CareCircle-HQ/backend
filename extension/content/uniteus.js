@@ -847,8 +847,8 @@ function harvestScreeningResults() {
   const out = [];
   const seen = new Set();
 
-  // Look for need cards with the specific class structure from diagnostic
-  document.querySelectorAll(".need-card .need-card__name").forEach((el) => {
+  // Strategy 1: Look for need cards with the specific class structure from diagnostic
+  document.querySelectorAll(".need-card .need-card__name, .displayed-needs .need-card__name").forEach((el) => {
     const t = cleanText(el.innerText);
     if (!t || t.length > 80) return;
     if (!isAllowedNeed(t)) return; // only keep the 5 allowed needs
@@ -857,6 +857,23 @@ function harvestScreeningResults() {
     seen.add(low);
     out.push(t);
   });
+
+  // Strategy 2: Look in the "Screening Results" section for any text matching allowed needs
+  const resultsSection = [...document.querySelectorAll("[aria-expanded='true']")].find(el =>
+    /screening results/i.test(cleanText(el.innerText))
+  );
+  if (resultsSection) {
+    const section = resultsSection.closest("section, div, [class*='risk-display']") || document.body;
+    const allText = cleanText(section.innerText);
+    ALLOWED_NEEDS.forEach(need => {
+      if (allText.toLowerCase().includes(need)) {
+        if (!seen.has(need)) {
+          seen.add(need);
+          out.push(need.charAt(0).toUpperCase() + need.slice(1));
+        }
+      }
+    });
+  }
 
   return out;
 }
@@ -879,13 +896,19 @@ function harvestScreeningDetail() {
     if (!labelEl) return;
 
     const q = cleanText(labelEl.innerText);
-    // Skip section headers (don't end with ?)
-    if (!q || !q.endsWith("?")) return;
-    // Skip the "Screening Duration" question - we handle that separately
+    if (!q || q.length > 300) return;
+
+    // Skip section headers (h3 tags like "Screening Questions", "Screening Details")
+    if (labelEl.tagName === "H3") return;
+    // Skip headers that contain ":" (like "Screening Name:", "Screening Organization:")
+    if (q.includes(":")) return;
+    // Skip the "Screening Duration" - we handle that separately
     if (/screening duration/i.test(q)) return;
+    // Skip section title headers
+    if (/^screening (details|questions)$/i.test(q)) return;
 
     const a = valueEl ? cleanText(valueEl.innerText) : "";
-    if (!a) return;
+    if (!a || a === q) return;
 
     const key = q.toLowerCase();
     if (seen.has(key)) return;
