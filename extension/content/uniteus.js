@@ -999,8 +999,10 @@ function harvestScreeningDetail() {
     }
   }
 
-  // Extract Screening Duration - look for the number near "Screening Duration" label
+  // Extract Screening Duration - look for the number near "Screening Duration" label.
+  // The value renders as two spans: the number ("8") and the unit ("Minutes").
   let duration = null;
+  let durationUnit = "";
   document.querySelectorAll(".ui-form-renderer-question-display").forEach((container) => {
     const labelEl = container.querySelector(".ui-form-renderer-question-display__label");
     if (!labelEl) return;
@@ -1009,14 +1011,30 @@ function harvestScreeningDetail() {
 
     // Look for a number in the container text
     const containerText = cleanText(container.innerText);
-    const match = containerText.match(/(\d+)/);
-    if (match) duration = match[1];
+    const numMatch = containerText.match(/(\d+)/);
+    if (numMatch) duration = numMatch[1];
+    const unitMatch = containerText.match(/\b(minutes?|hours?|hrs?|mins?)\b/i);
+    if (unitMatch) durationUnit = unitMatch[1];
   });
 
   // Fallback duration extraction
   if (!duration) {
-    const durationMatch = document.body.innerText.match(/Screening Duration\s*(\d+)/i);
-    if (durationMatch) duration = durationMatch[1];
+    const durationMatch = document.body.innerText.match(/Screening Duration\s*(\d+)\s*(minutes?|hours?)?/i);
+    if (durationMatch) {
+      duration = durationMatch[1];
+      if (durationMatch[2]) durationUnit = durationMatch[2];
+    }
+  }
+
+  // Track Screening Duration as a Q&A item too (in order, at the end of the form)
+  if (duration) {
+    if (!durationUnit) durationUnit = duration === "1" ? "Minute" : "Minutes";
+    const durAnswer = `${duration} ${durationUnit}`.trim();
+    const durKey = "screening duration";
+    if (!seen.has(durKey)) {
+      seen.add(durKey);
+      items.push({ q: "Screening Duration", a: durAnswer });
+    }
   }
 
   return { id, items, results: harvestScreeningResults(), duration };

@@ -900,11 +900,14 @@ function renderScreeningAccordion(s, i) {
   if (!d) {
     body = '<p class="muted">Detail not captured yet \u2014 re-scan to fetch its answers.</p>';
   } else {
-    // Duration is now extracted separately; fallback to finding it in items if not present
-    let dur = d.duration || "";
-    if (!dur) {
-      const durItem = d.items.find((it) => /screening duration/i.test(it.q || ""));
-      if (durItem) dur = durItem.a;
+    // Duration display: prefer the Q&A item answer (already "8 Minutes"),
+    // otherwise format the raw number from d.duration.
+    const durItem = (d.items || []).find((it) => /screening duration/i.test(it.q || ""));
+    let dur = "";
+    if (durItem) {
+      dur = durItem.a;
+    } else if (d.duration) {
+      dur = d.duration + (d.duration === "1" ? " Minute" : " Minutes");
     }
     const results = d.results || [];
     const hasQA = d.items && d.items.length > 0;
@@ -914,7 +917,7 @@ function renderScreeningAccordion(s, i) {
     html += `<div><span class="sum-k">Status</span>${escapeHtml(statusDate || "\u2014")}</div>`;
     if (dur)
       html += `<div class="scr-duration"><span class="sum-k">Screening Duration</span><strong>${escapeHtml(
-        dur + (dur === "1" ? " Minute" : " Minutes")
+        dur
       )}</strong></div>`;
     html += `</div>`;
 
@@ -930,7 +933,10 @@ function renderScreeningAccordion(s, i) {
         `<div class="scr-qa-h">Screening Questions</div>` +
         `<table class="qa-table"><tbody>` +
         d.items
-          .map((it) => `<tr class="qa"><th>${escapeHtml(it.q)}</th><td>${escapeHtml(it.a)}</td></tr>`)
+          .map((it) => {
+            const hl = /screening duration/i.test(it.q || "") ? " hl" : "";
+            return `<tr class="qa${hl}"><th>${escapeHtml(it.q)}</th><td>${escapeHtml(it.a)}</td></tr>`;
+          })
           .join("") +
         `</tbody></table>`;
     } else {
