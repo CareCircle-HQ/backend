@@ -181,6 +181,7 @@ class EligibilityAdmin(admin.ModelAdmin):
         "client_last_name",
     )
     autocomplete_fields = ("client", "case")
+    inlines = [AnswerInline]
 
 
 class QuestionOptionInline(admin.TabularInline):
@@ -206,10 +207,10 @@ class QuestionOptionAdmin(admin.ModelAdmin):
 
 @admin.register(Answer)
 class AnswerAdmin(admin.ModelAdmin):
-    list_display = ("answer_id", "screening", "question", "answer_type", "answer_status")
+    list_display = ("answer_id", "screening", "eligibility", "question", "answer_type", "answer_status")
     list_filter = ("answer_type", "answer_status", "answer_is_active")
     search_fields = ("answer_id",)
-    autocomplete_fields = ("screening", "question", "question_option")
+    autocomplete_fields = ("screening", "eligibility", "question", "question_option")
 
 
 @admin.register(ImportBatch)

@@ -1411,7 +1411,10 @@ function eligibilitySaveable() {
   );
 }
 
-function buildEligibilityPayloads(d, clientId) {
+// Build eligibility upsert payloads. Q&A is sent as normalized `answers`
+// (one Answer + nested Question per item) exactly like screenings, with
+// deterministic UUIDv5 ids so repeated saves update in place.
+async function buildEligibilityPayloads(d, clientId) {
   const payloads = [];
   for (const s of d.eligibilities) {
     const det = s.detail;
@@ -1419,14 +1422,29 @@ function buildEligibilityPayloads(d, clientId) {
     const eligId = det.id || s.id;
     if (!eligId) continue;
 
+    const answers = [];
+    for (const it of det.items) {
+      const q = (it.q || "").trim();
+      const a = (it.a || "").trim();
+      if (!q) continue;
+      const questionId = await uuidv5(eligId, "q|" + q);
+      const answerId = await uuidv5(eligId, "a|" + q);
+      answers.push({
+        answer_id: answerId,
+        answer_value: a,
+        value_string: a,
+        question: { question_id: questionId, question_primary_text: q },
+      });
+    }
+
     const payload = {
       eligibility_id: eligId,
       subject_id: clientId,
       performing_organization_name: s.org || "",
       screen_source: s.form || "",
-      responses: det.items.map((it) => ({ q: it.q, a: it.a })),
       eligible_services: Array.isArray(det.results) ? det.results : [],
     };
+    if (answers.length) payload.answers = answers;
     if (/complete/i.test(s.status || "")) payload.eligible_status = "eligible";
     payloads.push(payload);
   }
@@ -1476,7 +1494,7 @@ async function saveEligibility(ev) {
     setClientImported(true);
 
     setEligStatus("warn", "Saving assessments\u2026");
-    const payloads = buildEligibilityPayloads(d, ctx.client_id);
+    const payloads = await buildEligibilityPayloads(d, ctx.client_id);
     if (!payloads.length) {
       setEligStatus("err", "Nothing to save \u2014 re-scan first");
       return;

@@ -131,7 +131,9 @@ class ScreeningViewSet(BulkUpsertMixin, viewsets.ModelViewSet):
 class EligibilityViewSet(BulkUpsertMixin, viewsets.ModelViewSet):
     """CRUD + upsert for eligibility assessments (keyed on eligibility_id UUID)."""
 
-    queryset = Eligibility.objects.select_related("client", "case")
+    queryset = Eligibility.objects.select_related("client", "case").prefetch_related(
+        "answers"
+    )
     serializer_class = EligibilitySerializer
 
     def get_queryset(self):

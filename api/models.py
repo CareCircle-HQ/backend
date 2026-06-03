@@ -908,9 +908,6 @@ class Eligibility(models.Model):
     # --- Eligibility ---
     eligible_status = models.CharField(max_length=50, blank=True)
     eligible_services = models.JSONField(default=list, blank=True)
-    # Captured assessment question/answer pairs (the model has no normalized
-    # Answer relation like Screening, so responses are stored inline).
-    responses = models.JSONField(default=list, blank=True)
 
     # --- Verification ---
     verified_at = models.DateTimeField(null=True, blank=True)
@@ -1010,11 +1007,17 @@ class QuestionOption(models.Model):
 
 
 class Answer(models.Model):
-    """A client's answer to a question within a screening."""
+    """A client's answer to a question within a screening or eligibility assessment."""
 
     answer_id = models.UUIDField(primary_key=True, editable=False)
+    # An answer belongs to EITHER a screening or an eligibility assessment.
     screening = models.ForeignKey(
-        Screening, on_delete=models.CASCADE, related_name="answers"
+        Screening, on_delete=models.CASCADE, null=True, blank=True,
+        related_name="answers",
+    )
+    eligibility = models.ForeignKey(
+        Eligibility, on_delete=models.CASCADE, null=True, blank=True,
+        related_name="answers",
     )
     question = models.ForeignKey(
         Question, on_delete=models.SET_NULL, null=True, blank=True,
@@ -1048,6 +1051,7 @@ class Answer(models.Model):
     class Meta:
         indexes = [
             models.Index(fields=["screening"]),
+            models.Index(fields=["eligibility"]),
             models.Index(fields=["question"]),
         ]
 
