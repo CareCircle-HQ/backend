@@ -1130,9 +1130,22 @@ async function finishScan(scan) {
   }
 }
 
+// Guard against concurrent runs (page-load + SPA-interval can both fire).
+let screeningScanBusy = false;
+
 // Runs on every page load: if a scan is in progress and we've landed on the
 // expected detail page, harvest it and move on.
 async function maybeContinueScreeningScan() {
+  if (screeningScanBusy) return; // already handling a page; don't double-fire
+  screeningScanBusy = true;
+  try {
+    await _maybeContinueScreeningScan();
+  } finally {
+    screeningScanBusy = false;
+  }
+}
+
+async function _maybeContinueScreeningScan() {
   const { uw_scr_scan: scan } = await chrome.storage.local.get("uw_scr_scan");
   if (!scan || scan.status !== "running") return;
   if (Date.now() - new Date(scan.startedAt).getTime() > SCREENING_SCAN_TTL_MS) {
@@ -1155,24 +1168,29 @@ async function maybeContinueScreeningScan() {
   const m = location.href.match(new RegExp(`submission/(${UUID_RE.source})`, "i"));
   if (m) {
     if (scan.index >= scan.total) return; // nothing pending
-    // Wait for the actual Q&A question-display elements to render (not just the
-    // "Screening Results" header which appears early). We need enough containers
-    // with both a label and value to be confident the form has loaded.
-    await waitFor(() => {
-      const containers = document.querySelectorAll(".ui-form-renderer-question-display");
-      if (containers.length < 3) return false;
-      // Confirm at least a few have both label + value populated
-      let populated = 0;
-      containers.forEach((c) => {
-        const lab = c.querySelector(".ui-form-renderer-question-display__label");
-        const val = c.querySelector(".ui-form-renderer-question-display__value");
-        if (lab && val && cleanText(val.innerText)) populated += 1;
-      });
-      return populated >= 3;
-    }, 15000);
-    // Small settle delay to let any remaining questions paint
-    await new Promise((r) => setTimeout(r, 600));
-    const detail = harvestScreeningDetail();
+
+    // Keep harvesting until we actually get questions. The form renders
+    // asynchronously after the "Screening Results" header, so we poll the
+    // harvester itself (not just a text check) and only proceed once it
+    // returns Q&A items. Give it a generous window.
+    let detail = { id: null, items: [], results: [], duration: null };
+    const deadline = Date.now() + 25000;
+    while (Date.now() < deadline) {
+      detail = harvestScreeningDetail();
+      if (detail.items && detail.items.length > 0) break;
+      await new Promise((r) => setTimeout(r, 400));
+    }
+
+    // If we STILL have nothing, don't advance/navigate away — leave the page
+    // open and let the next tick retry, so the user can see what's happening.
+    if (!detail.items || detail.items.length === 0) {
+      scan.note = "Waiting for screening questions to load\u2026";
+      await saveScan(scan);
+      publishScreenings(scan);
+      return;
+    }
+
+    scan.note = "";
     scan.details[scan.index] = {
       id: m[1].toLowerCase(),
       items: detail.items,
