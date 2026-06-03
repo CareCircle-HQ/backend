@@ -1651,6 +1651,381 @@ async function _maybeContinueEligibilityScan() {
   }
 }
 
+// ===========================================================================
+// CASE AUTO-WALK CRAWLER (Met Council - SCN - PHS)
+// ===========================================================================
+// Mirrors the eligibility crawler: filter the facesheet cases list by the
+// target org, then visit each case detail page
+// (/dashboard/cases/<state>/<caseId>/contact/<clientId>) and harvest its fields.
+// The detail page renders fields as UPPERCASE label/value pairs, so we segment
+// the case content text on a fixed set of known labels. State lives in
+// uw_case_scan so the flow survives full page reloads / cross-area navigation.
+const CASE_SCAN_TTL_MS = SCREENING_SCAN_TTL_MS;
+
+// Known field labels on the case detail page (segmentation boundaries).
+const CASE_LABELS = [
+  "SERVICE TYPE",
+  "PROGRAM",
+  "DATE OPENED",
+  "DATE CLOSED",
+  "NETWORK",
+  "ORGANIZATION",
+  "PRIMARY WORKER",
+  "CASE DESCRIPTION",
+  "AUTHORIZATION STATUS",
+  "AUTHORIZED AMOUNT",
+  "AUTHORIZED SERVICE DELIVERY DATE(S)",
+  "PROGRAM CAP",
+  "NOTES",
+  "UNITE US AUTHORIZATION ID",
+  "SOCIAL CARE COVERAGE PLAN",
+  "SOCIAL CARE COVERAGE STATUS",
+];
+// Section headers that terminate the field area (boundaries, not captured).
+const CASE_STOPS = [
+  "ATTACHED DOCUMENTS",
+  "CLOSE CASE",
+  "CONTRACTED SERVICE",
+  "ADD NEW CONTRACTED SERVICE",
+  "FORM SUBMISSIONS",
+  "CASE NOTES",
+  "REFERRAL NOTES",
+  "REFERRAL HISTORY",
+  "RELATIONSHIPS",
+  "CARE TEAM",
+  "FAMILY MEMBERS",
+];
+
+function findCaseTable() {
+  return [...document.querySelectorAll("table")].find((t) => {
+    if (t.offsetParent === null) return false;
+    const heads = [...t.querySelectorAll("th")].map((th) =>
+      cleanText(th.innerText).toUpperCase()
+    );
+    return (
+      heads.includes("SERVICE TYPE") &&
+      heads.some((h) => h.includes("ORGANIZATION"))
+    );
+  });
+}
+
+function caseTableReady() {
+  const t = findCaseTable();
+  if (!t) return false;
+  let rows = [...t.querySelectorAll("tbody tr")];
+  if (!rows.length) rows = [...t.querySelectorAll("tr")].filter((r) => r.querySelector("td"));
+  return rows.length > 0;
+}
+
+// Parse the facesheet cases list for the target org, capturing each row's
+// case id / detail href so we can navigate to the detail page by URL.
+function harvestCaseList() {
+  const table = findCaseTable();
+  if (!table) return [];
+  let headers = [...table.querySelectorAll("thead th")].map((th) => cleanText(th.innerText));
+  if (!headers.length) {
+    headers = [...table.querySelectorAll("tr th")].map((th) => cleanText(th.innerText));
+  }
+  const col = (name) => headers.findIndex((h) => h.toUpperCase() === name);
+  const colIncl = (name) => headers.findIndex((h) => h.toUpperCase().includes(name));
+  const iService = col("SERVICE TYPE");
+  const iDate = colIncl("DATE OPENED");
+  const iStatus = col("STATUS");
+  const iOrg = colIncl("MANAGING ORGANIZATION") >= 0 ? colIncl("MANAGING ORGANIZATION") : colIncl("ORGANIZATION");
+  const iUpdated = colIncl("LAST UPDATED");
+
+  let rows = [...table.querySelectorAll("tbody tr")];
+  if (!rows.length) {
+    rows = [...table.querySelectorAll("tr")].filter((r) => r.querySelector("td"));
+  }
+  const norm = (s) => cleanText(s).toLowerCase();
+
+  const out = [];
+  rows.forEach((tr) => {
+    const cells = [...tr.children].filter((c) => c.tagName === "TD");
+    if (!cells.length) return;
+    const cell = (i) => (i >= 0 && cells[i] ? cleanText(cells[i].innerText) : "");
+    const orgText = iOrg >= 0 ? cell(iOrg) : cleanText(tr.innerText);
+    if (!norm(orgText).includes(norm(SCREENING_ORG))) return;
+
+    let id = null;
+    let href = null;
+    const a =
+      tr.querySelector('a[href*="/cases/"]') ||
+      tr.querySelector('a[href*="/case/"]') ||
+      tr.querySelector("a[href]");
+    if (a) {
+      href = a.getAttribute("href");
+      const mm = (href || "").match(UUID_RE);
+      if (mm) id = mm[0].toLowerCase();
+    }
+    if (!id) {
+      const mm = (tr.outerHTML || "").match(UUID_RE);
+      if (mm) id = mm[0].toLowerCase();
+    }
+
+    out.push({
+      id,
+      href,
+      service_type: cell(iService),
+      date_opened: cell(iDate),
+      status: cell(iStatus),
+      org: orgText,
+      updated: cell(iUpdated),
+    });
+  });
+  return out;
+}
+
+function parseCaseIdFromUrl() {
+  const m = location.href.match(
+    new RegExp(`/dashboard/cases/[^/]+/(${UUID_RE.source})`, "i")
+  );
+  return m ? m[1].toLowerCase() : null;
+}
+
+function caseDetailUrl(item, clientId) {
+  if (item && item.href) {
+    try {
+      return new URL(item.href, location.origin).href;
+    } catch (_) {}
+  }
+  if (item && item.id) {
+    return `${location.origin}/dashboard/cases/open/${item.id}/contact/${clientId}`;
+  }
+  return null;
+}
+
+// Climb from the "Case for ..." heading to the container that holds the case
+// fields, so we segment only the case content (not the client sidebar).
+function caseContentRoot() {
+  const h = [...document.querySelectorAll("h1, h2, h3, h4")].find((e) =>
+    /^case for /i.test(cleanText(e.innerText))
+  );
+  let c = h ? h.parentElement : null;
+  for (let i = 0; i < 12 && c; i++) {
+    const t = c.innerText || "";
+    if (/SERVICE TYPE/.test(t) && /DATE OPENED/.test(t)) return c;
+    c = c.parentElement;
+  }
+  return document.body;
+}
+
+function caseDetailReady() {
+  if (!parseCaseIdFromUrl()) return false;
+  const t = caseContentRoot().innerText || "";
+  return /SERVICE TYPE/.test(t) && /DATE OPENED/.test(t);
+}
+
+// Segment the case content text into label/value fields + the case status.
+function harvestCaseDetail() {
+  const id = parseCaseIdFromUrl();
+  const root = caseContentRoot();
+  const text = cleanText(root.innerText);
+
+  let status = "";
+  const sm = text.match(
+    /\b(OPEN|CLOSED|MANAGED|DRAFT|CANCELLED|PENDING AUTHORIZATION|OFF PLATFORM)\s+SERVICE TYPE/
+  );
+  if (sm) status = sm[1];
+
+  const boundaries = [];
+  const addPos = (label, isField) => {
+    const idx = text.indexOf(label);
+    if (idx >= 0) boundaries.push({ label, idx, end: idx + label.length, isField });
+  };
+  CASE_LABELS.forEach((l) => addPos(l, true));
+  CASE_STOPS.forEach((l) => addPos(l, false));
+  boundaries.sort((a, b) => a.idx - b.idx);
+
+  const fields = {};
+  for (let i = 0; i < boundaries.length; i++) {
+    const b = boundaries[i];
+    if (!b.isField) continue;
+    const next = boundaries[i + 1];
+    const val = text.slice(b.end, next ? next.idx : text.length).trim();
+    if (val) fields[b.label] = val;
+  }
+
+  return { id, status, fields };
+}
+
+function saveCaseScan(scan) {
+  return chrome.storage.local.set({ uw_case_scan: scan });
+}
+
+function publishCases(scan) {
+  const cases = scan.list.map((x, i) => ({
+    ...x,
+    detail: (scan.details && scan.details[i]) || null,
+  }));
+  chrome.storage.local.set({
+    uw_cases: {
+      clientId: scan.clientId,
+      org: SCREENING_ORG,
+      cases,
+      status: scan.status,
+      phase: scan.phase || null,
+      note: scan.note || "",
+      scannedAt: scan.startedAt,
+      finishedAt: scan.finishedAt || null,
+      progress: { done: scan.index, total: scan.total || scan.list.length },
+    },
+  });
+}
+
+async function startCaseScan(msg) {
+  const clientId = (msg && msg.clientId) || parseIdsFromUrl().client_id;
+  if (!clientId) return { ok: false, error: "Open the client's facesheet first" };
+
+  const scan = {
+    clientId,
+    status: "running",
+    phase: "list",
+    note: "Loading cases\u2026",
+    startedAt: new Date().toISOString(),
+    finishedAt: null,
+    list: [],
+    total: 0,
+    index: 0,
+    details: [],
+    returnUrl: null,
+  };
+  await saveCaseScan(scan);
+  publishCases(scan);
+
+  if (/\/cases\/?$/.test(location.pathname) && (await waitFor(() => caseTableReady(), 9000))) {
+    await beginCaseWalk(scan);
+    return { ok: true, count: scan.total };
+  }
+  location.assign(`${location.origin}/facesheet/${clientId}/cases`);
+  return { ok: true, count: null };
+}
+
+async function beginCaseWalk(scan) {
+  await waitFor(() => caseTableReady(), 12000);
+  const list = harvestCaseList();
+  scan.list = list;
+  scan.total = list.length;
+  scan.index = 0;
+  scan.details = [];
+  scan.phase = "detail";
+  scan.returnUrl = location.href;
+  scan.note = list.length ? "" : "No Met Council - SCN - PHS cases in the list.";
+  await saveCaseScan(scan);
+  publishCases(scan);
+
+  if (!list.length) return finishCaseScan(scan);
+  visitCaseIndex(scan);
+}
+
+async function visitCaseIndex(scan) {
+  if (scan.index >= scan.total) return finishCaseScan(scan);
+  const item = scan.list[scan.index];
+  const url = caseDetailUrl(item, scan.clientId);
+  if (url) {
+    location.assign(url);
+    return;
+  }
+  // No id/href -> skip this row.
+  scan.index += 1;
+  await saveCaseScan(scan);
+  return visitCaseIndex(scan);
+}
+
+async function finishCaseScan(scan) {
+  scan.status = "done";
+  scan.finishedAt = new Date().toISOString();
+  await saveCaseScan(scan);
+  publishCases(scan);
+  if (scan.returnUrl && location.href !== scan.returnUrl) {
+    location.assign(scan.returnUrl);
+  }
+}
+
+let caseScanBusy = false;
+
+async function maybeContinueCaseScan() {
+  if (caseScanBusy) return;
+  caseScanBusy = true;
+  try {
+    await _maybeContinueCaseScan();
+  } finally {
+    caseScanBusy = false;
+  }
+}
+
+async function _maybeContinueCaseScan() {
+  const { uw_case_scan: scan } = await chrome.storage.local.get("uw_case_scan");
+  if (!scan || scan.status !== "running") return;
+  if (Date.now() - new Date(scan.startedAt).getTime() > CASE_SCAN_TTL_MS) {
+    scan.status = "done";
+    await saveCaseScan(scan);
+    return;
+  }
+  const ids = parseIdsFromUrl();
+  if (ids.client_id && scan.clientId && ids.client_id !== scan.clientId) return;
+
+  // Phase 1: navigated to the cases list; harvest it.
+  if (scan.phase === "list") {
+    if (await waitFor(() => caseTableReady(), 12000)) {
+      await beginCaseWalk(scan);
+    }
+    return;
+  }
+
+  // On a case detail page: capture it, then move to the next case.
+  if (parseCaseIdFromUrl()) {
+    if (scan.index >= scan.total) return;
+
+    let detail = { id: null, status: "", fields: {} };
+    const deadline = Date.now() + 25000;
+    let lastCount = -1;
+    let stableTicks = 0;
+    while (Date.now() < deadline) {
+      detail = harvestCaseDetail();
+      const count = Object.keys(detail.fields || {}).length;
+      if (count === lastCount && count >= 3) {
+        stableTicks += 1;
+        if (stableTicks >= 2) break;
+      } else {
+        stableTicks = 0;
+      }
+      lastCount = count;
+      await sleep(400);
+    }
+
+    if (!detail.fields || Object.keys(detail.fields).length === 0) {
+      scan.note = "Waiting for case details to load\u2026";
+      await saveCaseScan(scan);
+      publishCases(scan);
+      return;
+    }
+
+    scan.note = "";
+    scan.details[scan.index] = {
+      id: detail.id || (scan.list[scan.index] && scan.list[scan.index].id),
+      status: detail.status,
+      fields: detail.fields,
+      capturedAt: new Date().toISOString(),
+    };
+    scan.index += 1;
+    await saveCaseScan(scan);
+    publishCases(scan);
+    if (scan.index >= scan.total) {
+      await finishCaseScan(scan);
+    } else {
+      visitCaseIndex(scan);
+    }
+    return;
+  }
+
+  // Back on the cases list with cases still to visit -> open the next one.
+  if (caseTableReady() && scan.index < scan.total) {
+    visitCaseIndex(scan);
+  }
+}
+
 // Allow the side panel to trigger a fresh scrape on demand.
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg && msg.type === "RESCRAPE") {
@@ -1666,6 +2041,12 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
   if (msg && msg.type === "ELIGIBILITY_RESCRAPE") {
     startEligibilityScan(msg).then((r) => sendResponse(r)).catch((e) =>
+      sendResponse({ ok: false, error: String(e) })
+    );
+    return true;
+  }
+  if (msg && msg.type === "CASE_RESCRAPE") {
+    startCaseScan(msg).then((r) => sendResponse(r)).catch((e) =>
       sendResponse({ ok: false, error: String(e) })
     );
     return true;
@@ -1698,6 +2079,7 @@ scheduleLightScrapes();
 // page navigation.
 maybeContinueScreeningScan();
 maybeContinueEligibilityScan();
+maybeContinueCaseScan();
 
 // Re-scan on SPA navigation (Unite Us is a single-page app).
 let lastHref = location.href;
@@ -1710,5 +2092,6 @@ setInterval(() => {
     scheduleLightScrapes();
     maybeContinueScreeningScan(); // resume the walk on in-app route changes too
     maybeContinueEligibilityScan();
+    maybeContinueCaseScan();
   }
 }, 1000);

@@ -474,9 +474,8 @@ function renderComparison(ctx) {
   // captured screening detail (renderScreenings); screeningHtml below feeds only
   // the full CRM comparison on the Data tab.
   fill("cmp-profile", profileHtml, openMsg);
-  fill("cmp-cases", caseHtml, "No cases detected or imported yet.");
-  // Note: cmp-eligibility now hosts the captured eligibility accordion
-  // (renderEligibility); the eligibility CRM comparison lives on the Data tab.
+  // Note: cmp-cases and cmp-eligibility now host the captured accordions
+  // (renderCases / renderEligibility); their CRM comparisons live on the Data tab.
 
   // Full comparison on the Data tab.
   fill(
@@ -1586,6 +1585,342 @@ async function saveEligibility(ev) {
   }
 }
 
+// ---------- Cases tab (Met Council - SCN - PHS) ----------
+// Captured by the content-script auto-walk and published to uw_cases.
+let caseData = null;
+
+// Display order for the captured case fields (key = uppercase page label).
+const CASE_FIELD_LABELS = [
+  ["PROGRAM", "Program"],
+  ["NETWORK", "Network"],
+  ["ORGANIZATION", "Organization"],
+  ["PRIMARY WORKER", "Primary Worker"],
+  ["CASE DESCRIPTION", "Description"],
+  ["AUTHORIZATION STATUS", "Authorization Status"],
+  ["AUTHORIZED AMOUNT", "Authorized Amount"],
+  ["AUTHORIZED SERVICE DELIVERY DATE(S)", "Service Delivery Dates"],
+  ["PROGRAM CAP", "Program Cap"],
+  ["NOTES", "Notes"],
+  ["UNITE US AUTHORIZATION ID", "Authorization ID"],
+  ["SOCIAL CARE COVERAGE PLAN", "Coverage Plan"],
+  ["SOCIAL CARE COVERAGE STATUS", "Coverage Status"],
+];
+
+function setCaseStatus(state, message) {
+  const badge = $("caseStatus");
+  if (!badge) return;
+  badge.className = "badge " + (state || "");
+  badge.textContent = message || "";
+}
+
+function renderCaseMeta() {
+  const el = $("caseMeta");
+  if (!el) return;
+  const d = caseData;
+  if (!d || !d.cases) {
+    el.textContent = "";
+    return;
+  }
+  if (d.note) {
+    el.textContent = d.note;
+    return;
+  }
+  const p = d.progress || { done: 0, total: 0 };
+  if (d.status === "running") {
+    el.textContent = `Scanning ${p.done}/${p.total}\u2026`;
+  } else if (d.finishedAt) {
+    const dt = new Date(d.finishedAt);
+    el.textContent =
+      `${d.cases.length} case(s) \u00b7 last scanned ` +
+      (isNaN(dt.getTime()) ? d.finishedAt : dt.toLocaleString());
+  } else {
+    el.textContent = `${d.cases.length} case(s) found`;
+  }
+}
+
+// One collapsible case panel: header = service type + status/date; body = the
+// captured field/value pairs.
+function renderCaseAccordion(c, i) {
+  const d = c.detail;
+  const status = (d && d.status) || c.status || "";
+  const statusDate = [status, c.date_opened].filter(Boolean).join(" \u00b7 ");
+  const title = c.service_type || (d && d.fields && d.fields["SERVICE TYPE"]) || `Case ${i + 1}`;
+  const head =
+    `<div class="acc-head"><span class="acc-title">${escapeHtml(title)}</span>` +
+    `<span class="acc-sub">${escapeHtml(statusDate)}</span></div>`;
+
+  let body;
+  if (!d || !d.fields) {
+    body = '<p class="muted">Detail not captured yet \u2014 re-scan to fetch its details.</p>';
+  } else {
+    const f = d.fields;
+    let html = `<div class="scr-meta">`;
+    html += `<div><span class="sum-k">Service Type</span>${escapeHtml(f["SERVICE TYPE"] || title || "\u2014")}</div>`;
+    html += `<div><span class="sum-k">Status</span>${escapeHtml(status || "\u2014")}</div>`;
+    html += `<div><span class="sum-k">Date Opened</span>${escapeHtml(f["DATE OPENED"] || c.date_opened || "\u2014")}</div>`;
+    html += `</div>`;
+
+    const rows = CASE_FIELD_LABELS.filter(([k]) => f[k]).map(
+      ([k, label]) =>
+        `<tr class="qa"><th>${escapeHtml(label)}</th><td>${escapeHtml(f[k])}</td></tr>`
+    );
+    if (rows.length) {
+      html +=
+        `<div class="scr-qa-h">Case Details</div>` +
+        `<table class="qa-table"><tbody>${rows.join("")}</tbody></table>`;
+    } else {
+      html += `<p class="muted">No case fields captured.</p>`;
+    }
+    body = html;
+  }
+  return `<div class="acc${i === 0 ? " open" : ""}">${head}<div class="acc-body">${body}</div></div>`;
+}
+
+function renderCases() {
+  const box = $("cmp-cases");
+  if (!box) return;
+  renderCaseMeta();
+  const d = caseData;
+  const matchesClient =
+    d && (!currentContext || !currentContext.client_id || d.clientId === currentContext.client_id);
+
+  if (!d || !matchesClient || !d.cases || !d.cases.length) {
+    box.innerHTML =
+      '<p class="muted">No Met Council cases captured yet. Open a Unite Us facesheet and click Re-scan.</p>';
+    updateCaseSaveBtn();
+    return;
+  }
+  box.innerHTML = d.cases.map((c, i) => renderCaseAccordion(c, i)).join("");
+  box.querySelectorAll(".acc-head").forEach((h) => {
+    h.addEventListener("click", () => h.parentElement.classList.toggle("open"));
+  });
+  updateCaseSaveBtn();
+}
+
+function updateCaseSaveBtn() {
+  const btn = $("caseSaveBtn");
+  if (!btn) return;
+  btn.disabled = !casesSaveable();
+  btn.title = btn.disabled
+    ? "Re-scan to capture cases before saving"
+    : "Save cases to the CRM (client must exist first)";
+}
+
+// Confirm the content script started the case scan (writes uw_cases).
+async function caseScanStarted(sinceMs, timeout) {
+  const start = Date.now();
+  while (Date.now() - start < timeout) {
+    const { uw_cases } = await chrome.storage.local.get("uw_cases");
+    if (
+      uw_cases &&
+      uw_cases.scannedAt &&
+      new Date(uw_cases.scannedAt).getTime() >= sinceMs - 1500
+    ) {
+      return true;
+    }
+    await new Promise((r) => setTimeout(r, 200));
+  }
+  return false;
+}
+
+async function caseRescan(ev) {
+  const btn = (ev && ev.currentTarget) || $("caseRescanBtn");
+  setBtnBusy(btn, true);
+  setCaseStatus("warn", "Starting\u2026");
+  const sentAt = Date.now();
+  try {
+    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    if (!tab || tab.id == null || !/app\.uniteus\.io/.test(tab.url || "")) {
+      setCaseStatus("err", "Open a Unite Us facesheet tab first");
+      return;
+    }
+    const clientId = currentContext && currentContext.client_id;
+    chrome.tabs.sendMessage(tab.id, { type: "CASE_RESCRAPE", clientId }).catch(() => {});
+    if (await caseScanStarted(sentAt, 3000)) {
+      setCaseStatus("warn", "Walking cases\u2026 keep this tab open");
+    } else {
+      setCaseStatus("err", "Couldn't reach the page \u2014 reload the Unite Us tab (F5), then retry");
+    }
+  } catch (_) {
+    setCaseStatus("err", "Reload the Unite Us tab (F5), then retry");
+  } finally {
+    setBtnBusy(btn, false);
+  }
+}
+
+// ---------- Save captured cases to the CRM ----------
+// Upserts on case_id (the /cases/.../<id> UUID). Client must exist first.
+
+function casesSaveable() {
+  const d = caseData;
+  if (!d || !Array.isArray(d.cases)) return false;
+  if (currentContext && currentContext.client_id && d.clientId !== currentContext.client_id) {
+    return false;
+  }
+  return d.cases.some((c) => c.detail && c.detail.fields && (c.detail.id || c.id));
+}
+
+// MM/DD/YYYY -> YYYY-MM-DD (case detail uses US date format).
+function parseUSDate(s) {
+  const m = String(s || "").trim().match(/(\d{1,2})\/(\d{1,2})\/(\d{4})/);
+  if (!m) return null;
+  const [, mm, dd, yy] = m;
+  return `${yy}-${mm.padStart(2, "0")}-${dd.padStart(2, "0")}`;
+}
+
+// "$8,736.00" -> "8736.00"
+function parseMoney(s) {
+  const cleaned = String(s || "").replace(/[^0-9.]/g, "");
+  return cleaned || null;
+}
+
+const CASE_STATUS_MAP = {
+  OPEN: "open",
+  CLOSED: "closed",
+  MANAGED: "managed",
+  DRAFT: "draft",
+  CANCELLED: "cancelled",
+  "PENDING AUTHORIZATION": "pending_authorization",
+  "OFF PLATFORM": "off_platform",
+};
+const AUTH_STATUS_MAP = {
+  ACCEPTED: "approved",
+  APPROVED: "approved",
+  PENDING: "pending",
+  DENIED: "denied",
+  EXPIRED: "expired",
+  "NOT REQUIRED": "not_required",
+};
+
+function buildCasePayloads(d, clientId) {
+  const payloads = [];
+  for (const c of d.cases) {
+    const det = c.detail;
+    if (!det || !det.fields) continue;
+    const caseId = det.id || c.id;
+    if (!caseId) continue;
+    const f = det.fields;
+
+    const payload = {
+      case_id: caseId,
+      client_id: clientId,
+      service_type: f["SERVICE TYPE"] || c.service_type || "",
+      program_name: f["PROGRAM"] || "",
+      network_name: f["NETWORK"] || "",
+      provider_name: f["ORGANIZATION"] || c.org || "",
+      primary_worker_name: f["PRIMARY WORKER"] || "",
+      case_description: f["CASE DESCRIPTION"] || "",
+      program_cap: f["PROGRAM CAP"] || "",
+      authorization_note: f["NOTES"] || "",
+      unite_us_authorization_id: f["UNITE US AUTHORIZATION ID"] || "",
+      social_care_coverage_plan: f["SOCIAL CARE COVERAGE PLAN"] || "",
+      social_care_coverage_status: f["SOCIAL CARE COVERAGE STATUS"] || "",
+      case_status: CASE_STATUS_MAP[(det.status || c.status || "").toUpperCase()] || "open",
+    };
+
+    const opened = parseUSDate(f["DATE OPENED"] || c.date_opened);
+    if (opened) payload.user_entered_opened_date = opened;
+    const closed = parseUSDate(f["DATE CLOSED"]);
+    if (closed) payload.user_entered_closed_date = closed;
+
+    const authStatus = AUTH_STATUS_MAP[(f["AUTHORIZATION STATUS"] || "").toUpperCase()];
+    if (authStatus) payload.service_authorization_status = authStatus;
+    if (f["AUTHORIZATION STATUS"]) payload.service_authorization_status_label = f["AUTHORIZATION STATUS"];
+
+    const amount = parseMoney(f["AUTHORIZED AMOUNT"]);
+    if (amount) payload.authorized_amount = amount;
+
+    const sd = f["AUTHORIZED SERVICE DELIVERY DATE(S)"];
+    if (sd) {
+      const parts = sd.split(/\s*[-\u2013]\s*/);
+      const start = parseUSDate(parts[0]);
+      const end = parseUSDate(parts[1]);
+      if (start) payload.service_authorization_approval_starts_at = start;
+      if (end) payload.service_authorization_approval_ends_at = end;
+    }
+
+    payloads.push(payload);
+  }
+  return payloads;
+}
+
+async function saveCases(ev) {
+  const btn = (ev && ev.currentTarget) || $("caseSaveBtn");
+  const ctx = currentContext;
+  const d = caseData;
+
+  if (!ctx || !ctx.client_id) {
+    setCaseStatus("err", "No client detected");
+    return;
+  }
+  if (!casesSaveable()) {
+    setCaseStatus("err", "Nothing to save \u2014 re-scan first");
+    return;
+  }
+  const cfg = await getConfig();
+  if (!cfg.token) {
+    setCaseStatus("err", "No API token configured");
+    return;
+  }
+
+  setBtnBusy(btn, true);
+  setCaseStatus("warn", "Checking client\u2026");
+  try {
+    const clientRes = await fetch(
+      `${cfg.backendUrl}/api/clients/${ctx.client_id}/`,
+      { headers: authHeader(cfg) }
+    );
+    if (clientRes.status === 404) {
+      setCaseStatus("err", "Client not in CRM \u2014 save it on the Profile tab first");
+      setClientImported(false);
+      return;
+    }
+    if (clientRes.status === 401 || clientRes.status === 403) {
+      setCaseStatus("err", "Auth error");
+      return;
+    }
+    if (!clientRes.ok) {
+      setCaseStatus("err", `Client check failed (${clientRes.status})`);
+      return;
+    }
+    setClientImported(true);
+
+    setCaseStatus("warn", "Saving cases\u2026");
+    const payloads = buildCasePayloads(d, ctx.client_id);
+    if (!payloads.length) {
+      setCaseStatus("err", "Nothing to save \u2014 re-scan first");
+      return;
+    }
+    const res = await fetch(`${cfg.backendUrl}/api/cases/bulk/`, {
+      method: "POST",
+      headers: { ...authHeader(cfg), "Content-Type": "application/json" },
+      body: JSON.stringify(payloads),
+    });
+    if (res.ok || res.status === 207) {
+      let body = {};
+      try { body = await res.json(); } catch (_) {}
+      const ok = body.succeeded != null ? body.succeeded : payloads.length;
+      const failed = body.failed || 0;
+      if (failed) {
+        setCaseStatus("warn", `Saved ${ok}, ${failed} failed`);
+      } else {
+        setCaseStatus("ok", `Saved ${ok} case(s) \u2713`);
+      }
+      await fetchCrm(cfg, ctx.client_id);
+    } else if (res.status === 401 || res.status === 403) {
+      setCaseStatus("err", "Auth error");
+    } else {
+      let detail = `Error ${res.status}`;
+      try { detail = summarizeErrors(await res.json()) || detail; } catch (_) {}
+      setCaseStatus("err", detail);
+    }
+  } catch (_) {
+    setCaseStatus("err", "Network error");
+  } finally {
+    setBtnBusy(btn, false);
+  }
+}
+
 // ---------- Save / upsert captured client to the CRM ----------
 // The backend ClientViewSet upserts on client_id, so a POST creates the client
 // if missing and updates it (plus nested address / insurances) if it exists.
@@ -1931,19 +2266,22 @@ function renderCrmStatus(ctx) {
 }
 
 async function loadContext() {
-  const { uw_context, uw_screenings, uw_eligibility } = await chrome.storage.local.get([
+  const { uw_context, uw_screenings, uw_eligibility, uw_cases } = await chrome.storage.local.get([
     "uw_context",
     "uw_screenings",
     "uw_eligibility",
+    "uw_cases",
   ]);
   currentContext = uw_context || null;
   screeningData = uw_screenings || null;
   eligibilityData = uw_eligibility || null;
+  caseData = uw_cases || null;
   renderContext(currentContext);
   renderCrmStatus(currentContext);
   renderComparison(currentContext);
   renderScreenings();
   renderEligibility();
+  renderCases();
   await maybeAutoValidate();
 }
 
@@ -2064,6 +2402,8 @@ function init() {
   $("scrSaveBtn").addEventListener("click", saveScreenings);
   $("eligRescanBtn").addEventListener("click", eligRescan);
   $("eligSaveBtn").addEventListener("click", saveEligibility);
+  $("caseRescanBtn").addEventListener("click", caseRescan);
+  $("caseSaveBtn").addEventListener("click", saveCases);
   $("diagnosticBtn").addEventListener("click", runDiagnostic);
   $("copyReportBtn").addEventListener("click", copyReport);
 
@@ -2114,6 +2454,18 @@ function init() {
         setEligStatus("warn", `Walking ${p.done}/${p.total}\u2026`);
       }
       renderEligibility();
+    }
+    // Case auto-walk progress / results.
+    if (area === "local" && changes.uw_cases) {
+      caseData = changes.uw_cases.newValue;
+      const d = caseData;
+      if (d && d.status === "done") {
+        setCaseStatus("ok", `Done \u2014 ${d.cases.length} case(s)`);
+      } else if (d && d.status === "running") {
+        const p = d.progress || { done: 0, total: 0 };
+        setCaseStatus("warn", `Walking ${p.done}/${p.total}\u2026`);
+      }
+      renderCases();
     }
   });
 }

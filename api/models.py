@@ -613,10 +613,23 @@ class Case(models.Model):
     service_authorization_status = models.CharField(
         max_length=20, choices=ServiceAuthorizationStatus.choices, blank=True
     )
+    # Raw status label as shown in the UI (e.g. "Accepted") preserving fidelity
+    # since the enum above normalizes it.
+    service_authorization_status_label = models.CharField(max_length=80, blank=True)
     service_authorization_request_starts_at = models.DateTimeField(null=True, blank=True)
     service_authorization_request_ends_at = models.DateTimeField(null=True, blank=True)
     service_authorization_approval_starts_at = models.DateTimeField(null=True, blank=True)
     service_authorization_approval_ends_at = models.DateTimeField(null=True, blank=True)
+    unite_us_authorization_id = models.CharField(max_length=80, blank=True)
+    authorized_amount = models.DecimalField(
+        max_digits=12, decimal_places=2, null=True, blank=True
+    )
+    program_cap = models.TextField(blank=True)
+    authorization_note = models.TextField(blank=True)
+
+    # --- Social Care Coverage (as shown on the case) ---
+    social_care_coverage_plan = models.CharField(max_length=255, blank=True)
+    social_care_coverage_status = models.CharField(max_length=80, blank=True)
 
     # --- Export Metadata ---
     export_provider_role = models.CharField(max_length=80, blank=True)
