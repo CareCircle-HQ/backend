@@ -807,7 +807,11 @@ async function waitForScreeningListSettled(timeout = 12000) {
     const total = t
       ? [...t.querySelectorAll("tbody tr")].filter((r) => r.querySelector("td")).length
       : 0;
-    if (total === lastTotal) {
+    // Only conclude "no Met Council rows" once the table actually HAS rows that
+    // have stopped changing. A table still fetching shows 0 rows, which is NOT
+    // settled -- treating it as settled caused empty harvests during the Profile
+    // reload (the walk starts before the rows finish loading).
+    if (total > 0 && total === lastTotal) {
       stable += 1;
       if (stable >= 3) break; // table finished loading with no Met Council rows
     } else {
