@@ -693,10 +693,16 @@ function buildProfileHtml(ctx) {
   );
   const crmScc = crmInsurances.filter((c) => sccNames.has(norm(c.plan_name)));
   const crmIns = crmInsurances.filter((c) => !sccNames.has(norm(c.plan_name)));
-  html += `<h3>${SCHEMA.insurance.title}</h3>`;
-  html += renderCoverageSection(ctx, "insurance", SCHEMA.insurance, crmIns);
-  html += `<h3>${SCHEMA.social_care_coverage.title}</h3>`;
-  html += renderCoverageSection(ctx, "social_care_coverage", SCHEMA.social_care_coverage, crmScc);
+  html += profileAccordion(
+    SCHEMA.insurance.title,
+    renderCoverageSection(ctx, "insurance", SCHEMA.insurance, crmIns),
+    false
+  );
+  html += profileAccordion(
+    SCHEMA.social_care_coverage.title,
+    renderCoverageSection(ctx, "social_care_coverage", SCHEMA.social_care_coverage, crmScc),
+    false
+  );
   return html;
 }
 
