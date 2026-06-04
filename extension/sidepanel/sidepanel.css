@@ -427,6 +427,22 @@ tr.cmp.cap-only { background: #eff6ff; }
 .tag.det { background: #eff6ff; color: var(--primary); }
 .tag.imp { background: #dcfce7; color: var(--ok); }
 .tag.inactive { background: #fef2f2; color: #dc2626; }
+.verify-ins {
+  font-size: 10px;
+  line-height: 1;
+  padding: 2px 7px;
+  border: 1px solid var(--primary, #2563eb);
+  color: var(--primary, #2563eb);
+  background: transparent;
+  border-radius: 4px;
+  cursor: pointer;
+}
+.verify-ins:hover:not(:disabled) { background: rgba(37, 99, 235, 0.1); }
+.verify-ins:disabled { opacity: 0.6; cursor: default; }
+.verify-status { font-size: 10.5px; margin-left: 6px; }
+.verify-status.ok { color: var(--ok, #16a34a); }
+.verify-status.warn { color: var(--warn, #b45309); }
+.verify-status.err { color: var(--danger, #dc2626); }
 
 textarea.diag {
   width: 100%;

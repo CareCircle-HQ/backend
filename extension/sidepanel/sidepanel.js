@@ -368,9 +368,19 @@ function renderCoverageSection(ctx, group, def, crmList, opts = {}) {
         (b.capObj && b.capObj.active === false
           ? '<span class="tag inactive">Inactive</span>'
           : "");
+      // "Verify Insurance" clicks the native Unite Us link on the matching card.
+      // Only offered for active insurance-group records (SCC has no verify link).
+      const canVerify =
+        b.capObj && group === "insurance" && b.capObj.active && b.capObj.plan_name;
+      const verify = canVerify
+        ? `<button class="verify-ins" data-plan="${escapeHtml(b.capObj.plan_name)}"` +
+          ` data-member="${escapeHtml(b.capObj.member_id || "")}"` +
+          ` data-index="${b.capObj.index != null ? b.capObj.index : ""}">Verify</button>` +
+          `<span class="verify-status"></span>`
+        : "";
       return (
         `<div class="rec-block"><div class="rec-head">` +
-        `<span class="rec-n">${escapeHtml(b.label)}</span> ${tags}</div>` +
+        `<span class="rec-n">${escapeHtml(b.label)}</span> ${tags} ${verify}</div>` +
         renderObjectSection(def, b.capObj, {}, b.crmObj, opts) +
         `</div>`
       );
@@ -597,7 +607,48 @@ function bindSnapshotPull() {
     box.querySelectorAll(".acc-head").forEach((h) => {
       h.addEventListener("click", () => h.parentElement.classList.toggle("open"));
     });
+    // "Verify Insurance" buttons -> click the native link on the page.
+    box.querySelectorAll(".verify-ins").forEach((btn) => {
+      btn.addEventListener("click", (ev) => {
+        ev.stopPropagation();
+        verifyInsurance(btn);
+      });
+    });
   });
+}
+
+// Ask the content script to click the native "Verify Insurance" link for the
+// card matching this button's plan/index, then show the returned result.
+async function verifyInsurance(btn) {
+  const status = btn.parentElement.querySelector(".verify-status");
+  const setStatus = (cls, msg) => {
+    if (status) {
+      status.className = "verify-status " + (cls || "");
+      status.textContent = msg || "";
+    }
+  };
+  btn.disabled = true;
+  setStatus("warn", "Verifying\u2026");
+  try {
+    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    if (!tab || tab.id == null || !/app\.uniteus\.io/.test(tab.url || "")) {
+      setStatus("err", "Open the Unite Us facesheet tab first");
+      return;
+    }
+    const idx = btn.getAttribute("data-index");
+    const r = await chrome.tabs.sendMessage(tab.id, {
+      type: "VERIFY_INSURANCE",
+      plan_name: btn.getAttribute("data-plan") || "",
+      member_id: btn.getAttribute("data-member") || "",
+      index: idx === "" ? null : Number(idx),
+    });
+    if (r && r.ok) setStatus("ok", r.summary || "Done");
+    else setStatus("err", (r && r.error) || "Verification failed");
+  } catch (_) {
+    setStatus("err", "Failed \u2014 reload the Unite Us tab (F5)");
+  } finally {
+    btn.disabled = false;
+  }
 }
 
 // ---- Consent gating -------------------------------------------------------
