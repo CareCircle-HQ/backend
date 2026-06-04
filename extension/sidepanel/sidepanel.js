@@ -410,12 +410,144 @@ function buildClientSummaryHtml(ctx) {
   );
 }
 
+// ---- Client Snapshot (per-client tracking on the Profile tab) -------------
+// Returns the captured walk data only when it belongs to the current client, so
+// stale data from a previous client never leaks into the snapshot.
+function snapDataFor(data, clientId) {
+  return data && data.clientId === clientId ? data : null;
+}
+
+function parseDateMaybe(s) {
+  if (!s) return null;
+  const t = Date.parse(s);
+  return isNaN(t) ? null : t;
+}
+
+// Most recent date among rows; falls back to the first non-empty raw string when
+// the dates aren't parseable.
+function latestDateStr(rows, getDate) {
+  let bestT = null;
+  let bestStr = "";
+  (rows || []).forEach((r) => {
+    const s = getDate(r);
+    if (!s) return;
+    const t = parseDateMaybe(s);
+    if (t != null) {
+      if (bestT == null || t > bestT) {
+        bestT = t;
+        bestStr = s;
+      }
+    } else if (!bestStr) {
+      bestStr = s;
+    }
+  });
+  return bestStr;
+}
+
+// Minutes captured for one screening (from the "Screening Duration" Q&A answer
+// like "8 Minutes", or the raw numeric duration).
+function screeningDurationMinutes(s) {
+  const d = s && s.detail;
+  if (!d) return 0;
+  const item = (d.items || []).find((it) => /screening duration/i.test(it.q || ""));
+  const raw = item ? item.a : d.duration || "";
+  const m = String(raw).match(/(\d+(?:\.\d+)?)/);
+  return m ? parseFloat(m[1]) : 0;
+}
+
+// The "Client Snapshot" card shown right under the client summary table. Each
+// row shows what we tracked; when we couldn't extract it, a "Pull" button lets
+// the user fetch it on the spot (a small re-pull control is always available).
+function buildSnapshotHtml(ctx) {
+  const cap = (ctx.captured && ctx.captured.client) || {};
+  const clientId = ctx.client_id;
+
+  // Consent
+  const consentStr = [cap.consent_status, cap.consented_at].filter(Boolean).join(" \u00b7 ");
+
+  // Screenings
+  const sd = snapDataFor(screeningData, clientId);
+  const screenings = (sd && sd.screenings) || [];
+  const scrMin = screenings.reduce((sum, s) => sum + screeningDurationMinutes(s), 0);
+  const scrLast = latestDateStr(screenings, (s) => s.date);
+
+  // Eligibility
+  const ed = snapDataFor(eligibilityData, clientId);
+  const eligs = (ed && ed.eligibilities) || [];
+  const eligLast = latestDateStr(eligs, (e) => e.date);
+
+  // Cases
+  const cd = snapDataFor(caseData, clientId);
+  const cases = (cd && cd.cases) || [];
+  const caseLast = latestDateStr(cases, (c) => c.date_opened);
+  const caseStatuses = [
+    ...new Set(cases.map((c) => (c.detail && c.detail.status) || c.status).filter(Boolean)),
+  ];
+
+  const repull = (key) =>
+    `<button class="snap-pull" data-pull="${key}" title="Re-pull">\u21bb</button>`;
+  const row = (label, valueHtml, key, missing) => {
+    const v = missing
+      ? `<span class="snap-v miss">Not captured <button class="snap-pull" data-pull="${key}">Pull</button></span>`
+      : `<span class="snap-v">${valueHtml} ${repull(key)}</span>`;
+    return `<div class="snap-row"><span class="snap-k">${label}</span>${v}</div>`;
+  };
+
+  const dash = "\u2014";
+  let html = '<div class="snapshot"><div class="snap-h">Client Snapshot</div>';
+  html += row("Consent", escapeHtml(consentStr), "consent", !consentStr);
+  html += row(
+    "Met Council Screenings",
+    `<strong>${screenings.length}</strong> \u00b7 last ${escapeHtml(scrLast || dash)}` +
+      (scrMin ? ` \u00b7 ${scrMin} min total` : ""),
+    "screening",
+    !sd
+  );
+  html += row(
+    "Met Council Eligibility",
+    `<strong>${eligs.length}</strong> \u00b7 last ${escapeHtml(eligLast || dash)}`,
+    "eligibility",
+    !ed
+  );
+  html += row(
+    "Met Council Cases",
+    `<strong>${cases.length}</strong>` +
+      (caseStatuses.length ? ` \u00b7 ${escapeHtml(caseStatuses.join(", "))}` : "") +
+      ` \u00b7 last ${escapeHtml(caseLast || dash)}`,
+    "cases",
+    !cd
+  );
+  html += "</div>";
+  return html;
+}
+
+// Wire the snapshot "Pull"/re-pull buttons (re-bound after every render since
+// renderComparison replaces #cmp-profile's innerHTML).
+function bindSnapshotPull() {
+  ["cmp-profile", "comparison"].forEach((boxId) => {
+    const box = $(boxId);
+    if (!box) return;
+    box.querySelectorAll(".snap-pull").forEach((btn) => {
+      btn.addEventListener("click", (ev) => {
+        ev.stopPropagation();
+        btn.disabled = true;
+        const k = btn.getAttribute("data-pull");
+        if (k === "consent") deepScrape();
+        else if (k === "screening") scrRescan();
+        else if (k === "eligibility") eligRescan();
+        else if (k === "cases") caseRescan();
+      });
+    });
+  });
+}
+
 // Profile view = Client + Address + Insurance comparison.
 function buildProfileHtml(ctx) {
   const pairs = ctx.scraped || {};
   const captured = ctx.captured || { client: {}, address: {} };
   const crmClient = crm.client;
   let html = buildClientSummaryHtml(ctx);
+  html += buildSnapshotHtml(ctx);
 
   // Client: structured captured profile data wins; pairs are only a fallback.
   const clientPairs = {
@@ -492,6 +624,7 @@ function renderComparison(ctx) {
   const saveBtn = $("saveBtn");
   if (saveBtn) saveBtn.disabled = empty;
   renderProfileMeta();
+  bindSnapshotPull();
 }
 
 // This function is serialized and injected into the page by executeScript,
@@ -2580,6 +2713,7 @@ function init() {
         setScrStatus("", "");
       }
       renderScreenings();
+      renderComparison(currentContext); // keep the Profile snapshot in sync
     }
     // Eligibility auto-walk progress / results.
     if (area === "local" && changes.uw_eligibility) {
@@ -2594,6 +2728,7 @@ function init() {
         setEligStatus("", "");
       }
       renderEligibility();
+      renderComparison(currentContext); // keep the Profile snapshot in sync
     }
     // Case auto-walk progress / results.
     if (area === "local" && changes.uw_cases) {
@@ -2608,6 +2743,7 @@ function init() {
         setCaseStatus("", "");
       }
       renderCases();
+      renderComparison(currentContext); // keep the Profile snapshot in sync
     }
   });
 }
