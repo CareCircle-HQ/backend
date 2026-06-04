@@ -1176,8 +1176,7 @@ function publishScreenings(scan) {
 // ensure we're on it (switch tab if on the facesheet, otherwise navigate to the
 // list URL). Harvesting + the per-detail walk are driven by
 // maybeContinueScreeningScan, which makes the whole flow survive page reloads.
-async function startScreeningScan(msg) {
-  const clientId = (msg && msg.clientId) || parseIdsFromUrl().client_id;
+async function startScreeningScanLegacy(msg, clientId) {
   if (!clientId) return { ok: false, error: "Open the client's facesheet first" };
 
   const scan = {
@@ -1398,6 +1397,267 @@ async function _maybeContinueScreeningScan() {
   // tab and click the next row (visitScreeningIndex calls ensureScreeningList).
   if (scan.index < scan.total) visitScreeningIndex(scan);
   else finishScan(scan);
+}
+
+// ---------------------------------------------------------------------------
+// Screenings via the Unite Us API (preferred, navigation-free).
+//
+// The page loads screenings from screenings-ingestion.uniteus.io using a
+// short-lived Bearer token + x-employee-id / x-provider-id headers. The
+// MAIN-world shim (uw_netcapture.js) forwards those headers here whenever the
+// page calls that host. We then enumerate + fetch each screening directly,
+// filtering to the logged-in provider's own org (x-provider-id), so there's no
+// fragile per-screening page navigation.
+// ---------------------------------------------------------------------------
+const SCREENINGS_API = "https://screenings-ingestion.uniteus.io/v2/screenings";
+const UU_CREDS_TTL_MS = 12 * 60 * 1000; // JWT is short-lived; refresh past this
+let uuCreds = null;
+
+// Receive credentials forwarded by the MAIN-world shim.
+window.addEventListener("message", (ev) => {
+  if (ev.source !== window) return;
+  const d = ev.data;
+  if (!d || d.__uw_creds !== true || !d.auth) return;
+  uuCreds = {
+    bearer: d.auth,
+    employeeId: d.employeeId || "",
+    providerId: (d.providerId || "").toLowerCase(),
+    ts: d.ts || Date.now(),
+  };
+  try {
+    chrome.storage.local.set({ uw_uu_creds: uuCreds });
+  } catch (_) {}
+});
+
+async function getUuCreds() {
+  if (uuCreds && Date.now() - uuCreds.ts < UU_CREDS_TTL_MS) return uuCreds;
+  try {
+    const { uw_uu_creds } = await chrome.storage.local.get("uw_uu_creds");
+    if (uw_uu_creds && Date.now() - uw_uu_creds.ts < UU_CREDS_TTL_MS) {
+      uuCreds = uw_uu_creds;
+      return uuCreds;
+    }
+  } catch (_) {}
+  return null;
+}
+
+// If we don't already hold fresh credentials, nudge the page to call the
+// screenings API by opening the Screenings facesheet tab (an in-app click, not
+// a navigation) and wait for the shim to forward the headers.
+async function bootstrapUuCreds(timeout = 12000) {
+  let creds = await getUuCreds();
+  if (creds) return creds;
+  if (!getFacesheetTabs().length) return null; // not on a facesheet; can't nudge
+  const deadline = Date.now() + timeout;
+  while (Date.now() < deadline) {
+    clickTabByLabel("Screenings"); // fires the list call -> shim forwards creds
+    await sleep(600);
+    creds = await getUuCreds();
+    if (creds) return creds;
+  }
+  console.warn("[uw-scr] bootstrap timed out without capturing creds");
+  return await getUuCreds();
+}
+
+function uuHeaders(creds) {
+  const h = { accept: "application/json", authorization: creds.bearer };
+  if (creds.employeeId) h["x-employee-id"] = creds.employeeId;
+  if (creds.providerId) h["x-provider-id"] = creds.providerId;
+  return h;
+}
+
+// Enumerate every screening for a person, following pagination.
+async function apiFetchScreeningList(clientId, creds) {
+  const out = [];
+  const limit = 20; // match the page's request exactly; larger values 400
+  let offset = 0;
+  for (let page = 0; page < 50; page++) {
+    const url =
+      `${SCREENINGS_API}?person_id=${encodeURIComponent(clientId)}` +
+      `&offset=${offset}&limit=${limit}&type=screening`;
+    const res = await fetch(url, {
+      headers: uuHeaders(creds),
+      credentials: "omit",
+    });
+    if (!res.ok) {
+      let detail = "";
+      try {
+        detail = (await res.text()).slice(0, 300);
+      } catch (_) {}
+      console.warn("[uw-scr] list error body:", detail);
+      throw new Error(`list ${res.status}`);
+    }
+    const body = await res.json();
+    const screens = Array.isArray(body.screens) ? body.screens : [];
+    out.push(...screens);
+    const total = body.total != null ? body.total : out.length;
+    offset += limit;
+    if (!screens.length || out.length >= total) break;
+  }
+  return out;
+}
+
+async function apiFetchScreeningDetail(id, creds) {
+  const url = `${SCREENINGS_API}/${id}?template_format=surveyjs`;
+  const res = await fetch(url, { headers: uuHeaders(creds), credentials: "omit" });
+  if (!res.ok) throw new Error(`detail ${res.status}`);
+  const body = await res.json();
+  return body.screen || body;
+}
+
+// Resolve a question's answer text: single answers carry an `answer` object;
+// select_multiple carry an `answers` array.
+function apiAnswerValue(q) {
+  if (q.answer) {
+    const v = q.answer.value || q.answer.string;
+    if (v) return v;
+  }
+  if (Array.isArray(q.answers) && q.answers.length) {
+    return q.answers
+      .map((a) => a.value || a.string)
+      .filter(Boolean)
+      .join(", ");
+  }
+  return "";
+}
+
+function fmtApiDate(iso) {
+  if (!iso) return "";
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return "";
+  return `${d.getMonth() + 1}/${d.getDate()}/${d.getFullYear()}`;
+}
+
+// Map an API detail (+ its list summary) to our { id, items, results, duration }
+// detail shape, mirroring harvestScreeningDetail's output.
+function parseApiScreenDetail(screen, summary) {
+  const qs = Array.isArray(screen.questions) ? screen.questions.slice() : [];
+  qs.sort((a, b) => (a.order || 0) - (b.order || 0));
+
+  const items = [];
+  for (const q of qs) {
+    const text = cleanText(q.primary_text || "");
+    if (!text) continue;
+    const a = cleanText(apiAnswerValue(q));
+    if (!a) continue;
+    items.push({ q: text, a });
+  }
+
+  let duration = "";
+  if (screen.duration != null) duration = String(screen.duration);
+  else if (summary && summary.duration != null) duration = String(summary.duration);
+  if (duration && /^\d+$/.test(duration)) {
+    const unit = duration === "1" ? "Minute" : "Minutes";
+    items.push({ q: "Screening Duration", a: `${duration} ${unit}` });
+  }
+
+  // Identified needs: the list summary carries clean canonical names. Keep only
+  // the allowed needs, matching the legacy harvestScreeningResults behaviour.
+  let needNames = [];
+  if (summary && Array.isArray(summary.identified_needs)) {
+    needNames = summary.identified_needs.map((n) => n.name).filter(Boolean);
+  }
+  const results = needNames.filter((n) => isAllowedNeed(n));
+
+  return { id: screen.id || (summary && summary.id), items, results, duration };
+}
+
+function publishScreeningsApi(clientId, screenings, status, note) {
+  const done = status === "done";
+  chrome.storage.local.set({
+    uw_screenings: {
+      clientId,
+      org: SCREENING_ORG,
+      screenings,
+      status,
+      phase: done ? null : "api",
+      note: note || "",
+      scannedAt: new Date().toISOString(),
+      finishedAt: done ? new Date().toISOString() : null,
+      progress: { done: screenings.length, total: screenings.length },
+    },
+  });
+}
+
+// Pull all of the provider's screenings for a client straight from the API.
+async function runScreeningApiScan(clientId) {
+  const creds = await bootstrapUuCreds(15000);
+  if (!creds) {
+    console.warn("[uw-scr] API scan aborted: no creds captured");
+    return { ok: false, error: "no-creds" };
+  }
+
+  const list = await apiFetchScreeningList(clientId, creds);
+  const provider = (creds.providerId || "").toLowerCase();
+  // The logged-in provider's own screenings = Met Council. Match the org id to
+  // x-provider-id (org name is unreliable / null in the API response).
+  const mine = provider
+    ? list.filter(
+        (s) => String(s.organization_id || "").toLowerCase() === provider
+      )
+    : list;
+
+  const screenings = [];
+  for (const s of mine) {
+    let detail;
+    try {
+      const screen = await apiFetchScreeningDetail(s.id, creds);
+      detail = parseApiScreenDetail(screen, s);
+    } catch (_) {
+      detail = {
+        id: s.id,
+        items: [],
+        results: [],
+        duration: s.duration != null ? String(s.duration) : "",
+      };
+    }
+    screenings.push({
+      id: s.id,
+      form: (s.template && s.template.consent_code) || "",
+      submitter: "",
+      status: s.status || "",
+      org: SCREENING_ORG,
+      date: fmtApiDate(s.status_at || s.updated_at || s.created_at),
+      detail,
+    });
+  }
+  return { ok: true, screenings };
+}
+
+// API-first entry point. Falls back to the legacy resumable DOM crawler when
+// no credentials can be captured (e.g. the page never called the API).
+async function startScreeningScan(msg) {
+  const clientId = (msg && msg.clientId) || parseIdsFromUrl().client_id;
+  if (!clientId) return { ok: false, error: "Open the client's facesheet first" };
+
+  // Drop any stale legacy crawler state so opening the Screenings tab during
+  // credential bootstrap can't resurrect an old DOM walk.
+  try {
+    await chrome.storage.local.remove("uw_scr_scan");
+  } catch (_) {}
+
+  // Publish a running state immediately so the panel's scanStarted() handshake
+  // sees fresh activity.
+  publishScreeningsApi(clientId, [], "running", "Fetching screenings\u2026");
+
+  try {
+    const api = await runScreeningApiScan(clientId);
+    if (api.ok) {
+      publishScreeningsApi(
+        clientId,
+        api.screenings,
+        "done",
+        api.screenings.length
+          ? ""
+          : "No Met Council - SCN - PHS screenings found."
+      );
+      return { ok: true, count: api.screenings.length };
+    }
+  } catch (e) {
+    console.warn("[uw-scr] API path failed, falling back to DOM crawler:", e);
+  }
+
+  return startScreeningScanLegacy(msg, clientId);
 }
 
 // ---------------------------------------------------------------------------

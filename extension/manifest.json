@@ -11,6 +11,7 @@
   ],
   "host_permissions": [
     "https://app.uniteus.io/*",
+    "https://screenings-ingestion.uniteus.io/*",
     "https://scnlp.metcouncil.org/*",
     "https://links.carecirclecs.com/*",
     "http://127.0.0.1:8000/*",
@@ -26,6 +27,12 @@
     "default_path": "sidepanel/sidepanel.html"
   },
   "content_scripts": [
+    {
+      "matches": ["https://app.uniteus.io/*"],
+      "js": ["content/uw_netcapture.js"],
+      "run_at": "document_start",
+      "world": "MAIN"
+    },
     {
       "matches": ["https://app.uniteus.io/*"],
       "js": ["content/uniteus.js"],
