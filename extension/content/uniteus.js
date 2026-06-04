@@ -792,6 +792,33 @@ async function ensureScreeningList(timeout = 12000) {
   return screeningTableReady();
 }
 
+// After the table appears its rows may still be streaming in (especially right
+// after a client switch, when the auto-walk starts before the data finished
+// loading). Wait until the Met Council rows show up, or until the total row
+// count holds steady across a few polls (so a client that genuinely has no
+// Met Council screenings doesn't hang). Returns the harvested filtered list.
+async function waitForScreeningListSettled(timeout = 12000) {
+  const deadline = Date.now() + timeout;
+  let lastTotal = -1;
+  let stable = 0;
+  while (Date.now() < deadline) {
+    if (getFilteredScreeningRows().length) break; // our rows are present
+    const t = findScreeningTable();
+    const total = t
+      ? [...t.querySelectorAll("tbody tr")].filter((r) => r.querySelector("td")).length
+      : 0;
+    if (total === lastTotal) {
+      stable += 1;
+      if (stable >= 3) break; // table finished loading with no Met Council rows
+    } else {
+      stable = 0;
+    }
+    lastTotal = total;
+    await sleep(400);
+  }
+  return harvestScreeningList();
+}
+
 // The data rows for the target org. Rows are clickable (<tr role="button">) and
 // carry no link/id, so navigation is by clicking the row; we track by index.
 function getFilteredScreeningRows() {
@@ -1138,7 +1165,7 @@ async function startScreeningScan(msg) {
 // row (rows are clickable <tr role="button"> with no link/id).
 async function beginScreeningWalk(scan) {
   await ensureScreeningList(12000);
-  const list = harvestScreeningList();
+  const list = await waitForScreeningListSettled(12000);
   scan.list = list;
   scan.total = list.length;
   scan.index = 0;
