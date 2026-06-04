@@ -685,6 +685,21 @@ async function publishContext(deep = false) {
   }
 }
 
+// Cases / screenings / eligibility are captured per-client. When the user
+// switches to a different client we must drop the previous client's data (both
+// the panel-facing results and any in-progress auto-walk state) so the tabs
+// don't show stale info from the prior client.
+function clearClientScopedData() {
+  chrome.storage.local.remove([
+    "uw_screenings",
+    "uw_eligibility",
+    "uw_cases",
+    "uw_scr_scan",
+    "uw_elig_scan",
+    "uw_case_scan",
+  ]);
+}
+
 // Publish the client_id quickly (before the slower full scrape) so the panel
 // can show the detected client immediately.
 function publishIdsOnly() {
@@ -692,6 +707,9 @@ function publishIdsOnly() {
   if (!ids.client_id) return;
   chrome.storage.local.get("uw_context", ({ uw_context }) => {
     if (uw_context && uw_context.client_id === ids.client_id) return;
+    // A different client (or first detection) -> purge the previous client's
+    // cases / screenings / eligibility before publishing the new context.
+    clearClientScopedData();
     chrome.storage.local.set({
       uw_context: {
         ...ids,

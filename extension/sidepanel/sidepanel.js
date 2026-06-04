@@ -2481,6 +2481,17 @@ function init() {
       if (clientChanged) {
         importStatus = { client: null };
         resetCrm();
+        // Drop the previous client's cases / screenings / eligibility so the
+        // tabs don't show stale data (the content script also clears storage).
+        screeningData = null;
+        eligibilityData = null;
+        caseData = null;
+        setScrStatus("", "");
+        setEligStatus("", "");
+        setCaseStatus("", "");
+        renderScreenings();
+        renderEligibility();
+        renderCases();
       }
       renderContext(currentContext);
       renderCrmStatus(currentContext);
@@ -2503,6 +2514,8 @@ function init() {
       } else if (d && d.status === "running") {
         const p = d.progress || { done: 0, total: 0 };
         setScrStatus("warn", `Walking ${p.done}/${p.total}\u2026`);
+      } else if (!d) {
+        setScrStatus("", "");
       }
       renderScreenings();
     }
@@ -2515,6 +2528,8 @@ function init() {
       } else if (d && d.status === "running") {
         const p = d.progress || { done: 0, total: 0 };
         setEligStatus("warn", `Walking ${p.done}/${p.total}\u2026`);
+      } else if (!d) {
+        setEligStatus("", "");
       }
       renderEligibility();
     }
@@ -2527,6 +2542,8 @@ function init() {
       } else if (d && d.status === "running") {
         const p = d.progress || { done: 0, total: 0 };
         setCaseStatus("warn", `Walking ${p.done}/${p.total}\u2026`);
+      } else if (!d) {
+        setCaseStatus("", "");
       }
       renderCases();
     }
