@@ -1130,6 +1130,24 @@ function renderScreeningAccordion(s, i) {
   return `<div class="acc${i === 0 ? " open" : ""}">${head}<div class="acc-body">${body}</div></div>`;
 }
 
+// Build an actionable empty-state for a data tab. If a scan already ran for this
+// client but captured nothing, guide the user to this tab's own Re-scan (it runs
+// on the settled page and is the most reliable). Otherwise show the generic hint.
+function emptyTabMessage(d, matchesClient, label) {
+  const ran = d && matchesClient && (d.status === "done" || d.finishedAt || d.note);
+  if (ran) {
+    return (
+      '<div class="empty-state">' +
+      `<p class="muted"><strong>No ${label} captured.</strong></p>` +
+      `<p class="muted">If you can see ${label} on the Unite Us page, click ` +
+      "<strong>Re-scan</strong> at the top of this tab to capture them directly " +
+      "(the full Profile reload can miss them when the list is still loading).</p>" +
+      "</div>"
+    );
+  }
+  return `<p class="muted">No ${label} captured yet. Open a Unite Us facesheet and click Re-scan.</p>`;
+}
+
 function renderScreenings() {
   const box = $("cmp-screening");
   if (!box) return;
@@ -1139,8 +1157,7 @@ function renderScreenings() {
     d && (!currentContext || !currentContext.client_id || d.clientId === currentContext.client_id);
 
   if (!d || !matchesClient || !d.screenings || !d.screenings.length) {
-    box.innerHTML =
-      '<p class="muted">No Met Council screenings captured yet. Open a Unite Us facesheet and click Re-scan.</p>';
+    box.innerHTML = emptyTabMessage(d, matchesClient, "Met Council screenings");
     return;
   }
   box.innerHTML = d.screenings.map((s, i) => renderScreeningAccordion(s, i)).join("");
@@ -1483,8 +1500,7 @@ function renderEligibility() {
     d && (!currentContext || !currentContext.client_id || d.clientId === currentContext.client_id);
 
   if (!d || !matchesClient || !d.eligibilities || !d.eligibilities.length) {
-    box.innerHTML =
-      '<p class="muted">No Met Council eligibility assessments captured yet. Open a Unite Us facesheet and click Re-scan.</p>';
+    box.innerHTML = emptyTabMessage(d, matchesClient, "Met Council eligibility assessments");
     updateEligSaveBtn();
     return;
   }
@@ -1783,8 +1799,7 @@ function renderCases() {
     d && (!currentContext || !currentContext.client_id || d.clientId === currentContext.client_id);
 
   if (!d || !matchesClient || !d.cases || !d.cases.length) {
-    box.innerHTML =
-      '<p class="muted">No Met Council cases captured yet. Open a Unite Us facesheet and click Re-scan.</p>';
+    box.innerHTML = emptyTabMessage(d, matchesClient, "Met Council cases");
     updateCaseSaveBtn();
     return;
   }
