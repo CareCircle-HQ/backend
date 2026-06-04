@@ -935,10 +935,14 @@ async function deepScrape() {
 const SCAN_MAX_MS = 5 * 60 * 1000; // give each auto-walk up to 5 min
 
 // Resolve once the given storage key reports the scan finished (status==="done").
-function waitForScanDone(key, timeoutMs) {
+// Also bails early when shouldAbort() turns true (e.g. the user switched client
+// or a newer scan started), so the caller's spinner can't get stuck waiting on a
+// scan that will never finish for the page we've since navigated away from.
+function waitForScanDone(key, timeoutMs, shouldAbort) {
   return new Promise((resolve) => {
     const deadline = Date.now() + timeoutMs;
     const check = async () => {
+      if (typeof shouldAbort === "function" && shouldAbort()) return resolve(false);
       const obj = (await chrome.storage.local.get(key))[key];
       if (obj && obj.status === "done") return resolve(true);
       if (Date.now() > deadline) return resolve(false);
@@ -951,7 +955,7 @@ function waitForScanDone(key, timeoutMs) {
 // Kick off one auto-walk (screening / eligibility / cases) and wait for it to
 // finish. Retries the start message because the tab may be mid-navigation when
 // the previous walk hands back control.
-async function runScanToCompletion(type) {
+async function runScanToCompletion(type, shouldAbort) {
   const map = {
     screening: { msg: "SCREENING_RESCRAPE", key: "uw_screenings", started: scanStarted, status: setScrStatus },
     eligibility: { msg: "ELIGIBILITY_RESCRAPE", key: "uw_eligibility", started: eligScanStarted, status: setEligStatus },
@@ -963,6 +967,7 @@ async function runScanToCompletion(type) {
   const startDeadline = Date.now() + 20000;
   let started = false;
   while (Date.now() < startDeadline && !started) {
+    if (typeof shouldAbort === "function" && shouldAbort()) return false;
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
     if (tab && tab.id != null && /app\.uniteus\.io/.test(tab.url || "")) {
       const sentAt = Date.now();
@@ -978,7 +983,7 @@ async function runScanToCompletion(type) {
     return false;
   }
   map.status("warn", "Walking\u2026 keep this tab open");
-  return waitForScanDone(map.key, SCAN_MAX_MS);
+  return waitForScanDone(map.key, SCAN_MAX_MS, shouldAbort);
 }
 
 // Grab everything: deep scrape + all three auto-walks. The walks navigate the
@@ -1009,11 +1014,11 @@ async function runFullScan() {
     if (stale()) return;
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
     if (tab && /app\.uniteus\.io/.test(tab.url || "")) {
-      await runScanToCompletion("screening");
+      await runScanToCompletion("screening", stale);
       if (stale()) return;
-      await runScanToCompletion("eligibility");
+      await runScanToCompletion("eligibility", stale);
       if (stale()) return;
-      await runScanToCompletion("cases");
+      await runScanToCompletion("cases", stale);
     }
   } catch (_) {
     // best-effort; per-tab reload buttons remain available
@@ -2283,6 +2288,11 @@ async function fetchCrm(cfg, clientId) {
       screening: scrRes.ok ? asList(await scrRes.json()) : [],
       eligibility: eligRes.ok ? asList(await eligRes.json()) : [],
     };
+    // Reflect CRM presence in the status table. A 404 here is expected (the
+    // client simply isn't imported yet) -> mark "not imported"; only leave the
+    // status untouched on transient errors (e.g. 5xx) so we don't show a false ❌.
+    if (clientRes.ok) importStatus.client = true;
+    else if (clientRes.status === 404) importStatus.client = false;
     backendRecords = {
       case: crm.case.map((c) => ({
         id: String(c.case_id),
