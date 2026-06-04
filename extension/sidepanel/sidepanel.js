@@ -248,9 +248,9 @@ function compareRow(label, captured, crm) {
   );
 }
 
-function compareTable(rows, capturedN, crmN, total) {
+function compareTable(rows, capturedN, crmN, total, opts = {}) {
   return (
-    `<table class="cmp-table">` +
+    `<table class="cmp-table${opts.noDot ? " no-dot" : ""}">` +
     `<thead><tr><th class="dot"></th><th>Field</th>` +
     `<th>Captured <span class="cnt">${capturedN}/${total}</span></th>` +
     `<th>CRM <span class="cnt">${crmN}/${total}</span></th></tr></thead>` +
@@ -262,7 +262,7 @@ function compareTable(rows, capturedN, crmN, total) {
 // capturedObj is the structured page-captured object keyed by field key/capKey;
 // when a field key is present there (even if ""), it is authoritative and we do
 // NOT fall back to fuzzy label matching (which can surface edit-mode garbage).
-function renderObjectSection(def, capturedObj, capturedPairs, crmObj) {
+function renderObjectSection(def, capturedObj, capturedPairs, crmObj, opts = {}) {
   const index = buildCapturedIndex(capturedPairs);
   capturedObj = capturedObj || {};
   let capN = 0;
@@ -277,7 +277,7 @@ function renderObjectSection(def, capturedObj, capturedPairs, crmObj) {
       return compareRow(f.label, cap, crm);
     })
     .join("");
-  return compareTable(rows, capN, crmN, def.fields.length);
+  return compareTable(rows, capN, crmN, def.fields.length, opts);
 }
 
 // Render a record-type section (cases/screenings/eligibility): union by id.
@@ -334,13 +334,13 @@ function renderRecordSection(def, type, ctx) {
 // page-captured records for that group (already filtered by the content script
 // per the workflow rules) and any matching CRM insurances, matched best-effort
 // by plan name. Falls back to a single empty schema table.
-function renderCoverageSection(ctx, group, def, crmList) {
+function renderCoverageSection(ctx, group, def, crmList, opts = {}) {
   const capList = (ctx && Array.isArray(ctx.insurance) ? ctx.insurance : []).filter(
     (c) => (c.group || "insurance") === group
   );
   crmList = crmList || [];
   if (!capList.length && !crmList.length) {
-    return renderObjectSection(def, {}, {}, null);
+    return renderObjectSection(def, {}, {}, null, opts);
   }
   const norm = (s) => String(s || "").trim().toLowerCase();
   const usedCap = new Set();
@@ -368,7 +368,7 @@ function renderCoverageSection(ctx, group, def, crmList) {
       return (
         `<div class="rec-block"><div class="rec-head">` +
         `<span class="rec-n">${escapeHtml(b.label)}</span> ${tags}</div>` +
-        renderObjectSection(def, b.capObj, {}, b.crmObj) +
+        renderObjectSection(def, b.capObj, {}, b.crmObj, opts) +
         `</div>`
       );
     })
@@ -675,7 +675,7 @@ function buildProfileHtml(ctx) {
   const addrPairs = { ...pairs, address: ctx.client_address || pairs["ADDRESS"] || "" };
   html += profileAccordion(
     SCHEMA.address.title,
-    renderObjectSection(SCHEMA.address, captured.address, addrPairs, addr),
+    renderObjectSection(SCHEMA.address, captured.address, addrPairs, addr, { noDot: true }),
     false
   );
 
@@ -695,12 +695,12 @@ function buildProfileHtml(ctx) {
   const crmIns = crmInsurances.filter((c) => !sccNames.has(norm(c.plan_name)));
   html += profileAccordion(
     SCHEMA.insurance.title,
-    renderCoverageSection(ctx, "insurance", SCHEMA.insurance, crmIns),
+    renderCoverageSection(ctx, "insurance", SCHEMA.insurance, crmIns, { noDot: true }),
     false
   );
   html += profileAccordion(
     SCHEMA.social_care_coverage.title,
-    renderCoverageSection(ctx, "social_care_coverage", SCHEMA.social_care_coverage, crmScc),
+    renderCoverageSection(ctx, "social_care_coverage", SCHEMA.social_care_coverage, crmScc, { noDot: true }),
     false
   );
   return html;
