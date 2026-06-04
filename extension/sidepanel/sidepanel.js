@@ -541,6 +541,49 @@ function bindSnapshotPull() {
   });
 }
 
+// ---- Consent gating -------------------------------------------------------
+// A client can only be worked once consent is Accepted. "Unknown" (not yet
+// captured), pending, declined, revoked and expired all count as "no consent".
+const NO_CONSENT_MSG =
+  "No consent on file \u2014 reload the Profile to capture consent first";
+
+function consentAccepted() {
+  const cap = currentContext && currentContext.captured && currentContext.captured.client;
+  return /accept/i.test((cap && cap.consent_status) || "");
+}
+
+// Without consent the ONLY allowed action is the Profile reload (so the user can
+// re-scan to pick up consent if it wasn't captured first time). Every other
+// reload + all save buttons are disabled. When consent is present we hand control
+// back to each feature's own enable logic.
+function refreshConsentGate() {
+  const ok = consentAccepted();
+  const rescanBtns = ["scrRescanBtn", "eligRescanBtn", "caseRescanBtn"];
+  if (!ok) {
+    [...rescanBtns, "scrSaveBtn", "eligSaveBtn", "caseSaveBtn", "saveBtn"].forEach((id) => {
+      const b = $(id);
+      if (b) {
+        b.disabled = true;
+        b.title = NO_CONSENT_MSG;
+      }
+    });
+  } else {
+    rescanBtns.forEach((id) => {
+      const b = $(id);
+      if (b) {
+        b.disabled = false;
+        b.title = "";
+      }
+    });
+    updateScrSaveBtn();
+    updateEligSaveBtn();
+    updateCaseSaveBtn();
+    const saveBtn = $("saveBtn");
+    if (saveBtn) saveBtn.disabled = !(currentContext && currentContext.client_id);
+  }
+  // The Profile reload buttons (rescanBtn / rescanBtn2) stay enabled regardless.
+}
+
 // Profile view = Client + Address + Insurance comparison.
 function buildProfileHtml(ctx) {
   const pairs = ctx.scraped || {};
@@ -625,6 +668,7 @@ function renderComparison(ctx) {
   if (saveBtn) saveBtn.disabled = empty;
   renderProfileMeta();
   bindSnapshotPull();
+  refreshConsentGate(); // disable everything but Profile reload when no consent
 }
 
 // This function is serialized and injected into the page by executeScript,
@@ -1145,6 +1189,20 @@ async function runFullScan() {
   try {
     await deepScrape();
     if (stale()) return;
+    // Consent gate: without consent there's nothing to work, so only the Profile
+    // is scraped and the other walks are skipped. Read uw_context straight from
+    // storage because the in-memory currentContext may not have caught the
+    // post-scrape update yet.
+    const { uw_context: fresh } = await chrome.storage.local.get("uw_context");
+    const cs =
+      fresh && fresh.captured && fresh.captured.client && fresh.captured.client.consent_status;
+    if (!/accept/i.test(cs || "")) {
+      const msg = "No consent \u2014 skipped";
+      setScrStatus("warn", msg);
+      setEligStatus("warn", msg);
+      setCaseStatus("warn", msg);
+      return;
+    }
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
     if (tab && /app\.uniteus\.io/.test(tab.url || "")) {
       await runScanToCompletion("screening", stale);
@@ -1310,8 +1368,11 @@ function renderScreenings() {
 function updateScrSaveBtn() {
   const btn = $("scrSaveBtn");
   if (!btn) return;
-  btn.disabled = !screeningsSaveable();
-  btn.title = btn.disabled
+  const ok = consentAccepted();
+  btn.disabled = !ok || !screeningsSaveable();
+  btn.title = !ok
+    ? NO_CONSENT_MSG
+    : btn.disabled
     ? "Re-scan to capture screenings before saving"
     : "Save screenings to the CRM (client must exist first)";
 }
@@ -1335,6 +1396,7 @@ async function scanStarted(sinceMs, timeout) {
 }
 
 async function scrRescan(ev) {
+  if (!consentAccepted()) return setScrStatus("warn", NO_CONSENT_MSG);
   const btn = (ev && ev.currentTarget) || $("scrRescanBtn");
   setBtnBusy(btn, true);
   setScrStatus("warn", "Starting\u2026");
@@ -1468,6 +1530,7 @@ async function buildScreeningPayloads(d, clientId) {
 }
 
 async function saveScreenings(ev) {
+  if (!consentAccepted()) return setScrStatus("warn", NO_CONSENT_MSG);
   const btn = (ev && ev.currentTarget) || $("scrSaveBtn");
   const ctx = currentContext;
   const d = screeningData;
@@ -1653,8 +1716,11 @@ function renderEligibility() {
 function updateEligSaveBtn() {
   const btn = $("eligSaveBtn");
   if (!btn) return;
-  btn.disabled = !eligibilitySaveable();
-  btn.title = btn.disabled
+  const ok = consentAccepted();
+  btn.disabled = !ok || !eligibilitySaveable();
+  btn.title = !ok
+    ? NO_CONSENT_MSG
+    : btn.disabled
     ? "Re-scan to capture eligibility assessments before saving"
     : "Save eligibility assessments to the CRM (client must exist first)";
 }
@@ -1677,6 +1743,7 @@ async function eligScanStarted(sinceMs, timeout) {
 }
 
 async function eligRescan(ev) {
+  if (!consentAccepted()) return setEligStatus("warn", NO_CONSENT_MSG);
   const btn = (ev && ev.currentTarget) || $("eligRescanBtn");
   setBtnBusy(btn, true);
   setEligStatus("warn", "Starting\u2026");
@@ -1760,6 +1827,7 @@ async function buildEligibilityPayloads(d, clientId) {
 }
 
 async function saveEligibility(ev) {
+  if (!consentAccepted()) return setEligStatus("warn", NO_CONSENT_MSG);
   const btn = (ev && ev.currentTarget) || $("eligSaveBtn");
   const ctx = currentContext;
   const d = eligibilityData;
@@ -1951,8 +2019,11 @@ function renderCases() {
 function updateCaseSaveBtn() {
   const btn = $("caseSaveBtn");
   if (!btn) return;
-  btn.disabled = !casesSaveable();
-  btn.title = btn.disabled
+  const ok = consentAccepted();
+  btn.disabled = !ok || !casesSaveable();
+  btn.title = !ok
+    ? NO_CONSENT_MSG
+    : btn.disabled
     ? "Re-scan to capture cases before saving"
     : "Save cases to the CRM (client must exist first)";
 }
@@ -1975,6 +2046,7 @@ async function caseScanStarted(sinceMs, timeout) {
 }
 
 async function caseRescan(ev) {
+  if (!consentAccepted()) return setCaseStatus("warn", NO_CONSENT_MSG);
   const btn = (ev && ev.currentTarget) || $("caseRescanBtn");
   setBtnBusy(btn, true);
   setCaseStatus("warn", "Starting\u2026");
@@ -2089,6 +2161,7 @@ function buildCasePayloads(d, clientId) {
 }
 
 async function saveCases(ev) {
+  if (!consentAccepted()) return setCaseStatus("warn", NO_CONSENT_MSG);
   const btn = (ev && ev.currentTarget) || $("caseSaveBtn");
   const ctx = currentContext;
   const d = caseData;
@@ -2309,6 +2382,7 @@ function setSaveStatus(state, message) {
 }
 
 async function saveClient(ev) {
+  if (!consentAccepted()) return setSaveStatus("warn", NO_CONSENT_MSG);
   const btn = (ev && ev.currentTarget) || $("saveBtn");
   const ctx = currentContext;
   if (!ctx || !ctx.client_id) {
