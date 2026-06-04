@@ -335,10 +335,16 @@ function renderRecordSection(def, type, ctx) {
 // per the workflow rules) and any matching CRM insurances, matched best-effort
 // by plan name. Falls back to a single empty schema table.
 function renderCoverageSection(ctx, group, def, crmList, opts = {}) {
+  // We capture every record (active + inactive) so the CRM can reconcile, but
+  // the profile only DISPLAYS active coverage (End Date >= today or no
+  // expiration). Captured records carry the active flag; CRM records are shown
+  // unless their status is inactive.
   const capList = (ctx && Array.isArray(ctx.insurance) ? ctx.insurance : []).filter(
-    (c) => (c.group || "insurance") === group
+    (c) => (c.group || "insurance") === group && c.active !== false
   );
-  crmList = crmList || [];
+  crmList = (crmList || []).filter(
+    (c) => String(c.status || "").toLowerCase() !== "inactive"
+  );
   if (!capList.length && !crmList.length) {
     return renderObjectSection(def, {}, {}, null, opts);
   }
