@@ -23,6 +23,7 @@ const DEFAULT_BACKEND = BAKED.backendUrl || "http://127.0.0.1:8000";
 const $ = (id) => document.getElementById(id);
 let currentContext = null;
 let isValidated = false;
+let autoScanTimer = null;
 const loadedFrames = new Set();
 
 // ---------- Config (transparent auth) ----------
@@ -980,28 +981,49 @@ async function runScanToCompletion(type) {
   return waitForScanDone(map.key, SCAN_MAX_MS);
 }
 
-// Profile reload = grab everything: deep scrape + all three auto-walks. The
-// walks navigate the tab, so they must run one after another, not concurrently.
-async function rescan(ev) {
-  const btn = (ev && ev.currentTarget) || $("rescanBtn");
-  const otherBtn = btn === $("rescanBtn") ? $("rescanBtn2") : $("rescanBtn");
-  setBtnBusy(btn, true);
-  setBtnBusy(otherBtn, true);
+// Grab everything: deep scrape + all three auto-walks. The walks navigate the
+// tab, so they must run one after another, not concurrently. A generation
+// counter lets a newer run (e.g. the user switched client mid-scan) cancel an
+// older one at the next checkpoint instead of scanning the wrong client.
+let scanGeneration = 0;
+
+async function runFullScan() {
+  const myGen = ++scanGeneration;
+  const targetClient = currentContext && currentContext.client_id;
+  if (!targetClient) return;
+  // Bail if a newer scan started or the user navigated to a different client.
+  const stale = () =>
+    myGen !== scanGeneration ||
+    !currentContext ||
+    currentContext.client_id !== targetClient;
+
+  setBtnBusy($("rescanBtn"), true);
+  setBtnBusy($("rescanBtn2"), true);
   try {
     await deepScrape();
+    if (stale()) return;
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-    const hasClient = currentContext && currentContext.client_id;
-    if (hasClient && tab && /app\.uniteus\.io/.test(tab.url || "")) {
+    if (tab && /app\.uniteus\.io/.test(tab.url || "")) {
       await runScanToCompletion("screening");
+      if (stale()) return;
       await runScanToCompletion("eligibility");
+      if (stale()) return;
       await runScanToCompletion("cases");
     }
   } catch (_) {
     // best-effort; per-tab reload buttons remain available
   } finally {
-    setBtnBusy(btn, false);
-    setBtnBusy(otherBtn, false);
+    // Only the latest run owns the buttons; don't un-busy a run still going.
+    if (myGen === scanGeneration) {
+      setBtnBusy($("rescanBtn"), false);
+      setBtnBusy($("rescanBtn2"), false);
+    }
   }
+}
+
+// Profile reload button handler.
+async function rescan() {
+  return runFullScan();
 }
 
 // ---------- Screenings tab (Met Council - SCN - PHS) ----------
@@ -2492,6 +2514,13 @@ function init() {
         renderScreenings();
         renderEligibility();
         renderCases();
+        // Auto-walk the new client's screenings / eligibility / cases. Debounced
+        // and delayed so the new facesheet has a moment to load, and so rapid
+        // A->B->C switches only scan the client we land on.
+        if (currentContext && currentContext.client_id) {
+          clearTimeout(autoScanTimer);
+          autoScanTimer = setTimeout(() => runFullScan(), 2000);
+        }
       }
       renderContext(currentContext);
       renderCrmStatus(currentContext);
