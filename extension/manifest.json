@@ -12,6 +12,7 @@
   "host_permissions": [
     "https://app.uniteus.io/*",
     "https://screenings-ingestion.uniteus.io/*",
+    "https://core.uniteus.io/*",
     "https://scnlp.metcouncil.org/*",
     "https://links.carecirclecs.com/*",
     "http://127.0.0.1:8000/*",

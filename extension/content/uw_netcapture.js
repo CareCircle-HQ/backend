@@ -1,16 +1,18 @@
 // MAIN-world shim injected at document_start on https://app.uniteus.io/*.
 //
-// Unite Us loads screening data from a separate API host
-// (screenings-ingestion.uniteus.io) using a short-lived Bearer token plus
-// x-employee-id / x-provider-id headers that only the page knows. This shim
-// wraps fetch + XMLHttpRequest so that whenever the page calls that host we
-// forward the auth headers (NOT the response body) to the isolated content
-// script via window.postMessage. The isolated script then makes its own direct
-// API calls to enumerate + fetch screenings without navigating the page.
+// Unite Us loads its data from separate API hosts (screenings-ingestion and
+// core.uniteus.io) using a short-lived Bearer token plus x-employee-id /
+// x-provider-id headers that only the page knows. This shim wraps fetch +
+// XMLHttpRequest so that whenever the page calls one of those hosts we forward
+// the auth headers (NOT the response body) to the isolated content script via
+// window.postMessage. The isolated script then makes its own direct API calls
+// (screenings, profile, insurance, etc.) without navigating the page.
 //
 // It never alters or blocks requests; it only observes the outgoing headers.
 (function () {
-  const HOST = "screenings-ingestion.uniteus.io";
+  const HOSTS = ["screenings-ingestion.uniteus.io", "core.uniteus.io"];
+  const matchHost = (url) =>
+    !!url && HOSTS.some((h) => url.indexOf(h) !== -1);
 
   function readHeader(headers, name) {
     if (!headers) return null;
@@ -60,7 +62,7 @@
           typeof input === "string"
             ? input
             : (input && input.url) || "";
-        if (url && url.indexOf(HOST) !== -1) {
+        if (matchHost(url)) {
           // Headers can live on the Request (input) or the init object.
           const initHeaders = init && init.headers;
           const reqHeaders = input && typeof input !== "string" && input.headers;
@@ -99,7 +101,7 @@
 
     XHR.prototype.send = function () {
       try {
-        if (this.__uw_url && String(this.__uw_url).indexOf(HOST) !== -1) {
+        if (matchHost(String(this.__uw_url || ""))) {
           const h = this.__uw_headers || {};
           emit(h["authorization"], h["x-employee-id"], h["x-provider-id"]);
         }

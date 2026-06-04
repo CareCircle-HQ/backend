@@ -690,6 +690,12 @@ async function publishContext(deep = false) {
     await restoreAccum(ids.client_id);
     const { pairs, records, captured } = await scrapePage(deep);
     mergeIntoAccum(ids.client_id, pairs, records, captured);
+    // Enrich with reliable core.uniteus.io API data (demographics, primary
+    // address, insurance + social care coverage). API values win over the DOM
+    // scrape for the fields they cover; the DOM scrape still supplies
+    // care_coordinator / languages / household / consent. Throttled internally;
+    // forced on deep scrapes (the Profile reload).
+    await maybeEnrichFromApi(ids.client_id, deep);
     persistAccum();
 
     const mergedPairs = accum.pairs;
@@ -1418,10 +1424,13 @@ window.addEventListener("message", (ev) => {
   if (ev.source !== window) return;
   const d = ev.data;
   if (!d || d.__uw_creds !== true || !d.auth) return;
+  // Different hosts send different headers (screenings carries x-provider-id,
+  // core carries only x-employee-id). Merge so we never drop an id captured
+  // from one host when a request to the other arrives.
   uuCreds = {
     bearer: d.auth,
-    employeeId: d.employeeId || "",
-    providerId: (d.providerId || "").toLowerCase(),
+    employeeId: d.employeeId || (uuCreds && uuCreds.employeeId) || "",
+    providerId: (d.providerId || (uuCreds && uuCreds.providerId) || "").toLowerCase(),
     ts: d.ts || Date.now(),
   };
   try {
@@ -1658,6 +1667,275 @@ async function startScreeningScan(msg) {
   }
 
   return startScreeningScanLegacy(msg, clientId);
+}
+
+// ---------------------------------------------------------------------------
+// Profile via the Unite Us core API (core.uniteus.io). Enriches the captured
+// client / address / insurance data with reliable JSON:API records instead of
+// the fragile DOM scrape. Runs alongside the DOM scrape: the API wins for the
+// fields it provides (demographics, primary address, insurance + social care
+// coverage), while the DOM scrape still supplies care_coordinator, preferred
+// languages, household size and consent (their core endpoints aren't wired yet).
+// ---------------------------------------------------------------------------
+const CORE_API = "https://core.uniteus.io/v1";
+const MEDICAL_PLAN_TYPES = "commercial,medicare,medicaid,tricare";
+let lastApiEnrich = { clientId: null, at: 0 };
+
+// Unite Us stores demographics as machine codes; the CRM/profile UI expect
+// human-readable labels (matching what the DOM scrape produced). Unknown codes
+// fall back to a title-cased version of the code.
+const RACE_LABELS = {
+  "american-indian-alaska-native": "American Indian/Alaska Native",
+  "asian": "Asian",
+  "black-african-american": "Black/African American",
+  "hispanic-latino": "Hispanic/Latino",
+  "native-hawaiian-other-pacific-islander": "Native Hawaiian/Other Pacific Islander",
+  "white": "White",
+  "multiracial": "Multiracial",
+  "other": "Other",
+  "declined": "Declined to answer",
+  "unknown": "Unknown",
+};
+const ETHNICITY_LABELS = {
+  "hispanic-or-latino": "Hispanic or Latino",
+  "not-hispanic-or-latino": "Not Hispanic or Latino",
+  "declined": "Declined to answer",
+  "unknown": "Unknown",
+};
+const SEXUALITY_LABELS = {
+  "straight-or-heterosexual": "Straight or Heterosexual",
+  "gay-or-lesbian": "Gay or Lesbian",
+  "lesbian": "Lesbian",
+  "gay": "Gay",
+  "bisexual": "Bisexual",
+  "queer": "Queer",
+  "questioning": "Questioning",
+  "pansexual": "Pansexual",
+  "asexual": "Asexual",
+  "other": "Other",
+  "declined": "Declined to answer",
+  "unknown": "Unknown",
+};
+const GENDER_LABELS = {
+  "male": "Male",
+  "female": "Female",
+  "nonbinary": "Non-binary",
+  "transgender": "Transgender",
+  "other": "Other",
+  "declined": "Declined to answer",
+  "unknown": "Unknown",
+};
+const MARITAL_LABELS = {
+  "single/never-married": "Single",
+  "single": "Single",
+  "married": "Married",
+  "partnered": "Partnered",
+  "separated": "Separated",
+  "divorced": "Divorced",
+  "widowed": "Widowed",
+  "unknown": "Unknown",
+};
+const PHONE_TYPE_LABELS = { mobile: "Mobile", home: "Home", work: "Work" };
+
+function titleizeCode(code) {
+  return String(code || "")
+    .replace(/[-/_]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .replace(/\b\w/g, (c) => c.toUpperCase());
+}
+function labelFor(map, code) {
+  if (!code) return "";
+  const key = String(code).toLowerCase();
+  return map[key] || titleizeCode(code);
+}
+
+function coreHeaders(creds) {
+  const h = { accept: "application/json", authorization: creds.bearer };
+  if (creds.employeeId) h["x-employee-id"] = creds.employeeId;
+  if (creds.providerId) h["x-provider-id"] = creds.providerId;
+  return h;
+}
+
+async function coreGet(path, creds) {
+  const res = await fetch(`${CORE_API}${path}`, {
+    headers: coreHeaders(creds),
+    credentials: "omit",
+  });
+  if (!res.ok) throw new Error(`core ${path.split("?")[0]} ${res.status}`);
+  return res.json();
+}
+
+// Resolve a list of plan ids to { id -> name } via the batched plans endpoint.
+async function coreGetPlanNames(planIds, creds) {
+  const ids = [...new Set(planIds.filter(Boolean))];
+  const names = {};
+  if (!ids.length) return names;
+  const body = await coreGet(
+    `/plans?filter[id]=${ids.join(",")}&page[number]=1&page[size]=${ids.length}`,
+    creds
+  );
+  for (const p of body.data || []) {
+    if (p && p.id) names[p.id] = (p.attributes && p.attributes.name) || "";
+  }
+  return names;
+}
+
+// 9999 sentinel / future / no-expiry means coverage is still in force.
+function coverageCurrent(expiredAt) {
+  if (!expiredAt) return true;
+  if (/\b9999\b/.test(expiredAt)) return true;
+  const d = new Date(expiredAt);
+  if (isNaN(d.getTime())) return false;
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  return d >= today;
+}
+
+const isoToDate = (s) => (s ? String(s).slice(0, 10) : "");
+
+// Map insurance records (medical or social) to the captured coverage shape,
+// keeping only currently-in-force records (the API returns full month-by-month
+// history; the profile only shows active coverage).
+function mapInsuranceRecords(records, group, planNames) {
+  const out = [];
+  for (const r of records) {
+    const a = r.attributes || {};
+    const current = coverageCurrent(a.expired_at);
+    const enrolled =
+      group === "social_care_coverage"
+        ? String(a.insurance_status || "").toLowerCase() === "enrolled"
+        : true;
+    if (!current || !enrolled) continue;
+    const planId = r.relationships && r.relationships.plan && r.relationships.plan.data && r.relationships.plan.data.id;
+    const planName = planNames[planId] || "";
+    if (!planName) continue; // CRM keys coverage on plan_name
+    out.push({
+      group,
+      plan_name: planName,
+      member_id: a.external_member_id || "",
+      group_id: a.external_group_id || "",
+      start_date: isoToDate(a.enrolled_at),
+      end_date: isoToDate(a.expired_at),
+      status: a.insurance_status || a.state || "",
+      active: true,
+    });
+  }
+  return out;
+}
+
+function mapPersonToClient(data) {
+  const a = (data && data.attributes) || {};
+  const c = {};
+  const set = (k, v) => { if (v) c[k] = v; };
+  set("first_name", a.first_name);
+  set("last_name", a.last_name);
+  set("middle_name", a.middle_name);
+  set("suffix", a.suffix);
+  set("date_of_birth", isoToDate(a.date_of_birth));
+  set("citizenship", a.citizenship ? titleizeCode(a.citizenship) : "");
+  set("race", a.race ? labelFor(RACE_LABELS, a.race) : "");
+  set("ethnicity", a.ethnicity ? labelFor(ETHNICITY_LABELS, a.ethnicity) : "");
+  set("gender", a.gender ? labelFor(GENDER_LABELS, a.gender) : "");
+  set("marital_status", a.marital_status ? labelFor(MARITAL_LABELS, a.marital_status) : "");
+  if (Array.isArray(a.sexuality) && a.sexuality.length) {
+    set("sexuality", a.sexuality.map((s) => labelFor(SEXUALITY_LABELS, s)).join(", "));
+  }
+  set("sexuality_other", a.sexuality_other);
+  set("gross_monthly_income", a.gross_monthly_income != null ? String(a.gross_monthly_income) : "");
+
+  const phone = (a.phone_numbers || []).find((p) => p.is_primary) || (a.phone_numbers || [])[0];
+  if (phone) {
+    set("client_phone_number", phone.phone_number);
+    set("phone_type", phone.phone_type ? labelFor(PHONE_TYPE_LABELS, phone.phone_type) : "");
+  }
+  const email = (a.email_addresses || []).find((e) => e.is_primary) || (a.email_addresses || [])[0];
+  if (email) set("client_email_address", email.email_address);
+  return c;
+}
+
+function mapPrimaryAddress(included) {
+  const addrs = (included || []).filter((x) => x.type === "address");
+  if (!addrs.length) return null;
+  const a = (addrs.find((x) => x.attributes && x.attributes.is_primary) || addrs[0]).attributes || {};
+  return {
+    address_type: cleanText(a.address_type || ""),
+    line1: cleanText(a.line_1 || ""),
+    line2: cleanText(a.line_2 || ""),
+    city: cleanText(a.city || ""),
+    county: cleanText(a.county || ""),
+    state: cleanText(a.state || ""),
+    postal_code: cleanText(a.postal_code || ""),
+  };
+}
+
+// Pull the profile from the core API and shape it like harvestProfile()'s
+// output. Returns null when no creds are available yet.
+async function enrichCapturedFromApi(clientId) {
+  const creds = await getUuCreds();
+  if (!creds) return null;
+
+  const person = await coreGet(`/people/${clientId}?include=addresses`, creds);
+  const client = mapPersonToClient(person.data);
+  const address = mapPrimaryAddress(person.included);
+
+  let insurance = [];
+  try {
+    const base = `/insurances?filter[person]=${clientId}&filter[state]=active,pending,inactive`;
+    const [med, soc] = await Promise.all([
+      coreGet(`${base}&filter[plan.plan_type]=${MEDICAL_PLAN_TYPES}`, creds),
+      coreGet(`${base}&filter[plan.plan_type]=social`, creds),
+    ]);
+    const medRecs = med.data || [];
+    const socRecs = soc.data || [];
+    const planIds = [...medRecs, ...socRecs]
+      .map((r) => r.relationships && r.relationships.plan && r.relationships.plan.data && r.relationships.plan.data.id)
+      .filter(Boolean);
+    const planNames = await coreGetPlanNames(planIds, creds);
+    insurance = [
+      ...mapInsuranceRecords(medRecs, "insurance", planNames),
+      ...mapInsuranceRecords(socRecs, "social_care_coverage", planNames),
+    ];
+  } catch (e) {
+    console.warn("[uw-prof] insurance fetch failed:", e);
+    return { client, address, insurance: null };
+  }
+  return { client, address, insurance, coverage_scraped: true };
+}
+
+// Merge API results into the accumulator. API values WIN for the fields it
+// provides; coverage is authoritative (replaces the DOM card scrape).
+function mergeApiCaptured(api) {
+  if (!api) return;
+  const dst = accum.captured.client || (accum.captured.client = {});
+  for (const [k, v] of Object.entries(api.client || {})) if (v) dst[k] = v;
+
+  if (api.address && (api.address.line1 || api.address.city || api.address.postal_code)) {
+    accum.captured.address = { ...(accum.captured.address || {}), ...api.address };
+  }
+  if (Array.isArray(api.insurance)) {
+    accum.insurance = api.insurance;
+    accum.coverageScraped = true;
+  }
+}
+
+// Best-effort: enrich the current client's captured data from the core API.
+// Throttled so the repeated light scrapes don't hammer the API.
+async function maybeEnrichFromApi(clientId, force) {
+  if (!clientId) return;
+  const fresh =
+    lastApiEnrich.clientId === clientId &&
+    Date.now() - lastApiEnrich.at < 120000;
+  if (fresh && !force) return;
+  try {
+    const api = await enrichCapturedFromApi(clientId);
+    if (api) {
+      mergeApiCaptured(api);
+      lastApiEnrich = { clientId, at: Date.now() };
+    }
+  } catch (e) {
+    console.warn("[uw-prof] API enrich failed:", e);
+  }
 }
 
 // ---------------------------------------------------------------------------
