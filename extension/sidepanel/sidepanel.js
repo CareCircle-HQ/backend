@@ -364,7 +364,10 @@ function renderCoverageSection(ctx, group, def, crmList, opts = {}) {
     .map((b) => {
       const tags =
         (b.capObj && Object.keys(b.capObj).length ? '<span class="tag det">Detected</span>' : "") +
-        (b.crmObj ? '<span class="tag imp">In CRM</span>' : "");
+        (b.crmObj ? '<span class="tag imp">In CRM</span>' : "") +
+        (b.capObj && b.capObj.active === false
+          ? '<span class="tag inactive">Inactive</span>'
+          : "");
       return (
         `<div class="rec-block"><div class="rec-head">` +
         `<span class="rec-n">${escapeHtml(b.label)}</span> ${tags}</div>` +
@@ -2421,7 +2424,11 @@ function buildClientPayload(ctx) {
   if (a.line1 || a.city || a.postal_code) payload.addresses = [a];
 
   // Insurance + Social Care Coverage both persist to the CRM Insurance table
-  // (the only coverage model). Map capKey -> field.
+  // (the only coverage model). Map capKey -> field. We send EVERY captured
+  // record (active and inactive) with an explicit status so the CRM mirrors
+  // Unite Us, and -- when the coverage sections were actually on the page --
+  // flag the payload as authoritative so the backend deactivates any stored
+  // policy that is no longer present in Unite Us.
   const ins = (Array.isArray(ctx.insurance) ? ctx.insurance : [])
     .filter((c) => c.plan_name)
     .map((c) => {
@@ -2432,11 +2439,21 @@ function buildClientPayload(ctx) {
       if (en) o.enrolled_at = en;
       const ex = toIsoDateTime(c.end_date);
       if (ex) o.expired_at = ex;
-      const st = toEnum(c.status, ENUMS.coverage_status);
-      if (st) o.status = st;
+      // active flag is authoritative; fall back to the captured status text.
+      o.status =
+        c.active === true
+          ? "active"
+          : c.active === false
+          ? "inactive"
+          : toEnum(c.status, ENUMS.coverage_status) || "active";
       return o;
     });
-  if (ins.length) payload.insurances = ins;
+  if (ctx.coverage_scraped) {
+    payload.insurances = ins; // authoritative list (may be empty)
+    payload.reconcile_insurances = true;
+  } else if (ins.length) {
+    payload.insurances = ins; // non-authoritative: fill only, never deactivate
+  }
 
   return payload;
 }

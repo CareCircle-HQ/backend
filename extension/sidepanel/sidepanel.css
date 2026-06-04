@@ -426,6 +426,7 @@ tr.cmp.cap-only { background: #eff6ff; }
 }
 .tag.det { background: #eff6ff; color: var(--primary); }
 .tag.imp { background: #dcfce7; color: var(--ok); }
+.tag.inactive { background: #fef2f2; color: #dc2626; }
 
 textarea.diag {
   width: 100%;

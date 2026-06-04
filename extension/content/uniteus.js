@@ -344,7 +344,12 @@ function harvestProfile() {
     }
   }
 
-  return { client, address, insurance: harvestInsurance() };
+  return {
+    client,
+    address,
+    insurance: harvestInsurance(),
+    coverage_scraped: coverageSectionsPresent(),
+  };
 }
 
 // Insurance Information + Social Care Coverage. Each saved record renders as a
@@ -353,9 +358,12 @@ function harvestProfile() {
 //   - Social Care Coverage: div[data-testid="social-insurance-profile-view"]
 // Plan Name / Start Date / End Date have value-level testids; Member ID and
 // Group ID are label <p> + value <p> pairs; SCC Status is its own testid.
-// We keep only the records the workflow cares about:
-//   - Insurance:            End Date >= today OR "--" (no expiration).
-//   - Social Care Coverage: Status == Enrolled AND (End Date >= today OR "--").
+// We capture EVERY record (so the CRM can reconcile active/inactive on save) and
+// tag each with an `active` flag:
+//   - Insurance:            active = End Date >= today OR no expiration.
+//   - Social Care Coverage: active = Status == Enrolled AND End Date >= today.
+// "No expiration" = "--" (placeholder) or a far-future date like 12/31/9999
+// (year 9999 is Unite Us's sentinel for "never expires").
 function harvestInsurance() {
   const out = [];
   const today = new Date();
@@ -364,6 +372,7 @@ function harvestInsurance() {
   const endDateOk = (raw) => {
     const v = cleanText(raw);
     if (!v || v === "--") return true; // no expiration
+    if (/\b9999\b/.test(v)) return true; // 12/31/9999 sentinel = never expires
     const d = new Date(v);
     return isNaN(d.getTime()) ? false : d >= today;
   };
@@ -398,7 +407,7 @@ function harvestInsurance() {
     return "";
   };
 
-  // Insurance records.
+  // Insurance records: active when the end date hasn't passed.
   [...document.querySelectorAll('[data-testid="payments-profile-view"]')].forEach(
     (root) => {
       const rec = {
@@ -410,11 +419,14 @@ function harvestInsurance() {
         end_date: valOf(root, "insPlanEndDateValue"),
         status: "",
       };
-      if (rec.plan_name && endDateOk(rec.end_date)) out.push(rec);
+      if (rec.plan_name) {
+        rec.active = endDateOk(rec.end_date);
+        out.push(rec);
+      }
     }
   );
 
-  // Social Care Coverage records.
+  // Social Care Coverage records: active when Enrolled AND not expired.
   [...document.querySelectorAll('[data-testid="social-insurance-profile-view"]')].forEach(
     (root) => {
       const rec = {
@@ -426,13 +438,31 @@ function harvestInsurance() {
         end_date: valOf(root, "sccPlanEndDateValue"),
         status: valOf(root, "sccEnrollStatus"),
       };
-      if (rec.plan_name && /^enrolled$/i.test(rec.status) && endDateOk(rec.end_date)) {
+      if (rec.plan_name) {
+        rec.active = /^enrolled$/i.test(rec.status) && endDateOk(rec.end_date);
         out.push(rec);
       }
     }
   );
 
   return out;
+}
+
+// True when the profile page's coverage sections are actually present (even if a
+// client has zero policies). Used as the authoritative-reconcile guard so we
+// never deactivate a client's stored insurances off a page that didn't load the
+// coverage sections.
+function coverageSectionsPresent() {
+  if (
+    document.querySelector(
+      '[data-testid="payments-profile-view"], [data-testid="social-insurance-profile-view"]'
+    )
+  ) {
+    return true;
+  }
+  return [...document.querySelectorAll("h1,h2,h3,h4,h5")].some((el) =>
+    /insurance information|social care coverage/i.test(cleanText(el.textContent))
+  );
 }
 
 // Light scrape harvests whatever is currently visible (Overview header gives
@@ -559,14 +589,14 @@ let lastPublished = null;
 // far for the SAME client_id, so the comparison shows the full picture instead
 // of only what's visible on the current page. It is reset when the client_id
 // changes and persisted to storage so it survives a full page reload.
-let accum = { clientId: null, pairs: {}, records: new Map(), captured: { client: {}, address: {} }, insurance: [] };
+let accum = { clientId: null, pairs: {}, records: new Map(), captured: { client: {}, address: {} }, insurance: [], coverageScraped: false };
 
 function recordKey(r) {
   return `${r.type}:${r.id || r.summary || ""}`;
 }
 
 function resetAccum(clientId) {
-  accum = { clientId, pairs: {}, records: new Map(), captured: { client: {}, address: {} }, insurance: [] };
+  accum = { clientId, pairs: {}, records: new Map(), captured: { client: {}, address: {} }, insurance: [], coverageScraped: false };
 }
 
 // Merge a fresh scrape into the accumulator without clobbering existing data.
@@ -601,7 +631,13 @@ function mergeIntoAccum(clientId, pairs, records, captured) {
         else if (!(k in dst)) dst[k] = "";
       }
     });
-    if (Array.isArray(captured.insurance) && captured.insurance.length) {
+    // When the coverage sections were actually on the page, take that scrape's
+    // full coverage list as authoritative (even when empty -- all policies may
+    // have been removed). Otherwise keep whatever a prior profile scrape found.
+    if (captured.coverage_scraped) {
+      accum.insurance = Array.isArray(captured.insurance) ? captured.insurance : [];
+      accum.coverageScraped = true;
+    } else if (Array.isArray(captured.insurance) && captured.insurance.length) {
       accum.insurance = captured.insurance;
     }
   }
@@ -615,6 +651,7 @@ function persistAccum() {
       records: [...accum.records.values()],
       captured: accum.captured,
       insurance: accum.insurance,
+      coverageScraped: accum.coverageScraped,
     },
   });
 }
@@ -632,6 +669,7 @@ async function restoreAccum(clientId) {
         records: new Map((uw_accum.records || []).map((r) => [recordKey(r), r])),
         captured: uw_accum.captured || { client: {}, address: {} },
         insurance: uw_accum.insurance || [],
+        coverageScraped: !!uw_accum.coverageScraped,
       };
       return;
     }
@@ -670,6 +708,7 @@ async function publishContext(deep = false) {
       scraped_count: Object.keys(mergedPairs).length,
       captured: accum.captured,
       insurance: accum.insurance,
+      coverage_scraped: accum.coverageScraped,
       source_url: location.href,
       captured_at: new Date().toISOString(),
     };

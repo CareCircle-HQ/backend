@@ -19,6 +19,7 @@ from .models import (
     Provider,
     Question,
     QuestionOption,
+    RecordStatus,
     ScreenTemplate,
     Screening,
     ServiceType,
@@ -210,6 +211,12 @@ class ClientSerializer(serializers.ModelSerializer):
         addresses = validated_data.pop("addresses", None)
         insurances = validated_data.pop("insurances", None)
         client_id = validated_data.pop("client_id")
+        # Non-model flag (ignored by the serializer fields) read from raw input:
+        # when set, the incoming insurance list is treated as authoritative and
+        # any stored policy missing from it is deactivated.
+        reconcile = bool(
+            getattr(self, "initial_data", {}).get("reconcile_insurances")
+        )
 
         client, _ = Client.objects.update_or_create(
             client_id=client_id, defaults=validated_data
@@ -229,22 +236,37 @@ class ClientSerializer(serializers.ModelSerializer):
                 )
 
         if insurances is not None:
+            seen_pks = []
             for ins in insurances:
                 key = ins.get("insurance_id")
                 if key:
-                    Insurance.objects.update_or_create(
+                    obj, _ = Insurance.objects.update_or_create(
                         client=client, insurance_id=key, defaults=ins
                     )
                 else:
                     # No external insurance_id (e.g. records scraped from the
                     # Unite Us page): dedupe by plan + member id so repeated
                     # syncs update the same row instead of creating duplicates.
-                    Insurance.objects.update_or_create(
+                    obj, _ = Insurance.objects.update_or_create(
                         client=client,
                         plan_name=ins.get("plan_name", ""),
                         external_member_id=ins.get("external_member_id", ""),
                         defaults=ins,
                     )
+                seen_pks.append(obj.pk)
+
+            # Authoritative reconcile: a policy stored on the client but absent
+            # from this (Unite Us-sourced) payload is no longer in the source, so
+            # mark it inactive instead of deleting it (preserves history and
+            # expired_at). Manually-verified rows are left untouched. Gated on the
+            # explicit flag so an ordinary/partial sync never deactivates records.
+            if reconcile:
+                (
+                    Insurance.objects.filter(client=client)
+                    .exclude(pk__in=seen_pks)
+                    .exclude(verified=True)
+                    .update(status=RecordStatus.INACTIVE)
+                )
 
         return client
 
