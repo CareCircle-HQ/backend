@@ -131,11 +131,15 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
   background: var(--card, rgba(148, 163, 184, 0.06));
 }
 .snap-h { font-weight: 600; font-size: 12px; text-transform: uppercase; letter-spacing: 0.04em; color: var(--muted); margin-bottom: 6px; }
-.snap-row { display: flex; justify-content: space-between; align-items: center; gap: 10px; padding: 4px 0; border-top: 1px solid var(--border, #e2e8f0); }
+.snap-row { display: flex; align-items: center; gap: 10px; padding: 4px 0; border-top: 1px solid var(--border, #e2e8f0); }
 .snap-row:first-of-type { border-top: none; }
-.snap-k { color: var(--muted); flex: 0 0 auto; }
-.snap-v { text-align: right; display: inline-flex; align-items: center; gap: 6px; flex-wrap: wrap; justify-content: flex-end; }
+.snap-k { color: var(--muted); flex: 0 0 38%; }
+.snap-v { flex: 1 1 auto; text-align: right; display: inline-flex; align-items: center; gap: 6px; flex-wrap: wrap; justify-content: flex-end; }
 .snap-v.miss { color: var(--danger, #dc2626); }
+.snap-s { flex: 0 0 auto; width: 16px; text-align: center; }
+.snap-mark { font-weight: 700; font-size: 14px; }
+.snap-mark.ok { color: #16a34a; }
+.snap-mark.bad { color: #dc2626; }
 .snap-pull {
   font-size: 11px;
   line-height: 1;

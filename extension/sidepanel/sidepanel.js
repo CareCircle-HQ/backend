@@ -423,6 +423,21 @@ function parseDateMaybe(s) {
   return isNaN(t) ? null : t;
 }
 
+// True when the (parseable) date is within the last `months` months.
+function withinMonths(dateStr, months) {
+  const t = parseDateMaybe(dateStr);
+  if (t == null) return false;
+  const cutoff = new Date();
+  cutoff.setMonth(cutoff.getMonth() - months);
+  return t >= cutoff.getTime();
+}
+
+// Short locale date; em dash when empty/unparseable.
+function fmtDate(s) {
+  const t = parseDateMaybe(s);
+  return t == null ? s || "\u2014" : new Date(t).toLocaleDateString();
+}
+
 // Most recent date among rows; falls back to the first non-empty raw string when
 // the dates aren't parseable.
 function latestDateStr(rows, getDate) {
@@ -480,42 +495,79 @@ function buildSnapshotHtml(ctx) {
   const cd = snapDataFor(caseData, clientId);
   const cases = (cd && cd.cases) || [];
   const caseLast = latestDateStr(cases, (c) => c.date_opened);
-  const caseStatuses = [
-    ...new Set(cases.map((c) => (c.detail && c.detail.status) || c.status).filter(Boolean)),
-  ];
+  const caseStatus = (c) => (c.detail && c.detail.status) || c.status || "";
+  const openCases = cases.filter((c) => /open|active|authorized/i.test(caseStatus(c))).length;
+  const closedCases = cases.filter((c) => /close|complete|resolved/i.test(caseStatus(c))).length;
 
+  // CRM presence (from the backend lookup) + when the record was added.
+  const crmClient = crm && crm.client;
+  const crmExists = !!crmClient;
+  const crmAdded = crmClient && (crmClient.created_at || crmClient.updated_at);
+
+  // Status rule: green when at least one record's most-recent date is <= 6 months
+  // old (and there is at least one record); red otherwise.
+  const recentOk = (rows, last) => rows.length > 0 && withinMonths(last, 6);
+
+  const mark = (ok) =>
+    ok
+      ? '<span class="snap-mark ok" title="OK">\u2713</span>'
+      : '<span class="snap-mark bad" title="Needs attention">\u2717</span>';
   const repull = (key) =>
     `<button class="snap-pull" data-pull="${key}" title="Re-pull">\u21bb</button>`;
-  const row = (label, valueHtml, key, missing) => {
-    const v = missing
-      ? `<span class="snap-v miss">Not captured <button class="snap-pull" data-pull="${key}">Pull</button></span>`
-      : `<span class="snap-v">${valueHtml} ${repull(key)}</span>`;
-    return `<div class="snap-row"><span class="snap-k">${label}</span>${v}</div>`;
+  const row = (label, valueHtml, key, missing, status) => {
+    let v;
+    if (missing) {
+      v = key
+        ? `<span class="snap-v miss">Not captured <button class="snap-pull" data-pull="${key}">Pull</button></span>`
+        : '<span class="snap-v miss">Not captured</span>';
+    } else {
+      v = `<span class="snap-v">${valueHtml}${key ? " " + repull(key) : ""}</span>`;
+    }
+    const s = status == null ? "" : mark(status);
+    return (
+      `<div class="snap-row"><span class="snap-k">${label}</span>${v}` +
+      `<span class="snap-s">${s}</span></div>`
+    );
   };
 
   const dash = "\u2014";
   let html = '<div class="snapshot"><div class="snap-h">Client Snapshot</div>';
-  html += row("Consent", escapeHtml(consentStr), "consent", !consentStr);
+  html += row(
+    "Consent",
+    escapeHtml(consentStr),
+    "consent",
+    !consentStr,
+    /accept/i.test(cap.consent_status || "")
+  );
   html += row(
     "Met Council Screenings",
     `<strong>${screenings.length}</strong> \u00b7 last ${escapeHtml(scrLast || dash)}` +
       (scrMin ? ` \u00b7 ${scrMin} min total` : ""),
     "screening",
-    !sd
+    !sd,
+    recentOk(screenings, scrLast)
   );
   html += row(
     "Met Council Eligibility",
     `<strong>${eligs.length}</strong> \u00b7 last ${escapeHtml(eligLast || dash)}`,
     "eligibility",
-    !ed
+    !ed,
+    recentOk(eligs, eligLast)
   );
   html += row(
     "Met Council Cases",
-    `<strong>${cases.length}</strong>` +
-      (caseStatuses.length ? ` \u00b7 ${escapeHtml(caseStatuses.join(", "))}` : "") +
+    `<strong>${cases.length}</strong> (${openCases} open, ${closedCases} closed)` +
       ` \u00b7 last ${escapeHtml(caseLast || dash)}`,
     "cases",
-    !cd
+    !cd,
+    recentOk(cases, caseLast)
+  );
+  html += row(
+    "In CRM",
+    crmExists ? `Yes \u00b7 added ${escapeHtml(fmtDate(crmAdded))}` : "Not in CRM",
+    null,
+    false,
+    crmExists
   );
   html += "</div>";
   return html;
