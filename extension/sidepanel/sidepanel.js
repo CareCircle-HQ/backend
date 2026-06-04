@@ -2514,12 +2514,12 @@ function init() {
         renderScreenings();
         renderEligibility();
         renderCases();
-        // Auto-walk the new client's screenings / eligibility / cases. Debounced
-        // and delayed so the new facesheet has a moment to load, and so rapid
-        // A->B->C switches only scan the client we land on.
+        // Auto-reload ONLY the Profile tab for the new client (deep scrape).
+        // Screenings / eligibility / cases stay cleared until the user reloads
+        // them on demand. Debounced + delayed so the facesheet can load first.
         if (currentContext && currentContext.client_id) {
           clearTimeout(autoScanTimer);
-          autoScanTimer = setTimeout(() => runFullScan(), 2000);
+          autoScanTimer = setTimeout(() => deepScrape(), 2000);
         }
       }
       renderContext(currentContext);
