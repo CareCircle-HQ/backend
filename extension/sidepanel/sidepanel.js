@@ -371,7 +371,7 @@ function renderCoverageSection(ctx, group, def, crmList, opts = {}) {
       // "Verify Insurance" clicks the native Unite Us link on the matching card.
       // Only offered for active insurance-group records (SCC has no verify link).
       const canVerify =
-        b.capObj && group === "insurance" && b.capObj.active && b.capObj.plan_name;
+        b.capObj && group === "insurance" && b.capObj.active !== false && b.capObj.plan_name;
       const verify = canVerify
         ? `<button class="verify-ins" data-plan="${escapeHtml(b.capObj.plan_name)}"` +
           ` data-member="${escapeHtml(b.capObj.member_id || "")}"` +
