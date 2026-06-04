@@ -986,11 +986,16 @@ async function runScanToCompletion(type) {
 // counter lets a newer run (e.g. the user switched client mid-scan) cancel an
 // older one at the next checkpoint instead of scanning the wrong client.
 let scanGeneration = 0;
+let fullScanRunning = false;
 
 async function runFullScan() {
   const myGen = ++scanGeneration;
   const targetClient = currentContext && currentContext.client_id;
   if (!targetClient) return;
+  // Cancel any pending auto profile-reload so it can't fire mid-walk and derail
+  // a scan (the walks navigate the page; a stray deep scrape clicks tabs).
+  clearTimeout(autoScanTimer);
+  fullScanRunning = true;
   // Bail if a newer scan started or the user navigated to a different client.
   const stale = () =>
     myGen !== scanGeneration ||
@@ -1015,6 +1020,7 @@ async function runFullScan() {
   } finally {
     // Only the latest run owns the buttons; don't un-busy a run still going.
     if (myGen === scanGeneration) {
+      fullScanRunning = false;
       setBtnBusy($("rescanBtn"), false);
       setBtnBusy($("rescanBtn2"), false);
     }
@@ -2519,7 +2525,9 @@ function init() {
         // them on demand. Debounced + delayed so the facesheet can load first.
         if (currentContext && currentContext.client_id) {
           clearTimeout(autoScanTimer);
-          autoScanTimer = setTimeout(() => deepScrape(), 2000);
+          autoScanTimer = setTimeout(() => {
+            if (!fullScanRunning) deepScrape();
+          }, 2000);
         }
       }
       renderContext(currentContext);
