@@ -407,13 +407,11 @@ function harvestInsurance() {
     return "";
   };
 
-  // Insurance records: active when the end date hasn't passed. `index` is the
-  // card's position among the insurance cards, used to target it for verify.
+  // Insurance records: active when the end date hasn't passed.
   [...document.querySelectorAll('[data-testid="payments-profile-view"]')].forEach(
-    (root, index) => {
+    (root) => {
       const rec = {
         group: "insurance",
-        index,
         plan_name: valOf(root, "insPlanNameValue"),
         member_id: labelValue(root, "Member ID"),
         group_id: labelValue(root, "Group ID"),
@@ -430,10 +428,9 @@ function harvestInsurance() {
 
   // Social Care Coverage records: active when Enrolled AND not expired.
   [...document.querySelectorAll('[data-testid="social-insurance-profile-view"]')].forEach(
-    (root, index) => {
+    (root) => {
       const rec = {
         group: "social_care_coverage",
-        index,
         plan_name: valOf(root, "sccPlanNameValue"),
         member_id: labelValue(root, "Member ID"),
         group_id: labelValue(root, "Group ID"),
@@ -449,56 +446,6 @@ function harvestInsurance() {
   );
 
   return out;
-}
-
-// Click the native "Verify Insurance" link on the matching insurance card and
-// wait for the inline "Insurance Verification" results to render. Targets the
-// card by plan name (falling back to index). Returns a short result summary.
-async function verifyInsurance(msg) {
-  const norm = (s) => String(s || "").trim().toLowerCase();
-  const cards = [...document.querySelectorAll('[data-testid="payments-profile-view"]')];
-  if (!cards.length) return { ok: false, error: "No insurance cards on this page" };
-
-  const planOf = (c) => {
-    const el = c.querySelector('[data-testid="insPlanNameValue"]');
-    return el ? cleanText(el.textContent) : "";
-  };
-  let card = null;
-  if (msg.plan_name) card = cards.find((c) => norm(planOf(c)) === norm(msg.plan_name));
-  if (!card && Number.isInteger(msg.index) && cards[msg.index]) card = cards[msg.index];
-  if (!card) return { ok: false, error: "Insurance card not found" };
-
-  // The "Verify Insurance" affordance: the element whose own text is exactly
-  // "Verify Insurance" (the checkmark icon carries no text). Prefer an actual
-  // interactive element, else its nearest clickable ancestor.
-  const matches = [...card.querySelectorAll('a,button,[role="button"],span,div')].filter(
-    (el) => /^verify insurance$/i.test(cleanText(el.textContent))
-  );
-  if (!matches.length) {
-    return { ok: false, error: "No 'Verify Insurance' link on this card" };
-  }
-  const interactive =
-    matches.find((el) => /^(a|button)$/i.test(el.tagName) || el.getAttribute("role") === "button") ||
-    matches[matches.length - 1].closest('a,button,[role="button"]') ||
-    matches[matches.length - 1];
-
-  interactive.scrollIntoView({ block: "center" });
-  interactive.click();
-
-  // Wait for the inline verification results to appear within the card.
-  const deadline = Date.now() + 15000;
-  const resultPhrases = /(match found|no match|not found|unable to verify|coverage status as of)/i;
-  while (Date.now() < deadline) {
-    if (/insurance verification/i.test(cleanText(card.textContent))) {
-      const lines = [...card.querySelectorAll("p,span,div,li")]
-        .map((el) => cleanText(el.textContent))
-        .filter((t) => t && t.length < 90 && resultPhrases.test(t));
-      const summary = [...new Set(lines)].slice(0, 4).join(" \u00b7 ");
-      if (summary) return { ok: true, summary };
-    }
-    await sleep(500);
-  }
-  return { ok: true, summary: "Verification requested (see the Unite Us page)" };
 }
 
 // True when the profile page's coverage sections are actually present (even if a
@@ -2241,12 +2188,6 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
   if (msg && msg.type === "ELIGIBILITY_RESCRAPE") {
     startEligibilityScan(msg).then((r) => sendResponse(r)).catch((e) =>
-      sendResponse({ ok: false, error: String(e) })
-    );
-    return true;
-  }
-  if (msg && msg.type === "VERIFY_INSURANCE") {
-    verifyInsurance(msg).then((r) => sendResponse(r)).catch((e) =>
       sendResponse({ ok: false, error: String(e) })
     );
     return true;
