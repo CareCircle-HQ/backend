@@ -631,14 +631,18 @@ function mergeIntoAccum(clientId, pairs, records, captured) {
         else if (!(k in dst)) dst[k] = "";
       }
     });
-    // When the coverage sections were actually on the page, take that scrape's
-    // full coverage list as authoritative (even when empty -- all policies may
-    // have been removed). Otherwise keep whatever a prior profile scrape found.
-    if (captured.coverage_scraped) {
-      accum.insurance = Array.isArray(captured.insurance) ? captured.insurance : [];
+    // Coverage list update. NEVER wipe a previously-captured non-empty list
+    // with an empty scrape: the coverage cards render async, so a scrape can see
+    // the section headings (coverage_scraped) before the cards exist, or land on
+    // a page (e.g. Overview) that shows the heading but not the cards. Only
+    // accept an empty list when we have nothing captured yet.
+    const captIns = Array.isArray(captured.insurance) ? captured.insurance : [];
+    if (captIns.length) {
+      accum.insurance = captIns;
+      if (captured.coverage_scraped) accum.coverageScraped = true;
+    } else if (captured.coverage_scraped) {
       accum.coverageScraped = true;
-    } else if (Array.isArray(captured.insurance) && captured.insurance.length) {
-      accum.insurance = captured.insurance;
+      if (!accum.insurance.length) accum.insurance = [];
     }
   }
 }
