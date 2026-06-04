@@ -799,24 +799,27 @@ async function ensureScreeningList(timeout = 12000) {
 // Met Council screenings doesn't hang). Returns the harvested filtered list.
 async function waitForScreeningListSettled(timeout = 12000) {
   const deadline = Date.now() + timeout;
+  let lastFiltered = -1;
   let lastTotal = -1;
   let stable = 0;
   while (Date.now() < deadline) {
-    if (getFilteredScreeningRows().length) break; // our rows are present
+    const filtered = getFilteredScreeningRows().length;
     const t = findScreeningTable();
     const total = t
       ? [...t.querySelectorAll("tbody tr")].filter((r) => r.querySelector("td")).length
       : 0;
-    // Only conclude "no Met Council rows" once the table actually HAS rows that
-    // have stopped changing. A table still fetching shows 0 rows, which is NOT
-    // settled -- treating it as settled caused empty harvests during the Profile
-    // reload (the walk starts before the rows finish loading).
-    if (total > 0 && total === lastTotal) {
+    // Settle only once BOTH the total and the filtered (Met Council) row counts
+    // stop changing across consecutive polls AND the table actually has rows.
+    // Breaking on the first matching row (the old behaviour) harvested a partial
+    // list while rows were still streaming, so scan.total came out too low and we
+    // skipped screenings. A still-loading table (total 0) is never "settled".
+    if (total > 0 && filtered === lastFiltered && total === lastTotal) {
       stable += 1;
-      if (stable >= 3) break; // table finished loading with no Met Council rows
+      if (stable >= 3) break;
     } else {
       stable = 0;
     }
+    lastFiltered = filtered;
     lastTotal = total;
     await sleep(400);
   }
@@ -1190,6 +1193,11 @@ async function beginScreeningWalk(scan) {
 async function visitScreeningIndex(scan) {
   if (scan.index >= scan.total) return finishScan(scan);
   if (!(await ensureScreeningList(12000))) return;
+  // The list re-streams its rows each time we return here, so the index-th row
+  // may not exist yet right after the tab opens. Wait until all the rows we
+  // harvested are present (or the count settles) before clicking -- otherwise the
+  // index maps to the wrong row, or row is undefined and we wrongly skip ahead.
+  await waitFor(() => getFilteredScreeningRows().length >= scan.total, 12000, 400);
   const row = getFilteredScreeningRows()[scan.index];
   if (!row) {
     scan.index += 1; // can't find it; skip ahead
