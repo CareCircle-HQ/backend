@@ -1247,6 +1247,12 @@ async function _maybeContinueScreeningScan() {
   if (scan.phase === "list") {
     if (await ensureScreeningList(12000)) {
       await beginScreeningWalk(scan);
+    } else if (getFacesheetTabs().length) {
+      // We're on the facesheet but the Screenings list never appeared. Finish
+      // (with a note) instead of leaving the scan "running" forever, which would
+      // hang the Profile reload and block the eligibility/case walks.
+      scan.note = "Couldn't open the Screenings list.";
+      await finishScan(scan);
     }
     return;
   }
@@ -1284,15 +1290,33 @@ async function _maybeContinueScreeningScan() {
       await new Promise((r) => setTimeout(r, 400));
     }
 
-    // Require at least one real question (not just the duration). If we only
-    // got the duration or nothing, leave the page open and retry next tick.
+    // Require at least one real question (not just the duration). If after the
+    // polling deadline we still have none, we skip this screening (below) rather
+    // than retry, since a static detail page won't re-fire this handler.
     const realQCount = (detail.items || []).filter(
       (it) => !/screening duration/i.test(it.q || "")
     ).length;
     if (realQCount === 0) {
-      scan.note = "Waiting for screening questions to load\u2026";
+      // Waited the full deadline without any real questions rendering (unexpected
+      // layout, or a genuinely empty form). Record what we captured and move on
+      // so the walk can't hang on this page forever and block the rest.
+      scan.note = "";
+      scan.details[scan.index] = {
+        id: m[1].toLowerCase(),
+        items: detail.items || [],
+        results: detail.results || [],
+        duration: detail.duration || null,
+        capturedAt: new Date().toISOString(),
+        partial: true,
+      };
+      scan.index += 1;
       await saveScan(scan);
       publishScreenings(scan);
+      if (scan.index >= scan.total) {
+        await finishScan(scan);
+      } else if (scan.returnUrl) {
+        location.assign(scan.returnUrl);
+      }
       return;
     }
 
