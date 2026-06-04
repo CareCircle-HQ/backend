@@ -590,6 +590,10 @@ function bindSnapshotPull() {
         else if (k === "cases") caseRescan();
       });
     });
+    // Collapsible Client/Address sections.
+    box.querySelectorAll(".acc-head").forEach((h) => {
+      h.addEventListener("click", () => h.parentElement.classList.toggle("open"));
+    });
   });
 }
 
@@ -636,6 +640,16 @@ function refreshConsentGate() {
   // The Profile reload buttons (rescanBtn / rescanBtn2) stay enabled regardless.
 }
 
+// Wrap a profile section in a collapsible accordion (same markup as the
+// screening/case accordions). `open` controls the initial expanded state.
+function profileAccordion(title, bodyHtml, open) {
+  return (
+    `<div class="acc${open ? " open" : ""}">` +
+    `<div class="acc-head"><span class="acc-title">${escapeHtml(title)}</span></div>` +
+    `<div class="acc-body">${bodyHtml}</div></div>`
+  );
+}
+
 // Profile view = Client + Address + Insurance comparison.
 function buildProfileHtml(ctx) {
   const pairs = ctx.scraped || {};
@@ -650,14 +664,20 @@ function buildProfileHtml(ctx) {
     "date of birth": ctx.client_dob || pairs["DOB"] || "",
     phone: ctx.client_phone || "",
   };
-  html += `<h3>${SCHEMA.client.title}</h3>`;
-  html += renderObjectSection(SCHEMA.client, captured.client, clientPairs, crmClient);
+  html += profileAccordion(
+    SCHEMA.client.title,
+    renderObjectSection(SCHEMA.client, captured.client, clientPairs, crmClient),
+    true
+  );
 
   // Address (current/primary): first CRM address vs captured primary address.
   const addr = crmClient && (crmClient.addresses || [])[0];
   const addrPairs = { ...pairs, address: ctx.client_address || pairs["ADDRESS"] || "" };
-  html += `<h3>${SCHEMA.address.title}</h3>`;
-  html += renderObjectSection(SCHEMA.address, captured.address, addrPairs, addr);
+  html += profileAccordion(
+    SCHEMA.address.title,
+    renderObjectSection(SCHEMA.address, captured.address, addrPairs, addr),
+    false
+  );
 
   // Insurance + Social Care Coverage: captured records (filtered per the
   // workflow rules) unioned with CRM insurances, matched best-effort by plan
