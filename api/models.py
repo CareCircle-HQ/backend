@@ -249,6 +249,10 @@ class Client(models.Model):
     updated_at = models.DateTimeField(null=True, blank=True)  # source last update
     is_active = models.BooleanField(default=True)
     crm_contact_id = models.CharField(max_length=64, blank=True, db_index=True)
+    # External CRM (GoHighLevel) push tracking. Temporary integration; see
+    # api.integrations.ghl. crm_sync_hash lets us skip redundant pushes.
+    crm_synced_at = models.DateTimeField(null=True, blank=True)
+    crm_sync_hash = models.CharField(max_length=64, blank=True)
     last_synced_at = models.DateTimeField(auto_now=True)  # local ingest tracking
     import_batch = models.ForeignKey(
         "ImportBatch", on_delete=models.SET_NULL, null=True, blank=True,

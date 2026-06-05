@@ -33,6 +33,12 @@ template.json
 profile.json
 list.json
 
+# GoHighLevel CRM catalog dumps (contain location field/pipeline ids)
+ghl_contact_fields.json
+ghl_opportunity_fields.json
+ghl_custom_fields.json
+ghl_pipelines.json
+
 # Extension local config (contains the service API token)
 extension/config.js
 # Chrome-generated artifacts when loading the unpacked extension
