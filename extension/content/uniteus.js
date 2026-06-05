@@ -691,10 +691,10 @@ async function publishContext(deep = false) {
     const { pairs, records, captured } = await scrapePage(deep);
     mergeIntoAccum(ids.client_id, pairs, records, captured);
     // Enrich with reliable core.uniteus.io API data (demographics, primary
-    // address, insurance + social care coverage). API values win over the DOM
-    // scrape for the fields they cover; the DOM scrape still supplies
-    // care_coordinator / languages / household / consent. Throttled internally;
-    // forced on deep scrapes (the Profile reload).
+    // address, insurance + social care coverage, care coordinator, consent,
+    // preferred languages). API values win over the DOM scrape for the fields
+    // they cover; the DOM scrape still supplies only household size. Throttled
+    // internally; forced on deep scrapes (the Profile reload).
     await maybeEnrichFromApi(ids.client_id, deep);
     persistAccum();
 
@@ -1674,8 +1674,8 @@ async function startScreeningScan(msg) {
 // client / address / insurance data with reliable JSON:API records instead of
 // the fragile DOM scrape. Runs alongside the DOM scrape: the API wins for the
 // fields it provides (demographics, primary address, insurance + social care
-// coverage), while the DOM scrape still supplies care_coordinator, preferred
-// languages, household size and consent (their core endpoints aren't wired yet).
+// coverage, care coordinator, consent and preferred languages); only household
+// size still comes from the DOM scrape (no API source found).
 // ---------------------------------------------------------------------------
 const CORE_API = "https://core.uniteus.io/v1";
 const MEDICAL_PLAN_TYPES = "commercial,medicare,medicaid,tricare";
@@ -1854,6 +1854,53 @@ function mapPersonToClient(data) {
   return c;
 }
 
+// Care coordinator: the care-team relationship's related_person, expanded in
+// `included`. Returns the coordinator's full name (multiple joined by ", ").
+function mapCareCoordinator(body) {
+  const rels = Array.isArray(body && body.data) ? body.data : [];
+  const people = {};
+  for (const inc of (body && body.included) || []) {
+    if (inc && inc.type === "person") people[inc.id] = inc.attributes || {};
+  }
+  const names = [];
+  for (const r of rels) {
+    const id = r.relationships && r.relationships.related_person &&
+      r.relationships.related_person.data && r.relationships.related_person.data.id;
+    const a = id && people[id];
+    if (!a) continue;
+    const name = cleanText([a.first_name, a.last_name].filter(Boolean).join(" "));
+    if (name) names.push(name);
+  }
+  return names.join(", ");
+}
+
+// Consent resource -> { consent_status, consented_at }. status text is titleized
+// so the side panel's toEnum / "accept" checks still match (e.g. "Accepted").
+function mapConsent(body) {
+  const a = (body && body.data && body.data.attributes) || {};
+  const out = {};
+  if (a.state) out.consent_status = titleizeCode(a.state);
+  if (a.consented_at) out.consented_at = fmtApiDate(a.consented_at);
+  return out;
+}
+
+// record_languages -> { preferred_spoken_language, preferred_written_language }.
+function mapLanguages(body) {
+  const recs = Array.isArray(body && body.data) ? body.data : [];
+  const pick = (kind) =>
+    recs
+      .filter((r) => (r.attributes || {}).record_language_type === kind)
+      .map((r) => cleanText((r.attributes || {}).language_name || ""))
+      .filter(Boolean)
+      .join(", ");
+  const out = {};
+  const spoken = pick("spoken");
+  const written = pick("written");
+  if (spoken) out.preferred_spoken_language = spoken;
+  if (written) out.preferred_written_language = written;
+  return out;
+}
+
 function mapPrimaryAddress(included) {
   const addrs = (included || []).filter((x) => x.type === "address");
   if (!addrs.length) return null;
@@ -1878,6 +1925,35 @@ async function enrichCapturedFromApi(clientId) {
   const person = await coreGet(`/people/${clientId}?include=addresses`, creds);
   const client = mapPersonToClient(person.data);
   const address = mapPrimaryAddress(person.included);
+
+  // Care coordinator, consent and preferred languages: each best-effort so a
+  // single failure can't sink the whole enrichment. The consent reference id
+  // comes from the person's relationships.
+  const consentId =
+    person.data && person.data.relationships && person.data.relationships.consent &&
+    person.data.relationships.consent.data && person.data.relationships.consent.data.id;
+  const safe = (p) => p.then((b) => b).catch((e) => {
+    console.warn("[uw-prof] enrich sub-fetch failed:", e);
+    return null;
+  });
+  const [careBody, langBody, consentBody] = await Promise.all([
+    safe(coreGet(
+      `/personal_relationships?filter[family_member]=false&filter[care_team_member]=true` +
+      `&filter[person]=${clientId}&page[number]=1&page[size]=20&include=related_person`,
+      creds
+    )),
+    safe(coreGet(
+      `/record_languages?filter[record_id]=${clientId}&filter[record_type]=Person`,
+      creds
+    )),
+    consentId ? safe(coreGet(`/consents/${consentId}`, creds)) : Promise.resolve(null),
+  ]);
+  if (careBody) {
+    const cc = mapCareCoordinator(careBody);
+    if (cc) client.care_coordinator = cc;
+  }
+  if (langBody) Object.assign(client, mapLanguages(langBody));
+  if (consentBody) Object.assign(client, mapConsent(consentBody));
 
   let insurance = [];
   try {
