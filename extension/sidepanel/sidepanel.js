@@ -615,6 +615,29 @@ function buildSnapshotHtml(ctx) {
     !cd,
     recentOk(cases, caseLast)
   );
+  // Medicaid: true when any active captured insurance has plan_type "medicaid".
+  const insurances = Array.isArray(ctx.insurance) ? ctx.insurance : [];
+  const hasMedicaid = insurances.some(
+    (i) =>
+      i &&
+      i.active !== false &&
+      String(i.plan_type || "").toLowerCase().includes("medicaid")
+  );
+  html += row("Medicaid", hasMedicaid ? "Yes" : "No", null, false, hasMedicaid);
+
+  // Social Care Coverage: count valid (active) social-care coverage records.
+  // 0 -> red X, >=1 -> green check.
+  const sccCount = insurances.filter(
+    (i) => i && i.active !== false && i.group === "social_care_coverage"
+  ).length;
+  html += row(
+    "Social Care Coverage",
+    `<strong>${sccCount}</strong> active`,
+    null,
+    false,
+    sccCount >= 1
+  );
+
   html += row(
     "In CRM",
     crmExists ? `Yes \u00b7 added ${escapeHtml(fmtDate(crmAdded))}` : "Not in CRM",

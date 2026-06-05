@@ -1821,19 +1821,25 @@ async function coreGet(path, creds) {
   return res.json();
 }
 
-// Resolve a list of plan ids to { id -> name } via the batched plans endpoint.
+// Resolve a list of plan ids to { id -> { name, plan_type } } via the batched
+// plans endpoint. plan_type is the authoritative coverage classification
+// (commercial / medicare / medicaid / tricare / social), so callers can tell
+// e.g. Medicaid from the code rather than guessing from the plan name.
 async function coreGetPlanNames(planIds, creds) {
   const ids = [...new Set(planIds.filter(Boolean))];
-  const names = {};
-  if (!ids.length) return names;
+  const info = {};
+  if (!ids.length) return info;
   const body = await coreGet(
     `/plans?filter[id]=${ids.join(",")}&page[number]=1&page[size]=${ids.length}`,
     creds
   );
   for (const p of body.data || []) {
-    if (p && p.id) names[p.id] = (p.attributes && p.attributes.name) || "";
+    if (p && p.id) {
+      const a = p.attributes || {};
+      info[p.id] = { name: a.name || "", plan_type: a.plan_type || "" };
+    }
   }
-  return names;
+  return info;
 }
 
 // 9999 sentinel / future / no-expiry means coverage is still in force.
@@ -1852,7 +1858,7 @@ const isoToDate = (s) => (s ? String(s).slice(0, 10) : "");
 // Map insurance records (medical or social) to the captured coverage shape,
 // keeping only currently-in-force records (the API returns full month-by-month
 // history; the profile only shows active coverage).
-function mapInsuranceRecords(records, group, planNames) {
+function mapInsuranceRecords(records, group, planInfo, medicaidPlanIds) {
   const out = [];
   for (const r of records) {
     const a = r.attributes || {};
@@ -1863,11 +1869,17 @@ function mapInsuranceRecords(records, group, planNames) {
         : true;
     if (!current || !enrolled) continue;
     const planId = r.relationships && r.relationships.plan && r.relationships.plan.data && r.relationships.plan.data.id;
-    const planName = planNames[planId] || "";
+    const plan = planInfo[planId] || {};
+    const planName = plan.name || "";
     if (!planName) continue; // CRM keys coverage on plan_name
+    // Prefer the authoritative server-filtered Medicaid set; fall back to the
+    // plan_type attribute from /plans for the other classifications.
+    const planType =
+      medicaidPlanIds && medicaidPlanIds.has(planId) ? "medicaid" : plan.plan_type || "";
     out.push({
       group,
       plan_name: planName,
+      plan_type: planType,
       member_id: a.external_member_id || "",
       group_id: a.external_group_id || "",
       start_date: isoToDate(a.enrolled_at),
@@ -2013,19 +2025,25 @@ async function enrichCapturedFromApi(clientId) {
   let insurance = [];
   try {
     const base = `/insurances?filter[person]=${clientId}&filter[state]=active,pending,inactive`;
-    const [med, soc] = await Promise.all([
+    // The dedicated medicaid query is the authoritative Medicaid signal: it uses
+    // the exact server-side filter the Unite Us UI uses, so it identifies
+    // Medicaid coverage regardless of how the /plans attribute is shaped.
+    const [med, soc, medicaid] = await Promise.all([
       coreGet(`${base}&filter[plan.plan_type]=${MEDICAL_PLAN_TYPES}`, creds),
       coreGet(`${base}&filter[plan.plan_type]=social`, creds),
+      coreGet(`${base}&filter[plan.plan_type]=medicaid`, creds),
     ]);
     const medRecs = med.data || [];
     const socRecs = soc.data || [];
-    const planIds = [...medRecs, ...socRecs]
-      .map((r) => r.relationships && r.relationships.plan && r.relationships.plan.data && r.relationships.plan.data.id)
-      .filter(Boolean);
+    const planIdOf = (r) =>
+      r.relationships && r.relationships.plan && r.relationships.plan.data && r.relationships.plan.data.id;
+    // plan ids confirmed Medicaid by the server-side filter.
+    const medicaidPlanIds = new Set((medicaid.data || []).map(planIdOf).filter(Boolean));
+    const planIds = [...medRecs, ...socRecs].map(planIdOf).filter(Boolean);
     const planNames = await coreGetPlanNames(planIds, creds);
     insurance = [
-      ...mapInsuranceRecords(medRecs, "insurance", planNames),
-      ...mapInsuranceRecords(socRecs, "social_care_coverage", planNames),
+      ...mapInsuranceRecords(medRecs, "insurance", planNames, medicaidPlanIds),
+      ...mapInsuranceRecords(socRecs, "social_care_coverage", planNames, medicaidPlanIds),
     ];
   } catch (e) {
     console.warn("[uw-prof] insurance fetch failed:", e);
