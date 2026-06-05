@@ -476,34 +476,23 @@ async function scrapePage(deep) {
   let captured = harvestProfile();
   if (!deep) return { pairs, records: [...recordMap.values()], captured };
 
+  // Cases, Screenings and Eligibility Assessments are now extracted via the
+  // core API (no navigation), so the deep scrape only visits the Profile tab -
+  // the sole remaining DOM-only source (e.g. household size). This avoids the
+  // facesheet tab-walk that previously navigated through every data tab.
   const labels = getFacesheetTabs().map((t) => cleanText(t.innerText));
-  for (const label of labels) {
-    if (label === "Overview") continue;
-    if (!clickTabByLabel(label)) continue;
+  if (labels.includes("Profile") && clickTabByLabel("Profile")) {
     await sleep(700); // let the tab's content load
     harvestFields(pairs);
-    if (label === "Profile") {
-      const c = harvestProfile();
-      if (c) captured = c;
-    }
+    const c = harvestProfile();
+    if (c) captured = c;
+    collectRecords(recordMap);
 
-    const type = TAB_RECORD_TYPE[label];
-    if (type) {
-      const before = recordMap.size;
-      harvestTableRecords(type, recordMap);
-      // The table data loads asynchronously; if nothing appeared yet, wait once.
-      if (recordMap.size === before) {
-        await sleep(900);
-        harvestTableRecords(type, recordMap);
-      }
-    }
+    // Restore the user's view to the Overview tab.
+    clickTabByLabel("Overview");
+    await sleep(150);
     collectRecords(recordMap);
   }
-
-  // Restore the user's view to the Overview tab.
-  clickTabByLabel("Overview");
-  await sleep(150);
-  collectRecords(recordMap);
   return { pairs, records: [...recordMap.values()], captured };
 }
 
@@ -1475,15 +1464,16 @@ function uuHeaders(creds) {
   return h;
 }
 
-// Enumerate every screening for a person, following pagination.
-async function apiFetchScreeningList(clientId, creds) {
+// Enumerate every screening (type=screening) or eligibility assessment
+// (type=assessment) for a person, following pagination.
+async function apiFetchScreeningList(clientId, creds, type = "screening") {
   const out = [];
   const limit = 20; // match the page's request exactly; larger values 400
   let offset = 0;
   for (let page = 0; page < 50; page++) {
     const url =
       `${SCREENINGS_API}?person_id=${encodeURIComponent(clientId)}` +
-      `&offset=${offset}&limit=${limit}&type=screening`;
+      `&offset=${offset}&limit=${limit}&type=${type}`;
     const res = await fetch(url, {
       headers: uuHeaders(creds),
       credentials: "omit",
@@ -2239,8 +2229,135 @@ function publishEligibility(scan) {
   });
 }
 
+// ---------------------------------------------------------------------------
+// Eligibility via the Unite Us API (preferred, navigation-free). Eligibility
+// assessments live on the same screenings-ingestion host as screenings, served
+// with type=assessment. The detail uses the identical SurveyJS-style questions
+// shape, so we reuse apiFetchScreeningDetail / apiAnswerValue. The eligible
+// programs ("Client May Be Eligible") come from each record's eligible_services.
+// ---------------------------------------------------------------------------
+
+// Map an assessment detail (+ its list summary) to our { id, items, results }
+// shape, mirroring harvestEligibilityDetail's output.
+function parseApiAssessmentDetail(screen, summary) {
+  const qs = Array.isArray(screen.questions) ? screen.questions.slice() : [];
+  qs.sort((a, b) => (a.order || 0) - (b.order || 0));
+
+  const items = [];
+  for (const q of qs) {
+    const text = cleanText(q.primary_text || "");
+    if (!text) continue;
+    const a = cleanText(apiAnswerValue(q));
+    if (!a) continue;
+    items.push({ q: text, a });
+  }
+
+  const svc =
+    (Array.isArray(screen.eligible_services) && screen.eligible_services) ||
+    (summary && Array.isArray(summary.eligible_services) && summary.eligible_services) ||
+    [];
+  const results = svc.map((x) => cleanText(x)).filter(Boolean);
+
+  return { id: screen.id || (summary && summary.id), items, results };
+}
+
+function publishEligibilityApi(clientId, eligibilities, status, note) {
+  const done = status === "done";
+  chrome.storage.local.set({
+    uw_eligibility: {
+      clientId,
+      org: SCREENING_ORG,
+      eligibilities,
+      status,
+      phase: done ? null : "api",
+      note: note || "",
+      scannedAt: new Date().toISOString(),
+      finishedAt: done ? new Date().toISOString() : null,
+      progress: { done: eligibilities.length, total: eligibilities.length },
+    },
+  });
+}
+
+// Pull all of the provider's eligibility assessments for a client from the API.
+async function runEligibilityApiScan(clientId) {
+  const creds = await bootstrapUuCreds(15000);
+  if (!creds) {
+    console.warn("[uw-elig] API scan aborted: no creds captured");
+    return { ok: false, error: "no-creds" };
+  }
+
+  const list = await apiFetchScreeningList(clientId, creds, "assessment");
+  const provider = (creds.providerId || "").toLowerCase();
+  // Keep only the logged-in provider's own assessments (Met Council); match the
+  // org id to x-provider-id (org name is unreliable / null in the API response).
+  const mine = provider
+    ? list.filter(
+        (s) => String(s.organization_id || "").toLowerCase() === provider
+      )
+    : list;
+
+  const eligibilities = [];
+  for (const s of mine) {
+    let detail;
+    try {
+      const screen = await apiFetchScreeningDetail(s.id, creds);
+      detail = parseApiAssessmentDetail(screen, s);
+    } catch (_) {
+      detail = {
+        id: s.id,
+        items: [],
+        results: Array.isArray(s.eligible_services) ? s.eligible_services : [],
+      };
+    }
+    eligibilities.push({
+      id: s.id,
+      form: (s.template && s.template.consent_code) || "",
+      submitter: "",
+      status: s.status || "",
+      org: SCREENING_ORG,
+      date: fmtApiDate(s.status_at || s.updated_at || s.created_at),
+      detail,
+    });
+  }
+  return { ok: true, eligibilities };
+}
+
+// API-first entry point. Falls back to the legacy resumable DOM crawler when no
+// credentials can be captured (e.g. the page never called the API).
 async function startEligibilityScan(msg) {
   const clientId = (msg && msg.clientId) || parseIdsFromUrl().client_id;
+  if (!clientId) return { ok: false, error: "Open the client's facesheet first" };
+
+  // Drop any stale legacy crawler state so opening tabs during credential
+  // bootstrap can't resurrect an old DOM walk.
+  try {
+    await chrome.storage.local.remove("uw_elig_scan");
+  } catch (_) {}
+
+  publishEligibilityApi(clientId, [], "running", "Fetching eligibility assessments\u2026");
+
+  try {
+    const api = await runEligibilityApiScan(clientId);
+    if (api.ok) {
+      publishEligibilityApi(
+        clientId,
+        api.eligibilities,
+        "done",
+        api.eligibilities.length
+          ? ""
+          : "No Met Council - SCN - PHS eligibility assessments found."
+      );
+      return { ok: true, count: api.eligibilities.length };
+    }
+  } catch (e) {
+    console.warn("[uw-elig] API path failed, falling back to DOM crawler:", e);
+  }
+
+  return startEligibilityScanLegacy(msg, clientId);
+}
+
+async function startEligibilityScanLegacy(msg, clientId) {
+  clientId = clientId || (msg && msg.clientId) || parseIdsFromUrl().client_id;
   if (!clientId) return { ok: false, error: "Open the client's facesheet first" };
 
   const scan = {
@@ -2417,7 +2534,278 @@ async function _maybeContinueEligibilityScan() {
 }
 
 // ===========================================================================
-// CASE AUTO-WALK CRAWLER (Met Council - SCN - PHS)
+// CASES via the Unite Us core API (core.uniteus.io) - Met Council only.
+// ===========================================================================
+// Replaces the DOM auto-walk: one cases-list call (filtered to the person),
+// then per-case related-entity lookups (service, program, network,
+// service_authorization -> insurance -> plan, notes, primary worker). Produces
+// the same uw_cases shape the side panel + buildCasePayloads expect: each case
+// carries detail.fields keyed by the page's UPPERCASE labels, so no downstream
+// change is needed. Per-scan id->name caches dedupe shared relationships (e.g.
+// every case sharing one network is fetched once).
+let caseApiCache = null;
+function freshCaseCache() {
+  return {
+    service: new Map(),
+    program: new Map(),
+    network: new Map(),
+    plan: new Map(),
+    employee: new Map(),
+  };
+}
+
+// cents -> "$8,736.00" (authorized amount display).
+function centsToUsd(c) {
+  if (c == null || isNaN(c)) return "";
+  return (
+    "$" +
+    (c / 100).toLocaleString("en-US", {
+      minimumFractionDigits: 2,
+      maximumFractionDigits: 2,
+    })
+  );
+}
+
+// ISO timestamp -> MM/DD/YYYY (matches the DOM format the side panel's
+// parseUSDate expects). Uses UTC parts so a midnight-UTC date doesn't slip a day.
+function isoToUS(s) {
+  if (!s) return "";
+  const d = new Date(s);
+  if (isNaN(d.getTime())) return "";
+  const mm = String(d.getUTCMonth() + 1).padStart(2, "0");
+  const dd = String(d.getUTCDate()).padStart(2, "0");
+  return `${mm}/${dd}/${d.getUTCFullYear()}`;
+}
+
+const CASE_STATE_LABELS = {
+  draft: "DRAFT",
+  open: "OPEN",
+  managed: "MANAGED",
+  off_platform: "OFF PLATFORM",
+  closed: "CLOSED",
+  cancelled: "CANCELLED",
+  pending_authorization: "PENDING AUTHORIZATION",
+};
+function caseStateLabel(state) {
+  const k = String(state || "").toLowerCase();
+  return CASE_STATE_LABELS[k] || k.replace(/_/g, " ").toUpperCase();
+}
+
+// Fetch a related resource's attributes.name once, caching by id.
+async function cachedName(kind, id, creds, path) {
+  if (!id) return "";
+  const store = caseApiCache[kind];
+  if (store.has(id)) return store.get(id);
+  let name = "";
+  try {
+    const body = await coreGet(`${path}/${id}`, creds);
+    name = (body.data && body.data.attributes && body.data.attributes.name) || "";
+  } catch (_) {}
+  store.set(id, name);
+  return name;
+}
+
+// Enumerate the person's cases, following pagination. include=primary_worker so
+// the worker name comes back in `included` (no extra call per case).
+async function apiFetchCaseList(clientId, creds) {
+  const out = [];
+  const employees = caseApiCache.employee;
+  let number = 1;
+  for (let guard = 0; guard < 20; guard++) {
+    const body = await coreGet(
+      `/cases?filter[person]=${clientId}&filter[include_pathways]=false` +
+        `&include=primary_worker&sort=updated_at&sort_direction=desc` +
+        `&page[number]=${number}&page[size]=50`,
+      creds
+    );
+    for (const inc of body.included || []) {
+      if (inc && inc.type === "employee") {
+        const a = inc.attributes || {};
+        const nm =
+          a.full_name || [a.first_name, a.last_name].filter(Boolean).join(" ");
+        if (nm) employees.set(inc.id, nm);
+      }
+    }
+    for (const c of body.data || []) out.push(c);
+    const tp = body.meta && body.meta.page && body.meta.page.total_pages;
+    if (!tp || number >= tp) break;
+    number += 1;
+  }
+  return out;
+}
+
+// Resolve every related entity for one case into the UPPERCASE-label field map
+// the side panel render + save-payload builder consume.
+async function buildCaseDetailFromApi(caseObj, creds) {
+  const rel = caseObj.relationships || {};
+  const attr = caseObj.attributes || {};
+  const relId = (k) => (rel[k] && rel[k].data && rel[k].data.id) || null;
+
+  const fields = {};
+  const status = caseStateLabel(attr.state);
+
+  if (attr.description) fields["CASE DESCRIPTION"] = attr.description;
+  fields["ORGANIZATION"] = SCREENING_ORG;
+
+  const serviceType = await cachedName("service", relId("service"), creds, "/services");
+  const programName = await cachedName("program", relId("program"), creds, "/programs");
+  const networkName = await cachedName("network", relId("network"), creds, "/networks");
+  if (serviceType) fields["SERVICE TYPE"] = serviceType;
+  if (programName) fields["PROGRAM"] = programName;
+  if (networkName) fields["NETWORK"] = networkName;
+
+  const workerName = caseApiCache.employee.get(relId("primary_worker")) || "";
+  if (workerName) fields["PRIMARY WORKER"] = workerName;
+
+  const opened = isoToUS(attr.opened_date);
+  const closed = isoToUS(attr.closed_date);
+  if (opened) fields["DATE OPENED"] = opened;
+  if (closed) fields["DATE CLOSED"] = closed;
+
+  // Authorization -> insurance (social care coverage) -> plan.
+  const authId = relId("service_authorization");
+  if (authId) {
+    try {
+      const authBody = await coreGet(`/service_authorizations/${authId}`, creds);
+      const aa = (authBody.data && authBody.data.attributes) || {};
+      const ar = (authBody.data && authBody.data.relationships) || {};
+      if (aa.state) fields["AUTHORIZATION STATUS"] = String(aa.state).toUpperCase();
+      if (aa.short_id) fields["UNITE US AUTHORIZATION ID"] = aa.short_id;
+      const amount = centsToUsd(aa.approved_cents);
+      if (amount) fields["AUTHORIZED AMOUNT"] = amount;
+      const s = isoToUS(aa.approved_starts_at);
+      const e = isoToUS(aa.approved_ends_at);
+      if (s || e) {
+        fields["AUTHORIZED SERVICE DELIVERY DATE(S)"] = [s, e]
+          .filter(Boolean)
+          .join(" - ");
+      }
+      const insId = ar.insurance && ar.insurance.data && ar.insurance.data.id;
+      if (insId) {
+        try {
+          const insBody = await coreGet(`/insurances/${insId}`, creds);
+          const ia = (insBody.data && insBody.data.attributes) || {};
+          const ir = (insBody.data && insBody.data.relationships) || {};
+          if (ia.insurance_status) {
+            fields["SOCIAL CARE COVERAGE STATUS"] = titleizeCode(ia.insurance_status);
+          }
+          const planId = ir.plan && ir.plan.data && ir.plan.data.id;
+          const planName = await cachedName("plan", planId, creds, "/plans");
+          if (planName) fields["SOCIAL CARE COVERAGE PLAN"] = planName;
+        } catch (_) {}
+      }
+    } catch (_) {}
+  }
+
+  // Case notes.
+  try {
+    const notesBody = await coreGet(
+      `/notes?filter[subject]=${caseObj.id}&page[number]=1&page[size]=100`,
+      creds
+    );
+    const texts = (notesBody.data || [])
+      .map((n) => (n.attributes && n.attributes.text) || "")
+      .filter(Boolean);
+    if (texts.length) fields["NOTES"] = texts.join("\n\n");
+  } catch (_) {}
+
+  return { id: caseObj.id, status, fields, capturedAt: new Date().toISOString() };
+}
+
+function publishCasesApi(clientId, cases, status, note) {
+  const done = status === "done";
+  chrome.storage.local.set({
+    uw_cases: {
+      clientId,
+      org: SCREENING_ORG,
+      cases,
+      status,
+      phase: done ? null : "api",
+      note: note || "",
+      scannedAt: new Date().toISOString(),
+      finishedAt: done ? new Date().toISOString() : null,
+      progress: { done: cases.length, total: cases.length },
+    },
+  });
+}
+
+// Pull all of the provider's (Met Council) cases for a client from the API.
+async function runCaseApiScan(clientId) {
+  const creds = await bootstrapUuCreds(15000);
+  if (!creds) {
+    console.warn("[uw-case] API scan aborted: no creds captured");
+    return { ok: false, error: "no-creds" };
+  }
+  caseApiCache = freshCaseCache();
+
+  const list = await apiFetchCaseList(clientId, creds);
+  const provider = (creds.providerId || "").toLowerCase();
+  // Keep only the logged-in provider's own cases (Met Council); match the
+  // case.provider relationship id to x-provider-id.
+  const mine = provider
+    ? list.filter((c) => {
+        const p =
+          c.relationships &&
+          c.relationships.provider &&
+          c.relationships.provider.data;
+        return p && String(p.id).toLowerCase() === provider;
+      })
+    : list;
+
+  const cases = [];
+  for (const c of mine) {
+    const detail = await buildCaseDetailFromApi(c, creds);
+    const f = detail.fields;
+    cases.push({
+      id: c.id,
+      href: null,
+      service_type: f["SERVICE TYPE"] || "",
+      date_opened: f["DATE OPENED"] || "",
+      status: detail.status,
+      org: SCREENING_ORG,
+      updated: fmtApiDate((c.attributes && c.attributes.updated_at) || ""),
+      detail,
+    });
+    // Stream progress so the panel fills in as each case resolves.
+    publishCasesApi(clientId, cases, "running", `Loaded ${cases.length}\u2026`);
+  }
+  return { ok: true, cases };
+}
+
+// API-first entry point. Falls back to the legacy resumable DOM crawler when no
+// credentials can be captured (e.g. the page never called the core API).
+async function startCaseScan(msg) {
+  const clientId = (msg && msg.clientId) || parseIdsFromUrl().client_id;
+  if (!clientId) return { ok: false, error: "Open the client's facesheet first" };
+
+  // Drop any stale legacy crawler state so opening the Cases tab during
+  // credential bootstrap can't resurrect an old DOM walk.
+  try {
+    await chrome.storage.local.remove("uw_case_scan");
+  } catch (_) {}
+
+  publishCasesApi(clientId, [], "running", "Fetching cases\u2026");
+
+  try {
+    const api = await runCaseApiScan(clientId);
+    if (api.ok) {
+      publishCasesApi(
+        clientId,
+        api.cases,
+        "done",
+        api.cases.length ? "" : "No Met Council - SCN - PHS cases found."
+      );
+      return { ok: true, count: api.cases.length };
+    }
+  } catch (e) {
+    console.warn("[uw-case] API path failed, falling back to DOM crawler:", e);
+  }
+
+  return startCaseScanLegacy(msg);
+}
+
+// ===========================================================================
+// CASE AUTO-WALK CRAWLER (Met Council - SCN - PHS) - legacy DOM fallback
 // ===========================================================================
 // Mirrors the eligibility crawler: filter the facesheet cases list by the
 // target org, then visit each case detail page
@@ -2639,7 +3027,7 @@ function publishCases(scan) {
   });
 }
 
-async function startCaseScan(msg) {
+async function startCaseScanLegacy(msg) {
   const clientId = (msg && msg.clientId) || parseIdsFromUrl().client_id;
   if (!clientId) return { ok: false, error: "Open the client's facesheet first" };
 
