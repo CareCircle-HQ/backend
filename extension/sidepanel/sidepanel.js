@@ -26,6 +26,50 @@ let isValidated = false;
 let autoScanTimer = null;
 const loadedFrames = new Set();
 
+// Session / view state driving the full-page home overlay.
+// sessionState: "ok" | "expired"; viewState.onClient: whether the user is
+// currently viewing a client on Unite Us (vs. search / dashboard / login).
+let sessionState = "ok";
+let viewState = { onClient: false };
+
+// Decide whether to show the full-page home / session screen. Shown when the
+// Unite Us session has expired, or when the user is not on a client page. The
+// last client's captured data stays mounted underneath, so returning to that
+// client shows it instantly (we only clear data when a DIFFERENT client loads).
+function updateHomeOverlay() {
+  const overlay = $("homeOverlay");
+  if (!overlay) return;
+  const expired = sessionState === "expired";
+  // Track the LIVE view: show the home screen whenever the user isn't looking at
+  // a client, even though the previous client's data stays cached underneath.
+  const offClient = viewState && viewState.onClient === false;
+  const show = expired || offClient;
+
+  overlay.classList.toggle("hidden", !show);
+  overlay.classList.toggle("expired", expired);
+  $("homeRetryBtn").classList.toggle("hidden", !expired);
+
+  if (expired) {
+    $("homeTitle").textContent = "Unite Us session expired";
+    $("homeMsg").textContent =
+      "Your Unite Us session ended. Log back in to Unite Us (or refresh the tab), then click Retry.";
+  } else {
+    $("homeTitle").textContent = "Open a client in Unite Us";
+    $("homeMsg").textContent =
+      "Search for a client on Unite Us and open their facesheet to start capturing their information here.";
+  }
+}
+
+// Retry after a session expiry: force a profile reload, which bootstraps a
+// fresh token (re-captured once the page makes its own API call post-login) and
+// republishes the session state. If it succeeds the overlay clears itself.
+async function retrySession() {
+  $("homeMsg").textContent = "Reconnecting\u2026";
+  try {
+    await deepScrape();
+  } catch (_) {}
+}
+
 // ---------- Config (transparent auth) ----------
 async function getConfig() {
   const { uw_config } = await chrome.storage.local.get("uw_config");
@@ -1209,6 +1253,9 @@ function waitForScanDone(key, timeoutMs, shouldAbort) {
       if (typeof shouldAbort === "function" && shouldAbort()) return resolve(false);
       const obj = (await chrome.storage.local.get(key))[key];
       if (obj && obj.status === "done") return resolve(true);
+      // Terminal failure states (no token / API error / session expired) - stop
+      // waiting instead of hanging until the timeout.
+      if (obj && (obj.status === "error" || obj.status === "auth")) return resolve(false);
       if (Date.now() > deadline) return resolve(false);
       setTimeout(check, 500);
     };
@@ -1246,14 +1293,15 @@ async function runScanToCompletion(type, shouldAbort) {
     map.status("err", "Couldn't start \u2014 reload the Unite Us tab (F5), then retry");
     return false;
   }
-  map.status("warn", "Walking\u2026 keep this tab open");
+  map.status("warn", "Loading from Unite Us\u2026");
   return waitForScanDone(map.key, SCAN_MAX_MS, shouldAbort);
 }
 
-// Grab everything: deep scrape + all three auto-walks. The walks navigate the
-// tab, so they must run one after another, not concurrently. A generation
-// counter lets a newer run (e.g. the user switched client mid-scan) cancel an
-// older one at the next checkpoint instead of scanning the wrong client.
+// Grab everything: profile + all three section scans. These are all
+// navigation-free API calls now, so they run CONCURRENTLY (they hit different
+// endpoints and write to different storage keys). A generation counter lets a
+// newer run (e.g. the user switched client mid-scan) cancel an older one at the
+// next checkpoint instead of scanning the wrong client.
 let scanGeneration = 0;
 let fullScanRunning = false;
 
@@ -1292,11 +1340,13 @@ async function runFullScan() {
     }
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
     if (tab && /app\.uniteus\.io/.test(tab.url || "")) {
-      await runScanToCompletion("screening", stale);
-      if (stale()) return;
-      await runScanToCompletion("eligibility", stale);
-      if (stale()) return;
-      await runScanToCompletion("cases", stale);
+      // Run all three concurrently - they're independent API scans now, so this
+      // cuts the total wait to the slowest one instead of their sum.
+      await Promise.all([
+        runScanToCompletion("screening", stale),
+        runScanToCompletion("eligibility", stale),
+        runScanToCompletion("cases", stale),
+      ]);
     }
   } catch (_) {
     // best-effort; per-tab reload buttons remain available
@@ -2690,22 +2740,28 @@ function renderCrmStatus(ctx) {
 }
 
 async function loadContext() {
-  const { uw_context, uw_screenings, uw_eligibility, uw_cases } = await chrome.storage.local.get([
-    "uw_context",
-    "uw_screenings",
-    "uw_eligibility",
-    "uw_cases",
-  ]);
+  const { uw_context, uw_screenings, uw_eligibility, uw_cases, uw_session, uw_view } =
+    await chrome.storage.local.get([
+      "uw_context",
+      "uw_screenings",
+      "uw_eligibility",
+      "uw_cases",
+      "uw_session",
+      "uw_view",
+    ]);
   currentContext = uw_context || null;
   screeningData = uw_screenings || null;
   eligibilityData = uw_eligibility || null;
   caseData = uw_cases || null;
+  sessionState = (uw_session && uw_session.state) || "ok";
+  viewState = uw_view || { onClient: !!(currentContext && currentContext.client_id) };
   renderContext(currentContext);
   renderCrmStatus(currentContext);
   renderComparison(currentContext);
   renderScreenings();
   renderEligibility();
   renderCases();
+  updateHomeOverlay();
   await maybeAutoValidate();
 }
 
@@ -2830,9 +2886,21 @@ function init() {
   $("caseSaveBtn").addEventListener("click", saveCases);
   $("diagnosticBtn").addEventListener("click", runDiagnostic);
   $("copyReportBtn").addEventListener("click", copyReport);
+  $("homeRetryBtn").addEventListener("click", retrySession);
 
   // Live-update when the content script captures a new/changed client.
   chrome.storage.onChanged.addListener((changes, area) => {
+    if (area !== "local") return;
+    // Session expiry / recovery -> toggle the full-page home overlay.
+    if (changes.uw_session) {
+      sessionState = (changes.uw_session.newValue && changes.uw_session.newValue.state) || "ok";
+      updateHomeOverlay();
+    }
+    // On/off a client page -> show the home overlay when off a client.
+    if (changes.uw_view) {
+      viewState = changes.uw_view.newValue || { onClient: false };
+      updateHomeOverlay();
+    }
     if (area === "local" && changes.uw_context) {
       const prev = currentContext;
       currentContext = changes.uw_context.newValue;
@@ -2853,14 +2921,15 @@ function init() {
         renderScreenings();
         renderEligibility();
         renderCases();
-        // Auto-reload ONLY the Profile tab for the new client (deep scrape).
-        // Screenings / eligibility / cases stay cleared until the user reloads
-        // them on demand. Debounced + delayed so the facesheet can load first.
+        // Auto-load EVERYTHING for the new client via the API: Profile, then
+        // (consent permitting) screenings, eligibility and cases. runFullScan
+        // is consent-gated internally, so pre-consent only the Profile loads.
+        // Debounced + delayed so the facesheet can settle first.
         if (currentContext && currentContext.client_id) {
           clearTimeout(autoScanTimer);
           autoScanTimer = setTimeout(() => {
-            if (!fullScanRunning) deepScrape();
-          }, 2000);
+            if (!fullScanRunning) runFullScan();
+          }, 1500);
         }
       }
       renderContext(currentContext);
@@ -2873,6 +2942,9 @@ function init() {
         setFormsUnlocked(false);
         activateTab("profile");
       }
+      // A client context arriving means we're on a client page again.
+      if (currentContext && currentContext.client_id) viewState.onClient = true;
+      updateHomeOverlay();
       maybeAutoValidate();
     }
     // Screening auto-walk progress / results.
@@ -2883,7 +2955,11 @@ function init() {
         setScrStatus("ok", `Done \u2014 ${d.screenings.length} screening(s)`);
       } else if (d && d.status === "running") {
         const p = d.progress || { done: 0, total: 0 };
-        setScrStatus("warn", `Walking ${p.done}/${p.total}\u2026`);
+        setScrStatus("warn", `Loading ${p.done}/${p.total}\u2026`);
+      } else if (d && d.status === "auth") {
+        setScrStatus("err", "Session expired");
+      } else if (d && d.status === "error") {
+        setScrStatus("err", d.note || "Couldn't load from Unite Us");
       } else if (!d) {
         setScrStatus("", "");
       }
@@ -2898,7 +2974,11 @@ function init() {
         setEligStatus("ok", `Done \u2014 ${d.eligibilities.length} assessment(s)`);
       } else if (d && d.status === "running") {
         const p = d.progress || { done: 0, total: 0 };
-        setEligStatus("warn", `Walking ${p.done}/${p.total}\u2026`);
+        setEligStatus("warn", `Loading ${p.done}/${p.total}\u2026`);
+      } else if (d && d.status === "auth") {
+        setEligStatus("err", "Session expired");
+      } else if (d && d.status === "error") {
+        setEligStatus("err", d.note || "Couldn't load from Unite Us");
       } else if (!d) {
         setEligStatus("", "");
       }
@@ -2913,7 +2993,11 @@ function init() {
         setCaseStatus("ok", `Done \u2014 ${d.cases.length} case(s)`);
       } else if (d && d.status === "running") {
         const p = d.progress || { done: 0, total: 0 };
-        setCaseStatus("warn", `Walking ${p.done}/${p.total}\u2026`);
+        setCaseStatus("warn", `Loading ${p.done}/${p.total}\u2026`);
+      } else if (d && d.status === "auth") {
+        setCaseStatus("err", "Session expired");
+      } else if (d && d.status === "error") {
+        setCaseStatus("err", d.note || "Couldn't load from Unite Us");
       } else if (!d) {
         setCaseStatus("", "");
       }

@@ -7,6 +7,19 @@
     <link rel="stylesheet" href="sidepanel.css" />
   </head>
   <body>
+    <!-- Full-page home / session screen. Shown when the user is off a client
+         page or the Unite Us session has expired. The last client's data stays
+         cached underneath and reappears when they return to that client. -->
+    <div id="homeOverlay" class="home-overlay hidden">
+      <img class="home-logo" src="assets/logo-400.png" alt="CareCircle" />
+      <h2 id="homeTitle" class="home-title">Open a client in Unite Us</h2>
+      <p id="homeMsg" class="home-msg">
+        Search for a client on Unite Us and open their facesheet to start
+        capturing their information here.
+      </p>
+      <button id="homeRetryBtn" class="primary hidden">Retry</button>
+    </div>
+
     <header class="app-header">
       <h1>Client Workflow</h1>
     </header>

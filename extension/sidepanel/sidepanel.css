@@ -112,6 +112,26 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
 .muted { color: var(--muted); }
 .hidden { display: none !important; }
 
+/* Full-page home / session screen (logo + message), overlaying the panel. */
+.home-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  background: var(--bg);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  padding: 32px 28px;
+  gap: 14px;
+}
+.home-overlay.expired { background: #fef2f2; }
+.home-logo { width: 140px; max-width: 60%; height: auto; opacity: 0.95; }
+.home-title { margin: 0; font-size: 17px; font-weight: 600; color: var(--text); }
+.home-msg { margin: 0; max-width: 320px; color: var(--muted); line-height: 1.5; }
+.home-overlay .primary { margin-top: 6px; padding: 9px 18px; border-radius: 8px; }
+
 .empty-state {
   border: 1px solid var(--primary, #2563eb);
   border-left-width: 4px;

@@ -465,34 +465,18 @@ function coverageSectionsPresent() {
   );
 }
 
-// Light scrape harvests whatever is currently visible (Overview header gives
-// name/DOB/TEL/ADDRESS). Deep scrape additionally walks each facesheet tab and
-// collects every case / screening / eligibility record it finds.
+// Read whatever is currently visible (the Overview header gives name / DOB /
+// TEL / ADDRESS) purely from the current DOM - NO tab navigation. Profile,
+// cases, screenings and eligibility are all sourced from the core API now
+// (see maybeEnrichFromApi + the API scans), which is authoritative; this light
+// pass only provides an instant first paint before the API responds. The `deep`
+// flag no longer walks tabs - it just forces the API enrichment downstream.
 async function scrapePage(deep) {
   const pairs = {};
   const recordMap = new Map();
   harvestFields(pairs);
   collectRecords(recordMap);
-  let captured = harvestProfile();
-  if (!deep) return { pairs, records: [...recordMap.values()], captured };
-
-  // Cases, Screenings and Eligibility Assessments are now extracted via the
-  // core API (no navigation), so the deep scrape only visits the Profile tab -
-  // the sole remaining DOM-only source (e.g. household size). This avoids the
-  // facesheet tab-walk that previously navigated through every data tab.
-  const labels = getFacesheetTabs().map((t) => cleanText(t.innerText));
-  if (labels.includes("Profile") && clickTabByLabel("Profile")) {
-    await sleep(700); // let the tab's content load
-    harvestFields(pairs);
-    const c = harvestProfile();
-    if (c) captured = c;
-    collectRecords(recordMap);
-
-    // Restore the user's view to the Overview tab.
-    clickTabByLabel("Overview");
-    await sleep(150);
-    collectRecords(recordMap);
-  }
+  const captured = harvestProfile();
   return { pairs, records: [...recordMap.values()], captured };
 }
 
@@ -760,6 +744,25 @@ function publishIdsOnly() {
       },
     });
   });
+}
+
+// Publish whether the user is currently looking at a client (facesheet / case /
+// eligibility / screening view) vs. some other Unite Us page (search, dashboard,
+// login). The side panel shows its full-page "home" screen whenever the user is
+// off a client - while still retaining the last client's extracted data so a
+// return is instant; we only drop that data when a DIFFERENT client appears.
+function publishView() {
+  const ids = parseIdsFromUrl();
+  try {
+    chrome.storage.local.set({
+      uw_view: {
+        onClient: !!ids.client_id,
+        clientId: ids.client_id || null,
+        href: location.href,
+        at: Date.now(),
+      },
+    });
+  } catch (_) {}
 }
 
 // ---------------------------------------------------------------------------
@@ -1439,6 +1442,55 @@ async function getUuCreds() {
   return null;
 }
 
+// Thrown when a Unite Us API call returns 401/403 - i.e. the captured Bearer
+// token expired or the user was logged out. Distinguished from generic errors
+// so callers never fall back to the DOM crawler (which would navigate the page
+// for a logged-out user); instead the panel shows the "log back in" screen.
+class AuthError extends Error {
+  constructor(status) {
+    super(`auth ${status}`);
+    this.name = "AuthError";
+    this.status = status;
+  }
+}
+const isAuthError = (e) =>
+  !!e && (e.name === "AuthError" || e.status === 401 || e.status === 403);
+
+// Drop the stale token so the next bootstrap waits for the page to mint a fresh
+// one (after the user re-logs in) instead of re-sending the dead JWT.
+function invalidateUuCreds() {
+  uuCreds = null;
+  try {
+    chrome.storage.local.remove("uw_uu_creds");
+  } catch (_) {}
+}
+
+const SESSION_EXPIRED_NOTE =
+  "Unite Us session expired \u2014 log back in to Unite Us, then retry.";
+const NO_API_NOTE =
+  "Couldn't read from Unite Us yet \u2014 open the client's facesheet and reload the tab (F5) if this persists.";
+const API_FAIL_NOTE =
+  "Couldn't load from Unite Us \u2014 reload the tab (F5) and retry.";
+
+// Global session signal the side panel watches to show / hide the full-page
+// "session expired" home screen.
+function publishSession(state) {
+  try {
+    chrome.storage.local.set({
+      uw_session: { state, at: new Date().toISOString() },
+    });
+  } catch (_) {}
+}
+
+// Map a fetch Response to an AuthError on 401/403 (invalidating creds), so a
+// dead token never silently degrades into a DOM walk.
+function throwIfAuth(res) {
+  if (res.status === 401 || res.status === 403) {
+    invalidateUuCreds();
+    throw new AuthError(res.status);
+  }
+}
+
 // If we don't already hold fresh credentials, nudge the page to call the
 // screenings API by opening the Screenings facesheet tab (an in-app click, not
 // a navigation) and wait for the shim to forward the headers.
@@ -1478,6 +1530,7 @@ async function apiFetchScreeningList(clientId, creds, type = "screening") {
       headers: uuHeaders(creds),
       credentials: "omit",
     });
+    throwIfAuth(res);
     if (!res.ok) {
       let detail = "";
       try {
@@ -1499,6 +1552,7 @@ async function apiFetchScreeningList(clientId, creds, type = "screening") {
 async function apiFetchScreeningDetail(id, creds) {
   const url = `${SCREENINGS_API}/${id}?template_format=surveyjs`;
   const res = await fetch(url, { headers: uuHeaders(creds), credentials: "omit" });
+  throwIfAuth(res);
   if (!res.ok) throw new Error(`detail ${res.status}`);
   const body = await res.json();
   return body.screen || body;
@@ -1642,6 +1696,7 @@ async function startScreeningScan(msg) {
   try {
     const api = await runScreeningApiScan(clientId);
     if (api.ok) {
+      publishSession("ok");
       publishScreeningsApi(
         clientId,
         api.screenings,
@@ -1652,11 +1707,20 @@ async function startScreeningScan(msg) {
       );
       return { ok: true, count: api.screenings.length };
     }
+    // API ran but no token could be captured. Do NOT scrape the DOM; prompt the
+    // user to make sure Unite Us is loaded / logged in.
+    publishScreeningsApi(clientId, [], "error", NO_API_NOTE);
+    return { ok: false, error: api.error || "no-creds" };
   } catch (e) {
-    console.warn("[uw-scr] API path failed, falling back to DOM crawler:", e);
+    if (isAuthError(e)) {
+      publishSession("expired");
+      publishScreeningsApi(clientId, [], "auth", SESSION_EXPIRED_NOTE);
+      return { ok: false, error: "auth" };
+    }
+    console.warn("[uw-scr] API scan failed:", e);
+    publishScreeningsApi(clientId, [], "error", API_FAIL_NOTE);
+    return { ok: false, error: String(e) };
   }
-
-  return startScreeningScanLegacy(msg, clientId);
 }
 
 // ---------------------------------------------------------------------------
@@ -1752,6 +1816,7 @@ async function coreGet(path, creds) {
     headers: coreHeaders(creds),
     credentials: "omit",
   });
+  throwIfAuth(res);
   if (!res.ok) throw new Error(`core ${path.split("?")[0]} ${res.status}`);
   return res.json();
 }
@@ -1993,13 +2058,23 @@ async function maybeEnrichFromApi(clientId, force) {
     lastApiEnrich.clientId === clientId &&
     Date.now() - lastApiEnrich.at < 120000;
   if (fresh && !force) return;
+  // On a forced reload (Profile reload / "Retry" after a session expiry) make
+  // sure we hold a live token: bootstrap re-captures one the moment the page
+  // makes its own API call after the user logs back in. (No-op when fresh creds
+  // are already cached.)
+  if (force) await bootstrapUuCreds(15000);
   try {
     const api = await enrichCapturedFromApi(clientId);
     if (api) {
       mergeApiCaptured(api);
       lastApiEnrich = { clientId, at: Date.now() };
+      publishSession("ok");
     }
   } catch (e) {
+    if (isAuthError(e)) {
+      publishSession("expired");
+      return;
+    }
     console.warn("[uw-prof] API enrich failed:", e);
   }
 }
@@ -2339,6 +2414,7 @@ async function startEligibilityScan(msg) {
   try {
     const api = await runEligibilityApiScan(clientId);
     if (api.ok) {
+      publishSession("ok");
       publishEligibilityApi(
         clientId,
         api.eligibilities,
@@ -2349,11 +2425,18 @@ async function startEligibilityScan(msg) {
       );
       return { ok: true, count: api.eligibilities.length };
     }
+    publishEligibilityApi(clientId, [], "error", NO_API_NOTE);
+    return { ok: false, error: api.error || "no-creds" };
   } catch (e) {
-    console.warn("[uw-elig] API path failed, falling back to DOM crawler:", e);
+    if (isAuthError(e)) {
+      publishSession("expired");
+      publishEligibilityApi(clientId, [], "auth", SESSION_EXPIRED_NOTE);
+      return { ok: false, error: "auth" };
+    }
+    console.warn("[uw-elig] API scan failed:", e);
+    publishEligibilityApi(clientId, [], "error", API_FAIL_NOTE);
+    return { ok: false, error: String(e) };
   }
-
-  return startEligibilityScanLegacy(msg, clientId);
 }
 
 async function startEligibilityScanLegacy(msg, clientId) {
@@ -2605,33 +2688,45 @@ async function cachedName(kind, id, creds, path) {
   return name;
 }
 
-// Enumerate the person's cases, following pagination. include=primary_worker so
-// the worker name comes back in `included` (no extra call per case).
+// Enumerate the person's cases, following pagination. Mirrors the exact request
+// the Unite Us cases tab makes (verified against the network capture); note we
+// do NOT pass include=primary_worker - core rejects that unknown include with a
+// 400, which is what was breaking the cases scan. Worker names are resolved
+// per-case via cachedEmployeeName() instead.
 async function apiFetchCaseList(clientId, creds) {
   const out = [];
-  const employees = caseApiCache.employee;
   let number = 1;
   for (let guard = 0; guard < 20; guard++) {
     const body = await coreGet(
-      `/cases?filter[person]=${clientId}&filter[include_pathways]=false` +
-        `&include=primary_worker&sort=updated_at&sort_direction=desc` +
+      `/cases?filter[person]=${clientId}` +
+        `&filter[state]=managed,off_platform&filter[include_pathways]=false` +
+        `&filter[internal_state]=managed,pending_authorization` +
+        `&sort=updated_at&sort_direction=desc` +
         `&page[number]=${number}&page[size]=50`,
       creds
     );
-    for (const inc of body.included || []) {
-      if (inc && inc.type === "employee") {
-        const a = inc.attributes || {};
-        const nm =
-          a.full_name || [a.first_name, a.last_name].filter(Boolean).join(" ");
-        if (nm) employees.set(inc.id, nm);
-      }
-    }
     for (const c of body.data || []) out.push(c);
     const tp = body.meta && body.meta.page && body.meta.page.total_pages;
     if (!tp || number >= tp) break;
     number += 1;
   }
   return out;
+}
+
+// Resolve an employee's display name (employees expose full_name, not name, so
+// cachedName can't be reused). Cached by id; failures degrade to an empty name.
+async function cachedEmployeeName(id, creds) {
+  if (!id) return "";
+  const store = caseApiCache.employee;
+  if (store.has(id)) return store.get(id);
+  let name = "";
+  try {
+    const body = await coreGet(`/employees/${id}`, creds);
+    const a = (body.data && body.data.attributes) || {};
+    name = a.full_name || [a.first_name, a.last_name].filter(Boolean).join(" ") || "";
+  } catch (_) {}
+  store.set(id, name);
+  return name;
 }
 
 // Resolve every related entity for one case into the UPPERCASE-label field map
@@ -2654,7 +2749,7 @@ async function buildCaseDetailFromApi(caseObj, creds) {
   if (programName) fields["PROGRAM"] = programName;
   if (networkName) fields["NETWORK"] = networkName;
 
-  const workerName = caseApiCache.employee.get(relId("primary_worker")) || "";
+  const workerName = await cachedEmployeeName(relId("primary_worker"), creds);
   if (workerName) fields["PRIMARY WORKER"] = workerName;
 
   const opened = isoToUS(attr.opened_date);
@@ -2740,17 +2835,19 @@ async function runCaseApiScan(clientId) {
 
   const list = await apiFetchCaseList(clientId, creds);
   const provider = (creds.providerId || "").toLowerCase();
-  // Keep only the logged-in provider's own cases (Met Council); match the
-  // case.provider relationship id to x-provider-id.
-  const mine = provider
-    ? list.filter((c) => {
-        const p =
-          c.relationships &&
-          c.relationships.provider &&
-          c.relationships.provider.data;
-        return p && String(p.id).toLowerCase() === provider;
-      })
-    : list;
+  const provOf = (c) => {
+    const p = c.relationships && c.relationships.provider && c.relationships.provider.data;
+    return p ? String(p.id).toLowerCase() : "";
+  };
+  // Keep only the logged-in provider's own cases (Met Council) by matching the
+  // case.provider relationship to x-provider-id. Defensive: if the response
+  // doesn't expose a provider relationship on ANY case, don't filter - the cases
+  // tab is already provider-scoped, so dropping everything would be wrong.
+  const hasProviderRel = list.some((c) => provOf(c));
+  const mine =
+    provider && hasProviderRel
+      ? list.filter((c) => provOf(c) === provider)
+      : list;
 
   const cases = [];
   for (const c of mine) {
@@ -2789,6 +2886,7 @@ async function startCaseScan(msg) {
   try {
     const api = await runCaseApiScan(clientId);
     if (api.ok) {
+      publishSession("ok");
       publishCasesApi(
         clientId,
         api.cases,
@@ -2797,11 +2895,18 @@ async function startCaseScan(msg) {
       );
       return { ok: true, count: api.cases.length };
     }
+    publishCasesApi(clientId, [], "error", NO_API_NOTE);
+    return { ok: false, error: api.error || "no-creds" };
   } catch (e) {
-    console.warn("[uw-case] API path failed, falling back to DOM crawler:", e);
+    if (isAuthError(e)) {
+      publishSession("expired");
+      publishCasesApi(clientId, [], "auth", SESSION_EXPIRED_NOTE);
+      return { ok: false, error: "auth" };
+    }
+    console.warn("[uw-case] API scan failed:", e);
+    publishCasesApi(clientId, [], "error", API_FAIL_NOTE);
+    return { ok: false, error: String(e) };
   }
-
-  return startCaseScanLegacy(msg);
 }
 
 // ===========================================================================
@@ -3227,12 +3332,61 @@ function scheduleLightScrapes() {
 
 // Initial run: light header scrape (no tab walking) so validation can proceed.
 publishIdsOnly();
+publishView();
 scheduleLightScrapes();
-// Resume an in-progress screening / eligibility auto-walk if one survived a
-// page navigation.
-maybeContinueScreeningScan();
-maybeContinueEligibilityScan();
-maybeContinueCaseScan();
+// The legacy DOM auto-walk crawlers are retired - everything is API-driven now,
+// so we no longer resume DOM walks (which navigated + scraped HTML). Drop any
+// leftover crawler state from a previous version so it can never resume.
+try {
+  chrome.storage.local.remove(["uw_scr_scan", "uw_elig_scan", "uw_case_scan"]);
+} catch (_) {}
+
+// Consent is read from the API-enriched profile (mirrors the panel's
+// consentAccepted gate). Stage B only auto-refreshes case / screening /
+// eligibility sections once the client has consented.
+function hasConsent() {
+  const cs =
+    accum &&
+    accum.captured &&
+    accum.captured.client &&
+    accum.captured.client.consent_status;
+  return /accept/i.test(cs || "");
+}
+
+// Which client section the user is currently viewing on the Unite Us page. We
+// prefer the selected facesheet tab (tab switches don't always change the URL),
+// then fall back to the sub-route for the screenings / cases / eligibility
+// bundles that ARE real navigations.
+function activeClientSection() {
+  const tab = [...document.querySelectorAll('[role="tab"]')].find(
+    (t) => t.getAttribute("aria-selected") === "true"
+  );
+  const label = tab ? cleanText(tab.innerText) : "";
+  if (/^cases$/i.test(label)) return "cases";
+  if (/^screenings$/i.test(label)) return "screenings";
+  if (/eligibility/i.test(label)) return "eligibility";
+  const p = location.pathname;
+  if (/\/eligibility/i.test(p)) return "eligibility";
+  if (/\/dashboard\/cases\//i.test(p)) return "cases";
+  if (/\/screenings?\//i.test(p)) return "screenings";
+  return null;
+}
+
+// Re-call a section's API when the user opens it, so newly added cases /
+// assessments / screenings show up. Debounced per section so rapid tab toggles
+// don't hammer the API.
+let lastSection = null;
+let lastSectionClient = null;
+const lastSectionFetch = {};
+function autoRefreshSection(section, clientId) {
+  if (!section || !clientId) return;
+  const now = Date.now();
+  if (lastSectionFetch[section] && now - lastSectionFetch[section] < 4000) return;
+  lastSectionFetch[section] = now;
+  if (section === "cases") startCaseScan({ clientId });
+  else if (section === "screenings") startScreeningScan({ clientId });
+  else if (section === "eligibility") startEligibilityScan({ clientId });
+}
 
 // Re-scan on SPA navigation (Unite Us is a single-page app).
 let lastHref = location.href;
@@ -3242,9 +3396,23 @@ setInterval(() => {
     lastHref = location.href;
     lastPublished = null;
     publishIdsOnly();
+    publishView();
     scheduleLightScrapes();
-    maybeContinueScreeningScan(); // resume the walk on in-app route changes too
-    maybeContinueEligibilityScan();
-    maybeContinueCaseScan();
+  }
+
+  // Stage B: detect facesheet tab switches (which may not change the URL) and
+  // auto-refresh the matching section once the client has consented.
+  const clientId = parseIdsFromUrl().client_id;
+  if (clientId !== lastSectionClient) {
+    lastSectionClient = clientId;
+    lastSection = null; // re-fire for the new client
+  }
+  const section = activeClientSection();
+  if (section !== lastSection) {
+    const entered = section; // may be null (e.g. Overview / Profile tab)
+    lastSection = section;
+    // Fire only when entering a data section; tracking null transitions too so
+    // Cases -> Overview -> Cases re-fires (the user revisited the tab).
+    if (entered && clientId && hasConsent()) autoRefreshSection(entered, clientId);
   }
 }, 1000);
