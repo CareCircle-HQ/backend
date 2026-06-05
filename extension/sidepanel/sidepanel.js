@@ -23,6 +23,7 @@ const DEFAULT_BACKEND = BAKED.backendUrl || "http://127.0.0.1:8000";
 const $ = (id) => document.getElementById(id);
 let currentContext = null;
 let isValidated = false;
+let autoScanTimer = null;
 const loadedFrames = new Set();
 
 // ---------- Config (transparent auth) ----------
@@ -247,9 +248,9 @@ function compareRow(label, captured, crm) {
   );
 }
 
-function compareTable(rows, capturedN, crmN, total) {
+function compareTable(rows, capturedN, crmN, total, opts = {}) {
   return (
-    `<table class="cmp-table">` +
+    `<table class="cmp-table${opts.noDot ? " no-dot" : ""}">` +
     `<thead><tr><th class="dot"></th><th>Field</th>` +
     `<th>Captured <span class="cnt">${capturedN}/${total}</span></th>` +
     `<th>CRM <span class="cnt">${crmN}/${total}</span></th></tr></thead>` +
@@ -261,7 +262,7 @@ function compareTable(rows, capturedN, crmN, total) {
 // capturedObj is the structured page-captured object keyed by field key/capKey;
 // when a field key is present there (even if ""), it is authoritative and we do
 // NOT fall back to fuzzy label matching (which can surface edit-mode garbage).
-function renderObjectSection(def, capturedObj, capturedPairs, crmObj) {
+function renderObjectSection(def, capturedObj, capturedPairs, crmObj, opts = {}) {
   const index = buildCapturedIndex(capturedPairs);
   capturedObj = capturedObj || {};
   let capN = 0;
@@ -276,7 +277,7 @@ function renderObjectSection(def, capturedObj, capturedPairs, crmObj) {
       return compareRow(f.label, cap, crm);
     })
     .join("");
-  return compareTable(rows, capN, crmN, def.fields.length);
+  return compareTable(rows, capN, crmN, def.fields.length, opts);
 }
 
 // Render a record-type section (cases/screenings/eligibility): union by id.
@@ -333,13 +334,19 @@ function renderRecordSection(def, type, ctx) {
 // page-captured records for that group (already filtered by the content script
 // per the workflow rules) and any matching CRM insurances, matched best-effort
 // by plan name. Falls back to a single empty schema table.
-function renderCoverageSection(ctx, group, def, crmList) {
+function renderCoverageSection(ctx, group, def, crmList, opts = {}) {
+  // We capture every record (active + inactive) so the CRM can reconcile, but
+  // the profile only DISPLAYS active coverage (End Date >= today or no
+  // expiration). Captured records carry the active flag; CRM records are shown
+  // unless their status is inactive.
   const capList = (ctx && Array.isArray(ctx.insurance) ? ctx.insurance : []).filter(
-    (c) => (c.group || "insurance") === group
+    (c) => (c.group || "insurance") === group && c.active !== false
   );
-  crmList = crmList || [];
+  crmList = (crmList || []).filter(
+    (c) => String(c.status || "").toLowerCase() !== "inactive"
+  );
   if (!capList.length && !crmList.length) {
-    return renderObjectSection(def, {}, {}, null);
+    return renderObjectSection(def, {}, {}, null, opts);
   }
   const norm = (s) => String(s || "").trim().toLowerCase();
   const usedCap = new Set();
@@ -363,11 +370,14 @@ function renderCoverageSection(ctx, group, def, crmList) {
     .map((b) => {
       const tags =
         (b.capObj && Object.keys(b.capObj).length ? '<span class="tag det">Detected</span>' : "") +
-        (b.crmObj ? '<span class="tag imp">In CRM</span>' : "");
+        (b.crmObj ? '<span class="tag imp">In CRM</span>' : "") +
+        (b.capObj && b.capObj.active === false
+          ? '<span class="tag inactive">Inactive</span>'
+          : "");
       return (
         `<div class="rec-block"><div class="rec-head">` +
         `<span class="rec-n">${escapeHtml(b.label)}</span> ${tags}</div>` +
-        renderObjectSection(def, b.capObj, {}, b.crmObj) +
+        renderObjectSection(def, b.capObj, {}, b.crmObj, opts) +
         `</div>`
       );
     })
@@ -409,12 +419,253 @@ function buildClientSummaryHtml(ctx) {
   );
 }
 
+// ---- Client Snapshot (per-client tracking on the Profile tab) -------------
+// Returns the captured walk data only when it belongs to the current client, so
+// stale data from a previous client never leaks into the snapshot.
+function snapDataFor(data, clientId) {
+  return data && data.clientId === clientId ? data : null;
+}
+
+function parseDateMaybe(s) {
+  if (!s) return null;
+  const t = Date.parse(s);
+  return isNaN(t) ? null : t;
+}
+
+// True when the (parseable) date is within the last `months` months.
+function withinMonths(dateStr, months) {
+  const t = parseDateMaybe(dateStr);
+  if (t == null) return false;
+  const cutoff = new Date();
+  cutoff.setMonth(cutoff.getMonth() - months);
+  return t >= cutoff.getTime();
+}
+
+// Short locale date; em dash when empty/unparseable.
+function fmtDate(s) {
+  const t = parseDateMaybe(s);
+  return t == null ? s || "\u2014" : new Date(t).toLocaleDateString();
+}
+
+// Most recent date among rows; falls back to the first non-empty raw string when
+// the dates aren't parseable.
+function latestDateStr(rows, getDate) {
+  let bestT = null;
+  let bestStr = "";
+  (rows || []).forEach((r) => {
+    const s = getDate(r);
+    if (!s) return;
+    const t = parseDateMaybe(s);
+    if (t != null) {
+      if (bestT == null || t > bestT) {
+        bestT = t;
+        bestStr = s;
+      }
+    } else if (!bestStr) {
+      bestStr = s;
+    }
+  });
+  return bestStr;
+}
+
+// Minutes captured for one screening (from the "Screening Duration" Q&A answer
+// like "8 Minutes", or the raw numeric duration).
+function screeningDurationMinutes(s) {
+  const d = s && s.detail;
+  if (!d) return 0;
+  const item = (d.items || []).find((it) => /screening duration/i.test(it.q || ""));
+  const raw = item ? item.a : d.duration || "";
+  const m = String(raw).match(/(\d+(?:\.\d+)?)/);
+  return m ? parseFloat(m[1]) : 0;
+}
+
+// The "Client Snapshot" card shown right under the client summary table. Each
+// row shows what we tracked; when we couldn't extract it, a "Pull" button lets
+// the user fetch it on the spot (a small re-pull control is always available).
+function buildSnapshotHtml(ctx) {
+  const cap = (ctx.captured && ctx.captured.client) || {};
+  const clientId = ctx.client_id;
+
+  // Consent
+  const consentStr = [cap.consent_status, cap.consented_at].filter(Boolean).join(" \u00b7 ");
+
+  // Screenings
+  const sd = snapDataFor(screeningData, clientId);
+  const screenings = (sd && sd.screenings) || [];
+  const scrMin = screenings.reduce((sum, s) => sum + screeningDurationMinutes(s), 0);
+  const scrLast = latestDateStr(screenings, (s) => s.date);
+
+  // Eligibility
+  const ed = snapDataFor(eligibilityData, clientId);
+  const eligs = (ed && ed.eligibilities) || [];
+  const eligLast = latestDateStr(eligs, (e) => e.date);
+
+  // Cases
+  const cd = snapDataFor(caseData, clientId);
+  const cases = (cd && cd.cases) || [];
+  const caseLast = latestDateStr(cases, (c) => c.date_opened);
+  const caseStatus = (c) => (c.detail && c.detail.status) || c.status || "";
+  const openCases = cases.filter((c) => /open|active|authorized/i.test(caseStatus(c))).length;
+  const closedCases = cases.filter((c) => /close|complete|resolved/i.test(caseStatus(c))).length;
+
+  // CRM presence (from the backend lookup) + when the record was added.
+  const crmClient = crm && crm.client;
+  const crmExists = !!crmClient;
+  const crmAdded = crmClient && (crmClient.created_at || crmClient.updated_at);
+
+  // Status rule: green when at least one record's most-recent date is <= 6 months
+  // old (and there is at least one record); red otherwise.
+  const recentOk = (rows, last) => rows.length > 0 && withinMonths(last, 6);
+
+  const mark = (ok) =>
+    ok
+      ? '<span class="snap-mark ok" title="OK">\u2713</span>'
+      : '<span class="snap-mark bad" title="Needs attention">\u2717</span>';
+  const repull = (key) =>
+    `<button class="snap-pull" data-pull="${key}" title="Re-pull">\u21bb</button>`;
+  const row = (label, valueHtml, key, missing, status) => {
+    let v;
+    if (missing) {
+      v = key
+        ? `<span class="snap-v miss">Not captured <button class="snap-pull" data-pull="${key}">Pull</button></span>`
+        : '<span class="snap-v miss">Not captured</span>';
+    } else {
+      v = `<span class="snap-v">${valueHtml}${key ? " " + repull(key) : ""}</span>`;
+    }
+    const s = status == null ? "" : mark(status);
+    return (
+      `<div class="snap-row"><span class="snap-k">${label}</span>${v}` +
+      `<span class="snap-s">${s}</span></div>`
+    );
+  };
+
+  const dash = "\u2014";
+  let html = '<div class="snapshot"><div class="snap-h">Client Snapshot</div>';
+  html += row(
+    "Consent",
+    escapeHtml(consentStr),
+    "consent",
+    !consentStr,
+    /accept/i.test(cap.consent_status || "")
+  );
+  html += row(
+    "Met Council Screenings",
+    `<strong>${screenings.length}</strong> \u00b7 last ${escapeHtml(scrLast || dash)}` +
+      (scrMin ? ` \u00b7 ${scrMin} min total` : ""),
+    "screening",
+    !sd,
+    recentOk(screenings, scrLast)
+  );
+  html += row(
+    "Met Council Eligibility",
+    `<strong>${eligs.length}</strong> \u00b7 last ${escapeHtml(eligLast || dash)}`,
+    "eligibility",
+    !ed,
+    recentOk(eligs, eligLast)
+  );
+  html += row(
+    "Met Council Cases",
+    `<strong>${cases.length}</strong> (${openCases} open, ${closedCases} closed)` +
+      ` \u00b7 last ${escapeHtml(caseLast || dash)}`,
+    "cases",
+    !cd,
+    recentOk(cases, caseLast)
+  );
+  html += row(
+    "In CRM",
+    crmExists ? `Yes \u00b7 added ${escapeHtml(fmtDate(crmAdded))}` : "Not in CRM",
+    null,
+    false,
+    crmExists
+  );
+  html += "</div>";
+  return html;
+}
+
+// Wire the snapshot "Pull"/re-pull buttons (re-bound after every render since
+// renderComparison replaces #cmp-profile's innerHTML).
+function bindSnapshotPull() {
+  ["cmp-profile", "comparison"].forEach((boxId) => {
+    const box = $(boxId);
+    if (!box) return;
+    box.querySelectorAll(".snap-pull").forEach((btn) => {
+      btn.addEventListener("click", (ev) => {
+        ev.stopPropagation();
+        btn.disabled = true;
+        const k = btn.getAttribute("data-pull");
+        if (k === "consent") deepScrape();
+        else if (k === "screening") scrRescan();
+        else if (k === "eligibility") eligRescan();
+        else if (k === "cases") caseRescan();
+      });
+    });
+    // Collapsible Client/Address sections.
+    box.querySelectorAll(".acc-head").forEach((h) => {
+      h.addEventListener("click", () => h.parentElement.classList.toggle("open"));
+    });
+  });
+}
+
+// ---- Consent gating -------------------------------------------------------
+// A client can only be worked once consent is Accepted. "Unknown" (not yet
+// captured), pending, declined, revoked and expired all count as "no consent".
+const NO_CONSENT_MSG =
+  "No consent on file \u2014 reload the Profile to capture consent first";
+
+function consentAccepted() {
+  const cap = currentContext && currentContext.captured && currentContext.captured.client;
+  return /accept/i.test((cap && cap.consent_status) || "");
+}
+
+// Without consent the ONLY allowed action is the Profile reload (so the user can
+// re-scan to pick up consent if it wasn't captured first time). Every other
+// reload + all save buttons are disabled. When consent is present we hand control
+// back to each feature's own enable logic.
+function refreshConsentGate() {
+  const ok = consentAccepted();
+  const rescanBtns = ["scrRescanBtn", "eligRescanBtn", "caseRescanBtn"];
+  if (!ok) {
+    [...rescanBtns, "scrSaveBtn", "eligSaveBtn", "caseSaveBtn", "saveBtn"].forEach((id) => {
+      const b = $(id);
+      if (b) {
+        b.disabled = true;
+        b.title = NO_CONSENT_MSG;
+      }
+    });
+  } else {
+    rescanBtns.forEach((id) => {
+      const b = $(id);
+      if (b) {
+        b.disabled = false;
+        b.title = "";
+      }
+    });
+    updateScrSaveBtn();
+    updateEligSaveBtn();
+    updateCaseSaveBtn();
+    const saveBtn = $("saveBtn");
+    if (saveBtn) saveBtn.disabled = !(currentContext && currentContext.client_id);
+  }
+  // The Profile reload buttons (rescanBtn / rescanBtn2) stay enabled regardless.
+}
+
+// Wrap a profile section in a collapsible accordion (same markup as the
+// screening/case accordions). `open` controls the initial expanded state.
+function profileAccordion(title, bodyHtml, open) {
+  return (
+    `<div class="acc${open ? " open" : ""}">` +
+    `<div class="acc-head"><span class="acc-title">${escapeHtml(title)}</span></div>` +
+    `<div class="acc-body">${bodyHtml}</div></div>`
+  );
+}
+
 // Profile view = Client + Address + Insurance comparison.
 function buildProfileHtml(ctx) {
   const pairs = ctx.scraped || {};
   const captured = ctx.captured || { client: {}, address: {} };
   const crmClient = crm.client;
   let html = buildClientSummaryHtml(ctx);
+  html += buildSnapshotHtml(ctx);
 
   // Client: structured captured profile data wins; pairs are only a fallback.
   const clientPairs = {
@@ -422,14 +673,20 @@ function buildProfileHtml(ctx) {
     "date of birth": ctx.client_dob || pairs["DOB"] || "",
     phone: ctx.client_phone || "",
   };
-  html += `<h3>${SCHEMA.client.title}</h3>`;
-  html += renderObjectSection(SCHEMA.client, captured.client, clientPairs, crmClient);
+  html += profileAccordion(
+    SCHEMA.client.title,
+    renderObjectSection(SCHEMA.client, captured.client, clientPairs, crmClient),
+    true
+  );
 
   // Address (current/primary): first CRM address vs captured primary address.
   const addr = crmClient && (crmClient.addresses || [])[0];
   const addrPairs = { ...pairs, address: ctx.client_address || pairs["ADDRESS"] || "" };
-  html += `<h3>${SCHEMA.address.title}</h3>`;
-  html += renderObjectSection(SCHEMA.address, captured.address, addrPairs, addr);
+  html += profileAccordion(
+    SCHEMA.address.title,
+    renderObjectSection(SCHEMA.address, captured.address, addrPairs, addr, { noDot: true }),
+    false
+  );
 
   // Insurance + Social Care Coverage: captured records (filtered per the
   // workflow rules) unioned with CRM insurances, matched best-effort by plan
@@ -445,10 +702,16 @@ function buildProfileHtml(ctx) {
   );
   const crmScc = crmInsurances.filter((c) => sccNames.has(norm(c.plan_name)));
   const crmIns = crmInsurances.filter((c) => !sccNames.has(norm(c.plan_name)));
-  html += `<h3>${SCHEMA.insurance.title}</h3>`;
-  html += renderCoverageSection(ctx, "insurance", SCHEMA.insurance, crmIns);
-  html += `<h3>${SCHEMA.social_care_coverage.title}</h3>`;
-  html += renderCoverageSection(ctx, "social_care_coverage", SCHEMA.social_care_coverage, crmScc);
+  html += profileAccordion(
+    SCHEMA.insurance.title,
+    renderCoverageSection(ctx, "insurance", SCHEMA.insurance, crmIns, { noDot: true }),
+    false
+  );
+  html += profileAccordion(
+    SCHEMA.social_care_coverage.title,
+    renderCoverageSection(ctx, "social_care_coverage", SCHEMA.social_care_coverage, crmScc, { noDot: true }),
+    false
+  );
   return html;
 }
 
@@ -470,11 +733,12 @@ function renderComparison(ctx) {
   const screeningHtml = empty ? "" : buildRecordHtml("screening", ctx);
   const eligibilityHtml = empty ? "" : buildRecordHtml("eligibility", ctx);
 
-  // Per-tab views.
+  // Per-tab views. The dedicated Screening tab is rendered separately from the
+  // captured screening detail (renderScreenings); screeningHtml below feeds only
+  // the full CRM comparison on the Data tab.
   fill("cmp-profile", profileHtml, openMsg);
-  fill("cmp-screening", screeningHtml, "No screenings detected or imported yet.");
-  fill("cmp-eligibility", eligibilityHtml, "No eligibility records detected or imported yet.");
-  fill("cmp-cases", caseHtml, "No cases detected or imported yet.");
+  // Note: cmp-cases and cmp-eligibility now host the captured accordions
+  // (renderCases / renderEligibility); their CRM comparisons live on the Data tab.
 
   // Full comparison on the Data tab.
   fill(
@@ -490,6 +754,8 @@ function renderComparison(ctx) {
   const saveBtn = $("saveBtn");
   if (saveBtn) saveBtn.disabled = empty;
   renderProfileMeta();
+  bindSnapshotPull();
+  refreshConsentGate(); // disable everything but Profile reload when no consent
 }
 
 // This function is serialized and injected into the page by executeScript,
@@ -645,6 +911,204 @@ function inspectPageFn() {
     .filter((s) => s && s.text)
     .slice(0, 40);
 
+  // Screenings list: how each row links to its detail page, so we can drive the
+  // auto-walk (anchor href / role=link / button / data-* / onclick).
+  const screeningRows = (() => {
+    const table = [...document.querySelectorAll("table")].find((t) => {
+      const heads = [...t.querySelectorAll("th")].map((th) =>
+        clean(th.innerText).toUpperCase()
+      );
+      return heads.includes("FORM") && heads.includes("ORGANIZATION");
+    });
+    if (!table) return { found: false };
+    let rows = [...table.querySelectorAll("tbody tr")];
+    if (!rows.length) {
+      rows = [...table.querySelectorAll("tr")].filter((r) => r.querySelector("td"));
+    }
+    const sample = rows.slice(0, 2).map((tr) => ({
+      text: clean(tr.innerText),
+      anchors: [...tr.querySelectorAll("a[href]")].map((a) => a.getAttribute("href")),
+      roleLinks: [...tr.querySelectorAll('[role="link"],[role="button"]')].map((e) =>
+        clean(e.innerText)
+      ),
+      buttons: [...tr.querySelectorAll("button")].map((b) =>
+        clean(b.innerText || b.getAttribute("aria-label"))
+      ),
+      dataAttrs: [...tr.querySelectorAll("[data-testid],[data-test-element],[data-id]")]
+        .slice(0, 16)
+        .map(
+          (e) =>
+            e.getAttribute("data-testid") ||
+            e.getAttribute("data-test-element") ||
+            e.getAttribute("data-id")
+        ),
+      html: (tr.outerHTML || "").slice(0, 3000),
+    }));
+    return { found: true, rowCount: rows.length, sample };
+  })();
+
+  // Screening DETAIL page: dump the HTML around the Questions and Results areas
+  // so we can write reliable Q&A / result selectors.
+  const screeningDetail = (() => {
+    if (!/submission\//i.test(location.href)) return { onDetail: false };
+    const grabAround = (re) => {
+      const el = [
+        ...document.querySelectorAll("h1,h2,h3,h4,h5,p,div,span,strong,label"),
+      ].find((e) => {
+        const t = clean(e.innerText);
+        return t && t.length < 50 && re.test(t);
+      });
+      if (!el) return null;
+      let c = el;
+      for (let i = 0; i < 5; i++) {
+        if (!c.parentElement) break;
+        c = c.parentElement;
+        if ((c.innerText || "").length > 500) break;
+      }
+      return (c.outerHTML || "").slice(0, 9000);
+    };
+
+    // Extract all Q&A pairs for debugging (same logic as harvestScreeningDetail)
+    const qaPairs = [];
+    const allElements = [...document.querySelectorAll("div, span, p, h1, h2, h3, h4, h5, h6")];
+    for (let i = 0; i < allElements.length; i++) {
+      const el = allElements[i];
+      const text = clean(el.innerText);
+      if (!text || text.length > 300) continue;
+      if (!text.endsWith("?")) continue;
+      // Skip section headers
+      if (text.toLowerCase().includes("screening")) continue;
+
+      let answerEl = null;
+      if (el.nextElementSibling) answerEl = el.nextElementSibling;
+      else if (el.parentElement && el.parentElement.nextElementSibling) {
+        answerEl = el.parentElement.nextElementSibling;
+      } else {
+        for (let j = i + 1; j < allElements.length && j < i + 5; j++) {
+          const nextEl = allElements[j];
+          const nextText = clean(nextEl.innerText);
+          if (!nextText || nextText.endsWith("?")) break;
+          if (nextText.toLowerCase().includes("screening")) break;
+          if (nextText && nextText.length < 200) {
+            answerEl = nextEl;
+            break;
+          }
+        }
+      }
+
+      if (answerEl) {
+        const answer = clean(answerEl.innerText);
+        if (answer && answer !== text && answer.length < 400) {
+          qaPairs.push({ q: text.slice(0, 100), a: answer.slice(0, 100) });
+        }
+      }
+    }
+
+    // Extract all leaf nodes that might be results (for debugging over-capture)
+    const allLeafTexts = [];
+    document.querySelectorAll("*").forEach((el) => {
+      if (el.children.length === 0) {
+        const t = clean(el.innerText);
+        if (t && t.length > 2 && t.length < 80) {
+          allLeafTexts.push(t);
+        }
+      }
+    });
+
+    return {
+      onDetail: true,
+      questionsHtml: grabAround(/^screening questions/i),
+      resultsHtml: grabAround(/^screening results/i),
+      detailsHtml: grabAround(/^screening details/i),
+      qaPairsFound: qaPairs.length,
+      qaPairsSample: qaPairs.slice(0, 20),
+      allLeafTextsSample: allLeafTexts.slice(0, 50),
+    };
+  })();
+
+  // Eligibility DETAIL page (/eligibility/view/<id>): dump the structure so we
+  // can write reliable Q&A selectors when the form-renderer classes differ.
+  const eligibilityDetail = (() => {
+    if (!/\/eligibility\/view\//i.test(location.href)) return { onDetail: false };
+    const formRenderer = document.querySelectorAll(".ui-form-renderer-question-display").length;
+    // Distinct class names of elements that contain visible label-like text.
+    const classSet = new Set();
+    document.querySelectorAll("div, span, p, dt, dd, label").forEach((el) => {
+      if (el.children.length) return;
+      const t = clean(el.innerText);
+      if (t && t.length < 200 && /[?:]$/.test(t)) {
+        const cls = (el.className || "").toString().slice(0, 120);
+        if (cls) classSet.add(cls);
+      }
+    });
+    // First 4000 chars of the main content HTML for selector inspection.
+    const main =
+      document.querySelector("main, [class*='renderer'], [class*='eligibility']") ||
+      document.body;
+    return {
+      onDetail: true,
+      formRendererCount: formRenderer,
+      labelClassesSample: [...classSet].slice(0, 25),
+      mainHtml: (main.outerHTML || "").slice(0, 9000),
+    };
+  })();
+
+  // Case DETAIL page (/dashboard/cases/.../contact/...): dump structure so we
+  // can map the visible fields (service type, status, dates, provider, program,
+  // worker, description, outcome, service authorization, etc.) to the Case model.
+  const caseDetail = (() => {
+    if (!/\/dashboard\/cases\//i.test(location.href)) return { onDetail: false };
+    // Label/value pairs: a label element whose next sibling holds the value.
+    const lv = {};
+    const addLV = (k, v) => {
+      k = clean(k);
+      v = clean(v);
+      if (k && v && k !== v && !(k in lv)) lv[k] = v;
+    };
+    document
+      .querySelectorAll("[class*='label'], [data-testid*='label'], dt, label, h3, h4, strong")
+      .forEach((l) => {
+        if (l.children.length) return;
+        const sib = l.nextElementSibling;
+        if (sib) addLV(l.innerText, sib.innerText);
+        else if (l.parentElement) {
+          const t = clean(l.parentElement.innerText);
+          const k = clean(l.innerText);
+          if (t.startsWith(k) && t.length > k.length) addLV(k, t.slice(k.length));
+        }
+      });
+    // Distinct label-ish class names (leaf text ending with ':' or short bold).
+    const classSet = new Set();
+    document.querySelectorAll("div, span, p, dt, label").forEach((el) => {
+      if (el.children.length) return;
+      const t = clean(el.innerText);
+      if (t && t.length < 60 && /:$/.test(t)) {
+        const cls = (el.className || "").toString().slice(0, 120);
+        if (cls) classSet.add(cls);
+      }
+    });
+    // Section headings + their container text within the case content area.
+    const sections = [...document.querySelectorAll("h1, h2, h3, h4, h5")]
+      .map((h) => {
+        const title = clean(h.innerText);
+        if (!title) return null;
+        const c = h.closest("section, article, div") || h.parentElement;
+        const text = c ? (c.innerText || "").replace(/\s+/g, " ").trim().slice(0, 1500) : "";
+        return { title, text };
+      })
+      .filter((s) => s && s.text)
+      .slice(0, 40);
+    const main =
+      document.querySelector("main, [class*='case'], [class*='content']") || document.body;
+    return {
+      onDetail: true,
+      labelValuePairs: lv,
+      labelClassesSample: [...classSet].slice(0, 25),
+      sections,
+      mainHtml: (main.outerHTML || "").slice(0, 14000),
+    };
+  })();
+
   return {
     url: location.href,
     title: document.title,
@@ -655,6 +1119,10 @@ function inspectPageFn() {
     dataTestElements: dataTestElems,
     labelValueSample: pairs,
     tables,
+    screeningRows,
+    screeningDetail,
+    eligibilityDetail,
+    caseDetail,
     coverageSections,
     sectionTexts,
     counts: {
@@ -716,9 +1184,8 @@ function setBtnBusy(btn, busy) {
   btn.classList.toggle("busy", busy);
 }
 
-async function rescan(ev) {
-  const btn = (ev && ev.currentTarget) || $("rescanBtn");
-  setBtnBusy(btn, true);
+// Deep profile/overview/records scrape (awaitable; walks data tabs in-place).
+async function deepScrape() {
   try {
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
     if (tab && tab.id != null) {
@@ -726,6 +1193,1133 @@ async function rescan(ev) {
     }
   } catch (_) {
     // content script may not be present on this tab
+  }
+}
+
+const SCAN_MAX_MS = 5 * 60 * 1000; // give each auto-walk up to 5 min
+
+// Resolve once the given storage key reports the scan finished (status==="done").
+// Also bails early when shouldAbort() turns true (e.g. the user switched client
+// or a newer scan started), so the caller's spinner can't get stuck waiting on a
+// scan that will never finish for the page we've since navigated away from.
+function waitForScanDone(key, timeoutMs, shouldAbort) {
+  return new Promise((resolve) => {
+    const deadline = Date.now() + timeoutMs;
+    const check = async () => {
+      if (typeof shouldAbort === "function" && shouldAbort()) return resolve(false);
+      const obj = (await chrome.storage.local.get(key))[key];
+      if (obj && obj.status === "done") return resolve(true);
+      if (Date.now() > deadline) return resolve(false);
+      setTimeout(check, 500);
+    };
+    check();
+  });
+}
+
+// Kick off one auto-walk (screening / eligibility / cases) and wait for it to
+// finish. Retries the start message because the tab may be mid-navigation when
+// the previous walk hands back control.
+async function runScanToCompletion(type, shouldAbort) {
+  const map = {
+    screening: { msg: "SCREENING_RESCRAPE", key: "uw_screenings", started: scanStarted, status: setScrStatus },
+    eligibility: { msg: "ELIGIBILITY_RESCRAPE", key: "uw_eligibility", started: eligScanStarted, status: setEligStatus },
+    cases: { msg: "CASE_RESCRAPE", key: "uw_cases", started: caseScanStarted, status: setCaseStatus },
+  }[type];
+  if (!map) return false;
+
+  const clientId = currentContext && currentContext.client_id;
+  const startDeadline = Date.now() + 20000;
+  let started = false;
+  while (Date.now() < startDeadline && !started) {
+    if (typeof shouldAbort === "function" && shouldAbort()) return false;
+    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    if (tab && tab.id != null && /app\.uniteus\.io/.test(tab.url || "")) {
+      const sentAt = Date.now();
+      try {
+        await chrome.tabs.sendMessage(tab.id, { type: map.msg, clientId });
+      } catch (_) {}
+      started = await map.started(sentAt, 2000);
+    }
+    if (!started) await new Promise((r) => setTimeout(r, 500));
+  }
+  if (!started) {
+    map.status("err", "Couldn't start \u2014 reload the Unite Us tab (F5), then retry");
+    return false;
+  }
+  map.status("warn", "Walking\u2026 keep this tab open");
+  return waitForScanDone(map.key, SCAN_MAX_MS, shouldAbort);
+}
+
+// Grab everything: deep scrape + all three auto-walks. The walks navigate the
+// tab, so they must run one after another, not concurrently. A generation
+// counter lets a newer run (e.g. the user switched client mid-scan) cancel an
+// older one at the next checkpoint instead of scanning the wrong client.
+let scanGeneration = 0;
+let fullScanRunning = false;
+
+async function runFullScan() {
+  const myGen = ++scanGeneration;
+  const targetClient = currentContext && currentContext.client_id;
+  if (!targetClient) return;
+  // Cancel any pending auto profile-reload so it can't fire mid-walk and derail
+  // a scan (the walks navigate the page; a stray deep scrape clicks tabs).
+  clearTimeout(autoScanTimer);
+  fullScanRunning = true;
+  // Bail if a newer scan started or the user navigated to a different client.
+  const stale = () =>
+    myGen !== scanGeneration ||
+    !currentContext ||
+    currentContext.client_id !== targetClient;
+
+  setBtnBusy($("rescanBtn"), true);
+  setBtnBusy($("rescanBtn2"), true);
+  try {
+    await deepScrape();
+    if (stale()) return;
+    // Consent gate: without consent there's nothing to work, so only the Profile
+    // is scraped and the other walks are skipped. Read uw_context straight from
+    // storage because the in-memory currentContext may not have caught the
+    // post-scrape update yet.
+    const { uw_context: fresh } = await chrome.storage.local.get("uw_context");
+    const cs =
+      fresh && fresh.captured && fresh.captured.client && fresh.captured.client.consent_status;
+    if (!/accept/i.test(cs || "")) {
+      const msg = "No consent \u2014 skipped";
+      setScrStatus("warn", msg);
+      setEligStatus("warn", msg);
+      setCaseStatus("warn", msg);
+      return;
+    }
+    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    if (tab && /app\.uniteus\.io/.test(tab.url || "")) {
+      await runScanToCompletion("screening", stale);
+      if (stale()) return;
+      await runScanToCompletion("eligibility", stale);
+      if (stale()) return;
+      await runScanToCompletion("cases", stale);
+    }
+  } catch (_) {
+    // best-effort; per-tab reload buttons remain available
+  } finally {
+    // Only the latest run owns the buttons; don't un-busy a run still going.
+    if (myGen === scanGeneration) {
+      fullScanRunning = false;
+      setBtnBusy($("rescanBtn"), false);
+      setBtnBusy($("rescanBtn2"), false);
+    }
+  }
+}
+
+// Profile reload button handler.
+async function rescan() {
+  return runFullScan();
+}
+
+// ---------- Screenings tab (Met Council - SCN - PHS) ----------
+// Captured by the content-script auto-walk and published to uw_screenings.
+let screeningData = null;
+
+function setScrStatus(state, message) {
+  const badge = $("scrStatus");
+  if (!badge) return;
+  badge.className = "badge " + (state || "");
+  badge.textContent = message || "";
+}
+
+function renderScrMeta() {
+  const el = $("scrMeta");
+  if (!el) return;
+  const d = screeningData;
+  if (!d || !d.screenings) {
+    el.textContent = "";
+    return;
+  }
+  if (d.note) {
+    el.textContent = d.note;
+    return;
+  }
+  const p = d.progress || { done: 0, total: 0 };
+  if (d.status === "running") {
+    el.textContent = `Scanning ${p.done}/${p.total}\u2026`;
+  } else if (d.finishedAt) {
+    const dt = new Date(d.finishedAt);
+    el.textContent =
+      `${d.screenings.length} screening(s) \u00b7 last scanned ` +
+      (isNaN(dt.getTime()) ? d.finishedAt : dt.toLocaleString());
+  } else {
+    el.textContent = `${d.screenings.length} screening(s) found`;
+  }
+}
+
+// One collapsible screening panel: header = form + status/date; body = meta,
+// highlighted Screening Duration, screening-result chips, ordered Q&A.
+function renderScreeningAccordion(s, i) {
+  const d = s.detail;
+  const statusLabel = /complete/i.test(s.status || "") ? "Completed" : s.status || "";
+  const statusDate = [statusLabel, s.date].filter(Boolean).join(" ");
+  const head =
+    `<div class="acc-head"><span class="acc-title">${escapeHtml(
+      s.form || `Screening ${i + 1}`
+    )}</span>` + `<span class="acc-sub">${escapeHtml(statusDate)}</span></div>`;
+
+  let body;
+  if (!d) {
+    body = '<p class="muted">Detail not captured yet \u2014 re-scan to fetch its answers.</p>';
+  } else {
+    // Duration display: prefer the Q&A item answer (already "8 Minutes"),
+    // otherwise format the raw number from d.duration.
+    const durItem = (d.items || []).find((it) => /screening duration/i.test(it.q || ""));
+    let dur = "";
+    if (durItem) {
+      dur = durItem.a;
+    } else if (d.duration) {
+      dur = d.duration + (d.duration === "1" ? " Minute" : " Minutes");
+    }
+    const results = d.results || [];
+    const hasQA = d.items && d.items.length > 0;
+
+    let html = `<div class="scr-meta">`;
+    html += `<div><span class="sum-k">Submitter</span>${escapeHtml(s.submitter || "\u2014")}</div>`;
+    html += `<div><span class="sum-k">Status</span>${escapeHtml(statusDate || "\u2014")}</div>`;
+    if (dur)
+      html += `<div class="scr-duration"><span class="sum-k">Screening Duration</span><strong>${escapeHtml(
+        dur
+      )}</strong></div>`;
+    html += `</div>`;
+
+    if (results.length) {
+      html +=
+        `<div class="scr-results"><div class="scr-results-h">Screening Results (${results.length} needs identified)</div>` +
+        results.map((r) => `<span class="chip">${escapeHtml(r)}</span>`).join("") +
+        `</div>`;
+    }
+
+    if (hasQA) {
+      html +=
+        `<div class="scr-qa-h">Screening Questions</div>` +
+        `<table class="qa-table"><tbody>` +
+        d.items
+          .map((it) => {
+            const hl = /screening duration/i.test(it.q || "") ? " hl" : "";
+            return `<tr class="qa${hl}"><th>${escapeHtml(it.q)}</th><td>${escapeHtml(it.a)}</td></tr>`;
+          })
+          .join("") +
+        `</tbody></table>`;
+    } else {
+      html += `<p class="muted">No Q&A captured. Use Inspect tool on the screening detail page to debug.</p>`;
+    }
+    body = html;
+  }
+  return `<div class="acc${i === 0 ? " open" : ""}">${head}<div class="acc-body">${body}</div></div>`;
+}
+
+// Build an actionable empty-state for a data tab. If a scan already ran for this
+// client but captured nothing, guide the user to this tab's own Re-scan (it runs
+// on the settled page and is the most reliable). Otherwise show the generic hint.
+function emptyTabMessage(d, matchesClient, label) {
+  const ran = d && matchesClient && (d.status === "done" || d.finishedAt || d.note);
+  if (ran) {
+    return (
+      '<div class="empty-state">' +
+      `<p class="muted"><strong>No ${label} captured.</strong></p>` +
+      `<p class="muted">If you can see ${label} on the Unite Us page, click ` +
+      "<strong>Re-scan</strong> at the top of this tab to capture them directly " +
+      "(the full Profile reload can miss them when the list is still loading).</p>" +
+      "</div>"
+    );
+  }
+  return `<p class="muted">No ${label} captured yet. Open a Unite Us facesheet and click Re-scan.</p>`;
+}
+
+function renderScreenings() {
+  const box = $("cmp-screening");
+  if (!box) return;
+  renderScrMeta();
+  const d = screeningData;
+  const matchesClient =
+    d && (!currentContext || !currentContext.client_id || d.clientId === currentContext.client_id);
+
+  if (!d || !matchesClient || !d.screenings || !d.screenings.length) {
+    box.innerHTML = emptyTabMessage(d, matchesClient, "Met Council screenings");
+    return;
+  }
+  box.innerHTML = d.screenings.map((s, i) => renderScreeningAccordion(s, i)).join("");
+  box.querySelectorAll(".acc-head").forEach((h) => {
+    h.addEventListener("click", () => h.parentElement.classList.toggle("open"));
+  });
+  updateScrSaveBtn();
+}
+
+// Enable the Save button only when there are captured screenings (with details)
+// for the current client.
+function updateScrSaveBtn() {
+  const btn = $("scrSaveBtn");
+  if (!btn) return;
+  const ok = consentAccepted();
+  btn.disabled = !ok || !screeningsSaveable();
+  btn.title = !ok
+    ? NO_CONSENT_MSG
+    : btn.disabled
+    ? "Re-scan to capture screenings before saving"
+    : "Save screenings to the CRM (client must exist first)";
+}
+
+// Poll storage to confirm the content script actually started the scan (it
+// writes uw_screenings immediately). Detects an orphaned/old content script.
+async function scanStarted(sinceMs, timeout) {
+  const start = Date.now();
+  while (Date.now() - start < timeout) {
+    const { uw_screenings } = await chrome.storage.local.get("uw_screenings");
+    if (
+      uw_screenings &&
+      uw_screenings.scannedAt &&
+      new Date(uw_screenings.scannedAt).getTime() >= sinceMs - 1500
+    ) {
+      return true;
+    }
+    await new Promise((r) => setTimeout(r, 200));
+  }
+  return false;
+}
+
+async function scrRescan(ev) {
+  if (!consentAccepted()) return setScrStatus("warn", NO_CONSENT_MSG);
+  const btn = (ev && ev.currentTarget) || $("scrRescanBtn");
+  setBtnBusy(btn, true);
+  setScrStatus("warn", "Starting\u2026");
+  const sentAt = Date.now();
+  try {
+    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    if (!tab || tab.id == null || !/app\.uniteus\.io/.test(tab.url || "")) {
+      setScrStatus("err", "Open a Unite Us facesheet tab first");
+      return;
+    }
+    const clientId = currentContext && currentContext.client_id;
+    // The page navigates during the walk, so the response may never arrive;
+    // progress is reported via storage (uw_screenings) instead.
+    chrome.tabs
+      .sendMessage(tab.id, { type: "SCREENING_RESCRAPE", clientId })
+      .catch(() => {});
+    // Confirm the content script picked it up; if not, it's the stale-script case.
+    if (await scanStarted(sentAt, 3000)) {
+      setScrStatus("warn", "Walking screenings\u2026 keep this tab open");
+    } else {
+      setScrStatus("err", "Couldn't reach the page \u2014 reload the Unite Us tab (F5), then retry");
+    }
+  } catch (_) {
+    setScrStatus("err", "Reload the Unite Us tab (F5), then retry");
+  } finally {
+    setBtnBusy(btn, false);
+  }
+}
+
+// ---------- Save captured screenings to the CRM ----------
+// The backend ScreeningViewSet upserts on enhanced_screen_id (the submission
+// UUID we captured). We generate deterministic UUIDv5 ids for the nested
+// questions/answers/needs so repeated saves update in place instead of
+// creating duplicates. A screening can only be saved once its client exists
+// in the CRM (the Screening.subject_id -> Client FK requires it).
+
+// Fixed fallback namespace (random UUID) used when a screening id is missing.
+const SCR_NS_FALLBACK = "6f1d3c2a-8b4e-4f7a-9c1d-2e5a7b8c9d0e";
+
+function uuidToBytes(uuid) {
+  const hex = String(uuid || "").replace(/[^0-9a-f]/gi, "");
+  if (hex.length < 32) return uuidToBytes(SCR_NS_FALLBACK);
+  const bytes = new Uint8Array(16);
+  for (let i = 0; i < 16; i++) bytes[i] = parseInt(hex.substr(i * 2, 2), 16);
+  return bytes;
+}
+
+// Deterministic UUIDv5 (SHA-1) namespaced by the screening id.
+async function uuidv5(namespaceUuid, name) {
+  const nsBytes = uuidToBytes(namespaceUuid);
+  const nameBytes = new TextEncoder().encode(name);
+  const data = new Uint8Array(nsBytes.length + nameBytes.length);
+  data.set(nsBytes, 0);
+  data.set(nameBytes, nsBytes.length);
+  const hashBuf = await crypto.subtle.digest("SHA-1", data);
+  const h = new Uint8Array(hashBuf).slice(0, 16);
+  h[6] = (h[6] & 0x0f) | 0x50; // version 5
+  h[8] = (h[8] & 0x3f) | 0x80; // RFC 4122 variant
+  const hx = [...h].map((b) => b.toString(16).padStart(2, "0")).join("");
+  return `${hx.slice(0, 8)}-${hx.slice(8, 12)}-${hx.slice(12, 16)}-${hx.slice(16, 20)}-${hx.slice(20)}`;
+}
+
+const isDurationQ = (q) => /screening duration/i.test(q || "");
+
+// Are there any captured screenings with detail items ready to save?
+function screeningsSaveable() {
+  const d = screeningData;
+  if (!d || !Array.isArray(d.screenings)) return false;
+  if (currentContext && currentContext.client_id && d.clientId !== currentContext.client_id) {
+    return false;
+  }
+  return d.screenings.some(
+    (s) => s.detail && Array.isArray(s.detail.items) && s.detail.items.length > 0
+  );
+}
+
+// Build the array of screening upsert payloads from captured data.
+async function buildScreeningPayloads(d, clientId) {
+  const payloads = [];
+  for (const s of d.screenings) {
+    const det = s.detail;
+    if (!det || !Array.isArray(det.items) || !det.items.length) continue;
+    // enhanced_screen_id: prefer the detail submission UUID, fall back to row id.
+    const screenId = det.id || s.id;
+    if (!screenId) continue;
+
+    const payload = {
+      enhanced_screen_id: screenId,
+      subject_id: clientId,
+      performing_organization_name: s.org || "",
+      screen_source: s.form || "",
+    };
+
+    // Duration captured as minutes in the UI; store seconds in the model.
+    if (det.duration && /^\d+$/.test(String(det.duration))) {
+      payload.duration = parseInt(det.duration, 10) * 60;
+    }
+
+    // Answers (one per non-duration Q&A item), with a deterministic question.
+    const answers = [];
+    for (const it of det.items) {
+      if (isDurationQ(it.q)) continue;
+      const q = (it.q || "").trim();
+      const a = (it.a || "").trim();
+      if (!q) continue;
+      const questionId = await uuidv5(screenId, "q|" + q);
+      const answerId = await uuidv5(screenId, "a|" + q);
+      answers.push({
+        answer_id: answerId,
+        answer_value: a,
+        value_string: a,
+        question: { question_id: questionId, question_primary_text: q },
+      });
+    }
+    if (answers.length) payload.answers = answers;
+
+    // Identified needs from the screening results chips.
+    const results = Array.isArray(det.results) ? det.results : [];
+    const needs = [];
+    for (const name of results) {
+      const n = (name || "").trim();
+      if (!n) continue;
+      const needId = await uuidv5(screenId, "n|" + n);
+      needs.push({ identified_social_need_id: needId, identified_social_need_name: n });
+    }
+    if (needs.length) payload.identified_social_needs = needs;
+
+    payloads.push(payload);
+  }
+  return payloads;
+}
+
+async function saveScreenings(ev) {
+  if (!consentAccepted()) return setScrStatus("warn", NO_CONSENT_MSG);
+  const btn = (ev && ev.currentTarget) || $("scrSaveBtn");
+  const ctx = currentContext;
+  const d = screeningData;
+
+  if (!ctx || !ctx.client_id) {
+    setScrStatus("err", "No client detected");
+    return;
+  }
+  if (!screeningsSaveable()) {
+    setScrStatus("err", "Nothing to save \u2014 re-scan first");
+    return;
+  }
+  const cfg = await getConfig();
+  if (!cfg.token) {
+    setScrStatus("err", "No API token configured");
+    return;
+  }
+
+  setBtnBusy(btn, true);
+  setScrStatus("warn", "Checking client\u2026");
+  try {
+    // Guard: the client must already exist in the CRM (FK requirement).
+    const clientRes = await fetch(
+      `${cfg.backendUrl}/api/clients/${ctx.client_id}/`,
+      { headers: authHeader(cfg) }
+    );
+    if (clientRes.status === 404) {
+      setScrStatus("err", "Client not in CRM \u2014 save it on the Profile tab first");
+      setClientImported(false);
+      return;
+    }
+    if (clientRes.status === 401 || clientRes.status === 403) {
+      setScrStatus("err", "Auth error");
+      return;
+    }
+    if (!clientRes.ok) {
+      setScrStatus("err", `Client check failed (${clientRes.status})`);
+      return;
+    }
+    setClientImported(true);
+
+    // Client exists -> build and upsert the screenings in one batch.
+    setScrStatus("warn", "Saving screenings\u2026");
+    const payloads = await buildScreeningPayloads(d, ctx.client_id);
+    if (!payloads.length) {
+      setScrStatus("err", "Nothing to save \u2014 re-scan first");
+      return;
+    }
+    const res = await fetch(`${cfg.backendUrl}/api/screenings/bulk/`, {
+      method: "POST",
+      headers: { ...authHeader(cfg), "Content-Type": "application/json" },
+      body: JSON.stringify(payloads),
+    });
+    if (res.ok || res.status === 207) {
+      let body = {};
+      try { body = await res.json(); } catch (_) {}
+      const ok = body.succeeded != null ? body.succeeded : payloads.length;
+      const failed = body.failed || 0;
+      if (failed) {
+        setScrStatus("warn", `Saved ${ok}, ${failed} failed`);
+      } else {
+        setScrStatus("ok", `Saved ${ok} screening(s) \u2713`);
+      }
+      await fetchCrm(cfg, ctx.client_id); // refresh CRM status
+    } else if (res.status === 401 || res.status === 403) {
+      setScrStatus("err", "Auth error");
+    } else {
+      let detail = `Error ${res.status}`;
+      try { detail = summarizeErrors(await res.json()) || detail; } catch (_) {}
+      setScrStatus("err", detail);
+    }
+  } catch (_) {
+    setScrStatus("err", "Network error");
+  } finally {
+    setBtnBusy(btn, false);
+  }
+}
+
+// ---------- Eligibility tab (Met Council - SCN - PHS) ----------
+// Captured by the content-script auto-walk and published to uw_eligibility.
+let eligibilityData = null;
+
+function setEligStatus(state, message) {
+  const badge = $("eligStatus");
+  if (!badge) return;
+  badge.className = "badge " + (state || "");
+  badge.textContent = message || "";
+}
+
+function renderEligMeta() {
+  const el = $("eligMeta");
+  if (!el) return;
+  const d = eligibilityData;
+  if (!d || !d.eligibilities) {
+    el.textContent = "";
+    return;
+  }
+  if (d.note) {
+    el.textContent = d.note;
+    return;
+  }
+  const p = d.progress || { done: 0, total: 0 };
+  if (d.status === "running") {
+    el.textContent = `Scanning ${p.done}/${p.total}\u2026`;
+  } else if (d.finishedAt) {
+    const dt = new Date(d.finishedAt);
+    el.textContent =
+      `${d.eligibilities.length} assessment(s) \u00b7 last scanned ` +
+      (isNaN(dt.getTime()) ? d.finishedAt : dt.toLocaleString());
+  } else {
+    el.textContent = `${d.eligibilities.length} assessment(s) found`;
+  }
+}
+
+// One collapsible eligibility panel: header = form + status/date; body = meta,
+// eligible-program chips, ordered Q&A.
+function renderEligibilityAccordion(s, i) {
+  const d = s.detail;
+  const statusLabel = /complete/i.test(s.status || "") ? "Complete" : s.status || "";
+  const statusDate = [statusLabel, s.date].filter(Boolean).join(" ");
+  const head =
+    `<div class="acc-head"><span class="acc-title">${escapeHtml(
+      s.form || `Eligibility ${i + 1}`
+    )}</span>` + `<span class="acc-sub">${escapeHtml(statusDate)}</span></div>`;
+
+  let body;
+  if (!d) {
+    body = '<p class="muted">Detail not captured yet \u2014 re-scan to fetch its answers.</p>';
+  } else {
+    const results = d.results || [];
+    const hasQA = d.items && d.items.length > 0;
+
+    let html = `<div class="scr-meta">`;
+    html += `<div><span class="sum-k">Submitter</span>${escapeHtml(s.submitter || "\u2014")}</div>`;
+    html += `<div><span class="sum-k">Status</span>${escapeHtml(statusDate || "\u2014")}</div>`;
+    html += `<div><span class="sum-k">Organization</span>${escapeHtml(s.org || "\u2014")}</div>`;
+    html += `</div>`;
+
+    if (results.length) {
+      html +=
+        `<div class="scr-results"><div class="scr-results-h">Client May Be Eligible (${results.length})</div>` +
+        results.map((r) => `<span class="chip">${escapeHtml(r)}</span>`).join("") +
+        `</div>`;
+    }
+
+    if (hasQA) {
+      html +=
+        `<div class="scr-qa-h">Assessment Questions</div>` +
+        `<table class="qa-table"><tbody>` +
+        d.items
+          .map((it) => `<tr class="qa"><th>${escapeHtml(it.q)}</th><td>${escapeHtml(it.a)}</td></tr>`)
+          .join("") +
+        `</tbody></table>`;
+    } else {
+      html += `<p class="muted">No Q&A captured.</p>`;
+    }
+    body = html;
+  }
+  return `<div class="acc${i === 0 ? " open" : ""}">${head}<div class="acc-body">${body}</div></div>`;
+}
+
+function renderEligibility() {
+  const box = $("cmp-eligibility");
+  if (!box) return;
+  renderEligMeta();
+  const d = eligibilityData;
+  const matchesClient =
+    d && (!currentContext || !currentContext.client_id || d.clientId === currentContext.client_id);
+
+  if (!d || !matchesClient || !d.eligibilities || !d.eligibilities.length) {
+    box.innerHTML = emptyTabMessage(d, matchesClient, "Met Council eligibility assessments");
+    updateEligSaveBtn();
+    return;
+  }
+  box.innerHTML = d.eligibilities.map((s, i) => renderEligibilityAccordion(s, i)).join("");
+  box.querySelectorAll(".acc-head").forEach((h) => {
+    h.addEventListener("click", () => h.parentElement.classList.toggle("open"));
+  });
+  updateEligSaveBtn();
+}
+
+// Enable the Save button only when there are captured assessments (with details).
+function updateEligSaveBtn() {
+  const btn = $("eligSaveBtn");
+  if (!btn) return;
+  const ok = consentAccepted();
+  btn.disabled = !ok || !eligibilitySaveable();
+  btn.title = !ok
+    ? NO_CONSENT_MSG
+    : btn.disabled
+    ? "Re-scan to capture eligibility assessments before saving"
+    : "Save eligibility assessments to the CRM (client must exist first)";
+}
+
+// Confirm the content script started the eligibility scan (writes uw_eligibility).
+async function eligScanStarted(sinceMs, timeout) {
+  const start = Date.now();
+  while (Date.now() - start < timeout) {
+    const { uw_eligibility } = await chrome.storage.local.get("uw_eligibility");
+    if (
+      uw_eligibility &&
+      uw_eligibility.scannedAt &&
+      new Date(uw_eligibility.scannedAt).getTime() >= sinceMs - 1500
+    ) {
+      return true;
+    }
+    await new Promise((r) => setTimeout(r, 200));
+  }
+  return false;
+}
+
+async function eligRescan(ev) {
+  if (!consentAccepted()) return setEligStatus("warn", NO_CONSENT_MSG);
+  const btn = (ev && ev.currentTarget) || $("eligRescanBtn");
+  setBtnBusy(btn, true);
+  setEligStatus("warn", "Starting\u2026");
+  const sentAt = Date.now();
+  try {
+    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    if (!tab || tab.id == null || !/app\.uniteus\.io/.test(tab.url || "")) {
+      setEligStatus("err", "Open a Unite Us facesheet tab first");
+      return;
+    }
+    const clientId = currentContext && currentContext.client_id;
+    chrome.tabs
+      .sendMessage(tab.id, { type: "ELIGIBILITY_RESCRAPE", clientId })
+      .catch(() => {});
+    if (await eligScanStarted(sentAt, 3000)) {
+      setEligStatus("warn", "Walking assessments\u2026 keep this tab open");
+    } else {
+      setEligStatus("err", "Couldn't reach the page \u2014 reload the Unite Us tab (F5), then retry");
+    }
+  } catch (_) {
+    setEligStatus("err", "Reload the Unite Us tab (F5), then retry");
+  } finally {
+    setBtnBusy(btn, false);
+  }
+}
+
+// ---------- Save captured eligibility assessments to the CRM ----------
+// Upserts on eligibility_id (the /view/<id> UUID). The Eligibility model has no
+// nested answers relation, so captured Q&A is stored inline in `responses` and
+// the eligible-program chips go to `eligible_services`. Client must exist first.
+
+function eligibilitySaveable() {
+  const d = eligibilityData;
+  if (!d || !Array.isArray(d.eligibilities)) return false;
+  if (currentContext && currentContext.client_id && d.clientId !== currentContext.client_id) {
+    return false;
+  }
+  return d.eligibilities.some(
+    (s) => s.detail && Array.isArray(s.detail.items) && s.detail.items.length > 0
+  );
+}
+
+// Build eligibility upsert payloads. Q&A is sent as normalized `answers`
+// (one Answer + nested Question per item) exactly like screenings, with
+// deterministic UUIDv5 ids so repeated saves update in place.
+async function buildEligibilityPayloads(d, clientId) {
+  const payloads = [];
+  for (const s of d.eligibilities) {
+    const det = s.detail;
+    if (!det || !Array.isArray(det.items) || !det.items.length) continue;
+    const eligId = det.id || s.id;
+    if (!eligId) continue;
+
+    const answers = [];
+    for (const it of det.items) {
+      const q = (it.q || "").trim();
+      const a = (it.a || "").trim();
+      if (!q) continue;
+      const questionId = await uuidv5(eligId, "q|" + q);
+      const answerId = await uuidv5(eligId, "a|" + q);
+      answers.push({
+        answer_id: answerId,
+        answer_value: a,
+        value_string: a,
+        question: { question_id: questionId, question_primary_text: q },
+      });
+    }
+
+    const payload = {
+      eligibility_id: eligId,
+      subject_id: clientId,
+      performing_organization_name: s.org || "",
+      screen_source: s.form || "",
+      eligible_services: Array.isArray(det.results) ? det.results : [],
+    };
+    if (answers.length) payload.answers = answers;
+    if (/complete/i.test(s.status || "")) payload.eligible_status = "eligible";
+    payloads.push(payload);
+  }
+  return payloads;
+}
+
+async function saveEligibility(ev) {
+  if (!consentAccepted()) return setEligStatus("warn", NO_CONSENT_MSG);
+  const btn = (ev && ev.currentTarget) || $("eligSaveBtn");
+  const ctx = currentContext;
+  const d = eligibilityData;
+
+  if (!ctx || !ctx.client_id) {
+    setEligStatus("err", "No client detected");
+    return;
+  }
+  if (!eligibilitySaveable()) {
+    setEligStatus("err", "Nothing to save \u2014 re-scan first");
+    return;
+  }
+  const cfg = await getConfig();
+  if (!cfg.token) {
+    setEligStatus("err", "No API token configured");
+    return;
+  }
+
+  setBtnBusy(btn, true);
+  setEligStatus("warn", "Checking client\u2026");
+  try {
+    // Guard: the client must already exist in the CRM (FK requirement).
+    const clientRes = await fetch(
+      `${cfg.backendUrl}/api/clients/${ctx.client_id}/`,
+      { headers: authHeader(cfg) }
+    );
+    if (clientRes.status === 404) {
+      setEligStatus("err", "Client not in CRM \u2014 save it on the Profile tab first");
+      setClientImported(false);
+      return;
+    }
+    if (clientRes.status === 401 || clientRes.status === 403) {
+      setEligStatus("err", "Auth error");
+      return;
+    }
+    if (!clientRes.ok) {
+      setEligStatus("err", `Client check failed (${clientRes.status})`);
+      return;
+    }
+    setClientImported(true);
+
+    setEligStatus("warn", "Saving assessments\u2026");
+    const payloads = await buildEligibilityPayloads(d, ctx.client_id);
+    if (!payloads.length) {
+      setEligStatus("err", "Nothing to save \u2014 re-scan first");
+      return;
+    }
+    const res = await fetch(`${cfg.backendUrl}/api/eligibility/bulk/`, {
+      method: "POST",
+      headers: { ...authHeader(cfg), "Content-Type": "application/json" },
+      body: JSON.stringify(payloads),
+    });
+    if (res.ok || res.status === 207) {
+      let body = {};
+      try { body = await res.json(); } catch (_) {}
+      const ok = body.succeeded != null ? body.succeeded : payloads.length;
+      const failed = body.failed || 0;
+      if (failed) {
+        setEligStatus("warn", `Saved ${ok}, ${failed} failed`);
+      } else {
+        setEligStatus("ok", `Saved ${ok} assessment(s) \u2713`);
+      }
+      await fetchCrm(cfg, ctx.client_id);
+    } else if (res.status === 401 || res.status === 403) {
+      setEligStatus("err", "Auth error");
+    } else {
+      let detail = `Error ${res.status}`;
+      try { detail = summarizeErrors(await res.json()) || detail; } catch (_) {}
+      setEligStatus("err", detail);
+    }
+  } catch (_) {
+    setEligStatus("err", "Network error");
+  } finally {
+    setBtnBusy(btn, false);
+  }
+}
+
+// ---------- Cases tab (Met Council - SCN - PHS) ----------
+// Captured by the content-script auto-walk and published to uw_cases.
+let caseData = null;
+
+// Display order for the captured case fields (key = uppercase page label).
+const CASE_FIELD_LABELS = [
+  ["PROGRAM", "Program"],
+  ["NETWORK", "Network"],
+  ["ORGANIZATION", "Organization"],
+  ["PRIMARY WORKER", "Primary Worker"],
+  ["CASE DESCRIPTION", "Description"],
+  ["AUTHORIZATION STATUS", "Authorization Status"],
+  ["AUTHORIZED AMOUNT", "Authorized Amount"],
+  ["AUTHORIZED SERVICE DELIVERY DATE(S)", "Service Delivery Dates"],
+  ["PROGRAM CAP", "Program Cap"],
+  ["NOTES", "Notes"],
+  ["UNITE US AUTHORIZATION ID", "Authorization ID"],
+  ["SOCIAL CARE COVERAGE PLAN", "Coverage Plan"],
+  ["SOCIAL CARE COVERAGE STATUS", "Coverage Status"],
+];
+
+function setCaseStatus(state, message) {
+  const badge = $("caseStatus");
+  if (!badge) return;
+  badge.className = "badge " + (state || "");
+  badge.textContent = message || "";
+}
+
+function renderCaseMeta() {
+  const el = $("caseMeta");
+  if (!el) return;
+  const d = caseData;
+  if (!d || !d.cases) {
+    el.textContent = "";
+    return;
+  }
+  if (d.note) {
+    el.textContent = d.note;
+    return;
+  }
+  const p = d.progress || { done: 0, total: 0 };
+  if (d.status === "running") {
+    el.textContent = `Scanning ${p.done}/${p.total}\u2026`;
+  } else if (d.finishedAt) {
+    const dt = new Date(d.finishedAt);
+    el.textContent =
+      `${d.cases.length} case(s) \u00b7 last scanned ` +
+      (isNaN(dt.getTime()) ? d.finishedAt : dt.toLocaleString());
+  } else {
+    el.textContent = `${d.cases.length} case(s) found`;
+  }
+}
+
+// One collapsible case panel: header = service type + status/date; body = the
+// captured field/value pairs.
+function renderCaseAccordion(c, i) {
+  const d = c.detail;
+  const status = (d && d.status) || c.status || "";
+  const statusDate = [status, c.date_opened].filter(Boolean).join(" \u00b7 ");
+  const title = c.service_type || (d && d.fields && d.fields["SERVICE TYPE"]) || `Case ${i + 1}`;
+  const head =
+    `<div class="acc-head"><span class="acc-title">${escapeHtml(title)}</span>` +
+    `<span class="acc-sub">${escapeHtml(statusDate)}</span></div>`;
+
+  let body;
+  if (!d || !d.fields) {
+    body = '<p class="muted">Detail not captured yet \u2014 re-scan to fetch its details.</p>';
+  } else {
+    const f = d.fields;
+    let html = `<div class="scr-meta">`;
+    html += `<div><span class="sum-k">Service Type</span>${escapeHtml(f["SERVICE TYPE"] || title || "\u2014")}</div>`;
+    html += `<div><span class="sum-k">Status</span>${escapeHtml(status || "\u2014")}</div>`;
+    html += `<div><span class="sum-k">Date Opened</span>${escapeHtml(f["DATE OPENED"] || c.date_opened || "\u2014")}</div>`;
+    html += `</div>`;
+
+    const rows = CASE_FIELD_LABELS.filter(([k]) => f[k]).map(
+      ([k, label]) =>
+        `<tr class="qa"><th>${escapeHtml(label)}</th><td>${escapeHtml(f[k])}</td></tr>`
+    );
+    if (rows.length) {
+      html +=
+        `<div class="scr-qa-h">Case Details</div>` +
+        `<table class="qa-table"><tbody>${rows.join("")}</tbody></table>`;
+    } else {
+      html += `<p class="muted">No case fields captured.</p>`;
+    }
+    body = html;
+  }
+  return `<div class="acc${i === 0 ? " open" : ""}">${head}<div class="acc-body">${body}</div></div>`;
+}
+
+function renderCases() {
+  const box = $("cmp-cases");
+  if (!box) return;
+  renderCaseMeta();
+  const d = caseData;
+  const matchesClient =
+    d && (!currentContext || !currentContext.client_id || d.clientId === currentContext.client_id);
+
+  if (!d || !matchesClient || !d.cases || !d.cases.length) {
+    box.innerHTML = emptyTabMessage(d, matchesClient, "Met Council cases");
+    updateCaseSaveBtn();
+    return;
+  }
+  box.innerHTML = d.cases.map((c, i) => renderCaseAccordion(c, i)).join("");
+  box.querySelectorAll(".acc-head").forEach((h) => {
+    h.addEventListener("click", () => h.parentElement.classList.toggle("open"));
+  });
+  updateCaseSaveBtn();
+}
+
+function updateCaseSaveBtn() {
+  const btn = $("caseSaveBtn");
+  if (!btn) return;
+  const ok = consentAccepted();
+  btn.disabled = !ok || !casesSaveable();
+  btn.title = !ok
+    ? NO_CONSENT_MSG
+    : btn.disabled
+    ? "Re-scan to capture cases before saving"
+    : "Save cases to the CRM (client must exist first)";
+}
+
+// Confirm the content script started the case scan (writes uw_cases).
+async function caseScanStarted(sinceMs, timeout) {
+  const start = Date.now();
+  while (Date.now() - start < timeout) {
+    const { uw_cases } = await chrome.storage.local.get("uw_cases");
+    if (
+      uw_cases &&
+      uw_cases.scannedAt &&
+      new Date(uw_cases.scannedAt).getTime() >= sinceMs - 1500
+    ) {
+      return true;
+    }
+    await new Promise((r) => setTimeout(r, 200));
+  }
+  return false;
+}
+
+async function caseRescan(ev) {
+  if (!consentAccepted()) return setCaseStatus("warn", NO_CONSENT_MSG);
+  const btn = (ev && ev.currentTarget) || $("caseRescanBtn");
+  setBtnBusy(btn, true);
+  setCaseStatus("warn", "Starting\u2026");
+  const sentAt = Date.now();
+  try {
+    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    if (!tab || tab.id == null || !/app\.uniteus\.io/.test(tab.url || "")) {
+      setCaseStatus("err", "Open a Unite Us facesheet tab first");
+      return;
+    }
+    const clientId = currentContext && currentContext.client_id;
+    chrome.tabs.sendMessage(tab.id, { type: "CASE_RESCRAPE", clientId }).catch(() => {});
+    if (await caseScanStarted(sentAt, 3000)) {
+      setCaseStatus("warn", "Walking cases\u2026 keep this tab open");
+    } else {
+      setCaseStatus("err", "Couldn't reach the page \u2014 reload the Unite Us tab (F5), then retry");
+    }
+  } catch (_) {
+    setCaseStatus("err", "Reload the Unite Us tab (F5), then retry");
+  } finally {
+    setBtnBusy(btn, false);
+  }
+}
+
+// ---------- Save captured cases to the CRM ----------
+// Upserts on case_id (the /cases/.../<id> UUID). Client must exist first.
+
+function casesSaveable() {
+  const d = caseData;
+  if (!d || !Array.isArray(d.cases)) return false;
+  if (currentContext && currentContext.client_id && d.clientId !== currentContext.client_id) {
+    return false;
+  }
+  return d.cases.some((c) => c.detail && c.detail.fields && (c.detail.id || c.id));
+}
+
+// MM/DD/YYYY -> YYYY-MM-DD (case detail uses US date format).
+function parseUSDate(s) {
+  const m = String(s || "").trim().match(/(\d{1,2})\/(\d{1,2})\/(\d{4})/);
+  if (!m) return null;
+  const [, mm, dd, yy] = m;
+  return `${yy}-${mm.padStart(2, "0")}-${dd.padStart(2, "0")}`;
+}
+
+const CASE_STATUS_MAP = {
+  OPEN: "open",
+  CLOSED: "closed",
+  MANAGED: "managed",
+  DRAFT: "draft",
+  CANCELLED: "cancelled",
+  "PENDING AUTHORIZATION": "pending_authorization",
+  "OFF PLATFORM": "off_platform",
+};
+const AUTH_STATUS_MAP = {
+  ACCEPTED: "approved",
+  APPROVED: "approved",
+  PENDING: "pending",
+  DENIED: "denied",
+  EXPIRED: "expired",
+  "NOT REQUIRED": "not_required",
+};
+
+function buildCasePayloads(d, clientId) {
+  const payloads = [];
+  for (const c of d.cases) {
+    const det = c.detail;
+    if (!det || !det.fields) continue;
+    const caseId = det.id || c.id;
+    if (!caseId) continue;
+    const f = det.fields;
+
+    const payload = {
+      case_id: caseId,
+      client_id: clientId,
+      service_type: f["SERVICE TYPE"] || c.service_type || "",
+      program_name: f["PROGRAM"] || "",
+      network_name: f["NETWORK"] || "",
+      provider_name: f["ORGANIZATION"] || c.org || "",
+      primary_worker_name: f["PRIMARY WORKER"] || "",
+      case_description: f["CASE DESCRIPTION"] || "",
+      program_cap: f["PROGRAM CAP"] || "",
+      authorization_note: f["NOTES"] || "",
+      unite_us_authorization_id: f["UNITE US AUTHORIZATION ID"] || "",
+      social_care_coverage_plan: f["SOCIAL CARE COVERAGE PLAN"] || "",
+      social_care_coverage_status: f["SOCIAL CARE COVERAGE STATUS"] || "",
+      case_status: CASE_STATUS_MAP[(det.status || c.status || "").toUpperCase()] || "open",
+    };
+
+    const opened = parseUSDate(f["DATE OPENED"] || c.date_opened);
+    if (opened) payload.user_entered_opened_date = opened;
+    const closed = parseUSDate(f["DATE CLOSED"]);
+    if (closed) payload.user_entered_closed_date = closed;
+
+    const authStatus = AUTH_STATUS_MAP[(f["AUTHORIZATION STATUS"] || "").toUpperCase()];
+    if (authStatus) payload.service_authorization_status = authStatus;
+    if (f["AUTHORIZATION STATUS"]) payload.service_authorization_status_label = f["AUTHORIZATION STATUS"];
+
+    if (f["AUTHORIZED AMOUNT"]) payload.authorized_amount = f["AUTHORIZED AMOUNT"];
+
+    const sd = f["AUTHORIZED SERVICE DELIVERY DATE(S)"];
+    if (sd) {
+      const parts = sd.split(/\s*[-\u2013]\s*/);
+      const start = parseUSDate(parts[0]);
+      const end = parseUSDate(parts[1]);
+      if (start) payload.service_authorization_approval_starts_at = start;
+      if (end) payload.service_authorization_approval_ends_at = end;
+    }
+
+    payloads.push(payload);
+  }
+  return payloads;
+}
+
+async function saveCases(ev) {
+  if (!consentAccepted()) return setCaseStatus("warn", NO_CONSENT_MSG);
+  const btn = (ev && ev.currentTarget) || $("caseSaveBtn");
+  const ctx = currentContext;
+  const d = caseData;
+
+  if (!ctx || !ctx.client_id) {
+    setCaseStatus("err", "No client detected");
+    return;
+  }
+  if (!casesSaveable()) {
+    setCaseStatus("err", "Nothing to save \u2014 re-scan first");
+    return;
+  }
+  const cfg = await getConfig();
+  if (!cfg.token) {
+    setCaseStatus("err", "No API token configured");
+    return;
+  }
+
+  setBtnBusy(btn, true);
+  setCaseStatus("warn", "Checking client\u2026");
+  try {
+    const clientRes = await fetch(
+      `${cfg.backendUrl}/api/clients/${ctx.client_id}/`,
+      { headers: authHeader(cfg) }
+    );
+    if (clientRes.status === 404) {
+      setCaseStatus("err", "Client not in CRM \u2014 save it on the Profile tab first");
+      setClientImported(false);
+      return;
+    }
+    if (clientRes.status === 401 || clientRes.status === 403) {
+      setCaseStatus("err", "Auth error");
+      return;
+    }
+    if (!clientRes.ok) {
+      setCaseStatus("err", `Client check failed (${clientRes.status})`);
+      return;
+    }
+    setClientImported(true);
+
+    setCaseStatus("warn", "Saving cases\u2026");
+    const payloads = buildCasePayloads(d, ctx.client_id);
+    if (!payloads.length) {
+      setCaseStatus("err", "Nothing to save \u2014 re-scan first");
+      return;
+    }
+    const res = await fetch(`${cfg.backendUrl}/api/cases/bulk/`, {
+      method: "POST",
+      headers: { ...authHeader(cfg), "Content-Type": "application/json" },
+      body: JSON.stringify(payloads),
+    });
+    if (res.ok || res.status === 207) {
+      let body = {};
+      try { body = await res.json(); } catch (_) {}
+      const ok = body.succeeded != null ? body.succeeded : payloads.length;
+      const failed = body.failed || 0;
+      if (failed) {
+        setCaseStatus("warn", `Saved ${ok}, ${failed} failed`);
+      } else {
+        setCaseStatus("ok", `Saved ${ok} case(s) \u2713`);
+      }
+      await fetchCrm(cfg, ctx.client_id);
+    } else if (res.status === 401 || res.status === 403) {
+      setCaseStatus("err", "Auth error");
+    } else {
+      let detail = `Error ${res.status}`;
+      try { detail = summarizeErrors(await res.json()) || detail; } catch (_) {}
+      setCaseStatus("err", detail);
+    }
+  } catch (_) {
+    setCaseStatus("err", "Network error");
   } finally {
     setBtnBusy(btn, false);
   }
@@ -836,7 +2430,11 @@ function buildClientPayload(ctx) {
   if (a.line1 || a.city || a.postal_code) payload.addresses = [a];
 
   // Insurance + Social Care Coverage both persist to the CRM Insurance table
-  // (the only coverage model). Map capKey -> field.
+  // (the only coverage model). Map capKey -> field. We send EVERY captured
+  // record (active and inactive) with an explicit status so the CRM mirrors
+  // Unite Us, and -- when the coverage sections were actually on the page --
+  // flag the payload as authoritative so the backend deactivates any stored
+  // policy that is no longer present in Unite Us.
   const ins = (Array.isArray(ctx.insurance) ? ctx.insurance : [])
     .filter((c) => c.plan_name)
     .map((c) => {
@@ -847,11 +2445,21 @@ function buildClientPayload(ctx) {
       if (en) o.enrolled_at = en;
       const ex = toIsoDateTime(c.end_date);
       if (ex) o.expired_at = ex;
-      const st = toEnum(c.status, ENUMS.coverage_status);
-      if (st) o.status = st;
+      // active flag is authoritative; fall back to the captured status text.
+      o.status =
+        c.active === true
+          ? "active"
+          : c.active === false
+          ? "inactive"
+          : toEnum(c.status, ENUMS.coverage_status) || "active";
       return o;
     });
-  if (ins.length) payload.insurances = ins;
+  if (ctx.coverage_scraped) {
+    payload.insurances = ins; // authoritative list (may be empty)
+    payload.reconcile_insurances = true;
+  } else if (ins.length) {
+    payload.insurances = ins; // non-authoritative: fill only, never deactivate
+  }
 
   return payload;
 }
@@ -875,6 +2483,7 @@ function setSaveStatus(state, message) {
 }
 
 async function saveClient(ev) {
+  if (!consentAccepted()) return setSaveStatus("warn", NO_CONSENT_MSG);
   const btn = (ev && ev.currentTarget) || $("saveBtn");
   const ctx = currentContext;
   if (!ctx || !ctx.client_id) {
@@ -987,6 +2596,11 @@ async function fetchCrm(cfg, clientId) {
       screening: scrRes.ok ? asList(await scrRes.json()) : [],
       eligibility: eligRes.ok ? asList(await eligRes.json()) : [],
     };
+    // Reflect CRM presence in the status table. A 404 here is expected (the
+    // client simply isn't imported yet) -> mark "not imported"; only leave the
+    // status untouched on transient errors (e.g. 5xx) so we don't show a false ❌.
+    if (clientRes.ok) importStatus.client = true;
+    else if (clientRes.status === 404) importStatus.client = false;
     backendRecords = {
       case: crm.case.map((c) => ({
         id: String(c.case_id),
@@ -1076,11 +2690,22 @@ function renderCrmStatus(ctx) {
 }
 
 async function loadContext() {
-  const { uw_context } = await chrome.storage.local.get("uw_context");
+  const { uw_context, uw_screenings, uw_eligibility, uw_cases } = await chrome.storage.local.get([
+    "uw_context",
+    "uw_screenings",
+    "uw_eligibility",
+    "uw_cases",
+  ]);
   currentContext = uw_context || null;
+  screeningData = uw_screenings || null;
+  eligibilityData = uw_eligibility || null;
+  caseData = uw_cases || null;
   renderContext(currentContext);
   renderCrmStatus(currentContext);
   renderComparison(currentContext);
+  renderScreenings();
+  renderEligibility();
+  renderCases();
   await maybeAutoValidate();
 }
 
@@ -1197,6 +2822,12 @@ function init() {
   $("rescanBtn").addEventListener("click", rescan);
   $("rescanBtn2").addEventListener("click", rescan);
   $("saveBtn").addEventListener("click", saveClient);
+  $("scrRescanBtn").addEventListener("click", scrRescan);
+  $("scrSaveBtn").addEventListener("click", saveScreenings);
+  $("eligRescanBtn").addEventListener("click", eligRescan);
+  $("eligSaveBtn").addEventListener("click", saveEligibility);
+  $("caseRescanBtn").addEventListener("click", caseRescan);
+  $("caseSaveBtn").addEventListener("click", saveCases);
   $("diagnosticBtn").addEventListener("click", runDiagnostic);
   $("copyReportBtn").addEventListener("click", copyReport);
 
@@ -1211,6 +2842,26 @@ function init() {
       if (clientChanged) {
         importStatus = { client: null };
         resetCrm();
+        // Drop the previous client's cases / screenings / eligibility so the
+        // tabs don't show stale data (the content script also clears storage).
+        screeningData = null;
+        eligibilityData = null;
+        caseData = null;
+        setScrStatus("", "");
+        setEligStatus("", "");
+        setCaseStatus("", "");
+        renderScreenings();
+        renderEligibility();
+        renderCases();
+        // Auto-reload ONLY the Profile tab for the new client (deep scrape).
+        // Screenings / eligibility / cases stay cleared until the user reloads
+        // them on demand. Debounced + delayed so the facesheet can load first.
+        if (currentContext && currentContext.client_id) {
+          clearTimeout(autoScanTimer);
+          autoScanTimer = setTimeout(() => {
+            if (!fullScanRunning) deepScrape();
+          }, 2000);
+        }
       }
       renderContext(currentContext);
       renderCrmStatus(currentContext);
@@ -1223,6 +2874,51 @@ function init() {
         activateTab("profile");
       }
       maybeAutoValidate();
+    }
+    // Screening auto-walk progress / results.
+    if (area === "local" && changes.uw_screenings) {
+      screeningData = changes.uw_screenings.newValue;
+      const d = screeningData;
+      if (d && d.status === "done") {
+        setScrStatus("ok", `Done \u2014 ${d.screenings.length} screening(s)`);
+      } else if (d && d.status === "running") {
+        const p = d.progress || { done: 0, total: 0 };
+        setScrStatus("warn", `Walking ${p.done}/${p.total}\u2026`);
+      } else if (!d) {
+        setScrStatus("", "");
+      }
+      renderScreenings();
+      renderComparison(currentContext); // keep the Profile snapshot in sync
+    }
+    // Eligibility auto-walk progress / results.
+    if (area === "local" && changes.uw_eligibility) {
+      eligibilityData = changes.uw_eligibility.newValue;
+      const d = eligibilityData;
+      if (d && d.status === "done") {
+        setEligStatus("ok", `Done \u2014 ${d.eligibilities.length} assessment(s)`);
+      } else if (d && d.status === "running") {
+        const p = d.progress || { done: 0, total: 0 };
+        setEligStatus("warn", `Walking ${p.done}/${p.total}\u2026`);
+      } else if (!d) {
+        setEligStatus("", "");
+      }
+      renderEligibility();
+      renderComparison(currentContext); // keep the Profile snapshot in sync
+    }
+    // Case auto-walk progress / results.
+    if (area === "local" && changes.uw_cases) {
+      caseData = changes.uw_cases.newValue;
+      const d = caseData;
+      if (d && d.status === "done") {
+        setCaseStatus("ok", `Done \u2014 ${d.cases.length} case(s)`);
+      } else if (d && d.status === "running") {
+        const p = d.progress || { done: 0, total: 0 };
+        setCaseStatus("warn", `Walking ${p.done}/${p.total}\u2026`);
+      } else if (!d) {
+        setCaseStatus("", "");
+      }
+      renderCases();
+      renderComparison(currentContext); // keep the Profile snapshot in sync
     }
   });
 }

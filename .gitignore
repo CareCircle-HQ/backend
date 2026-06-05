@@ -26,6 +26,13 @@ output/*
 *.csv
 data/*
 
+# Network captures + scratch API responses (contain live tokens / PII)
+*.har
+network.har
+template.json
+profile.json
+list.json
+
 # Extension local config (contains the service API token)
 extension/config.js
 # Chrome-generated artifacts when loading the unpacked extension

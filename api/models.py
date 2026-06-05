@@ -613,10 +613,23 @@ class Case(models.Model):
     service_authorization_status = models.CharField(
         max_length=20, choices=ServiceAuthorizationStatus.choices, blank=True
     )
+    # Raw status label as shown in the UI (e.g. "Accepted") preserving fidelity
+    # since the enum above normalizes it.
+    service_authorization_status_label = models.CharField(max_length=80, blank=True)
     service_authorization_request_starts_at = models.DateTimeField(null=True, blank=True)
     service_authorization_request_ends_at = models.DateTimeField(null=True, blank=True)
     service_authorization_approval_starts_at = models.DateTimeField(null=True, blank=True)
     service_authorization_approval_ends_at = models.DateTimeField(null=True, blank=True)
+    unite_us_authorization_id = models.CharField(max_length=80, blank=True)
+    # Free text: usually a dollar amount (e.g. "$8,736.00") but can also be a
+    # unit/time description (e.g. "20 units (293-307 minutes)").
+    authorized_amount = models.CharField(max_length=120, blank=True)
+    program_cap = models.TextField(blank=True)
+    authorization_note = models.TextField(blank=True)
+
+    # --- Social Care Coverage (as shown on the case) ---
+    social_care_coverage_plan = models.CharField(max_length=255, blank=True)
+    social_care_coverage_status = models.CharField(max_length=80, blank=True)
 
     # --- Export Metadata ---
     export_provider_role = models.CharField(max_length=80, blank=True)
@@ -1007,11 +1020,17 @@ class QuestionOption(models.Model):
 
 
 class Answer(models.Model):
-    """A client's answer to a question within a screening."""
+    """A client's answer to a question within a screening or eligibility assessment."""
 
     answer_id = models.UUIDField(primary_key=True, editable=False)
+    # An answer belongs to EITHER a screening or an eligibility assessment.
     screening = models.ForeignKey(
-        Screening, on_delete=models.CASCADE, related_name="answers"
+        Screening, on_delete=models.CASCADE, null=True, blank=True,
+        related_name="answers",
+    )
+    eligibility = models.ForeignKey(
+        Eligibility, on_delete=models.CASCADE, null=True, blank=True,
+        related_name="answers",
     )
     question = models.ForeignKey(
         Question, on_delete=models.SET_NULL, null=True, blank=True,
@@ -1045,6 +1064,7 @@ class Answer(models.Model):
     class Meta:
         indexes = [
             models.Index(fields=["screening"]),
+            models.Index(fields=["eligibility"]),
             models.Index(fields=["question"]),
         ]
 
@@ -1136,3 +1156,46 @@ class ImportBatch(models.Model):
 
     def __str__(self):
         return f"{self.get_source_display()} import {self.pk} ({self.status})"
+
+
+
+class ScreeningForm(models.Model):
+    name = models.CharField(max_length=255)
+    description = models.TextField(blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    def __str__(self):
+        return self.name
+
+
+class Questionnaire(models.Model):
+    screening = models.OneToOneField(
+        ScreeningForm,
+        on_delete=models.CASCADE,
+        related_name="screening_questionnaire"
+    )
+    title = models.CharField(max_length=255)
+
+    def __str__(self):
+        return f"{self.title} ({self.screening.name})"
+
+
+class Assessment(models.Model):
+    name = models.CharField(max_length=255)
+    description = models.TextField(blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    def __str__(self):
+        return self.name
+
+
+class AssessmentQuestionnaire(models.Model):
+    assessment = models.OneToOneField(
+        Assessment,
+        on_delete=models.CASCADE,
+        related_name="assessment_questionnaire"
+    )
+    title = models.CharField(max_length=255)
+
+    def __str__(self):
+        return f"{self.title} ({self.assessment.name})"
