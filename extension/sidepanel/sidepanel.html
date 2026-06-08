@@ -12,16 +12,42 @@
          cached underneath and reappears when they return to that client. -->
     <div id="homeOverlay" class="home-overlay hidden">
       <img class="home-logo" src="assets/logo-400.png" alt="CareCircle" />
-      <h2 id="homeTitle" class="home-title">Open a client in Unite Us</h2>
-      <p id="homeMsg" class="home-msg">
-        Search for a client on Unite Us and open their facesheet to start
-        capturing their information here.
-      </p>
-      <button id="homeRetryBtn" class="primary hidden">Retry</button>
+
+      <!-- Agent-code gate: shown on first load until an agent code is set. The
+           code is stored on this device and used to prepopulate the E-Form. -->
+      <div id="agentGate" class="agent-gate hidden">
+        <h2 class="home-title">Enter your Agent Code</h2>
+        <p class="home-msg">
+          Your Agent Code identifies you on enrollments. It's saved on this
+          device and used to prepopulate forms.
+        </p>
+        <input
+          id="agentCodeInput"
+          class="agent-code-input"
+          type="text"
+          placeholder="Agent Code"
+          autocomplete="off"
+          spellcheck="false"
+        />
+        <button id="agentCodeSaveBtn" class="primary">Save &amp; Continue</button>
+      </div>
+
+      <div id="homeDefault">
+        <h2 id="homeTitle" class="home-title">Open a client in Unite Us</h2>
+        <p id="homeMsg" class="home-msg">
+          Search for a client on Unite Us and open their facesheet to start
+          capturing their information here.
+        </p>
+        <button id="homeRetryBtn" class="primary hidden">Retry</button>
+      </div>
     </div>
 
     <header class="app-header">
       <h1>Client Workflow</h1>
+      <div class="header-right">
+        <span id="agentTag" class="agent-tag hidden" title="Logged-in Unite Us user"></span>
+        <button id="logoutBtn" class="logout-btn hidden" title="Log out (clear Agent Code)">Logout</button>
+      </div>
     </header>
 
     <!-- Tab bar -->
@@ -134,10 +160,23 @@
         </div>
       </section>
 
-      <!-- Tab 5: E-Form -->
+      <!-- Tab 5: E-Form (custom enrollment intake) -->
       <section class="panel" data-panel="eform">
-        <iframe class="form-frame" id="frame-eform" title="E-Form"></iframe>
-        <div class="placeholder hidden" id="ph-eform">E-Form URL not configured yet.</div>
+        <div class="row spread">
+          <h2>E-Form</h2>
+          <div class="actions">
+            <button id="eformSaveBtn" class="act-btn save" title="Save E-Form" aria-label="Save E-Form" disabled>
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><path d="M17 21v-8H7v8"/><path d="M7 3v5h8"/></svg>
+            </button>
+          </div>
+        </div>
+        <div class="profile-meta">
+          <span id="eformMeta" class="muted"></span>
+          <span id="eformStatus" class="badge"></span>
+        </div>
+        <form id="eformForm" class="eform" autocomplete="off" novalidate>
+          <p class="muted">Open a Unite Us facesheet to load the enrollment form.</p>
+        </form>
       </section>
 
       <!-- Tab 6: N-Form -->

@@ -43,7 +43,7 @@ function parseIdsFromUrl() {
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-const cleanText = (s) => (s || "").replace(/\s+/g, " ").trim();
+const cleanText = (s) => (s == null ? "" : String(s)).replace(/\s+/g, " ").trim();
 
 // Facesheet navigation tabs we walk to reveal hidden sections. These are safe,
 // read-only views. We intentionally do NOT click arbitrary aria-expanded toggles
@@ -1428,6 +1428,8 @@ window.addEventListener("message", (ev) => {
   try {
     chrome.storage.local.set({ uw_uu_creds: uuCreds });
   } catch (_) {}
+  // Resolve the logged-in user the moment we hold an employee id (throttled).
+  maybeDetectUser();
 });
 
 async function getUuCreds() {
@@ -1480,6 +1482,97 @@ function publishSession(state) {
       uw_session: { state, at: new Date().toISOString() },
     });
   } catch (_) {}
+  // Keep the detected logged-in user's validity in lockstep with the session:
+  // expire it when the token dies, (re)detect when the session is healthy.
+  if (state === "expired") {
+    markUuUserInvalid();
+  } else if (state === "ok") {
+    maybeDetectUser();
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Logged-in Unite Us user auto-detection
+// ---------------------------------------------------------------------------
+// The network shim forwards the page's x-employee-id alongside the Bearer
+// token. As soon as we hold credentials (i.e. right after the user logs in and
+// the page makes its first API call), we resolve that id to the employee's
+// identity via the core API and cache it in uw_uu_user. Every piece of data we
+// capture can then be attributed to whoever is logged in. The cached record's
+// `valid` flag tracks whether the Unite Us session is still live.
+const UU_USER_TTL_MS = 10 * 60 * 1000; // re-resolve identity past this
+let lastUserDetect = { employeeId: null, at: 0 };
+
+function parseEmployee(body) {
+  const d = body && body.data;
+  if (!d || !d.id) return null;
+  const a = d.attributes || {};
+  const rel = d.relationships || {};
+  const relId = (k) => (rel[k] && rel[k].data && rel[k].data.id) || "";
+  const first = a.first_name || "";
+  const last = a.last_name || "";
+  return {
+    employee_id: d.id,
+    user_id: relId("user"),
+    provider_id: relId("provider"),
+    first_name: first,
+    last_name: last,
+    name: `${first} ${last}`.trim(),
+    email: a.email || "",
+    work_title: a.work_title || "",
+    state: a.state || "",
+  };
+}
+
+function publishUuUser(user, valid) {
+  try {
+    chrome.storage.local.set({
+      uw_uu_user: {
+        ...user,
+        valid: valid !== false,
+        detected_at: new Date().toISOString(),
+      },
+    });
+  } catch (_) {}
+}
+
+// Mark the stored user as no longer backed by a live session (keep the identity
+// for display) when the token expires / the user logs out.
+async function markUuUserInvalid() {
+  try {
+    const { uw_uu_user } = await chrome.storage.local.get("uw_uu_user");
+    if (uw_uu_user && uw_uu_user.valid) {
+      await chrome.storage.local.set({ uw_uu_user: { ...uw_uu_user, valid: false } });
+    }
+  } catch (_) {}
+  lastUserDetect = { employeeId: null, at: 0 }; // force a fresh resolve next time
+}
+
+// Resolve + cache the logged-in employee. Throttled by employee id + TTL so the
+// frequent credential messages don't hammer the API. No-op until we hold creds
+// that include an employee id (the core host supplies it).
+async function maybeDetectUser(force) {
+  const creds = await getUuCreds();
+  if (!creds || !creds.employeeId) return;
+  const fresh =
+    !force &&
+    lastUserDetect.employeeId === creds.employeeId &&
+    Date.now() - lastUserDetect.at < UU_USER_TTL_MS;
+  if (fresh) return;
+  try {
+    const body = await coreGet(`/employees/${creds.employeeId}`, creds);
+    const user = parseEmployee(body);
+    if (user) {
+      lastUserDetect = { employeeId: creds.employeeId, at: Date.now() };
+      publishUuUser(user, true);
+    }
+  } catch (e) {
+    if (isAuthError(e)) {
+      markUuUserInvalid();
+      return;
+    }
+    console.warn("[uw-user] detect failed:", e);
+  }
 }
 
 // Map a fetch Response to an AuthError on 401/403 (invalidating creds), so a
@@ -1559,17 +1652,28 @@ async function apiFetchScreeningDetail(id, creds) {
 }
 
 // Resolve a question's answer text: single answers carry an `answer` object;
-// select_multiple carry an `answers` array.
+// select_multiple carry an `answers` array. Numeric / boolean answers (e.g.
+// "How many family members...": 1) live under different keys depending on the
+// question type, and may be raw numbers, so coerce everything to a string and
+// probe the known answer fields.
 function apiAnswerValue(q) {
-  if (q.answer) {
-    const v = q.answer.value || q.answer.string;
+  const toStr = (v) => (v == null || v === "" ? "" : String(v));
+  const fromOne = (ans) => {
+    if (ans == null) return "";
+    if (typeof ans !== "object") return toStr(ans); // raw scalar answer
+    if (typeof ans.boolean === "boolean") return ans.boolean ? "Yes" : "No";
+    const keys = ["value", "string", "number", "numeric", "integer", "text", "label"];
+    for (const k of keys) {
+      if (ans[k] != null && ans[k] !== "") return toStr(ans[k]);
+    }
+    return "";
+  };
+  if (q.answer != null) {
+    const v = fromOne(q.answer);
     if (v) return v;
   }
   if (Array.isArray(q.answers) && q.answers.length) {
-    return q.answers
-      .map((a) => a.value || a.string)
-      .filter(Boolean)
-      .join(", ");
+    return q.answers.map(fromOne).filter(Boolean).join(", ");
   }
   return "";
 }

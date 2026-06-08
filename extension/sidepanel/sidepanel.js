@@ -2,8 +2,9 @@
 // and tabbed embedded forms. Auth is transparent via the baked service token.
 
 // Form URLs per tab. Leave a value empty ("") to show a "not configured" notice.
+// The E-Form is now a custom-built form (see the E-Form section below), not an
+// embedded iframe, so it is intentionally absent from this map.
 const FORMS = {
-  eform: "https://links.carecirclecs.com/widget/form/fg6YKsPnZCb4qOtzZ1GU",
   nform: "", // TODO: set N-Form URL
   vform: "", // TODO: set V-Form URL
 };
@@ -26,11 +27,22 @@ let isValidated = false;
 let autoScanTimer = null;
 const loadedFrames = new Set();
 
+// E-Form state: which client the form was last built for, and whether the user
+// has edited it (so background data refreshes don't clobber their input).
+let eformBuiltFor = null;
+let eformDirty = false;
+
 // Session / view state driving the full-page home overlay.
 // sessionState: "ok" | "expired"; viewState.onClient: whether the user is
 // currently viewing a client on Unite Us (vs. search / dashboard / login).
 let sessionState = "ok";
 let viewState = { onClient: false };
+
+// Identity shown in the header. agentUser = auto-detected Unite Us employee
+// (uw_uu_user); agentCode = the manually-entered Met Council Agent Code
+// (uw_agent_code), gated on first load and used to prefill the E-Form.
+let agentUser = null;
+let agentCode = "";
 
 // Decide whether to show the full-page home / session screen. Shown when the
 // Unite Us session has expired, or when the user is not on a client page. The
@@ -39,16 +51,29 @@ let viewState = { onClient: false };
 function updateHomeOverlay() {
   const overlay = $("homeOverlay");
   if (!overlay) return;
+  // The agent-code gate takes priority: until a code is set we keep the home
+  // screen up and show the prompt instead of the client/session messaging.
+  const needAgent = !agentCode;
   const expired = sessionState === "expired";
   // Track the LIVE view: show the home screen whenever the user isn't looking at
   // a client, even though the previous client's data stays cached underneath.
   const offClient = viewState && viewState.onClient === false;
-  const show = expired || offClient;
+  const show = needAgent || expired || offClient;
 
   overlay.classList.toggle("hidden", !show);
-  overlay.classList.toggle("expired", expired);
-  $("homeRetryBtn").classList.toggle("hidden", !expired);
+  overlay.classList.toggle("expired", expired && !needAgent);
 
+  const gate = $("agentGate");
+  const def = $("homeDefault");
+  if (gate) gate.classList.toggle("hidden", !needAgent);
+  if (def) def.classList.toggle("hidden", needAgent);
+  if (needAgent) {
+    const inp = $("agentCodeInput");
+    if (inp && document.activeElement !== inp) inp.focus();
+    return;
+  }
+
+  $("homeRetryBtn").classList.toggle("hidden", !expired);
   if (expired) {
     $("homeTitle").textContent = "Unite Us session expired";
     $("homeMsg").textContent =
@@ -58,6 +83,37 @@ function updateHomeOverlay() {
     $("homeMsg").textContent =
       "Search for a client on Unite Us and open their facesheet to start capturing their information here.";
   }
+}
+
+// Persist the entered Agent Code, clear the gate, and prefill the E-Form.
+async function saveAgentCode() {
+  const inp = $("agentCodeInput");
+  const code = ((inp && inp.value) || "").trim();
+  if (!code) {
+    if (inp) inp.focus();
+    return;
+  }
+  agentCode = code;
+  try {
+    await chrome.storage.local.set({ uw_agent_code: code });
+  } catch (_) {}
+  renderAgentTag();
+  updateHomeOverlay();
+  refreshEformIfPristine(); // push the code into the form if untouched
+}
+
+// Log out of the extension session: drop the Agent Code so the gate returns.
+// (Does not touch the Unite Us session itself.)
+async function logout() {
+  agentCode = "";
+  try {
+    await chrome.storage.local.remove("uw_agent_code");
+  } catch (_) {}
+  const inp = $("agentCodeInput");
+  if (inp) inp.value = "";
+  renderAgentTag();
+  updateHomeOverlay();
+  refreshEformIfPristine(); // clear the prefilled code from the form if untouched
 }
 
 // Retry after a session expiry: force a profile reload, which bootstraps a
@@ -122,7 +178,9 @@ function escapeHtml(s) {
   return String(s)
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;");
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
 }
 
 // ---------------------------------------------------------------------------
@@ -2795,6 +2853,460 @@ async function maybeAutoValidate() {
   if (cfg.token) validateClient();
 }
 
+// ---------- E-Form tab (custom enrollment intake) ----------
+// A hand-built form (was an embedded GHL iframe). Fields are prepopulated from
+// already-captured data: family size <- the eligibility Q&A, preferred language
+// <- the captured client, and the delivery address <- the client's primary
+// address. (Eligible For / Referred for live on earlier steps, so they're not
+// repeated here.) The Save handler is a stub for now (collects + validates
+// only); the submit destination is TBD.
+
+const EFORM_LANGS = ["English", "Mandarin", "Spanish", "Yiddish", "Other"];
+const EFORM_CHANNELS = ["Phone", "SMS", "Email"];
+const EFORM_TIMES = [
+  "Morning (9am - 12pm)",
+  "Early Afternoon (12pm - 3pm)",
+  "Late afternoon (3pm - 6pm)",
+  "Evening (6pm - 8pm)",
+];
+const EFORM_TRANSFER = [
+  "Transfer Successful (Verification agent Answered)",
+  "Transfer Failed",
+  "No Verification Needed",
+];
+
+// Map the form's human labels to the backend's enum codes (Client model).
+const EFORM_CHANNEL_CODES = { Phone: "phone", SMS: "text", Email: "email" };
+const EFORM_TIME_CODES = {
+  "Morning (9am - 12pm)": "morning",
+  "Early Afternoon (12pm - 3pm)": "early_afternoon",
+  "Late afternoon (3pm - 6pm)": "late_afternoon",
+  "Evening (6pm - 8pm)": "evening",
+};
+const EFORM_TRANSFER_CODES = {
+  "Transfer Successful (Verification agent Answered)": "transfer_successful",
+  "Transfer Failed": "transfer_failed",
+  "No Verification Needed": "no_verification_needed",
+};
+
+// Data sources (all guarded against stale data for a different client) -------
+const NUM_WORDS = {
+  zero: 0, one: 1, two: 2, three: 3, four: 4, five: 5,
+  six: 6, seven: 7, eight: 8, nine: 9, ten: 10,
+};
+
+// Parse a count from an eligibility answer: a digit ("3", "3 members") or a
+// spelled-out number ("three"). Null if neither is present.
+function parseCountAnswer(a) {
+  const s = String(a || "");
+  const digit = s.match(/\d+/);
+  if (digit) return parseInt(digit[0], 10);
+  const word = s.toLowerCase().match(/\b(zero|one|two|three|four|five|six|seven|eight|nine|ten)\b/);
+  return word ? NUM_WORDS[word[1]] : null;
+}
+
+// The medicaid-enrolled family-member count from the eligibility assessment
+// answer to "How many immediate family members in your household are
+// medicaid-enrolled ...". Drives "Is this a family?" and "Total Family
+// Members". Null if not found. Matching is lenient (wording / answer format
+// varies) but still scoped to the medicaid family-members question.
+function eformFamilyCount() {
+  const d = eligibilityData;
+  if (!d || !Array.isArray(d.eligibilities)) return null;
+  if (currentContext && currentContext.client_id && d.clientId !== currentContext.client_id) return null;
+  for (const s of d.eligibilities) {
+    const items = s.detail && Array.isArray(s.detail.items) ? s.detail.items : [];
+    for (const it of items) {
+      const q = it.q || "";
+      if (/family members/i.test(q) && /medicaid/i.test(q)) {
+        const n = parseCountAnswer(it.a);
+        if (n != null) return n;
+      }
+    }
+  }
+  return null;
+}
+
+function eformPrimaryAddress() {
+  const a = currentContext && currentContext.captured && currentContext.captured.address;
+  if (a) return { street: a.line1 || "", city: a.city || "", state: a.state || "", zip: a.postal_code || "" };
+  return { street: "", city: "", state: "", zip: "" };
+}
+
+function eformPreferredLanguage() {
+  const c = currentContext && currentContext.captured && currentContext.captured.client;
+  return (c && (c.preferred_spoken_language || c.preferred_written_language)) || "";
+}
+
+function eformAgentNote() {
+  return agentCode
+    ? "Prefilled from your saved Agent Code (set on the home screen)."
+    : "No Agent Code saved \u2014 set one from the home screen (Logout to change).";
+}
+
+// HTML builders -------------------------------------------------------------
+function efText(id, label, opts = {}) {
+  const req = opts.req ? '<span class="req">*</span>' : "";
+  const type = opts.number ? "number" : "text";
+  const extra = opts.number ? ' inputmode="numeric" min="0" step="1"' : "";
+  const val = opts.value != null ? ` value="${escapeHtml(opts.value)}"` : "";
+  const ph = opts.ph ? ` placeholder="${escapeHtml(opts.ph)}"` : "";
+  const note = opts.note ? `<div class="field-note">${escapeHtml(opts.note)}</div>` : "";
+  return (
+    `<div class="field" data-field="${id}">` +
+    `<label class="field-label" for="${id}">${escapeHtml(label)}${req}</label>` +
+    `<input type="${type}" id="${id}"${extra}${val}${ph} />${note}</div>`
+  );
+}
+
+function efOptions(name, label, values, opts = {}) {
+  const type = opts.type || "checkbox";
+  const inline = opts.inline ? " inline" : "";
+  const cols = opts.cols ? ` cols-${opts.cols}` : "";
+  const req = opts.req ? '<span class="req">*</span>' : "";
+  const selected = new Set((opts.selected || []).map((s) => String(s)));
+  const note = opts.note ? `<div class="field-note">${escapeHtml(opts.note)}</div>` : "";
+  const rows = values
+    .map((v, i) => {
+      const checked = selected.has(String(v)) ? " checked" : "";
+      return (
+        `<label class="opt"><input type="${type}" name="${name}" id="${name}_${i}" ` +
+        `value="${escapeHtml(v)}"${checked} /> ${escapeHtml(v)}</label>`
+      );
+    })
+    .join("");
+  return (
+    `<div class="field" data-field="${name}">` +
+    `<label class="field-label">${escapeHtml(label)}${req}</label>` +
+    `<div class="opt-group${inline}${cols}">${rows}</div>${note}</div>`
+  );
+}
+
+// Build (or rebuild) the form for the current client, prepopulating from data.
+function buildEform() {
+  const form = $("eformForm");
+  if (!form) return;
+  const cid = currentContext && currentContext.client_id;
+  if (!cid) {
+    form.innerHTML = '<p class="muted">Open a Unite Us facesheet to load the enrollment form.</p>';
+    return;
+  }
+
+  const fam = eformFamilyCount();
+  const addr = eformPrimaryAddress();
+  const lang = eformPreferredLanguage();
+  const langSel = EFORM_LANGS.filter((l) => new RegExp(`\\b${l}\\b`, "i").test(lang));
+  // Family iff more than one medicaid-enrolled member; default to "No" otherwise
+  // (including when the count isn't found).
+  const familyYesNo = fam != null && fam > 1 ? "Yes" : "No";
+
+  let html = "";
+  // Member ID: hidden; populated from the detected client (TODO: confirm via API).
+  html += `<input type="hidden" id="ef_member_id" value="${escapeHtml(cid)}" />`;
+
+  html += efText("ef_lead_source", "Lead Source", { req: true, ph: "e.g. Street Team, Referral" });
+
+  html += efOptions("ef_is_family", "Is this a family?", ["Yes", "No"], {
+    type: "radio",
+    req: true,
+    inline: true,
+    selected: familyYesNo ? [familyYesNo] : [],
+    note:
+      fam != null
+        ? `Derived from eligibility: ${fam} medicaid-enrolled family member(s).`
+        : "Not found in eligibility \u2014 select manually.",
+  });
+
+  html += efText("ef_total_family", "Total Family Members (Incl.)", {
+    req: true,
+    number: true,
+    value: fam != null ? String(fam) : "",
+    note: fam != null ? "From the eligibility assessment." : "",
+  });
+
+  html += efOptions("ef_attestation", "Attestation Needed?", ["Yes", "No"], {
+    type: "radio",
+    req: true,
+    inline: true,
+    selected: ["No"],
+  });
+
+  html += efOptions("ef_channel", "Preferred Communication Channel", EFORM_CHANNELS, {
+    type: "checkbox",
+    req: true,
+    inline: true,
+    note: "Select at least one.",
+  });
+
+  html += efOptions("ef_time", "Preferred Communication Time of Day", EFORM_TIMES, {
+    type: "checkbox",
+    req: true,
+    cols: 2,
+  });
+
+  html += efOptions("ef_language", "Preferred Communication Language", EFORM_LANGS, {
+    type: "checkbox",
+    req: true,
+    cols: 2,
+    selected: langSel,
+    note: lang ? `Captured preference: ${lang}` : "",
+  });
+
+  html +=
+    `<div class="field" data-field="ef_delivery">` +
+    `<div class="subhead">` +
+    `<label class="field-label">Delivery Address <span class="req">*</span></label>` +
+    `<button type="button" class="link-btn" id="ef_addr_clear">Clear</button></div>` +
+    `<div class="addr-grid">` +
+    `<input class="full" type="text" id="ef_addr_street" placeholder="Street Address" value="${escapeHtml(addr.street)}" />` +
+    `<input type="text" id="ef_addr_city" placeholder="City" value="${escapeHtml(addr.city)}" />` +
+    `<input type="text" id="ef_addr_state" placeholder="State" value="${escapeHtml(addr.state)}" />` +
+    `<input class="full" type="text" id="ef_addr_zip" placeholder="Zip Code" value="${escapeHtml(addr.zip)}" /></div>` +
+    `<div class="field-note">Loaded from the client's primary address. Clear to enter a new delivery address.</div></div>`;
+
+  html += efText("ef_call_duration", "Phone call duration when finished with Eligibility (minutes)", {
+    req: true,
+    number: true,
+    ph: "Whole minutes",
+    note: "BEFORE STARTING NAVIGATION.",
+  });
+
+  html += efOptions("ef_transfer", "Call Transfer Answered?", EFORM_TRANSFER, {
+    type: "radio",
+    req: true,
+  });
+
+  html += efText("ef_agent_code", "Agent Code", {
+    req: true,
+    value: agentCode,
+    note: eformAgentNote(),
+  });
+
+  form.innerHTML = html;
+  updateEformSaveBtn();
+}
+
+// Activate: build once per client (or when emptied); refresh meta line.
+function activateEform() {
+  const cid = (currentContext && currentContext.client_id) || null;
+  const form = $("eformForm");
+  if (eformBuiltFor !== cid || !form || !form.querySelector("[data-field]")) {
+    buildEform();
+    eformBuiltFor = cid;
+    eformDirty = false;
+  }
+  updateEformMeta();
+}
+
+// Rebuild from fresh data only if the user hasn't started editing, so a
+// background scan completing doesn't wipe their input.
+function refreshEformIfPristine() {
+  if (eformBuiltFor == null) return;
+  if (eformBuiltFor !== ((currentContext && currentContext.client_id) || null)) return;
+  if (eformDirty) return;
+  buildEform();
+}
+
+function eformChecked(name) {
+  return [...document.querySelectorAll(`#eformForm input[name="${name}"]:checked`)].map((e) => e.value);
+}
+
+function collectEform() {
+  const val = (id) => {
+    const e = $(id);
+    return e ? e.value.trim() : "";
+  };
+  return {
+    member_id: val("ef_member_id"),
+    lead_source: val("ef_lead_source"),
+    is_family: eformChecked("ef_is_family")[0] || "",
+    total_family_members: val("ef_total_family"),
+    attestation_needed: eformChecked("ef_attestation")[0] || "",
+    communication_channels: eformChecked("ef_channel"),
+    communication_times: eformChecked("ef_time"),
+    communication_languages: eformChecked("ef_language"),
+    delivery_street: val("ef_addr_street"),
+    delivery_city: val("ef_addr_city"),
+    delivery_state: val("ef_addr_state"),
+    delivery_zip: val("ef_addr_zip"),
+    call_duration_minutes: val("ef_call_duration"),
+    call_transfer: eformChecked("ef_transfer")[0] || "",
+    agent_code: val("ef_agent_code"),
+  };
+}
+
+// Returns the list of invalid field keys (empty = valid).
+function eformValidate(d) {
+  const missing = [];
+  const need = (ok, field) => {
+    if (!ok) missing.push(field);
+  };
+  need(d.lead_source, "ef_lead_source");
+  need(d.is_family, "ef_is_family");
+  need(d.total_family_members !== "", "ef_total_family");
+  need(d.attestation_needed, "ef_attestation");
+  need(d.communication_channels.length, "ef_channel");
+  need(d.communication_times.length, "ef_time");
+  need(d.communication_languages.length, "ef_language");
+  need(d.delivery_street && d.delivery_city && d.delivery_state && d.delivery_zip, "ef_delivery");
+  need(d.call_duration_minutes !== "", "ef_call_duration");
+  need(d.call_transfer, "ef_transfer");
+  need(d.agent_code, "ef_agent_code");
+  return missing;
+}
+
+function markEformInvalid(missing) {
+  document.querySelectorAll("#eformForm .field").forEach((f) => f.classList.remove("invalid"));
+  new Set(missing).forEach((id) => {
+    const f = document.querySelector(`#eformForm .field[data-field="${id}"]`);
+    if (f) f.classList.add("invalid");
+  });
+}
+
+function setEformStatus(state, message) {
+  const b = $("eformStatus");
+  if (!b) return;
+  b.className = "badge " + (state || "");
+  b.textContent = message || "";
+}
+
+function updateEformMeta() {
+  const el = $("eformMeta");
+  if (!el) return;
+  const cid = currentContext && currentContext.client_id;
+  el.textContent = cid ? "Review & complete the enrollment form" : "";
+}
+
+function updateEformSaveBtn() {
+  const btn = $("eformSaveBtn");
+  if (!btn) return;
+  const cid = currentContext && currentContext.client_id;
+  const missing = cid ? eformValidate(collectEform()) : ["*"];
+  btn.disabled = missing.length > 0;
+  btn.title = btn.disabled ? "Complete all required fields to save" : "Save E-Form";
+}
+
+// Respond to user edits: enforce integer-only fields, mark dirty, refresh state.
+function onEformChange(e) {
+  const t = e && e.target;
+  if (t && (t.id === "ef_total_family" || t.id === "ef_call_duration")) {
+    const clean = t.value.replace(/[^0-9]/g, "");
+    if (clean !== t.value) t.value = clean;
+  }
+  eformDirty = true;
+  updateEformSaveBtn();
+}
+
+function onEformClick(e) {
+  if (e.target && e.target.id === "ef_addr_clear") {
+    ["ef_addr_street", "ef_addr_city", "ef_addr_state", "ef_addr_zip"].forEach((id) => {
+      const el = $(id);
+      if (el) el.value = "";
+    });
+    eformDirty = true;
+    const s = $("ef_addr_street");
+    if (s) s.focus();
+    updateEformSaveBtn();
+  }
+}
+
+// Map the collected E-Form values onto the Client model shape for a PATCH.
+function buildEformPayload(d) {
+  const isYes = (v) => v === "Yes";
+  const toInt = (v) => (v === "" ? null : parseInt(v, 10));
+  const codes = (arr, map) => arr.map((v) => map[v]).filter(Boolean);
+
+  const payload = {
+    client_id: d.member_id,
+    lead_source: d.lead_source,
+    is_family: isYes(d.is_family),
+    total_family_members: toInt(d.total_family_members),
+    attestation_needed: isYes(d.attestation_needed),
+    communication_channels: codes(d.communication_channels, EFORM_CHANNEL_CODES),
+    preferred_communication_times: codes(d.communication_times, EFORM_TIME_CODES),
+    preferred_languages: d.communication_languages.slice(),
+    call_duration_minutes: toInt(d.call_duration_minutes),
+    call_transfer_answered: EFORM_TRANSFER_CODES[d.call_transfer] || "",
+    agent_code: d.agent_code,
+  };
+
+  // Delivery address -> nested upsert (address_type "delivery"). Flag whether it
+  // differs from the client's captured primary address.
+  const primary = eformPrimaryAddress();
+  const norm = (s) => String(s || "").trim().toLowerCase();
+  const sameAsPrimary =
+    norm(primary.street) === norm(d.delivery_street) &&
+    norm(primary.city) === norm(d.delivery_city) &&
+    norm(primary.state) === norm(d.delivery_state) &&
+    norm(primary.zip) === norm(d.delivery_zip);
+  payload.different_delivery_address = !sameAsPrimary;
+  payload.addresses = [
+    {
+      address_type: "delivery",
+      line1: d.delivery_street,
+      city: d.delivery_city,
+      state: (d.delivery_state || "").trim().toUpperCase(),
+      postal_code: d.delivery_zip,
+      is_active: true,
+    },
+  ];
+  return payload;
+}
+
+// Save the enrollment form: validates, then PATCHes the existing client. The
+// client must already exist in the CRM (the E-Form tab only unlocks after the
+// Profile validates the client), so a 404 means "save the Profile first".
+async function saveEform(ev) {
+  if (!consentAccepted()) return setEformStatus("warn", NO_CONSENT_MSG);
+  const cid = currentContext && currentContext.client_id;
+  if (!cid) {
+    setEformStatus("err", "No client detected");
+    return;
+  }
+  const data = collectEform();
+  const missing = eformValidate(data);
+  markEformInvalid(missing);
+  if (missing.length) {
+    setEformStatus("err", `Complete ${missing.length} required field(s)`);
+    return;
+  }
+  const cfg = await getConfig();
+  if (!cfg.token) {
+    setEformStatus("err", "No API token configured");
+    return;
+  }
+
+  const btn = (ev && ev.currentTarget) || $("eformSaveBtn");
+  setBtnBusy(btn, true);
+  setEformStatus("warn", "Saving\u2026");
+  try {
+    const res = await fetch(`${cfg.backendUrl}/api/clients/${cid}/`, {
+      method: "PATCH",
+      headers: { ...authHeader(cfg), "Content-Type": "application/json" },
+      body: JSON.stringify(buildEformPayload(data)),
+    });
+    if (res.ok) {
+      setEformStatus("ok", "Saved \u2713");
+      eformDirty = false;
+      await fetchCrm(cfg, cid); // refresh CRM column + last-updated
+    } else if (res.status === 404) {
+      setEformStatus("err", "Client not in CRM \u2014 save the Profile tab first");
+    } else if (res.status === 401 || res.status === 403) {
+      setEformStatus("err", "Auth error");
+    } else {
+      let detail = `Error ${res.status}`;
+      try {
+        detail = summarizeErrors(await res.json()) || detail;
+      } catch (_) {}
+      setEformStatus("err", detail);
+    }
+  } catch (_) {
+    setEformStatus("err", "Network error");
+  } finally {
+    setBtnBusy(btn, false);
+  }
+}
+
 // ---------- Validation ----------
 function setValidation(state, message) {
   const badge = $("validationStatus");
@@ -2853,6 +3365,50 @@ async function validateClient() {
   }
 }
 
+// ---------- Logged-in agent badge ----------
+// Shows the auto-detected Unite Us user (agentUser) alongside the manually-set
+// Agent Code (agentCode), and toggles the logout button. Sources: uw_uu_user
+// and uw_agent_code in local storage.
+function renderAgentTag() {
+  const el = $("agentTag");
+  const lo = $("logoutBtn");
+  const user = agentUser;
+  const hasUser = !!(user && (user.name || user.email));
+  if (el) {
+    const parts = [];
+    if (hasUser) parts.push(user.name || user.email);
+    if (agentCode) parts.push(`#${agentCode}`);
+    if (!parts.length) {
+      el.classList.add("hidden");
+      el.textContent = "";
+    } else {
+      el.textContent = parts.join("  \u00b7  ");
+      el.classList.remove("hidden");
+      el.classList.toggle("expired", hasUser && user.valid === false);
+      const emailPart = hasUser && user.email ? ` <${user.email}>` : "";
+      const statusPart = hasUser && user.valid === false ? " \u2014 session expired" : "";
+      const userPart = hasUser ? `Logged-in Unite Us user: ${user.name || ""}${emailPart}${statusPart}` : "";
+      const codePart = agentCode ? `Agent Code: ${agentCode}` : "";
+      el.title = [userPart, codePart].filter(Boolean).join(" \u00b7 ");
+    }
+  }
+  // Logout is available whenever an Agent Code session is active.
+  if (lo) lo.classList.toggle("hidden", !agentCode);
+}
+
+async function loadAgent() {
+  try {
+    const { uw_uu_user, uw_agent_code } = await chrome.storage.local.get([
+      "uw_uu_user",
+      "uw_agent_code",
+    ]);
+    agentUser = uw_uu_user || null;
+    agentCode = uw_agent_code || "";
+  } catch (_) {}
+  renderAgentTag();
+  updateHomeOverlay();
+}
+
 // ---------- Tabs / panels ----------
 function loadFrame(name) {
   if (loadedFrames.has(name)) return;
@@ -2879,6 +3435,7 @@ function activateTab(name) {
     p.classList.toggle("active", p.dataset.panel === name)
   );
   if (name in FORMS) loadFrame(name);
+  if (name === "eform") activateEform();
 }
 
 function initTabs() {
@@ -2896,6 +3453,7 @@ function init() {
   initTabs();
   setFormsUnlocked(false);
   loadContext();
+  loadAgent();
 
   $("validateBtn").addEventListener("click", validateClient);
   $("rescanBtn").addEventListener("click", rescan);
@@ -2907,9 +3465,25 @@ function init() {
   $("eligSaveBtn").addEventListener("click", saveEligibility);
   $("caseRescanBtn").addEventListener("click", caseRescan);
   $("caseSaveBtn").addEventListener("click", saveCases);
+  $("eformSaveBtn").addEventListener("click", saveEform);
+  // Delegated on the form so listeners survive rebuilds of its inner markup.
+  const eform = $("eformForm");
+  if (eform) {
+    eform.addEventListener("input", onEformChange);
+    eform.addEventListener("change", onEformChange);
+    eform.addEventListener("click", onEformClick);
+  }
   $("diagnosticBtn").addEventListener("click", runDiagnostic);
   $("copyReportBtn").addEventListener("click", copyReport);
   $("homeRetryBtn").addEventListener("click", retrySession);
+  $("agentCodeSaveBtn").addEventListener("click", saveAgentCode);
+  $("agentCodeInput").addEventListener("keydown", (e) => {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      saveAgentCode();
+    }
+  });
+  $("logoutBtn").addEventListener("click", logout);
 
   // Live-update when the content script captures a new/changed client.
   chrome.storage.onChanged.addListener((changes, area) => {
@@ -2923,6 +3497,18 @@ function init() {
     if (changes.uw_view) {
       viewState = changes.uw_view.newValue || { onClient: false };
       updateHomeOverlay();
+    }
+    // Logged-in Unite Us user detected / session validity changed.
+    if (changes.uw_uu_user) {
+      agentUser = changes.uw_uu_user.newValue || null;
+      renderAgentTag();
+    }
+    // Agent Code set / cleared (possibly from another panel instance).
+    if (changes.uw_agent_code) {
+      agentCode = changes.uw_agent_code.newValue || "";
+      renderAgentTag();
+      updateHomeOverlay();
+      refreshEformIfPristine();
     }
     if (area === "local" && changes.uw_context) {
       const prev = currentContext;
@@ -2944,6 +3530,12 @@ function init() {
         renderScreenings();
         renderEligibility();
         renderCases();
+        // Reset the E-Form so it rebuilds (prepopulated) for the new client.
+        eformBuiltFor = null;
+        eformDirty = false;
+        setEformStatus("", "");
+        const ef = $("eformForm");
+        if (ef) ef.innerHTML = '<p class="muted">Open a Unite Us facesheet to load the enrollment form.</p>';
         // Auto-load EVERYTHING for the new client via the API: Profile, then
         // (consent permitting) screenings, eligibility and cases. runFullScan
         // is consent-gated internally, so pre-consent only the Profile loads.
@@ -3007,6 +3599,7 @@ function init() {
       }
       renderEligibility();
       renderComparison(currentContext); // keep the Profile snapshot in sync
+      refreshEformIfPristine(); // refresh prefilled "Eligible For" / family size
     }
     // Case auto-walk progress / results.
     if (area === "local" && changes.uw_cases) {
@@ -3026,6 +3619,7 @@ function init() {
       }
       renderCases();
       renderComparison(currentContext); // keep the Profile snapshot in sync
+      refreshEformIfPristine(); // keep the E-Form in sync if untouched
     }
   });
 }

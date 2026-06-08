@@ -339,6 +339,15 @@ class Client(models.Model):
     communication_channel = models.CharField(
         max_length=20, choices=CommunicationChannel.choices, blank=True
     )
+    # E-Form (enrollment intake) multi-selects. Lists rather than the single
+    # fields above because the form allows choosing several values.
+    # communication_channels: CommunicationChannel codes (e.g. ["phone", "text"]).
+    # preferred_communication_times: CommunicationTimeOfDay codes (a flat list,
+    #   distinct from the per-weekday preferred_communication_time_of_day above).
+    # preferred_languages: free-text language labels (e.g. ["English", "Spanish"]).
+    communication_channels = models.JSONField(default=list, blank=True)
+    preferred_communication_times = models.JSONField(default=list, blank=True)
+    preferred_languages = models.JSONField(default=list, blank=True)
 
     # --- Contact Information (primary) ---
     phone_type = models.CharField(

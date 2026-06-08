@@ -33,6 +33,47 @@ body {
   color: #fff;
 }
 .app-header h1 { font-size: 15px; margin: 0; font-weight: 600; }
+.header-right { display: flex; align-items: center; gap: 8px; min-width: 0; max-width: 72%; }
+.logout-btn {
+  flex: 0 0 auto;
+  background: rgba(255, 255, 255, 0.16);
+  color: #fff;
+  border: none;
+  border-radius: 999px;
+  padding: 3px 10px;
+  font-size: 11px;
+  font-weight: 500;
+  cursor: pointer;
+}
+.logout-btn:hover { background: rgba(255, 255, 255, 0.3); }
+
+/* Logged-in Unite Us agent badge */
+.agent-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+  max-width: 100%;
+  font-size: 11px;
+  font-weight: 500;
+  color: #fff;
+  background: rgba(255, 255, 255, 0.16);
+  border-radius: 999px;
+  padding: 3px 9px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.agent-tag::before {
+  content: "";
+  flex: 0 0 auto;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #4ade80;
+}
+.agent-tag.expired { background: rgba(255, 255, 255, 0.1); color: #fecaca; }
+.agent-tag.expired::before { background: #f87171; }
 
 .icon-btn {
   background: transparent;
@@ -131,6 +172,19 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
 .home-title { margin: 0; font-size: 17px; font-weight: 600; color: var(--text); }
 .home-msg { margin: 0; max-width: 320px; color: var(--muted); line-height: 1.5; }
 .home-overlay .primary { margin-top: 6px; padding: 9px 18px; border-radius: 8px; }
+#homeDefault,
+.agent-gate { display: flex; flex-direction: column; align-items: center; gap: 14px; }
+.agent-gate { width: 100%; max-width: 280px; }
+.agent-code-input {
+  width: 100%;
+  padding: 9px 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  font-size: 15px;
+  text-align: center;
+  letter-spacing: 0.04em;
+  margin-top: 0;
+}
 
 .empty-state {
   border: 1px solid var(--primary, #2563eb);
@@ -541,6 +595,51 @@ textarea.diag {
 
 /* Form iframes fill their panel */
 .form-frame { flex: 1; width: 100%; border: none; display: block; }
+
+/* Custom E-Form (enrollment intake) */
+.panel[data-panel="eform"] { padding: 12px; overflow-y: auto; }
+.eform .field { margin-bottom: 14px; }
+.eform .field-label {
+  display: block;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--text);
+  margin-bottom: 6px;
+}
+.eform .req { color: var(--err); margin-left: 2px; }
+.eform input[type="text"],
+.eform input[type="number"] { width: 100%; margin-top: 0; }
+.eform .opt-group { display: flex; flex-direction: column; gap: 7px; margin-top: 2px; }
+.eform .opt-group.inline { flex-direction: row; flex-wrap: wrap; gap: 8px 16px; }
+.eform .opt-group.cols-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 7px 14px; }
+.eform .opt {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin: 0;
+  font-size: 12.5px;
+  font-weight: 400;
+  color: var(--text);
+  cursor: pointer;
+}
+.eform .opt input { width: auto; margin: 0; }
+.eform .addr-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.eform .addr-grid .full { grid-column: 1 / -1; }
+.eform .subhead { display: flex; align-items: center; justify-content: space-between; }
+.eform .link-btn {
+  background: none;
+  border: none;
+  color: var(--primary);
+  cursor: pointer;
+  font-size: 11px;
+  font-weight: 600;
+  padding: 0;
+}
+.eform .link-btn:hover { text-decoration: underline; }
+.eform .field-note { font-size: 11px; color: var(--muted); margin-top: 5px; }
+.eform .field.invalid .field-label { color: var(--err); }
+.eform .field.invalid input { border-color: var(--err); }
+.eform .field.invalid .opt-group { outline: 1px solid #fecaca; border-radius: 6px; padding: 6px; }
 .placeholder {
   flex: 1;
   display: flex;

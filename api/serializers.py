@@ -9,6 +9,7 @@ from .models import (
     Answer,
     Case,
     Client,
+    CommunicationChannel,
     CommunicationTimeOfDay,
     Eligibility,
     IdentifiedSocialNeed,
@@ -168,6 +169,47 @@ class ClientSerializer(serializers.ModelSerializer):
 
     def validate_referred_for(self, value):
         return self._validate_services(value, "referred_for")
+
+    @staticmethod
+    def _validate_code_list(value, field_name, allowed):
+        """Validate a multi-select list against an allowed set of codes,
+        de-duplicating while preserving order."""
+        if value in (None, ""):
+            return []
+        if not isinstance(value, list):
+            raise serializers.ValidationError(
+                f"{field_name} must be a list of values."
+            )
+        invalid = [v for v in value if v not in allowed]
+        if invalid:
+            raise serializers.ValidationError(
+                f"Invalid {field_name} values: {invalid}. "
+                f"Allowed: {sorted(allowed)}"
+            )
+        return list(dict.fromkeys(value))
+
+    def validate_communication_channels(self, value):
+        return self._validate_code_list(
+            value, "communication_channels", set(CommunicationChannel.values)
+        )
+
+    def validate_preferred_communication_times(self, value):
+        return self._validate_code_list(
+            value,
+            "preferred_communication_times",
+            set(CommunicationTimeOfDay.values),
+        )
+
+    def validate_preferred_languages(self, value):
+        """Free-text language labels; just enforce a clean list of strings."""
+        if value in (None, ""):
+            return []
+        if not isinstance(value, list):
+            raise serializers.ValidationError(
+                "preferred_languages must be a list of language names."
+            )
+        cleaned = [str(v).strip() for v in value if str(v).strip()]
+        return list(dict.fromkeys(cleaned))
 
     def validate_preferred_communication_time_of_day(self, value):
         if value in (None, ""):
