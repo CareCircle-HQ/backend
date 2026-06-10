@@ -9,9 +9,11 @@ removed cleanly later:
     3. Drop the ``crm_*`` columns via a migration.
 
 Nothing here may raise into the request path -- a CRM failure must never break a
-local save. The public entry point is :func:`sync_client`.
+local save. The public entry points are :func:`sync_client`, :func:`sync_case`,
+:func:`sync_screening`, and :func:`sync_eligibility`.
 """
 
 from .contacts import sync_client
+from .opportunities import sync_case, sync_eligibility, sync_screening
 
-__all__ = ["sync_client"]
+__all__ = ["sync_client", "sync_case", "sync_eligibility", "sync_screening"]

@@ -134,6 +134,18 @@ class CaseViewSet(BulkUpsertMixin, viewsets.ModelViewSet):
             qs = qs.filter(client_id=client)
         return qs
 
+    # --- TEMPORARY: mirror the case to the external GHL CRM as an opportunity.
+    def perform_create(self, serializer):
+        serializer.save()
+        ghl.sync_case(serializer.instance)
+
+    def perform_update(self, serializer):
+        serializer.save()
+        ghl.sync_case(serializer.instance)
+
+    def post_upsert(self, obj):
+        ghl.sync_case(obj)
+
 
 class ContractedServiceViewSet(BulkUpsertMixin, viewsets.ModelViewSet):
     """CRUD + upsert for contracted services (keyed on provided_service UUID).
@@ -170,6 +182,18 @@ class ScreeningViewSet(BulkUpsertMixin, viewsets.ModelViewSet):
             qs = qs.filter(client_id=client)
         return qs
 
+    # --- TEMPORARY: mirror the screening to the external GHL CRM as an opportunity.
+    def perform_create(self, serializer):
+        serializer.save()
+        ghl.sync_screening(serializer.instance)
+
+    def perform_update(self, serializer):
+        serializer.save()
+        ghl.sync_screening(serializer.instance)
+
+    def post_upsert(self, obj):
+        ghl.sync_screening(obj)
+
 
 class EligibilityViewSet(BulkUpsertMixin, viewsets.ModelViewSet):
     """CRUD + upsert for eligibility assessments (keyed on eligibility_id UUID)."""
@@ -185,6 +209,18 @@ class EligibilityViewSet(BulkUpsertMixin, viewsets.ModelViewSet):
         if client:
             qs = qs.filter(client_id=client)
         return qs
+
+    # --- TEMPORARY: mirror the eligibility to the external GHL CRM as an opportunity.
+    def perform_create(self, serializer):
+        serializer.save()
+        ghl.sync_eligibility(serializer.instance)
+
+    def perform_update(self, serializer):
+        serializer.save()
+        ghl.sync_eligibility(serializer.instance)
+
+    def post_upsert(self, obj):
+        ghl.sync_eligibility(obj)
 
 
 class ProviderViewSet(viewsets.ReadOnlyModelViewSet):

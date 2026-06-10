@@ -224,12 +224,12 @@ case.authorized_amount = "$8,736.00"
 
 ## 4. Missing Fields in Our API (Need to Add)
 
-### 4.1 Doctor Information (Contact)
+### 4.1 Doctor Information (Contact) - ✅ COMPLETE
 
-Currently **NOT** in `Client` model:
+**Status:** Added to Client model (Migration 0019) and mapped to GHL custom fields.
 
 ```python
-# Add to Client model:
+# Client model fields (COMPLETE):
 doctors_name = models.CharField(max_length=255, blank=True)
 doctors_street_address = models.CharField(max_length=255, blank=True)
 doctors_phone = models.CharField(max_length=32, blank=True)
@@ -237,67 +237,62 @@ doctors_fax = models.CharField(max_length=32, blank=True)
 doctors_email = models.EmailField(blank=True)
 ```
 
-**Source:** Unite Us facesheet "Doctor/PCP" section
+**Source:** Enrollment form E-Form "Doctor/PCP" section
+**GHL Fields:** `VDp9dccvMPl8Yood6e9O`, `Yvfn5jNSITA7oDZ9qc0G`, `XtwIwYRKfgaTe88T92wB`, `XJyU9CjxrH5dID7vWtcC`, `ViDnbjtmh5VhDJHby2hW`
 
-### 4.2 Meal Category (Screening/Eligibility)
+### 4.2 Meal Category (Screening/Eligibility) - OUT OF SCOPE
 
-```python
-# Add to Screening and Eligibility models:
-meal_category = models.CharField(max_length=50, blank=True)
-# Values: "Kosher", "Regular", "Special Diet", etc.
-```
+~~`meal_category`~~ - **Captured outside our scope** (not in our API)
 
-**Source:** Screening questions/answers
+**Status:** Will be handled by external system, not synced from our API.
 
-### 4.3 Food Allergies (Screening)
+### 4.3 Food Allergies (Screening) - OUT OF SCOPE
 
-```python
-# Add to Screening model:
-food_allergies = models.JSONField(default=list, blank=True)
-# Values: ["Dairy", "Gluten", "Nuts", "Shellfish", "Other"]
-other_allergies = models.CharField(max_length=255, blank=True)
-```
+~~`food_allergies`~~, ~~`other_allergies`~~ - **Captured outside our scope** (not in our API)
 
-**Source:** HM screening question responses
+**Status:** Will be handled by external system, not synced from our API.
 
-### 4.4 Screening Form URL
+### 4.4 Screening Form URL - OUT OF SCOPE
 
-```python
-# Add to Screening model:
-screening_form_url = models.URLField(blank=True)
-# Or enrollment_platform_url
-```
+~~`screening_form_url`~~ - **Captured outside our scope** (not in our API)
 
-**Source:** Generated during screening completion
+**Status:** Will be handled by external system, not synced from our API.
 
 ---
 
-## 5. Proposed Implementation Order
+## 5. Implementation Status
 
-### Phase 1: Contact Fields (Immediate)
-- [ ] Map remaining contact custom fields
-- [ ] Add doctor fields to Client model
-- [ ] Add household member count resolver
-- [ ] Test contact sync end-to-end
+### ✅ Phase 1: Contact Fields (COMPLETE)
+- [x] Map remaining contact custom fields
+- [x] Add doctor fields to Client model (`doctors_name`, `doctors_street_address`, `doctors_phone`, `doctors_fax`, `doctors_email`)
+- [x] Add `crm_source`, `crm_sync_hash`, `crm_synced_at` to Client
+- [x] Test contact sync end-to-end
 
-### Phase 2: Opportunity Infrastructure
-- [ ] Create `opportunities.py` module
-- [ ] Define pipeline/stage mappings
-- [ ] Implement opportunity creation for Screenings
-- [ ] Implement opportunity creation for Cases
-- [ ] Implement opportunity creation for Eligibility
+### ✅ Phase 2: Opportunity Infrastructure (COMPLETE)
+- [x] Create `opportunities.py` module
+- [x] Define pipeline IDs from `pipelines_id.csv`
+- [x] Implement opportunity sync for Screenings (B: Screening pipeline)
+- [x] Implement opportunity sync for Eligibility (C: Eligibility Assessment pipeline)
+- [x] Implement opportunity sync for Cases (G1/D/E pipelines based on service type)
+- [x] Add `crm_opportunity_id`, `crm_sync_hash`, `crm_synced_at` to Screening/Case/Eligibility
+- [ ] Configure stage IDs for each pipeline (TODO: Get from GHL)
 
-### Phase 3: Data Transformations
-- [ ] Add option mapping utilities
-- [ ] Add currency parsing
-- [ ] Add boolean presence check helpers
-- [ ] Add date formatting standardization
+### ✅ Phase 3: Data Transformations (COMPLETE)
+- [x] Add option mapping utilities
+- [x] Add currency parsing (`_parse_currency`)
+- [x] Add boolean presence check helpers
+- [x] Add date formatting standardization
 
-### Phase 4: Missing Fields
-- [ ] Migration: Add doctor fields
-- [ ] Migration: Add meal_category
-- [ ] Migration: Add food_allergies
-- [ ] Update ETL to populate new fields
+### ✅ Phase 4: API Migrations (COMPLETE)
+- [x] Migration 0019: Add doctor fields to Client
+- [x] Migration 0019: Add CRM tracking fields to Client/Screening/Case/Eligibility
+- [x] Update extension E-Form with doctor section
+- [x] Hide V-Form tab from extension
+
+### ❌ OUT OF SCOPE (External System)
+- ~~meal_category~~ - Captured by external system
+- ~~food_allergies~~ - Captured by external system  
+- ~~screening_form_url~~ - Captured by external system
 
 ---
 
@@ -314,7 +309,7 @@ FIELD_ASSIGNED_AGENT_ATTESTATION_REQUESTED = "wuXdpSPdvglOX2XaMdOT"
 FIELD_ASSIGNED_AGENT_ATTESTATION_COMPLETE = "v02vvzMuoOMcD3wqS5nD"
 FIELD_DATE_OF_FIRST_DELIVERY = "wW6QENM8RU9fRzQPEU2u"
 
-# To be added after API migration:
+# Added to custom_fields.py:
 FIELD_DOCTORS_NAME = "VDp9dccvMPl8Yood6e9O"
 FIELD_DOCTORS_STREET_ADDRESS = "Yvfn5jNSITA7oDZ9qc0G"
 FIELD_DOCTORS_PHONE = "XtwIwYRKfgaTe88T92wB"
