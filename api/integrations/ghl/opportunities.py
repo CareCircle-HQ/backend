@@ -21,31 +21,41 @@ from . import config
 logger = logging.getLogger(__name__)
 
 # =============================================================================
-# Pipeline & Stage Configuration (to be populated from env or API)
+# Pipeline & Stage Configuration (from tmp/pipelines_id.csv)
 # =============================================================================
 
-PIPELINE_SCREENING = " screening_pipeline_id"  # TODO: Get from GHL
-PIPELINE_CASE = "case_pipeline_id"  # TODO: Get from GHL
-PIPELINE_ELIGIBILITY = "eligibility_pipeline_id"  # TODO: Get from GHL
+# B: Screening - for HM screening opportunities
+PIPELINE_SCREENING = "ENJvUOcoV0fQWX36V8Rq"
 
-# Stage mappings - populate after checking GHL pipeline structure
+# C: Eligibility Assessment - for eligibility opportunities  
+PIPELINE_ELIGIBILITY = "F6cAYzGyB9H1Tsb88QZO"
+
+# G1: Internal Services - Food Delivery - for food delivery cases
+# Other service types may map to different G-pipelines
+PIPELINE_CASE_FOOD = "05nsZFCbcujvqSJIdlbN"
+
+# D: Navigation - for navigation cases
+PIPELINE_CASE_NAVIGATION = "2GToxmnm3MrMsotZ1kgn"
+
+# E: External Services - for external service cases
+PIPELINE_CASE_EXTERNAL = "vVnLwzTO1nkVxUt0zmdF"
+
+# F: Attestation - for attestation tracking
+PIPELINE_ATTESTATION = "ld0HoLxCzj8ooiuOm8hX"
+
+# Stage mappings - TODO: Get actual stage IDs from GHL for each pipeline
+# Stages vary by pipeline and need to be configured per pipeline
 STAGES = {
     "screening": {
-        "new": "stage_id_new",
-        "in_progress": "stage_id_in_progress",
-        "completed": "stage_id_completed",
-    },
-    "case": {
-        "open": "stage_id_open",
-        "in_progress": "stage_id_in_progress",
-        "authorized": "stage_id_authorized",
-        "closed": "stage_id_closed",
+        "new": "new",  # TODO: Replace with actual GHL stage ID
+        "in_progress": "in_progress",
+        "completed": "completed",
     },
     "eligibility": {
-        "assigned": "stage_id_assigned",
-        "in_review": "stage_id_in_review",
-        "eligible": "stage_id_eligible",
-        "ineligible": "stage_id_ineligible",
+        "assigned": "assigned",
+        "in_review": "in_review",
+        "eligible": "eligible",
+        "ineligible": "ineligible",
     },
 }
 
