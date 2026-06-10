@@ -1,18 +1,19 @@
 # Django REST API
-Django==6.0.5
-djangorestframework==3.17.1
-djangorestframework_simplejwt==5.5.1
-django-cors-headers==4.9.0
+Django==4.2.20
+psycopg2-binary==2.9.9
+djangorestframework==3.15.2
+djangorestframework-simplejwt==5.3.1
+django-cors-headers==4.3.1
 
 # Config / environment
-python-dotenv==1.2.2
+python-dotenv==1.0.1
 
 # CRM integration (GoHighLevel)
 gohighlevel-api-client==1.0.0b1
 
 # HTTP
-requests==2.34.2
+requests==2.31.0
 
 # Production server / static files
-gunicorn==23.0.0
-whitenoise==6.9.0
+gunicorn==21.2.0
+whitenoise==6.6.0
