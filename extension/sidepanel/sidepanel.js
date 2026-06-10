@@ -1706,11 +1706,23 @@ async function buildScreeningPayloads(d, clientId) {
       subject_id: clientId,
       performing_organization_name: s.org || "",
       screen_source: s.form || "",
+      // NEW: Capture screening metadata from list view
+      screen_type: s.form || "",  // Form name like "HM #3", "SCN", "PHS"
+      screen_status: s.status || "",  // Status from list view
+      provider_name: s.submitter || "",  // Submitter name
     };
 
     // Duration captured as minutes in the UI; store seconds in the model.
     if (det.duration && /^\d+$/.test(String(det.duration))) {
       payload.duration = parseInt(det.duration, 10) * 60;
+    }
+
+    // NEW: Parse created date from list view (format like "May 26, 2026")
+    if (s.date) {
+      const parsedDate = new Date(s.date);
+      if (!isNaN(parsedDate.getTime())) {
+        payload.screen_created_at = parsedDate.toISOString();
+      }
     }
 
     // Answers (one per non-duration Q&A item), with a deterministic question.
