@@ -22,7 +22,8 @@ SYNC_ENABLED = getattr(settings, "CRM_SYNC_ENABLED", False)
 TIMEOUT = getattr(settings, "GHL_TIMEOUT", 10)
 
 # Value written to the GHL contact ``source`` field.
-CONTACT_SOURCE = getattr(settings, "GHL_CONTACT_SOURCE", "Benefully extension")
+# Previously defaulted to "Benefully extension", now blank to be captured from enrollment form.
+CONTACT_SOURCE = getattr(settings, "GHL_CONTACT_SOURCE", "")
 
 
 def is_enabled():

@@ -3167,6 +3167,37 @@ function buildEform() {
     note: eformAgentNote(),
   });
 
+  // Doctor/PCP Information Section
+  html += "<hr/><h4>Doctor/PCP Information</h4>";
+
+  html += efText("ef_doctors_name", "Doctor Name", {
+    req: false,
+    ph: "Dr. Jane Smith",
+  });
+
+  html += efText("ef_doctors_street_address", "Doctor Street Address", {
+    req: false,
+    ph: "123 Medical Plaza, Suite 100",
+  });
+
+  html += efText("ef_doctors_phone", "Doctor Phone", {
+    req: false,
+    ph: "(555) 123-4567",
+    type: "tel",
+  });
+
+  html += efText("ef_doctors_fax", "Doctor Fax", {
+    req: false,
+    ph: "(555) 123-4568",
+    type: "tel",
+  });
+
+  html += efText("ef_doctors_email", "Doctor Email", {
+    req: false,
+    ph: "doctor@clinic.com",
+    type: "email",
+  });
+
   form.innerHTML = html;
   updateEformSaveBtn();
 }
@@ -3217,6 +3248,12 @@ function collectEform() {
     call_duration_minutes: val("ef_call_duration"),
     call_transfer: eformChecked("ef_transfer")[0] || "",
     agent_code: val("ef_agent_code"),
+    // Doctor/PCP Information
+    doctors_name: val("ef_doctors_name"),
+    doctors_street_address: val("ef_doctors_street_address"),
+    doctors_phone: val("ef_doctors_phone"),
+    doctors_fax: val("ef_doctors_fax"),
+    doctors_email: val("ef_doctors_email"),
   };
 }
 
@@ -3313,6 +3350,13 @@ function buildEformPayload(d) {
     call_duration_minutes: toInt(d.call_duration_minutes),
     call_transfer_answered: EFORM_TRANSFER_CODES[d.call_transfer] || "",
     agent_code: d.agent_code,
+    // Doctor/PCP Information
+    doctors_name: d.doctors_name || "",
+    doctors_street_address: d.doctors_street_address || "",
+    doctors_phone: d.doctors_phone || "",
+    doctors_fax: d.doctors_fax || "",
+    doctors_email: d.doctors_email || "",
+    crm_source: d.lead_source || "",  // Store lead source as crm_source
   };
 
   // Delivery address -> nested upsert (address_type "delivery"). Flag whether it

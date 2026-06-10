@@ -356,9 +356,21 @@ class Client(models.Model):
     client_phone_number = models.CharField(max_length=32, blank=True)  # PII
     client_email_address = models.EmailField(blank=True)  # PII
 
+    # --- Doctor/PCP Information (from enrollment form) ---
+    doctors_name = models.CharField(max_length=255, blank=True)
+    doctors_street_address = models.CharField(max_length=255, blank=True)
+    doctors_phone = models.CharField(max_length=32, blank=True)
+    doctors_fax = models.CharField(max_length=32, blank=True)
+    doctors_email = models.EmailField(blank=True)
+
     # --- Care Coordination ---
     care_coordinator = models.CharField(max_length=255, blank=True)
     care_coordinator_status = models.CharField(max_length=80, blank=True)
+
+    # --- CRM Sync Tracking (External - GoHighLevel) ---
+    crm_source = models.CharField(max_length=120, blank=True)  # Source from enrollment form
+    crm_sync_hash = models.CharField(max_length=64, blank=True)
+    crm_synced_at = models.DateTimeField(null=True, blank=True)
 
     class Meta:
         ordering = ["last_name", "first_name"]
@@ -734,6 +746,11 @@ class Case(models.Model):
     social_care_coverage_plan = models.CharField(max_length=255, blank=True)
     social_care_coverage_status = models.CharField(max_length=80, blank=True)
 
+    # --- CRM Sync Tracking (External - GoHighLevel Opportunity) ---
+    crm_opportunity_id = models.CharField(max_length=64, blank=True, db_index=True)
+    crm_sync_hash = models.CharField(max_length=64, blank=True)
+    crm_synced_at = models.DateTimeField(null=True, blank=True)
+
     # --- Export Metadata ---
     export_provider_role = models.CharField(max_length=80, blank=True)
     import_batch = models.ForeignKey(
@@ -984,6 +1001,11 @@ class Screening(models.Model):
     # --- Sensitivity Flags ---
     is_case_sensitive = models.BooleanField(default=False)
 
+    # --- CRM Sync Tracking (External - GoHighLevel Opportunity) ---
+    crm_opportunity_id = models.CharField(max_length=64, blank=True, db_index=True)
+    crm_sync_hash = models.CharField(max_length=64, blank=True)
+    crm_synced_at = models.DateTimeField(null=True, blank=True)
+
     # --- Filtering & Metadata (ETL) ---
     filter_date = models.DateField(null=True, blank=True)
     import_batch = models.ForeignKey(
@@ -1090,6 +1112,11 @@ class Eligibility(models.Model):
     verified_at = models.DateTimeField(null=True, blank=True)
     verified_by_id = models.UUIDField(null=True, blank=True)
     verified_by_type = models.CharField(max_length=50, blank=True)
+
+    # --- CRM Sync Tracking (External - GoHighLevel Opportunity) ---
+    crm_opportunity_id = models.CharField(max_length=64, blank=True, db_index=True)
+    crm_sync_hash = models.CharField(max_length=64, blank=True)
+    crm_synced_at = models.DateTimeField(null=True, blank=True)
 
     # --- Sensitivity & Metadata ---
     is_case_sensitive = models.BooleanField(default=False)
