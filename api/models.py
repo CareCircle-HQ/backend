@@ -33,6 +33,22 @@ class ConsentStatus(models.TextChoices):
     EXPIRED = "expired", "Expired"
 
 
+class ClientStage(models.TextChoices):
+    """Acquisition funnel stage for a client/person. Auto-derived from synced
+    Unite Us data (consent, screenings, eligibility, cases) by
+    ``api.services.lifecycle.recompute_client_stage``.
+
+    lead -> prospect -> screened -> eligible | ineligible -> client
+    """
+
+    LEAD = "lead", "Lead"  # pulled from Unite Us (Medicaid), no consent yet
+    PROSPECT = "prospect", "Prospect"  # consent accepted
+    SCREENED = "screened", "Screened"  # >=1 completed Met Council screening
+    ELIGIBLE = "eligible", "Eligible"  # eligibility assessment found eligible
+    INELIGIBLE = "ineligible", "Ineligible"  # eligibility found not eligible
+    CLIENT = "client", "Client"  # >=1 Met Council case exists
+
+
 class CommunicationChannel(models.TextChoices):
     EMAIL = "email", "Email"
     PHONE = "phone", "Phone"
@@ -233,6 +249,10 @@ class Client(models.Model):
     updated_at = models.DateTimeField(null=True, blank=True)  # source last update
     is_active = models.BooleanField(default=True)
     crm_contact_id = models.CharField(max_length=64, blank=True, db_index=True)
+    # External CRM (GoHighLevel) push tracking. Temporary integration; see
+    # api.integrations.ghl. crm_sync_hash lets us skip redundant pushes.
+    crm_synced_at = models.DateTimeField(null=True, blank=True)
+    crm_sync_hash = models.CharField(max_length=64, blank=True)
     last_synced_at = models.DateTimeField(auto_now=True)  # local ingest tracking
     import_batch = models.ForeignKey(
         "ImportBatch", on_delete=models.SET_NULL, null=True, blank=True,
@@ -291,6 +311,14 @@ class Client(models.Model):
     )
     consented_at = models.DateTimeField(null=True, blank=True)
 
+    # --- Lifecycle (acquisition funnel) ---
+    # Auto-derived from synced data; see api.services.lifecycle.
+    lifecycle_stage = models.CharField(
+        max_length=20, choices=ClientStage.choices, default=ClientStage.LEAD,
+        db_index=True,
+    )
+    lifecycle_stage_at = models.DateTimeField(null=True, blank=True)
+
     # --- Household & Income ---
     gross_monthly_income = models.DecimalField(
         max_digits=10, decimal_places=2, null=True, blank=True
@@ -311,6 +339,15 @@ class Client(models.Model):
     communication_channel = models.CharField(
         max_length=20, choices=CommunicationChannel.choices, blank=True
     )
+    # E-Form (enrollment intake) multi-selects. Lists rather than the single
+    # fields above because the form allows choosing several values.
+    # communication_channels: CommunicationChannel codes (e.g. ["phone", "text"]).
+    # preferred_communication_times: CommunicationTimeOfDay codes (a flat list,
+    #   distinct from the per-weekday preferred_communication_time_of_day above).
+    # preferred_languages: free-text language labels (e.g. ["English", "Spanish"]).
+    communication_channels = models.JSONField(default=list, blank=True)
+    preferred_communication_times = models.JSONField(default=list, blank=True)
+    preferred_languages = models.JSONField(default=list, blank=True)
 
     # --- Contact Information (primary) ---
     phone_type = models.CharField(
@@ -443,6 +480,72 @@ class Insurance(models.Model):
 
     def __str__(self):
         return f"{self.plan_name or self.plan_type} for {self.client_id}"
+
+
+# ===========================================================================
+# PRODUCT & SERVICE CATALOG
+# ===========================================================================
+class Product(models.Model):
+    """A product we can deliver to a client. Products are derived from the
+    screening result. We track every product available in Unite Us, but only
+    flag the ones we actually offer (``is_offered``). Today the only offered
+    product is Food.
+    """
+
+    code = models.SlugField(max_length=60, unique=True)
+    name = models.CharField(max_length=255)
+    description = models.TextField(blank=True)
+    # We provide this product (vs. merely tracking that it exists in Unite Us).
+    is_offered = models.BooleanField(default=False)
+    is_active = models.BooleanField(default=True)
+    source = models.CharField(max_length=120, default="Unite Us")
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["name"]
+        indexes = [models.Index(fields=["is_offered", "is_active"])]
+
+    def __str__(self):
+        return self.name
+
+
+class Service(models.Model):
+    """A service type a client may be eligible for, taken from the eligibility
+    result ("Client May Be Eligible for:"). Mirrors the Unite Us taxonomy
+    (``ServiceType``). We keep every value, but only flag the ones we offer
+    (``is_offered``); offered services map to the ``Product`` we deliver them
+    under. Currently offered: Medically Tailored Meals (MTM) and Clinically
+    Appropriate Meals, both under the Food product.
+    """
+
+    code = models.CharField(
+        max_length=80, choices=ServiceType.choices, unique=True
+    )
+    name = models.CharField(max_length=255)
+    category = models.CharField(max_length=120, blank=True)  # e.g. "Food"
+    product = models.ForeignKey(
+        Product,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="services",
+    )
+    # We provide this service (vs. merely tracking that it exists in Unite Us).
+    is_offered = models.BooleanField(default=False)
+    is_active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["name"]
+        indexes = [
+            models.Index(fields=["is_offered", "is_active"]),
+            models.Index(fields=["product"]),
+        ]
+
+    def __str__(self):
+        return self.name
 
 
 # ===========================================================================
@@ -651,6 +754,67 @@ class Case(models.Model):
 
     def __str__(self):
         return f"Case {self.case_id} ({self.get_case_status_display()})"
+
+
+class ContractedService(models.Model):
+    """A contracted service (Unite Us ``provided_service``) on a case.
+
+    A case may have one or more contracted services. Each maps to a Unite Us
+    ``provided_service`` and carries its service-authorization terms (amount,
+    delivery window, duration) plus the latest invoice (number + link). Keyed on
+    the source ``provided_service`` id so imports are idempotent upserts.
+    """
+
+    # Source ``provided_service`` external id.
+    contracted_service_id = models.UUIDField(primary_key=True, editable=False)
+    case = models.ForeignKey(
+        Case, on_delete=models.CASCADE, related_name="contracted_services"
+    )
+
+    # --- Service definition (fee_schedule_program) ---
+    name = models.CharField(max_length=255, blank=True)
+    service_type = models.CharField(max_length=120, blank=True)
+    status = models.CharField(max_length=80, blank=True)  # raw provided_service state
+    fee_schedule_program_id = models.UUIDField(null=True, blank=True)
+    fee_schedule_program_name = models.CharField(max_length=255, blank=True)
+    unit_type = models.CharField(max_length=80, blank=True)
+
+    # --- Service authorization terms ---
+    service_authorization_id = models.UUIDField(null=True, blank=True)
+    unite_us_authorization_id = models.CharField(max_length=80, blank=True)  # short_id
+    authorization_status = models.CharField(max_length=80, blank=True)
+    # Free text: dollar amount (e.g. "$8,736.00") or unit/time description.
+    authorized_amount = models.CharField(max_length=120, blank=True)
+    authorized_units = models.CharField(max_length=80, blank=True)
+    # Free text duration, e.g. "20 units (293-307 minutes)".
+    service_duration = models.CharField(max_length=255, blank=True)
+    service_starts_at = models.DateField(null=True, blank=True)
+    service_ends_at = models.DateField(null=True, blank=True)
+
+    # --- Invoice (latest active invoice for this provided service) ---
+    invoice_number = models.CharField(max_length=120, blank=True)
+    invoice_status = models.CharField(max_length=80, blank=True)
+    invoice_amount = models.CharField(max_length=120, blank=True)
+    invoice_url = models.URLField(max_length=1000, blank=True)  # invoice link
+    invoiced_at = models.DateTimeField(null=True, blank=True)
+
+    # --- Source / ingest metadata ---
+    created_at = models.DateTimeField(null=True, blank=True)
+    updated_at = models.DateTimeField(null=True, blank=True)
+    import_batch = models.ForeignKey(
+        "ImportBatch", on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="contracted_services",
+    )
+
+    class Meta:
+        ordering = ["name"]
+        indexes = [
+            models.Index(fields=["case"]),
+            models.Index(fields=["service_authorization_id"]),
+        ]
+
+    def __str__(self):
+        return f"ContractedService {self.contracted_service_id} ({self.name})"
 
 
 # ===========================================================================
@@ -1199,3 +1363,242 @@ class AssessmentQuestionnaire(models.Model):
 
     def __str__(self):
         return f"{self.title} ({self.assessment.name})"
+
+
+# ===========================================================================
+# CLIENT LIFECYCLE / ENROLLMENT
+# ===========================================================================
+# The acquisition funnel (Client.lifecycle_stage) is auto-derived from synced
+# Unite Us data. Service delivery is tracked per-product on an Enrollment, which
+# advances through its own stages via guarded manual transitions. StageEvent is
+# an append-only audit log of every transition (powers funnel/time-in-stage
+# reporting). See api.services.lifecycle for the transition logic.
+class EnrollmentStage(models.TextChoices):
+    """Service-delivery stage for a single (client, product) enrollment."""
+
+    PENDING_VALIDATION = "pending_validation", "Pending Validation"
+    VALIDATED = "validated", "Validated"
+    PENDING_VERIFICATION = "pending_verification", "Pending Verification"
+    VERIFIED = "verified", "Verified"
+    SERVICE_ACTIVE = "service_active", "Service Active"
+    SERVICE_COMPLETE = "service_complete", "Service Complete"
+    CLOSED = "closed", "Closed"
+    ON_HOLD = "on_hold", "On Hold"
+    CANCELLED = "cancelled", "Cancelled"
+
+
+class ProcessType(models.TextChoices):
+    """An operational process run against an enrollment. Extensible: new process
+    types (e.g. re-validation) can be added without new tables."""
+
+    VALIDATION = "validation", "Validation"
+    VERIFICATION = "verification", "Verification"
+
+
+class ProcessStatus(models.TextChoices):
+    NOT_STARTED = "not_started", "Not Started"
+    IN_PROGRESS = "in_progress", "In Progress"
+    COMPLETED = "completed", "Completed"
+    FAILED = "failed", "Failed"
+
+
+class ProcessResult(models.TextChoices):
+    PASS = "pass", "Pass"
+    FAIL = "fail", "Fail"
+    NEEDS_FOLLOWUP = "needs_followup", "Needs Follow-up"
+
+
+class ScheduleStatus(models.TextChoices):
+    SCHEDULED = "scheduled", "Scheduled"
+    COMPLETED = "completed", "Completed"
+    CANCELLED = "cancelled", "Cancelled"
+    RESCHEDULED = "rescheduled", "Rescheduled"
+
+
+class ScheduleCadence(models.TextChoices):
+    ONCE = "once", "One-time"
+    DAILY = "daily", "Daily"
+    WEEKLY = "weekly", "Weekly"
+    BIWEEKLY = "biweekly", "Bi-weekly"
+    MONTHLY = "monthly", "Monthly"
+
+
+class StageEntityType(models.TextChoices):
+    CLIENT = "client", "Client"
+    ENROLLMENT = "enrollment", "Enrollment"
+
+
+class StageEventSource(models.TextChoices):
+    AUTO = "auto", "Auto (derived)"
+    MANUAL = "manual", "Manual"
+
+
+class Enrollment(models.Model):
+    """A client's enrollment into a single product we deliver. One row per
+    (client, product). Owns the service-delivery stage and its schedule.
+
+    The acquisition funnel lives on Client.lifecycle_stage; this picks up once a
+    client reaches the ``client`` stage and we begin validation/verification/
+    service for a specific product.
+    """
+
+    client = models.ForeignKey(
+        Client, on_delete=models.CASCADE, related_name="enrollments"
+    )
+    product = models.ForeignKey(
+        Product, on_delete=models.PROTECT, related_name="enrollments"
+    )
+    # The Met Council case this enrollment is delivered under (optional until a
+    # case exists).
+    case = models.ForeignKey(
+        Case, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="enrollments",
+    )
+    stage = models.CharField(
+        max_length=25, choices=EnrollmentStage.choices,
+        default=EnrollmentStage.PENDING_VALIDATION, db_index=True,
+    )
+    stage_at = models.DateTimeField(null=True, blank=True)
+    opened_at = models.DateTimeField(auto_now_add=True)
+    closed_at = models.DateTimeField(null=True, blank=True)
+    note = models.TextField(blank=True)
+
+    class Meta:
+        ordering = ["-opened_at"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["client", "product"], name="unique_client_product_enrollment"
+            )
+        ]
+        indexes = [
+            models.Index(fields=["client", "stage"]),
+            models.Index(fields=["product", "stage"]),
+        ]
+
+    def __str__(self):
+        return f"{self.client_id} / {self.product_id} ({self.stage})"
+
+
+class EnrollmentProcess(models.Model):
+    """A validation/verification (or future) process run for an enrollment.
+
+    Process-specific captured data (validated delivery address, household size,
+    verification answers, etc.) is stored in ``data`` as flexible JSON; canonical
+    values still live on Client/Address. When the verification questionnaire
+    firms up, ``data`` can graduate into structured question/answer tables.
+    """
+
+    enrollment = models.ForeignKey(
+        Enrollment, on_delete=models.CASCADE, related_name="processes"
+    )
+    process_type = models.CharField(
+        max_length=20, choices=ProcessType.choices, db_index=True
+    )
+    status = models.CharField(
+        max_length=20, choices=ProcessStatus.choices,
+        default=ProcessStatus.NOT_STARTED,
+    )
+    result = models.CharField(
+        max_length=20, choices=ProcessResult.choices, blank=True
+    )
+    data = models.JSONField(default=dict, blank=True)
+    performed_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="enrollment_processes",
+    )
+    started_at = models.DateTimeField(null=True, blank=True)
+    completed_at = models.DateTimeField(null=True, blank=True)
+    note = models.TextField(blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["enrollment", "process_type", "status"]),
+        ]
+
+    def __str__(self):
+        return f"{self.get_process_type_display()} for enrollment {self.enrollment_id} ({self.status})"
+
+
+class ServiceSchedule(models.Model):
+    """When services are delivered for an enrollment. Supports one-time and
+    recurring cadences. Individual delivery occurrences/visits can be modeled
+    separately later if needed.
+    """
+
+    enrollment = models.ForeignKey(
+        Enrollment, on_delete=models.CASCADE, related_name="schedules"
+    )
+    service = models.ForeignKey(
+        Service, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="schedules",
+    )
+    cadence = models.CharField(
+        max_length=20, choices=ScheduleCadence.choices, default=ScheduleCadence.ONCE
+    )
+    scheduled_start = models.DateTimeField(null=True, blank=True)
+    scheduled_end = models.DateTimeField(null=True, blank=True)
+    status = models.CharField(
+        max_length=20, choices=ScheduleStatus.choices,
+        default=ScheduleStatus.SCHEDULED,
+    )
+    note = models.TextField(blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["scheduled_start"]
+        indexes = [
+            models.Index(fields=["enrollment", "status"]),
+            models.Index(fields=["scheduled_start"]),
+        ]
+
+    def __str__(self):
+        return f"Schedule for enrollment {self.enrollment_id} ({self.status})"
+
+
+class StageEvent(models.Model):
+    """Append-only audit log of a stage transition on either a Client (funnel)
+    or an Enrollment (service delivery). Mirrors the nullable-FK pattern used by
+    Answer (screening/eligibility). Powers funnel conversion and time-in-stage
+    reporting.
+    """
+
+    entity_type = models.CharField(
+        max_length=20, choices=StageEntityType.choices, db_index=True
+    )
+    client = models.ForeignKey(
+        Client, on_delete=models.CASCADE, null=True, blank=True,
+        related_name="stage_events",
+    )
+    enrollment = models.ForeignKey(
+        Enrollment, on_delete=models.CASCADE, null=True, blank=True,
+        related_name="stage_events",
+    )
+    from_stage = models.CharField(max_length=25, blank=True)
+    to_stage = models.CharField(max_length=25)
+    source = models.CharField(
+        max_length=10, choices=StageEventSource.choices,
+        default=StageEventSource.AUTO,
+    )
+    actor = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="stage_events",
+    )
+    note = models.TextField(blank=True)
+    metadata = models.JSONField(default=dict, blank=True)
+    entered_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-entered_at"]
+        indexes = [
+            models.Index(fields=["entity_type", "to_stage"]),
+            models.Index(fields=["client", "entered_at"]),
+            models.Index(fields=["enrollment", "entered_at"]),
+        ]
+
+    def __str__(self):
+        ref = self.enrollment_id or self.client_id
+        return f"{self.entity_type} {ref}: {self.from_stage or '-'} -> {self.to_stage}"

@@ -59,6 +59,7 @@ INSTALLED_APPS = [
 
 MIDDLEWARE = [
     'django.middleware.security.SecurityMiddleware',
+    'whitenoise.middleware.WhiteNoiseMiddleware',
     'corsheaders.middleware.CorsMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
     'django.middleware.common.CommonMiddleware',
@@ -134,6 +135,17 @@ USE_TZ = True
 # https://docs.djangoproject.com/en/6.0/howto/static-files/
 
 STATIC_URL = 'static/'
+STATIC_ROOT = BASE_DIR / 'staticfiles'
+
+# WhiteNoise: serve static files in production with compression + manifest.
+STORAGES = {
+    'default': {
+        'BACKEND': 'django.core.files.storage.FileSystemStorage',
+    },
+    'staticfiles': {
+        'BACKEND': 'whitenoise.storage.CompressedManifestStaticFilesStorage',
+    },
+}
 
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
@@ -169,3 +181,17 @@ SIMPLE_JWT = {
 CORS_ALLOWED_ORIGINS = [
     o for o in os.getenv('CORS_ALLOWED_ORIGINS', 'http://localhost:3000').split(',') if o
 ]
+
+
+# ---------------------------------------------------------------------------
+# GoHighLevel (GHL) CRM integration -- TEMPORARY. See api/integrations/ghl.
+# Off by default; flip CRM_SYNC_ENABLED=true once GHL_PRIVATE_TOKEN +
+# GHL_LOCATION_ID are set in the environment.
+# ---------------------------------------------------------------------------
+CRM_SYNC_ENABLED = os.getenv('CRM_SYNC_ENABLED', 'False').lower() == 'true'
+GHL_PRIVATE_TOKEN = os.getenv('GHL_PRIVATE_TOKEN', '')
+GHL_LOCATION_ID = os.getenv('GHL_LOCATION_ID', '')
+GHL_API_BASE = os.getenv('GHL_API_BASE', 'https://services.leadconnectorhq.com')
+GHL_API_VERSION = os.getenv('GHL_API_VERSION', '2021-07-28')
+GHL_TIMEOUT = int(os.getenv('GHL_TIMEOUT', '10'))
+GHL_CONTACT_SOURCE = os.getenv('GHL_CONTACT_SOURCE', 'Benefully extension')

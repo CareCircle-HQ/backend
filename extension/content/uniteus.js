@@ -43,7 +43,7 @@ function parseIdsFromUrl() {
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-const cleanText = (s) => (s || "").replace(/\s+/g, " ").trim();
+const cleanText = (s) => (s == null ? "" : String(s)).replace(/\s+/g, " ").trim();
 
 // Facesheet navigation tabs we walk to reveal hidden sections. These are safe,
 // read-only views. We intentionally do NOT click arbitrary aria-expanded toggles
@@ -465,34 +465,18 @@ function coverageSectionsPresent() {
   );
 }
 
-// Light scrape harvests whatever is currently visible (Overview header gives
-// name/DOB/TEL/ADDRESS). Deep scrape additionally walks each facesheet tab and
-// collects every case / screening / eligibility record it finds.
+// Read whatever is currently visible (the Overview header gives name / DOB /
+// TEL / ADDRESS) purely from the current DOM - NO tab navigation. Profile,
+// cases, screenings and eligibility are all sourced from the core API now
+// (see maybeEnrichFromApi + the API scans), which is authoritative; this light
+// pass only provides an instant first paint before the API responds. The `deep`
+// flag no longer walks tabs - it just forces the API enrichment downstream.
 async function scrapePage(deep) {
   const pairs = {};
   const recordMap = new Map();
   harvestFields(pairs);
   collectRecords(recordMap);
-  let captured = harvestProfile();
-  if (!deep) return { pairs, records: [...recordMap.values()], captured };
-
-  // Cases, Screenings and Eligibility Assessments are now extracted via the
-  // core API (no navigation), so the deep scrape only visits the Profile tab -
-  // the sole remaining DOM-only source (e.g. household size). This avoids the
-  // facesheet tab-walk that previously navigated through every data tab.
-  const labels = getFacesheetTabs().map((t) => cleanText(t.innerText));
-  if (labels.includes("Profile") && clickTabByLabel("Profile")) {
-    await sleep(700); // let the tab's content load
-    harvestFields(pairs);
-    const c = harvestProfile();
-    if (c) captured = c;
-    collectRecords(recordMap);
-
-    // Restore the user's view to the Overview tab.
-    clickTabByLabel("Overview");
-    await sleep(150);
-    collectRecords(recordMap);
-  }
+  const captured = harvestProfile();
   return { pairs, records: [...recordMap.values()], captured };
 }
 
@@ -760,6 +744,25 @@ function publishIdsOnly() {
       },
     });
   });
+}
+
+// Publish whether the user is currently looking at a client (facesheet / case /
+// eligibility / screening view) vs. some other Unite Us page (search, dashboard,
+// login). The side panel shows its full-page "home" screen whenever the user is
+// off a client - while still retaining the last client's extracted data so a
+// return is instant; we only drop that data when a DIFFERENT client appears.
+function publishView() {
+  const ids = parseIdsFromUrl();
+  try {
+    chrome.storage.local.set({
+      uw_view: {
+        onClient: !!ids.client_id,
+        clientId: ids.client_id || null,
+        href: location.href,
+        at: Date.now(),
+      },
+    });
+  } catch (_) {}
 }
 
 // ---------------------------------------------------------------------------
@@ -1425,6 +1428,8 @@ window.addEventListener("message", (ev) => {
   try {
     chrome.storage.local.set({ uw_uu_creds: uuCreds });
   } catch (_) {}
+  // Resolve the logged-in user the moment we hold an employee id (throttled).
+  maybeDetectUser();
 });
 
 async function getUuCreds() {
@@ -1437,6 +1442,146 @@ async function getUuCreds() {
     }
   } catch (_) {}
   return null;
+}
+
+// Thrown when a Unite Us API call returns 401/403 - i.e. the captured Bearer
+// token expired or the user was logged out. Distinguished from generic errors
+// so callers never fall back to the DOM crawler (which would navigate the page
+// for a logged-out user); instead the panel shows the "log back in" screen.
+class AuthError extends Error {
+  constructor(status) {
+    super(`auth ${status}`);
+    this.name = "AuthError";
+    this.status = status;
+  }
+}
+const isAuthError = (e) =>
+  !!e && (e.name === "AuthError" || e.status === 401 || e.status === 403);
+
+// Drop the stale token so the next bootstrap waits for the page to mint a fresh
+// one (after the user re-logs in) instead of re-sending the dead JWT.
+function invalidateUuCreds() {
+  uuCreds = null;
+  try {
+    chrome.storage.local.remove("uw_uu_creds");
+  } catch (_) {}
+}
+
+const SESSION_EXPIRED_NOTE =
+  "Unite Us session expired \u2014 log back in to Unite Us, then retry.";
+const NO_API_NOTE =
+  "Couldn't read from Unite Us yet \u2014 open the client's facesheet and reload the tab (F5) if this persists.";
+const API_FAIL_NOTE =
+  "Couldn't load from Unite Us \u2014 reload the tab (F5) and retry.";
+
+// Global session signal the side panel watches to show / hide the full-page
+// "session expired" home screen.
+function publishSession(state) {
+  try {
+    chrome.storage.local.set({
+      uw_session: { state, at: new Date().toISOString() },
+    });
+  } catch (_) {}
+  // Keep the detected logged-in user's validity in lockstep with the session:
+  // expire it when the token dies, (re)detect when the session is healthy.
+  if (state === "expired") {
+    markUuUserInvalid();
+  } else if (state === "ok") {
+    maybeDetectUser();
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Logged-in Unite Us user auto-detection
+// ---------------------------------------------------------------------------
+// The network shim forwards the page's x-employee-id alongside the Bearer
+// token. As soon as we hold credentials (i.e. right after the user logs in and
+// the page makes its first API call), we resolve that id to the employee's
+// identity via the core API and cache it in uw_uu_user. Every piece of data we
+// capture can then be attributed to whoever is logged in. The cached record's
+// `valid` flag tracks whether the Unite Us session is still live.
+const UU_USER_TTL_MS = 10 * 60 * 1000; // re-resolve identity past this
+let lastUserDetect = { employeeId: null, at: 0 };
+
+function parseEmployee(body) {
+  const d = body && body.data;
+  if (!d || !d.id) return null;
+  const a = d.attributes || {};
+  const rel = d.relationships || {};
+  const relId = (k) => (rel[k] && rel[k].data && rel[k].data.id) || "";
+  const first = a.first_name || "";
+  const last = a.last_name || "";
+  return {
+    employee_id: d.id,
+    user_id: relId("user"),
+    provider_id: relId("provider"),
+    first_name: first,
+    last_name: last,
+    name: `${first} ${last}`.trim(),
+    email: a.email || "",
+    work_title: a.work_title || "",
+    state: a.state || "",
+  };
+}
+
+function publishUuUser(user, valid) {
+  try {
+    chrome.storage.local.set({
+      uw_uu_user: {
+        ...user,
+        valid: valid !== false,
+        detected_at: new Date().toISOString(),
+      },
+    });
+  } catch (_) {}
+}
+
+// Mark the stored user as no longer backed by a live session (keep the identity
+// for display) when the token expires / the user logs out.
+async function markUuUserInvalid() {
+  try {
+    const { uw_uu_user } = await chrome.storage.local.get("uw_uu_user");
+    if (uw_uu_user && uw_uu_user.valid) {
+      await chrome.storage.local.set({ uw_uu_user: { ...uw_uu_user, valid: false } });
+    }
+  } catch (_) {}
+  lastUserDetect = { employeeId: null, at: 0 }; // force a fresh resolve next time
+}
+
+// Resolve + cache the logged-in employee. Throttled by employee id + TTL so the
+// frequent credential messages don't hammer the API. No-op until we hold creds
+// that include an employee id (the core host supplies it).
+async function maybeDetectUser(force) {
+  const creds = await getUuCreds();
+  if (!creds || !creds.employeeId) return;
+  const fresh =
+    !force &&
+    lastUserDetect.employeeId === creds.employeeId &&
+    Date.now() - lastUserDetect.at < UU_USER_TTL_MS;
+  if (fresh) return;
+  try {
+    const body = await coreGet(`/employees/${creds.employeeId}`, creds);
+    const user = parseEmployee(body);
+    if (user) {
+      lastUserDetect = { employeeId: creds.employeeId, at: Date.now() };
+      publishUuUser(user, true);
+    }
+  } catch (e) {
+    if (isAuthError(e)) {
+      markUuUserInvalid();
+      return;
+    }
+    console.warn("[uw-user] detect failed:", e);
+  }
+}
+
+// Map a fetch Response to an AuthError on 401/403 (invalidating creds), so a
+// dead token never silently degrades into a DOM walk.
+function throwIfAuth(res) {
+  if (res.status === 401 || res.status === 403) {
+    invalidateUuCreds();
+    throw new AuthError(res.status);
+  }
 }
 
 // If we don't already hold fresh credentials, nudge the page to call the
@@ -1478,6 +1623,7 @@ async function apiFetchScreeningList(clientId, creds, type = "screening") {
       headers: uuHeaders(creds),
       credentials: "omit",
     });
+    throwIfAuth(res);
     if (!res.ok) {
       let detail = "";
       try {
@@ -1499,23 +1645,35 @@ async function apiFetchScreeningList(clientId, creds, type = "screening") {
 async function apiFetchScreeningDetail(id, creds) {
   const url = `${SCREENINGS_API}/${id}?template_format=surveyjs`;
   const res = await fetch(url, { headers: uuHeaders(creds), credentials: "omit" });
+  throwIfAuth(res);
   if (!res.ok) throw new Error(`detail ${res.status}`);
   const body = await res.json();
   return body.screen || body;
 }
 
 // Resolve a question's answer text: single answers carry an `answer` object;
-// select_multiple carry an `answers` array.
+// select_multiple carry an `answers` array. Numeric / boolean answers (e.g.
+// "How many family members...": 1) live under different keys depending on the
+// question type, and may be raw numbers, so coerce everything to a string and
+// probe the known answer fields.
 function apiAnswerValue(q) {
-  if (q.answer) {
-    const v = q.answer.value || q.answer.string;
+  const toStr = (v) => (v == null || v === "" ? "" : String(v));
+  const fromOne = (ans) => {
+    if (ans == null) return "";
+    if (typeof ans !== "object") return toStr(ans); // raw scalar answer
+    if (typeof ans.boolean === "boolean") return ans.boolean ? "Yes" : "No";
+    const keys = ["value", "string", "number", "numeric", "integer", "text", "label"];
+    for (const k of keys) {
+      if (ans[k] != null && ans[k] !== "") return toStr(ans[k]);
+    }
+    return "";
+  };
+  if (q.answer != null) {
+    const v = fromOne(q.answer);
     if (v) return v;
   }
   if (Array.isArray(q.answers) && q.answers.length) {
-    return q.answers
-      .map((a) => a.value || a.string)
-      .filter(Boolean)
-      .join(", ");
+    return q.answers.map(fromOne).filter(Boolean).join(", ");
   }
   return "";
 }
@@ -1642,6 +1800,7 @@ async function startScreeningScan(msg) {
   try {
     const api = await runScreeningApiScan(clientId);
     if (api.ok) {
+      publishSession("ok");
       publishScreeningsApi(
         clientId,
         api.screenings,
@@ -1652,11 +1811,20 @@ async function startScreeningScan(msg) {
       );
       return { ok: true, count: api.screenings.length };
     }
+    // API ran but no token could be captured. Do NOT scrape the DOM; prompt the
+    // user to make sure Unite Us is loaded / logged in.
+    publishScreeningsApi(clientId, [], "error", NO_API_NOTE);
+    return { ok: false, error: api.error || "no-creds" };
   } catch (e) {
-    console.warn("[uw-scr] API path failed, falling back to DOM crawler:", e);
+    if (isAuthError(e)) {
+      publishSession("expired");
+      publishScreeningsApi(clientId, [], "auth", SESSION_EXPIRED_NOTE);
+      return { ok: false, error: "auth" };
+    }
+    console.warn("[uw-scr] API scan failed:", e);
+    publishScreeningsApi(clientId, [], "error", API_FAIL_NOTE);
+    return { ok: false, error: String(e) };
   }
-
-  return startScreeningScanLegacy(msg, clientId);
 }
 
 // ---------------------------------------------------------------------------
@@ -1752,23 +1920,30 @@ async function coreGet(path, creds) {
     headers: coreHeaders(creds),
     credentials: "omit",
   });
+  throwIfAuth(res);
   if (!res.ok) throw new Error(`core ${path.split("?")[0]} ${res.status}`);
   return res.json();
 }
 
-// Resolve a list of plan ids to { id -> name } via the batched plans endpoint.
+// Resolve a list of plan ids to { id -> { name, plan_type } } via the batched
+// plans endpoint. plan_type is the authoritative coverage classification
+// (commercial / medicare / medicaid / tricare / social), so callers can tell
+// e.g. Medicaid from the code rather than guessing from the plan name.
 async function coreGetPlanNames(planIds, creds) {
   const ids = [...new Set(planIds.filter(Boolean))];
-  const names = {};
-  if (!ids.length) return names;
+  const info = {};
+  if (!ids.length) return info;
   const body = await coreGet(
     `/plans?filter[id]=${ids.join(",")}&page[number]=1&page[size]=${ids.length}`,
     creds
   );
   for (const p of body.data || []) {
-    if (p && p.id) names[p.id] = (p.attributes && p.attributes.name) || "";
+    if (p && p.id) {
+      const a = p.attributes || {};
+      info[p.id] = { name: a.name || "", plan_type: a.plan_type || "" };
+    }
   }
-  return names;
+  return info;
 }
 
 // 9999 sentinel / future / no-expiry means coverage is still in force.
@@ -1787,7 +1962,7 @@ const isoToDate = (s) => (s ? String(s).slice(0, 10) : "");
 // Map insurance records (medical or social) to the captured coverage shape,
 // keeping only currently-in-force records (the API returns full month-by-month
 // history; the profile only shows active coverage).
-function mapInsuranceRecords(records, group, planNames) {
+function mapInsuranceRecords(records, group, planInfo, medicaidPlanIds) {
   const out = [];
   for (const r of records) {
     const a = r.attributes || {};
@@ -1798,11 +1973,17 @@ function mapInsuranceRecords(records, group, planNames) {
         : true;
     if (!current || !enrolled) continue;
     const planId = r.relationships && r.relationships.plan && r.relationships.plan.data && r.relationships.plan.data.id;
-    const planName = planNames[planId] || "";
+    const plan = planInfo[planId] || {};
+    const planName = plan.name || "";
     if (!planName) continue; // CRM keys coverage on plan_name
+    // Prefer the authoritative server-filtered Medicaid set; fall back to the
+    // plan_type attribute from /plans for the other classifications.
+    const planType =
+      medicaidPlanIds && medicaidPlanIds.has(planId) ? "medicaid" : plan.plan_type || "";
     out.push({
       group,
       plan_name: planName,
+      plan_type: planType,
       member_id: a.external_member_id || "",
       group_id: a.external_group_id || "",
       start_date: isoToDate(a.enrolled_at),
@@ -1948,19 +2129,25 @@ async function enrichCapturedFromApi(clientId) {
   let insurance = [];
   try {
     const base = `/insurances?filter[person]=${clientId}&filter[state]=active,pending,inactive`;
-    const [med, soc] = await Promise.all([
+    // The dedicated medicaid query is the authoritative Medicaid signal: it uses
+    // the exact server-side filter the Unite Us UI uses, so it identifies
+    // Medicaid coverage regardless of how the /plans attribute is shaped.
+    const [med, soc, medicaid] = await Promise.all([
       coreGet(`${base}&filter[plan.plan_type]=${MEDICAL_PLAN_TYPES}`, creds),
       coreGet(`${base}&filter[plan.plan_type]=social`, creds),
+      coreGet(`${base}&filter[plan.plan_type]=medicaid`, creds),
     ]);
     const medRecs = med.data || [];
     const socRecs = soc.data || [];
-    const planIds = [...medRecs, ...socRecs]
-      .map((r) => r.relationships && r.relationships.plan && r.relationships.plan.data && r.relationships.plan.data.id)
-      .filter(Boolean);
+    const planIdOf = (r) =>
+      r.relationships && r.relationships.plan && r.relationships.plan.data && r.relationships.plan.data.id;
+    // plan ids confirmed Medicaid by the server-side filter.
+    const medicaidPlanIds = new Set((medicaid.data || []).map(planIdOf).filter(Boolean));
+    const planIds = [...medRecs, ...socRecs].map(planIdOf).filter(Boolean);
     const planNames = await coreGetPlanNames(planIds, creds);
     insurance = [
-      ...mapInsuranceRecords(medRecs, "insurance", planNames),
-      ...mapInsuranceRecords(socRecs, "social_care_coverage", planNames),
+      ...mapInsuranceRecords(medRecs, "insurance", planNames, medicaidPlanIds),
+      ...mapInsuranceRecords(socRecs, "social_care_coverage", planNames, medicaidPlanIds),
     ];
   } catch (e) {
     console.warn("[uw-prof] insurance fetch failed:", e);
@@ -1993,13 +2180,23 @@ async function maybeEnrichFromApi(clientId, force) {
     lastApiEnrich.clientId === clientId &&
     Date.now() - lastApiEnrich.at < 120000;
   if (fresh && !force) return;
+  // On a forced reload (Profile reload / "Retry" after a session expiry) make
+  // sure we hold a live token: bootstrap re-captures one the moment the page
+  // makes its own API call after the user logs back in. (No-op when fresh creds
+  // are already cached.)
+  if (force) await bootstrapUuCreds(15000);
   try {
     const api = await enrichCapturedFromApi(clientId);
     if (api) {
       mergeApiCaptured(api);
       lastApiEnrich = { clientId, at: Date.now() };
+      publishSession("ok");
     }
   } catch (e) {
+    if (isAuthError(e)) {
+      publishSession("expired");
+      return;
+    }
     console.warn("[uw-prof] API enrich failed:", e);
   }
 }
@@ -2339,6 +2536,7 @@ async function startEligibilityScan(msg) {
   try {
     const api = await runEligibilityApiScan(clientId);
     if (api.ok) {
+      publishSession("ok");
       publishEligibilityApi(
         clientId,
         api.eligibilities,
@@ -2349,11 +2547,18 @@ async function startEligibilityScan(msg) {
       );
       return { ok: true, count: api.eligibilities.length };
     }
+    publishEligibilityApi(clientId, [], "error", NO_API_NOTE);
+    return { ok: false, error: api.error || "no-creds" };
   } catch (e) {
-    console.warn("[uw-elig] API path failed, falling back to DOM crawler:", e);
+    if (isAuthError(e)) {
+      publishSession("expired");
+      publishEligibilityApi(clientId, [], "auth", SESSION_EXPIRED_NOTE);
+      return { ok: false, error: "auth" };
+    }
+    console.warn("[uw-elig] API scan failed:", e);
+    publishEligibilityApi(clientId, [], "error", API_FAIL_NOTE);
+    return { ok: false, error: String(e) };
   }
-
-  return startEligibilityScanLegacy(msg, clientId);
 }
 
 async function startEligibilityScanLegacy(msg, clientId) {
@@ -2577,6 +2782,14 @@ function isoToUS(s) {
   return `${mm}/${dd}/${d.getUTCFullYear()}`;
 }
 
+// ISO timestamp -> "YYYY-MM-DD" (the DateField format the backend expects for
+// contracted-service delivery dates). Returns "" for empty/unparseable input.
+function isoDateOnly(s) {
+  if (!s) return "";
+  const m = String(s).match(/^\d{4}-\d{2}-\d{2}/);
+  return m ? m[0] : "";
+}
+
 const CASE_STATE_LABELS = {
   draft: "DRAFT",
   open: "OPEN",
@@ -2605,31 +2818,230 @@ async function cachedName(kind, id, creds, path) {
   return name;
 }
 
-// Enumerate the person's cases, following pagination. include=primary_worker so
-// the worker name comes back in `included` (no extra call per case).
+// Enumerate the person's cases, following pagination. Mirrors the exact request
+// the Unite Us cases tab makes (verified against the network capture); note we
+// do NOT pass include=primary_worker - core rejects that unknown include with a
+// 400, which is what was breaking the cases scan. Worker names are resolved
+// per-case via cachedEmployeeName() instead.
 async function apiFetchCaseList(clientId, creds) {
   const out = [];
-  const employees = caseApiCache.employee;
   let number = 1;
   for (let guard = 0; guard < 20; guard++) {
     const body = await coreGet(
-      `/cases?filter[person]=${clientId}&filter[include_pathways]=false` +
-        `&include=primary_worker&sort=updated_at&sort_direction=desc` +
+      `/cases?filter[person]=${clientId}` +
+        `&filter[state]=managed,off_platform&filter[include_pathways]=false` +
+        `&filter[internal_state]=managed,pending_authorization` +
+        `&sort=updated_at&sort_direction=desc` +
         `&page[number]=${number}&page[size]=50`,
       creds
     );
-    for (const inc of body.included || []) {
-      if (inc && inc.type === "employee") {
-        const a = inc.attributes || {};
-        const nm =
-          a.full_name || [a.first_name, a.last_name].filter(Boolean).join(" ");
-        if (nm) employees.set(inc.id, nm);
-      }
-    }
     for (const c of body.data || []) out.push(c);
     const tp = body.meta && body.meta.page && body.meta.page.total_pages;
     if (!tp || number >= tp) break;
     number += 1;
+  }
+  return out;
+}
+
+// Resolve an employee's display name (employees expose full_name, not name, so
+// cachedName can't be reused). Cached by id; failures degrade to an empty name.
+async function cachedEmployeeName(id, creds) {
+  if (!id) return "";
+  const store = caseApiCache.employee;
+  if (store.has(id)) return store.get(id);
+  let name = "";
+  try {
+    const body = await coreGet(`/employees/${id}`, creds);
+    const a = (body.data && body.data.attributes) || {};
+    name = a.full_name || [a.first_name, a.last_name].filter(Boolean).join(" ") || "";
+  } catch (_) {}
+  store.set(id, name);
+  return name;
+}
+
+// Human-readable service duration from a provided_service. The record carries a
+// numeric `service_duration` (minutes) plus optional clock start/end times.
+function formatProvidedDuration(a) {
+  if (a.service_duration == null || a.service_duration === "") return "";
+  let s = `${a.service_duration} min`;
+  const start = a.service_duration_start_time;
+  const end = a.service_duration_end_time;
+  if (start || end) s += ` (${[start, end].filter(Boolean).join("\u2013")})`;
+  return s;
+}
+
+// Pull a display description out of a provided_service's metadata array, e.g.
+// [{ field: "specific_support_provided", value: "Coordination of resources…" }].
+function providedServiceDescription(a) {
+  if (!Array.isArray(a.metadata)) return "";
+  const pref = a.metadata.find((m) => m && m.field === "specific_support_provided" && m.value);
+  if (pref) return pref.value;
+  const any = a.metadata.find((m) => m && m.value);
+  return any ? any.value : "";
+}
+
+// Fetch the case's Contracted Services (Unite Us "provided_services"). A case
+// may have one or more. The provided_service carries the delivery facts
+// directly (state, unit_amount, service_duration, starts_at, metadata, and its
+// invoices relationship); it does NOT link to the authorization, so the case's
+// service_authorization is fetched separately and applied when unambiguous (a
+// single auth on the case). Each row is also enriched with its program name and
+// invoice. Every sub-fetch is best-effort: a failure degrades a field to ""
+// rather than dropping the row.
+//
+// Shapes verified against live /provided_services and /service_authorizations
+// responses. Invoice attribute names below are still best-effort (no invoice
+// response captured yet) — see docs/contracted-services.md "Detecting the API".
+async function apiFetchContractedServices(caseId, creds) {
+  if (!caseId) return [];
+  let list = [];
+  try {
+    const body = await coreGet(
+      `/provided_services?filter[case]=${caseId}&page[number]=1&page[size]=100`,
+      creds
+    );
+    list = body.data || [];
+  } catch (e) {
+    console.warn("[uw-case] provided_services fetch failed:", e);
+    return [];
+  }
+  if (!list.length) return [];
+
+  // The case's authorization (amount / approved units / window / short id /
+  // fee schedule program). Applied to every provided_service only when the case
+  // has exactly one auth, since the provided_service carries no auth link.
+  let soleAuth = null;
+  try {
+    const ab = await coreGet(
+      `/service_authorizations?filter[case]=${caseId}&page[number]=1&page[size]=100`,
+      creds
+    );
+    const auths = ab.data || [];
+    if (auths.length === 1) soleAuth = auths[0];
+  } catch (_) {}
+
+  const out = [];
+  for (const ps of list) {
+    const a = ps.attributes || {};
+    const rel = ps.relationships || {};
+    const relId = (k) => (rel[k] && rel[k].data && rel[k].data.id) || null;
+    const relList = (k) => (rel[k] && Array.isArray(rel[k].data) ? rel[k].data : []);
+
+    const cs = {
+      contracted_service_id: ps.id,
+      name: providedServiceDescription(a),
+      service_type: "",
+      status: a.state ? caseStateLabel(a.state) : "",
+      fee_schedule_program_id: null,
+      fee_schedule_program_name: "",
+      unit_type: "",
+      service_authorization_id: null,
+      unite_us_authorization_id: "",
+      authorization_status: "",
+      authorized_amount: "",
+      // provided_service.unit_amount = units claimed for this delivery; used as
+      // a fallback until the auth's approved_unit_amount overrides it below.
+      authorized_units: a.unit_amount != null ? String(a.unit_amount) : "",
+      service_duration: formatProvidedDuration(a),
+      service_starts_at: isoDateOnly(a.starts_at),
+      service_ends_at: isoDateOnly(a.ends_at),
+      invoice_number: "",
+      invoice_status: "",
+      invoice_amount: "",
+      invoice_url: "",
+      invoiced_at: "",
+      created_at: a.created_at || "",
+      updated_at: a.updated_at || "",
+    };
+
+    // Program name -> service type.
+    cs.service_type = await cachedName("program", relId("program"), creds, "/programs");
+
+    // Apply the case's sole authorization (amount / approved units / window /
+    // short id / status / fee schedule program).
+    if (soleAuth) {
+      const aa = soleAuth.attributes || {};
+      const aRel = soleAuth.relationships || {};
+      const aRelId = (k) => (aRel[k] && aRel[k].data && aRel[k].data.id) || null;
+
+      cs.service_authorization_id = soleAuth.id || null;
+      if (aa.state) cs.authorization_status = String(aa.state).toUpperCase();
+      if (aa.short_id) cs.unite_us_authorization_id = aa.short_id;
+      // approved_* is authoritative; fall back to requested_* (e.g. pending).
+      const amount = centsToUsd(aa.approved_cents != null ? aa.approved_cents : aa.requested_cents);
+      if (amount) cs.authorized_amount = amount;
+      const units = aa.approved_unit_amount != null ? aa.approved_unit_amount : aa.requested_unit_amount;
+      if (units != null) cs.authorized_units = String(units);
+      const aStart = isoDateOnly(aa.approved_starts_at || aa.requested_starts_at);
+      const aEnd = isoDateOnly(aa.approved_ends_at || aa.requested_ends_at);
+      if (aStart) cs.service_starts_at = aStart;
+      if (aEnd) cs.service_ends_at = aEnd;
+      cs.fee_schedule_program_id = aRelId("fee_schedule_program");
+    }
+
+    // Invoice: the provided_service references its invoice(s) directly. The
+    // invoice is a denormalized superset — besides its own number / status /
+    // amount it echoes the fee schedule program (name + unit) and the service
+    // authorization, so we backfill those from it when present. Verified shape.
+    const invIds = relList("invoices").map((d) => d.id).filter(Boolean);
+    if (invIds.length) {
+      try {
+        const ib = await coreGet(`/invoices/${invIds[invIds.length - 1]}`, creds);
+        const inv = ib.data;
+        const ia = (inv && inv.attributes) || {};
+        if (inv) {
+          cs.invoice_number = ia.short_id || ia.invoice_number || inv.id || "";
+          // invoice_status is the payer disposition (e.g. accepted_by_payer);
+          // fall back to the lifecycle state (active/…).
+          cs.invoice_status = ia.invoice_status
+            ? String(ia.invoice_status).replace(/_/g, " ").toUpperCase()
+            : ia.state
+            ? String(ia.state).toUpperCase()
+            : "";
+          // total_amount_invoiced is in cents (e.g. 1750 -> $17.50).
+          const invAmt = centsToUsd(
+            ia.total_amount_invoiced != null ? ia.total_amount_invoiced : ia.amount_paid
+          );
+          if (invAmt) cs.invoice_amount = invAmt;
+          cs.invoiced_at = ia.created_at || ia.approved_at || "";
+          // No link field in the payload; use a navigable in-app invoice URL.
+          cs.invoice_url = ia.invoice_url || ia.pdf_url || `${location.origin}/invoices/${inv.id}`;
+
+          // Backfill the denormalized program + authorization fields.
+          if (!cs.fee_schedule_program_id) cs.fee_schedule_program_id = ia.fee_schedule_program_id || null;
+          if (!cs.fee_schedule_program_name) cs.fee_schedule_program_name = ia.fee_schedule_program_name || "";
+          if (!cs.unit_type) cs.unit_type = ia.fee_schedule_program_unit || "";
+          if (!cs.unite_us_authorization_id)
+            cs.unite_us_authorization_id = ia.service_authorization_short_id || "";
+          if (!cs.authorized_amount) {
+            const a2 = centsToUsd(ia.service_authorization_approved_cents);
+            if (a2) cs.authorized_amount = a2;
+          }
+          if (ia.service_authorization_approved_unit_amount != null)
+            cs.authorized_units = String(ia.service_authorization_approved_unit_amount);
+          if (!cs.service_starts_at)
+            cs.service_starts_at = isoDateOnly(ia.service_authorization_approved_starts_at);
+          if (!cs.service_ends_at)
+            cs.service_ends_at = isoDateOnly(ia.service_authorization_approved_ends_at);
+          if (!cs.name)
+            cs.name = providedServiceDescription({ metadata: ia.provided_service_metadata });
+        }
+      } catch (_) {}
+    }
+
+    // Fee schedule program definition (name + unit) — only fetched if neither
+    // the authorization nor the invoice already supplied it.
+    if (cs.fee_schedule_program_id && (!cs.fee_schedule_program_name || !cs.unit_type)) {
+      try {
+        const fb = await coreGet(`/fee_schedule_programs/${cs.fee_schedule_program_id}`, creds);
+        const fa = (fb.data && fb.data.attributes) || {};
+        if (!cs.fee_schedule_program_name) cs.fee_schedule_program_name = fa.name || "";
+        if (!cs.unit_type) cs.unit_type = fa.unit || fa.unit_type || "";
+        if (!cs.name) cs.name = fa.name || "";
+      } catch (_) {}
+    }
+
+    out.push(cs);
   }
   return out;
 }
@@ -2654,7 +3066,7 @@ async function buildCaseDetailFromApi(caseObj, creds) {
   if (programName) fields["PROGRAM"] = programName;
   if (networkName) fields["NETWORK"] = networkName;
 
-  const workerName = caseApiCache.employee.get(relId("primary_worker")) || "";
+  const workerName = await cachedEmployeeName(relId("primary_worker"), creds);
   if (workerName) fields["PRIMARY WORKER"] = workerName;
 
   const opened = isoToUS(attr.opened_date);
@@ -2709,7 +3121,16 @@ async function buildCaseDetailFromApi(caseObj, creds) {
     if (texts.length) fields["NOTES"] = texts.join("\n\n");
   } catch (_) {}
 
-  return { id: caseObj.id, status, fields, capturedAt: new Date().toISOString() };
+  // Contracted services (provided_services) on this case, with their invoices.
+  const contracted_services = await apiFetchContractedServices(caseObj.id, creds);
+
+  return {
+    id: caseObj.id,
+    status,
+    fields,
+    contracted_services,
+    capturedAt: new Date().toISOString(),
+  };
 }
 
 function publishCasesApi(clientId, cases, status, note) {
@@ -2740,17 +3161,19 @@ async function runCaseApiScan(clientId) {
 
   const list = await apiFetchCaseList(clientId, creds);
   const provider = (creds.providerId || "").toLowerCase();
-  // Keep only the logged-in provider's own cases (Met Council); match the
-  // case.provider relationship id to x-provider-id.
-  const mine = provider
-    ? list.filter((c) => {
-        const p =
-          c.relationships &&
-          c.relationships.provider &&
-          c.relationships.provider.data;
-        return p && String(p.id).toLowerCase() === provider;
-      })
-    : list;
+  const provOf = (c) => {
+    const p = c.relationships && c.relationships.provider && c.relationships.provider.data;
+    return p ? String(p.id).toLowerCase() : "";
+  };
+  // Keep only the logged-in provider's own cases (Met Council) by matching the
+  // case.provider relationship to x-provider-id. Defensive: if the response
+  // doesn't expose a provider relationship on ANY case, don't filter - the cases
+  // tab is already provider-scoped, so dropping everything would be wrong.
+  const hasProviderRel = list.some((c) => provOf(c));
+  const mine =
+    provider && hasProviderRel
+      ? list.filter((c) => provOf(c) === provider)
+      : list;
 
   const cases = [];
   for (const c of mine) {
@@ -2789,6 +3212,7 @@ async function startCaseScan(msg) {
   try {
     const api = await runCaseApiScan(clientId);
     if (api.ok) {
+      publishSession("ok");
       publishCasesApi(
         clientId,
         api.cases,
@@ -2797,11 +3221,18 @@ async function startCaseScan(msg) {
       );
       return { ok: true, count: api.cases.length };
     }
+    publishCasesApi(clientId, [], "error", NO_API_NOTE);
+    return { ok: false, error: api.error || "no-creds" };
   } catch (e) {
-    console.warn("[uw-case] API path failed, falling back to DOM crawler:", e);
+    if (isAuthError(e)) {
+      publishSession("expired");
+      publishCasesApi(clientId, [], "auth", SESSION_EXPIRED_NOTE);
+      return { ok: false, error: "auth" };
+    }
+    console.warn("[uw-case] API scan failed:", e);
+    publishCasesApi(clientId, [], "error", API_FAIL_NOTE);
+    return { ok: false, error: String(e) };
   }
-
-  return startCaseScanLegacy(msg);
 }
 
 // ===========================================================================
@@ -3227,12 +3658,61 @@ function scheduleLightScrapes() {
 
 // Initial run: light header scrape (no tab walking) so validation can proceed.
 publishIdsOnly();
+publishView();
 scheduleLightScrapes();
-// Resume an in-progress screening / eligibility auto-walk if one survived a
-// page navigation.
-maybeContinueScreeningScan();
-maybeContinueEligibilityScan();
-maybeContinueCaseScan();
+// The legacy DOM auto-walk crawlers are retired - everything is API-driven now,
+// so we no longer resume DOM walks (which navigated + scraped HTML). Drop any
+// leftover crawler state from a previous version so it can never resume.
+try {
+  chrome.storage.local.remove(["uw_scr_scan", "uw_elig_scan", "uw_case_scan"]);
+} catch (_) {}
+
+// Consent is read from the API-enriched profile (mirrors the panel's
+// consentAccepted gate). Stage B only auto-refreshes case / screening /
+// eligibility sections once the client has consented.
+function hasConsent() {
+  const cs =
+    accum &&
+    accum.captured &&
+    accum.captured.client &&
+    accum.captured.client.consent_status;
+  return /accept/i.test(cs || "");
+}
+
+// Which client section the user is currently viewing on the Unite Us page. We
+// prefer the selected facesheet tab (tab switches don't always change the URL),
+// then fall back to the sub-route for the screenings / cases / eligibility
+// bundles that ARE real navigations.
+function activeClientSection() {
+  const tab = [...document.querySelectorAll('[role="tab"]')].find(
+    (t) => t.getAttribute("aria-selected") === "true"
+  );
+  const label = tab ? cleanText(tab.innerText) : "";
+  if (/^cases$/i.test(label)) return "cases";
+  if (/^screenings$/i.test(label)) return "screenings";
+  if (/eligibility/i.test(label)) return "eligibility";
+  const p = location.pathname;
+  if (/\/eligibility/i.test(p)) return "eligibility";
+  if (/\/dashboard\/cases\//i.test(p)) return "cases";
+  if (/\/screenings?\//i.test(p)) return "screenings";
+  return null;
+}
+
+// Re-call a section's API when the user opens it, so newly added cases /
+// assessments / screenings show up. Debounced per section so rapid tab toggles
+// don't hammer the API.
+let lastSection = null;
+let lastSectionClient = null;
+const lastSectionFetch = {};
+function autoRefreshSection(section, clientId) {
+  if (!section || !clientId) return;
+  const now = Date.now();
+  if (lastSectionFetch[section] && now - lastSectionFetch[section] < 4000) return;
+  lastSectionFetch[section] = now;
+  if (section === "cases") startCaseScan({ clientId });
+  else if (section === "screenings") startScreeningScan({ clientId });
+  else if (section === "eligibility") startEligibilityScan({ clientId });
+}
 
 // Re-scan on SPA navigation (Unite Us is a single-page app).
 let lastHref = location.href;
@@ -3242,9 +3722,23 @@ setInterval(() => {
     lastHref = location.href;
     lastPublished = null;
     publishIdsOnly();
+    publishView();
     scheduleLightScrapes();
-    maybeContinueScreeningScan(); // resume the walk on in-app route changes too
-    maybeContinueEligibilityScan();
-    maybeContinueCaseScan();
+  }
+
+  // Stage B: detect facesheet tab switches (which may not change the URL) and
+  // auto-refresh the matching section once the client has consented.
+  const clientId = parseIdsFromUrl().client_id;
+  if (clientId !== lastSectionClient) {
+    lastSectionClient = clientId;
+    lastSection = null; // re-fire for the new client
+  }
+  const section = activeClientSection();
+  if (section !== lastSection) {
+    const entered = section; // may be null (e.g. Overview / Profile tab)
+    lastSection = section;
+    // Fire only when entering a data section; tracking null transitions too so
+    // Cases -> Overview -> Cases re-fires (the user revisited the tab).
+    if (entered && clientId && hasConsent()) autoRefreshSection(entered, clientId);
   }
 }, 1000);

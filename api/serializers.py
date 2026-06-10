@@ -9,6 +9,8 @@ from .models import (
     Answer,
     Case,
     Client,
+    ContractedService,
+    CommunicationChannel,
     CommunicationTimeOfDay,
     Eligibility,
     IdentifiedSocialNeed,
@@ -168,6 +170,47 @@ class ClientSerializer(serializers.ModelSerializer):
 
     def validate_referred_for(self, value):
         return self._validate_services(value, "referred_for")
+
+    @staticmethod
+    def _validate_code_list(value, field_name, allowed):
+        """Validate a multi-select list against an allowed set of codes,
+        de-duplicating while preserving order."""
+        if value in (None, ""):
+            return []
+        if not isinstance(value, list):
+            raise serializers.ValidationError(
+                f"{field_name} must be a list of values."
+            )
+        invalid = [v for v in value if v not in allowed]
+        if invalid:
+            raise serializers.ValidationError(
+                f"Invalid {field_name} values: {invalid}. "
+                f"Allowed: {sorted(allowed)}"
+            )
+        return list(dict.fromkeys(value))
+
+    def validate_communication_channels(self, value):
+        return self._validate_code_list(
+            value, "communication_channels", set(CommunicationChannel.values)
+        )
+
+    def validate_preferred_communication_times(self, value):
+        return self._validate_code_list(
+            value,
+            "preferred_communication_times",
+            set(CommunicationTimeOfDay.values),
+        )
+
+    def validate_preferred_languages(self, value):
+        """Free-text language labels; just enforce a clean list of strings."""
+        if value in (None, ""):
+            return []
+        if not isinstance(value, list):
+            raise serializers.ValidationError(
+                "preferred_languages must be a list of language names."
+            )
+        cleaned = [str(v).strip() for v in value if str(v).strip()]
+        return list(dict.fromkeys(cleaned))
 
     def validate_preferred_communication_time_of_day(self, value):
         if value in (None, ""):
@@ -346,6 +389,39 @@ class CaseSerializer(serializers.ModelSerializer):
         )
         case, _ = Case.objects.update_or_create(case_id=case_id, defaults=validated_data)
         return case
+
+
+class ContractedServiceSerializer(serializers.ModelSerializer):
+    contracted_service_id = serializers.UUIDField()
+    case_id = serializers.UUIDField()
+
+    class Meta:
+        model = ContractedService
+        exclude = ("case", "import_batch")
+
+    @transaction.atomic
+    def create(self, validated_data):
+        return self._upsert(validated_data)
+
+    @transaction.atomic
+    def update(self, instance, validated_data):
+        return self._upsert(validated_data)
+
+    def _upsert(self, validated_data):
+        contracted_service_id = validated_data.pop("contracted_service_id")
+        case_id = validated_data.pop("case_id")
+
+        case = Case.objects.filter(pk=case_id).first()
+        if case is None:
+            raise serializers.ValidationError(
+                {"case_id": f"Case {case_id} does not exist. Import the case first."}
+            )
+
+        validated_data["case"] = case
+        obj, _ = ContractedService.objects.update_or_create(
+            contracted_service_id=contracted_service_id, defaults=validated_data
+        )
+        return obj
 
 
 # ===========================================================================

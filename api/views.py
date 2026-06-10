@@ -8,6 +8,7 @@ from rest_framework import status
 from .models import (
     Case,
     Client,
+    ContractedService,
     Eligibility,
     ImportBatch,
     Program,
@@ -17,6 +18,7 @@ from .models import (
 from .serializers import (
     CaseSerializer,
     ClientSerializer,
+    ContractedServiceSerializer,
     EligibilitySerializer,
     ImportBatchSerializer,
     ProgramSerializer,
@@ -25,6 +27,8 @@ from .serializers import (
     ScreeningSerializer,
     UserSerializer,
 )
+# TEMPORARY external-CRM mirror; remove with the api/integrations package.
+from .integrations import ghl
 
 
 class RegisterView(generics.CreateAPIView):
@@ -72,6 +76,7 @@ class BulkUpsertMixin:
             serializer = self.get_serializer(data=item)
             if serializer.is_valid():
                 obj = serializer.save()
+                self.post_upsert(obj)
                 created.append(str(obj.pk))
             else:
                 errors.append({"index": index, "errors": serializer.errors})
@@ -86,6 +91,10 @@ class BulkUpsertMixin:
             status=status.HTTP_207_MULTI_STATUS if errors else status.HTTP_200_OK,
         )
 
+    def post_upsert(self, obj):
+        """Hook called after a successful bulk upsert. No-op by default."""
+        return None
+
 
 class ClientViewSet(BulkUpsertMixin, viewsets.ModelViewSet):
     """CRUD + upsert for clients (keyed on source client_id UUID)."""
@@ -94,6 +103,20 @@ class ClientViewSet(BulkUpsertMixin, viewsets.ModelViewSet):
         "addresses", "insurances", "military_profile"
     )
     serializer_class = ClientSerializer
+
+    # --- TEMPORARY: mirror the client to the external GHL CRM on save. The
+    # sync is best-effort and never raises; remove these three hooks (and the
+    # api/integrations package) when the external CRM is retired. ---
+    def perform_create(self, serializer):
+        serializer.save()
+        ghl.sync_client(serializer.instance)
+
+    def perform_update(self, serializer):
+        serializer.save()
+        ghl.sync_client(serializer.instance)
+
+    def post_upsert(self, obj):
+        ghl.sync_client(obj)
 
 
 class CaseViewSet(BulkUpsertMixin, viewsets.ModelViewSet):
@@ -109,6 +132,26 @@ class CaseViewSet(BulkUpsertMixin, viewsets.ModelViewSet):
         client = self.request.query_params.get("client")
         if client:
             qs = qs.filter(client_id=client)
+        return qs
+
+
+class ContractedServiceViewSet(BulkUpsertMixin, viewsets.ModelViewSet):
+    """CRUD + upsert for contracted services (keyed on provided_service UUID).
+
+    Filterable by ``?case=<uuid>`` or ``?client=<uuid>`` (via the parent case).
+    """
+
+    queryset = ContractedService.objects.select_related("case")
+    serializer_class = ContractedServiceSerializer
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        case = self.request.query_params.get("case")
+        if case:
+            qs = qs.filter(case_id=case)
+        client = self.request.query_params.get("client")
+        if client:
+            qs = qs.filter(case__client_id=client)
         return qs
 
 

@@ -10,6 +10,9 @@ python-dotenv==1.2.2
 # CRM integration (GoHighLevel)
 gohighlevel-api-client==1.0.0b1
 
-# Data scraping / HTTP
+# HTTP
 requests==2.34.2
-playwright==1.60.0
+
+# Production server / static files
+gunicorn==23.0.0
+whitenoise==6.9.0

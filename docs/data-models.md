@@ -18,6 +18,7 @@ erDiagram
   Provider ||--o{ Program : offers
   Provider ||--o{ Case : "provider / originating_provider"
   Program ||--o{ Case : for
+  Case ||--o{ ContractedService : has
   Case ||--o{ Screening : has
   Case ||--o{ Eligibility : has
   ScreenTemplate ||--o{ Screening : defines
@@ -176,6 +177,31 @@ UUID PK `case_id`. FK to `Client`, two `Provider` FKs (`provider`,
 | `authorized_amount` | Char | Free text: dollar amount or unit/time description. |
 | `program_cap` / `authorization_note` | Text | |
 | `social_care_coverage_plan` / `social_care_coverage_status` | Char | |
+| `import_batch` | FK → ImportBatch | |
+
+## ContractedService
+
+FK to `Case` (`related_name="contracted_services"`). A case may have one or more.
+Maps to a Unite Us `provided_service`; PK `contracted_service_id` is the source
+UUID. See [contracted-services.md](./contracted-services.md).
+
+| Field | Type | Notes |
+|---|---|---|
+| `contracted_service_id` | UUIDField (PK) | Source `provided_service` id. |
+| `case` | FK → Case | |
+| `name` / `service_type` / `status` | Char | Service definition + raw state. |
+| `fee_schedule_program_id` / `fee_schedule_program_name` / `unit_type` | UUID / Char | Fee schedule program. |
+| `service_authorization_id` | UUID | |
+| `unite_us_authorization_id` | Char | Authorization `short_id`. |
+| `authorization_status` | Char | |
+| `authorized_amount` | Char | Free text dollar amount or unit/time. |
+| `authorized_units` | Char | |
+| `service_duration` | Char | Free text, e.g. "20 units (293-307 minutes)". |
+| `service_starts_at` / `service_ends_at` | Date | Delivery window. |
+| `invoice_number` / `invoice_status` / `invoice_amount` | Char | Latest active invoice. |
+| `invoice_url` | URL | Invoice link. |
+| `invoiced_at` | DateTime | |
+| `created_at` / `updated_at` | DateTime | Source timestamps. |
 | `import_batch` | FK → ImportBatch | |
 
 ## ScreenTemplate

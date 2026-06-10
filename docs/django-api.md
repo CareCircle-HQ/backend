@@ -31,6 +31,7 @@ standard CRUD plus a `/bulk/` POST action.
 |---|---|---|---|
 | Clients | `clients/` | `client_id` (UUID) | CRUD + `bulk`. Nested `addresses`, `insurances`, `military_profile`. |
 | Cases | `cases/` | `case_id` (UUID) | CRUD + `bulk`. Client must already exist. |
+| Contracted Services | `contracted-services/` | `contracted_service_id` (UUID) | CRUD + `bulk`. Filter by `?case=` / `?client=`. Case must already exist. See [contracted-services.md](./contracted-services.md). |
 | Screenings | `screenings/` | `enhanced_screen_id` (UUID) | CRUD + `bulk`. |
 | Eligibility | `eligibility/` | `eligibility_id` (UUID) | CRUD + `bulk`. |
 | Providers | `providers/` | `provider_id` (UUID) | Read-only. |
