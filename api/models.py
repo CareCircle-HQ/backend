@@ -756,6 +756,67 @@ class Case(models.Model):
         return f"Case {self.case_id} ({self.get_case_status_display()})"
 
 
+class ContractedService(models.Model):
+    """A contracted service (Unite Us ``provided_service``) on a case.
+
+    A case may have one or more contracted services. Each maps to a Unite Us
+    ``provided_service`` and carries its service-authorization terms (amount,
+    delivery window, duration) plus the latest invoice (number + link). Keyed on
+    the source ``provided_service`` id so imports are idempotent upserts.
+    """
+
+    # Source ``provided_service`` external id.
+    contracted_service_id = models.UUIDField(primary_key=True, editable=False)
+    case = models.ForeignKey(
+        Case, on_delete=models.CASCADE, related_name="contracted_services"
+    )
+
+    # --- Service definition (fee_schedule_program) ---
+    name = models.CharField(max_length=255, blank=True)
+    service_type = models.CharField(max_length=120, blank=True)
+    status = models.CharField(max_length=80, blank=True)  # raw provided_service state
+    fee_schedule_program_id = models.UUIDField(null=True, blank=True)
+    fee_schedule_program_name = models.CharField(max_length=255, blank=True)
+    unit_type = models.CharField(max_length=80, blank=True)
+
+    # --- Service authorization terms ---
+    service_authorization_id = models.UUIDField(null=True, blank=True)
+    unite_us_authorization_id = models.CharField(max_length=80, blank=True)  # short_id
+    authorization_status = models.CharField(max_length=80, blank=True)
+    # Free text: dollar amount (e.g. "$8,736.00") or unit/time description.
+    authorized_amount = models.CharField(max_length=120, blank=True)
+    authorized_units = models.CharField(max_length=80, blank=True)
+    # Free text duration, e.g. "20 units (293-307 minutes)".
+    service_duration = models.CharField(max_length=255, blank=True)
+    service_starts_at = models.DateField(null=True, blank=True)
+    service_ends_at = models.DateField(null=True, blank=True)
+
+    # --- Invoice (latest active invoice for this provided service) ---
+    invoice_number = models.CharField(max_length=120, blank=True)
+    invoice_status = models.CharField(max_length=80, blank=True)
+    invoice_amount = models.CharField(max_length=120, blank=True)
+    invoice_url = models.URLField(max_length=1000, blank=True)  # invoice link
+    invoiced_at = models.DateTimeField(null=True, blank=True)
+
+    # --- Source / ingest metadata ---
+    created_at = models.DateTimeField(null=True, blank=True)
+    updated_at = models.DateTimeField(null=True, blank=True)
+    import_batch = models.ForeignKey(
+        "ImportBatch", on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="contracted_services",
+    )
+
+    class Meta:
+        ordering = ["name"]
+        indexes = [
+            models.Index(fields=["case"]),
+            models.Index(fields=["service_authorization_id"]),
+        ]
+
+    def __str__(self):
+        return f"ContractedService {self.contracted_service_id} ({self.name})"
+
+
 # ===========================================================================
 # SCREENING DOMAIN
 # ===========================================================================

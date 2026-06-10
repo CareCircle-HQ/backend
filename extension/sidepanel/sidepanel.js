@@ -2209,9 +2209,52 @@ function renderCaseAccordion(c, i) {
     } else {
       html += `<p class="muted">No case fields captured.</p>`;
     }
+    html += renderContractedServices(d.contracted_services);
     body = html;
   }
   return `<div class="acc${i === 0 ? " open" : ""}">${head}<div class="acc-body">${body}</div></div>`;
+}
+
+// Captured contracted services for a case. Highlights the fields the workflow
+// cares about: service duration, invoice number, and invoice link.
+const CONTRACTED_FIELD_LABELS = [
+  ["fee_schedule_program_name", "Fee Schedule Program"],
+  ["status", "Status"],
+  ["unit_type", "Unit Type"],
+  ["authorized_units", "Authorized Units"],
+  ["authorized_amount", "Authorized Amount"],
+  ["service_duration", "Service Duration"],
+  ["service_starts_at", "Service Start"],
+  ["service_ends_at", "Service End"],
+  ["unite_us_authorization_id", "Authorization ID"],
+  ["authorization_status", "Authorization Status"],
+  ["invoice_number", "Invoice #"],
+  ["invoice_status", "Invoice Status"],
+  ["invoice_amount", "Invoice Amount"],
+];
+
+function renderContractedServices(list) {
+  if (!Array.isArray(list) || !list.length) return "";
+  let html = `<div class="scr-qa-h">Contracted Services (${list.length})</div>`;
+  for (const cs of list) {
+    const name = cs.name || cs.fee_schedule_program_name || cs.service_type || "Contracted Service";
+    const rows = CONTRACTED_FIELD_LABELS.filter(([k]) => cs[k]).map(
+      ([k, label]) => `<tr class="qa"><th>${escapeHtml(label)}</th><td>${escapeHtml(cs[k])}</td></tr>`
+    );
+    if (cs.invoice_url) {
+      rows.push(
+        `<tr class="qa"><th>Invoice Link</th><td>` +
+        `<a href="${escapeHtml(cs.invoice_url)}" target="_blank" rel="noopener">View invoice</a></td></tr>`
+      );
+    }
+    html +=
+      `<div class="cs-block"><div class="cs-name">${escapeHtml(name)}</div>` +
+      (rows.length
+        ? `<table class="qa-table"><tbody>${rows.join("")}</tbody></table>`
+        : `<p class="muted">No details captured.</p>`) +
+      `</div>`;
+  }
+  return html;
 }
 
 function renderCases() {
@@ -2378,6 +2421,45 @@ function buildCasePayloads(d, clientId) {
   return payloads;
 }
 
+// Flatten every captured case's contracted services into upsert payloads for
+// /api/contracted-services/bulk/. Keyed on contracted_service_id; case_id must
+// reference a case that was just saved.
+function buildContractedServicePayloads(d, clientId) {
+  const payloads = [];
+  for (const c of d.cases) {
+    const det = c.detail;
+    if (!det || !det.id) continue;
+    const list = Array.isArray(det.contracted_services) ? det.contracted_services : [];
+    for (const cs of list) {
+      if (!cs || !cs.contracted_service_id) continue;
+      payloads.push({ ...cs, case_id: det.id });
+    }
+  }
+  return payloads;
+}
+
+// Best-effort upsert of contracted services after their parent cases are saved.
+// Never throws: a CRM-side failure here must not mask a successful case save.
+async function saveContractedServices(cfg, d, clientId) {
+  const payloads = buildContractedServicePayloads(d, clientId);
+  if (!payloads.length) return "";
+  try {
+    const res = await fetch(`${cfg.backendUrl}/api/contracted-services/bulk/`, {
+      method: "POST",
+      headers: { ...authHeader(cfg), "Content-Type": "application/json" },
+      body: JSON.stringify(payloads),
+    });
+    if (res.ok || res.status === 207) {
+      let body = {};
+      try { body = await res.json(); } catch (_) {}
+      const ok = body.succeeded != null ? body.succeeded : payloads.length;
+      const failed = body.failed || 0;
+      return failed ? ` + ${ok} service(s), ${failed} failed` : ` + ${ok} service(s)`;
+    }
+  } catch (_) {}
+  return "";
+}
+
 async function saveCases(ev) {
   if (!consentAccepted()) return setCaseStatus("warn", NO_CONSENT_MSG);
   const btn = (ev && ev.currentTarget) || $("caseSaveBtn");
@@ -2436,10 +2518,13 @@ async function saveCases(ev) {
       try { body = await res.json(); } catch (_) {}
       const ok = body.succeeded != null ? body.succeeded : payloads.length;
       const failed = body.failed || 0;
+      // Contracted services reference a saved case, so save them only after the
+      // cases upsert returns. The suffix reports how many services were saved.
+      const csNote = await saveContractedServices(cfg, d, ctx.client_id);
       if (failed) {
-        setCaseStatus("warn", `Saved ${ok}, ${failed} failed`);
+        setCaseStatus("warn", `Saved ${ok}, ${failed} failed${csNote}`);
       } else {
-        setCaseStatus("ok", `Saved ${ok} case(s) \u2713`);
+        setCaseStatus("ok", `Saved ${ok} case(s)${csNote} \u2713`);
       }
       await fetchCrm(cfg, ctx.client_id);
     } else if (res.status === 401 || res.status === 403) {

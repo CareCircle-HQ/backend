@@ -578,6 +578,15 @@ textarea.diag {
   margin: 0 4px 4px 0;
 }
 
+.cs-block {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 10px;
+  margin: 8px 0;
+  background: var(--bg-soft, #f9fafb);
+}
+.cs-name { font-size: 12px; font-weight: 600; color: var(--text); margin-bottom: 6px; }
+
 .qa-table { width: 100%; border-collapse: collapse; font-size: 12px; }
 .qa-table tr.qa { border-top: 1px solid var(--border); }
 .qa-table tr.qa:first-child { border-top: none; }

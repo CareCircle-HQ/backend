@@ -8,6 +8,7 @@ from rest_framework import status
 from .models import (
     Case,
     Client,
+    ContractedService,
     Eligibility,
     ImportBatch,
     Program,
@@ -17,6 +18,7 @@ from .models import (
 from .serializers import (
     CaseSerializer,
     ClientSerializer,
+    ContractedServiceSerializer,
     EligibilitySerializer,
     ImportBatchSerializer,
     ProgramSerializer,
@@ -130,6 +132,26 @@ class CaseViewSet(BulkUpsertMixin, viewsets.ModelViewSet):
         client = self.request.query_params.get("client")
         if client:
             qs = qs.filter(client_id=client)
+        return qs
+
+
+class ContractedServiceViewSet(BulkUpsertMixin, viewsets.ModelViewSet):
+    """CRUD + upsert for contracted services (keyed on provided_service UUID).
+
+    Filterable by ``?case=<uuid>`` or ``?client=<uuid>`` (via the parent case).
+    """
+
+    queryset = ContractedService.objects.select_related("case")
+    serializer_class = ContractedServiceSerializer
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        case = self.request.query_params.get("case")
+        if case:
+            qs = qs.filter(case_id=case)
+        client = self.request.query_params.get("client")
+        if client:
+            qs = qs.filter(case__client_id=client)
         return qs
 
 

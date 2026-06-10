@@ -25,6 +25,7 @@ media/
 output/*
 *.csv
 data/*
+tmp/*
 
 # Network captures + scratch API responses (contain live tokens / PII)
 *.har

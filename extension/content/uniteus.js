@@ -2782,6 +2782,14 @@ function isoToUS(s) {
   return `${mm}/${dd}/${d.getUTCFullYear()}`;
 }
 
+// ISO timestamp -> "YYYY-MM-DD" (the DateField format the backend expects for
+// contracted-service delivery dates). Returns "" for empty/unparseable input.
+function isoDateOnly(s) {
+  if (!s) return "";
+  const m = String(s).match(/^\d{4}-\d{2}-\d{2}/);
+  return m ? m[0] : "";
+}
+
 const CASE_STATE_LABELS = {
   draft: "DRAFT",
   open: "OPEN",
@@ -2849,6 +2857,193 @@ async function cachedEmployeeName(id, creds) {
   } catch (_) {}
   store.set(id, name);
   return name;
+}
+
+// Human-readable service duration from a provided_service. The record carries a
+// numeric `service_duration` (minutes) plus optional clock start/end times.
+function formatProvidedDuration(a) {
+  if (a.service_duration == null || a.service_duration === "") return "";
+  let s = `${a.service_duration} min`;
+  const start = a.service_duration_start_time;
+  const end = a.service_duration_end_time;
+  if (start || end) s += ` (${[start, end].filter(Boolean).join("\u2013")})`;
+  return s;
+}
+
+// Pull a display description out of a provided_service's metadata array, e.g.
+// [{ field: "specific_support_provided", value: "Coordination of resources…" }].
+function providedServiceDescription(a) {
+  if (!Array.isArray(a.metadata)) return "";
+  const pref = a.metadata.find((m) => m && m.field === "specific_support_provided" && m.value);
+  if (pref) return pref.value;
+  const any = a.metadata.find((m) => m && m.value);
+  return any ? any.value : "";
+}
+
+// Fetch the case's Contracted Services (Unite Us "provided_services"). A case
+// may have one or more. The provided_service carries the delivery facts
+// directly (state, unit_amount, service_duration, starts_at, metadata, and its
+// invoices relationship); it does NOT link to the authorization, so the case's
+// service_authorization is fetched separately and applied when unambiguous (a
+// single auth on the case). Each row is also enriched with its program name and
+// invoice. Every sub-fetch is best-effort: a failure degrades a field to ""
+// rather than dropping the row.
+//
+// Shapes verified against live /provided_services and /service_authorizations
+// responses. Invoice attribute names below are still best-effort (no invoice
+// response captured yet) — see docs/contracted-services.md "Detecting the API".
+async function apiFetchContractedServices(caseId, creds) {
+  if (!caseId) return [];
+  let list = [];
+  try {
+    const body = await coreGet(
+      `/provided_services?filter[case]=${caseId}&page[number]=1&page[size]=100`,
+      creds
+    );
+    list = body.data || [];
+  } catch (e) {
+    console.warn("[uw-case] provided_services fetch failed:", e);
+    return [];
+  }
+  if (!list.length) return [];
+
+  // The case's authorization (amount / approved units / window / short id /
+  // fee schedule program). Applied to every provided_service only when the case
+  // has exactly one auth, since the provided_service carries no auth link.
+  let soleAuth = null;
+  try {
+    const ab = await coreGet(
+      `/service_authorizations?filter[case]=${caseId}&page[number]=1&page[size]=100`,
+      creds
+    );
+    const auths = ab.data || [];
+    if (auths.length === 1) soleAuth = auths[0];
+  } catch (_) {}
+
+  const out = [];
+  for (const ps of list) {
+    const a = ps.attributes || {};
+    const rel = ps.relationships || {};
+    const relId = (k) => (rel[k] && rel[k].data && rel[k].data.id) || null;
+    const relList = (k) => (rel[k] && Array.isArray(rel[k].data) ? rel[k].data : []);
+
+    const cs = {
+      contracted_service_id: ps.id,
+      name: providedServiceDescription(a),
+      service_type: "",
+      status: a.state ? caseStateLabel(a.state) : "",
+      fee_schedule_program_id: null,
+      fee_schedule_program_name: "",
+      unit_type: "",
+      service_authorization_id: null,
+      unite_us_authorization_id: "",
+      authorization_status: "",
+      authorized_amount: "",
+      // provided_service.unit_amount = units claimed for this delivery; used as
+      // a fallback until the auth's approved_unit_amount overrides it below.
+      authorized_units: a.unit_amount != null ? String(a.unit_amount) : "",
+      service_duration: formatProvidedDuration(a),
+      service_starts_at: isoDateOnly(a.starts_at),
+      service_ends_at: isoDateOnly(a.ends_at),
+      invoice_number: "",
+      invoice_status: "",
+      invoice_amount: "",
+      invoice_url: "",
+      invoiced_at: "",
+      created_at: a.created_at || "",
+      updated_at: a.updated_at || "",
+    };
+
+    // Program name -> service type.
+    cs.service_type = await cachedName("program", relId("program"), creds, "/programs");
+
+    // Apply the case's sole authorization (amount / approved units / window /
+    // short id / status / fee schedule program).
+    if (soleAuth) {
+      const aa = soleAuth.attributes || {};
+      const aRel = soleAuth.relationships || {};
+      const aRelId = (k) => (aRel[k] && aRel[k].data && aRel[k].data.id) || null;
+
+      cs.service_authorization_id = soleAuth.id || null;
+      if (aa.state) cs.authorization_status = String(aa.state).toUpperCase();
+      if (aa.short_id) cs.unite_us_authorization_id = aa.short_id;
+      // approved_* is authoritative; fall back to requested_* (e.g. pending).
+      const amount = centsToUsd(aa.approved_cents != null ? aa.approved_cents : aa.requested_cents);
+      if (amount) cs.authorized_amount = amount;
+      const units = aa.approved_unit_amount != null ? aa.approved_unit_amount : aa.requested_unit_amount;
+      if (units != null) cs.authorized_units = String(units);
+      const aStart = isoDateOnly(aa.approved_starts_at || aa.requested_starts_at);
+      const aEnd = isoDateOnly(aa.approved_ends_at || aa.requested_ends_at);
+      if (aStart) cs.service_starts_at = aStart;
+      if (aEnd) cs.service_ends_at = aEnd;
+      cs.fee_schedule_program_id = aRelId("fee_schedule_program");
+    }
+
+    // Invoice: the provided_service references its invoice(s) directly. The
+    // invoice is a denormalized superset — besides its own number / status /
+    // amount it echoes the fee schedule program (name + unit) and the service
+    // authorization, so we backfill those from it when present. Verified shape.
+    const invIds = relList("invoices").map((d) => d.id).filter(Boolean);
+    if (invIds.length) {
+      try {
+        const ib = await coreGet(`/invoices/${invIds[invIds.length - 1]}`, creds);
+        const inv = ib.data;
+        const ia = (inv && inv.attributes) || {};
+        if (inv) {
+          cs.invoice_number = ia.short_id || ia.invoice_number || inv.id || "";
+          // invoice_status is the payer disposition (e.g. accepted_by_payer);
+          // fall back to the lifecycle state (active/…).
+          cs.invoice_status = ia.invoice_status
+            ? String(ia.invoice_status).replace(/_/g, " ").toUpperCase()
+            : ia.state
+            ? String(ia.state).toUpperCase()
+            : "";
+          // total_amount_invoiced is in cents (e.g. 1750 -> $17.50).
+          const invAmt = centsToUsd(
+            ia.total_amount_invoiced != null ? ia.total_amount_invoiced : ia.amount_paid
+          );
+          if (invAmt) cs.invoice_amount = invAmt;
+          cs.invoiced_at = ia.created_at || ia.approved_at || "";
+          // No link field in the payload; use a navigable in-app invoice URL.
+          cs.invoice_url = ia.invoice_url || ia.pdf_url || `${location.origin}/invoices/${inv.id}`;
+
+          // Backfill the denormalized program + authorization fields.
+          if (!cs.fee_schedule_program_id) cs.fee_schedule_program_id = ia.fee_schedule_program_id || null;
+          if (!cs.fee_schedule_program_name) cs.fee_schedule_program_name = ia.fee_schedule_program_name || "";
+          if (!cs.unit_type) cs.unit_type = ia.fee_schedule_program_unit || "";
+          if (!cs.unite_us_authorization_id)
+            cs.unite_us_authorization_id = ia.service_authorization_short_id || "";
+          if (!cs.authorized_amount) {
+            const a2 = centsToUsd(ia.service_authorization_approved_cents);
+            if (a2) cs.authorized_amount = a2;
+          }
+          if (ia.service_authorization_approved_unit_amount != null)
+            cs.authorized_units = String(ia.service_authorization_approved_unit_amount);
+          if (!cs.service_starts_at)
+            cs.service_starts_at = isoDateOnly(ia.service_authorization_approved_starts_at);
+          if (!cs.service_ends_at)
+            cs.service_ends_at = isoDateOnly(ia.service_authorization_approved_ends_at);
+          if (!cs.name)
+            cs.name = providedServiceDescription({ metadata: ia.provided_service_metadata });
+        }
+      } catch (_) {}
+    }
+
+    // Fee schedule program definition (name + unit) — only fetched if neither
+    // the authorization nor the invoice already supplied it.
+    if (cs.fee_schedule_program_id && (!cs.fee_schedule_program_name || !cs.unit_type)) {
+      try {
+        const fb = await coreGet(`/fee_schedule_programs/${cs.fee_schedule_program_id}`, creds);
+        const fa = (fb.data && fb.data.attributes) || {};
+        if (!cs.fee_schedule_program_name) cs.fee_schedule_program_name = fa.name || "";
+        if (!cs.unit_type) cs.unit_type = fa.unit || fa.unit_type || "";
+        if (!cs.name) cs.name = fa.name || "";
+      } catch (_) {}
+    }
+
+    out.push(cs);
+  }
+  return out;
 }
 
 // Resolve every related entity for one case into the UPPERCASE-label field map
@@ -2926,7 +3121,16 @@ async function buildCaseDetailFromApi(caseObj, creds) {
     if (texts.length) fields["NOTES"] = texts.join("\n\n");
   } catch (_) {}
 
-  return { id: caseObj.id, status, fields, capturedAt: new Date().toISOString() };
+  // Contracted services (provided_services) on this case, with their invoices.
+  const contracted_services = await apiFetchContractedServices(caseObj.id, creds);
+
+  return {
+    id: caseObj.id,
+    status,
+    fields,
+    contracted_services,
+    capturedAt: new Date().toISOString(),
+  };
 }
 
 function publishCasesApi(clientId, cases, status, note) {

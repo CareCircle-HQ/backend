@@ -9,6 +9,7 @@ from .models import (
     Answer,
     Case,
     Client,
+    ContractedService,
     CommunicationChannel,
     CommunicationTimeOfDay,
     Eligibility,
@@ -388,6 +389,39 @@ class CaseSerializer(serializers.ModelSerializer):
         )
         case, _ = Case.objects.update_or_create(case_id=case_id, defaults=validated_data)
         return case
+
+
+class ContractedServiceSerializer(serializers.ModelSerializer):
+    contracted_service_id = serializers.UUIDField()
+    case_id = serializers.UUIDField()
+
+    class Meta:
+        model = ContractedService
+        exclude = ("case", "import_batch")
+
+    @transaction.atomic
+    def create(self, validated_data):
+        return self._upsert(validated_data)
+
+    @transaction.atomic
+    def update(self, instance, validated_data):
+        return self._upsert(validated_data)
+
+    def _upsert(self, validated_data):
+        contracted_service_id = validated_data.pop("contracted_service_id")
+        case_id = validated_data.pop("case_id")
+
+        case = Case.objects.filter(pk=case_id).first()
+        if case is None:
+            raise serializers.ValidationError(
+                {"case_id": f"Case {case_id} does not exist. Import the case first."}
+            )
+
+        validated_data["case"] = case
+        obj, _ = ContractedService.objects.update_or_create(
+            contracted_service_id=contracted_service_id, defaults=validated_data
+        )
+        return obj
 
 
 # ===========================================================================
