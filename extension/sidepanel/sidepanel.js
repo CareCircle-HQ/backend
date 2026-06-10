@@ -1725,10 +1725,9 @@ async function buildScreeningPayloads(d, clientId) {
       }
     }
 
-    // Answers (one per non-duration Q&A item), with a deterministic question.
+    // Answers (ALL Q&A items including Screening Duration), with a deterministic question.
     const answers = [];
     for (const it of det.items) {
-      if (isDurationQ(it.q)) continue;
       const q = (it.q || "").trim();
       const a = (it.a || "").trim();
       if (!q) continue;
