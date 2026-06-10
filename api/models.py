@@ -927,7 +927,7 @@ class Screening(models.Model):
     )
     screen_status_at = models.DateTimeField(null=True, blank=True)
     screen_type = models.CharField(
-        max_length=20, choices=ScreenType.choices, blank=True
+        max_length=120, blank=True  # Free-form: HM #3, SCN, PHS, etc.
     )
     screen_source = models.CharField(max_length=120, blank=True)
     parent_screen = models.ForeignKey(
