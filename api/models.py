@@ -923,7 +923,7 @@ class Screening(models.Model):
     screen_created_at = models.DateTimeField(null=True, blank=True)
     screen_updated_at = models.DateTimeField(null=True, blank=True)
     screen_status = models.CharField(
-        max_length=20, choices=ScreenStatus.choices, blank=True
+        max_length=50, blank=True  # Free-form: complete, in_progress, pending, etc.
     )
     screen_status_at = models.DateTimeField(null=True, blank=True)
     screen_type = models.CharField(
