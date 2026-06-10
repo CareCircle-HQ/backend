@@ -40,6 +40,9 @@ PIPELINE_CASE_NAVIGATION = "2GToxmnm3MrMsotZ1kgn"
 # E: External Services - for external service cases
 PIPELINE_CASE_EXTERNAL = "vVnLwzTO1nkVxUt0zmdF"
 
+# Default case pipeline (use food delivery as default for now)
+PIPELINE_CASE = PIPELINE_CASE_FOOD
+
 # F: Attestation - for attestation tracking
 PIPELINE_ATTESTATION = "ld0HoLxCzj8ooiuOm8hX"
 
@@ -56,6 +59,12 @@ STAGES = {
         "in_review": "in_review",
         "eligible": "eligible",
         "ineligible": "ineligible",
+    },
+    "case": {
+        "open": "open",
+        "in_progress": "in_progress",
+        "authorized": "authorized",
+        "closed": "closed",
     },
 }
 
