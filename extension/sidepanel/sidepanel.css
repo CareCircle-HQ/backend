@@ -643,6 +643,48 @@ textarea.diag {
 .eform .dur-cell { display: flex; flex-direction: column; gap: 4px; }
 .eform .dur-label { font-size: 11.5px; font-weight: 500; color: var(--muted); }
 .eform .dur-cell input { width: 100%; }
+.eform .dur-grid.dur-grid-2 { grid-template-columns: 1fr 1fr; }
+
+/* Screening tab: Call Duration field (moved from the E-Form). */
+.scr-duration-field {
+  margin: 8px 0 4px;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: #f8fafc;
+}
+.scr-duration-field .field-label {
+  display: block;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--text);
+  margin-bottom: 6px;
+}
+.scr-duration-field input { width: 100%; margin: 0; }
+.scr-duration-field .field-note { font-size: 11px; color: var(--muted); margin-top: 5px; }
+.scr-duration-field .field-note:empty { display: none; }
+
+/* Cases tab: enrollment fields (Call Duration + Attestation) moved from E-Form.
+   The container also carries the .eform class so the shared field styles apply. */
+.case-fields {
+  margin: 8px 0 4px;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: #f8fafc;
+}
+.case-fields:empty { display: none; }
+.case-fields .pf-title {
+  margin: 0 0 10px;
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--muted);
+}
+.case-fields h4 { margin: 0 0 10px; font-size: 12.5px; }
+.case-fields hr { border: none; border-top: 1px solid var(--border); margin: 4px 0 12px; }
+.case-fields .field:last-child { margin-bottom: 0; }
 .eform-save-bottom { width: 100%; margin-top: 6px; padding: 10px; border-radius: 8px; }
 .eform .subhead { display: flex; align-items: center; justify-content: space-between; }
 .eform .link-btn {
@@ -659,6 +701,51 @@ textarea.diag {
 .eform .field.invalid .field-label { color: var(--err); }
 .eform .field.invalid input { border-color: var(--err); }
 .eform .field.invalid .opt-group { outline: 1px solid #fecaca; border-radius: 6px; padding: 6px; }
+
+/* Editable Profile-tab enrollment fields (mirrors the E-Form field styles). */
+.profile-fields {
+  margin: 4px 0 12px;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: #f8fafc;
+}
+.profile-fields:empty { display: none; }
+.profile-fields .pf-title {
+  margin: 0 0 10px;
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--muted);
+}
+.profile-fields .field { margin-bottom: 14px; }
+.profile-fields .field:last-child { margin-bottom: 0; }
+.profile-fields .field-label {
+  display: block;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--text);
+  margin-bottom: 6px;
+}
+.profile-fields input[type="text"],
+.profile-fields input[type="number"] { width: 100%; margin-top: 0; }
+.profile-fields .pf-grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 0 14px; }
+.profile-fields .opt-group { display: flex; flex-direction: column; gap: 7px; margin-top: 2px; }
+.profile-fields .opt-group.inline { flex-direction: row; flex-wrap: wrap; gap: 8px 16px; }
+.profile-fields .opt-group.cols-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 7px 14px; }
+.profile-fields .opt {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin: 0;
+  font-size: 12.5px;
+  font-weight: 400;
+  color: var(--text);
+  cursor: pointer;
+}
+.profile-fields .opt input { width: auto; margin: 0; }
+.profile-fields .field-note { font-size: 11px; color: var(--muted); margin-top: 5px; }
 .placeholder {
   flex: 1;
   display: flex;

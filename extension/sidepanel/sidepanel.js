@@ -893,18 +893,6 @@ function buildProfileHtml(ctx) {
   let html = buildClientSummaryHtml(ctx);
   html += buildSnapshotHtml(ctx);
 
-  // Client: structured captured profile data wins; pairs are only a fallback.
-  const clientPairs = {
-    ...pairs,
-    "date of birth": ctx.client_dob || pairs["DOB"] || "",
-    phone: ctx.client_phone || "",
-  };
-  html += profileAccordion(
-    SCHEMA.client.title,
-    renderObjectSection(SCHEMA.client, captured.client, clientPairs, crmClient),
-    true
-  );
-
   // Address (current/primary): first CRM address vs captured primary address.
   const addr = crmClient && (crmClient.addresses || [])[0];
   const addrPairs = { ...pairs, address: ctx.client_address || pairs["ADDRESS"] || "" };
@@ -946,6 +934,90 @@ function buildRecordHtml(type, ctx) {
   return renderRecordSection(SCHEMA[type], type, ctx);
 }
 
+// ---------------------------------------------------------------------------
+// Editable Profile fields (moved out of the E-Form). These persist with the
+// client on the Profile "Save" action via buildClientPayload. Rendered into the
+// static #profileFields container so they survive cmp-profile re-renders.
+// ---------------------------------------------------------------------------
+let profileFieldsBuiltFor = null; // client_id the inputs were built for
+let profileFieldsDirty = false;   // user started editing -> don't clobber input
+
+function reverseCodeMap(map) {
+  const out = {};
+  Object.entries(map).forEach(([label, code]) => { out[code] = label; });
+  return out;
+}
+
+function renderProfileFields(ctx) {
+  const box = $("profileFields");
+  if (!box) return;
+  const cid = (ctx && ctx.client_id) || null;
+  if (!cid) {
+    box.innerHTML = "";
+    profileFieldsBuiltFor = null;
+    profileFieldsDirty = false;
+    return;
+  }
+  // Keep the user's edits: don't rebuild a dirty form for the same client.
+  if (profileFieldsBuiltFor === cid && profileFieldsDirty) return;
+
+  const c = (typeof crm !== "undefined" && crm && crm.client) ? crm.client : {};
+  const chanRev = reverseCodeMap(EFORM_CHANNEL_CODES);
+  const timeRev = reverseCodeMap(EFORM_TIME_CODES);
+
+  const leadSource = c.lead_source || "";
+  const channelLabels = (c.communication_channels || []).map((v) => chanRev[v]).filter(Boolean);
+  const timeLabels = (c.preferred_communication_times || []).map((v) => timeRev[v]).filter(Boolean);
+  let langLabels = (c.preferred_languages || []).slice();
+  if (!langLabels.length) {
+    const capLang = eformPreferredLanguage();
+    if (capLang) langLabels = EFORM_LANGS.filter((l) => new RegExp(`\\b${l}\\b`, "i").test(capLang));
+  }
+
+  const famCount = (c.total_family_members != null && c.total_family_members !== "")
+    ? String(c.total_family_members) : "";
+
+  let html = '<h3 class="pf-title">Enrollment Details</h3>';
+  // Lead Source + family count share a 2-column row.
+  html += '<div class="pf-grid-2">';
+  html += efText("pf_lead_source", "Lead Source", {
+    ph: "e.g. Street Team, Referral",
+    value: leadSource,
+  });
+  html += efText("pf_total_family", "How many family members", {
+    number: true,
+    value: famCount,
+    ph: "0",
+  });
+  html += "</div>";
+  html += efOptions("pf_channel", "Preferred Communication Channel", EFORM_CHANNELS, {
+    type: "checkbox", inline: true, selected: channelLabels,
+  });
+  html += efOptions("pf_time", "Preferred Communication Time of Day", EFORM_TIMES, {
+    type: "checkbox", cols: 2, selected: timeLabels,
+  });
+  html += efOptions("pf_language", "Preferred Communication Language", EFORM_LANGS, {
+    type: "checkbox", cols: 2, selected: langLabels,
+  });
+  box.innerHTML = html;
+  box.oninput = (e) => {
+    const t = e && e.target;
+    if (t && t.id === "pf_total_family") {
+      const clean = t.value.replace(/[^0-9]/g, "");
+      if (clean !== t.value) t.value = clean;
+    }
+    profileFieldsDirty = true;
+  };
+  profileFieldsBuiltFor = cid;
+  profileFieldsDirty = false;
+}
+
+// Checked values for a profile-fields option group (scoped to #profileFields).
+function profileChecked(name) {
+  return [...document.querySelectorAll(`#profileFields input[name="${name}"]:checked`)]
+    .map((e) => e.value);
+}
+
 function renderComparison(ctx) {
   const empty = !ctx || !ctx.client_id;
   const fill = (id, html, emptyMsg) => {
@@ -963,6 +1035,7 @@ function renderComparison(ctx) {
   // captured screening detail (renderScreenings); screeningHtml below feeds only
   // the full CRM comparison on the Data tab.
   fill("cmp-profile", profileHtml, openMsg);
+  renderProfileFields(empty ? null : ctx);
   // Note: cmp-cases and cmp-eligibility now host the captured accordions
   // (renderCases / renderEligibility); their CRM comparisons live on the Data tab.
 
@@ -1663,8 +1736,35 @@ function emptyTabMessage(d, matchesClient, label) {
   return `<p class="muted">No ${label} captured yet. Open a Unite Us facesheet and click Re-scan.</p>`;
 }
 
+// Screening Call Duration (minutes) field, moved here from the E-Form. Persists
+// on the client (screening_call_duration_minutes) when screenings are saved.
+let scrDurationDirty = false;
+
+function renderScrDurationField() {
+  const input = $("scr_call_duration");
+  if (!input) return;
+  if (scrDurationDirty) return; // don't clobber the agent's edits
+  const c = (typeof crm !== "undefined" && crm && crm.client) ? crm.client : {};
+  let val = "";
+  if (c.screening_call_duration_minutes != null && c.screening_call_duration_minutes !== "") {
+    val = String(c.screening_call_duration_minutes);
+  } else {
+    const cap = eformScreeningDuration();
+    if (cap != null) val = String(cap);
+  }
+  input.value = val;
+  const note = $("scr_call_duration_note");
+  if (note) {
+    const cap = eformScreeningDuration();
+    note.textContent = cap != null
+      ? `Prefilled from the captured Screening Duration (${cap} min) \u2014 editable.`
+      : "";
+  }
+}
+
 function renderScreenings() {
   const box = $("cmp-screening");
+  renderScrDurationField();
   if (!box) return;
   renderScrMeta();
   const d = screeningData;
@@ -1888,6 +1988,18 @@ async function saveScreenings(ev) {
       return;
     }
     setClientImported(true);
+
+    // Persist the manually-entered Screening call duration on the client
+    // (moved here from the E-Form). Best-effort; failures don't block screenings.
+    const durInput = $("scr_call_duration");
+    const durRaw = durInput ? durInput.value.replace(/[^0-9]/g, "") : "";
+    if (durRaw !== "") {
+      await fetch(`${cfg.backendUrl}/api/clients/${ctx.client_id}/`, {
+        method: "PATCH",
+        headers: { ...authHeader(cfg), "Content-Type": "application/json" },
+        body: JSON.stringify({ screening_call_duration_minutes: parseInt(durRaw, 10) }),
+      }).catch(() => {});
+    }
 
     // Client exists -> build and upsert the screenings in one batch.
     setScrStatus("warn", "Saving screenings\u2026");
@@ -2357,8 +2469,147 @@ function renderContractedServices(list) {
   return html;
 }
 
+// ---------------------------------------------------------------------------
+// Cases-tab enrollment fields (moved from the E-Form): Call Duration (Eligibility
+// + Cases) and the Attestation Needed? toggle with its Doctor/PCP section. These
+// persist on the client (PATCH) when cases are saved.
+// ---------------------------------------------------------------------------
+let caseFieldsBuiltFor = null;
+let caseFieldsDirty = false;
+
+function caseFieldChecked(name) {
+  return [...document.querySelectorAll(`#caseFields input[name="${name}"]:checked`)]
+    .map((e) => e.value);
+}
+
+function renderCaseFields() {
+  const box = $("caseFields");
+  if (!box) return;
+  const cid = (currentContext && currentContext.client_id) || null;
+  if (!cid) {
+    box.innerHTML = "";
+    caseFieldsBuiltFor = null;
+    caseFieldsDirty = false;
+    return;
+  }
+  if (caseFieldsBuiltFor === cid && caseFieldsDirty) return; // keep edits
+
+  const prev = (typeof crm !== "undefined" && crm && crm.client) ? crm.client : {};
+  const attYesNo = prev.attestation_needed ? "Yes" : "No";
+  const docReq = attYesNo === "Yes";
+  const eligDur = prev.eligibility_call_duration_minutes != null
+    ? String(prev.eligibility_call_duration_minutes) : "";
+  const caseDur = prev.cases_call_duration_minutes != null
+    ? String(prev.cases_call_duration_minutes) : "";
+
+  const durInput = (id, value) =>
+    `<input type="number" id="${id}" inputmode="numeric" min="0" step="1" placeholder="0"` +
+    `${value !== "" ? ` value="${escapeHtml(value)}"` : ""} />`;
+
+  let html = '<h3 class="pf-title">Case Details</h3>';
+  html += `<div class="field" data-field="cf_call_durations">` +
+    `<label class="field-label">Call Duration (Minutes):</label>` +
+    `<div class="dur-grid dur-grid-2">` +
+    `<div class="dur-cell"><span class="dur-label">Eligibility</span>${durInput("cf_eligibility_call_duration", eligDur)}</div>` +
+    `<div class="dur-cell"><span class="dur-label">Cases</span>${durInput("cf_cases_call_duration", caseDur)}</div>` +
+    `</div></div>`;
+
+  html += efOptions("cf_attestation", "Attestation Needed?", ["Yes", "No"], {
+    type: "radio", req: true, inline: true, selected: [attYesNo],
+  });
+
+  html += `<div id="cf_doctor_section" style="display:${docReq ? "block" : "none"};">`;
+  html += "<hr/><h4>Doctor/PCP Information</h4>";
+  html += efText("cf_doctor_name", "Doctor Name", {
+    req: docReq, ph: "Dr. Jane Smith", value: prev.doctor_name || "",
+  });
+  html += efText("cf_doctor_street", "Doctor Street Address", {
+    ph: "123 Medical Plaza, Suite 100", value: prev.doctor_street || "",
+  });
+  html += `<div class="field" data-field="cf_doctor_addr">` +
+    `<label class="field-label">Doctor City / State / Zip</label>` +
+    `<div class="addr-grid">` +
+    `<input type="text" id="cf_doctor_city" placeholder="City" value="${escapeHtml(prev.doctor_city || "")}" />` +
+    `<input type="text" id="cf_doctor_state" placeholder="State" maxlength="2" value="${escapeHtml(prev.doctor_state || "")}" />` +
+    `<input type="text" id="cf_doctor_zip" placeholder="Zip" maxlength="10" value="${escapeHtml(prev.doctor_zip || "")}" />` +
+    `</div></div>`;
+  html += `<div class="field-grid-2">`;
+  html += efText("cf_doctor_phone", "Doctor Phone", {
+    req: docReq, ph: "(555) 123-4567", value: prev.doctor_phone || "",
+  });
+  html += efText("cf_doctor_fax", "Doctor Fax", {
+    ph: "(555) 123-4568", value: prev.doctor_fax || "",
+  });
+  html += efText("cf_doctor_email", "Doctor Email", {
+    ph: "doctor@clinic.com", value: prev.doctor_email || "",
+  });
+  html += `</div>`;
+  html += `</div>`;
+
+  box.innerHTML = html;
+  caseFieldsBuiltFor = cid;
+  caseFieldsDirty = false;
+}
+
+// Returns the list of invalid case-field keys (empty = valid).
+function caseFieldsValidate() {
+  const missing = [];
+  const att = caseFieldChecked("cf_attestation")[0] || "";
+  if (!att) missing.push("cf_attestation");
+  if (att === "Yes") {
+    const name = ($("cf_doctor_name") || {}).value || "";
+    const phone = ($("cf_doctor_phone") || {}).value || "";
+    if (!name.trim()) missing.push("cf_doctor_name");
+    if (!phone.trim()) missing.push("cf_doctor_phone");
+  }
+  return missing;
+}
+
+function markCaseFieldsInvalid(missing) {
+  document.querySelectorAll("#caseFields .field").forEach((f) => f.classList.remove("invalid"));
+  new Set(missing).forEach((id) => {
+    const f = document.querySelector(`#caseFields .field[data-field="${id}"]`);
+    if (f) f.classList.add("invalid");
+  });
+}
+
+// Build the client PATCH body for the case-tab fields (durations + attestation).
+function buildCaseClientPayload() {
+  const val = (id) => { const e = $(id); return e ? e.value.trim() : ""; };
+  const digits = (v) => v.replace(/[^0-9]/g, "");
+  const toInt = (v) => (v === "" ? null : parseInt(v, 10));
+  const att = (caseFieldChecked("cf_attestation")[0] || "") === "Yes";
+
+  const payload = {
+    attestation_needed: att,
+    eligibility_call_duration_minutes: toInt(digits(val("cf_eligibility_call_duration"))),
+    cases_call_duration_minutes: toInt(digits(val("cf_cases_call_duration"))),
+  };
+  if (att) {
+    payload.doctor_name = val("cf_doctor_name");
+    payload.doctor_street = val("cf_doctor_street");
+    payload.doctor_city = val("cf_doctor_city");
+    payload.doctor_state = (val("cf_doctor_state") || "").toUpperCase();
+    payload.doctor_zip = val("cf_doctor_zip");
+    payload.doctor_phone = val("cf_doctor_phone");
+    payload.doctor_fax = val("cf_doctor_fax");
+    payload.doctor_email = val("cf_doctor_email");
+  } else {
+    payload.doctor_name = "";
+    payload.doctor_street = "";
+    payload.doctor_city = "";
+    payload.doctor_state = "";
+    payload.doctor_zip = "";
+    payload.doctor_phone = "";
+    payload.doctor_fax = "";
+    payload.doctor_email = "";
+  }
+  return payload;
+}
+
 function renderCases() {
   const box = $("cmp-cases");
+  renderCaseFields();
   if (!box) return;
   renderCaseMeta();
   const d = caseData;
@@ -2607,6 +2858,20 @@ async function saveCases(ev) {
     }
     setClientImported(true);
 
+    // Case-tab enrollment fields (moved from the E-Form): validate, then persist
+    // on the client. Attestation is required; Doctor Name + Phone when "Yes".
+    const cfMissing = caseFieldsValidate();
+    markCaseFieldsInvalid(cfMissing);
+    if (cfMissing.length) {
+      setCaseStatus("err", `Complete ${cfMissing.length} required field(s) above`);
+      return;
+    }
+    await fetch(`${cfg.backendUrl}/api/clients/${ctx.client_id}/`, {
+      method: "PATCH",
+      headers: { ...authHeader(cfg), "Content-Type": "application/json" },
+      body: JSON.stringify(buildCaseClientPayload()),
+    }).catch(() => {});
+
     setCaseStatus("warn", "Saving cases\u2026");
     const payloads = buildCasePayloads(d, ctx.client_id);
     if (!payloads.length) {
@@ -2737,6 +3002,29 @@ function buildClientPayload(ctx) {
   set("gross_monthly_income", income);
   const hh = String(cap.household_size || "").replace(/[^0-9]/g, "");
   if (hh) payload.household_size = Number(hh);
+
+  // Editable Profile-tab enrollment fields (moved out of the E-Form). Lists are
+  // only sent when the agent selected something, so we never wipe CRM data.
+  const leadSourceEl = document.getElementById("pf_lead_source");
+  set("lead_source", leadSourceEl ? leadSourceEl.value.trim() : "");
+  const channels = profileChecked("pf_channel")
+    .map((v) => EFORM_CHANNEL_CODES[v]).filter(Boolean);
+  const commTimes = profileChecked("pf_time")
+    .map((v) => EFORM_TIME_CODES[v]).filter(Boolean);
+  const langs = profileChecked("pf_language");
+  if (channels.length) payload.communication_channels = channels;
+  if (commTimes.length) payload.preferred_communication_times = commTimes;
+  if (langs.length) payload.preferred_languages = langs;
+
+  // Family count drives the hidden "Is this a family?" flag: 1 => not a family,
+  // >1 => family. Both sent only when a count was entered.
+  const famEl = document.getElementById("pf_total_family");
+  const famRaw = famEl ? famEl.value.replace(/[^0-9]/g, "") : "";
+  if (famRaw !== "") {
+    const famNum = Number(famRaw);
+    payload.total_family_members = famNum;
+    payload.is_a_family = famNum > 1;
+  }
 
   // Primary address (only when we captured something locatable).
   const a = {};
@@ -3196,143 +3484,18 @@ function buildEform() {
     return;
   }
 
-  const fam = eformFamilyCount();
-  const lang = eformPreferredLanguage();
-  // Previously-saved client record (from the CRM lookup) used to prefill
-  // attestation + doctor fields so re-opening the form shows prior answers.
-  const prev = (typeof crm !== "undefined" && crm && crm.client) ? crm.client : {};
-  const attYesNo = prev.attestation_needed ? "Yes" : "No";
-  const langSel = EFORM_LANGS.filter((l) => new RegExp(`\\b${l}\\b`, "i").test(lang));
-  // Family iff more than one medicaid-enrolled member; default to "No" otherwise
-  // (including when the count isn't found).
-  const familyYesNo = fam != null && fam > 1 ? "Yes" : "No";
-
   let html = "";
-  // Member ID: hidden; populated from the detected client (TODO: confirm via API).
+  // Member ID: hidden; populated from the detected client.
   html += `<input type="hidden" id="ef_member_id" value="${escapeHtml(cid)}" />`;
 
-  html += efText("ef_lead_source", "Lead Source", { req: true, ph: "e.g. Street Team, Referral" });
-
-  html += efOptions("ef_is_a_family", "Is this a family?", ["Yes", "No"], {
-    type: "radio",
-    req: true,
-    inline: true,
-    selected: familyYesNo ? [familyYesNo] : [],
-    note:
-      fam != null
-        ? `Derived from eligibility: ${fam} medicaid-enrolled family member(s).`
-        : "Not found in eligibility \u2014 select manually.",
-  });
-
-  html += efText("ef_total_family", "Total Family Members (Incl.)", {
-    req: true,
-    number: true,
-    value: fam != null ? String(fam) : "",
-    note: fam != null ? "From the eligibility assessment." : "",
-  });
-
-  html += efOptions("ef_channel", "Preferred Communication Channel", EFORM_CHANNELS, {
-    type: "checkbox",
-    req: true,
-    inline: true,
-    note: "Select at least one.",
-  });
-
-  html += efOptions("ef_time", "Preferred Communication Time of Day", EFORM_TIMES, {
-    type: "checkbox",
-    req: true,
-    cols: 2,
-  });
-
-  html += efOptions("ef_language", "Preferred Communication Language", EFORM_LANGS, {
-    type: "checkbox",
-    req: true,
-    cols: 2,
-    selected: langSel,
-    note: lang ? `Captured preference: ${lang}` : "",
-  });
-
-  // Call durations: one section label, three columns (Screening/Eligibility/Cases).
-  // Screening is prefilled from the captured "Screening Duration" Q&A (editable).
-  const scrDur = eformScreeningDuration();
-  const durInput = (id, value) =>
-    `<input type="number" id="${id}" inputmode="numeric" min="0" step="1" placeholder="0"` +
-    `${value != null ? ` value="${value}"` : ""} />`;
-  html += `<div class="field" data-field="ef_call_durations">` +
-    `<label class="field-label">Call Duration (Minutes):</label>` +
-    `<div class="dur-grid">` +
-    `<div class="dur-cell"><span class="dur-label">Screening</span>${durInput("ef_screening_call_duration", scrDur)}</div>` +
-    `<div class="dur-cell"><span class="dur-label">Eligibility</span>${durInput("ef_eligibility_call_duration")}</div>` +
-    `<div class="dur-cell"><span class="dur-label">Cases</span>${durInput("ef_cases_call_duration")}</div>` +
-    `</div>` +
-    (scrDur != null ? `<div class="field-note">Screening prefilled from the captured Screening Duration.</div>` : "") +
-    `</div>`;
-
+  // Lead Source + communication prefs live on the Profile tab; the Screening
+  // call duration on the Screening tab; Eligibility/Cases call durations and the
+  // Attestation/Doctor section on the Cases tab. The E-Form now only captures
+  // the call transfer outcome.
   html += efOptions("ef_transfer", "Call Transfer Answered?", EFORM_TRANSFER, {
     type: "radio",
     req: true,
   });
-
-  // Attestation toggle placed last so the doctor fields it reveals appear
-  // right after it (no scrolling past other fields to see them).
-  html += efOptions("ef_attestation", "Attestation Needed?", ["Yes", "No"], {
-    type: "radio",
-    req: true,
-    inline: true,
-    selected: [attYesNo],
-  });
-
-  // Doctor/PCP Information Section - shown only when attestation is needed.
-  // Required iff attestation_needed=Yes; prefilled from the previous record.
-  const docReq = attYesNo === "Yes";
-  html += `<div id="ef_doctor_section" style="display:${docReq ? "block" : "none"};">`;
-  html += "<hr/><h4>Doctor/PCP Information</h4>";
-
-  html += efText("ef_doctor_name", "Doctor Name", {
-    req: docReq,
-    ph: "Dr. Jane Smith",
-    value: prev.doctor_name || "",
-  });
-
-  html += efText("ef_doctor_street", "Doctor Street Address", {
-    req: false,
-    ph: "123 Medical Plaza, Suite 100",
-    value: prev.doctor_street || "",
-  });
-
-  html += `<div class="field" data-field="ef_doctor_addr">` +
-    `<label class="field-label">Doctor City / State / Zip</label>` +
-    `<div class="addr-grid">` +
-    `<input type="text" id="ef_doctor_city" placeholder="City" value="${escapeHtml(prev.doctor_city || "")}" />` +
-    `<input type="text" id="ef_doctor_state" placeholder="State" maxlength="2" value="${escapeHtml(prev.doctor_state || "")}" />` +
-    `<input type="text" id="ef_doctor_zip" placeholder="Zip" maxlength="10" value="${escapeHtml(prev.doctor_zip || "")}" />` +
-    `</div></div>`;
-
-  // Phone / Fax / Email in a 2-column grid (matches the City/State/Zip row).
-  html += `<div class="field-grid-2">`;
-  html += efText("ef_doctor_phone", "Doctor Phone", {
-    req: docReq,
-    ph: "(555) 123-4567",
-    type: "tel",
-    value: prev.doctor_phone || "",
-  });
-
-  html += efText("ef_doctor_fax", "Doctor Fax", {
-    req: false,
-    ph: "(555) 123-4568",
-    type: "tel",
-    value: prev.doctor_fax || "",
-  });
-
-  html += efText("ef_doctor_email", "Doctor Email", {
-    req: false,
-    ph: "doctor@clinic.com",
-    type: "email",
-    value: prev.doctor_email || "",
-  });
-  html += `</div>`;
-
-  html += `</div>`;
 
   form.innerHTML = html;
   updateEformSaveBtn();
@@ -3370,26 +3533,7 @@ function collectEform() {
   };
   return {
     member_id: val("ef_member_id"),
-    lead_source: val("ef_lead_source"),
-    is_a_family: eformChecked("ef_is_a_family")[0] || "",
-    total_family_members: val("ef_total_family"),
-    attestation_needed: eformChecked("ef_attestation")[0] || "",
-    communication_channels: eformChecked("ef_channel"),
-    communication_times: eformChecked("ef_time"),
-    communication_languages: eformChecked("ef_language"),
-    screening_call_duration_minutes: val("ef_screening_call_duration"),
-    eligibility_call_duration_minutes: val("ef_eligibility_call_duration"),
-    cases_call_duration_minutes: val("ef_cases_call_duration"),
     call_transfer: eformChecked("ef_transfer")[0] || "",
-    // Doctor/PCP Information
-    doctor_name: val("ef_doctor_name"),
-    doctor_street: val("ef_doctor_street"),
-    doctor_city: val("ef_doctor_city"),
-    doctor_state: val("ef_doctor_state"),
-    doctor_zip: val("ef_doctor_zip"),
-    doctor_phone: val("ef_doctor_phone"),
-    doctor_fax: val("ef_doctor_fax"),
-    doctor_email: val("ef_doctor_email"),
   };
 }
 
@@ -3399,21 +3543,7 @@ function eformValidate(d) {
   const need = (ok, field) => {
     if (!ok) missing.push(field);
   };
-  need(d.lead_source, "ef_lead_source");
-  need(d.is_a_family, "ef_is_a_family");
-  need(d.total_family_members !== "", "ef_total_family");
-  need(d.attestation_needed, "ef_attestation");
-  need(d.communication_channels.length, "ef_channel");
-  need(d.communication_times.length, "ef_time");
-  need(d.communication_languages.length, "ef_language");
   need(d.call_transfer, "ef_transfer");
-  // Note: call duration fields are optional
-  // When attestation_needed=Yes, only Doctor Name and Phone are required;
-  // the remaining doctor fields are shown but optional.
-  if (d.attestation_needed === "Yes") {
-    need(d.doctor_name, "ef_doctor_name");
-    need(d.doctor_phone, "ef_doctor_phone");
-  }
   return missing;
 }
 
@@ -3454,73 +3584,18 @@ function updateEformSaveBtn() {
   });
 }
 
-// Respond to user edits: enforce integer-only fields, mark dirty, refresh state.
-function onEformChange(e) {
-  const t = e && e.target;
-  if (t && (t.id === "ef_total_family" ||
-            t.id === "ef_screening_call_duration" ||
-            t.id === "ef_eligibility_call_duration" ||
-            t.id === "ef_cases_call_duration")) {
-    const clean = t.value.replace(/[^0-9]/g, "");
-    if (clean !== t.value) t.value = clean;
-  }
-
-  // Show/hide doctor section based on attestation_needed
-  if (t && t.name === "ef_attestation") {
-    const doctorSection = $("ef_doctor_section");
-    if (doctorSection) {
-      doctorSection.style.display = t.value === "Yes" ? "block" : "none";
-    }
-  }
-
+// Respond to user edits: mark dirty, refresh state.
+function onEformChange() {
   eformDirty = true;
   updateEformSaveBtn();
 }
 
 // Map the collected E-Form values onto the Client model shape for a PATCH.
 function buildEformPayload(d) {
-  const isYes = (v) => v === "Yes";
-  const toInt = (v) => (v === "" ? null : parseInt(v, 10));
-  const codes = (arr, map) => arr.map((v) => map[v]).filter(Boolean);
-
-  const payload = {
+  return {
     client_id: d.member_id,
-    lead_source: d.lead_source,
-    is_a_family: isYes(d.is_a_family),
-    total_family_members: toInt(d.total_family_members),
-    attestation_needed: isYes(d.attestation_needed),
-    communication_channels: codes(d.communication_channels, EFORM_CHANNEL_CODES),
-    preferred_communication_times: codes(d.communication_times, EFORM_TIME_CODES),
-    preferred_languages: d.communication_languages.slice(),
-    screening_call_duration_minutes: toInt(d.screening_call_duration_minutes),
-    eligibility_call_duration_minutes: toInt(d.eligibility_call_duration_minutes),
-    cases_call_duration_minutes: toInt(d.cases_call_duration_minutes),
     call_transfer_answered: EFORM_TRANSFER_CODES[d.call_transfer] || "",
   };
-
-  // Doctor/PCP Information: only sent when attestation is needed; otherwise
-  // cleared so switching to "No" wipes any prior doctor data.
-  if (isYes(d.attestation_needed)) {
-    payload.doctor_name = d.doctor_name || "";
-    payload.doctor_street = d.doctor_street || "";
-    payload.doctor_city = d.doctor_city || "";
-    payload.doctor_state = (d.doctor_state || "").trim().toUpperCase();
-    payload.doctor_zip = d.doctor_zip || "";
-    payload.doctor_phone = d.doctor_phone || "";
-    payload.doctor_fax = d.doctor_fax || "";
-    payload.doctor_email = d.doctor_email || "";
-  } else {
-    payload.doctor_name = "";
-    payload.doctor_street = "";
-    payload.doctor_city = "";
-    payload.doctor_state = "";
-    payload.doctor_zip = "";
-    payload.doctor_phone = "";
-    payload.doctor_fax = "";
-    payload.doctor_email = "";
-  }
-
-  return payload;
 }
 
 // Save the enrollment form: validates, then PATCHes the existing client. The
@@ -3768,10 +3843,36 @@ function init() {
   $("saveBtn").addEventListener("click", saveClient);
   $("scrRescanBtn").addEventListener("click", scrRescan);
   $("scrSaveBtn").addEventListener("click", saveScreenings);
+  const scrDur = $("scr_call_duration");
+  if (scrDur) {
+    scrDur.addEventListener("input", (e) => {
+      const t = e.target;
+      const clean = t.value.replace(/[^0-9]/g, "");
+      if (clean !== t.value) t.value = clean;
+      scrDurationDirty = true;
+    });
+  }
   $("eligRescanBtn").addEventListener("click", eligRescan);
   $("eligSaveBtn").addEventListener("click", saveEligibility);
   $("caseRescanBtn").addEventListener("click", caseRescan);
   $("caseSaveBtn").addEventListener("click", saveCases);
+  const caseFields = $("caseFields");
+  if (caseFields) {
+    const onCaseFieldChange = (e) => {
+      const t = e.target;
+      if (t && (t.id === "cf_eligibility_call_duration" || t.id === "cf_cases_call_duration")) {
+        const clean = t.value.replace(/[^0-9]/g, "");
+        if (clean !== t.value) t.value = clean;
+      }
+      if (t && t.name === "cf_attestation") {
+        const sec = $("cf_doctor_section");
+        if (sec) sec.style.display = t.value === "Yes" ? "block" : "none";
+      }
+      caseFieldsDirty = true;
+    };
+    caseFields.addEventListener("input", onCaseFieldChange);
+    caseFields.addEventListener("change", onCaseFieldChange);
+  }
   $("eformSaveBtn").addEventListener("click", saveEform);
   $("eformSaveBtnBottom").addEventListener("click", saveEform);
   // Delegated on the form so listeners survive rebuilds of its inner markup.
@@ -3831,6 +3932,8 @@ function init() {
         screeningData = null;
         eligibilityData = null;
         caseData = null;
+        scrDurationDirty = false;
+        caseFieldsDirty = false;
         setScrStatus("", "");
         setEligStatus("", "");
         setCaseStatus("", "");
