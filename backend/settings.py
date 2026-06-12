@@ -211,3 +211,13 @@ GHL_API_BASE = os.getenv('GHL_API_BASE', 'https://services.leadconnectorhq.com')
 GHL_API_VERSION = os.getenv('GHL_API_VERSION', '2021-07-28')
 GHL_TIMEOUT = int(os.getenv('GHL_TIMEOUT', '10'))
 GHL_CONTACT_SOURCE = os.getenv('GHL_CONTACT_SOURCE', 'Benefully extension')
+
+
+# ---------------------------------------------------------------------------
+# CallTools dialer integration. See api/integrations/calltools.
+# Auth: "Authorization: Token <CALLTOOLS_API_TOKEN>". Base URL is the per-silo
+# subdomain of calltools.io (e.g. https://east-1.calltools.io/api).
+# ---------------------------------------------------------------------------
+CALLTOOLS_API_TOKEN = os.getenv('CALLTOOLS_API_TOKEN', '')
+CALLTOOLS_API_BASE = os.getenv('CALLTOOLS_API_BASE', 'https://east-1.calltools.io/api')
+CALLTOOLS_TIMEOUT = int(os.getenv('CALLTOOLS_TIMEOUT', '15'))

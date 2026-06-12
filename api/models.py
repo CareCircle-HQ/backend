@@ -1427,10 +1427,28 @@ class Agent(models.Model):
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     name = models.CharField(max_length=255)
-    agent_code = models.CharField(max_length=20, unique=True, db_index=True)
+    # agent_code is the value GHL + the extension use; sourced from the CallTools
+    # dialer extension when synced. Nullable: users without an extension are still
+    # stored (for identity/features) but can't authenticate by code. NULLs are
+    # treated as distinct, so multiple code-less agents are allowed.
+    agent_code = models.CharField(
+        max_length=20, unique=True, null=True, blank=True, db_index=True
+    )
     group = models.CharField(max_length=50, choices=AGENT_GROUPS, default="Screeners")
     status = models.CharField(max_length=20, default="Active")
     cbo = models.CharField(max_length=255, blank=True, default="Met Council")
+
+    # --- CallTools dialer identity (synced from /api/users/) ---
+    calltools_app_user = models.UUIDField(null=True, blank=True, unique=True, db_index=True)
+    email = models.EmailField(blank=True)
+    username = models.CharField(max_length=150, blank=True)
+    first_name = models.CharField(max_length=120, blank=True)
+    last_name = models.CharField(max_length=120, blank=True)
+    is_agent = models.BooleanField(default=True)
+    is_manager = models.BooleanField(default=False)
+    is_account_owner = models.BooleanField(default=False)
+    calltools_synced_at = models.DateTimeField(null=True, blank=True)
+
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 

@@ -179,7 +179,12 @@ async function saveAgentCode() {
     renderAgentTag();
     updateHomeOverlay();
     refreshEformIfPristine();
-    
+
+    // Seed the dialer badge from the login response, then start live polling.
+    ctStatus = loginData.calltools || null;
+    renderCtStatus();
+    startCtPolling();
+
     // Show success message
     const msg = $("homeMsg");
     if (msg) {
@@ -201,6 +206,7 @@ async function saveAgentCode() {
 async function logout() {
   agentCode = "";
   agentAuth = { token: null, refreshToken: null, agentName: null, agentGroup: null, expiresAt: null, isLoggedIn: false };
+  stopCtPolling();
   try {
     await chrome.storage.local.remove(["uw_agent_code", "uw_agent_token", "uw_agent_refresh_token", "uw_agent_name", "uw_agent_group", "uw_agent_expires_at"]);
   } catch (_) {}
@@ -948,6 +954,83 @@ function reverseCodeMap(map) {
   return out;
 }
 
+// CallTools campaigns power the Lead Source dropdown. Fetched once from the
+// backend (which caches the upstream call) and reused across renders.
+let campaignCache = null;       // [{id, uuid, name, active}]
+let campaignFetchPromise = null;
+
+async function fetchCampaigns(force = false) {
+  if (campaignCache && !force) return campaignCache;
+  if (campaignFetchPromise) return campaignFetchPromise;
+  campaignFetchPromise = (async () => {
+    try {
+      const cfg = await getConfig();
+      const res = await fetch(`${cfg.backendUrl}/api/calltools/campaigns/`, {
+        headers: authHeader(cfg),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        campaignCache = Array.isArray(data) ? data : [];
+      }
+    } catch (_) {
+      /* keep whatever we had; the select falls back to the saved value */
+    } finally {
+      campaignFetchPromise = null;
+    }
+    return campaignCache || [];
+  })();
+  return campaignFetchPromise;
+}
+
+// Fill the Lead Source <select> with campaigns, preserving the saved value even
+// if it isn't in the current campaign list (legacy free-text or inactive id).
+async function populateLeadSourceSelect() {
+  const sel = $("pf_lead_source");
+  if (!sel) return;
+  const current = sel.value || "";
+  const campaigns = await fetchCampaigns();
+  if (!sel.isConnected) return; // re-rendered while we were fetching
+  const rows = ['<option value="">Select campaign\u2026</option>'];
+  let matched = false;
+  campaigns.forEach((c) => {
+    const v = String(c.id);
+    const isSel = v === String(current);
+    if (isSel) matched = true;
+    const label = c.active ? c.name : `${c.name} (inactive)`;
+    rows.push(
+      `<option value="${escapeHtml(v)}"${isSel ? " selected" : ""}>${escapeHtml(label)}</option>`
+    );
+  });
+  if (current && !matched) {
+    rows.push(
+      `<option value="${escapeHtml(current)}" selected>${escapeHtml(current)} (current)</option>`
+    );
+  }
+  sel.innerHTML = rows.join("");
+  maybeAutoSelectLeadSource();
+}
+
+// Auto-select the Lead Source dropdown from the agent's active CallTools call
+// when that call carries a campaign id and is for the loaded client. Respects a
+// manual edit (profileFieldsDirty) so the agent's own choice always wins.
+function maybeAutoSelectLeadSource() {
+  const sel = $("pf_lead_source");
+  if (!sel || profileFieldsDirty) return;
+  const call = ctStatus && ctStatus.active_call;
+  if (!call || call.campaign == null) return;
+  if (call.matches_client === false) return; // a different client is on the line
+  const v = String(call.campaign);
+  if (![...sel.options].some((o) => o.value === v)) {
+    const c = (campaignCache || []).find((x) => String(x.id) === v);
+    const label = c ? (c.active ? c.name : `${c.name} (inactive)`) : `Campaign ${v}`;
+    const opt = document.createElement("option");
+    opt.value = v;
+    opt.textContent = `${label} (from call)`;
+    sel.appendChild(opt);
+  }
+  if (sel.value !== v) sel.value = v;
+}
+
 function renderProfileFields(ctx) {
   const box = $("profileFields");
   if (!box) return;
@@ -980,9 +1063,12 @@ function renderProfileFields(ctx) {
   let html = '<h3 class="pf-title">Enrollment Details</h3>';
   // Lead Source + family count share a 2-column row.
   html += '<div class="pf-grid-2">';
-  html += efText("pf_lead_source", "Lead Source", {
-    ph: "e.g. Street Team, Referral",
+  // Lead Source is a CallTools campaign. Seed with the saved value so it isn't
+  // lost before campaigns load; populateLeadSourceSelect() fills the full list.
+  const initialLeadOpts = leadSource ? [{ value: leadSource, label: String(leadSource) }] : [];
+  html += efSelect("pf_lead_source", "Lead Source", initialLeadOpts, {
     value: leadSource,
+    placeholder: "Select campaign\u2026",
   });
   html += efText("pf_total_family", "How many family members", {
     number: true,
@@ -1008,6 +1094,7 @@ function renderProfileFields(ctx) {
     }
     profileFieldsDirty = true;
   };
+  populateLeadSourceSelect();
   profileFieldsBuiltFor = cid;
   profileFieldsDirty = false;
 }
@@ -1762,6 +1849,57 @@ function renderScrDurationField() {
   }
 }
 
+// ---------- Screening call timer ----------
+// A simple stopwatch in the Screening tab. Start/Stop pauses & resumes; Copy
+// writes the elapsed minutes (rounded up) into the Call Duration field.
+let scrTimerRunning = false;
+let scrTimerStartTs = 0;
+let scrTimerAccumMs = 0;
+let scrTimerInterval = null;
+
+function scrTimerElapsedMs() {
+  return scrTimerAccumMs + (scrTimerRunning ? Date.now() - scrTimerStartTs : 0);
+}
+
+function renderScrTimer() {
+  const disp = $("scrTimerDisplay");
+  if (disp) {
+    const total = Math.floor(scrTimerElapsedMs() / 1000);
+    const mm = String(Math.floor(total / 60)).padStart(2, "0");
+    const ss = String(total % 60).padStart(2, "0");
+    disp.textContent = `${mm}:${ss}`;
+  }
+  const btn = $("scrTimerToggle");
+  if (btn) {
+    btn.textContent = scrTimerRunning ? "Stop" : "Start";
+    btn.classList.toggle("running", scrTimerRunning);
+  }
+}
+
+function toggleScrTimer() {
+  if (scrTimerRunning) {
+    scrTimerAccumMs = scrTimerElapsedMs();
+    scrTimerRunning = false;
+    clearInterval(scrTimerInterval);
+    scrTimerInterval = null;
+  } else {
+    scrTimerStartTs = Date.now();
+    scrTimerRunning = true;
+    clearInterval(scrTimerInterval);
+    scrTimerInterval = setInterval(renderScrTimer, 1000);
+  }
+  renderScrTimer();
+}
+
+function copyScrTimerToDuration() {
+  const ms = scrTimerElapsedMs();
+  const minutes = ms > 0 ? Math.max(1, Math.ceil(ms / 60000)) : 0;
+  const input = $("scr_call_duration");
+  if (!input) return;
+  input.value = String(minutes);
+  scrDurationDirty = true; // it's now an explicit agent value
+}
+
 function renderScreenings() {
   const box = $("cmp-screening");
   renderScrDurationField();
@@ -2482,6 +2620,77 @@ function caseFieldChecked(name) {
     .map((e) => e.value);
 }
 
+// ---------- Cases call timers (Eligibility + Cases) ----------
+// Two independent stopwatches. Each persists across caseFields re-renders since
+// state lives here, not in the DOM. Start/Stop pauses & resumes; Copy writes the
+// elapsed minutes (rounded up) into its own duration field.
+const caseTimers = {
+  elig: {
+    running: false, startTs: 0, accumMs: 0, interval: null,
+    display: "cfEligTimerDisplay", toggle: "cfEligTimerToggle",
+    copy: "cfEligTimerCopy", target: "cf_eligibility_call_duration",
+  },
+  cases: {
+    running: false, startTs: 0, accumMs: 0, interval: null,
+    display: "cfCasesTimerDisplay", toggle: "cfCasesTimerToggle",
+    copy: "cfCasesTimerCopy", target: "cf_cases_call_duration",
+  },
+};
+
+function caseTimerElapsedMs(t) {
+  return t.accumMs + (t.running ? Date.now() - t.startTs : 0);
+}
+
+function renderCaseTimer(key) {
+  const t = caseTimers[key];
+  if (!t) return;
+  const disp = $(t.display);
+  if (disp) {
+    const total = Math.floor(caseTimerElapsedMs(t) / 1000);
+    const mm = String(Math.floor(total / 60)).padStart(2, "0");
+    const ss = String(total % 60).padStart(2, "0");
+    disp.textContent = `${mm}:${ss}`;
+  }
+  const btn = $(t.toggle);
+  if (btn) {
+    btn.textContent = t.running ? "Stop" : "Start";
+    btn.classList.toggle("running", t.running);
+  }
+}
+
+function renderCaseTimers() {
+  renderCaseTimer("elig");
+  renderCaseTimer("cases");
+}
+
+function toggleCaseTimer(key) {
+  const t = caseTimers[key];
+  if (!t) return;
+  if (t.running) {
+    t.accumMs = caseTimerElapsedMs(t);
+    t.running = false;
+    clearInterval(t.interval);
+    t.interval = null;
+  } else {
+    t.startTs = Date.now();
+    t.running = true;
+    clearInterval(t.interval);
+    t.interval = setInterval(() => renderCaseTimer(key), 1000);
+  }
+  renderCaseTimer(key);
+}
+
+function copyCaseTimer(key) {
+  const t = caseTimers[key];
+  if (!t) return;
+  const ms = caseTimerElapsedMs(t);
+  const minutes = ms > 0 ? Math.max(1, Math.ceil(ms / 60000)) : 0;
+  const input = $(t.target);
+  if (!input) return;
+  input.value = String(minutes);
+  caseFieldsDirty = true; // explicit agent value
+}
+
 function renderCaseFields() {
   const box = $("caseFields");
   if (!box) return;
@@ -2506,12 +2715,23 @@ function renderCaseFields() {
     `<input type="number" id="${id}" inputmode="numeric" min="0" step="1" placeholder="0"` +
     `${value !== "" ? ` value="${escapeHtml(value)}"` : ""} />`;
 
+  // Per-field call timer (display + Start/Stop + Copy). ``key`` is Elig | Cases.
+  const timerBlock = (key) =>
+    `<div class="case-timer">` +
+    `<span id="cf${key}TimerDisplay" class="scr-timer-display">00:00</span>` +
+    `<div class="scr-timer-btns">` +
+    `<button id="cf${key}TimerToggle" class="timer-btn" type="button">Start</button>` +
+    `<button id="cf${key}TimerCopy" class="timer-btn" type="button" title="Copy elapsed minutes to this field">Copy</button>` +
+    `</div></div>`;
+
   let html = '<h3 class="pf-title">Case Details</h3>';
   html += `<div class="field" data-field="cf_call_durations">` +
     `<label class="field-label">Call Duration (Minutes):</label>` +
-    `<div class="dur-grid dur-grid-2">` +
+    `<div class="dur-grid dur-grid-4">` +
     `<div class="dur-cell"><span class="dur-label">Eligibility</span>${durInput("cf_eligibility_call_duration", eligDur)}</div>` +
+    `<div class="dur-cell"><span class="dur-label">Timer</span>${timerBlock("Elig")}</div>` +
     `<div class="dur-cell"><span class="dur-label">Cases</span>${durInput("cf_cases_call_duration", caseDur)}</div>` +
+    `<div class="dur-cell"><span class="dur-label">Timer</span>${timerBlock("Cases")}</div>` +
     `</div></div>`;
 
   html += efOptions("cf_attestation", "Attestation Needed?", ["Yes", "No"], {
@@ -2547,6 +2767,7 @@ function renderCaseFields() {
   html += `</div>`;
 
   box.innerHTML = html;
+  renderCaseTimers();
   caseFieldsBuiltFor = cid;
   caseFieldsDirty = false;
 }
@@ -3451,6 +3672,27 @@ function efText(id, label, opts = {}) {
   );
 }
 
+// Single-select dropdown. ``options`` is an array of {value, label}; ``opts.value``
+// pre-selects a matching option. Mirrors the .field markup used by efText.
+function efSelect(id, label, options, opts = {}) {
+  const req = opts.req ? '<span class="req">*</span>' : "";
+  const sel = opts.value != null ? String(opts.value) : "";
+  const ph = opts.placeholder || "Select\u2026";
+  const note = opts.note ? `<div class="field-note">${escapeHtml(opts.note)}</div>` : "";
+  const rows = [`<option value="">${escapeHtml(ph)}</option>`].concat(
+    (options || []).map((o) => {
+      const v = String(o.value);
+      const checked = v === sel ? " selected" : "";
+      return `<option value="${escapeHtml(v)}"${checked}>${escapeHtml(o.label)}</option>`;
+    })
+  );
+  return (
+    `<div class="field" data-field="${id}">` +
+    `<label class="field-label" for="${id}">${escapeHtml(label)}${req}</label>` +
+    `<select id="${id}">${rows.join("")}</select>${note}</div>`
+  );
+}
+
 function efOptions(name, label, values, opts = {}) {
   const type = opts.type || "checkbox";
   const inline = opts.inline ? " inline" : "";
@@ -3746,6 +3988,98 @@ function renderAgentTag() {
   if (lo) lo.classList.toggle("hidden", !agentCode);
 }
 
+// ---------- CallTools dialer presence ----------
+// Polls /api/agents/<code>/calltools/ while logged in and renders a header badge
+// showing the agent's dialer presence (online / on call / offline) and, when on
+// a call, whether the live number matches the currently loaded client's phone.
+let ctStatus = null;        // last snapshot from the backend
+let ctStatusTimer = null;   // setInterval handle
+const CT_POLL_MS = 10000;
+
+function currentClientPhone() {
+  const fromCrm =
+    (typeof crm !== "undefined" && crm && crm.client && crm.client.client_phone_number) || "";
+  return fromCrm || (currentContext && currentContext.client_phone) || "";
+}
+
+function fmtPhone(v) {
+  const d = String(v || "").replace(/\D/g, "").slice(-10);
+  return d.length === 10 ? `(${d.slice(0, 3)}) ${d.slice(3, 6)}-${d.slice(6)}` : (v || "");
+}
+
+function renderCtStatus() {
+  const el = $("ctStatus");
+  if (!el) return;
+  if (!agentAuth.isLoggedIn || !ctStatus) {
+    el.classList.add("hidden");
+    el.textContent = "";
+    return;
+  }
+  const call = ctStatus.active_call;
+  let label, cls;
+  if (call) {
+    const num = fmtPhone(call.number);
+    if (call.matches_client === true) {
+      label = `On call \u00b7 ${num} \u00b7 \u2713 this client`;
+      cls = "match";
+    } else if (call.matches_client === false) {
+      label = `On call \u00b7 ${num} \u00b7 \u2717 different`;
+      cls = "mismatch";
+    } else {
+      label = `On call \u00b7 ${num}`;
+      cls = "oncall";
+    }
+  } else if (ctStatus.status === "online") {
+    label = "Dialer: Online";
+    cls = "online";
+  } else if (ctStatus.status === "offline") {
+    label = "Dialer: Offline";
+    cls = "offline";
+  } else {
+    label = "Dialer: \u2014";
+    cls = "unknown";
+  }
+  el.textContent = label;
+  el.className = `ct-status ${cls}`;
+  el.classList.remove("hidden");
+}
+
+async function pollCtStatus() {
+  if (!agentAuth.isLoggedIn || !agentCode) return;
+  try {
+    const cfg = await getConfig();
+    const phone = currentClientPhone();
+    const qs = phone ? `?client_phone=${encodeURIComponent(phone)}` : "";
+    const res = await fetch(
+      `${cfg.backendUrl}/api/agents/${encodeURIComponent(agentCode)}/calltools/${qs}`,
+      { headers: authHeader(cfg) }
+    );
+    if (res.ok) {
+      ctStatus = await res.json();
+      renderCtStatus();
+      maybeAutoSelectLeadSource();
+    }
+  } catch (_) {
+    /* transient; keep the previous badge until the next poll */
+  }
+}
+
+function startCtPolling() {
+  stopCtPolling();
+  if (!agentAuth.isLoggedIn) return;
+  pollCtStatus();
+  ctStatusTimer = setInterval(pollCtStatus, CT_POLL_MS);
+}
+
+function stopCtPolling() {
+  if (ctStatusTimer) {
+    clearInterval(ctStatusTimer);
+    ctStatusTimer = null;
+  }
+  ctStatus = null;
+  renderCtStatus();
+}
+
 async function loadAgent() {
   try {
     const { uw_uu_user, uw_agent_code } = await chrome.storage.local.get([
@@ -3789,6 +4123,7 @@ async function loadAgent() {
   } catch (_) {}
   renderAgentTag();
   updateHomeOverlay();
+  if (agentAuth.isLoggedIn) startCtPolling();
 }
 
 // ---------- Tabs / panels ----------
@@ -3852,6 +4187,11 @@ function init() {
       scrDurationDirty = true;
     });
   }
+  const scrTimerToggleBtn = $("scrTimerToggle");
+  if (scrTimerToggleBtn) scrTimerToggleBtn.addEventListener("click", toggleScrTimer);
+  const scrTimerCopyBtn = $("scrTimerCopy");
+  if (scrTimerCopyBtn) scrTimerCopyBtn.addEventListener("click", copyScrTimerToDuration);
+  renderScrTimer();
   $("eligRescanBtn").addEventListener("click", eligRescan);
   $("eligSaveBtn").addEventListener("click", saveEligibility);
   $("caseRescanBtn").addEventListener("click", caseRescan);
@@ -3872,6 +4212,13 @@ function init() {
     };
     caseFields.addEventListener("input", onCaseFieldChange);
     caseFields.addEventListener("change", onCaseFieldChange);
+    caseFields.addEventListener("click", (e) => {
+      const id = e.target && e.target.id;
+      if (id === "cfEligTimerToggle") toggleCaseTimer("elig");
+      else if (id === "cfEligTimerCopy") copyCaseTimer("elig");
+      else if (id === "cfCasesTimerToggle") toggleCaseTimer("cases");
+      else if (id === "cfCasesTimerCopy") copyCaseTimer("cases");
+    });
   }
   $("eformSaveBtn").addEventListener("click", saveEform);
   $("eformSaveBtnBottom").addEventListener("click", saveEform);
@@ -3971,6 +4318,8 @@ function init() {
       if (currentContext && currentContext.client_id) viewState.onClient = true;
       updateHomeOverlay();
       maybeAutoValidate();
+      // Refresh the dialer match against the new client's phone immediately.
+      if (clientChanged && agentAuth.isLoggedIn) pollCtStatus();
     }
     // Screening auto-walk progress / results.
     if (area === "local" && changes.uw_screenings) {

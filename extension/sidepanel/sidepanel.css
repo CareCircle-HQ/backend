@@ -75,6 +75,40 @@ body {
 .agent-tag.expired { background: rgba(255, 255, 255, 0.1); color: #fecaca; }
 .agent-tag.expired::before { background: #f87171; }
 
+/* CallTools dialer status badge */
+.ct-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+  max-width: 100%;
+  font-size: 11px;
+  font-weight: 600;
+  color: #fff;
+  background: rgba(255, 255, 255, 0.16);
+  border-radius: 999px;
+  padding: 3px 9px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.ct-status::before {
+  content: "";
+  flex: 0 0 auto;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #9ca3af;
+}
+.ct-status.online::before { background: #4ade80; }
+.ct-status.offline::before { background: #9ca3af; }
+.ct-status.unknown { opacity: 0.75; }
+.ct-status.oncall::before { background: #60a5fa; }
+.ct-status.match { background: rgba(34, 197, 94, 0.28); }
+.ct-status.match::before { background: #22c55e; }
+.ct-status.mismatch { background: rgba(245, 158, 11, 0.3); }
+.ct-status.mismatch::before { background: #f59e0b; }
+
 .icon-btn {
   background: transparent;
   border: none;
@@ -644,6 +678,20 @@ textarea.diag {
 .eform .dur-label { font-size: 11.5px; font-weight: 500; color: var(--muted); }
 .eform .dur-cell input { width: 100%; }
 .eform .dur-grid.dur-grid-2 { grid-template-columns: 1fr 1fr; }
+/* 4 columns: each duration field beside its own timer (mirrors Screening). */
+.eform .dur-grid.dur-grid-4 {
+  grid-template-columns: 0.8fr 1.2fr 0.8fr 1.2fr;
+  align-items: start;
+}
+/* Per-field call timer inside a duration cell. */
+.case-timer {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.case-timer .scr-timer-display { font-size: 15px; min-width: 44px; }
+.case-timer .timer-btn { padding: 4px 9px; }
 
 /* Screening tab: Call Duration field (moved from the E-Form). */
 .scr-duration-field {
@@ -663,6 +711,39 @@ textarea.diag {
 .scr-duration-field input { width: 100%; margin: 0; }
 .scr-duration-field .field-note { font-size: 11px; color: var(--muted); margin-top: 5px; }
 .scr-duration-field .field-note:empty { display: none; }
+
+/* Two-column layout: duration field + call timer. */
+.scr-duration-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0 14px;
+  align-items: start;
+}
+.scr-timer {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.scr-timer-display {
+  font-variant-numeric: tabular-nums;
+  font-size: 18px;
+  font-weight: 700;
+  color: var(--text);
+  min-width: 56px;
+}
+.scr-timer-btns { display: flex; gap: 6px; }
+.timer-btn {
+  font-size: 12px;
+  font-weight: 600;
+  padding: 5px 12px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: #fff;
+  color: var(--text);
+  cursor: pointer;
+}
+.timer-btn:hover { background: #f1f5f9; }
+.timer-btn.running { background: #fee2e2; border-color: #fca5a5; color: #b91c1c; }
 
 /* Cases tab: enrollment fields (Call Duration + Attestation) moved from E-Form.
    The container also carries the .eform class so the shared field styles apply. */
@@ -729,7 +810,16 @@ textarea.diag {
   margin-bottom: 6px;
 }
 .profile-fields input[type="text"],
-.profile-fields input[type="number"] { width: 100%; margin-top: 0; }
+.profile-fields input[type="number"],
+.profile-fields select { width: 100%; margin-top: 0; }
+.profile-fields select {
+  padding: 7px 8px;
+  font: inherit;
+  color: var(--text);
+  background: #fff;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
 .profile-fields .pf-grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 0 14px; }
 .profile-fields .opt-group { display: flex; flex-direction: column; gap: 7px; margin-top: 2px; }
 .profile-fields .opt-group.inline { flex-direction: row; flex-wrap: wrap; gap: 8px 16px; }

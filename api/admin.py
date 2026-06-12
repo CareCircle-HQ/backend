@@ -226,9 +226,13 @@ class ImportBatchAdmin(admin.ModelAdmin):
 
 @admin.register(Agent)
 class AgentAdmin(admin.ModelAdmin):
-    list_display = ("name", "agent_code", "group", "status", "cbo", "created_at")
-    list_filter = ("group", "status", "cbo")
-    search_fields = ("name", "agent_code")
+    list_display = (
+        "name", "agent_code", "email", "group", "status", "cbo",
+        "is_manager", "calltools_synced_at",
+    )
+    list_filter = ("group", "status", "cbo", "is_agent", "is_manager", "is_account_owner")
+    search_fields = ("name", "agent_code", "email", "username", "calltools_app_user")
+    readonly_fields = ("calltools_synced_at",)
     ordering = ("name",)
 
 

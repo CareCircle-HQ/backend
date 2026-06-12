@@ -20,6 +20,7 @@ from .views import (
     ScreeningViewSet,
 )
 from .views_agent import AgentLoginView, AgentValidateView
+from .views_calltools import CallToolsAgentStatusView, CallToolsCampaignsView
 
 router = DefaultRouter()
 router.register("clients", ClientViewSet, basename="client")
@@ -40,6 +41,13 @@ urlpatterns = [
     # Agent validation & login
     path("agents/validate/", AgentValidateView.as_view(), name="agent-validate"),
     path("agents/login/", AgentLoginView.as_view(), name="agent-login"),
+    path(
+        "agents/<str:code>/calltools/",
+        CallToolsAgentStatusView.as_view(),
+        name="agent-calltools-status",
+    ),
+    # CallTools dialer
+    path("calltools/campaigns/", CallToolsCampaignsView.as_view(), name="calltools-campaigns"),
     # User
     path("me/", MeView.as_view(), name="me"),
     # Misc

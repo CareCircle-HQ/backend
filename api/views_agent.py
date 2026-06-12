@@ -1,11 +1,26 @@
 """Agent authentication and validation views."""
 
+import logging
 from datetime import timedelta
 from django.utils import timezone
 from rest_framework import status, views
 from rest_framework.response import Response
 from rest_framework_simplejwt.tokens import AccessToken
 from .models import Agent
+from .integrations.calltools import config as ct_config, presence as ct_presence
+
+logger = logging.getLogger(__name__)
+
+
+def _calltools_presence(agent):
+    """Best-effort CallTools presence for an agent; never raises."""
+    if not (ct_config.is_enabled() and agent.calltools_app_user):
+        return None
+    try:
+        return ct_presence.agent_presence(agent.calltools_app_user)
+    except Exception as exc:  # pragma: no cover - presence is non-critical
+        logger.warning("CallTools presence lookup failed for %s: %s", agent.agent_code, exc)
+        return None
 
 
 class AgentLoginView(views.APIView):
@@ -54,6 +69,7 @@ class AgentLoginView(views.APIView):
                 "group": agent.group,
                 "cbo": agent.cbo,
             },
+            "calltools": _calltools_presence(agent),
             "access_token": str(access),
             "expires_in": 86400,  # 24 hours in seconds
             "expires_at": (timezone.now() + timedelta(hours=24)).isoformat(),
