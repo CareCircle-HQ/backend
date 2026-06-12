@@ -44,6 +44,16 @@ let viewState = { onClient: false };
 let agentUser = null;
 let agentCode = "";
 
+// Agent authentication state
+let agentAuth = {
+  token: null,
+  refreshToken: null,
+  agentName: null,
+  agentGroup: null,
+  expiresAt: null,
+  isLoggedIn: false,
+};
+
 // Decide whether to show the full-page home / session screen. Shown when the
 // Unite Us session has expired, or when the user is not on a client page. The
 // last client's captured data stays mounted underneath, so returning to that
@@ -86,6 +96,7 @@ function updateHomeOverlay() {
 }
 
 // Persist the entered Agent Code, clear the gate, and prefill the E-Form.
+// Now validates agent via API and gets JWT token.
 async function saveAgentCode() {
   const inp = $("agentCodeInput");
   const code = ((inp && inp.value) || "").trim();
@@ -93,22 +104,108 @@ async function saveAgentCode() {
     if (inp) inp.focus();
     return;
   }
-  agentCode = code;
+  
+  // Validate agent via API
+  const validateBtn = $("agentCodeSaveBtn");
+  if (validateBtn) {
+    validateBtn.textContent = "Validating...";
+    validateBtn.disabled = true;
+  }
+  
+  const cfg = await getConfig();
   try {
-    await chrome.storage.local.set({ uw_agent_code: code });
-  } catch (_) {}
-  renderAgentTag();
-  updateHomeOverlay();
-  refreshEformIfPristine(); // push the code into the form if untouched
+    // First validate the agent code
+    const validateResp = await fetch(`${cfg.backendUrl}/api/agents/validate/?code=${encodeURIComponent(code)}`);
+    if (!validateResp.ok) {
+      const err = await validateResp.json();
+      alert("Invalid agent code: " + (err.error || "Unknown error"));
+      if (validateBtn) {
+        validateBtn.textContent = "Save";
+        validateBtn.disabled = false;
+      }
+      return;
+    }
+    
+    const validateData = await validateResp.json();
+    if (!validateData.valid) {
+      alert("Invalid agent code");
+      if (validateBtn) {
+        validateBtn.textContent = "Save";
+        validateBtn.disabled = false;
+      }
+      return;
+    }
+    
+    // Now login to get JWT token
+    const loginResp = await fetch(`${cfg.backendUrl}/api/agents/login/`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ agent_code: code }),
+    });
+    
+    if (!loginResp.ok) {
+      const err = await loginResp.json();
+      alert("Login failed: " + (err.error || "Unknown error"));
+      if (validateBtn) {
+        validateBtn.textContent = "Save";
+        validateBtn.disabled = false;
+      }
+      return;
+    }
+    
+    const loginData = await loginResp.json();
+    
+    // Store agent auth data
+    agentCode = code;
+    agentAuth = {
+      token: loginData.access_token,
+      refreshToken: loginData.refresh_token,
+      agentName: loginData.agent.name,
+      agentGroup: loginData.agent.group,
+      expiresAt: new Date(loginData.expires_at).getTime(),
+      isLoggedIn: true,
+    };
+    
+    // Save to storage
+    await chrome.storage.local.set({
+      uw_agent_code: code,
+      uw_agent_token: loginData.access_token,
+      uw_agent_refresh_token: loginData.refresh_token,
+      uw_agent_name: loginData.agent.name,
+      uw_agent_group: loginData.agent.group,
+      uw_agent_expires_at: loginData.expires_at,
+    });
+    
+    renderAgentTag();
+    updateHomeOverlay();
+    refreshEformIfPristine();
+    
+    // Show success message
+    const msg = $("homeMsg");
+    if (msg) {
+      msg.textContent = `Welcome ${agentAuth.agentName}! Your session expires in 24 hours.`;
+    }
+    
+  } catch (e) {
+    console.error("Agent login error:", e);
+    alert("Network error. Please check your connection and try again.");
+    if (validateBtn) {
+      validateBtn.textContent = "Save";
+      validateBtn.disabled = false;
+    }
+  }
 }
 
 // Log out of the extension session: drop the Agent Code so the gate returns.
 // (Does not touch the Unite Us session itself.)
 async function logout() {
   agentCode = "";
+  agentAuth = { token: null, refreshToken: null, agentName: null, agentGroup: null, expiresAt: null, isLoggedIn: false };
   try {
-    await chrome.storage.local.remove("uw_agent_code");
+    await chrome.storage.local.remove(["uw_agent_code", "uw_agent_token", "uw_agent_refresh_token", "uw_agent_name", "uw_agent_group", "uw_agent_expires_at"]);
   } catch (_) {}
+  renderAgentTag();
+  updateHomeOverlay();
   const inp = $("agentCodeInput");
   if (inp) inp.value = "";
   renderAgentTag();
@@ -138,6 +235,10 @@ async function getConfig() {
 }
 
 function authHeader(cfg) {
+  // Use agent JWT token if available, otherwise fall back to config token
+  if (agentAuth.token) {
+    return { Authorization: `Bearer ${agentAuth.token}` };
+  }
   return { Authorization: `${cfg.scheme} ${cfg.token}` };
 }
 
@@ -1725,33 +1826,20 @@ async function buildScreeningPayloads(d, clientId) {
       }
     }
 
-    // Answers (ALL Q&A items including Screening Duration), with a deterministic question.
-    const answers = [];
+    // Questions & Answers - simple JSON array
+    const questions_answers = [];
     for (const it of det.items) {
       const q = (it.q || "").trim();
       const a = (it.a || "").trim();
       if (!q) continue;
-      const questionId = await uuidv5(screenId, "q|" + q);
-      const answerId = await uuidv5(screenId, "a|" + q);
-      answers.push({
-        answer_id: answerId,
-        answer_value: a,
-        value_string: a,
-        question: { question_id: questionId, question_primary_text: q },
-      });
+      questions_answers.push({ question: q, answer: a });
     }
-    if (answers.length) payload.answers = answers;
+    if (questions_answers.length) payload.questions_answers = questions_answers;
 
-    // Identified needs from the screening results chips.
+    // Identified needs from the screening results chips - simple array of strings
     const results = Array.isArray(det.results) ? det.results : [];
-    const needs = [];
-    for (const name of results) {
-      const n = (name || "").trim();
-      if (!n) continue;
-      const needId = await uuidv5(screenId, "n|" + n);
-      needs.push({ identified_social_need_id: needId, identified_social_need_name: n });
-    }
-    if (needs.length) payload.identified_social_needs = needs;
+    const identified_social_needs = results.map(n => (n || "").trim()).filter(n => n);
+    if (identified_social_needs.length) payload.identified_social_needs = identified_social_needs;
 
     payloads.push(payload);
   }
@@ -2015,9 +2103,7 @@ function eligibilitySaveable() {
   );
 }
 
-// Build eligibility upsert payloads. Q&A is sent as normalized `answers`
-// (one Answer + nested Question per item) exactly like screenings, with
-// deterministic UUIDv5 ids so repeated saves update in place.
+// Build eligibility upsert payloads. Q&A is sent as simple JSON array.
 async function buildEligibilityPayloads(d, clientId) {
   const payloads = [];
   for (const s of d.eligibilities) {
@@ -2026,29 +2112,30 @@ async function buildEligibilityPayloads(d, clientId) {
     const eligId = det.id || s.id;
     if (!eligId) continue;
 
-    const answers = [];
+    // Questions & Answers - simple JSON array
+    const questions_answers = [];
     for (const it of det.items) {
       const q = (it.q || "").trim();
       const a = (it.a || "").trim();
       if (!q) continue;
-      const questionId = await uuidv5(eligId, "q|" + q);
-      const answerId = await uuidv5(eligId, "a|" + q);
-      answers.push({
-        answer_id: answerId,
-        answer_value: a,
-        value_string: a,
-        question: { question_id: questionId, question_primary_text: q },
-      });
+      questions_answers.push({ question: q, answer: a });
     }
 
     const payload = {
       eligibility_id: eligId,
       subject_id: clientId,
       performing_organization_name: s.org || "",
-      screen_source: s.form || "",
+      provider_name: s.submitter || "",  // from list table
       eligible_services: Array.isArray(det.results) ? det.results : [],
     };
-    if (answers.length) payload.answers = answers;
+    // Parse the list-table date to ISO (DRF rejects raw US-format dates).
+    if (s.date) {
+      const parsedDate = new Date(s.date);
+      if (!isNaN(parsedDate.getTime())) {
+        payload.screen_created_at = parsedDate.toISOString();
+      }
+    }
+    if (questions_answers.length) payload.questions_answers = questions_answers;
     if (/complete/i.test(s.status || "")) payload.eligible_status = "eligible";
     payloads.push(payload);
   }
@@ -2148,6 +2235,8 @@ const CASE_FIELD_LABELS = [
   ["AUTHORIZATION STATUS", "Authorization Status"],
   ["AUTHORIZED AMOUNT", "Authorized Amount"],
   ["AUTHORIZED SERVICE DELIVERY DATE(S)", "Service Delivery Dates"],
+  ["UNIT", "Unit"],
+  ["RATE", "Rate"],
   ["PROGRAM CAP", "Program Cap"],
   ["NOTES", "Notes"],
   ["UNITE US AUTHORIZATION ID", "Authorization ID"],
@@ -2392,12 +2481,15 @@ function buildCasePayloads(d, clientId) {
 
     const payload = {
       case_id: caseId,
+      subject_id: clientId,
       client_id: clientId,
+      // List "Service Type" → service_type; Detail "PROGRAM" → program_name
       service_type: f["SERVICE TYPE"] || c.service_type || "",
       program_name: f["PROGRAM"] || "",
       network_name: f["NETWORK"] || "",
       provider_name: f["ORGANIZATION"] || c.org || "",
       primary_worker_name: f["PRIMARY WORKER"] || "",
+      agent_code: agentCode || "",
       case_description: f["CASE DESCRIPTION"] || "",
       program_cap: f["PROGRAM CAP"] || "",
       authorization_note: f["NOTES"] || "",
@@ -2407,16 +2499,18 @@ function buildCasePayloads(d, clientId) {
       case_status: CASE_STATUS_MAP[(det.status || c.status || "").toUpperCase()] || "open",
     };
 
+    // "DATE OPENED" → date_opened (renamed from created_at)
     const opened = parseUSDate(f["DATE OPENED"] || c.date_opened);
-    if (opened) payload.user_entered_opened_date = opened;
-    const closed = parseUSDate(f["DATE CLOSED"]);
-    if (closed) payload.user_entered_closed_date = closed;
+    if (opened) payload.date_opened = opened;
+    // Note: case_closed_at comes from list view status, not detail DATE CLOSED
 
     const authStatus = AUTH_STATUS_MAP[(f["AUTHORIZATION STATUS"] || "").toUpperCase()];
     if (authStatus) payload.service_authorization_status = authStatus;
     if (f["AUTHORIZATION STATUS"]) payload.service_authorization_status_label = f["AUTHORIZATION STATUS"];
 
     if (f["AUTHORIZED AMOUNT"]) payload.authorized_amount = f["AUTHORIZED AMOUNT"];
+    if (f["UNIT"]) payload.authorized_unit = f["UNIT"];
+    if (f["RATE"]) payload.authorized_rate = f["RATE"];
 
     const sd = f["AUTHORIZED SERVICE DELIVERY DATE(S)"];
     if (sd) {
@@ -2638,7 +2732,7 @@ function buildClientPayload(ctx) {
   set("client_phone_number", cap.client_phone_number);
   set("phone_type", toEnum(cap.phone_type, ENUMS.phone_type));
   set("client_email_address", cap.client_email_address);
-  set("care_coordinator", cap.care_coordinator);
+  set("agent_code", cap.care_coordinator);  // Model field is agent_code
   const income = String(cap.gross_monthly_income || "").replace(/[^0-9.]/g, "");
   set("gross_monthly_income", income);
   const hh = String(cap.household_size || "").replace(/[^0-9]/g, "");
@@ -2647,14 +2741,21 @@ function buildClientPayload(ctx) {
   // Primary address (only when we captured something locatable).
   const a = {};
   const aset = (k, v) => { if (v) a[k] = v; };
-  aset("address_type", String(addr.address_type || "current").toLowerCase());
-  aset("line1", addr.line1);
-  aset("line2", addr.line2);
+  aset("type", String(addr.type || addr.address_type || "current").toLowerCase());
+  // Map line1/line2 to street (model changed from line1/line2 to street)
+  const street = [addr.line1, addr.line2].filter(Boolean).join(" ").trim();
+  aset("street", street || addr.street);
   aset("city", addr.city);
   aset("county", addr.county);
   aset("state", String(addr.state || "").toUpperCase());
-  aset("postal_code", addr.postal_code);
-  if (a.line1 || a.city || a.postal_code) payload.addresses = [a];
+  aset("zip", addr.postal_code || addr.zip);
+  if (a.street || a.city || a.zip) {
+    payload.addresses = [a];
+    console.log("Address added:", JSON.stringify(a));
+  }
+
+  // Debug: log the full payload
+  console.log("Client Payload:", JSON.stringify(payload, null, 2));
 
   // Insurance + Social Care Coverage both persist to the CRM Insurance table
   // (the only coverage model). Map capKey -> field. We send EVERY captured
@@ -3023,21 +3124,28 @@ function eformFamilyCount() {
   return null;
 }
 
-function eformPrimaryAddress() {
-  const a = currentContext && currentContext.captured && currentContext.captured.address;
-  if (a) return { street: a.line1 || "", city: a.city || "", state: a.state || "", zip: a.postal_code || "" };
-  return { street: "", city: "", state: "", zip: "" };
+// Total screening-call minutes captured from the "Screening Duration" Q&A
+// across the current client's screenings. Prefills the E-Form's Screening
+// duration field (the agent can still edit it). Null if none captured.
+function eformScreeningDuration() {
+  const d = screeningData;
+  if (!d || !Array.isArray(d.screenings)) return null;
+  if (currentContext && currentContext.client_id && d.clientId !== currentContext.client_id) return null;
+  let total = 0;
+  let found = false;
+  for (const s of d.screenings) {
+    const mins = screeningDurationMinutes(s);
+    if (mins > 0) {
+      total += mins;
+      found = true;
+    }
+  }
+  return found ? Math.round(total) : null;
 }
 
 function eformPreferredLanguage() {
   const c = currentContext && currentContext.captured && currentContext.captured.client;
   return (c && (c.preferred_spoken_language || c.preferred_written_language)) || "";
-}
-
-function eformAgentNote() {
-  return agentCode
-    ? "Prefilled from your saved Agent Code (set on the home screen)."
-    : "No Agent Code saved \u2014 set one from the home screen (Logout to change).";
 }
 
 // HTML builders -------------------------------------------------------------
@@ -3089,8 +3197,11 @@ function buildEform() {
   }
 
   const fam = eformFamilyCount();
-  const addr = eformPrimaryAddress();
   const lang = eformPreferredLanguage();
+  // Previously-saved client record (from the CRM lookup) used to prefill
+  // attestation + doctor fields so re-opening the form shows prior answers.
+  const prev = (typeof crm !== "undefined" && crm && crm.client) ? crm.client : {};
+  const attYesNo = prev.attestation_needed ? "Yes" : "No";
   const langSel = EFORM_LANGS.filter((l) => new RegExp(`\\b${l}\\b`, "i").test(lang));
   // Family iff more than one medicaid-enrolled member; default to "No" otherwise
   // (including when the count isn't found).
@@ -3102,7 +3213,7 @@ function buildEform() {
 
   html += efText("ef_lead_source", "Lead Source", { req: true, ph: "e.g. Street Team, Referral" });
 
-  html += efOptions("ef_is_family", "Is this a family?", ["Yes", "No"], {
+  html += efOptions("ef_is_a_family", "Is this a family?", ["Yes", "No"], {
     type: "radio",
     req: true,
     inline: true,
@@ -3118,13 +3229,6 @@ function buildEform() {
     number: true,
     value: fam != null ? String(fam) : "",
     note: fam != null ? "From the eligibility assessment." : "",
-  });
-
-  html += efOptions("ef_attestation", "Attestation Needed?", ["Yes", "No"], {
-    type: "radio",
-    req: true,
-    inline: true,
-    selected: ["No"],
   });
 
   html += efOptions("ef_channel", "Preferred Communication Channel", EFORM_CHANNELS, {
@@ -3148,66 +3252,87 @@ function buildEform() {
     note: lang ? `Captured preference: ${lang}` : "",
   });
 
-  html +=
-    `<div class="field" data-field="ef_delivery">` +
-    `<div class="subhead">` +
-    `<label class="field-label">Delivery Address <span class="req">*</span></label>` +
-    `<button type="button" class="link-btn" id="ef_addr_clear">Clear</button></div>` +
-    `<div class="addr-grid">` +
-    `<input class="full" type="text" id="ef_addr_street" placeholder="Street Address" value="${escapeHtml(addr.street)}" />` +
-    `<input type="text" id="ef_addr_city" placeholder="City" value="${escapeHtml(addr.city)}" />` +
-    `<input type="text" id="ef_addr_state" placeholder="State" value="${escapeHtml(addr.state)}" />` +
-    `<input class="full" type="text" id="ef_addr_zip" placeholder="Zip Code" value="${escapeHtml(addr.zip)}" /></div>` +
-    `<div class="field-note">Loaded from the client's primary address. Clear to enter a new delivery address.</div></div>`;
-
-  html += efText("ef_call_duration", "Phone call duration when finished with Eligibility (minutes)", {
-    req: true,
-    number: true,
-    ph: "Whole minutes",
-    note: "BEFORE STARTING NAVIGATION.",
-  });
+  // Call durations: one section label, three columns (Screening/Eligibility/Cases).
+  // Screening is prefilled from the captured "Screening Duration" Q&A (editable).
+  const scrDur = eformScreeningDuration();
+  const durInput = (id, value) =>
+    `<input type="number" id="${id}" inputmode="numeric" min="0" step="1" placeholder="0"` +
+    `${value != null ? ` value="${value}"` : ""} />`;
+  html += `<div class="field" data-field="ef_call_durations">` +
+    `<label class="field-label">Call Duration (Minutes):</label>` +
+    `<div class="dur-grid">` +
+    `<div class="dur-cell"><span class="dur-label">Screening</span>${durInput("ef_screening_call_duration", scrDur)}</div>` +
+    `<div class="dur-cell"><span class="dur-label">Eligibility</span>${durInput("ef_eligibility_call_duration")}</div>` +
+    `<div class="dur-cell"><span class="dur-label">Cases</span>${durInput("ef_cases_call_duration")}</div>` +
+    `</div>` +
+    (scrDur != null ? `<div class="field-note">Screening prefilled from the captured Screening Duration.</div>` : "") +
+    `</div>`;
 
   html += efOptions("ef_transfer", "Call Transfer Answered?", EFORM_TRANSFER, {
     type: "radio",
     req: true,
   });
 
-  html += efText("ef_agent_code", "Agent Code", {
+  // Attestation toggle placed last so the doctor fields it reveals appear
+  // right after it (no scrolling past other fields to see them).
+  html += efOptions("ef_attestation", "Attestation Needed?", ["Yes", "No"], {
+    type: "radio",
     req: true,
-    value: agentCode,
-    note: eformAgentNote(),
+    inline: true,
+    selected: [attYesNo],
   });
 
-  // Doctor/PCP Information Section
+  // Doctor/PCP Information Section - shown only when attestation is needed.
+  // Required iff attestation_needed=Yes; prefilled from the previous record.
+  const docReq = attYesNo === "Yes";
+  html += `<div id="ef_doctor_section" style="display:${docReq ? "block" : "none"};">`;
   html += "<hr/><h4>Doctor/PCP Information</h4>";
 
-  html += efText("ef_doctors_name", "Doctor Name", {
-    req: false,
+  html += efText("ef_doctor_name", "Doctor Name", {
+    req: docReq,
     ph: "Dr. Jane Smith",
+    value: prev.doctor_name || "",
   });
 
-  html += efText("ef_doctors_street_address", "Doctor Street Address", {
+  html += efText("ef_doctor_street", "Doctor Street Address", {
     req: false,
     ph: "123 Medical Plaza, Suite 100",
+    value: prev.doctor_street || "",
   });
 
-  html += efText("ef_doctors_phone", "Doctor Phone", {
-    req: false,
+  html += `<div class="field" data-field="ef_doctor_addr">` +
+    `<label class="field-label">Doctor City / State / Zip</label>` +
+    `<div class="addr-grid">` +
+    `<input type="text" id="ef_doctor_city" placeholder="City" value="${escapeHtml(prev.doctor_city || "")}" />` +
+    `<input type="text" id="ef_doctor_state" placeholder="State" maxlength="2" value="${escapeHtml(prev.doctor_state || "")}" />` +
+    `<input type="text" id="ef_doctor_zip" placeholder="Zip" maxlength="10" value="${escapeHtml(prev.doctor_zip || "")}" />` +
+    `</div></div>`;
+
+  // Phone / Fax / Email in a 2-column grid (matches the City/State/Zip row).
+  html += `<div class="field-grid-2">`;
+  html += efText("ef_doctor_phone", "Doctor Phone", {
+    req: docReq,
     ph: "(555) 123-4567",
     type: "tel",
+    value: prev.doctor_phone || "",
   });
 
-  html += efText("ef_doctors_fax", "Doctor Fax", {
+  html += efText("ef_doctor_fax", "Doctor Fax", {
     req: false,
     ph: "(555) 123-4568",
     type: "tel",
+    value: prev.doctor_fax || "",
   });
 
-  html += efText("ef_doctors_email", "Doctor Email", {
+  html += efText("ef_doctor_email", "Doctor Email", {
     req: false,
     ph: "doctor@clinic.com",
     type: "email",
+    value: prev.doctor_email || "",
   });
+  html += `</div>`;
+
+  html += `</div>`;
 
   form.innerHTML = html;
   updateEformSaveBtn();
@@ -3246,25 +3371,25 @@ function collectEform() {
   return {
     member_id: val("ef_member_id"),
     lead_source: val("ef_lead_source"),
-    is_family: eformChecked("ef_is_family")[0] || "",
+    is_a_family: eformChecked("ef_is_a_family")[0] || "",
     total_family_members: val("ef_total_family"),
     attestation_needed: eformChecked("ef_attestation")[0] || "",
     communication_channels: eformChecked("ef_channel"),
     communication_times: eformChecked("ef_time"),
     communication_languages: eformChecked("ef_language"),
-    delivery_street: val("ef_addr_street"),
-    delivery_city: val("ef_addr_city"),
-    delivery_state: val("ef_addr_state"),
-    delivery_zip: val("ef_addr_zip"),
-    call_duration_minutes: val("ef_call_duration"),
+    screening_call_duration_minutes: val("ef_screening_call_duration"),
+    eligibility_call_duration_minutes: val("ef_eligibility_call_duration"),
+    cases_call_duration_minutes: val("ef_cases_call_duration"),
     call_transfer: eformChecked("ef_transfer")[0] || "",
-    agent_code: val("ef_agent_code"),
     // Doctor/PCP Information
-    doctors_name: val("ef_doctors_name"),
-    doctors_street_address: val("ef_doctors_street_address"),
-    doctors_phone: val("ef_doctors_phone"),
-    doctors_fax: val("ef_doctors_fax"),
-    doctors_email: val("ef_doctors_email"),
+    doctor_name: val("ef_doctor_name"),
+    doctor_street: val("ef_doctor_street"),
+    doctor_city: val("ef_doctor_city"),
+    doctor_state: val("ef_doctor_state"),
+    doctor_zip: val("ef_doctor_zip"),
+    doctor_phone: val("ef_doctor_phone"),
+    doctor_fax: val("ef_doctor_fax"),
+    doctor_email: val("ef_doctor_email"),
   };
 }
 
@@ -3275,16 +3400,20 @@ function eformValidate(d) {
     if (!ok) missing.push(field);
   };
   need(d.lead_source, "ef_lead_source");
-  need(d.is_family, "ef_is_family");
+  need(d.is_a_family, "ef_is_a_family");
   need(d.total_family_members !== "", "ef_total_family");
   need(d.attestation_needed, "ef_attestation");
   need(d.communication_channels.length, "ef_channel");
   need(d.communication_times.length, "ef_time");
   need(d.communication_languages.length, "ef_language");
-  need(d.delivery_street && d.delivery_city && d.delivery_state && d.delivery_zip, "ef_delivery");
-  need(d.call_duration_minutes !== "", "ef_call_duration");
   need(d.call_transfer, "ef_transfer");
-  need(d.agent_code, "ef_agent_code");
+  // Note: call duration fields are optional
+  // When attestation_needed=Yes, only Doctor Name and Phone are required;
+  // the remaining doctor fields are shown but optional.
+  if (d.attestation_needed === "Yes") {
+    need(d.doctor_name, "ef_doctor_name");
+    need(d.doctor_phone, "ef_doctor_phone");
+  }
   return missing;
 }
 
@@ -3312,35 +3441,40 @@ function updateEformMeta() {
 
 function updateEformSaveBtn() {
   const btn = $("eformSaveBtn");
-  if (!btn) return;
+  const btnBottom = $("eformSaveBtnBottom");
+  if (!btn && !btnBottom) return;
   const cid = currentContext && currentContext.client_id;
   const missing = cid ? eformValidate(collectEform()) : ["*"];
-  btn.disabled = missing.length > 0;
-  btn.title = btn.disabled ? "Complete all required fields to save" : "Save E-Form";
+  const disabled = missing.length > 0;
+  const title = disabled ? "Complete all required fields to save" : "Save E-Form";
+  [btn, btnBottom].forEach((b) => {
+    if (!b) return;
+    b.disabled = disabled;
+    b.title = title;
+  });
 }
 
 // Respond to user edits: enforce integer-only fields, mark dirty, refresh state.
 function onEformChange(e) {
   const t = e && e.target;
-  if (t && (t.id === "ef_total_family" || t.id === "ef_call_duration")) {
+  if (t && (t.id === "ef_total_family" ||
+            t.id === "ef_screening_call_duration" ||
+            t.id === "ef_eligibility_call_duration" ||
+            t.id === "ef_cases_call_duration")) {
     const clean = t.value.replace(/[^0-9]/g, "");
     if (clean !== t.value) t.value = clean;
   }
+
+  // Show/hide doctor section based on attestation_needed
+  if (t && t.name === "ef_attestation") {
+    const doctorSection = $("ef_doctor_section");
+    if (doctorSection) {
+      doctorSection.style.display = t.value === "Yes" ? "block" : "none";
+    }
+  }
+
   eformDirty = true;
   updateEformSaveBtn();
-}
-
-function onEformClick(e) {
-  if (e.target && e.target.id === "ef_addr_clear") {
-    ["ef_addr_street", "ef_addr_city", "ef_addr_state", "ef_addr_zip"].forEach((id) => {
-      const el = $(id);
-      if (el) el.value = "";
-    });
-    eformDirty = true;
-    const s = $("ef_addr_street");
-    if (s) s.focus();
-    updateEformSaveBtn();
-  }
 }
 
 // Map the collected E-Form values onto the Client model shape for a PATCH.
@@ -3352,44 +3486,40 @@ function buildEformPayload(d) {
   const payload = {
     client_id: d.member_id,
     lead_source: d.lead_source,
-    is_family: isYes(d.is_family),
+    is_a_family: isYes(d.is_a_family),
     total_family_members: toInt(d.total_family_members),
     attestation_needed: isYes(d.attestation_needed),
     communication_channels: codes(d.communication_channels, EFORM_CHANNEL_CODES),
     preferred_communication_times: codes(d.communication_times, EFORM_TIME_CODES),
     preferred_languages: d.communication_languages.slice(),
-    call_duration_minutes: toInt(d.call_duration_minutes),
+    screening_call_duration_minutes: toInt(d.screening_call_duration_minutes),
+    eligibility_call_duration_minutes: toInt(d.eligibility_call_duration_minutes),
+    cases_call_duration_minutes: toInt(d.cases_call_duration_minutes),
     call_transfer_answered: EFORM_TRANSFER_CODES[d.call_transfer] || "",
-    agent_code: d.agent_code,
-    // Doctor/PCP Information
-    doctors_name: d.doctors_name || "",
-    doctors_street_address: d.doctors_street_address || "",
-    doctors_phone: d.doctors_phone || "",
-    doctors_fax: d.doctors_fax || "",
-    doctors_email: d.doctors_email || "",
-    crm_source: d.lead_source || "",  // Store lead source as crm_source
   };
 
-  // Delivery address -> nested upsert (address_type "delivery"). Flag whether it
-  // differs from the client's captured primary address.
-  const primary = eformPrimaryAddress();
-  const norm = (s) => String(s || "").trim().toLowerCase();
-  const sameAsPrimary =
-    norm(primary.street) === norm(d.delivery_street) &&
-    norm(primary.city) === norm(d.delivery_city) &&
-    norm(primary.state) === norm(d.delivery_state) &&
-    norm(primary.zip) === norm(d.delivery_zip);
-  payload.different_delivery_address = !sameAsPrimary;
-  payload.addresses = [
-    {
-      address_type: "delivery",
-      line1: d.delivery_street,
-      city: d.delivery_city,
-      state: (d.delivery_state || "").trim().toUpperCase(),
-      postal_code: d.delivery_zip,
-      is_active: true,
-    },
-  ];
+  // Doctor/PCP Information: only sent when attestation is needed; otherwise
+  // cleared so switching to "No" wipes any prior doctor data.
+  if (isYes(d.attestation_needed)) {
+    payload.doctor_name = d.doctor_name || "";
+    payload.doctor_street = d.doctor_street || "";
+    payload.doctor_city = d.doctor_city || "";
+    payload.doctor_state = (d.doctor_state || "").trim().toUpperCase();
+    payload.doctor_zip = d.doctor_zip || "";
+    payload.doctor_phone = d.doctor_phone || "";
+    payload.doctor_fax = d.doctor_fax || "";
+    payload.doctor_email = d.doctor_email || "";
+  } else {
+    payload.doctor_name = "";
+    payload.doctor_street = "";
+    payload.doctor_city = "";
+    payload.doctor_state = "";
+    payload.doctor_zip = "";
+    payload.doctor_phone = "";
+    payload.doctor_fax = "";
+    payload.doctor_email = "";
+  }
+
   return payload;
 }
 
@@ -3512,12 +3642,16 @@ async function validateClient() {
 function renderAgentTag() {
   const el = $("agentTag");
   const lo = $("logoutBtn");
+  // Prefer the validated agent (from /api/agents/login) for the displayed name.
+  const validatedName = agentAuth.isLoggedIn ? agentAuth.agentName : "";
   const user = agentUser;
   const hasUser = !!(user && (user.name || user.email));
   if (el) {
     const parts = [];
-    if (hasUser) parts.push(user.name || user.email);
+    if (validatedName) parts.push(validatedName);
+    else if (hasUser) parts.push(user.name || user.email);
     if (agentCode) parts.push(`#${agentCode}`);
+    if (agentAuth.isLoggedIn && agentAuth.agentGroup) parts.push(agentAuth.agentGroup);
     if (!parts.length) {
       el.classList.add("hidden");
       el.textContent = "";
@@ -3525,11 +3659,12 @@ function renderAgentTag() {
       el.textContent = parts.join("  \u00b7  ");
       el.classList.remove("hidden");
       el.classList.toggle("expired", hasUser && user.valid === false);
+      const agentPart = validatedName ? `Agent: ${validatedName} (${agentAuth.agentGroup || ""})` : "";
       const emailPart = hasUser && user.email ? ` <${user.email}>` : "";
       const statusPart = hasUser && user.valid === false ? " \u2014 session expired" : "";
-      const userPart = hasUser ? `Logged-in Unite Us user: ${user.name || ""}${emailPart}${statusPart}` : "";
+      const userPart = hasUser ? `Unite Us user: ${user.name || ""}${emailPart}${statusPart}` : "";
       const codePart = agentCode ? `Agent Code: ${agentCode}` : "";
-      el.title = [userPart, codePart].filter(Boolean).join(" \u00b7 ");
+      el.title = [agentPart, userPart, codePart].filter(Boolean).join(" \u00b7 ");
     }
   }
   // Logout is available whenever an Agent Code session is active.
@@ -3544,6 +3679,38 @@ async function loadAgent() {
     ]);
     agentUser = uw_uu_user || null;
     agentCode = uw_agent_code || "";
+    
+    // Load agent auth data
+    const { uw_agent_token, uw_agent_refresh_token, uw_agent_name, uw_agent_group, uw_agent_expires_at } = 
+      await chrome.storage.local.get([
+        "uw_agent_token",
+        "uw_agent_refresh_token",
+        "uw_agent_name",
+        "uw_agent_group",
+        "uw_agent_expires_at",
+      ]);
+    
+    if (uw_agent_token && uw_agent_expires_at) {
+      const expiresAt = new Date(uw_agent_expires_at).getTime();
+      const now = Date.now();
+      
+      if (expiresAt > now) {
+        // Token is still valid
+        agentAuth = {
+          token: uw_agent_token,
+          refreshToken: uw_agent_refresh_token || null,
+          agentName: uw_agent_name || null,
+          agentGroup: uw_agent_group || null,
+          expiresAt: expiresAt,
+          isLoggedIn: true,
+        };
+      } else {
+        // Token expired - clear it
+        await logout();
+        const msg = $("homeMsg");
+        if (msg) msg.textContent = "Session expired. Please log in again.";
+      }
+    }
   } catch (_) {}
   renderAgentTag();
   updateHomeOverlay();
@@ -3606,12 +3773,12 @@ function init() {
   $("caseRescanBtn").addEventListener("click", caseRescan);
   $("caseSaveBtn").addEventListener("click", saveCases);
   $("eformSaveBtn").addEventListener("click", saveEform);
+  $("eformSaveBtnBottom").addEventListener("click", saveEform);
   // Delegated on the form so listeners survive rebuilds of its inner markup.
   const eform = $("eformForm");
   if (eform) {
     eform.addEventListener("input", onEformChange);
     eform.addEventListener("change", onEformChange);
-    eform.addEventListener("click", onEformClick);
   }
   $("diagnosticBtn").addEventListener("click", runDiagnostic);
   $("copyReportBtn").addEventListener("click", copyReport);
@@ -3720,6 +3887,7 @@ function init() {
       }
       renderScreenings();
       renderComparison(currentContext); // keep the Profile snapshot in sync
+      refreshEformIfPristine(); // prefill Screening duration from the Q&A
     }
     // Eligibility auto-walk progress / results.
     if (area === "local" && changes.uw_eligibility) {

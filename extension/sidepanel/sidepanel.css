@@ -634,6 +634,16 @@ textarea.diag {
 .eform .opt input { width: auto; margin: 0; }
 .eform .addr-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
 .eform .addr-grid .full { grid-column: 1 / -1; }
+/* 2-column row of labeled fields (e.g. Doctor Phone/Fax). The 3rd item
+   (Email) spans both columns so it stays readable on the second row. */
+.eform .field-grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 0 14px; }
+.eform .field-grid-2 .field:nth-child(3) { grid-column: 1 / -1; }
+/* Call Duration (Minutes): three columns, each with its own small label. */
+.eform .dur-grid { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 8px; }
+.eform .dur-cell { display: flex; flex-direction: column; gap: 4px; }
+.eform .dur-label { font-size: 11.5px; font-weight: 500; color: var(--muted); }
+.eform .dur-cell input { width: 100%; }
+.eform-save-bottom { width: 100%; margin-top: 6px; padding: 10px; border-radius: 8px; }
 .eform .subhead { display: flex; align-items: center; justify-content: space-between; }
 .eform .link-btn {
   background: none;

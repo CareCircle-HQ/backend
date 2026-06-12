@@ -1,3 +1,5 @@
+import uuid
+
 from django.conf import settings
 from django.db import models
 
@@ -64,8 +66,11 @@ class PhoneType(models.TextChoices):
 
 class AddressType(models.TextChoices):
     CURRENT = "current", "Current"
+    HOME = "home", "Home"
+    WORK = "work", "Work"
     MAILING = "mailing", "Mailing"
     DELIVERY = "delivery", "Delivery"
+    TEMPORARY = "temporary", "Temporary"
 
 
 class USState(models.TextChoices):
@@ -240,145 +245,79 @@ def default_communication_time_of_day():
 class Client(models.Model):
     """A client/person ingested from the source system (Unite Us)."""
 
-    # --- Core Client Info ---
-    # Primary key is the source system's external_id (UUID string).
+    # --- Core Identification ---
     client_id = models.UUIDField(primary_key=True, editable=False)
-    created_by_id = models.UUIDField(null=True, blank=True)  # source agent id
-    created_by_name = models.CharField(max_length=255, blank=True)
-    created_at = models.DateTimeField(null=True, blank=True)  # source creation
-    updated_at = models.DateTimeField(null=True, blank=True)  # source last update
-    is_active = models.BooleanField(default=True)
-    crm_contact_id = models.CharField(max_length=64, blank=True, db_index=True)
-    # External CRM (GoHighLevel) push tracking. Temporary integration; see
-    # api.integrations.ghl. crm_sync_hash lets us skip redundant pushes.
-    crm_synced_at = models.DateTimeField(null=True, blank=True)
-    crm_sync_hash = models.CharField(max_length=64, blank=True)
-    last_synced_at = models.DateTimeField(auto_now=True)  # local ingest tracking
-    import_batch = models.ForeignKey(
-        "ImportBatch", on_delete=models.SET_NULL, null=True, blank=True,
-        related_name="clients",
-    )
-
-    # --- Personal Information ---
     first_name = models.CharField(max_length=120)
-    middle_name = models.CharField(max_length=120, blank=True)
     last_name = models.CharField(max_length=120)
-    suffix = models.CharField(max_length=20, blank=True)
-    title = models.CharField(max_length=20, blank=True)
     date_of_birth = models.DateField(null=True, blank=True)  # PII
-    gender = models.CharField(
-        max_length=20, choices=Gender.choices, blank=True
-    )
-    sexuality = models.CharField(max_length=50, blank=True)
-    sexuality_other = models.CharField(max_length=120, blank=True)
-    race = models.CharField(max_length=100, blank=True)
-    ethnicity = models.CharField(max_length=100, blank=True)
-    marital_status = models.CharField(
-        max_length=20, choices=MaritalStatus.choices, blank=True
-    )
-    citizenship = models.CharField(max_length=100, blank=True)
-    time_zone = models.CharField(max_length=64, default="America/New_York")
-    enrollment_from = models.CharField(max_length=120, default="Unite Us")
-    lead_source = models.CharField(max_length=120, blank=True)
+    client_phone_number = models.CharField(max_length=30, blank=True)  # PII
+    phone_type = models.CharField(max_length=20, blank=True)  # mobile/home/work
+    client_email_address = models.EmailField(blank=True)  # PII
+    consent_accepted = models.BooleanField(default=False)
+    consent_status = models.CharField(max_length=20, blank=True)  # E-form: accepted/declined
+    consented_at = models.DateTimeField(null=True, blank=True)
+    consent_doc_url = models.URLField(blank=True)
 
-    # --- Program Eligibility & Referral (multi-select) ---
-    # Lists of ServiceType values; validated in the serializer.
-    eligible_for = models.JSONField(default=list, blank=True)
-    referred_for = models.JSONField(default=list, blank=True)
+    # --- CRM Sync (External - GoHighLevel) ---
+    crm_contact_id = models.CharField(max_length=64, blank=True, db_index=True)
+    crm_sync_hash = models.CharField(max_length=64, blank=True)
+    crm_synced_at = models.DateTimeField(null=True, blank=True)
 
-    # --- Family / Household flags ---
-    is_family = models.BooleanField(default=False)
-    total_family_members = models.PositiveIntegerField(
-        null=True, blank=True
-    )  # includes the primary client
+    # --- Metadata ---
+    created_at = models.DateTimeField(null=True, blank=True)
+    updated_at = models.DateTimeField(null=True, blank=True)
 
-    # --- Attestation & Delivery ---
-    attestation_needed = models.BooleanField(default=False)
-    different_delivery_address = models.BooleanField(default=False)
+    # --- Demographics ---
+    gender = models.CharField(max_length=20, blank=True)  # male/female/other/unknown
+    marital_status = models.CharField(max_length=20, blank=True)  # single/married/divorced/widowed
+    race = models.CharField(max_length=80, blank=True)  # E-form
+    ethnicity = models.CharField(max_length=80, blank=True)  # E-form
+    sexuality = models.CharField(max_length=80, blank=True)  # E-form
+    education = models.CharField(max_length=50, blank=True)  # high school, college, etc.
+    language = models.CharField(max_length=50, blank=True)  # Primary language (English, Spanish, etc.)
+    preferred_spoken_language = models.CharField(max_length=50, blank=True)  # E-form
+    preferred_written_language = models.CharField(max_length=50, blank=True)  # E-form
+    employment_status = models.CharField(max_length=1, blank=True)  # Enum
+    household_size = models.PositiveSmallIntegerField(null=True, blank=True)
+    household_income_range = models.CharField(max_length=2, blank=True)  # Enum
 
-    # --- Agent / Call Tracking ---
-    agent_code = models.CharField(max_length=64, blank=True, db_index=True)
-    call_duration_minutes = models.PositiveIntegerField(
-        null=True, blank=True
-    )  # length of the eligibility phone call, in minutes
+    # --- Program Fields (from E-Form) ---
+    screening_call_duration_minutes = models.PositiveIntegerField(null=True, blank=True)
+    eligibility_call_duration_minutes = models.PositiveIntegerField(null=True, blank=True)
+    cases_call_duration_minutes = models.PositiveIntegerField(null=True, blank=True)
     call_transfer_answered = models.CharField(
         max_length=30, choices=CallTransferStatus.choices, blank=True
     )
+    preferred_contact_method = models.CharField(max_length=1, blank=True)  # Enum
+    communication_channels = models.JSONField(default=list, blank=True)  # Array of codes
+    preferred_communication_times = models.JSONField(default=list, blank=True)  # Array of codes
+    preferred_languages = models.JSONField(default=list, blank=True)  # Array of codes
+    agent_code = models.CharField(max_length=60, blank=True)
+    agent_name = models.CharField(max_length=255, blank=True)
+    lead_source = models.CharField(max_length=80, blank=True)
+    is_a_family = models.BooleanField(default=False)
+    total_family_members = models.PositiveSmallIntegerField(null=True, blank=True)
+    attestation_needed = models.BooleanField(default=False)
 
-    # --- Consent ---
-    consent_status = models.CharField(
-        max_length=20, choices=ConsentStatus.choices, default=ConsentStatus.PENDING
-    )
-    consented_at = models.DateTimeField(null=True, blank=True)
+    # --- Doctor Information (shown only if attestation_needed=True) ---
+    doctor_name = models.CharField(max_length=255, blank=True)
+    doctor_street = models.CharField(max_length=255, blank=True)
+    doctor_city = models.CharField(max_length=120, blank=True)
+    doctor_state = models.CharField(max_length=2, blank=True)
+    doctor_zip = models.CharField(max_length=10, blank=True)
+    doctor_phone = models.CharField(max_length=30, blank=True)
+    doctor_fax = models.CharField(max_length=30, blank=True)
+    doctor_email = models.EmailField(blank=True)
 
-    # --- Lifecycle (acquisition funnel) ---
-    # Auto-derived from synced data; see api.services.lifecycle.
-    lifecycle_stage = models.CharField(
-        max_length=20, choices=ClientStage.choices, default=ClientStage.LEAD,
-        db_index=True,
-    )
-    lifecycle_stage_at = models.DateTimeField(null=True, blank=True)
-
-    # --- Household & Income ---
-    gross_monthly_income = models.DecimalField(
-        max_digits=10, decimal_places=2, null=True, blank=True
-    )
-    household_size = models.PositiveIntegerField(null=True, blank=True)
-    adults_in_household = models.PositiveIntegerField(null=True, blank=True)
-    children_in_household = models.PositiveIntegerField(null=True, blank=True)
-
-    # --- Communication Preferences ---
-    preferred_communication_method = models.CharField(
-        max_length=20, choices=CommunicationChannel.choices, blank=True
-    )
-    preferred_communication_time_of_day = models.JSONField(
-        default=default_communication_time_of_day, blank=True
-    )
-    preferred_spoken_language = models.CharField(max_length=80, blank=True)
-    preferred_written_language = models.CharField(max_length=80, blank=True)
-    communication_channel = models.CharField(
-        max_length=20, choices=CommunicationChannel.choices, blank=True
-    )
-    # E-Form (enrollment intake) multi-selects. Lists rather than the single
-    # fields above because the form allows choosing several values.
-    # communication_channels: CommunicationChannel codes (e.g. ["phone", "text"]).
-    # preferred_communication_times: CommunicationTimeOfDay codes (a flat list,
-    #   distinct from the per-weekday preferred_communication_time_of_day above).
-    # preferred_languages: free-text language labels (e.g. ["English", "Spanish"]).
-    communication_channels = models.JSONField(default=list, blank=True)
-    preferred_communication_times = models.JSONField(default=list, blank=True)
-    preferred_languages = models.JSONField(default=list, blank=True)
-
-    # --- Contact Information (primary) ---
-    phone_type = models.CharField(
-        max_length=10, choices=PhoneType.choices, default=PhoneType.MOBILE, blank=True
-    )
-    client_phone_number = models.CharField(max_length=32, blank=True)  # PII
-    client_email_address = models.EmailField(blank=True)  # PII
-
-    # --- Doctor/PCP Information (from enrollment form) ---
-    doctors_name = models.CharField(max_length=255, blank=True)
-    doctors_street_address = models.CharField(max_length=255, blank=True)
-    doctors_phone = models.CharField(max_length=32, blank=True)
-    doctors_fax = models.CharField(max_length=32, blank=True)
-    doctors_email = models.EmailField(blank=True)
-
-    # --- Care Coordination ---
-    care_coordinator = models.CharField(max_length=255, blank=True)
-    care_coordinator_status = models.CharField(max_length=80, blank=True)
-
-    # --- CRM Sync Tracking (External - GoHighLevel) ---
-    crm_source = models.CharField(max_length=120, blank=True)  # Source from enrollment form
-    crm_sync_hash = models.CharField(max_length=64, blank=True)
-    crm_synced_at = models.DateTimeField(null=True, blank=True)
+    # --- Eligibility & Referral ---
+    elegible_programs = models.JSONField(default=list, blank=True)  # From screening
+    referred_for = models.JSONField(default=list, blank=True)  # From eligibility
 
     class Meta:
         ordering = ["last_name", "first_name"]
         indexes = [
             models.Index(fields=["last_name", "first_name"]),
             models.Index(fields=["date_of_birth"]),
-            models.Index(fields=["created_by_id"]),
-            models.Index(fields=["is_active"]),
         ]
 
     def __str__(self):
@@ -422,36 +361,30 @@ class MilitaryProfile(models.Model):
 
 
 class Address(models.Model):
-    """Normalized address. Supports current + mailing, with active/history tracking."""
+    """Normalized address. Supports current + delivery types per profile.md."""
 
     client = models.ForeignKey(
         Client, on_delete=models.CASCADE, related_name="addresses"
     )
-    address_type = models.CharField(
-        max_length=10, choices=AddressType.choices, default=AddressType.CURRENT
+    type = models.CharField(
+        max_length=20, choices=AddressType.choices, default=AddressType.CURRENT
     )
-    is_mailing_address = models.BooleanField(default=False)
-    line1 = models.CharField(max_length=255, blank=True)  # PII
-    line2 = models.CharField(max_length=255, blank=True)  # PII
+    street = models.CharField(max_length=255, blank=True)  # PII
     city = models.CharField(max_length=120, blank=True)
-    county = models.CharField(max_length=120, blank=True)
-    postal_code = models.CharField(max_length=10, blank=True)
-    state = models.CharField(max_length=2, choices=USState.choices, blank=True)
-    is_active = models.BooleanField(default=True)
-    added_by_name = models.CharField(max_length=255, blank=True)
-    validated = models.BooleanField(default=False)
+    state = models.CharField(max_length=2, blank=True)
+    zip = models.CharField(max_length=10, blank=True)
     created_at = models.DateTimeField(null=True, blank=True)
     updated_at = models.DateTimeField(null=True, blank=True)
 
     class Meta:
-        ordering = ["-is_active", "address_type"]
+        ordering = ["type"]
         indexes = [
-            models.Index(fields=["client", "address_type", "is_active"]),
-            models.Index(fields=["postal_code"]),
+            models.Index(fields=["client", "type"]),
+            models.Index(fields=["zip"]),
         ]
 
     def __str__(self):
-        return f"{self.get_address_type_display()} address for {self.client_id}"
+        return f"{self.get_type_display()} address for {self.client_id}"
 
 
 class Insurance(models.Model):
@@ -633,13 +566,10 @@ class Case(models.Model):
 
     # --- Core Case Information ---
     case_id = models.UUIDField(primary_key=True, editable=False)  # source external_id
+    subject_id = models.UUIDField(db_index=True, null=True, blank=True)  # source client reference
     client = models.ForeignKey(
         Client, on_delete=models.CASCADE, related_name="cases"
     )
-    # Denormalized client snapshot (as received at case creation).
-    client_first_name = models.CharField(max_length=120, blank=True)
-    client_last_name = models.CharField(max_length=120, blank=True)
-    client_dob = models.DateField(null=True, blank=True)  # PII/PHI
     previous_case = models.ForeignKey(
         "self",
         on_delete=models.SET_NULL,
@@ -649,15 +579,13 @@ class Case(models.Model):
     )
     created_by_id = models.UUIDField(null=True, blank=True)  # source agent id
     created_by_name = models.CharField(max_length=255, blank=True)
-    created_at = models.DateTimeField(null=True, blank=True)  # source creation
+    date_opened = models.DateTimeField(null=True, blank=True)  # Date Opened from Unite Us
     updated_at = models.DateTimeField(null=True, blank=True)  # source last update
 
     # Product (model to be defined later) - placeholder reference for now.
     product_id = models.UUIDField(null=True, blank=True)
 
     # --- Case Dates & Timeline ---
-    user_entered_opened_date = models.DateField(null=True, blank=True)
-    user_entered_closed_date = models.DateField(null=True, blank=True)
     ar_submitted_on = models.DateTimeField(null=True, blank=True)
     case_processed_at = models.DateTimeField(null=True, blank=True)
     case_managed_at = models.DateTimeField(null=True, blank=True)
@@ -702,20 +630,18 @@ class Case(models.Model):
         blank=True,
         related_name="cases",
     )
-    program_name = models.CharField(max_length=255, blank=True)
+    # service_type = Service Type from list view / Service Type from detail
 
     # --- Case Assignment ---
     primary_worker_id = models.UUIDField(null=True, blank=True)
     primary_worker_name = models.CharField(max_length=255, blank=True)
-    care_coordinator = models.CharField(max_length=255, blank=True)
-    care_coordinator_status = models.CharField(max_length=80, blank=True)
+    agent_code = models.CharField(max_length=60, blank=True)  # Agent code from E-form / care coordinator
 
     # --- Service Information ---
-    # service_type/subtype come from the Unite Us taxonomy (180+ values); the
-    # upcoming Product/Service model will own the canonical list, so kept as
-    # indexed text here rather than a fixed enum.
-    service_type = models.CharField(max_length=120, blank=True, db_index=True)
-    service_subtype = models.CharField(max_length=120, blank=True)
+    # Service Type from list view (what we called program_name before)
+    service_type = models.CharField(max_length=255, blank=True, db_index=True)
+    # Program Name from detail view (what we called service_subtype before)
+    program_name = models.CharField(max_length=255, blank=True)
 
     # --- Outcome Information ---
     outcome_id = models.UUIDField(null=True, blank=True)
@@ -739,6 +665,8 @@ class Case(models.Model):
     # Free text: usually a dollar amount (e.g. "$8,736.00") but can also be a
     # unit/time description (e.g. "20 units (293-307 minutes)").
     authorized_amount = models.CharField(max_length=120, blank=True)
+    authorized_unit = models.CharField(max_length=80, blank=True)  # Unit from authorization
+    authorized_rate = models.CharField(max_length=80, blank=True)  # Rate from authorization
     program_cap = models.TextField(blank=True)
     authorization_note = models.TextField(blank=True)
 
@@ -751,15 +679,8 @@ class Case(models.Model):
     crm_sync_hash = models.CharField(max_length=64, blank=True)
     crm_synced_at = models.DateTimeField(null=True, blank=True)
 
-    # --- Export Metadata ---
-    export_provider_role = models.CharField(max_length=80, blank=True)
-    import_batch = models.ForeignKey(
-        "ImportBatch", on_delete=models.SET_NULL, null=True, blank=True,
-        related_name="cases",
-    )
-
     class Meta:
-        ordering = ["-created_at"]
+        ordering = ["-date_opened"]
         indexes = [
             models.Index(fields=["client", "case_status"]),
             models.Index(fields=["provider"]),
@@ -910,118 +831,49 @@ class Screening(models.Model):
 
     # --- Core Screening Information ---
     enhanced_screen_id = models.UUIDField(primary_key=True, editable=False)
-    # subject_id is the source's client reference; mapped to `client` FK on import.
     subject_id = models.UUIDField(db_index=True)
-    subject_type = models.CharField(max_length=50, blank=True)
     client = models.ForeignKey(
         Client, on_delete=models.SET_NULL, null=True, blank=True,
         related_name="screenings",
-    )  # mapped from subject_id during import
-    active_screen = models.BooleanField(default=True)
-    assigned_at = models.DateTimeField(null=True, blank=True)
-    assigned_to_id = models.UUIDField(null=True, blank=True)
+    )
     screen_created_at = models.DateTimeField(null=True, blank=True)
-    screen_updated_at = models.DateTimeField(null=True, blank=True)
     screen_status = models.CharField(
         max_length=50, blank=True  # Free-form: complete, in_progress, pending, etc.
     )
-    screen_status_at = models.DateTimeField(null=True, blank=True)
     screen_type = models.CharField(
         max_length=120, blank=True  # Free-form: HM #3, SCN, PHS, etc.
     )
     screen_source = models.CharField(max_length=120, blank=True)
-    parent_screen = models.ForeignKey(
-        "self", on_delete=models.SET_NULL, null=True, blank=True,
-        related_name="child_screens",
-    )
-    related_screen = models.ForeignKey(
-        "self", on_delete=models.SET_NULL, null=True, blank=True,
-        related_name="related_to_screens",
-    )
-    case = models.ForeignKey(
-        Case, on_delete=models.SET_NULL, null=True, blank=True,
-        related_name="screenings",
-    )
-    template = models.ForeignKey(
-        ScreenTemplate, on_delete=models.SET_NULL, null=True, blank=True,
-        related_name="screenings",
-    )
 
-    # --- Client Snapshot ---
-    client_first_name = models.CharField(max_length=120, blank=True)
-    client_last_name = models.CharField(max_length=120, blank=True)
-    client_dob = models.DateField(null=True, blank=True)  # PII/PHI
-
-    # --- Screening Timing & Activity ---
-    duration = models.PositiveIntegerField(null=True, blank=True)  # seconds
-    facilitator_id = models.UUIDField(null=True, blank=True)
-    facilitator_type = models.CharField(max_length=50, blank=True)
-    provider_id = models.UUIDField(null=True, blank=True)
+    # --- Provider Info ---
     provider_name = models.CharField(max_length=255, blank=True)
     performing_organization_name = models.CharField(max_length=255, blank=True)
-    outreach_count = models.PositiveIntegerField(default=0)
-    outreach_status = models.CharField(
-        max_length=20, choices=OutreachStatus.choices, blank=True
-    )
 
-    # --- Decline / Outreach Details ---
-    decline_note = models.TextField(blank=True)
-    decline_reason_id = models.UUIDField(null=True, blank=True)
-    decline_primary_text = models.CharField(max_length=255, blank=True)
-    decline_secondary_text = models.CharField(max_length=255, blank=True)
-    decline_reason_key = models.CharField(max_length=120, blank=True)
+    # --- Screening Content ---
+    duration = models.PositiveIntegerField(null=True, blank=True)  # seconds
+    questions_answers = models.JSONField(default=list, blank=True)  # [{question, answer}]
+    identified_social_needs = models.JSONField(default=list, blank=True)  # [needs from screening]
 
-    # --- Communication & Interpreter ---
-    interpreter_id = models.UUIDField(null=True, blank=True)
-    interpreter_type = models.CharField(max_length=50, blank=True)
-    language = models.CharField(max_length=80, blank=True)
-
-    # --- Consent & Risk Scoring ---
-    consent = models.BooleanField(null=True, blank=True)
-    consent_code = models.CharField(max_length=80, blank=True)
-    interpersonal_safety_riskscore = models.FloatField(null=True, blank=True)  # PHI
-    interpersonal_safety_interpretation = models.CharField(max_length=255, blank=True)
-
-    # --- Clinical Coding ---
-    screen_snomed_codes = models.JSONField(default=list, blank=True)
-    screen_icd10_codes = models.JSONField(default=list, blank=True)
-    clinical_code_classification = models.CharField(max_length=120, blank=True)
-    verified_clinical_code = models.CharField(max_length=50, blank=True)
-    verified_clinical_code_description = models.CharField(max_length=255, blank=True)
-
-    # --- Eligibility ---
+    # --- Eligibility (if applicable) ---
     eligible_status = models.CharField(max_length=50, blank=True)
     eligible_services = models.JSONField(default=list, blank=True)
 
-    # --- Verification ---
-    verified_at = models.DateTimeField(null=True, blank=True)
-    verified_by_id = models.UUIDField(null=True, blank=True)
-    verified_by_type = models.CharField(max_length=50, blank=True)
-
-    # --- Sensitivity Flags ---
-    is_case_sensitive = models.BooleanField(default=False)
-
-    # --- CRM Sync Tracking (External - GoHighLevel Opportunity) ---
+    # --- CRM Sync Tracking ---
     crm_opportunity_id = models.CharField(max_length=64, blank=True, db_index=True)
     crm_sync_hash = models.CharField(max_length=64, blank=True)
     crm_synced_at = models.DateTimeField(null=True, blank=True)
 
-    # --- Filtering & Metadata (ETL) ---
-    filter_date = models.DateField(null=True, blank=True)
-    import_batch = models.ForeignKey(
-        "ImportBatch", on_delete=models.SET_NULL, null=True, blank=True,
-        related_name="screenings",
-    )
+    # --- Metadata ---
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:
         ordering = ["-screen_created_at"]
         indexes = [
             models.Index(fields=["subject_id"]),
             models.Index(fields=["client", "screen_status"]),
-            models.Index(fields=["case"]),
             models.Index(fields=["screen_status"]),
             models.Index(fields=["screen_type"]),
-            models.Index(fields=["template"]),
         ]
 
     def __str__(self):
@@ -1029,111 +881,43 @@ class Screening(models.Model):
 
 
 class Eligibility(models.Model):
-    """An eligibility assessment for a subject (client).
+    """An eligibility assessment for a subject (client)."""
 
-    Structurally the same shape as a Screening, but stored separately because
-    eligibility assessments are a distinct record type. Import routing uses the
-    source ``screen_type`` to decide between Screening and Eligibility.
-    """
-
-    # source enhanced_screen_id of the assessment
+    # --- Core Information ---
     eligibility_id = models.UUIDField(primary_key=True, editable=False)
     subject_id = models.UUIDField(db_index=True)  # source client reference
-    subject_type = models.CharField(max_length=50, blank=True)
     client = models.ForeignKey(
         Client, on_delete=models.SET_NULL, null=True, blank=True,
         related_name="eligibilities",
-    )  # mapped from subject_id during import
-    case = models.ForeignKey(
-        Case, on_delete=models.SET_NULL, null=True, blank=True,
-        related_name="eligibilities",
     )
-    active_screen = models.BooleanField(default=True)
-    assigned_at = models.DateTimeField(null=True, blank=True)
-    assigned_to_id = models.UUIDField(null=True, blank=True)
     screen_created_at = models.DateTimeField(null=True, blank=True)
-    screen_updated_at = models.DateTimeField(null=True, blank=True)
-    screen_status = models.CharField(
-        max_length=20, choices=ScreenStatus.choices, blank=True
-    )
-    screen_status_at = models.DateTimeField(null=True, blank=True)
-    screen_type = models.CharField(
-        max_length=20, choices=ScreenType.choices, blank=True
-    )
-    screen_source = models.CharField(max_length=120, blank=True)
+    eligible_status = models.CharField(max_length=50, blank=True)  # e.g., "Eligible", "Not Eligible"
 
-    # --- Client Snapshot ---
-    client_first_name = models.CharField(max_length=120, blank=True)
-    client_last_name = models.CharField(max_length=120, blank=True)
-    client_dob = models.DateField(null=True, blank=True)  # PII/PHI
+    # --- Provider Info ---
+    provider_name = models.CharField(max_length=255, blank=True)  # submitter from Unite Us
+    performing_organization_name = models.CharField(max_length=255, blank=True)  # org from Unite Us
 
-    # --- Timing & Activity ---
-    duration = models.PositiveIntegerField(null=True, blank=True)
-    facilitator_id = models.UUIDField(null=True, blank=True)
-    facilitator_type = models.CharField(max_length=50, blank=True)
-    provider_id = models.UUIDField(null=True, blank=True)
-    provider_name = models.CharField(max_length=255, blank=True)
-    performing_organization_name = models.CharField(max_length=255, blank=True)
-    outreach_count = models.PositiveIntegerField(default=0)
-    outreach_status = models.CharField(
-        max_length=20, choices=OutreachStatus.choices, blank=True
-    )
+    # --- Eligibility Content ---
+    # Duration from E-form: "BEFORE STARTING NAVIGATION - What is the duration of the phone call?"
+    duration = models.PositiveIntegerField(null=True, blank=True)  # seconds
+    questions_answers = models.JSONField(default=list, blank=True)  # [{question, answer}] from Unite Us
+    eligible_services = models.JSONField(default=list, blank=True)  # ["Medicaid", "SNAP", etc.]
 
-    # --- Decline / Outreach ---
-    decline_note = models.TextField(blank=True)
-    decline_reason_id = models.UUIDField(null=True, blank=True)
-    decline_primary_text = models.CharField(max_length=255, blank=True)
-    decline_secondary_text = models.CharField(max_length=255, blank=True)
-    decline_reason_key = models.CharField(max_length=120, blank=True)
-
-    # --- Communication & Interpreter ---
-    interpreter_id = models.UUIDField(null=True, blank=True)
-    interpreter_type = models.CharField(max_length=50, blank=True)
-    language = models.CharField(max_length=80, blank=True)
-
-    # --- Consent & Risk Scoring ---
-    consent = models.BooleanField(null=True, blank=True)
-    consent_code = models.CharField(max_length=80, blank=True)
-    interpersonal_safety_riskscore = models.FloatField(null=True, blank=True)  # PHI
-    interpersonal_safety_interpretation = models.CharField(max_length=255, blank=True)
-
-    # --- Clinical Coding ---
-    screen_snomed_codes = models.JSONField(default=list, blank=True)
-    screen_icd10_codes = models.JSONField(default=list, blank=True)
-    clinical_code_classification = models.CharField(max_length=120, blank=True)
-    verified_clinical_code = models.CharField(max_length=50, blank=True)
-    verified_clinical_code_description = models.CharField(max_length=255, blank=True)
-
-    # --- Eligibility ---
-    eligible_status = models.CharField(max_length=50, blank=True)
-    eligible_services = models.JSONField(default=list, blank=True)
-
-    # --- Verification ---
-    verified_at = models.DateTimeField(null=True, blank=True)
-    verified_by_id = models.UUIDField(null=True, blank=True)
-    verified_by_type = models.CharField(max_length=50, blank=True)
-
-    # --- CRM Sync Tracking (External - GoHighLevel Opportunity) ---
+    # --- CRM Sync Tracking ---
     crm_opportunity_id = models.CharField(max_length=64, blank=True, db_index=True)
     crm_sync_hash = models.CharField(max_length=64, blank=True)
     crm_synced_at = models.DateTimeField(null=True, blank=True)
 
-    # --- Sensitivity & Metadata ---
-    is_case_sensitive = models.BooleanField(default=False)
-    filter_date = models.DateField(null=True, blank=True)
-    import_batch = models.ForeignKey(
-        "ImportBatch", on_delete=models.SET_NULL, null=True, blank=True,
-        related_name="eligibilities",
-    )
+    # --- Metadata ---
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:
         ordering = ["-screen_created_at"]
         verbose_name_plural = "eligibilities"
         indexes = [
             models.Index(fields=["subject_id"]),
-            models.Index(fields=["client", "screen_status"]),
-            models.Index(fields=["case"]),
-            models.Index(fields=["eligible_status"]),
+            models.Index(fields=["client", "eligible_status"]),
         ]
 
     def __str__(self):
@@ -1268,7 +1052,7 @@ class IdentifiedSocialNeed(models.Model):
 
     identified_social_need_id = models.UUIDField(primary_key=True, editable=False)
     screening = models.ForeignKey(
-        Screening, on_delete=models.CASCADE, related_name="identified_social_needs"
+        Screening, on_delete=models.CASCADE, related_name="social_needs_set"
     )
     identified_social_need_code = models.CharField(max_length=80, blank=True)
     identified_social_need_name = models.CharField(max_length=255, blank=True)
@@ -1629,3 +1413,63 @@ class StageEvent(models.Model):
     def __str__(self):
         ref = self.enrollment_id or self.client_id
         return f"{self.entity_type} {ref}: {self.from_stage or '-'} -> {self.to_stage}"
+
+
+class Agent(models.Model):
+    """Agent/Employee who uses the extension system. Validated by agent code."""
+
+    AGENT_GROUPS = [
+        ("Screeners", "Screeners"),
+        ("Verifiers", "Verifiers"),
+        ("Management", "Management"),
+        ("CS", "CS"),
+    ]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    name = models.CharField(max_length=255)
+    agent_code = models.CharField(max_length=20, unique=True, db_index=True)
+    group = models.CharField(max_length=50, choices=AGENT_GROUPS, default="Screeners")
+    status = models.CharField(max_length=20, default="Active")
+    cbo = models.CharField(max_length=255, blank=True, default="Met Council")
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["name"]
+        indexes = [
+            models.Index(fields=["agent_code", "status"]),
+            models.Index(fields=["group", "status"]),
+        ]
+
+    def __str__(self):
+        return f"{self.name} ({self.agent_code}) - {self.group}"
+
+
+class ProgramPipeline(models.Model):
+    """Maps a source Program Name to the GHL pipeline a case should sync to.
+
+    Cases are routed to a GHL opportunity pipeline by looking up the case's
+    ``program_name`` here. The authoritative routing value is ``pipeline_id``
+    (the ``pipeline_name`` column in the source data has typos and is for human
+    reference only). The category columns support a fallback when a case's
+    program name is not found in this table.
+    """
+
+    program_name = models.CharField(max_length=255, unique=True, db_index=True)
+    main_category = models.CharField(max_length=120, blank=True)
+    # ELIGIBILITY / NAVIGATION / Internal Services / External Services, etc.
+    case_category = models.CharField(max_length=120, blank=True, db_index=True)
+    services_category = models.CharField(max_length=120, blank=True)
+    pipeline_name = models.CharField(max_length=120, blank=True)  # human label
+    pipeline_id = models.CharField(max_length=64)  # authoritative GHL pipeline id
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["program_name"]
+        indexes = [
+            models.Index(fields=["case_category"]),
+        ]
+
+    def __str__(self):
+        return f"{self.program_name} -> {self.pipeline_name} ({self.pipeline_id})"

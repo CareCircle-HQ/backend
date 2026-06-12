@@ -98,14 +98,14 @@ def _agent_code_external_services(client):
 
 def _assigned_agent_attestation_requested(client):
     """Agent assigned when attestation was requested."""
-    return client.care_coordinator
+    return client.agent_code
 
 
 def _assigned_agent_attestation_complete(client):
     """Agent who completed attestation."""
-    # Same as care_coordinator if consent accepted
+    # Same as agent_code if consent accepted
     if client.consent_status == "accepted":
-        return client.care_coordinator
+        return client.agent_code
     return None
 
 
@@ -210,8 +210,10 @@ def _member_status(client):
 
 def _final_verification_status(client):
     """Overall verification status based on screenings."""
-    # Aggregate from related screenings
-    verified_screenings = client.screenings.filter(verified_at__isnull=False).exists()
+    # Aggregate from related screenings (verified_at was removed; use status)
+    verified_screenings = client.screenings.filter(
+        screen_status__iexact="complete"
+    ).exists()
     return "Complete" if verified_screenings else "Pending"
 
 

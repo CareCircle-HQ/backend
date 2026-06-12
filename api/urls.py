@@ -19,6 +19,7 @@ from .views import (
     RegisterView,
     ScreeningViewSet,
 )
+from .views_agent import AgentLoginView, AgentValidateView
 
 router = DefaultRouter()
 router.register("clients", ClientViewSet, basename="client")
@@ -36,6 +37,9 @@ urlpatterns = [
     path("auth/token/", TokenObtainPairView.as_view(), name="token_obtain_pair"),
     path("auth/token/refresh/", TokenRefreshView.as_view(), name="token_refresh"),
     path("auth/token/verify/", TokenVerifyView.as_view(), name="token_verify"),
+    # Agent validation & login
+    path("agents/validate/", AgentValidateView.as_view(), name="agent-validate"),
+    path("agents/login/", AgentLoginView.as_view(), name="agent-login"),
     # User
     path("me/", MeView.as_view(), name="me"),
     # Misc

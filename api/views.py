@@ -104,18 +104,49 @@ class ClientViewSet(BulkUpsertMixin, viewsets.ModelViewSet):
     )
     serializer_class = ClientSerializer
 
+    def _agent_save_kwargs(self):
+        """Stamp the authenticated agent's real code + full name onto the client.
+
+        The extension sends the agent's NAME in ``agent_code``; the canonical
+        code and name live on the agent JWT (``request.user.agent_code`` /
+        ``request.user.name``). Override them so downstream (GHL Agent Code /
+        Assigned Agent) resolves reliably.
+        """
+        user = self.request.user
+        kwargs = {}
+        code = getattr(user, "agent_code", None)
+        if code:
+            kwargs["agent_code"] = code
+        name = getattr(user, "name", None)
+        if name:
+            kwargs["agent_name"] = name
+        return kwargs
+
     # --- TEMPORARY: mirror the client to the external GHL CRM on save. The
     # sync is best-effort and never raises; remove these three hooks (and the
     # api/integrations package) when the external CRM is retired. ---
     def perform_create(self, serializer):
-        serializer.save()
+        serializer.save(**self._agent_save_kwargs())
         ghl.sync_client(serializer.instance)
 
     def perform_update(self, serializer):
-        serializer.save()
+        serializer.save(**self._agent_save_kwargs())
         ghl.sync_client(serializer.instance)
 
     def post_upsert(self, obj):
+        # Bulk path: stamp the agent code + name from the JWT if available.
+        user = self.request.user
+        updates = []
+        code = getattr(user, "agent_code", None)
+        if code and obj.agent_code != code:
+            obj.agent_code = code
+            updates.append("agent_code")
+        name = getattr(user, "name", None)
+        if name and obj.agent_name != name:
+            obj.agent_name = name
+            updates.append("agent_name")
+        if updates:
+            obj.save(update_fields=updates)
         ghl.sync_client(obj)
 
 
@@ -170,9 +201,7 @@ class ContractedServiceViewSet(BulkUpsertMixin, viewsets.ModelViewSet):
 class ScreeningViewSet(BulkUpsertMixin, viewsets.ModelViewSet):
     """CRUD + upsert for screenings (keyed on enhanced_screen_id UUID)."""
 
-    queryset = Screening.objects.select_related("client", "case", "template").prefetch_related(
-        "answers", "identified_social_needs", "verified_social_needs"
-    )
+    queryset = Screening.objects.select_related("client")
     serializer_class = ScreeningSerializer
 
     def get_queryset(self):
@@ -198,9 +227,7 @@ class ScreeningViewSet(BulkUpsertMixin, viewsets.ModelViewSet):
 class EligibilityViewSet(BulkUpsertMixin, viewsets.ModelViewSet):
     """CRUD + upsert for eligibility assessments (keyed on eligibility_id UUID)."""
 
-    queryset = Eligibility.objects.select_related("client", "case").prefetch_related(
-        "answers"
-    )
+    queryset = Eligibility.objects.select_related("client")
     serializer_class = EligibilitySerializer
 
     def get_queryset(self):
@@ -210,17 +237,9 @@ class EligibilityViewSet(BulkUpsertMixin, viewsets.ModelViewSet):
             qs = qs.filter(client_id=client)
         return qs
 
-    # --- TEMPORARY: mirror the eligibility to the external GHL CRM as an opportunity.
-    def perform_create(self, serializer):
-        serializer.save()
-        ghl.sync_eligibility(serializer.instance)
-
-    def perform_update(self, serializer):
-        serializer.save()
-        ghl.sync_eligibility(serializer.instance)
-
-    def post_upsert(self, obj):
-        ghl.sync_eligibility(obj)
+    # NOTE: Eligibility is intentionally NOT mirrored to GHL. Saving an
+    # eligibility assessment must not create/update any GHL opportunity, so the
+    # sync hooks are deliberately omitted here.
 
 
 class ProviderViewSet(viewsets.ReadOnlyModelViewSet):
