@@ -274,7 +274,7 @@ class ClientSerializer(serializers.ModelSerializer):
             for addr in addresses:
                 Address.objects.update_or_create(
                     client=client,
-                    address_type=addr.get("address_type", "current"),
+                    type=addr.get("type", "current"),
                     defaults=addr,
                 )
 
@@ -319,6 +319,7 @@ class ClientSerializer(serializers.ModelSerializer):
 # ===========================================================================
 class CaseSerializer(serializers.ModelSerializer):
     case_id = serializers.UUIDField()
+    subject_id = serializers.UUIDField(required=False, allow_null=True)
     client_id = serializers.UUIDField()
     previous_case_id = serializers.UUIDField(required=False, allow_null=True)
     originating_provider_id = serializers.UUIDField(required=False, allow_null=True)
@@ -333,7 +334,6 @@ class CaseSerializer(serializers.ModelSerializer):
             "originating_provider",
             "provider",
             "program",
-            "import_batch",
         )
 
     @transaction.atomic
@@ -346,13 +346,16 @@ class CaseSerializer(serializers.ModelSerializer):
 
     def _upsert(self, validated_data):
         case_id = validated_data.pop("case_id")
+        subject_id = validated_data.pop("subject_id", None)
         client_id = validated_data.pop("client_id")
         previous_case_id = validated_data.pop("previous_case_id", None)
         originating_provider_id = validated_data.pop("originating_provider_id", None)
         provider_id = validated_data.pop("provider_id", None)
         program_id = validated_data.pop("program_id", None)
 
-        client = Client.objects.filter(pk=client_id).first()
+        # Use subject_id if provided, otherwise fall back to client_id
+        lookup_id = subject_id or client_id
+        client = Client.objects.filter(pk=lookup_id).first()
         if client is None:
             raise serializers.ValidationError(
                 {"client_id": f"Client {client_id} does not exist. Import the client first."}
@@ -480,58 +483,32 @@ class VerifiedSocialNeedSerializer(serializers.ModelSerializer):
         exclude = ("screening",)
 
 
-def _upsert_template(data):
-    if not data:
-        return None
-    data = dict(data)
-    tid = data.pop("template_id")
-    parent_id = data.pop("parent_template_id", None)
-    if parent_id:
-        data["parent_template"] = ScreenTemplate.objects.filter(pk=parent_id).first()
-    obj, _ = ScreenTemplate.objects.update_or_create(template_id=tid, defaults=data)
-    return obj
-
-
-def _upsert_question(data, template):
-    if not data:
-        return None
-    data = dict(data)
-    qid = data.pop("question_id")
-    parent_id = data.pop("parent_question_id", None)
-    data["template"] = template
-    if parent_id:
-        data["parent_question"] = Question.objects.filter(pk=parent_id).first()
-    obj, _ = Question.objects.update_or_create(question_id=qid, defaults=data)
-    return obj
-
-
-def _upsert_option(data, question):
-    if not data:
-        return None
-    data = dict(data)
-    oid = data.pop("question_option_id")
-    parent_id = data.pop("parent_question_option_id", None)
-    data["question"] = question
-    if parent_id:
-        data["parent_question_option"] = QuestionOption.objects.filter(pk=parent_id).first()
-    obj, _ = QuestionOption.objects.update_or_create(question_option_id=oid, defaults=data)
-    return obj
-
-
 class ScreeningSerializer(serializers.ModelSerializer):
     enhanced_screen_id = serializers.UUIDField()
     subject_id = serializers.UUIDField()
-    case_id = serializers.UUIDField(required=False, allow_null=True)
-    parent_screen_id = serializers.UUIDField(required=False, allow_null=True)
-    related_screen_id = serializers.UUIDField(required=False, allow_null=True)
-    template = ScreenTemplateSerializer(required=False, allow_null=True)
-    answers = AnswerSerializer(many=True, required=False)
-    identified_social_needs = IdentifiedSocialNeedSerializer(many=True, required=False)
-    verified_social_needs = VerifiedSocialNeedSerializer(many=True, required=False)
+    questions_answers = serializers.JSONField(required=False, default=list)
+    identified_social_needs = serializers.JSONField(required=False, default=list)
 
     class Meta:
         model = Screening
-        exclude = ("client", "case", "parent_screen", "related_screen", "import_batch")
+        fields = [
+            "enhanced_screen_id",
+            "subject_id",
+            "screen_created_at",
+            "screen_status",
+            "screen_type",
+            "screen_source",
+            "provider_name",
+            "performing_organization_name",
+            "duration",
+            "questions_answers",
+            "identified_social_needs",
+            "eligible_status",
+            "eligible_services",
+            "crm_opportunity_id",
+            "crm_sync_hash",
+            "crm_synced_at",
+        ]
 
     @transaction.atomic
     def create(self, validated_data):
@@ -544,65 +521,13 @@ class ScreeningSerializer(serializers.ModelSerializer):
     def _upsert(self, validated_data):
         screen_id = validated_data.pop("enhanced_screen_id")
         subject_id = validated_data.get("subject_id")
-        case_id = validated_data.pop("case_id", None)
-        parent_screen_id = validated_data.pop("parent_screen_id", None)
-        related_screen_id = validated_data.pop("related_screen_id", None)
-        template_data = validated_data.pop("template", None)
-        answers = validated_data.pop("answers", None)
-        identified = validated_data.pop("identified_social_needs", None)
-        verified = validated_data.pop("verified_social_needs", None)
 
-        template = _upsert_template(template_data)
-
-        validated_data["template"] = template
+        # Link to client if exists
         validated_data["client"] = Client.objects.filter(pk=subject_id).first()
-        validated_data["case"] = (
-            Case.objects.filter(pk=case_id).first() if case_id else None
-        )
-        validated_data["parent_screen"] = (
-            Screening.objects.filter(pk=parent_screen_id).first()
-            if parent_screen_id
-            else None
-        )
-        validated_data["related_screen"] = (
-            Screening.objects.filter(pk=related_screen_id).first()
-            if related_screen_id
-            else None
-        )
 
         screening, _ = Screening.objects.update_or_create(
             enhanced_screen_id=screen_id, defaults=validated_data
         )
-
-        if answers is not None:
-            for ans in answers:
-                ans = dict(ans)
-                question = _upsert_question(ans.pop("question", None), template)
-                option = _upsert_option(ans.pop("question_option", None), question)
-                aid = ans.pop("answer_id")
-                ans["screening"] = screening
-                ans["question"] = question
-                ans["question_option"] = option
-                Answer.objects.update_or_create(answer_id=aid, defaults=ans)
-
-        if identified is not None:
-            for need in identified:
-                need = dict(need)
-                nid = need.pop("identified_social_need_id")
-                need["screening"] = screening
-                IdentifiedSocialNeed.objects.update_or_create(
-                    identified_social_need_id=nid, defaults=need
-                )
-
-        if verified is not None:
-            for need in verified:
-                need = dict(need)
-                nid = need.pop("verified_social_need_id")
-                need["screening"] = screening
-                VerifiedSocialNeed.objects.update_or_create(
-                    verified_social_need_id=nid, defaults=need
-                )
-
         return screening
 
 
@@ -612,12 +537,25 @@ class ScreeningSerializer(serializers.ModelSerializer):
 class EligibilitySerializer(serializers.ModelSerializer):
     eligibility_id = serializers.UUIDField()
     subject_id = serializers.UUIDField()
-    case_id = serializers.UUIDField(required=False, allow_null=True)
-    answers = AnswerSerializer(many=True, required=False)
+    questions_answers = serializers.JSONField(required=False, default=list)
+    eligible_services = serializers.JSONField(required=False, default=list)
 
     class Meta:
         model = Eligibility
-        exclude = ("client", "case", "import_batch")
+        fields = [
+            "eligibility_id",
+            "subject_id",
+            "screen_created_at",
+            "eligible_status",
+            "provider_name",
+            "performing_organization_name",
+            "duration",
+            "questions_answers",
+            "eligible_services",
+            "crm_opportunity_id",
+            "crm_sync_hash",
+            "crm_synced_at",
+        ]
 
     @transaction.atomic
     def create(self, validated_data):
@@ -630,25 +568,11 @@ class EligibilitySerializer(serializers.ModelSerializer):
     def _upsert(self, validated_data):
         eid = validated_data.pop("eligibility_id")
         subject_id = validated_data.get("subject_id")
-        case_id = validated_data.pop("case_id", None)
-        answers = validated_data.pop("answers", None)
+
+        # Link to client if exists
         validated_data["client"] = Client.objects.filter(pk=subject_id).first()
-        validated_data["case"] = (
-            Case.objects.filter(pk=case_id).first() if case_id else None
-        )
+
         obj, _ = Eligibility.objects.update_or_create(
             eligibility_id=eid, defaults=validated_data
         )
-
-        if answers is not None:
-            for ans in answers:
-                ans = dict(ans)
-                question = _upsert_question(ans.pop("question", None), None)
-                option = _upsert_option(ans.pop("question_option", None), question)
-                aid = ans.pop("answer_id")
-                ans["eligibility"] = obj
-                ans["question"] = question
-                ans["question_option"] = option
-                Answer.objects.update_or_create(answer_id=aid, defaults=ans)
-
         return obj

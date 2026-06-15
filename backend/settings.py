@@ -162,6 +162,7 @@ DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 # Django REST Framework
 REST_FRAMEWORK = {
     'DEFAULT_AUTHENTICATION_CLASSES': (
+        'api.authentication.AgentJWTAuthentication',
         'rest_framework_simplejwt.authentication.JWTAuthentication',
         'rest_framework.authentication.TokenAuthentication',
     ),
@@ -188,9 +189,14 @@ SIMPLE_JWT = {
 }
 
 # CORS
-CORS_ALLOWED_ORIGINS = [
-    o for o in os.getenv('CORS_ALLOWED_ORIGINS', 'http://localhost:3000').split(',') if o
-]
+# Allow Chrome extensions (chrome-extension:// origins) and localhost for local dev
+# In DEBUG mode, allow all origins for easier extension development
+if DEBUG:
+    CORS_ALLOW_ALL_ORIGINS = True
+else:
+    CORS_ALLOWED_ORIGINS = [
+        o for o in os.getenv('CORS_ALLOWED_ORIGINS', 'http://localhost:3000').split(',') if o
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -205,3 +211,13 @@ GHL_API_BASE = os.getenv('GHL_API_BASE', 'https://services.leadconnectorhq.com')
 GHL_API_VERSION = os.getenv('GHL_API_VERSION', '2021-07-28')
 GHL_TIMEOUT = int(os.getenv('GHL_TIMEOUT', '10'))
 GHL_CONTACT_SOURCE = os.getenv('GHL_CONTACT_SOURCE', 'Benefully extension')
+
+
+# ---------------------------------------------------------------------------
+# CallTools dialer integration. See api/integrations/calltools.
+# Auth: "Authorization: Token <CALLTOOLS_API_TOKEN>". Base URL is the per-silo
+# subdomain of calltools.io (e.g. https://east-1.calltools.io/api).
+# ---------------------------------------------------------------------------
+CALLTOOLS_API_TOKEN = os.getenv('CALLTOOLS_API_TOKEN', '')
+CALLTOOLS_API_BASE = os.getenv('CALLTOOLS_API_BASE', 'https://east-1.calltools.io/api')
+CALLTOOLS_TIMEOUT = int(os.getenv('CALLTOOLS_TIMEOUT', '15'))

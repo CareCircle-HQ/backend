@@ -2,6 +2,7 @@ from django.contrib import admin
 
 from .models import (
     Address,
+    Agent,
     Answer,
     Assessment,
     AssessmentQuestionnaire,
@@ -13,6 +14,7 @@ from .models import (
     Insurance,
     MilitaryProfile,
     Program,
+    ProgramPipeline,
     Provider,
     Question,
     Questionnaire,
@@ -46,17 +48,14 @@ class ClientAdmin(admin.ModelAdmin):
         "first_name",
         "last_name",
         "client_email_address",
-        "is_active",
-        "consent_status",
+        "consent_accepted",
+        "attestation_needed",
         "crm_contact_id",
     )
     list_filter = (
-        "is_active",
-        "consent_status",
-        "enrollment_from",
-        "is_family",
+        "consent_accepted",
         "attestation_needed",
-        "different_delivery_address",
+        "is_a_family",
         "call_transfer_answered",
     )
     search_fields = (
@@ -74,8 +73,8 @@ class ClientAdmin(admin.ModelAdmin):
 
 @admin.register(Address)
 class AddressAdmin(admin.ModelAdmin):
-    list_display = ("client", "address_type", "city", "state", "is_active")
-    list_filter = ("address_type", "is_active", "state")
+    list_display = ("client", "type", "city", "state")
+    list_filter = ("type", "state")
 
 
 @admin.register(Insurance)
@@ -105,13 +104,12 @@ class CaseAdmin(admin.ModelAdmin):
         "case_status",
         "service_type",
         "provider",
-        "created_at",
+        "date_opened",
     )
     list_filter = ("case_status", "service_authorization_status", "case_is_referred")
     search_fields = (
         "case_id",
         "client__last_name",
-        "client_last_name",
         "provider_name",
         "created_by_name",
     )
@@ -149,18 +147,16 @@ class ScreeningAdmin(admin.ModelAdmin):
         "client",
         "screen_status",
         "screen_type",
-        "eligible_status",
         "screen_created_at",
     )
-    list_filter = ("screen_status", "screen_type", "outreach_status", "is_case_sensitive")
+    list_filter = ("screen_status", "screen_type")
     search_fields = (
         "enhanced_screen_id",
         "subject_id",
         "client__last_name",
-        "client_last_name",
     )
-    autocomplete_fields = ("client", "case", "template", "parent_screen", "related_screen")
-    inlines = [AnswerInline, IdentifiedSocialNeedInline, VerifiedSocialNeedInline]
+    autocomplete_fields = ("client",)
+    inlines = [AnswerInline]
 
 
 @admin.register(Eligibility)
@@ -168,19 +164,16 @@ class EligibilityAdmin(admin.ModelAdmin):
     list_display = (
         "eligibility_id",
         "client",
-        "screen_status",
-        "screen_type",
         "eligible_status",
         "screen_created_at",
     )
-    list_filter = ("screen_status", "screen_type", "eligible_status")
+    list_filter = ("eligible_status",)
     search_fields = (
         "eligibility_id",
         "subject_id",
         "client__last_name",
-        "client_last_name",
     )
-    autocomplete_fields = ("client", "case")
+    autocomplete_fields = ("client",)
     inlines = [AnswerInline]
 
 
@@ -229,6 +222,32 @@ class ImportBatchAdmin(admin.ModelAdmin):
     list_filter = ("source", "status")
     search_fields = ("file_name",)
     readonly_fields = ("imported_at",)
+
+
+@admin.register(Agent)
+class AgentAdmin(admin.ModelAdmin):
+    list_display = (
+        "name", "agent_code", "email", "group", "status", "cbo",
+        "is_manager", "calltools_synced_at",
+    )
+    list_filter = ("group", "status", "cbo", "is_agent", "is_manager", "is_account_owner")
+    search_fields = ("name", "agent_code", "email", "username", "calltools_app_user")
+    readonly_fields = ("calltools_synced_at",)
+    ordering = ("name",)
+
+
+@admin.register(ProgramPipeline)
+class ProgramPipelineAdmin(admin.ModelAdmin):
+    list_display = (
+        "program_name",
+        "case_category",
+        "pipeline_name",
+        "pipeline_id",
+        "updated_at",
+    )
+    list_filter = ("case_category", "main_category", "pipeline_name")
+    search_fields = ("program_name", "pipeline_id")
+    ordering = ("program_name",)
 
 
 @admin.register(ScreeningForm)

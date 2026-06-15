@@ -26,12 +26,13 @@ _UPDATE_EXCLUDED_FIELDS = {"gender"}
 
 
 def _primary_address(client):
-    """Best delivery/current address: prefer active, else the first on file."""
+    """Best address for the contact: prefer current/home, else the first on file."""
     addresses = list(client.addresses.all())
     if not addresses:
         return None
+    preferred = ("current", "home")
     for addr in addresses:
-        if addr.is_active:
+        if addr.type in preferred:
             return addr
     return addresses[0]
 
@@ -62,11 +63,10 @@ def build_contact_payload(client):
 
     addr = _primary_address(client)
     if addr:
-        line = " ".join(p for p in [addr.line1, addr.line2] if p).strip()
-        put("address1", line)
+        put("address1", addr.street)
         put("city", addr.city)
         put("state", addr.state)
-        put("postalCode", addr.postal_code)
+        put("postalCode", addr.zip)
     put("country", "US")
 
     put("source", config.CONTACT_SOURCE)
