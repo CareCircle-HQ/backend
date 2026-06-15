@@ -6,21 +6,19 @@ from rest_framework.decorators import action
 from rest_framework import status
 
 from .models import (
+    Assessment,
     Case,
     Client,
     ContractedService,
-    Eligibility,
-    ImportBatch,
     Program,
     Provider,
     Screening,
 )
 from .serializers import (
+    AssessmentSerializer,
     CaseSerializer,
     ClientSerializer,
     ContractedServiceSerializer,
-    EligibilitySerializer,
-    ImportBatchSerializer,
     ProgramSerializer,
     ProviderSerializer,
     RegisterSerializer,
@@ -100,7 +98,7 @@ class ClientViewSet(BulkUpsertMixin, viewsets.ModelViewSet):
     """CRUD + upsert for clients (keyed on source client_id UUID)."""
 
     queryset = Client.objects.all().prefetch_related(
-        "addresses", "insurances", "military_profile"
+        "addresses", "insurances", "social_care_coverages", "military_profile"
     )
     serializer_class = ClientSerializer
 
@@ -224,11 +222,11 @@ class ScreeningViewSet(BulkUpsertMixin, viewsets.ModelViewSet):
         ghl.sync_screening(obj)
 
 
-class EligibilityViewSet(BulkUpsertMixin, viewsets.ModelViewSet):
-    """CRUD + upsert for eligibility assessments (keyed on eligibility_id UUID)."""
+class AssessmentViewSet(BulkUpsertMixin, viewsets.ModelViewSet):
+    """CRUD + upsert for assessments (keyed on assessment_id UUID)."""
 
-    queryset = Eligibility.objects.select_related("client")
-    serializer_class = EligibilitySerializer
+    queryset = Assessment.objects.select_related("client")
+    serializer_class = AssessmentSerializer
 
     def get_queryset(self):
         qs = super().get_queryset()
@@ -237,8 +235,8 @@ class EligibilityViewSet(BulkUpsertMixin, viewsets.ModelViewSet):
             qs = qs.filter(client_id=client)
         return qs
 
-    # NOTE: Eligibility is intentionally NOT mirrored to GHL. Saving an
-    # eligibility assessment must not create/update any GHL opportunity, so the
+    # NOTE: Assessments are intentionally NOT mirrored to GHL. Saving an
+    # assessment must not create/update any GHL opportunity, so the
     # sync hooks are deliberately omitted here.
 
 
@@ -250,13 +248,3 @@ class ProviderViewSet(viewsets.ReadOnlyModelViewSet):
 class ProgramViewSet(viewsets.ReadOnlyModelViewSet):
     queryset = Program.objects.all()
     serializer_class = ProgramSerializer
-
-
-class ImportBatchViewSet(viewsets.ModelViewSet):
-    """Track import runs. Records the authenticated user as importer."""
-
-    queryset = ImportBatch.objects.all()
-    serializer_class = ImportBatchSerializer
-
-    def perform_create(self, serializer):
-        serializer.save(imported_by=self.request.user)

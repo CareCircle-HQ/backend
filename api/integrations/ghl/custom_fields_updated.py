@@ -142,7 +142,7 @@ def _hm9_screening(client):
 
 def _hm7_eligibility(client):
     """Check if client has HM #7 eligibility assessment."""
-    eligibilities = client.eligibilities.filter(
+    eligibilities = client.assessments.filter(
         screen_type__icontains="HM #7"
     ).exists()
     return "Yes" if eligibilities else None

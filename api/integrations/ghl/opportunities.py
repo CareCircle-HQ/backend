@@ -581,7 +581,7 @@ def build_eligibility_payload(eligibility):
 
     _add(OP_ELIGIBILITY_FIELDS.get("case_create_date"),
          eligibility.screen_created_at.isoformat() if eligibility.screen_created_at else None)
-    _add(OP_ELIGIBILITY_FIELDS.get("enrollment_case_id"), str(eligibility.eligibility_id))
+    _add(OP_ELIGIBILITY_FIELDS.get("enrollment_case_id"), str(eligibility.assessment_id))
     _add(OP_ELIGIBILITY_FIELDS.get("enrollment_client_id"),
          str(client.client_id) if client.client_id else None)
     _add(OP_ELIGIBILITY_FIELDS.get("agent_code"), _to_number(client.agent_code))
@@ -814,7 +814,7 @@ def sync_case(case):
 
 def sync_eligibility(eligibility):
     """Sync an Eligibility to GHL as an Opportunity (create or update)."""
-    eid = getattr(eligibility, "eligibility_id", "?")
+    eid = getattr(eligibility, "assessment_id", "?")
     print(f"[GHL] sync_eligibility({eid}) enabled={config.is_enabled()}", flush=True)
     if not config.is_enabled():
         print("[GHL]   SKIPPED: CRM sync disabled (CRM_SYNC_ENABLED / token / "

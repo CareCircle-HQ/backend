@@ -7,12 +7,11 @@ from rest_framework_simplejwt.views import (
 )
 
 from .views import (
+    AssessmentViewSet,
     CaseViewSet,
     ClientViewSet,
     ContractedServiceViewSet,
-    EligibilityViewSet,
     HealthView,
-    ImportBatchViewSet,
     MeView,
     ProgramViewSet,
     ProviderViewSet,
@@ -27,10 +26,9 @@ router.register("clients", ClientViewSet, basename="client")
 router.register("cases", CaseViewSet, basename="case")
 router.register("contracted-services", ContractedServiceViewSet, basename="contracted-service")
 router.register("screenings", ScreeningViewSet, basename="screening")
-router.register("eligibility", EligibilityViewSet, basename="eligibility")
+router.register("assessments", AssessmentViewSet, basename="assessment")
 router.register("providers", ProviderViewSet, basename="provider")
 router.register("programs", ProgramViewSet, basename="program")
-router.register("import-batches", ImportBatchViewSet, basename="import-batch")
 
 urlpatterns = [
     # Auth
