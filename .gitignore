@@ -40,11 +40,6 @@ ghl_opportunity_fields.json
 ghl_custom_fields.json
 ghl_pipelines.json
 
-# Extension local config (contains the service API token)
-extension/config.js
-# Chrome-generated artifacts when loading the unpacked extension
-extension/_metadata/
-
 # OS / IDE
 .DS_Store
 .idea/
