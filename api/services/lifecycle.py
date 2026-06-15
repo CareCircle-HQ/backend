@@ -77,7 +77,7 @@ def _eligibility_stage(client):
     """
     statuses = [
         (e.eligible_status or "").strip().lower()
-        for e in client.eligibilities.all()
+        for e in client.assessments.all()
         if (e.eligible_status or "").strip()
     ]
     if not statuses:

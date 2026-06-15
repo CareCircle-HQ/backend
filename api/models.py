@@ -172,6 +172,15 @@ class RecordStatus(models.TextChoices):
     EXPIRED = "expired", "Expired"
 
 
+class SocialCareCoverageStatus(models.TextChoices):
+    """Enrollment status for a social care coverage plan (distinct from medical
+    insurance, which uses RecordStatus)."""
+
+    ENROLLED = "enrolled", "Enrolled"
+    NON_ENROLLED = "non_enrolled", "Non-Enrolled"
+    EXPIRED = "expired", "Expired"
+
+
 class ServiceType(models.TextChoices):
     """Services a client may be eligible for / referred for (multi-select)."""
 
@@ -395,7 +404,8 @@ class Insurance(models.Model):
     )
     plan_external_id = models.CharField(max_length=64, blank=True, db_index=True)
     plan_type = models.CharField(
-        max_length=20, choices=InsurancePlanType.choices, blank=True
+        max_length=20, choices=InsurancePlanType.choices,
+        default=InsurancePlanType.MEDICAID, blank=True,
     )
     plan_name = models.CharField(max_length=255, blank=True)
     insurance_id = models.CharField(max_length=64, blank=True, db_index=True)  # PII
@@ -427,41 +437,54 @@ class Insurance(models.Model):
         return f"{self.plan_name or self.plan_type} for {self.client_id}"
 
 
+class SocialCareCoverage(models.Model):
+    """Normalized social care coverage record. Split out from Insurance so social
+    coverage (Enrolled/Non-Enrolled/Expired) is tracked separately from medical
+    insurance (Active/Inactive/Expired). A client may have multiple records over
+    time. Default plan_type is Medicaid."""
+
+    client = models.ForeignKey(
+        Client, on_delete=models.CASCADE, related_name="social_care_coverages"
+    )
+    coverage_id = models.CharField(max_length=64, blank=True, db_index=True)  # source id
+    plan_type = models.CharField(
+        max_length=20, choices=InsurancePlanType.choices,
+        default=InsurancePlanType.MEDICAID, blank=True,
+    )
+    plan_name = models.CharField(max_length=255, blank=True)
+    external_member_id = models.CharField(max_length=64, blank=True)  # PII
+    external_group_id = models.CharField(max_length=64, blank=True)
+    status = models.CharField(
+        max_length=20, choices=SocialCareCoverageStatus.choices, blank=True
+    )
+    enrolled_at = models.DateTimeField(null=True, blank=True)  # Start Date
+    expired_at = models.DateTimeField(null=True, blank=True)  # End Date
+    verified = models.BooleanField(default=False)
+    verified_at = models.DateTimeField(null=True, blank=True)
+    ingested = models.BooleanField(default=False)
+    created_at = models.DateTimeField(null=True, blank=True)
+    updated_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["-enrolled_at"]
+        indexes = [
+            models.Index(fields=["client", "status"]),
+            models.Index(fields=["external_member_id"]),
+        ]
+
+    def __str__(self):
+        return f"{self.plan_name or 'Social Care Coverage'} for {self.client_id}"
+
+
 # ===========================================================================
 # PRODUCT & SERVICE CATALOG
 # ===========================================================================
-class Product(models.Model):
-    """A product we can deliver to a client. Products are derived from the
-    screening result. We track every product available in Unite Us, but only
-    flag the ones we actually offer (``is_offered``). Today the only offered
-    product is Food.
-    """
-
-    code = models.SlugField(max_length=60, unique=True)
-    name = models.CharField(max_length=255)
-    description = models.TextField(blank=True)
-    # We provide this product (vs. merely tracking that it exists in Unite Us).
-    is_offered = models.BooleanField(default=False)
-    is_active = models.BooleanField(default=True)
-    source = models.CharField(max_length=120, default="Unite Us")
-    created_at = models.DateTimeField(auto_now_add=True)
-    updated_at = models.DateTimeField(auto_now=True)
-
-    class Meta:
-        ordering = ["name"]
-        indexes = [models.Index(fields=["is_offered", "is_active"])]
-
-    def __str__(self):
-        return self.name
-
-
 class Service(models.Model):
     """A service type a client may be eligible for, taken from the eligibility
     result ("Client May Be Eligible for:"). Mirrors the Unite Us taxonomy
     (``ServiceType``). We keep every value, but only flag the ones we offer
-    (``is_offered``); offered services map to the ``Product`` we deliver them
-    under. Currently offered: Medically Tailored Meals (MTM) and Clinically
-    Appropriate Meals, both under the Food product.
+    (``is_offered``). Currently offered: Medically Tailored Meals (MTM) and
+    Clinically Appropriate Meals.
     """
 
     code = models.CharField(
@@ -469,12 +492,14 @@ class Service(models.Model):
     )
     name = models.CharField(max_length=255)
     category = models.CharField(max_length=120, blank=True)  # e.g. "Food"
-    product = models.ForeignKey(
-        Product,
+    # Master-list link: a Program (from assessments/cases) can have many
+    # service types. Set from Cases (service_type + program_name).
+    program = models.ForeignKey(
+        "Program",
         on_delete=models.SET_NULL,
         null=True,
         blank=True,
-        related_name="services",
+        related_name="service_types",
     )
     # We provide this service (vs. merely tracking that it exists in Unite Us).
     is_offered = models.BooleanField(default=False)
@@ -486,7 +511,6 @@ class Service(models.Model):
         ordering = ["name"]
         indexes = [
             models.Index(fields=["is_offered", "is_active"]),
-            models.Index(fields=["product"]),
         ]
 
     def __str__(self):
@@ -541,13 +565,44 @@ class Provider(models.Model):
         return self.name
 
 
-class Program(models.Model):
-    """Normalized program offered by a provider."""
+class ProgramMainCategory(models.Model):
+    """Master list of program main categories (e.g. Housing, Food, Social
+    Support, Transportation). Built up from saved Screening results; Programs
+    are related to a category later.
+    """
 
-    program_id = models.UUIDField(primary_key=True, editable=False)
+    name = models.CharField(max_length=255, unique=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["name"]
+        verbose_name_plural = "program main categories"
+
+    def __str__(self):
+        return self.name
+
+
+class Program(models.Model):
+    """Normalized program offered by a provider.
+
+    Operational rows come from Cases keyed by the source ``program_id`` UUID.
+    The master list is also fed (deduped by ``name``) from Assessment
+    "Client May Be Eligible" results and Case program names; those name-based
+    rows get an auto-generated ``program_id``.
+    """
+
+    program_id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     name = models.CharField(max_length=255)
     provider = models.ForeignKey(
         Provider,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="programs",
+    )
+    main_category = models.ForeignKey(
+        ProgramMainCategory,
         on_delete=models.SET_NULL,
         null=True,
         blank=True,
@@ -739,10 +794,6 @@ class ContractedService(models.Model):
     # --- Source / ingest metadata ---
     created_at = models.DateTimeField(null=True, blank=True)
     updated_at = models.DateTimeField(null=True, blank=True)
-    import_batch = models.ForeignKey(
-        "ImportBatch", on_delete=models.SET_NULL, null=True, blank=True,
-        related_name="contracted_services",
-    )
 
     class Meta:
         ordering = ["name"]
@@ -783,47 +834,6 @@ class OutreachStatus(models.TextChoices):
     REACHED = "reached", "Reached"
     UNREACHABLE = "unreachable", "Unreachable"
     COMPLETED = "completed", "Completed"
-
-
-class AnswerType(models.TextChoices):
-    TEXT = "text", "Text"
-    BOOLEAN = "boolean", "Boolean"
-    DATE = "date", "Date"
-    DATETIME = "datetime", "Datetime"
-    INTEGER = "integer", "Integer"
-    FLOAT = "float", "Float"
-    SINGLE_SELECT = "single_select", "Single Select"
-    MULTI_SELECT = "multi_select", "Multi Select"
-
-
-class ScreenTemplate(models.Model):
-    """Normalized screening template (questionnaire definition)."""
-
-    template_id = models.UUIDField(primary_key=True, editable=False)
-    active_template = models.BooleanField(default=True)
-    template_description = models.TextField(blank=True)
-    template_hcpcs_code = models.CharField(max_length=20, blank=True)
-    template_loinc_code = models.CharField(max_length=20, blank=True)
-    template_loinc_group = models.CharField(max_length=50, blank=True)
-    template_loinc_version = models.CharField(max_length=20, blank=True)
-    parent_template = models.ForeignKey(
-        "self", on_delete=models.SET_NULL, null=True, blank=True,
-        related_name="child_templates",
-    )
-    template_snomed_codes = models.JSONField(default=list, blank=True)
-    template_source = models.CharField(max_length=120, blank=True)
-    template_status = models.CharField(max_length=50, blank=True)
-    template_status_at = models.DateTimeField(null=True, blank=True)
-    template_title = models.CharField(max_length=255, blank=True)
-    template_type = models.CharField(max_length=80, blank=True)
-    template_version = models.CharField(max_length=20, blank=True)
-    from_file = models.BooleanField(default=False)
-
-    class Meta:
-        ordering = ["template_title"]
-
-    def __str__(self):
-        return self.template_title or str(self.template_id)
 
 
 class Screening(models.Model):
@@ -880,15 +890,15 @@ class Screening(models.Model):
         return f"Screening {self.enhanced_screen_id} ({self.screen_status})"
 
 
-class Eligibility(models.Model):
-    """An eligibility assessment for a subject (client)."""
+class Assessment(models.Model):
+    """An assessment for a subject (client). Formerly named Eligibility."""
 
     # --- Core Information ---
-    eligibility_id = models.UUIDField(primary_key=True, editable=False)
+    assessment_id = models.UUIDField(primary_key=True, editable=False)
     subject_id = models.UUIDField(db_index=True)  # source client reference
     client = models.ForeignKey(
         Client, on_delete=models.SET_NULL, null=True, blank=True,
-        related_name="eligibilities",
+        related_name="assessments",
     )
     screen_created_at = models.DateTimeField(null=True, blank=True)
     eligible_status = models.CharField(max_length=50, blank=True)  # e.g., "Eligible", "Not Eligible"
@@ -914,137 +924,14 @@ class Eligibility(models.Model):
 
     class Meta:
         ordering = ["-screen_created_at"]
-        verbose_name_plural = "eligibilities"
+        verbose_name_plural = "assessments"
         indexes = [
             models.Index(fields=["subject_id"]),
             models.Index(fields=["client", "eligible_status"]),
         ]
 
     def __str__(self):
-        return f"Eligibility {self.eligibility_id} ({self.eligible_status})"
-
-
-class Question(models.Model):
-    """Normalized screening question (belongs to a template)."""
-
-    question_id = models.UUIDField(primary_key=True, editable=False)
-    template = models.ForeignKey(
-        ScreenTemplate, on_delete=models.CASCADE, null=True, blank=True,
-        related_name="questions",
-    )
-    parent_question = models.ForeignKey(
-        "self", on_delete=models.SET_NULL, null=True, blank=True,
-        related_name="child_questions",
-    )
-    question_primary_text = models.TextField(blank=True)
-    question_secondary_text = models.TextField(blank=True)
-    question_required = models.BooleanField(default=False)
-    question_type = models.CharField(max_length=50, blank=True)
-    question_category = models.CharField(max_length=120, blank=True)
-    question_language = models.CharField(max_length=80, blank=True)
-    question_loinc_code = models.CharField(max_length=20, blank=True)
-    question_loinc_version = models.CharField(max_length=20, blank=True)
-    question_hcpcs_code = models.CharField(max_length=20, blank=True)
-    question_status = models.CharField(max_length=50, blank=True)
-    question_status_at = models.DateTimeField(null=True, blank=True)
-    question_is_active = models.BooleanField(default=True)
-    admin_only = models.BooleanField(default=False)
-
-    class Meta:
-        indexes = [models.Index(fields=["template"])]
-
-    def __str__(self):
-        return self.question_primary_text[:60] or str(self.question_id)
-
-
-class QuestionOption(models.Model):
-    """Normalized answer option for a question."""
-
-    question_option_id = models.UUIDField(primary_key=True, editable=False)
-    question = models.ForeignKey(
-        Question, on_delete=models.CASCADE, null=True, blank=True,
-        related_name="options",
-    )
-    parent_question_option = models.ForeignKey(
-        "self", on_delete=models.SET_NULL, null=True, blank=True,
-        related_name="child_options",
-    )
-    question_option_text = models.TextField(blank=True)
-    question_option_category_code = models.CharField(max_length=80, blank=True)
-    question_option_loinc_list_id = models.CharField(max_length=50, blank=True)
-    question_option_loinc_version = models.CharField(max_length=20, blank=True)
-    question_option_weight = models.FloatField(null=True, blank=True)
-    question_option_language = models.CharField(max_length=80, blank=True)
-    question_option_hcpcs_code = models.CharField(max_length=20, blank=True)
-    question_option_loinc_code = models.CharField(max_length=20, blank=True)
-    question_option_icd10_codes = models.JSONField(default=list, blank=True)
-    question_option_snomed_codes = models.JSONField(default=list, blank=True)
-    question_option_score = models.FloatField(null=True, blank=True)
-    question_option_type = models.CharField(max_length=50, blank=True)
-    question_option_value = models.CharField(max_length=255, blank=True)
-    question_option_value_bool = models.BooleanField(null=True, blank=True)
-    question_option_value_float = models.FloatField(null=True, blank=True)
-    question_option_value_int = models.IntegerField(null=True, blank=True)
-    question_option_is_active = models.BooleanField(default=True)
-
-    class Meta:
-        indexes = [models.Index(fields=["question"])]
-
-    def __str__(self):
-        return self.question_option_text[:60] or str(self.question_option_id)
-
-
-class Answer(models.Model):
-    """A client's answer to a question within a screening or eligibility assessment."""
-
-    answer_id = models.UUIDField(primary_key=True, editable=False)
-    # An answer belongs to EITHER a screening or an eligibility assessment.
-    screening = models.ForeignKey(
-        Screening, on_delete=models.CASCADE, null=True, blank=True,
-        related_name="answers",
-    )
-    eligibility = models.ForeignKey(
-        Eligibility, on_delete=models.CASCADE, null=True, blank=True,
-        related_name="answers",
-    )
-    question = models.ForeignKey(
-        Question, on_delete=models.SET_NULL, null=True, blank=True,
-        related_name="answers",
-    )
-    question_option = models.ForeignKey(
-        "QuestionOption", on_delete=models.SET_NULL, null=True, blank=True,
-        related_name="answers",
-    )  # the selected option (source question_option_id)
-    answer_is_active = models.BooleanField(default=True)
-    answer_language = models.CharField(max_length=80, blank=True)
-    answer_type = models.CharField(
-        max_length=20, choices=AnswerType.choices, blank=True
-    )
-    answer_status = models.CharField(max_length=50, blank=True)
-    answer_status_at = models.DateTimeField(null=True, blank=True)
-    answer_value = models.TextField(blank=True)  # PHI
-    answer_value_bool = models.BooleanField(null=True, blank=True)
-    answer_value_datetime = models.DateTimeField(null=True, blank=True)
-    answer_value_float = models.FloatField(null=True, blank=True)
-    answer_value_int = models.IntegerField(null=True, blank=True)
-    value_string = models.TextField(blank=True)  # PHI
-    answer_score = models.FloatField(null=True, blank=True)
-    answer_weight = models.FloatField(null=True, blank=True)
-    interpretations = models.JSONField(default=list, blank=True)
-    answer_created_at = models.DateTimeField(null=True, blank=True)
-    answer_updated_at = models.DateTimeField(null=True, blank=True)
-    translated_by_id = models.UUIDField(null=True, blank=True)
-    translated_by_type = models.CharField(max_length=50, blank=True)
-
-    class Meta:
-        indexes = [
-            models.Index(fields=["screening"]),
-            models.Index(fields=["eligibility"]),
-            models.Index(fields=["question"]),
-        ]
-
-    def __str__(self):
-        return f"Answer {self.answer_id}"
+        return f"Assessment {self.assessment_id} ({self.eligible_status})"
 
 
 class IdentifiedSocialNeed(models.Model):
@@ -1084,96 +971,6 @@ class VerifiedSocialNeed(models.Model):
 
     def __str__(self):
         return self.verified_social_need_name or str(self.verified_social_need_id)
-
-
-# ===========================================================================
-# IMPORT / ETL METADATA
-# ===========================================================================
-class ImportSource(models.TextChoices):
-    CLIENTS = "clients", "Clients"
-    CASES = "cases", "Cases"
-    SCREENINGS = "screenings", "Screenings"
-
-
-class ImportStatus(models.TextChoices):
-    PENDING = "pending", "Pending"
-    RUNNING = "running", "Running"
-    COMPLETED = "completed", "Completed"
-    FAILED = "failed", "Failed"
-
-
-class ImportBatch(models.Model):
-    """One CSV import run. Normalizes the per-row ETL metadata (pull_* / data_pulled_at)
-    that repeats across every source row, and anchors the admin import feature."""
-
-    source = models.CharField(max_length=20, choices=ImportSource.choices)
-    file_name = models.CharField(max_length=255, blank=True)
-    pull_start_date = models.DateField(null=True, blank=True)
-    pull_end_date = models.DateField(null=True, blank=True)
-    pull_timestamp = models.DateTimeField(null=True, blank=True)
-    data_pulled_at = models.DateTimeField(null=True, blank=True)
-    row_count = models.PositiveIntegerField(default=0)
-    success_count = models.PositiveIntegerField(default=0)
-    error_count = models.PositiveIntegerField(default=0)
-    status = models.CharField(
-        max_length=20, choices=ImportStatus.choices, default=ImportStatus.PENDING
-    )
-    error_log = models.TextField(blank=True)
-    imported_by = models.ForeignKey(
-        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True,
-        related_name="import_batches",
-    )
-    imported_at = models.DateTimeField(auto_now_add=True)
-
-    class Meta:
-        ordering = ["-imported_at"]
-        indexes = [models.Index(fields=["source", "status"])]
-
-    def __str__(self):
-        return f"{self.get_source_display()} import {self.pk} ({self.status})"
-
-
-
-class ScreeningForm(models.Model):
-    name = models.CharField(max_length=255)
-    description = models.TextField(blank=True)
-    created_at = models.DateTimeField(auto_now_add=True)
-
-    def __str__(self):
-        return self.name
-
-
-class Questionnaire(models.Model):
-    screening = models.OneToOneField(
-        ScreeningForm,
-        on_delete=models.CASCADE,
-        related_name="screening_questionnaire"
-    )
-    title = models.CharField(max_length=255)
-
-    def __str__(self):
-        return f"{self.title} ({self.screening.name})"
-
-
-class Assessment(models.Model):
-    name = models.CharField(max_length=255)
-    description = models.TextField(blank=True)
-    created_at = models.DateTimeField(auto_now_add=True)
-
-    def __str__(self):
-        return self.name
-
-
-class AssessmentQuestionnaire(models.Model):
-    assessment = models.OneToOneField(
-        Assessment,
-        on_delete=models.CASCADE,
-        related_name="assessment_questionnaire"
-    )
-    title = models.CharField(max_length=255)
-
-    def __str__(self):
-        return f"{self.title} ({self.assessment.name})"
 
 
 # ===========================================================================
@@ -1245,19 +1042,16 @@ class StageEventSource(models.TextChoices):
 
 
 class Enrollment(models.Model):
-    """A client's enrollment into a single product we deliver. One row per
-    (client, product). Owns the service-delivery stage and its schedule.
+    """A client's enrollment into the service we deliver. Owns the
+    service-delivery stage and its schedule.
 
     The acquisition funnel lives on Client.lifecycle_stage; this picks up once a
     client reaches the ``client`` stage and we begin validation/verification/
-    service for a specific product.
+    service.
     """
 
     client = models.ForeignKey(
         Client, on_delete=models.CASCADE, related_name="enrollments"
-    )
-    product = models.ForeignKey(
-        Product, on_delete=models.PROTECT, related_name="enrollments"
     )
     # The Met Council case this enrollment is delivered under (optional until a
     # case exists).
@@ -1276,18 +1070,12 @@ class Enrollment(models.Model):
 
     class Meta:
         ordering = ["-opened_at"]
-        constraints = [
-            models.UniqueConstraint(
-                fields=["client", "product"], name="unique_client_product_enrollment"
-            )
-        ]
         indexes = [
             models.Index(fields=["client", "stage"]),
-            models.Index(fields=["product", "stage"]),
         ]
 
     def __str__(self):
-        return f"{self.client_id} / {self.product_id} ({self.stage})"
+        return f"{self.client_id} ({self.stage})"
 
 
 class EnrollmentProcess(models.Model):

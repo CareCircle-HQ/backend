@@ -1,30 +1,34 @@
+import logging
+
 from django.contrib.auth import get_user_model
 from django.contrib.auth.password_validation import validate_password
 from django.db import transaction
+from django.utils import timezone
 from rest_framework import serializers
+
+from .services import catalog
+
+logger = logging.getLogger(__name__)
 
 from .models import (
     WEEKDAYS,
     Address,
-    Answer,
     Case,
     Client,
+    Assessment,
     ContractedService,
     CommunicationChannel,
     CommunicationTimeOfDay,
-    Eligibility,
     IdentifiedSocialNeed,
-    ImportBatch,
     Insurance,
     MilitaryProfile,
     Program,
     Provider,
-    Question,
-    QuestionOption,
     RecordStatus,
-    ScreenTemplate,
     Screening,
     ServiceType,
+    SocialCareCoverage,
+    SocialCareCoverageStatus,
     VerifiedSocialNeed,
 )
 
@@ -111,13 +115,6 @@ class ProgramSerializer(serializers.ModelSerializer):
         fields = "__all__"
 
 
-class ImportBatchSerializer(serializers.ModelSerializer):
-    class Meta:
-        model = ImportBatch
-        fields = "__all__"
-        read_only_fields = ("imported_at", "imported_by")
-
-
 # ===========================================================================
 # Client domain
 # ===========================================================================
@@ -139,11 +136,18 @@ class InsuranceSerializer(serializers.ModelSerializer):
         exclude = ("id", "client")
 
 
+class SocialCareCoverageSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = SocialCareCoverage
+        exclude = ("id", "client")
+
+
 class ClientSerializer(serializers.ModelSerializer):
     client_id = serializers.UUIDField()
     military_profile = MilitaryProfileSerializer(required=False, allow_null=True)
     addresses = AddressSerializer(many=True, required=False)
     insurances = InsuranceSerializer(many=True, required=False)
+    social_care_coverages = SocialCareCoverageSerializer(many=True, required=False)
 
     class Meta:
         model = Client
@@ -249,17 +253,26 @@ class ClientSerializer(serializers.ModelSerializer):
     def update(self, instance, validated_data):
         return self._upsert(validated_data)
 
+    @staticmethod
+    def _is_expired(expired_at):
+        """True when an end date is in the past (so coverage is no longer in
+        force). A missing end date means "no expiration"."""
+        if not expired_at:
+            return False
+        return expired_at < timezone.now()
+
     def _upsert(self, validated_data):
         military = validated_data.pop("military_profile", None)
         addresses = validated_data.pop("addresses", None)
         insurances = validated_data.pop("insurances", None)
+        social_care_coverages = validated_data.pop("social_care_coverages", None)
         client_id = validated_data.pop("client_id")
-        # Non-model flag (ignored by the serializer fields) read from raw input:
-        # when set, the incoming insurance list is treated as authoritative and
-        # any stored policy missing from it is deactivated.
-        reconcile = bool(
-            getattr(self, "initial_data", {}).get("reconcile_insurances")
-        )
+        # Non-model flags (ignored by the serializer fields) read from raw input:
+        # when set, the incoming list is treated as authoritative and any stored
+        # record missing from it is deactivated.
+        raw = getattr(self, "initial_data", {}) or {}
+        reconcile = bool(raw.get("reconcile_insurances"))
+        reconcile_scc = bool(raw.get("reconcile_social_care_coverages"))
 
         client, _ = Client.objects.update_or_create(
             client_id=client_id, defaults=validated_data
@@ -281,6 +294,14 @@ class ClientSerializer(serializers.ModelSerializer):
         if insurances is not None:
             seen_pks = []
             for ins in insurances:
+                # Status from the end date: no end date or the 9999 sentinel
+                # ("never expires") => Active; a past end date => Expired.
+                # Otherwise keep the incoming status.
+                exp = ins.get("expired_at")
+                if exp is None or getattr(exp, "year", None) == 9999:
+                    ins["status"] = RecordStatus.ACTIVE
+                elif self._is_expired(exp):
+                    ins["status"] = RecordStatus.EXPIRED
                 key = ins.get("insurance_id")
                 if key:
                     obj, _ = Insurance.objects.update_or_create(
@@ -309,6 +330,36 @@ class ClientSerializer(serializers.ModelSerializer):
                     .exclude(pk__in=seen_pks)
                     .exclude(verified=True)
                     .update(status=RecordStatus.INACTIVE)
+                )
+
+        if social_care_coverages is not None:
+            seen_scc_pks = []
+            for scc in social_care_coverages:
+                # Auto-derive Expired from the end date.
+                if self._is_expired(scc.get("expired_at")):
+                    scc["status"] = SocialCareCoverageStatus.EXPIRED
+                key = scc.get("coverage_id")
+                if key:
+                    obj, _ = SocialCareCoverage.objects.update_or_create(
+                        client=client, coverage_id=key, defaults=scc
+                    )
+                else:
+                    obj, _ = SocialCareCoverage.objects.update_or_create(
+                        client=client,
+                        plan_name=scc.get("plan_name", ""),
+                        external_member_id=scc.get("external_member_id", ""),
+                        defaults=scc,
+                    )
+                seen_scc_pks.append(obj.pk)
+
+            # Authoritative reconcile: coverage absent from this payload is no
+            # longer in the source, so mark it Non-Enrolled (preserves history).
+            if reconcile_scc:
+                (
+                    SocialCareCoverage.objects.filter(client=client)
+                    .exclude(pk__in=seen_scc_pks)
+                    .exclude(verified=True)
+                    .update(status=SocialCareCoverageStatus.NON_ENROLLED)
                 )
 
         return client
@@ -391,6 +442,12 @@ class CaseSerializer(serializers.ModelSerializer):
             }
         )
         case, _ = Case.objects.update_or_create(case_id=case_id, defaults=validated_data)
+        # Best-effort: build the master Service catalog (service_type linked to
+        # its Program). Never let a catalog error break the case save.
+        try:
+            catalog.upsert_service_from_case(case.service_type, case.program_name)
+        except Exception:
+            logger.exception("catalog.upsert_service_from_case failed")
         return case
 
 
@@ -430,43 +487,6 @@ class ContractedServiceSerializer(serializers.ModelSerializer):
 # ===========================================================================
 # Screening domain
 # ===========================================================================
-class ScreenTemplateSerializer(serializers.ModelSerializer):
-    template_id = serializers.UUIDField()
-    parent_template_id = serializers.UUIDField(required=False, allow_null=True)
-
-    class Meta:
-        model = ScreenTemplate
-        exclude = ("parent_template",)
-
-
-class QuestionSerializer(serializers.ModelSerializer):
-    question_id = serializers.UUIDField()
-    parent_question_id = serializers.UUIDField(required=False, allow_null=True)
-
-    class Meta:
-        model = Question
-        exclude = ("template", "parent_question")
-
-
-class QuestionOptionSerializer(serializers.ModelSerializer):
-    question_option_id = serializers.UUIDField()
-    parent_question_option_id = serializers.UUIDField(required=False, allow_null=True)
-
-    class Meta:
-        model = QuestionOption
-        exclude = ("question", "parent_question_option")
-
-
-class AnswerSerializer(serializers.ModelSerializer):
-    answer_id = serializers.UUIDField()
-    question = QuestionSerializer(required=False, allow_null=True)
-    question_option = QuestionOptionSerializer(required=False, allow_null=True)
-
-    class Meta:
-        model = Answer
-        exclude = ("screening", "eligibility")
-
-
 class IdentifiedSocialNeedSerializer(serializers.ModelSerializer):
     identified_social_need_id = serializers.UUIDField()
 
@@ -528,22 +548,27 @@ class ScreeningSerializer(serializers.ModelSerializer):
         screening, _ = Screening.objects.update_or_create(
             enhanced_screen_id=screen_id, defaults=validated_data
         )
+        # Best-effort: store unique ProgramMainCategory rows from the results.
+        try:
+            catalog.upsert_main_categories(screening.identified_social_needs)
+        except Exception:
+            logger.exception("catalog.upsert_main_categories failed")
         return screening
 
 
 # ===========================================================================
-# Eligibility domain
+# Assessment domain (formerly Eligibility)
 # ===========================================================================
-class EligibilitySerializer(serializers.ModelSerializer):
-    eligibility_id = serializers.UUIDField()
+class AssessmentSerializer(serializers.ModelSerializer):
+    assessment_id = serializers.UUIDField()
     subject_id = serializers.UUIDField()
     questions_answers = serializers.JSONField(required=False, default=list)
     eligible_services = serializers.JSONField(required=False, default=list)
 
     class Meta:
-        model = Eligibility
+        model = Assessment
         fields = [
-            "eligibility_id",
+            "assessment_id",
             "subject_id",
             "screen_created_at",
             "eligible_status",
@@ -566,13 +591,18 @@ class EligibilitySerializer(serializers.ModelSerializer):
         return self._upsert(validated_data)
 
     def _upsert(self, validated_data):
-        eid = validated_data.pop("eligibility_id")
+        aid = validated_data.pop("assessment_id")
         subject_id = validated_data.get("subject_id")
 
         # Link to client if exists
         validated_data["client"] = Client.objects.filter(pk=subject_id).first()
 
-        obj, _ = Eligibility.objects.update_or_create(
-            eligibility_id=eid, defaults=validated_data
+        obj, _ = Assessment.objects.update_or_create(
+            assessment_id=aid, defaults=validated_data
         )
+        # Best-effort: store unique master Programs from "Client May Be Eligible".
+        try:
+            catalog.upsert_programs(obj.eligible_services)
+        except Exception:
+            logger.exception("catalog.upsert_programs failed")
         return obj

@@ -3,25 +3,19 @@ from django.contrib import admin
 from .models import (
     Address,
     Agent,
-    Answer,
     Assessment,
-    AssessmentQuestionnaire,
     Case,
     Client,
-    Eligibility,
     IdentifiedSocialNeed,
-    ImportBatch,
     Insurance,
     MilitaryProfile,
     Program,
+    ProgramMainCategory,
     ProgramPipeline,
     Provider,
-    Question,
-    Questionnaire,
-    QuestionOption,
-    ScreenTemplate,
     Screening,
-    ScreeningForm,
+    Service,
+    SocialCareCoverage,
     VerifiedSocialNeed,
 )
 
@@ -38,6 +32,11 @@ class AddressInline(admin.TabularInline):
 
 class InsuranceInline(admin.TabularInline):
     model = Insurance
+    extra = 0
+
+
+class SocialCareCoverageInline(admin.TabularInline):
+    model = SocialCareCoverage
     extra = 0
 
 
@@ -68,7 +67,12 @@ class ClientAdmin(admin.ModelAdmin):
         "agent_code",
         "lead_source",
     )
-    inlines = [MilitaryProfileInline, AddressInline, InsuranceInline]
+    inlines = [
+        MilitaryProfileInline,
+        AddressInline,
+        InsuranceInline,
+        SocialCareCoverageInline,
+    ]
 
 
 @admin.register(Address)
@@ -83,6 +87,13 @@ class InsuranceAdmin(admin.ModelAdmin):
     list_filter = ("plan_type", "status", "is_primary")
 
 
+@admin.register(SocialCareCoverage)
+class SocialCareCoverageAdmin(admin.ModelAdmin):
+    list_display = ("client", "plan_name", "plan_type", "status", "enrolled_at", "expired_at")
+    list_filter = ("plan_type", "status")
+    search_fields = ("client__client_id", "plan_name", "external_member_id")
+
+
 @admin.register(Provider)
 class ProviderAdmin(admin.ModelAdmin):
     list_display = ("provider_id", "name", "network_name", "is_active")
@@ -90,10 +101,27 @@ class ProviderAdmin(admin.ModelAdmin):
     search_fields = ("provider_id", "name", "network_name")
 
 
+@admin.register(ProgramMainCategory)
+class ProgramMainCategoryAdmin(admin.ModelAdmin):
+    list_display = ("name", "created_at", "updated_at")
+    search_fields = ("name",)
+    ordering = ("name",)
+
+
 @admin.register(Program)
 class ProgramAdmin(admin.ModelAdmin):
-    list_display = ("program_id", "name", "provider")
+    list_display = ("program_id", "name", "main_category", "provider")
+    list_filter = ("main_category",)
     search_fields = ("program_id", "name")
+    autocomplete_fields = ("provider", "main_category")
+
+
+@admin.register(Service)
+class ServiceAdmin(admin.ModelAdmin):
+    list_display = ("code", "name", "program", "is_offered", "is_active")
+    list_filter = ("is_offered", "is_active")
+    search_fields = ("code", "name")
+    autocomplete_fields = ("program",)
 
 
 @admin.register(Case)
@@ -116,13 +144,6 @@ class CaseAdmin(admin.ModelAdmin):
     autocomplete_fields = ("client", "provider", "originating_provider", "program", "previous_case")
 
 
-class AnswerInline(admin.TabularInline):
-    model = Answer
-    extra = 0
-    fields = ("question", "answer_type", "answer_value", "answer_score", "answer_status")
-    autocomplete_fields = ("question",)
-
-
 class IdentifiedSocialNeedInline(admin.TabularInline):
     model = IdentifiedSocialNeed
     extra = 0
@@ -131,13 +152,6 @@ class IdentifiedSocialNeedInline(admin.TabularInline):
 class VerifiedSocialNeedInline(admin.TabularInline):
     model = VerifiedSocialNeed
     extra = 0
-
-
-@admin.register(ScreenTemplate)
-class ScreenTemplateAdmin(admin.ModelAdmin):
-    list_display = ("template_id", "template_title", "template_type", "template_status", "active_template")
-    list_filter = ("active_template", "template_type")
-    search_fields = ("template_id", "template_title", "template_loinc_code")
 
 
 @admin.register(Screening)
@@ -156,72 +170,23 @@ class ScreeningAdmin(admin.ModelAdmin):
         "client__last_name",
     )
     autocomplete_fields = ("client",)
-    inlines = [AnswerInline]
 
 
-@admin.register(Eligibility)
-class EligibilityAdmin(admin.ModelAdmin):
+@admin.register(Assessment)
+class AssessmentAdmin(admin.ModelAdmin):
     list_display = (
-        "eligibility_id",
+        "assessment_id",
         "client",
         "eligible_status",
         "screen_created_at",
     )
     list_filter = ("eligible_status",)
     search_fields = (
-        "eligibility_id",
+        "assessment_id",
         "subject_id",
         "client__last_name",
     )
     autocomplete_fields = ("client",)
-    inlines = [AnswerInline]
-
-
-class QuestionOptionInline(admin.TabularInline):
-    model = QuestionOption
-    extra = 0
-
-
-@admin.register(Question)
-class QuestionAdmin(admin.ModelAdmin):
-    list_display = ("question_id", "question_primary_text", "question_type", "question_category", "question_is_active")
-    list_filter = ("question_is_active", "question_type", "admin_only")
-    search_fields = ("question_id", "question_primary_text", "question_loinc_code")
-    autocomplete_fields = ("template", "parent_question")
-    inlines = [QuestionOptionInline]
-
-
-@admin.register(QuestionOption)
-class QuestionOptionAdmin(admin.ModelAdmin):
-    list_display = ("question_option_id", "question_option_text", "question_option_type", "question_option_is_active")
-    search_fields = ("question_option_id", "question_option_text")
-    autocomplete_fields = ("question", "parent_question_option")
-
-
-@admin.register(Answer)
-class AnswerAdmin(admin.ModelAdmin):
-    list_display = ("answer_id", "screening", "eligibility", "question", "answer_type", "answer_status")
-    list_filter = ("answer_type", "answer_status", "answer_is_active")
-    search_fields = ("answer_id",)
-    autocomplete_fields = ("screening", "eligibility", "question", "question_option")
-
-
-@admin.register(ImportBatch)
-class ImportBatchAdmin(admin.ModelAdmin):
-    list_display = (
-        "id",
-        "source",
-        "status",
-        "file_name",
-        "row_count",
-        "success_count",
-        "error_count",
-        "imported_by",
-        "imported_at",
-    )
-    list_filter = ("source", "status")
-    search_fields = ("file_name",)
-    readonly_fields = ("imported_at",)
 
 
 @admin.register(Agent)
@@ -248,29 +213,3 @@ class ProgramPipelineAdmin(admin.ModelAdmin):
     list_filter = ("case_category", "main_category", "pipeline_name")
     search_fields = ("program_name", "pipeline_id")
     ordering = ("program_name",)
-
-
-@admin.register(ScreeningForm)
-class ScreeningFormAdmin(admin.ModelAdmin):
-    list_display = ("name", "created_at")
-    search_fields = ("name",)
-
-
-@admin.register(Questionnaire)
-class QuestionnaireAdmin(admin.ModelAdmin):
-    list_display = ("title", "screening")
-    search_fields = ("title", "screening__name")
-    autocomplete_fields = ("screening",)
-
-
-@admin.register(Assessment)
-class AssessmentAdmin(admin.ModelAdmin):
-    list_display = ("name", "created_at")
-    search_fields = ("name",)
-
-
-@admin.register(AssessmentQuestionnaire)
-class AssessmentQuestionnaireAdmin(admin.ModelAdmin):
-    list_display = ("title", "assessment")
-    search_fields = ("title", "assessment__name")
-    autocomplete_fields = ("assessment",)
