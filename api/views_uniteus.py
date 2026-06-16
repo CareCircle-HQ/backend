@@ -13,6 +13,7 @@ from datetime import timedelta
 from django.utils import timezone
 from django.utils.dateparse import parse_datetime
 from rest_framework import status, views
+from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
 from .models import Agent, UniteUsCredential, UniteUsCredentialStatus
@@ -86,4 +87,79 @@ class UniteUsCredentialCaptureView(views.APIView):
                 "created": created,
             },
             status=status.HTTP_201_CREATED if created else status.HTTP_200_OK,
+        )
+
+
+class UniteUsRunUpdateView(views.APIView):
+    """POST /api/uniteus/run-update/
+
+    On-demand trigger for the Unite Us data pull, invoked from the extension's
+    "Sync Now" button. Runs the pull **synchronously** scoped to the requesting
+    agent's active provider credential and returns the resulting ImportRun
+    summary so the panel can show what changed.
+
+    Body (optional):
+        {"client_id": "<unite-us person uuid>"}  # pull just this one client
+    With no client_id the agent's whole client set is refreshed (cron-like).
+    """
+
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        agent_id = getattr(request.user, "agent_id", None)
+        if not agent_id:
+            return Response(
+                {"error": "Agent authentication required."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        cred = (
+            UniteUsCredential.objects.filter(
+                agent_id=agent_id, status=UniteUsCredentialStatus.ACTIVE
+            )
+            .order_by("-updated_at")
+            .first()
+        )
+        if cred is None:
+            return Response(
+                {
+                    "error": (
+                        "No active Unite Us credential for this agent. Log in to "
+                        "Unite Us in the browser so the extension can capture a "
+                        "session, then try again."
+                    )
+                },
+                status=status.HTTP_409_CONFLICT,
+            )
+
+        client_id = str(request.data.get("client_id") or "").strip()
+        client_ids = [client_id] if client_id else None
+        agent_code = getattr(request.user, "agent_code", "") or str(agent_id)
+
+        # Imported here (not at module load) to keep this view light and avoid
+        # pulling the whole import pipeline on every request import cycle.
+        from .services.uniteus_import import run_daily_pull
+
+        run = run_daily_pull(
+            triggered_by=f"extension:agent:{agent_code}",
+            provider_id=cred.provider_id,
+            client_ids=client_ids,
+        )
+
+        return Response(
+            {
+                "import_run_id": run.pk,
+                "status": run.status,
+                "created": run.created_count,
+                "updated": run.updated_count,
+                "skipped": run.skipped_count,
+                "errors": run.error_count,
+                "stats": run.stats or {},
+                "error_log": run.error_log or "",
+                "scope": {
+                    "client_id": client_id or None,
+                    "provider_id": cred.provider_id,
+                },
+            },
+            status=status.HTTP_200_OK,
         )

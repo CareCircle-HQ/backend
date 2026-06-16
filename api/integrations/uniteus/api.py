@@ -171,10 +171,22 @@ class UniteUsClient:
         return self.core_get(f"/invoices/{invoice_id}")
 
     # -- notes -------------------------------------------------------------
-    def list_notes(self, subject_id):
-        """Notes whose subject is a person or a case (subject_id)."""
+    def list_notes(self, subject_id, subject_type):
+        """Notes whose subject is a person or a case.
+
+        The core API requires the polymorphic subject filtered by both the id
+        (``filter[subject]``) and a lowercase type (``filter[subject.type]``,
+        one of ``person``, ``case``, ``referral``); omitting either returns 400.
+        """
         return list(
-            self._paginate("/notes", {"filter[subject]": subject_id}, page_size=100)
+            self._paginate(
+                "/notes",
+                {
+                    "filter[subject]": subject_id,
+                    "filter[subject.type]": (subject_type or "").lower(),
+                },
+                page_size=100,
+            )
         )
 
     # -- generic related lookups ------------------------------------------

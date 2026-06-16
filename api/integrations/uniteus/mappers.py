@@ -13,7 +13,9 @@ from api.models import (
     AddressType,
     CaseStatus,
     InsurancePlanType,
+    RecordStatus,
     ServiceAuthorizationStatus,
+    SocialCareCoverageStatus,
 )
 
 
@@ -167,6 +169,11 @@ def map_insurance_record(rec, plan_info, medicaid_ids):
         "external_group_id": a.get("external_group_id") or "",
         "enrolled_at": _dt(a.get("enrolled_at")),
         "expired_at": _dt(a.get("expired_at")),
+        # Serializer overrides ACTIVE/EXPIRED from the dates; this preserves
+        # pending/inactive and is the default when no end date applies.
+        "status": _enum_or_blank(
+            a.get("insurance_status") or a.get("state"), RecordStatus.values
+        ),
     }
 
 
@@ -183,6 +190,10 @@ def map_coverage_record(rec, plan_info, medicaid_ids):
         "external_group_id": a.get("external_group_id") or "",
         "enrolled_at": _dt(a.get("enrolled_at")),
         "expired_at": _dt(a.get("expired_at")),
+        # enrolled/non_enrolled; serializer overrides to EXPIRED from the dates.
+        "status": _enum_or_blank(
+            a.get("insurance_status"), SocialCareCoverageStatus.values
+        ),
     }
 
 

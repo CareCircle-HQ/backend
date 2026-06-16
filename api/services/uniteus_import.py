@@ -30,6 +30,7 @@ from api.integrations.uniteus.api import (
 from api.models import (
     Case,
     Client,
+    ContractedService,
     ImportRun,
     ImportRunStatus,
     Insurance,
@@ -43,7 +44,7 @@ from api.serializers import (
     ClientSerializer,
     ContractedServiceSerializer,
 )
-from api.services import tickets
+from api.services import tickets, timeline
 
 logger = logging.getLogger(__name__)
 
@@ -72,6 +73,13 @@ class DailyPull:
             self.errors.append(f"{dataset} upsert failed ({data.get('client_id') or data.get('case_id') or data.get('contracted_service_id')}): {exc}")
             logger.warning("daily_pull %s upsert failed: %s", dataset, exc)
             return None
+
+    def _emit_timeline(self, builder, obj):
+        """Emit a timeline event, isolating failures from the import run."""
+        try:
+            builder(obj, source=ChangeSource.IMPORT, actor="system:unite-us-import")
+        except Exception:  # noqa: BLE001
+            logger.warning("timeline emit failed (%s)", type(obj).__name__, exc_info=True)
 
     # -- related-name resolution (cached per run) --------------------------
     def _name(self, resource_path, rid, attrs=("name", "full_name")):
@@ -108,8 +116,9 @@ class DailyPull:
 
     # -- notes -------------------------------------------------------------
     def _process_notes(self, subject_id, client, case):
+        subject_type = "Case" if case is not None else "Person"
         try:
-            records = self.api.list_notes(subject_id)
+            records = self.api.list_notes(subject_id, subject_type)
         except UniteUsApiError as exc:
             self.errors.append(f"notes for {subject_id}: {exc}")
             return
@@ -210,6 +219,7 @@ class DailyPull:
             case, previous_status=prev_status, previous_auth_status=prev_auth,
             import_run=self.run,
         )
+        self._emit_timeline(timeline.event_for_case, case)
 
     # -- person / client ---------------------------------------------------
     def _process_person(self, client_id):
@@ -257,14 +267,24 @@ class DailyPull:
             tickets.evaluate_new_coverage(client, self.run)
 
         tickets.evaluate_client_coverage(client, self.run)
+
+        # Timeline events for the consent + each insurance / coverage record.
+        self._emit_timeline(timeline.event_for_consent, client)
+        for ins in Insurance.objects.filter(client=client):
+            self._emit_timeline(timeline.event_for_insurance, ins)
+        for scc in SocialCareCoverage.objects.filter(client=client):
+            self._emit_timeline(timeline.event_for_social_care_coverage, scc)
+
         self._process_notes(subject_id=client_id, client=client, case=None)
 
         for case_rec in self.api.list_cases(client_id):
             self._process_case(case_rec, client)
 
     # -- entry -------------------------------------------------------------
-    def execute(self, client_limit=None, provider_id=None):
-        creds = UniteUsCredential.objects.filter(status=UniteUsCredentialStatus.ACTIVE)
+    def execute(self, client_limit=None, provider_id=None, client_ids=None):
+        creds = UniteUsCredential.objects.filter(
+            status=UniteUsCredentialStatus.ACTIVE
+        ).defer("access_token", "refresh_token")  # decrypt lazily, per-credential
         if provider_id:
             creds = creds.filter(provider_id=provider_id)
         creds = list(creds)
@@ -272,11 +292,23 @@ class DailyPull:
             self.errors.append("No active Unite Us credentials; nothing to pull.")
             return
 
-        client_ids = [str(c) for c in Client.objects.values_list("client_id", flat=True)]
-        if client_limit:
-            client_ids = client_ids[:client_limit]
+        if client_ids:
+            client_ids = [str(c) for c in client_ids]
+        else:
+            client_ids = [str(c) for c in Client.objects.values_list("client_id", flat=True)]
+            if client_limit:
+                client_ids = client_ids[:client_limit]
 
         for cred in creds:
+            # Lazily decrypt the token columns now (they were deferred above); a
+            # corrupt / rotated-key credential is skipped with a ticket rather
+            # than crashing the whole nightly run.
+            try:
+                _ = cred.refresh_token
+            except Exception as exc:  # noqa: BLE001
+                tickets.evaluate_credential_expired(cred, self.run)
+                self.errors.append(f"credential {cred.pk} unreadable: {exc}")
+                continue
             self.api = uu_api.UniteUsClient(cred)
             self.name_cache = {}
             try:
@@ -307,7 +339,8 @@ class DailyPull:
         self.run.processed_count = sum(agg.values())
 
 
-def run_daily_pull(*, triggered_by="cron", client_limit=None, provider_id=None):
+def run_daily_pull(*, triggered_by="cron", client_limit=None, provider_id=None,
+                   client_ids=None):
     """Execute one daily pull and return the persisted ImportRun."""
     run = ImportRun.objects.create(
         source="uniteus", status=ImportRunStatus.RUNNING, triggered_by=triggered_by
@@ -315,7 +348,10 @@ def run_daily_pull(*, triggered_by="cron", client_limit=None, provider_id=None):
     puller = DailyPull(run)
     try:
         with change_context(ChangeSource.IMPORT, "system:unite-us-import"):
-            puller.execute(client_limit=client_limit, provider_id=provider_id)
+            puller.execute(
+                client_limit=client_limit, provider_id=provider_id,
+                client_ids=client_ids,
+            )
         run.status = ImportRunStatus.COMPLETED
     except Exception as exc:  # noqa: BLE001
         run.status = ImportRunStatus.FAILED

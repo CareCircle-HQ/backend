@@ -1,3 +1,7 @@
+import logging
+import uuid
+
+from django.db.models import Q
 from rest_framework import generics, permissions, viewsets
 from rest_framework.response import Response
 from rest_framework.views import APIView
@@ -10,23 +14,45 @@ from .models import (
     Case,
     Client,
     ContractedService,
+    HouseholdMember,
     Program,
     Provider,
     Screening,
+    TimelineEvent,
 )
 from .serializers import (
     AssessmentSerializer,
     CaseSerializer,
     ClientSerializer,
     ContractedServiceSerializer,
+    HouseholdSerializer,
     ProgramSerializer,
     ProviderSerializer,
     RegisterSerializer,
     ScreeningSerializer,
+    TimelineEventSerializer,
     UserSerializer,
+    ensure_household_with_primary,
 )
 # TEMPORARY external-CRM mirror; remove with the api/integrations package.
 from .integrations import ghl
+from .services import timeline
+
+logger = logging.getLogger(__name__)
+
+
+def _agent_actor(request):
+    """Attribution string for the authenticated agent, e.g. 'agent:355'."""
+    code = getattr(getattr(request, "user", None), "agent_code", None)
+    return f"agent:{code}" if code else ""
+
+
+def _safe_timeline(builder, obj, request):
+    """Emit a timeline event, never letting a failure break the API write."""
+    try:
+        builder(obj, actor=_agent_actor(request))
+    except Exception:  # noqa: BLE001
+        logger.exception("timeline emit failed for %s", type(obj).__name__)
 
 
 class RegisterView(generics.CreateAPIView):
@@ -126,10 +152,12 @@ class ClientViewSet(BulkUpsertMixin, viewsets.ModelViewSet):
     def perform_create(self, serializer):
         serializer.save(**self._agent_save_kwargs())
         ghl.sync_client(serializer.instance)
+        _safe_timeline(timeline.event_for_consent, serializer.instance, self.request)
 
     def perform_update(self, serializer):
         serializer.save(**self._agent_save_kwargs())
         ghl.sync_client(serializer.instance)
+        _safe_timeline(timeline.event_for_consent, serializer.instance, self.request)
 
     def post_upsert(self, obj):
         # Bulk path: stamp the agent code + name from the JWT if available.
@@ -146,6 +174,153 @@ class ClientViewSet(BulkUpsertMixin, viewsets.ModelViewSet):
         if updates:
             obj.save(update_fields=updates)
         ghl.sync_client(obj)
+        _safe_timeline(timeline.event_for_consent, obj, self.request)
+
+    @action(detail=True, methods=["get"])
+    def timeline(self, request, pk=None):
+        """Central client history: all domain events newest-first, plus renewal
+        grouping metadata for the dashboard's "Renewal #N" section headers."""
+        client = self.get_object()
+        events = list(
+            TimelineEvent.objects.filter(client=client)
+            .select_related("content_type", "enrollment")
+            .order_by("-occurred_at", "-created_at")
+        )
+        by_cycle = {}
+        for ev in events:
+            by_cycle.setdefault(ev.renewal_number, []).append(ev)
+        renewals = []
+        for num in sorted(by_cycle, reverse=True):
+            if num < 2:  # cycle 1 is the initial (ungrouped) timeline
+                continue
+            dates = [e.occurred_at for e in by_cycle[num] if e.occurred_at]
+            renewals.append({
+                "renewal_number": num,
+                "label": f"Renewal #{num}",
+                "period_start": min(dates).date().isoformat() if dates else None,
+                "period_end": max(dates).date().isoformat() if dates else None,
+                "count": len(by_cycle[num]),
+            })
+        return Response({
+            "client_id": str(client.pk),
+            "renewals": renewals,
+            "results": TimelineEventSerializer(events, many=True).data,
+        })
+
+    @action(detail=False, methods=["get"])
+    def search(self, request):
+        """Find existing clients by member ID (client UUID) or by Medicaid /
+        insurance member ID (external_member_id). Used by the household member
+        picker. Returns lightweight rows, not the full client serializer."""
+        q = (request.query_params.get("q") or "").strip()
+        if len(q) < 2:
+            return Response([])
+
+        filters = (
+            Q(insurances__external_member_id__icontains=q)
+            | Q(social_care_coverages__external_member_id__icontains=q)
+        )
+        # client_id is a UUID column: only match it when q parses as a UUID.
+        try:
+            filters |= Q(client_id=uuid.UUID(q))
+        except (ValueError, AttributeError, TypeError):
+            pass
+
+        qs = (
+            Client.objects.filter(filters)
+            .distinct()
+            .prefetch_related("insurances", "social_care_coverages")[:25]
+        )
+
+        results = []
+        for c in qs:
+            member_ids = sorted({
+                mid
+                for src in (c.insurances.all(), c.social_care_coverages.all())
+                for mid in (x.external_member_id for x in src)
+                if mid
+            })
+            results.append({
+                "client_id": str(c.client_id),
+                "first_name": c.first_name,
+                "last_name": c.last_name,
+                "date_of_birth": c.date_of_birth.isoformat() if c.date_of_birth else None,
+                "member_ids": member_ids,
+                "in_household": HouseholdMember.objects.filter(client=c).exists(),
+            })
+        return Response(results)
+
+    def _household_response(self, client):
+        household = ensure_household_with_primary(client)
+        data = HouseholdSerializer(household).data
+        data["max_members"] = client.total_family_members or 1
+        return Response(data)
+
+    @action(detail=True, methods=["get"])
+    def household(self, request, pk=None):
+        """Get-or-create this client's household (with the client as primary)
+        and return it with its members and the max member cap."""
+        return self._household_response(self.get_object())
+
+    @action(detail=True, methods=["post"], url_path="household/add")
+    def household_add(self, request, pk=None):
+        """Add an existing client to this client's household. Enforces the
+        family-size cap and the one-household-per-client rule."""
+        primary = self.get_object()
+        member_id = request.data.get("client_id")
+        if not member_id:
+            return Response(
+                {"detail": "client_id is required."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        household = ensure_household_with_primary(primary)
+
+        # Idempotent: already a member of THIS household -> just return it.
+        if household.members.filter(client_id=member_id).exists():
+            return self._household_response(primary)
+
+        max_members = primary.total_family_members or 1
+        if household.members.count() >= max_members:
+            return Response(
+                {"detail": f"Household is full ({max_members} member(s) allowed)."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        try:
+            member_client = Client.objects.get(pk=member_id)
+        except (Client.DoesNotExist, ValueError):
+            return Response(
+                {"detail": "Client not found."}, status=status.HTTP_404_NOT_FOUND
+            )
+        if HouseholdMember.objects.filter(client=member_client).exists():
+            return Response(
+                {"detail": "Client already belongs to a household."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        HouseholdMember.objects.create(
+            household=household, client=member_client, is_primary=False
+        )
+        return self._household_response(primary)
+
+    @action(detail=True, methods=["post"], url_path="household/remove")
+    def household_remove(self, request, pk=None):
+        """Remove a member from this client's household. The primary member
+        cannot be removed."""
+        primary = self.get_object()
+        member_id = request.data.get("client_id")
+        household = ensure_household_with_primary(primary)
+        member = household.members.filter(client_id=member_id).first()
+        if member is None:
+            return Response(
+                {"detail": "Not a member of this household."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+        if member.is_primary:
+            return Response(
+                {"detail": "The primary member cannot be removed."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        member.delete()
+        return self._household_response(primary)
 
 
 class CaseViewSet(BulkUpsertMixin, viewsets.ModelViewSet):
@@ -167,13 +342,16 @@ class CaseViewSet(BulkUpsertMixin, viewsets.ModelViewSet):
     def perform_create(self, serializer):
         serializer.save()
         ghl.sync_case(serializer.instance)
+        _safe_timeline(timeline.event_for_case, serializer.instance, self.request)
 
     def perform_update(self, serializer):
         serializer.save()
         ghl.sync_case(serializer.instance)
+        _safe_timeline(timeline.event_for_case, serializer.instance, self.request)
 
     def post_upsert(self, obj):
         ghl.sync_case(obj)
+        _safe_timeline(timeline.event_for_case, obj, self.request)
 
 
 class ContractedServiceViewSet(BulkUpsertMixin, viewsets.ModelViewSet):
@@ -213,13 +391,16 @@ class ScreeningViewSet(BulkUpsertMixin, viewsets.ModelViewSet):
     def perform_create(self, serializer):
         serializer.save()
         ghl.sync_screening(serializer.instance)
+        _safe_timeline(timeline.event_for_screening, serializer.instance, self.request)
 
     def perform_update(self, serializer):
         serializer.save()
         ghl.sync_screening(serializer.instance)
+        _safe_timeline(timeline.event_for_screening, serializer.instance, self.request)
 
     def post_upsert(self, obj):
         ghl.sync_screening(obj)
+        _safe_timeline(timeline.event_for_screening, obj, self.request)
 
 
 class AssessmentViewSet(BulkUpsertMixin, viewsets.ModelViewSet):
@@ -238,6 +419,16 @@ class AssessmentViewSet(BulkUpsertMixin, viewsets.ModelViewSet):
     # NOTE: Assessments are intentionally NOT mirrored to GHL. Saving an
     # assessment must not create/update any GHL opportunity, so the
     # sync hooks are deliberately omitted here.
+    def perform_create(self, serializer):
+        serializer.save()
+        _safe_timeline(timeline.event_for_assessment, serializer.instance, self.request)
+
+    def perform_update(self, serializer):
+        serializer.save()
+        _safe_timeline(timeline.event_for_assessment, serializer.instance, self.request)
+
+    def post_upsert(self, obj):
+        _safe_timeline(timeline.event_for_assessment, obj, self.request)
 
 
 class ProviderViewSet(viewsets.ReadOnlyModelViewSet):

@@ -66,9 +66,14 @@ def upsert_program(name):
     if not name:
         return None
     program_name, category_name = _split_name_and_category(name)
-    program, _ = Program.objects.get_or_create(
-        name=program_name, defaults={"program_id": uuid.uuid4()}
-    )
+    # Tolerate pre-existing duplicate Programs with the same name (the name
+    # column isn't unique): pick the first rather than letting get_or_create
+    # raise MultipleObjectsReturned.
+    program = Program.objects.filter(name=program_name).order_by("pk").first()
+    if program is None:
+        program = Program.objects.create(
+            name=program_name, program_id=uuid.uuid4()
+        )
     if category_name:
         category, _ = ProgramMainCategory.objects.get_or_create(name=category_name)
         if program.main_category_id != category.pk:

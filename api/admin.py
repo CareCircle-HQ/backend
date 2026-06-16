@@ -7,6 +7,8 @@ from .models import (
     Assessment,
     Case,
     Client,
+    Household,
+    HouseholdMember,
     IdentifiedSocialNeed,
     ImportRun,
     Insurance,
@@ -20,6 +22,7 @@ from .models import (
     Service,
     SocialCareCoverage,
     Ticket,
+    TimelineEvent,
     UniteUsCredential,
     VerifiedSocialNeed,
 )
@@ -52,11 +55,13 @@ class ClientAdmin(admin.ModelAdmin):
         "first_name",
         "last_name",
         "client_email_address",
+        "is_level",
         "consent_accepted",
         "attestation_needed",
         "crm_contact_id",
     )
     list_filter = (
+        "is_level",
         "consent_accepted",
         "attestation_needed",
         "is_a_family",
@@ -136,10 +141,18 @@ class CaseAdmin(admin.ModelAdmin):
         "client",
         "case_status",
         "service_type",
+        "case_type",
+        "household_type",
         "provider",
         "date_opened",
     )
-    list_filter = ("case_status", "service_authorization_status", "case_is_referred")
+    list_filter = (
+        "case_type",
+        "household_type",
+        "case_status",
+        "service_authorization_status",
+        "case_is_referred",
+    )
     search_fields = (
         "case_id",
         "client__last_name",
@@ -147,6 +160,31 @@ class CaseAdmin(admin.ModelAdmin):
         "created_by_name",
     )
     autocomplete_fields = ("client", "provider", "originating_provider", "program", "previous_case")
+
+
+class HouseholdMemberInline(admin.TabularInline):
+    model = HouseholdMember
+    extra = 0
+    autocomplete_fields = ("client",)
+
+
+@admin.register(Household)
+class HouseholdAdmin(admin.ModelAdmin):
+    list_display = ("household_id", "name", "member_count", "created_at")
+    search_fields = ("household_id", "name", "members__client__client_id")
+    inlines = (HouseholdMemberInline,)
+
+    @admin.display(description="members")
+    def member_count(self, obj):
+        return obj.members.count()
+
+
+@admin.register(HouseholdMember)
+class HouseholdMemberAdmin(admin.ModelAdmin):
+    list_display = ("client", "household", "is_primary", "relationship", "added_at")
+    list_filter = ("is_primary",)
+    search_fields = ("client__client_id", "client__last_name", "household__name")
+    autocomplete_fields = ("client", "household")
 
 
 class IdentifiedSocialNeedInline(admin.TabularInline):
@@ -263,3 +301,20 @@ class TicketAdmin(SimpleHistoryAdmin):
     list_filter = ("status", "type", "severity")
     search_fields = ("reason",)
     autocomplete_fields = ("client", "case", "assigned_to", "import_run")
+
+
+@admin.register(TimelineEvent)
+class TimelineEventAdmin(admin.ModelAdmin):
+    list_display = (
+        "occurred_at", "event_type", "client", "title", "badge_text",
+        "badge_tone", "renewal_number", "source", "actor",
+    )
+    list_filter = ("event_type", "badge_tone", "source", "renewal_number")
+    search_fields = (
+        "client__client_id", "client__first_name", "client__last_name",
+        "title", "subtitle", "actor", "dedupe_key", "object_id",
+    )
+    date_hierarchy = "occurred_at"
+    ordering = ("-occurred_at", "-created_at")
+    raw_id_fields = ("client", "enrollment", "content_type")
+    readonly_fields = ("created_at",)

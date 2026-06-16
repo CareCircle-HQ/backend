@@ -20,7 +20,7 @@ from .views import (
 )
 from .views_agent import AgentLoginView, AgentValidateView
 from .views_calltools import CallToolsAgentStatusView, CallToolsCampaignsView
-from .views_uniteus import UniteUsCredentialCaptureView
+from .views_uniteus import UniteUsCredentialCaptureView, UniteUsRunUpdateView
 
 router = DefaultRouter()
 router.register("clients", ClientViewSet, basename="client")
@@ -52,6 +52,12 @@ urlpatterns = [
         "uniteus/credentials/",
         UniteUsCredentialCaptureView.as_view(),
         name="uniteus-credential-capture",
+    ),
+    # On-demand updater trigger (extension "Sync Now" button)
+    path(
+        "uniteus/run-update/",
+        UniteUsRunUpdateView.as_view(),
+        name="uniteus-run-update",
     ),
     # User
     path("me/", MeView.as_view(), name="me"),
