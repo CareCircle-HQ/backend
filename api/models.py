@@ -3,6 +3,9 @@ import uuid
 from django.conf import settings
 from django.db import models
 
+from api.history import tracked_history
+from api.fields import EncryptedTextField
+
 
 # ---------------------------------------------------------------------------
 # Enumerations (TextChoices)
@@ -322,6 +325,8 @@ class Client(models.Model):
     elegible_programs = models.JSONField(default=list, blank=True)  # From screening
     referred_for = models.JSONField(default=list, blank=True)  # From eligibility
 
+    history = tracked_history()
+
     class Meta:
         ordering = ["last_name", "first_name"]
         indexes = [
@@ -426,6 +431,8 @@ class Insurance(models.Model):
     created_at = models.DateTimeField(null=True, blank=True)
     updated_at = models.DateTimeField(null=True, blank=True)
 
+    history = tracked_history()
+
     class Meta:
         ordering = ["-is_primary", "-enrolled_at"]
         indexes = [
@@ -464,6 +471,8 @@ class SocialCareCoverage(models.Model):
     ingested = models.BooleanField(default=False)
     created_at = models.DateTimeField(null=True, blank=True)
     updated_at = models.DateTimeField(null=True, blank=True)
+
+    history = tracked_history()
 
     class Meta:
         ordering = ["-enrolled_at"]
@@ -734,6 +743,8 @@ class Case(models.Model):
     crm_sync_hash = models.CharField(max_length=64, blank=True)
     crm_synced_at = models.DateTimeField(null=True, blank=True)
 
+    history = tracked_history()
+
     class Meta:
         ordering = ["-date_opened"]
         indexes = [
@@ -794,6 +805,8 @@ class ContractedService(models.Model):
     # --- Source / ingest metadata ---
     created_at = models.DateTimeField(null=True, blank=True)
     updated_at = models.DateTimeField(null=True, blank=True)
+
+    history = tracked_history()
 
     class Meta:
         ordering = ["name"]
@@ -1279,3 +1292,215 @@ class ProgramPipeline(models.Model):
 
     def __str__(self):
         return f"{self.program_name} -> {self.pipeline_name} ({self.pipeline_id})"
+
+
+# ===========================================================================
+# UNITE US INTEGRATION / DAILY PULL
+# ===========================================================================
+class UniteUsCredentialStatus(models.TextChoices):
+    ACTIVE = "active", "Active"
+    EXPIRED = "expired", "Expired"
+    REVOKED = "revoked", "Revoked"
+
+
+class UniteUsCredential(models.Model):
+    """Per-provider Unite Us OAuth credentials captured by the extension on agent
+    login and refreshed server-side for the daily pull. The access/refresh token
+    columns are encrypted at rest (see api.fields.EncryptedTextField)."""
+
+    provider_id = models.CharField(max_length=64, db_index=True)  # x-provider-id
+    employee_id = models.CharField(max_length=64, blank=True, db_index=True)  # x-employee-id
+    agent = models.ForeignKey(
+        "Agent", on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="uniteus_credentials",
+    )
+    access_token = EncryptedTextField(blank=True)
+    refresh_token = EncryptedTextField(blank=True)
+    access_expires_at = models.DateTimeField(null=True, blank=True)
+    scope = models.CharField(max_length=255, blank=True)
+    token_type = models.CharField(max_length=40, blank=True, default="Bearer")
+    status = models.CharField(
+        max_length=20, choices=UniteUsCredentialStatus.choices,
+        default=UniteUsCredentialStatus.ACTIVE, db_index=True,
+    )
+    last_captured_at = models.DateTimeField(null=True, blank=True)  # last extension push
+    last_refreshed_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["-updated_at"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["provider_id", "employee_id"],
+                name="unique_uniteus_provider_employee",
+            )
+        ]
+        indexes = [models.Index(fields=["status"])]
+
+    def __str__(self):
+        return f"UniteUs cred provider={self.provider_id} ({self.status})"
+
+
+class ImportRunStatus(models.TextChoices):
+    PENDING = "pending", "Pending"
+    RUNNING = "running", "Running"
+    COMPLETED = "completed", "Completed"
+    FAILED = "failed", "Failed"
+
+
+class ImportRun(models.Model):
+    """One execution of the daily Unite Us pull. Run-level audit anchor: holds
+    per-dataset counts, errors, and the tickets it raised. Per-entity field
+    diffs live in the django-simple-history tables, tagged source='import'."""
+
+    source = models.CharField(max_length=40, default="uniteus")
+    status = models.CharField(
+        max_length=20, choices=ImportRunStatus.choices,
+        default=ImportRunStatus.PENDING, db_index=True,
+    )
+    triggered_by = models.CharField(max_length=120, blank=True)  # cron | agent:355 | manual
+    started_at = models.DateTimeField(auto_now_add=True)
+    finished_at = models.DateTimeField(null=True, blank=True)
+    # Per-dataset breakdown, e.g.
+    # {"cases": {"created": 1, "updated": 2, "skipped": 0, "errors": 0}, ...}
+    stats = models.JSONField(default=dict, blank=True)
+    processed_count = models.PositiveIntegerField(default=0)
+    created_count = models.PositiveIntegerField(default=0)
+    updated_count = models.PositiveIntegerField(default=0)
+    skipped_count = models.PositiveIntegerField(default=0)
+    error_count = models.PositiveIntegerField(default=0)
+    error_log = models.TextField(blank=True)
+
+    class Meta:
+        ordering = ["-started_at"]
+        indexes = [models.Index(fields=["source", "status"])]
+
+    def __str__(self):
+        return f"ImportRun {self.pk} {self.source} ({self.status})"
+
+
+# ===========================================================================
+# NOTES (append-only)
+# ===========================================================================
+class NoteSource(models.TextChoices):
+    UNITE_US = "unite_us", "Unite Us"
+    AGENT = "agent", "Agent"
+    SYSTEM = "system", "System"
+
+
+class Note(models.Model):
+    """Append-only note attached to a Client and/or Case. Imported from Unite Us
+    or authored by an agent; never overwritten. De-duped on source_note_id (or
+    content_hash + source_created_at) so re-runs don't duplicate."""
+
+    client = models.ForeignKey(
+        "Client", on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="notes",
+    )
+    case = models.ForeignKey(
+        "Case", on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="notes",
+    )
+    source = models.CharField(
+        max_length=20, choices=NoteSource.choices, default=NoteSource.UNITE_US
+    )
+    source_note_id = models.CharField(max_length=64, blank=True, db_index=True)
+    author_name = models.CharField(max_length=255, blank=True)
+    body = models.TextField(blank=True)
+    content_hash = models.CharField(max_length=64, blank=True, db_index=True)
+    source_created_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    history = tracked_history()
+
+    class Meta:
+        ordering = ["-source_created_at", "-created_at"]
+        indexes = [
+            models.Index(fields=["client", "source_created_at"]),
+            models.Index(fields=["case", "source_created_at"]),
+            models.Index(fields=["source", "source_note_id"]),
+        ]
+
+    def __str__(self):
+        ref = self.case_id or self.client_id
+        return f"Note {self.pk} ({self.source}) for {ref}"
+
+
+# ===========================================================================
+# AGENT FOLLOW-UP TICKETS
+# ===========================================================================
+class TicketType(models.TextChoices):
+    NO_ACTIVE_INSURANCE = "no_active_insurance", "No active insurance"
+    INSURANCE_EXPIRED = "insurance_expired", "Insurance expired"
+    NO_ACTIVE_COVERAGE = "no_active_coverage", "No active social care coverage"
+    COVERAGE_EXPIRED = "coverage_expired", "Social care coverage expired"
+    MEMBER_NOT_FOUND = "member_not_found", "Member not found"
+    CASE_CLOSED = "case_closed", "Case closed"
+    AUTHORIZATION_CHANGED = "authorization_changed", "Authorization status changed"
+    CASE_NO_SERVICES = "case_no_services", "Case with no contracted services"
+    NEW_INSURANCE = "new_insurance", "New insurance created (validate)"
+    NEW_COVERAGE = "new_coverage", "New social care coverage created"
+    ADDRESS_OUT_OF_AREA = "address_out_of_area", "Address outside coverage area"
+    CREDENTIAL_EXPIRED = "credential_expired", "Unite Us login expired (re-login)"
+
+
+class TicketStatus(models.TextChoices):
+    OPEN = "open", "Open"
+    IN_PROGRESS = "in_progress", "In Progress"
+    RESOLVED = "resolved", "Resolved"
+
+
+class TicketSeverity(models.TextChoices):
+    LOW = "low", "Low"
+    MEDIUM = "medium", "Medium"
+    HIGH = "high", "High"
+
+
+class Ticket(models.Model):
+    """An agent follow-up item raised by the daily pull when it detects a
+    situation a human must review. References the related Client/Case and the
+    ImportRun that raised it."""
+
+    type = models.CharField(max_length=40, choices=TicketType.choices, db_index=True)
+    status = models.CharField(
+        max_length=20, choices=TicketStatus.choices,
+        default=TicketStatus.OPEN, db_index=True,
+    )
+    severity = models.CharField(
+        max_length=10, choices=TicketSeverity.choices, default=TicketSeverity.MEDIUM
+    )
+    reason = models.TextField(blank=True)  # human-readable explanation
+    client = models.ForeignKey(
+        "Client", on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="tickets",
+    )
+    case = models.ForeignKey(
+        "Case", on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="tickets",
+    )
+    import_run = models.ForeignKey(
+        "ImportRun", on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="tickets",
+    )
+    assigned_to = models.ForeignKey(
+        "Agent", on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="tickets",
+    )
+    resolved_at = models.DateTimeField(null=True, blank=True)
+    resolved_by = models.CharField(max_length=120, blank=True)  # agent:355 / user:alex
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    history = tracked_history()
+
+    class Meta:
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["status", "type"]),
+            models.Index(fields=["client", "status"]),
+            models.Index(fields=["case", "status"]),
+        ]
+
+    def __str__(self):
+        return f"Ticket {self.pk} {self.type} ({self.status})"

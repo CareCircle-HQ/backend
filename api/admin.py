@@ -1,4 +1,5 @@
 from django.contrib import admin
+from simple_history.admin import SimpleHistoryAdmin
 
 from .models import (
     Address,
@@ -7,8 +8,10 @@ from .models import (
     Case,
     Client,
     IdentifiedSocialNeed,
+    ImportRun,
     Insurance,
     MilitaryProfile,
+    Note,
     Program,
     ProgramMainCategory,
     ProgramPipeline,
@@ -16,6 +19,8 @@ from .models import (
     Screening,
     Service,
     SocialCareCoverage,
+    Ticket,
+    UniteUsCredential,
     VerifiedSocialNeed,
 )
 
@@ -213,3 +218,48 @@ class ProgramPipelineAdmin(admin.ModelAdmin):
     list_filter = ("case_category", "main_category", "pipeline_name")
     search_fields = ("program_name", "pipeline_id")
     ordering = ("program_name",)
+
+
+@admin.register(UniteUsCredential)
+class UniteUsCredentialAdmin(admin.ModelAdmin):
+    # Never expose the encrypted token columns in the admin form/list.
+    list_display = (
+        "provider_id", "employee_id", "agent", "status",
+        "access_expires_at", "last_captured_at", "last_refreshed_at",
+    )
+    list_filter = ("status",)
+    search_fields = ("provider_id", "employee_id")
+    exclude = ("access_token", "refresh_token")
+    readonly_fields = ("last_captured_at", "last_refreshed_at", "created_at", "updated_at")
+    autocomplete_fields = ("agent",)
+
+
+@admin.register(ImportRun)
+class ImportRunAdmin(admin.ModelAdmin):
+    list_display = (
+        "id", "source", "status", "triggered_by",
+        "processed_count", "created_count", "updated_count",
+        "skipped_count", "error_count", "started_at", "finished_at",
+    )
+    list_filter = ("source", "status")
+    search_fields = ("source", "triggered_by")
+    readonly_fields = ("started_at",)
+
+
+@admin.register(Note)
+class NoteAdmin(SimpleHistoryAdmin):
+    list_display = ("id", "source", "client", "case", "author_name", "source_created_at")
+    list_filter = ("source",)
+    search_fields = ("source_note_id", "author_name", "body")
+    autocomplete_fields = ("client", "case")
+
+
+@admin.register(Ticket)
+class TicketAdmin(SimpleHistoryAdmin):
+    list_display = (
+        "id", "type", "status", "severity", "client", "case",
+        "assigned_to", "created_at",
+    )
+    list_filter = ("status", "type", "severity")
+    search_fields = ("reason",)
+    autocomplete_fields = ("client", "case", "assigned_to", "import_run")

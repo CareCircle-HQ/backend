@@ -52,6 +52,7 @@ INSTALLED_APPS = [
     'rest_framework.authtoken',
     'rest_framework_simplejwt',
     'corsheaders',
+    'simple_history',
 
     # Local
     'api',
@@ -67,6 +68,9 @@ MIDDLEWARE = [
     'django.contrib.auth.middleware.AuthenticationMiddleware',
     'django.contrib.messages.middleware.MessageMiddleware',
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
+    # Exposes the current request to simple-history so changes are attributed
+    # (api.history reads it lazily to set change source/actor).
+    'simple_history.middleware.HistoryRequestMiddleware',
 ]
 
 ROOT_URLCONF = 'backend.urls'
@@ -221,3 +225,28 @@ GHL_CONTACT_SOURCE = os.getenv('GHL_CONTACT_SOURCE', 'Benefully extension')
 CALLTOOLS_API_TOKEN = os.getenv('CALLTOOLS_API_TOKEN', '')
 CALLTOOLS_API_BASE = os.getenv('CALLTOOLS_API_BASE', 'https://east-1.calltools.io/api')
 CALLTOOLS_TIMEOUT = int(os.getenv('CALLTOOLS_TIMEOUT', '15'))
+
+
+# ---------------------------------------------------------------------------
+# Field-level encryption (Unite Us tokens at rest). A urlsafe base64 32-byte
+# Fernet key. Generate with:
+#   python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+# Required at runtime to read/write encrypted columns; NOT needed for migrations.
+# ---------------------------------------------------------------------------
+FIELD_ENCRYPTION_KEY = os.getenv('FIELD_ENCRYPTION_KEY', '')
+
+
+# ---------------------------------------------------------------------------
+# Unite Us API integration (daily data pull). The backend stores per-provider
+# credentials captured by the extension and refreshes them via the OAuth
+# refresh-token grant. Endpoint specifics are confirmed via the extension's
+# auth-capture (window.__uwCapture(true)).
+# ---------------------------------------------------------------------------
+UNITEUS_ENABLED = os.getenv('UNITEUS_ENABLED', 'False').lower() == 'true'
+UNITEUS_TOKEN_URL = os.getenv('UNITEUS_TOKEN_URL', '')  # OAuth token endpoint
+UNITEUS_CLIENT_ID = os.getenv('UNITEUS_CLIENT_ID', '')
+UNITEUS_CLIENT_SECRET = os.getenv('UNITEUS_CLIENT_SECRET', '')  # blank for PKCE/public
+UNITEUS_API_BASE = os.getenv('UNITEUS_API_BASE', 'https://core.uniteus.io')
+UNITEUS_TIMEOUT = int(os.getenv('UNITEUS_TIMEOUT', '30'))
+# Refresh the access token when it expires within this many seconds.
+UNITEUS_REFRESH_SKEW = int(os.getenv('UNITEUS_REFRESH_SKEW', '120'))

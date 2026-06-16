@@ -20,6 +20,7 @@ from .views import (
 )
 from .views_agent import AgentLoginView, AgentValidateView
 from .views_calltools import CallToolsAgentStatusView, CallToolsCampaignsView
+from .views_uniteus import UniteUsCredentialCaptureView
 
 router = DefaultRouter()
 router.register("clients", ClientViewSet, basename="client")
@@ -46,6 +47,12 @@ urlpatterns = [
     ),
     # CallTools dialer
     path("calltools/campaigns/", CallToolsCampaignsView.as_view(), name="calltools-campaigns"),
+    # Unite Us credential capture (extension pushes the captured session here)
+    path(
+        "uniteus/credentials/",
+        UniteUsCredentialCaptureView.as_view(),
+        name="uniteus-credential-capture",
+    ),
     # User
     path("me/", MeView.as_view(), name="me"),
     # Misc

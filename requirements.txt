@@ -11,6 +11,12 @@ python-dotenv==1.0.1
 # CRM integration (GoHighLevel)
 gohighlevel-api-client==1.0.0b1
 
+# Audit / per-entity history
+django-simple-history==3.7.0
+
+# Token encryption at rest (Unite Us credentials)
+cryptography==48.0.1
+
 # HTTP
 requests==2.31.0
 

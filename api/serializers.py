@@ -457,7 +457,7 @@ class ContractedServiceSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = ContractedService
-        exclude = ("case", "import_batch")
+        exclude = ("case",)
 
     @transaction.atomic
     def create(self, validated_data):
