@@ -223,7 +223,12 @@ else:
 # GoHighLevel (GHL) CRM integration -- TEMPORARY. See api/integrations/ghl.
 # Off by default; flip CRM_SYNC_ENABLED=true once GHL_PRIVATE_TOKEN +
 # GHL_LOCATION_ID are set in the environment.
+#
+# MVP phase: CRM_SYNC_DISCONNECTED hard-disconnects ALL outbound syncing to the
+# external CRM (overrides CRM_SYNC_ENABLED). Defaults to True so no data leaves
+# our API during the MVP. Set CRM_SYNC_DISCONNECTED=false to re-enable.
 # ---------------------------------------------------------------------------
+CRM_SYNC_DISCONNECTED = os.getenv('CRM_SYNC_DISCONNECTED', 'True').lower() == 'true'
 CRM_SYNC_ENABLED = os.getenv('CRM_SYNC_ENABLED', 'False').lower() == 'true'
 GHL_PRIVATE_TOKEN = os.getenv('GHL_PRIVATE_TOKEN', '')
 GHL_LOCATION_ID = os.getenv('GHL_LOCATION_ID', '')

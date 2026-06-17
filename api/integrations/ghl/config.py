@@ -18,6 +18,14 @@ LOCATION_ID = getattr(settings, "GHL_LOCATION_ID", "")
 # Master switch. When false, sync calls are complete no-ops.
 SYNC_ENABLED = getattr(settings, "CRM_SYNC_ENABLED", False)
 
+# MVP phase: hard-disconnect ALL outbound syncing to the external CRM,
+# regardless of CRM_SYNC_ENABLED / token / location. This is the single gate
+# every sync function (sync_client/sync_case/sync_screening/sync_eligibility)
+# checks, so flipping this off stops all data from leaving our API.
+# To re-enable the GHL mirror after the MVP, set this back to False (or delete
+# this block) and configure CRM_SYNC_ENABLED + token + location.
+DISCONNECTED = getattr(settings, "CRM_SYNC_DISCONNECTED", True)
+
 # Network timeout (seconds) for every CRM request.
 TIMEOUT = getattr(settings, "GHL_TIMEOUT", 10)
 
@@ -27,7 +35,14 @@ CONTACT_SOURCE = getattr(settings, "GHL_CONTACT_SOURCE", "")
 
 
 def is_enabled():
-    """True only when the integration is switched on AND minimally configured."""
+    """True only when the integration is switched on AND minimally configured.
+
+    During the MVP we hard-disconnect from the external CRM: when DISCONNECTED
+    is set, this always returns False so no data leaves our API, regardless of
+    CRM_SYNC_ENABLED / token / location.
+    """
+    if DISCONNECTED:
+        return False
     return bool(SYNC_ENABLED and PRIVATE_TOKEN and LOCATION_ID)
 
 
