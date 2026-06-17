@@ -45,7 +45,11 @@ from .serializers import (
 # TEMPORARY external-CRM mirror; remove with the api/integrations package.
 from .integrations import ghl
 from .services import timeline
-from .services.lifecycle import InvalidTransition, advance_enrollment
+from .services.lifecycle import (
+    InvalidTransition,
+    advance_enrollment,
+    reconcile_enrollment_authorization,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -519,6 +523,12 @@ class EnrollmentVerificationViewSet(viewsets.ModelViewSet):
                 note=request.data.get("note", "") or "",
                 force=bool(request.data.get("force")),
             )
+            # Once verification completes, immediately project the case's
+            # authorization outcome (it may already be Accepted -> orders).
+            if enrollment.stage == EnrollmentStage.VERIFIED:
+                reconcile_enrollment_authorization(
+                    enrollment, actor=getattr(request, "user", None)
+                )
         except InvalidTransition as exc:
             return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
         enrollment.refresh_from_db()

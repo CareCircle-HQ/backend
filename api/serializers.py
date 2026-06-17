@@ -31,6 +31,7 @@ from .models import (
     CommunicationTimeOfDay,
     IdentifiedSocialNeed,
     Insurance,
+    MemberStatus,
     MemberVerification,
     MenuCategory,
     MenuType,
@@ -503,6 +504,9 @@ class MemberVerificationSerializer(serializers.ModelSerializer):
             "other_dietary_restrictions",
             "meal_category",
             "menu_type",
+            "status",
+            "denied_reason",
+            "meals_per_delivery",
             "general_verification_notes",
             "created_at",
             "updated_at",
@@ -545,7 +549,9 @@ class EnrollmentVerificationSerializer(serializers.ModelSerializer):
             "delivery_address_id",
             "stage",
             "program_name",
+            "service_type",
             "household_size",
+            "delivery_weekdays",
             "is_family_verified",
             "medicaid_type_verified",
             "delivery_address_verified",
@@ -608,6 +614,9 @@ class EnrollmentVerificationSerializer(serializers.ModelSerializer):
                 other_dietary_restrictions=m.get("other_dietary_restrictions", ""),
                 meal_category=m.get("meal_category", ""),
                 menu_type=m.get("menu_type", ""),
+                status=m.get("status", MemberStatus.PENDING_VERIFICATION),
+                denied_reason=m.get("denied_reason", ""),
+                meals_per_delivery=m.get("meals_per_delivery"),
                 general_verification_notes=m.get("general_verification_notes", ""),
             )
 
@@ -624,10 +633,14 @@ class EnrollmentVerificationSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError(
                 {"client_id": "A valid client_id is required."}
             )
+        case = Case.objects.filter(pk=case_id).first() if case_id else None
+        # Snapshot the case's Service Type when the ext didn't send one.
+        if case is not None and not validated_data.get("service_type"):
+            validated_data["service_type"] = case.service_type
         enrollment = EnrollmentVerification.objects.create(
             client=client,
             household=Household.objects.filter(pk=hid).first() if hid else None,
-            case=Case.objects.filter(pk=case_id).first() if case_id else None,
+            case=case,
             delivery_address=Address.objects.filter(pk=aid).first() if aid else None,
             **validated_data,
         )

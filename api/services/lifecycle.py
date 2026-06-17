@@ -22,6 +22,7 @@ from api.models import (
     ProcessStatus,
     ProcessType,
     ScreenStatus,
+    ServiceAuthorizationStatus,
     StageEntityType,
     StageEvent,
     StageEventSource,
@@ -273,6 +274,14 @@ def advance_enrollment(enrollment, to_stage, *, actor=None, note="", force=False
         note=note,
     )
 
+    # On entering AUTHORIZED (Accepted), generate the full delivery schedule.
+    # Idempotent (no-ops if orders already exist), so re-entering AUTHORIZED
+    # (e.g. after ON_HOLD) never double-creates orders.
+    if to_stage == EnrollmentStage.AUTHORIZED:
+        from api.services.orders import generate_orders_for_enrollment
+
+        generate_orders_for_enrollment(enrollment)
+
     # Mirror the transition onto the client's central timeline (best-effort:
     # a timeline hiccup must never roll back the stage change).
     try:
@@ -289,3 +298,54 @@ def advance_enrollment(enrollment, to_stage, *, actor=None, note="", force=False
 
         logging.getLogger(__name__).exception("timeline.event_for_verification failed")
     return enrollment
+
+
+# Case authorization status -> the enrollment stage it should drive the
+# enrollment to (only applied once the enrollment is past verification).
+_AUTH_STATUS_TO_STAGE = {
+    ServiceAuthorizationStatus.APPROVED: EnrollmentStage.AUTHORIZED,
+    ServiceAuthorizationStatus.NOT_REQUIRED: EnrollmentStage.AUTHORIZED,
+    ServiceAuthorizationStatus.DENIED: EnrollmentStage.DENIED,
+    ServiceAuthorizationStatus.EXPIRED: EnrollmentStage.ON_HOLD,
+    ServiceAuthorizationStatus.PENDING: EnrollmentStage.WAITING_AUTHORIZATION,
+}
+
+# Stages from which an authorization outcome may be applied. Before verification
+# is complete we never act on the case's authorization (a case accepted early
+# just waits until the household is verified).
+_AUTH_ELIGIBLE_STAGES = {
+    EnrollmentStage.VERIFIED,
+    EnrollmentStage.WAITING_AUTHORIZATION,
+}
+
+
+def reconcile_enrollment_authorization(enrollment, *, actor=None, note=""):
+    """Project the linked Case's authorization status onto the enrollment stage.
+
+    This is the single chokepoint for the externally-driven "Accepted" outcome:
+    callers (verification completion, the nightly Unite Us import, a manual
+    "mark Accepted" action) all funnel through here rather than touching orders
+    directly. Order generation happens as a side-effect of entering AUTHORIZED
+    inside :func:`advance_enrollment`.
+
+    No-ops unless the enrollment is eligible (past verification) and the case
+    has an actionable authorization status. Idempotent.
+    """
+    case = enrollment.case
+    if case is None:
+        return enrollment
+    if EnrollmentStage(enrollment.stage) not in _AUTH_ELIGIBLE_STAGES:
+        return enrollment
+
+    target = _AUTH_STATUS_TO_STAGE.get(case.service_authorization_status)
+    if target is None:
+        # Blank / unknown status -> we are still waiting on the authority.
+        target = EnrollmentStage.WAITING_AUTHORIZATION
+
+    if EnrollmentStage(enrollment.stage) == target:
+        return enrollment
+    try:
+        return advance_enrollment(enrollment, target, actor=actor, note=note)
+    except InvalidTransition:
+        # Defensive: an illegal projection (e.g. terminal stage) is a no-op.
+        return enrollment

@@ -219,7 +219,21 @@ class DailyPull:
             case, previous_status=prev_status, previous_auth_status=prev_auth,
             import_run=self.run,
         )
+        self._reconcile_enrollments(case)
         self._emit_timeline(timeline.event_for_case, case)
+
+    def _reconcile_enrollments(self, case):
+        """Project the (possibly updated) case authorization onto any verified
+        enrollments. When the status flips to Accepted, this is what triggers
+        delivery-order generation during the nightly run. Best-effort: a single
+        enrollment hiccup must not abort the import."""
+        from api.services.lifecycle import reconcile_enrollment_authorization
+
+        for enrollment in case.enrollments.all():
+            try:
+                reconcile_enrollment_authorization(enrollment)
+            except Exception as exc:  # pragma: no cover - defensive
+                self.errors.append(f"reconcile enrollment {enrollment.pk}: {exc}")
 
     # -- person / client ---------------------------------------------------
     def _process_person(self, client_id):
