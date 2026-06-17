@@ -159,12 +159,33 @@ ENROLLMENT_TRANSITIONS = {
     },
     EnrollmentStage.PENDING_VERIFICATION: {
         EnrollmentStage.VERIFIED,
+        EnrollmentStage.WAITING_AUTHORIZATION,
+        EnrollmentStage.DENIED,
         EnrollmentStage.ON_HOLD,
         EnrollmentStage.CANCELLED,
     },
     EnrollmentStage.VERIFIED: {
+        EnrollmentStage.WAITING_AUTHORIZATION,
+        EnrollmentStage.AUTHORIZED,
         EnrollmentStage.SERVICE_ACTIVE,
         EnrollmentStage.ON_HOLD,
+        EnrollmentStage.CANCELLED,
+    },
+    EnrollmentStage.WAITING_AUTHORIZATION: {
+        EnrollmentStage.AUTHORIZED,
+        EnrollmentStage.DENIED,
+        EnrollmentStage.ON_HOLD,
+        EnrollmentStage.CANCELLED,
+    },
+    EnrollmentStage.AUTHORIZED: {
+        EnrollmentStage.SERVICE_ACTIVE,
+        EnrollmentStage.ON_HOLD,
+        EnrollmentStage.CANCELLED,
+    },
+    EnrollmentStage.DENIED: {
+        EnrollmentStage.PENDING_VERIFICATION,
+        EnrollmentStage.WAITING_AUTHORIZATION,
+        EnrollmentStage.CLOSED,
         EnrollmentStage.CANCELLED,
     },
     EnrollmentStage.SERVICE_ACTIVE: {
@@ -179,6 +200,8 @@ ENROLLMENT_TRANSITIONS = {
         EnrollmentStage.VALIDATED,
         EnrollmentStage.PENDING_VERIFICATION,
         EnrollmentStage.VERIFIED,
+        EnrollmentStage.WAITING_AUTHORIZATION,
+        EnrollmentStage.AUTHORIZED,
         EnrollmentStage.SERVICE_ACTIVE,
         EnrollmentStage.CANCELLED,
     },
@@ -239,7 +262,7 @@ def advance_enrollment(enrollment, to_stage, *, actor=None, note="", force=False
         update_fields.append("closed_at")
     enrollment.save(update_fields=update_fields)
 
-    StageEvent.objects.create(
+    stage_event = StageEvent.objects.create(
         entity_type=StageEntityType.ENROLLMENT,
         enrollment=enrollment,
         client=enrollment.client,
@@ -249,4 +272,20 @@ def advance_enrollment(enrollment, to_stage, *, actor=None, note="", force=False
         actor=actor,
         note=note,
     )
+
+    # Mirror the transition onto the client's central timeline (best-effort:
+    # a timeline hiccup must never roll back the stage change).
+    try:
+        from api.services import timeline
+
+        actor_name = getattr(actor, "get_full_name", lambda: "")() or getattr(
+            actor, "username", ""
+        )
+        timeline.event_for_verification(
+            enrollment, stage_event=stage_event, actor=actor_name or ""
+        )
+    except Exception:  # pragma: no cover - defensive
+        import logging
+
+        logging.getLogger(__name__).exception("timeline.event_for_verification failed")
     return enrollment

@@ -1,7 +1,12 @@
 import uuid
 
 from django.conf import settings
+from django.contrib.contenttypes.fields import GenericForeignKey
+from django.contrib.contenttypes.models import ContentType
 from django.db import models
+
+from api.history import tracked_history
+from api.fields import EncryptedTextField
 
 
 # ---------------------------------------------------------------------------
@@ -231,6 +236,14 @@ class CallTransferStatus(models.TextChoices):
     NO_VERIFICATION_NEEDED = "no_verification_needed", "No Verification Needed"
 
 
+class ClientLevel(models.TextChoices):
+    """Service level a client falls under, derived from the "Client May Be
+    Eligible For" services whose names carry a "Level 1"/"Level 2" marker."""
+
+    LEVEL_1 = "level_1", "Level 1"
+    LEVEL_2 = "level_2", "Level 2"
+
+
 WEEKDAYS = (
     "monday",
     "tuesday",
@@ -321,6 +334,13 @@ class Client(models.Model):
     # --- Eligibility & Referral ---
     elegible_programs = models.JSONField(default=list, blank=True)  # From screening
     referred_for = models.JSONField(default=list, blank=True)  # From eligibility
+    # Derived on assessment save from eligible service names carrying a
+    # "Level 1"/"Level 2" marker. Level 2 takes precedence over Level 1.
+    is_level = models.CharField(
+        max_length=10, choices=ClientLevel.choices, blank=True
+    )
+
+    history = tracked_history()
 
     class Meta:
         ordering = ["last_name", "first_name"]
@@ -426,6 +446,8 @@ class Insurance(models.Model):
     created_at = models.DateTimeField(null=True, blank=True)
     updated_at = models.DateTimeField(null=True, blank=True)
 
+    history = tracked_history()
+
     class Meta:
         ordering = ["-is_primary", "-enrolled_at"]
         indexes = [
@@ -464,6 +486,8 @@ class SocialCareCoverage(models.Model):
     ingested = models.BooleanField(default=False)
     created_at = models.DateTimeField(null=True, blank=True)
     updated_at = models.DateTimeField(null=True, blank=True)
+
+    history = tracked_history()
 
     class Meta:
         ordering = ["-enrolled_at"]
@@ -518,6 +542,61 @@ class Service(models.Model):
 
 
 # ===========================================================================
+# HOUSEHOLD DOMAIN
+# ===========================================================================
+class Household(models.Model):
+    """A family/household group that ties multiple clients together.
+
+    Members (including the primary) are stored as HouseholdMember rows, so the
+    full group is ``household.members``. A client belongs to at most one
+    household (enforced by the OneToOne on HouseholdMember.client)."""
+
+    household_id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    name = models.CharField(max_length=255, blank=True)  # optional label e.g. "Doe Household"
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+
+    def __str__(self):
+        return self.name or f"Household {self.household_id}"
+
+
+class HouseholdMember(models.Model):
+    """Membership of a single client in a household (the intermediary model).
+
+    The primary member is included here too, flagged ``is_primary`` (at most one
+    primary per household)."""
+
+    household = models.ForeignKey(
+        Household, on_delete=models.CASCADE, related_name="members"
+    )
+    # OneToOne: a client can be in at most one household at a time.
+    client = models.OneToOneField(
+        Client, on_delete=models.CASCADE, related_name="household_membership"
+    )
+    is_primary = models.BooleanField(default=False)
+    relationship = models.CharField(max_length=60, blank=True)  # e.g. spouse, child, guardian
+    added_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-is_primary", "added_at"]
+        constraints = [
+            # At most one primary member per household.
+            models.UniqueConstraint(
+                fields=["household"],
+                condition=models.Q(is_primary=True),
+                name="unique_primary_per_household",
+            ),
+        ]
+
+    def __str__(self):
+        tag = " (primary)" if self.is_primary else ""
+        return f"{self.client_id} in {self.household_id}{tag}"
+
+
+# ===========================================================================
 # CASE DOMAIN
 # ===========================================================================
 class CaseStatus(models.TextChoices):
@@ -546,6 +625,24 @@ class ServiceAuthorizationStatus(models.TextChoices):
     APPROVED = "approved", "Approved"
     DENIED = "denied", "Denied"
     EXPIRED = "expired", "Expired"
+
+
+class CaseType(models.TextChoices):
+    """Classification of a case. Auto-derived on save from the case's
+    service_type (Social Service Case Management => Internal Service, anything
+    else => Navigation); External Service is set explicitly when applicable."""
+
+    NAVIGATION = "navigation", "Navigation"
+    EXTERNAL_SERVICE = "external_service", "External Service"
+    INTERNAL_SERVICE = "internal_service", "Internal Service"
+
+
+class CaseHouseholdType(models.TextChoices):
+    """Whether a case is tracked for a single individual or a household.
+    Auto-derived on save from the client's household data."""
+
+    INDIVIDUAL = "individual", "Individual"
+    HOUSEHOLD = "household", "Household"
 
 
 class Provider(models.Model):
@@ -698,6 +795,20 @@ class Case(models.Model):
     # Program Name from detail view (what we called service_subtype before)
     program_name = models.CharField(max_length=255, blank=True)
 
+    # --- Case Classification (auto-derived on save) ---
+    # Navigation / External Service / Internal Service. Derived from
+    # service_type: "Social Service Case Management" => Internal Service,
+    # otherwise => Navigation (see CaseSerializer).
+    case_type = models.CharField(
+        max_length=20, choices=CaseType.choices, default=CaseType.INTERNAL_SERVICE
+    )
+    # Individual vs Household, derived from the client's household data.
+    household_type = models.CharField(
+        max_length=12,
+        choices=CaseHouseholdType.choices,
+        default=CaseHouseholdType.INDIVIDUAL,
+    )
+
     # --- Outcome Information ---
     outcome_id = models.UUIDField(null=True, blank=True)
     outcome_description = models.TextField(blank=True)
@@ -733,6 +844,8 @@ class Case(models.Model):
     crm_opportunity_id = models.CharField(max_length=64, blank=True, db_index=True)
     crm_sync_hash = models.CharField(max_length=64, blank=True)
     crm_synced_at = models.DateTimeField(null=True, blank=True)
+
+    history = tracked_history()
 
     class Meta:
         ordering = ["-date_opened"]
@@ -794,6 +907,8 @@ class ContractedService(models.Model):
     # --- Source / ingest metadata ---
     created_at = models.DateTimeField(null=True, blank=True)
     updated_at = models.DateTimeField(null=True, blank=True)
+
+    history = tracked_history()
 
     class Meta:
         ordering = ["name"]
@@ -982,17 +1097,73 @@ class VerifiedSocialNeed(models.Model):
 # an append-only audit log of every transition (powers funnel/time-in-stage
 # reporting). See api.services.lifecycle for the transition logic.
 class EnrollmentStage(models.TextChoices):
-    """Service-delivery stage for a single (client, product) enrollment."""
+    """Service-delivery / verification stage for a household enrollment.
+
+    The authorization outcome (Draft/Pending/Accepted/Denied) is expressed
+    directly through the authorization-related stages below: a Draft maps to
+    ``pending_verification``, Pending to ``waiting_authorization``, Accepted to
+    ``authorized`` and Denied to ``denied``.
+    """
 
     PENDING_VALIDATION = "pending_validation", "Pending Validation"
     VALIDATED = "validated", "Validated"
     PENDING_VERIFICATION = "pending_verification", "Pending Verification"
     VERIFIED = "verified", "Verified"
+    WAITING_AUTHORIZATION = "waiting_authorization", "Waiting Authorization"
+    AUTHORIZED = "authorized", "Authorized"
+    DENIED = "denied", "Denied"
     SERVICE_ACTIVE = "service_active", "Service Active"
     SERVICE_COMPLETE = "service_complete", "Service Complete"
     CLOSED = "closed", "Closed"
     ON_HOLD = "on_hold", "On Hold"
+    # Retained for backward-compatibility with existing rows / cancellations;
+    # not part of the verification wizard flow.
     CANCELLED = "cancelled", "Cancelled"
+
+
+class DietaryRestriction(models.TextChoices):
+    """Dietary restrictions for a household member (multi-select)."""
+
+    NONE = "none", "None"
+    DIABETES = "diabetes", "Diabetes"
+    POSTPARTUM = "postpartum", "Postpartum"
+    CARDIO_METABOLIC = "cardio_metabolic", "Cardio-metabolic"
+
+
+class FoodAllergy(models.TextChoices):
+    """Food allergies for a household member (multi-select)."""
+
+    NONE = "none", "None"
+    SOY = "soy", "Soy"
+    WHEAT = "wheat", "Wheat"
+    SESAME = "sesame", "Sesame"
+    RED_MEAT = "red_meat", "Red Meat"
+    PORK = "pork", "Pork"
+    MILK = "milk", "Milk"
+    EGGS = "eggs", "Eggs"
+    FISH = "fish", "Fish"
+    SHELLFISH = "shellfish", "Shellfish"
+    TREE_NUTS = "tree_nuts", "Tree Nuts"
+    PEANUTS = "peanuts", "Peanuts"
+    OTHER = "other", "Other"
+
+
+class MenuCategory(models.TextChoices):
+    """Meal category a household member is assigned to (single-select)."""
+
+    FRESH_MEAL = "fresh_meal", "Fresh Meal"
+    DAIRY_FREE = "dairy_free", "Dairy Free"
+    FISH_FREE = "fish_free", "Fish Free"
+    VEGETARIAN = "vegetarian", "Vegetarian"
+
+
+class MenuType(models.TextChoices):
+    """Menu type a household member is assigned to (single-select)."""
+
+    STANDARD = "standard", "Standard"
+    FISH_FREE = "fish_free", "Fish Free"
+    VEGETARIAN = "vegetarian", "Vegetarian"
+    DAIRY_FREE = "dairy_free", "Dairy Free"
 
 
 class ProcessType(models.TextChoices):
@@ -1041,9 +1212,14 @@ class StageEventSource(models.TextChoices):
     MANUAL = "manual", "Manual"
 
 
-class Enrollment(models.Model):
-    """A client's enrollment into the service we deliver. Owns the
-    service-delivery stage and its schedule.
+class EnrollmentVerification(models.Model):
+    """A household's verification enrollment into the service we deliver. Owns
+    the verification/authorization stage, the verification questionnaire data
+    (per-member via :class:`MemberVerification`) and the delivery schedule.
+
+    The verification applies to the WHOLE household: ``household`` is the source
+    of the participant members. ``client`` remains the primary client (kept for
+    funnel/timeline attribution and backward-compatibility).
 
     The acquisition funnel lives on Client.lifecycle_stage; this picks up once a
     client reaches the ``client`` stage and we begin validation/verification/
@@ -1053,6 +1229,12 @@ class Enrollment(models.Model):
     client = models.ForeignKey(
         Client, on_delete=models.CASCADE, related_name="enrollments"
     )
+    # The household this verification applies to; participants come from its
+    # members. Optional until a household exists for the client.
+    household = models.ForeignKey(
+        "Household", on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="enrollment_verifications",
+    )
     # The Met Council case this enrollment is delivered under (optional until a
     # case exists).
     case = models.ForeignKey(
@@ -1061,8 +1243,28 @@ class Enrollment(models.Model):
     )
     stage = models.CharField(
         max_length=25, choices=EnrollmentStage.choices,
-        default=EnrollmentStage.PENDING_VALIDATION, db_index=True,
+        default=EnrollmentStage.PENDING_VERIFICATION, db_index=True,
     )
+    # The program the household is participating in (Step 1; free text taken
+    # from the case/contracted service, e.g. "Medically Tailored Meals").
+    program_name = models.CharField(max_length=255, blank=True)
+    # Household size snapshot captured during the wizard (Step 1).
+    household_size = models.PositiveSmallIntegerField(null=True, blank=True)
+    # Delivery address shared by all participants (Step 2 - Delivery Address).
+    delivery_address = models.ForeignKey(
+        "Address", on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="enrollment_verifications",
+    )
+    # --- Step 4: Validation checks (tri-state: null = not checked yet). ---
+    is_family_verified = models.BooleanField(null=True, blank=True)
+    medicaid_type_verified = models.BooleanField(null=True, blank=True)
+    delivery_address_verified = models.BooleanField(null=True, blank=True)
+    # Short display code, e.g. "ENR-8754". Assigned on creation.
+    code = models.CharField(max_length=20, blank=True, db_index=True)
+    # Renewal cycle counter. Renewals reuse the SAME enrollment (re-run
+    # screening/assessment/verification) rather than creating a new row; this
+    # tracks which cycle the enrollment is on (1 = initial, 2 = first renewal…).
+    renewal_number = models.PositiveSmallIntegerField(default=1)
     stage_at = models.DateTimeField(null=True, blank=True)
     opened_at = models.DateTimeField(auto_now_add=True)
     closed_at = models.DateTimeField(null=True, blank=True)
@@ -1072,10 +1274,70 @@ class Enrollment(models.Model):
         ordering = ["-opened_at"]
         indexes = [
             models.Index(fields=["client", "stage"]),
+            models.Index(fields=["household", "stage"]),
+        ]
+        constraints = [
+            # At most one verification per (navigation) case. Renewals reuse the
+            # same row, so this never blocks a renewal. NULL case is unconstrained.
+            models.UniqueConstraint(
+                fields=["case"],
+                condition=models.Q(case__isnull=False),
+                name="uniq_enrollment_verification_per_case",
+            ),
         ]
 
     def __str__(self):
         return f"{self.client_id} ({self.stage})"
+
+
+class MemberVerification(models.Model):
+    """Per-household-member verification questionnaire answers (wizard Step 2).
+
+    One row per participant in an enrollment's household. Dietary restrictions
+    and food allergies are multi-select (stored as lists of choice codes);
+    meal category and menu type are single-select.
+    """
+
+    enrollment = models.ForeignKey(
+        EnrollmentVerification, on_delete=models.CASCADE,
+        related_name="member_verifications",
+    )
+    # The participant client this row is for. Snapshot ``member_name`` is kept
+    # so the row stays readable even if the client link is later cleared.
+    client = models.ForeignKey(
+        Client, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="member_verifications",
+    )
+    member_name = models.CharField(max_length=255, blank=True)
+    # Multi-select choice-code lists (validated in the serializer against
+    # DietaryRestriction / FoodAllergy). Default empty == nothing selected.
+    dietary_restrictions = models.JSONField(default=list, blank=True)
+    food_allergies = models.JSONField(default=list, blank=True)
+    other_dietary_restrictions = models.TextField(blank=True)
+    meal_category = models.CharField(
+        max_length=20, choices=MenuCategory.choices, blank=True
+    )
+    menu_type = models.CharField(
+        max_length=20, choices=MenuType.choices, blank=True
+    )
+    general_verification_notes = models.TextField(blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["created_at"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["enrollment", "client"],
+                name="uniq_member_verification_per_enrollment_client",
+            ),
+        ]
+        indexes = [
+            models.Index(fields=["enrollment"]),
+        ]
+
+    def __str__(self):
+        return f"Member verification for {self.member_name or self.client_id} (enrollment {self.enrollment_id})"
 
 
 class EnrollmentProcess(models.Model):
@@ -1088,7 +1350,7 @@ class EnrollmentProcess(models.Model):
     """
 
     enrollment = models.ForeignKey(
-        Enrollment, on_delete=models.CASCADE, related_name="processes"
+        EnrollmentVerification, on_delete=models.CASCADE, related_name="processes"
     )
     process_type = models.CharField(
         max_length=20, choices=ProcessType.choices, db_index=True
@@ -1128,7 +1390,7 @@ class ServiceSchedule(models.Model):
     """
 
     enrollment = models.ForeignKey(
-        Enrollment, on_delete=models.CASCADE, related_name="schedules"
+        EnrollmentVerification, on_delete=models.CASCADE, related_name="schedules"
     )
     service = models.ForeignKey(
         Service, on_delete=models.SET_NULL, null=True, blank=True,
@@ -1173,7 +1435,7 @@ class StageEvent(models.Model):
         related_name="stage_events",
     )
     enrollment = models.ForeignKey(
-        Enrollment, on_delete=models.CASCADE, null=True, blank=True,
+        EnrollmentVerification, on_delete=models.CASCADE, null=True, blank=True,
         related_name="stage_events",
     )
     from_stage = models.CharField(max_length=25, blank=True)
@@ -1279,3 +1541,317 @@ class ProgramPipeline(models.Model):
 
     def __str__(self):
         return f"{self.program_name} -> {self.pipeline_name} ({self.pipeline_id})"
+
+
+# ===========================================================================
+# UNITE US INTEGRATION / DAILY PULL
+# ===========================================================================
+class UniteUsCredentialStatus(models.TextChoices):
+    ACTIVE = "active", "Active"
+    EXPIRED = "expired", "Expired"
+    REVOKED = "revoked", "Revoked"
+
+
+class UniteUsCredential(models.Model):
+    """Per-provider Unite Us OAuth credentials captured by the extension on agent
+    login and refreshed server-side for the daily pull. The access/refresh token
+    columns are encrypted at rest (see api.fields.EncryptedTextField)."""
+
+    provider_id = models.CharField(max_length=64, db_index=True)  # x-provider-id
+    employee_id = models.CharField(max_length=64, blank=True, db_index=True)  # x-employee-id
+    agent = models.ForeignKey(
+        "Agent", on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="uniteus_credentials",
+    )
+    access_token = EncryptedTextField(blank=True)
+    refresh_token = EncryptedTextField(blank=True)
+    access_expires_at = models.DateTimeField(null=True, blank=True)
+    scope = models.CharField(max_length=255, blank=True)
+    token_type = models.CharField(max_length=40, blank=True, default="Bearer")
+    status = models.CharField(
+        max_length=20, choices=UniteUsCredentialStatus.choices,
+        default=UniteUsCredentialStatus.ACTIVE, db_index=True,
+    )
+    last_captured_at = models.DateTimeField(null=True, blank=True)  # last extension push
+    last_refreshed_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["-updated_at"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["provider_id", "employee_id"],
+                name="unique_uniteus_provider_employee",
+            )
+        ]
+        indexes = [models.Index(fields=["status"])]
+
+    def __str__(self):
+        return f"UniteUs cred provider={self.provider_id} ({self.status})"
+
+
+class ImportRunStatus(models.TextChoices):
+    PENDING = "pending", "Pending"
+    RUNNING = "running", "Running"
+    COMPLETED = "completed", "Completed"
+    FAILED = "failed", "Failed"
+
+
+class ImportRun(models.Model):
+    """One execution of the daily Unite Us pull. Run-level audit anchor: holds
+    per-dataset counts, errors, and the tickets it raised. Per-entity field
+    diffs live in the django-simple-history tables, tagged source='import'."""
+
+    source = models.CharField(max_length=40, default="uniteus")
+    status = models.CharField(
+        max_length=20, choices=ImportRunStatus.choices,
+        default=ImportRunStatus.PENDING, db_index=True,
+    )
+    triggered_by = models.CharField(max_length=120, blank=True)  # cron | agent:355 | manual
+    started_at = models.DateTimeField(auto_now_add=True)
+    finished_at = models.DateTimeField(null=True, blank=True)
+    # Per-dataset breakdown, e.g.
+    # {"cases": {"created": 1, "updated": 2, "skipped": 0, "errors": 0}, ...}
+    stats = models.JSONField(default=dict, blank=True)
+    processed_count = models.PositiveIntegerField(default=0)
+    created_count = models.PositiveIntegerField(default=0)
+    updated_count = models.PositiveIntegerField(default=0)
+    skipped_count = models.PositiveIntegerField(default=0)
+    error_count = models.PositiveIntegerField(default=0)
+    error_log = models.TextField(blank=True)
+
+    class Meta:
+        ordering = ["-started_at"]
+        indexes = [models.Index(fields=["source", "status"])]
+
+    def __str__(self):
+        return f"ImportRun {self.pk} {self.source} ({self.status})"
+
+
+# ===========================================================================
+# NOTES (append-only)
+# ===========================================================================
+class NoteSource(models.TextChoices):
+    UNITE_US = "unite_us", "Unite Us"
+    AGENT = "agent", "Agent"
+    SYSTEM = "system", "System"
+
+
+class Note(models.Model):
+    """Append-only note attached to a Client and/or Case. Imported from Unite Us
+    or authored by an agent; never overwritten. De-duped on source_note_id (or
+    content_hash + source_created_at) so re-runs don't duplicate."""
+
+    client = models.ForeignKey(
+        "Client", on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="notes",
+    )
+    case = models.ForeignKey(
+        "Case", on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="notes",
+    )
+    source = models.CharField(
+        max_length=20, choices=NoteSource.choices, default=NoteSource.UNITE_US
+    )
+    source_note_id = models.CharField(max_length=64, blank=True, db_index=True)
+    author_name = models.CharField(max_length=255, blank=True)
+    body = models.TextField(blank=True)
+    content_hash = models.CharField(max_length=64, blank=True, db_index=True)
+    source_created_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    history = tracked_history()
+
+    class Meta:
+        ordering = ["-source_created_at", "-created_at"]
+        indexes = [
+            models.Index(fields=["client", "source_created_at"]),
+            models.Index(fields=["case", "source_created_at"]),
+            models.Index(fields=["source", "source_note_id"]),
+        ]
+
+    def __str__(self):
+        ref = self.case_id or self.client_id
+        return f"Note {self.pk} ({self.source}) for {ref}"
+
+
+# ===========================================================================
+# AGENT FOLLOW-UP TICKETS
+# ===========================================================================
+class TicketType(models.TextChoices):
+    NO_ACTIVE_INSURANCE = "no_active_insurance", "No active insurance"
+    INSURANCE_EXPIRED = "insurance_expired", "Insurance expired"
+    NO_ACTIVE_COVERAGE = "no_active_coverage", "No active social care coverage"
+    COVERAGE_EXPIRED = "coverage_expired", "Social care coverage expired"
+    MEMBER_NOT_FOUND = "member_not_found", "Member not found"
+    CASE_CLOSED = "case_closed", "Case closed"
+    AUTHORIZATION_CHANGED = "authorization_changed", "Authorization status changed"
+    CASE_NO_SERVICES = "case_no_services", "Case with no contracted services"
+    NEW_INSURANCE = "new_insurance", "New insurance created (validate)"
+    NEW_COVERAGE = "new_coverage", "New social care coverage created"
+    ADDRESS_OUT_OF_AREA = "address_out_of_area", "Address outside coverage area"
+    CREDENTIAL_EXPIRED = "credential_expired", "Unite Us login expired (re-login)"
+
+
+class TicketStatus(models.TextChoices):
+    OPEN = "open", "Open"
+    IN_PROGRESS = "in_progress", "In Progress"
+    RESOLVED = "resolved", "Resolved"
+
+
+class TicketSeverity(models.TextChoices):
+    LOW = "low", "Low"
+    MEDIUM = "medium", "Medium"
+    HIGH = "high", "High"
+
+
+class Ticket(models.Model):
+    """An agent follow-up item raised by the daily pull when it detects a
+    situation a human must review. References the related Client/Case and the
+    ImportRun that raised it."""
+
+    type = models.CharField(max_length=40, choices=TicketType.choices, db_index=True)
+    status = models.CharField(
+        max_length=20, choices=TicketStatus.choices,
+        default=TicketStatus.OPEN, db_index=True,
+    )
+    severity = models.CharField(
+        max_length=10, choices=TicketSeverity.choices, default=TicketSeverity.MEDIUM
+    )
+    reason = models.TextField(blank=True)  # human-readable explanation
+    client = models.ForeignKey(
+        "Client", on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="tickets",
+    )
+    case = models.ForeignKey(
+        "Case", on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="tickets",
+    )
+    import_run = models.ForeignKey(
+        "ImportRun", on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="tickets",
+    )
+    assigned_to = models.ForeignKey(
+        "Agent", on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="tickets",
+    )
+    resolved_at = models.DateTimeField(null=True, blank=True)
+    resolved_by = models.CharField(max_length=120, blank=True)  # agent:355 / user:alex
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    history = tracked_history()
+
+    class Meta:
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["status", "type"]),
+            models.Index(fields=["client", "status"]),
+            models.Index(fields=["case", "status"]),
+        ]
+
+    def __str__(self):
+        return f"Ticket {self.pk} {self.type} ({self.status})"
+
+
+# ===========================================================================
+# CLIENT TIMELINE (central history)
+# ===========================================================================
+class TimelineEventType(models.TextChoices):
+    CONSENT_GRANTED = "consent_granted", "Consent Granted"
+    INSURANCE = "insurance", "Insurance"
+    SOCIAL_CARE_COVERAGE = "social_care_coverage", "Social Care Coverage"
+    SCREENING = "screening", "Screening"
+    ASSESSMENT = "assessment", "Assessment"
+    CASE_OPENED = "case_opened", "Case"
+    VERIFICATION = "verification", "Verification"
+    ENROLLED = "enrolled", "Enrolled"
+
+
+class TimelineBadgeTone(models.TextChoices):
+    """Visual tone for the right-hand badge on a timeline row."""
+
+    NEUTRAL = "neutral", "Neutral"
+    INFO = "info", "Info"
+    SUCCESS = "success", "Success"
+    WARNING = "warning", "Warning"
+    DANGER = "danger", "Danger"
+
+
+class TimelineEvent(models.Model):
+    """A single entry in a client's central history/timeline.
+
+    A denormalized, append-style event stream that unifies heterogeneous domain
+    events (consent, insurance, coverage, screening, assessment, case,
+    verification, enrollment) into one ordered list. Each event carries display
+    fields (title/subtitle/badge) plus a generic link to its source entity so
+    the UI can deep-link to the underlying record. Written at each capture point
+    via ``api.services.timeline.emit_timeline_event`` and de-duped on
+    ``dedupe_key`` so re-imports/re-saves don't create duplicates.
+    """
+
+    client = models.ForeignKey(
+        "Client", on_delete=models.CASCADE, related_name="timeline_events"
+    )
+    # The enrollment whose renewal cycle this event belongs to (set once an
+    # enrollment exists; null for early-funnel events like the first consent /
+    # screening). Renewal grouping in the UI keys off (enrollment, renewal_number).
+    enrollment = models.ForeignKey(
+        "EnrollmentVerification", on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="timeline_events",
+    )
+    # Renewal cycle the event occurred in: 1 = initial, 2 = first renewal, …
+    # The UI renders a "Renewal #N" group header for N >= 2.
+    renewal_number = models.PositiveSmallIntegerField(default=1, db_index=True)
+    event_type = models.CharField(
+        max_length=30, choices=TimelineEventType.choices, db_index=True
+    )
+    # The domain date shown on the row (e.g. screen_created_at, enrolled_at),
+    # NOT the row's insert time (created_at).
+    occurred_at = models.DateTimeField(db_index=True)
+
+    title = models.CharField(max_length=255, blank=True)
+    subtitle = models.CharField(max_length=255, blank=True)
+    badge_text = models.CharField(max_length=120, blank=True)
+    badge_tone = models.CharField(
+        max_length=10, choices=TimelineBadgeTone.choices,
+        default=TimelineBadgeTone.NEUTRAL, blank=True,
+    )
+
+    # Attribution (mirrors api.history.ChangeSource): import | extension | admin | crm | system.
+    source = models.CharField(max_length=20, blank=True, db_index=True)
+    actor = models.CharField(max_length=120, blank=True)
+
+    # Generic link to the source entity. object_id is a CharField because the
+    # linked PKs are mixed (UUIDs for Screening/Assessment/Case/Client, ints for
+    # Enrollment/EnrollmentProcess).
+    content_type = models.ForeignKey(
+        ContentType, on_delete=models.SET_NULL, null=True, blank=True
+    )
+    object_id = models.CharField(max_length=64, blank=True)
+    entity = GenericForeignKey("content_type", "object_id")
+
+    metadata = models.JSONField(default=dict, blank=True)
+    # Idempotency key, e.g. "screening:<uuid>" or "consent_granted:<client_id>".
+    # Unique when set so emit() can update_or_create without duplicating.
+    dedupe_key = models.CharField(max_length=128, blank=True, db_index=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-occurred_at", "-created_at"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["dedupe_key"],
+                condition=~models.Q(dedupe_key=""),
+                name="unique_timeline_dedupe_key",
+            )
+        ]
+        indexes = [
+            models.Index(fields=["client", "occurred_at"]),
+            models.Index(fields=["event_type"]),
+            models.Index(fields=["enrollment", "renewal_number"]),
+        ]
+
+    def __str__(self):
+        return f"{self.event_type} for {self.client_id} @ {self.occurred_at:%Y-%m-%d}"

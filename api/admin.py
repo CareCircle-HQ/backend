@@ -1,4 +1,5 @@
 from django.contrib import admin
+from simple_history.admin import SimpleHistoryAdmin
 
 from .models import (
     Address,
@@ -6,9 +7,15 @@ from .models import (
     Assessment,
     Case,
     Client,
+    EnrollmentVerification,
+    Household,
+    HouseholdMember,
     IdentifiedSocialNeed,
+    ImportRun,
     Insurance,
+    MemberVerification,
     MilitaryProfile,
+    Note,
     Program,
     ProgramMainCategory,
     ProgramPipeline,
@@ -16,6 +23,9 @@ from .models import (
     Screening,
     Service,
     SocialCareCoverage,
+    Ticket,
+    TimelineEvent,
+    UniteUsCredential,
     VerifiedSocialNeed,
 )
 
@@ -40,6 +50,45 @@ class SocialCareCoverageInline(admin.TabularInline):
     extra = 0
 
 
+class MemberVerificationInline(admin.TabularInline):
+    model = MemberVerification
+    extra = 0
+    autocomplete_fields = ("client",)
+
+
+@admin.register(EnrollmentVerification)
+class EnrollmentVerificationAdmin(admin.ModelAdmin):
+    list_display = (
+        "id",
+        "client",
+        "household",
+        "program_name",
+        "stage",
+        "is_family_verified",
+        "medicaid_type_verified",
+        "delivery_address_verified",
+        "renewal_number",
+        "opened_at",
+    )
+    list_filter = (
+        "stage",
+        "is_family_verified",
+        "medicaid_type_verified",
+        "delivery_address_verified",
+    )
+    search_fields = (
+        "client__client_id",
+        "client__first_name",
+        "client__last_name",
+        "program_name",
+        "code",
+    )
+    autocomplete_fields = ("client", "household")
+    raw_id_fields = ("case", "delivery_address")
+    readonly_fields = ("opened_at", "stage_at", "closed_at")
+    inlines = (MemberVerificationInline,)
+
+
 @admin.register(Client)
 class ClientAdmin(admin.ModelAdmin):
     list_display = (
@@ -47,11 +96,13 @@ class ClientAdmin(admin.ModelAdmin):
         "first_name",
         "last_name",
         "client_email_address",
+        "is_level",
         "consent_accepted",
         "attestation_needed",
         "crm_contact_id",
     )
     list_filter = (
+        "is_level",
         "consent_accepted",
         "attestation_needed",
         "is_a_family",
@@ -131,10 +182,18 @@ class CaseAdmin(admin.ModelAdmin):
         "client",
         "case_status",
         "service_type",
+        "case_type",
+        "household_type",
         "provider",
         "date_opened",
     )
-    list_filter = ("case_status", "service_authorization_status", "case_is_referred")
+    list_filter = (
+        "case_type",
+        "household_type",
+        "case_status",
+        "service_authorization_status",
+        "case_is_referred",
+    )
     search_fields = (
         "case_id",
         "client__last_name",
@@ -142,6 +201,31 @@ class CaseAdmin(admin.ModelAdmin):
         "created_by_name",
     )
     autocomplete_fields = ("client", "provider", "originating_provider", "program", "previous_case")
+
+
+class HouseholdMemberInline(admin.TabularInline):
+    model = HouseholdMember
+    extra = 0
+    autocomplete_fields = ("client",)
+
+
+@admin.register(Household)
+class HouseholdAdmin(admin.ModelAdmin):
+    list_display = ("household_id", "name", "member_count", "created_at")
+    search_fields = ("household_id", "name", "members__client__client_id")
+    inlines = (HouseholdMemberInline,)
+
+    @admin.display(description="members")
+    def member_count(self, obj):
+        return obj.members.count()
+
+
+@admin.register(HouseholdMember)
+class HouseholdMemberAdmin(admin.ModelAdmin):
+    list_display = ("client", "household", "is_primary", "relationship", "added_at")
+    list_filter = ("is_primary",)
+    search_fields = ("client__client_id", "client__last_name", "household__name")
+    autocomplete_fields = ("client", "household")
 
 
 class IdentifiedSocialNeedInline(admin.TabularInline):
@@ -213,3 +297,65 @@ class ProgramPipelineAdmin(admin.ModelAdmin):
     list_filter = ("case_category", "main_category", "pipeline_name")
     search_fields = ("program_name", "pipeline_id")
     ordering = ("program_name",)
+
+
+@admin.register(UniteUsCredential)
+class UniteUsCredentialAdmin(admin.ModelAdmin):
+    # Never expose the encrypted token columns in the admin form/list.
+    list_display = (
+        "provider_id", "employee_id", "agent", "status",
+        "access_expires_at", "last_captured_at", "last_refreshed_at",
+    )
+    list_filter = ("status",)
+    search_fields = ("provider_id", "employee_id")
+    exclude = ("access_token", "refresh_token")
+    readonly_fields = ("last_captured_at", "last_refreshed_at", "created_at", "updated_at")
+    autocomplete_fields = ("agent",)
+
+
+@admin.register(ImportRun)
+class ImportRunAdmin(admin.ModelAdmin):
+    list_display = (
+        "id", "source", "status", "triggered_by",
+        "processed_count", "created_count", "updated_count",
+        "skipped_count", "error_count", "started_at", "finished_at",
+    )
+    list_filter = ("source", "status")
+    search_fields = ("source", "triggered_by")
+    readonly_fields = ("started_at",)
+
+
+@admin.register(Note)
+class NoteAdmin(SimpleHistoryAdmin):
+    list_display = ("id", "source", "client", "case", "author_name", "source_created_at")
+    list_filter = ("source",)
+    search_fields = ("source_note_id", "author_name", "body")
+    autocomplete_fields = ("client", "case")
+
+
+@admin.register(Ticket)
+class TicketAdmin(SimpleHistoryAdmin):
+    list_display = (
+        "id", "type", "status", "severity", "client", "case",
+        "assigned_to", "created_at",
+    )
+    list_filter = ("status", "type", "severity")
+    search_fields = ("reason",)
+    autocomplete_fields = ("client", "case", "assigned_to", "import_run")
+
+
+@admin.register(TimelineEvent)
+class TimelineEventAdmin(admin.ModelAdmin):
+    list_display = (
+        "occurred_at", "event_type", "client", "title", "badge_text",
+        "badge_tone", "renewal_number", "source", "actor",
+    )
+    list_filter = ("event_type", "badge_tone", "source", "renewal_number")
+    search_fields = (
+        "client__client_id", "client__first_name", "client__last_name",
+        "title", "subtitle", "actor", "dedupe_key", "object_id",
+    )
+    date_hierarchy = "occurred_at"
+    ordering = ("-occurred_at", "-created_at")
+    raw_id_fields = ("client", "enrollment", "content_type")
+    readonly_fields = ("created_at",)

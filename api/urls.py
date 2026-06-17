@@ -10,6 +10,7 @@ from .views import (
     AssessmentViewSet,
     CaseViewSet,
     ClientViewSet,
+    EnrollmentVerificationViewSet,
     ContractedServiceViewSet,
     HealthView,
     MeView,
@@ -20,6 +21,7 @@ from .views import (
 )
 from .views_agent import AgentLoginView, AgentValidateView
 from .views_calltools import CallToolsAgentStatusView, CallToolsCampaignsView
+from .views_uniteus import UniteUsCredentialCaptureView, UniteUsRunUpdateView
 
 router = DefaultRouter()
 router.register("clients", ClientViewSet, basename="client")
@@ -27,6 +29,11 @@ router.register("cases", CaseViewSet, basename="case")
 router.register("contracted-services", ContractedServiceViewSet, basename="contracted-service")
 router.register("screenings", ScreeningViewSet, basename="screening")
 router.register("assessments", AssessmentViewSet, basename="assessment")
+router.register(
+    "enrollment-verifications",
+    EnrollmentVerificationViewSet,
+    basename="enrollment-verification",
+)
 router.register("providers", ProviderViewSet, basename="provider")
 router.register("programs", ProgramViewSet, basename="program")
 
@@ -46,6 +53,18 @@ urlpatterns = [
     ),
     # CallTools dialer
     path("calltools/campaigns/", CallToolsCampaignsView.as_view(), name="calltools-campaigns"),
+    # Unite Us credential capture (extension pushes the captured session here)
+    path(
+        "uniteus/credentials/",
+        UniteUsCredentialCaptureView.as_view(),
+        name="uniteus-credential-capture",
+    ),
+    # On-demand updater trigger (extension "Sync Now" button)
+    path(
+        "uniteus/run-update/",
+        UniteUsRunUpdateView.as_view(),
+        name="uniteus-run-update",
+    ),
     # User
     path("me/", MeView.as_view(), name="me"),
     # Misc

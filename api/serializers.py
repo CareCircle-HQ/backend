@@ -1,4 +1,5 @@
 import logging
+import re
 
 from django.contrib.auth import get_user_model
 from django.contrib.auth.password_validation import validate_password
@@ -14,13 +15,25 @@ from .models import (
     WEEKDAYS,
     Address,
     Case,
+    CaseHouseholdType,
+    CaseType,
     Client,
+    ClientLevel,
+    DietaryRestriction,
+    EnrollmentStage,
+    EnrollmentVerification,
+    FoodAllergy,
+    Household,
+    HouseholdMember,
     Assessment,
     ContractedService,
     CommunicationChannel,
     CommunicationTimeOfDay,
     IdentifiedSocialNeed,
     Insurance,
+    MemberVerification,
+    MenuCategory,
+    MenuType,
     MilitaryProfile,
     Program,
     Provider,
@@ -29,6 +42,7 @@ from .models import (
     ServiceType,
     SocialCareCoverage,
     SocialCareCoverageStatus,
+    TimelineEvent,
     VerifiedSocialNeed,
 )
 
@@ -142,6 +156,24 @@ class SocialCareCoverageSerializer(serializers.ModelSerializer):
         exclude = ("id", "client")
 
 
+def _safe_update_or_create(model, defaults, **lookup):
+    """Like ``Model.objects.update_or_create`` but tolerant of pre-existing
+    duplicate rows matching ``lookup``.
+
+    Some dedupe keys aren't unique-constrained (e.g. Insurance keyed by
+    client + plan_name + external_member_id), and historical data can contain
+    duplicates. Plain ``update_or_create`` raises MultipleObjectsReturned in
+    that case; this picks the first match and updates it instead.
+    """
+    obj = model.objects.filter(**lookup).order_by("pk").first()
+    if obj is None:
+        return model.objects.create(**{**lookup, **defaults}), True
+    for field, value in defaults.items():
+        setattr(obj, field, value)
+    obj.save()
+    return obj, False
+
+
 class ClientSerializer(serializers.ModelSerializer):
     client_id = serializers.UUIDField()
     military_profile = MilitaryProfileSerializer(required=False, allow_null=True)
@@ -152,6 +184,8 @@ class ClientSerializer(serializers.ModelSerializer):
     class Meta:
         model = Client
         fields = "__all__"
+        # Derived server-side on assessment save; never written by the client.
+        read_only_fields = ("is_level",)
 
     def _validate_services(self, value, field_name):
         if value in (None, ""):
@@ -304,18 +338,19 @@ class ClientSerializer(serializers.ModelSerializer):
                     ins["status"] = RecordStatus.EXPIRED
                 key = ins.get("insurance_id")
                 if key:
-                    obj, _ = Insurance.objects.update_or_create(
-                        client=client, insurance_id=key, defaults=ins
+                    obj, _ = _safe_update_or_create(
+                        Insurance, ins, client=client, insurance_id=key
                     )
                 else:
                     # No external insurance_id (e.g. records scraped from the
                     # Unite Us page): dedupe by plan + member id so repeated
                     # syncs update the same row instead of creating duplicates.
-                    obj, _ = Insurance.objects.update_or_create(
+                    obj, _ = _safe_update_or_create(
+                        Insurance,
+                        ins,
                         client=client,
                         plan_name=ins.get("plan_name", ""),
                         external_member_id=ins.get("external_member_id", ""),
-                        defaults=ins,
                     )
                 seen_pks.append(obj.pk)
 
@@ -340,15 +375,16 @@ class ClientSerializer(serializers.ModelSerializer):
                     scc["status"] = SocialCareCoverageStatus.EXPIRED
                 key = scc.get("coverage_id")
                 if key:
-                    obj, _ = SocialCareCoverage.objects.update_or_create(
-                        client=client, coverage_id=key, defaults=scc
+                    obj, _ = _safe_update_or_create(
+                        SocialCareCoverage, scc, client=client, coverage_id=key
                     )
                 else:
-                    obj, _ = SocialCareCoverage.objects.update_or_create(
+                    obj, _ = _safe_update_or_create(
+                        SocialCareCoverage,
+                        scc,
                         client=client,
                         plan_name=scc.get("plan_name", ""),
                         external_member_id=scc.get("external_member_id", ""),
-                        defaults=scc,
                     )
                 seen_scc_pks.append(obj.pk)
 
@@ -362,12 +398,331 @@ class ClientSerializer(serializers.ModelSerializer):
                     .update(status=SocialCareCoverageStatus.NON_ENROLLED)
                 )
 
+        # Saving the profile may have changed the client's household data, which
+        # drives each case's Individual/Household classification. Refresh any of
+        # this client's cases whose household_type no longer matches.
+        new_household_type = derive_household_type(client)
+        Case.objects.filter(client=client).exclude(
+            household_type=new_household_type
+        ).update(household_type=new_household_type)
+
+        # When the profile marks this client as part of a family, make sure a
+        # household exists with this client as its primary member, so the group
+        # always has at least one participant. Single individuals don't get a
+        # household here (avoids creating one per imported client).
+        if client.is_a_family or (client.total_family_members or 0) > 1:
+            ensure_household_with_primary(client)
+
         return client
+
+
+# ===========================================================================
+# Household domain
+# ===========================================================================
+def ensure_household_with_primary(client):
+    """Get-or-create ``client``'s household with the client as primary member.
+
+    If the client already belongs to a household (e.g. added to a relative's
+    household), that household is returned unchanged. Otherwise a new household
+    is created with the client flagged as its primary member.
+    """
+    membership = HouseholdMember.objects.filter(client=client).first()
+    if membership is not None:
+        return membership.household
+    household = Household.objects.create()
+    HouseholdMember.objects.create(household=household, client=client, is_primary=True)
+    return household
+
+
+class HouseholdMemberSerializer(serializers.ModelSerializer):
+    client_id = serializers.UUIDField(source="client.client_id", read_only=True)
+    first_name = serializers.CharField(source="client.first_name", read_only=True)
+    last_name = serializers.CharField(source="client.last_name", read_only=True)
+    date_of_birth = serializers.DateField(source="client.date_of_birth", read_only=True)
+
+    class Meta:
+        model = HouseholdMember
+        fields = (
+            "client_id",
+            "first_name",
+            "last_name",
+            "date_of_birth",
+            "is_primary",
+            "relationship",
+            "added_at",
+        )
+
+
+class HouseholdSerializer(serializers.ModelSerializer):
+    members = HouseholdMemberSerializer(many=True, read_only=True)
+
+    class Meta:
+        model = Household
+        fields = ("household_id", "name", "members", "created_at", "updated_at")
+
+
+# ===========================================================================
+# Enrollment verification domain
+# ===========================================================================
+_UNSET = object()  # sentinel: distinguish "omitted" from an explicit null on PATCH
+
+
+def _validate_choice_codes(value, choices_cls, field_name):
+    """Validate a multi-select list against a TextChoices set, de-duplicating
+    while preserving order. Empty / null normalizes to []."""
+    if value in (None, ""):
+        return []
+    if not isinstance(value, list):
+        raise serializers.ValidationError(f"{field_name} must be a list of codes.")
+    valid = set(choices_cls.values)
+    invalid = [v for v in value if v not in valid]
+    if invalid:
+        raise serializers.ValidationError(
+            f"Invalid {field_name} values: {invalid}. Allowed: {sorted(valid)}"
+        )
+    seen = []
+    for v in value:
+        if v not in seen:
+            seen.append(v)
+    return seen
+
+
+class MemberVerificationSerializer(serializers.ModelSerializer):
+    # The participant client UUID (the FK's pk). Readable + writable; resolved
+    # to a Client by the parent EnrollmentVerificationSerializer.
+    client_id = serializers.UUIDField(required=False, allow_null=True)
+
+    class Meta:
+        model = MemberVerification
+        fields = (
+            "id",
+            "client_id",
+            "member_name",
+            "dietary_restrictions",
+            "food_allergies",
+            "other_dietary_restrictions",
+            "meal_category",
+            "menu_type",
+            "general_verification_notes",
+            "created_at",
+            "updated_at",
+        )
+        read_only_fields = ("id", "created_at", "updated_at")
+
+    def validate_dietary_restrictions(self, value):
+        return _validate_choice_codes(value, DietaryRestriction, "dietary_restrictions")
+
+    def validate_food_allergies(self, value):
+        return _validate_choice_codes(value, FoodAllergy, "food_allergies")
+
+
+class EnrollmentVerificationSerializer(serializers.ModelSerializer):
+    """Read/write the verification enrollment plus its per-member answers.
+
+    ``stage`` is read-only here: stage changes (which include the Step-4
+    authorization outcome) must go through the ``set-stage`` action so they are
+    guarded and recorded on the timeline.
+    """
+
+    # Write-only inputs, resolved to FKs in create/update.
+    client_id = serializers.UUIDField(write_only=True, required=False)
+    household_id = serializers.UUIDField(write_only=True, required=False, allow_null=True)
+    case_id = serializers.UUIDField(write_only=True, required=False, allow_null=True)
+    delivery_address_id = serializers.IntegerField(
+        write_only=True, required=False, allow_null=True
+    )
+    members = MemberVerificationSerializer(
+        many=True, source="member_verifications", required=False
+    )
+
+    class Meta:
+        model = EnrollmentVerification
+        fields = (
+            "id",
+            "client_id",
+            "household_id",
+            "case_id",
+            "delivery_address_id",
+            "stage",
+            "program_name",
+            "household_size",
+            "is_family_verified",
+            "medicaid_type_verified",
+            "delivery_address_verified",
+            "code",
+            "renewal_number",
+            "stage_at",
+            "opened_at",
+            "closed_at",
+            "note",
+            "members",
+        )
+        read_only_fields = ("id", "stage", "code", "stage_at", "opened_at", "closed_at")
+
+    def validate_members(self, value):
+        if value is None:
+            return value
+        if len(value) > 10:
+            raise serializers.ValidationError("A household may have at most 10 members.")
+        if len(value) < 1:
+            raise serializers.ValidationError("At least 1 member is required.")
+        return value
+
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        data["client_id"] = str(instance.client_id) if instance.client_id else None
+        data["household_id"] = str(instance.household_id) if instance.household_id else None
+        data["case_id"] = str(instance.case_id) if instance.case_id else None
+        data["stage_display"] = instance.get_stage_display()
+        data["delivery_address"] = (
+            AddressSerializer(instance.delivery_address).data
+            if instance.delivery_address_id
+            else None
+        )
+        return data
+
+    def _sync_members(self, enrollment, members):
+        """Full-replace the enrollment's member verifications from the payload."""
+        enrollment.member_verifications.all().delete()
+        seen_clients = set()
+        for m in members:
+            client_uuid = m.get("client_id")
+            if client_uuid is not None and client_uuid in seen_clients:
+                continue  # ignore duplicate participant rows
+            member_client = (
+                Client.objects.filter(pk=client_uuid).first() if client_uuid else None
+            )
+            if client_uuid is not None:
+                seen_clients.add(client_uuid)
+            name = m.get("member_name") or (
+                f"{member_client.first_name} {member_client.last_name}".strip()
+                if member_client
+                else ""
+            )
+            MemberVerification.objects.create(
+                enrollment=enrollment,
+                client=member_client,
+                member_name=name,
+                dietary_restrictions=m.get("dietary_restrictions", []),
+                food_allergies=m.get("food_allergies", []),
+                other_dietary_restrictions=m.get("other_dietary_restrictions", ""),
+                meal_category=m.get("meal_category", ""),
+                menu_type=m.get("menu_type", ""),
+                general_verification_notes=m.get("general_verification_notes", ""),
+            )
+
+    @transaction.atomic
+    def create(self, validated_data):
+        members = validated_data.pop("member_verifications", [])
+        cid = validated_data.pop("client_id", None)
+        hid = validated_data.pop("household_id", None)
+        case_id = validated_data.pop("case_id", None)
+        aid = validated_data.pop("delivery_address_id", None)
+
+        client = Client.objects.filter(pk=cid).first() if cid else None
+        if client is None:
+            raise serializers.ValidationError(
+                {"client_id": "A valid client_id is required."}
+            )
+        enrollment = EnrollmentVerification.objects.create(
+            client=client,
+            household=Household.objects.filter(pk=hid).first() if hid else None,
+            case=Case.objects.filter(pk=case_id).first() if case_id else None,
+            delivery_address=Address.objects.filter(pk=aid).first() if aid else None,
+            **validated_data,
+        )
+        self._sync_members(enrollment, members)
+        return enrollment
+
+    @transaction.atomic
+    def update(self, instance, validated_data):
+        members = validated_data.pop("member_verifications", None)
+        cid = validated_data.pop("client_id", None)
+        hid = validated_data.pop("household_id", _UNSET)
+        case_id = validated_data.pop("case_id", _UNSET)
+        aid = validated_data.pop("delivery_address_id", _UNSET)
+
+        if cid:
+            client = Client.objects.filter(pk=cid).first()
+            if client is not None:
+                instance.client = client
+        if hid is not _UNSET:
+            instance.household = Household.objects.filter(pk=hid).first() if hid else None
+        if case_id is not _UNSET:
+            instance.case = Case.objects.filter(pk=case_id).first() if case_id else None
+        if aid is not _UNSET:
+            instance.delivery_address = (
+                Address.objects.filter(pk=aid).first() if aid else None
+            )
+        for field, value in validated_data.items():
+            setattr(instance, field, value)
+        instance.save()
+        if members is not None:
+            self._sync_members(instance, members)
+        return instance
 
 
 # ===========================================================================
 # Case domain
 # ===========================================================================
+# A case whose Service Type is exactly this is an Internal (Case Management)
+# case; any other service type is treated as Navigation.
+SOCIAL_SERVICE_CASE_MANAGEMENT = "Social Service Case Management"
+
+
+def derive_case_type(service_type):
+    """Navigation / Internal Service from a case's service_type.
+
+    Returns None when service_type is blank so callers can leave the existing
+    value (or the model default) untouched. Never returns External Service —
+    that classification is only ever set explicitly.
+    """
+    st = (service_type or "").strip()
+    if not st:
+        return None
+    if st.casefold() == SOCIAL_SERVICE_CASE_MANAGEMENT.casefold():
+        return CaseType.INTERNAL_SERVICE
+    return CaseType.NAVIGATION
+
+
+def derive_household_type(client):
+    """Individual vs Household from the client's household data: a household
+    when the client is flagged as a family or has more than one member."""
+    is_household = bool(getattr(client, "is_a_family", False)) or (
+        (getattr(client, "household_size", None) or 0) > 1
+    )
+    return (
+        CaseHouseholdType.HOUSEHOLD if is_household else CaseHouseholdType.INDIVIDUAL
+    )
+
+
+# Matches a "Level 1"/"Level 2" marker in an eligible service name, tolerant of
+# spacing (e.g. "Level2") and word boundaries (won't match "Level 12").
+_LEVEL_2_RE = re.compile(r"\blevel\s*2\b", re.IGNORECASE)
+_LEVEL_1_RE = re.compile(r"\blevel\s*1\b", re.IGNORECASE)
+
+
+def derive_client_level(eligible_services):
+    """Scan an assessment's eligible service names for a "Level 1"/"Level 2"
+    marker and return the matching ClientLevel value, or None when neither is
+    present. Level 2 takes precedence over Level 1.
+    """
+    has_level_1 = has_level_2 = False
+    for raw in eligible_services or []:
+        name = raw.get("name") or raw.get("code") if isinstance(raw, dict) else raw
+        if not isinstance(name, str):
+            continue
+        if _LEVEL_2_RE.search(name):
+            has_level_2 = True
+        elif _LEVEL_1_RE.search(name):
+            has_level_1 = True
+    if has_level_2:
+        return ClientLevel.LEVEL_2
+    if has_level_1:
+        return ClientLevel.LEVEL_1
+    return None
+
+
 class CaseSerializer(serializers.ModelSerializer):
     case_id = serializers.UUIDField()
     subject_id = serializers.UUIDField(required=False, allow_null=True)
@@ -441,6 +796,17 @@ class CaseSerializer(serializers.ModelSerializer):
                 "previous_case": previous_case,
             }
         )
+
+        # Auto-classify on every create/update. An explicit value in the payload
+        # wins (e.g. a manually-set External Service); otherwise derive from the
+        # service_type (case_type) and the client's household data (household_type).
+        if "case_type" not in validated_data:
+            derived_type = derive_case_type(validated_data.get("service_type"))
+            if derived_type is not None:
+                validated_data["case_type"] = derived_type
+        if "household_type" not in validated_data:
+            validated_data["household_type"] = derive_household_type(client)
+
         case, _ = Case.objects.update_or_create(case_id=case_id, defaults=validated_data)
         # Best-effort: build the master Service catalog (service_type linked to
         # its Program). Never let a catalog error break the case save.
@@ -457,7 +823,7 @@ class ContractedServiceSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = ContractedService
-        exclude = ("case", "import_batch")
+        exclude = ("case",)
 
     @transaction.atomic
     def create(self, validated_data):
@@ -605,4 +971,50 @@ class AssessmentSerializer(serializers.ModelSerializer):
             catalog.upsert_programs(obj.eligible_services)
         except Exception:
             logger.exception("catalog.upsert_programs failed")
+        # Derive the client's service level from the eligible service names
+        # carrying a "Level 1"/"Level 2" marker. Only set when detected so a
+        # marker-less assessment doesn't wipe a level set by another one.
+        if obj.client:
+            level = derive_client_level(obj.eligible_services)
+            if level and obj.client.is_level != level:
+                obj.client.is_level = level
+                obj.client.save(update_fields=["is_level"])
         return obj
+
+
+# ===========================================================================
+# Timeline (central history)
+# ===========================================================================
+class TimelineEventSerializer(serializers.ModelSerializer):
+    """Read-only view of a timeline event for the manager dashboard.
+
+    ``entity_type`` / ``entity_id`` give the frontend a stable deep-link to the
+    underlying record (screening, assessment, case, insurance, …) without
+    embedding the whole object.
+    """
+
+    entity_type = serializers.SerializerMethodField()
+    entity_id = serializers.CharField(source="object_id", read_only=True)
+
+    class Meta:
+        model = TimelineEvent
+        fields = [
+            "id",
+            "event_type",
+            "occurred_at",
+            "title",
+            "subtitle",
+            "badge_text",
+            "badge_tone",
+            "source",
+            "actor",
+            "renewal_number",
+            "enrollment",
+            "entity_type",
+            "entity_id",
+            "metadata",
+            "created_at",
+        ]
+
+    def get_entity_type(self, obj):
+        return obj.content_type.model if obj.content_type_id else None
