@@ -54,12 +54,53 @@ python manage.py runserver
 ```
 
 ### Production ⚠️
+- **Public URL**: `https://www.carecircleinternal.com`
 - **Database**: AWS RDS (PostgreSQL)
 - **Host**: `prod.czu4cm6ye26e.us-east-2.rds.amazonaws.com`
 - **Database**: `Prod`
 - **File**: `.env.prod`
 - **Debug**: Disabled
 - **Usage**: Live application
+
+Required `.env.prod` web/domain settings:
+
+```bash
+DJANGO_DEBUG=False
+DJANGO_ALLOWED_HOSTS=www.carecircleinternal.com,carecircleinternal.com
+DJANGO_CSRF_TRUSTED_ORIGINS=https://www.carecircleinternal.com
+# Web frontends only; chrome-extension:// origins are auto-allowed by regex.
+CORS_ALLOWED_ORIGINS=https://www.carecircleinternal.com
+```
+
+The Chrome extension must also point at production: set `backendUrl` to
+`https://www.carecircleinternal.com` in `extension/config.js`, and ensure
+`https://www.carecircleinternal.com/*` is listed in `extension/manifest.json`
+`host_permissions`.
+
+## Verifying the live environment
+
+Hit the health endpoint to confirm which backend is actually responding:
+
+```bash
+curl https://www.carecircleinternal.com/api/health/
+```
+
+A live production backend returns `environment: "production"` and
+`debug: false`:
+
+```json
+{
+  "status": "ok",
+  "environment": "production",
+  "debug": false,
+  "host": "www.carecircleinternal.com",
+  "database": "ok",
+  "server_time": "2026-06-17T20:42:00+00:00"
+}
+```
+
+If `environment` is `local`/`dev` or `debug` is `true`, you are NOT hitting the
+live prod environment.
 
 ```bash
 # Switch to production (requires confirmation)
