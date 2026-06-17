@@ -18,6 +18,7 @@ from .views import (
     ProviderViewSet,
     RegisterView,
     ScreeningViewSet,
+    ZipCodeCheckView,
 )
 from .views_agent import AgentLoginView, AgentValidateView
 from .views_calltools import CallToolsAgentStatusView, CallToolsCampaignsView
@@ -69,6 +70,7 @@ urlpatterns = [
     path("me/", MeView.as_view(), name="me"),
     # Misc
     path("health/", HealthView.as_view(), name="health"),
+    path("zipcodes/check/", ZipCodeCheckView.as_view(), name="zipcode-check"),
     # Domain resources
     path("", include(router.urls)),
 ]

@@ -70,11 +70,11 @@ def _has_met_council_case(client):
     return False
 
 
-def _eligibility_stage(client):
-    """Return ELIGIBLE / INELIGIBLE / None from the client's eligibility results.
+def _assessment_outcome(client):
+    """Return "eligible" / "ineligible" / None from the client's assessments.
 
-    Prefers ELIGIBLE when results are mixed. Returns None when no eligibility
-    result has been resolved yet.
+    Prefers "eligible" when results are mixed. None when no assessment has a
+    resolved eligibility result yet.
     """
     statuses = [
         (e.eligible_status or "").strip().lower()
@@ -88,32 +88,113 @@ def _eligibility_stage(client):
         return "ineligible" in s or "not eligible" in s
 
     if any("eligible" in s and not is_ineligible(s) for s in statuses):
-        return ClientStage.ELIGIBLE
+        return "eligible"
     if any(is_ineligible(s) for s in statuses):
-        return ClientStage.INELIGIBLE
+        return "ineligible"
     return None
 
 
-def derive_client_stage(client):
-    """Compute the funnel stage from the client's current data (no writes).
+def _derive_early_funnel(client):
+    """Early funnel stage from synced Unite Us data (no writes).
 
-    Priority (highest first): client > eligible|ineligible > screened >
-    prospect > lead.
+    Priority (highest first): navigation > assessment > not_eligible >
+    screened > consent > inactive.
     """
     if _has_met_council_case(client):
-        return ClientStage.CLIENT
+        return ClientStage.NAVIGATION
 
-    elig = _eligibility_stage(client)
-    if elig is not None:
-        return elig
+    outcome = _assessment_outcome(client)
+    if outcome == "eligible":
+        return ClientStage.ASSESSMENT
+    if outcome == "ineligible":
+        return ClientStage.NOT_ELIGIBLE
 
     if _has_met_council_screening(client):
         return ClientStage.SCREENED
 
-    if (client.consent_status or "").lower() == "accepted":
-        return ClientStage.PROSPECT
+    if client.consent_accepted or (client.consent_status or "").lower() == "accepted":
+        return ClientStage.CONSENT
 
-    return ClientStage.LEAD
+    return ClientStage.INACTIVE
+
+
+# EnrollmentVerification.stage -> the ClientStage it drives the client to, for
+# the stages that actively govern the client (past verification start). DENIED
+# is intentionally non-terminal: it parks the client at Waiting Authorization
+# ("needs attention", easily re-accepted) rather than an off-ramp.
+_ENROLLMENT_DRIVES = {
+    EnrollmentStage.PENDING_VERIFICATION: ClientStage.PENDING_VERIFICATION,
+    EnrollmentStage.VERIFIED: ClientStage.VERIFIED,
+    EnrollmentStage.WAITING_AUTHORIZATION: ClientStage.WAITING_AUTHORIZATION,
+    EnrollmentStage.DENIED: ClientStage.WAITING_AUTHORIZATION,
+    EnrollmentStage.AUTHORIZED: ClientStage.AUTHORIZED,
+    EnrollmentStage.SERVICE_ACTIVE: ClientStage.ACTIVE,
+    EnrollmentStage.SERVICE_COMPLETE: ClientStage.COMPLETED,
+}
+
+# Rank used to pick the most-advanced enrollment when a client has several.
+# Paused/terminal stages rank 0 so an active enrollment always wins.
+_ENROLLMENT_RANK = {
+    EnrollmentStage.ON_HOLD: 0,
+    EnrollmentStage.CLOSED: 0,
+    EnrollmentStage.CANCELLED: 0,
+    EnrollmentStage.PENDING_VALIDATION: 1,
+    EnrollmentStage.VALIDATED: 2,
+    EnrollmentStage.PENDING_VERIFICATION: 3,
+    EnrollmentStage.VERIFIED: 4,
+    EnrollmentStage.WAITING_AUTHORIZATION: 5,
+    EnrollmentStage.DENIED: 5,
+    EnrollmentStage.AUTHORIZED: 6,
+    EnrollmentStage.SERVICE_ACTIVE: 7,
+    EnrollmentStage.SERVICE_COMPLETE: 8,
+}
+
+
+def _primary_enrollment(client):
+    """The enrollment that governs the client's stage: the most-advanced one,
+    tie-broken by most-recent stage change. None when the client has none."""
+    enrollments = list(client.enrollments.all())
+    if not enrollments:
+        return None
+
+    def sort_key(e):
+        return (
+            _ENROLLMENT_RANK.get(EnrollmentStage(e.stage), 0),
+            e.stage_at or e.opened_at,
+        )
+
+    return max(enrollments, key=sort_key)
+
+
+def derive_client_stage(client):
+    """Compute the client's lifecycle stage (no writes).
+
+    The early funnel governs until an EnrollmentVerification exists; from
+    Pending Verification onward the enrollment's stage takes precedence.
+    """
+    early = _derive_early_funnel(client)
+    enr = _primary_enrollment(client)
+    if enr is None:
+        return early
+
+    stage = EnrollmentStage(enr.stage)
+
+    # Enrollment exists but hasn't reached verification yet: early funnel rules.
+    if stage in (EnrollmentStage.PENDING_VALIDATION, EnrollmentStage.VALIDATED):
+        return early
+
+    # On hold: don't move the client (keep its current stage).
+    if stage == EnrollmentStage.ON_HOLD:
+        return client.lifecycle_stage or early
+
+    # Closed / cancelled: terminal off-ramp, but never downgrade a client that
+    # already reached Active / Completed.
+    if stage in (EnrollmentStage.CLOSED, EnrollmentStage.CANCELLED):
+        if client.lifecycle_stage in (ClientStage.ACTIVE, ClientStage.COMPLETED):
+            return client.lifecycle_stage
+        return ClientStage.NOT_ELIGIBLE
+
+    return _ENROLLMENT_DRIVES.get(stage, early)
 
 
 @transaction.atomic
@@ -297,6 +378,10 @@ def advance_enrollment(enrollment, to_stage, *, actor=None, note="", force=False
         import logging
 
         logging.getLogger(__name__).exception("timeline.event_for_verification failed")
+
+    # Keep the client's lifecycle stage in sync with this enrollment's stage.
+    if enrollment.client_id:
+        recompute_client_stage(enrollment.client, actor=actor)
     return enrollment
 
 

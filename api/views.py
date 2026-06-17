@@ -1,4 +1,5 @@
 import logging
+import os
 import uuid
 
 from django.db import IntegrityError
@@ -11,6 +12,7 @@ from rest_framework.decorators import action
 from rest_framework import status
 
 from .models import (
+    AllowedZipCode,
     Assessment,
     Case,
     Client,
@@ -48,6 +50,7 @@ from .services import timeline
 from .services.lifecycle import (
     InvalidTransition,
     advance_enrollment,
+    recompute_client_stage,
     reconcile_enrollment_authorization,
 )
 
@@ -68,6 +71,18 @@ def _safe_timeline(builder, obj, request):
         logger.exception("timeline emit failed for %s", type(obj).__name__)
 
 
+def _safe_recompute_stage(obj):
+    """Recompute the client's lifecycle stage after a screening/assessment write,
+    never letting a failure break the API write."""
+    client = getattr(obj, "client", None)
+    if client is None:
+        return
+    try:
+        recompute_client_stage(client)
+    except Exception:  # noqa: BLE001
+        logger.exception("recompute_client_stage failed for %s", getattr(client, "pk", None))
+
+
 class RegisterView(generics.CreateAPIView):
     """Public endpoint to create a new user."""
 
@@ -85,12 +100,62 @@ class MeView(APIView):
 
 
 class HealthView(APIView):
-    """Simple public health check."""
+    """Public health check. Reports which environment is responding (so a caller
+    can confirm it's hitting the real live prod backend, not local/dev) plus a
+    quick database connectivity probe."""
 
     permission_classes = [permissions.AllowAny]
 
     def get(self, request):
-        return Response({"status": "ok"})
+        from django.conf import settings as dj_settings
+        from django.db import connection
+        from django.utils import timezone
+
+        db_ok = True
+        try:
+            connection.ensure_connection()
+        except Exception:  # noqa: BLE001 - report unhealthy DB rather than 500
+            db_ok = False
+
+        return Response({
+            "status": "ok" if db_ok else "degraded",
+            "environment": os.getenv("ENVIRONMENT", "local"),
+            "debug": dj_settings.DEBUG,
+            "host": request.get_host(),
+            "database": "ok" if db_ok else "error",
+            "server_time": timezone.now().isoformat(),
+        })
+
+
+class ZipCodeCheckView(APIView):
+    """Check whether a ZIP code is in the allowed service area.
+
+    GET /api/zipcodes/check/?zip=11201 ->
+        {"zip": "11201", "allowed": true, "borough": "...", "scn": "...",
+         "platform": "..."}
+    """
+
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        raw = (request.query_params.get("zip") or "").strip()
+        # Normalize ZIP+4 to the 5-digit base.
+        zip5 = raw.split("-")[0][:5]
+        if not zip5:
+            return Response(
+                {"detail": "A 'zip' query parameter is required."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        match = AllowedZipCode.objects.filter(
+            zip_code=zip5, is_active=True
+        ).first()
+        return Response({
+            "zip": zip5,
+            "allowed": match is not None,
+            "borough": match.borough if match else "",
+            "scn": match.scn if match else "",
+            "platform": match.platform if match else "",
+        })
 
 
 class BulkUpsertMixin:
@@ -405,15 +470,18 @@ class ScreeningViewSet(BulkUpsertMixin, viewsets.ModelViewSet):
         serializer.save()
         ghl.sync_screening(serializer.instance)
         _safe_timeline(timeline.event_for_screening, serializer.instance, self.request)
+        _safe_recompute_stage(serializer.instance)
 
     def perform_update(self, serializer):
         serializer.save()
         ghl.sync_screening(serializer.instance)
         _safe_timeline(timeline.event_for_screening, serializer.instance, self.request)
+        _safe_recompute_stage(serializer.instance)
 
     def post_upsert(self, obj):
         ghl.sync_screening(obj)
         _safe_timeline(timeline.event_for_screening, obj, self.request)
+        _safe_recompute_stage(obj)
 
 
 class AssessmentViewSet(BulkUpsertMixin, viewsets.ModelViewSet):
@@ -435,13 +503,16 @@ class AssessmentViewSet(BulkUpsertMixin, viewsets.ModelViewSet):
     def perform_create(self, serializer):
         serializer.save()
         _safe_timeline(timeline.event_for_assessment, serializer.instance, self.request)
+        _safe_recompute_stage(serializer.instance)
 
     def perform_update(self, serializer):
         serializer.save()
         _safe_timeline(timeline.event_for_assessment, serializer.instance, self.request)
+        _safe_recompute_stage(serializer.instance)
 
     def post_upsert(self, obj):
         _safe_timeline(timeline.event_for_assessment, obj, self.request)
+        _safe_recompute_stage(obj)
 
 
 def _choices(enum):
@@ -491,6 +562,8 @@ class EnrollmentVerificationViewSet(viewsets.ModelViewSet):
     def perform_create(self, serializer):
         serializer.save()
         _safe_timeline(timeline.event_for_verification, serializer.instance, self.request)
+        # New enrollment (default Pending Verification) drives the client stage.
+        _safe_recompute_stage(serializer.instance)
 
     @action(detail=False, methods=["get"])
     def choices(self, request):

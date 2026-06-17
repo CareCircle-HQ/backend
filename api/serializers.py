@@ -185,8 +185,8 @@ class ClientSerializer(serializers.ModelSerializer):
     class Meta:
         model = Client
         fields = "__all__"
-        # Derived server-side on assessment save; never written by the client.
-        read_only_fields = ("is_level",)
+        # Derived server-side; never written by the client/extension.
+        read_only_fields = ("is_level", "lifecycle_stage", "lifecycle_stage_at")
 
     def _validate_services(self, value, field_name):
         if value in (None, ""):
@@ -550,6 +550,7 @@ class EnrollmentVerificationSerializer(serializers.ModelSerializer):
             "stage",
             "program_name",
             "service_type",
+            "call_transfer_answered",
             "household_size",
             "delivery_weekdays",
             "is_family_verified",
