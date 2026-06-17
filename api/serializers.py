@@ -19,6 +19,10 @@ from .models import (
     CaseType,
     Client,
     ClientLevel,
+    DietaryRestriction,
+    EnrollmentStage,
+    EnrollmentVerification,
+    FoodAllergy,
     Household,
     HouseholdMember,
     Assessment,
@@ -27,6 +31,9 @@ from .models import (
     CommunicationTimeOfDay,
     IdentifiedSocialNeed,
     Insurance,
+    MemberVerification,
+    MenuCategory,
+    MenuType,
     MilitaryProfile,
     Program,
     Provider,
@@ -452,6 +459,207 @@ class HouseholdSerializer(serializers.ModelSerializer):
     class Meta:
         model = Household
         fields = ("household_id", "name", "members", "created_at", "updated_at")
+
+
+# ===========================================================================
+# Enrollment verification domain
+# ===========================================================================
+_UNSET = object()  # sentinel: distinguish "omitted" from an explicit null on PATCH
+
+
+def _validate_choice_codes(value, choices_cls, field_name):
+    """Validate a multi-select list against a TextChoices set, de-duplicating
+    while preserving order. Empty / null normalizes to []."""
+    if value in (None, ""):
+        return []
+    if not isinstance(value, list):
+        raise serializers.ValidationError(f"{field_name} must be a list of codes.")
+    valid = set(choices_cls.values)
+    invalid = [v for v in value if v not in valid]
+    if invalid:
+        raise serializers.ValidationError(
+            f"Invalid {field_name} values: {invalid}. Allowed: {sorted(valid)}"
+        )
+    seen = []
+    for v in value:
+        if v not in seen:
+            seen.append(v)
+    return seen
+
+
+class MemberVerificationSerializer(serializers.ModelSerializer):
+    # The participant client UUID (the FK's pk). Readable + writable; resolved
+    # to a Client by the parent EnrollmentVerificationSerializer.
+    client_id = serializers.UUIDField(required=False, allow_null=True)
+
+    class Meta:
+        model = MemberVerification
+        fields = (
+            "id",
+            "client_id",
+            "member_name",
+            "dietary_restrictions",
+            "food_allergies",
+            "other_dietary_restrictions",
+            "meal_category",
+            "menu_type",
+            "general_verification_notes",
+            "created_at",
+            "updated_at",
+        )
+        read_only_fields = ("id", "created_at", "updated_at")
+
+    def validate_dietary_restrictions(self, value):
+        return _validate_choice_codes(value, DietaryRestriction, "dietary_restrictions")
+
+    def validate_food_allergies(self, value):
+        return _validate_choice_codes(value, FoodAllergy, "food_allergies")
+
+
+class EnrollmentVerificationSerializer(serializers.ModelSerializer):
+    """Read/write the verification enrollment plus its per-member answers.
+
+    ``stage`` is read-only here: stage changes (which include the Step-4
+    authorization outcome) must go through the ``set-stage`` action so they are
+    guarded and recorded on the timeline.
+    """
+
+    # Write-only inputs, resolved to FKs in create/update.
+    client_id = serializers.UUIDField(write_only=True, required=False)
+    household_id = serializers.UUIDField(write_only=True, required=False, allow_null=True)
+    case_id = serializers.UUIDField(write_only=True, required=False, allow_null=True)
+    delivery_address_id = serializers.IntegerField(
+        write_only=True, required=False, allow_null=True
+    )
+    members = MemberVerificationSerializer(
+        many=True, source="member_verifications", required=False
+    )
+
+    class Meta:
+        model = EnrollmentVerification
+        fields = (
+            "id",
+            "client_id",
+            "household_id",
+            "case_id",
+            "delivery_address_id",
+            "stage",
+            "program_name",
+            "household_size",
+            "is_family_verified",
+            "medicaid_type_verified",
+            "delivery_address_verified",
+            "code",
+            "renewal_number",
+            "stage_at",
+            "opened_at",
+            "closed_at",
+            "note",
+            "members",
+        )
+        read_only_fields = ("id", "stage", "code", "stage_at", "opened_at", "closed_at")
+
+    def validate_members(self, value):
+        if value is None:
+            return value
+        if len(value) > 10:
+            raise serializers.ValidationError("A household may have at most 10 members.")
+        if len(value) < 1:
+            raise serializers.ValidationError("At least 1 member is required.")
+        return value
+
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        data["client_id"] = str(instance.client_id) if instance.client_id else None
+        data["household_id"] = str(instance.household_id) if instance.household_id else None
+        data["case_id"] = str(instance.case_id) if instance.case_id else None
+        data["stage_display"] = instance.get_stage_display()
+        data["delivery_address"] = (
+            AddressSerializer(instance.delivery_address).data
+            if instance.delivery_address_id
+            else None
+        )
+        return data
+
+    def _sync_members(self, enrollment, members):
+        """Full-replace the enrollment's member verifications from the payload."""
+        enrollment.member_verifications.all().delete()
+        seen_clients = set()
+        for m in members:
+            client_uuid = m.get("client_id")
+            if client_uuid is not None and client_uuid in seen_clients:
+                continue  # ignore duplicate participant rows
+            member_client = (
+                Client.objects.filter(pk=client_uuid).first() if client_uuid else None
+            )
+            if client_uuid is not None:
+                seen_clients.add(client_uuid)
+            name = m.get("member_name") or (
+                f"{member_client.first_name} {member_client.last_name}".strip()
+                if member_client
+                else ""
+            )
+            MemberVerification.objects.create(
+                enrollment=enrollment,
+                client=member_client,
+                member_name=name,
+                dietary_restrictions=m.get("dietary_restrictions", []),
+                food_allergies=m.get("food_allergies", []),
+                other_dietary_restrictions=m.get("other_dietary_restrictions", ""),
+                meal_category=m.get("meal_category", ""),
+                menu_type=m.get("menu_type", ""),
+                general_verification_notes=m.get("general_verification_notes", ""),
+            )
+
+    @transaction.atomic
+    def create(self, validated_data):
+        members = validated_data.pop("member_verifications", [])
+        cid = validated_data.pop("client_id", None)
+        hid = validated_data.pop("household_id", None)
+        case_id = validated_data.pop("case_id", None)
+        aid = validated_data.pop("delivery_address_id", None)
+
+        client = Client.objects.filter(pk=cid).first() if cid else None
+        if client is None:
+            raise serializers.ValidationError(
+                {"client_id": "A valid client_id is required."}
+            )
+        enrollment = EnrollmentVerification.objects.create(
+            client=client,
+            household=Household.objects.filter(pk=hid).first() if hid else None,
+            case=Case.objects.filter(pk=case_id).first() if case_id else None,
+            delivery_address=Address.objects.filter(pk=aid).first() if aid else None,
+            **validated_data,
+        )
+        self._sync_members(enrollment, members)
+        return enrollment
+
+    @transaction.atomic
+    def update(self, instance, validated_data):
+        members = validated_data.pop("member_verifications", None)
+        cid = validated_data.pop("client_id", None)
+        hid = validated_data.pop("household_id", _UNSET)
+        case_id = validated_data.pop("case_id", _UNSET)
+        aid = validated_data.pop("delivery_address_id", _UNSET)
+
+        if cid:
+            client = Client.objects.filter(pk=cid).first()
+            if client is not None:
+                instance.client = client
+        if hid is not _UNSET:
+            instance.household = Household.objects.filter(pk=hid).first() if hid else None
+        if case_id is not _UNSET:
+            instance.case = Case.objects.filter(pk=case_id).first() if case_id else None
+        if aid is not _UNSET:
+            instance.delivery_address = (
+                Address.objects.filter(pk=aid).first() if aid else None
+            )
+        for field, value in validated_data.items():
+            setattr(instance, field, value)
+        instance.save()
+        if members is not None:
+            self._sync_members(instance, members)
+        return instance
 
 
 # ===========================================================================

@@ -7,11 +7,13 @@ from .models import (
     Assessment,
     Case,
     Client,
+    EnrollmentVerification,
     Household,
     HouseholdMember,
     IdentifiedSocialNeed,
     ImportRun,
     Insurance,
+    MemberVerification,
     MilitaryProfile,
     Note,
     Program,
@@ -46,6 +48,45 @@ class InsuranceInline(admin.TabularInline):
 class SocialCareCoverageInline(admin.TabularInline):
     model = SocialCareCoverage
     extra = 0
+
+
+class MemberVerificationInline(admin.TabularInline):
+    model = MemberVerification
+    extra = 0
+    autocomplete_fields = ("client",)
+
+
+@admin.register(EnrollmentVerification)
+class EnrollmentVerificationAdmin(admin.ModelAdmin):
+    list_display = (
+        "id",
+        "client",
+        "household",
+        "program_name",
+        "stage",
+        "is_family_verified",
+        "medicaid_type_verified",
+        "delivery_address_verified",
+        "renewal_number",
+        "opened_at",
+    )
+    list_filter = (
+        "stage",
+        "is_family_verified",
+        "medicaid_type_verified",
+        "delivery_address_verified",
+    )
+    search_fields = (
+        "client__client_id",
+        "client__first_name",
+        "client__last_name",
+        "program_name",
+        "code",
+    )
+    autocomplete_fields = ("client", "household")
+    raw_id_fields = ("case", "delivery_address")
+    readonly_fields = ("opened_at", "stage_at", "closed_at")
+    inlines = (MemberVerificationInline,)
 
 
 @admin.register(Client)

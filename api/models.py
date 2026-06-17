@@ -1097,17 +1097,73 @@ class VerifiedSocialNeed(models.Model):
 # an append-only audit log of every transition (powers funnel/time-in-stage
 # reporting). See api.services.lifecycle for the transition logic.
 class EnrollmentStage(models.TextChoices):
-    """Service-delivery stage for a single (client, product) enrollment."""
+    """Service-delivery / verification stage for a household enrollment.
+
+    The authorization outcome (Draft/Pending/Accepted/Denied) is expressed
+    directly through the authorization-related stages below: a Draft maps to
+    ``pending_verification``, Pending to ``waiting_authorization``, Accepted to
+    ``authorized`` and Denied to ``denied``.
+    """
 
     PENDING_VALIDATION = "pending_validation", "Pending Validation"
     VALIDATED = "validated", "Validated"
     PENDING_VERIFICATION = "pending_verification", "Pending Verification"
     VERIFIED = "verified", "Verified"
+    WAITING_AUTHORIZATION = "waiting_authorization", "Waiting Authorization"
+    AUTHORIZED = "authorized", "Authorized"
+    DENIED = "denied", "Denied"
     SERVICE_ACTIVE = "service_active", "Service Active"
     SERVICE_COMPLETE = "service_complete", "Service Complete"
     CLOSED = "closed", "Closed"
     ON_HOLD = "on_hold", "On Hold"
+    # Retained for backward-compatibility with existing rows / cancellations;
+    # not part of the verification wizard flow.
     CANCELLED = "cancelled", "Cancelled"
+
+
+class DietaryRestriction(models.TextChoices):
+    """Dietary restrictions for a household member (multi-select)."""
+
+    NONE = "none", "None"
+    DIABETES = "diabetes", "Diabetes"
+    POSTPARTUM = "postpartum", "Postpartum"
+    CARDIO_METABOLIC = "cardio_metabolic", "Cardio-metabolic"
+
+
+class FoodAllergy(models.TextChoices):
+    """Food allergies for a household member (multi-select)."""
+
+    NONE = "none", "None"
+    SOY = "soy", "Soy"
+    WHEAT = "wheat", "Wheat"
+    SESAME = "sesame", "Sesame"
+    RED_MEAT = "red_meat", "Red Meat"
+    PORK = "pork", "Pork"
+    MILK = "milk", "Milk"
+    EGGS = "eggs", "Eggs"
+    FISH = "fish", "Fish"
+    SHELLFISH = "shellfish", "Shellfish"
+    TREE_NUTS = "tree_nuts", "Tree Nuts"
+    PEANUTS = "peanuts", "Peanuts"
+    OTHER = "other", "Other"
+
+
+class MenuCategory(models.TextChoices):
+    """Meal category a household member is assigned to (single-select)."""
+
+    FRESH_MEAL = "fresh_meal", "Fresh Meal"
+    DAIRY_FREE = "dairy_free", "Dairy Free"
+    FISH_FREE = "fish_free", "Fish Free"
+    VEGETARIAN = "vegetarian", "Vegetarian"
+
+
+class MenuType(models.TextChoices):
+    """Menu type a household member is assigned to (single-select)."""
+
+    STANDARD = "standard", "Standard"
+    FISH_FREE = "fish_free", "Fish Free"
+    VEGETARIAN = "vegetarian", "Vegetarian"
+    DAIRY_FREE = "dairy_free", "Dairy Free"
 
 
 class ProcessType(models.TextChoices):
@@ -1156,9 +1212,14 @@ class StageEventSource(models.TextChoices):
     MANUAL = "manual", "Manual"
 
 
-class Enrollment(models.Model):
-    """A client's enrollment into the service we deliver. Owns the
-    service-delivery stage and its schedule.
+class EnrollmentVerification(models.Model):
+    """A household's verification enrollment into the service we deliver. Owns
+    the verification/authorization stage, the verification questionnaire data
+    (per-member via :class:`MemberVerification`) and the delivery schedule.
+
+    The verification applies to the WHOLE household: ``household`` is the source
+    of the participant members. ``client`` remains the primary client (kept for
+    funnel/timeline attribution and backward-compatibility).
 
     The acquisition funnel lives on Client.lifecycle_stage; this picks up once a
     client reaches the ``client`` stage and we begin validation/verification/
@@ -1168,6 +1229,12 @@ class Enrollment(models.Model):
     client = models.ForeignKey(
         Client, on_delete=models.CASCADE, related_name="enrollments"
     )
+    # The household this verification applies to; participants come from its
+    # members. Optional until a household exists for the client.
+    household = models.ForeignKey(
+        "Household", on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="enrollment_verifications",
+    )
     # The Met Council case this enrollment is delivered under (optional until a
     # case exists).
     case = models.ForeignKey(
@@ -1176,11 +1243,22 @@ class Enrollment(models.Model):
     )
     stage = models.CharField(
         max_length=25, choices=EnrollmentStage.choices,
-        default=EnrollmentStage.PENDING_VALIDATION, db_index=True,
+        default=EnrollmentStage.PENDING_VERIFICATION, db_index=True,
     )
-    # Human-facing product/service the client is enrolled into (free text taken
-    # from the case/contracted service, e.g. "Meals on Wheels", "PCA").
-    product_name = models.CharField(max_length=255, blank=True)
+    # The program the household is participating in (Step 1; free text taken
+    # from the case/contracted service, e.g. "Medically Tailored Meals").
+    program_name = models.CharField(max_length=255, blank=True)
+    # Household size snapshot captured during the wizard (Step 1).
+    household_size = models.PositiveSmallIntegerField(null=True, blank=True)
+    # Delivery address shared by all participants (Step 2 - Delivery Address).
+    delivery_address = models.ForeignKey(
+        "Address", on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="enrollment_verifications",
+    )
+    # --- Step 4: Validation checks (tri-state: null = not checked yet). ---
+    is_family_verified = models.BooleanField(null=True, blank=True)
+    medicaid_type_verified = models.BooleanField(null=True, blank=True)
+    delivery_address_verified = models.BooleanField(null=True, blank=True)
     # Short display code, e.g. "ENR-8754". Assigned on creation.
     code = models.CharField(max_length=20, blank=True, db_index=True)
     # Renewal cycle counter. Renewals reuse the SAME enrollment (re-run
@@ -1196,10 +1274,70 @@ class Enrollment(models.Model):
         ordering = ["-opened_at"]
         indexes = [
             models.Index(fields=["client", "stage"]),
+            models.Index(fields=["household", "stage"]),
+        ]
+        constraints = [
+            # At most one verification per (navigation) case. Renewals reuse the
+            # same row, so this never blocks a renewal. NULL case is unconstrained.
+            models.UniqueConstraint(
+                fields=["case"],
+                condition=models.Q(case__isnull=False),
+                name="uniq_enrollment_verification_per_case",
+            ),
         ]
 
     def __str__(self):
         return f"{self.client_id} ({self.stage})"
+
+
+class MemberVerification(models.Model):
+    """Per-household-member verification questionnaire answers (wizard Step 2).
+
+    One row per participant in an enrollment's household. Dietary restrictions
+    and food allergies are multi-select (stored as lists of choice codes);
+    meal category and menu type are single-select.
+    """
+
+    enrollment = models.ForeignKey(
+        EnrollmentVerification, on_delete=models.CASCADE,
+        related_name="member_verifications",
+    )
+    # The participant client this row is for. Snapshot ``member_name`` is kept
+    # so the row stays readable even if the client link is later cleared.
+    client = models.ForeignKey(
+        Client, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="member_verifications",
+    )
+    member_name = models.CharField(max_length=255, blank=True)
+    # Multi-select choice-code lists (validated in the serializer against
+    # DietaryRestriction / FoodAllergy). Default empty == nothing selected.
+    dietary_restrictions = models.JSONField(default=list, blank=True)
+    food_allergies = models.JSONField(default=list, blank=True)
+    other_dietary_restrictions = models.TextField(blank=True)
+    meal_category = models.CharField(
+        max_length=20, choices=MenuCategory.choices, blank=True
+    )
+    menu_type = models.CharField(
+        max_length=20, choices=MenuType.choices, blank=True
+    )
+    general_verification_notes = models.TextField(blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["created_at"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["enrollment", "client"],
+                name="uniq_member_verification_per_enrollment_client",
+            ),
+        ]
+        indexes = [
+            models.Index(fields=["enrollment"]),
+        ]
+
+    def __str__(self):
+        return f"Member verification for {self.member_name or self.client_id} (enrollment {self.enrollment_id})"
 
 
 class EnrollmentProcess(models.Model):
@@ -1212,7 +1350,7 @@ class EnrollmentProcess(models.Model):
     """
 
     enrollment = models.ForeignKey(
-        Enrollment, on_delete=models.CASCADE, related_name="processes"
+        EnrollmentVerification, on_delete=models.CASCADE, related_name="processes"
     )
     process_type = models.CharField(
         max_length=20, choices=ProcessType.choices, db_index=True
@@ -1252,7 +1390,7 @@ class ServiceSchedule(models.Model):
     """
 
     enrollment = models.ForeignKey(
-        Enrollment, on_delete=models.CASCADE, related_name="schedules"
+        EnrollmentVerification, on_delete=models.CASCADE, related_name="schedules"
     )
     service = models.ForeignKey(
         Service, on_delete=models.SET_NULL, null=True, blank=True,
@@ -1297,7 +1435,7 @@ class StageEvent(models.Model):
         related_name="stage_events",
     )
     enrollment = models.ForeignKey(
-        Enrollment, on_delete=models.CASCADE, null=True, blank=True,
+        EnrollmentVerification, on_delete=models.CASCADE, null=True, blank=True,
         related_name="stage_events",
     )
     from_stage = models.CharField(max_length=25, blank=True)
@@ -1660,7 +1798,7 @@ class TimelineEvent(models.Model):
     # enrollment exists; null for early-funnel events like the first consent /
     # screening). Renewal grouping in the UI keys off (enrollment, renewal_number).
     enrollment = models.ForeignKey(
-        "Enrollment", on_delete=models.SET_NULL, null=True, blank=True,
+        "EnrollmentVerification", on_delete=models.SET_NULL, null=True, blank=True,
         related_name="timeline_events",
     )
     # Renewal cycle the event occurred in: 1 = initial, 2 = first renewal, …

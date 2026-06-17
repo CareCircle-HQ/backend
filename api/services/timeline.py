@@ -15,8 +15,9 @@ unconditionally after an upsert.
 NOTE: this is distinct from django-simple-history (api.history), which records
 field-level audit diffs. The timeline is the curated, human-facing event stream.
 
-Verification / Enrollment events are intentionally NOT emitted here yet — those
-originate from the verifier agents' CRM and will be wired when that feed lands.
+Verification / authorization stage changes are emitted by
+``event_for_verification``, called from ``api.services.lifecycle.advance_enrollment``
+on every guarded stage transition.
 """
 
 import logging
@@ -27,6 +28,7 @@ from django.utils import timezone
 from api.history import ChangeSource
 from api.models import (
     CaseStatus,
+    EnrollmentStage,
     RecordStatus,
     SocialCareCoverageStatus,
     TimelineBadgeTone,
@@ -288,4 +290,53 @@ def event_for_social_care_coverage(coverage, *, source=ChangeSource.IMPORT, acto
         entity=coverage,
         metadata={"verified": coverage.verified},
         dedupe_key=f"social_care_coverage:{coverage.pk}",
+    )
+
+
+_VERIFICATION_STAGE_TONE = {
+    EnrollmentStage.PENDING_VALIDATION: TimelineBadgeTone.NEUTRAL,
+    EnrollmentStage.VALIDATED: TimelineBadgeTone.INFO,
+    EnrollmentStage.PENDING_VERIFICATION: TimelineBadgeTone.NEUTRAL,
+    EnrollmentStage.VERIFIED: TimelineBadgeTone.SUCCESS,
+    EnrollmentStage.WAITING_AUTHORIZATION: TimelineBadgeTone.WARNING,
+    EnrollmentStage.AUTHORIZED: TimelineBadgeTone.SUCCESS,
+    EnrollmentStage.DENIED: TimelineBadgeTone.DANGER,
+    EnrollmentStage.SERVICE_ACTIVE: TimelineBadgeTone.SUCCESS,
+    EnrollmentStage.SERVICE_COMPLETE: TimelineBadgeTone.SUCCESS,
+    EnrollmentStage.ON_HOLD: TimelineBadgeTone.WARNING,
+    EnrollmentStage.CLOSED: TimelineBadgeTone.NEUTRAL,
+    EnrollmentStage.CANCELLED: TimelineBadgeTone.DANGER,
+}
+
+
+def event_for_verification(enrollment, *, stage_event=None, source=ChangeSource.SYSTEM, actor=""):
+    """Emit a timeline event for an enrollment verification stage change.
+
+    Called from :func:`api.services.lifecycle.advance_enrollment` after a
+    transition. When ``stage_event`` is supplied the write is keyed on that
+    StageEvent (one timeline row per transition); otherwise it logs unconditionally.
+    """
+    client = enrollment.client
+    if client is None:
+        return None
+    occurred = enrollment.stage_at or timezone.now()
+    try:
+        label = EnrollmentStage(enrollment.stage).label
+    except ValueError:
+        label = (enrollment.stage or "").replace("_", " ").title()
+    tone = _VERIFICATION_STAGE_TONE.get(enrollment.stage, TimelineBadgeTone.NEUTRAL)
+    dedupe = f"verification_stage:{stage_event.pk}" if stage_event is not None else ""
+    return emit_timeline_event(
+        client=client,
+        event_type=TimelineEventType.VERIFICATION,
+        occurred_at=occurred,
+        title=enrollment.program_name or "Verification",
+        subtitle=f"Stage changed to {label}",
+        badge_text=label,
+        badge_tone=tone,
+        source=source,
+        actor=actor,
+        entity=enrollment,
+        enrollment=enrollment,
+        dedupe_key=dedupe,
     )

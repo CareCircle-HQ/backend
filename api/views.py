@@ -1,6 +1,7 @@
 import logging
 import uuid
 
+from django.db import IntegrityError
 from django.db.models import Q
 from rest_framework import generics, permissions, viewsets
 from rest_framework.response import Response
@@ -14,7 +15,13 @@ from .models import (
     Case,
     Client,
     ContractedService,
+    DietaryRestriction,
+    EnrollmentStage,
+    EnrollmentVerification,
+    FoodAllergy,
     HouseholdMember,
+    MenuCategory,
+    MenuType,
     Program,
     Provider,
     Screening,
@@ -25,6 +32,7 @@ from .serializers import (
     CaseSerializer,
     ClientSerializer,
     ContractedServiceSerializer,
+    EnrollmentVerificationSerializer,
     HouseholdSerializer,
     ProgramSerializer,
     ProviderSerializer,
@@ -37,6 +45,7 @@ from .serializers import (
 # TEMPORARY external-CRM mirror; remove with the api/integrations package.
 from .integrations import ghl
 from .services import timeline
+from .services.lifecycle import InvalidTransition, advance_enrollment
 
 logger = logging.getLogger(__name__)
 
@@ -429,6 +438,91 @@ class AssessmentViewSet(BulkUpsertMixin, viewsets.ModelViewSet):
 
     def post_upsert(self, obj):
         _safe_timeline(timeline.event_for_assessment, obj, self.request)
+
+
+def _choices(enum):
+    """Serialize a TextChoices enum to [{value, label}] for the wizard UI."""
+    return [{"value": v, "label": l} for v, l in enum.choices]
+
+
+class EnrollmentVerificationViewSet(viewsets.ModelViewSet):
+    """CRUD for household verification enrollments + the wizard data.
+
+    Stage changes go through the ``set-stage`` action (guarded + timeline-logged)
+    rather than a plain PATCH, since the Step-4 authorization outcome IS the
+    stage. Filterable by ``?client=<uuid>`` or ``?household=<uuid>``.
+    """
+
+    queryset = EnrollmentVerification.objects.select_related(
+        "client", "household", "case", "delivery_address"
+    ).prefetch_related("member_verifications__client")
+    serializer_class = EnrollmentVerificationSerializer
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        client = self.request.query_params.get("client")
+        if client:
+            qs = qs.filter(client_id=client)
+        household = self.request.query_params.get("household")
+        if household:
+            qs = qs.filter(household_id=household)
+        return qs
+
+    def create(self, request, *args, **kwargs):
+        # One verification per navigation case (also guarded by a DB constraint).
+        case_id = request.data.get("case_id")
+        if case_id and EnrollmentVerification.objects.filter(case_id=case_id).exists():
+            return Response(
+                {"detail": "A verification has already been requested for this case."},
+                status=status.HTTP_409_CONFLICT,
+            )
+        try:
+            return super().create(request, *args, **kwargs)
+        except IntegrityError:
+            return Response(
+                {"detail": "A verification has already been requested for this case."},
+                status=status.HTTP_409_CONFLICT,
+            )
+
+    def perform_create(self, serializer):
+        serializer.save()
+        _safe_timeline(timeline.event_for_verification, serializer.instance, self.request)
+
+    @action(detail=False, methods=["get"])
+    def choices(self, request):
+        """All enum options the verification wizard needs (stages + Step-2 picks)."""
+        return Response({
+            "stages": _choices(EnrollmentStage),
+            "dietary_restrictions": _choices(DietaryRestriction),
+            "food_allergies": _choices(FoodAllergy),
+            "meal_categories": _choices(MenuCategory),
+            "menu_types": _choices(MenuType),
+        })
+
+    @action(detail=True, methods=["post"], url_path="set-stage")
+    def set_stage(self, request, pk=None):
+        """Advance the enrollment to a new stage (this includes the Step-4
+        authorization outcome). Guarded by the transition map; pass
+        ``force=true`` to bypass the validation/verification process gates."""
+        enrollment = self.get_object()
+        to_stage = request.data.get("stage")
+        if to_stage not in set(EnrollmentStage.values):
+            return Response(
+                {"detail": f"Invalid stage. Allowed: {sorted(EnrollmentStage.values)}"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        try:
+            advance_enrollment(
+                enrollment,
+                to_stage,
+                actor=getattr(request, "user", None),
+                note=request.data.get("note", "") or "",
+                force=bool(request.data.get("force")),
+            )
+        except InvalidTransition as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        enrollment.refresh_from_db()
+        return Response(self.get_serializer(enrollment).data)
 
 
 class ProviderViewSet(viewsets.ReadOnlyModelViewSet):

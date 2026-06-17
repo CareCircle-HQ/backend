@@ -10,6 +10,7 @@ from .views import (
     AssessmentViewSet,
     CaseViewSet,
     ClientViewSet,
+    EnrollmentVerificationViewSet,
     ContractedServiceViewSet,
     HealthView,
     MeView,
@@ -28,6 +29,11 @@ router.register("cases", CaseViewSet, basename="case")
 router.register("contracted-services", ContractedServiceViewSet, basename="contracted-service")
 router.register("screenings", ScreeningViewSet, basename="screening")
 router.register("assessments", AssessmentViewSet, basename="assessment")
+router.register(
+    "enrollment-verifications",
+    EnrollmentVerificationViewSet,
+    basename="enrollment-verification",
+)
 router.register("providers", ProviderViewSet, basename="provider")
 router.register("programs", ProgramViewSet, basename="program")
 
