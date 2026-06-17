@@ -1110,7 +1110,7 @@ class EnrollmentStage(models.TextChoices):
     PENDING_VERIFICATION = "pending_verification", "Pending Verification"
     VERIFIED = "verified", "Verified"
     WAITING_AUTHORIZATION = "waiting_authorization", "Waiting Authorization"
-    AUTHORIZED = "authorized", "Authorized"
+    AUTHORIZED = "authorized", "Accepted"
     DENIED = "denied", "Denied"
     SERVICE_ACTIVE = "service_active", "Service Active"
     SERVICE_COMPLETE = "service_complete", "Service Complete"
@@ -1164,6 +1164,16 @@ class MenuType(models.TextChoices):
     FISH_FREE = "fish_free", "Fish Free"
     VEGETARIAN = "vegetarian", "Vegetarian"
     DAIRY_FREE = "dairy_free", "Dairy Free"
+
+
+class MemberStatus(models.TextChoices):
+    """Per-member verification outcome within an enrollment. Members are
+    verified/denied individually; the household enrollment stage is the
+    aggregate roll-up. Denied members are excluded from order generation."""
+
+    PENDING_VERIFICATION = "pending_verification", "Pending Verification"
+    VERIFIED = "verified", "Verified"
+    DENIED = "denied", "Denied"
 
 
 class ProcessType(models.TextChoices):
@@ -1248,8 +1258,17 @@ class EnrollmentVerification(models.Model):
     # The program the household is participating in (Step 1; free text taken
     # from the case/contracted service, e.g. "Medically Tailored Meals").
     program_name = models.CharField(max_length=255, blank=True)
+    # The case's Service Type (list-view value, e.g. "Food Insecurity").
+    # Snapshotted from the linked Case.service_type when the enrollment is
+    # created from the extension.
+    service_type = models.CharField(max_length=255, blank=True)
     # Household size snapshot captured during the wizard (Step 1).
     household_size = models.PositiveSmallIntegerField(null=True, blank=True)
+    # Weekday codes the customer wants deliveries on (agent-entered), e.g.
+    # ["mon", "thu"]. The count == deliveries per week; expanded across the
+    # case authorization window when orders are generated. Codes are the
+    # lowercase 3-letter day names (mon/tue/wed/thu/fri/sat/sun).
+    delivery_weekdays = models.JSONField(default=list, blank=True)
     # Delivery address shared by all participants (Step 2 - Delivery Address).
     delivery_address = models.ForeignKey(
         "Address", on_delete=models.SET_NULL, null=True, blank=True,
@@ -1320,6 +1339,16 @@ class MemberVerification(models.Model):
     menu_type = models.CharField(
         max_length=20, choices=MenuType.choices, blank=True
     )
+    # Per-member verification outcome. Denied members are excluded from order
+    # generation; the enrollment stage is the household-level roll-up.
+    status = models.CharField(
+        max_length=25, choices=MemberStatus.choices,
+        default=MemberStatus.PENDING_VERIFICATION, db_index=True,
+    )
+    denied_reason = models.TextField(blank=True)
+    # Agent-entered: how many meals/boxes this member receives per delivery.
+    # Copied onto each generated OrderSchedule.how_many_meals_or_boxes.
+    meals_per_delivery = models.PositiveSmallIntegerField(null=True, blank=True)
     general_verification_notes = models.TextField(blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -1418,6 +1447,119 @@ class ServiceSchedule(models.Model):
 
     def __str__(self):
         return f"Schedule for enrollment {self.enrollment_id} ({self.status})"
+
+
+# ===========================================================================
+# ORDER / DELIVERY DOMAIN
+# ===========================================================================
+class OrderStatus(models.TextChoices):
+    """Fulfillment status of a single member's delivery order."""
+
+    SCHEDULED = "scheduled", "Scheduled"
+    ON_THE_KITCHEN = "on_the_kitchen", "On the Kitchen"
+    ON_THE_WAY = "on_the_way", "On the Way"
+    DELIVERED = "delivered", "Delivered"
+    CANCELLED = "cancelled", "Cancelled"
+
+
+def generate_household_group_code():
+    """A short, human-readable identifier (e.g. ``HG-3F9A2C``) shared by every
+    order in the same household delivery batch, so the kitchen and delivery
+    company can group and deliver a household's food together. Generated once
+    per batch and assigned to each :class:`OrderSchedule` in that batch."""
+    return f"HG-{uuid.uuid4().hex[:6].upper()}"
+
+
+class OrderSchedule(models.Model):
+    """A single member's food delivery order, generated when a verification
+    enrollment is saved. One row per participant per delivery; orders for the
+    same household batch share a ``household_group_code`` so they ship together.
+
+    The member-facing fields (name/phone/email/allergies/restrictions/menu_type/
+    delivery_address) are SNAPSHOTS taken at creation, so a historical order
+    stays accurate even if the member or enrollment later changes.
+    """
+
+    order_id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    enrollment = models.ForeignKey(
+        EnrollmentVerification, on_delete=models.CASCADE, related_name="orders"
+    )
+    program_name = models.CharField(max_length=255, blank=True)
+    # The participant this order is for (the wizard's per-member row).
+    member = models.ForeignKey(
+        MemberVerification, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="orders",
+    )
+    member_name = models.CharField(max_length=255, blank=True)
+    anticipated_delivery_date = models.DateField(null=True, blank=True)
+    # External system identifiers (no local Kitchen/DeliveryCompany tables yet);
+    # empty until the order is dispatched.
+    sent_to_kitchen_id = models.CharField(max_length=120, blank=True)
+    sent_to_delivery_company_id = models.CharField(max_length=120, blank=True)
+    # The household these deliveries belong to + the shared batch code. Every
+    # order delivered together for a household carries the same group code.
+    household = models.ForeignKey(
+        "Household", on_delete=models.PROTECT, null=True, blank=True,
+        related_name="orders",
+    )
+    household_group_code = models.CharField(max_length=20, db_index=True)
+    status = models.CharField(
+        max_length=20, choices=OrderStatus.choices,
+        default=OrderStatus.SCHEDULED, db_index=True,
+    )
+    delivery_address = models.TextField(blank=True)
+    address_notes = models.TextField(blank=True)
+    # Multi-select snapshots (choice-code lists, validated in the serializer
+    # against FoodAllergy / DietaryRestriction).
+    allergies = models.JSONField(default=list, blank=True)
+    restrictions = models.JSONField(default=list, blank=True)
+    menu_type = models.CharField(
+        max_length=20, choices=MenuType.choices, blank=True
+    )
+    notes = models.TextField(blank=True)
+    member_phone = models.CharField(max_length=40, blank=True)
+    member_email = models.EmailField(blank=True)
+    how_many_meals_or_boxes = models.PositiveSmallIntegerField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["enrollment", "status"]),
+            models.Index(fields=["household_group_code"]),
+            models.Index(fields=["status"]),
+        ]
+
+    def __str__(self):
+        return f"Order {self.order_id} for {self.member_name or self.member_id} ({self.status})"
+
+
+class OrderDeliveryProof(models.Model):
+    """A proof-of-delivery image for an order. The binary lives in S3; this row
+    stores the object key + public/signed URL and upload metadata. An order can
+    have many proofs."""
+
+    order = models.ForeignKey(
+        OrderSchedule, on_delete=models.CASCADE, related_name="proofs"
+    )
+    s3_key = models.CharField(max_length=500)
+    file_url = models.URLField(blank=True)
+    content_type = models.CharField(max_length=100, blank=True)
+    uploaded_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="order_delivery_proofs",
+    )
+    uploaded_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["uploaded_at"]
+        indexes = [
+            models.Index(fields=["order"]),
+        ]
+
+    def __str__(self):
+        return f"Proof for order {self.order_id} ({self.s3_key})"
 
 
 class StageEvent(models.Model):
