@@ -649,13 +649,16 @@ class ServiceAuthorizationStatus(models.TextChoices):
 
 
 class CaseType(models.TextChoices):
-    """Classification of a case. Auto-derived on save from the case's
-    service_type (Social Service Case Management => Internal Service, anything
-    else => Navigation); External Service is set explicitly when applicable."""
+    """Classification of a case. Auto-derived on save by matching the case's
+    program_name against the ProgramPipeline table (program_name -> case_category)
+    and mapping that category here; falls back to the service_type heuristic
+    (Social Service Case Management => Internal Service, else => Navigation) when
+    the program is not found in ProgramPipeline."""
 
     NAVIGATION = "navigation", "Navigation"
     EXTERNAL_SERVICE = "external_service", "External Service"
     INTERNAL_SERVICE = "internal_service", "Internal Service"
+    ELIGIBILITY = "eligibility", "Eligibility"
 
 
 class CaseHouseholdType(models.TextChoices):
