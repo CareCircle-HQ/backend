@@ -220,6 +220,20 @@ else:
 
 
 # ---------------------------------------------------------------------------
+# Reverse proxy / TLS (nginx terminates HTTPS in production).
+# nginx forwards "X-Forwarded-Proto: https", so tell Django the request is
+# secure. Without this, request.is_secure() is False and the admin/browsable
+# API CSRF check fails for HTTPS POSTs ("CSRF verification failed").
+# Requires nginx to set: proxy_set_header X-Forwarded-Proto $scheme;
+# ---------------------------------------------------------------------------
+if not DEBUG:
+    SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
+    # Cookies should only travel over HTTPS in production.
+    SESSION_COOKIE_SECURE = True
+    CSRF_COOKIE_SECURE = True
+
+
+# ---------------------------------------------------------------------------
 # GoHighLevel (GHL) CRM integration -- TEMPORARY. See api/integrations/ghl.
 # Off by default; flip CRM_SYNC_ENABLED=true once GHL_PRIVATE_TOKEN +
 # GHL_LOCATION_ID are set in the environment.
