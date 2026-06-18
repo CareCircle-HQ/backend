@@ -301,7 +301,12 @@ class ClientSerializer(serializers.ModelSerializer):
         addresses = validated_data.pop("addresses", None)
         insurances = validated_data.pop("insurances", None)
         social_care_coverages = validated_data.pop("social_care_coverages", None)
-        client_id = validated_data.pop("client_id")
+        # On a partial update (PATCH) the payload may omit client_id; fall back
+        # to the instance being updated so we don't KeyError. client_id is still
+        # required on create (enforced by the serializer field).
+        client_id = validated_data.pop("client_id", None)
+        if client_id is None and self.instance is not None:
+            client_id = self.instance.client_id
         # Non-model flags (ignored by the serializer fields) read from raw input:
         # when set, the incoming list is treated as authoritative and any stored
         # record missing from it is deactivated.

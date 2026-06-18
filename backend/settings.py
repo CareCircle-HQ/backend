@@ -216,7 +216,16 @@ else:
     # The Chrome extension calls the live API from a chrome-extension://<id>
     # origin. The id changes per install/build, so allow any extension origin
     # by regex rather than pinning a single id in CORS_ALLOWED_ORIGINS.
-    CORS_ALLOWED_ORIGIN_REGEXES = [r"^chrome-extension://[a-p]{32}$"]
+    #
+    # The Unite Us content script (extension/content/uniteus.js) POSTs the
+    # captured session to /api/uniteus/credentials/ from the app.uniteus.io page
+    # origin (MV3 content-script fetches are CORS-checked against the page
+    # origin), so that origin must be allowed too. The endpoint is still
+    # token-authenticated.
+    CORS_ALLOWED_ORIGIN_REGEXES = [
+        r"^chrome-extension://[a-p]{32}$",
+        r"^https://app\.uniteus\.io$",
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -285,3 +294,42 @@ UNITEUS_API_BASE = os.getenv('UNITEUS_API_BASE', 'https://core.uniteus.io')
 UNITEUS_TIMEOUT = int(os.getenv('UNITEUS_TIMEOUT', '30'))
 # Refresh the access token when it expires within this many seconds.
 UNITEUS_REFRESH_SKEW = int(os.getenv('UNITEUS_REFRESH_SKEW', '120'))
+
+
+# ---------------------------------------------------------------------------
+# Logging. Django's default config only writes to the console when DEBUG=True
+# (the console handler is gated by require_debug_true) and otherwise relies on
+# mail_admins -- so with DEBUG=False and no email backend, unhandled 500
+# tracebacks are silently dropped. This config always logs to the console
+# (captured by gunicorn -> journald) so server errors are visible in production.
+# LOG_LEVEL defaults to INFO; set LOG_LEVEL=WARNING in prod to quiet it down.
+# ---------------------------------------------------------------------------
+LOG_LEVEL = os.getenv('LOG_LEVEL', 'INFO').upper()
+LOGGING = {
+    'version': 1,
+    'disable_existing_loggers': False,
+    'formatters': {
+        'verbose': {
+            'format': '[{asctime}] {levelname} {name}: {message}',
+            'style': '{',
+        },
+    },
+    'handlers': {
+        'console': {
+            'class': 'logging.StreamHandler',
+            'formatter': 'verbose',
+        },
+    },
+    'root': {
+        'handlers': ['console'],
+        'level': LOG_LEVEL,
+    },
+    'loggers': {
+        # Always log request errors (5xx tracebacks) regardless of DEBUG.
+        'django.request': {
+            'handlers': ['console'],
+            'level': 'ERROR',
+            'propagate': False,
+        },
+    },
+}
