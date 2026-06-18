@@ -13,8 +13,9 @@ set -euo pipefail
 # Always operate from the directory this script lives in.
 cd "$(dirname "$0")"
 
-echo "==> Pulling latest code"
-git pull --ff-only
+echo "==> Pulling latest code (main)"
+git checkout main
+git pull --ff-only origin main
 
 # Activate the virtualenv (server uses ./venv; fall back to ./.venv).
 if [ -d venv ]; then
