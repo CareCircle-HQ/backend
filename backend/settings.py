@@ -283,6 +283,13 @@ MAILGUN_FROM = os.getenv('MAILGUN_FROM', '')
 MAILGUN_API_BASE = os.getenv('MAILGUN_API_BASE', 'https://api.mailgun.net')
 MAILGUN_TIMEOUT = int(os.getenv('MAILGUN_TIMEOUT', '15'))
 
+# ---------------------------------------------------------------------------
+# Google Places (New) — proxied server-side for the extension's doctor-address
+# autocomplete. Keeping the key here (never shipped to the client) avoids MV3
+# remote-script CSP issues and keeps the key restricted to our backend.
+# ---------------------------------------------------------------------------
+GOOGLE_MAP_KEY = os.getenv('GOOGLE_MAP_KEY', '')
+
 # Agent login 2FA code policy.
 AGENT_2FA_CODE_TTL_SECONDS = int(os.getenv('AGENT_2FA_CODE_TTL_SECONDS', '600'))
 AGENT_2FA_RESEND_COOLDOWN_SECONDS = int(

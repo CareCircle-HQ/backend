@@ -27,6 +27,7 @@ from .views_agent import (
     AgentVerifyCodeView,
 )
 from .views_calltools import CallToolsAgentStatusView, CallToolsCampaignsView
+from .views_places import PlacesAutocompleteView, PlacesDetailsView
 from .views_uniteus import UniteUsCredentialCaptureView, UniteUsRunUpdateView
 
 router = DefaultRouter()
@@ -82,6 +83,9 @@ urlpatterns = [
         UniteUsRunUpdateView.as_view(),
         name="uniteus-run-update",
     ),
+    # Google Places (New) proxy — doctor-address autocomplete
+    path("places/autocomplete/", PlacesAutocompleteView.as_view(), name="places-autocomplete"),
+    path("places/details/", PlacesDetailsView.as_view(), name="places-details"),
     # User
     path("me/", MeView.as_view(), name="me"),
     # Misc
