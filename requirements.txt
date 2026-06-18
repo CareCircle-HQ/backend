@@ -1,25 +1,29 @@
 # Django REST API
-Django==4.2.20
-psycopg2-binary==2.9.9
-djangorestframework==3.15.2
-djangorestframework-simplejwt==5.3.1
-django-cors-headers==4.3.1
+# Python 3.14 requires the Django 5.2 LTS stack (4.2 only supports <=3.12).
+Django>=5.2,<6.0
+# psycopg3 ships prebuilt wheels for new Python versions (no pg_config build);
+# Django 5.2 uses the same "django.db.backends.postgresql" engine for it.
+psycopg[binary]>=3.2,<4.0
+djangorestframework>=3.16,<3.17
+djangorestframework-simplejwt>=5.5,<6.0
+django-cors-headers>=4.7,<5.0
 
 # Config / environment
 python-dotenv==1.0.1
 
-# CRM integration (GoHighLevel)
-gohighlevel-api-client==1.0.0b1
+# NOTE: gohighlevel-api-client (the `highlevel` SDK) was removed -- it was never
+# imported; the GHL integration in api/integrations/ghl uses raw `requests`.
+# Re-add only if the SDK is actually used.
 
 # Audit / per-entity history
-django-simple-history==3.7.0
+django-simple-history>=3.8,<4.0
 
 # Token encryption at rest (Unite Us credentials)
-cryptography==48.0.1
+cryptography>=44,<46
 
 # HTTP
-requests==2.31.0
+requests>=2.32,<3.0
 
 # Production server / static files
-gunicorn==21.2.0
-whitenoise==6.6.0
+gunicorn>=23,<24
+whitenoise>=6.8,<7.0

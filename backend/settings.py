@@ -36,6 +36,18 @@ DEBUG = os.getenv("DJANGO_DEBUG", "True").lower() == "true"
 
 ALLOWED_HOSTS = os.getenv("DJANGO_ALLOWED_HOSTS", "localhost,127.0.0.1").split(",")
 
+# Origins (scheme + host) trusted for unsafe requests (admin/browsable-API
+# POSTs over HTTPS). Required in production, e.g.
+# https://www.carecircleinternal.com
+CSRF_TRUSTED_ORIGINS = [
+    o.strip()
+    for o in os.getenv(
+        "DJANGO_CSRF_TRUSTED_ORIGINS",
+        "http://localhost:8000,http://127.0.0.1:8000",
+    ).split(",")
+    if o.strip()
+]
+
 
 # Application definition
 
@@ -201,13 +213,22 @@ else:
     CORS_ALLOWED_ORIGINS = [
         o for o in os.getenv('CORS_ALLOWED_ORIGINS', 'http://localhost:3000').split(',') if o
     ]
+    # The Chrome extension calls the live API from a chrome-extension://<id>
+    # origin. The id changes per install/build, so allow any extension origin
+    # by regex rather than pinning a single id in CORS_ALLOWED_ORIGINS.
+    CORS_ALLOWED_ORIGIN_REGEXES = [r"^chrome-extension://[a-p]{32}$"]
 
 
 # ---------------------------------------------------------------------------
 # GoHighLevel (GHL) CRM integration -- TEMPORARY. See api/integrations/ghl.
 # Off by default; flip CRM_SYNC_ENABLED=true once GHL_PRIVATE_TOKEN +
 # GHL_LOCATION_ID are set in the environment.
+#
+# MVP phase: CRM_SYNC_DISCONNECTED hard-disconnects ALL outbound syncing to the
+# external CRM (overrides CRM_SYNC_ENABLED). Defaults to True so no data leaves
+# our API during the MVP. Set CRM_SYNC_DISCONNECTED=false to re-enable.
 # ---------------------------------------------------------------------------
+CRM_SYNC_DISCONNECTED = os.getenv('CRM_SYNC_DISCONNECTED', 'True').lower() == 'true'
 CRM_SYNC_ENABLED = os.getenv('CRM_SYNC_ENABLED', 'False').lower() == 'true'
 GHL_PRIVATE_TOKEN = os.getenv('GHL_PRIVATE_TOKEN', '')
 GHL_LOCATION_ID = os.getenv('GHL_LOCATION_ID', '')

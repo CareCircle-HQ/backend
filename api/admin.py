@@ -4,6 +4,7 @@ from simple_history.admin import SimpleHistoryAdmin
 from .models import (
     Address,
     Agent,
+    AllowedZipCode,
     Assessment,
     Case,
     Client,
@@ -96,12 +97,14 @@ class ClientAdmin(admin.ModelAdmin):
         "first_name",
         "last_name",
         "client_email_address",
+        "lifecycle_stage",
         "is_level",
         "consent_accepted",
         "attestation_needed",
         "crm_contact_id",
     )
     list_filter = (
+        "lifecycle_stage",
         "is_level",
         "consent_accepted",
         "attestation_needed",
@@ -283,6 +286,14 @@ class AgentAdmin(admin.ModelAdmin):
     search_fields = ("name", "agent_code", "email", "username", "calltools_app_user")
     readonly_fields = ("calltools_synced_at",)
     ordering = ("name",)
+
+
+@admin.register(AllowedZipCode)
+class AllowedZipCodeAdmin(admin.ModelAdmin):
+    list_display = ("zip_code", "borough", "scn", "platform", "is_active")
+    list_filter = ("is_active", "platform", "scn")
+    search_fields = ("zip_code", "borough")
+    ordering = ("zip_code",)
 
 
 @admin.register(ProgramPipeline)

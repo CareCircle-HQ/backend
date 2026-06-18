@@ -198,12 +198,18 @@ def _member_status(client):
     """Client lifecycle stage for member status."""
     # Map lifecycle_stage to GHL status values
     status_map = {
-        "lead": "Lead",
-        "prospect": "Prospect",
+        "inactive": "Inactive",
+        "consent": "Consent",
         "screened": "Screened",
-        "eligible": "Eligible",
-        "ineligible": "Not Eligible",
-        "client": "Active Client",
+        "assessment": "Assessment",
+        "navigation": "Navigation",
+        "pending_verification": "Pending Verification",
+        "verified": "Verified",
+        "waiting_authorization": "Waiting Authorization",
+        "authorized": "Authorized",
+        "active": "Active",
+        "completed": "Completed",
+        "not_eligible": "Not Eligible",
     }
     return status_map.get(client.lifecycle_stage)
 

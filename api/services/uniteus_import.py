@@ -294,6 +294,14 @@ class DailyPull:
         for case_rec in self.api.list_cases(client_id):
             self._process_case(case_rec, client)
 
+        # Recompute the acquisition funnel now that consent + cases are synced.
+        try:
+            from api.services.lifecycle import recompute_client_stage
+
+            recompute_client_stage(client)
+        except Exception:  # noqa: BLE001 - never abort the import on a funnel hiccup
+            logger.warning("recompute_client_stage failed for %s", client_id, exc_info=True)
+
     # -- entry -------------------------------------------------------------
     def execute(self, client_limit=None, provider_id=None, client_ids=None):
         creds = UniteUsCredential.objects.filter(

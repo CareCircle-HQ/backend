@@ -41,19 +41,33 @@ class ConsentStatus(models.TextChoices):
 
 
 class ClientStage(models.TextChoices):
-    """Acquisition funnel stage for a client/person. Auto-derived from synced
-    Unite Us data (consent, screenings, eligibility, cases) by
+    """Lifecycle stage for a client/person, maintained by
     ``api.services.lifecycle.recompute_client_stage``.
 
-    lead -> prospect -> screened -> eligible | ineligible -> client
+    The early funnel is *derived* from synced Unite Us data (consent,
+    screenings, assessments, cases). Once an EnrollmentVerification exists, the
+    later stages are *driven by* that enrollment's stage and take precedence.
+
+    inactive -> consent -> screened -> assessment -> navigation ->
+    pending_verification -> verified -> waiting_authorization -> authorized ->
+    active -> completed   (terminal off-ramp: not_eligible)
     """
 
-    LEAD = "lead", "Lead"  # pulled from Unite Us (Medicaid), no consent yet
-    PROSPECT = "prospect", "Prospect"  # consent accepted
+    # --- Early funnel (derived from synced data) ---
+    INACTIVE = "inactive", "Inactive"  # default: no consent / not pursued / disposed
+    CONSENT = "consent", "Consent"  # consent accepted
     SCREENED = "screened", "Screened"  # >=1 completed Met Council screening
-    ELIGIBLE = "eligible", "Eligible"  # eligibility assessment found eligible
-    INELIGIBLE = "ineligible", "Ineligible"  # eligibility found not eligible
-    CLIENT = "client", "Client"  # >=1 Met Council case exists
+    ASSESSMENT = "assessment", "Assessment"  # completed assessment, eligible
+    NAVIGATION = "navigation", "Navigation"  # >=1 Met Council case
+    # --- Enrollment-driven (mirror EnrollmentVerification.stage) ---
+    PENDING_VERIFICATION = "pending_verification", "Pending Verification"
+    VERIFIED = "verified", "Verified"
+    WAITING_AUTHORIZATION = "waiting_authorization", "Waiting Authorization"
+    AUTHORIZED = "authorized", "Authorized"
+    ACTIVE = "active", "Active"  # receiving deliveries
+    COMPLETED = "completed", "Completed"  # after last delivery
+    # --- Terminal off-ramp ---
+    NOT_ELIGIBLE = "not_eligible", "Not Eligible"  # ineligible / closed without service
 
 
 class CommunicationChannel(models.TextChoices):
@@ -279,6 +293,13 @@ class Client(models.Model):
     consent_status = models.CharField(max_length=20, blank=True)  # E-form: accepted/declined
     consented_at = models.DateTimeField(null=True, blank=True)
     consent_doc_url = models.URLField(blank=True)
+
+    # --- Lifecycle funnel (maintained by api.services.lifecycle) ---
+    lifecycle_stage = models.CharField(
+        max_length=25, choices=ClientStage.choices,
+        default=ClientStage.INACTIVE, db_index=True,
+    )
+    lifecycle_stage_at = models.DateTimeField(null=True, blank=True)
 
     # --- CRM Sync (External - GoHighLevel) ---
     crm_contact_id = models.CharField(max_length=64, blank=True, db_index=True)
@@ -1262,6 +1283,11 @@ class EnrollmentVerification(models.Model):
     # Snapshotted from the linked Case.service_type when the enrollment is
     # created from the extension.
     service_type = models.CharField(max_length=255, blank=True)
+    # Call-transfer outcome captured on the E-Form when the verification was
+    # requested (snapshot of the same value also stored on the Client).
+    call_transfer_answered = models.CharField(
+        max_length=30, choices=CallTransferStatus.choices, blank=True
+    )
     # Household size snapshot captured during the wizard (Step 1).
     household_size = models.PositiveSmallIntegerField(null=True, blank=True)
     # Weekday codes the customer wants deliveries on (agent-entered), e.g.
@@ -1683,6 +1709,26 @@ class ProgramPipeline(models.Model):
 
     def __str__(self):
         return f"{self.program_name} -> {self.pipeline_name} ({self.pipeline_id})"
+
+
+class AllowedZipCode(models.Model):
+    """A ZIP code we are allowed to serve. Agents may only request verification
+    for clients whose primary address ZIP is in this table. Imported from
+    ``tmp/ZipCodes.csv`` via ``manage.py import_zipcodes``."""
+
+    zip_code = models.CharField(max_length=10, unique=True, db_index=True)
+    borough = models.CharField(max_length=255, blank=True)  # Borough/Neighborhood
+    scn = models.CharField(max_length=120, blank=True)
+    platform = models.CharField(max_length=120, blank=True)
+    is_active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["zip_code"]
+
+    def __str__(self):
+        return f"{self.zip_code} ({self.borough})" if self.borough else self.zip_code
 
 
 # ===========================================================================
