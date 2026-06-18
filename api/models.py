@@ -1,9 +1,13 @@
+import secrets
 import uuid
+from datetime import timedelta
 
 from django.conf import settings
+from django.contrib.auth.hashers import check_password, make_password
 from django.contrib.contenttypes.fields import GenericForeignKey
 from django.contrib.contenttypes.models import ContentType
 from django.db import models
+from django.utils import timezone
 
 from api.history import tracked_history
 from api.fields import EncryptedTextField
@@ -1665,6 +1669,9 @@ class Agent(models.Model):
     username = models.CharField(max_length=150, blank=True)
     first_name = models.CharField(max_length=120, blank=True)
     last_name = models.CharField(max_length=120, blank=True)
+    # Job title and department (sourced from the company directory CSV).
+    title = models.CharField(max_length=150, blank=True)
+    department = models.CharField(max_length=150, blank=True)
     is_agent = models.BooleanField(default=True)
     is_manager = models.BooleanField(default=False)
     is_account_owner = models.BooleanField(default=False)
@@ -1682,6 +1689,76 @@ class Agent(models.Model):
 
     def __str__(self):
         return f"{self.name} ({self.agent_code}) - {self.group}"
+
+
+class AgentLoginCode(models.Model):
+    """A short-lived, single-use 2FA code emailed to an agent's company email to
+    complete extension login.
+
+    The plaintext code is never stored — only a salted hash (Django's password
+    hashers). A code expires after a short TTL, is single-use (``consumed_at``),
+    and caps the number of verification attempts to resist brute force.
+    """
+
+    CODE_LENGTH = 6
+
+    email = models.EmailField(db_index=True)
+    # The active agent this code was issued for (resolved from the email at
+    # request time). Kept for auditing and to mint the JWT on verify.
+    agent = models.ForeignKey(
+        Agent,
+        on_delete=models.CASCADE,
+        related_name="login_codes",
+        null=True,
+        blank=True,
+    )
+    code_hash = models.CharField(max_length=128)
+    expires_at = models.DateTimeField(db_index=True)
+    consumed_at = models.DateTimeField(null=True, blank=True)
+    attempts = models.PositiveSmallIntegerField(default=0)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        indexes = [models.Index(fields=["email", "expires_at"])]
+
+    def __str__(self):
+        return f"2FA code for {self.email} (exp {self.expires_at:%Y-%m-%d %H:%M})"
+
+    @property
+    def is_expired(self):
+        return timezone.now() >= self.expires_at
+
+    @property
+    def is_consumed(self):
+        return self.consumed_at is not None
+
+    @staticmethod
+    def generate_code():
+        """A zero-padded numeric code of length ``CODE_LENGTH`` (e.g. "042913")."""
+        upper = 10 ** AgentLoginCode.CODE_LENGTH
+        return f"{secrets.randbelow(upper):0{AgentLoginCode.CODE_LENGTH}d}"
+
+    @classmethod
+    def issue(cls, email, agent=None, ttl_seconds=None):
+        """Create and store a new code for ``email``; returns ``(instance, code)``.
+
+        Only the hash is persisted; the returned plaintext ``code`` is for
+        delivery (email) and is not recoverable afterwards.
+        """
+        ttl = ttl_seconds or getattr(settings, "AGENT_2FA_CODE_TTL_SECONDS", 600)
+        code = cls.generate_code()
+        obj = cls.objects.create(
+            email=(email or "").strip().lower(),
+            agent=agent,
+            code_hash=make_password(code),
+            expires_at=timezone.now() + timedelta(seconds=ttl),
+        )
+        return obj, code
+
+    def check_code(self, code):
+        """True when ``code`` matches the stored hash."""
+        return check_password(str(code or "").strip(), self.code_hash)
 
 
 class ProgramPipeline(models.Model):

@@ -272,6 +272,26 @@ CALLTOOLS_TIMEOUT = int(os.getenv('CALLTOOLS_TIMEOUT', '15'))
 
 
 # ---------------------------------------------------------------------------
+# Mailgun transactional email (agent login 2FA codes). See api/integrations/mailgun.
+# Auth: HTTP basic ("api", MAILGUN_API_KEY). MAILGUN_DOMAIN is the sending domain
+# (a sandbox sandboxXXXX.mailgun.org for testing, or a verified domain in prod).
+# MAILGUN_FROM overrides the From header; defaults to postmaster@<domain>.
+# ---------------------------------------------------------------------------
+MAILGUN_API_KEY = os.getenv('MAILGUN_API_KEY', '')
+MAILGUN_DOMAIN = os.getenv('MAILGUN_DOMAIN', '')
+MAILGUN_FROM = os.getenv('MAILGUN_FROM', '')
+MAILGUN_API_BASE = os.getenv('MAILGUN_API_BASE', 'https://api.mailgun.net')
+MAILGUN_TIMEOUT = int(os.getenv('MAILGUN_TIMEOUT', '15'))
+
+# Agent login 2FA code policy.
+AGENT_2FA_CODE_TTL_SECONDS = int(os.getenv('AGENT_2FA_CODE_TTL_SECONDS', '600'))
+AGENT_2FA_RESEND_COOLDOWN_SECONDS = int(
+    os.getenv('AGENT_2FA_RESEND_COOLDOWN_SECONDS', '30')
+)
+AGENT_2FA_MAX_ATTEMPTS = int(os.getenv('AGENT_2FA_MAX_ATTEMPTS', '5'))
+
+
+# ---------------------------------------------------------------------------
 # Field-level encryption (Unite Us tokens at rest). A urlsafe base64 32-byte
 # Fernet key. Generate with:
 #   python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"

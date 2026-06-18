@@ -113,13 +113,17 @@ class UniteUsRunUpdateView(views.APIView):
                 status=status.HTTP_403_FORBIDDEN,
             )
 
-        cred = (
-            UniteUsCredential.objects.filter(
-                agent_id=agent_id, status=UniteUsCredentialStatus.ACTIVE
-            )
-            .order_by("-updated_at")
-            .first()
-        )
+        # Prefer a credential captured by the requesting agent, but fall back to
+        # any active credential. The captured credential is the org's shared
+        # Unite Us provider session, and the daily cron pull already uses every
+        # active credential regardless of agent. Agents commonly have several
+        # Agent records (duplicate/again-issued codes for the same person), so
+        # the captured session may be linked to a sibling record — don't 409 in
+        # that case when a usable provider session exists.
+        active = UniteUsCredential.objects.filter(
+            status=UniteUsCredentialStatus.ACTIVE
+        ).order_by("-updated_at")
+        cred = active.filter(agent_id=agent_id).first() or active.first()
         if cred is None:
             return Response(
                 {

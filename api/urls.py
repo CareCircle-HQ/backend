@@ -20,7 +20,12 @@ from .views import (
     ScreeningViewSet,
     ZipCodeCheckView,
 )
-from .views_agent import AgentLoginView, AgentValidateView
+from .views_agent import (
+    AgentLoginView,
+    AgentRequestCodeView,
+    AgentValidateView,
+    AgentVerifyCodeView,
+)
 from .views_calltools import CallToolsAgentStatusView, CallToolsCampaignsView
 from .views_uniteus import UniteUsCredentialCaptureView, UniteUsRunUpdateView
 
@@ -47,6 +52,17 @@ urlpatterns = [
     # Agent validation & login
     path("agents/validate/", AgentValidateView.as_view(), name="agent-validate"),
     path("agents/login/", AgentLoginView.as_view(), name="agent-login"),
+    # Email + 2FA login: request a one-time code by company email, then verify
+    path(
+        "agents/request-code/",
+        AgentRequestCodeView.as_view(),
+        name="agent-request-code",
+    ),
+    path(
+        "agents/verify-code/",
+        AgentVerifyCodeView.as_view(),
+        name="agent-verify-code",
+    ),
     path(
         "agents/<str:code>/calltools/",
         CallToolsAgentStatusView.as_view(),

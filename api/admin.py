@@ -4,6 +4,7 @@ from simple_history.admin import SimpleHistoryAdmin
 from .models import (
     Address,
     Agent,
+    AgentLoginCode,
     AllowedZipCode,
     Assessment,
     Case,
@@ -286,6 +287,20 @@ class AgentAdmin(admin.ModelAdmin):
     search_fields = ("name", "agent_code", "email", "username", "calltools_app_user")
     readonly_fields = ("calltools_synced_at",)
     ordering = ("name",)
+
+
+@admin.register(AgentLoginCode)
+class AgentLoginCodeAdmin(admin.ModelAdmin):
+    # The plaintext code is never stored (only code_hash); nothing sensitive to
+    # expose here. Useful for auditing 2FA requests/usage.
+    list_display = (
+        "email", "agent", "expires_at", "consumed_at", "attempts", "created_at",
+    )
+    list_filter = ("consumed_at",)
+    search_fields = ("email", "agent__name", "agent__email")
+    readonly_fields = ("code_hash", "created_at")
+    autocomplete_fields = ("agent",)
+    ordering = ("-created_at",)
 
 
 @admin.register(AllowedZipCode)
