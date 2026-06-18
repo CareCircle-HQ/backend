@@ -37,6 +37,7 @@ from .models import (
     MenuType,
     MilitaryProfile,
     Program,
+    ProgramPipeline,
     Provider,
     RecordStatus,
     Screening,
@@ -301,7 +302,12 @@ class ClientSerializer(serializers.ModelSerializer):
         addresses = validated_data.pop("addresses", None)
         insurances = validated_data.pop("insurances", None)
         social_care_coverages = validated_data.pop("social_care_coverages", None)
-        client_id = validated_data.pop("client_id")
+        # On a partial update (PATCH) the payload may omit client_id; fall back
+        # to the instance being updated so we don't KeyError. client_id is still
+        # required on create (enforced by the serializer field).
+        client_id = validated_data.pop("client_id", None)
+        if client_id is None and self.instance is not None:
+            client_id = self.instance.client_id
         # Non-model flags (ignored by the serializer fields) read from raw input:
         # when set, the incoming list is treated as authoritative and any stored
         # record missing from it is deactivated.
@@ -684,13 +690,51 @@ class EnrollmentVerificationSerializer(serializers.ModelSerializer):
 SOCIAL_SERVICE_CASE_MANAGEMENT = "Social Service Case Management"
 
 
-def derive_case_type(service_type):
-    """Navigation / Internal Service from a case's service_type.
+# Map a ProgramPipeline.case_category value to a Case.case_type. Keys are
+# casefolded; both singular/plural spellings from the source data are accepted.
+_PIPELINE_CATEGORY_TO_CASE_TYPE = {
+    "navigation": CaseType.NAVIGATION,
+    "eligibility": CaseType.ELIGIBILITY,
+    "internal service": CaseType.INTERNAL_SERVICE,
+    "internal services": CaseType.INTERNAL_SERVICE,
+    "external service": CaseType.EXTERNAL_SERVICE,
+    "external services": CaseType.EXTERNAL_SERVICE,
+}
 
-    Returns None when service_type is blank so callers can leave the existing
-    value (or the model default) untouched. Never returns External Service —
-    that classification is only ever set explicitly.
+
+def derive_case_type_from_pipeline(program_name):
+    """Classify a case by matching its program_name against the ProgramPipeline
+    table and mapping the matched row's case_category to a CaseType.
+
+    The match is case-insensitive and whitespace-trimmed so minor differences
+    between the Unite Us program name and the seeded table still resolve.
+    Returns None when program_name is blank, no row matches, or the matched
+    category isn't recognized — callers then fall back to the service_type
+    heuristic.
     """
+    pn = (program_name or "").strip()
+    if not pn:
+        return None
+    row = ProgramPipeline.objects.filter(program_name__iexact=pn).first()
+    if row is None:
+        return None
+    return _PIPELINE_CATEGORY_TO_CASE_TYPE.get((row.case_category or "").strip().casefold())
+
+
+def derive_case_type(service_type, program_name=None):
+    """Classify a case.
+
+    Primary rule: match ``program_name`` against the ProgramPipeline table and
+    use the mapped case_category. Fallback (program not in the table): the
+    legacy ``service_type`` heuristic — Social Service Case Management =>
+    Internal Service, anything else => Navigation.
+
+    Returns None only when there's nothing to classify on (so callers leave the
+    existing value / model default untouched).
+    """
+    from_pipeline = derive_case_type_from_pipeline(program_name)
+    if from_pipeline is not None:
+        return from_pipeline
     st = (service_type or "").strip()
     if not st:
         return None
@@ -815,7 +859,10 @@ class CaseSerializer(serializers.ModelSerializer):
         # wins (e.g. a manually-set External Service); otherwise derive from the
         # service_type (case_type) and the client's household data (household_type).
         if "case_type" not in validated_data:
-            derived_type = derive_case_type(validated_data.get("service_type"))
+            derived_type = derive_case_type(
+                validated_data.get("service_type"),
+                validated_data.get("program_name"),
+            )
             if derived_type is not None:
                 validated_data["case_type"] = derived_type
         if "household_type" not in validated_data:
