@@ -28,6 +28,11 @@ from .views_agent import (
 )
 from .views_calltools import CallToolsAgentStatusView, CallToolsCampaignsView
 from .views_places import PlacesAutocompleteView, PlacesDetailsView
+from .views_phones import (
+    ClientPhoneDetailView,
+    ClientPhonesView,
+    PhoneLookupView,
+)
 from .views_uniteus import UniteUsCredentialCaptureView, UniteUsRunUpdateView
 
 router = DefaultRouter()
@@ -86,6 +91,18 @@ urlpatterns = [
     # Google Places (New) proxy — doctor-address autocomplete
     path("places/autocomplete/", PlacesAutocompleteView.as_view(), name="places-autocomplete"),
     path("places/details/", PlacesDetailsView.as_view(), name="places-details"),
+    # Client phones — caller-ID reverse lookup + manual assignment
+    path("phones/lookup/", PhoneLookupView.as_view(), name="phone-lookup"),
+    path(
+        "clients/<uuid:client_id>/phones/",
+        ClientPhonesView.as_view(),
+        name="client-phones",
+    ),
+    path(
+        "clients/<uuid:client_id>/phones/<uuid:client_phone_id>/",
+        ClientPhoneDetailView.as_view(),
+        name="client-phone-detail",
+    ),
     # User
     path("me/", MeView.as_view(), name="me"),
     # Misc

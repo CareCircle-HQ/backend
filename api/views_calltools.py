@@ -12,7 +12,8 @@ from rest_framework import permissions, status, views
 from rest_framework.response import Response
 
 from .integrations.calltools import campaigns, client, config, presence
-from .models import Agent
+from .models import Agent, ClientPhone
+from .views_phones import _client_match
 
 logger = logging.getLogger(__name__)
 
@@ -101,4 +102,21 @@ class CallToolsAgentStatusView(views.APIView):
         snapshot = presence.agent_presence(
             agent.calltools_app_user, client_phone=client_phone
         )
+        # Caller ID: attach the client(s) the live caller's number is tied to so
+        # the extension can offer to open one or assign the number to a client.
+        active = snapshot.get("active_call")
+        if active and active.get("number"):
+            normalized = ClientPhone.normalize(active["number"])
+            if normalized:
+                phones = (
+                    ClientPhone.objects.filter(normalized=normalized)
+                    .select_related("client")
+                    .order_by("-is_primary", "client__last_name")
+                )
+                matches = [_client_match(p) for p in phones]
+                active["matched_clients"] = matches
+                active["match_count"] = len(matches)
+            else:
+                active["matched_clients"] = []
+                active["match_count"] = 0
         return Response(snapshot)
