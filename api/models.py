@@ -441,6 +441,68 @@ class Address(models.Model):
         return f"{self.get_type_display()} address for {self.client_id}"
 
 
+class ClientPhoneSource(models.TextChoices):
+    UNITEUS = "uniteus", "Unite Us"
+    CALLTOOLS = "calltools", "CallTools"
+    AGENT = "agent", "Agent"
+
+
+class ClientPhone(models.Model):
+    """A phone number tied to a client. A client accumulates many numbers over
+    time (the original Unite Us number plus any numbers they call in from), and
+    the *same* number may be tied to multiple clients (e.g. household members
+    sharing a phone). Matching is done on ``normalized`` (last-10 digits, the
+    same convention as ``calltools.presence.numbers_match``)."""
+
+    client_phone_id = models.UUIDField(
+        primary_key=True, default=uuid.uuid4, editable=False
+    )
+    client = models.ForeignKey(
+        Client, on_delete=models.CASCADE, related_name="phones"
+    )
+    raw = models.CharField(max_length=40)  # as received / entered
+    normalized = models.CharField(max_length=20, db_index=True)  # last 10 digits
+    label = models.CharField(max_length=20, blank=True)  # mobile/home/work
+    source = models.CharField(
+        max_length=20,
+        choices=ClientPhoneSource.choices,
+        default=ClientPhoneSource.AGENT,
+    )
+    is_primary = models.BooleanField(default=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+    last_seen_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["-is_primary", "-created_at"]
+        constraints = [
+            # A client can't list the same number twice; two different clients
+            # CAN share a number (no global uniqueness).
+            models.UniqueConstraint(
+                fields=["client", "normalized"],
+                name="uniq_client_phone_normalized",
+            )
+        ]
+        indexes = [
+            models.Index(fields=["normalized"]),
+            models.Index(fields=["client", "is_primary"]),
+        ]
+
+    @staticmethod
+    def normalize(value):
+        """Reduce a phone number to comparable digits (last 10, US-style).
+        Mirrors ``api.integrations.calltools.presence._normalize_number``."""
+        digits = "".join(ch for ch in str(value or "") if ch.isdigit())
+        return digits[-10:] if len(digits) >= 10 else digits
+
+    def save(self, *args, **kwargs):
+        if not self.normalized:
+            self.normalized = self.normalize(self.raw)
+        super().save(*args, **kwargs)
+
+    def __str__(self):
+        return f"{self.raw} -> {self.client_id}"
+
+
 class Insurance(models.Model):
     """Normalized insurance record. A client may have multiple plans over time."""
 
@@ -2123,3 +2185,435 @@ class TimelineEvent(models.Model):
 
     def __str__(self):
         return f"{self.event_type} for {self.client_id} @ {self.occurred_at:%Y-%m-%d}"
+
+
+# ---------------------------------------------------------------------------
+# Menus & dietary tagging
+# ---------------------------------------------------------------------------
+class DietaryTagType(models.TextChoices):
+    RESTRICTION = "restriction", "Restriction"
+    ALLERGY = "allergy", "Allergy"
+
+
+class DietaryTag(models.Model):
+    """A single dietary tag, e.g. "no meat" (RESTRICTION) or "dairy" (ALLERGY)."""
+
+    dietary_tag_id = models.UUIDField(
+        primary_key=True, default=uuid.uuid4, editable=False
+    )
+    name = models.CharField(max_length=120, unique=True)
+    type = models.CharField(max_length=20, choices=DietaryTagType.choices)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["name"]
+        indexes = [models.Index(fields=["type"])]
+
+    def __str__(self):
+        return f"{self.name} ({self.get_type_display()})"
+
+
+class MenuType(models.Model):
+    """A menu variant, e.g. Standard, Vegetarian, Dairy-Free. Associated with
+    zero or more DietaryTags through MenuTypeTag."""
+
+    menu_type_id = models.UUIDField(
+        primary_key=True, default=uuid.uuid4, editable=False
+    )
+    name = models.CharField(max_length=120, unique=True)
+    tags = models.ManyToManyField(
+        DietaryTag,
+        through="MenuTypeTag",
+        related_name="menu_types",
+        blank=True,
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["name"]
+
+    def __str__(self):
+        return self.name
+
+
+class MenuTypeTag(models.Model):
+    """Join table linking a MenuType to a DietaryTag."""
+
+    menu_type = models.ForeignKey(
+        MenuType, on_delete=models.CASCADE, related_name="menu_type_tags"
+    )
+    dietary_tag = models.ForeignKey(
+        DietaryTag, on_delete=models.CASCADE, related_name="menu_type_tags"
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["menu_type", "dietary_tag"],
+                name="uniq_menu_type_dietary_tag",
+            )
+        ]
+        indexes = [
+            models.Index(fields=["menu_type"]),
+            models.Index(fields=["dietary_tag"]),
+        ]
+
+    def __str__(self):
+        return f"{self.menu_type} - {self.dietary_tag}"
+
+
+# ---------------------------------------------------------------------------
+# Kitchens
+# ---------------------------------------------------------------------------
+class KitchenStatus(models.TextChoices):
+    ACTIVE = "active", "Active"
+    INACTIVE = "inactive", "Inactive"
+    SUSPENDED = "suspended", "Suspended"
+
+
+class KitchenIntegrationMethod(models.TextChoices):
+    EMAIL = "email", "Email"
+    API = "api", "API"
+
+
+class Kitchen(models.Model):
+    """A kitchen/vendor that fulfills meal orders. Offers one or more
+    MenuTypes (through KitchenMenuType) and is reached via one or more
+    KitchenIntegrations (email or API)."""
+
+    kitchen_id = models.UUIDField(
+        primary_key=True, default=uuid.uuid4, editable=False
+    )
+    name = models.CharField(max_length=255)
+    address = models.CharField(max_length=255, blank=True)
+    phone = models.CharField(max_length=40, blank=True)
+    email = models.EmailField(blank=True)
+    status = models.CharField(
+        max_length=20,
+        choices=KitchenStatus.choices,
+        default=KitchenStatus.ACTIVE,
+    )
+    max_orders_per_day = models.PositiveIntegerField(null=True, blank=True)
+    menu_types = models.ManyToManyField(
+        MenuType,
+        through="KitchenMenuType",
+        related_name="kitchens",
+        blank=True,
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["name"]
+        indexes = [models.Index(fields=["status"])]
+
+    def __str__(self):
+        return self.name
+
+
+class KitchenMenuType(models.Model):
+    """Join table: which MenuTypes a Kitchen offers."""
+
+    kitchen = models.ForeignKey(
+        Kitchen, on_delete=models.CASCADE, related_name="kitchen_menu_types"
+    )
+    menu_type = models.ForeignKey(
+        MenuType, on_delete=models.CASCADE, related_name="kitchen_menu_types"
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["kitchen", "menu_type"],
+                name="uniq_kitchen_menu_type",
+            )
+        ]
+        indexes = [
+            models.Index(fields=["kitchen"]),
+            models.Index(fields=["menu_type"]),
+        ]
+
+    def __str__(self):
+        return f"{self.kitchen} - {self.menu_type}"
+
+
+class KitchenIntegration(models.Model):
+    """How a Kitchen receives orders: by EMAIL or API. ``config`` carries the
+    method-specific settings (endpoint, email, credentials, etc.)."""
+
+    kitchen_integration_id = models.UUIDField(
+        primary_key=True, default=uuid.uuid4, editable=False
+    )
+    kitchen = models.ForeignKey(
+        Kitchen, on_delete=models.CASCADE, related_name="integrations"
+    )
+    method = models.CharField(
+        max_length=20, choices=KitchenIntegrationMethod.choices
+    )
+    config = models.JSONField(default=dict, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["kitchen", "method"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["kitchen", "method"],
+                name="uniq_kitchen_integration_method",
+            )
+        ]
+        indexes = [models.Index(fields=["kitchen"])]
+
+    def __str__(self):
+        return f"{self.kitchen} ({self.get_method_display()})"
+
+
+# ---------------------------------------------------------------------------
+# Delivery companies
+# ---------------------------------------------------------------------------
+class DeliveryCompanyStatus(models.TextChoices):
+    ACTIVE = "active", "Active"
+    INACTIVE = "inactive", "Inactive"
+    SUSPENDED = "suspended", "Suspended"
+
+
+class DeliveryCompanyIntegrationMethod(models.TextChoices):
+    EMAIL = "email", "Email"
+    API = "api", "API"
+
+
+class DeliveryCompany(models.Model):
+    """A delivery company/vendor that transports meal orders."""
+
+    delivery_company_id = models.UUIDField(
+        primary_key=True, default=uuid.uuid4, editable=False
+    )
+    name = models.CharField(max_length=255)
+    address = models.CharField(max_length=255, blank=True)
+    phone = models.CharField(max_length=40, blank=True)
+    email = models.EmailField(blank=True)
+    status = models.CharField(
+        max_length=20,
+        choices=DeliveryCompanyStatus.choices,
+        default=DeliveryCompanyStatus.ACTIVE,
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["name"]
+        verbose_name_plural = "delivery companies"
+        indexes = [models.Index(fields=["status"])]
+
+    def __str__(self):
+        return self.name
+
+
+class DeliveryCompanyIntegration(models.Model):
+    """How a DeliveryCompany receives orders: by EMAIL or API. ``config``
+    carries the method-specific settings (endpoint, email, credentials, etc.).
+    At most one integration per company may be flagged ``is_primary``."""
+
+    delivery_company_integration_id = models.UUIDField(
+        primary_key=True, default=uuid.uuid4, editable=False
+    )
+    delivery_company = models.ForeignKey(
+        DeliveryCompany, on_delete=models.CASCADE, related_name="integrations"
+    )
+    method = models.CharField(
+        max_length=20, choices=DeliveryCompanyIntegrationMethod.choices
+    )
+    is_primary = models.BooleanField(default=False)
+    config = models.JSONField(default=dict, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["delivery_company", "-is_primary", "method"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["delivery_company", "method"],
+                name="uniq_delivery_company_integration_method",
+            ),
+            # At most one primary integration per delivery company.
+            models.UniqueConstraint(
+                fields=["delivery_company"],
+                condition=models.Q(is_primary=True),
+                name="uniq_primary_delivery_company_integration",
+            ),
+        ]
+        indexes = [models.Index(fields=["delivery_company"])]
+
+    def __str__(self):
+        return f"{self.delivery_company} ({self.get_method_display()})"
+
+
+# ---------------------------------------------------------------------------
+# Purchase orders & delivery orders
+# ---------------------------------------------------------------------------
+class PurchaseOrderStatus(models.TextChoices):
+    DRAFT = "draft", "Draft"
+    CONFIRMED = "confirmed", "Confirmed"
+    COMPLETED = "completed", "Completed"
+    CANCELLED = "cancelled", "Cancelled"
+
+
+class PurchaseOrderKitchenStatus(models.TextChoices):
+    NOT_SENT = "not_sent", "Not Sent"
+    SENT_TO_KITCHEN = "sent_to_kitchen", "Sent to Kitchen"
+    ACCEPTED_BY_KITCHEN = "accepted_by_kitchen", "Accepted by Kitchen"
+    IN_PREPARATION = "in_preparation", "In Preparation"
+    READY_FOR_DISPATCH = "ready_for_dispatch", "Ready for Dispatch"
+
+
+class PurchaseOrderDeliveryStatus(models.TextChoices):
+    NOT_SENT = "not_sent", "Not Sent"
+    SENT_TO_DELIVERY = "sent_to_delivery", "Sent to Delivery"
+    ACCEPTED_BY_DELIVERY = "accepted_by_delivery", "Accepted by Delivery"
+    OUT_FOR_DELIVERY = "out_for_delivery", "Out for Delivery"
+    COMPLETED = "completed", "Completed"
+    PARTIALLY_COMPLETED = "partially_completed", "Partially Completed"
+
+
+class DeliveryOrderStatus(models.TextChoices):
+    PENDING = "pending", "Pending"
+    READY_FOR_DELIVERY = "ready_for_delivery", "Ready for Delivery"
+    OUT_FOR_DELIVERY = "out_for_delivery", "Out for Delivery"
+    DELIVERED = "delivered", "Delivered"
+    ON_HOLD = "on_hold", "On Hold"
+    CANCELLED = "cancelled", "Cancelled"
+    FAILED = "failed", "Failed"
+    RETURNED = "returned", "Returned"
+
+
+class PurchaseOrder(models.Model):
+    """A batch order placed with a Kitchen and routed through a DeliveryCompany.
+    Contains many DeliveryOrders (one per member/household)."""
+
+    purchase_order_id = models.UUIDField(
+        primary_key=True, default=uuid.uuid4, editable=False
+    )
+    # Planned fulfillment date.
+    delivery_date = models.DateField(null=True, blank=True)
+    status = models.CharField(
+        max_length=20,
+        choices=PurchaseOrderStatus.choices,
+        default=PurchaseOrderStatus.DRAFT,
+    )
+    kitchen_status = models.CharField(
+        max_length=30,
+        choices=PurchaseOrderKitchenStatus.choices,
+        default=PurchaseOrderKitchenStatus.NOT_SENT,
+    )
+    delivery_status = models.CharField(
+        max_length=30,
+        choices=PurchaseOrderDeliveryStatus.choices,
+        default=PurchaseOrderDeliveryStatus.NOT_SENT,
+    )
+    kitchen = models.ForeignKey(
+        Kitchen,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="purchase_orders",
+    )
+    delivery_company = models.ForeignKey(
+        DeliveryCompany,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="purchase_orders",
+    )
+    # Timestamps for when the order was dispatched to each party.
+    sent_to_kitchen_at = models.DateTimeField(null=True, blank=True)
+    sent_to_delivery_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["status"]),
+            models.Index(fields=["delivery_date"]),
+            models.Index(fields=["kitchen", "status"]),
+        ]
+
+    def __str__(self):
+        return f"PO {self.purchase_order_id} ({self.get_status_display()})"
+
+
+class DeliveryOrder(models.Model):
+    """A single member's delivery within a PurchaseOrder."""
+
+    delivery_order_id = models.UUIDField(
+        primary_key=True, default=uuid.uuid4, editable=False
+    )
+    purchase_order = models.ForeignKey(
+        PurchaseOrder, on_delete=models.CASCADE, related_name="delivery_orders"
+    )
+    member = models.ForeignKey(
+        Client,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="delivery_orders",
+    )
+    group = models.ForeignKey(
+        Household,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="delivery_orders",
+    )
+    status = models.CharField(
+        max_length=30,
+        choices=DeliveryOrderStatus.choices,
+        default=DeliveryOrderStatus.PENDING,
+    )
+    expected_delivery_date = models.DateField(null=True, blank=True)
+    delivered_at = models.DateTimeField(null=True, blank=True)
+    kitchen = models.ForeignKey(
+        Kitchen,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="delivery_orders",
+    )
+    menu_type = models.ForeignKey(
+        MenuType,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="delivery_orders",
+    )
+    # Per-order overrides on top of the MenuType's tags.
+    custom_dietary_tags = models.ManyToManyField(
+        DietaryTag, related_name="delivery_orders", blank=True
+    )
+    delivery_company = models.ForeignKey(
+        DeliveryCompany,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="delivery_orders",
+    )
+    # Proof of delivery: list of image references (URLs / storage keys).
+    proof_of_delivery = models.JSONField(default=list, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["purchase_order"]),
+            models.Index(fields=["status"]),
+            models.Index(fields=["member"]),
+            models.Index(fields=["expected_delivery_date"]),
+        ]
+
+    def __str__(self):
+        return f"DeliveryOrder {self.delivery_order_id} ({self.get_status_display()})"
