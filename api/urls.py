@@ -108,6 +108,8 @@ urlpatterns = [
     # Misc
     path("health/", HealthView.as_view(), name="health"),
     path("zipcodes/check/", ZipCodeCheckView.as_view(), name="zipcode-check"),
+    # Customer-support web portal API (separate from the extension API above)
+    path("portal/", include("api.portal.urls")),
     # Domain resources
     path("", include(router.urls)),
 ]
