@@ -16,13 +16,17 @@ from ..models import (
     Client,
     EnrollmentStage,
     EnrollmentVerification,
+    HouseholdMember,
+    MemberStatus,
     MemberVerification,
     Note,
     NoteSource,
     PurchaseOrder,
+    ServiceAuthorizationStatus,
     Ticket,
     TimelineEvent,
 )
+from ..services.lifecycle import advance_enrollment
 from .base import PortalAPIView, PortalGenericAPIView, current_agent
 from . import serializers as s
 
@@ -104,7 +108,8 @@ class MembersStatsView(PortalAPIView):
 def _get_member(client_id):
     return get_object_or_404(
         Client.objects.prefetch_related(
-            "insurances", "military_profile", "addresses", "tickets", "enrollments"
+            "insurances", "military_profile", "addresses", "tickets",
+            "enrollments", "cases",
         ),
         pk=client_id,
     )
@@ -182,7 +187,9 @@ class MemberHouseholdView(PortalAPIView):
         enr = self._enrollment(client_id)
         if enr is None:
             return Response({"enrollment": None, "address": None, "members": []})
-        members = enr.member_verifications.all()
+        members = enr.member_verifications.select_related(
+            "client__household_membership"
+        ).all()
         addr = enr.delivery_address
         return Response(
             {
@@ -278,18 +285,17 @@ class MemberTicketsView(PortalAPIView):
         return Response(s.PortalTicketSerializer(qs, many=True).data)
 
 
-# Maps the wizard's authorization outcome onto an EnrollmentStage.
-AUTH_STATUS_TO_STAGE = {
-    "Draft": EnrollmentStage.PENDING_VERIFICATION,
-    "Pending": EnrollmentStage.WAITING_AUTHORIZATION,
-    "Accepted": EnrollmentStage.AUTHORIZED,
-    "Denied": EnrollmentStage.DENIED,
-}
-
-
 class MemberVerificationCreateView(PortalAPIView):
     """POST: create an EnrollmentVerification + MemberVerifications + delivery
-    Address for a member (the 5-step wizard)."""
+    Address for a member (the 5-step wizard).
+
+    On save the household is verified, advancing the enrollment to VERIFIED
+    (which drives the client to the "Verified" lifecycle stage). When the
+    authorization outcome is "Accepted" the enrollment is advanced straight to
+    SERVICE_ACTIVE ("In Service"), bypassing AUTHORIZED so no delivery orders
+    are auto-generated — orders are created manually afterwards. Each transition
+    is recorded on the client's history (StageEvent + timeline event).
+    """
 
     @transaction.atomic
     def post(self, request, client_id):
@@ -314,6 +320,8 @@ class MemberVerificationCreateView(PortalAPIView):
         household = getattr(
             getattr(client, "household_membership", None), "household", None
         )
+        # Start at PENDING_VERIFICATION; the guarded lifecycle transitions below
+        # move it forward and write the history rows.
         enrollment = EnrollmentVerification.objects.create(
             client=client,
             household=household,
@@ -324,9 +332,7 @@ class MemberVerificationCreateView(PortalAPIView):
             is_family_verified=data.get("is_family_verified"),
             medicaid_type_verified=data.get("medicaid_type_verified"),
             delivery_address_verified=data.get("delivery_address_verified"),
-            stage=AUTH_STATUS_TO_STAGE.get(
-                data.get("auth_status"), EnrollmentStage.PENDING_VERIFICATION
-            ),
+            stage=EnrollmentStage.PENDING_VERIFICATION,
         )
 
         for m in data["members"]:
@@ -340,6 +346,40 @@ class MemberVerificationCreateView(PortalAPIView):
                 meal_category=m.get("meal_category", ""),
                 menu_type=m.get("menu_type", ""),
                 general_verification_notes=m.get("notes", ""),
+                status=MemberStatus.VERIFIED,
+            )
+
+            # Wire the member's mobile-app login number onto their HouseholdMember
+            # row (the field powers the Benefully member app login). Only members
+            # that map to a real client/household-member can be wired here.
+            mobile = (m.get("mobile_number") or "").strip()
+            member_client_id = m.get("client_id")
+            if mobile and member_client_id:
+                HouseholdMember.objects.filter(
+                    client_id=member_client_id
+                ).update(mobile_app_username=mobile)
+
+        # Completing the wizard IS the verification, so force past the process
+        # gate. This records a StageEvent + timeline event and recomputes the
+        # client's lifecycle stage to "Verified".
+        advance_enrollment(
+            enrollment, EnrollmentStage.VERIFIED, force=True,
+            note="Verification completed via support portal.",
+        )
+
+        # The authorization outcome is sourced from the client's case (NOT the
+        # client/frontend): only an Accepted (APPROVED) case promotes the
+        # household straight into service. Any other status leaves the client at
+        # "Verified". Going VERIFIED -> SERVICE_ACTIVE skips AUTHORIZED, so no
+        # delivery orders are auto-generated — orders are created manually.
+        case = s.primary_case(client)
+        accepted = bool(
+            case and case.service_authorization_status == ServiceAuthorizationStatus.APPROVED
+        )
+        if accepted:
+            advance_enrollment(
+                enrollment, EnrollmentStage.SERVICE_ACTIVE, force=True,
+                note="Authorization accepted — placed in service.",
             )
 
         return Response(

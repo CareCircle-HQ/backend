@@ -27,6 +27,8 @@ from .views_agent import (
     AgentVerifyCodeView,
 )
 from .views_calltools import CallToolsAgentStatusView, CallToolsCampaignsView
+from .views_leads import LeadViewSet
+from .views_member_app import MemberAppRequestCodeView
 from .views_places import PlacesAutocompleteView, PlacesDetailsView
 from .views_phones import (
     ClientPhoneDetailView,
@@ -48,6 +50,7 @@ router.register(
 )
 router.register("providers", ProviderViewSet, basename="provider")
 router.register("programs", ProgramViewSet, basename="program")
+router.register("leads", LeadViewSet, basename="lead")
 
 urlpatterns = [
     # Auth
@@ -68,6 +71,13 @@ urlpatterns = [
         "agents/verify-code/",
         AgentVerifyCodeView.as_view(),
         name="agent-verify-code",
+    ),
+    # Member mobile app: request a 2FA code by mobile number (SMS via Twilio
+    # later; emailed to an operator inbox for now).
+    path(
+        "member-app/request-code/",
+        MemberAppRequestCodeView.as_view(),
+        name="member-app-request-code",
     ),
     path(
         "agents/<str:code>/calltools/",

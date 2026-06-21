@@ -25,6 +25,7 @@ from ..models import (
     MenuType,
     Note,
     PurchaseOrder,
+    ServiceAuthorizationStatus,
     SocialCareCoverage,
     Ticket,
     TicketNote,
@@ -104,6 +105,34 @@ def active_enrollment(client):
     open_ones = [e for e in enrollments if e.closed_at is None]
     pool = open_ones or enrollments
     return sorted(pool, key=lambda e: e.opened_at or timezone.now(), reverse=True)[0]
+
+
+def primary_case(client):
+    """The case whose service authorization governs the client: the most
+    recently opened case that carries an authorization status, else the most
+    recent case. None when the client has no cases."""
+    cases = list(client.cases.all())
+    if not cases:
+        return None
+    with_auth = [c for c in cases if c.service_authorization_status]
+    pool = with_auth or cases
+    return sorted(pool, key=lambda c: c.date_opened or timezone.now(), reverse=True)[0]
+
+
+def case_authorization(case):
+    """Read-only authorization snapshot for a case: normalized status, the raw
+    display label (e.g. "Accepted"), and whether it counts as accepted."""
+    if case is None:
+        return {"status": "", "status_label": "", "is_accepted": False}
+    status = case.service_authorization_status or ""
+    label = case.service_authorization_status_label or (
+        case.get_service_authorization_status_display() if status else ""
+    )
+    return {
+        "status": status,
+        "status_label": label,
+        "is_accepted": status == ServiceAuthorizationStatus.APPROVED,
+    }
 
 
 def is_insurance_expiring(plan):
@@ -190,6 +219,10 @@ class MemberDetailSerializer(serializers.Serializer):
                 if client.lifecycle_stage_at
                 else None,
             },
+            # Read-only authorization status sourced from the client's case.
+            # Drives the (read-only) Authorization Status shown in the
+            # verification wizard's validation step.
+            "authorization": case_authorization(primary_case(client)),
             "demographics": {
                 "gender": client.gender,
                 "marital_status": client.marital_status,
@@ -538,14 +571,15 @@ class PortalHouseholdMemberSerializer(serializers.ModelSerializer):
     id = serializers.IntegerField(source="pk", read_only=True)
     client_id = serializers.SerializerMethodField()
     name = serializers.SerializerMethodField()
+    mobile_number = serializers.SerializerMethodField()
     status_label = serializers.CharField(source="get_status_display", read_only=True)
 
     class Meta:
         model = MemberVerification
         fields = [
-            "id", "client_id", "name", "status", "status_label",
+            "id", "client_id", "name", "mobile_number", "status", "status_label",
             "dietary_restrictions", "food_allergies", "other_dietary_restrictions",
-            "meal_category", "menu_type",
+            "meal_category", "menu_type", "general_verification_notes",
         ]
 
     def get_client_id(self, obj):
@@ -553,6 +587,11 @@ class PortalHouseholdMemberSerializer(serializers.ModelSerializer):
 
     def get_name(self, obj):
         return obj.member_name or (_full_name(obj.client) if obj.client else "")
+
+    def get_mobile_number(self, obj):
+        # The member-app login number lives on the member's HouseholdMember row.
+        membership = getattr(obj.client, "household_membership", None) if obj.client_id else None
+        return (getattr(membership, "mobile_app_username", "") or "")
 
 
 class PortalAddressEditSerializer(serializers.Serializer):
@@ -570,6 +609,7 @@ class PortalMemberDietaryEditSerializer(serializers.Serializer):
     other_dietary_restrictions = serializers.CharField(allow_blank=True, required=False)
     meal_category = serializers.CharField(allow_blank=True, required=False)
     menu_type = serializers.CharField(allow_blank=True, required=False)
+    general_verification_notes = serializers.CharField(allow_blank=True, required=False)
 
 
 # ---------------------------------------------------------------------------
@@ -669,6 +709,10 @@ class PortalDeliveryCompanySerializer(serializers.ModelSerializer):
 class VerificationMemberInputSerializer(serializers.Serializer):
     client_id = serializers.UUIDField(required=False, allow_null=True)
     member_name = serializers.CharField(required=False, allow_blank=True)
+    # Mobile number the member will use to sign into the Benefully mobile app.
+    # Wired to HouseholdMember.mobile_app_username when the member maps to a
+    # household member (i.e. has a client_id).
+    mobile_number = serializers.CharField(required=False, allow_blank=True)
     dietary_restrictions = serializers.ListField(
         child=serializers.CharField(), required=False, default=list
     )

@@ -665,6 +665,13 @@ class HouseholdMember(models.Model):
     )
     is_primary = models.BooleanField(default=False)
     relationship = models.CharField(max_length=60, blank=True)  # e.g. spouse, child, guardian
+    # Login username for the Benefully member mobile app. This is the mobile
+    # number the member chooses to sign in with (also the destination for the
+    # SMS 2FA code). Unique across members; null when the member hasn't enrolled
+    # in the app yet.
+    mobile_app_username = models.CharField(
+        max_length=32, null=True, blank=True, unique=True, db_index=True
+    )
     added_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
@@ -1764,6 +1771,13 @@ class AgentLoginCode(models.Model):
 
     CODE_LENGTH = 6
 
+    class Source(models.TextChoices):
+        # The app a code was requested from. Codes are scoped per source so a
+        # login attempt in one app doesn't invalidate a pending code in the
+        # other (an agent may use both the extension and the support portal).
+        EXTENSION = "extension", "Extension"
+        PORTAL = "portal", "Support portal"
+
     email = models.EmailField(db_index=True)
     # The active agent this code was issued for (resolved from the email at
     # request time). Kept for auditing and to mint the JWT on verify.
@@ -1773,6 +1787,12 @@ class AgentLoginCode(models.Model):
         related_name="login_codes",
         null=True,
         blank=True,
+    )
+    source = models.CharField(
+        max_length=20,
+        choices=Source.choices,
+        default=Source.EXTENSION,
+        db_index=True,
     )
     code_hash = models.CharField(max_length=128)
     expires_at = models.DateTimeField(db_index=True)
@@ -1802,17 +1822,90 @@ class AgentLoginCode(models.Model):
         return f"{secrets.randbelow(upper):0{AgentLoginCode.CODE_LENGTH}d}"
 
     @classmethod
-    def issue(cls, email, agent=None, ttl_seconds=None):
+    def issue(cls, email, agent=None, ttl_seconds=None, source=None):
         """Create and store a new code for ``email``; returns ``(instance, code)``.
 
         Only the hash is persisted; the returned plaintext ``code`` is for
-        delivery (email) and is not recoverable afterwards.
+        delivery (email) and is not recoverable afterwards. ``source`` scopes the
+        code to the requesting app (extension vs portal) so codes don't collide.
         """
         ttl = ttl_seconds or getattr(settings, "AGENT_2FA_CODE_TTL_SECONDS", 600)
         code = cls.generate_code()
         obj = cls.objects.create(
             email=(email or "").strip().lower(),
             agent=agent,
+            source=source or cls.Source.EXTENSION,
+            code_hash=make_password(code),
+            expires_at=timezone.now() + timedelta(seconds=ttl),
+        )
+        return obj, code
+
+    def check_code(self, code):
+        """True when ``code`` matches the stored hash."""
+        return check_password(str(code or "").strip(), self.code_hash)
+
+
+class HouseholdMemberLoginCode(models.Model):
+    """A short-lived, single-use 2FA code for the Benefully member mobile app.
+
+    Mirrors :class:`AgentLoginCode` but is keyed by a mobile number (the
+    member's app username) and links to the :class:`HouseholdMember` when one is
+    matched. Only a salted hash of the code is stored; codes expire, are
+    single-use, and cap verification attempts.
+
+    Delivery is intended to be SMS (Twilio). Until that's wired up the code is
+    emailed to an operator inbox instead (see ``views_member_app``).
+    """
+
+    CODE_LENGTH = 6
+
+    member = models.ForeignKey(
+        "HouseholdMember",
+        on_delete=models.CASCADE,
+        related_name="login_codes",
+        null=True,
+        blank=True,
+    )
+    mobile_number = models.CharField(max_length=32, db_index=True)
+    code_hash = models.CharField(max_length=128)
+    expires_at = models.DateTimeField(db_index=True)
+    consumed_at = models.DateTimeField(null=True, blank=True)
+    attempts = models.PositiveSmallIntegerField(default=0)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        indexes = [models.Index(fields=["mobile_number", "expires_at"])]
+
+    def __str__(self):
+        return f"Member 2FA code for {self.mobile_number} (exp {self.expires_at:%Y-%m-%d %H:%M})"
+
+    @property
+    def is_expired(self):
+        return timezone.now() >= self.expires_at
+
+    @property
+    def is_consumed(self):
+        return self.consumed_at is not None
+
+    @staticmethod
+    def generate_code():
+        """A zero-padded numeric code of length ``CODE_LENGTH`` (e.g. "042913")."""
+        upper = 10 ** HouseholdMemberLoginCode.CODE_LENGTH
+        return f"{secrets.randbelow(upper):0{HouseholdMemberLoginCode.CODE_LENGTH}d}"
+
+    @classmethod
+    def issue(cls, mobile_number, member=None, ttl_seconds=None):
+        """Create and store a new code for ``mobile_number``; returns ``(instance, code)``.
+
+        Only the hash is persisted; the returned plaintext ``code`` is for
+        delivery (SMS/email) and is not recoverable afterwards.
+        """
+        ttl = ttl_seconds or getattr(settings, "AGENT_2FA_CODE_TTL_SECONDS", 600)
+        code = cls.generate_code()
+        obj = cls.objects.create(
+            mobile_number=(mobile_number or "").strip(),
+            member=member,
             code_hash=make_password(code),
             expires_at=timezone.now() + timedelta(seconds=ttl),
         )
@@ -2651,3 +2744,83 @@ class TicketNote(models.Model):
 
     def __str__(self):
         return f"Note on ticket {self.ticket_id} by {self.author_name or 'system'}"
+
+
+# ===========================================================================
+# LEADS (public eligibility funnel)
+# ===========================================================================
+class Lead(models.Model):
+    """A prospective member captured from the public eligibility funnel
+    (Benefully mobile app / landing page).
+
+    Two-step intake:
+      * Step 1 (required): contact fields + Medicaid enrollment status + the
+        legal disclaimer acceptance (TCPA-style consent to be contacted).
+      * Step 2 (optional): enrichment fields filled in on a follow-up screen.
+
+    The disclaimer acceptance timestamp (``disclaimer_accepted_at``) is stamped
+    automatically when consent is recorded. ``do_not_contact`` is an explicit
+    opt-out the lead can set to stop further outreach.
+    """
+
+    class MedicaidEnrollment(models.TextChoices):
+        YES = "yes", "Yes"
+        NO = "no", "No"
+        NOT_SURE = "not_sure", "Not sure"
+
+    class ContactMethod(models.TextChoices):
+        PHONE = "phone", "Phone"
+        TEXT = "text", "Text"
+        EMAIL = "email", "Email"
+
+    class Status(models.TextChoices):
+        NEW = "new", "New"
+        CONTACTED = "contacted", "Contacted"
+        QUALIFIED = "qualified", "Qualified"
+        CONVERTED = "converted", "Converted"
+        DISQUALIFIED = "disqualified", "Disqualified"
+
+    lead_id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+
+    # --- Step 1: required capture ---
+    first_name = models.CharField(max_length=120)
+    last_name = models.CharField(max_length=120)
+    # Phone is the primary follow-up channel; kept as free text (normalization
+    # happens at the serializer layer) so international/format variants survive.
+    phone_number = models.CharField(max_length=32, db_index=True)
+    email = models.EmailField(blank=True, db_index=True)
+    zip_code = models.CharField(max_length=10)
+    medicaid_enrollment = models.CharField(
+        max_length=10, choices=MedicaidEnrollment.choices
+    )
+
+    # Legal disclaimer acceptance — consent to be contacted by phone/text/email.
+    disclaimer_accepted = models.BooleanField(default=False)
+    disclaimer_accepted_at = models.DateTimeField(null=True, blank=True)
+
+    # --- Step 2: optional enrichment ---
+    medicaid_id = models.CharField(max_length=60, blank=True)
+    date_of_birth = models.DateField(null=True, blank=True)
+    additional_details = models.TextField(blank=True)
+    household_size = models.PositiveSmallIntegerField(null=True, blank=True)
+    preferred_contact_method = models.CharField(
+        max_length=10, choices=ContactMethod.choices, blank=True
+    )
+
+    # Explicit opt-out: when true, do not contact the lead any further.
+    do_not_contact = models.BooleanField(default=False)
+
+    status = models.CharField(
+        max_length=20, choices=Status.choices, default=Status.NEW, db_index=True
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["status", "created_at"]),
+        ]
+
+    def __str__(self):
+        return f"Lead {self.first_name} {self.last_name} ({self.phone_number})"

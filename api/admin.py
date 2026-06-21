@@ -12,9 +12,11 @@ from .models import (
     EnrollmentVerification,
     Household,
     HouseholdMember,
+    HouseholdMemberLoginCode,
     IdentifiedSocialNeed,
     ImportRun,
     Insurance,
+    Lead,
     MemberVerification,
     MilitaryProfile,
     Note,
@@ -226,10 +228,29 @@ class HouseholdAdmin(admin.ModelAdmin):
 
 @admin.register(HouseholdMember)
 class HouseholdMemberAdmin(admin.ModelAdmin):
-    list_display = ("client", "household", "is_primary", "relationship", "added_at")
+    list_display = (
+        "client", "household", "is_primary", "relationship",
+        "mobile_app_username", "added_at",
+    )
     list_filter = ("is_primary",)
-    search_fields = ("client__client_id", "client__last_name", "household__name")
+    search_fields = (
+        "client__client_id", "client__last_name", "household__name",
+        "mobile_app_username",
+    )
     autocomplete_fields = ("client", "household")
+
+
+@admin.register(HouseholdMemberLoginCode)
+class HouseholdMemberLoginCodeAdmin(admin.ModelAdmin):
+    # Plaintext codes are never stored (only code_hash). Useful for auditing
+    # member-app 2FA requests/usage.
+    list_display = (
+        "mobile_number", "member", "created_at", "expires_at",
+        "consumed_at", "attempts",
+    )
+    search_fields = ("mobile_number",)
+    readonly_fields = ("code_hash", "created_at")
+    ordering = ("-created_at",)
 
 
 class IdentifiedSocialNeedInline(admin.TabularInline):
@@ -368,6 +389,22 @@ class TicketAdmin(SimpleHistoryAdmin):
     list_filter = ("status", "type", "severity")
     search_fields = ("reason",)
     autocomplete_fields = ("client", "case", "assigned_to", "import_run")
+
+
+@admin.register(Lead)
+class LeadAdmin(admin.ModelAdmin):
+    list_display = (
+        "lead_id", "first_name", "last_name", "phone_number", "email",
+        "zip_code", "medicaid_enrollment", "status", "do_not_contact",
+        "created_at",
+    )
+    list_filter = (
+        "status", "medicaid_enrollment", "do_not_contact",
+        "disclaimer_accepted", "preferred_contact_method",
+    )
+    search_fields = ("first_name", "last_name", "phone_number", "email", "zip_code")
+    readonly_fields = ("lead_id", "disclaimer_accepted_at", "created_at", "updated_at")
+    ordering = ("-created_at",)
 
 
 @admin.register(TimelineEvent)

@@ -31,6 +31,7 @@ from .models import (
     CommunicationTimeOfDay,
     IdentifiedSocialNeed,
     Insurance,
+    Lead,
     MemberStatus,
     MemberVerification,
     MenuCategory,
@@ -1079,3 +1080,83 @@ class TimelineEventSerializer(serializers.ModelSerializer):
 
     def get_entity_type(self, obj):
         return obj.content_type.model if obj.content_type_id else None
+
+
+class LeadSerializer(serializers.ModelSerializer):
+    """Serialize/validate a public-funnel :class:`Lead`.
+
+    Step-1 fields (name, phone, ZIP, Medicaid status) are required on create
+    along with the legal disclaimer; step-2 fields are optional and typically
+    PATCHed in later. ``disclaimer_accepted_at`` is server-stamped when consent
+    is recorded; ``status`` is managed internally (read-only to the funnel).
+    """
+
+    class Meta:
+        model = Lead
+        fields = [
+            "lead_id",
+            # Step 1 — required capture
+            "first_name",
+            "last_name",
+            "phone_number",
+            "email",
+            "zip_code",
+            "medicaid_enrollment",
+            "disclaimer_accepted",
+            "disclaimer_accepted_at",
+            # Step 2 — optional enrichment
+            "medicaid_id",
+            "date_of_birth",
+            "additional_details",
+            "household_size",
+            "preferred_contact_method",
+            "do_not_contact",
+            # Internal / metadata
+            "status",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = [
+            "lead_id",
+            "disclaimer_accepted_at",
+            "status",
+            "created_at",
+            "updated_at",
+        ]
+
+    def validate_phone_number(self, value):
+        digits = re.sub(r"\D", "", value or "")
+        if len(digits) < 10:
+            raise serializers.ValidationError("Enter a valid phone number.")
+        return (value or "").strip()
+
+    def validate_zip_code(self, value):
+        v = (value or "").strip()
+        if not re.fullmatch(r"\d{5}(-\d{4})?", v):
+            raise serializers.ValidationError("Enter a valid 5-digit ZIP code.")
+        return v
+
+    def validate(self, attrs):
+        # Submitting step 1 ("Check My Eligibility") records consent — so the
+        # disclaimer must be accepted to create a lead.
+        if self.instance is None and not attrs.get("disclaimer_accepted"):
+            raise serializers.ValidationError(
+                {"disclaimer_accepted": "You must accept the disclaimer to continue."}
+            )
+        return attrs
+
+    def _stamp_consent(self, validated_data, instance=None):
+        # Record when consent was given the first time it flips to accepted.
+        if validated_data.get("disclaimer_accepted"):
+            already = getattr(instance, "disclaimer_accepted_at", None)
+            if not already:
+                validated_data["disclaimer_accepted_at"] = timezone.now()
+        return validated_data
+
+    def create(self, validated_data):
+        validated_data = self._stamp_consent(validated_data)
+        return super().create(validated_data)
+
+    def update(self, instance, validated_data):
+        validated_data = self._stamp_consent(validated_data, instance)
+        return super().update(instance, validated_data)

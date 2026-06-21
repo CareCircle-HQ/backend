@@ -20,6 +20,10 @@ from .views_members import (
     MembersListView,
     MembersStatsView,
 )
+from .views_places import (
+    PortalPlacesAutocompleteView,
+    PortalPlacesDetailsView,
+)
 from .views_orders import (
     DeliveryCompaniesListView,
     KitchensListView,
@@ -106,6 +110,11 @@ urlpatterns = [
         "settings/delivery-company-integrations/<uuid:integration_id>/set-primary/",
         DeliveryCompanyIntegrationSetPrimaryView.as_view(),
     ),
+
+    # Google Places proxy — delivery-address autocomplete (mirrors the
+    # extension's doctor-address autocomplete; key stays server-side).
+    path("places/autocomplete/", PortalPlacesAutocompleteView.as_view(), name="portal-places-autocomplete"),
+    path("places/details/", PortalPlacesDetailsView.as_view(), name="portal-places-details"),
 
     # Dashboard
     path("dashboard/", DashboardView.as_view(), name="portal-dashboard"),

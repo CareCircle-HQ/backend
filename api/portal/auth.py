@@ -60,9 +60,12 @@ class PortalRequestCodeView(views.APIView):
             logger.info("Portal 2FA requested for ineligible email: %s", email)
             return generic
 
+        # Scoped to the portal source so the portal and extension don't throttle
+        # or invalidate each other's pending codes (an agent may use both).
         recent = (
             AgentLoginCode.objects.filter(
                 email=email,
+                source=AgentLoginCode.Source.PORTAL,
                 consumed_at__isnull=True,
                 created_at__gte=timezone.now() - timedelta(seconds=cooldown),
             )
@@ -73,11 +76,30 @@ class PortalRequestCodeView(views.APIView):
             logger.info("Portal 2FA resend throttled for %s", email)
             return generic
 
-        obj, code = AgentLoginCode.issue(email, agent=agent, ttl_seconds=ttl_seconds)
-        subject, text, html = _twofa_email_bodies(agent, code, ttl_seconds // 60)
+        obj, code = AgentLoginCode.issue(
+            email,
+            agent=agent,
+            ttl_seconds=ttl_seconds,
+            source=AgentLoginCode.Source.PORTAL,
+        )
+        subject, text, html = _twofa_email_bodies(
+            agent, code, ttl_seconds // 60, app_label="support portal"
+        )
         try:
             send_email(to=f"{agent.name} <{email}>", subject=subject, text=text, html=html)
         except MailgunError as exc:
+            # Local dev fallback: when running with DEBUG (no Mailgun configured),
+            # don't 502 the login flow — keep the code and print it to the server
+            # console so the developer can sign in. NEVER active in production.
+            if settings.DEBUG:
+                logger.warning(
+                    "\n[DEV 2FA] Mailgun unavailable; login code for %s: %s "
+                    "(valid %d min)\n",
+                    email,
+                    code,
+                    ttl_seconds // 60,
+                )
+                return generic
             obj.delete()
             logger.exception("Mailgun send failed for %s: %s", email, exc)
             return Response(
@@ -113,7 +135,11 @@ class PortalVerifyCodeView(views.APIView):
         )
 
         login_code = (
-            AgentLoginCode.objects.filter(email=email, consumed_at__isnull=True)
+            AgentLoginCode.objects.filter(
+                email=email,
+                source=AgentLoginCode.Source.PORTAL,
+                consumed_at__isnull=True,
+            )
             .order_by("-created_at")
             .first()
         )

@@ -16,13 +16,17 @@ from .models import Agent, AgentLoginCode
 logger = logging.getLogger(__name__)
 
 
-def _twofa_email_bodies(agent, code, ttl_minutes):
-    """(subject, text, html) for the 2FA code email."""
+def _twofa_email_bodies(agent, code, ttl_minutes, app_label="extension"):
+    """(subject, text, html) for the 2FA code email.
+
+    ``app_label`` names the app the code is for (e.g. "extension" or "support
+    portal") so the email matches where the agent requested it.
+    """
     name = (agent.first_name or agent.name or "there").split(" ")[0]
     subject = f"Your CareCircle login code: {code}"
     text = (
         f"Hi {name},\n\n"
-        f"Your CareCircle extension login code is: {code}\n\n"
+        f"Your CareCircle {app_label} login code is: {code}\n\n"
         f"This code expires in {ttl_minutes} minutes. If you didn't request it, "
         f"you can ignore this email.\n"
     )
@@ -30,7 +34,7 @@ def _twofa_email_bodies(agent, code, ttl_minutes):
         f"<div style=\"font-family:-apple-system,Segoe UI,Roboto,sans-serif;"
         f"color:#1e293b\">"
         f"<p>Hi {name},</p>"
-        f"<p>Your CareCircle extension login code is:</p>"
+        f"<p>Your CareCircle {app_label} login code is:</p>"
         f"<p style=\"font-size:28px;font-weight:700;letter-spacing:4px;"
         f"color:#0F766E\">{code}</p>"
         f"<p style=\"color:#64748b\">This code expires in {ttl_minutes} minutes. "
@@ -203,9 +207,12 @@ class AgentRequestCodeView(views.APIView):
             return generic
 
         # Throttle: skip if a still-valid code was issued within the cooldown.
+        # Scoped to the extension source so a portal request doesn't throttle
+        # (or get throttled by) an extension request.
         recent = (
             AgentLoginCode.objects.filter(
                 email=email,
+                source=AgentLoginCode.Source.EXTENSION,
                 consumed_at__isnull=True,
                 created_at__gte=timezone.now() - timedelta(seconds=cooldown),
             )
@@ -216,7 +223,12 @@ class AgentRequestCodeView(views.APIView):
             logger.info("2FA resend throttled for %s", email)
             return generic
 
-        obj, code = AgentLoginCode.issue(email, agent=agent, ttl_seconds=ttl_seconds)
+        obj, code = AgentLoginCode.issue(
+            email,
+            agent=agent,
+            ttl_seconds=ttl_seconds,
+            source=AgentLoginCode.Source.EXTENSION,
+        )
         subject, text, html = _twofa_email_bodies(agent, code, ttl_seconds // 60)
         try:
             send_email(to=f"{agent.name} <{email}>", subject=subject, text=text, html=html)
@@ -264,7 +276,11 @@ class AgentVerifyCodeView(views.APIView):
         )
 
         login_code = (
-            AgentLoginCode.objects.filter(email=email, consumed_at__isnull=True)
+            AgentLoginCode.objects.filter(
+                email=email,
+                source=AgentLoginCode.Source.EXTENSION,
+                consumed_at__isnull=True,
+            )
             .order_by("-created_at")
             .first()
         )
