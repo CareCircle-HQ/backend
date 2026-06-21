@@ -2222,6 +2222,9 @@ class MenuType(models.Model):
         primary_key=True, default=uuid.uuid4, editable=False
     )
     name = models.CharField(max_length=120, unique=True)
+    # Whether this menu type is offered for new enrollments. Disabled types are
+    # hidden from selection but kept for historical records.
+    is_active = models.BooleanField(default=True)
     tags = models.ManyToManyField(
         DietaryTag,
         through="MenuTypeTag",
@@ -2617,3 +2620,34 @@ class DeliveryOrder(models.Model):
 
     def __str__(self):
         return f"DeliveryOrder {self.delivery_order_id} ({self.get_status_display()})"
+
+
+# ===========================================================================
+# TICKET NOTES (customer-support portal)
+# ===========================================================================
+class TicketNote(models.Model):
+    """A customer-support note added to a Ticket from the support portal.
+
+    Distinct from :class:`Note` (Unite Us client/case notes): these are
+    internal agent actions documenting work on a follow-up ticket.
+    """
+
+    ticket = models.ForeignKey(
+        Ticket, on_delete=models.CASCADE, related_name="notes"
+    )
+    # The agent who wrote the note; ``author_name`` is a snapshot so the row
+    # stays readable even if the agent record changes/clears.
+    author_agent = models.ForeignKey(
+        "Agent", on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="ticket_notes",
+    )
+    author_name = models.CharField(max_length=255, blank=True)
+    body = models.TextField()
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["created_at"]
+        indexes = [models.Index(fields=["ticket", "created_at"])]
+
+    def __str__(self):
+        return f"Note on ticket {self.ticket_id} by {self.author_name or 'system'}"
