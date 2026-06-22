@@ -18,6 +18,7 @@ from django.utils import timezone
 from api.models import (
     ClientStage,
     EnrollmentStage,
+    MemberStatus,
     ProcessResult,
     ProcessStatus,
     ProcessType,
@@ -150,10 +151,52 @@ _ENROLLMENT_RANK = {
 }
 
 
+def _governing_enrollments(client):
+    """Enrollments that govern this client's lifecycle stage.
+
+    A verification applies to the WHOLE household, so a client is governed by:
+
+    * their own enrollments (where they are the primary), and
+    * every enrollment of the household they belong to (as a non-primary
+      member) UNLESS they were individually denied on it.
+
+    That lets every household member inherit the household enrollment's stage,
+    so they all move together — to Pending Verification when a verification is
+    requested, and to Verified / Active when it completes — not just the primary.
+    Per-member ``DENIED`` (recorded on a :class:`MemberVerification`) opts a
+    member out so a denied member never rides the household to Verified/Active.
+    """
+    seen = {e.pk: e for e in client.enrollments.all()}
+
+    # Household enrollments: the client participates via their household
+    # membership. The household's members are the source of truth, so a member
+    # is governed even before a per-member MemberVerification row exists.
+    membership = getattr(client, "household_membership", None)
+    if membership is not None:
+        for enr in membership.household.enrollment_verifications.all():
+            if enr.pk in seen:
+                continue
+            mv = enr.member_verifications.filter(client=client).first()
+            if mv is not None and mv.status == MemberStatus.DENIED:
+                continue  # individually denied -> not governed by this enrollment
+            seen[enr.pk] = enr
+
+    # Also honor any MemberVerification linking the client to an enrollment whose
+    # household they aren't a (current) member of (defensive: e.g. membership
+    # changed after the row was written).
+    for mv in client.member_verifications.select_related("enrollment").all():
+        if mv.status == MemberStatus.DENIED:
+            continue
+        enr = mv.enrollment
+        if enr is not None:
+            seen.setdefault(enr.pk, enr)
+    return list(seen.values())
+
+
 def _primary_enrollment(client):
     """The enrollment that governs the client's stage: the most-advanced one,
     tie-broken by most-recent stage change. None when the client has none."""
-    enrollments = list(client.enrollments.all())
+    enrollments = _governing_enrollments(client)
     if not enrollments:
         return None
 
@@ -221,6 +264,59 @@ def recompute_client_stage(client, *, actor=None, save=True):
         actor=actor,
     )
     return target
+
+
+def _enrollment_participant_clients(enrollment):
+    """The clients governed by ``enrollment``: every member of its household,
+    plus anyone linked through a MemberVerification row (defensive). Members
+    individually marked DENIED are excluded.
+
+    Falls back to the MemberVerification rows when the enrollment has no
+    household (older/individual enrollments).
+    """
+    denied = set(
+        enrollment.member_verifications.filter(status=MemberStatus.DENIED)
+        .values_list("client_id", flat=True)
+    )
+    clients = {}
+    household = enrollment.household
+    if household is not None:
+        for hm in household.members.select_related("client").all():
+            if hm.client_id and hm.client_id not in denied:
+                clients[hm.client_id] = hm.client
+    for mv in enrollment.member_verifications.select_related("client").all():
+        if mv.client_id and mv.client_id not in denied:
+            clients.setdefault(mv.client_id, mv.client)
+    return list(clients.values())
+
+
+def _recompute_household_members(enrollment, *, actor=None, exclude_client_id=None):
+    """Recompute the lifecycle stage of every non-denied participant in
+    ``enrollment`` other than ``exclude_client_id`` (usually the primary, which
+    the caller has already handled).
+
+    The whole household is verified/served under one enrollment, so when the
+    enrollment advances each participating member must advance with it — e.g.
+    all members go to Pending Verification when the verification is requested,
+    and all become Active when the household is placed in service, not just the
+    primary.
+    """
+    for client in _enrollment_participant_clients(enrollment):
+        if client is None or client.pk == exclude_client_id:
+            continue
+        recompute_client_stage(client, actor=actor)
+
+
+def recompute_enrollment_household(enrollment, *, actor=None):
+    """Recompute the lifecycle stage for the enrollment's primary client AND
+    every non-denied household participant, so the whole group tracks the
+    enrollment stage together. Safe to call on creation (Pending Verification)
+    and on every stage change."""
+    if enrollment.client_id:
+        recompute_client_stage(enrollment.client, actor=actor)
+    _recompute_household_members(
+        enrollment, actor=actor, exclude_client_id=enrollment.client_id
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -379,9 +475,10 @@ def advance_enrollment(enrollment, to_stage, *, actor=None, note="", force=False
 
         logging.getLogger(__name__).exception("timeline.event_for_verification failed")
 
-    # Keep the client's lifecycle stage in sync with this enrollment's stage.
-    if enrollment.client_id:
-        recompute_client_stage(enrollment.client, actor=actor)
+    # Keep the whole household's lifecycle stage in sync with this enrollment:
+    # the primary AND every non-denied participant advance together (e.g. all
+    # members go Active when placed in service, not just the primary).
+    recompute_enrollment_household(enrollment, actor=actor)
     return enrollment
 
 

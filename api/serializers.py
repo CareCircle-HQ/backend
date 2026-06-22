@@ -38,6 +38,7 @@ from .models import (
     MenuType,
     MilitaryProfile,
     Program,
+    ProgramEligibility,
     ProgramPipeline,
     Provider,
     RecordStatus,
@@ -130,6 +131,25 @@ class ProgramSerializer(serializers.ModelSerializer):
     class Meta:
         model = Program
         fields = "__all__"
+
+
+class ProgramEligibilitySerializer(serializers.ModelSerializer):
+    """A member's model-scored eligibility for a Program. ``program`` is
+    embedded read-only so a single response carries the program details."""
+
+    program = ProgramSerializer(read_only=True)
+
+    class Meta:
+        model = ProgramEligibility
+        fields = [
+            "id",
+            "member",
+            "program",
+            "eligibility_score",
+            "is_eligible",
+            "model_version",
+            "evaluated_at",
+        ]
 
 
 # ===========================================================================

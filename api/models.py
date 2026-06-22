@@ -802,12 +802,84 @@ class Program(models.Model):
         blank=True,
         related_name="programs",
     )
+    description = models.TextField(blank=True)
+    # Optional rule-based eligibility criteria (machine-evaluable rules).
+    eligibility_rules = models.JSONField(default=dict, blank=True)
+    # Optional eligibility questions surfaced to the member (list of question
+    # definitions).
+    eligibility_questions = models.JSONField(default=list, blank=True)
+    active = models.BooleanField(default=True)
 
     class Meta:
         ordering = ["name"]
 
     def __str__(self):
         return self.name
+
+
+class ProgramEligibility(models.Model):
+    """A member's predicted eligibility for a Program (model-scored).
+
+    One row per evaluation; the latest by ``evaluated_at`` reflects the current
+    standing for a given ``model_version``.
+    """
+
+    member = models.ForeignKey(
+        HouseholdMember,
+        on_delete=models.CASCADE,
+        related_name="program_eligibilities",
+    )
+    program = models.ForeignKey(
+        Program,
+        on_delete=models.CASCADE,
+        related_name="eligibilities",
+    )
+    # Predicted probability in [0, 1].
+    eligibility_score = models.FloatField(null=True, blank=True)
+    # Thresholded decision derived from ``eligibility_score``.
+    is_eligible = models.BooleanField(default=False)
+    model_version = models.CharField(max_length=60, blank=True)
+    evaluated_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-evaluated_at"]
+        indexes = [
+            models.Index(fields=["member", "program"]),
+            models.Index(fields=["program", "is_eligible"]),
+        ]
+        verbose_name_plural = "program eligibilities"
+
+    def __str__(self):
+        return f"{self.member_id} / {self.program_id}: {self.eligibility_score}"
+
+
+class ProgramDisplayLog(models.Model):
+    """Tracks a Program being shown to a member in the app and the member's
+    downstream actions (click / apply) for engagement analytics."""
+
+    member = models.ForeignKey(
+        HouseholdMember,
+        on_delete=models.CASCADE,
+        related_name="program_display_logs",
+    )
+    program = models.ForeignKey(
+        Program,
+        on_delete=models.CASCADE,
+        related_name="display_logs",
+    )
+    displayed_at = models.DateTimeField(auto_now_add=True)
+    clicked = models.BooleanField(default=False)
+    applied = models.BooleanField(default=False)
+
+    class Meta:
+        ordering = ["-displayed_at"]
+        indexes = [
+            models.Index(fields=["member", "program"]),
+            models.Index(fields=["program", "displayed_at"]),
+        ]
+
+    def __str__(self):
+        return f"{self.member_id} / {self.program_id} @ {self.displayed_at:%Y-%m-%d}"
 
 
 class Case(models.Model):

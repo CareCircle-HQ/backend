@@ -14,6 +14,7 @@ from .views import (
     ContractedServiceViewSet,
     HealthView,
     MeView,
+    ProgramEligibilityListView,
     ProgramViewSet,
     ProviderViewSet,
     RegisterView,
@@ -118,6 +119,13 @@ urlpatterns = [
     # Misc
     path("health/", HealthView.as_view(), name="health"),
     path("zipcodes/check/", ZipCodeCheckView.as_view(), name="zipcode-check"),
+    # Program eligibilities available for a household member
+    # (?member=<id>, optional ?program=&is_eligible=&model_version=)
+    path(
+        "program-eligibilities/",
+        ProgramEligibilityListView.as_view(),
+        name="program-eligibilities",
+    ),
     # Customer-support web portal API (separate from the extension API above)
     path("portal/", include("api.portal.urls")),
     # Domain resources

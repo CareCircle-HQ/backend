@@ -219,17 +219,24 @@ def event_for_case(case, *, source=ChangeSource.EXTENSION, actor=""):
         or case.case_managed_at
         or case.updated_at
     )
+    # Lead with the case classification (Internal Service / Navigation /
+    # External Service / Eligibility) so multiple case events on one timeline are
+    # distinguishable at a glance, followed by the provider.
+    type_label = case.get_case_type_display()
+    provider = case.provider_name or case.originating_provider_name or ""
+    subtitle = " \u00b7 ".join(p for p in (type_label, provider) if p)
     return emit_timeline_event(
         client=client,
         event_type=TimelineEventType.CASE_OPENED,
         occurred_at=occurred,
         title=case.program_name or case.service_type or "Case",
-        subtitle=case.provider_name or case.originating_provider_name or "",
+        subtitle=subtitle,
         badge_text=case.get_case_status_display(),
         badge_tone=_CASE_TONE.get(case.case_status, TimelineBadgeTone.NEUTRAL),
         source=source,
         actor=actor,
         entity=case,
+        metadata={"case_type": case.case_type},
         dedupe_key=f"case_opened:{case.pk}",
     )
 

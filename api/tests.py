@@ -1,5 +1,4 @@
 import uuid
-from unittest import mock
 
 from django.test import TestCase
 from django.urls import reverse
@@ -124,12 +123,9 @@ class InsuranceReconcileTest(TestCase):
         )
 
 
-@mock.patch("api.views.ghl.sync_screening", lambda *a, **k: None)
-@mock.patch("api.views.ghl.sync_case", lambda *a, **k: None)
-@mock.patch("api.views.ghl.sync_client", lambda *a, **k: None)
 class ExtensionTimelineTest(TestCase):
     """Drive the real extension HTTP endpoints as an authenticated agent and
-    assert that TimelineEvents are emitted (GHL mirror mocked out)."""
+    assert that TimelineEvents are emitted."""
 
     def setUp(self):
         self.agent = Agent.objects.create(
@@ -292,3 +288,85 @@ class ExtensionTimelineTest(TestCase):
         self.assertSetEqual(types, {"consent_granted", "case_opened"})
         occurred = [e["occurred_at"] for e in body["results"]]
         self.assertEqual(occurred, sorted(occurred, reverse=True))
+
+
+class HouseholdEnrollmentActivationTest(TestCase):
+    """When a household enrollment advances, every non-denied participant — not
+    just the primary — should follow the enrollment's lifecycle stage."""
+
+    def _client(self, first="A", last="B"):
+        return Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name=first, last_name=last
+        )
+
+    def _household_enrollment(self, members, *, stage=None):
+        """Build a household + EnrollmentVerification with MemberVerification
+        rows. ``members`` is a list of (client, status); the first is primary.
+        Returns the enrollment.
+        """
+        from .models import (
+            EnrollmentStage,
+            EnrollmentVerification,
+            Household,
+            HouseholdMember,
+            MemberVerification,
+        )
+
+        household = Household.objects.create(name="Test Household")
+        primary_client = members[0][0]
+        for i, (client, _status) in enumerate(members):
+            HouseholdMember.objects.create(
+                household=household, client=client, is_primary=(i == 0)
+            )
+        enrollment = EnrollmentVerification.objects.create(
+            client=primary_client,
+            household=household,
+            stage=stage or EnrollmentStage.PENDING_VERIFICATION,
+        )
+        for client, status in members:
+            MemberVerification.objects.create(
+                enrollment=enrollment, client=client, status=status
+            )
+        return enrollment
+
+    def test_all_non_denied_members_go_active(self):
+        from .models import ClientStage, EnrollmentStage, MemberStatus
+        from .services.lifecycle import advance_enrollment
+
+        primary = self._client("Pat", "Primary")
+        spouse = self._client("Sam", "Spouse")
+        child = self._client("Kid", "Child")
+        enrollment = self._household_enrollment([
+            (primary, MemberStatus.VERIFIED),
+            (spouse, MemberStatus.VERIFIED),
+            (child, MemberStatus.VERIFIED),
+        ])
+
+        advance_enrollment(enrollment, EnrollmentStage.VERIFIED, force=True)
+        advance_enrollment(enrollment, EnrollmentStage.SERVICE_ACTIVE, force=True)
+
+        for c in (primary, spouse, child):
+            c.refresh_from_db()
+            self.assertEqual(
+                c.lifecycle_stage, ClientStage.ACTIVE,
+                f"{c.first_name} should be Active, got {c.lifecycle_stage}",
+            )
+
+    def test_denied_member_does_not_go_active(self):
+        from .models import ClientStage, EnrollmentStage, MemberStatus
+        from .services.lifecycle import advance_enrollment
+
+        primary = self._client("Pat", "Primary")
+        denied = self._client("Dee", "Denied")
+        enrollment = self._household_enrollment([
+            (primary, MemberStatus.VERIFIED),
+            (denied, MemberStatus.DENIED),
+        ])
+
+        advance_enrollment(enrollment, EnrollmentStage.VERIFIED, force=True)
+        advance_enrollment(enrollment, EnrollmentStage.SERVICE_ACTIVE, force=True)
+
+        primary.refresh_from_db()
+        denied.refresh_from_db()
+        self.assertEqual(primary.lifecycle_stage, ClientStage.ACTIVE)
+        self.assertNotEqual(denied.lifecycle_stage, ClientStage.ACTIVE)

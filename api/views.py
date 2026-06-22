@@ -5,6 +5,7 @@ import uuid
 from django.db import IntegrityError
 from django.db.models import Q
 from rest_framework import generics, permissions, viewsets
+from rest_framework.exceptions import ValidationError
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
@@ -25,6 +26,7 @@ from .models import (
     MenuCategory,
     MenuType,
     Program,
+    ProgramEligibility,
     Provider,
     Screening,
     TimelineEvent,
@@ -36,6 +38,7 @@ from .serializers import (
     ContractedServiceSerializer,
     EnrollmentVerificationSerializer,
     HouseholdSerializer,
+    ProgramEligibilitySerializer,
     ProgramSerializer,
     ProviderSerializer,
     RegisterSerializer,
@@ -44,13 +47,12 @@ from .serializers import (
     UserSerializer,
     ensure_household_with_primary,
 )
-# TEMPORARY external-CRM mirror; remove with the api/integrations package.
-from .integrations import ghl
 from .services import timeline
 from .services.lifecycle import (
     InvalidTransition,
     advance_enrollment,
     recompute_client_stage,
+    recompute_enrollment_household,
     reconcile_enrollment_authorization,
 )
 
@@ -81,6 +83,19 @@ def _safe_recompute_stage(obj):
         recompute_client_stage(client)
     except Exception:  # noqa: BLE001
         logger.exception("recompute_client_stage failed for %s", getattr(client, "pk", None))
+
+
+def _safe_recompute_household(enrollment):
+    """Recompute the lifecycle stage for an enrollment's primary AND every
+    non-denied household member (so the whole group tracks the enrollment, e.g.
+    all members go to Pending Verification when a verification is requested),
+    never letting a failure break the API write."""
+    try:
+        recompute_enrollment_household(enrollment)
+    except Exception:  # noqa: BLE001
+        logger.exception(
+            "recompute_enrollment_household failed for %s", getattr(enrollment, "pk", None)
+        )
 
 
 class RegisterView(generics.CreateAPIView):
@@ -224,17 +239,12 @@ class ClientViewSet(BulkUpsertMixin, viewsets.ModelViewSet):
             kwargs["agent_name"] = name
         return kwargs
 
-    # --- TEMPORARY: mirror the client to the external GHL CRM on save. The
-    # sync is best-effort and never raises; remove these three hooks (and the
-    # api/integrations package) when the external CRM is retired. ---
     def perform_create(self, serializer):
         serializer.save(**self._agent_save_kwargs())
-        ghl.sync_client(serializer.instance)
         _safe_timeline(timeline.event_for_consent, serializer.instance, self.request)
 
     def perform_update(self, serializer):
         serializer.save(**self._agent_save_kwargs())
-        ghl.sync_client(serializer.instance)
         _safe_timeline(timeline.event_for_consent, serializer.instance, self.request)
 
     def post_upsert(self, obj):
@@ -251,7 +261,6 @@ class ClientViewSet(BulkUpsertMixin, viewsets.ModelViewSet):
             updates.append("agent_name")
         if updates:
             obj.save(update_fields=updates)
-        ghl.sync_client(obj)
         _safe_timeline(timeline.event_for_consent, obj, self.request)
 
     @action(detail=True, methods=["get"])
@@ -416,19 +425,15 @@ class CaseViewSet(BulkUpsertMixin, viewsets.ModelViewSet):
             qs = qs.filter(client_id=client)
         return qs
 
-    # --- TEMPORARY: mirror the case to the external GHL CRM as an opportunity.
     def perform_create(self, serializer):
         serializer.save()
-        ghl.sync_case(serializer.instance)
         _safe_timeline(timeline.event_for_case, serializer.instance, self.request)
 
     def perform_update(self, serializer):
         serializer.save()
-        ghl.sync_case(serializer.instance)
         _safe_timeline(timeline.event_for_case, serializer.instance, self.request)
 
     def post_upsert(self, obj):
-        ghl.sync_case(obj)
         _safe_timeline(timeline.event_for_case, obj, self.request)
 
 
@@ -465,23 +470,20 @@ class ScreeningViewSet(BulkUpsertMixin, viewsets.ModelViewSet):
             qs = qs.filter(client_id=client)
         return qs
 
-    # --- TEMPORARY: mirror the screening to the external GHL CRM as an opportunity.
+    # Screening save records the Screening timeline event but intentionally does
+    # NOT advance the lifecycle stage: the funnel only moves on explicit steps
+    # (verification) and the nightly Unite Us import, never on an ext screening
+    # write. (Stage is left untouched here by design.)
     def perform_create(self, serializer):
         serializer.save()
-        ghl.sync_screening(serializer.instance)
         _safe_timeline(timeline.event_for_screening, serializer.instance, self.request)
-        _safe_recompute_stage(serializer.instance)
 
     def perform_update(self, serializer):
         serializer.save()
-        ghl.sync_screening(serializer.instance)
         _safe_timeline(timeline.event_for_screening, serializer.instance, self.request)
-        _safe_recompute_stage(serializer.instance)
 
     def post_upsert(self, obj):
-        ghl.sync_screening(obj)
         _safe_timeline(timeline.event_for_screening, obj, self.request)
-        _safe_recompute_stage(obj)
 
 
 class AssessmentViewSet(BulkUpsertMixin, viewsets.ModelViewSet):
@@ -562,8 +564,10 @@ class EnrollmentVerificationViewSet(viewsets.ModelViewSet):
     def perform_create(self, serializer):
         serializer.save()
         _safe_timeline(timeline.event_for_verification, serializer.instance, self.request)
-        # New enrollment (default Pending Verification) drives the client stage.
-        _safe_recompute_stage(serializer.instance)
+        # A new enrollment (default Pending Verification) drives the WHOLE
+        # household's lifecycle stage: the primary and every non-denied member
+        # move to Pending Verification together, not just the primary.
+        _safe_recompute_household(serializer.instance)
 
     @action(detail=False, methods=["get"])
     def choices(self, request):
@@ -616,3 +620,65 @@ class ProviderViewSet(viewsets.ReadOnlyModelViewSet):
 class ProgramViewSet(viewsets.ReadOnlyModelViewSet):
     queryset = Program.objects.all()
     serializer_class = ProgramSerializer
+
+
+def _parse_bool(raw):
+    """Parse a query-param boolean; returns True/False or None if unrecognized."""
+    val = str(raw or "").strip().lower()
+    if val in ("true", "1", "yes"):
+        return True
+    if val in ("false", "0", "no"):
+        return False
+    return None
+
+
+class ProgramEligibilityListView(generics.ListAPIView):
+    """Program eligibilities available for a given household member.
+
+    GET /api/program-eligibilities/?member=<household_member_id>
+        -> all eligibility rows for that member (n records), newest first.
+
+    Narrow the result with optional filters (combine to return a single row):
+        &program=<program_id>          exact Program UUID
+        &is_eligible=true|false        thresholded decision
+        &model_version=<str>           a specific scoring model version
+
+    ``member`` is required; an int HouseholdMember id.
+    """
+
+    serializer_class = ProgramEligibilitySerializer
+
+    def get_queryset(self):
+        member = self.request.query_params.get("member")
+        if not member:
+            raise ValidationError({"member": "This query parameter is required."})
+        try:
+            member_id = int(member)
+        except (TypeError, ValueError):
+            raise ValidationError({"member": "Must be a numeric household member id."})
+
+        qs = (
+            ProgramEligibility.objects.select_related(
+                "program", "program__provider", "program__main_category"
+            )
+            .filter(member_id=member_id)
+        )
+
+        program = self.request.query_params.get("program")
+        if program:
+            qs = qs.filter(program_id=program)
+
+        is_eligible = self.request.query_params.get("is_eligible")
+        if is_eligible is not None:
+            parsed = _parse_bool(is_eligible)
+            if parsed is None:
+                raise ValidationError(
+                    {"is_eligible": "Must be a boolean (true/false)."}
+                )
+            qs = qs.filter(is_eligible=parsed)
+
+        model_version = self.request.query_params.get("model_version")
+        if model_version:
+            qs = qs.filter(model_version=model_version)
+
+        return qs
