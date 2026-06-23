@@ -1,18 +1,17 @@
 """Work queue (global tickets) + ticket detail/status/notes + agents list."""
 
-from django.db.models import Q
+from django.db.models import Case as DBCase, IntegerField, Q, When
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from rest_framework import status as http
 from rest_framework.response import Response
 
-from ..models import Agent, Ticket, TicketNote
+from ..models import Agent, Ticket, TicketNote, TicketType
 from .base import PortalAPIView, PortalGenericAPIView, current_agent
-from .permissions import PORTAL_ALLOWED_GROUPS
 from . import serializers as s
 
 TICKET_PREFETCH = ("notes",)
-TICKET_SELECT = ("assigned_to", "client", "case")
+TICKET_SELECT = ("assigned_to", "client", "case", "type")
 
 # open -> in_progress -> resolved -> open
 STATUS_CYCLE = {"open": "in_progress", "in_progress": "resolved", "resolved": "open"}
@@ -47,7 +46,11 @@ class WorkQueueView(PortalGenericAPIView):
             qs = qs.filter(severity=severity)
         type_val = (p.get("type") or "").strip()
         if type_val and type_val.lower() not in ("all", "all types"):
-            qs = qs.filter(type=type_val)
+            qs = qs.filter(type__code=type_val)
+        mine = (p.get("mine") or "").strip().lower()
+        if mine in ("1", "true", "yes"):
+            agent = current_agent(self.request)
+            qs = qs.filter(assigned_to=agent) if agent else qs.none()
         return qs.distinct()
 
     def get(self, request):
@@ -144,9 +147,29 @@ class TicketNotesView(PortalAPIView):
         )
 
 
+class TicketTypesListView(PortalAPIView):
+    """Active ticket types for the New-Ticket type picker (loaded from the DB)."""
+
+    def get(self, request):
+        types = TicketType.objects.filter(is_active=True).order_by("label")
+        return Response(s.PortalTicketTypeSerializer(types, many=True).data)
+
+
+# Groups assignable to a ticket, in display order (CS first, then Management).
+ASSIGNABLE_GROUPS = ["CS", "Management"]
+
+
 class AgentsListView(PortalAPIView):
     def get(self, request):
-        agents = Agent.objects.filter(
-            status="Active", group__in=PORTAL_ALLOWED_GROUPS
-        ).order_by("name")
+        agents = (
+            Agent.objects.filter(status="Active", group__in=ASSIGNABLE_GROUPS)
+            .order_by(
+                DBCase(
+                    When(group="CS", then=0),
+                    default=1,
+                    output_field=IntegerField(),
+                ),
+                "name",
+            )
+        )
         return Response(s.PortalAgentSerializer(agents, many=True).data)

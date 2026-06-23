@@ -14,6 +14,7 @@ logger = logging.getLogger(__name__)
 from .models import (
     WEEKDAYS,
     Address,
+    Agent,
     Case,
     CaseHouseholdType,
     CaseType,
@@ -32,13 +33,14 @@ from .models import (
     IdentifiedSocialNeed,
     Insurance,
     Lead,
-    MemberStatus,
-    MemberVerification,
+    LeadNote,
+    MemberDietaryProfile,
     MenuCategory,
     MenuType,
     MilitaryProfile,
     Program,
     ProgramEligibility,
+    ProgramMainCategory,
     ProgramPipeline,
     Provider,
     RecordStatus,
@@ -434,13 +436,10 @@ class ClientSerializer(serializers.ModelSerializer):
             household_type=new_household_type
         ).update(household_type=new_household_type)
 
-        # When the profile marks this client as part of a family, make sure a
-        # household exists with this client as its primary member, so the group
-        # always has at least one participant. Single individuals don't get a
-        # household here (avoids creating one per imported client).
-        if client.is_a_family or (client.total_family_members or 0) > 1:
-            ensure_household_with_primary(client)
-
+        # NOTE: the client's household is NOT created here. It is created when
+        # an Internal Service case is saved (see CaseSerializer), since a
+        # household only matters once the client has an internal service to be
+        # verified/delivered for.
         return client
 
 
@@ -515,13 +514,13 @@ def _validate_choice_codes(value, choices_cls, field_name):
     return seen
 
 
-class MemberVerificationSerializer(serializers.ModelSerializer):
+class MemberDietaryProfileSerializer(serializers.ModelSerializer):
     # The participant client UUID (the FK's pk). Readable + writable; resolved
     # to a Client by the parent EnrollmentVerificationSerializer.
     client_id = serializers.UUIDField(required=False, allow_null=True)
 
     class Meta:
-        model = MemberVerification
+        model = MemberDietaryProfile
         fields = (
             "id",
             "client_id",
@@ -531,8 +530,6 @@ class MemberVerificationSerializer(serializers.ModelSerializer):
             "other_dietary_restrictions",
             "meal_category",
             "menu_type",
-            "status",
-            "denied_reason",
             "meals_per_delivery",
             "general_verification_notes",
             "created_at",
@@ -562,8 +559,8 @@ class EnrollmentVerificationSerializer(serializers.ModelSerializer):
     delivery_address_id = serializers.IntegerField(
         write_only=True, required=False, allow_null=True
     )
-    members = MemberVerificationSerializer(
-        many=True, source="member_verifications", required=False
+    members = MemberDietaryProfileSerializer(
+        many=True, source="member_profiles", required=False
     )
 
     class Meta:
@@ -616,8 +613,10 @@ class EnrollmentVerificationSerializer(serializers.ModelSerializer):
         return data
 
     def _sync_members(self, enrollment, members):
-        """Full-replace the enrollment's member verifications from the payload."""
-        enrollment.member_verifications.all().delete()
+        """Full-replace the enrollment's per-member dietary profiles."""
+        from api.services.catalog import menu_type_for_member
+
+        enrollment.member_profiles.all().delete()
         seen_clients = set()
         for m in members:
             client_uuid = m.get("client_id")
@@ -633,7 +632,7 @@ class EnrollmentVerificationSerializer(serializers.ModelSerializer):
                 if member_client
                 else ""
             )
-            MemberVerification.objects.create(
+            MemberDietaryProfile.objects.create(
                 enrollment=enrollment,
                 client=member_client,
                 member_name=name,
@@ -641,16 +640,18 @@ class EnrollmentVerificationSerializer(serializers.ModelSerializer):
                 food_allergies=m.get("food_allergies", []),
                 other_dietary_restrictions=m.get("other_dietary_restrictions", ""),
                 meal_category=m.get("meal_category", ""),
-                menu_type=m.get("menu_type", ""),
-                status=m.get("status", MemberStatus.PENDING_VERIFICATION),
-                denied_reason=m.get("denied_reason", ""),
+                # Derive menu type from dietary data when not explicitly sent.
+                menu_type=m.get("menu_type") or menu_type_for_member(
+                    food_allergies=m.get("food_allergies", []),
+                    meal_category=m.get("meal_category", ""),
+                ),
                 meals_per_delivery=m.get("meals_per_delivery"),
                 general_verification_notes=m.get("general_verification_notes", ""),
             )
 
     @transaction.atomic
     def create(self, validated_data):
-        members = validated_data.pop("member_verifications", [])
+        members = validated_data.pop("member_profiles", [])
         cid = validated_data.pop("client_id", None)
         hid = validated_data.pop("household_id", None)
         case_id = validated_data.pop("case_id", None)
@@ -677,7 +678,7 @@ class EnrollmentVerificationSerializer(serializers.ModelSerializer):
 
     @transaction.atomic
     def update(self, instance, validated_data):
-        members = validated_data.pop("member_verifications", None)
+        members = validated_data.pop("member_profiles", None)
         cid = validated_data.pop("client_id", None)
         hid = validated_data.pop("household_id", _UNSET)
         case_id = validated_data.pop("case_id", _UNSET)
@@ -896,6 +897,22 @@ class CaseSerializer(serializers.ModelSerializer):
             catalog.upsert_service_from_case(case.service_type, case.program_name)
         except Exception:
             logger.exception("catalog.upsert_service_from_case failed")
+        # Best-effort: for Internal Service cases, link the program to its
+        # ProductType (Meals/Boxes) by keyword in the program name.
+        try:
+            if case.case_type == CaseType.INTERNAL_SERVICE and case.program_id:
+                catalog.assign_product_type_for_internal_service(case.program)
+        except Exception:
+            logger.exception("catalog.assign_product_type_for_internal_service failed")
+        # Internal Service cases are the ones that go through verification and
+        # meal/box delivery, so ensure the client has a household (with this
+        # client as primary) here — on case save — rather than on profile save.
+        # Get-or-create, so re-saving the case never duplicates the household.
+        try:
+            if case.case_type == CaseType.INTERNAL_SERVICE:
+                ensure_household_with_primary(client)
+        except Exception:
+            logger.exception("ensure_household_with_primary failed for internal service case")
         return case
 
 
@@ -1102,6 +1119,13 @@ class TimelineEventSerializer(serializers.ModelSerializer):
         return obj.content_type.model if obj.content_type_id else None
 
 
+class LeadNoteSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = LeadNote
+        fields = ["id", "author_name", "body", "created_at"]
+        read_only_fields = ["id", "author_name", "created_at"]
+
+
 class LeadSerializer(serializers.ModelSerializer):
     """Serialize/validate a public-funnel :class:`Lead`.
 
@@ -1109,7 +1133,24 @@ class LeadSerializer(serializers.ModelSerializer):
     along with the legal disclaimer; step-2 fields are optional and typically
     PATCHed in later. ``disclaimer_accepted_at`` is server-stamped when consent
     is recorded; ``status`` is managed internally (read-only to the funnel).
+
+    ``assigned_to`` links the screener following up on the lead; ``converted_client``
+    links the Client the lead became (set on conversion) for funnel tracking.
     """
+
+    assigned_to = serializers.PrimaryKeyRelatedField(
+        queryset=Agent.objects.all(), allow_null=True, required=False
+    )
+    assigned_to_name = serializers.SerializerMethodField()
+    converted_client = serializers.PrimaryKeyRelatedField(
+        queryset=Client.objects.all(), allow_null=True, required=False
+    )
+    converted_client_name = serializers.SerializerMethodField()
+    interested_programs = serializers.PrimaryKeyRelatedField(
+        many=True, queryset=ProgramMainCategory.objects.all(), required=False
+    )
+    interested_program_names = serializers.SerializerMethodField()
+    notes = LeadNoteSerializer(many=True, read_only=True)
 
     class Meta:
         model = Lead
@@ -1131,6 +1172,14 @@ class LeadSerializer(serializers.ModelSerializer):
             "household_size",
             "preferred_contact_method",
             "do_not_contact",
+            # Assignment & conversion tracking
+            "assigned_to",
+            "assigned_to_name",
+            "converted_client",
+            "converted_client_name",
+            "interested_programs",
+            "interested_program_names",
+            "notes",
             # Internal / metadata
             "status",
             "created_at",
@@ -1143,6 +1192,16 @@ class LeadSerializer(serializers.ModelSerializer):
             "created_at",
             "updated_at",
         ]
+
+    def get_assigned_to_name(self, obj):
+        return obj.assigned_to.name if obj.assigned_to_id else None
+
+    def get_converted_client_name(self, obj):
+        c = obj.converted_client
+        return f"{c.first_name} {c.last_name}".strip() if obj.converted_client_id else None
+
+    def get_interested_program_names(self, obj):
+        return [c.name for c in obj.interested_programs.all()]
 
     def validate_phone_number(self, value):
         digits = re.sub(r"\D", "", value or "")

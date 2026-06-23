@@ -777,6 +777,125 @@ class ProgramMainCategory(models.Model):
         return self.name
 
 
+class ProductTypeKind(models.TextChoices):
+    """The kind of product an Internal Service program delivers."""
+
+    MEALS = "meals", "Meals"
+    BOXES = "boxes", "Boxes"
+
+
+class DeliveryCadence(models.TextChoices):
+    """How often a product type is delivered each week."""
+
+    MON_THU = "mon_thu", "Mon/Thu"
+    TUE_FRI = "tue_fri", "Tue/Fri"
+    ONCE_A_WEEK = "once_a_week", "Once a Week"
+
+
+class ProductType(models.Model):
+    """A deliverable product (Meals or Boxes) with its per-delivery quantity and
+    weekly delivery cadence. Programs that fulfill Internal Service cases are
+    linked to one of these based on a keyword in the program name."""
+
+    product_type_id = models.UUIDField(
+        primary_key=True, default=uuid.uuid4, editable=False
+    )
+    type = models.CharField(
+        max_length=20, choices=ProductTypeKind.choices
+    )
+    prod_per_delivery = models.PositiveIntegerField(default=0)
+    delivery_days_cadence = models.CharField(
+        max_length=20, choices=DeliveryCadence.choices, blank=True
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["type", "delivery_days_cadence"]
+        # The same product (e.g. Meals) may exist with different delivery
+        # cadences, but each (type, cadence) pair must be unique.
+        constraints = [
+            models.UniqueConstraint(
+                fields=["type", "delivery_days_cadence"],
+                name="uniq_product_type_type_cadence",
+            )
+        ]
+
+    def __str__(self):
+        cadence = self.get_delivery_days_cadence_display()
+        return f"{self.get_type_display()} ({cadence})" if cadence else self.get_type_display()
+
+
+class Weekday(models.IntegerChoices):
+    """Weekday numbering matching Python's ``date.weekday()`` (Mon == 0)."""
+
+    MON = 0, "Monday"
+    TUE = 1, "Tuesday"
+    WED = 2, "Wednesday"
+    THU = 3, "Thursday"
+    FRI = 4, "Friday"
+    SAT = 5, "Saturday"
+    SUN = 6, "Sunday"
+
+
+class CadenceRule(models.Model):
+    """Editable rule that decides a member's delivery cadence from the weekday a
+    case becomes active (authorization Accepted), per product kind.
+
+    One row per (product_kind, accepted_weekday). Each row defines the cadence
+    assigned, the weekdays deliveries land on, the weekdays purchase orders are
+    generated, and the weekday of the *first* delivery (which lets us encode
+    custom rules like "accepted Wednesday skips this week's Thursday and starts
+    the following Monday").
+
+    Weekday lists use the lowercase codes shared with
+    ``EnrollmentVerification.delivery_weekdays`` ("mon", "tue", ... "sun").
+    """
+
+    WEEKDAY_CODES = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
+
+    product_kind = models.CharField(
+        max_length=20, choices=ProductTypeKind.choices
+    )
+    accepted_weekday = models.IntegerField(
+        choices=Weekday.choices,
+        help_text="Weekday the case authorization is accepted (becomes active).",
+    )
+    cadence = models.CharField(
+        max_length=20, choices=DeliveryCadence.choices
+    )
+    delivery_weekdays = models.JSONField(
+        default=list, blank=True,
+        help_text='Weekdays deliveries land on, e.g. ["mon", "thu"].',
+    )
+    po_weekdays = models.JSONField(
+        default=list, blank=True,
+        help_text='Weekdays purchase orders are generated, e.g. ["tue", "fri"].',
+    )
+    first_delivery_weekday = models.IntegerField(
+        choices=Weekday.choices,
+        help_text="Weekday of the first delivery (the next delivery day after activation).",
+    )
+    is_active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["product_kind", "accepted_weekday"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["product_kind", "accepted_weekday"],
+                name="uniq_cadence_rule_kind_weekday",
+            )
+        ]
+
+    def __str__(self):
+        return (
+            f"{self.get_product_kind_display()} / accepted "
+            f"{self.get_accepted_weekday_display()} -> {self.get_cadence_display()}"
+        )
+
+
 class Program(models.Model):
     """Normalized program offered by a provider.
 
@@ -797,6 +916,15 @@ class Program(models.Model):
     )
     main_category = models.ForeignKey(
         ProgramMainCategory,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="programs",
+    )
+    # Set for Internal Service programs: Meals vs Boxes, derived from the program
+    # name. See api.services.catalog.assign_product_type_for_internal_service.
+    product_type = models.ForeignKey(
+        ProductType,
         on_delete=models.SET_NULL,
         null=True,
         blank=True,
@@ -1335,16 +1463,6 @@ class MenuType(models.TextChoices):
     DAIRY_FREE = "dairy_free", "Dairy Free"
 
 
-class MemberStatus(models.TextChoices):
-    """Per-member verification outcome within an enrollment. Members are
-    verified/denied individually; the household enrollment stage is the
-    aggregate roll-up. Denied members are excluded from order generation."""
-
-    PENDING_VERIFICATION = "pending_verification", "Pending Verification"
-    VERIFIED = "verified", "Verified"
-    DENIED = "denied", "Denied"
-
-
 class ProcessType(models.TextChoices):
     """An operational process run against an enrollment. Extensible: new process
     types (e.g. re-validation) can be added without new tables."""
@@ -1394,7 +1512,8 @@ class StageEventSource(models.TextChoices):
 class EnrollmentVerification(models.Model):
     """A household's verification enrollment into the service we deliver. Owns
     the verification/authorization stage, the verification questionnaire data
-    (per-member via :class:`MemberVerification`) and the delivery schedule.
+    (per-member dietary via :class:`MemberDietaryProfile`) and the delivery
+    schedule.
 
     The verification applies to the WHOLE household: ``household`` is the source
     of the participant members. ``client`` remains the primary client (kept for
@@ -1483,23 +1602,27 @@ class EnrollmentVerification(models.Model):
         return f"{self.client_id} ({self.stage})"
 
 
-class MemberVerification(models.Model):
-    """Per-household-member verification questionnaire answers (wizard Step 2).
+class MemberDietaryProfile(models.Model):
+    """Per-household-member dietary profile captured during the household
+    verification (wizard Step 2).
 
-    One row per participant in an enrollment's household. Dietary restrictions
-    and food allergies are multi-select (stored as lists of choice codes);
-    meal category and menu type are single-select.
+    The household is the unit of verification (the outcome lives on
+    ``EnrollmentVerification.stage``); this row only holds a participant's
+    dietary data, which is used to assign a product type + menu and build the
+    delivery plan. One row per participant in an enrollment's household.
+    Dietary restrictions and food allergies are multi-select (stored as lists
+    of choice codes); meal category and menu type are single-select.
     """
 
     enrollment = models.ForeignKey(
         EnrollmentVerification, on_delete=models.CASCADE,
-        related_name="member_verifications",
+        related_name="member_profiles",
     )
     # The participant client this row is for. Snapshot ``member_name`` is kept
     # so the row stays readable even if the client link is later cleared.
     client = models.ForeignKey(
         Client, on_delete=models.SET_NULL, null=True, blank=True,
-        related_name="member_verifications",
+        related_name="member_profiles",
     )
     member_name = models.CharField(max_length=255, blank=True)
     # Multi-select choice-code lists (validated in the serializer against
@@ -1513,13 +1636,6 @@ class MemberVerification(models.Model):
     menu_type = models.CharField(
         max_length=20, choices=MenuType.choices, blank=True
     )
-    # Per-member verification outcome. Denied members are excluded from order
-    # generation; the enrollment stage is the household-level roll-up.
-    status = models.CharField(
-        max_length=25, choices=MemberStatus.choices,
-        default=MemberStatus.PENDING_VERIFICATION, db_index=True,
-    )
-    denied_reason = models.TextField(blank=True)
     # Agent-entered: how many meals/boxes this member receives per delivery.
     # Copied onto each generated OrderSchedule.how_many_meals_or_boxes.
     meals_per_delivery = models.PositiveSmallIntegerField(null=True, blank=True)
@@ -1532,7 +1648,7 @@ class MemberVerification(models.Model):
         constraints = [
             models.UniqueConstraint(
                 fields=["enrollment", "client"],
-                name="uniq_member_verification_per_enrollment_client",
+                name="uniq_member_dietary_profile_per_enrollment_client",
             ),
         ]
         indexes = [
@@ -1540,7 +1656,7 @@ class MemberVerification(models.Model):
         ]
 
     def __str__(self):
-        return f"Member verification for {self.member_name or self.client_id} (enrollment {self.enrollment_id})"
+        return f"Dietary profile for {self.member_name or self.client_id} (enrollment {self.enrollment_id})"
 
 
 class EnrollmentProcess(models.Model):
@@ -1623,6 +1739,84 @@ class ServiceSchedule(models.Model):
         return f"Schedule for enrollment {self.enrollment_id} ({self.status})"
 
 
+class MemberDeliverySchedule(models.Model):
+    """A single household member's recurring delivery PLAN for an enrollment.
+
+    Created once a verification is completed and its case authorization is
+    Accepted. It is the durable source of truth for "what should be delivered to
+    this member each week" and is expanded into dated :class:`OrderSchedule`
+    occurrences (the delivery calendar) across the case authorization window.
+
+    Cadence and per-delivery quantity come from ``product_type`` but are
+    snapshotted here so the plan stays stable even if the ProductType row later
+    changes. ``menu_type`` is snapshotted from the member's verification answers.
+    """
+
+    enrollment = models.ForeignKey(
+        EnrollmentVerification, on_delete=models.CASCADE,
+        related_name="delivery_schedules",
+    )
+    # The member this plan is for. ``member_profile`` links back to the dietary
+    # profile; ``household_member`` is the durable household membership.
+    household_member = models.ForeignKey(
+        HouseholdMember, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="delivery_schedules",
+    )
+    member_profile = models.ForeignKey(
+        MemberDietaryProfile, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="delivery_schedules",
+    )
+    member_name = models.CharField(max_length=255, blank=True)
+    program = models.ForeignKey(
+        Program, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="delivery_schedules",
+    )
+    # Source of cadence + per-delivery quantity (snapshotted below).
+    product_type = models.ForeignKey(
+        ProductType, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="delivery_schedules",
+    )
+    # Snapshots taken from ``product_type`` at creation.
+    delivery_days_cadence = models.CharField(
+        max_length=20, choices=DeliveryCadence.choices, blank=True
+    )
+    prod_per_delivery = models.PositiveSmallIntegerField(default=0)
+    # Total meals/boxes across the authorization window
+    # (= prod_per_delivery * number of delivery dates).
+    meals_boxes_total = models.PositiveIntegerField(default=0)
+    menu_type = models.CharField(
+        max_length=20, choices=MenuType.choices, blank=True
+    )
+    # Snapshot of the case authorization window the plan covers.
+    starts_on = models.DateField(null=True, blank=True)
+    ends_on = models.DateField(null=True, blank=True)
+    status = models.CharField(
+        max_length=20, choices=ScheduleStatus.choices,
+        default=ScheduleStatus.SCHEDULED, db_index=True,
+    )
+    note = models.TextField(blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["enrollment", "status"]),
+            models.Index(fields=["household_member"]),
+        ]
+        constraints = [
+            # One plan per member per program within an enrollment.
+            models.UniqueConstraint(
+                fields=["enrollment", "household_member", "program"],
+                name="uniq_member_delivery_schedule",
+            ),
+        ]
+
+    def __str__(self):
+        who = self.member_name or self.household_member_id
+        return f"Delivery plan for {who} ({self.delivery_days_cadence or 'no cadence'})"
+
+
 # ===========================================================================
 # ORDER / DELIVERY DOMAIN
 # ===========================================================================
@@ -1661,7 +1855,7 @@ class OrderSchedule(models.Model):
     program_name = models.CharField(max_length=255, blank=True)
     # The participant this order is for (the wizard's per-member row).
     member = models.ForeignKey(
-        MemberVerification, on_delete=models.SET_NULL, null=True, blank=True,
+        MemberDietaryProfile, on_delete=models.SET_NULL, null=True, blank=True,
         related_name="orders",
     )
     member_name = models.CharField(max_length=255, blank=True)
@@ -2174,7 +2368,11 @@ class Note(models.Model):
 # ===========================================================================
 # AGENT FOLLOW-UP TICKETS
 # ===========================================================================
-class TicketType(models.TextChoices):
+class TicketTypeCode(models.TextChoices):
+    """Canonical ticket-type codes raised by the daily pull. The :class:`TicketType`
+    table is seeded from these; the codes stay stable so services can keep
+    referencing them symbolically (e.g. ``TicketTypeCode.CASE_CLOSED``)."""
+
     NO_ACTIVE_INSURANCE = "no_active_insurance", "No active insurance"
     INSURANCE_EXPIRED = "insurance_expired", "Insurance expired"
     NO_ACTIVE_COVERAGE = "no_active_coverage", "No active social care coverage"
@@ -2201,12 +2399,43 @@ class TicketSeverity(models.TextChoices):
     HIGH = "high", "High"
 
 
+class TicketType(models.Model):
+    """A type/category of agent follow-up ticket. Seeded from
+    :class:`TicketTypeCode` but stored in the database so new types can be added
+    (and labels/descriptions/default severity tuned) from the admin without a
+    code change."""
+
+    ticket_type_id = models.UUIDField(
+        primary_key=True, default=uuid.uuid4, editable=False
+    )
+    code = models.SlugField(max_length=40, unique=True)
+    label = models.CharField(max_length=120)
+    description = models.TextField(blank=True)
+    default_severity = models.CharField(
+        max_length=10, choices=TicketSeverity.choices, default=TicketSeverity.MEDIUM
+    )
+    # Whether this type is offered when manually creating a ticket. Inactive
+    # types stay valid for historical/auto-raised tickets but are hidden from
+    # the create picker.
+    is_active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["label"]
+
+    def __str__(self):
+        return self.label
+
+
 class Ticket(models.Model):
     """An agent follow-up item raised by the daily pull when it detects a
     situation a human must review. References the related Client/Case and the
     ImportRun that raised it."""
 
-    type = models.CharField(max_length=40, choices=TicketType.choices, db_index=True)
+    type = models.ForeignKey(
+        TicketType, on_delete=models.PROTECT, related_name="tickets"
+    )
     status = models.CharField(
         max_length=20, choices=TicketStatus.choices,
         default=TicketStatus.OPEN, db_index=True,
@@ -2447,6 +2676,13 @@ class KitchenIntegrationMethod(models.TextChoices):
     API = "api", "API"
 
 
+class KitchenProductType(models.TextChoices):
+    """Kinds of product a kitchen can fulfill. A kitchen may support both."""
+
+    MEAL = "meal", "Meal"
+    BOX = "box", "Box"
+
+
 class Kitchen(models.Model):
     """A kitchen/vendor that fulfills meal orders. Offers one or more
     MenuTypes (through KitchenMenuType) and is reached via one or more
@@ -2465,6 +2701,9 @@ class Kitchen(models.Model):
         default=KitchenStatus.ACTIVE,
     )
     max_orders_per_day = models.PositiveIntegerField(null=True, blank=True)
+    # Product kinds this kitchen supports, e.g. ["meal", "box"]. Values are
+    # KitchenProductType codes; an empty list means none configured yet.
+    supported_products = models.JSONField(default=list, blank=True)
     menu_types = models.ManyToManyField(
         MenuType,
         through="KitchenMenuType",
@@ -2483,13 +2722,25 @@ class Kitchen(models.Model):
 
 
 class KitchenMenuType(models.Model):
-    """Join table: which MenuTypes a Kitchen offers."""
+    """Join table: which MenuTypes a Kitchen offers, with the per-kitchen price
+    and the allergies (DietaryTags) this kitchen CANNOT accommodate."""
 
     kitchen = models.ForeignKey(
         Kitchen, on_delete=models.CASCADE, related_name="kitchen_menu_types"
     )
     menu_type = models.ForeignKey(
         MenuType, on_delete=models.CASCADE, related_name="kitchen_menu_types"
+    )
+    # Price the kitchen charges for this menu type.
+    menu_type_price = models.DecimalField(
+        max_digits=8, decimal_places=2, null=True, blank=True
+    )
+    # Allergy DietaryTags this kitchen cannot manage for this menu type.
+    # Members with any of these allergies must be routed to another kitchen.
+    restrictions = models.ManyToManyField(
+        DietaryTag,
+        related_name="kitchen_menu_type_restrictions",
+        blank=True,
     )
     created_at = models.DateTimeField(auto_now_add=True)
 
@@ -2847,10 +3098,12 @@ class Lead(models.Model):
 
     class Status(models.TextChoices):
         NEW = "new", "New"
+        ATTEMPTING_CONTACT = "attempting_contact", "Attempting to Contact"
         CONTACTED = "contacted", "Contacted"
-        QUALIFIED = "qualified", "Qualified"
-        CONVERTED = "converted", "Converted"
-        DISQUALIFIED = "disqualified", "Disqualified"
+        ENROLLED = "enrolled", "Enrolled"
+        NOT_ELIGIBLE = "not_eligible", "Not Eligible"
+        CLOSED = "closed", "Close"
+        LOST = "lost", "Lost"
 
     lead_id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
 
@@ -2885,6 +3138,31 @@ class Lead(models.Model):
     status = models.CharField(
         max_length=20, choices=Status.choices, default=Status.NEW, db_index=True
     )
+
+    # --- Assignment & conversion tracking ---
+    # Screener responsible for following up on this lead.
+    assigned_to = models.ForeignKey(
+        "Agent",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="assigned_leads",
+    )
+    # Set when a lead converts into an enrolled client, for funnel tracking.
+    converted_client = models.ForeignKey(
+        "Client",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="leads",
+    )
+    # Program main categories the lead expressed interest in (multi-select).
+    interested_programs = models.ManyToManyField(
+        "ProgramMainCategory",
+        blank=True,
+        related_name="interested_leads",
+    )
+
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -2896,3 +3174,30 @@ class Lead(models.Model):
 
     def __str__(self):
         return f"Lead {self.first_name} {self.last_name} ({self.phone_number})"
+
+
+class LeadNote(models.Model):
+    """A follow-up note an agent records against a :class:`Lead`.
+
+    Author is stored both as a nullable FK (so we can keep the link even if the
+    note text is the source of truth) and as a denormalized ``author_name`` so
+    the display name survives if the agent is later removed.
+    """
+
+    lead = models.ForeignKey(Lead, on_delete=models.CASCADE, related_name="notes")
+    author = models.ForeignKey(
+        "Agent",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="lead_notes",
+    )
+    author_name = models.CharField(max_length=200, blank=True)
+    body = models.TextField()
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+
+    def __str__(self):
+        return f"Note on {self.lead_id} by {self.author_name or 'agent'}"

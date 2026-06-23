@@ -16,9 +16,9 @@ from datetime import timedelta
 from django.db import transaction
 
 from api.models import (
-    MemberStatus,
     OrderSchedule,
     OrderStatus,
+    ScheduleStatus,
     generate_household_group_code,
 )
 
@@ -89,11 +89,9 @@ def generate_orders_for_enrollment(enrollment):
     if not dates:
         return []
 
-    members = [
-        m
-        for m in enrollment.member_verifications.select_related("client").all()
-        if m.status != MemberStatus.DENIED
-    ]
+    members = list(
+        enrollment.member_profiles.select_related("client").all()
+    )
     if not members:
         return []
 
@@ -123,6 +121,64 @@ def generate_orders_for_enrollment(enrollment):
                     member_phone=getattr(client, "client_phone_number", "") or "",
                     member_email=getattr(client, "client_email_address", "") or "",
                     how_many_meals_or_boxes=m.meals_per_delivery,
+                )
+            )
+    return OrderSchedule.objects.bulk_create(orders)
+
+
+@transaction.atomic
+def generate_delivery_calendar(enrollment):
+    """Expand each ``MemberDeliverySchedule`` (the recurring plan) into dated
+    :class:`OrderSchedule` occurrences — the delivery calendar that PO
+    generation later aggregates.
+
+    Unlike :func:`generate_orders_for_enrollment`, this is driven by the
+    per-member PLAN, so it honors each plan's ``starts_on`` (the first delivery
+    date, which already encodes the cadence's first-delivery / Wednesday-skip
+    rule) and ``ends_on``. Delivery weekdays come from the enrollment (auto-set
+    from the matched CadenceRule).
+
+    Idempotent: returns ``[]`` if the enrollment already has orders.
+    """
+    if enrollment.orders.exists():
+        return []
+
+    schedules = list(
+        enrollment.delivery_schedules.filter(status=ScheduleStatus.SCHEDULED)
+        .select_related("member_profile", "member_profile__client")
+    )
+    if not schedules:
+        return []
+
+    weekdays = enrollment.delivery_weekdays or []
+    group_code = generate_household_group_code()
+    address_text = _format_address(enrollment.delivery_address)
+
+    orders = []
+    for sched in schedules:
+        dates = _delivery_dates(sched.starts_on, sched.ends_on, weekdays)
+        if not dates:
+            continue
+        m = sched.member_profile
+        client = getattr(m, "client", None)
+        for d in dates:
+            orders.append(
+                OrderSchedule(
+                    enrollment=enrollment,
+                    program_name=enrollment.program_name,
+                    member=m,
+                    member_name=sched.member_name or (m.member_name if m else ""),
+                    anticipated_delivery_date=d,
+                    household=enrollment.household,
+                    household_group_code=group_code,
+                    status=OrderStatus.SCHEDULED,
+                    delivery_address=address_text,
+                    allergies=list(getattr(m, "food_allergies", []) or []),
+                    restrictions=list(getattr(m, "dietary_restrictions", []) or []),
+                    menu_type=sched.menu_type or (m.menu_type if m else ""),
+                    member_phone=getattr(client, "client_phone_number", "") or "",
+                    member_email=getattr(client, "client_email_address", "") or "",
+                    how_many_meals_or_boxes=sched.prod_per_delivery,
                 )
             )
     return OrderSchedule.objects.bulk_create(orders)

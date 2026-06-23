@@ -291,17 +291,20 @@ class ExtensionTimelineTest(TestCase):
 
 
 class HouseholdEnrollmentActivationTest(TestCase):
-    """When a household enrollment advances, every non-denied participant — not
-    just the primary — should follow the enrollment's lifecycle stage."""
+    """When a household enrollment advances, every participant — not just the
+    primary — should follow the enrollment's lifecycle stage. The household is
+    the unit of verification; there is no per-member exclusion."""
 
     def _client(self, first="A", last="B"):
         return Client.objects.create(
             client_id=str(uuid.uuid4()), first_name=first, last_name=last
         )
 
-    def _household_enrollment(self, members, *, stage=None):
-        """Build a household + EnrollmentVerification with MemberVerification
-        rows. ``members`` is a list of (client, status); the first is primary.
+    def _household_enrollment(self, clients, *, stage=None, profiles_for=None):
+        """Build a household + EnrollmentVerification with MemberDietaryProfile
+        rows. ``clients`` is a list of clients; the first is the primary.
+        ``profiles_for`` (defaults to all) limits which clients get a profile
+        row, so the household-membership governance path can be exercised.
         Returns the enrollment.
         """
         from .models import (
@@ -309,38 +312,31 @@ class HouseholdEnrollmentActivationTest(TestCase):
             EnrollmentVerification,
             Household,
             HouseholdMember,
-            MemberVerification,
+            MemberDietaryProfile,
         )
 
         household = Household.objects.create(name="Test Household")
-        primary_client = members[0][0]
-        for i, (client, _status) in enumerate(members):
+        for i, client in enumerate(clients):
             HouseholdMember.objects.create(
                 household=household, client=client, is_primary=(i == 0)
             )
         enrollment = EnrollmentVerification.objects.create(
-            client=primary_client,
+            client=clients[0],
             household=household,
             stage=stage or EnrollmentStage.PENDING_VERIFICATION,
         )
-        for client, status in members:
-            MemberVerification.objects.create(
-                enrollment=enrollment, client=client, status=status
-            )
+        for client in (clients if profiles_for is None else profiles_for):
+            MemberDietaryProfile.objects.create(enrollment=enrollment, client=client)
         return enrollment
 
-    def test_all_non_denied_members_go_active(self):
-        from .models import ClientStage, EnrollmentStage, MemberStatus
+    def test_all_household_members_go_active(self):
+        from .models import ClientStage, EnrollmentStage
         from .services.lifecycle import advance_enrollment
 
         primary = self._client("Pat", "Primary")
         spouse = self._client("Sam", "Spouse")
         child = self._client("Kid", "Child")
-        enrollment = self._household_enrollment([
-            (primary, MemberStatus.VERIFIED),
-            (spouse, MemberStatus.VERIFIED),
-            (child, MemberStatus.VERIFIED),
-        ])
+        enrollment = self._household_enrollment([primary, spouse, child])
 
         advance_enrollment(enrollment, EnrollmentStage.VERIFIED, force=True)
         advance_enrollment(enrollment, EnrollmentStage.SERVICE_ACTIVE, force=True)
@@ -352,21 +348,21 @@ class HouseholdEnrollmentActivationTest(TestCase):
                 f"{c.first_name} should be Active, got {c.lifecycle_stage}",
             )
 
-    def test_denied_member_does_not_go_active(self):
-        from .models import ClientStage, EnrollmentStage, MemberStatus
+    def test_member_without_profile_still_goes_active(self):
+        # A household member governed purely via membership (no per-member
+        # dietary profile row) still follows the enrollment's stage.
+        from .models import ClientStage, EnrollmentStage
         from .services.lifecycle import advance_enrollment
 
         primary = self._client("Pat", "Primary")
-        denied = self._client("Dee", "Denied")
-        enrollment = self._household_enrollment([
-            (primary, MemberStatus.VERIFIED),
-            (denied, MemberStatus.DENIED),
-        ])
+        spouse = self._client("Sam", "Spouse")
+        enrollment = self._household_enrollment(
+            [primary, spouse], profiles_for=[primary]
+        )
 
         advance_enrollment(enrollment, EnrollmentStage.VERIFIED, force=True)
         advance_enrollment(enrollment, EnrollmentStage.SERVICE_ACTIVE, force=True)
 
-        primary.refresh_from_db()
-        denied.refresh_from_db()
-        self.assertEqual(primary.lifecycle_stage, ClientStage.ACTIVE)
-        self.assertNotEqual(denied.lifecycle_stage, ClientStage.ACTIVE)
+        for c in (primary, spouse):
+            c.refresh_from_db()
+            self.assertEqual(c.lifecycle_stage, ClientStage.ACTIVE)

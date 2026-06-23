@@ -532,7 +532,7 @@ class EnrollmentVerificationViewSet(viewsets.ModelViewSet):
 
     queryset = EnrollmentVerification.objects.select_related(
         "client", "household", "case", "delivery_address"
-    ).prefetch_related("member_verifications__client")
+    ).prefetch_related("member_profiles__client")
     serializer_class = EnrollmentVerificationSerializer
 
     def get_queryset(self):

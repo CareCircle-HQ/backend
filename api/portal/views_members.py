@@ -13,12 +13,12 @@ from rest_framework.response import Response
 
 from ..models import (
     Address,
+    Case,
     Client,
     EnrollmentStage,
     EnrollmentVerification,
     HouseholdMember,
-    MemberStatus,
-    MemberVerification,
+    MemberDietaryProfile,
     Note,
     NoteSource,
     PurchaseOrder,
@@ -26,7 +26,10 @@ from ..models import (
     Ticket,
     TimelineEvent,
 )
+from ..services.catalog import menu_type_for_member
+from ..services.delivery import create_member_delivery_schedules
 from ..services.lifecycle import advance_enrollment
+from ..services.orders import generate_delivery_calendar
 from .base import PortalAPIView, PortalGenericAPIView, current_agent
 from . import serializers as s
 
@@ -55,7 +58,11 @@ class MembersListView(PortalGenericAPIView):
     serializer_class = s.MemberListSerializer
 
     def get_queryset(self):
-        qs = Client.objects.all().prefetch_related(*MEMBER_LIST_PREFETCH)
+        qs = (
+            Client.objects.all()
+            .select_related("household_membership__household")
+            .prefetch_related(*MEMBER_LIST_PREFETCH)
+        )
         params = self.request.query_params
 
         search = (params.get("search") or "").strip()
@@ -90,10 +97,82 @@ class MembersListView(PortalGenericAPIView):
 
         return qs.distinct()
 
+    def _serialize_member(self, client, is_primary, relationship=""):
+        data = s.MemberListSerializer(client).data
+        data["is_primary"] = is_primary
+        data["relationship"] = relationship
+        return data
+
+    def _build_groups(self):
+        """Group the filtered clients into household groups (one row per
+        household, plus each household-less client as its own group). A
+        household is included whenever ANY of its members match the filters; the
+        expanded view then shows ALL of that household's members."""
+        clients = list(self.get_queryset())
+
+        household_ids, seen_hh, individuals = [], set(), []
+        for c in clients:
+            hm = getattr(c, "household_membership", None)
+            if hm and hm.household_id:
+                if hm.household_id not in seen_hh:
+                    seen_hh.add(hm.household_id)
+                    household_ids.append(hm.household_id)
+            else:
+                individuals.append(c)
+
+        groups = []
+        if household_ids:
+            members = (
+                HouseholdMember.objects.filter(household_id__in=household_ids)
+                .select_related("household", "client")
+                .prefetch_related(
+                    "client__insurances", "client__military_profile",
+                    "client__enrollments",
+                )
+                .order_by("-is_primary", "added_at")
+            )
+            by_hh = {}
+            for hm in members:
+                by_hh.setdefault(hm.household_id, []).append(hm)
+            for hid in household_ids:
+                hms = by_hh.get(hid)
+                if not hms:
+                    continue
+                primary_hm = next((h for h in hms if h.is_primary), hms[0])
+                member_data = [
+                    self._serialize_member(h.client, h.is_primary, h.relationship)
+                    for h in hms
+                ]
+                primary_data = next(
+                    (m for m in member_data if m["id"] == str(primary_hm.client_id)),
+                    member_data[0],
+                )
+                groups.append({
+                    "id": str(hid),
+                    "type": "household",
+                    "name": primary_hm.household.name or primary_data["name"],
+                    "member_count": len(member_data),
+                    "primary": primary_data,
+                    "members": member_data,
+                })
+
+        for c in individuals:
+            primary_data = self._serialize_member(c, True)
+            groups.append({
+                "id": str(c.client_id),
+                "type": "individual",
+                "name": primary_data["name"],
+                "member_count": 1,
+                "primary": primary_data,
+                "members": [primary_data],
+            })
+
+        groups.sort(key=lambda g: (g["name"] or "").lower())
+        return groups
+
     def get(self, request):
-        page = self.paginate_queryset(self.get_queryset())
-        data = self.get_serializer(page, many=True).data
-        return self.get_paginated_response(data)
+        page = self.paginate_queryset(self._build_groups())
+        return self.get_paginated_response(page)
 
 
 class MembersStatsView(PortalAPIView):
@@ -108,7 +187,7 @@ class MembersStatsView(PortalAPIView):
 def _get_member(client_id):
     return get_object_or_404(
         Client.objects.prefetch_related(
-            "insurances", "military_profile", "addresses", "tickets",
+            "insurances", "military_profile", "addresses", "tickets__type",
             "enrollments", "cases",
         ),
         pk=client_id,
@@ -187,7 +266,7 @@ class MemberHouseholdView(PortalAPIView):
         enr = self._enrollment(client_id)
         if enr is None:
             return Response({"enrollment": None, "address": None, "members": []})
-        members = enr.member_verifications.select_related(
+        members = enr.member_profiles.select_related(
             "client__household_membership"
         ).all()
         addr = enr.delivery_address
@@ -230,11 +309,11 @@ class MemberHouseholdView(PortalAPIView):
 
 
 class HouseholdMemberEditView(PortalAPIView):
-    """PATCH a single household member's dietary info (MemberVerification)."""
+    """PATCH a single household member's dietary info (MemberDietaryProfile)."""
 
     def patch(self, request, client_id, member_id):
         mv = get_object_or_404(
-            MemberVerification, pk=member_id, enrollment__client_id=client_id
+            MemberDietaryProfile, pk=member_id, enrollment__client_id=client_id
         )
         ser = s.PortalMemberDietaryEditSerializer(data=request.data)
         ser.is_valid(raise_exception=True)
@@ -274,19 +353,33 @@ class MemberNotesView(PortalGenericAPIView):
         return Response(s.PortalNoteSerializer(note).data, status=http.HTTP_201_CREATED)
 
 
+class MemberCasesView(PortalAPIView):
+    """All cases for a member, for the New-Ticket “related case” dropdown."""
+
+    def get(self, request, client_id):
+        get_object_or_404(Client, pk=client_id)
+        cases = Case.objects.filter(client_id=client_id).order_by("-date_opened")
+        return Response(s.PortalCaseOptionSerializer(cases, many=True).data)
+
+
 class MemberTicketsView(PortalAPIView):
     def get(self, request, client_id):
         get_object_or_404(Client, pk=client_id)
         qs = (
             Ticket.objects.filter(client_id=client_id)
-            .select_related("assigned_to", "client", "case")
+            .select_related("assigned_to", "client", "case", "type")
             .prefetch_related("notes")
         )
+        # ?mine=true -> only tickets assigned to the requesting agent.
+        mine = (request.query_params.get("mine") or "").strip().lower()
+        if mine in ("1", "true", "yes"):
+            agent = current_agent(request)
+            qs = qs.filter(assigned_to=agent) if agent else qs.none()
         return Response(s.PortalTicketSerializer(qs, many=True).data)
 
 
 class MemberVerificationCreateView(PortalAPIView):
-    """POST: create an EnrollmentVerification + MemberVerifications + delivery
+    """POST: create an EnrollmentVerification + MemberDietaryProfiles + delivery
     Address for a member (the 5-step wizard).
 
     On save the household is verified, advancing the enrollment to VERIFIED
@@ -336,7 +429,7 @@ class MemberVerificationCreateView(PortalAPIView):
         )
 
         for m in data["members"]:
-            MemberVerification.objects.create(
+            MemberDietaryProfile.objects.create(
                 enrollment=enrollment,
                 client_id=m.get("client_id"),
                 member_name=m.get("member_name", ""),
@@ -344,9 +437,14 @@ class MemberVerificationCreateView(PortalAPIView):
                 food_allergies=m.get("food_allergies", []),
                 other_dietary_restrictions=m.get("other_dietary_restrictions", ""),
                 meal_category=m.get("meal_category", ""),
-                menu_type=m.get("menu_type", ""),
+                # Menu type is derived from the member's dietary data (allergy
+                # overrides win, else meal_category) when not explicitly sent.
+                menu_type=m.get("menu_type")
+                or menu_type_for_member(
+                    food_allergies=m.get("food_allergies", []),
+                    meal_category=m.get("meal_category", ""),
+                ),
                 general_verification_notes=m.get("notes", ""),
-                status=MemberStatus.VERIFIED,
             )
 
             # Wire the member's mobile-app login number onto their HouseholdMember
@@ -381,6 +479,24 @@ class MemberVerificationCreateView(PortalAPIView):
                 enrollment, EnrollmentStage.SERVICE_ACTIVE, force=True,
                 note="Authorization accepted — placed in service.",
             )
+            # Best-effort link the case for reporting, but only when it isn't
+            # already owned by another enrollment (a case maps to at most one
+            # enrollment — uniq_enrollment_verification_per_case).
+            if (
+                case is not None
+                and enrollment.case_id is None
+                and not EnrollmentVerification.objects.filter(case=case)
+                .exclude(pk=enrollment.pk)
+                .exists()
+            ):
+                enrollment.case = case
+                enrollment.save(update_fields=["case"])
+            # Cadence + authorization window come from the case (passed in
+            # explicitly so this does not depend on the case link above).
+            create_member_delivery_schedules(enrollment, case=case)
+            # Expand the per-member plans into the dated delivery calendar
+            # (OrderSchedule rows) that PO generation later aggregates.
+            generate_delivery_calendar(enrollment)
 
         return Response(
             {"id": enrollment.pk, "code": enrollment.code, "stage": enrollment.stage},

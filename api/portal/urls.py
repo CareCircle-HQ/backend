@@ -5,8 +5,16 @@ from rest_framework.routers import SimpleRouter
 
 from .auth import PortalRequestCodeView, PortalVerifyCodeView
 from .views_dashboard import DashboardView
+from .views_leads import (
+    PortalLeadDetailView,
+    PortalLeadNotesView,
+    PortalLeadsView,
+    PortalProgramCategoriesView,
+    PortalScreenersView,
+)
 from .views_members import (
     HouseholdMemberEditView,
+    MemberCasesView,
     MemberDetailView,
     MemberHistoryDetailView,
     MemberHistoryView,
@@ -47,6 +55,7 @@ from .views_tickets import (
     TicketDetailView,
     TicketNotesView,
     TicketsStatsView,
+    TicketTypesListView,
     WorkQueueView,
 )
 
@@ -78,15 +87,24 @@ urlpatterns = [
         HouseholdMemberEditView.as_view(),
     ),
     path("members/<uuid:client_id>/notes/", MemberNotesView.as_view()),
+    path("members/<uuid:client_id>/cases/", MemberCasesView.as_view()),
     path("members/<uuid:client_id>/tickets/", MemberTicketsView.as_view()),
     path("members/<uuid:client_id>/verification/", MemberVerificationCreateView.as_view()),
 
     # Work queue (global tickets)
     path("tickets/", WorkQueueView.as_view(), name="portal-tickets"),
+    path("tickets/types/", TicketTypesListView.as_view(), name="portal-ticket-types"),
     path("tickets/stats/", TicketsStatsView.as_view(), name="portal-tickets-stats"),
     path("tickets/<int:ticket_id>/", TicketDetailView.as_view(), name="portal-ticket-detail"),
     path("tickets/<int:ticket_id>/notes/", TicketNotesView.as_view()),
     path("agents/", AgentsListView.as_view(), name="portal-agents"),
+
+    # Leads (agent-created from the Work Queue + Leads page)
+    path("leads/", PortalLeadsView.as_view(), name="portal-leads"),
+    path("leads/<uuid:lead_id>/", PortalLeadDetailView.as_view(), name="portal-lead-detail"),
+    path("leads/<uuid:lead_id>/notes/", PortalLeadNotesView.as_view(), name="portal-lead-notes"),
+    path("screeners/", PortalScreenersView.as_view(), name="portal-screeners"),
+    path("program-categories/", PortalProgramCategoriesView.as_view(), name="portal-program-categories"),
 
     # Orders (global purchase orders)
     path("purchase-orders/", PurchaseOrdersView.as_view(), name="portal-purchase-orders"),
