@@ -32,7 +32,12 @@ from api.models import (
     ScheduleStatus,
 )
 from api.services.catalog import menu_type_for_member, product_type_kind_for_name
-from api.services.orders import _WEEKDAY_CODES, _delivery_dates
+from api.services.orders import (
+    _WEEKDAY_CODES,
+    _delivery_dates,
+    _weekday_ints,
+    meals_for_delivery,
+)
 
 # Manual cadence -> the weekday codes deliveries land on. ``once_a_week`` carries
 # no fixed day: the agent supplies the single weekday on the Logistics page.
@@ -224,7 +229,14 @@ def create_member_delivery_schedules(
             for w in delivery_weekdays if w in _WEEKDAY_CODES
         ]
         start = min(candidates) if candidates else accept_date
-    num_dates = len(_delivery_dates(start, end, delivery_weekdays))
+    delivery_dates = _delivery_dates(start, end, delivery_weekdays)
+    num_dates = len(delivery_dates)
+    weekday_ints = _weekday_ints(delivery_weekdays)
+    # Meals use a per-day rate (per-delivery quantity varies by coverage); boxes
+    # use a flat per-delivery count.
+    meals_per_day = (
+        product_type.meals_per_day if (product_type and not is_boxes) else 0
+    )
 
     schedules = []
     for m in members:
@@ -238,6 +250,15 @@ def create_member_delivery_schedules(
         prod_per_delivery = member_quantities.get(m.pk, m.meals_per_delivery)
         if prod_per_delivery is None:
             prod_per_delivery = product_type.prod_per_delivery if product_type else 0
+        # Window total: meals sum each delivery's coverage x daily rate (9 + 12
+        # + ...); boxes are a flat per-delivery count across all dates.
+        if meals_per_day:
+            total = sum(
+                meals_for_delivery(d.weekday(), weekday_ints, meals_per_day)
+                for d in delivery_dates
+            )
+        else:
+            total = prod_per_delivery * num_dates
         schedules.append(
             MemberDeliverySchedule(
                 enrollment=enrollment,
@@ -249,7 +270,8 @@ def create_member_delivery_schedules(
                 kitchen=kitchen,
                 delivery_days_cadence=cadence,
                 prod_per_delivery=prod_per_delivery,
-                meals_boxes_total=prod_per_delivery * num_dates,
+                meals_per_day=meals_per_day,
+                meals_boxes_total=total,
                 # Snapshot the member's menu type; derive it from their dietary
                 # data as a fallback so the plan is never left without one.
                 menu_type=m.menu_type or menu_type_for_member(

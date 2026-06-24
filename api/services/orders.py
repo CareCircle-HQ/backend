@@ -58,6 +58,31 @@ def _delivery_window(enrollment):
     return start.date(), end.date()
 
 
+def coverage_days(weekday, delivery_weekday_ints):
+    """Number of days a delivery on ``weekday`` covers: the cyclic gap to the
+    next delivery weekday in the cadence. The gaps over a week always sum to 7,
+    so a Mon/Thu cadence yields 3 (Mon->Thu) then 4 (Thu->Mon). A single weekly
+    delivery covers the full 7 days."""
+    days = sorted(set(delivery_weekday_ints))
+    if not days or weekday not in days:
+        return 7
+    i = days.index(weekday)
+    nxt = days[(i + 1) % len(days)]
+    return (nxt - weekday) % 7 or 7
+
+
+def meals_for_delivery(weekday, delivery_weekday_ints, meals_per_day):
+    """Per-delivery meal count = ``meals_per_day`` x the days that delivery
+    covers (see :func:`coverage_days`)."""
+    return (meals_per_day or 0) * coverage_days(weekday, delivery_weekday_ints)
+
+
+def _weekday_ints(weekday_codes):
+    """Convert a list of weekday codes ("mon", "thu", ...) to date.weekday()
+    ints, ignoring anything unrecognized."""
+    return [_WEEKDAY_CODES[w] for w in (weekday_codes or []) if w in _WEEKDAY_CODES]
+
+
 def _delivery_dates(start, end, weekdays):
     """Every date in [start, end] whose weekday is one of ``weekdays`` (a list
     of weekday codes). Returns a sorted list of dates."""
@@ -151,6 +176,7 @@ def generate_delivery_calendar(enrollment):
         return []
 
     weekdays = enrollment.delivery_weekdays or []
+    weekday_ints = _weekday_ints(weekdays)
     group_code = generate_household_group_code()
     address_text = _format_address(enrollment.delivery_address)
 
@@ -162,6 +188,13 @@ def generate_delivery_calendar(enrollment):
         m = sched.member_profile
         client = getattr(m, "client", None)
         for d in dates:
+            # Meals: quantity is the daily rate x days this delivery covers
+            # (e.g. 3/day -> 9 then 12 on a Mon/Thu cadence). Boxes: flat
+            # per-delivery count.
+            if sched.meals_per_day:
+                qty = meals_for_delivery(d.weekday(), weekday_ints, sched.meals_per_day)
+            else:
+                qty = sched.prod_per_delivery
             orders.append(
                 OrderSchedule(
                     enrollment=enrollment,
@@ -179,7 +212,7 @@ def generate_delivery_calendar(enrollment):
                     menu_type=sched.menu_type or (m.menu_type if m else ""),
                     member_phone=getattr(client, "client_phone_number", "") or "",
                     member_email=getattr(client, "client_email_address", "") or "",
-                    how_many_meals_or_boxes=sched.prod_per_delivery,
+                    how_many_meals_or_boxes=qty,
                 )
             )
     return OrderSchedule.objects.bulk_create(orders)

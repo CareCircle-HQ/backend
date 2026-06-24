@@ -805,6 +805,11 @@ class ProductType(models.Model):
         max_length=20, choices=ProductTypeKind.choices
     )
     prod_per_delivery = models.PositiveIntegerField(default=0)
+    # For meals: the per-DAY meal rate (e.g. 3). The per-delivery quantity is
+    # this rate multiplied by the number of days that delivery covers (the gap
+    # to the next delivery in the cadence), so a Mon/Thu cadence yields 9 then
+    # 12 meals. Unused for boxes (which use the flat ``prod_per_delivery``).
+    meals_per_day = models.PositiveSmallIntegerField(default=0)
     delivery_days_cadence = models.CharField(
         max_length=20, choices=DeliveryCadence.choices, blank=True
     )
@@ -1797,8 +1802,12 @@ class MemberDeliverySchedule(models.Model):
         max_length=20, choices=DeliveryCadence.choices, blank=True
     )
     prod_per_delivery = models.PositiveSmallIntegerField(default=0)
-    # Total meals/boxes across the authorization window
-    # (= prod_per_delivery * number of delivery dates).
+    # Snapshot of ProductType.meals_per_day for meals plans (0 for boxes). The
+    # per-delivery quantity is meals_per_day * the days each delivery covers.
+    meals_per_day = models.PositiveSmallIntegerField(default=0)
+    # Total meals/boxes across the authorization window. For boxes this is
+    # prod_per_delivery * number of delivery dates; for meals it is the sum of
+    # each delivery's coverage * meals_per_day.
     meals_boxes_total = models.PositiveIntegerField(default=0)
     menu_type = models.CharField(
         max_length=20, choices=MenuType.choices, blank=True
@@ -3038,6 +3047,10 @@ class DeliveryOrder(models.Model):
         choices=DeliveryOrderStatus.choices,
         default=DeliveryOrderStatus.PENDING,
     )
+    # How many meals/boxes this member receives for this delivery. Snapshotted
+    # from OrderSchedule.how_many_meals_or_boxes at PO generation so the kitchen
+    # export reflects the quantity even if the schedule later changes.
+    quantity = models.PositiveSmallIntegerField(null=True, blank=True)
     expected_delivery_date = models.DateField(null=True, blank=True)
     delivered_at = models.DateTimeField(null=True, blank=True)
     # The ACTUAL kitchen fulfilling this delivery. Defaults to the household's

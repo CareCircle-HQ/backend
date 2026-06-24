@@ -22,6 +22,8 @@ from ..models import (
 )
 from ..services.purchase_orders import (
     build_kitchen_export_csv,
+    build_po_summary_data,
+    build_po_summary_report,
     generate_purchase_order,
     preview_purchase_orders,
     split_purchase_order,
@@ -59,6 +61,9 @@ class PurchaseOrdersView(PortalGenericAPIView):
         status_val = (p.get("status") or "").strip()
         if status_val and status_val.lower() != "all":
             qs = qs.filter(status=status_val.lower())
+        kind = (p.get("kind") or "").strip()
+        if kind and kind.lower() != "all":
+            qs = qs.filter(kind=kind.lower())
         kitchen = (p.get("kitchen") or "").strip()
         if kitchen and kitchen.lower() != "all":
             qs = qs.filter(kitchen_id=kitchen)
@@ -148,6 +153,32 @@ class KitchenExportView(PortalAPIView):
         resp["Content-Disposition"] = f'attachment; filename="{filename}"'
         resp["X-Export-Filename"] = filename
         return resp
+
+
+class PurchaseOrderReportView(PortalAPIView):
+    """Download a per-order summary CSV for a PO: totals (members + total
+    meals/boxes) and a per-menu-type breakdown."""
+
+    def get(self, request, po_id):
+        po = get_object_or_404(
+            PurchaseOrder.objects.select_related("kitchen"), pk=po_id
+        )
+        filename, csv_text = build_po_summary_report(po)
+        resp = HttpResponse(csv_text, content_type="text/csv")
+        resp["Content-Disposition"] = f'attachment; filename="{filename}"'
+        resp["X-Export-Filename"] = filename
+        return resp
+
+
+class PurchaseOrderReportDataView(PortalAPIView):
+    """Structured (JSON) per-order summary for the in-app report view: totals,
+    per-menu-type breakdown, and per-household member lines."""
+
+    def get(self, request, po_id):
+        po = get_object_or_404(
+            PurchaseOrder.objects.select_related("kitchen"), pk=po_id
+        )
+        return Response(build_po_summary_data(po))
 
 
 class SendToDeliveryView(PortalAPIView):

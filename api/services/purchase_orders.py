@@ -293,6 +293,7 @@ def generate_purchase_order(kind, delivery_date, kitchen, schedule_ids, split_se
             member=s.member.client if s.member else None,
             group=s.household,
             status=DeliveryOrderStatus.PENDING,
+            quantity=s.how_many_meals_or_boxes,
             expected_delivery_date=delivery_date,
             kitchen=kitchen,
             default_kitchen=default_kitchen,
@@ -344,7 +345,7 @@ def split_purchase_order(po, delivery_order_ids, new_delivery_date):
 
 # Boxes export columns, in order.
 _BOX_EXPORT_HEADERS = [
-    "Delivery Date", "OrderID", "HouseholdID", "MemberID", "Name",
+    "Delivery Date", "OrderID", "HouseholdID", "Quantity", "MemberID", "Name",
     "Address 1", "Address 2", "City", "State", "Postal",
     "MenuType", "FOOD NOTE", "Email address", "Phone",
 ]
@@ -444,6 +445,7 @@ def build_kitchen_export_rows(po):
             do.expected_delivery_date.isoformat() if do.expected_delivery_date else "",
             str(do.delivery_order_id),
             _household_label(do.group),
+            do.quantity if do.quantity is not None else "",
             str(c.client_id) if c else "",
             name,
             addr.street if addr else "",
@@ -467,3 +469,90 @@ def build_kitchen_export_csv(po):
     writer.writerow(headers)
     writer.writerows(rows)
     return kitchen_export_filename(po), buf.getvalue()
+
+
+# ---------------------------------------------------------------------------
+# Per-order summary report (totals + per-menu-type breakdown)
+# ---------------------------------------------------------------------------
+
+def _report_filename(po):
+    """e.g. PO-BOX-2026-W27-K01_ENG_summary.csv."""
+    base = kitchen_export_filename(po)
+    stem = base[:-4] if base.lower().endswith(".csv") else base
+    return f"{stem}_summary.csv"
+
+
+def build_po_summary_data(po):
+    """Structured summary of a single PurchaseOrder for the report view:
+    overall totals, a per-menu-type breakdown, and per-household member lines.
+    "Quantity" is meals for meals POs and boxes for boxes POs (it reads the
+    snapshotted ``DeliveryOrder.quantity``)."""
+    orders = list(
+        po.delivery_orders.select_related("member", "group", "menu_type")
+        .order_by("group_id", "member__last_name", "member__first_name")
+    )
+    is_meals = (po.kind or "").lower() == ProductTypeKind.MEALS
+    unit = "Meals" if is_meals else "Boxes"
+
+    total_members = len(orders)
+    total_qty = sum((do.quantity or 0) for do in orders)
+
+    # Per-menu-type breakdown.
+    by_menu = {}
+    for do in orders:
+        label = do.menu_type.name if do.menu_type else "—"
+        agg = by_menu.setdefault(label, {"members": 0, "quantity": 0})
+        agg["members"] += 1
+        agg["quantity"] += (do.quantity or 0)
+    menu_types = [
+        {"label": label, "members": agg["members"], "quantity": agg["quantity"]}
+        for label, agg in sorted(by_menu.items())
+    ]
+
+    # Per-household grouping.
+    households = {}
+    for do in orders:
+        label = _household_label(do.group)
+        h = households.setdefault(label, {"label": label, "quantity": 0, "members": []})
+        c = do.member
+        name = (f"{c.first_name} {c.last_name}".strip() if c else "") or "—"
+        h["quantity"] += (do.quantity or 0)
+        h["members"].append({
+            "name": name,
+            "quantity": do.quantity if do.quantity is not None else 0,
+            "menu_type": do.menu_type.name if do.menu_type else "—",
+        })
+
+    return {
+        "po_number": po.po_number or str(po.pk),
+        "kind": (po.kind or "").lower(),
+        "unit": unit,
+        "kitchen_name": po.kitchen.name if po.kitchen else "Unassigned",
+        "delivery_date": po.delivery_date.isoformat() if po.delivery_date else None,
+        "total_members": total_members,
+        "total_quantity": total_qty,
+        "menu_types": menu_types,
+        "households": sorted(households.values(), key=lambda h: h["label"]),
+    }
+
+
+def build_po_summary_report(po):
+    """Return ``(filename, csv_text)`` for the PO summary report (CSV form)."""
+    data = build_po_summary_data(po)
+    unit = data["unit"]
+
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(["Purchase Order", data["po_number"]])
+    writer.writerow(["Kind", unit])
+    writer.writerow(["Kitchen", data["kitchen_name"]])
+    writer.writerow(["Delivery Date", data["delivery_date"] or ""])
+    writer.writerow([])
+    writer.writerow(["Total Members", data["total_members"]])
+    writer.writerow([f"Total {unit}", data["total_quantity"]])
+    writer.writerow([])
+    writer.writerow(["MenuType", "Members", unit])
+    for mt in data["menu_types"]:
+        writer.writerow([mt["label"], mt["members"], mt["quantity"]])
+
+    return _report_filename(po), buf.getvalue()
