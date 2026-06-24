@@ -1,0 +1,469 @@
+"""Purchase-order scheduling, preview, generation and splitting.
+
+A PurchaseOrder is one batch for a single ``(product_type, delivery_date,
+kitchen)``: it aggregates the dated delivery calendar (:class:`OrderSchedule`)
+for that date and kitchen into per-member :class:`DeliveryOrder` lines.
+
+Schedule (agreed rule, also stored on CadenceRule after migration 0084):
+  - Meals deliver Mon/Thu (cadence ``mon_thu``) or Tue/Fri (``tue_fri``); each
+    delivery weekday is ordered on its partner weekday (Mon PO -> Thu delivery,
+    Thu PO -> next Mon; Tue PO -> Fri, Fri PO -> next Tue).
+  - Boxes deliver Wednesday, ordered the Friday before.
+
+Kitchen routing: a member's household-assigned kitchen is the DEFAULT (stored on
+the OrderSchedule snapshot). At PO time an agent may reroute a member to another
+capable kitchen for that date only; that is recorded on ``DeliveryOrder.kitchen``
+(with ``default_kitchen`` + ``rerouted`` kept for the UI) and never mutates the
+household preference.
+"""
+import csv
+import io
+import re
+from datetime import timedelta
+
+from django.db import transaction
+from django.utils import timezone
+
+from api.models import (
+    Address,
+    AddressType,
+    DeliveryOrder,
+    DeliveryOrderStatus,
+    DietaryRestriction,
+    FoodAllergy,
+    Kitchen,
+    MemberDietaryProfile,
+    MenuType,
+    OrderSchedule,
+    ProductType,
+    ProductTypeKind,
+    PurchaseOrder,
+    PurchaseOrderStatus,
+    ScheduleStatus,
+)
+from api.services.catalog import product_type_kind_for_name
+from api.services.kitchens import _MENU_CODE_TO_NAME, _norm
+from api.services.orders import _WEEKDAY_CODES
+
+_DIETARY_LABELS = dict(DietaryRestriction.choices)
+_ALLERGY_LABELS = dict(FoodAllergy.choices)
+
+# Reverse of _WEEKDAY_CODES: int weekday -> 3-letter code.
+_WEEKDAY_NAMES = {v: k for k, v in _WEEKDAY_CODES.items()}
+_WEEKDAY_ABBR = {0: "MON", 1: "TUE", 2: "WED", 3: "THU", 4: "FRI", 5: "SAT", 6: "SUN"}
+
+# Meal delivery weekday (int) -> the PO weekday it is ordered on.
+_MEAL_PO_WEEKDAY = {0: 3, 3: 0, 1: 4, 4: 1}  # Mon<-Thu, Thu<-Mon, Tue<-Fri, Fri<-Tue
+# Box delivery is Wednesday, ordered the Friday before.
+_BOX_PO_WEEKDAY = 4
+
+# Delivery weekday (int) -> the DeliveryCadence the delivery belongs to.
+_WEEKDAY_CADENCE = {
+    0: "mon_thu", 3: "mon_thu",
+    1: "tue_fri", 4: "tue_fri",
+    2: "once_a_week",  # boxes
+}
+
+
+def _prev_weekday(d, weekday):
+    """The first date strictly before ``d`` whose weekday() == ``weekday``."""
+    days = (d.weekday() - weekday) % 7
+    return d - timedelta(days=days or 7)
+
+
+def po_date_for_delivery(kind, delivery_date):
+    """The PO/cutoff date for a given product ``kind`` and delivery date."""
+    wd = delivery_date.weekday()
+    if kind == ProductTypeKind.BOXES:
+        po_wd = _BOX_PO_WEEKDAY
+    else:
+        po_wd = _MEAL_PO_WEEKDAY.get(wd)
+    if po_wd is None:
+        return None
+    return _prev_weekday(delivery_date, po_wd)
+
+
+def cadence_for_delivery_date(delivery_date):
+    """The DeliveryCadence code a delivery on this weekday belongs to."""
+    return _WEEKDAY_CADENCE.get(delivery_date.weekday(), "")
+
+
+def _product_type_for(kind, delivery_date):
+    """The ProductType matching the kind + the cadence implied by the weekday."""
+    if kind is None:
+        return None
+    cadence = cadence_for_delivery_date(delivery_date)
+    qs = ProductType.objects.filter(type=kind)
+    if cadence:
+        match = qs.filter(delivery_days_cadence=cadence).first()
+        if match is not None:
+            return match
+    return qs.first()
+
+
+def _kitchen_code(kitchen, _cache={}):
+    """A short, stable code for a kitchen, e.g. "K01" (1-based by creation)."""
+    if kitchen is None:
+        return "K00"
+    if not _cache:
+        for i, kid in enumerate(
+            Kitchen.objects.order_by("created_at").values_list("pk", flat=True)
+        ):
+            _cache[str(kid)] = "K%02d" % (i + 1)
+    return _cache.get(str(kitchen.pk), "K%02d" % 0)
+
+
+def build_po_number(kind, delivery_date, kitchen, split_seq=None):
+    """Human-readable PO number, e.g. PO-MEALS-2026-W26-THU-K01 or
+    PO-BOX-2026-W26-K01. ``split_seq`` (>=2) appends a "-S2" split suffix."""
+    iso = delivery_date.isocalendar()
+    year, week = iso[0], iso[1]
+    kind_label = "BOX" if kind == ProductTypeKind.BOXES else "MEALS"
+    parts = [f"PO-{kind_label}", str(year), f"W{week:02d}"]
+    if kind != ProductTypeKind.BOXES:
+        parts.append(_WEEKDAY_ABBR.get(delivery_date.weekday(), ""))
+    parts.append(_kitchen_code(kitchen))
+    number = "-".join(p for p in parts if p)
+    if split_seq and split_seq >= 2:
+        number = f"{number}-S{split_seq}"
+    return number
+
+
+def _ensure_unique_po_number(base):
+    """Return ``base`` or a "-2", "-3"... suffixed variant that is unused."""
+    if not PurchaseOrder.objects.filter(po_number=base).exists():
+        return base
+    i = 2
+    while PurchaseOrder.objects.filter(po_number=f"{base}-{i}").exists():
+        i += 1
+    return f"{base}-{i}"
+
+
+def _menu_type_index():
+    """Normalized catalog MenuType name -> MenuType model instance."""
+    return {_norm(mt.name): mt for mt in MenuType.objects.all()}
+
+
+def _resolve_menu_type(code, index):
+    """Map a member menu-type CODE to the catalog MenuType model, or None."""
+    name = _MENU_CODE_TO_NAME.get(code, code)
+    wanted = _norm(name)
+    mt = index.get(wanted)
+    if mt is not None:
+        return mt
+    return next(
+        (v for key, v in index.items() if wanted and (wanted in key or key in wanted)),
+        None,
+    )
+
+
+def _due_schedules(kind, delivery_date):
+    """SCHEDULED OrderSchedule rows for the given kind that land on the date."""
+    qs = (
+        OrderSchedule.objects.filter(
+            anticipated_delivery_date=delivery_date,
+            status=ScheduleStatus.SCHEDULED,
+        )
+        .select_related("member", "member__client", "household", "kitchen")
+    )
+    out = []
+    for s in qs:
+        if product_type_kind_for_name(s.program_name) == kind:
+            out.append(s)
+    return out
+
+
+def _batched_client_ids(delivery_date):
+    """Client ids that already have a DeliveryOrder for this delivery date."""
+    return set(
+        DeliveryOrder.objects.filter(expected_delivery_date=delivery_date)
+        .exclude(member__isnull=True)
+        .values_list("member_id", flat=True)
+    )
+
+
+def preview_purchase_orders(kind, delivery_date):
+    """Aggregate the delivery calendar for ``(kind, delivery_date)`` grouped by
+    each member's DEFAULT (household) kitchen, with menu-type counts, total
+    meals, and remaining per-kitchen capacity (orders/day). Members already in a
+    DeliveryOrder for that date are flagged ``batched``."""
+    schedules = _due_schedules(kind, delivery_date)
+    batched = _batched_client_ids(delivery_date)
+    po_date = po_date_for_delivery(kind, delivery_date)
+
+    # Existing delivery-order counts per kitchen for this date (for capacity).
+    used = {}
+    for kid in (
+        DeliveryOrder.objects.filter(expected_delivery_date=delivery_date)
+        .exclude(kitchen__isnull=True)
+        .values_list("kitchen_id", flat=True)
+    ):
+        used[str(kid)] = used.get(str(kid), 0) + 1
+
+    groups = {}  # kitchen_id (str) or "" -> group dict
+    for s in schedules:
+        k = s.kitchen
+        kid = str(k.pk) if k else ""
+        g = groups.get(kid)
+        if g is None:
+            cap = k.max_orders_per_day if k else None
+            g = groups[kid] = {
+                "kitchen_id": kid or None,
+                "kitchen_name": k.name if k else "Unassigned",
+                "capacity": cap,
+                "capacity_used": used.get(kid, 0),
+                "capacity_left": (cap - used.get(kid, 0)) if cap is not None else None,
+                "total_members": 0,
+                "total_meals": 0,
+                "menu_types": {},
+                "members": [],
+            }
+        is_batched = s.member and s.member.client_id in batched
+        qty = s.how_many_meals_or_boxes or 0
+        code = s.menu_type or ""
+        mt = g["menu_types"].setdefault(
+            code, {"code": code, "label": _MENU_CODE_TO_NAME.get(code, code or "—"), "members": 0, "meals": 0}
+        )
+        mt["members"] += 1
+        mt["meals"] += qty
+        if not is_batched:
+            g["total_members"] += 1
+            g["total_meals"] += qty
+        g["members"].append({
+            "schedule_id": str(s.order_id),
+            "client_id": str(s.member.client_id) if s.member and s.member.client_id else None,
+            "name": s.member_name or "",
+            "menu_type": code,
+            "menu_type_label": _MENU_CODE_TO_NAME.get(code, code or "—"),
+            "meals": qty,
+            "batched": bool(is_batched),
+        })
+
+    for g in groups.values():
+        g["menu_types"] = list(g["menu_types"].values())
+
+    return {
+        "kind": kind,
+        "delivery_date": delivery_date.isoformat(),
+        "po_date": po_date.isoformat() if po_date else None,
+        "cadence": cadence_for_delivery_date(delivery_date),
+        "kitchens": sorted(groups.values(), key=lambda x: (x["kitchen_name"] or "").lower()),
+    }
+
+
+@transaction.atomic
+def generate_purchase_order(kind, delivery_date, kitchen, schedule_ids, split_seq=None):
+    """Create one PurchaseOrder for ``kitchen`` on ``delivery_date`` and a
+    DeliveryOrder for each selected OrderSchedule. Schedules whose default
+    kitchen differs from ``kitchen`` are flagged ``rerouted``. Skips schedules
+    already batched for that date (idempotent on re-submit)."""
+    schedules = list(
+        OrderSchedule.objects.filter(
+            order_id__in=schedule_ids, status=ScheduleStatus.SCHEDULED
+        ).select_related("member", "member__client", "household", "kitchen")
+    )
+    already = _batched_client_ids(delivery_date)
+    schedules = [
+        s for s in schedules
+        if not (s.member and s.member.client_id in already)
+    ]
+    if not schedules:
+        return None
+
+    po_number = _ensure_unique_po_number(
+        build_po_number(kind, delivery_date, kitchen, split_seq=split_seq)
+    )
+    po = PurchaseOrder.objects.create(
+        po_number=po_number,
+        kind=kind or "",
+        product_type=_product_type_for(kind, delivery_date),
+        delivery_date=delivery_date,
+        po_date=po_date_for_delivery(kind, delivery_date),
+        kitchen=kitchen,
+        status=PurchaseOrderStatus.DRAFT,
+    )
+
+    menu_index = _menu_type_index()
+    orders = []
+    for s in schedules:
+        default_kitchen = s.kitchen
+        rerouted = bool(kitchen and default_kitchen and kitchen.pk != default_kitchen.pk)
+        orders.append(DeliveryOrder(
+            purchase_order=po,
+            member=s.member.client if s.member else None,
+            group=s.household,
+            status=DeliveryOrderStatus.PENDING,
+            expected_delivery_date=delivery_date,
+            kitchen=kitchen,
+            default_kitchen=default_kitchen,
+            rerouted=rerouted,
+            menu_type=_resolve_menu_type(s.menu_type, menu_index),
+        ))
+    DeliveryOrder.objects.bulk_create(orders)
+    return po
+
+
+@transaction.atomic
+def split_purchase_order(po, delivery_order_ids, new_delivery_date):
+    """Move whole DeliveryOrders out of ``po`` into a new PurchaseOrder with its
+    own delivery date. The new PO inherits kitchen/kind/product_type and links
+    back via ``split_from``. Returns the new PO (or None if nothing moved)."""
+    movers = list(
+        po.delivery_orders.filter(delivery_order_id__in=delivery_order_ids)
+    )
+    if not movers:
+        return None
+
+    # Next split sequence for this kitchen+date lineage.
+    root = po.split_from or po
+    seq = root.splits.count() + 2  # -S2, -S3, ...
+    po_number = _ensure_unique_po_number(
+        build_po_number(po.kind or None, new_delivery_date, po.kitchen, split_seq=seq)
+    )
+    new_po = PurchaseOrder.objects.create(
+        po_number=po_number,
+        kind=po.kind,
+        product_type=po.product_type,
+        delivery_date=new_delivery_date,
+        po_date=po_date_for_delivery(po.kind or None, new_delivery_date),
+        kitchen=po.kitchen,
+        delivery_company=po.delivery_company,
+        status=PurchaseOrderStatus.DRAFT,
+        split_from=root,
+    )
+    for do in movers:
+        do.purchase_order = new_po
+        do.expected_delivery_date = new_delivery_date
+        do.save(update_fields=["purchase_order", "expected_delivery_date", "updated_at"])
+    return new_po
+
+
+# ---------------------------------------------------------------------------
+# Kitchen export (CSV sent to the kitchen when a PO is dispatched)
+# ---------------------------------------------------------------------------
+
+# Boxes export columns, in order.
+_BOX_EXPORT_HEADERS = [
+    "Delivery Date", "OrderID", "HouseholdID", "MemberID", "Name",
+    "Address 1", "Address 2", "City", "State", "Postal",
+    "MenuType", "FOOD NOTE", "Email address", "Phone",
+]
+
+
+def _slug(value):
+    """Filename-safe token: alnum + dashes, collapsed."""
+    return re.sub(r"[^A-Za-z0-9]+", "-", (value or "").strip()).strip("-") or "NA"
+
+
+def _member_address(client):
+    """Best delivery address for a client: prefer DELIVERY, then CURRENT/HOME,
+    then any. Returns an Address or None."""
+    if client is None:
+        return None
+    addrs = list(client.addresses.all())
+    if not addrs:
+        return None
+    by_type = {a.type: a for a in addrs}
+    for t in (AddressType.DELIVERY, AddressType.CURRENT, AddressType.HOME):
+        if t in by_type:
+            return by_type[t]
+    return addrs[0]
+
+
+# Values that carry no dietary information and should be dropped from the note
+# (codes or stored display labels), matched case-insensitively.
+_NONE_LIKE = {"none", "no restrictions", "norestrictions", "n/a", "na"}
+
+
+def _food_note(client):
+    """Human-readable dietary note from the member's latest dietary profile:
+    restrictions + allergies (labels) + free-text other restrictions. Drops
+    "none"-like placeholders and de-duplicates while preserving order."""
+    if client is None:
+        return ""
+    prof = (
+        MemberDietaryProfile.objects.filter(client=client)
+        .order_by("-updated_at")
+        .first()
+    )
+    if prof is None:
+        return ""
+    parts = []
+    seen = set()
+
+    def add(label):
+        text = (label or "").strip()
+        key = text.lower()
+        if not text or key in _NONE_LIKE or key in seen:
+            return
+        seen.add(key)
+        parts.append(text)
+
+    for code in (prof.dietary_restrictions or []):
+        add(_DIETARY_LABELS.get(code, code))
+    for code in (prof.food_allergies or []):
+        add(_ALLERGY_LABELS.get(code, code))
+    if (prof.other_dietary_restrictions or "").strip():
+        add(prof.other_dietary_restrictions)
+    return "; ".join(parts)
+
+
+def kitchen_export_filename(po):
+    """e.g. PO-BOX-2026-W27-K01_ENG.csv — includes PO number + kitchen."""
+    po_part = _slug(po.po_number or str(po.pk))
+    kitchen_part = _slug(po.kitchen.name if po.kitchen else "Unassigned")
+    return f"{po_part}_{kitchen_part}.csv"
+
+
+def _household_label(household):
+    """Human-readable household identifier for exports: the household's name if
+    set, otherwise a short ``HH-XXXXXXXX`` code derived from its UUID (members of
+    the same household share this, so the kitchen can group their food)."""
+    if household is None:
+        return ""
+    if (household.name or "").strip():
+        return household.name.strip()
+    return f"HH-{household.household_id.hex[:8].upper()}"
+
+
+def build_kitchen_export_rows(po):
+    """Header + per-delivery-order rows for ``po``'s kitchen export."""
+    orders = (
+        po.delivery_orders.select_related("member", "group", "menu_type")
+        .prefetch_related("member__addresses")
+        .order_by("group_id", "member__last_name", "member__first_name")
+    )
+    rows = []
+    for do in orders:
+        c = do.member
+        addr = _member_address(c)
+        name = (
+            f"{c.first_name} {c.last_name}".strip() if c else ""
+        )
+        rows.append([
+            do.expected_delivery_date.isoformat() if do.expected_delivery_date else "",
+            str(do.delivery_order_id),
+            _household_label(do.group),
+            str(c.client_id) if c else "",
+            name,
+            addr.street if addr else "",
+            "",  # Address 2 — not modeled separately today
+            addr.city if addr else "",
+            addr.state if addr else "",
+            addr.zip if addr else "",
+            do.menu_type.name if do.menu_type else "",
+            _food_note(c),
+            c.client_email_address if c else "",
+            c.client_phone_number if c else "",
+        ])
+    return _BOX_EXPORT_HEADERS, rows
+
+
+def build_kitchen_export_csv(po):
+    """Return ``(filename, csv_text)`` for ``po``'s kitchen export."""
+    headers, rows = build_kitchen_export_rows(po)
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(headers)
+    writer.writerows(rows)
+    return kitchen_export_filename(po), buf.getvalue()

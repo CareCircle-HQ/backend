@@ -38,8 +38,12 @@ from .views_places import (
 )
 from .views_orders import (
     DeliveryCompaniesListView,
+    KitchenExportView,
     KitchensListView,
     PurchaseOrderDeliveryOrdersView,
+    PurchaseOrderGenerateView,
+    PurchaseOrderPreviewView,
+    PurchaseOrderSplitView,
     PurchaseOrdersStatsView,
     PurchaseOrdersView,
     SendToDeliveryView,
@@ -118,8 +122,12 @@ urlpatterns = [
     # Orders (global purchase orders)
     path("purchase-orders/", PurchaseOrdersView.as_view(), name="portal-purchase-orders"),
     path("purchase-orders/stats/", PurchaseOrdersStatsView.as_view()),
+    path("purchase-orders/preview/", PurchaseOrderPreviewView.as_view()),
+    path("purchase-orders/generate/", PurchaseOrderGenerateView.as_view()),
+    path("purchase-orders/<uuid:po_id>/split/", PurchaseOrderSplitView.as_view()),
     path("purchase-orders/<uuid:po_id>/delivery-orders/", PurchaseOrderDeliveryOrdersView.as_view()),
     path("purchase-orders/<uuid:po_id>/send-to-kitchen/", SendToKitchenView.as_view()),
+    path("purchase-orders/<uuid:po_id>/kitchen-export/", KitchenExportView.as_view()),
     path("purchase-orders/<uuid:po_id>/send-to-delivery/", SendToDeliveryView.as_view()),
     path("kitchens/", KitchensListView.as_view(), name="portal-kitchens"),
     path("delivery-companies/", DeliveryCompaniesListView.as_view(), name="portal-delivery-companies"),

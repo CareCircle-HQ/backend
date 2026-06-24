@@ -35,6 +35,7 @@ from ..services.delivery import (
     current_household_cadence,
     update_household_cadence,
 )
+from ..services.orders import generate_delivery_calendar
 from ..services.kitchens import kitchen_options
 from ..services.lifecycle import advance_enrollment
 from .base import PortalAPIView, PortalGenericAPIView, current_agent
@@ -672,6 +673,10 @@ class MemberAssignKitchenView(PortalAPIView):
             enr, case=case, cadence=cadence, once_a_week_weekday=once_weekday,
             kitchen=kitchen, member_quantities=member_quantities,
         )
+
+        # Expand the per-member plans into the dated delivery calendar
+        # (OrderSchedule) so the household shows up for PO generation.
+        generate_delivery_calendar(enr)
 
         advance_enrollment(
             enr, EnrollmentStage.SERVICE_ACTIVE, force=True,

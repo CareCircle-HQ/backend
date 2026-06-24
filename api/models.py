@@ -1887,6 +1887,14 @@ class OrderSchedule(models.Model):
         related_name="orders",
     )
     household_group_code = models.CharField(max_length=20, db_index=True)
+    # Snapshot of the household's DEFAULT (assigned) kitchen at calendar
+    # generation. Used to aggregate the delivery calendar into purchase orders
+    # by kitchen. The ACTUAL kitchen a delivery is fulfilled by lives on the
+    # DeliveryOrder (it may be rerouted at PO time); this stays the default.
+    kitchen = models.ForeignKey(
+        "Kitchen", on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="order_schedules",
+    )
     status = models.CharField(
         max_length=20, choices=OrderStatus.choices,
         default=OrderStatus.SCHEDULED, db_index=True,
@@ -2932,8 +2940,29 @@ class PurchaseOrder(models.Model):
     purchase_order_id = models.UUIDField(
         primary_key=True, default=uuid.uuid4, editable=False
     )
-    # Planned fulfillment date.
+    # Human-readable, unique business key, e.g. "PO-MEALS-2026-W26-THU-K01" or
+    # "PO-BOX-2026-W26-K01". The UUID above stays the real primary key.
+    po_number = models.CharField(max_length=64, blank=True, unique=True, null=True)
+    # Which product this PO is for. ``kind`` is the coarse Meals/Boxes split;
+    # ``product_type`` pins the exact ProductType (kind + cadence).
+    kind = models.CharField(
+        max_length=20, choices=ProductTypeKind.choices, blank=True
+    )
+    product_type = models.ForeignKey(
+        ProductType, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="purchase_orders",
+    )
+    # Planned fulfillment (delivery) date.
     delivery_date = models.DateField(null=True, blank=True)
+    # The PO/cutoff date the order is placed on (distinct from delivery_date),
+    # derived from the product's PO->delivery weekday schedule.
+    po_date = models.DateField(null=True, blank=True)
+    # When this PO was split off another (e.g. a kitchen could only fulfil part
+    # of the batch on the original date). Null for originally-generated POs.
+    split_from = models.ForeignKey(
+        "self", on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="splits",
+    )
     status = models.CharField(
         max_length=20,
         choices=PurchaseOrderStatus.choices,
@@ -3011,6 +3040,9 @@ class DeliveryOrder(models.Model):
     )
     expected_delivery_date = models.DateField(null=True, blank=True)
     delivered_at = models.DateTimeField(null=True, blank=True)
+    # The ACTUAL kitchen fulfilling this delivery. Defaults to the household's
+    # assigned kitchen but may be rerouted at PO time (load balancing) for this
+    # delivery only — the household preference is never mutated.
     kitchen = models.ForeignKey(
         Kitchen,
         on_delete=models.SET_NULL,
@@ -3018,6 +3050,18 @@ class DeliveryOrder(models.Model):
         blank=True,
         related_name="delivery_orders",
     )
+    # The household's default/assigned kitchen at PO time, kept so the UI can
+    # show "rerouted from X". Equals ``kitchen`` unless rerouted.
+    default_kitchen = models.ForeignKey(
+        Kitchen,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="default_delivery_orders",
+    )
+    # True when ``kitchen`` differs from ``default_kitchen`` (load-balanced to a
+    # different capable kitchen for this delivery).
+    rerouted = models.BooleanField(default=False)
     menu_type = models.ForeignKey(
         MenuType,
         on_delete=models.SET_NULL,

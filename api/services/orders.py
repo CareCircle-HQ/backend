@@ -145,7 +145,7 @@ def generate_delivery_calendar(enrollment):
 
     schedules = list(
         enrollment.delivery_schedules.filter(status=ScheduleStatus.SCHEDULED)
-        .select_related("member_profile", "member_profile__client")
+        .select_related("member_profile", "member_profile__client", "kitchen")
     )
     if not schedules:
         return []
@@ -171,6 +171,7 @@ def generate_delivery_calendar(enrollment):
                     anticipated_delivery_date=d,
                     household=enrollment.household,
                     household_group_code=group_code,
+                    kitchen=sched.kitchen,
                     status=OrderStatus.SCHEDULED,
                     delivery_address=address_text,
                     allergies=list(getattr(m, "food_allergies", []) or []),

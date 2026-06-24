@@ -2,21 +2,42 @@
 orders, and the send-to-kitchen / send-to-delivery actions."""
 
 from django.db.models import Q
+from django.http import HttpResponse
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from rest_framework import status as http
 from rest_framework.response import Response
 
+from datetime import date as _date
+
 from ..models import (
     DeliveryCompany,
     DeliveryOrder,
+    DeliveryOrderStatus,
     Kitchen,
+    ProductTypeKind,
     PurchaseOrder,
     PurchaseOrderDeliveryStatus,
     PurchaseOrderKitchenStatus,
 )
+from ..services.purchase_orders import (
+    build_kitchen_export_csv,
+    generate_purchase_order,
+    preview_purchase_orders,
+    split_purchase_order,
+)
 from .base import PortalAPIView, PortalGenericAPIView
 from . import serializers as s
+
+
+def _parse_date(value):
+    """Parse an ISO date string (YYYY-MM-DD); return None on failure."""
+    if not value:
+        return None
+    try:
+        return _date.fromisoformat(str(value)[:10])
+    except (TypeError, ValueError):
+        return None
 
 PO_PREFETCH = ("delivery_orders", "kitchen", "delivery_company")
 
@@ -103,8 +124,30 @@ class SendToKitchenView(PortalAPIView):
         if po.status == "draft":
             po.status = "confirmed"
         po.save(update_fields=["kitchen_status", "sent_to_kitchen_at", "status", "updated_at"])
+        # Advance each line item so the kitchen-prepared orders are flagged
+        # ready to hand off to the delivery company. Only move items still in
+        # the initial PENDING state to avoid overriding later lifecycle states.
+        po.delivery_orders.filter(status=DeliveryOrderStatus.PENDING).update(
+            status=DeliveryOrderStatus.READY_FOR_DELIVERY,
+            updated_at=timezone.now(),
+        )
         po = PurchaseOrder.objects.prefetch_related(*PO_PREFETCH).get(pk=po.pk)
         return Response(s.PortalPurchaseOrderSerializer(po).data)
+
+
+class KitchenExportView(PortalAPIView):
+    """Download the kitchen export CSV for a PO (the file handed to the kitchen
+    when the PO is dispatched). Filename embeds the PO number + kitchen."""
+
+    def get(self, request, po_id):
+        po = get_object_or_404(
+            PurchaseOrder.objects.select_related("kitchen"), pk=po_id
+        )
+        filename, csv_text = build_kitchen_export_csv(po)
+        resp = HttpResponse(csv_text, content_type="text/csv")
+        resp["Content-Disposition"] = f'attachment; filename="{filename}"'
+        resp["X-Export-Filename"] = filename
+        return resp
 
 
 class SendToDeliveryView(PortalAPIView):
@@ -132,4 +175,77 @@ class DeliveryCompaniesListView(PortalAPIView):
         companies = DeliveryCompany.objects.all().order_by("name")
         return Response(
             [{"id": str(c.pk), "name": c.name, "status": c.status} for c in companies]
+        )
+
+
+def _parse_kind(value):
+    value = (value or "").strip().lower()
+    if value in (ProductTypeKind.MEALS, ProductTypeKind.BOXES):
+        return value
+    return None
+
+
+class PurchaseOrderPreviewView(PortalAPIView):
+    """Aggregate the delivery calendar for a (kind, delivery_date) into a
+    per-kitchen / per-menu-type breakdown with capacity, ready to turn into POs."""
+
+    def get(self, request):
+        kind = _parse_kind(request.query_params.get("kind"))
+        delivery_date = _parse_date(request.query_params.get("delivery_date"))
+        if kind is None or delivery_date is None:
+            return Response(
+                {"detail": "kind (meals|boxes) and delivery_date (YYYY-MM-DD) are required."},
+                status=http.HTTP_400_BAD_REQUEST,
+            )
+        return Response(preview_purchase_orders(kind, delivery_date))
+
+
+class PurchaseOrderGenerateView(PortalAPIView):
+    """Create one PO for a kitchen on a delivery date from selected member
+    schedules (the agent's % / subset selection)."""
+
+    def post(self, request):
+        kind = _parse_kind(request.data.get("kind"))
+        delivery_date = _parse_date(request.data.get("delivery_date"))
+        kitchen_id = request.data.get("kitchen_id") or None
+        schedule_ids = request.data.get("schedule_ids") or []
+        if kind is None or delivery_date is None or not schedule_ids:
+            return Response(
+                {"detail": "kind, delivery_date and schedule_ids are required."},
+                status=http.HTTP_400_BAD_REQUEST,
+            )
+        kitchen = Kitchen.objects.filter(pk=kitchen_id).first() if kitchen_id else None
+        po = generate_purchase_order(kind, delivery_date, kitchen, schedule_ids)
+        if po is None:
+            return Response(
+                {"detail": "No eligible schedules to batch (already ordered?)."},
+                status=http.HTTP_409_CONFLICT,
+            )
+        po = PurchaseOrder.objects.prefetch_related(*PO_PREFETCH).get(pk=po.pk)
+        return Response(
+            s.PortalPurchaseOrderSerializer(po).data, status=http.HTTP_201_CREATED
+        )
+
+
+class PurchaseOrderSplitView(PortalAPIView):
+    """Move selected DeliveryOrders out of a PO into a new PO on another date."""
+
+    def post(self, request, po_id):
+        po = get_object_or_404(PurchaseOrder, pk=po_id)
+        new_date = _parse_date(request.data.get("delivery_date"))
+        delivery_order_ids = request.data.get("delivery_order_ids") or []
+        if new_date is None or not delivery_order_ids:
+            return Response(
+                {"detail": "delivery_date and delivery_order_ids are required."},
+                status=http.HTTP_400_BAD_REQUEST,
+            )
+        new_po = split_purchase_order(po, delivery_order_ids, new_date)
+        if new_po is None:
+            return Response(
+                {"detail": "No matching delivery orders to move."},
+                status=http.HTTP_400_BAD_REQUEST,
+            )
+        new_po = PurchaseOrder.objects.prefetch_related(*PO_PREFETCH).get(pk=new_po.pk)
+        return Response(
+            s.PortalPurchaseOrderSerializer(new_po).data, status=http.HTTP_201_CREATED
         )

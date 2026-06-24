@@ -596,13 +596,17 @@ class PortalPurchaseOrderSerializer(serializers.ModelSerializer):
     delivery_company_name = serializers.SerializerMethodField()
     counts = serializers.SerializerMethodField()
 
+    kind_label = serializers.CharField(source="get_kind_display", read_only=True)
+    split_from_id = serializers.UUIDField(read_only=True)
+
     class Meta:
         model = PurchaseOrder
         fields = [
-            "id", "delivery_date", "created_at", "sent_to_kitchen_at",
+            "id", "po_number", "kind", "kind_label", "delivery_date", "po_date",
+            "created_at", "sent_to_kitchen_at",
             "sent_to_delivery_at", "status", "status_label", "kitchen_status",
             "kitchen_status_label", "delivery_status", "delivery_status_label",
-            "kitchen_name", "delivery_company_name", "counts",
+            "kitchen_name", "delivery_company_name", "split_from_id", "counts",
         ]
 
     def get_kitchen_name(self, obj):
