@@ -7,17 +7,22 @@ from .models import (
     AgentLoginCode,
     AllowedZipCode,
     Assessment,
+    CadenceRule,
     Case,
     Client,
     EnrollmentVerification,
     Household,
     HouseholdMember,
+    HouseholdMemberLoginCode,
     IdentifiedSocialNeed,
     ImportRun,
     Insurance,
-    MemberVerification,
+    Lead,
+    MemberDeliverySchedule,
+    MemberDietaryProfile,
     MilitaryProfile,
     Note,
+    ProductType,
     Program,
     ProgramMainCategory,
     ProgramPipeline,
@@ -26,6 +31,7 @@ from .models import (
     Service,
     SocialCareCoverage,
     Ticket,
+    TicketType,
     TimelineEvent,
     UniteUsCredential,
     VerifiedSocialNeed,
@@ -52,8 +58,8 @@ class SocialCareCoverageInline(admin.TabularInline):
     extra = 0
 
 
-class MemberVerificationInline(admin.TabularInline):
-    model = MemberVerification
+class MemberDietaryProfileInline(admin.TabularInline):
+    model = MemberDietaryProfile
     extra = 0
     autocomplete_fields = ("client",)
 
@@ -88,7 +94,7 @@ class EnrollmentVerificationAdmin(admin.ModelAdmin):
     autocomplete_fields = ("client", "household")
     raw_id_fields = ("case", "delivery_address")
     readonly_fields = ("opened_at", "stage_at", "closed_at")
-    inlines = (MemberVerificationInline,)
+    inlines = (MemberDietaryProfileInline,)
 
 
 @admin.register(Client)
@@ -163,6 +169,74 @@ class ProgramMainCategoryAdmin(admin.ModelAdmin):
     ordering = ("name",)
 
 
+@admin.register(ProductType)
+class ProductTypeAdmin(admin.ModelAdmin):
+    list_display = (
+        "type",
+        "prod_per_delivery",
+        "delivery_days_cadence",
+        "created_at",
+        "updated_at",
+    )
+    list_filter = ("type", "delivery_days_cadence")
+    search_fields = ("type", "delivery_days_cadence")
+    readonly_fields = ("product_type_id", "created_at", "updated_at")
+    ordering = ("type",)
+
+
+@admin.register(CadenceRule)
+class CadenceRuleAdmin(admin.ModelAdmin):
+    list_display = (
+        "product_kind",
+        "accepted_weekday",
+        "cadence",
+        "delivery_weekdays",
+        "po_weekdays",
+        "first_delivery_weekday",
+        "is_active",
+    )
+    list_filter = ("product_kind", "cadence", "is_active")
+    ordering = ("product_kind", "accepted_weekday")
+    readonly_fields = ("created_at", "updated_at")
+
+
+@admin.register(MemberDeliverySchedule)
+class MemberDeliveryScheduleAdmin(admin.ModelAdmin):
+    list_display = (
+        "id",
+        "member_name",
+        "enrollment",
+        "program",
+        "product_type",
+        "delivery_days_cadence",
+        "prod_per_delivery",
+        "meals_boxes_total",
+        "menu_type",
+        "status",
+        "starts_on",
+        "ends_on",
+        "created_at",
+    )
+    list_filter = ("status", "delivery_days_cadence", "menu_type", "product_type")
+    search_fields = (
+        "member_name",
+        "enrollment__code",
+        "enrollment__client__client_id",
+        "program__name",
+    )
+    autocomplete_fields = (
+        "enrollment",
+        "household_member",
+        "program",
+        "product_type",
+    )
+    # MemberDietaryProfile has no registered ModelAdmin (only an inline), so it
+    # can't be an autocomplete target; use a raw id widget instead.
+    raw_id_fields = ("member_profile",)
+    readonly_fields = ("created_at", "updated_at")
+    ordering = ("-created_at",)
+
+
 @admin.register(Program)
 class ProgramAdmin(admin.ModelAdmin):
     list_display = ("program_id", "name", "main_category", "provider")
@@ -226,10 +300,29 @@ class HouseholdAdmin(admin.ModelAdmin):
 
 @admin.register(HouseholdMember)
 class HouseholdMemberAdmin(admin.ModelAdmin):
-    list_display = ("client", "household", "is_primary", "relationship", "added_at")
+    list_display = (
+        "client", "household", "is_primary", "relationship",
+        "mobile_app_username", "added_at",
+    )
     list_filter = ("is_primary",)
-    search_fields = ("client__client_id", "client__last_name", "household__name")
+    search_fields = (
+        "client__client_id", "client__last_name", "household__name",
+        "mobile_app_username",
+    )
     autocomplete_fields = ("client", "household")
+
+
+@admin.register(HouseholdMemberLoginCode)
+class HouseholdMemberLoginCodeAdmin(admin.ModelAdmin):
+    # Plaintext codes are never stored (only code_hash). Useful for auditing
+    # member-app 2FA requests/usage.
+    list_display = (
+        "mobile_number", "member", "created_at", "expires_at",
+        "consumed_at", "attempts",
+    )
+    search_fields = ("mobile_number",)
+    readonly_fields = ("code_hash", "created_at")
+    ordering = ("-created_at",)
 
 
 class IdentifiedSocialNeedInline(admin.TabularInline):
@@ -359,6 +452,15 @@ class NoteAdmin(SimpleHistoryAdmin):
     autocomplete_fields = ("client", "case")
 
 
+@admin.register(TicketType)
+class TicketTypeAdmin(admin.ModelAdmin):
+    list_display = ("label", "code", "default_severity", "is_active", "updated_at")
+    list_filter = ("is_active", "default_severity")
+    search_fields = ("code", "label", "description")
+    readonly_fields = ("ticket_type_id", "created_at", "updated_at")
+    ordering = ("label",)
+
+
 @admin.register(Ticket)
 class TicketAdmin(SimpleHistoryAdmin):
     list_display = (
@@ -366,8 +468,27 @@ class TicketAdmin(SimpleHistoryAdmin):
         "assigned_to", "created_at",
     )
     list_filter = ("status", "type", "severity")
+    list_select_related = ("type", "client", "case", "assigned_to")
     search_fields = ("reason",)
-    autocomplete_fields = ("client", "case", "assigned_to", "import_run")
+    autocomplete_fields = ("type", "client", "case", "assigned_to", "import_run")
+
+
+@admin.register(Lead)
+class LeadAdmin(admin.ModelAdmin):
+    list_display = (
+        "lead_id", "first_name", "last_name", "phone_number", "email",
+        "zip_code", "medicaid_enrollment", "status", "assigned_to",
+        "converted_client", "do_not_contact", "created_at",
+    )
+    list_filter = (
+        "status", "medicaid_enrollment", "do_not_contact",
+        "disclaimer_accepted", "preferred_contact_method",
+    )
+    search_fields = ("first_name", "last_name", "phone_number", "email", "zip_code")
+    autocomplete_fields = ("assigned_to", "converted_client")
+    filter_horizontal = ("interested_programs",)
+    readonly_fields = ("lead_id", "disclaimer_accepted_at", "created_at", "updated_at")
+    ordering = ("-created_at",)
 
 
 @admin.register(TimelineEvent)

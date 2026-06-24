@@ -128,6 +128,7 @@ _ENROLLMENT_DRIVES = {
     EnrollmentStage.WAITING_AUTHORIZATION: ClientStage.WAITING_AUTHORIZATION,
     EnrollmentStage.DENIED: ClientStage.WAITING_AUTHORIZATION,
     EnrollmentStage.AUTHORIZED: ClientStage.AUTHORIZED,
+    EnrollmentStage.KITCHEN_ASSIGNMENT: ClientStage.KITCHEN_ASSIGNMENT,
     EnrollmentStage.SERVICE_ACTIVE: ClientStage.ACTIVE,
     EnrollmentStage.SERVICE_COMPLETE: ClientStage.COMPLETED,
 }
@@ -145,15 +146,49 @@ _ENROLLMENT_RANK = {
     EnrollmentStage.WAITING_AUTHORIZATION: 5,
     EnrollmentStage.DENIED: 5,
     EnrollmentStage.AUTHORIZED: 6,
-    EnrollmentStage.SERVICE_ACTIVE: 7,
-    EnrollmentStage.SERVICE_COMPLETE: 8,
+    EnrollmentStage.KITCHEN_ASSIGNMENT: 7,
+    EnrollmentStage.SERVICE_ACTIVE: 8,
+    EnrollmentStage.SERVICE_COMPLETE: 9,
 }
+
+
+def _governing_enrollments(client):
+    """Enrollments that govern this client's lifecycle stage.
+
+    A verification applies to the WHOLE household, so a client is governed by:
+
+    * their own enrollments (where they are the primary), and
+    * every enrollment of the household they belong to (as a non-primary
+      member).
+
+    That lets every household member inherit the household enrollment's stage,
+    so they all move together — to Pending Verification when a verification is
+    requested, and to Verified / Active when it completes — not just the primary.
+    """
+    seen = {e.pk: e for e in client.enrollments.all()}
+
+    # Household enrollments: the client participates via their household
+    # membership. The household's members are the source of truth, so a member
+    # is governed even before a per-member MemberDietaryProfile row exists.
+    membership = getattr(client, "household_membership", None)
+    if membership is not None:
+        for enr in membership.household.enrollment_verifications.all():
+            seen.setdefault(enr.pk, enr)
+
+    # Also honor any MemberDietaryProfile linking the client to an enrollment
+    # whose household they aren't a (current) member of (defensive: e.g.
+    # membership changed after the row was written).
+    for mp in client.member_profiles.select_related("enrollment").all():
+        enr = mp.enrollment
+        if enr is not None:
+            seen.setdefault(enr.pk, enr)
+    return list(seen.values())
 
 
 def _primary_enrollment(client):
     """The enrollment that governs the client's stage: the most-advanced one,
     tie-broken by most-recent stage change. None when the client has none."""
-    enrollments = list(client.enrollments.all())
+    enrollments = _governing_enrollments(client)
     if not enrollments:
         return None
 
@@ -223,6 +258,54 @@ def recompute_client_stage(client, *, actor=None, save=True):
     return target
 
 
+def _enrollment_participant_clients(enrollment):
+    """The clients governed by ``enrollment``: every member of its household,
+    plus anyone linked through a MemberDietaryProfile row (defensive).
+
+    Falls back to the MemberDietaryProfile rows when the enrollment has no
+    household (older/individual enrollments).
+    """
+    clients = {}
+    household = enrollment.household
+    if household is not None:
+        for hm in household.members.select_related("client").all():
+            if hm.client_id:
+                clients[hm.client_id] = hm.client
+    for mp in enrollment.member_profiles.select_related("client").all():
+        if mp.client_id:
+            clients.setdefault(mp.client_id, mp.client)
+    return list(clients.values())
+
+
+def _recompute_household_members(enrollment, *, actor=None, exclude_client_id=None):
+    """Recompute the lifecycle stage of every participant in ``enrollment``
+    other than ``exclude_client_id`` (usually the primary, which the caller has
+    already handled).
+
+    The whole household is verified/served under one enrollment, so when the
+    enrollment advances each participating member must advance with it — e.g.
+    all members go to Pending Verification when the verification is requested,
+    and all become Active when the household is placed in service, not just the
+    primary.
+    """
+    for client in _enrollment_participant_clients(enrollment):
+        if client is None or client.pk == exclude_client_id:
+            continue
+        recompute_client_stage(client, actor=actor)
+
+
+def recompute_enrollment_household(enrollment, *, actor=None):
+    """Recompute the lifecycle stage for the enrollment's primary client AND
+    every household participant, so the whole group tracks the enrollment stage
+    together. Safe to call on creation (Pending Verification) and on every
+    stage change."""
+    if enrollment.client_id:
+        recompute_client_stage(enrollment.client, actor=actor)
+    _recompute_household_members(
+        enrollment, actor=actor, exclude_client_id=enrollment.client_id
+    )
+
+
 # ---------------------------------------------------------------------------
 # Service delivery (Enrollment.stage)
 # ---------------------------------------------------------------------------
@@ -249,17 +332,25 @@ ENROLLMENT_TRANSITIONS = {
     EnrollmentStage.VERIFIED: {
         EnrollmentStage.WAITING_AUTHORIZATION,
         EnrollmentStage.AUTHORIZED,
+        EnrollmentStage.KITCHEN_ASSIGNMENT,
         EnrollmentStage.SERVICE_ACTIVE,
         EnrollmentStage.ON_HOLD,
         EnrollmentStage.CANCELLED,
     },
     EnrollmentStage.WAITING_AUTHORIZATION: {
         EnrollmentStage.AUTHORIZED,
+        EnrollmentStage.KITCHEN_ASSIGNMENT,
         EnrollmentStage.DENIED,
         EnrollmentStage.ON_HOLD,
         EnrollmentStage.CANCELLED,
     },
     EnrollmentStage.AUTHORIZED: {
+        EnrollmentStage.KITCHEN_ASSIGNMENT,
+        EnrollmentStage.SERVICE_ACTIVE,
+        EnrollmentStage.ON_HOLD,
+        EnrollmentStage.CANCELLED,
+    },
+    EnrollmentStage.KITCHEN_ASSIGNMENT: {
         EnrollmentStage.SERVICE_ACTIVE,
         EnrollmentStage.ON_HOLD,
         EnrollmentStage.CANCELLED,
@@ -284,6 +375,7 @@ ENROLLMENT_TRANSITIONS = {
         EnrollmentStage.VERIFIED,
         EnrollmentStage.WAITING_AUTHORIZATION,
         EnrollmentStage.AUTHORIZED,
+        EnrollmentStage.KITCHEN_ASSIGNMENT,
         EnrollmentStage.SERVICE_ACTIVE,
         EnrollmentStage.CANCELLED,
     },
@@ -379,17 +471,18 @@ def advance_enrollment(enrollment, to_stage, *, actor=None, note="", force=False
 
         logging.getLogger(__name__).exception("timeline.event_for_verification failed")
 
-    # Keep the client's lifecycle stage in sync with this enrollment's stage.
-    if enrollment.client_id:
-        recompute_client_stage(enrollment.client, actor=actor)
+    # Keep the whole household's lifecycle stage in sync with this enrollment:
+    # the primary AND every non-denied participant advance together (e.g. all
+    # members go Active when placed in service, not just the primary).
+    recompute_enrollment_household(enrollment, actor=actor)
     return enrollment
 
 
 # Case authorization status -> the enrollment stage it should drive the
 # enrollment to (only applied once the enrollment is past verification).
 _AUTH_STATUS_TO_STAGE = {
-    ServiceAuthorizationStatus.APPROVED: EnrollmentStage.AUTHORIZED,
-    ServiceAuthorizationStatus.NOT_REQUIRED: EnrollmentStage.AUTHORIZED,
+    ServiceAuthorizationStatus.APPROVED: EnrollmentStage.KITCHEN_ASSIGNMENT,
+    ServiceAuthorizationStatus.NOT_REQUIRED: EnrollmentStage.KITCHEN_ASSIGNMENT,
     ServiceAuthorizationStatus.DENIED: EnrollmentStage.DENIED,
     ServiceAuthorizationStatus.EXPIRED: EnrollmentStage.ON_HOLD,
     ServiceAuthorizationStatus.PENDING: EnrollmentStage.WAITING_AUTHORIZATION,

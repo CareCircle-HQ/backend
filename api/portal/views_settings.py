@@ -10,8 +10,10 @@ from ..models import (
     DeliveryCompany,
     DeliveryCompanyIntegration,
     DietaryTag,
+    DietaryTagType,
     Kitchen,
     KitchenIntegration,
+    KitchenMenuType,
     MenuType,
     MenuTypeTag,
 )
@@ -65,13 +67,47 @@ class DietaryTagViewSet(viewsets.ModelViewSet):
 
 class KitchenViewSet(viewsets.ModelViewSet):
     permission_classes = [IsPortalAgent]
-    queryset = Kitchen.objects.all().prefetch_related("menu_types", "integrations")
+    queryset = Kitchen.objects.all().prefetch_related(
+        "menu_types",
+        "integrations",
+        "kitchen_menu_types__menu_type",
+        "kitchen_menu_types__restrictions",
+    )
     serializer_class = s.PortalKitchenSerializer
 
     @action(detail=True, methods=["put"], url_path="menu-types")
     def menu_types(self, request, pk=None):
         kitchen = self.get_object()
         kitchen.menu_types.set(request.data.get("menu_type_ids", []))
+        kitchen.refresh_from_db()
+        return Response(self.get_serializer(kitchen).data)
+
+    @action(detail=True, methods=["put"], url_path="menu-type-config")
+    def menu_type_config(self, request, pk=None):
+        """Set the per-kitchen price and unmanageable allergies for ONE offered
+        menu type. Body: {menu_type_id, price?, restriction_tag_ids?}.
+
+        Only DietaryTags of type ``allergy`` are accepted as restrictions."""
+        kitchen = self.get_object()
+        mt_id = request.data.get("menu_type_id")
+        kmt = (
+            KitchenMenuType.objects.filter(kitchen=kitchen, menu_type_id=mt_id)
+            .first()
+        )
+        if kmt is None:
+            return Response(
+                {"error": "This kitchen does not offer that menu type."},
+                status=http.HTTP_404_NOT_FOUND,
+            )
+        if "price" in request.data:
+            kmt.menu_type_price = request.data.get("price") or None
+            kmt.save(update_fields=["menu_type_price"])
+        if "restriction_tag_ids" in request.data:
+            tags = DietaryTag.objects.filter(
+                pk__in=request.data.get("restriction_tag_ids") or [],
+                type=DietaryTagType.ALLERGY,
+            )
+            kmt.restrictions.set(tags)
         kitchen.refresh_from_db()
         return Response(self.get_serializer(kitchen).data)
 

@@ -5,13 +5,25 @@ from rest_framework.routers import SimpleRouter
 
 from .auth import PortalRequestCodeView, PortalVerifyCodeView
 from .views_dashboard import DashboardView
+from .views_leads import (
+    PortalLeadDetailView,
+    PortalLeadNotesView,
+    PortalLeadsView,
+    PortalProgramCategoriesView,
+    PortalScreenersView,
+)
 from .views_members import (
     HouseholdMemberEditView,
+    MemberAssignKitchenView,
+    MemberCadenceView,
+    MemberCasesView,
     MemberDetailView,
     MemberHistoryDetailView,
     MemberHistoryView,
     MemberHouseholdView,
     MemberInsuranceView,
+    MemberKitchenOptionsView,
+    MemberKitchenView,
     MemberNotesView,
     MemberOrdersView,
     MemberSocialCoverageView,
@@ -20,10 +32,20 @@ from .views_members import (
     MembersListView,
     MembersStatsView,
 )
+from .views_places import (
+    PortalPlacesAutocompleteView,
+    PortalPlacesDetailsView,
+)
 from .views_orders import (
     DeliveryCompaniesListView,
+    KitchenExportView,
     KitchensListView,
     PurchaseOrderDeliveryOrdersView,
+    PurchaseOrderGenerateView,
+    PurchaseOrderPreviewView,
+    PurchaseOrderReportDataView,
+    PurchaseOrderReportView,
+    PurchaseOrderSplitView,
     PurchaseOrdersStatsView,
     PurchaseOrdersView,
     SendToDeliveryView,
@@ -43,6 +65,7 @@ from .views_tickets import (
     TicketDetailView,
     TicketNotesView,
     TicketsStatsView,
+    TicketTypesListView,
     WorkQueueView,
 )
 
@@ -73,22 +96,42 @@ urlpatterns = [
         "members/<uuid:client_id>/household/members/<int:member_id>/",
         HouseholdMemberEditView.as_view(),
     ),
+    # Logistics / kitchen assignment
+    path("members/<uuid:client_id>/kitchen-options/", MemberKitchenOptionsView.as_view()),
+    path("members/<uuid:client_id>/assign-kitchen/", MemberAssignKitchenView.as_view()),
+    path("members/<uuid:client_id>/kitchen/", MemberKitchenView.as_view()),
+    path("members/<uuid:client_id>/cadence/", MemberCadenceView.as_view()),
     path("members/<uuid:client_id>/notes/", MemberNotesView.as_view()),
+    path("members/<uuid:client_id>/cases/", MemberCasesView.as_view()),
     path("members/<uuid:client_id>/tickets/", MemberTicketsView.as_view()),
     path("members/<uuid:client_id>/verification/", MemberVerificationCreateView.as_view()),
 
     # Work queue (global tickets)
     path("tickets/", WorkQueueView.as_view(), name="portal-tickets"),
+    path("tickets/types/", TicketTypesListView.as_view(), name="portal-ticket-types"),
     path("tickets/stats/", TicketsStatsView.as_view(), name="portal-tickets-stats"),
     path("tickets/<int:ticket_id>/", TicketDetailView.as_view(), name="portal-ticket-detail"),
     path("tickets/<int:ticket_id>/notes/", TicketNotesView.as_view()),
     path("agents/", AgentsListView.as_view(), name="portal-agents"),
 
+    # Leads (agent-created from the Work Queue + Leads page)
+    path("leads/", PortalLeadsView.as_view(), name="portal-leads"),
+    path("leads/<uuid:lead_id>/", PortalLeadDetailView.as_view(), name="portal-lead-detail"),
+    path("leads/<uuid:lead_id>/notes/", PortalLeadNotesView.as_view(), name="portal-lead-notes"),
+    path("screeners/", PortalScreenersView.as_view(), name="portal-screeners"),
+    path("program-categories/", PortalProgramCategoriesView.as_view(), name="portal-program-categories"),
+
     # Orders (global purchase orders)
     path("purchase-orders/", PurchaseOrdersView.as_view(), name="portal-purchase-orders"),
     path("purchase-orders/stats/", PurchaseOrdersStatsView.as_view()),
+    path("purchase-orders/preview/", PurchaseOrderPreviewView.as_view()),
+    path("purchase-orders/generate/", PurchaseOrderGenerateView.as_view()),
+    path("purchase-orders/<uuid:po_id>/split/", PurchaseOrderSplitView.as_view()),
     path("purchase-orders/<uuid:po_id>/delivery-orders/", PurchaseOrderDeliveryOrdersView.as_view()),
     path("purchase-orders/<uuid:po_id>/send-to-kitchen/", SendToKitchenView.as_view()),
+    path("purchase-orders/<uuid:po_id>/kitchen-export/", KitchenExportView.as_view()),
+    path("purchase-orders/<uuid:po_id>/report/", PurchaseOrderReportView.as_view()),
+    path("purchase-orders/<uuid:po_id>/report-data/", PurchaseOrderReportDataView.as_view()),
     path("purchase-orders/<uuid:po_id>/send-to-delivery/", SendToDeliveryView.as_view()),
     path("kitchens/", KitchensListView.as_view(), name="portal-kitchens"),
     path("delivery-companies/", DeliveryCompaniesListView.as_view(), name="portal-delivery-companies"),
@@ -106,6 +149,11 @@ urlpatterns = [
         "settings/delivery-company-integrations/<uuid:integration_id>/set-primary/",
         DeliveryCompanyIntegrationSetPrimaryView.as_view(),
     ),
+
+    # Google Places proxy — delivery-address autocomplete (mirrors the
+    # extension's doctor-address autocomplete; key stays server-side).
+    path("places/autocomplete/", PortalPlacesAutocompleteView.as_view(), name="portal-places-autocomplete"),
+    path("places/details/", PortalPlacesDetailsView.as_view(), name="portal-places-details"),
 
     # Dashboard
     path("dashboard/", DashboardView.as_view(), name="portal-dashboard"),

@@ -13,6 +13,8 @@ from rest_framework import serializers
 
 from ..models import (
     Address,
+    Case,
+    CaseType,
     DeliveryCompany,
     DeliveryCompanyIntegration,
     DeliveryOrder,
@@ -21,13 +23,17 @@ from ..models import (
     Insurance,
     Kitchen,
     KitchenIntegration,
-    MemberVerification,
+    KitchenMenuType,
+    KitchenProductType,
+    MemberDietaryProfile,
     MenuType,
     Note,
     PurchaseOrder,
+    ServiceAuthorizationStatus,
     SocialCareCoverage,
     Ticket,
     TicketNote,
+    TicketType,
     TimelineEvent,
 )
 
@@ -106,6 +112,48 @@ def active_enrollment(client):
     return sorted(pool, key=lambda e: e.opened_at or timezone.now(), reverse=True)[0]
 
 
+def primary_case(client):
+    """The case whose service authorization governs the client: the most
+    recently opened case that carries an authorization status, else the most
+    recent case. None when the client has no cases."""
+    cases = list(client.cases.all())
+    if not cases:
+        return None
+    with_auth = [c for c in cases if c.service_authorization_status]
+    pool = with_auth or cases
+    return sorted(pool, key=lambda c: c.date_opened or timezone.now(), reverse=True)[0]
+
+
+def internal_service_case(client):
+    """The client's Internal Service case — the one the verification and meal/box
+    delivery attach to. Prefers a case carrying an authorization status, else
+    the most recently opened one. None when there is no Internal Service case."""
+    cases = [
+        c for c in client.cases.all() if c.case_type == CaseType.INTERNAL_SERVICE
+    ]
+    if not cases:
+        return None
+    with_auth = [c for c in cases if c.service_authorization_status]
+    pool = with_auth or cases
+    return sorted(pool, key=lambda c: c.date_opened or timezone.now(), reverse=True)[0]
+
+
+def case_authorization(case):
+    """Read-only authorization snapshot for a case: normalized status, the raw
+    display label (e.g. "Accepted"), and whether it counts as accepted."""
+    if case is None:
+        return {"status": "", "status_label": "", "is_accepted": False}
+    status = case.service_authorization_status or ""
+    label = case.service_authorization_status_label or (
+        case.get_service_authorization_status_display() if status else ""
+    )
+    return {
+        "status": status,
+        "status_label": label,
+        "is_accepted": status == ServiceAuthorizationStatus.APPROVED,
+    }
+
+
 def is_insurance_expiring(plan):
     if plan.status != "active" or not plan.expired_at:
         return False
@@ -166,6 +214,7 @@ class MemberDetailSerializer(serializers.Serializer):
 
     def to_representation(self, client):
         ins = primary_insurance(client)
+        svc_case = internal_service_case(client)
         current_addr = next(
             (a for a in client.addresses.all() if a.type == "current"),
             next(iter(client.addresses.all()), None),
@@ -189,6 +238,17 @@ class MemberDetailSerializer(serializers.Serializer):
                 "stage_at": client.lifecycle_stage_at.isoformat()
                 if client.lifecycle_stage_at
                 else None,
+            },
+            # Read-only authorization status sourced from the client's case.
+            # Drives the (read-only) Authorization Status shown in the
+            # verification wizard's validation step.
+            "authorization": case_authorization(primary_case(client)),
+            # The Internal Service case the verification + delivery attach to.
+            # Its program name is shown (read-only) in the verification wizard.
+            "service": {
+                "program_name": svc_case.program_name if svc_case else "",
+                "service_type": svc_case.service_type if svc_case else "",
+                "case_id": str(svc_case.case_id) if svc_case else None,
             },
             "demographics": {
                 "gender": client.gender,
@@ -229,7 +289,7 @@ class MemberDetailSerializer(serializers.Serializer):
                 {
                     "kind": "ticket",
                     "severity": t.severity,
-                    "label": t.get_type_display(),
+                    "label": t.type.label,
                     "detail": t.reason,
                 }
             )
@@ -360,7 +420,8 @@ class PortalTicketNoteSerializer(serializers.ModelSerializer):
 class PortalTicketSerializer(serializers.ModelSerializer):
     id = serializers.IntegerField(source="pk", read_only=True)
     code = serializers.SerializerMethodField()
-    type_label = serializers.CharField(source="get_type_display", read_only=True)
+    type = serializers.SlugRelatedField(slug_field="code", read_only=True)
+    type_label = serializers.CharField(source="type.label", read_only=True)
     status_label = serializers.CharField(source="get_status_display", read_only=True)
     client_id = serializers.SerializerMethodField()
     client_name = serializers.SerializerMethodField()
@@ -395,8 +456,39 @@ class PortalTicketSerializer(serializers.ModelSerializer):
         return obj.assigned_to.name if obj.assigned_to else None
 
 
+class PortalTicketTypeSerializer(serializers.ModelSerializer):
+    id = serializers.UUIDField(source="ticket_type_id", read_only=True)
+
+    class Meta:
+        model = TicketType
+        fields = ["id", "code", "label", "description", "default_severity"]
+
+
+class PortalCaseOptionSerializer(serializers.ModelSerializer):
+    """Lightweight case row for the New-Ticket “related case” dropdown."""
+
+    id = serializers.UUIDField(source="case_id", read_only=True)
+    code = serializers.SerializerMethodField()
+    status = serializers.CharField(source="case_status", read_only=True)
+    status_label = serializers.CharField(source="get_case_status_display", read_only=True)
+    type_label = serializers.CharField(source="get_case_type_display", read_only=True)
+    date_opened = serializers.DateTimeField(read_only=True)
+
+    class Meta:
+        model = Case
+        fields = [
+            "id", "code", "status", "status_label", "type_label",
+            "service_type", "program_name", "date_opened",
+        ]
+
+    def get_code(self, obj):
+        return f"CSE-{str(obj.case_id)[:8]}"
+
+
 class PortalTicketCreateSerializer(serializers.Serializer):
-    type = serializers.ChoiceField(choices=[c[0] for c in Ticket._meta.get_field("type").choices])
+    type = serializers.SlugRelatedField(
+        slug_field="code", queryset=TicketType.objects.all()
+    )
     severity = serializers.ChoiceField(
         choices=["low", "medium", "high"], default="medium"
     )
@@ -404,6 +496,19 @@ class PortalTicketCreateSerializer(serializers.Serializer):
     client_id = serializers.UUIDField(required=False, allow_null=True)
     case_id = serializers.UUIDField(required=False, allow_null=True)
     assignee_id = serializers.UUIDField(required=False, allow_null=True)
+
+    def validate(self, attrs):
+        case_id = attrs.get("case_id")
+        if case_id:
+            case = Case.objects.filter(pk=case_id).first()
+            if case is None:
+                raise serializers.ValidationError({"case_id": "Unknown case."})
+            client_id = attrs.get("client_id")
+            if client_id and str(case.client_id) != str(client_id):
+                raise serializers.ValidationError(
+                    {"case_id": "Case does not belong to the selected member."}
+                )
+        return attrs
 
 
 # ---------------------------------------------------------------------------
@@ -491,13 +596,17 @@ class PortalPurchaseOrderSerializer(serializers.ModelSerializer):
     delivery_company_name = serializers.SerializerMethodField()
     counts = serializers.SerializerMethodField()
 
+    kind_label = serializers.CharField(source="get_kind_display", read_only=True)
+    split_from_id = serializers.UUIDField(read_only=True)
+
     class Meta:
         model = PurchaseOrder
         fields = [
-            "id", "delivery_date", "created_at", "sent_to_kitchen_at",
+            "id", "po_number", "kind", "kind_label", "delivery_date", "po_date",
+            "created_at", "sent_to_kitchen_at",
             "sent_to_delivery_at", "status", "status_label", "kitchen_status",
             "kitchen_status_label", "delivery_status", "delivery_status_label",
-            "kitchen_name", "delivery_company_name", "counts",
+            "kitchen_name", "delivery_company_name", "split_from_id", "counts",
         ]
 
     def get_kitchen_name(self, obj):
@@ -533,19 +642,19 @@ class PortalMemberOrderSerializer(PortalPurchaseOrderSerializer):
 # Household
 # ---------------------------------------------------------------------------
 class PortalHouseholdMemberSerializer(serializers.ModelSerializer):
-    """A member row in the household tab, sourced from MemberVerification."""
+    """A member row in the household tab, sourced from MemberDietaryProfile."""
 
     id = serializers.IntegerField(source="pk", read_only=True)
     client_id = serializers.SerializerMethodField()
     name = serializers.SerializerMethodField()
-    status_label = serializers.CharField(source="get_status_display", read_only=True)
+    mobile_number = serializers.SerializerMethodField()
 
     class Meta:
-        model = MemberVerification
+        model = MemberDietaryProfile
         fields = [
-            "id", "client_id", "name", "status", "status_label",
+            "id", "client_id", "name", "mobile_number",
             "dietary_restrictions", "food_allergies", "other_dietary_restrictions",
-            "meal_category", "menu_type",
+            "meal_category", "menu_type", "general_verification_notes",
         ]
 
     def get_client_id(self, obj):
@@ -553,6 +662,11 @@ class PortalHouseholdMemberSerializer(serializers.ModelSerializer):
 
     def get_name(self, obj):
         return obj.member_name or (_full_name(obj.client) if obj.client else "")
+
+    def get_mobile_number(self, obj):
+        # The member-app login number lives on the member's HouseholdMember row.
+        membership = getattr(obj.client, "household_membership", None) if obj.client_id else None
+        return (getattr(membership, "mobile_app_username", "") or "")
 
 
 class PortalAddressEditSerializer(serializers.Serializer):
@@ -570,6 +684,7 @@ class PortalMemberDietaryEditSerializer(serializers.Serializer):
     other_dietary_restrictions = serializers.CharField(allow_blank=True, required=False)
     meal_category = serializers.CharField(allow_blank=True, required=False)
     menu_type = serializers.CharField(allow_blank=True, required=False)
+    general_verification_notes = serializers.CharField(allow_blank=True, required=False)
 
 
 # ---------------------------------------------------------------------------
@@ -621,21 +736,51 @@ class PortalKitchenIntegrationSerializer(serializers.ModelSerializer):
         return _mask_config(obj.method, obj.config)
 
 
+class PortalKitchenMenuTypeSerializer(serializers.ModelSerializer):
+    """Per-kitchen config for one menu type: price + allergies it can't manage."""
+
+    menu_type_id = serializers.UUIDField(read_only=True)
+    name = serializers.CharField(source="menu_type.name", read_only=True)
+    price = serializers.DecimalField(
+        source="menu_type_price", max_digits=8, decimal_places=2, allow_null=True,
+    )
+    restriction_tag_ids = serializers.SerializerMethodField()
+
+    class Meta:
+        model = KitchenMenuType
+        fields = ["menu_type_id", "name", "price", "restriction_tag_ids"]
+
+    def get_restriction_tag_ids(self, obj):
+        return [str(t.pk) for t in obj.restrictions.all()]
+
+
 class PortalKitchenSerializer(serializers.ModelSerializer):
     id = serializers.UUIDField(source="pk", read_only=True)
     status_label = serializers.CharField(source="get_status_display", read_only=True)
     menu_type_ids = serializers.SerializerMethodField()
+    menu_types = PortalKitchenMenuTypeSerializer(
+        source="kitchen_menu_types", many=True, read_only=True
+    )
+    supported_products = serializers.ListField(
+        child=serializers.ChoiceField(choices=KitchenProductType.values),
+        required=False,
+    )
+    product_options = serializers.SerializerMethodField()
     integrations = PortalKitchenIntegrationSerializer(many=True, read_only=True)
 
     class Meta:
         model = Kitchen
         fields = [
             "id", "name", "address", "phone", "email", "status", "status_label",
-            "max_orders_per_day", "menu_type_ids", "integrations",
+            "max_orders_per_day", "supported_products", "product_options",
+            "menu_type_ids", "menu_types", "integrations",
         ]
 
     def get_menu_type_ids(self, obj):
         return [str(m.pk) for m in obj.menu_types.all()]
+
+    def get_product_options(self, obj):
+        return [{"value": v, "label": l} for v, l in KitchenProductType.choices]
 
 
 class PortalDeliveryCompanyIntegrationSerializer(serializers.ModelSerializer):
@@ -669,6 +814,10 @@ class PortalDeliveryCompanySerializer(serializers.ModelSerializer):
 class VerificationMemberInputSerializer(serializers.Serializer):
     client_id = serializers.UUIDField(required=False, allow_null=True)
     member_name = serializers.CharField(required=False, allow_blank=True)
+    # Mobile number the member will use to sign into the Benefully mobile app.
+    # Wired to HouseholdMember.mobile_app_username when the member maps to a
+    # household member (i.e. has a client_id).
+    mobile_number = serializers.CharField(required=False, allow_blank=True)
     dietary_restrictions = serializers.ListField(
         child=serializers.CharField(), required=False, default=list
     )
