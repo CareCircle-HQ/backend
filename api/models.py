@@ -68,6 +68,7 @@ class ClientStage(models.TextChoices):
     VERIFIED = "verified", "Verified"
     WAITING_AUTHORIZATION = "waiting_authorization", "Waiting Authorization"
     AUTHORIZED = "authorized", "Authorized"
+    KITCHEN_ASSIGNMENT = "kitchen_assignment", "Kitchen Assignment"  # accepted auth, awaiting manual kitchen assignment
     ACTIVE = "active", "Active"  # receiving deliveries
     COMPLETED = "completed", "Completed"  # after last delivery
     # --- Terminal off-ramp ---
@@ -1409,6 +1410,7 @@ class EnrollmentStage(models.TextChoices):
     WAITING_AUTHORIZATION = "waiting_authorization", "Waiting Authorization"
     AUTHORIZED = "authorized", "Accepted"
     DENIED = "denied", "Denied"
+    KITCHEN_ASSIGNMENT = "kitchen_assignment", "Kitchen Assignment"
     SERVICE_ACTIVE = "service_active", "Service Active"
     SERVICE_COMPLETE = "service_complete", "Service Complete"
     CLOSED = "closed", "Closed"
@@ -1538,6 +1540,14 @@ class EnrollmentVerification(models.Model):
     case = models.ForeignKey(
         Case, on_delete=models.SET_NULL, null=True, blank=True,
         related_name="enrollments",
+    )
+    # The kitchen assigned to fulfill this household's deliveries. One kitchen
+    # serves the whole household (members are never split across kitchens). Set
+    # on the Logistics page; editable from the member profile. NULL until
+    # assigned.
+    kitchen = models.ForeignKey(
+        "Kitchen", on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="enrollment_verifications",
     )
     stage = models.CharField(
         max_length=25, choices=EnrollmentStage.choices,
@@ -1774,6 +1784,12 @@ class MemberDeliverySchedule(models.Model):
     # Source of cadence + per-delivery quantity (snapshotted below).
     product_type = models.ForeignKey(
         ProductType, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="delivery_schedules",
+    )
+    # Snapshot of the household's assigned kitchen at the time the plan was
+    # created (the household-level assignment lives on the enrollment).
+    kitchen = models.ForeignKey(
+        "Kitchen", on_delete=models.SET_NULL, null=True, blank=True,
         related_name="delivery_schedules",
     )
     # Snapshots taken from ``product_type`` at creation.

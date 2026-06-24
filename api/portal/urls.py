@@ -14,12 +14,16 @@ from .views_leads import (
 )
 from .views_members import (
     HouseholdMemberEditView,
+    MemberAssignKitchenView,
+    MemberCadenceView,
     MemberCasesView,
     MemberDetailView,
     MemberHistoryDetailView,
     MemberHistoryView,
     MemberHouseholdView,
     MemberInsuranceView,
+    MemberKitchenOptionsView,
+    MemberKitchenView,
     MemberNotesView,
     MemberOrdersView,
     MemberSocialCoverageView,
@@ -86,6 +90,11 @@ urlpatterns = [
         "members/<uuid:client_id>/household/members/<int:member_id>/",
         HouseholdMemberEditView.as_view(),
     ),
+    # Logistics / kitchen assignment
+    path("members/<uuid:client_id>/kitchen-options/", MemberKitchenOptionsView.as_view()),
+    path("members/<uuid:client_id>/assign-kitchen/", MemberAssignKitchenView.as_view()),
+    path("members/<uuid:client_id>/kitchen/", MemberKitchenView.as_view()),
+    path("members/<uuid:client_id>/cadence/", MemberCadenceView.as_view()),
     path("members/<uuid:client_id>/notes/", MemberNotesView.as_view()),
     path("members/<uuid:client_id>/cases/", MemberCasesView.as_view()),
     path("members/<uuid:client_id>/tickets/", MemberTicketsView.as_view()),

@@ -14,6 +14,7 @@ from rest_framework import serializers
 from ..models import (
     Address,
     Case,
+    CaseType,
     DeliveryCompany,
     DeliveryCompanyIntegration,
     DeliveryOrder,
@@ -123,6 +124,20 @@ def primary_case(client):
     return sorted(pool, key=lambda c: c.date_opened or timezone.now(), reverse=True)[0]
 
 
+def internal_service_case(client):
+    """The client's Internal Service case — the one the verification and meal/box
+    delivery attach to. Prefers a case carrying an authorization status, else
+    the most recently opened one. None when there is no Internal Service case."""
+    cases = [
+        c for c in client.cases.all() if c.case_type == CaseType.INTERNAL_SERVICE
+    ]
+    if not cases:
+        return None
+    with_auth = [c for c in cases if c.service_authorization_status]
+    pool = with_auth or cases
+    return sorted(pool, key=lambda c: c.date_opened or timezone.now(), reverse=True)[0]
+
+
 def case_authorization(case):
     """Read-only authorization snapshot for a case: normalized status, the raw
     display label (e.g. "Accepted"), and whether it counts as accepted."""
@@ -199,6 +214,7 @@ class MemberDetailSerializer(serializers.Serializer):
 
     def to_representation(self, client):
         ins = primary_insurance(client)
+        svc_case = internal_service_case(client)
         current_addr = next(
             (a for a in client.addresses.all() if a.type == "current"),
             next(iter(client.addresses.all()), None),
@@ -227,6 +243,13 @@ class MemberDetailSerializer(serializers.Serializer):
             # Drives the (read-only) Authorization Status shown in the
             # verification wizard's validation step.
             "authorization": case_authorization(primary_case(client)),
+            # The Internal Service case the verification + delivery attach to.
+            # Its program name is shown (read-only) in the verification wizard.
+            "service": {
+                "program_name": svc_case.program_name if svc_case else "",
+                "service_type": svc_case.service_type if svc_case else "",
+                "case_id": str(svc_case.case_id) if svc_case else None,
+            },
             "demographics": {
                 "gender": client.gender,
                 "marital_status": client.marital_status,

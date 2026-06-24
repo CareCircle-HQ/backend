@@ -128,6 +128,7 @@ _ENROLLMENT_DRIVES = {
     EnrollmentStage.WAITING_AUTHORIZATION: ClientStage.WAITING_AUTHORIZATION,
     EnrollmentStage.DENIED: ClientStage.WAITING_AUTHORIZATION,
     EnrollmentStage.AUTHORIZED: ClientStage.AUTHORIZED,
+    EnrollmentStage.KITCHEN_ASSIGNMENT: ClientStage.KITCHEN_ASSIGNMENT,
     EnrollmentStage.SERVICE_ACTIVE: ClientStage.ACTIVE,
     EnrollmentStage.SERVICE_COMPLETE: ClientStage.COMPLETED,
 }
@@ -145,8 +146,9 @@ _ENROLLMENT_RANK = {
     EnrollmentStage.WAITING_AUTHORIZATION: 5,
     EnrollmentStage.DENIED: 5,
     EnrollmentStage.AUTHORIZED: 6,
-    EnrollmentStage.SERVICE_ACTIVE: 7,
-    EnrollmentStage.SERVICE_COMPLETE: 8,
+    EnrollmentStage.KITCHEN_ASSIGNMENT: 7,
+    EnrollmentStage.SERVICE_ACTIVE: 8,
+    EnrollmentStage.SERVICE_COMPLETE: 9,
 }
 
 
@@ -330,17 +332,25 @@ ENROLLMENT_TRANSITIONS = {
     EnrollmentStage.VERIFIED: {
         EnrollmentStage.WAITING_AUTHORIZATION,
         EnrollmentStage.AUTHORIZED,
+        EnrollmentStage.KITCHEN_ASSIGNMENT,
         EnrollmentStage.SERVICE_ACTIVE,
         EnrollmentStage.ON_HOLD,
         EnrollmentStage.CANCELLED,
     },
     EnrollmentStage.WAITING_AUTHORIZATION: {
         EnrollmentStage.AUTHORIZED,
+        EnrollmentStage.KITCHEN_ASSIGNMENT,
         EnrollmentStage.DENIED,
         EnrollmentStage.ON_HOLD,
         EnrollmentStage.CANCELLED,
     },
     EnrollmentStage.AUTHORIZED: {
+        EnrollmentStage.KITCHEN_ASSIGNMENT,
+        EnrollmentStage.SERVICE_ACTIVE,
+        EnrollmentStage.ON_HOLD,
+        EnrollmentStage.CANCELLED,
+    },
+    EnrollmentStage.KITCHEN_ASSIGNMENT: {
         EnrollmentStage.SERVICE_ACTIVE,
         EnrollmentStage.ON_HOLD,
         EnrollmentStage.CANCELLED,
@@ -365,6 +375,7 @@ ENROLLMENT_TRANSITIONS = {
         EnrollmentStage.VERIFIED,
         EnrollmentStage.WAITING_AUTHORIZATION,
         EnrollmentStage.AUTHORIZED,
+        EnrollmentStage.KITCHEN_ASSIGNMENT,
         EnrollmentStage.SERVICE_ACTIVE,
         EnrollmentStage.CANCELLED,
     },
@@ -470,8 +481,8 @@ def advance_enrollment(enrollment, to_stage, *, actor=None, note="", force=False
 # Case authorization status -> the enrollment stage it should drive the
 # enrollment to (only applied once the enrollment is past verification).
 _AUTH_STATUS_TO_STAGE = {
-    ServiceAuthorizationStatus.APPROVED: EnrollmentStage.AUTHORIZED,
-    ServiceAuthorizationStatus.NOT_REQUIRED: EnrollmentStage.AUTHORIZED,
+    ServiceAuthorizationStatus.APPROVED: EnrollmentStage.KITCHEN_ASSIGNMENT,
+    ServiceAuthorizationStatus.NOT_REQUIRED: EnrollmentStage.KITCHEN_ASSIGNMENT,
     ServiceAuthorizationStatus.DENIED: EnrollmentStage.DENIED,
     ServiceAuthorizationStatus.EXPIRED: EnrollmentStage.ON_HOLD,
     ServiceAuthorizationStatus.PENDING: EnrollmentStage.WAITING_AUTHORIZATION,

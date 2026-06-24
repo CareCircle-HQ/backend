@@ -6,7 +6,7 @@ import uuid
 from datetime import datetime
 
 from django.db import transaction
-from django.db.models import Q
+from django.db.models import Count, Q
 from django.shortcuts import get_object_or_404
 from rest_framework import status as http
 from rest_framework.response import Response
@@ -15,9 +15,11 @@ from ..models import (
     Address,
     Case,
     Client,
+    DeliveryCadence,
     EnrollmentStage,
     EnrollmentVerification,
     HouseholdMember,
+    Kitchen,
     MemberDietaryProfile,
     Note,
     NoteSource,
@@ -26,10 +28,15 @@ from ..models import (
     Ticket,
     TimelineEvent,
 )
-from ..services.catalog import menu_type_for_member
-from ..services.delivery import create_member_delivery_schedules
+from ..services.catalog import menu_type_for_member, product_type_kind_for_name
+from ..services.delivery import (
+    cadence_options_for_kind,
+    create_member_delivery_schedules,
+    current_household_cadence,
+    update_household_cadence,
+)
+from ..services.kitchens import kitchen_options
 from ..services.lifecycle import advance_enrollment
-from ..services.orders import generate_delivery_calendar
 from .base import PortalAPIView, PortalGenericAPIView, current_agent
 from . import serializers as s
 
@@ -38,8 +45,16 @@ STATUS_TO_STAGES = {
     "Denied": ["not_eligible"],
     "Pending": ["pending_verification", "waiting_authorization"],
     "Verified": ["verified", "authorized"],
+    "Kitchen Assignment": ["kitchen_assignment"],
     "Active": ["active"],
     "Completed": ["completed"],
+}
+
+# Page-level base scope: restricts the list to the lifecycle stages a given
+# work area cares about (independent of the per-status filter chips).
+SCOPE_TO_STAGES = {
+    "verification": ["pending_verification", "waiting_authorization"],
+    "logistics": ["kitchen_assignment"],
 }
 
 MEMBER_LIST_PREFETCH = ("insurances", "military_profile", "enrollments")
@@ -87,6 +102,12 @@ class MembersListView(PortalGenericAPIView):
                 pass
             qs = qs.filter(cond)
 
+        # Page-level scope (Verification / Logistics) restricts which stages are
+        # ever shown, before the per-status filter chips are applied.
+        scope_stages = SCOPE_TO_STAGES.get((params.get("scope") or "").strip())
+        if scope_stages:
+            qs = qs.filter(lifecycle_stage__in=scope_stages)
+
         status_val = (params.get("status") or "").strip()
         if status_val and status_val.lower() != "all":
             stages = STATUS_TO_STAGES.get(status_val)
@@ -95,6 +116,18 @@ class MembersListView(PortalGenericAPIView):
             else:
                 qs = qs.filter(lifecycle_stage=status_val)
 
+        # Product-kind filter (Meals vs Boxes), keyed off the household's program
+        # name. A household is always one kind, so meals/boxes never mix.
+        service_type = (params.get("service_type") or "").strip().lower()
+        kw = {"meals": "meal", "boxes": "box"}.get(service_type)
+        if kw:
+            qs = qs.filter(
+                Q(enrollments__program_name__icontains=kw)
+                | Q(
+                    household_membership__household__enrollment_verifications__program_name__icontains=kw
+                )
+            )
+
         return qs.distinct()
 
     def _serialize_member(self, client, is_primary, relationship=""):
@@ -102,6 +135,16 @@ class MembersListView(PortalGenericAPIView):
         data["is_primary"] = is_primary
         data["relationship"] = relationship
         return data
+
+    @staticmethod
+    def _service_type_for_client(client):
+        """Meals/Boxes kind derived from the client's enrollment program name
+        (prefetched). Empty when neither keyword is present."""
+        for enr in client.enrollments.all():
+            kind = product_type_kind_for_name(enr.program_name)
+            if kind:
+                return kind
+        return ""
 
     def _build_groups(self):
         """Group the filtered clients into household groups (one row per
@@ -152,6 +195,7 @@ class MembersListView(PortalGenericAPIView):
                     "type": "household",
                     "name": primary_hm.household.name or primary_data["name"],
                     "member_count": len(member_data),
+                    "service_type": self._service_type_for_client(primary_hm.client),
                     "primary": primary_data,
                     "members": member_data,
                 })
@@ -163,6 +207,7 @@ class MembersListView(PortalGenericAPIView):
                 "type": "individual",
                 "name": primary_data["name"],
                 "member_count": 1,
+                "service_type": self._service_type_for_client(c),
                 "primary": primary_data,
                 "members": [primary_data],
             })
@@ -171,6 +216,13 @@ class MembersListView(PortalGenericAPIView):
         return groups
 
     def get(self, request):
+        # Flat mode: one row per individual member (no household grouping),
+        # used by the Members page. Otherwise return household groups.
+        if request.query_params.get("flat"):
+            members = [s.MemberListSerializer(c).data for c in self.get_queryset()]
+            members.sort(key=lambda m: (m["name"] or "").lower())
+            page = self.paginate_queryset(members)
+            return self.get_paginated_response(page)
         page = self.paginate_queryset(self._build_groups())
         return self.get_paginated_response(page)
 
@@ -178,9 +230,20 @@ class MembersListView(PortalGenericAPIView):
 class MembersStatsView(PortalAPIView):
     def get(self, request):
         qs = Client.objects.all()
+        scope_stages = SCOPE_TO_STAGES.get(
+            (request.query_params.get("scope") or "").strip()
+        )
+        if scope_stages:
+            qs = qs.filter(lifecycle_stage__in=scope_stages)
         counts = {"total": qs.count()}
         for label, stages in STATUS_TO_STAGES.items():
             counts[label.lower()] = qs.filter(lifecycle_stage__in=stages).count()
+        # Raw per-stage counts (powers stage-specific filter chips such as
+        # Pending Verification / Waiting Authorization on the Verification page).
+        counts["stages"] = {
+            row["lifecycle_stage"]: row["n"]
+            for row in qs.values("lifecycle_stage").annotate(n=Count("id"))
+        }
         return Response(counts)
 
 
@@ -270,9 +333,24 @@ class MemberHouseholdView(PortalAPIView):
             "client__household_membership"
         ).all()
         addr = enr.delivery_address
+        program_name = (
+            (enr.case.program.name if enr.case and enr.case.program_id else "")
+            or enr.program_name
+        )
+        kind = product_type_kind_for_name(program_name)
+        cadence = current_household_cadence(enr)
         return Response(
             {
-                "enrollment": {"id": enr.pk, "code": enr.code, "stage": enr.stage},
+                "enrollment": {
+                    "id": enr.pk, "code": enr.code, "stage": enr.stage,
+                    "kitchen_id": str(enr.kitchen_id) if enr.kitchen_id else None,
+                    "kitchen_name": enr.kitchen.name if enr.kitchen_id else "",
+                    "service_type": kind.value if kind else "",
+                    "service_type_label": kind.label if kind else "",
+                    "cadence": cadence,
+                    "cadence_label": dict(DeliveryCadence.choices).get(cadence, ""),
+                    "cadence_options": cadence_options_for_kind(kind),
+                },
                 "address": {
                     "street": addr.street, "city": addr.city,
                     "state": addr.state, "zip": addr.zip,
@@ -466,18 +544,20 @@ class MemberVerificationCreateView(PortalAPIView):
         )
 
         # The authorization outcome is sourced from the client's case (NOT the
-        # client/frontend): only an Accepted (APPROVED) case promotes the
-        # household straight into service. Any other status leaves the client at
-        # "Verified". Going VERIFIED -> SERVICE_ACTIVE skips AUTHORIZED, so no
-        # delivery orders are auto-generated — orders are created manually.
+        # client/frontend): only an Accepted (APPROVED) case advances the
+        # household to "Kitchen Assignment". Any other status leaves the client
+        # at "Verified". The member is NOT auto-activated and no delivery
+        # schedule/orders are generated here — that happens later when the
+        # kitchen assignment is executed manually (separate page), which is what
+        # moves the household into service.
         case = s.primary_case(client)
         accepted = bool(
             case and case.service_authorization_status == ServiceAuthorizationStatus.APPROVED
         )
         if accepted:
             advance_enrollment(
-                enrollment, EnrollmentStage.SERVICE_ACTIVE, force=True,
-                note="Authorization accepted — placed in service.",
+                enrollment, EnrollmentStage.KITCHEN_ASSIGNMENT, force=True,
+                note="Authorization accepted — awaiting kitchen assignment.",
             )
             # Best-effort link the case for reporting, but only when it isn't
             # already owned by another enrollment (a case maps to at most one
@@ -491,14 +571,170 @@ class MemberVerificationCreateView(PortalAPIView):
             ):
                 enrollment.case = case
                 enrollment.save(update_fields=["case"])
-            # Cadence + authorization window come from the case (passed in
-            # explicitly so this does not depend on the case link above).
-            create_member_delivery_schedules(enrollment, case=case)
-            # Expand the per-member plans into the dated delivery calendar
-            # (OrderSchedule rows) that PO generation later aggregates.
-            generate_delivery_calendar(enrollment)
 
         return Response(
             {"id": enrollment.pk, "code": enrollment.code, "stage": enrollment.stage},
             status=http.HTTP_201_CREATED,
         )
+
+
+def _logistics_enrollment(client_id):
+    """The active enrollment for a member, or (None, error_response)."""
+    client = get_object_or_404(Client, pk=client_id)
+    enr = s.active_enrollment(client)
+    if enr is None:
+        return None, None, Response(
+            {"error": "No active enrollment for this member."},
+            status=http.HTTP_404_NOT_FOUND,
+        )
+    return client, enr, None
+
+
+class MemberKitchenOptionsView(PortalAPIView):
+    """Logistics: the household's members (read-only dietary), the available
+    kitchens with per-member coverage warnings, cadence options and the
+    authorization window — everything needed to assign a kitchen."""
+
+    def get(self, request, client_id):
+        client, enr, err = _logistics_enrollment(client_id)
+        if err is not None:
+            return err
+        data = kitchen_options(enr)
+        case = enr.case or s.primary_case(client)
+        window = {"starts_on": None, "ends_on": None}
+        if case is not None:
+            starts = case.service_authorization_approval_starts_at
+            ends = case.service_authorization_approval_ends_at
+            window = {
+                "starts_on": starts.date().isoformat() if starts else None,
+                "ends_on": ends.date().isoformat() if ends else None,
+            }
+        data["enrollment"] = {
+            "id": enr.pk,
+            "code": enr.code,
+            "stage": enr.stage,
+            "program_name": enr.program_name,
+            "kitchen_id": str(enr.kitchen_id) if enr.kitchen_id else None,
+        }
+        data["cadence_options"] = cadence_options_for_kind(data.get("product_kind"))
+        data["window"] = window
+        return Response(data)
+
+
+class MemberAssignKitchenView(PortalAPIView):
+    """Logistics: assign a kitchen + cadence to the whole household, build the
+    per-member delivery plans, and activate the household (Service Active).
+
+    PO generation stays a separate manual step. Body:
+    ``{kitchen_id, cadence, once_a_week_weekday?, member_quantities?}``.
+    """
+
+    @transaction.atomic
+    def post(self, request, client_id):
+        client, enr, err = _logistics_enrollment(client_id)
+        if err is not None:
+            return err
+
+        kitchen_id = request.data.get("kitchen_id")
+        cadence = (request.data.get("cadence") or "").strip()
+        once_weekday = (request.data.get("once_a_week_weekday") or "").strip() or None
+
+        kitchen = get_object_or_404(Kitchen, pk=kitchen_id) if kitchen_id else None
+        if kitchen is None:
+            return Response(
+                {"error": "kitchen_id is required."}, status=http.HTTP_400_BAD_REQUEST
+            )
+        if cadence not in DeliveryCadence.values:
+            return Response(
+                {"error": "A valid cadence is required."},
+                status=http.HTTP_400_BAD_REQUEST,
+            )
+        if cadence == DeliveryCadence.ONCE_A_WEEK and not once_weekday:
+            return Response(
+                {"error": "once_a_week_weekday is required for a weekly cadence."},
+                status=http.HTTP_400_BAD_REQUEST,
+            )
+
+        # Per-member quantity overrides: {member_profile_id: qty}.
+        raw_qty = request.data.get("member_quantities") or {}
+        member_quantities = {}
+        for key, val in raw_qty.items():
+            try:
+                member_quantities[int(key)] = int(val)
+            except (TypeError, ValueError):
+                continue
+
+        enr.kitchen = kitchen
+        enr.save(update_fields=["kitchen"])
+
+        case = enr.case or s.primary_case(client)
+        create_member_delivery_schedules(
+            enr, case=case, cadence=cadence, once_a_week_weekday=once_weekday,
+            kitchen=kitchen, member_quantities=member_quantities,
+        )
+
+        advance_enrollment(
+            enr, EnrollmentStage.SERVICE_ACTIVE, force=True,
+            note=f"Kitchen assigned ({kitchen.name}); service activated.",
+        )
+        return Response({
+            "id": enr.pk,
+            "stage": enr.stage,
+            "kitchen_id": str(kitchen.pk),
+            "kitchen_name": kitchen.name,
+        })
+
+
+class MemberKitchenView(PortalAPIView):
+    """Change the household's assigned kitchen from the member profile editor.
+
+    The assignment is household-wide: it updates the enrollment and any existing
+    delivery-plan snapshots. PATCH body: ``{kitchen_id}`` (null clears it)."""
+
+    def patch(self, request, client_id):
+        client, enr, err = _logistics_enrollment(client_id)
+        if err is not None:
+            return err
+        kitchen_id = request.data.get("kitchen_id")
+        kitchen = get_object_or_404(Kitchen, pk=kitchen_id) if kitchen_id else None
+        enr.kitchen = kitchen
+        enr.save(update_fields=["kitchen"])
+        enr.delivery_schedules.update(kitchen=kitchen)
+        return Response({
+            "kitchen_id": str(kitchen.pk) if kitchen else None,
+            "kitchen_name": kitchen.name if kitchen else "",
+        })
+
+
+class MemberCadenceView(PortalAPIView):
+    """Change the household's delivery cadence from the member profile editor.
+
+    Household-wide: recomputes the delivery plan (weekdays, first delivery,
+    per-delivery quantity, totals) on every existing schedule. Boxes keep their
+    fixed Wednesday schedule. PATCH body: ``{cadence, once_a_week_weekday?}``."""
+
+    @transaction.atomic
+    def patch(self, request, client_id):
+        client, enr, err = _logistics_enrollment(client_id)
+        if err is not None:
+            return err
+        cadence = (request.data.get("cadence") or "").strip()
+        once_weekday = (request.data.get("once_a_week_weekday") or "").strip() or None
+        if cadence not in DeliveryCadence.values:
+            return Response(
+                {"error": "A valid cadence is required."},
+                status=http.HTTP_400_BAD_REQUEST,
+            )
+        if cadence == DeliveryCadence.ONCE_A_WEEK and not once_weekday:
+            return Response(
+                {"error": "once_a_week_weekday is required for a weekly cadence."},
+                status=http.HTTP_400_BAD_REQUEST,
+            )
+        case = enr.case or s.primary_case(client)
+        update_household_cadence(
+            enr, cadence=cadence, once_a_week_weekday=once_weekday, case=case
+        )
+        return Response({
+            "cadence": current_household_cadence(enr) or cadence,
+            "cadence_label": dict(DeliveryCadence.choices).get(cadence, ""),
+        })
