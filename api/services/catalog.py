@@ -22,15 +22,13 @@ from api.models import (
 
 logger = logging.getLogger(__name__)
 
-# Member-level menu type codes. NOTE: the member-level ``MenuType`` TextChoices
-# (api.models, "standard"/"fish_free"/"vegetarian"/"dairy_free") is shadowed in
-# the models namespace by the later ``MenuType`` model, so we reference the
-# stable string codes (the values stored on MemberDietaryProfile.menu_type)
-# directly rather than importing the enum.
-_MENU_STANDARD = "standard"
-_MENU_FISH_FREE = "fish_free"
-_MENU_VEGETARIAN = "vegetarian"
-_MENU_DAIRY_FREE = "dairy_free"
+# Member-level menu type NAMES. ``MemberDietaryProfile.menu_type`` stores the
+# admin-managed catalog ``MenuType`` name (e.g. "Standard", "Kosher"), so the
+# derived fallback below returns names too.
+_MENU_STANDARD = "Standard"
+_MENU_FISH_FREE = "Fish Free"
+_MENU_VEGETARIAN = "Vegetarian"
+_MENU_DAIRY_FREE = "Dairy Free"
 
 # Allergies that force a specific (stricter) menu type, highest priority. Menu
 # type is single-select, so the first match in this order wins.

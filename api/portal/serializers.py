@@ -33,6 +33,7 @@ from ..models import (
     SocialCareCoverage,
     Ticket,
     TicketNote,
+    TicketSource,
     TicketType,
     TimelineEvent,
 )
@@ -99,6 +100,11 @@ _STATUS_MAP = {
 
 
 def verification_status(client):
+    # On Hold is a service-state overlay on top of the member's real stage: a
+    # held member keeps their underlying stage (e.g. Active) but the list shows
+    # "On Hold" until service resumes.
+    if service_hold_state(client)["on_hold"]:
+        return "On Hold"
     return _STATUS_MAP.get(client.lifecycle_stage, client.get_lifecycle_stage_display())
 
 
@@ -110,6 +116,22 @@ def active_enrollment(client):
     open_ones = [e for e in enrollments if e.closed_at is None]
     pool = open_ones or enrollments
     return sorted(pool, key=lambda e: e.opened_at or timezone.now(), reverse=True)[0]
+
+
+def service_hold_state(client):
+    """Whether the client's household service is paused (enrollment On Hold).
+
+    Drives the Hold/Resume button in the member header. ``can_hold`` is true
+    when there is an active enrollment that is not already on hold.
+    """
+    enr = active_enrollment(client)
+    on_hold = bool(enr and enr.stage == "on_hold")
+    return {
+        "has_enrollment": enr is not None,
+        "on_hold": on_hold,
+        "can_hold": bool(enr is not None and not on_hold),
+        "enrollment_stage": enr.stage if enr else None,
+    }
 
 
 def primary_case(client):
@@ -238,6 +260,7 @@ class MemberDetailSerializer(serializers.Serializer):
                 "stage_at": client.lifecycle_stage_at.isoformat()
                 if client.lifecycle_stage_at
                 else None,
+                "service_hold": service_hold_state(client),
             },
             # Read-only authorization status sourced from the client's case.
             # Drives the (read-only) Authorization Status shown in the
@@ -423,6 +446,7 @@ class PortalTicketSerializer(serializers.ModelSerializer):
     type = serializers.SlugRelatedField(slug_field="code", read_only=True)
     type_label = serializers.CharField(source="type.label", read_only=True)
     status_label = serializers.CharField(source="get_status_display", read_only=True)
+    source_label = serializers.CharField(source="get_source_display", read_only=True)
     client_id = serializers.SerializerMethodField()
     client_name = serializers.SerializerMethodField()
     case_code = serializers.SerializerMethodField()
@@ -433,8 +457,9 @@ class PortalTicketSerializer(serializers.ModelSerializer):
         model = Ticket
         fields = [
             "id", "code", "type", "type_label", "status", "status_label",
-            "severity", "reason", "client_id", "client_name", "case_code",
-            "assignee", "created_at", "updated_at", "resolved_at", "notes",
+            "severity", "source", "source_label", "reason", "client_id",
+            "client_name", "case_code", "assignee", "created_at", "updated_at",
+            "resolved_at", "notes",
         ]
 
     def get_code(self, obj):
@@ -491,6 +516,9 @@ class PortalTicketCreateSerializer(serializers.Serializer):
     )
     severity = serializers.ChoiceField(
         choices=["low", "medium", "high"], default="medium"
+    )
+    source = serializers.ChoiceField(
+        choices=TicketSource.values, required=False, allow_blank=True, default=""
     )
     reason = serializers.CharField()
     client_id = serializers.UUIDField(required=False, allow_null=True)
@@ -648,6 +676,7 @@ class PortalHouseholdMemberSerializer(serializers.ModelSerializer):
     client_id = serializers.SerializerMethodField()
     name = serializers.SerializerMethodField()
     mobile_number = serializers.SerializerMethodField()
+    status_label = serializers.CharField(source="get_status_display", read_only=True)
 
     class Meta:
         model = MemberDietaryProfile
@@ -655,6 +684,7 @@ class PortalHouseholdMemberSerializer(serializers.ModelSerializer):
             "id", "client_id", "name", "mobile_number",
             "dietary_restrictions", "food_allergies", "other_dietary_restrictions",
             "meal_category", "menu_type", "general_verification_notes",
+            "status", "status_label", "kitchen_meal_type", "kitchen_food_notes",
         ]
 
     def get_client_id(self, obj):

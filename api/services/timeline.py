@@ -316,12 +316,49 @@ _VERIFICATION_STAGE_TONE = {
 }
 
 
+# Each enrollment stage maps to its own granular (timeline event type, title).
+# One distinct TimelineEventType per stage so the History tab can filter and
+# read each transition precisely instead of collapsing them into generic
+# "Verification" / "Service" rows.
+_STAGE_TIMELINE = {
+    EnrollmentStage.PENDING_VALIDATION: (TimelineEventType.PENDING_VALIDATION, "Pending Validation"),
+    EnrollmentStage.VALIDATED: (TimelineEventType.VALIDATED, "Validated"),
+    EnrollmentStage.PENDING_VERIFICATION: (TimelineEventType.VERIFICATION_REQUESTED, "Verification Requested"),
+    EnrollmentStage.VERIFIED: (TimelineEventType.VERIFICATION_COMPLETED, "Verification Completed"),
+    EnrollmentStage.WAITING_AUTHORIZATION: (TimelineEventType.WAITING_AUTHORIZATION, "Waiting Authorization"),
+    EnrollmentStage.AUTHORIZED: (TimelineEventType.AUTHORIZED, "Authorized"),
+    EnrollmentStage.DENIED: (TimelineEventType.DENIED, "Denied"),
+    EnrollmentStage.KITCHEN_ASSIGNMENT: (TimelineEventType.KITCHEN_ASSIGNED, "Kitchen Assigned"),
+    EnrollmentStage.SERVICE_ACTIVE: (TimelineEventType.SERVICE_ACTIVATED, "Service Activated"),
+    EnrollmentStage.SERVICE_COMPLETE: (TimelineEventType.SERVICE_COMPLETED, "Service Completed"),
+    EnrollmentStage.ON_HOLD: (TimelineEventType.SERVICE_ON_HOLD, "Service On Hold"),
+    EnrollmentStage.CLOSED: (TimelineEventType.SERVICE_CLOSED, "Service Closed"),
+    EnrollmentStage.CANCELLED: (TimelineEventType.SERVICE_CANCELLED, "Service Cancelled"),
+}
+
+
+def stage_timeline_fields(stage, *, from_stage=None):
+    """(event_type, title) for an enrollment stage. ``from_stage`` lets a
+    transition read more naturally (e.g. resuming from hold = 'Service Resumed',
+    which is its own granular event type). Returns None when the stage is
+    unknown."""
+    try:
+        stage = EnrollmentStage(stage)
+    except ValueError:
+        return None
+    if stage == EnrollmentStage.SERVICE_ACTIVE and from_stage == EnrollmentStage.ON_HOLD:
+        return TimelineEventType.SERVICE_RESUMED, "Service Resumed"
+    return _STAGE_TIMELINE.get(stage, (TimelineEventType.VERIFICATION, stage.label))
+
+
 def event_for_verification(enrollment, *, stage_event=None, source=ChangeSource.SYSTEM, actor=""):
-    """Emit a timeline event for an enrollment verification stage change.
+    """Emit a timeline event for an enrollment stage change.
 
     Called from :func:`api.services.lifecycle.advance_enrollment` after a
     transition. When ``stage_event`` is supplied the write is keyed on that
     StageEvent (one timeline row per transition); otherwise it logs unconditionally.
+    The event type + title reflect the specific stage (Verification vs Service),
+    so hold/resume and other service changes read as their own events.
     """
     client = enrollment.client
     if client is None:
@@ -331,19 +368,116 @@ def event_for_verification(enrollment, *, stage_event=None, source=ChangeSource.
         label = EnrollmentStage(enrollment.stage).label
     except ValueError:
         label = (enrollment.stage or "").replace("_", " ").title()
+    from_stage = stage_event.from_stage if stage_event is not None else None
+    fields = stage_timeline_fields(enrollment.stage, from_stage=from_stage)
+    event_type, title = fields if fields else (TimelineEventType.VERIFICATION, label or "Verification")
     tone = _VERIFICATION_STAGE_TONE.get(enrollment.stage, TimelineBadgeTone.NEUTRAL)
     dedupe = f"verification_stage:{stage_event.pk}" if stage_event is not None else ""
     return emit_timeline_event(
         client=client,
-        event_type=TimelineEventType.VERIFICATION,
+        event_type=event_type,
         occurred_at=occurred,
-        title=enrollment.program_name or "Verification",
-        subtitle=f"Stage changed to {label}",
+        title=title,
+        subtitle=enrollment.program_name or "",
         badge_text=label,
         badge_tone=tone,
         source=source,
         actor=actor,
         entity=enrollment,
         enrollment=enrollment,
+        dedupe_key=dedupe,
+    )
+
+
+_TICKET_SEVERITY_TONE = {
+    "high": TimelineBadgeTone.DANGER,
+    "medium": TimelineBadgeTone.WARNING,
+    "low": TimelineBadgeTone.INFO,
+}
+
+
+def event_for_ticket_created(ticket, *, source=ChangeSource.CRM, actor=""):
+    """Emit a 'New Ticket Created' event the first time a ticket is opened for a
+    client. No-op for client-less tickets (e.g. member-not-found). De-duped on
+    the ticket pk so re-saves don't duplicate the row."""
+    client = ticket.client
+    if client is None:
+        return None
+    occurred = ticket.created_at or timezone.now()
+    type_label = ticket.type.label if ticket.type_id else "Ticket"
+    severity = (ticket.severity or "").lower()
+    return emit_timeline_event(
+        client=client,
+        event_type=TimelineEventType.TICKET_CREATED,
+        occurred_at=occurred,
+        title="New Ticket Created",
+        subtitle=ticket.reason or type_label,
+        badge_text=ticket.get_severity_display() if ticket.severity else "",
+        badge_tone=_TICKET_SEVERITY_TONE.get(severity, TimelineBadgeTone.NEUTRAL),
+        source=source,
+        actor=actor,
+        entity=ticket,
+        metadata={
+            "ticket_type": type_label,
+            "severity": severity,
+            "ticket_source": ticket.source or "",
+        },
+        dedupe_key=f"ticket_created:{ticket.pk}",
+    )
+
+
+def _format_address(address):
+    region = " ".join(p for p in (address.state, address.zip) if p)
+    return ", ".join(p for p in (address.street, address.city, region) if p)
+
+
+def event_for_delivery_address_change(
+    client, address, *, previous="", enrollment=None,
+    source=ChangeSource.CRM, actor="",
+):
+    """Emit a 'Delivery Address Changed' event. Not de-duped (each change is its
+    own timeline point); ``previous`` is the pre-edit address string."""
+    if client is None or address is None:
+        return None
+    new_addr = _format_address(address)
+    return emit_timeline_event(
+        client=client,
+        event_type=TimelineEventType.DELIVERY_ADDRESS_CHANGED,
+        occurred_at=timezone.now(),
+        title="Delivery Address Changed",
+        subtitle=new_addr,
+        source=source,
+        actor=actor,
+        entity=address,
+        enrollment=enrollment,
+        metadata={"previous": previous, "new": new_addr},
+    )
+
+
+def event_for_out_of_orbit(
+    profile, *, enrollment=None, reason="", source=ChangeSource.SYSTEM, actor="",
+):
+    """Emit a 'Household set as Out of Orbit' event for the member whose dietary
+    data (menu type + allergies) can't be safely fulfilled. Logged on the
+    member's own client; de-duped per enrollment so re-running the kitchen
+    assignment doesn't duplicate the row."""
+    client = getattr(profile, "client", None)
+    if client is None:
+        return None
+    enrollment = enrollment or getattr(profile, "enrollment", None)
+    dedupe = f"out_of_orbit:{enrollment.pk}:{profile.pk}" if enrollment is not None else ""
+    return emit_timeline_event(
+        client=client,
+        event_type=TimelineEventType.OUT_OF_ORBIT,
+        occurred_at=timezone.now(),
+        title="Household set as Out of Orbit",
+        subtitle=profile.member_name or "",
+        badge_text="Out of Orbit",
+        badge_tone=TimelineBadgeTone.WARNING,
+        source=source,
+        actor=actor,
+        entity=profile,
+        enrollment=enrollment,
+        metadata={"reason": reason, "menu_type": profile.menu_type or ""},
         dedupe_key=dedupe,
     )

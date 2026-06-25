@@ -25,6 +25,7 @@ from ..models import (
     NoteSource,
     PurchaseOrder,
     ServiceAuthorizationStatus,
+    StageEvent,
     Ticket,
     TimelineEvent,
 )
@@ -37,7 +38,9 @@ from ..services.delivery import (
 )
 from ..services.orders import generate_delivery_calendar
 from ..services.kitchens import kitchen_options
-from ..services.lifecycle import advance_enrollment
+from ..services.meal_rules import apply_to_member
+from ..services.lifecycle import InvalidTransition, advance_enrollment
+from ..services import timeline
 from .base import PortalAPIView, PortalGenericAPIView, current_agent
 from . import serializers as s
 
@@ -374,6 +377,7 @@ class MemberHouseholdView(PortalAPIView):
         ser.is_valid(raise_exception=True)
         data = ser.validated_data
         addr = enr.delivery_address
+        previous = timeline._format_address(addr) if addr is not None else ""
         if addr is None:
             addr = Address.objects.create(client_id=client_id, type="temporary")
             enr.delivery_address = addr
@@ -382,6 +386,16 @@ class MemberHouseholdView(PortalAPIView):
             if field in data:
                 setattr(addr, field, data[field])
         addr.save()
+        new_addr = timeline._format_address(addr)
+        if new_addr != previous:
+            agent = current_agent(request)
+            try:
+                timeline.event_for_delivery_address_change(
+                    enr.client, addr, previous=previous, enrollment=enr,
+                    actor=(f"agent:{agent.code}" if agent and agent.code else ""),
+                )
+            except Exception:  # never let history-logging break the edit
+                pass
         return Response(
             {"street": addr.street, "city": addr.city, "state": addr.state, "zip": addr.zip}
         )
@@ -400,6 +414,96 @@ class HouseholdMemberEditView(PortalAPIView):
             setattr(mv, field, value)
         mv.save()
         return Response(s.PortalHouseholdMemberSerializer(mv).data)
+
+
+class MemberServiceHoldView(PortalAPIView):
+    """Pause the member's household service.
+
+    Moves the active enrollment to On Hold (which logs a StageEvent and mirrors
+    a 'Stage changed to On Hold' entry onto the timeline), then records a client
+    note with the reason. While On Hold the household is excluded from any new
+    Purchase Order until service is resumed.
+    """
+
+    def post(self, request, client_id):
+        client = get_object_or_404(Client, pk=client_id)
+        enr = s.active_enrollment(client)
+        if enr is None:
+            return Response(
+                {"error": "This member has no active enrollment to place on hold."},
+                status=http.HTTP_404_NOT_FOUND,
+            )
+        if EnrollmentStage(enr.stage) == EnrollmentStage.ON_HOLD:
+            return Response(
+                {"error": "Service is already on hold."},
+                status=http.HTTP_400_BAD_REQUEST,
+            )
+        reason = (request.data.get("reason") or "").strip()
+        if not reason:
+            return Response(
+                {"reason": "A reason is required to place service on hold."},
+                status=http.HTTP_400_BAD_REQUEST,
+            )
+        agent = current_agent(request)
+        author = agent.name if agent else ""
+        try:
+            advance_enrollment(
+                enr, EnrollmentStage.ON_HOLD,
+                note=f"Placed on hold by {author or 'support portal'}. Reason: {reason}",
+            )
+        except InvalidTransition as exc:
+            return Response({"error": str(exc)}, status=http.HTTP_400_BAD_REQUEST)
+        Note.objects.create(
+            client=client, source=NoteSource.AGENT, author_name=author,
+            body=f"Service placed on hold. Reason: {reason}",
+        )
+        return Response(s.MemberDetailSerializer(client).data)
+
+
+class MemberServiceResumeView(PortalAPIView):
+    """Resume a held household.
+
+    Returns the enrollment to the stage it was in before the hold (defaulting to
+    Service Active), which logs a StageEvent + timeline entry and re-includes the
+    household in Purchase Order batching. Records a client note.
+    """
+
+    def post(self, request, client_id):
+        client = get_object_or_404(Client, pk=client_id)
+        enr = s.active_enrollment(client)
+        if enr is None or EnrollmentStage(enr.stage) != EnrollmentStage.ON_HOLD:
+            return Response(
+                {"error": "Service is not on hold."},
+                status=http.HTTP_400_BAD_REQUEST,
+            )
+        # Resume to the stage the enrollment held from (most recent hold event).
+        last_hold = StageEvent.objects.filter(
+            enrollment=enr, to_stage=EnrollmentStage.ON_HOLD
+        ).first()
+        target = EnrollmentStage.SERVICE_ACTIVE
+        if last_hold and last_hold.from_stage:
+            try:
+                target = EnrollmentStage(last_hold.from_stage)
+            except ValueError:
+                target = EnrollmentStage.SERVICE_ACTIVE
+        reason = (request.data.get("reason") or "").strip()
+        agent = current_agent(request)
+        author = agent.name if agent else ""
+        suffix = f" Reason: {reason}" if reason else ""
+        try:
+            # force=True: a prior process gate (e.g. verification) already passed
+            # before the hold, so restoring the prior stage must not be re-gated.
+            advance_enrollment(
+                enr, target, force=True,
+                note=f"Service resumed by {author or 'support portal'}.{suffix}",
+            )
+        except InvalidTransition as exc:
+            return Response({"error": str(exc)}, status=http.HTTP_400_BAD_REQUEST)
+        Note.objects.create(
+            client=client, source=NoteSource.AGENT, author_name=author,
+            body=f"Service resumed.{suffix}",
+        )
+        return Response(s.MemberDetailSerializer(client).data)
 
 
 class MemberNotesView(PortalGenericAPIView):
@@ -667,6 +771,23 @@ class MemberAssignKitchenView(PortalAPIView):
 
         enr.kitchen = kitchen
         enr.save(update_fields=["kitchen"])
+
+        # Apply the Meal Rules to each member: derive the kitchen meal type +
+        # food notes (sent to the kitchen on the PO) or flag the member Out of
+        # Orbit. Out-of-orbit members are excluded from schedules + POs.
+        agent = current_agent(request)
+        actor = f"agent:{agent.code}" if agent and agent.code else ""
+        for profile in enr.member_profiles.select_related("client").all():
+            _result, became_out = apply_to_member(profile)
+            if became_out:
+                try:
+                    timeline.event_for_out_of_orbit(
+                        profile, enrollment=enr,
+                        reason="Allergy/menu combination cannot be safely fulfilled.",
+                        actor=actor,
+                    )
+                except Exception:  # never let history-logging break assignment
+                    pass
 
         case = enr.case or s.primary_case(client)
         create_member_delivery_schedules(

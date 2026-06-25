@@ -27,6 +27,7 @@ from api.models import (
     DeliveryCadence,
     HouseholdMember,
     MemberDeliverySchedule,
+    MemberStatus,
     ProductType,
     ProductTypeKind,
     ScheduleStatus,
@@ -187,8 +188,12 @@ def create_member_delivery_schedules(
     if case is None:
         case = enrollment.case
 
+    # Out-of-orbit members (allergy/menu combos the kitchen can't safely fulfill)
+    # get no delivery plan and are therefore excluded from all Purchase Orders.
     members = list(
-        enrollment.member_profiles.select_related("client").all()
+        enrollment.member_profiles.select_related("client")
+        .exclude(status=MemberStatus.OUT_OF_ORBIT)
+        .all()
     )
     if not members:
         return []
@@ -277,6 +282,9 @@ def create_member_delivery_schedules(
                 menu_type=m.menu_type or menu_type_for_member(
                     food_allergies=m.food_allergies, meal_category=m.meal_category,
                 ),
+                # Snapshot the meal-rule result sent to the kitchen on the PO.
+                kitchen_meal_type=m.kitchen_meal_type,
+                kitchen_food_notes=m.kitchen_food_notes,
                 starts_on=start,
                 ends_on=end,
                 status=ScheduleStatus.SCHEDULED,
