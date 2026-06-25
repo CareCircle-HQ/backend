@@ -30,9 +30,11 @@ from api.models import (
     DeliveryOrder,
     DeliveryOrderStatus,
     DietaryRestriction,
+    EnrollmentStage,
     FoodAllergy,
     Kitchen,
     MemberDietaryProfile,
+    MemberStatus,
     MenuType,
     OrderSchedule,
     ProductType,
@@ -158,12 +160,18 @@ def _resolve_menu_type(code, index):
 
 
 def _due_schedules(kind, delivery_date):
-    """SCHEDULED OrderSchedule rows for the given kind that land on the date."""
+    """SCHEDULED OrderSchedule rows for the given kind that land on the date.
+
+    Schedules whose enrollment is On Hold are excluded: a paused household must
+    not appear in any new Purchase Order until its service is resumed.
+    """
     qs = (
         OrderSchedule.objects.filter(
             anticipated_delivery_date=delivery_date,
             status=ScheduleStatus.SCHEDULED,
         )
+        .exclude(enrollment__stage=EnrollmentStage.ON_HOLD)
+        .exclude(member__status=MemberStatus.OUT_OF_ORBIT)
         .select_related("member", "member__client", "household", "kitchen")
     )
     out = []
@@ -260,7 +268,10 @@ def generate_purchase_order(kind, delivery_date, kitchen, schedule_ids, split_se
     schedules = list(
         OrderSchedule.objects.filter(
             order_id__in=schedule_ids, status=ScheduleStatus.SCHEDULED
-        ).select_related("member", "member__client", "household", "kitchen")
+        )
+        .exclude(enrollment__stage=EnrollmentStage.ON_HOLD)
+        .exclude(member__status=MemberStatus.OUT_OF_ORBIT)
+        .select_related("member", "member__client", "household", "kitchen")
     )
     already = _batched_client_ids(delivery_date)
     schedules = [
@@ -299,6 +310,9 @@ def generate_purchase_order(kind, delivery_date, kitchen, schedule_ids, split_se
             default_kitchen=default_kitchen,
             rerouted=rerouted,
             menu_type=_resolve_menu_type(s.menu_type, menu_index),
+            # Meal-rule result is what the kitchen export actually sends.
+            kitchen_meal_type=s.kitchen_meal_type,
+            kitchen_food_notes=s.kitchen_food_notes,
         ))
     DeliveryOrder.objects.bulk_create(orders)
     return po
@@ -453,8 +467,8 @@ def build_kitchen_export_rows(po):
             addr.city if addr else "",
             addr.state if addr else "",
             addr.zip if addr else "",
-            do.menu_type.name if do.menu_type else "",
-            _food_note(c),
+            do.kitchen_meal_type or (do.menu_type.name if do.menu_type else ""),
+            do.kitchen_food_notes,
             c.client_email_address if c else "",
             c.client_phone_number if c else "",
         ])

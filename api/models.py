@@ -1462,12 +1462,38 @@ class MenuCategory(models.TextChoices):
 
 
 class MenuType(models.TextChoices):
-    """Menu type a household member is assigned to (single-select)."""
+    """Menu type a household member is assigned to (single-select).
+
+    DEPRECATED for member storage: ``MemberDietaryProfile.menu_type`` now stores
+    the admin-managed catalog :class:`MenuType` (model) *name* directly so new
+    menu variants (e.g. Kosher, Halal) are usable without code changes. This
+    enum is kept for legacy code paths and the data migration that converts old
+    codes to names.
+    """
 
     STANDARD = "standard", "Standard"
     FISH_FREE = "fish_free", "Fish Free"
     VEGETARIAN = "vegetarian", "Vegetarian"
     DAIRY_FREE = "dairy_free", "Dairy Free"
+
+
+class MemberStatus(models.TextChoices):
+    """Service status of an individual household member (per enrollment).
+
+    ``OUT_OF_ORBIT`` is set automatically at kitchen-assignment time when the
+    member's menu type + food allergies can't be safely fulfilled (see
+    ``api.services.meal_rules``). Out-of-orbit members are excluded from all
+    delivery schedules and Purchase Orders until their dietary data changes and
+    the rule is re-applied.
+    """
+
+    ACTIVE = "active", "Active"
+    OUT_OF_ORBIT = "out_of_orbit", "Out of Orbit"
+
+
+# Kitchen meal type that is not a catalog MenuType: signals the kitchen to
+# prepare a fully allergen-free meal for a member with an allergy combination.
+KITCHEN_MEAL_ALLERGEN_FREE = "Allergen Free"
 
 
 class ProcessType(models.TextChoices):
@@ -1648,9 +1674,22 @@ class MemberDietaryProfile(models.Model):
     meal_category = models.CharField(
         max_length=20, choices=MenuCategory.choices, blank=True
     )
-    menu_type = models.CharField(
-        max_length=20, choices=MenuType.choices, blank=True
+    # Stores the admin-managed catalog ``MenuType`` (model) NAME, e.g.
+    # "Standard", "Dairy Free", "Vegetarian", "Kosher", "Halal". (Historically
+    # this held a short code from the ``MenuType`` TextChoices; a data migration
+    # converts those to names.)
+    menu_type = models.CharField(max_length=120, blank=True)
+    # Per-member service status. Set to OUT_OF_ORBIT automatically when the meal
+    # rule (api.services.meal_rules) can't safely fulfill the member.
+    status = models.CharField(
+        max_length=20, choices=MemberStatus.choices,
+        default=MemberStatus.ACTIVE, db_index=True,
     )
+    # Result of applying the meal rule at kitchen-assignment time. These (not
+    # ``menu_type``/derived food notes) are what we send to the kitchen on the
+    # Purchase Order for each member.
+    kitchen_meal_type = models.CharField(max_length=120, blank=True)
+    kitchen_food_notes = models.TextField(blank=True)
     # Agent-entered: how many meals/boxes this member receives per delivery.
     # Copied onto each generated OrderSchedule.how_many_meals_or_boxes.
     meals_per_delivery = models.PositiveSmallIntegerField(null=True, blank=True)
@@ -1809,9 +1848,11 @@ class MemberDeliverySchedule(models.Model):
     # prod_per_delivery * number of delivery dates; for meals it is the sum of
     # each delivery's coverage * meals_per_day.
     meals_boxes_total = models.PositiveIntegerField(default=0)
-    menu_type = models.CharField(
-        max_length=20, choices=MenuType.choices, blank=True
-    )
+    # Snapshot of the member's catalog MenuType NAME (see MemberDietaryProfile).
+    menu_type = models.CharField(max_length=120, blank=True)
+    # Snapshot of the per-member meal-rule result (api.services.meal_rules).
+    kitchen_meal_type = models.CharField(max_length=120, blank=True)
+    kitchen_food_notes = models.TextField(blank=True)
     # Snapshot of the case authorization window the plan covers.
     starts_on = models.DateField(null=True, blank=True)
     ends_on = models.DateField(null=True, blank=True)
@@ -1914,9 +1955,11 @@ class OrderSchedule(models.Model):
     # against FoodAllergy / DietaryRestriction).
     allergies = models.JSONField(default=list, blank=True)
     restrictions = models.JSONField(default=list, blank=True)
-    menu_type = models.CharField(
-        max_length=20, choices=MenuType.choices, blank=True
-    )
+    # Snapshot of the member's catalog MenuType NAME (see MemberDietaryProfile).
+    menu_type = models.CharField(max_length=120, blank=True)
+    # Snapshot of the per-member meal-rule result (api.services.meal_rules).
+    kitchen_meal_type = models.CharField(max_length=120, blank=True)
+    kitchen_food_notes = models.TextField(blank=True)
     notes = models.TextField(blank=True)
     member_phone = models.CharField(max_length=40, blank=True)
     member_email = models.EmailField(blank=True)
@@ -2402,22 +2445,42 @@ class Note(models.Model):
 # AGENT FOLLOW-UP TICKETS
 # ===========================================================================
 class TicketTypeCode(models.TextChoices):
-    """Canonical ticket-type codes raised by the daily pull. The :class:`TicketType`
-    table is seeded from these; the codes stay stable so services can keep
-    referencing them symbolically (e.g. ``TicketTypeCode.CASE_CLOSED``)."""
+    """Canonical ticket-type codes. The :class:`TicketType` table is seeded from
+    these; the codes stay stable so services can keep referencing them
+    symbolically (e.g. ``TicketTypeCode.SYSTEM_CHANGE_DETECTED``).
 
-    NO_ACTIVE_INSURANCE = "no_active_insurance", "No active insurance"
-    INSURANCE_EXPIRED = "insurance_expired", "Insurance expired"
-    NO_ACTIVE_COVERAGE = "no_active_coverage", "No active social care coverage"
-    COVERAGE_EXPIRED = "coverage_expired", "Social care coverage expired"
-    MEMBER_NOT_FOUND = "member_not_found", "Member not found"
-    CASE_CLOSED = "case_closed", "Case closed"
-    AUTHORIZATION_CHANGED = "authorization_changed", "Authorization status changed"
-    CASE_NO_SERVICES = "case_no_services", "Case with no contracted services"
-    NEW_INSURANCE = "new_insurance", "New insurance created (validate)"
-    NEW_COVERAGE = "new_coverage", "New social care coverage created"
-    ADDRESS_OUT_OF_AREA = "address_out_of_area", "Address outside coverage area"
-    CREDENTIAL_EXPIRED = "credential_expired", "Unite Us login expired (re-login)"
+    The first block is the human-facing set offered in the New-Ticket picker.
+    ``SYSTEM_CHANGE_DETECTED`` is raised by the system (daily import / update
+    feature) when it detects a change on a member's information; it is hidden
+    from the manual picker. Legacy auto-pull codes (no_active_insurance,
+    case_closed, …) remain in the database as inactive types for historical
+    tickets but are no longer raised — the import now opens
+    ``SYSTEM_CHANGE_DETECTED`` with a descriptive reason instead."""
+
+    VERIFICATION = "verification", "Verification"
+    APPOINTMENT = "appointment", "Appointment"
+    SERVICE_CHANGE = "service_change", "Service Change"
+    DELIVERY_ISSUE = "delivery_issue", "Delivery Issue"
+    ADDRESS_UPDATE = "address_update", "Address Update"
+    CASE_CLOSURE = "case_closure", "Case Closure"
+    FOOD_COMPLAINT = "food_complaint", "Food Complaint"
+    PAUSE_SERVICE = "pause_service", "Pause Service"
+    STATUS_CHECK = "status_check", "Status Check"
+    LOGIN_PROBLEM = "login_problem", "Login Problem"
+    CANCELLATION = "cancellation", "Cancellation"
+    MISSING_WRONG_ORDER = "missing_wrong_order", "Missing / Wrong Order"
+    SYSTEM_CHANGE_DETECTED = "system_change_detected", "System Change Detected"
+
+
+class TicketSource(models.TextChoices):
+    """Where a ticket originated, captured when an agent opens one manually."""
+
+    LIVE_CALL = "live_call", "Live Call"
+    CALL_BACK = "call_back", "Call Back"
+    ASSIGNED_TICKET = "assigned_ticket", "Assigned Ticket"
+    DELIVERY_ISSUE = "delivery_issue", "Delivery Issue"
+    EMAIL = "email", "Email"
+    OTHER = "other", "Other"
 
 
 class TicketStatus(models.TextChoices):
@@ -2476,6 +2539,11 @@ class Ticket(models.Model):
     severity = models.CharField(
         max_length=10, choices=TicketSeverity.choices, default=TicketSeverity.MEDIUM
     )
+    # Where the ticket came from (set when an agent opens one manually; blank for
+    # system-raised tickets such as SYSTEM_CHANGE_DETECTED).
+    source = models.CharField(
+        max_length=20, choices=TicketSource.choices, blank=True, default=""
+    )
     reason = models.TextField(blank=True)  # human-readable explanation
     client = models.ForeignKey(
         "Client", on_delete=models.SET_NULL, null=True, blank=True,
@@ -2522,8 +2590,33 @@ class TimelineEventType(models.TextChoices):
     SCREENING = "screening", "Screening"
     ASSESSMENT = "assessment", "Assessment"
     CASE_OPENED = "case_opened", "Case"
-    VERIFICATION = "verification", "Verification"
+    # --- Verification / authorization stages: one granular type per stage so
+    # the History tab reads each transition distinctly instead of a pile of
+    # generic "Verification" rows. ---
+    PENDING_VALIDATION = "pending_validation", "Pending Validation"
+    VALIDATED = "validated", "Validated"
+    VERIFICATION_REQUESTED = "verification_requested", "Verification Requested"
+    VERIFICATION_COMPLETED = "verification_completed", "Verification Completed"
+    WAITING_AUTHORIZATION = "waiting_authorization", "Waiting Authorization"
+    AUTHORIZED = "authorized", "Authorized"
+    DENIED = "denied", "Denied"
+    # --- Service-delivery lifecycle: one granular type per event. ---
+    KITCHEN_ASSIGNED = "kitchen_assigned", "Kitchen Assigned"
+    SERVICE_ACTIVATED = "service_activated", "Service Activated"
+    SERVICE_ON_HOLD = "service_on_hold", "Service On Hold"
+    SERVICE_RESUMED = "service_resumed", "Service Resumed"
+    SERVICE_COMPLETED = "service_completed", "Service Completed"
+    SERVICE_CLOSED = "service_closed", "Service Closed"
+    SERVICE_CANCELLED = "service_cancelled", "Service Cancelled"
     ENROLLED = "enrolled", "Enrolled"
+    # --- Other client-lifecycle events not tied to a stage transition. ---
+    TICKET_CREATED = "ticket_created", "New Ticket Created"
+    DELIVERY_ADDRESS_CHANGED = "delivery_address_changed", "Delivery Address Changed"
+    OUT_OF_ORBIT = "out_of_orbit", "Out of Orbit"
+    # --- Legacy coarse types: retained so existing rows stay valid; no longer
+    # emitted by the timeline service (a data migration remaps old rows). ---
+    VERIFICATION = "verification", "Verification"
+    SERVICE = "service", "Service"
 
 
 class TimelineBadgeTone(models.TextChoices):
@@ -3082,6 +3175,12 @@ class DeliveryOrder(models.Model):
         blank=True,
         related_name="delivery_orders",
     )
+    # Per-member meal-rule result, snapshotted at PO generation. These are what
+    # the kitchen export sends for each member (replacing the raw menu type +
+    # derived food note). ``kitchen_meal_type`` may be a catalog MenuType name
+    # or "Allergen Free".
+    kitchen_meal_type = models.CharField(max_length=120, blank=True)
+    kitchen_food_notes = models.TextField(blank=True)
     # Per-order overrides on top of the MenuType's tags.
     custom_dietary_tags = models.ManyToManyField(
         DietaryTag, related_name="delivery_orders", blank=True

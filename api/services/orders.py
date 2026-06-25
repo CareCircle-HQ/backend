@@ -16,6 +16,7 @@ from datetime import timedelta
 from django.db import transaction
 
 from api.models import (
+    MemberStatus,
     OrderSchedule,
     OrderStatus,
     ScheduleStatus,
@@ -114,8 +115,11 @@ def generate_orders_for_enrollment(enrollment):
     if not dates:
         return []
 
+    # Out-of-orbit members are excluded from all delivery orders.
     members = list(
-        enrollment.member_profiles.select_related("client").all()
+        enrollment.member_profiles.select_related("client")
+        .exclude(status=MemberStatus.OUT_OF_ORBIT)
+        .all()
     )
     if not members:
         return []
@@ -143,6 +147,8 @@ def generate_orders_for_enrollment(enrollment):
                     allergies=list(m.food_allergies or []),
                     restrictions=list(m.dietary_restrictions or []),
                     menu_type=m.menu_type,
+                    kitchen_meal_type=m.kitchen_meal_type,
+                    kitchen_food_notes=m.kitchen_food_notes,
                     member_phone=getattr(client, "client_phone_number", "") or "",
                     member_email=getattr(client, "client_email_address", "") or "",
                     how_many_meals_or_boxes=m.meals_per_delivery,
@@ -210,6 +216,8 @@ def generate_delivery_calendar(enrollment):
                     allergies=list(getattr(m, "food_allergies", []) or []),
                     restrictions=list(getattr(m, "dietary_restrictions", []) or []),
                     menu_type=sched.menu_type or (m.menu_type if m else ""),
+                    kitchen_meal_type=sched.kitchen_meal_type or (m.kitchen_meal_type if m else ""),
+                    kitchen_food_notes=sched.kitchen_food_notes or (m.kitchen_food_notes if m else ""),
                     member_phone=getattr(client, "client_phone_number", "") or "",
                     member_email=getattr(client, "client_email_address", "") or "",
                     how_many_meals_or_boxes=qty,

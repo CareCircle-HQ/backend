@@ -577,7 +577,13 @@ class EnrollmentVerificationViewSet(viewsets.ModelViewSet):
             "dietary_restrictions": _choices(DietaryRestriction),
             "food_allergies": _choices(FoodAllergy),
             "meal_categories": _choices(MenuCategory),
-            "menu_types": _choices(MenuType),
+            # Menu types come from the admin-managed catalog (so new variants
+            # like Kosher/Halal are usable without code changes); the member's
+            # menu_type stores the chosen name.
+            "menu_types": [
+                {"value": mt.name, "label": mt.name}
+                for mt in MenuType.objects.filter(is_active=True).order_by("name")
+            ],
         })
 
     @action(detail=True, methods=["post"], url_path="set-stage")

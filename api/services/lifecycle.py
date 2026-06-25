@@ -134,9 +134,13 @@ _ENROLLMENT_DRIVES = {
 }
 
 # Rank used to pick the most-advanced enrollment when a client has several.
-# Paused/terminal stages rank 0 so an active enrollment always wins.
+# Terminal stages rank 0 so an active enrollment always wins. ON_HOLD ranks as
+# high as SERVICE_ACTIVE: a held household reached service, so it must outrank a
+# stale earlier-stage enrollment (e.g. a leftover pending_verification row) and
+# not drag the member backwards. Between a genuinely active enrollment and a
+# held one, the recency tie-break (stage_at) decides.
 _ENROLLMENT_RANK = {
-    EnrollmentStage.ON_HOLD: 0,
+    EnrollmentStage.ON_HOLD: 8,
     EnrollmentStage.CLOSED: 0,
     EnrollmentStage.CANCELLED: 0,
     EnrollmentStage.PENDING_VALIDATION: 1,
@@ -201,6 +205,24 @@ def _primary_enrollment(client):
     return max(enrollments, key=sort_key)
 
 
+def _held_from_stage(enrollment):
+    """The enrollment stage an On Hold enrollment was paused FROM, read off the
+    most recent 'to On Hold' StageEvent. None when no such event exists."""
+    ev = (
+        StageEvent.objects.filter(
+            enrollment=enrollment, to_stage=EnrollmentStage.ON_HOLD
+        )
+        .order_by("-entered_at")
+        .first()
+    )
+    if ev and ev.from_stage:
+        try:
+            return EnrollmentStage(ev.from_stage)
+        except ValueError:
+            return None
+    return None
+
+
 def derive_client_stage(client):
     """Compute the client's lifecycle stage (no writes).
 
@@ -218,8 +240,13 @@ def derive_client_stage(client):
     if stage in (EnrollmentStage.PENDING_VALIDATION, EnrollmentStage.VALIDATED):
         return early
 
-    # On hold: don't move the client (keep its current stage).
+    # On hold: the member keeps the stage they reached before the hold (a hold
+    # is a temporary pause, not a regression). Derive that from the stage the
+    # enrollment was held FROM so a stale lifecycle_stage can't drag it back.
     if stage == EnrollmentStage.ON_HOLD:
+        held_from = _held_from_stage(enr)
+        if held_from is not None:
+            return _ENROLLMENT_DRIVES.get(held_from, client.lifecycle_stage or early)
         return client.lifecycle_stage or early
 
     # Closed / cancelled: terminal off-ramp, but never downgrade a client that

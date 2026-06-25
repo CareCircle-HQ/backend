@@ -51,19 +51,17 @@ def open_ticket(ticket_type, *, reason, severity=TicketSeverity.MEDIUM,
     the same type for the same (client, case) is reused.
     """
     type_obj = _resolve_ticket_type(ticket_type)
+    # Dedupe on (type, client, case, reason): now that the import routes every
+    # detection through SYSTEM_CHANGE_DETECTED, the reason is what distinguishes
+    # one detected change from another for the same subject.
     existing = Ticket.objects.filter(
-        type=type_obj, status__in=OPEN_STATUSES, client=client, case=case
+        type=type_obj, status__in=OPEN_STATUSES, client=client, case=case,
+        reason=reason,
     ).first()
     if existing:
-        changed = []
-        if reason and existing.reason != reason:
-            existing.reason = reason
-            changed.append("reason")
         if import_run and existing.import_run_id != import_run.pk:
             existing.import_run = import_run
-            changed.append("import_run")
-        if changed:
-            existing.save(update_fields=changed + ["updated_at"])
+            existing.save(update_fields=["import_run", "updated_at"])
         return existing, False
     ticket = Ticket.objects.create(
         type=type_obj, reason=reason, severity=severity,
@@ -79,12 +77,8 @@ def evaluate_client_coverage(client, import_run=None):
     has_active_ins = any(i.status == RecordStatus.ACTIVE for i in insurances)
     has_expired_ins = any(i.status == RecordStatus.EXPIRED for i in insurances)
     if not has_active_ins:
-        ttype = (
-            TicketTypeCode.INSURANCE_EXPIRED if has_expired_ins
-            else TicketTypeCode.NO_ACTIVE_INSURANCE
-        )
         open_ticket(
-            ttype,
+            TicketTypeCode.SYSTEM_CHANGE_DETECTED,
             reason="Member has no active insurance"
             + (" (existing insurance expired)." if has_expired_ins else "."),
             client=client, import_run=import_run,
@@ -98,12 +92,8 @@ def evaluate_client_coverage(client, import_run=None):
         c.status == SocialCareCoverageStatus.EXPIRED for c in coverages
     )
     if not has_active_cov:
-        ttype = (
-            TicketTypeCode.COVERAGE_EXPIRED if has_expired_cov
-            else TicketTypeCode.NO_ACTIVE_COVERAGE
-        )
         open_ticket(
-            ttype,
+            TicketTypeCode.SYSTEM_CHANGE_DETECTED,
             reason="Member has no active social care coverage"
             + (" (coverage expired)." if has_expired_cov else "."),
             client=client, import_run=import_run,
@@ -112,7 +102,7 @@ def evaluate_client_coverage(client, import_run=None):
 
 def evaluate_new_insurance(client, import_run=None):
     open_ticket(
-        TicketTypeCode.NEW_INSURANCE,
+        TicketTypeCode.SYSTEM_CHANGE_DETECTED,
         reason="New insurance created from the import; requires agent validation.",
         client=client, import_run=import_run,
     )
@@ -120,7 +110,7 @@ def evaluate_new_insurance(client, import_run=None):
 
 def evaluate_new_coverage(client, import_run=None):
     open_ticket(
-        TicketTypeCode.NEW_COVERAGE,
+        TicketTypeCode.SYSTEM_CHANGE_DETECTED,
         reason="New social care coverage created from the import.",
         client=client, import_run=import_run,
     )
@@ -128,7 +118,7 @@ def evaluate_new_coverage(client, import_run=None):
 
 def evaluate_member_not_found(reference, import_run=None):
     open_ticket(
-        TicketTypeCode.MEMBER_NOT_FOUND,
+        TicketTypeCode.SYSTEM_CHANGE_DETECTED,
         reason=f"Incoming record references an unknown member: {reference}.",
         severity=TicketSeverity.HIGH, import_run=import_run,
     )
@@ -139,7 +129,7 @@ def evaluate_case(case, *, previous_status=None, previous_auth_status=None,
     """Case closed, authorization changed, and case-with-no-services (spec §6)."""
     if case.case_status == CaseStatus.CLOSED and previous_status != CaseStatus.CLOSED:
         open_ticket(
-            TicketTypeCode.CASE_CLOSED,
+            TicketTypeCode.SYSTEM_CHANGE_DETECTED,
             reason=f"Case {case.case_id} changed to Closed.",
             client=case.client, case=case, import_run=import_run,
         )
@@ -150,7 +140,7 @@ def evaluate_case(case, *, previous_status=None, previous_auth_status=None,
         and case.service_authorization_status != previous_auth_status
     ):
         open_ticket(
-            TicketTypeCode.AUTHORIZATION_CHANGED,
+            TicketTypeCode.SYSTEM_CHANGE_DETECTED,
             reason=(
                 f"Authorization status changed: "
                 f"{previous_auth_status or '-'} -> {case.service_authorization_status}."
@@ -160,7 +150,7 @@ def evaluate_case(case, *, previous_status=None, previous_auth_status=None,
 
     if not ContractedService.objects.filter(case=case).exists():
         open_ticket(
-            TicketTypeCode.CASE_NO_SERVICES,
+            TicketTypeCode.SYSTEM_CHANGE_DETECTED,
             reason=f"Case {case.case_id} has no contracted services.",
             client=case.client, case=case, import_run=import_run,
         )
@@ -168,7 +158,7 @@ def evaluate_case(case, *, previous_status=None, previous_auth_status=None,
 
 def evaluate_credential_expired(credential, import_run=None):
     open_ticket(
-        TicketTypeCode.CREDENTIAL_EXPIRED,
+        TicketTypeCode.SYSTEM_CHANGE_DETECTED,
         reason=(
             f"Unite Us login expired for provider {credential.provider_id}"
             + (f" / employee {credential.employee_id}" if credential.employee_id else "")
