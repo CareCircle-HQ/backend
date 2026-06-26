@@ -2070,6 +2070,7 @@ class Agent(models.Model):
     AGENT_GROUPS = [
         ("Screeners", "Screeners"),
         ("Verifiers", "Verifiers"),
+        ("Logistics", "Logistics"),
         ("Management", "Management"),
         ("CS", "CS"),
     ]
