@@ -71,6 +71,7 @@ def _agent_login_response(agent):
     access["agent_code"] = agent.agent_code
     access["agent_name"] = agent.name
     access["agent_group"] = agent.group
+    access["agent_is_manager"] = agent.is_manager
 
     has_code = bool(agent.agent_code)
     return {
@@ -81,6 +82,7 @@ def _agent_login_response(agent):
             "email": agent.email,
             "agent_code": agent.agent_code,
             "group": agent.group,
+            "is_manager": agent.is_manager,
             "cbo": agent.cbo,
         },
         # The dialer is only usable when the agent has a CallTools extension
