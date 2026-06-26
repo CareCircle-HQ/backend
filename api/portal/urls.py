@@ -53,6 +53,7 @@ from .views_orders import (
     SendToDeliveryView,
     SendToKitchenView,
 )
+from .views_imports import ImportRunsView, ImportUploadView
 from .views_settings import (
     DeliveryCompanyIntegrationDetailView,
     DeliveryCompanyIntegrationSetPrimaryView,
@@ -139,6 +140,10 @@ urlpatterns = [
     path("purchase-orders/<uuid:po_id>/send-to-delivery/", SendToDeliveryView.as_view()),
     path("kitchens/", KitchensListView.as_view(), name="portal-kitchens"),
     path("delivery-companies/", DeliveryCompaniesListView.as_view(), name="portal-delivery-companies"),
+
+    # Settings > Import: manual Unite Us CSV upload + run history
+    path("settings/imports/", ImportRunsView.as_view(), name="portal-import-runs"),
+    path("settings/imports/upload/", ImportUploadView.as_view(), name="portal-import-upload"),
 
     # Settings integration sub-resources (not covered by the viewset router)
     path(

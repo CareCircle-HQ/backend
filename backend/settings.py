@@ -211,7 +211,9 @@ if DEBUG:
     CORS_ALLOW_ALL_ORIGINS = True
 else:
     CORS_ALLOWED_ORIGINS = [
-        o for o in os.getenv('CORS_ALLOWED_ORIGINS', 'http://localhost:3000').split(',') if o
+        o.strip()
+        for o in os.getenv('CORS_ALLOWED_ORIGINS', 'http://localhost:3000').split(',')
+        if o.strip()
     ]
     # The Chrome extension calls the live API from a chrome-extension://<id>
     # origin. The id changes per install/build, so allow any extension origin

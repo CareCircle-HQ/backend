@@ -200,6 +200,35 @@ class CadenceRuleAdmin(admin.ModelAdmin):
     readonly_fields = ("created_at", "updated_at")
 
 
+@admin.register(MemberDietaryProfile)
+class MemberDietaryProfileAdmin(admin.ModelAdmin):
+    list_display = (
+        "id",
+        "member_name",
+        "client",
+        "enrollment",
+        "status",
+        "meal_category",
+        "menu_type",
+        "kitchen_meal_type",
+        "meals_per_delivery",
+        "updated_at",
+    )
+    list_editable = ("status",)
+    list_filter = ("status", "meal_category", "menu_type")
+    search_fields = (
+        "member_name",
+        "client__client_id",
+        "client__first_name",
+        "client__last_name",
+        "enrollment__code",
+        "enrollment__client__client_id",
+    )
+    autocomplete_fields = ("client", "enrollment")
+    readonly_fields = ("created_at", "updated_at")
+    ordering = ("-created_at",)
+
+
 @admin.register(MemberDeliverySchedule)
 class MemberDeliveryScheduleAdmin(admin.ModelAdmin):
     list_display = (
@@ -229,10 +258,8 @@ class MemberDeliveryScheduleAdmin(admin.ModelAdmin):
         "household_member",
         "program",
         "product_type",
+        "member_profile",
     )
-    # MemberDietaryProfile has no registered ModelAdmin (only an inline), so it
-    # can't be an autocomplete target; use a raw id widget instead.
-    raw_id_fields = ("member_profile",)
     readonly_fields = ("created_at", "updated_at")
     ordering = ("-created_at",)
 

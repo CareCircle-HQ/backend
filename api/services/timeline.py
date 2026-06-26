@@ -150,12 +150,20 @@ def event_for_screening(screening, *, source=ChangeSource.EXTENSION, actor=""):
     occurred = screening.screen_created_at or screening.created_at
     needs = screening.identified_social_needs or []
     n = len(needs)
+    status = (screening.screen_status or "").strip().lower()
     if n:
         badge_text = f"{n} unmet social need" + ("s" if n != 1 else "")
         tone = TimelineBadgeTone.WARNING
     else:
         badge_text = (screening.screen_status or "").replace("_", " ").title()
-        tone = TimelineBadgeTone.NEUTRAL
+        if status.startswith("complete"):
+            tone = TimelineBadgeTone.SUCCESS  # green: finished screening
+        elif status in ("declined", "cancelled"):
+            tone = TimelineBadgeTone.DANGER
+        elif status == "expired":
+            tone = TimelineBadgeTone.WARNING  # orange: needs re-screening
+        else:
+            tone = TimelineBadgeTone.NEUTRAL
     return emit_timeline_event(
         client=client,
         event_type=TimelineEventType.SCREENING,
@@ -203,8 +211,13 @@ def event_for_assessment(assessment, *, source=ChangeSource.EXTENSION, actor="")
 
 
 _CASE_TONE = {
+    # Green: the case is actively open / being managed.
     CaseStatus.OPEN: TimelineBadgeTone.SUCCESS,
+    CaseStatus.MANAGED: TimelineBadgeTone.SUCCESS,
+    # Orange: needs attention or is no longer active.
     CaseStatus.PENDING_AUTHORIZATION: TimelineBadgeTone.WARNING,
+    CaseStatus.CLOSED: TimelineBadgeTone.WARNING,
+    # Red: cancelled.
     CaseStatus.CANCELLED: TimelineBadgeTone.DANGER,
 }
 
@@ -248,8 +261,10 @@ def event_for_insurance(insurance, *, source=ChangeSource.IMPORT, actor=""):
     occurred = insurance.enrolled_at or insurance.created_at
     status = insurance.status or insurance.record_status
     if status == RecordStatus.ACTIVE:
-        tone = TimelineBadgeTone.SUCCESS
-    elif status in (RecordStatus.EXPIRED, RecordStatus.INACTIVE):
+        tone = TimelineBadgeTone.SUCCESS  # green: active coverage
+    elif status == RecordStatus.EXPIRED:
+        tone = TimelineBadgeTone.WARNING  # orange: expired, needs renewal
+    elif status == RecordStatus.INACTIVE:
         tone = TimelineBadgeTone.DANGER
     else:
         tone = TimelineBadgeTone.NEUTRAL
@@ -277,9 +292,9 @@ def event_for_social_care_coverage(coverage, *, source=ChangeSource.IMPORT, acto
         return None
     occurred = coverage.enrolled_at or coverage.created_at
     if coverage.status == SocialCareCoverageStatus.ENROLLED:
-        tone = TimelineBadgeTone.SUCCESS
+        tone = TimelineBadgeTone.SUCCESS  # green: actively enrolled
     elif coverage.status == SocialCareCoverageStatus.EXPIRED:
-        tone = TimelineBadgeTone.DANGER
+        tone = TimelineBadgeTone.WARNING  # orange: expired, needs renewal
     else:
         tone = TimelineBadgeTone.NEUTRAL
     member = coverage.external_member_id
@@ -480,4 +495,31 @@ def event_for_out_of_orbit(
         enrollment=enrollment,
         metadata={"reason": reason, "menu_type": profile.menu_type or ""},
         dedupe_key=dedupe,
+    )
+
+
+def event_for_member_reactivated(
+    profile, *, enrollment=None, source=ChangeSource.SYSTEM, actor="",
+):
+    """Emit a 'Member reactivated' event when an out-of-orbit member is returned
+    to Active service (e.g. an agent picked a fulfillable menu type). Logged on
+    the member's own client. Not de-duped, so each deactivate/reactivate cycle
+    is recorded."""
+    client = getattr(profile, "client", None)
+    if client is None:
+        return None
+    enrollment = enrollment or getattr(profile, "enrollment", None)
+    return emit_timeline_event(
+        client=client,
+        event_type=TimelineEventType.MEMBER_REACTIVATED,
+        occurred_at=timezone.now(),
+        title="Member reactivated",
+        subtitle=profile.member_name or "",
+        badge_text="Active",
+        badge_tone=TimelineBadgeTone.SUCCESS,
+        source=source,
+        actor=actor,
+        entity=profile,
+        enrollment=enrollment,
+        metadata={"menu_type": profile.menu_type or ""},
     )
