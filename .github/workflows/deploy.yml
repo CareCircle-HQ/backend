@@ -1,0 +1,39 @@
+name: Deploy
+
+# Run the server-side deploy.sh on a nightly schedule via a SELF-HOSTED runner.
+# The runner agent lives ON the server, so the job executes locally where git,
+# the virtualenv and (passwordless) sudo already work. deploy.sh does
+# `git pull origin main`, migrate, collectstatic and restarts gunicorn/nginx —
+# picking up whatever is on main. No inbound SSH or secrets are needed; the
+# runner only makes outbound HTTPS calls to GitHub.
+#
+# NOTE: scheduled workflows only run from the file on the DEFAULT branch (main),
+# and GitHub cron is always UTC (no timezone). 06:00 UTC = 02:00 America/
+# New_York during EDT (01:00 during EST — UTC doesn't shift for DST).
+on:
+  schedule:
+    - cron: "0 6 * * *"        # nightly @ 02:00 ET (EDT) / 01:00 ET (EST)
+  workflow_dispatch: {}        # allow manual "Run workflow" from the Actions tab
+
+# Never run two deploys at once; if a new commit lands mid-deploy, the in-flight
+# run is cancelled in favour of the latest.
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Deploy to production
+    # Runs on the self-hosted runner installed on the server. With a single
+    # runner the built-in `self-hosted` label is enough; add a custom label
+    # (and list it here) if you ever register more runners.
+    runs-on: self-hosted
+    timeout-minutes: 30
+    steps:
+      - name: Run deploy.sh
+        # deploy.sh cd's into its own directory and pulls main itself, so we
+        # don't need actions/checkout. Adjust the path if the repo isn't here.
+        run: |
+          set -euo pipefail
+          cd ~/backend
+          ./deploy.sh
