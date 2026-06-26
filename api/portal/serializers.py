@@ -715,6 +715,11 @@ class PortalMemberDietaryEditSerializer(serializers.Serializer):
     meal_category = serializers.CharField(allow_blank=True, required=False)
     menu_type = serializers.CharField(allow_blank=True, required=False)
     general_verification_notes = serializers.CharField(allow_blank=True, required=False)
+    # When true, return an out-of-orbit member to Active service. The view
+    # re-runs the meal rule with the edited menu type/allergies and only
+    # reactivates if the new combination can be fulfilled (it is not a model
+    # field, so the view pops it before assigning the rest).
+    reactivate = serializers.BooleanField(required=False, default=False)
 
 
 # ---------------------------------------------------------------------------

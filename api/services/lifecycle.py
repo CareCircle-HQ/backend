@@ -16,6 +16,7 @@ from django.db import transaction
 from django.utils import timezone
 
 from api.models import (
+    CaseType,
     ClientStage,
     EnrollmentStage,
     ProcessResult,
@@ -54,9 +55,14 @@ def _is_met_council(provider_id, org_name):
 
 def _has_met_council_screening(client):
     for s in client.screenings.all():
-        if s.screen_status != ScreenStatus.COMPLETED:
+        # Tolerate both "completed" (enum) and "complete" (Unite Us export /
+        # extension list-view label) so a finished screening always counts.
+        if not (s.screen_status or "").strip().lower().startswith("complete"):
             continue
-        if _is_met_council(s.provider_id, s.performing_organization_name or s.provider_name):
+        # Screening has no provider_id column; match Met Council by org/provider
+        # name (getattr keeps this safe if a provider_id is added later).
+        provider_id = getattr(s, "provider_id", None)
+        if _is_met_council(provider_id, s.performing_organization_name or s.provider_name):
             return True
     return False
 
@@ -94,12 +100,60 @@ def _assessment_outcome(client):
     return None
 
 
+# An internal-service (meals/boxes) case's authorization status -> the
+# ClientStage it drives the funnel to BEFORE a household enrollment exists.
+# Mirrors the enrollment projection (_AUTH_STATUS_TO_STAGE): denied/expired are
+# non-terminal and park at Waiting Authorization ("needs attention").
+_CASE_AUTH_TO_STAGE = {
+    ServiceAuthorizationStatus.APPROVED: ClientStage.AUTHORIZED,
+    ServiceAuthorizationStatus.NOT_REQUIRED: ClientStage.AUTHORIZED,
+    ServiceAuthorizationStatus.PENDING: ClientStage.WAITING_AUTHORIZATION,
+    ServiceAuthorizationStatus.DENIED: ClientStage.WAITING_AUTHORIZATION,
+    ServiceAuthorizationStatus.EXPIRED: ClientStage.WAITING_AUTHORIZATION,
+}
+
+# Rank to pick the most-advanced authorization stage across a client's cases.
+_EARLY_AUTH_RANK = {
+    ClientStage.WAITING_AUTHORIZATION: 1,
+    ClientStage.AUTHORIZED: 2,
+}
+
+
+def _case_authorization_stage(client):
+    """Highest authorization-derived stage across the client's internal-service
+    (meals/boxes) cases, or None when none carry an actionable auth status.
+
+    This lets the acquisition funnel reflect a case's authorization outcome even
+    before a household EnrollmentVerification exists (e.g. data imported from the
+    Unite Us cases export). Once an enrollment exists it governs instead — see
+    ``derive_client_stage`` — so this only fills the pre-enrollment gap.
+    """
+    best, best_rank = None, 0
+    for c in client.cases.all():
+        if c.case_type != CaseType.INTERNAL_SERVICE:
+            continue
+        stage = _CASE_AUTH_TO_STAGE.get(c.service_authorization_status)
+        if stage is None:
+            continue
+        rank = _EARLY_AUTH_RANK.get(stage, 0)
+        if rank > best_rank:
+            best, best_rank = stage, rank
+    return best
+
+
 def _derive_early_funnel(client):
     """Early funnel stage from synced Unite Us data (no writes).
 
-    Priority (highest first): navigation > assessment > not_eligible >
-    screened > consent > inactive.
+    Priority (highest first): authorized/waiting (from an internal-service
+    case's authorization) > navigation > assessment > not_eligible > screened >
+    consent > inactive.
     """
+    # An internal-service (meals/boxes) case with an authorization outcome
+    # advances the funnel past Navigation even without an enrollment.
+    auth_stage = _case_authorization_stage(client)
+    if auth_stage is not None:
+        return auth_stage
+
     if _has_met_council_case(client):
         return ClientStage.NAVIGATION
 

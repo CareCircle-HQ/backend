@@ -1037,6 +1037,7 @@ class AssessmentSerializer(serializers.ModelSerializer):
             "subject_id",
             "screen_created_at",
             "eligible_status",
+            "form_name",
             "provider_name",
             "performing_organization_name",
             "duration",

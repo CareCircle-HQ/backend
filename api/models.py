@@ -289,6 +289,7 @@ class Client(models.Model):
     # --- Core Identification ---
     client_id = models.UUIDField(primary_key=True, editable=False)
     first_name = models.CharField(max_length=120)
+    middle_name = models.CharField(max_length=120, blank=True)
     last_name = models.CharField(max_length=120)
     date_of_birth = models.DateField(null=True, blank=True)  # PII
     client_phone_number = models.CharField(max_length=30, blank=True)  # PII
@@ -326,8 +327,17 @@ class Client(models.Model):
     preferred_spoken_language = models.CharField(max_length=50, blank=True)  # E-form
     preferred_written_language = models.CharField(max_length=50, blank=True)  # E-form
     employment_status = models.CharField(max_length=1, blank=True)  # Enum
+    citizenship = models.CharField(max_length=80, blank=True)  # Unite Us export
     household_size = models.PositiveSmallIntegerField(null=True, blank=True)
+    adults_in_household = models.PositiveSmallIntegerField(null=True, blank=True)
+    children_in_household = models.PositiveSmallIntegerField(null=True, blank=True)
     household_income_range = models.CharField(max_length=2, blank=True)  # Enum
+    # Free-text monthly income from the Unite Us export (kept as a string so we
+    # don't lose source fidelity, e.g. "$2,500" or "2500").
+    gross_monthly_income = models.CharField(max_length=40, blank=True)
+    # Assigned care coordinator (client-level) from the Unite Us export.
+    care_coordinator = models.CharField(max_length=255, blank=True)
+    care_coordinator_status = models.CharField(max_length=20, blank=True)  # active/inactive
 
     # --- Program Fields (from E-Form) ---
     screening_call_duration_minutes = models.PositiveIntegerField(null=True, blank=True)
@@ -426,6 +436,7 @@ class Address(models.Model):
     )
     street = models.CharField(max_length=255, blank=True)  # PII
     city = models.CharField(max_length=120, blank=True)
+    county = models.CharField(max_length=120, blank=True)  # Unite Us export
     state = models.CharField(max_length=2, blank=True)
     zip = models.CharField(max_length=10, blank=True)
     created_at = models.DateTimeField(null=True, blank=True)
@@ -1320,6 +1331,8 @@ class Assessment(models.Model):
     )
     screen_created_at = models.DateTimeField(null=True, blank=True)
     eligible_status = models.CharField(max_length=50, blank=True)  # e.g., "Eligible", "Not Eligible"
+    # The assessment/form type, e.g. "Unite NYC - Food Assistance Assessment".
+    form_name = models.CharField(max_length=255, blank=True)
 
     # --- Provider Info ---
     provider_name = models.CharField(max_length=255, blank=True)  # submitter from Unite Us
@@ -2613,6 +2626,7 @@ class TimelineEventType(models.TextChoices):
     TICKET_CREATED = "ticket_created", "New Ticket Created"
     DELIVERY_ADDRESS_CHANGED = "delivery_address_changed", "Delivery Address Changed"
     OUT_OF_ORBIT = "out_of_orbit", "Out of Orbit"
+    MEMBER_REACTIVATED = "member_reactivated", "Member Reactivated"
     # --- Legacy coarse types: retained so existing rows stay valid; no longer
     # emitted by the timeline service (a data migration remaps old rows). ---
     VERIFICATION = "verification", "Verification"

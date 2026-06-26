@@ -21,6 +21,7 @@ from ..models import (
     HouseholdMember,
     Kitchen,
     MemberDietaryProfile,
+    MemberStatus,
     Note,
     NoteSource,
     PurchaseOrder,
@@ -410,9 +411,34 @@ class HouseholdMemberEditView(PortalAPIView):
         )
         ser = s.PortalMemberDietaryEditSerializer(data=request.data)
         ser.is_valid(raise_exception=True)
-        for field, value in ser.validated_data.items():
+        data = dict(ser.validated_data)
+        # `reactivate` is a control flag, not a model field — handle separately.
+        reactivate = data.pop("reactivate", False)
+        for field, value in data.items():
             setattr(mv, field, value)
-        mv.save()
+
+        if reactivate and mv.status == MemberStatus.OUT_OF_ORBIT:
+            # Re-run the meal rule against the edited menu type/allergies. Only
+            # return the member to Active if the new combination can actually be
+            # fulfilled; otherwise the agent must pick a different menu type.
+            result, _ = apply_to_member(mv, save=False)
+            if result.out_of_orbit:
+                return Response(
+                    {"error": "Pick a different menu type to activate this member."},
+                    status=http.HTTP_400_BAD_REQUEST,
+                )
+            mv.save()
+            agent = current_agent(request)
+            actor = f"agent:{agent.agent_code}" if agent and agent.agent_code else ""
+            try:
+                timeline.event_for_member_reactivated(
+                    mv, enrollment=mv.enrollment, actor=actor,
+                )
+            except Exception:  # never let history-logging break the edit
+                pass
+        else:
+            mv.save()
+
         return Response(s.PortalHouseholdMemberSerializer(mv).data)
 
 
@@ -776,7 +802,7 @@ class MemberAssignKitchenView(PortalAPIView):
         # food notes (sent to the kitchen on the PO) or flag the member Out of
         # Orbit. Out-of-orbit members are excluded from schedules + POs.
         agent = current_agent(request)
-        actor = f"agent:{agent.code}" if agent and agent.code else ""
+        actor = f"agent:{agent.agent_code}" if agent and agent.agent_code else ""
         for profile in enr.member_profiles.select_related("client").all():
             _result, became_out = apply_to_member(profile)
             if became_out:
