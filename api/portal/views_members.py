@@ -7,6 +7,7 @@ from datetime import datetime
 
 from django.db import transaction
 from django.db.models import Count, Q
+from django.db.models.functions import Lower
 from django.shortcuts import get_object_or_404
 from rest_framework import status as http
 from rest_framework.response import Response
@@ -224,10 +225,15 @@ class MembersListView(PortalGenericAPIView):
         # Flat mode: one row per individual member (no household grouping),
         # used by the Members page. Otherwise return household groups.
         if request.query_params.get("flat"):
-            members = [s.MemberListSerializer(c).data for c in self.get_queryset()]
-            members.sort(key=lambda m: (m["name"] or "").lower())
-            page = self.paginate_queryset(members)
-            return self.get_paginated_response(page)
+            # Order + paginate in SQL (LIMIT/OFFSET) so we only ever serialize
+            # one page; serializing/sorting the whole clients table per request
+            # does not scale once the full member base is imported. Lower() on
+            # the name columns reproduces the previous case-insensitive
+            # "First Last" ordering.
+            qs = self.get_queryset().order_by(Lower("first_name"), Lower("last_name"))
+            page = self.paginate_queryset(qs)
+            data = [s.MemberListSerializer(c).data for c in page]
+            return self.get_paginated_response(data)
         page = self.paginate_queryset(self._build_groups())
         return self.get_paginated_response(page)
 
