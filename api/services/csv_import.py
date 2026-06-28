@@ -64,6 +64,55 @@ TIMELINE_ACTOR = "system:csv-import"
 SUPPORTED_EXPORT_TYPES = ("clients", "screening", "assessments", "cases")
 
 
+# --- streaming helpers -----------------------------------------------------
+def _text_stream(file_obj):
+    """Wrap a binary file-like in a streaming UTF-8 (BOM-tolerant) text reader.
+
+    Avoids loading the whole upload into memory -- the denormalized screening
+    export runs to several GB. Handles plain binary files (CLI
+    ``open(path, "rb")``), ``io.BytesIO``, and Django ``UploadedFile`` objects
+    (whose raw bytes live on ``.file``). Falls back to decoding an
+    already-read payload for objects that aren't TextIOWrapper-compatible.
+    """
+    raw = getattr(file_obj, "file", file_obj)
+    try:
+        raw.seek(0)
+    except (AttributeError, OSError, ValueError):
+        pass
+    try:
+        return io.TextIOWrapper(raw, encoding="utf-8-sig", newline="")
+    except (TypeError, AttributeError):
+        data = file_obj.read()
+        if isinstance(data, bytes):
+            data = data.decode("utf-8-sig")
+        return io.StringIO(data)
+
+
+def _iter_contiguous_groups(reader, key_field):
+    """Yield ``(key, rows)`` for runs of consecutive rows sharing ``key_field``.
+
+    Memory-safe for huge exports: only one entity's rows are held at a time
+    (the Unite Us denormalized exports emit all rows for an entity together).
+    Rows with a blank key are yielded individually as ``(None, [row])`` so the
+    caller can count them as skipped without disturbing the current group.
+    """
+    current_key = None
+    bucket = []
+    for row in reader:
+        k = (row.get(key_field) or "").strip()
+        if not k:
+            yield None, [row]
+            continue
+        if k != current_key:
+            if bucket:
+                yield current_key, bucket
+            current_key, bucket = k, [row]
+        else:
+            bucket.append(row)
+    if bucket:
+        yield current_key, bucket
+
+
 # --- value parsing helpers -------------------------------------------------
 def _s(row, key):
     """Trimmed string for a column (missing column -> '')."""
@@ -584,27 +633,19 @@ class CsvImporter:
 
     def import_screenings(self, reader):
         self.dataset = "screenings"
-        # Group the denormalized (one-row-per-answer) rows by screen.
-        groups = OrderedDict()
-        for row in reader:
-            sid = (row.get("enhanced_screen_id") or "").strip()
-            if not sid:
+        # Stream the denormalized (one-row-per-answer) export grouped by screen,
+        # holding only one screen's rows in memory at a time -- this file can be
+        # several GB. Rows for a screen are contiguous in the export.
+        for sid, rows in _iter_contiguous_groups(reader, "enhanced_screen_id"):
+            if sid is None:
                 self._count("skipped")
                 continue
-            groups.setdefault(sid, []).append(row)
-
-        # Append-only: screenings are immutable once complete, so skip any
-        # enhanced_screen_id we already store. This makes re-imports of the same
-        # (or an overlapping) file cheap and non-destructive.
-        existing = {
-            str(pk)
-            for pk in Screening.objects.filter(
-                pk__in=list(groups.keys())
-            ).values_list("pk", flat=True)
-        }
-
-        for sid, rows in groups.items():
-            if sid in existing:
+            # Append-only + idempotent: screenings are immutable once complete,
+            # so skip any enhanced_screen_id we already store (checked per
+            # group). This keeps re-imports cheap and non-destructive, and also
+            # guards the rare case of a screen split across non-contiguous
+            # groups -- the second group is skipped once the first creates it.
+            if Screening.objects.filter(pk=sid).exists():
                 self._count("skipped")
                 continue
             try:
@@ -738,11 +779,10 @@ def run_csv_import(*, export_type, file_obj, triggered_by="manual"):
     )
     importer = CsvImporter(run)
     try:
-        # Decode to text; tolerate a UTF-8 BOM from spreadsheet exports.
-        raw = file_obj.read()
-        if isinstance(raw, bytes):
-            raw = raw.decode("utf-8-sig")
-        reader = csv.DictReader(io.StringIO(raw))
+        # Stream the file as text (tolerating a UTF-8 BOM from spreadsheet
+        # exports) rather than reading it all into memory -- the screening
+        # export runs to several GB.
+        reader = csv.DictReader(_text_stream(file_obj))
         with change_context(ChangeSource.IMPORT, f"csv:{triggered_by}"):
             if export_type == "clients":
                 importer.import_clients(reader)
