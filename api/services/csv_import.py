@@ -559,11 +559,16 @@ def map_case_row(row):
 
 # --- importer --------------------------------------------------------------
 class CsvImporter:
-    def __init__(self, run):
+    def __init__(self, run, emit_side_effects=True):
         self.run = run
         self.errors = []
         self.stats = {"created": 0, "updated": 0, "skipped": 0, "errors": 0}
         self.dataset = "clients"  # stats label; set per import_* method
+        # When False, import rows only -- skip timeline events + funnel-stage
+        # recompute. Used for bulk historical loads where the derived trail is
+        # regenerated separately (and avoids timeline dedupe collisions with the
+        # daily API sync).
+        self.emit_side_effects = emit_side_effects
 
     def _count(self, kind):
         self.stats[kind] += 1
@@ -625,7 +630,8 @@ class CsvImporter:
                 ser.is_valid(raise_exception=True)
                 client = ser.save()
                 self._count("updated" if existed else "created")
-                self._post_save(client)
+                if self.emit_side_effects:
+                    self._post_save(client)
             except Exception as exc:  # isolate one bad client from the run
                 self._count("errors")
                 self.errors.append(f"client {cid}: {exc}")
@@ -655,8 +661,9 @@ class CsvImporter:
                 screening = ser.save()
                 self._save_screening_needs(screening, rows)
                 self._count("created")
-                self._emit_screening_timeline(screening)
-                self._recompute_stage(screening.client_id, screening.client)
+                if self.emit_side_effects:
+                    self._emit_screening_timeline(screening)
+                    self._recompute_stage(screening.client_id, screening.client)
             except Exception as exc:  # isolate one bad screen from the run
                 self._count("errors")
                 self.errors.append(f"screening {sid}: {exc}")
@@ -703,7 +710,8 @@ class CsvImporter:
                 ser.is_valid(raise_exception=True)
                 assessment = ser.save()
                 self._count("updated" if existed else "created")
-                self._post_save_assessment(assessment)
+                if self.emit_side_effects:
+                    self._post_save_assessment(assessment)
             except Exception as exc:  # isolate one bad submission from the run
                 self._count("errors")
                 self.errors.append(f"assessment {sid}: {exc}")
@@ -735,7 +743,8 @@ class CsvImporter:
                 ser.is_valid(raise_exception=True)
                 case = ser.save()
                 self._count("updated" if existed else "created")
-                self._post_save_case(case)
+                if self.emit_side_effects:
+                    self._post_save_case(case)
             except Exception as exc:  # isolate one bad case from the run
                 self._count("errors")
                 self.errors.append(f"case {cid}: {exc}")
@@ -762,11 +771,15 @@ class CsvImporter:
         self.run.processed_count = sum(self.stats.values())
 
 
-def run_csv_import(*, export_type, file_obj, triggered_by="manual"):
+def run_csv_import(*, export_type, file_obj, triggered_by="manual", emit_side_effects=True):
     """Import an uploaded Unite Us CSV ``file_obj`` of ``export_type``.
 
     Returns the persisted :class:`ImportRun`. ``file_obj`` may be any
     binary/text file-like object (e.g. a Django ``UploadedFile``).
+
+    When ``emit_side_effects`` is False, only the data rows are written --
+    timeline events and funnel-stage recompute are skipped (useful for bulk
+    historical loads).
     """
     if export_type not in SUPPORTED_EXPORT_TYPES:
         raise ValueError(
@@ -777,7 +790,7 @@ def run_csv_import(*, export_type, file_obj, triggered_by="manual"):
     run = ImportRun.objects.create(
         source=CSV_SOURCE, status=ImportRunStatus.RUNNING, triggered_by=triggered_by,
     )
-    importer = CsvImporter(run)
+    importer = CsvImporter(run, emit_side_effects=emit_side_effects)
     try:
         # Stream the file as text (tolerating a UTF-8 BOM from spreadsheet
         # exports) rather than reading it all into memory -- the screening
