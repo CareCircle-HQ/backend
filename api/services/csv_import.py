@@ -20,9 +20,10 @@ into an :class:`~api.models.ImportRun`.
 import csv
 import io
 import logging
-import re
 from collections import OrderedDict
 
+from django.core.exceptions import ValidationError
+from django.core.validators import validate_email
 from django.utils import timezone
 from django.utils.dateparse import parse_datetime
 
@@ -182,14 +183,21 @@ def _enum(value, allowed, default=""):
     return v if v in allowed else default
 
 
-# Basic email shape check — the export occasionally contains junk (e.g. a phone
-# number or "n/a") in the email column, which the EmailField would reject and
-# fail the whole client. We drop such values rather than block the import.
-_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
-
-
+# Email validity check — the export occasionally contains junk (e.g. a phone
+# number, "n/a", or a malformed address like "foo@bar..com") in the email
+# column, which the EmailField would reject and fail the whole client. We drop
+# such values rather than block the import. Use Django's own validator so this
+# check matches the serializer's EmailField exactly (a looser regex would let
+# values through that the serializer then rejects, re-introducing the failure).
 def _valid_email(value):
-    return bool(_EMAIL_RE.match((value or "").strip()))
+    value = (value or "").strip()
+    if not value:
+        return False
+    try:
+        validate_email(value)
+    except ValidationError:
+        return False
+    return True
 
 
 # --- per-client mapping ----------------------------------------------------
