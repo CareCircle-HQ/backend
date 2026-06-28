@@ -11,13 +11,14 @@ from django.core.cache import cache
 from rest_framework import permissions, status, views
 from rest_framework.response import Response
 
-from .integrations.calltools import campaigns, client, config, presence
+from .integrations.calltools import campaigns, client, config, presence, queues
 from .models import Agent, ClientPhone
 from .views_phones import _client_match
 
 logger = logging.getLogger(__name__)
 
 _CACHE_KEY = "calltools:campaign_options"
+_QUEUES_CACHE_KEY = "calltools:queue_options"
 _CACHE_TTL = 300  # seconds
 
 
@@ -51,6 +52,44 @@ class CallToolsCampaignsView(views.APIView):
             options = campaigns.list_campaign_options(active_only=active_only)
         except client.CallToolsError as exc:
             logger.warning("CallTools campaigns fetch failed: %s", exc)
+            return Response(
+                {"detail": str(exc)}, status=status.HTTP_502_BAD_GATEWAY
+            )
+
+        cache.set(cache_key, options, _CACHE_TTL)
+        return Response(options)
+
+
+class CallToolsQueuesView(views.APIView):
+    """GET /api/calltools/queues/
+
+    Returns ``[{id, uuid, name, active}]`` for the Lead Source dropdown.
+    Query param ``active_only=true`` restricts to active queues.
+    Query param ``refresh=true`` bypasses the cache.
+    """
+
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        if not config.is_enabled():
+            return Response(
+                {"detail": "CallTools is not configured (CALLTOOLS_API_TOKEN)."},
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+
+        active_only = request.query_params.get("active_only") == "true"
+        refresh = request.query_params.get("refresh") == "true"
+        cache_key = f"{_QUEUES_CACHE_KEY}:{int(active_only)}"
+
+        if not refresh:
+            cached = cache.get(cache_key)
+            if cached is not None:
+                return Response(cached)
+
+        try:
+            options = queues.list_queue_options(active_only=active_only)
+        except client.CallToolsError as exc:
+            logger.warning("CallTools queues fetch failed: %s", exc)
             return Response(
                 {"detail": str(exc)}, status=status.HTTP_502_BAD_GATEWAY
             )

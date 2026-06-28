@@ -90,6 +90,7 @@ def get_active_call(app_user, calls=None):
         "direction": "inbound" if call.get("inbound") else "outbound",
         "call_type": call.get("call_type"),
         "campaign": call.get("campaign"),
+        "queue": call.get("queue"),
         "contact": call.get("contact"),
         "started_at": call.get("start"),
         "answered_at": call.get("answered_on"),
