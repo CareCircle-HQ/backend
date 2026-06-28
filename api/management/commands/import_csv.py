@@ -37,6 +37,14 @@ class Command(BaseCommand):
             required=True,
             help="Path to the CSV file to import.",
         )
+        parser.add_argument(
+            "--data-only",
+            action="store_true",
+            help=(
+                "Import rows only -- skip timeline events and funnel-stage "
+                "recompute. Use for bulk historical loads."
+            ),
+        )
 
     def handle(self, *args, **options):
         export_type = options["type"]
@@ -50,6 +58,7 @@ class Command(BaseCommand):
         with open(path, "rb") as f:
             run = run_csv_import(
                 export_type=export_type, file_obj=f, triggered_by="cli",
+                emit_side_effects=not options["data_only"],
             )
 
         msg = (
