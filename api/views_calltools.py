@@ -1,8 +1,8 @@
 """CallTools-backed read endpoints for the extension.
 
-Currently exposes the campaign list used to populate the Profile tab's Lead
-Source dropdown. Results are cached briefly so we don't hit CallTools on every
-panel open.
+Exposes the queue list used to populate the Profile tab's Lead Source dropdown
+and the agent's live presence/caller-ID. Results are cached briefly so we don't
+hit CallTools on every panel open.
 """
 
 import logging
@@ -11,54 +11,15 @@ from django.core.cache import cache
 from rest_framework import permissions, status, views
 from rest_framework.response import Response
 
-from .integrations.calltools import campaigns, client, config, presence, queues
+from .integrations.calltools import client, config, presence, queues
 from .models import Agent, ClientPhone
 from .portal.base import current_agent
 from .views_phones import _client_match
 
 logger = logging.getLogger(__name__)
 
-_CACHE_KEY = "calltools:campaign_options"
 _QUEUES_CACHE_KEY = "calltools:queue_options"
 _CACHE_TTL = 300  # seconds
-
-
-class CallToolsCampaignsView(views.APIView):
-    """GET /api/calltools/campaigns/
-
-    Returns ``[{id, uuid, name, active}]`` for the Lead Source dropdown.
-    Query param ``active_only=true`` restricts to active campaigns.
-    Query param ``refresh=true`` bypasses the cache.
-    """
-
-    permission_classes = [permissions.IsAuthenticated]
-
-    def get(self, request):
-        if not config.is_enabled():
-            return Response(
-                {"detail": "CallTools is not configured (CALLTOOLS_API_TOKEN)."},
-                status=status.HTTP_503_SERVICE_UNAVAILABLE,
-            )
-
-        active_only = request.query_params.get("active_only") == "true"
-        refresh = request.query_params.get("refresh") == "true"
-        cache_key = f"{_CACHE_KEY}:{int(active_only)}"
-
-        if not refresh:
-            cached = cache.get(cache_key)
-            if cached is not None:
-                return Response(cached)
-
-        try:
-            options = campaigns.list_campaign_options(active_only=active_only)
-        except client.CallToolsError as exc:
-            logger.warning("CallTools campaigns fetch failed: %s", exc)
-            return Response(
-                {"detail": str(exc)}, status=status.HTTP_502_BAD_GATEWAY
-            )
-
-        cache.set(cache_key, options, _CACHE_TTL)
-        return Response(options)
 
 
 class CallToolsQueuesView(views.APIView):
