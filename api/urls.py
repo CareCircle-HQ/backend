@@ -27,7 +27,11 @@ from .views_agent import (
     AgentValidateView,
     AgentVerifyCodeView,
 )
-from .views_calltools import CallToolsAgentStatusView, CallToolsCampaignsView
+from .views_calltools import (
+    CallToolsAgentStatusView,
+    CallToolsCampaignsView,
+    CallToolsQueuesView,
+)
 from .views_leads import LeadViewSet
 from .views_member_app import MemberAppRequestCodeView
 from .views_places import PlacesAutocompleteView, PlacesDetailsView
@@ -87,6 +91,7 @@ urlpatterns = [
     ),
     # CallTools dialer
     path("calltools/campaigns/", CallToolsCampaignsView.as_view(), name="calltools-campaigns"),
+    path("calltools/queues/", CallToolsQueuesView.as_view(), name="calltools-queues"),
     # Unite Us credential capture (extension pushes the captured session here)
     path(
         "uniteus/credentials/",
