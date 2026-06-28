@@ -61,7 +61,11 @@ def _agent_login_response(agent):
     Shared by the agent-code login and the email/2FA verify flow so both return
     an identical shape. ``agent_code`` may be null for agents without a dialer
     extension; ``calltools_enabled`` tells the client whether to surface the
-    CallTools dialer features (only when the agent has a code).
+    CallTools dialer features. We gate on the CallTools identity
+    (``calltools_app_user``) rather than the dialer extension (``agent_code``)
+    so managers/agents who are linked to CallTools but have no extension still
+    get presence + caller ID. The presence endpoint resolves the agent from the
+    JWT, so no extension is needed to identify them.
     """
     # Build an access token directly so we control the 24-hour lifetime
     # (RefreshToken.access_token would use the short default lifetime).
@@ -73,7 +77,7 @@ def _agent_login_response(agent):
     access["agent_group"] = agent.group
     access["agent_is_manager"] = agent.is_manager
 
-    has_code = bool(agent.agent_code)
+    has_calltools = bool(agent.calltools_app_user)
     return {
         "success": True,
         "agent": {
@@ -85,10 +89,11 @@ def _agent_login_response(agent):
             "is_manager": agent.is_manager,
             "cbo": agent.cbo,
         },
-        # The dialer is only usable when the agent has a CallTools extension
-        # (agent_code). The client should hide/disable CallTools UI otherwise.
-        "calltools_enabled": has_code,
-        "calltools": _calltools_presence(agent) if has_code else None,
+        # The dialer is usable whenever the agent is linked to a CallTools
+        # account (calltools_app_user), regardless of whether they have a dialer
+        # extension. The client should hide/disable CallTools UI otherwise.
+        "calltools_enabled": has_calltools,
+        "calltools": _calltools_presence(agent) if has_calltools else None,
         "access_token": str(access),
         "expires_in": 86400,  # 24 hours in seconds
         "expires_at": (timezone.now() + timedelta(hours=24)).isoformat(),

@@ -13,6 +13,7 @@ from rest_framework.response import Response
 
 from .integrations.calltools import campaigns, client, config, presence, queues
 from .models import Agent, ClientPhone
+from .portal.base import current_agent
 from .views_phones import _client_match
 
 logger = logging.getLogger(__name__)
@@ -99,11 +100,16 @@ class CallToolsQueuesView(views.APIView):
 
 
 class CallToolsAgentStatusView(views.APIView):
-    """GET /api/agents/<code>/calltools/
+    """GET /api/calltools/status/ (preferred) or /api/agents/<code>/calltools/
 
     Returns the agent's live CallTools presence and active call:
         {app_user, logged_in, on_call, status, active_call}
     where status is on_call | online | offline | unknown.
+
+    The agent is resolved from the authenticated JWT (no identifier needed in
+    the URL); presence keys off the agent's ``calltools_app_user``, so agents
+    linked to CallTools work even without a dialer extension. The legacy
+    ``<code>`` route is still accepted for backward compatibility.
 
     Pass ``?client_phone=<number>`` to also get ``active_call.matches_client``
     (last-10-digit comparison) so the extension can flag a match with the
@@ -112,17 +118,21 @@ class CallToolsAgentStatusView(views.APIView):
 
     permission_classes = [permissions.IsAuthenticated]
 
-    def get(self, request, code):
+    def get(self, request, code=None):
         if not config.is_enabled():
             return Response(
                 {"detail": "CallTools is not configured (CALLTOOLS_API_TOKEN)."},
                 status=status.HTTP_503_SERVICE_UNAVAILABLE,
             )
 
-        agent = Agent.objects.filter(agent_code=code).first()
+        # Prefer the authenticated agent (JWT); fall back to the legacy
+        # ``agent_code`` path param so older extension builds keep working.
+        agent = current_agent(request)
+        if agent is None and code:
+            agent = Agent.objects.filter(agent_code=code).first()
         if agent is None:
             return Response(
-                {"detail": f"No agent with code {code}."},
+                {"detail": "No agent for this session."},
                 status=status.HTTP_404_NOT_FOUND,
             )
         if not agent.calltools_app_user:

@@ -90,6 +90,7 @@ urlpatterns = [
         name="agent-calltools-status",
     ),
     # CallTools dialer
+    path("calltools/status/", CallToolsAgentStatusView.as_view(), name="calltools-status"),
     path("calltools/campaigns/", CallToolsCampaignsView.as_view(), name="calltools-campaigns"),
     path("calltools/queues/", CallToolsQueuesView.as_view(), name="calltools-queues"),
     # Unite Us credential capture (extension pushes the captured session here)
