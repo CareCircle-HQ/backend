@@ -45,6 +45,23 @@ class Command(BaseCommand):
                 "recompute. Use for bulk historical loads."
             ),
         )
+        parser.add_argument(
+            "--provider-id",
+            default=None,
+            help=(
+                "Cases only: import only rows whose provider_id matches. "
+                "Combined with --provider-name as an OR; non-matching rows are "
+                "skipped."
+            ),
+        )
+        parser.add_argument(
+            "--provider-name",
+            default=None,
+            help=(
+                "Cases only: import only rows whose provider_name matches "
+                "(case-insensitive, trimmed). OR-combined with --provider-id."
+            ),
+        )
 
     def handle(self, *args, **options):
         export_type = options["type"]
@@ -59,6 +76,8 @@ class Command(BaseCommand):
             run = run_csv_import(
                 export_type=export_type, file_obj=f, triggered_by="cli",
                 emit_side_effects=not options["data_only"],
+                provider_id=options.get("provider_id"),
+                provider_name=options.get("provider_name"),
             )
 
         msg = (
