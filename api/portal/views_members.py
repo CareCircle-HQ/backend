@@ -144,6 +144,23 @@ class MembersListView(PortalGenericAPIView):
                 )
             )
 
+        # Special status flags that aren't lifecycle stages:
+        #   * out_of_orbit -> the member has a MemberDietaryProfile the meal rule
+        #     couldn't safely fulfill (status OUT_OF_ORBIT).
+        #   * on_hold      -> the member's (or household's) enrollment is paused
+        #     (On Hold). NB: lifecycle_stage keeps the held-from stage, so this
+        #     must be filtered on the enrollment stage, not lifecycle_stage.
+        flag = (params.get("flag") or "").strip().lower()
+        if flag == "out_of_orbit":
+            qs = qs.filter(member_profiles__status=MemberStatus.OUT_OF_ORBIT)
+        elif flag == "on_hold":
+            qs = qs.filter(
+                Q(enrollments__stage=EnrollmentStage.ON_HOLD)
+                | Q(
+                    household_membership__household__enrollment_verifications__stage=EnrollmentStage.ON_HOLD
+                )
+            )
+
         return qs.distinct()
 
     def _serialize_member(self, client, is_primary, relationship=""):
