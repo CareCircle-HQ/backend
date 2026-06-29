@@ -118,8 +118,20 @@ def verification_status(client):
 
 
 def active_enrollment(client):
-    """Most recent non-closed enrollment for the client (drives household/dates)."""
+    """Most recent non-closed enrollment governing the client (drives status /
+    household / dates).
+
+    The verification applies to the WHOLE household, so a non-primary member has
+    no enrollment of their own: fall back to their household's enrollment. Without
+    this, only the primary reflects the household's denied / on-hold / date state
+    while every other member falls back to the coarser ``lifecycle_stage`` (e.g.
+    showing "Waiting Authorization" instead of "Authorization Denied").
+    """
     enrollments = list(client.enrollments.all())
+    if not enrollments:
+        membership = getattr(client, "household_membership", None)
+        if membership is not None:
+            enrollments = list(membership.household.enrollment_verifications.all())
     if not enrollments:
         return None
     open_ones = [e for e in enrollments if e.closed_at is None]
