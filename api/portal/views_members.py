@@ -15,6 +15,7 @@ from rest_framework.response import Response
 from ..models import (
     Address,
     Case,
+    CaseType,
     Client,
     DeliveryCadence,
     EnrollmentStage,
@@ -73,6 +74,23 @@ SCOPE_TO_STAGES = {
 MEMBER_LIST_PREFETCH = ("insurances", "military_profile", "enrollments")
 
 
+def require_internal_service_primary(qs):
+    """Restrict a Client queryset to the members the Verification page should
+    show: everyone must belong to a household whose PRIMARY member holds an
+    Internal Service case (the case the verification + meal/box delivery attach
+    to). The internal-service-case holder is always the household primary, so
+    dependents are kept via their household and strays with no household — or
+    whose primary has no internal-service case — are dropped.
+
+    Caller is responsible for ``.distinct()`` (this adds multi-valued joins)."""
+    return qs.filter(
+        household_membership__household__members__is_primary=True,
+        household_membership__household__members__client__cases__case_type=(
+            CaseType.INTERNAL_SERVICE
+        ),
+    )
+
+
 def _parse_date(value):
     for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%m-%d-%Y"):
         try:
@@ -117,9 +135,15 @@ class MembersListView(PortalGenericAPIView):
 
         # Page-level scope (Verification / Logistics) restricts which stages are
         # ever shown, before the per-status filter chips are applied.
-        scope_stages = SCOPE_TO_STAGES.get((params.get("scope") or "").strip())
+        scope = (params.get("scope") or "").strip()
+        scope_stages = SCOPE_TO_STAGES.get(scope)
         if scope_stages:
             qs = qs.filter(lifecycle_stage__in=scope_stages)
+
+        # Verification page: only members whose household primary holds an
+        # Internal Service case (see require_internal_service_primary).
+        if scope == "verification":
+            qs = require_internal_service_primary(qs)
 
         status_val = (params.get("status") or "").strip()
         if status_val and status_val.lower() != "all":
@@ -345,11 +369,15 @@ class MembersListView(PortalGenericAPIView):
 class MembersStatsView(PortalAPIView):
     def get(self, request):
         qs = Client.objects.all()
-        scope_stages = SCOPE_TO_STAGES.get(
-            (request.query_params.get("scope") or "").strip()
-        )
+        scope = (request.query_params.get("scope") or "").strip()
+        scope_stages = SCOPE_TO_STAGES.get(scope)
         if scope_stages:
             qs = qs.filter(lifecycle_stage__in=scope_stages)
+        # Mirror the Verification list's eligibility filter so the chip counts
+        # match the rows actually shown. The join makes rows non-unique, so all
+        # counts below must be DISTINCT on the client.
+        if scope == "verification":
+            qs = require_internal_service_primary(qs).distinct()
         counts = {"total": qs.count()}
         for label, stages in STATUS_TO_STAGES.items():
             counts[label.lower()] = qs.filter(lifecycle_stage__in=stages).count()
@@ -357,7 +385,9 @@ class MembersStatsView(PortalAPIView):
         # Pending Verification / Waiting Authorization on the Verification page).
         counts["stages"] = {
             row["lifecycle_stage"]: row["n"]
-            for row in qs.values("lifecycle_stage").annotate(n=Count("id"))
+            for row in qs.values("lifecycle_stage").annotate(
+                n=Count("id", distinct=True)
+            )
         }
         return Response(counts)
 
