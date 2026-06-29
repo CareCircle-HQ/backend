@@ -6,6 +6,7 @@ import uuid
 from datetime import datetime
 
 from django.db import transaction
+from django.utils import timezone
 from django.db.models import Count, Q
 from django.db.models.functions import Lower
 from django.shortcuts import get_object_or_404
@@ -15,7 +16,10 @@ from rest_framework.response import Response
 from ..models import (
     Address,
     Case,
+    CaseType,
     Client,
+    ClientPhone,
+    ClientPhoneSource,
     DeliveryCadence,
     EnrollmentStage,
     EnrollmentVerification,
@@ -31,6 +35,7 @@ from ..models import (
     Ticket,
     TimelineEvent,
 )
+from ..views_phones import _phone_dict
 from ..services.catalog import menu_type_for_member, product_type_kind_for_name
 from ..services.delivery import (
     cadence_options_for_kind,
@@ -71,6 +76,23 @@ SCOPE_TO_STAGES = {
 }
 
 MEMBER_LIST_PREFETCH = ("insurances", "military_profile", "enrollments")
+
+
+def require_internal_service_primary(qs):
+    """Restrict a Client queryset to the members the Verification page should
+    show: everyone must belong to a household whose PRIMARY member holds an
+    Internal Service case (the case the verification + meal/box delivery attach
+    to). The internal-service-case holder is always the household primary, so
+    dependents are kept via their household and strays with no household — or
+    whose primary has no internal-service case — are dropped.
+
+    Caller is responsible for ``.distinct()`` (this adds multi-valued joins)."""
+    return qs.filter(
+        household_membership__household__members__is_primary=True,
+        household_membership__household__members__client__cases__case_type=(
+            CaseType.INTERNAL_SERVICE
+        ),
+    )
 
 
 def _parse_date(value):
@@ -117,9 +139,15 @@ class MembersListView(PortalGenericAPIView):
 
         # Page-level scope (Verification / Logistics) restricts which stages are
         # ever shown, before the per-status filter chips are applied.
-        scope_stages = SCOPE_TO_STAGES.get((params.get("scope") or "").strip())
+        scope = (params.get("scope") or "").strip()
+        scope_stages = SCOPE_TO_STAGES.get(scope)
         if scope_stages:
             qs = qs.filter(lifecycle_stage__in=scope_stages)
+
+        # Verification page: only members whose household primary holds an
+        # Internal Service case (see require_internal_service_primary).
+        if scope == "verification":
+            qs = require_internal_service_primary(qs)
 
         status_val = (params.get("status") or "").strip()
         if status_val and status_val.lower() != "all":
@@ -345,11 +373,15 @@ class MembersListView(PortalGenericAPIView):
 class MembersStatsView(PortalAPIView):
     def get(self, request):
         qs = Client.objects.all()
-        scope_stages = SCOPE_TO_STAGES.get(
-            (request.query_params.get("scope") or "").strip()
-        )
+        scope = (request.query_params.get("scope") or "").strip()
+        scope_stages = SCOPE_TO_STAGES.get(scope)
         if scope_stages:
             qs = qs.filter(lifecycle_stage__in=scope_stages)
+        # Mirror the Verification list's eligibility filter so the chip counts
+        # match the rows actually shown. The join makes rows non-unique, so all
+        # counts below must be DISTINCT on the client.
+        if scope == "verification":
+            qs = require_internal_service_primary(qs).distinct()
         counts = {"total": qs.count()}
         for label, stages in STATUS_TO_STAGES.items():
             counts[label.lower()] = qs.filter(lifecycle_stage__in=stages).count()
@@ -357,7 +389,9 @@ class MembersStatsView(PortalAPIView):
         # Pending Verification / Waiting Authorization on the Verification page).
         counts["stages"] = {
             row["lifecycle_stage"]: row["n"]
-            for row in qs.values("lifecycle_stage").annotate(n=Count("id"))
+            for row in qs.values("lifecycle_stage").annotate(
+                n=Count("id", distinct=True)
+            )
         }
         return Response(counts)
 
@@ -390,6 +424,82 @@ class MemberSocialCoverageView(PortalAPIView):
         client = get_object_or_404(Client, pk=client_id)
         plans = client.social_care_coverages.all()
         return Response(s.PortalSocialCoverageSerializer(plans, many=True).data)
+
+
+class MemberPhonesView(PortalAPIView):
+    """GET/POST /members/<client_id>/phones/ — list and add the client's phone
+    numbers (the Communication Preferences card on the member profile). Shares
+    the ClientPhone model + response shape with the extension caller-ID flow."""
+
+    def get(self, request, client_id):
+        get_object_or_404(Client, pk=client_id)
+        phones = ClientPhone.objects.filter(client_id=client_id)
+        return Response([_phone_dict(p) for p in phones])
+
+    def post(self, request, client_id):
+        client = get_object_or_404(Client, pk=client_id)
+        number = (request.data.get("number") or "").strip()
+        normalized = ClientPhone.normalize(number)
+        if not normalized:
+            return Response(
+                {"error": "A valid phone number (at least 10 digits) is required."},
+                status=http.HTTP_400_BAD_REQUEST,
+            )
+        label = (request.data.get("label") or "").strip()
+        # Idempotent on (client, normalized): re-adding the same number refreshes
+        # it rather than tripping the unique constraint.
+        phone, created = ClientPhone.objects.get_or_create(
+            client=client,
+            normalized=normalized,
+            defaults={"raw": number, "label": label, "source": ClientPhoneSource.AGENT},
+        )
+        phone.last_seen_at = timezone.now()
+        if not created and label and not phone.label:
+            phone.label = label
+        phone.save(update_fields=["last_seen_at", "label"])
+        # First number a client ever gets becomes primary by default.
+        make_primary = bool(request.data.get("is_primary")) or (
+            created and not ClientPhone.objects.filter(
+                client=client, is_primary=True
+            ).exclude(pk=phone.pk).exists()
+        )
+        if make_primary:
+            ClientPhone.objects.filter(client=client, is_primary=True).exclude(
+                pk=phone.pk
+            ).update(is_primary=False)
+            phone.is_primary = True
+            phone.save(update_fields=["is_primary"])
+        return Response(
+            _phone_dict(phone),
+            status=http.HTTP_201_CREATED if created else http.HTTP_200_OK,
+        )
+
+
+class MemberPhoneDetailView(PortalAPIView):
+    """PATCH/DELETE /members/<client_id>/phones/<client_phone_id>/ — edit the
+    label / primary flag, or remove a number."""
+
+    def patch(self, request, client_id, client_phone_id):
+        phone = get_object_or_404(
+            ClientPhone, pk=client_phone_id, client_id=client_id
+        )
+        if bool(request.data.get("is_primary")):
+            ClientPhone.objects.filter(
+                client_id=client_id, is_primary=True
+            ).exclude(pk=phone.pk).update(is_primary=False)
+            phone.is_primary = True
+            phone.save(update_fields=["is_primary"])
+        if "label" in request.data:
+            phone.label = (request.data.get("label") or "").strip()
+            phone.save(update_fields=["label"])
+        return Response(_phone_dict(phone))
+
+    def delete(self, request, client_id, client_phone_id):
+        phone = get_object_or_404(
+            ClientPhone, pk=client_phone_id, client_id=client_id
+        )
+        phone.delete()
+        return Response(status=http.HTTP_204_NO_CONTENT)
 
 
 class MemberHistoryView(PortalGenericAPIView):
