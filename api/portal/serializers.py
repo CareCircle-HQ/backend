@@ -533,6 +533,55 @@ class PortalCaseOptionSerializer(serializers.ModelSerializer):
         return f"CSE-{str(obj.case_id)[:8]}"
 
 
+class PortalMemberCaseSerializer(serializers.ModelSerializer):
+    """Full case row for the member profile's Cases tab."""
+
+    id = serializers.UUIDField(source="case_id", read_only=True)
+    code = serializers.SerializerMethodField()
+    status = serializers.CharField(source="case_status", read_only=True)
+    status_label = serializers.CharField(source="get_case_status_display", read_only=True)
+    type = serializers.CharField(source="case_type", read_only=True)
+    type_label = serializers.CharField(source="get_case_type_display", read_only=True)
+    auth_status = serializers.CharField(
+        source="service_authorization_status", read_only=True
+    )
+    auth_status_label = serializers.SerializerMethodField()
+    provider_name = serializers.SerializerMethodField()
+    resolution_type = serializers.CharField(
+        source="outcome_resolution_type", read_only=True
+    )
+    resolution_label = serializers.CharField(
+        source="get_outcome_resolution_type_display", read_only=True
+    )
+
+    class Meta:
+        model = Case
+        fields = [
+            "id", "code", "status", "status_label", "type", "type_label",
+            "service_type", "program_name", "provider_name",
+            "primary_worker_name", "date_opened", "case_closed_at",
+            "auth_status", "auth_status_label",
+            "authorized_amount", "authorized_unit",
+            "service_authorization_approval_starts_at",
+            "service_authorization_approval_ends_at",
+            "outcome_description", "resolution_type", "resolution_label",
+            "case_description",
+        ]
+
+    def get_code(self, obj):
+        return f"CSE-{str(obj.case_id)[:8]}"
+
+    def get_auth_status_label(self, obj):
+        return obj.service_authorization_status_label or (
+            obj.get_service_authorization_status_display()
+            if obj.service_authorization_status
+            else ""
+        )
+
+    def get_provider_name(self, obj):
+        return obj.provider_name or obj.originating_provider_name or ""
+
+
 class PortalTicketCreateSerializer(serializers.Serializer):
     type = serializers.SlugRelatedField(
         slug_field="code", queryset=TicketType.objects.all()
