@@ -183,6 +183,17 @@ class MembersListView(PortalGenericAPIView):
                 )
             )
 
+        # Household-composition filter: "multi" restricts to members whose
+        # household has more than one member (excludes solo households and
+        # ungrouped individuals).
+        household_filter = (params.get("household") or "").strip().lower()
+        if household_filter == "multi":
+            qs = qs.annotate(
+                _hh_member_count=Count(
+                    "household_membership__household__members", distinct=True
+                )
+            ).filter(_hh_member_count__gt=1)
+
         return qs.distinct()
 
     def _serialize_member(self, client, is_primary, relationship=""):
