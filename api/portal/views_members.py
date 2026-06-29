@@ -123,11 +123,26 @@ class MembersListView(PortalGenericAPIView):
 
         status_val = (params.get("status") or "").strip()
         if status_val and status_val.lower() != "all":
-            stages = STATUS_TO_STAGES.get(status_val)
-            if stages:
-                qs = qs.filter(lifecycle_stage__in=stages)
+            if status_val == "Denied":
+                # "Denied" covers BOTH the eligibility denial (lifecycle_stage
+                # not_eligible) AND a denied case authorization. The latter parks
+                # the client's lifecycle_stage at waiting_authorization while the
+                # enrollment records the DENIED outcome, so it can't be matched on
+                # lifecycle_stage alone -- match the enrollment stage too (own or
+                # household).
+                qs = qs.filter(
+                    Q(lifecycle_stage="not_eligible")
+                    | Q(enrollments__stage=EnrollmentStage.DENIED)
+                    | Q(
+                        household_membership__household__enrollment_verifications__stage=EnrollmentStage.DENIED
+                    )
+                )
             else:
-                qs = qs.filter(lifecycle_stage=status_val)
+                stages = STATUS_TO_STAGES.get(status_val)
+                if stages:
+                    qs = qs.filter(lifecycle_stage__in=stages)
+                else:
+                    qs = qs.filter(lifecycle_stage=status_val)
 
         # Product-kind filter (Meals vs Boxes), keyed off the household's program
         # name. A household is always one kind, so meals/boxes never mix.
