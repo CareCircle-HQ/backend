@@ -179,27 +179,60 @@ class MembersListView(PortalGenericAPIView):
                 return kind
         return ""
 
-    def _build_groups(self):
-        """Group the filtered clients into household groups (one row per
-        household, plus each household-less client as its own group). A
-        household is included whenever ANY of its members match the filters; the
-        expanded view then shows ALL of that household's members."""
-        clients = list(self.get_queryset())
-
-        household_ids, seen_hh, individuals = [], set(), []
-        for c in clients:
-            hm = getattr(c, "household_membership", None)
-            if hm and hm.household_id:
-                if hm.household_id not in seen_hh:
-                    seen_hh.add(hm.household_id)
-                    household_ids.append(hm.household_id)
+    def _group_entries(self):
+        """Lightweight, ordered list of group identifiers for the filtered set
+        WITHOUT serializing anyone. Each entry is
+        ``{"type": "household"|"individual", "id", "name"}``. Households are
+        de-duplicated and ordered (with individuals) by the household/primary
+        name so pagination is stable and only the requested page is ever built
+        + serialized. A household is included when ANY member matches; its full
+        roster is loaded when the page is built."""
+        rows = self.get_queryset().values_list(
+            "client_id", "household_membership__household_id",
+            "first_name", "last_name",
+        )
+        hh_ids, seen_hh, individuals = [], set(), []
+        for cid, hid, fn, ln in rows:
+            if hid:
+                if hid not in seen_hh:
+                    seen_hh.add(hid)
+                    hh_ids.append(hid)
             else:
-                individuals.append(c)
+                name = f"{(fn or '').strip()} {(ln or '').strip()}".strip()
+                individuals.append((cid, name))
 
-        groups = []
-        if household_ids:
+        # Household sort name = household name, else its primary's name (one query).
+        hh_names = {}
+        if hh_ids:
+            for hid, hname, fn, ln in HouseholdMember.objects.filter(
+                household_id__in=hh_ids, is_primary=True
+            ).values_list(
+                "household_id", "household__name",
+                "client__first_name", "client__last_name",
+            ):
+                hh_names[hid] = (
+                    hname or f"{(fn or '').strip()} {(ln or '').strip()}".strip()
+                )
+
+        entries = [
+            {"type": "household", "id": hid, "name": hh_names.get(hid, "")}
+            for hid in hh_ids
+        ] + [
+            {"type": "individual", "id": cid, "name": name}
+            for cid, name in individuals
+        ]
+        entries.sort(key=lambda e: (e["name"] or "").lower())
+        return entries
+
+    def _build_groups_for_page(self, entries):
+        """Serialize ONLY the groups on the current page, preserving order."""
+        hh_ids = [e["id"] for e in entries if e["type"] == "household"]
+        ind_ids = [e["id"] for e in entries if e["type"] == "individual"]
+        groups_by_key = {}
+
+        if hh_ids:
             members = (
-                HouseholdMember.objects.filter(household_id__in=household_ids)
+                HouseholdMember.objects.filter(household_id__in=hh_ids)
                 .select_related("household", "client")
                 .prefetch_related(
                     "client__insurances", "client__military_profile",
@@ -210,7 +243,7 @@ class MembersListView(PortalGenericAPIView):
             by_hh = {}
             for hm in members:
                 by_hh.setdefault(hm.household_id, []).append(hm)
-            for hid in household_ids:
+            for hid in hh_ids:
                 hms = by_hh.get(hid)
                 if not hms:
                     continue
@@ -223,7 +256,7 @@ class MembersListView(PortalGenericAPIView):
                     (m for m in member_data if m["id"] == str(primary_hm.client_id)),
                     member_data[0],
                 )
-                groups.append({
+                groups_by_key[("household", hid)] = {
                     "id": str(hid),
                     "type": "household",
                     "name": primary_hm.household.name or primary_data["name"],
@@ -231,22 +264,30 @@ class MembersListView(PortalGenericAPIView):
                     "service_type": self._service_type_for_client(primary_hm.client),
                     "primary": primary_data,
                     "members": member_data,
-                })
+                }
 
-        for c in individuals:
-            primary_data = self._serialize_member(c, True)
-            groups.append({
-                "id": str(c.client_id),
-                "type": "individual",
-                "name": primary_data["name"],
-                "member_count": 1,
-                "service_type": self._service_type_for_client(c),
-                "primary": primary_data,
-                "members": [primary_data],
-            })
+        if ind_ids:
+            clients = Client.objects.filter(client_id__in=ind_ids).prefetch_related(
+                *MEMBER_LIST_PREFETCH
+            )
+            for c in clients:
+                primary_data = self._serialize_member(c, True)
+                groups_by_key[("individual", c.client_id)] = {
+                    "id": str(c.client_id),
+                    "type": "individual",
+                    "name": primary_data["name"],
+                    "member_count": 1,
+                    "service_type": self._service_type_for_client(c),
+                    "primary": primary_data,
+                    "members": [primary_data],
+                }
 
-        groups.sort(key=lambda g: (g["name"] or "").lower())
-        return groups
+        # Preserve the paginated order from `entries`.
+        return [
+            groups_by_key[(e["type"], e["id"])]
+            for e in entries
+            if (e["type"], e["id"]) in groups_by_key
+        ]
 
     def get(self, request):
         # Flat mode: one row per individual member (no household grouping),
@@ -261,8 +302,11 @@ class MembersListView(PortalGenericAPIView):
             page = self.paginate_queryset(qs)
             data = [s.MemberListSerializer(c).data for c in page]
             return self.get_paginated_response(data)
-        page = self.paginate_queryset(self._build_groups())
-        return self.get_paginated_response(page)
+        # Grouped mode (Verification / Logistics): build the ordered group keys
+        # cheaply, paginate THEM, and serialize only the current page's groups
+        # (previously the whole scoped set was serialized on every request).
+        page = self.paginate_queryset(self._group_entries())
+        return self.get_paginated_response(self._build_groups_for_page(page or []))
 
 
 class MembersStatsView(PortalAPIView):
