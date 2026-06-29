@@ -54,12 +54,19 @@ STATUS_TO_STAGES = {
     "Kitchen Assignment": ["kitchen_assignment"],
     "Active": ["active"],
     "Completed": ["completed"],
+    # Verification-page combined chip: wizard completed AND awaiting the case
+    # authorization are one work-state ("verified, waiting on authorization").
+    "verified_awaiting": ["verified", "waiting_authorization"],
 }
 
 # Page-level base scope: restricts the list to the lifecycle stages a given
 # work area cares about (independent of the per-status filter chips).
 SCOPE_TO_STAGES = {
-    "verification": ["pending_verification", "waiting_authorization"],
+    # Verification work area: households whose verification was requested
+    # (pending_verification), completed (verified), or are awaiting case
+    # authorization (waiting_authorization). 'verified' must be included or a
+    # finished-but-unauthorized household would disappear from the page.
+    "verification": ["pending_verification", "verified", "waiting_authorization"],
     "logistics": ["kitchen_assignment"],
 }
 
