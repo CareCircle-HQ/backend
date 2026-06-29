@@ -13,6 +13,7 @@ source of truth for funnel-conversion and time-in-stage reporting.
 
 from django.conf import settings
 from django.db import transaction
+from django.db.models import F
 from django.utils import timezone
 
 from api.models import (
@@ -444,6 +445,10 @@ ENROLLMENT_TRANSITIONS = {
     EnrollmentStage.DENIED: {
         EnrollmentStage.PENDING_VERIFICATION,
         EnrollmentStage.WAITING_AUTHORIZATION,
+        # A denial can be superseded by a newer internal-service case: an
+        # approval re-advances to Kitchen Assignment, an expiry parks On Hold.
+        EnrollmentStage.KITCHEN_ASSIGNMENT,
+        EnrollmentStage.ON_HOLD,
         EnrollmentStage.CLOSED,
         EnrollmentStage.CANCELLED,
     },
@@ -580,11 +585,38 @@ _AUTH_STATUS_TO_STAGE = {
 _AUTH_ELIGIBLE_STAGES = {
     EnrollmentStage.VERIFIED,
     EnrollmentStage.WAITING_AUTHORIZATION,
+    # DENIED is re-evaluable: a denial can be superseded by a newer
+    # internal-service case (re-approval / re-submission), so reconcile must be
+    # able to move a denied enrollment forward again when the governing
+    # (most-recent) case changes outcome.
+    EnrollmentStage.DENIED,
 }
 
 
+def governing_internal_case(enrollment):
+    """The internal-service case whose authorization governs this enrollment.
+
+    A household can accumulate several internal-service cases over time (e.g. a
+    denial later followed by a re-approval). The *current* one -- the most
+    recently opened internal-service case on the enrollment's client -- must
+    drive the enrollment, not whichever case happens to sit on ``enrollment.case``
+    (which may be a stale, superseded case). Falls back to ``enrollment.case``
+    when the client has no internal-service case.
+    """
+    client = enrollment.client
+    if client is not None:
+        latest = (
+            client.cases.filter(case_type=CaseType.INTERNAL_SERVICE)
+            .order_by(F("date_opened").desc(nulls_last=True))
+            .first()
+        )
+        if latest is not None:
+            return latest
+    return enrollment.case
+
+
 def reconcile_enrollment_authorization(enrollment, *, actor=None, note=""):
-    """Project the linked Case's authorization status onto the enrollment stage.
+    """Project the governing Case's authorization status onto the enrollment stage.
 
     This is the single chokepoint for the externally-driven "Accepted" outcome:
     callers (verification completion, the nightly Unite Us import, a manual
@@ -592,14 +624,26 @@ def reconcile_enrollment_authorization(enrollment, *, actor=None, note=""):
     directly. Order generation happens as a side-effect of entering AUTHORIZED
     inside :func:`advance_enrollment`.
 
+    The governing case is the most recent internal-service case on the client
+    (see :func:`governing_internal_case`), not necessarily ``enrollment.case`` --
+    a superseded denial must not keep a later re-approval from advancing. The
+    enrollment's ``case`` FK is repointed at the governing case so downstream
+    consumers (order / delivery windows) read the current authorization.
+
     No-ops unless the enrollment is eligible (past verification) and the case
     has an actionable authorization status. Idempotent.
     """
-    case = enrollment.case
-    if case is None:
-        return enrollment
     if EnrollmentStage(enrollment.stage) not in _AUTH_ELIGIBLE_STAGES:
         return enrollment
+
+    case = governing_internal_case(enrollment)
+    if case is None:
+        return enrollment
+    # Keep enrollment.case pointing at the governing (current) case so the
+    # order/delivery authorization window is read from the right case.
+    if enrollment.case_id != case.case_id:
+        enrollment.case = case
+        enrollment.save(update_fields=["case"])
 
     target = _AUTH_STATUS_TO_STAGE.get(case.service_authorization_status)
     if target is None:

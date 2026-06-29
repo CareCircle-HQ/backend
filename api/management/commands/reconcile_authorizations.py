@@ -36,10 +36,12 @@ from api.services.lifecycle import reconcile_enrollment_authorization
 
 # Only enrollments past verification are reconciled (mirrors
 # api.services.lifecycle._AUTH_ELIGIBLE_STAGES). pending_verification is
-# deliberately excluded.
+# deliberately excluded. DENIED is included so a denial superseded by a newer
+# (re-)approved internal-service case gets moved forward again.
 ELIGIBLE_STAGES = [
     EnrollmentStage.VERIFIED,
     EnrollmentStage.WAITING_AUTHORIZATION,
+    EnrollmentStage.DENIED,
 ]
 
 
