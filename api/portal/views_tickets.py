@@ -52,6 +52,10 @@ class WorkQueueView(PortalGenericAPIView):
         if mine in ("1", "true", "yes"):
             agent = current_agent(self.request)
             qs = qs.filter(assigned_to=agent) if agent else qs.none()
+        # Filter by a specific assignee (manager view: inspect one agent's queue).
+        assignee_val = (p.get("assignee") or "").strip()
+        if assignee_val:
+            qs = qs.filter(assigned_to_id=assignee_val)
         # Stable ordering is REQUIRED for correct pagination (without an ORDER BY
         # the page contents are arbitrary and can repeat/skip across pages).
         # Default newest-first; honor the list's recent/oldest sort toggle.
