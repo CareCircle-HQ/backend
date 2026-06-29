@@ -79,8 +79,12 @@ def evaluate_client_coverage(client, import_run=None):
     if not has_active_ins:
         open_ticket(
             TicketTypeCode.SYSTEM_CHANGE_DETECTED,
-            reason="Member has no active insurance"
-            + (" (existing insurance expired)." if has_expired_ins else "."),
+            reason=(
+                "Member has no active insurance on file"
+                + (" (their previous insurance has expired)" if has_expired_ins else "")
+                + ". Confirm the member's current insurance with them and update the "
+                "record before making any service eligibility decisions."
+            ),
             client=client, import_run=import_run,
         )
 
@@ -94,8 +98,12 @@ def evaluate_client_coverage(client, import_run=None):
     if not has_active_cov:
         open_ticket(
             TicketTypeCode.SYSTEM_CHANGE_DETECTED,
-            reason="Member has no active social care coverage"
-            + (" (coverage expired)." if has_expired_cov else "."),
+            reason=(
+                "Member has no active social care coverage"
+                + (" (their coverage has expired)" if has_expired_cov else "")
+                + ". Verify the member's social care enrollment is current; without "
+                "active coverage the member may not be eligible for service."
+            ),
             client=client, import_run=import_run,
         )
 
@@ -103,7 +111,11 @@ def evaluate_client_coverage(client, import_run=None):
 def evaluate_new_insurance(client, import_run=None):
     open_ticket(
         TicketTypeCode.SYSTEM_CHANGE_DETECTED,
-        reason="New insurance created from the import; requires agent validation.",
+        reason=(
+            "A new insurance record was created for this member from the latest "
+            "import. Review the plan type, member ID and status, and confirm the "
+            "details are correct before relying on them for eligibility."
+        ),
         client=client, import_run=import_run,
     )
 
@@ -111,7 +123,11 @@ def evaluate_new_insurance(client, import_run=None):
 def evaluate_new_coverage(client, import_run=None):
     open_ticket(
         TicketTypeCode.SYSTEM_CHANGE_DETECTED,
-        reason="New social care coverage created from the import.",
+        reason=(
+            "A new social care coverage record was created for this member from "
+            "the latest import. Confirm the coverage program, status and effective "
+            "dates are correct."
+        ),
         client=client, import_run=import_run,
     )
 
@@ -119,7 +135,11 @@ def evaluate_new_coverage(client, import_run=None):
 def evaluate_member_not_found(reference, import_run=None):
     open_ticket(
         TicketTypeCode.SYSTEM_CHANGE_DETECTED,
-        reason=f"Incoming record references an unknown member: {reference}.",
+        reason=(
+            f"An incoming import record references a member that does not exist in "
+            f"the system: {reference}. Locate the matching member (or create one) "
+            f"and re-link the record so the import can process it."
+        ),
         severity=TicketSeverity.HIGH, import_run=import_run,
     )
 
@@ -130,7 +150,11 @@ def evaluate_case(case, *, previous_status=None, previous_auth_status=None,
     if case.case_status == CaseStatus.CLOSED and previous_status != CaseStatus.CLOSED:
         open_ticket(
             TicketTypeCode.SYSTEM_CHANGE_DETECTED,
-            reason=f"Case {case.case_id} changed to Closed.",
+            reason=(
+                f"Case {case.case_id} changed to Closed in Unite Us. Review whether "
+                f"the member's meal/box service should be paused or closed, and "
+                f"follow up with the member to confirm the end of service."
+            ),
             client=case.client, case=case, import_run=import_run,
         )
 
@@ -142,16 +166,24 @@ def evaluate_case(case, *, previous_status=None, previous_auth_status=None,
         open_ticket(
             TicketTypeCode.SYSTEM_CHANGE_DETECTED,
             reason=(
-                f"Authorization status changed: "
-                f"{previous_auth_status or '-'} -> {case.service_authorization_status}."
+                f"Service authorization for case {case.case_id} changed from "
+                f"'{previous_auth_status or '-'}' to "
+                f"'{case.service_authorization_status}'. Review the new "
+                f"authorization and adjust the member's service (activate, pause, "
+                f"or close) accordingly."
             ),
             client=case.client, case=case, import_run=import_run,
         )
 
     if not ContractedService.objects.filter(case=case).exists():
         open_ticket(
-            TicketTypeCode.SYSTEM_CHANGE_DETECTED,
-            reason=f"Case {case.case_id} has no contracted services.",
+            TicketTypeCode.CASE_NO_SERVICES,
+            reason=(
+                f"Case {case.case_id} has no contracted (internal) services "
+                f"attached, so the member has no active internal-services "
+                f"contract. Confirm whether an internal-services contract needs to "
+                f"be added before meal/box service can proceed."
+            ),
             client=case.client, case=case, import_run=import_run,
         )
 
@@ -160,9 +192,10 @@ def evaluate_credential_expired(credential, import_run=None):
     open_ticket(
         TicketTypeCode.SYSTEM_CHANGE_DETECTED,
         reason=(
-            f"Unite Us login expired for provider {credential.provider_id}"
+            f"The Unite Us login expired for provider {credential.provider_id}"
             + (f" / employee {credential.employee_id}" if credential.employee_id else "")
-            + "; agent must re-login so the daily pull can resume."
+            + ". An agent must re-login to Unite Us so the daily data pull can "
+            "resume; until then member data will not refresh."
         ),
         severity=TicketSeverity.HIGH, import_run=import_run,
     )
