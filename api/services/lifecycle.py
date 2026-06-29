@@ -415,6 +415,11 @@ ENROLLMENT_TRANSITIONS = {
         EnrollmentStage.AUTHORIZED,
         EnrollmentStage.KITCHEN_ASSIGNMENT,
         EnrollmentStage.SERVICE_ACTIVE,
+        # A verified household whose case authorization comes back Denied is
+        # projected straight to DENIED (non-terminal: parks the client at
+        # Waiting Authorization). Without this the reconcile no-ops and the
+        # household is stuck showing "verified".
+        EnrollmentStage.DENIED,
         EnrollmentStage.ON_HOLD,
         EnrollmentStage.CANCELLED,
     },
