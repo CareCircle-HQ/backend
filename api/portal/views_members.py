@@ -785,11 +785,15 @@ class MemberNotesView(PortalGenericAPIView):
 
 
 class MemberCasesView(PortalAPIView):
-    """All cases for a member, for the New-Ticket “related case” dropdown."""
+    """A member's cases. The lightweight shape powers the New-Ticket “related
+    case” dropdown; ``?detail=1`` returns the full shape for the profile's
+    Cases tab (authorization, dates, provider, outcome)."""
 
     def get(self, request, client_id):
         get_object_or_404(Client, pk=client_id)
         cases = Case.objects.filter(client_id=client_id).order_by("-date_opened")
+        if request.query_params.get("detail"):
+            return Response(s.PortalMemberCaseSerializer(cases, many=True).data)
         return Response(s.PortalCaseOptionSerializer(cases, many=True).data)
 
 
