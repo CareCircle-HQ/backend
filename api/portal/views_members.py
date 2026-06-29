@@ -54,6 +54,9 @@ STATUS_TO_STAGES = {
     "Kitchen Assignment": ["kitchen_assignment"],
     "Active": ["active"],
     "Completed": ["completed"],
+    # Verification-page combined chip: wizard completed AND awaiting the case
+    # authorization are one work-state ("verified, waiting on authorization").
+    "verified_awaiting": ["verified", "waiting_authorization"],
 }
 
 # Page-level base scope: restricts the list to the lifecycle stages a given
