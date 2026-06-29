@@ -6,6 +6,7 @@ import uuid
 from datetime import datetime
 
 from django.db import transaction
+from django.utils import timezone
 from django.db.models import Count, Q
 from django.db.models.functions import Lower
 from django.shortcuts import get_object_or_404
@@ -17,6 +18,8 @@ from ..models import (
     Case,
     CaseType,
     Client,
+    ClientPhone,
+    ClientPhoneSource,
     DeliveryCadence,
     EnrollmentStage,
     EnrollmentVerification,
@@ -32,6 +35,7 @@ from ..models import (
     Ticket,
     TimelineEvent,
 )
+from ..views_phones import _phone_dict
 from ..services.catalog import menu_type_for_member, product_type_kind_for_name
 from ..services.delivery import (
     cadence_options_for_kind,
@@ -420,6 +424,82 @@ class MemberSocialCoverageView(PortalAPIView):
         client = get_object_or_404(Client, pk=client_id)
         plans = client.social_care_coverages.all()
         return Response(s.PortalSocialCoverageSerializer(plans, many=True).data)
+
+
+class MemberPhonesView(PortalAPIView):
+    """GET/POST /members/<client_id>/phones/ — list and add the client's phone
+    numbers (the Communication Preferences card on the member profile). Shares
+    the ClientPhone model + response shape with the extension caller-ID flow."""
+
+    def get(self, request, client_id):
+        get_object_or_404(Client, pk=client_id)
+        phones = ClientPhone.objects.filter(client_id=client_id)
+        return Response([_phone_dict(p) for p in phones])
+
+    def post(self, request, client_id):
+        client = get_object_or_404(Client, pk=client_id)
+        number = (request.data.get("number") or "").strip()
+        normalized = ClientPhone.normalize(number)
+        if not normalized:
+            return Response(
+                {"error": "A valid phone number (at least 10 digits) is required."},
+                status=http.HTTP_400_BAD_REQUEST,
+            )
+        label = (request.data.get("label") or "").strip()
+        # Idempotent on (client, normalized): re-adding the same number refreshes
+        # it rather than tripping the unique constraint.
+        phone, created = ClientPhone.objects.get_or_create(
+            client=client,
+            normalized=normalized,
+            defaults={"raw": number, "label": label, "source": ClientPhoneSource.AGENT},
+        )
+        phone.last_seen_at = timezone.now()
+        if not created and label and not phone.label:
+            phone.label = label
+        phone.save(update_fields=["last_seen_at", "label"])
+        # First number a client ever gets becomes primary by default.
+        make_primary = bool(request.data.get("is_primary")) or (
+            created and not ClientPhone.objects.filter(
+                client=client, is_primary=True
+            ).exclude(pk=phone.pk).exists()
+        )
+        if make_primary:
+            ClientPhone.objects.filter(client=client, is_primary=True).exclude(
+                pk=phone.pk
+            ).update(is_primary=False)
+            phone.is_primary = True
+            phone.save(update_fields=["is_primary"])
+        return Response(
+            _phone_dict(phone),
+            status=http.HTTP_201_CREATED if created else http.HTTP_200_OK,
+        )
+
+
+class MemberPhoneDetailView(PortalAPIView):
+    """PATCH/DELETE /members/<client_id>/phones/<client_phone_id>/ — edit the
+    label / primary flag, or remove a number."""
+
+    def patch(self, request, client_id, client_phone_id):
+        phone = get_object_or_404(
+            ClientPhone, pk=client_phone_id, client_id=client_id
+        )
+        if bool(request.data.get("is_primary")):
+            ClientPhone.objects.filter(
+                client_id=client_id, is_primary=True
+            ).exclude(pk=phone.pk).update(is_primary=False)
+            phone.is_primary = True
+            phone.save(update_fields=["is_primary"])
+        if "label" in request.data:
+            phone.label = (request.data.get("label") or "").strip()
+            phone.save(update_fields=["label"])
+        return Response(_phone_dict(phone))
+
+    def delete(self, request, client_id, client_phone_id):
+        phone = get_object_or_404(
+            ClientPhone, pk=client_phone_id, client_id=client_id
+        )
+        phone.delete()
+        return Response(status=http.HTTP_204_NO_CONTENT)
 
 
 class MemberHistoryView(PortalGenericAPIView):
