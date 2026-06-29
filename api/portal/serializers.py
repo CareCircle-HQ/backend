@@ -90,8 +90,8 @@ def member_flags(client):
 # lifecycle_stage -> coarse verification status used by the members filter.
 _STATUS_MAP = {
     "not_eligible": "Denied",
-    "pending_verification": "Pending",
-    "waiting_authorization": "Pending",
+    "pending_verification": "Pending Verification",
+    "waiting_authorization": "Waiting Authorization",
     "verified": "Verified",
     "authorized": "Verified",
     "active": "Active",
