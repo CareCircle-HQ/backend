@@ -105,6 +105,14 @@ def verification_status(client):
     # "On Hold" until service resumes.
     if service_hold_state(client)["on_hold"]:
         return "On Hold"
+    # A denied case authorization parks the client at Waiting Authorization
+    # (client lifecycle stage), but the enrollment records the DENIED outcome.
+    # Surface it as "Denied" so the verification list distinguishes a rejected
+    # authorization from one still awaiting a decision (both stay under the
+    # Verified filter).
+    enr = active_enrollment(client)
+    if enr is not None and enr.stage == "denied":
+        return "Denied"
     return _STATUS_MAP.get(client.lifecycle_stage, client.get_lifecycle_stage_display())
 
 
