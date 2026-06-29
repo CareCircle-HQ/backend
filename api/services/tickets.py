@@ -188,27 +188,7 @@ def evaluate_case(case, *, previous_status=None, previous_auth_status=None,
         )
 
 
-def evaluate_credential_expired(credential, import_run=None):
-    # Prefer naming the agent who owns the login (CS can ask that person to
-    # re-authenticate); fall back to the raw Unite Us ids when unlinked.
-    agent = credential.agent
-    if agent and (agent.name or agent.email):
-        who = agent.name or agent.email
-        contact = f" ({agent.email})" if agent.email and agent.name else ""
-        subject = f"the Unite Us login for {who}{contact}"
-    else:
-        subject = (
-            f"a Unite Us login (provider {credential.provider_id}"
-            + (f", employee {credential.employee_id}" if credential.employee_id else "")
-            + ")"
-        )
-    open_ticket(
-        TicketTypeCode.SYSTEM_CHANGE_DETECTED,
-        reason=(
-            f"The daily Unite Us data pull is paused because {subject} has "
-            "expired. Ask that agent to re-login to Unite Us through the browser "
-            "extension to restore the connection; until then member data "
-            "(cases, insurance, coverage) will not refresh."
-        ),
-        severity=TicketSeverity.HIGH, import_run=import_run,
-    )
+# NOTE: an expired/unreadable Unite Us credential is an integration problem
+# (an agent must re-login via the extension), NOT customer-support work, so it
+# intentionally does NOT open a work-queue ticket. The daily pull logs it and
+# records it on the ImportRun's errors instead (see services/uniteus_import.py).

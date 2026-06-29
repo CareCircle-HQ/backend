@@ -323,12 +323,14 @@ class DailyPull:
 
         for cred in creds:
             # Lazily decrypt the token columns now (they were deferred above); a
-            # corrupt / rotated-key credential is skipped with a ticket rather
-            # than crashing the whole nightly run.
+            # corrupt / rotated-key credential is skipped (logged on the run)
+            # rather than crashing the whole nightly run.
             try:
                 _ = cred.refresh_token
             except Exception as exc:  # noqa: BLE001
-                tickets.evaluate_credential_expired(cred, self.run)
+                # Integration/auth problem, not CS work: record it on the run +
+                # logs only. Do NOT open a customer-support work-queue ticket.
+                logger.warning("daily_pull credential %s unreadable: %s", cred.pk, exc)
                 self.errors.append(f"credential {cred.pk} unreadable: {exc}")
                 continue
             self.api = uu_api.UniteUsClient(cred)
@@ -343,7 +345,10 @@ class DailyPull:
                         self._count("clients", "errors")
                         self.errors.append(f"person {cid}: {exc}")
             except UniteUsAuthExpired as exc:
-                tickets.evaluate_credential_expired(cred, self.run)
+                # Expired Unite Us login is an integration issue (an agent must
+                # re-login via the extension), not CS work: log + record on the
+                # run, no customer-support ticket.
+                logger.warning("daily_pull credential %s expired: %s", cred.pk, exc)
                 self.errors.append(f"credential {cred.pk} expired: {exc}")
                 continue
 
