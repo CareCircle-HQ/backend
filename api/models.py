@@ -2487,6 +2487,9 @@ class TicketTypeCode(models.TextChoices):
     LOGIN_PROBLEM = "login_problem", "Login Problem"
     CANCELLATION = "cancellation", "Cancellation"
     MISSING_WRONG_ORDER = "missing_wrong_order", "Missing / Wrong Order"
+    # Raised by the daily import when an internal-service case has no contracted
+    # services (the member has no active internal-services contract).
+    CASE_NO_SERVICES = "case_no_services", "No Internal services Case"
     SYSTEM_CHANGE_DETECTED = "system_change_detected", "System Change Detected"
 
 

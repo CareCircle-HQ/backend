@@ -177,7 +177,7 @@ def evaluate_case(case, *, previous_status=None, previous_auth_status=None,
 
     if not ContractedService.objects.filter(case=case).exists():
         open_ticket(
-            TicketTypeCode.SYSTEM_CHANGE_DETECTED,
+            TicketTypeCode.CASE_NO_SERVICES,
             reason=(
                 f"Case {case.case_id} has no contracted (internal) services "
                 f"attached, so the member has no active internal-services "
