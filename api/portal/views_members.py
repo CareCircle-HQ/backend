@@ -467,7 +467,7 @@ class MemberHouseholdView(PortalAPIView):
                     "cadence_options": cadence_options_for_kind(kind),
                 },
                 "address": {
-                    "street": addr.street, "city": addr.city,
+                    "street": addr.street, "unit": addr.unit, "city": addr.city,
                     "state": addr.state, "zip": addr.zip,
                     "notes": addr.notes,
                 }
@@ -494,7 +494,7 @@ class MemberHouseholdView(PortalAPIView):
             addr = Address.objects.create(client_id=client_id, type="temporary")
             enr.delivery_address = addr
             enr.save(update_fields=["delivery_address"])
-        for field in ("street", "city", "state", "zip", "notes"):
+        for field in ("street", "unit", "city", "state", "zip", "notes"):
             if field in data:
                 setattr(addr, field, data[field])
         addr.save()
@@ -509,8 +509,8 @@ class MemberHouseholdView(PortalAPIView):
             except Exception:  # never let history-logging break the edit
                 pass
         return Response(
-            {"street": addr.street, "city": addr.city, "state": addr.state,
-             "zip": addr.zip, "notes": addr.notes}
+            {"street": addr.street, "unit": addr.unit, "city": addr.city,
+             "state": addr.state, "zip": addr.zip, "notes": addr.notes}
         )
 
 
@@ -718,14 +718,13 @@ class MemberVerificationCreateView(PortalAPIView):
         ser.is_valid(raise_exception=True)
         data = ser.validated_data
 
-        # Delivery address (shared by the household).
-        street = data.get("street", "")
-        if data.get("apt"):
-            street = f"{street} {data['apt']}".strip()
+        # Delivery address (shared by the household). Unit/apt is stored in its
+        # own field so the kitchen + delivery label can show it distinctly.
         address = Address.objects.create(
             client=client,
             type="temporary",
-            street=street,
+            street=data.get("street", ""),
+            unit=data.get("apt", ""),
             city=data.get("city", ""),
             state=data.get("state", ""),
             zip=data.get("zip", ""),
