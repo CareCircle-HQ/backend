@@ -392,6 +392,7 @@ class MemberHouseholdView(PortalAPIView):
                 "address": {
                     "street": addr.street, "city": addr.city,
                     "state": addr.state, "zip": addr.zip,
+                    "notes": addr.notes,
                 }
                 if addr
                 else None,
@@ -416,7 +417,7 @@ class MemberHouseholdView(PortalAPIView):
             addr = Address.objects.create(client_id=client_id, type="temporary")
             enr.delivery_address = addr
             enr.save(update_fields=["delivery_address"])
-        for field in ("street", "city", "state", "zip"):
+        for field in ("street", "city", "state", "zip", "notes"):
             if field in data:
                 setattr(addr, field, data[field])
         addr.save()
@@ -431,7 +432,8 @@ class MemberHouseholdView(PortalAPIView):
             except Exception:  # never let history-logging break the edit
                 pass
         return Response(
-            {"street": addr.street, "city": addr.city, "state": addr.state, "zip": addr.zip}
+            {"street": addr.street, "city": addr.city, "state": addr.state,
+             "zip": addr.zip, "notes": addr.notes}
         )
 
 
@@ -650,6 +652,7 @@ class MemberVerificationCreateView(PortalAPIView):
             city=data.get("city", ""),
             state=data.get("state", ""),
             zip=data.get("zip", ""),
+            notes=data.get("address_notes", ""),
         )
 
         household = getattr(

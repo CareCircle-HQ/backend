@@ -502,6 +502,7 @@ class Command(BaseCommand):
             city=city[:120],
             state=_clean(cells.get(_COL_STATE))[:2],
             zip=_clean(cells.get(_COL_ZIP))[:10],
+            notes=_clean(cells.get(_COL_ADDR_NOTES)),
             created_at=now,
             updated_at=now,
         )

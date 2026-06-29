@@ -439,6 +439,10 @@ class Address(models.Model):
     county = models.CharField(max_length=120, blank=True)  # Unite Us export
     state = models.CharField(max_length=2, blank=True)
     zip = models.CharField(max_length=10, blank=True)
+    # Free-text delivery instructions for this address (e.g. "Call on arrival,
+    # leave at front desk"). Captured during verification; flows to the kitchen
+    # on the delivery order.
+    notes = models.TextField(blank=True)
     created_at = models.DateTimeField(null=True, blank=True)
     updated_at = models.DateTimeField(null=True, blank=True)
 

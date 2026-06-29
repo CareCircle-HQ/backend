@@ -293,6 +293,7 @@ class MemberDetailSerializer(serializers.Serializer):
                 "city": current_addr.city if current_addr else "",
                 "state": current_addr.state if current_addr else "",
                 "zip": current_addr.zip if current_addr else "",
+                "notes": current_addr.notes if current_addr else "",
             }
             if current_addr
             else None,
@@ -704,6 +705,7 @@ class PortalAddressEditSerializer(serializers.Serializer):
     city = serializers.CharField(allow_blank=True, required=False)
     state = serializers.CharField(allow_blank=True, required=False, max_length=2)
     zip = serializers.CharField(allow_blank=True, required=False, max_length=10)
+    notes = serializers.CharField(allow_blank=True, required=False)
 
 
 class PortalMemberDietaryEditSerializer(serializers.Serializer):
@@ -874,6 +876,7 @@ class VerificationCreateSerializer(serializers.Serializer):
     city = serializers.CharField(allow_blank=True, required=False)
     state = serializers.CharField(allow_blank=True, required=False, max_length=2)
     zip = serializers.CharField(allow_blank=True, required=False, max_length=10)
+    address_notes = serializers.CharField(allow_blank=True, required=False)
     # Schedule
     start_date = serializers.DateField(required=False, allow_null=True)
     end_date = serializers.DateField(required=False, allow_null=True)
