@@ -355,7 +355,13 @@ class Command(BaseCommand):
         return household, member_clients, block_for
 
     def _open_status_check(self, primary, case, flag_value):
-        reason = f"Client need Review - {(flag_value or '').strip()}".strip(" -")
+        flag = (flag_value or "").strip()
+        reason = (
+            "Status check needed: the LIST 2 verification review flagged this "
+            + (f"member as '{flag}'. " if flag else "member for review. ")
+            + "Review the member's eligibility and meal details, and confirm "
+            "whether service should be (re)started, kept Out of Orbit, or closed."
+        )
         existing = Ticket.objects.filter(
             type=self.status_check_type, status__in=_OPEN_STATUSES,
             client=primary, case=case,

@@ -39,7 +39,9 @@ from api.management.commands.import_meal_verifications import _clean, _read_rows
 _COL_CASE, _COL_CLIENT = "B", "C"
 _OPEN_STATUSES = (TicketStatus.OPEN, TicketStatus.IN_PROGRESS)
 _DEFAULT_REASON = (
-    "Case needs attention: review the member for service closure."
+    "Case is pending closure (per the Unite Us 'Pending Closure' list). Review "
+    "the member's meal/box service and complete the closure process, confirming "
+    "the end of deliveries with the member and recording the closure reason."
 )
 
 
