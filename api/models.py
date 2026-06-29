@@ -435,6 +435,9 @@ class Address(models.Model):
         max_length=20, choices=AddressType.choices, default=AddressType.CURRENT
     )
     street = models.CharField(max_length=255, blank=True)  # PII
+    # Unit / apartment / suite number (kept separate from street so the kitchen
+    # and delivery label can show it distinctly).
+    unit = models.CharField(max_length=60, blank=True)  # PII
     city = models.CharField(max_length=120, blank=True)
     county = models.CharField(max_length=120, blank=True)  # Unite Us export
     state = models.CharField(max_length=2, blank=True)

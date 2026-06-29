@@ -52,7 +52,17 @@ class WorkQueueView(PortalGenericAPIView):
         if mine in ("1", "true", "yes"):
             agent = current_agent(self.request)
             qs = qs.filter(assigned_to=agent) if agent else qs.none()
-        return qs.distinct()
+        # Filter by a specific assignee (manager view: inspect one agent's queue).
+        assignee_val = (p.get("assignee") or "").strip()
+        if assignee_val:
+            qs = qs.filter(assigned_to_id=assignee_val)
+        # Stable ordering is REQUIRED for correct pagination (without an ORDER BY
+        # the page contents are arbitrary and can repeat/skip across pages).
+        # Default newest-first; honor the list's recent/oldest sort toggle.
+        ordering = (p.get("ordering") or "-created_at").strip()
+        if ordering not in ("created_at", "-created_at"):
+            ordering = "-created_at"
+        return qs.distinct().order_by(ordering, "-pk")
 
     def get(self, request):
         page = self.paginate_queryset(self.get_queryset())

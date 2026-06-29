@@ -311,6 +311,7 @@ class MemberDetailSerializer(serializers.Serializer):
             },
             "address": {
                 "street": current_addr.street if current_addr else "",
+                "unit": current_addr.unit if current_addr else "",
                 "city": current_addr.city if current_addr else "",
                 "state": current_addr.state if current_addr else "",
                 "zip": current_addr.zip if current_addr else "",
@@ -723,6 +724,7 @@ class PortalHouseholdMemberSerializer(serializers.ModelSerializer):
 
 class PortalAddressEditSerializer(serializers.Serializer):
     street = serializers.CharField(allow_blank=True, required=False)
+    unit = serializers.CharField(allow_blank=True, required=False, max_length=60)
     city = serializers.CharField(allow_blank=True, required=False)
     state = serializers.CharField(allow_blank=True, required=False, max_length=2)
     zip = serializers.CharField(allow_blank=True, required=False, max_length=10)

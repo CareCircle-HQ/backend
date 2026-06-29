@@ -443,7 +443,10 @@ def event_for_ticket_created(ticket, *, source=ChangeSource.CRM, actor=""):
 
 def _format_address(address):
     region = " ".join(p for p in (address.state, address.zip) if p)
-    return ", ".join(p for p in (address.street, address.city, region) if p)
+    unit = getattr(address, "unit", "")
+    return ", ".join(
+        p for p in (address.street, unit, address.city, region) if p
+    )
 
 
 def event_for_delivery_address_change(

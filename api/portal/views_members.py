@@ -123,11 +123,26 @@ class MembersListView(PortalGenericAPIView):
 
         status_val = (params.get("status") or "").strip()
         if status_val and status_val.lower() != "all":
-            stages = STATUS_TO_STAGES.get(status_val)
-            if stages:
-                qs = qs.filter(lifecycle_stage__in=stages)
+            if status_val == "Denied":
+                # "Denied" covers BOTH the eligibility denial (lifecycle_stage
+                # not_eligible) AND a denied case authorization. The latter parks
+                # the client's lifecycle_stage at waiting_authorization while the
+                # enrollment records the DENIED outcome, so it can't be matched on
+                # lifecycle_stage alone -- match the enrollment stage too (own or
+                # household).
+                qs = qs.filter(
+                    Q(lifecycle_stage="not_eligible")
+                    | Q(enrollments__stage=EnrollmentStage.DENIED)
+                    | Q(
+                        household_membership__household__enrollment_verifications__stage=EnrollmentStage.DENIED
+                    )
+                )
             else:
-                qs = qs.filter(lifecycle_stage=status_val)
+                stages = STATUS_TO_STAGES.get(status_val)
+                if stages:
+                    qs = qs.filter(lifecycle_stage__in=stages)
+                else:
+                    qs = qs.filter(lifecycle_stage=status_val)
 
         # Product-kind filter (Meals vs Boxes), keyed off the household's program
         # name. A household is always one kind, so meals/boxes never mix.
@@ -167,6 +182,17 @@ class MembersListView(PortalGenericAPIView):
                     household_membership__household__enrollment_verifications__stage=EnrollmentStage.ON_HOLD
                 )
             )
+
+        # Household-composition filter: "multi" restricts to members whose
+        # household has more than one member (excludes solo households and
+        # ungrouped individuals).
+        household_filter = (params.get("household") or "").strip().lower()
+        if household_filter == "multi":
+            qs = qs.annotate(
+                _hh_member_count=Count(
+                    "household_membership__household__members", distinct=True
+                )
+            ).filter(_hh_member_count__gt=1)
 
         return qs.distinct()
 
@@ -441,7 +467,7 @@ class MemberHouseholdView(PortalAPIView):
                     "cadence_options": cadence_options_for_kind(kind),
                 },
                 "address": {
-                    "street": addr.street, "city": addr.city,
+                    "street": addr.street, "unit": addr.unit, "city": addr.city,
                     "state": addr.state, "zip": addr.zip,
                     "notes": addr.notes,
                 }
@@ -468,7 +494,7 @@ class MemberHouseholdView(PortalAPIView):
             addr = Address.objects.create(client_id=client_id, type="temporary")
             enr.delivery_address = addr
             enr.save(update_fields=["delivery_address"])
-        for field in ("street", "city", "state", "zip", "notes"):
+        for field in ("street", "unit", "city", "state", "zip", "notes"):
             if field in data:
                 setattr(addr, field, data[field])
         addr.save()
@@ -483,8 +509,8 @@ class MemberHouseholdView(PortalAPIView):
             except Exception:  # never let history-logging break the edit
                 pass
         return Response(
-            {"street": addr.street, "city": addr.city, "state": addr.state,
-             "zip": addr.zip, "notes": addr.notes}
+            {"street": addr.street, "unit": addr.unit, "city": addr.city,
+             "state": addr.state, "zip": addr.zip, "notes": addr.notes}
         )
 
 
@@ -692,14 +718,13 @@ class MemberVerificationCreateView(PortalAPIView):
         ser.is_valid(raise_exception=True)
         data = ser.validated_data
 
-        # Delivery address (shared by the household).
-        street = data.get("street", "")
-        if data.get("apt"):
-            street = f"{street} {data['apt']}".strip()
+        # Delivery address (shared by the household). Unit/apt is stored in its
+        # own field so the kitchen + delivery label can show it distinctly.
         address = Address.objects.create(
             client=client,
             type="temporary",
-            street=street,
+            street=data.get("street", ""),
+            unit=data.get("apt", ""),
             city=data.get("city", ""),
             state=data.get("state", ""),
             zip=data.get("zip", ""),
