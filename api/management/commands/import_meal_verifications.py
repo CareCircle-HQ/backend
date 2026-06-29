@@ -233,6 +233,27 @@ class Command(BaseCommand):
             default="mon_thu",
             help="Which meal cadence sheet code 'A' maps to (B gets the other).",
         )
+        # Defaults for thin sheets (e.g. the Williamsburg list) whose Facility /
+        # Cadence / Meal Category columns are blank. Only fill gaps -- a value
+        # present in the row always wins.
+        parser.add_argument(
+            "--default-facility",
+            default="",
+            help="Kitchen name to use when a row's Facility is blank/unmapped "
+            "(e.g. 'Williamsburg').",
+        )
+        parser.add_argument(
+            "--default-cadence",
+            choices=["mon_thu", "tue_fri"],
+            default="",
+            help="Meal cadence to use when a row's Cadence is blank.",
+        )
+        parser.add_argument(
+            "--default-menu",
+            default="",
+            help="MenuType name to use when a member's meal category is blank "
+            "(implies the member is a meals member, e.g. 'Kosher').",
+        )
 
     def handle(self, *args, **options):
         apply = options["apply"]
@@ -252,6 +273,18 @@ class Command(BaseCommand):
             else DeliveryCadence.MON_THU
         )
         cadence_map = {"a": cad_a, "b": cad_b}
+
+        # Gap-fill defaults for thin sheets (blank facility/cadence/menu).
+        self.default_facility = (options.get("default_facility") or "").strip()
+        self.default_menu = (options.get("default_menu") or "").strip()
+        dc = options.get("default_cadence") or ""
+        self.default_cadence = (
+            DeliveryCadence.MON_THU
+            if dc == "mon_thu"
+            else DeliveryCadence.TUE_FRI
+            if dc == "tue_fri"
+            else None
+        )
 
         kitchens = {k.name: k for k in Kitchen.objects.all()}
 
@@ -398,6 +431,8 @@ class Command(BaseCommand):
         for m in member_clients:
             block = block_for.get(str(m.client_id), _MEMBER_BLOCKS[0])
             fields, kind = _profile_fields(block, cells)
+            if self.default_menu and not fields["menu_type"]:
+                fields["menu_type"] = self.default_menu
             if m is primary:
                 primary_kind = kind
             MemberDietaryProfile.objects.create(
@@ -412,12 +447,20 @@ class Command(BaseCommand):
             note="Imported from Meal Inputs verification sheet.",
         )
 
+        # A blank primary meal category with a default menu -> treat as meals.
+        if primary_kind is None and self.default_menu:
+            primary_kind = ProductTypeKind.MEALS
+
         # --- Kitchen assignment + activation (only when authorized) ---
         facility = (cells.get(_COL_FACILITY) or "").strip().lower()
         kitchen = kitchens.get(_FACILITY_TO_KITCHEN.get(facility, ""))
+        if kitchen is None and self.default_facility:
+            kitchen = kitchens.get(self.default_facility)
         is_boxes = primary_kind == ProductTypeKind.BOXES
         cadence_code = (cells.get(_COL_CADENCE) or "").strip().lower()
         meal_cadence = cadence_map.get(cadence_code)
+        if meal_cadence is None and not is_boxes and self.default_cadence:
+            meal_cadence = self.default_cadence
         authorized = case.service_authorization_status in _AUTHORIZED
         has_cadence = is_boxes or meal_cadence is not None
 
