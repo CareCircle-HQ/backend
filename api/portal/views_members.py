@@ -172,6 +172,15 @@ class MembersListView(PortalGenericAPIView):
                 else:
                     qs = qs.filter(lifecycle_stage=status_val)
 
+        # Internal-service filter: only members who hold an Internal Service
+        # case (the meal/box case the verification + delivery attach to; in our
+        # data this is the household primary). Independent of the status chips,
+        # so it composes with "All" or any verification status.
+        if (params.get("has_internal_service") or "").strip().lower() in (
+            "1", "true", "yes",
+        ):
+            qs = qs.filter(cases__case_type=CaseType.INTERNAL_SERVICE)
+
         # Product-kind filter (Meals vs Boxes), keyed off the household's program
         # name. A household is always one kind, so meals/boxes never mix.
         service_type = (params.get("service_type") or "").strip().lower()
@@ -211,16 +220,21 @@ class MembersListView(PortalGenericAPIView):
                 )
             )
 
-        # Household-composition filter: "multi" restricts to members whose
-        # household has more than one member (excludes solo households and
-        # ungrouped individuals).
+        # Household-composition filter:
+        #   "multi"  -> members whose household has more than one member.
+        #   "single" -> members in a solo (one-member) household OR ungrouped
+        #               individuals with no household (member count <= 1).
         household_filter = (params.get("household") or "").strip().lower()
-        if household_filter == "multi":
+        if household_filter in ("multi", "single"):
             qs = qs.annotate(
                 _hh_member_count=Count(
                     "household_membership__household__members", distinct=True
                 )
-            ).filter(_hh_member_count__gt=1)
+            )
+            if household_filter == "multi":
+                qs = qs.filter(_hh_member_count__gt=1)
+            else:  # single
+                qs = qs.filter(_hh_member_count__lte=1)
 
         return qs.distinct()
 

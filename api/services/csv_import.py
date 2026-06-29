@@ -488,8 +488,14 @@ def map_assessment_group(submission_id, rows):
 
 # --- per-case mapping ------------------------------------------------------
 # Unite Us authorization state -> our ServiceAuthorizationStatus (mirrors
-# mappers._AUTH_STATE_MAP in the daily import).
-_AUTH_STATE_MAP = {"accepted": "approved"}
+# mappers._AUTH_STATE_MAP in the daily import). The cases export carries states
+# our enum doesn't model 1:1: "requested"/"deferred" are pre-decision states ->
+# Pending; "draft" stays unmapped (normalized status blank, raw label kept).
+_AUTH_STATE_MAP = {
+    "accepted": "approved",
+    "requested": "pending",
+    "deferred": "pending",
+}
 
 
 def map_case_row(row):
@@ -736,14 +742,28 @@ class CsvImporter:
             logger.warning("csv_import assessment timeline failed", exc_info=True)
         self._recompute_stage(assessment.client_id, assessment.client)
 
-    def import_cases(self, reader):
+    def import_cases(self, reader, provider_id=None, provider_name=None):
         self.dataset = "cases"
+        # Optional provider scope: import only rows serviced by the given
+        # provider (id OR name, case-insensitive/trimmed). Non-matching rows are
+        # counted as skipped. Used to load a single provider (e.g. Met Council)
+        # from a network-wide export.
+        want_id = (str(provider_id).strip() if provider_id else "")
+        want_name = (provider_name or "").strip().casefold()
+        provider_filter = bool(want_id or want_name)
         # One row per case — stream directly, no grouping needed.
         for row in reader:
             cid = (row.get("case_id") or "").strip()
             if not cid:
                 self._count("skipped")
                 continue
+            if provider_filter:
+                row_id = (row.get("provider_id") or "").strip()
+                row_name = (row.get("provider_name") or "").strip().casefold()
+                if not ((want_id and row_id == want_id)
+                        or (want_name and row_name == want_name)):
+                    self._count("skipped")
+                    continue
             existed = Case.objects.filter(pk=cid).exists()
             try:
                 payload = map_case_row(row)
@@ -779,7 +799,8 @@ class CsvImporter:
         self.run.processed_count = sum(self.stats.values())
 
 
-def run_csv_import(*, export_type, file_obj, triggered_by="manual", emit_side_effects=True):
+def run_csv_import(*, export_type, file_obj, triggered_by="manual", emit_side_effects=True,
+                   provider_id=None, provider_name=None):
     """Import an uploaded Unite Us CSV ``file_obj`` of ``export_type``.
 
     Returns the persisted :class:`ImportRun`. ``file_obj`` may be any
@@ -812,7 +833,9 @@ def run_csv_import(*, export_type, file_obj, triggered_by="manual", emit_side_ef
             elif export_type == "assessments":
                 importer.import_assessments(reader)
             elif export_type == "cases":
-                importer.import_cases(reader)
+                importer.import_cases(
+                    reader, provider_id=provider_id, provider_name=provider_name,
+                )
         run.status = ImportRunStatus.COMPLETED
     except Exception as exc:  # fatal: bad file / decode error
         run.status = ImportRunStatus.FAILED
