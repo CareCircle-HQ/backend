@@ -145,11 +145,13 @@ def cadence_rule_for(product_kind, accept_date):
     ).first()
 
 
-def _resolve_product_type(program_name, cadence):
+def _resolve_product_type(program_name, cadence, kind=None):
     """Pick the ProductType for this plan: matched by program-name keyword
     (Meals/Boxes) and, when possible, the chosen weekday cadence. Falls back to
-    any ProductType of the right kind, then None."""
-    kind = product_type_kind_for_name(program_name)
+    any ProductType of the right kind, then None.
+
+    ``kind`` overrides the program-name keyword detection when supplied."""
+    kind = kind or product_type_kind_for_name(program_name)
     if kind is None:
         return None
     qs = ProductType.objects.filter(type=kind)
@@ -163,7 +165,7 @@ def _resolve_product_type(program_name, cadence):
 @transaction.atomic
 def create_member_delivery_schedules(
     enrollment, case=None, cadence="", once_a_week_weekday=None,
-    kitchen=None, member_quantities=None,
+    kitchen=None, member_quantities=None, product_kind=None,
 ):
     """Create one MemberDeliverySchedule per household member of ``enrollment``.
 
@@ -206,13 +208,13 @@ def create_member_delivery_schedules(
     # before) that ignores the agent-picked weekday; meals use the chosen
     # cadence. Product type is still matched by program-kind AND cadence so
     # meals/boxes (and their per-delivery quantities) never mix.
-    kind = product_type_kind_for_name(program_name)
+    kind = product_kind or product_type_kind_for_name(program_name)
     is_boxes = kind == ProductTypeKind.BOXES
     if is_boxes:
         delivery_weekdays = [BOX_DELIVERY_WEEKDAY]
     else:
         delivery_weekdays = weekdays_for_cadence(cadence, once_a_week_weekday)
-    product_type = _resolve_product_type(program_name, cadence)
+    product_type = _resolve_product_type(program_name, cadence, kind=kind)
 
     # Persist the delivery weekdays onto the enrollment so any downstream order
     # generation expands the same days.
