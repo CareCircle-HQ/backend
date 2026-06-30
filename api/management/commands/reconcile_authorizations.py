@@ -34,14 +34,13 @@ from django.db import transaction
 from api.models import EnrollmentStage, EnrollmentVerification
 from api.services.lifecycle import reconcile_enrollment_authorization
 
-# Only enrollments past verification are reconciled (mirrors
+# Only verified enrollments are reconciled (mirrors
 # api.services.lifecycle._AUTH_ELIGIBLE_STAGES). pending_verification is
-# deliberately excluded. DENIED is included so a denial superseded by a newer
-# (re-)approved internal-service case gets moved forward again.
+# deliberately excluded. A verified household stays at VERIFIED until its
+# governing case authorization is approved, which advances it to
+# kitchen_assignment; a later re-approval is picked up on the next run.
 ELIGIBLE_STAGES = [
     EnrollmentStage.VERIFIED,
-    EnrollmentStage.WAITING_AUTHORIZATION,
-    EnrollmentStage.DENIED,
 ]
 
 

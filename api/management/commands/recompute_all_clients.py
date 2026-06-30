@@ -28,8 +28,6 @@ _FUNNEL_ORDER = [
     ClientStage.NAVIGATION,
     ClientStage.PENDING_VERIFICATION,
     ClientStage.VERIFIED,
-    ClientStage.WAITING_AUTHORIZATION,
-    ClientStage.AUTHORIZED,
     ClientStage.KITCHEN_ASSIGNMENT,
     ClientStage.ACTIVE,
     ClientStage.COMPLETED,

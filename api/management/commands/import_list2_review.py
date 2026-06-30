@@ -286,10 +286,12 @@ class Command(BaseCommand):
                 profile.updated_at = now
                 profile.save(update_fields=["status", "updated_at"])
         elif state == _INELIGIBLE:
-            advance_enrollment(
-                enr, EnrollmentStage.DENIED, force=True,
-                note="LIST 2 import: final verification shows ineligible.",
-            )
+            # Ineligible final verification: there is no longer a DENIED
+            # enrollment stage (authorization/eligibility outcomes are separate
+            # from the verification stage). Leave the enrollment at Pending
+            # Verification and recompute the members' funnel stages.
+            for m in member_clients:
+                recompute_client_stage(m)
         else:  # needs verification -> leave at Pending Verification
             for m in member_clients:
                 recompute_client_stage(m)

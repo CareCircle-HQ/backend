@@ -11,7 +11,7 @@ from datetime import timedelta
 from django.utils import timezone
 from rest_framework import serializers
 
-from api.services.lifecycle import governing_case_key
+from api.services.lifecycle import governing_case_key, verification_completed
 
 from ..models import (
     Address,
@@ -90,12 +90,14 @@ def member_flags(client):
 
 
 # lifecycle_stage -> coarse verification status used by the members filter.
+# Verification is a yes/no fact (Pending Verification / Verified). The case
+# authorization outcome is a SEPARATE dimension (see authorization_status) and
+# never appears here.
 _STATUS_MAP = {
     "not_eligible": "Denied",
     "pending_verification": "Pending Verification",
-    "waiting_authorization": "Waiting Authorization",
     "verified": "Verified",
-    "authorized": "Verified",
+    "kitchen_assignment": "Kitchen Assignment",
     "active": "Active",
     "completed": "Completed",
 }
@@ -107,16 +109,26 @@ def verification_status(client):
     # "On Hold" until service resumes.
     if service_hold_state(client)["on_hold"]:
         return "On Hold"
-    # A denied case authorization parks the client at Waiting Authorization
-    # (client lifecycle stage), but the enrollment records the DENIED outcome.
-    # Surface it as "Authorization Denied" -- distinct from the eligibility
-    # "Denied" (not_eligible) -- so the verification list distinguishes a
-    # rejected authorization from one still awaiting a decision (both stay under
-    # the Verified filter).
-    enr = active_enrollment(client)
-    if enr is not None and enr.stage == "denied":
-        return "Authorization Denied"
+    # Verification is a yes/no fact: until the pop-up is completed the member is
+    # Pending Verification, regardless of any case authorization status (which is
+    # surfaced separately via authorization_status). This guards against a stage
+    # that implies verification without the pop-up actually having been done.
+    if not verification_completed(client) and client.lifecycle_stage in (
+        "pending_verification",
+        "verified",
+        "kitchen_assignment",
+    ):
+        return "Pending Verification"
     return _STATUS_MAP.get(client.lifecycle_stage, client.get_lifecycle_stage_display())
+
+
+def authorization_status(client):
+    """The meal/box case authorization that gates kitchen assignment, as a
+    ``{status, status_label, is_accepted}`` snapshot. Sourced from the client's
+    Internal Service case (falls back to the governing case). This is a separate
+    dimension from verification_status -- shown as its own badge/column."""
+    case = internal_service_case(client) or primary_case(client)
+    return case_authorization(case)
 
 
 def active_enrollment(client):
@@ -227,6 +239,8 @@ class MemberListSerializer(serializers.Serializer):
     lifecycle_stage = serializers.CharField()
     lifecycle_stage_label = serializers.CharField(source="get_lifecycle_stage_display")
     verification_status = serializers.SerializerMethodField()
+    authorization_status = serializers.SerializerMethodField()
+    authorization_status_label = serializers.SerializerMethodField()
     medicaid_id = serializers.SerializerMethodField()
     case_manager = serializers.CharField(source="agent_name")
     flags = serializers.SerializerMethodField()
@@ -238,6 +252,12 @@ class MemberListSerializer(serializers.Serializer):
 
     def get_verification_status(self, obj):
         return verification_status(obj)
+
+    def get_authorization_status(self, obj):
+        return authorization_status(obj)["status"]
+
+    def get_authorization_status_label(self, obj):
+        return authorization_status(obj)["status_label"]
 
     def get_medicaid_id(self, obj):
         return medicaid_member_id(obj)
@@ -286,10 +306,12 @@ class MemberDetailSerializer(serializers.Serializer):
                 else None,
                 "service_hold": service_hold_state(client),
             },
-            # Read-only authorization status sourced from the client's case.
-            # Drives the (read-only) Authorization Status shown in the
-            # verification wizard's validation step.
-            "authorization": case_authorization(primary_case(client)),
+            # Read-only authorization status sourced from the client's GOVERNING
+            # internal-service case (the meal/box case that gates kitchen
+            # assignment) -- falls back to the governing case of any type. Shown
+            # as the profile's Authorization badge and in the verification
+            # wizard's validation step. Separate dimension from verification.
+            "authorization": case_authorization(svc_case or primary_case(client)),
             # The Internal Service case the verification + delivery attach to.
             # Its program name is shown (read-only) in the verification wizard.
             "service": {

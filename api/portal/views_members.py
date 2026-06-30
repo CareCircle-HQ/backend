@@ -53,26 +53,60 @@ from .base import PortalAPIView, PortalGenericAPIView, current_agent
 from . import serializers as s
 
 # Reverse of serializers._STATUS_MAP: a filter value -> the lifecycle stages it covers.
+# Verification is a yes/no fact (Pending Verification / Verified), so those two
+# chips are NOT in this map -- they are resolved via verification_completed_q()
+# (the verified_at fact), not lifecycle_stage. Authorization is a separate
+# dimension handled by the `authorization` filter param.
 STATUS_TO_STAGES = {
     "Denied": ["not_eligible"],
-    "Pending": ["pending_verification", "waiting_authorization"],
-    "Verified": ["verified", "authorized"],
     "Kitchen Assignment": ["kitchen_assignment"],
     "Active": ["active"],
     "Completed": ["completed"],
-    # Verification-page combined chip: wizard completed AND awaiting the case
-    # authorization are one work-state ("verified, waiting on authorization").
-    "verified_awaiting": ["verified", "waiting_authorization"],
 }
+
+# Authorization filter value -> (matching statuses, statuses that OUTRANK it).
+# A client is shown under a given authorization only when their GOVERNING
+# internal-service case has it -- i.e. they hold a case with a matching status
+# and none with a more favorable one. This mirrors lifecycle.governing_case_key
+# favorability (approved/not_required > pending > denied), so the filter agrees
+# with the Authorization badge (which reflects the governing case). Without the
+# outrank exclusion, a client with both a denied and a pending case would wrongly
+# appear under "Denied" while their badge reads "Waiting Authorization".
+AUTHORIZATION_FILTERS = {
+    "approved": (["approved", "not_required"], []),
+    "pending": (["pending"], ["approved", "not_required"]),
+    "denied": (["denied"], ["approved", "not_required", "pending"]),
+}
+
+
+def apply_authorization_filter(qs, value):
+    """Restrict ``qs`` to clients whose GOVERNING internal-service case has the
+    given authorization ``value``. Caller handles ``.distinct()``."""
+    spec = AUTHORIZATION_FILTERS.get(value)
+    if not spec:
+        return qs
+    match_statuses, outrank = spec
+    qs = qs.filter(
+        cases__case_type=CaseType.INTERNAL_SERVICE,
+        cases__service_authorization_status__in=match_statuses,
+    )
+    if outrank:
+        # Drop clients holding a more favorable internal-service authorization
+        # (that more favorable case would be the governing one instead).
+        qs = qs.exclude(
+            cases__case_type=CaseType.INTERNAL_SERVICE,
+            cases__service_authorization_status__in=outrank,
+        )
+    return qs
+
 
 # Page-level base scope: restricts the list to the lifecycle stages a given
 # work area cares about (independent of the per-status filter chips).
 SCOPE_TO_STAGES = {
     # Verification work area: households whose verification was requested
-    # (pending_verification), completed (verified), or are awaiting case
-    # authorization (waiting_authorization). 'verified' must be included or a
-    # finished-but-unauthorized household would disappear from the page.
-    "verification": ["pending_verification", "verified", "waiting_authorization"],
+    # (pending_verification) or completed (verified). An approved household
+    # advances to kitchen_assignment and moves to the logistics work area.
+    "verification": ["pending_verification", "verified"],
     "logistics": ["kitchen_assignment"],
 }
 
@@ -93,6 +127,22 @@ def require_internal_service_primary(qs):
         household_membership__household__members__client__cases__case_type=(
             CaseType.INTERNAL_SERVICE
         ),
+    )
+
+
+def verification_completed_q():
+    """Clients whose verification POP-UP was completed: a governing enrollment --
+    their own or their household's -- has ``verified_at`` set. DB-level mirror of
+    ``lifecycle.verification_completed`` and the single determinant for the
+    Verification page's Pending vs Verified split.
+
+    Keyed off the explicit verification fact, NOT the enrollment stage or the
+    client's lifecycle_stage. The case authorization status (a separate
+    dimension) never affects this.
+
+    Caller is responsible for ``.distinct()`` (this adds multi-valued joins)."""
+    return Q(enrollments__verified_at__isnull=False) | Q(
+        household_membership__household__enrollment_verifications__verified_at__isnull=False
     )
 
 
@@ -152,26 +202,32 @@ class MembersListView(PortalGenericAPIView):
 
         status_val = (params.get("status") or "").strip()
         if status_val and status_val.lower() != "all":
-            if status_val == "Denied":
-                # "Denied" covers BOTH the eligibility denial (lifecycle_stage
-                # not_eligible) AND a denied case authorization. The latter parks
-                # the client's lifecycle_stage at waiting_authorization while the
-                # enrollment records the DENIED outcome, so it can't be matched on
-                # lifecycle_stage alone -- match the enrollment stage too (own or
-                # household).
-                qs = qs.filter(
-                    Q(lifecycle_stage="not_eligible")
-                    | Q(enrollments__stage=EnrollmentStage.DENIED)
-                    | Q(
-                        household_membership__household__enrollment_verifications__stage=EnrollmentStage.DENIED
-                    )
-                )
+            if status_val in ("Denied", "not_eligible"):
+                # Eligibility denial only (lifecycle_stage not_eligible). A denied
+                # case AUTHORIZATION is no longer an eligibility/verification
+                # state -- it is surfaced via the separate `authorization` filter.
+                qs = qs.filter(lifecycle_stage="not_eligible")
+            elif status_val in ("verified_awaiting", "Verified"):
+                # Verification page "Verified" chip: the pop-up was completed
+                # (verified_at set). Independent of the case authorization status.
+                qs = qs.filter(verification_completed_q())
+            elif status_val in ("pending_verification", "Pending"):
+                # Verification page "Pending Verification" chip: pop-up NOT yet
+                # completed (verified_at null), regardless of any case auth status.
+                qs = qs.exclude(verification_completed_q())
             else:
                 stages = STATUS_TO_STAGES.get(status_val)
                 if stages:
                     qs = qs.filter(lifecycle_stage__in=stages)
                 else:
                     qs = qs.filter(lifecycle_stage=status_val)
+
+        # Authorization filter (separate dimension from verification): match the
+        # client's GOVERNING internal-service case authorization. Composes with
+        # the status chips.
+        auth_val = (params.get("authorization") or "").strip().lower()
+        if auth_val in AUTHORIZATION_FILTERS:
+            qs = apply_authorization_filter(qs, auth_val)
 
         # Internal-service filter: only members who hold an Internal Service
         # case (the meal/box case the verification + delivery attach to; in our
@@ -400,8 +456,24 @@ class MembersStatsView(PortalAPIView):
         counts = {"total": qs.count()}
         for label, stages in STATUS_TO_STAGES.items():
             counts[label.lower()] = qs.filter(lifecycle_stage__in=stages).count()
-        # Raw per-stage counts (powers stage-specific filter chips such as
-        # Pending Verification / Waiting Authorization on the Verification page).
+        # Verification work-area chips are split on whether the verification was
+        # actually COMPLETED (enrollment stage), not lifecycle_stage -- so a
+        # case-auth-driven waiting_authorization counts as Pending, not Verified.
+        # Override the lifecycle-based counts above to match the list filters.
+        if scope == "verification":
+            completed_q = verification_completed_q()
+            counts["verified_awaiting"] = qs.filter(completed_q).distinct().count()
+            counts["pending_verification"] = qs.exclude(completed_q).distinct().count()
+        # Authorization counts (separate dimension): how many members' GOVERNING
+        # internal-service case is in each authorization status. Powers the
+        # Authorization filter chips; uses the same governing-aware filter as the
+        # list so counts match the rows.
+        counts["authorization"] = {
+            key: apply_authorization_filter(qs, key).distinct().count()
+            for key in AUTHORIZATION_FILTERS
+        }
+        # Raw per-stage counts (powers stage-specific filter chips on the
+        # Verification page).
         counts["stages"] = {
             row["lifecycle_stage"]: row["n"]
             for row in qs.values("lifecycle_stage").annotate(
@@ -832,12 +904,13 @@ class MemberVerificationCreateView(PortalAPIView):
     """POST: create an EnrollmentVerification + MemberDietaryProfiles + delivery
     Address for a member (the 5-step wizard).
 
-    On save the household is verified, advancing the enrollment to VERIFIED
-    (which drives the client to the "Verified" lifecycle stage). When the
-    authorization outcome is "Accepted" the enrollment is advanced straight to
-    SERVICE_ACTIVE ("In Service"), bypassing AUTHORIZED so no delivery orders
-    are auto-generated — orders are created manually afterwards. Each transition
-    is recorded on the client's history (StageEvent + timeline event).
+    On save the household is verified: ``verified_at``/``verified_by`` are set
+    (the source-of-truth verification fact) and the enrollment advances to
+    VERIFIED (driving the client to the "Verified" lifecycle stage). When the
+    governing case authorization is "Accepted" the enrollment is advanced to
+    KITCHEN_ASSIGNMENT (awaiting the manual kitchen-assignment step, which builds
+    the delivery schedule). Each transition is recorded on the client's history
+    (StageEvent + timeline event).
     """
 
     @transaction.atomic
@@ -907,9 +980,14 @@ class MemberVerificationCreateView(PortalAPIView):
                     client_id=member_client_id
                 ).update(mobile_app_username=mobile)
 
-        # Completing the wizard IS the verification, so force past the process
-        # gate. This records a StageEvent + timeline event and recomputes the
-        # client's lifecycle stage to "Verified".
+        # Completing the wizard IS the verification: stamp the source-of-truth
+        # fact (verified_at/verified_by), then force past the process gate. This
+        # records a StageEvent + timeline event and recomputes the client's
+        # lifecycle stage to "Verified".
+        agent = current_agent(request)
+        enrollment.verified_at = timezone.now()
+        enrollment.verified_by = agent
+        enrollment.save(update_fields=["verified_at", "verified_by"])
         advance_enrollment(
             enrollment, EnrollmentStage.VERIFIED, force=True,
             note="Verification completed via support portal.",
