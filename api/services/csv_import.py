@@ -585,9 +585,18 @@ class CsvImporter:
         # regenerated separately (and avoids timeline dedupe collisions with the
         # daily API sync).
         self.emit_side_effects = emit_side_effects
+        # Every client_id whose data this run created/updated. At the end of the
+        # run we recompute each one's funnel stage ONCE, so the import always
+        # self-heals lifecycle_stage even on bulk loads (emit_side_effects=False)
+        # and regardless of the order the client/case/screening files arrive in.
+        self.touched_client_ids = set()
 
     def _count(self, kind):
         self.stats[kind] += 1
+
+    def _mark_touched(self, client_id):
+        if client_id:
+            self.touched_client_ids.add(str(client_id))
 
     def _recompute_stage(self, client_id, client):
         """Recompute the client's funnel stage after an import write, isolating
@@ -645,6 +654,7 @@ class CsvImporter:
                 ser = ClientSerializer(data=payload)
                 ser.is_valid(raise_exception=True)
                 client = ser.save()
+                self._mark_touched(client.pk)
                 self._count("updated" if existed else "created")
                 if self.emit_side_effects:
                     self._post_save(client)
@@ -675,11 +685,11 @@ class CsvImporter:
                 ser = ScreeningSerializer(data=payload)
                 ser.is_valid(raise_exception=True)
                 screening = ser.save()
+                self._mark_touched(screening.client_id)
                 self._save_screening_needs(screening, rows)
                 self._count("created")
                 if self.emit_side_effects:
                     self._emit_screening_timeline(screening)
-                    self._recompute_stage(screening.client_id, screening.client)
             except Exception as exc:  # isolate one bad screen from the run
                 self._count("errors")
                 self.errors.append(f"screening {sid}: {exc}")
@@ -725,6 +735,7 @@ class CsvImporter:
                 ser = AssessmentSerializer(data=payload)
                 ser.is_valid(raise_exception=True)
                 assessment = ser.save()
+                self._mark_touched(assessment.client_id)
                 self._count("updated" if existed else "created")
                 if self.emit_side_effects:
                     self._post_save_assessment(assessment)
@@ -792,6 +803,7 @@ class CsvImporter:
                 ser = CaseSerializer(data=payload)
                 ser.is_valid(raise_exception=True)
                 case = ser.save()
+                self._mark_touched(case.client_id)
                 self._count("updated" if existed else "created")
                 if self.emit_side_effects:
                     self._post_save_case(case)
@@ -811,6 +823,28 @@ class CsvImporter:
         except Exception:  # noqa: BLE001
             logger.warning("csv_import case timeline failed", exc_info=True)
         self._recompute_stage(case.client_id, case.client)
+
+    def recompute_touched(self):
+        """Recompute the funnel stage for every client this run touched, once.
+
+        Runs at the END of the import (after all rows are written) so each
+        client's stage is derived from the full picture for this file, not the
+        partial state mid-stream. Always runs -- including bulk loads where
+        per-record side effects are disabled -- so a stale lifecycle_stage can
+        never survive an upload. Each client is isolated from the others.
+        """
+        from api.services.lifecycle import recompute_client_stage
+
+        for cid in self.touched_client_ids:
+            client = Client.objects.filter(pk=cid).first()
+            if client is None:
+                continue
+            try:
+                recompute_client_stage(client)
+            except Exception:  # noqa: BLE001 - a funnel hiccup must not fail the run
+                logger.warning(
+                    "recompute_client_stage failed for %s", cid, exc_info=True
+                )
 
     def finalize(self):
         self.run.stats = {self.dataset: dict(self.stats)}
@@ -858,6 +892,10 @@ def run_csv_import(*, export_type, file_obj, triggered_by="manual", emit_side_ef
                 importer.import_cases(
                     reader, provider_id=provider_id, provider_name=provider_name,
                 )
+            # Always reconcile the funnel stage for every touched client, so the
+            # upload self-heals lifecycle_stage even when per-record side effects
+            # are off (bulk load) or the client file was imported before cases.
+            importer.recompute_touched()
         run.status = ImportRunStatus.COMPLETED
     except Exception as exc:  # fatal: bad file / decode error
         run.status = ImportRunStatus.FAILED

@@ -137,12 +137,12 @@ class Command(BaseCommand):
             member_name=f"{primary.first_name or ''} {primary.last_name or ''}".strip(),
         )
 
-        # Denied authorization -> keep the enrollment as Denied.
+        # A denied authorization no longer changes the enrollment stage --
+        # authorization is a separate dimension shown from the Case. The
+        # enrollment stays at Pending Verification (the pop-up was not run by
+        # this import); the denied status is recorded for the run report only.
         if case.service_authorization_status == ServiceAuthorizationStatus.DENIED:
-            advance_enrollment(
-                enr, EnrollmentStage.DENIED, force=True,
-                note="LIST 5 import: case authorization is denied.",
-            )
+            recompute_client_stage(primary)
             return ("denied", addr_kind, "case authorization denied")
 
         # Otherwise leave at Pending Verification.

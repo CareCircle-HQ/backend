@@ -53,8 +53,12 @@ class ClientStage(models.TextChoices):
     later stages are *driven by* that enrollment's stage and take precedence.
 
     inactive -> consent -> screened -> assessment -> navigation ->
-    pending_verification -> verified -> waiting_authorization -> authorized ->
-    active -> completed   (terminal off-ramp: not_eligible)
+    pending_verification -> verified -> kitchen_assignment -> active ->
+    completed   (terminal off-ramp: not_eligible)
+
+    Verification is a yes/no fact (pop-up completed). The case authorization
+    status (approved/pending/denied/expired) is a SEPARATE dimension on the Case
+    -- it gates the move to kitchen_assignment but is never a lifecycle stage.
     """
 
     # --- Early funnel (derived from synced data) ---
@@ -66,9 +70,7 @@ class ClientStage(models.TextChoices):
     # --- Enrollment-driven (mirror EnrollmentVerification.stage) ---
     PENDING_VERIFICATION = "pending_verification", "Pending Verification"
     VERIFIED = "verified", "Verified"
-    WAITING_AUTHORIZATION = "waiting_authorization", "Waiting Authorization"
-    AUTHORIZED = "authorized", "Authorized"
-    KITCHEN_ASSIGNMENT = "kitchen_assignment", "Kitchen Assignment"  # accepted auth, awaiting manual kitchen assignment
+    KITCHEN_ASSIGNMENT = "kitchen_assignment", "Kitchen Assignment"  # approved auth, awaiting manual kitchen assignment
     ACTIVE = "active", "Active"  # receiving deliveries
     COMPLETED = "completed", "Completed"  # after last delivery
     # --- Terminal off-ramp ---
@@ -1423,19 +1425,17 @@ class VerifiedSocialNeed(models.Model):
 class EnrollmentStage(models.TextChoices):
     """Service-delivery / verification stage for a household enrollment.
 
-    The authorization outcome (Draft/Pending/Accepted/Denied) is expressed
-    directly through the authorization-related stages below: a Draft maps to
-    ``pending_verification``, Pending to ``waiting_authorization``, Accepted to
-    ``authorized`` and Denied to ``denied``.
+    Verification is a yes/no fact: ``pending_verification`` until the pop-up is
+    completed (``verified_at`` set), then ``verified``. The case authorization
+    outcome (approved/pending/denied/expired) is a SEPARATE dimension on the
+    linked Case -- it gates whether a verified household advances to
+    ``kitchen_assignment``, but is NEVER an enrollment stage.
     """
 
     PENDING_VALIDATION = "pending_validation", "Pending Validation"
     VALIDATED = "validated", "Validated"
     PENDING_VERIFICATION = "pending_verification", "Pending Verification"
     VERIFIED = "verified", "Verified"
-    WAITING_AUTHORIZATION = "waiting_authorization", "Waiting Authorization"
-    AUTHORIZED = "authorized", "Accepted"
-    DENIED = "denied", "Denied"
     KITCHEN_ASSIGNMENT = "kitchen_assignment", "Kitchen Assignment"
     SERVICE_ACTIVE = "service_active", "Service Active"
     SERVICE_COMPLETE = "service_complete", "Service Complete"
@@ -1633,6 +1633,16 @@ class EnrollmentVerification(models.Model):
     is_family_verified = models.BooleanField(null=True, blank=True)
     medicaid_type_verified = models.BooleanField(null=True, blank=True)
     delivery_address_verified = models.BooleanField(null=True, blank=True)
+    # Verification fact: set when the verification pop-up is COMPLETED (the job
+    # that captures food allergies, delivery address, the Step-4 checks). This --
+    # not the stage -- is the source of truth for "is this household verified?".
+    # NULL = pending_verification; set = verified. Never touched by the data
+    # import; only the pop-up (or a one-off backfill) sets it.
+    verified_at = models.DateTimeField(null=True, blank=True, db_index=True)
+    verified_by = models.ForeignKey(
+        "Agent", on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="verified_enrollments",
+    )
     # Short display code, e.g. "ENR-8754". Assigned on creation.
     code = models.CharField(max_length=20, blank=True, db_index=True)
     # Renewal cycle counter. Renewals reuse the SAME enrollment (re-run

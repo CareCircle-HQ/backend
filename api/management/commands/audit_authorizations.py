@@ -30,12 +30,10 @@ from api.services.lifecycle import (
     governing_internal_case,
 )
 
-# Enrollments past verification -- the only ones whose case authorization is
-# actionable (mirrors reconcile_authorizations.ELIGIBLE_STAGES).
+# Verified enrollments -- the only ones whose case authorization is actionable
+# (mirrors reconcile_authorizations.ELIGIBLE_STAGES).
 ELIGIBLE_STAGES = [
     EnrollmentStage.VERIFIED,
-    EnrollmentStage.WAITING_AUTHORIZATION,
-    EnrollmentStage.DENIED,
 ]
 
 
@@ -77,23 +75,17 @@ class Command(BaseCommand):
             auth = (case.service_authorization_status or "(blank)") if case else "(no internal case)"
             by_stage[enr.stage][auth] += 1
 
-            # Would reconcile move it? Blank/unknown -> Waiting Authorization.
+            # Would reconcile move it? Only an approval advances the stage.
             target = None
             if case is not None:
-                target = _AUTH_STATUS_TO_STAGE.get(
-                    case.service_authorization_status, EnrollmentStage.WAITING_AUTHORIZATION
-                )
+                target = _AUTH_STATUS_TO_STAGE.get(case.service_authorization_status)
             # "Affected": the governing internal-service case is APPROVED
-            # (target == Kitchen Assignment) but the enrollment is still parked
-            # at Waiting Authorization OR reads DENIED -- exactly the households
-            # the date-tie bug mis-projected. reconcile_authorizations --apply
-            # advances them to Kitchen Assignment.
+            # (target == Kitchen Assignment) but the enrollment is still VERIFIED
+            # -- reconcile_authorizations --apply advances it to Kitchen
+            # Assignment.
             is_affected = (
                 target == EnrollmentStage.KITCHEN_ASSIGNMENT
-                and enr.stage in (
-                    EnrollmentStage.WAITING_AUTHORIZATION,
-                    EnrollmentStage.DENIED,
-                )
+                and enr.stage == EnrollmentStage.VERIFIED
             )
 
             hh = enr.household

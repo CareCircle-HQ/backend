@@ -102,60 +102,17 @@ def _assessment_outcome(client):
     return None
 
 
-# An internal-service (meals/boxes) case's authorization status -> the
-# ClientStage it drives the funnel to BEFORE a household enrollment exists.
-# Mirrors the enrollment projection (_AUTH_STATUS_TO_STAGE): denied/expired are
-# non-terminal and park at Waiting Authorization ("needs attention").
-_CASE_AUTH_TO_STAGE = {
-    ServiceAuthorizationStatus.APPROVED: ClientStage.AUTHORIZED,
-    ServiceAuthorizationStatus.NOT_REQUIRED: ClientStage.AUTHORIZED,
-    ServiceAuthorizationStatus.PENDING: ClientStage.WAITING_AUTHORIZATION,
-    ServiceAuthorizationStatus.DENIED: ClientStage.WAITING_AUTHORIZATION,
-    ServiceAuthorizationStatus.EXPIRED: ClientStage.WAITING_AUTHORIZATION,
-}
-
-# Rank to pick the most-advanced authorization stage across a client's cases.
-_EARLY_AUTH_RANK = {
-    ClientStage.WAITING_AUTHORIZATION: 1,
-    ClientStage.AUTHORIZED: 2,
-}
-
-
-def _case_authorization_stage(client):
-    """Highest authorization-derived stage across the client's internal-service
-    (meals/boxes) cases, or None when none carry an actionable auth status.
-
-    This lets the acquisition funnel reflect a case's authorization outcome even
-    before a household EnrollmentVerification exists (e.g. data imported from the
-    Unite Us cases export). Once an enrollment exists it governs instead — see
-    ``derive_client_stage`` — so this only fills the pre-enrollment gap.
-    """
-    best, best_rank = None, 0
-    for c in client.cases.all():
-        if c.case_type != CaseType.INTERNAL_SERVICE:
-            continue
-        stage = _CASE_AUTH_TO_STAGE.get(c.service_authorization_status)
-        if stage is None:
-            continue
-        rank = _EARLY_AUTH_RANK.get(stage, 0)
-        if rank > best_rank:
-            best, best_rank = stage, rank
-    return best
-
-
 def _derive_early_funnel(client):
     """Early funnel stage from synced Unite Us data (no writes).
 
-    Priority (highest first): authorized/waiting (from an internal-service
-    case's authorization) > navigation > assessment > not_eligible > screened >
+    Priority (highest first): navigation > assessment > not_eligible > screened >
     consent > inactive.
-    """
-    # An internal-service (meals/boxes) case with an authorization outcome
-    # advances the funnel past Navigation even without an enrollment.
-    auth_stage = _case_authorization_stage(client)
-    if auth_stage is not None:
-        return auth_stage
 
+    A case's authorization status NEVER advances the funnel here: authorization
+    is a separate dimension on the Case (it gates kitchen assignment for an
+    already-verified household), not a funnel stage. A client with an
+    internal-service case but no completed verification stays at Navigation.
+    """
     if _has_met_council_case(client):
         return ClientStage.NAVIGATION
 
@@ -175,18 +132,13 @@ def _derive_early_funnel(client):
 
 
 # EnrollmentVerification.stage -> the ClientStage it drives the client to, for
-# the stages that actively govern the client (past verification start). DENIED
-# is intentionally non-terminal: a denied authorization keeps the client in the
-# verification stage (Verified) with the authorization outcome shown as Denied,
-# rather than advancing to Kitchen Assignment or off-ramping the client. This
-# lets the household be re-submitted/re-accepted without losing the Verified
-# state.
+# the stages that actively govern the client (past verification start). A
+# verified household whose authorization is pending/denied stays at Verified
+# (the authorization outcome is shown separately, sourced from the Case); only
+# an approved authorization advances the enrollment to Kitchen Assignment.
 _ENROLLMENT_DRIVES = {
     EnrollmentStage.PENDING_VERIFICATION: ClientStage.PENDING_VERIFICATION,
     EnrollmentStage.VERIFIED: ClientStage.VERIFIED,
-    EnrollmentStage.WAITING_AUTHORIZATION: ClientStage.WAITING_AUTHORIZATION,
-    EnrollmentStage.DENIED: ClientStage.VERIFIED,
-    EnrollmentStage.AUTHORIZED: ClientStage.AUTHORIZED,
     EnrollmentStage.KITCHEN_ASSIGNMENT: ClientStage.KITCHEN_ASSIGNMENT,
     EnrollmentStage.SERVICE_ACTIVE: ClientStage.ACTIVE,
     EnrollmentStage.SERVICE_COMPLETE: ClientStage.COMPLETED,
@@ -206,9 +158,6 @@ _ENROLLMENT_RANK = {
     EnrollmentStage.VALIDATED: 2,
     EnrollmentStage.PENDING_VERIFICATION: 3,
     EnrollmentStage.VERIFIED: 4,
-    EnrollmentStage.WAITING_AUTHORIZATION: 5,
-    EnrollmentStage.DENIED: 5,
-    EnrollmentStage.AUTHORIZED: 6,
     EnrollmentStage.KITCHEN_ASSIGNMENT: 7,
     EnrollmentStage.SERVICE_ACTIVE: 8,
     EnrollmentStage.SERVICE_COMPLETE: 9,
@@ -280,6 +229,21 @@ def _held_from_stage(enrollment):
         except ValueError:
             return None
     return None
+
+
+def verification_completed(client):
+    """True when the household's verification POP-UP was completed for a
+    governing enrollment -- the job that captures food allergies, delivery
+    address, the Step-4 validation checks, etc.
+
+    Keyed off the explicit ``verified_at`` fact (set only by the pop-up or a
+    one-off backfill), never the enrollment stage or the client's
+    lifecycle_stage. The authorization outcome (approved/pending/denied) is a
+    separate dimension and does not affect this.
+    """
+    return any(
+        e.verified_at is not None for e in _governing_enrollments(client)
+    )
 
 
 def derive_client_stage(client):
@@ -410,32 +374,14 @@ ENROLLMENT_TRANSITIONS = {
     },
     EnrollmentStage.PENDING_VERIFICATION: {
         EnrollmentStage.VERIFIED,
-        EnrollmentStage.WAITING_AUTHORIZATION,
-        EnrollmentStage.DENIED,
         EnrollmentStage.ON_HOLD,
         EnrollmentStage.CANCELLED,
     },
     EnrollmentStage.VERIFIED: {
-        EnrollmentStage.WAITING_AUTHORIZATION,
-        EnrollmentStage.AUTHORIZED,
-        EnrollmentStage.KITCHEN_ASSIGNMENT,
-        EnrollmentStage.SERVICE_ACTIVE,
-        # A verified household whose case authorization comes back Denied is
-        # projected straight to DENIED (non-terminal: parks the client at
-        # Waiting Authorization). Without this the reconcile no-ops and the
-        # household is stuck showing "verified".
-        EnrollmentStage.DENIED,
-        EnrollmentStage.ON_HOLD,
-        EnrollmentStage.CANCELLED,
-    },
-    EnrollmentStage.WAITING_AUTHORIZATION: {
-        EnrollmentStage.AUTHORIZED,
-        EnrollmentStage.KITCHEN_ASSIGNMENT,
-        EnrollmentStage.DENIED,
-        EnrollmentStage.ON_HOLD,
-        EnrollmentStage.CANCELLED,
-    },
-    EnrollmentStage.AUTHORIZED: {
+        # An approved authorization advances a verified household to Kitchen
+        # Assignment (reconcile_enrollment_authorization). A pending/denied/
+        # expired authorization leaves it at VERIFIED -- the outcome is shown
+        # separately (from the Case), never as a stage.
         EnrollmentStage.KITCHEN_ASSIGNMENT,
         EnrollmentStage.SERVICE_ACTIVE,
         EnrollmentStage.ON_HOLD,
@@ -444,16 +390,6 @@ ENROLLMENT_TRANSITIONS = {
     EnrollmentStage.KITCHEN_ASSIGNMENT: {
         EnrollmentStage.SERVICE_ACTIVE,
         EnrollmentStage.ON_HOLD,
-        EnrollmentStage.CANCELLED,
-    },
-    EnrollmentStage.DENIED: {
-        EnrollmentStage.PENDING_VERIFICATION,
-        EnrollmentStage.WAITING_AUTHORIZATION,
-        # A denial can be superseded by a newer internal-service case: an
-        # approval re-advances to Kitchen Assignment, an expiry parks On Hold.
-        EnrollmentStage.KITCHEN_ASSIGNMENT,
-        EnrollmentStage.ON_HOLD,
-        EnrollmentStage.CLOSED,
         EnrollmentStage.CANCELLED,
     },
     EnrollmentStage.SERVICE_ACTIVE: {
@@ -468,8 +404,6 @@ ENROLLMENT_TRANSITIONS = {
         EnrollmentStage.VALIDATED,
         EnrollmentStage.PENDING_VERIFICATION,
         EnrollmentStage.VERIFIED,
-        EnrollmentStage.WAITING_AUTHORIZATION,
-        EnrollmentStage.AUTHORIZED,
         EnrollmentStage.KITCHEN_ASSIGNMENT,
         EnrollmentStage.SERVICE_ACTIVE,
         EnrollmentStage.CANCELLED,
@@ -542,13 +476,11 @@ def advance_enrollment(enrollment, to_stage, *, actor=None, note="", force=False
         note=note,
     )
 
-    # On entering AUTHORIZED (Accepted), generate the full delivery schedule.
-    # Idempotent (no-ops if orders already exist), so re-entering AUTHORIZED
-    # (e.g. after ON_HOLD) never double-creates orders.
-    if to_stage == EnrollmentStage.AUTHORIZED:
-        from api.services.orders import generate_orders_for_enrollment
-
-        generate_orders_for_enrollment(enrollment)
+    # Delivery orders are NOT generated here. They are built at the manual
+    # kitchen-assignment step (MemberAssignKitchenView -> create_member_delivery_
+    # schedules + generate_delivery_calendar), which is the only place a kitchen,
+    # cadence and delivery weekdays exist. Entering KITCHEN_ASSIGNMENT only marks
+    # the household as awaiting that manual step.
 
     # Mirror the transition onto the client's central timeline (best-effort:
     # a timeline hiccup must never roll back the stage change).
@@ -573,27 +505,21 @@ def advance_enrollment(enrollment, to_stage, *, actor=None, note="", force=False
     return enrollment
 
 
-# Case authorization status -> the enrollment stage it should drive the
-# enrollment to (only applied once the enrollment is past verification).
+# Case authorization status -> the enrollment stage it advances to. ONLY an
+# approval moves the stage (verified -> kitchen_assignment). Pending / denied /
+# expired make NO stage change: authorization is a separate dimension shown from
+# the Case, never an enrollment stage. A denial that is later superseded by a
+# re-approval advances the still-VERIFIED enrollment when reconcile re-runs.
 _AUTH_STATUS_TO_STAGE = {
     ServiceAuthorizationStatus.APPROVED: EnrollmentStage.KITCHEN_ASSIGNMENT,
     ServiceAuthorizationStatus.NOT_REQUIRED: EnrollmentStage.KITCHEN_ASSIGNMENT,
-    ServiceAuthorizationStatus.DENIED: EnrollmentStage.DENIED,
-    ServiceAuthorizationStatus.EXPIRED: EnrollmentStage.ON_HOLD,
-    ServiceAuthorizationStatus.PENDING: EnrollmentStage.WAITING_AUTHORIZATION,
 }
 
-# Stages from which an authorization outcome may be applied. Before verification
-# is complete we never act on the case's authorization (a case accepted early
-# just waits until the household is verified).
+# Stages from which an approval may advance the enrollment to kitchen assignment.
+# Before verification is complete we never act on the case's authorization (a
+# case accepted early just waits until the household is verified).
 _AUTH_ELIGIBLE_STAGES = {
     EnrollmentStage.VERIFIED,
-    EnrollmentStage.WAITING_AUTHORIZATION,
-    # DENIED is re-evaluable: a denial can be superseded by a newer
-    # internal-service case (re-approval / re-submission), so reconcile must be
-    # able to move a denied enrollment forward again when the governing
-    # (most-recent) case changes outcome.
-    EnrollmentStage.DENIED,
 }
 
 
@@ -658,9 +584,10 @@ def reconcile_enrollment_authorization(enrollment, *, actor=None, note=""):
 
     This is the single chokepoint for the externally-driven "Accepted" outcome:
     callers (verification completion, the nightly Unite Us import, a manual
-    "mark Accepted" action) all funnel through here rather than touching orders
-    directly. Order generation happens as a side-effect of entering AUTHORIZED
-    inside :func:`advance_enrollment`.
+    "mark Accepted" action) all funnel through here. ONLY an approval advances
+    the stage (verified -> kitchen_assignment); pending/denied/expired make no
+    stage change (the household stays Verified and the authorization status is
+    shown separately).
 
     The governing case is the most recent internal-service case on the client
     (see :func:`governing_internal_case`), not necessarily ``enrollment.case`` --
@@ -668,8 +595,7 @@ def reconcile_enrollment_authorization(enrollment, *, actor=None, note=""):
     enrollment's ``case`` FK is repointed at the governing case so downstream
     consumers (order / delivery windows) read the current authorization.
 
-    No-ops unless the enrollment is eligible (past verification) and the case
-    has an actionable authorization status. Idempotent.
+    No-ops unless the enrollment is verified and the case is approved. Idempotent.
     """
     if EnrollmentStage(enrollment.stage) not in _AUTH_ELIGIBLE_STAGES:
         return enrollment
@@ -685,8 +611,9 @@ def reconcile_enrollment_authorization(enrollment, *, actor=None, note=""):
 
     target = _AUTH_STATUS_TO_STAGE.get(case.service_authorization_status)
     if target is None:
-        # Blank / unknown status -> we are still waiting on the authority.
-        target = EnrollmentStage.WAITING_AUTHORIZATION
+        # Not approved (pending / denied / expired / blank): no stage change.
+        # The household stays Verified; the status is surfaced from the Case.
+        return enrollment
 
     if EnrollmentStage(enrollment.stage) == target:
         return enrollment
