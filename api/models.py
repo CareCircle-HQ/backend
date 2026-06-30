@@ -355,6 +355,11 @@ class Client(models.Model):
     agent_code = models.CharField(max_length=60, blank=True)
     agent_name = models.CharField(max_length=255, blank=True)
     lead_source = models.CharField(max_length=80, blank=True)
+    # Williamsburg exception flag: derived from ``lead_source == "Williamsburg"``
+    # (set on every client upsert). When set, an ext verification request is
+    # fast-tracked straight to Service Active (see api.services.williamsburg)
+    # instead of waiting on the manual verification + kitchen-assignment steps.
+    is_williamsburg = models.BooleanField(default=False, db_index=True)
     is_a_family = models.BooleanField(default=False)
     total_family_members = models.PositiveSmallIntegerField(null=True, blank=True)
     attestation_needed = models.BooleanField(default=False)
