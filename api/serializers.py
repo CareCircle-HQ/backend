@@ -210,7 +210,9 @@ class ClientSerializer(serializers.ModelSerializer):
         model = Client
         fields = "__all__"
         # Derived server-side; never written by the client/extension.
-        read_only_fields = ("is_level", "lifecycle_stage", "lifecycle_stage_at")
+        read_only_fields = (
+            "is_level", "lifecycle_stage", "lifecycle_stage_at", "is_williamsburg",
+        )
 
     def _validate_services(self, value, field_name):
         if value in (None, ""):
@@ -337,6 +339,14 @@ class ClientSerializer(serializers.ModelSerializer):
         raw = getattr(self, "initial_data", {}) or {}
         reconcile = bool(raw.get("reconcile_insurances"))
         reconcile_scc = bool(raw.get("reconcile_social_care_coverages"))
+
+        # Williamsburg exception flag is derived from lead_source. Only set it
+        # when lead_source is part of this write (so a partial PATCH that omits
+        # lead_source never clears it).
+        if "lead_source" in validated_data:
+            validated_data["is_williamsburg"] = (
+                (validated_data.get("lead_source") or "").strip().lower() == "williamsburg"
+            )
 
         client, _ = Client.objects.update_or_create(
             client_id=client_id, defaults=validated_data
