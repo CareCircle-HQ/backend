@@ -1116,10 +1116,11 @@ class Case(models.Model):
     # Program Name from detail view (what we called service_subtype before)
     program_name = models.CharField(max_length=255, blank=True)
 
-    # --- Case Classification (auto-derived on save) ---
-    # Navigation / External Service / Internal Service. Derived from
-    # service_type: "Social Service Case Management" => Internal Service,
-    # otherwise => Navigation (see CaseSerializer).
+    # --- Case Classification (auto-derived on upsert) ---
+    # Internal Service when service_type is a meal/box subtype (Medically
+    # Tailored Meals / Produce Prescription/Voucher); otherwise the
+    # program_name's ProgramPipeline category (Eligibility / Navigation /
+    # External Service), defaulting to Navigation. See derive_case_type.
     case_type = models.CharField(
         max_length=20, choices=CaseType.choices, default=CaseType.INTERNAL_SERVICE
     )
