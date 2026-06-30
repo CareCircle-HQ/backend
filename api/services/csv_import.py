@@ -42,11 +42,14 @@ from api.models import (
     ImportRunStatus,
     Insurance,
     InsurancePlanType,
+    Note,
+    NoteSource,
     OutcomeResolutionType,
     Screening,
     ServiceAuthorizationStatus,
     SocialCareCoverage,
     SocialCareCoverageStatus,
+    UniteUsAgent,
     VerifiedSocialNeed,
 )
 from api.serializers import (
@@ -63,8 +66,13 @@ logger = logging.getLogger(__name__)
 CSV_SOURCE = "csv_uniteus"
 TIMELINE_ACTOR = "system:csv-import"
 
-# Export types this importer understands. Mapped in follow-up slices: notes.
+# Export types exposed in the Settings > Import web UI.
 SUPPORTED_EXPORT_TYPES = ("clients", "screening", "assessments", "cases")
+
+# Every export type the engine understands. ``notes`` is intentionally CLI-only
+# (run via ``manage.py import_csv``) and NOT in SUPPORTED_EXPORT_TYPES, so the
+# Settings upload never offers it.
+CLI_EXPORT_TYPES = SUPPORTED_EXPORT_TYPES + ("notes",)
 
 
 # --- streaming helpers -----------------------------------------------------
@@ -663,20 +671,62 @@ class CsvImporter:
                 self.errors.append(f"client {cid}: {exc}")
                 logger.warning("csv_import client %s failed: %s", cid, exc)
 
-    def import_screenings(self, reader):
+    def import_screenings(self, reader, provider_id=None, provider_name=None):
         self.dataset = "screenings"
-        # Stream the denormalized (one-row-per-answer) export grouped by screen,
-        # holding only one screen's rows in memory at a time -- this file can be
-        # several GB. Rows for a screen are contiguous in the export.
-        for sid, rows in _iter_contiguous_groups(reader, "enhanced_screen_id"):
-            if sid is None:
+        # Optional provider scope: import only screens performed by the given
+        # provider (id OR name, case-insensitive/trimmed). Non-matching screens
+        # are counted as skipped. Lets a network-wide export be narrowed to a
+        # single provider (e.g. Met Council).
+        want_id = (str(provider_id).strip() if provider_id else "")
+        want_name = (provider_name or "").strip().casefold()
+        provider_filter = bool(want_id or want_name)
+        # Unite Us facilitator allowlist: when any US-flagged UniteUsAgent rows
+        # exist, only import screens whose ``facilitator_id`` is one of them.
+        # NB: the screening export's ``facilitator_id`` maps to
+        # ``UniteUsAgent.employee_id`` (NOT ``user_id``, which is what the cases
+        # export's ``case_created_by_id`` maps to). Only agents with the US flag
+        # (is_us=True) count -- Met Council Team agents are excluded. An EMPTY
+        # list means no gate -- accept all -- so imports keep working until the
+        # allowlist is populated.
+        allow_facilitator_ids = {
+            str(e).lower()
+            for e in UniteUsAgent.objects.filter(
+                is_us=True, employee_id__isnull=False
+            ).values_list("employee_id", flat=True)
+        }
+        # Group the denormalized (one-row-per-answer) export by screen. The Unite
+        # Us export does NOT guarantee a screen's rows are contiguous -- they can
+        # be scattered across the file -- so collect ALL rows per screen id before
+        # building the payload. (A contiguous-only pass would create each screen
+        # from just the first fragment of its answers and skip the rest as
+        # "already exists".) Holds the file in memory; fine for the
+        # few-hundred-MB exports we import.
+        groups = OrderedDict()
+        for row in reader:
+            sid = (row.get("enhanced_screen_id") or "").strip()
+            if not sid:
                 self._count("skipped")
                 continue
+            groups.setdefault(sid, []).append(row)
+
+        for sid, rows in groups.items():
+            head = rows[0]
+            # Facilitator allowlist (only enforced when the list is non-empty).
+            if allow_facilitator_ids:
+                facilitator = (head.get("facilitator_id") or "").strip().lower()
+                if facilitator not in allow_facilitator_ids:
+                    self._count("skipped")
+                    continue
+            if provider_filter:
+                row_id = (head.get("provider_id") or "").strip()
+                row_name = (head.get("provider_name") or "").strip().casefold()
+                if not ((want_id and row_id == want_id)
+                        or (want_name and row_name == want_name)):
+                    self._count("skipped")
+                    continue
             # Append-only + idempotent: screenings are immutable once complete,
-            # so skip any enhanced_screen_id we already store (checked per
-            # group). This keeps re-imports cheap and non-destructive, and also
-            # guards the rare case of a screen split across non-contiguous
-            # groups -- the second group is skipped once the first creates it.
+            # so skip any enhanced_screen_id we already store. This keeps
+            # re-imports cheap and non-destructive.
             if Screening.objects.filter(pk=sid).exists():
                 self._count("skipped")
                 continue
@@ -717,8 +767,29 @@ class CsvImporter:
         except Exception:  # noqa: BLE001 - never fail the import on a timeline hiccup
             logger.warning("csv_import screening timeline failed", exc_info=True)
 
-    def import_assessments(self, reader):
+    def import_assessments(self, reader, provider_id=None, provider_name=None):
         self.dataset = "assessments"
+        # Optional provider scope: import only submissions performed by the given
+        # provider (id OR name, case-insensitive/trimmed). Non-matching ones are
+        # counted as skipped. Lets a network-wide export be narrowed to a single
+        # provider (e.g. Met Council).
+        want_id = (str(provider_id).strip() if provider_id else "")
+        want_name = (provider_name or "").strip().casefold()
+        provider_filter = bool(want_id or want_name)
+        # Unite Us creator allowlist: when any US-flagged UniteUsAgent rows exist,
+        # only import submissions whose ``submission_created_by_id`` is one of
+        # them. This maps to ``UniteUsAgent.user_id`` (the SAME key the cases
+        # export's ``case_created_by_id`` uses -- unlike screenings, whose
+        # ``facilitator_id`` maps to ``employee_id``). Only agents with the US
+        # flag (is_us=True) count -- Met Council Team agents are excluded. An
+        # EMPTY list means no gate -- accept all -- so imports keep working until
+        # the allowlist is populated.
+        allow_creator_ids = {
+            str(u).lower()
+            for u in UniteUsAgent.objects.filter(is_us=True).values_list(
+                "user_id", flat=True
+            )
+        }
         # Group the denormalized (one-row-per-question) rows by submission.
         groups = OrderedDict()
         for row in reader:
@@ -729,6 +800,20 @@ class CsvImporter:
             groups.setdefault(sid, []).append(row)
 
         for sid, rows in groups.items():
+            head = rows[0]
+            # Creator allowlist (only enforced when the list is non-empty).
+            if allow_creator_ids:
+                creator = (head.get("submission_created_by_id") or "").strip().lower()
+                if creator not in allow_creator_ids:
+                    self._count("skipped")
+                    continue
+            if provider_filter:
+                row_id = (head.get("provider_id") or "").strip()
+                row_name = (head.get("provider_name") or "").strip().casefold()
+                if not ((want_id and row_id == want_id)
+                        or (want_name and row_name == want_name)):
+                    self._count("skipped")
+                    continue
             existed = Assessment.objects.filter(pk=sid).exists()
             try:
                 payload = map_assessment_group(sid, rows)
@@ -755,6 +840,90 @@ class CsvImporter:
             logger.warning("csv_import assessment timeline failed", exc_info=True)
         self._recompute_stage(assessment.client_id, assessment.client)
 
+    def import_notes(self, reader):
+        self.dataset = "notes"
+        # Unite Us author allowlist: when any US-flagged UniteUsAgent rows exist,
+        # only import notes whose ``noted_by_employee_id`` is one of them. This
+        # maps to ``UniteUsAgent.employee_id`` (the SAME key the screening
+        # export's ``facilitator_id`` uses). We also use the matched agent to
+        # translate the author into a readable name -- the notes export carries
+        # no author-name column. Only agents with the US flag (is_us=True) count.
+        # An EMPTY allowlist means no gate -- accept all -- but author_name is
+        # then only filled when the employee id happens to match an agent.
+        agents_by_emp = {
+            str(a.employee_id).lower(): a
+            for a in UniteUsAgent.objects.exclude(employee_id__isnull=True)
+        }
+        allow_author_ids = {
+            emp for emp, a in agents_by_emp.items() if a.is_us
+        }
+        # Pre-load existing Unite Us note ids so re-runs are a cheap set lookup
+        # (the model has no unique constraint on source_note_id).
+        existing_note_ids = set(
+            Note.objects.filter(source=NoteSource.UNITE_US)
+            .exclude(source_note_id="")
+            .values_list("source_note_id", flat=True)
+        )
+        # Per-run caches so shared clients/cases aren't re-queried each row.
+        client_cache = {}
+        case_cache = {}
+
+        def _client(cid):
+            if cid not in client_cache:
+                client_cache[cid] = Client.objects.filter(pk=cid).first()
+            return client_cache[cid]
+
+        def _case(case_id):
+            if case_id not in case_cache:
+                case_cache[case_id] = Case.objects.filter(pk=case_id).first()
+            return case_cache[case_id]
+
+        # One row per note -- stream directly, no grouping needed.
+        for row in reader:
+            note_id = (row.get("note_id") or "").strip()
+            if not note_id:
+                self._count("skipped")
+                continue
+            # Author allowlist (only enforced when the list is non-empty).
+            author_emp = (row.get("noted_by_employee_id") or "").strip().lower()
+            if allow_author_ids and author_emp not in allow_author_ids:
+                self._count("skipped")
+                continue
+            # Idempotent: skip note ids we already store.
+            if note_id in existing_note_ids:
+                self._count("skipped")
+                continue
+            # Track notes by client: require the client to exist so a re-run
+            # after the clients import picks up any that were missing.
+            cid = (row.get("client_id") or "").strip()
+            client = _client(cid) if cid else None
+            if client is None:
+                self._count("skipped")
+                continue
+            # Link the case when the note's subject is a Case we already store.
+            case = None
+            if (row.get("subject_type") or "").strip().lower() == "case":
+                sid = (row.get("subject_id") or "").strip()
+                if sid:
+                    case = _case(sid)
+            agent = agents_by_emp.get(author_emp)
+            try:
+                Note.objects.create(
+                    client=client,
+                    case=case,
+                    source=NoteSource.UNITE_US,
+                    source_note_id=note_id,
+                    author_name=(agent.name if agent else ""),
+                    body=(row.get("text") or "").strip(),
+                    source_created_at=_aware_dt(row, "note_created_at"),
+                )
+                existing_note_ids.add(note_id)
+                self._count("created")
+            except Exception as exc:  # isolate one bad note from the run
+                self._count("errors")
+                self.errors.append(f"note {note_id}: {exc}")
+                logger.warning("csv_import note %s failed: %s", note_id, exc)
+
     def import_cases(self, reader, provider_id=None, provider_name=None):
         self.dataset = "cases"
         # Optional provider scope: import only rows serviced by the given
@@ -764,12 +933,30 @@ class CsvImporter:
         want_id = (str(provider_id).strip() if provider_id else "")
         want_name = (provider_name or "").strip().casefold()
         provider_filter = bool(want_id or want_name)
+        # Unite Us creator allowlist: when any US-flagged UniteUsAgent rows are
+        # configured, only import cases whose ``case_created_by_id`` is in that
+        # list (it maps exactly to Case.created_by_id). Only agents with the US
+        # flag (is_us=True) count -- Met Council Team agents are excluded. An
+        # EMPTY list means no gate -- accept all -- so existing imports keep
+        # working until the list is populated.
+        allow_creator_ids = {
+            str(u).lower()
+            for u in UniteUsAgent.objects.filter(is_us=True).values_list(
+                "user_id", flat=True
+            )
+        }
         # One row per case — stream directly, no grouping needed.
         for row in reader:
             cid = (row.get("case_id") or "").strip()
             if not cid:
                 self._count("skipped")
                 continue
+            # Creator allowlist (only enforced when the list is non-empty).
+            if allow_creator_ids:
+                creator = (row.get("case_created_by_id") or "").strip().lower()
+                if creator not in allow_creator_ids:
+                    self._count("skipped")
+                    continue
             if provider_filter:
                 row_id = (row.get("provider_id") or "").strip()
                 row_name = (row.get("provider_name") or "").strip().casefold()
@@ -866,10 +1053,10 @@ def run_csv_import(*, export_type, file_obj, triggered_by="manual", emit_side_ef
     timeline events and funnel-stage recompute are skipped (useful for bulk
     historical loads).
     """
-    if export_type not in SUPPORTED_EXPORT_TYPES:
+    if export_type not in CLI_EXPORT_TYPES:
         raise ValueError(
             f"Unsupported export_type '{export_type}'. "
-            f"Supported: {', '.join(SUPPORTED_EXPORT_TYPES)}."
+            f"Supported: {', '.join(CLI_EXPORT_TYPES)}."
         )
 
     run = ImportRun.objects.create(
@@ -885,13 +1072,19 @@ def run_csv_import(*, export_type, file_obj, triggered_by="manual", emit_side_ef
             if export_type == "clients":
                 importer.import_clients(reader)
             elif export_type == "screening":
-                importer.import_screenings(reader)
+                importer.import_screenings(
+                    reader, provider_id=provider_id, provider_name=provider_name,
+                )
             elif export_type == "assessments":
-                importer.import_assessments(reader)
+                importer.import_assessments(
+                    reader, provider_id=provider_id, provider_name=provider_name,
+                )
             elif export_type == "cases":
                 importer.import_cases(
                     reader, provider_id=provider_id, provider_name=provider_name,
                 )
+            elif export_type == "notes":
+                importer.import_notes(reader)
             # Always reconcile the funnel stage for every touched client, so the
             # upload self-heals lifecycle_stage even when per-record side effects
             # are off (bulk load) or the client file was imported before cases.

@@ -164,9 +164,14 @@ class ZipCodeCheckView(APIView):
         match = AllowedZipCode.objects.filter(
             zip_code=zip5, is_active=True
         ).first()
+        # TEMPORARY STOPGAP (remove to restore real service-area gating): force
+        # every ZIP to report as allowed so the extension's verification
+        # preflight never blocks on "outside our service area". Real borough/scn/
+        # platform are still returned when the ZIP is known. To restore, change
+        # "allowed" back to ``match is not None``.
         return Response({
             "zip": zip5,
-            "allowed": match is not None,
+            "allowed": True,
             "borough": match.borough if match else "",
             "scn": match.scn if match else "",
             "platform": match.platform if match else "",

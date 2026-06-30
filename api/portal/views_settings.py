@@ -7,6 +7,7 @@ from rest_framework.decorators import action
 from rest_framework.response import Response
 
 from ..models import (
+    Agent,
     DeliveryCompany,
     DeliveryCompanyIntegration,
     DietaryTag,
@@ -196,3 +197,49 @@ class DeliveryCompanyIntegrationSetPrimaryView(PortalAPIView):
         integ.is_primary = True
         integ.save(update_fields=["is_primary"])
         return Response(s.PortalDeliveryCompanyIntegrationSerializer(integ).data)
+
+
+class CrmAgentViewSet(viewsets.ModelViewSet):
+    """Settings > CareCircle Agents: manage our internal CRM agent roster.
+
+    Full list (no pagination, so the UI can search/filter client-side) plus
+    create/update. Optional ``?search=`` (name/email/code) and ``?group=``
+    query filters. Delete is disabled -- agents are deactivated via ``status``
+    so historical references (tickets, cases) stay intact.
+    """
+
+    permission_classes = [IsPortalAgent]
+    serializer_class = s.PortalCrmAgentSerializer
+    pagination_class = None
+    http_method_names = ["get", "post", "patch", "put", "head", "options"]
+
+    def get_queryset(self):
+        qs = Agent.objects.all().order_by("name")
+        params = self.request.query_params
+        group = (params.get("group") or "").strip()
+        if group:
+            qs = qs.filter(group=group)
+        search = (params.get("search") or "").strip()
+        if search:
+            from django.db.models import Q
+
+            qs = qs.filter(
+                Q(name__icontains=search)
+                | Q(email__icontains=search)
+                | Q(agent_code__icontains=search)
+                | Q(title__icontains=search)
+            )
+        return qs
+
+    def list(self, request, *args, **kwargs):
+        qs = self.filter_queryset(self.get_queryset())
+        data = self.get_serializer(qs, many=True).data
+        # Surface the selectable group choices so the UI dropdown stays in sync
+        # with the model without hard-coding them on the frontend.
+        return Response(
+            {
+                "count": len(data),
+                "groups": [g[0] for g in Agent.AGENT_GROUPS],
+                "results": data,
+            }
+        )

@@ -2134,6 +2134,52 @@ class Agent(models.Model):
         return f"{self.name} ({self.agent_code}) - {self.group}"
 
 
+class UniteUsAgent(models.Model):
+    """A Unite Us (Unite NYC / SCN) platform user, sourced from the Unite Us
+    users export.
+
+    These are SEPARATE from :class:`Agent` (our extension/CallTools users) -- they
+    are Met Council / network staff who create cases in Unite Us and have nothing
+    to do with our agent accounts. Their ``user_id`` matches ``Case.created_by_id``
+    (a perfect, complete join in the data), so this managed list is used purely to
+    filter imported cases by the Unite Us user who created them.
+
+    Managed from Settings (add/remove) and seedable from the users export.
+    """
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    # The Unite Us user_id == Case.created_by_id. Unique natural key; required so
+    # the entry can actually match (and filter) cases.
+    user_id = models.UUIDField(unique=True, db_index=True)
+    # Optional Unite Us employee_id (a different id; kept for reference only).
+    employee_id = models.UUIDField(null=True, blank=True)
+    first_name = models.CharField(max_length=120, blank=True)
+    last_name = models.CharField(max_length=120, blank=True)
+    name = models.CharField(max_length=255, blank=True)
+    email = models.EmailField(blank=True)
+    work_title = models.CharField(max_length=255, blank=True)
+    # Employee status from the export ("active"/"inactive"); informational.
+    status = models.CharField(max_length=20, blank=True, default="active")
+    # Whether this person is a Unite Us ("US") / CareCircle agent, sourced from
+    # the CareCircle team roster ("Us?" column). Anyone NOT on the roster is
+    # treated as Met Council staff (is_us=False).
+    is_us = models.BooleanField(default=False)
+    # The team this agent originates from, from the CareCircle roster
+    # ("Originating Team", e.g. "CareCircle Call Center"). Defaults to
+    # "Met Council Team" for everyone not on the roster.
+    originating_team = models.CharField(max_length=120, blank=True, default="Met Council Team")
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["name"]
+        verbose_name = "Unite Us agent"
+        verbose_name_plural = "Unite Us agents"
+
+    def __str__(self):
+        return f"{self.name or self.email or self.user_id}"
+
+
 class AgentLoginCode(models.Model):
     """A short-lived, single-use 2FA code emailed to an agent's company email to
     complete extension login.

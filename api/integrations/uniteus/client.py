@@ -28,8 +28,14 @@ class UniteUsAuthError(Exception):
 def needs_refresh(cred):
     if not cred.access_token:
         return True
+    # No known expiry (the extension often captures the bearer from a request
+    # header, so the OAuth ``expires_in`` is absent and ``access_expires_at``
+    # is null): treat a freshly captured token as usable rather than forcing a
+    # refresh we may not be able to perform. If it has actually expired the
+    # live API call returns 401/403 and the UniteUsAuthExpired re-login path
+    # takes over.
     if not cred.access_expires_at:
-        return True
+        return False
     return cred.access_expires_at <= timezone.now() + timedelta(
         seconds=config.refresh_skew()
     )
@@ -50,7 +56,16 @@ def refresh_credential(cred):
 
     url = config.token_url()
     if not url:
-        raise UniteUsAuthError("UNITEUS_TOKEN_URL is not configured")
+        # No OAuth token endpoint configured: we can't refresh server-side, so
+        # mark the credential EXPIRED and let the caller fall back to the
+        # re-login path (an agent re-capturing a fresh token via the extension)
+        # instead of raising a config error for every person in the pull.
+        logger.warning(
+            "Unite Us token refresh skipped: UNITEUS_TOKEN_URL not configured "
+            "(credential %s marked expired)", cred.pk,
+        )
+        _mark_expired(cred)
+        return False
 
     data = {"grant_type": "refresh_token", "refresh_token": cred.refresh_token}
     if config.client_id():
