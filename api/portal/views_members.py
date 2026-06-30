@@ -43,6 +43,7 @@ from ..services.delivery import (
     current_household_cadence,
     update_household_cadence,
 )
+from ..services.client_diagnostic import diagnose_client
 from ..services.orders import generate_delivery_calendar
 from ..services.kitchens import kitchen_options
 from ..services.meal_rules import apply_to_member
@@ -1130,3 +1131,17 @@ class MemberCadenceView(PortalAPIView):
             "cadence": current_household_cadence(enr) or cadence,
             "cadence_label": dict(DeliveryCadence.choices).get(cadence, ""),
         })
+
+
+class MemberDiagnosticView(PortalAPIView):
+    """GET: a read-only service-readiness diagnostic for a client.
+
+    Returns a grouped checklist (coverage, case, lifecycle, verification,
+    logistics, tickets) with per-check status (ok/warn/fail/na) plus an overall
+    ``ready_for_service`` flag and the list of blocking checks. Never mutates
+    state. See api.services.client_diagnostic.diagnose_client.
+    """
+
+    def get(self, request, client_id):
+        client = get_object_or_404(Client, pk=client_id)
+        return Response(diagnose_client(client))
