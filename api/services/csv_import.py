@@ -753,8 +753,29 @@ class CsvImporter:
         except Exception:  # noqa: BLE001 - never fail the import on a timeline hiccup
             logger.warning("csv_import screening timeline failed", exc_info=True)
 
-    def import_assessments(self, reader):
+    def import_assessments(self, reader, provider_id=None, provider_name=None):
         self.dataset = "assessments"
+        # Optional provider scope: import only submissions performed by the given
+        # provider (id OR name, case-insensitive/trimmed). Non-matching ones are
+        # counted as skipped. Lets a network-wide export be narrowed to a single
+        # provider (e.g. Met Council).
+        want_id = (str(provider_id).strip() if provider_id else "")
+        want_name = (provider_name or "").strip().casefold()
+        provider_filter = bool(want_id or want_name)
+        # Unite Us creator allowlist: when any US-flagged UniteUsAgent rows exist,
+        # only import submissions whose ``submission_created_by_id`` is one of
+        # them. This maps to ``UniteUsAgent.user_id`` (the SAME key the cases
+        # export's ``case_created_by_id`` uses -- unlike screenings, whose
+        # ``facilitator_id`` maps to ``employee_id``). Only agents with the US
+        # flag (is_us=True) count -- Met Council Team agents are excluded. An
+        # EMPTY list means no gate -- accept all -- so imports keep working until
+        # the allowlist is populated.
+        allow_creator_ids = {
+            str(u).lower()
+            for u in UniteUsAgent.objects.filter(is_us=True).values_list(
+                "user_id", flat=True
+            )
+        }
         # Group the denormalized (one-row-per-question) rows by submission.
         groups = OrderedDict()
         for row in reader:
@@ -765,6 +786,20 @@ class CsvImporter:
             groups.setdefault(sid, []).append(row)
 
         for sid, rows in groups.items():
+            head = rows[0]
+            # Creator allowlist (only enforced when the list is non-empty).
+            if allow_creator_ids:
+                creator = (head.get("submission_created_by_id") or "").strip().lower()
+                if creator not in allow_creator_ids:
+                    self._count("skipped")
+                    continue
+            if provider_filter:
+                row_id = (head.get("provider_id") or "").strip()
+                row_name = (head.get("provider_name") or "").strip().casefold()
+                if not ((want_id and row_id == want_id)
+                        or (want_name and row_name == want_name)):
+                    self._count("skipped")
+                    continue
             existed = Assessment.objects.filter(pk=sid).exists()
             try:
                 payload = map_assessment_group(sid, rows)
@@ -943,7 +978,9 @@ def run_csv_import(*, export_type, file_obj, triggered_by="manual", emit_side_ef
                     reader, provider_id=provider_id, provider_name=provider_name,
                 )
             elif export_type == "assessments":
-                importer.import_assessments(reader)
+                importer.import_assessments(
+                    reader, provider_id=provider_id, provider_name=provider_name,
+                )
             elif export_type == "cases":
                 importer.import_cases(
                     reader, provider_id=provider_id, provider_name=provider_name,

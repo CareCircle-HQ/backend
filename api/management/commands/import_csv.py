@@ -49,18 +49,18 @@ class Command(BaseCommand):
             "--provider-id",
             default=None,
             help=(
-                "Cases & screening only: import only rows whose provider_id "
-                "matches. Combined with --provider-name as an OR; non-matching "
-                "rows are skipped."
+                "Cases, screening & assessments only: import only rows whose "
+                "provider_id matches. Combined with --provider-name as an OR; "
+                "non-matching rows are skipped."
             ),
         )
         parser.add_argument(
             "--provider-name",
             default=None,
             help=(
-                "Cases & screening only: import only rows whose provider_name "
-                "matches (case-insensitive, trimmed). OR-combined with "
-                "--provider-id."
+                "Cases, screening & assessments only: import only rows whose "
+                "provider_name matches (case-insensitive, trimmed). OR-combined "
+                "with --provider-id."
             ),
         )
 
