@@ -706,12 +706,6 @@ class EnrollmentVerificationSerializer(serializers.ModelSerializer):
 
 # ===========================================================================
 # Case domain
-# ===========================================================================
-# A case whose Service Type is exactly this is an Internal (Case Management)
-# case; any other service type is treated as Navigation.
-SOCIAL_SERVICE_CASE_MANAGEMENT = "Social Service Case Management"
-
-
 # Map a ProgramPipeline.case_category value to a Case.case_type. Keys are
 # casefolded; both singular/plural spellings from the source data are accepted.
 _PIPELINE_CATEGORY_TO_CASE_TYPE = {
@@ -743,25 +737,37 @@ def derive_case_type_from_pipeline(program_name):
     return _PIPELINE_CATEGORY_TO_CASE_TYPE.get((row.case_category or "").strip().casefold())
 
 
+# Service subtypes (stored in ``Case.service_type``) that ARE our internal
+# meal/box service. Internal-service status is keyed on these subtypes, NOT on
+# the program name -- they map 1:1 to the meal/box programs and also catch
+# cases whose program_name is blank.
+INTERNAL_SERVICE_SUBTYPES = frozenset({
+    "medically tailored meals",
+    "produce prescription/voucher",
+})
+
+
 def derive_case_type(service_type, program_name=None):
     """Classify a case.
 
-    Primary rule: match ``program_name`` against the ProgramPipeline table and
-    use the mapped case_category. Fallback (program not in the table): the
-    legacy ``service_type`` heuristic — Social Service Case Management =>
-    Internal Service, anything else => Navigation.
+    Internal Service is identified by the meal/box service subtype (stored in
+    ``service_type``): Medically Tailored Meals or Produce Prescription/Voucher.
+    Otherwise the type comes from the ``program_name``'s ProgramPipeline
+    category (Eligibility / Navigation / External Service); a blank or unmatched
+    program is Navigation.
 
-    Returns None only when there's nothing to classify on (so callers leave the
-    existing value / model default untouched).
+    Returns None only when there's nothing to classify on (no internal subtype,
+    no program match, and no service_type), so callers leave the existing value
+    / model default untouched.
     """
+    st = (service_type or "").strip()
+    if st.casefold() in INTERNAL_SERVICE_SUBTYPES:
+        return CaseType.INTERNAL_SERVICE
     from_pipeline = derive_case_type_from_pipeline(program_name)
     if from_pipeline is not None:
         return from_pipeline
-    st = (service_type or "").strip()
     if not st:
         return None
-    if st.casefold() == SOCIAL_SERVICE_CASE_MANAGEMENT.casefold():
-        return CaseType.INTERNAL_SERVICE
     return CaseType.NAVIGATION
 
 

@@ -35,6 +35,7 @@ from api.models import (
     Assessment,
     Case,
     CaseStatus,
+    CaseType,
     Client,
     IdentifiedSocialNeed,
     ImportRun,
@@ -53,6 +54,7 @@ from api.serializers import (
     CaseSerializer,
     ClientSerializer,
     ScreeningSerializer,
+    derive_case_type,
 )
 from api.services import timeline
 
@@ -764,6 +766,26 @@ class CsvImporter:
                         or (want_name and row_name == want_name)):
                     self._count("skipped")
                     continue
+            # Referral cases (Unite Us case_status == "referred") are intake
+            # referrals, not managed cases -- never import them. (The status
+            # isn't a stored CaseStatus value, so it would otherwise land as
+            # OPEN and pollute the case list / verification flow.)
+            if (row.get("case_status") or "").strip().lower() == "referred":
+                self._count("skipped")
+                continue
+            # A blank program_name means the case never advanced into a Met
+            # Council program (overwhelmingly declined / denied / recalled): out
+            # of scope, don't import.
+            if not (row.get("program_name") or "").strip():
+                self._count("skipped")
+                continue
+            # External-service cases are out of scope -- we don't track them.
+            # (Classified from the program's ProgramPipeline category.)
+            if derive_case_type(
+                row.get("service_subtype"), row.get("program_name")
+            ) == CaseType.EXTERNAL_SERVICE:
+                self._count("skipped")
+                continue
             existed = Case.objects.filter(pk=cid).exists()
             try:
                 payload = map_case_row(row)
