@@ -18,6 +18,7 @@ from .views_members import (
     MemberCadenceView,
     MemberCasesView,
     MemberDetailView,
+    MemberDiagnosticView,
     MemberHistoryDetailView,
     MemberHistoryView,
     MemberHouseholdView,
@@ -117,6 +118,7 @@ urlpatterns = [
     path("members/<uuid:client_id>/cases/", MemberCasesView.as_view()),
     path("members/<uuid:client_id>/tickets/", MemberTicketsView.as_view()),
     path("members/<uuid:client_id>/verification/", MemberVerificationCreateView.as_view()),
+    path("members/<uuid:client_id>/diagnostic/", MemberDiagnosticView.as_view()),
 
     # Work queue (global tickets)
     path("tickets/", WorkQueueView.as_view(), name="portal-tickets"),

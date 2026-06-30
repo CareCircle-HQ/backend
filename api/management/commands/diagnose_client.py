@@ -73,10 +73,42 @@ class Command(BaseCommand):
                 "via case authorization."
             ))
 
+        # --- Household -------------------------------------------------------
+        membership = getattr(client, "household_membership", None)
+        self.stdout.write(self.style.MIGRATE_HEADING("\n3) Household"))
+        if membership is None:
+            self.stdout.write(
+                "  (no household membership) -> this client is governed only by "
+                "their own cases/enrollments."
+            )
+        else:
+            household = membership.household
+            members = list(household.members.select_related("client").all())
+            self.stdout.write(
+                f"  household_id : {household.household_id}"
+                f"  (members: {len(members)})"
+            )
+            for hm in members:
+                mc = hm.client
+                tag = " (primary)" if hm.is_primary else ""
+                self.stdout.write(
+                    f"    - {mc.pk}  {mc.first_name} {mc.last_name}{tag}: "
+                    f"lifecycle_stage={mc.lifecycle_stage}"
+                )
+            hh_enrollments = list(household.enrollment_verifications.all())
+            self.stdout.write(
+                f"  household enrollments: {len(hh_enrollments)}"
+            )
+            for e in hh_enrollments:
+                self.stdout.write(
+                    f"    - {e.pk}  stage={e.stage}  stage_at={e.stage_at}  "
+                    f"case={getattr(e, 'case_id', None)}"
+                )
+
         # --- Enrollments -----------------------------------------------------
         enrollments = _governing_enrollments(client)
         self.stdout.write(self.style.MIGRATE_HEADING(
-            f"\n3) Governing enrollments ({len(enrollments)})"
+            f"\n4) Governing enrollments ({len(enrollments)})"
         ))
         for e in enrollments:
             self.stdout.write(
@@ -91,7 +123,7 @@ class Command(BaseCommand):
         )
 
         # --- Derived stage ---------------------------------------------------
-        self.stdout.write(self.style.MIGRATE_HEADING("\n4) Stage derivation"))
+        self.stdout.write(self.style.MIGRATE_HEADING("\n5) Stage derivation"))
         early = _derive_early_funnel(client)
         derived = derive_client_stage(client)
         self.stdout.write(f"  early-funnel stage : {early}")
@@ -110,7 +142,7 @@ class Command(BaseCommand):
         if options["recompute"]:
             new_stage = recompute_client_stage(client, save=True)
             self.stdout.write(self.style.SUCCESS(
-                f"\n5) recompute_client_stage applied -> {new_stage}"
+                f"\n6) recompute_client_stage applied -> {new_stage}"
             ))
         else:
             self.stdout.write(self.style.WARNING(
