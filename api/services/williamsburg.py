@@ -33,6 +33,8 @@ WILLIAMSBURG_MENU_TYPE = "Kosher"
 WILLIAMSBURG_FOOD_ALLERGIES = ["pork", "shellfish"]
 WILLIAMSBURG_KITCHEN_MEAL_TYPE = "Kosher"
 WILLIAMSBURG_KITCHEN_FOOD_NOTES = "Pork Free, Shellfish Free"
+# MenuCategory has no "Kosher"; the standard/regular meal category is Fresh Meal.
+WILLIAMSBURG_MEAL_CATEGORY = "fresh_meal"
 
 
 def _primary_current_address(client):
@@ -114,7 +116,7 @@ def fast_track_williamsburg_enrollment(enrollment, *, actor=None, agent=None):
             member_name=f"{member.first_name} {member.last_name}".strip(),
             menu_type=WILLIAMSBURG_MENU_TYPE,
             food_allergies=list(WILLIAMSBURG_FOOD_ALLERGIES),
-            meal_category="",
+            meal_category=WILLIAMSBURG_MEAL_CATEGORY,
             status=MemberStatus.ACTIVE,
             kitchen_meal_type=WILLIAMSBURG_KITCHEN_MEAL_TYPE,
             kitchen_food_notes=WILLIAMSBURG_KITCHEN_FOOD_NOTES,
