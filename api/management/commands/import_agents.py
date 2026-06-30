@@ -62,8 +62,13 @@ class Command(BaseCommand):
         with open(path, "r", encoding="utf-8-sig") as f, transaction.atomic():
             for row in csv.DictReader(f):
                 r = {_norm(k): (v or "").strip() for k, v in row.items()}
-                # The directory export uses "User principal name" for email.
-                email = _norm(r.get("user principal name") or r.get("email"))
+                # Email column varies by export: the directory uses "User
+                # principal name"; the Azure user export uses "Email Address".
+                email = _norm(
+                    r.get("user principal name")
+                    or r.get("email address")
+                    or r.get("email")
+                )
                 if not email or "@" not in email:
                     skipped += 1
                     continue
