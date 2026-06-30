@@ -176,13 +176,16 @@ def _derive_early_funnel(client):
 
 # EnrollmentVerification.stage -> the ClientStage it drives the client to, for
 # the stages that actively govern the client (past verification start). DENIED
-# is intentionally non-terminal: it parks the client at Waiting Authorization
-# ("needs attention", easily re-accepted) rather than an off-ramp.
+# is intentionally non-terminal: a denied authorization keeps the client in the
+# verification stage (Verified) with the authorization outcome shown as Denied,
+# rather than advancing to Kitchen Assignment or off-ramping the client. This
+# lets the household be re-submitted/re-accepted without losing the Verified
+# state.
 _ENROLLMENT_DRIVES = {
     EnrollmentStage.PENDING_VERIFICATION: ClientStage.PENDING_VERIFICATION,
     EnrollmentStage.VERIFIED: ClientStage.VERIFIED,
     EnrollmentStage.WAITING_AUTHORIZATION: ClientStage.WAITING_AUTHORIZATION,
-    EnrollmentStage.DENIED: ClientStage.WAITING_AUTHORIZATION,
+    EnrollmentStage.DENIED: ClientStage.VERIFIED,
     EnrollmentStage.AUTHORIZED: ClientStage.AUTHORIZED,
     EnrollmentStage.KITCHEN_ASSIGNMENT: ClientStage.KITCHEN_ASSIGNMENT,
     EnrollmentStage.SERVICE_ACTIVE: ClientStage.ACTIVE,
