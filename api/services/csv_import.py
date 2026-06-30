@@ -664,8 +664,29 @@ class CsvImporter:
                 self.errors.append(f"client {cid}: {exc}")
                 logger.warning("csv_import client %s failed: %s", cid, exc)
 
-    def import_screenings(self, reader):
+    def import_screenings(self, reader, provider_id=None, provider_name=None):
         self.dataset = "screenings"
+        # Optional provider scope: import only screens performed by the given
+        # provider (id OR name, case-insensitive/trimmed). Non-matching screens
+        # are counted as skipped. Lets a network-wide export be narrowed to a
+        # single provider (e.g. Met Council).
+        want_id = (str(provider_id).strip() if provider_id else "")
+        want_name = (provider_name or "").strip().casefold()
+        provider_filter = bool(want_id or want_name)
+        # Unite Us facilitator allowlist: when any US-flagged UniteUsAgent rows
+        # exist, only import screens whose ``facilitator_id`` is one of them.
+        # NB: the screening export's ``facilitator_id`` maps to
+        # ``UniteUsAgent.employee_id`` (NOT ``user_id``, which is what the cases
+        # export's ``case_created_by_id`` maps to). Only agents with the US flag
+        # (is_us=True) count -- Met Council Team agents are excluded. An EMPTY
+        # list means no gate -- accept all -- so imports keep working until the
+        # allowlist is populated.
+        allow_facilitator_ids = {
+            str(e).lower()
+            for e in UniteUsAgent.objects.filter(
+                is_us=True, employee_id__isnull=False
+            ).values_list("employee_id", flat=True)
+        }
         # Stream the denormalized (one-row-per-answer) export grouped by screen,
         # holding only one screen's rows in memory at a time -- this file can be
         # several GB. Rows for a screen are contiguous in the export.
@@ -673,6 +694,20 @@ class CsvImporter:
             if sid is None:
                 self._count("skipped")
                 continue
+            head = rows[0]
+            # Facilitator allowlist (only enforced when the list is non-empty).
+            if allow_facilitator_ids:
+                facilitator = (head.get("facilitator_id") or "").strip().lower()
+                if facilitator not in allow_facilitator_ids:
+                    self._count("skipped")
+                    continue
+            if provider_filter:
+                row_id = (head.get("provider_id") or "").strip()
+                row_name = (head.get("provider_name") or "").strip().casefold()
+                if not ((want_id and row_id == want_id)
+                        or (want_name and row_name == want_name)):
+                    self._count("skipped")
+                    continue
             # Append-only + idempotent: screenings are immutable once complete,
             # so skip any enhanced_screen_id we already store (checked per
             # group). This keeps re-imports cheap and non-destructive, and also
@@ -904,7 +939,9 @@ def run_csv_import(*, export_type, file_obj, triggered_by="manual", emit_side_ef
             if export_type == "clients":
                 importer.import_clients(reader)
             elif export_type == "screening":
-                importer.import_screenings(reader)
+                importer.import_screenings(
+                    reader, provider_id=provider_id, provider_name=provider_name,
+                )
             elif export_type == "assessments":
                 importer.import_assessments(reader)
             elif export_type == "cases":
