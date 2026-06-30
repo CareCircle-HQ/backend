@@ -15,6 +15,7 @@ from api.services.lifecycle import governing_case_key, verification_completed
 
 from ..models import (
     Address,
+    Agent,
     Case,
     CaseType,
     DeliveryCompany,
@@ -124,11 +125,11 @@ def verification_status(client):
 
 def authorization_status(client):
     """The meal/box case authorization that gates kitchen assignment, as a
-    ``{status, status_label, is_accepted}`` snapshot. Sourced from the client's
-    Internal Service case (falls back to the governing case). This is a separate
-    dimension from verification_status -- shown as its own badge/column."""
-    case = internal_service_case(client) or primary_case(client)
-    return case_authorization(case)
+    ``{status, status_label, is_accepted}`` snapshot. Sourced ONLY from the
+    client's Internal Service case -- members without one have no authorization
+    to show (empty values). This is a separate dimension from
+    verification_status, surfaced as its own column."""
+    return case_authorization(internal_service_case(client))
 
 
 def active_enrollment(client):
@@ -644,6 +645,55 @@ class PortalAgentSerializer(serializers.Serializer):
     name = serializers.CharField()
     group = serializers.CharField()
     email = serializers.EmailField()
+
+
+# ---------------------------------------------------------------------------
+# CareCircle agents (Settings CRUD over the internal Agent / CRM roster)
+# ---------------------------------------------------------------------------
+class PortalCrmAgentSerializer(serializers.ModelSerializer):
+    """Full CRUD serializer for our internal CareCircle/CRM agents.
+
+    Editable from Settings; the CallTools-synced identity fields are read-only
+    so a manual edit never clobbers what the dialer sync owns.
+    """
+
+    group_label = serializers.CharField(source="get_group_display", read_only=True)
+
+    class Meta:
+        model = Agent
+        fields = [
+            "id",
+            "name",
+            "agent_code",
+            "group",
+            "group_label",
+            "status",
+            "cbo",
+            "email",
+            "first_name",
+            "last_name",
+            "title",
+            "department",
+            "is_manager",
+            # Read-only CallTools identity / sync metadata.
+            "username",
+            "calltools_synced_at",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = [
+            "id",
+            "group_label",
+            "username",
+            "calltools_synced_at",
+            "created_at",
+            "updated_at",
+        ]
+
+    def validate_agent_code(self, value):
+        # Normalize empty string to NULL so the unique constraint treats
+        # code-less agents as distinct (matches the model's nullable design).
+        return (value or "").strip() or None
 
 
 # ---------------------------------------------------------------------------

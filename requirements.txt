@@ -24,6 +24,9 @@ cryptography>=44,<46
 # HTTP
 requests>=2.32,<3.0
 
+# Excel (.xlsx) parsing -- CareCircle team roster import (import_unite_us_agents)
+openpyxl>=3.1,<4.0
+
 # Production server / static files
 gunicorn>=23,<24
 whitenoise>=6.8,<7.0

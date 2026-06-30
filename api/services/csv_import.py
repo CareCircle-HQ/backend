@@ -47,6 +47,7 @@ from api.models import (
     ServiceAuthorizationStatus,
     SocialCareCoverage,
     SocialCareCoverageStatus,
+    UniteUsAgent,
     VerifiedSocialNeed,
 )
 from api.serializers import (
@@ -764,12 +765,30 @@ class CsvImporter:
         want_id = (str(provider_id).strip() if provider_id else "")
         want_name = (provider_name or "").strip().casefold()
         provider_filter = bool(want_id or want_name)
+        # Unite Us creator allowlist: when any US-flagged UniteUsAgent rows are
+        # configured, only import cases whose ``case_created_by_id`` is in that
+        # list (it maps exactly to Case.created_by_id). Only agents with the US
+        # flag (is_us=True) count -- Met Council Team agents are excluded. An
+        # EMPTY list means no gate -- accept all -- so existing imports keep
+        # working until the list is populated.
+        allow_creator_ids = {
+            str(u).lower()
+            for u in UniteUsAgent.objects.filter(is_us=True).values_list(
+                "user_id", flat=True
+            )
+        }
         # One row per case — stream directly, no grouping needed.
         for row in reader:
             cid = (row.get("case_id") or "").strip()
             if not cid:
                 self._count("skipped")
                 continue
+            # Creator allowlist (only enforced when the list is non-empty).
+            if allow_creator_ids:
+                creator = (row.get("case_created_by_id") or "").strip().lower()
+                if creator not in allow_creator_ids:
+                    self._count("skipped")
+                    continue
             if provider_filter:
                 row_id = (row.get("provider_id") or "").strip()
                 row_name = (row.get("provider_name") or "").strip().casefold()

@@ -33,6 +33,7 @@ from .models import (
     Ticket,
     TicketType,
     TimelineEvent,
+    UniteUsAgent,
     UniteUsCredential,
     VerifiedSocialNeed,
 )
@@ -407,6 +408,14 @@ class AgentAdmin(admin.ModelAdmin):
     list_filter = ("group", "status", "cbo", "is_agent", "is_manager", "is_account_owner")
     search_fields = ("name", "agent_code", "email", "username", "calltools_app_user")
     readonly_fields = ("calltools_synced_at",)
+    ordering = ("name",)
+
+
+@admin.register(UniteUsAgent)
+class UniteUsAgentAdmin(admin.ModelAdmin):
+    list_display = ("name", "email", "work_title", "status", "user_id", "updated_at")
+    list_filter = ("status",)
+    search_fields = ("name", "first_name", "last_name", "email", "user_id", "employee_id")
     ordering = ("name",)
 
 

@@ -56,8 +56,14 @@ from .views_orders import (
     SendToDeliveryView,
     SendToKitchenView,
 )
-from .views_imports import ImportRunsView, ImportUploadView
+from .views_imports import (
+    ImportRunsView,
+    ImportUploadView,
+    UniteUsAgentDetailView,
+    UniteUsAgentsView,
+)
 from .views_settings import (
+    CrmAgentViewSet,
     DeliveryCompanyIntegrationDetailView,
     DeliveryCompanyIntegrationSetPrimaryView,
     DeliveryCompanyViewSet,
@@ -82,6 +88,7 @@ router.register("settings/kitchens", KitchenViewSet, basename="portal-kitchen")
 router.register(
     "settings/delivery-companies", DeliveryCompanyViewSet, basename="portal-delivery-company"
 )
+router.register("settings/agents", CrmAgentViewSet, basename="portal-crm-agent")
 
 urlpatterns = [
     # Auth
@@ -153,6 +160,13 @@ urlpatterns = [
     # Settings > Import: manual Unite Us CSV upload + run history
     path("settings/imports/", ImportRunsView.as_view(), name="portal-import-runs"),
     path("settings/imports/upload/", ImportUploadView.as_view(), name="portal-import-upload"),
+    # Settings > Import: Unite Us agents allowlist (gates which cases import)
+    path("settings/unite-us-agents/", UniteUsAgentsView.as_view(), name="portal-unite-us-agents"),
+    path(
+        "settings/unite-us-agents/<uuid:agent_id>/",
+        UniteUsAgentDetailView.as_view(),
+        name="portal-unite-us-agent-detail",
+    ),
 
     # Settings integration sub-resources (not covered by the viewset router)
     path(
