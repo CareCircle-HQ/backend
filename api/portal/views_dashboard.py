@@ -19,9 +19,24 @@ from .base import PortalAPIView
 STAGE_RANK = {
     "inactive": 0, "consent": 1, "screened": 2, "assessment": 3, "navigation": 4,
     "pending_verification": 5, "verified": 6, "waiting_authorization": 7,
-    "authorized": 8, "active": 9, "completed": 10,
+    "authorized": 8, "kitchen_assignment": 9, "active": 10, "completed": 11,
 }
-CONVERTED_STAGES = ("active", "completed")
+
+# The Conversion Funnel bars, in order, each mapped to the MINIMUM lifecycle
+# rank a client must have reached to be counted in that (cumulative) bar. The
+# internal-service-case holder is the household's primary "member"; leads and
+# dependents without an internal-service case are carried by their household's
+# stage.
+FUNNEL_BARS = [
+    ("Consent", STAGE_RANK["consent"]),
+    ("Screening", STAGE_RANK["screened"]),
+    ("Eligibility", STAGE_RANK["assessment"]),
+    ("Internal Service Case", STAGE_RANK["navigation"]),
+    ("Verification", STAGE_RANK["pending_verification"]),
+    ("Kitchen Assignment", STAGE_RANK["kitchen_assignment"]),
+    ("Active", STAGE_RANK["active"]),
+    ("Completed", STAGE_RANK["completed"]),
+]
 
 
 def _period_start(period):
@@ -45,32 +60,40 @@ class DashboardView(PortalAPIView):
         start = _period_start(period)
         now = timezone.now()
 
-        # --- Funnel (cumulative lifecycle counts, excluding not_eligible) ---
-        stage_counts = dict(
+        # --- Funnel (cumulative lifecycle counts, split by household size) ---
+        # Each client is bucketed by household composition: a "multiple-member"
+        # household (>1 member) vs "single" (a one-member household or an
+        # ungrouped individual). Bars are cumulative -- a client counts toward
+        # every bar at or below the stage they've reached.
+        rows = (
             Client.objects.exclude(lifecycle_stage="not_eligible")
-            .values_list("lifecycle_stage")
-            .annotate(n=Count("client_id"))
+            .annotate(hh=Count("household_membership__household__members", distinct=True))
+            .values_list("lifecycle_stage", "hh")
         )
-        by_rank = {}
-        for stage, n in stage_counts.items():
-            by_rank[STAGE_RANK.get(stage, 0)] = by_rank.get(STAGE_RANK.get(stage, 0), 0) + n
+        single_by_rank, multi_by_rank = {}, {}
+        for stage, hh in rows:
+            rank = STAGE_RANK.get(stage, 0)
+            bucket = multi_by_rank if (hh or 0) > 1 else single_by_rank
+            bucket[rank] = bucket.get(rank, 0) + 1
 
-        consent = _at_least(by_rank, STAGE_RANK["consent"])
-        screening = _at_least(by_rank, STAGE_RANK["screened"])
-        eligible = _at_least(by_rank, STAGE_RANK["assessment"])
-        converted = Client.objects.filter(lifecycle_stage__in=CONVERTED_STAGES).count()
-        verified_plus = _at_least(by_rank, STAGE_RANK["verified"])
+        stages = []
+        for name, rank in FUNNEL_BARS:
+            s = _at_least(single_by_rank, rank)
+            m = _at_least(multi_by_rank, rank)
+            stages.append({"name": name, "single": s, "multi": m, "value": s + m})
+
+        by_name = {st["name"]: st["value"] for st in stages}
+        consent = by_name["Consent"]
+        screening = by_name["Screening"]
+        eligible = by_name["Eligibility"]
+        verified_plus = by_name["Verification"]
+        converted = by_name["Active"]  # cumulative: reached >= Active
 
         def pct(num, den):
             return round(num / den * 100) if den else 0
 
         funnel = {
-            "stages": [
-                {"name": "Consent", "value": consent},
-                {"name": "Screening", "value": screening},
-                {"name": "Eligible", "value": eligible},
-                {"name": "Converted", "value": converted},
-            ],
+            "stages": stages,
             "rates": {
                 "consent_to_screening": pct(screening, consent),
                 "screening_to_eligible": pct(eligible, screening),
