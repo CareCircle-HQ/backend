@@ -915,7 +915,7 @@ class CsvImporter:
                     source_note_id=note_id,
                     author_name=(agent.name if agent else ""),
                     body=(row.get("text") or "").strip(),
-                    source_created_at=_dt(row, "note_created_at"),
+                    source_created_at=_aware_dt(row, "note_created_at"),
                 )
                 existing_note_ids.add(note_id)
                 self._count("created")
