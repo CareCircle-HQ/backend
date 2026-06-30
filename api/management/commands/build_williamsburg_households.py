@@ -25,6 +25,7 @@ Usage:
     python manage.py build_williamsburg_households --apply     # commit
     python manage.py build_williamsburg_households --file a.xlsx --file b.xlsx
 """
+import glob
 from collections import Counter
 
 import openpyxl
@@ -41,10 +42,9 @@ from api.models import (
 from api.portal.serializers import internal_service_case
 from api.services.williamsburg import fast_track_williamsburg_enrollment
 
-_DEFAULT_FILES = [
-    "tmp/verification/WilliamsburgClients1.xlsx",
-    "tmp/verification/WilliamsburgClients2.xlsx",
-]
+# Auto-discovered by default so new roster drops (WilliamsburgClients3.xlsx, …)
+# are picked up just by re-running the command. Override with --file.
+_DEFAULT_GLOB = "tmp/verification/WilliamsburgClients*.xlsx"
 _PRIMARY_COL = "Unite Us Client ID"
 _HM_COLS = [f"HM #{n} - Enrollment Platform Client ID" for n in range(2, 11)]
 
@@ -87,21 +87,32 @@ class Command(BaseCommand):
     def add_arguments(self, parser):
         parser.add_argument(
             "--file", action="append", dest="files",
-            help="Roster .xlsx (repeatable). Defaults to the two Williamsburg sheets.",
+            help=(
+                "Roster .xlsx (repeatable). Defaults to auto-discovering "
+                f"{_DEFAULT_GLOB}."
+            ),
         )
         parser.add_argument("--apply", action="store_true", help="Commit changes.")
 
     def handle(self, *args, **options):
-        files = options.get("files") or _DEFAULT_FILES
+        files = options.get("files") or sorted(glob.glob(_DEFAULT_GLOB))
         apply = options["apply"]
+        if not files:
+            self.stdout.write(self.style.ERROR(
+                f"No roster files found (looked for {_DEFAULT_GLOB}). Use --file."
+            ))
+            return
 
         report = Counter()
         members_stat = Counter()
         flags = []
 
         households = []
+        self.stdout.write(self.style.MIGRATE_HEADING("Roster files:"))
         for path in files:
-            households.extend(_read_households(path))
+            rows = _read_households(path)
+            self.stdout.write(f"  {path}: {len(rows)} household rows")
+            households.extend(rows)
 
         with transaction.atomic():
             for primary_id, member_ids in households:
