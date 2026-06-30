@@ -11,7 +11,7 @@ Every transition appends a :class:`~api.models.StageEvent` row, which is the
 source of truth for funnel-conversion and time-in-stage reporting.
 """
 
-from datetime import datetime
+from datetime import datetime, timezone as dt_timezone
 
 from django.conf import settings
 from django.db import transaction
@@ -608,7 +608,7 @@ _AUTH_FAVOR_RANK = {
 
 # Timezone-aware floor so cases with a missing date sort last (never beat a
 # dated case) instead of raising on a None comparison.
-_DT_FLOOR = datetime.min.replace(tzinfo=timezone.utc)
+_DT_FLOOR = datetime.min.replace(tzinfo=dt_timezone.utc)
 
 
 def governing_case_key(case):
