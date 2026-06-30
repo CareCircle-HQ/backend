@@ -11,6 +11,8 @@ from datetime import timedelta
 from django.utils import timezone
 from rest_framework import serializers
 
+from api.services.lifecycle import governing_case_key
+
 from ..models import (
     Address,
     Case,
@@ -157,28 +159,29 @@ def service_hold_state(client):
 
 def primary_case(client):
     """The case whose service authorization governs the client: the most
-    recently opened case that carries an authorization status, else the most
-    recent case. None when the client has no cases."""
+    favorable / most recently opened case that carries an authorization status,
+    else the most recent case. Chosen by :func:`governing_case_key` so an
+    approved authorization wins over a same-or-earlier-dated denial. None when
+    the client has no cases."""
     cases = list(client.cases.all())
     if not cases:
         return None
     with_auth = [c for c in cases if c.service_authorization_status]
     pool = with_auth or cases
-    return sorted(pool, key=lambda c: c.date_opened or timezone.now(), reverse=True)[0]
+    return max(pool, key=governing_case_key)
 
 
 def internal_service_case(client):
     """The client's Internal Service case — the one the verification and meal/box
-    delivery attach to. Prefers a case carrying an authorization status, else
-    the most recently opened one. None when there is no Internal Service case."""
+    delivery attach to. Chosen by :func:`governing_case_key` (authorization
+    favorability first, then recency), so an approved case wins over a
+    same-or-earlier-dated denial. None when there is no Internal Service case."""
     cases = [
         c for c in client.cases.all() if c.case_type == CaseType.INTERNAL_SERVICE
     ]
     if not cases:
         return None
-    with_auth = [c for c in cases if c.service_authorization_status]
-    pool = with_auth or cases
-    return sorted(pool, key=lambda c: c.date_opened or timezone.now(), reverse=True)[0]
+    return max(cases, key=governing_case_key)
 
 
 def case_authorization(case):
