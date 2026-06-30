@@ -30,7 +30,11 @@ logger = logging.getLogger(__name__)
 # The exception's fixed assignment values.
 WILLIAMSBURG_KITCHEN_NAME = "Williamsburg"
 WILLIAMSBURG_MENU_TYPE = "Kosher"
-WILLIAMSBURG_FOOD_ALLERGIES = ["pork", "shellfish"]
+# The verification fields are explicitly empty -- these clients have no real
+# dietary restrictions or food allergies. The Kosher pork/shellfish exclusion
+# is NOT an allergy; it is carried to the kitchen via the meal type + notes.
+WILLIAMSBURG_DIETARY_RESTRICTIONS = ["none"]  # "No restrictions"
+WILLIAMSBURG_FOOD_ALLERGIES = ["none"]  # "None"
 WILLIAMSBURG_KITCHEN_MEAL_TYPE = "Kosher"
 WILLIAMSBURG_KITCHEN_FOOD_NOTES = "Pork Free, Shellfish Free"
 # MenuCategory has no "Kosher"; the standard/regular meal category is Fresh Meal.
@@ -115,6 +119,7 @@ def fast_track_williamsburg_enrollment(enrollment, *, actor=None, agent=None):
             client=member,
             member_name=f"{member.first_name} {member.last_name}".strip(),
             menu_type=WILLIAMSBURG_MENU_TYPE,
+            dietary_restrictions=list(WILLIAMSBURG_DIETARY_RESTRICTIONS),
             food_allergies=list(WILLIAMSBURG_FOOD_ALLERGIES),
             meal_category=WILLIAMSBURG_MEAL_CATEGORY,
             status=MemberStatus.ACTIVE,
