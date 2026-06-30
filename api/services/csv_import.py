@@ -42,6 +42,8 @@ from api.models import (
     ImportRunStatus,
     Insurance,
     InsurancePlanType,
+    Note,
+    NoteSource,
     OutcomeResolutionType,
     Screening,
     ServiceAuthorizationStatus,
@@ -64,8 +66,13 @@ logger = logging.getLogger(__name__)
 CSV_SOURCE = "csv_uniteus"
 TIMELINE_ACTOR = "system:csv-import"
 
-# Export types this importer understands. Mapped in follow-up slices: notes.
+# Export types exposed in the Settings > Import web UI.
 SUPPORTED_EXPORT_TYPES = ("clients", "screening", "assessments", "cases")
+
+# Every export type the engine understands. ``notes`` is intentionally CLI-only
+# (run via ``manage.py import_csv``) and NOT in SUPPORTED_EXPORT_TYPES, so the
+# Settings upload never offers it.
+CLI_EXPORT_TYPES = SUPPORTED_EXPORT_TYPES + ("notes",)
 
 
 # --- streaming helpers -----------------------------------------------------
@@ -826,6 +833,90 @@ class CsvImporter:
             logger.warning("csv_import assessment timeline failed", exc_info=True)
         self._recompute_stage(assessment.client_id, assessment.client)
 
+    def import_notes(self, reader):
+        self.dataset = "notes"
+        # Unite Us author allowlist: when any US-flagged UniteUsAgent rows exist,
+        # only import notes whose ``noted_by_employee_id`` is one of them. This
+        # maps to ``UniteUsAgent.employee_id`` (the SAME key the screening
+        # export's ``facilitator_id`` uses). We also use the matched agent to
+        # translate the author into a readable name -- the notes export carries
+        # no author-name column. Only agents with the US flag (is_us=True) count.
+        # An EMPTY allowlist means no gate -- accept all -- but author_name is
+        # then only filled when the employee id happens to match an agent.
+        agents_by_emp = {
+            str(a.employee_id).lower(): a
+            for a in UniteUsAgent.objects.exclude(employee_id__isnull=True)
+        }
+        allow_author_ids = {
+            emp for emp, a in agents_by_emp.items() if a.is_us
+        }
+        # Pre-load existing Unite Us note ids so re-runs are a cheap set lookup
+        # (the model has no unique constraint on source_note_id).
+        existing_note_ids = set(
+            Note.objects.filter(source=NoteSource.UNITE_US)
+            .exclude(source_note_id="")
+            .values_list("source_note_id", flat=True)
+        )
+        # Per-run caches so shared clients/cases aren't re-queried each row.
+        client_cache = {}
+        case_cache = {}
+
+        def _client(cid):
+            if cid not in client_cache:
+                client_cache[cid] = Client.objects.filter(pk=cid).first()
+            return client_cache[cid]
+
+        def _case(case_id):
+            if case_id not in case_cache:
+                case_cache[case_id] = Case.objects.filter(pk=case_id).first()
+            return case_cache[case_id]
+
+        # One row per note -- stream directly, no grouping needed.
+        for row in reader:
+            note_id = (row.get("note_id") or "").strip()
+            if not note_id:
+                self._count("skipped")
+                continue
+            # Author allowlist (only enforced when the list is non-empty).
+            author_emp = (row.get("noted_by_employee_id") or "").strip().lower()
+            if allow_author_ids and author_emp not in allow_author_ids:
+                self._count("skipped")
+                continue
+            # Idempotent: skip note ids we already store.
+            if note_id in existing_note_ids:
+                self._count("skipped")
+                continue
+            # Track notes by client: require the client to exist so a re-run
+            # after the clients import picks up any that were missing.
+            cid = (row.get("client_id") or "").strip()
+            client = _client(cid) if cid else None
+            if client is None:
+                self._count("skipped")
+                continue
+            # Link the case when the note's subject is a Case we already store.
+            case = None
+            if (row.get("subject_type") or "").strip().lower() == "case":
+                sid = (row.get("subject_id") or "").strip()
+                if sid:
+                    case = _case(sid)
+            agent = agents_by_emp.get(author_emp)
+            try:
+                Note.objects.create(
+                    client=client,
+                    case=case,
+                    source=NoteSource.UNITE_US,
+                    source_note_id=note_id,
+                    author_name=(agent.name if agent else ""),
+                    body=(row.get("text") or "").strip(),
+                    source_created_at=_dt(row, "note_created_at"),
+                )
+                existing_note_ids.add(note_id)
+                self._count("created")
+            except Exception as exc:  # isolate one bad note from the run
+                self._count("errors")
+                self.errors.append(f"note {note_id}: {exc}")
+                logger.warning("csv_import note %s failed: %s", note_id, exc)
+
     def import_cases(self, reader, provider_id=None, provider_name=None):
         self.dataset = "cases"
         # Optional provider scope: import only rows serviced by the given
@@ -955,10 +1046,10 @@ def run_csv_import(*, export_type, file_obj, triggered_by="manual", emit_side_ef
     timeline events and funnel-stage recompute are skipped (useful for bulk
     historical loads).
     """
-    if export_type not in SUPPORTED_EXPORT_TYPES:
+    if export_type not in CLI_EXPORT_TYPES:
         raise ValueError(
             f"Unsupported export_type '{export_type}'. "
-            f"Supported: {', '.join(SUPPORTED_EXPORT_TYPES)}."
+            f"Supported: {', '.join(CLI_EXPORT_TYPES)}."
         )
 
     run = ImportRun.objects.create(
@@ -985,6 +1076,8 @@ def run_csv_import(*, export_type, file_obj, triggered_by="manual", emit_side_ef
                 importer.import_cases(
                     reader, provider_id=provider_id, provider_name=provider_name,
                 )
+            elif export_type == "notes":
+                importer.import_notes(reader)
             # Always reconcile the funnel stage for every touched client, so the
             # upload self-heals lifecycle_stage even when per-record side effects
             # are off (bulk load) or the client file was imported before cases.
