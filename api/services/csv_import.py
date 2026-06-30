@@ -694,13 +694,22 @@ class CsvImporter:
                 is_us=True, employee_id__isnull=False
             ).values_list("employee_id", flat=True)
         }
-        # Stream the denormalized (one-row-per-answer) export grouped by screen,
-        # holding only one screen's rows in memory at a time -- this file can be
-        # several GB. Rows for a screen are contiguous in the export.
-        for sid, rows in _iter_contiguous_groups(reader, "enhanced_screen_id"):
-            if sid is None:
+        # Group the denormalized (one-row-per-answer) export by screen. The Unite
+        # Us export does NOT guarantee a screen's rows are contiguous -- they can
+        # be scattered across the file -- so collect ALL rows per screen id before
+        # building the payload. (A contiguous-only pass would create each screen
+        # from just the first fragment of its answers and skip the rest as
+        # "already exists".) Holds the file in memory; fine for the
+        # few-hundred-MB exports we import.
+        groups = OrderedDict()
+        for row in reader:
+            sid = (row.get("enhanced_screen_id") or "").strip()
+            if not sid:
                 self._count("skipped")
                 continue
+            groups.setdefault(sid, []).append(row)
+
+        for sid, rows in groups.items():
             head = rows[0]
             # Facilitator allowlist (only enforced when the list is non-empty).
             if allow_facilitator_ids:
@@ -716,10 +725,8 @@ class CsvImporter:
                     self._count("skipped")
                     continue
             # Append-only + idempotent: screenings are immutable once complete,
-            # so skip any enhanced_screen_id we already store (checked per
-            # group). This keeps re-imports cheap and non-destructive, and also
-            # guards the rare case of a screen split across non-contiguous
-            # groups -- the second group is skipped once the first creates it.
+            # so skip any enhanced_screen_id we already store. This keeps
+            # re-imports cheap and non-destructive.
             if Screening.objects.filter(pk=sid).exists():
                 self._count("skipped")
                 continue
