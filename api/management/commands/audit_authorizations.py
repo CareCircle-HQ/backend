@@ -6,15 +6,16 @@ members + a delivery address?". A verified household sits at Waiting Authorizati
 until its governing internal-service case carries an *approved* (or not-required)
 authorization status -- a blank / pending status keeps it parked there. This
 command shows, per enrollment stage, the distribution of the governing case's
-authorization status, and flags enrollments that are STUCK (the case is already
-approved, so reconcile_authorizations --apply would move them to Kitchen
-Assignment).
+authorization status, and flags every AFFECTED household -- one whose governing
+internal-service case is approved but whose enrollment still reads Waiting
+Authorization OR Denied (so reconcile_authorizations --apply would move it to
+Kitchen Assignment).
 
 It writes NOTHING. Run it on prod to see the real picture:
 
     python manage.py audit_authorizations            # summary only
     python manage.py audit_authorizations --details   # + per-household lines
-    python manage.py audit_authorizations --stuck      # only the stuck households
+    python manage.py audit_authorizations --affected   # only the affected households
 
 The companion writer is ``reconcile_authorizations`` (use --apply there to fix
 the stuck ones).
@@ -51,8 +52,9 @@ class Command(BaseCommand):
             help="List every enrollment (client, household size, address, case, status).",
         )
         parser.add_argument(
-            "--stuck", action="store_true",
-            help="Only show households that would advance (approved case but not yet moved).",
+            "--stuck", "--affected", dest="stuck", action="store_true",
+            help="Only show AFFECTED households: approved governing case but still "
+                 "reading Waiting Authorization or Denied (would advance on reconcile).",
         )
 
     def handle(self, *args, **opts):
@@ -65,7 +67,7 @@ class Command(BaseCommand):
         # stage -> Counter(auth_status)
         by_stage = defaultdict(Counter)
         # (stage, auth_status) -> projected target stage
-        stuck_rows = []
+        affected_rows = []
         detail_rows = []
         total = 0
 
@@ -81,9 +83,17 @@ class Command(BaseCommand):
                 target = _AUTH_STATUS_TO_STAGE.get(
                     case.service_authorization_status, EnrollmentStage.WAITING_AUTHORIZATION
                 )
-            is_stuck = (
-                enr.stage == EnrollmentStage.WAITING_AUTHORIZATION
-                and target == EnrollmentStage.KITCHEN_ASSIGNMENT
+            # "Affected": the governing internal-service case is APPROVED
+            # (target == Kitchen Assignment) but the enrollment is still parked
+            # at Waiting Authorization OR reads DENIED -- exactly the households
+            # the date-tie bug mis-projected. reconcile_authorizations --apply
+            # advances them to Kitchen Assignment.
+            is_affected = (
+                target == EnrollmentStage.KITCHEN_ASSIGNMENT
+                and enr.stage in (
+                    EnrollmentStage.WAITING_AUTHORIZATION,
+                    EnrollmentStage.DENIED,
+                )
             )
 
             hh = enr.household
@@ -105,8 +115,8 @@ class Command(BaseCommand):
                 "auth": auth,
                 "would_move_to": target if (target and target != enr.stage) else "",
             }
-            if is_stuck:
-                stuck_rows.append(row)
+            if is_affected:
+                affected_rows.append(row)
             if opts["details"]:
                 detail_rows.append(row)
 
@@ -124,28 +134,33 @@ class Command(BaseCommand):
                 self.stdout.write(f"    {n:6d}  case auth = {auth}")
             self.stdout.write("")
 
-        # ---- Stuck flag ----------------------------------------------------
-        if stuck_rows:
+        # ---- Affected flag -------------------------------------------------
+        if affected_rows:
+            by_cur = Counter(r["stage"] for r in affected_rows)
+            breakdown = ", ".join(f"{n} {st}" for st, n in by_cur.most_common())
             self.stdout.write(self.style.WARNING(
-                f"{len(stuck_rows)} household(s) STUCK: at Waiting Authorization but the "
-                f"governing case is APPROVED -> run 'reconcile_authorizations --apply' to "
-                f"advance them to Kitchen Assignment.\n"
+                f"{len(affected_rows)} household(s) AFFECTED: the governing internal-"
+                f"service case is APPROVED but the enrollment still reads Waiting "
+                f"Authorization / Denied ({breakdown}) -> run "
+                f"'reconcile_authorizations --apply' to advance them to Kitchen "
+                f"Assignment.\n"
             ))
-            for r in stuck_rows:
+            for r in affected_rows:
                 self.stdout.write(
-                    f"    {r['code']:>12}  {r['name'][:28]:<28}  hh={r['hh_size']}  "
-                    f"{r['addr']}  case={r['case_id']}"
+                    f"    {r['code']:>12}  {r['stage']:<22}  {r['name'][:26]:<26}  "
+                    f"hh={r['hh_size']}  {r['addr']:<8}  case={r['case_id']}"
                 )
             self.stdout.write("")
         else:
             self.stdout.write(self.style.SUCCESS(
-                "No stuck households: every Waiting-Authorization enrollment has a "
-                "non-approved (blank/pending/denied/expired) case, so its status is correct.\n"
+                "No affected households: every Waiting-Authorization / Denied enrollment "
+                "has a non-approved (blank/pending/denied/expired) governing case, so its "
+                "status is correct.\n"
             ))
 
         # ---- Optional per-household detail ---------------------------------
-        rows = stuck_rows if opts["stuck"] else detail_rows
-        if rows and not (opts["stuck"] and stuck_rows):
+        rows = affected_rows if opts["stuck"] else detail_rows
+        if rows and not (opts["stuck"] and affected_rows):
             self.stdout.write(self.style.MIGRATE_HEADING("Detail:"))
             for r in rows:
                 move = f"  => {r['would_move_to']}" if r["would_move_to"] else ""

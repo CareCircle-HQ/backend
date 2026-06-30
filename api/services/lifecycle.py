@@ -11,9 +11,10 @@ Every transition appends a :class:`~api.models.StageEvent` row, which is the
 source of truth for funnel-conversion and time-in-stage reporting.
 """
 
+from datetime import datetime
+
 from django.conf import settings
 from django.db import transaction
-from django.db.models import F
 from django.utils import timezone
 
 from api.models import (
@@ -593,25 +594,59 @@ _AUTH_ELIGIBLE_STAGES = {
 }
 
 
+# Authorization favorability for choosing the GOVERNING internal-service case
+# among several. An approval supersedes a denial regardless of dates: a
+# household holding at least one approved meal/box authorization IS authorized,
+# even if a parallel program was denied (or denied the same day). Higher wins.
+_AUTH_FAVOR_RANK = {
+    ServiceAuthorizationStatus.APPROVED: 4,
+    ServiceAuthorizationStatus.NOT_REQUIRED: 4,
+    ServiceAuthorizationStatus.PENDING: 3,
+    ServiceAuthorizationStatus.DENIED: 2,
+    ServiceAuthorizationStatus.EXPIRED: 1,
+}
+
+# Timezone-aware floor so cases with a missing date sort last (never beat a
+# dated case) instead of raising on a None comparison.
+_DT_FLOOR = datetime.min.replace(tzinfo=timezone.utc)
+
+
+def governing_case_key(case):
+    """Descending sort key for picking the governing case among several.
+
+    Priority: most favorable authorization first (an approval beats a denial no
+    matter the dates), then most recently opened, then most recently updated,
+    then case_id -- a stable, environment-independent final tiebreak so the same
+    case is chosen everywhere. The previous date-only sort left exact
+    ``date_opened`` ties to arbitrary DB row order, which could pick a denied
+    case over an approved one for the same household.
+    """
+    return (
+        _AUTH_FAVOR_RANK.get(case.service_authorization_status, 0),
+        case.date_opened or _DT_FLOOR,
+        case.updated_at or _DT_FLOOR,
+        str(case.case_id),
+    )
+
+
 def governing_internal_case(enrollment):
     """The internal-service case whose authorization governs this enrollment.
 
-    A household can accumulate several internal-service cases over time (e.g. a
-    denial later followed by a re-approval). The *current* one -- the most
-    recently opened internal-service case on the enrollment's client -- must
-    drive the enrollment, not whichever case happens to sit on ``enrollment.case``
-    (which may be a stale, superseded case). Falls back to ``enrollment.case``
-    when the client has no internal-service case.
+    A household can accumulate several internal-service cases (parallel meal/box
+    programs, or a denial later followed by a re-approval). The governing one is
+    chosen by :func:`governing_case_key` -- an approved authorization wins over a
+    denied one regardless of dates -- not whichever case happens to sit on
+    ``enrollment.case`` (which may be stale/superseded). Falls back to
+    ``enrollment.case`` when the client has no internal-service case.
     """
     client = enrollment.client
     if client is not None:
-        latest = (
-            client.cases.filter(case_type=CaseType.INTERNAL_SERVICE)
-            .order_by(F("date_opened").desc(nulls_last=True))
-            .first()
-        )
-        if latest is not None:
-            return latest
+        cases = [
+            c for c in client.cases.all()
+            if c.case_type == CaseType.INTERNAL_SERVICE
+        ]
+        if cases:
+            return max(cases, key=governing_case_key)
     return enrollment.case
 
 
