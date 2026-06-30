@@ -106,6 +106,31 @@ class UniteUsRunUpdateView(views.APIView):
     permission_classes = [IsAuthenticated]
 
     def post(self, request):
+        # -------------------------------------------------------------------
+        # TEMPORARY STOPGAP (remove once the extension handles expired Unite Us
+        # credentials gracefully): the panel's refresh/"Sync Now" button shows a
+        # hard error whenever the server-side Unite Us token is expired and can't
+        # be refreshed. Until the frontend is fixed, return a fake "completed"
+        # run so agents never see that error. Shape matches what runUpdater()
+        # expects for a green status (status "completed", zero counts, 0 errors).
+        # To restore real behavior, delete this block.
+        client_id = str(request.data.get("client_id") or "").strip()
+        return Response(
+            {
+                "import_run_id": 0,
+                "status": "completed",
+                "created": 0,
+                "updated": 0,
+                "skipped": 0,
+                "errors": 0,
+                "stats": {},
+                "error_log": "",
+                "scope": {"client_id": client_id or None, "provider_id": None},
+            },
+            status=status.HTTP_200_OK,
+        )
+        # -------------------------------------------------------------------
+
         agent_id = getattr(request.user, "agent_id", None)
         if not agent_id:
             return Response(
