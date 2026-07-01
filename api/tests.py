@@ -366,3 +366,86 @@ class HouseholdEnrollmentActivationTest(TestCase):
         for c in (primary, spouse):
             c.refresh_from_db()
             self.assertEqual(c.lifecycle_stage, ClientStage.ACTIVE)
+
+
+class SoleInternalServiceDenialTest(TestCase):
+    """A client whose ONLY internal-service (meal/box) case is denied is a full
+    stop: the enrollment is paused (On Hold) and a follow-up ticket is raised.
+    Two-plus internal-service cases are never a full stop. A later re-approval
+    resumes the auto-paused enrollment."""
+
+    def _client(self):
+        return Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Casey", last_name="Case"
+        )
+
+    def _enrollment(self, client, stage):
+        from .models import EnrollmentStage, EnrollmentVerification, Household, HouseholdMember
+
+        household = Household.objects.create(name="HH")
+        HouseholdMember.objects.create(household=household, client=client, is_primary=True)
+        return EnrollmentVerification.objects.create(
+            client=client, household=household, stage=stage,
+            verified_at=timezone.now(),
+        )
+
+    def _save_case(self, client, case_id, auth_status):
+        from .serializers import CaseSerializer
+
+        data = {
+            "case_id": case_id,
+            "client_id": str(client.client_id),
+            "case_type": "internal_service",
+            "program_name": "Medically Tailored Meals",
+            "service_authorization_status": auth_status,
+            "date_opened": timezone.now().isoformat(),
+        }
+        ser = CaseSerializer(data=data)
+        ser.is_valid(raise_exception=True)
+        return ser.save()
+
+    def test_sole_denied_case_pauses_and_tickets(self):
+        from .models import EnrollmentStage, Ticket
+        from .portal.serializers import verification_status
+
+        client = self._client()
+        enr = self._enrollment(client, EnrollmentStage.KITCHEN_ASSIGNMENT)
+        case_id = str(uuid.uuid4())
+        # First save as pending -> no pause.
+        self._save_case(client, case_id, "pending")
+        enr.refresh_from_db()
+        self.assertEqual(enr.stage, EnrollmentStage.KITCHEN_ASSIGNMENT)
+
+        # Deny the sole internal-service case -> full stop (On Hold) + ticket.
+        self._save_case(client, case_id, "denied")
+        enr.refresh_from_db()
+        self.assertEqual(enr.stage, EnrollmentStage.ON_HOLD)
+        self.assertEqual(verification_status(client), "On Hold")
+        self.assertEqual(
+            Ticket.objects.filter(client=client, case_id=case_id).count(), 1
+        )
+
+    def test_two_internal_cases_denied_does_not_pause(self):
+        from .models import EnrollmentStage
+
+        client = self._client()
+        enr = self._enrollment(client, EnrollmentStage.KITCHEN_ASSIGNMENT)
+        self._save_case(client, str(uuid.uuid4()), "approved")
+        self._save_case(client, str(uuid.uuid4()), "denied")
+        enr.refresh_from_db()
+        self.assertEqual(enr.stage, EnrollmentStage.KITCHEN_ASSIGNMENT)
+
+    def test_reapproval_resumes_paused_enrollment(self):
+        from .models import EnrollmentStage
+
+        client = self._client()
+        enr = self._enrollment(client, EnrollmentStage.KITCHEN_ASSIGNMENT)
+        case_id = str(uuid.uuid4())
+        self._save_case(client, case_id, "denied")
+        enr.refresh_from_db()
+        self.assertEqual(enr.stage, EnrollmentStage.ON_HOLD)
+
+        # Re-approve the same sole case -> auto-resume to the held-from stage.
+        self._save_case(client, case_id, "approved")
+        enr.refresh_from_db()
+        self.assertEqual(enr.stage, EnrollmentStage.KITCHEN_ASSIGNMENT)
