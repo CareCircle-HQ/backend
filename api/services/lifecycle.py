@@ -622,3 +622,105 @@ def reconcile_enrollment_authorization(enrollment, *, actor=None, note=""):
     except InvalidTransition:
         # Defensive: an illegal projection (e.g. terminal stage) is a no-op.
         return enrollment
+
+
+# ---------------------------------------------------------------------------
+# Internal-service authorization full-stop (single denied meal/box case)
+# ---------------------------------------------------------------------------
+# Post-verification enrollment stages a denial pauses. Before verification there
+# is nothing to pause; ON_HOLD / terminal stages are left as-is.
+_DENIAL_PAUSE_STAGES = {
+    EnrollmentStage.VERIFIED,
+    EnrollmentStage.KITCHEN_ASSIGNMENT,
+    EnrollmentStage.SERVICE_ACTIVE,
+}
+
+# Stamped on the auto-pause StageEvent so the reverse (auto-resume on a later
+# favorable authorization) only ever un-pauses enrollments THIS rule paused --
+# never a manual Place-on-Hold.
+_DENIAL_HOLD_NOTE = "Auto-paused: sole internal-service meal/box case denied."
+
+
+def _internal_service_cases(client):
+    return [c for c in client.cases.all() if c.case_type == CaseType.INTERNAL_SERVICE]
+
+
+def _resume_auto_paused_enrollment(enrollment, *, actor=None):
+    """Resume an enrollment that THIS rule auto-paused (ON_HOLD) back to the
+    stage it was held from. No-op when the most recent hold was NOT an auto-pause
+    (so a manual Place-on-Hold is never silently overridden)."""
+    last_hold = (
+        StageEvent.objects.filter(
+            enrollment=enrollment, to_stage=EnrollmentStage.ON_HOLD
+        )
+        .order_by("-entered_at")
+        .first()
+    )
+    if not last_hold or not (last_hold.note or "").startswith(_DENIAL_HOLD_NOTE):
+        return enrollment
+    target = EnrollmentStage.KITCHEN_ASSIGNMENT
+    if last_hold.from_stage:
+        try:
+            target = EnrollmentStage(last_hold.from_stage)
+        except ValueError:
+            target = EnrollmentStage.KITCHEN_ASSIGNMENT
+    try:
+        return advance_enrollment(
+            enrollment, target, actor=actor, force=True,
+            note="Auto-resumed: internal-service case re-approved.",
+        )
+    except InvalidTransition:
+        return enrollment
+
+
+def reconcile_internal_service_authorization(client, *, actor=None):
+    """React to a change in the client's internal-service case authorization.
+
+    Full-stop rule: a client with EXACTLY ONE internal-service (meal/box) case
+    whose authorization is DENIED is paused -- every post-verification enrollment
+    is moved to On Hold (mirrors the manual Place-on-Hold), which drops them off
+    the kitchen-assignment queue and pauses delivery. Reversible: when the
+    governing internal-service authorization later becomes favorable (the sole
+    case is re-approved, or a second approved case supersedes it) the enrollment
+    auto-resumes to the stage it was held from.
+
+    With ZERO or TWO-plus internal-service cases we NEVER full-stop: an
+    approved/pending parallel meal/box program keeps the household in service
+    (``governing_case_key`` already prefers the favorable case).
+
+    Best-effort and idempotent. Returns ``{"sole_denied": bool, "paused": bool}``.
+    """
+    result = {"sole_denied": False, "paused": False}
+    cases = _internal_service_cases(client)
+    if not cases:
+        recompute_client_stage(client, actor=actor)
+        return result
+
+    governing = max(cases, key=governing_case_key)
+    gov_status = governing.service_authorization_status
+    sole = len(cases) == 1
+
+    if sole and gov_status == ServiceAuthorizationStatus.DENIED:
+        # Single denied meal/box case -> full stop: pause every servable enrollment.
+        result["sole_denied"] = True
+        for enr in _governing_enrollments(client):
+            if EnrollmentStage(enr.stage) in _DENIAL_PAUSE_STAGES:
+                try:
+                    advance_enrollment(
+                        enr, EnrollmentStage.ON_HOLD, actor=actor,
+                        note=_DENIAL_HOLD_NOTE,
+                    )
+                    result["paused"] = True
+                except InvalidTransition:
+                    pass
+    elif gov_status in (
+        ServiceAuthorizationStatus.APPROVED,
+        ServiceAuthorizationStatus.NOT_REQUIRED,
+    ):
+        # Favorable authorization -> un-pause anything this rule auto-paused.
+        for enr in _governing_enrollments(client):
+            if EnrollmentStage(enr.stage) == EnrollmentStage.ON_HOLD:
+                _resume_auto_paused_enrollment(enr, actor=actor)
+
+    recompute_client_stage(client, actor=actor)
+    return result

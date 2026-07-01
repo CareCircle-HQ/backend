@@ -906,6 +906,13 @@ class CaseSerializer(serializers.ModelSerializer):
         if "household_type" not in validated_data:
             validated_data["household_type"] = derive_household_type(client)
 
+        # Capture the stored authorization status BEFORE the write so we can tell
+        # when this save is the transition that denies the case (for the ticket).
+        _prev_auth = (
+            Case.objects.filter(pk=case_id)
+            .values_list("service_authorization_status", flat=True)
+            .first()
+        )
         case, _ = Case.objects.update_or_create(case_id=case_id, defaults=validated_data)
         # Best-effort: build the master Service catalog (service_type linked to
         # its Program). Never let a catalog error break the case save.
@@ -929,6 +936,49 @@ class CaseSerializer(serializers.ModelSerializer):
                 ensure_household_with_primary(client)
         except Exception:
             logger.exception("ensure_household_with_primary failed for internal service case")
+        # Internal-service authorization full-stop rule: a client with a SINGLE
+        # internal-service (meal/box) case that is denied is auto-paused (On Hold)
+        # so service stops and they drop off kitchen assignment; a later favorable
+        # authorization resumes them. Two-plus internal-service cases are never a
+        # full stop. Raise a HIGH follow-up ticket the first time the sole case
+        # flips to denied. Best-effort: never let this break the case save.
+        try:
+            if case.case_type == CaseType.INTERNAL_SERVICE:
+                from .models import (
+                    ServiceAuthorizationStatus,
+                    TicketSeverity,
+                    TicketTypeCode,
+                )
+                from .services import tickets
+                from .services.lifecycle import (
+                    reconcile_internal_service_authorization,
+                )
+
+                outcome = reconcile_internal_service_authorization(client)
+                newly_denied = (
+                    outcome["sole_denied"]
+                    and _prev_auth != ServiceAuthorizationStatus.DENIED
+                    and case.service_authorization_status
+                    == ServiceAuthorizationStatus.DENIED
+                )
+                if newly_denied:
+                    tickets.open_ticket(
+                        TicketTypeCode.SYSTEM_CHANGE_DETECTED,
+                        reason=(
+                            f"The member's only internal-service (meal/box) case "
+                            f"{case.case_id} was denied. Service has been paused "
+                            f"(placed On Hold) and the member removed from kitchen "
+                            f"assignment. Confirm the denial and follow up with the "
+                            f"member; if it is overturned, resume service."
+                        ),
+                        severity=TicketSeverity.HIGH,
+                        client=client,
+                        case=case,
+                    )
+        except Exception:
+            logger.exception(
+                "internal-service authorization reconcile failed for case %s", case_id
+            )
         return case
 
 

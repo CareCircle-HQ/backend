@@ -219,6 +219,18 @@ class MembersListView(PortalGenericAPIView):
                 )
             )
             qs = qs.filter(Exists(open_internal_case))
+            # A paused (On Hold) household keeps lifecycle_stage=kitchen_assignment
+            # -- the hold is an overlay on the underlying stage -- so exclude it
+            # here to actually remove it from the kitchen-assignment queue (e.g.
+            # a sole internal-service case that was denied auto-pauses the member).
+            qs = qs.exclude(
+                Q(enrollments__stage=EnrollmentStage.ON_HOLD)
+                | Q(
+                    household_membership__household__enrollment_verifications__stage=(
+                        EnrollmentStage.ON_HOLD
+                    )
+                )
+            )
 
         status_val = (params.get("status") or "").strip()
         if status_val and status_val.lower() != "all":
