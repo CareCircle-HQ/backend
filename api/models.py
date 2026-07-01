@@ -2703,6 +2703,7 @@ class TimelineEventType(models.TextChoices):
     DELIVERY_ADDRESS_CHANGED = "delivery_address_changed", "Delivery Address Changed"
     OUT_OF_ORBIT = "out_of_orbit", "Out of Orbit"
     MEMBER_REACTIVATED = "member_reactivated", "Member Reactivated"
+    HOUSEHOLD_MEMBER_ADDED = "household_member_added", "Household Member Added"
     # --- Legacy coarse types: retained so existing rows stay valid; no longer
     # emitted by the timeline service (a data migration remaps old rows). ---
     VERIFICATION = "verification", "Verification"

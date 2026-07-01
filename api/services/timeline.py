@@ -496,6 +496,33 @@ def event_for_out_of_orbit(
     )
 
 
+def event_for_household_member_added(
+    primary_client, member_client, *, enrollment=None, source=ChangeSource.CRM, actor="",
+):
+    """Emit a 'Household Member Added' event on the PRIMARY client's timeline
+    when an agent adds another member to the household (e.g. via the
+    verification wizard's member search). De-duped per primary+member so
+    re-saving the verification doesn't duplicate the row."""
+    if primary_client is None or member_client is None:
+        return None
+    name = f"{member_client.first_name} {member_client.last_name}".strip()
+    return emit_timeline_event(
+        client=primary_client,
+        event_type=TimelineEventType.HOUSEHOLD_MEMBER_ADDED,
+        occurred_at=timezone.now(),
+        title="Household Member Added",
+        subtitle=name or "New member",
+        badge_text="Added",
+        badge_tone=TimelineBadgeTone.INFO,
+        source=source,
+        actor=actor,
+        entity=member_client,
+        enrollment=enrollment,
+        metadata={"member_client_id": str(member_client.pk)},
+        dedupe_key=f"household_member_added:{primary_client.pk}:{member_client.pk}",
+    )
+
+
 def event_for_member_reactivated(
     profile, *, enrollment=None, source=ChangeSource.SYSTEM, actor="",
 ):
