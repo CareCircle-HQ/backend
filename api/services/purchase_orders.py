@@ -417,7 +417,7 @@ def split_purchase_order(po, delivery_order_ids, new_delivery_date):
 # Boxes export columns, in order.
 _BOX_EXPORT_HEADERS = [
     "Delivery Date", "OrderID", "HouseholdID", "Quantity", "MemberID", "Name",
-    "Address 1", "Address 2", "City", "State", "Postal",
+    "Address 1", "Address 2", "City", "State", "Postal", "Delivery Notes",
     "MenuType", "FOOD NOTE", "Email address", "Phone",
 ]
 
@@ -490,12 +490,52 @@ def kitchen_export_filename(po):
 def _household_label(household):
     """Human-readable household identifier for exports: the household's name if
     set, otherwise a short ``HH-XXXXXXXX`` code derived from its UUID (members of
-    the same household share this, so the kitchen can group their food)."""
+    the same household share this, so the kitchen can group their food).
+
+    A trailing "Household" word (e.g. "NUTOVICS Household") is dropped so the
+    export shows just the family name ("NUTOVICS")."""
     if household is None:
         return ""
-    if (household.name or "").strip():
-        return household.name.strip()
+    name = (household.name or "").strip()
+    if name:
+        name = re.sub(r"\s+household$", "", name, flags=re.IGNORECASE).strip()
+        if name:
+            return name
     return f"HH-{household.household_id.hex[:8].upper()}"
+
+
+def _delivery_notes(client):
+    """Delivery notes captured on the verification pop-up for this member: the
+    ``notes`` on their enrollment's delivery address. Falls back to any note on
+    the member's own best address."""
+    if client is None:
+        return ""
+    prof = (
+        MemberDietaryProfile.objects.filter(client=client)
+        .select_related("enrollment__delivery_address")
+        .order_by("-updated_at")
+        .first()
+    )
+    if prof and prof.enrollment_id and prof.enrollment.delivery_address:
+        note = (prof.enrollment.delivery_address.notes or "").strip()
+        if note:
+            return note
+    addr = _member_address(client)
+    return (addr.notes or "").strip() if addr else ""
+
+
+def _format_phone(value):
+    """Format a US phone number as (XXX) XXX-XXXX. Leaves anything that isn't a
+    plain 10-digit (or 1+10) number untouched."""
+    raw = (value or "").strip()
+    if not raw:
+        return ""
+    digits = re.sub(r"\D", "", raw)
+    if len(digits) == 11 and digits.startswith("1"):
+        digits = digits[1:]
+    if len(digits) == 10:
+        return f"({digits[:3]}) {digits[3:6]}-{digits[6:]}"
+    return raw
 
 
 def build_kitchen_export_rows(po):
@@ -524,10 +564,11 @@ def build_kitchen_export_rows(po):
             addr.city if addr else "",
             addr.state if addr else "",
             addr.zip if addr else "",
+            _delivery_notes(c),
             do.kitchen_meal_type or (do.menu_type.name if do.menu_type else ""),
             do.kitchen_food_notes,
             c.client_email_address if c else "",
-            c.client_phone_number if c else "",
+            _format_phone(c.client_phone_number) if c else "",
         ])
     return _BOX_EXPORT_HEADERS, rows
 
