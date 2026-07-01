@@ -36,12 +36,14 @@ from .views_members import (
     MemberVerificationCreateView,
     MembersListView,
     MembersStatsView,
+    MenuTypesListView,
 )
 from .views_places import (
     PortalPlacesAutocompleteView,
     PortalPlacesDetailsView,
 )
 from .views_orders import (
+    CancelPurchaseOrderView,
     DeliveryCompaniesListView,
     KitchenExportView,
     KitchensListView,
@@ -98,6 +100,7 @@ urlpatterns = [
     # Members + sub-resources
     path("members/", MembersListView.as_view(), name="portal-members"),
     path("members/stats/", MembersStatsView.as_view(), name="portal-members-stats"),
+    path("menu-types/", MenuTypesListView.as_view(), name="portal-menu-types"),
     path("members/<uuid:client_id>/", MemberDetailView.as_view(), name="portal-member-detail"),
     path("members/<uuid:client_id>/insurance/", MemberInsuranceView.as_view()),
     path("members/<uuid:client_id>/social-coverage/", MemberSocialCoverageView.as_view()),
@@ -149,6 +152,7 @@ urlpatterns = [
     path("purchase-orders/generate/", PurchaseOrderGenerateView.as_view()),
     path("purchase-orders/<uuid:po_id>/split/", PurchaseOrderSplitView.as_view()),
     path("purchase-orders/<uuid:po_id>/delivery-orders/", PurchaseOrderDeliveryOrdersView.as_view()),
+    path("purchase-orders/<uuid:po_id>/cancel/", CancelPurchaseOrderView.as_view()),
     path("purchase-orders/<uuid:po_id>/send-to-kitchen/", SendToKitchenView.as_view()),
     path("purchase-orders/<uuid:po_id>/kitchen-export/", KitchenExportView.as_view()),
     path("purchase-orders/<uuid:po_id>/report/", PurchaseOrderReportView.as_view()),

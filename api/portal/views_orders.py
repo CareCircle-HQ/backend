@@ -1,6 +1,8 @@
 """Global Orders page: purchase orders list/create, stats, lazy delivery
 orders, and the send-to-kitchen / send-to-delivery actions."""
 
+import uuid
+
 from django.db.models import Q
 from django.http import HttpResponse
 from django.shortcuts import get_object_or_404
@@ -19,6 +21,7 @@ from ..models import (
     PurchaseOrder,
     PurchaseOrderDeliveryStatus,
     PurchaseOrderKitchenStatus,
+    PurchaseOrderStatus,
 )
 from ..services.purchase_orders import (
     build_kitchen_export_csv,
@@ -41,6 +44,14 @@ def _parse_date(value):
     except (TypeError, ValueError):
         return None
 
+
+def _parse_uuid(value):
+    """Parse ``value`` as a UUID; return None if it isn't one."""
+    try:
+        return uuid.UUID(str(value).strip())
+    except (TypeError, ValueError, AttributeError):
+        return None
+
 PO_PREFETCH = ("delivery_orders", "kitchen", "delivery_company")
 
 
@@ -52,12 +63,24 @@ class PurchaseOrdersView(PortalGenericAPIView):
         p = self.request.query_params
         search = (p.get("search") or "").strip()
         if search:
-            qs = qs.filter(
-                Q(kitchen__name__icontains=search)
+            cond = (
+                Q(po_number__icontains=search)
+                | Q(kitchen__name__icontains=search)
                 | Q(delivery_company__name__icontains=search)
                 | Q(delivery_orders__member__first_name__icontains=search)
                 | Q(delivery_orders__member__last_name__icontains=search)
-            ).distinct()
+            )
+            # UUID columns need an exact match (icontains isn't valid on a
+            # UUIDField). Match the PO id, the delivery-order ("order") id, and
+            # the member id so agents can paste any of those.
+            uid = _parse_uuid(search)
+            if uid:
+                cond |= (
+                    Q(pk=uid)
+                    | Q(delivery_orders__delivery_order_id=uid)
+                    | Q(delivery_orders__member__client_id=uid)
+                )
+            qs = qs.filter(cond).distinct()
         status_val = (p.get("status") or "").strip()
         if status_val and status_val.lower() != "all":
             qs = qs.filter(status=status_val.lower())
@@ -179,6 +202,41 @@ class PurchaseOrderReportDataView(PortalAPIView):
             PurchaseOrder.objects.select_related("kitchen"), pk=po_id
         )
         return Response(build_po_summary_data(po))
+
+
+class CancelPurchaseOrderView(PortalAPIView):
+    """Cancel a purchase order: mark the PO cancelled and cancel its still-open
+    delivery orders. Line items that already reached a terminal state
+    (delivered/returned/failed/cancelled) are left untouched. A completed or
+    already-cancelled PO can't be cancelled again."""
+
+    def post(self, request, po_id):
+        po = get_object_or_404(PurchaseOrder, pk=po_id)
+        if po.status in (
+            PurchaseOrderStatus.CANCELLED,
+            PurchaseOrderStatus.COMPLETED,
+        ):
+            return Response(
+                {
+                    "detail": (
+                        f"A {po.get_status_display().lower()} purchase order "
+                        "can't be cancelled."
+                    )
+                },
+                status=http.HTTP_409_CONFLICT,
+            )
+        po.status = PurchaseOrderStatus.CANCELLED
+        po.save(update_fields=["status", "updated_at"])
+        po.delivery_orders.exclude(
+            status__in=(
+                DeliveryOrderStatus.DELIVERED,
+                DeliveryOrderStatus.CANCELLED,
+                DeliveryOrderStatus.RETURNED,
+                DeliveryOrderStatus.FAILED,
+            )
+        ).update(status=DeliveryOrderStatus.CANCELLED, updated_at=timezone.now())
+        po = PurchaseOrder.objects.prefetch_related(*PO_PREFETCH).get(pk=po.pk)
+        return Response(s.PortalPurchaseOrderSerializer(po).data)
 
 
 class SendToDeliveryView(PortalAPIView):
