@@ -827,8 +827,16 @@ class HouseholdMemberEditView(PortalAPIView):
     """PATCH a single household member's dietary info (MemberDietaryProfile)."""
 
     def patch(self, request, client_id, member_id):
+        # Scope the profile to the URL client's ACTIVE enrollment -- the exact
+        # set the Household tab (HouseholdView.get) lists. A non-primary member
+        # has no enrollment of their own, so active_enrollment() falls back to
+        # the household's enrollment (owned by the primary). Filtering by
+        # ``enrollment__client_id=client_id`` would 404 for such members, since
+        # the enrollment's owner is the primary, not the member being viewed.
+        client = get_object_or_404(Client, pk=client_id)
+        enr = s.active_enrollment(client)
         mv = get_object_or_404(
-            MemberDietaryProfile, pk=member_id, enrollment__client_id=client_id
+            MemberDietaryProfile, pk=member_id, enrollment=enr,
         )
         ser = s.PortalMemberDietaryEditSerializer(data=request.data)
         ser.is_valid(raise_exception=True)
