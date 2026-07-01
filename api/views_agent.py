@@ -1,6 +1,7 @@
 """Agent authentication and validation views."""
 
 import logging
+import os
 from datetime import timedelta
 
 from django.conf import settings
@@ -14,6 +15,12 @@ from .integrations.mailgun import MailgunError, send_email
 from .models import Agent, AgentLoginCode
 
 logger = logging.getLogger(__name__)
+
+# Agent session length. Agents work all day and the extension has no silent
+# token refresh, so a short-lived token logs them out mid-work (a save returns
+# 401 -> the panel raises the login gate). Use a long-lived token; override with
+# AGENT_TOKEN_DAYS if needed.
+AGENT_TOKEN_DAYS = int(os.getenv("AGENT_TOKEN_DAYS", "30"))
 
 
 def _twofa_email_bodies(agent, code, ttl_minutes, app_label="extension"):
@@ -67,10 +74,11 @@ def _agent_login_response(agent):
     get presence + caller ID. The presence endpoint resolves the agent from the
     JWT, so no extension is needed to identify them.
     """
-    # Build an access token directly so we control the 24-hour lifetime
+    # Build an access token directly so we control the lifetime
     # (RefreshToken.access_token would use the short default lifetime).
+    lifetime = timedelta(days=AGENT_TOKEN_DAYS)
     access = AccessToken()
-    access.set_exp(lifetime=timedelta(hours=24))
+    access.set_exp(lifetime=lifetime)
     access["agent_id"] = str(agent.id)
     access["agent_code"] = agent.agent_code
     access["agent_name"] = agent.name
@@ -95,8 +103,8 @@ def _agent_login_response(agent):
         "calltools_enabled": has_calltools,
         "calltools": _calltools_presence(agent) if has_calltools else None,
         "access_token": str(access),
-        "expires_in": 86400,  # 24 hours in seconds
-        "expires_at": (timezone.now() + timedelta(hours=24)).isoformat(),
+        "expires_in": int(lifetime.total_seconds()),
+        "expires_at": (timezone.now() + lifetime).isoformat(),
     }
 
 
