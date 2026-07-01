@@ -3,7 +3,7 @@
 the verification wizard write."""
 
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from django.db import transaction
 from django.utils import timezone
@@ -154,6 +154,59 @@ def _parse_date(value):
         except (ValueError, TypeError):
             continue
     return None
+
+
+def period_date_range(period):
+    """Map a Verification-page period code to an inclusive (start, end) date
+    window on the LOCAL calendar, or None for "all"/blank/unknown (no filter).
+
+    Weeks start on Monday. Current periods (this_week/month/year) end today
+    rather than at the calendar boundary -- records can't be in the future, so
+    this is equivalent and avoids surprising empty ranges.
+    """
+    period = (period or "").strip().lower()
+    if not period or period == "all":
+        return None
+    today = timezone.localdate()
+    if period == "today":
+        return today, today
+    if period == "yesterday":
+        y = today - timedelta(days=1)
+        return y, y
+    if period == "this_week":
+        return today - timedelta(days=today.weekday()), today
+    if period == "last_week":
+        this_week_start = today - timedelta(days=today.weekday())
+        return this_week_start - timedelta(days=7), this_week_start - timedelta(days=1)
+    if period == "this_month":
+        return today.replace(day=1), today
+    if period == "last_month":
+        end = today.replace(day=1) - timedelta(days=1)
+        return end.replace(day=1), end
+    if period == "this_year":
+        return today.replace(month=1, day=1), today
+    return None
+
+
+def apply_period_filter(qs, period):
+    """Restrict ``qs`` to clients whose governing enrollment -- their own or
+    their household's -- was OPENED within the period window. No-op when the
+    period maps to no range. Caller is responsible for ``.distinct()`` (this
+    adds multi-valued joins)."""
+    rng = period_date_range(period)
+    if not rng:
+        return qs
+    start, end = rng
+    return qs.filter(
+        Q(
+            enrollments__opened_at__date__gte=start,
+            enrollments__opened_at__date__lte=end,
+        )
+        | Q(
+            household_membership__household__enrollment_verifications__opened_at__date__gte=start,
+            household_membership__household__enrollment_verifications__opened_at__date__lte=end,
+        )
+    )
 
 
 class MembersListView(PortalGenericAPIView):
@@ -325,6 +378,10 @@ class MembersListView(PortalGenericAPIView):
             else:  # single
                 qs = qs.filter(_hh_member_count__lte=1)
 
+        # Date-period filter (Verification page dropdown): narrow to households
+        # whose enrollment record was OPENED within the selected window.
+        qs = apply_period_filter(qs, params.get("period"))
+
         return qs.distinct()
 
     def _serialize_member(self, client, is_primary, relationship=""):
@@ -485,6 +542,12 @@ class MembersStatsView(PortalAPIView):
         # counts below must be DISTINCT on the client.
         if scope == "verification":
             qs = require_internal_service_primary(qs).distinct()
+        # Date-period filter (mirrors the list) so the chip counts match the
+        # rows shown for the selected window.
+        period = request.query_params.get("period")
+        qs = apply_period_filter(qs, period)
+        if period_date_range(period):
+            qs = qs.distinct()
         counts = {"total": qs.count()}
         for label, stages in STATUS_TO_STAGES.items():
             counts[label.lower()] = qs.filter(lifecycle_stage__in=stages).count()

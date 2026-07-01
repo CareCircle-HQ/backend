@@ -111,6 +111,19 @@ def _window_end(case):
     return ends_at.date() if ends_at else None
 
 
+def _meal_delivery_anchor(case):
+    """Anchor for the first MEAL delivery: the later of today and the auth
+    window start.
+
+    Anchoring on today means a case whose authorization start date is already in
+    the past (common -- cases are often authorized with a start date already
+    over) still schedules a real UPCOMING delivery instead of one in the past.
+    When the auth window opens in the future we use that start instead, so we
+    never schedule a delivery before the authorization is active.
+    """
+    return max(timezone.localdate(), _accept_date(case))
+
+
 def _next_weekday(d, weekday):
     """The first date strictly after ``d`` whose weekday() == ``weekday``."""
     days = (weekday - d.weekday()) % 7
@@ -222,7 +235,6 @@ def create_member_delivery_schedules(
         enrollment.delivery_weekdays = delivery_weekdays
         enrollment.save(update_fields=["delivery_weekdays"])
 
-    accept_date = _accept_date(case)
     end = _window_end(case)
     if is_boxes:
         # First box delivery is anchored on the assignment date (today): the
@@ -230,12 +242,15 @@ def create_member_delivery_schedules(
         start = box_first_delivery(timezone.localdate())
     else:
         # First meal delivery = the soonest chosen weekday strictly after the
-        # accept day; the plan runs to the end of the auth window.
+        # anchor (the later of today and the auth window start), so a case
+        # authorized with a start date already in the past still schedules a
+        # real upcoming delivery. The plan runs to the end of the auth window.
+        anchor = _meal_delivery_anchor(case)
         candidates = [
-            _next_weekday(accept_date, _WEEKDAY_CODES[w])
+            _next_weekday(anchor, _WEEKDAY_CODES[w])
             for w in delivery_weekdays if w in _WEEKDAY_CODES
         ]
-        start = min(candidates) if candidates else accept_date
+        start = min(candidates) if candidates else anchor
     delivery_dates = _delivery_dates(start, end, delivery_weekdays)
     num_dates = len(delivery_dates)
     weekday_ints = _weekday_ints(delivery_weekdays)
@@ -329,16 +344,19 @@ def update_household_cadence(enrollment, cadence, once_a_week_weekday=None, case
     enrollment.delivery_weekdays = delivery_weekdays
     enrollment.save(update_fields=["delivery_weekdays"])
 
-    accept_date = _accept_date(case)
     end = _window_end(case)
     if is_boxes:
         start = box_first_delivery(timezone.localdate())
     else:
+        # Anchor the first meal delivery on the later of today and the auth
+        # window start (see _meal_delivery_anchor) so a past-dated authorization
+        # still suggests a real upcoming delivery.
+        anchor = _meal_delivery_anchor(case)
         candidates = [
-            _next_weekday(accept_date, _WEEKDAY_CODES[w])
+            _next_weekday(anchor, _WEEKDAY_CODES[w])
             for w in delivery_weekdays if w in _WEEKDAY_CODES
         ]
-        start = min(candidates) if candidates else accept_date
+        start = min(candidates) if candidates else anchor
     num_dates = len(_delivery_dates(start, end, delivery_weekdays))
 
     for sched in enrollment.delivery_schedules.all():
