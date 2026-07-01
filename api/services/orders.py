@@ -14,8 +14,10 @@ it safely (and repeatedly) without creating duplicates.
 from datetime import timedelta
 
 from django.db import transaction
+from django.utils import timezone
 
 from api.models import (
+    DeliveryOrder,
     MemberStatus,
     OrderSchedule,
     OrderStatus,
@@ -224,3 +226,226 @@ def generate_delivery_calendar(enrollment):
                 )
             )
     return OrderSchedule.objects.bulk_create(orders)
+
+
+@transaction.atomic
+def resync_scheduled_orders(*, enrollment=None, delivery_date=None, from_date=None):
+    """Refresh future SCHEDULED OrderSchedule snapshots from the CURRENT member
+    dietary profiles + the household's assigned kitchen. Returns the count of
+    rows updated.
+
+    OrderSchedule rows are point-in-time snapshots (kitchen, menu_type,
+    allergies, kitchen_meal_type, ...). When a member's menu type / allergies or
+    the household kitchen change AFTER the delivery calendar was built, the
+    still-SCHEDULED occurrences keep the stale values -- so PO generation groups
+    a reassigned member under the OLD kitchen and can wrongly flag a supported
+    menu as "unsupported". This re-pulls the live values onto those rows. Only
+    SCHEDULED rows are touched; dispatched/historical orders keep their snapshot.
+
+    Scope with ``enrollment`` (one household) and/or ``delivery_date`` (a single
+    date, e.g. the PO popup "refresh"). When no ``delivery_date`` is given,
+    ``from_date`` (default today) limits it to future occurrences so past orders
+    are never rewritten.
+    """
+    qs = OrderSchedule.objects.filter(status=OrderStatus.SCHEDULED)
+    if enrollment is not None:
+        qs = qs.filter(enrollment=enrollment)
+    if delivery_date is not None:
+        qs = qs.filter(anticipated_delivery_date=delivery_date)
+    else:
+        qs = qs.filter(
+            anticipated_delivery_date__gte=from_date or timezone.localdate()
+        )
+    qs = qs.select_related("member", "enrollment")
+
+    updated = 0
+    for o in qs:
+        m = o.member
+        if m is None:
+            continue
+        new_kitchen_id = o.enrollment.kitchen_id if o.enrollment else o.kitchen_id
+        fields = {
+            "kitchen_id": new_kitchen_id,
+            "menu_type": m.menu_type or "",
+            "kitchen_meal_type": m.kitchen_meal_type or "",
+            "kitchen_food_notes": m.kitchen_food_notes or "",
+            "allergies": list(m.food_allergies or []),
+            "restrictions": list(m.dietary_restrictions or []),
+        }
+        if all(getattr(o, f) == v for f, v in fields.items()):
+            continue  # already in sync
+        for f, v in fields.items():
+            setattr(o, f, v)
+        o.save(update_fields=[
+            "kitchen", "menu_type", "kitchen_meal_type", "kitchen_food_notes",
+            "allergies", "restrictions", "updated_at",
+        ])
+        updated += 1
+    return updated
+
+
+@transaction.atomic
+def sync_delivery_calendar(enrollment, from_date=None):
+    """Reconcile an enrollment's FUTURE delivery occurrences with its CURRENT
+    member plans + dietary profiles. Idempotent; safe to call after any change.
+
+    Unlike :func:`generate_delivery_calendar` (a one-shot no-op once orders
+    exist), this keeps the dated calendar in step with later edits:
+
+    * **adds** occurrences for any planned member/date missing from the calendar
+      -- so a member added to the household, or new dates from a cadence change,
+      are never left out of Purchase Orders;
+    * **removes** future SCHEDULED occurrences no longer in the plan (e.g. dates
+      dropped by a cadence change);
+    * **refreshes** the kitchen / menu / allergy / quantity snapshots on the
+      rows it keeps (see :func:`resync_scheduled_orders`).
+
+    A (member, date) already batched into a PO -- i.e. a ``DeliveryOrder`` exists
+    for that member's client on that date -- is NEVER added, removed, or altered,
+    so committed orders stay stable. Past occurrences (before ``from_date``,
+    default today) are left untouched.
+
+    Returns ``{"added": n, "removed": n, "updated": n}``.
+    """
+    from_date = from_date or timezone.localdate()
+    weekdays = enrollment.delivery_weekdays or []
+    weekday_ints = _weekday_ints(weekdays)
+
+    plans = list(
+        enrollment.delivery_schedules.filter(status=ScheduleStatus.SCHEDULED)
+        .select_related("member_profile", "member_profile__client")
+    )
+    # Skip out-of-orbit members: they carry a plan but are excluded from POs.
+    plans = [
+        p for p in plans
+        if p.member_profile and p.member_profile.status != MemberStatus.OUT_OF_ORBIT
+    ]
+
+    existing = list(
+        enrollment.orders.filter(
+            status=OrderStatus.SCHEDULED, anticipated_delivery_date__gte=from_date,
+        ).select_related("member")
+    )
+    existing_by_key = {
+        (o.member_id, o.anticipated_delivery_date): o for o in existing
+    }
+
+    # (client_id, date) pairs already committed to a DeliveryOrder -- untouchable.
+    client_by_profile = {
+        p.member_profile_id: p.member_profile.client_id for p in plans
+    }
+    all_client_ids = [c for c in client_by_profile.values() if c]
+    batched = set(
+        DeliveryOrder.objects.filter(
+            member_id__in=all_client_ids, expected_delivery_date__gte=from_date,
+        ).values_list("member_id", "expected_delivery_date")
+    )
+
+    group_code = (
+        existing[0].household_group_code if existing else generate_household_group_code()
+    )
+    address_text = _format_address(enrollment.delivery_address)
+
+    def _qty(plan, d):
+        if plan.meals_per_day:
+            return meals_for_delivery(d.weekday(), weekday_ints, plan.meals_per_day)
+        return plan.prod_per_delivery
+
+    expected_keys = set()
+    to_create = []
+    updated = 0
+    for plan in plans:
+        m = plan.member_profile
+        client = getattr(m, "client", None)
+        client_id = client_by_profile.get(plan.member_profile_id)
+        for d in _delivery_dates(plan.starts_on, plan.ends_on, weekdays):
+            if d < from_date:
+                continue
+            key = (m.pk, d)
+            expected_keys.add(key)
+            if (client_id, d) in batched:
+                continue  # committed to a PO -- leave it alone
+            row = existing_by_key.get(key)
+            if row is None:
+                to_create.append(OrderSchedule(
+                    enrollment=enrollment,
+                    program_name=enrollment.program_name,
+                    member=m,
+                    member_name=plan.member_name or m.member_name,
+                    anticipated_delivery_date=d,
+                    household=enrollment.household,
+                    household_group_code=group_code,
+                    kitchen_id=enrollment.kitchen_id,
+                    status=OrderStatus.SCHEDULED,
+                    delivery_address=address_text,
+                    allergies=list(m.food_allergies or []),
+                    restrictions=list(m.dietary_restrictions or []),
+                    menu_type=m.menu_type or "",
+                    kitchen_meal_type=m.kitchen_meal_type or "",
+                    kitchen_food_notes=m.kitchen_food_notes or "",
+                    member_phone=getattr(client, "client_phone_number", "") or "",
+                    member_email=getattr(client, "client_email_address", "") or "",
+                    how_many_meals_or_boxes=_qty(plan, d),
+                ))
+            else:
+                fields = {
+                    "kitchen_id": enrollment.kitchen_id,
+                    "menu_type": m.menu_type or "",
+                    "kitchen_meal_type": m.kitchen_meal_type or "",
+                    "kitchen_food_notes": m.kitchen_food_notes or "",
+                    "allergies": list(m.food_allergies or []),
+                    "restrictions": list(m.dietary_restrictions or []),
+                    "how_many_meals_or_boxes": _qty(plan, d),
+                }
+                if any(getattr(row, f) != v for f, v in fields.items()):
+                    for f, v in fields.items():
+                        setattr(row, f, v)
+                    row.save(update_fields=[
+                        "kitchen", "menu_type", "kitchen_meal_type",
+                        "kitchen_food_notes", "allergies", "restrictions",
+                        "how_many_meals_or_boxes", "updated_at",
+                    ])
+                    updated += 1
+
+    # Remove future occurrences no longer planned (and not already batched).
+    stale_ids = [
+        o.pk for key, o in existing_by_key.items()
+        if key not in expected_keys
+        and (client_by_profile.get(o.member_id), o.anticipated_delivery_date) not in batched
+    ]
+    removed = 0
+    if stale_ids:
+        removed = OrderSchedule.objects.filter(pk__in=stale_ids).delete()[0]
+
+    if to_create:
+        OrderSchedule.objects.bulk_create(to_create)
+
+    return {"added": len(to_create), "removed": removed, "updated": updated}
+
+
+def sync_active_calendars(from_date=None):
+    """Reconcile the delivery calendar for every enrollment that currently has
+    future occurrences (see :func:`sync_delivery_calendar`).
+
+    Backs the PO popup "Refresh" and the ``sync_delivery_calendars`` command so
+    no eligible member is ever missing from a Purchase Order: any member added
+    to an already-active household, and any cadence/kitchen/dietary drift, is
+    picked up. Brand-new households get their calendar at kitchen-assignment
+    time, so they are already covered. Returns aggregate counts.
+    """
+    from api.models import EnrollmentVerification
+
+    from_date = from_date or timezone.localdate()
+    enr_ids = list(
+        OrderSchedule.objects.filter(
+            status=OrderStatus.SCHEDULED, anticipated_delivery_date__gte=from_date,
+        ).values_list("enrollment_id", flat=True).distinct()
+    )
+    totals = {"enrollments": 0, "added": 0, "removed": 0, "updated": 0}
+    for enr in EnrollmentVerification.objects.filter(pk__in=enr_ids).iterator():
+        res = sync_delivery_calendar(enr, from_date=from_date)
+        totals["enrollments"] += 1
+        totals["added"] += res["added"]
+        totals["removed"] += res["removed"]
+        totals["updated"] += res["updated"]
+    return totals
