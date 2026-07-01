@@ -540,10 +540,15 @@ def _format_phone(value):
 
 def build_kitchen_export_rows(po):
     """Header + per-delivery-order rows for ``po``'s kitchen export."""
+    # Group every household's members together (and sort households by the
+    # HouseholdID label the kitchen reads) so the kitchen can prepare and pack
+    # all of one household's food as a single batch. ``group_id`` is the
+    # secondary key so members stay contiguous even when household names collide
+    # or are blank.
     orders = (
         po.delivery_orders.select_related("member", "group", "menu_type")
         .prefetch_related("member__addresses")
-        .order_by("group_id", "member__last_name", "member__first_name")
+        .order_by("group__name", "group_id", "member__last_name", "member__first_name")
     )
     rows = []
     for do in orders:
