@@ -449,3 +449,130 @@ class SoleInternalServiceDenialTest(TestCase):
         self._save_case(client, case_id, "approved")
         enr.refresh_from_db()
         self.assertEqual(enr.stage, EnrollmentStage.KITCHEN_ASSIGNMENT)
+
+
+class LogisticsRosterFilterTest(TestCase):
+    """The Logistics (kitchen-assignment) roster hides members who can't be
+    assigned a kitchen: out-of-orbit members and members whose internal-service
+    case(s) are ALL closed/cancelled. A household with no remaining displayable
+    members drops out entirely. The Members page (no scope) still shows them."""
+
+    def _client(self, first, last, stage=None):
+        from .models import ClientStage
+
+        return Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name=first, last_name=last,
+            lifecycle_stage=stage or ClientStage.KITCHEN_ASSIGNMENT,
+        )
+
+    def _internal_case(self, client, status=None):
+        from .models import Case, CaseStatus, CaseType
+
+        return Case.objects.create(
+            case_id=uuid.uuid4(), client=client,
+            case_type=CaseType.INTERNAL_SERVICE,
+            case_status=status or CaseStatus.OPEN,
+            program_name="Medically Tailored Meals",
+        )
+
+    def _household(self, primary, *dependents):
+        from .models import Household, HouseholdMember
+
+        hh = Household.objects.create(name=f"{primary.last_name} Household")
+        HouseholdMember.objects.create(household=hh, client=primary, is_primary=True)
+        for dep in dependents:
+            HouseholdMember.objects.create(household=hh, client=dep, is_primary=False)
+        return hh
+
+    def _enrollment(self, primary, household, member_statuses):
+        """member_statuses: {client: MemberStatus} -> one profile per entry."""
+        from .models import (
+            EnrollmentStage,
+            EnrollmentVerification,
+            MemberDietaryProfile,
+        )
+
+        enr = EnrollmentVerification.objects.create(
+            client=primary, household=household,
+            stage=EnrollmentStage.KITCHEN_ASSIGNMENT,
+        )
+        for client, status in member_statuses.items():
+            MemberDietaryProfile.objects.create(
+                enrollment=enr, client=client, status=status
+            )
+        return enr
+
+    def _groups(self, **params):
+        from rest_framework.request import Request
+        from rest_framework.test import APIRequestFactory
+
+        from .portal.views_members import MembersListView
+
+        view = MembersListView()
+        view.request = Request(APIRequestFactory().get("/portal/members/", params))
+        view.kwargs = {}
+        return view._build_groups_for_page(view._group_entries())
+
+    def test_out_of_orbit_member_hidden_from_household(self):
+        from .models import ClientStage, MemberStatus
+
+        primary = self._client("Pat", "Primary")
+        dep = self._client("Dee", "Dependent", stage=ClientStage.ACTIVE)
+        hh = self._household(primary, dep)
+        self._internal_case(primary)
+        self._enrollment(primary, hh, {
+            primary: MemberStatus.ACTIVE,
+            dep: MemberStatus.OUT_OF_ORBIT,
+        })
+
+        groups = self._groups(scope="logistics")
+        self.assertEqual(len(groups), 1)
+        ids = {m["id"] for m in groups[0]["members"]}
+        self.assertIn(str(primary.client_id), ids)
+        self.assertNotIn(str(dep.client_id), ids)
+        self.assertEqual(groups[0]["member_count"], 1)
+
+    def test_closed_internal_case_member_hidden(self):
+        from .models import CaseStatus, ClientStage, MemberStatus
+
+        primary = self._client("Pat", "Primary")
+        dep = self._client("Dee", "Dependent", stage=ClientStage.ACTIVE)
+        hh = self._household(primary, dep)
+        self._internal_case(primary)  # open -> keeps the household on the page
+        self._internal_case(dep, CaseStatus.CLOSED)  # dep's own case is finished
+        self._enrollment(primary, hh, {
+            primary: MemberStatus.ACTIVE,
+            dep: MemberStatus.ACTIVE,
+        })
+
+        groups = self._groups(scope="logistics")
+        self.assertEqual(len(groups), 1)
+        ids = {m["id"] for m in groups[0]["members"]}
+        self.assertNotIn(str(dep.client_id), ids)
+
+    def test_household_dropped_when_all_members_hidden(self):
+        from .models import MemberStatus
+
+        primary = self._client("Sol", "Solo")
+        hh = self._household(primary)
+        self._internal_case(primary)
+        self._enrollment(primary, hh, {primary: MemberStatus.OUT_OF_ORBIT})
+
+        self.assertEqual(self._groups(scope="logistics"), [])
+
+    def test_members_page_still_shows_out_of_orbit(self):
+        from .models import ClientStage, MemberStatus
+
+        primary = self._client("Pat", "Primary")
+        dep = self._client("Dee", "Dependent", stage=ClientStage.ACTIVE)
+        hh = self._household(primary, dep)
+        self._internal_case(primary)
+        self._enrollment(primary, hh, {
+            primary: MemberStatus.ACTIVE,
+            dep: MemberStatus.OUT_OF_ORBIT,
+        })
+
+        groups = self._groups()  # no scope == Members page
+        hh_group = next(g for g in groups if g["type"] == "household")
+        ids = {m["id"] for m in hh_group["members"]}
+        self.assertIn(str(dep.client_id), ids)

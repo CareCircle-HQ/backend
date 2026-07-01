@@ -412,6 +412,24 @@ class MembersListView(PortalGenericAPIView):
         return data
 
     @staticmethod
+    def _hidden_in_logistics(client):
+        """Members that shouldn't wait in the kitchen-assignment queue and so are
+        dropped from the Logistics roster: out-of-orbit members (the meal rule
+        can't safely fulfill them) and members whose internal-service case(s) are
+        ALL closed/cancelled (service finished). A dependent with no internal-
+        service case of their own is kept -- they ride with the household."""
+        if s.member_out_of_orbit(client):
+            return True
+        internal = [
+            c for c in client.cases.all() if c.case_type == CaseType.INTERNAL_SERVICE
+        ]
+        if internal and all(
+            c.case_status in (CaseStatus.CLOSED, CaseStatus.CANCELLED) for c in internal
+        ):
+            return True
+        return False
+
+    @staticmethod
     def _service_type_for_client(client):
         """Meals/Boxes kind derived from the client's enrollment program name
         (prefetched). Empty when neither keyword is present."""
@@ -471,6 +489,9 @@ class MembersListView(PortalGenericAPIView):
         hh_ids = [e["id"] for e in entries if e["type"] == "household"]
         ind_ids = [e["id"] for e in entries if e["type"] == "individual"]
         groups_by_key = {}
+        # Logistics (kitchen-assignment) hides out-of-orbit / finished-case
+        # members from each household roster (see _hidden_in_logistics).
+        logistics = (self.request.query_params.get("scope") or "").strip() == "logistics"
 
         if hh_ids:
             members = (
@@ -478,7 +499,7 @@ class MembersListView(PortalGenericAPIView):
                 .select_related("household", "client")
                 .prefetch_related(
                     "client__insurances", "client__military_profile",
-                    "client__enrollments", "client__member_profiles",
+                    "client__enrollments", "client__member_profiles", "client__cases",
                 )
                 .order_by("-is_primary", "added_at")
             )
@@ -489,6 +510,13 @@ class MembersListView(PortalGenericAPIView):
                 hms = by_hh.get(hid)
                 if not hms:
                     continue
+                if logistics:
+                    hms = [
+                        h for h in hms
+                        if h.client and not self._hidden_in_logistics(h.client)
+                    ]
+                    if not hms:
+                        continue  # whole household hidden -> drop from the page
                 primary_hm = next((h for h in hms if h.is_primary), hms[0])
                 member_data = [
                     self._serialize_member(h.client, h.is_primary, h.relationship)
@@ -510,9 +538,11 @@ class MembersListView(PortalGenericAPIView):
 
         if ind_ids:
             clients = Client.objects.filter(client_id__in=ind_ids).prefetch_related(
-                *MEMBER_LIST_PREFETCH
+                *MEMBER_LIST_PREFETCH, "cases"
             )
             for c in clients:
+                if logistics and self._hidden_in_logistics(c):
+                    continue  # out-of-orbit / finished-case individual
                 primary_data = self._serialize_member(c, True)
                 groups_by_key[("individual", c.client_id)] = {
                     "id": str(c.client_id),
