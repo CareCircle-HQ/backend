@@ -1154,6 +1154,9 @@ class Case(models.Model):
     service_authorization_status_label = models.CharField(max_length=80, blank=True)
     service_authorization_request_starts_at = models.DateTimeField(null=True, blank=True)
     service_authorization_request_ends_at = models.DateTimeField(null=True, blank=True)
+    # Requested (pre-decision) dollar amount from the Unite Us authorization
+    # (requested_cents). The approved figure lives in authorized_amount.
+    service_authorization_requested_amount = models.CharField(max_length=120, blank=True)
     service_authorization_approval_starts_at = models.DateTimeField(null=True, blank=True)
     service_authorization_approval_ends_at = models.DateTimeField(null=True, blank=True)
     unite_us_authorization_id = models.CharField(max_length=80, blank=True)

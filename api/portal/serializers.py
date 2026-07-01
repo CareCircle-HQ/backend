@@ -610,8 +610,11 @@ class PortalMemberCaseSerializer(serializers.ModelSerializer):
             "primary_worker_name", "date_opened", "case_closed_at",
             "auth_status", "auth_status_label",
             "authorized_amount", "authorized_unit",
+            "service_authorization_requested_amount",
             "service_authorization_approval_starts_at",
             "service_authorization_approval_ends_at",
+            "service_authorization_request_starts_at",
+            "service_authorization_request_ends_at",
             "outcome_description", "resolution_type", "resolution_label",
             "case_description",
         ]
