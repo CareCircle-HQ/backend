@@ -29,6 +29,7 @@ from ..models import (
     KitchenMenuType,
     KitchenProductType,
     MemberDietaryProfile,
+    MemberStatus,
     MenuType,
     Note,
     PurchaseOrder,
@@ -154,6 +155,23 @@ def active_enrollment(client):
     return sorted(pool, key=lambda e: e.opened_at or timezone.now(), reverse=True)[0]
 
 
+def member_out_of_orbit(client):
+    """True when the client's active-enrollment dietary profile is Out of Orbit
+    (the meal rule couldn't be safely fulfilled). Out-of-orbit members are
+    excluded from delivery schedules/POs, so the Logistics roster hides them.
+    Scoped to the active enrollment so a stale profile from a closed enrollment
+    never hides a member."""
+    profiles = list(client.member_profiles.all())
+    if not profiles:
+        return False
+    enr = active_enrollment(client)
+    if enr is not None:
+        for mp in profiles:
+            if mp.enrollment_id == enr.pk:
+                return mp.status == MemberStatus.OUT_OF_ORBIT
+    return False
+
+
 def service_hold_state(client):
     """Whether the client's household service is paused (enrollment On Hold).
 
@@ -245,11 +263,15 @@ class MemberListSerializer(serializers.Serializer):
     medicaid_id = serializers.SerializerMethodField()
     case_manager = serializers.CharField(source="agent_name")
     flags = serializers.SerializerMethodField()
+    out_of_orbit = serializers.SerializerMethodField()
     start_date = serializers.SerializerMethodField()
     end_date = serializers.SerializerMethodField()
 
     def get_name(self, obj):
         return _full_name(obj)
+
+    def get_out_of_orbit(self, obj):
+        return member_out_of_orbit(obj)
 
     def get_verification_status(self, obj):
         return verification_status(obj)

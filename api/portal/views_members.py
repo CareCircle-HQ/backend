@@ -7,7 +7,7 @@ from datetime import datetime
 
 from django.db import transaction
 from django.utils import timezone
-from django.db.models import Count, Q
+from django.db.models import Count, Exists, OuterRef, Q
 from django.db.models.functions import Lower
 from django.shortcuts import get_object_or_404
 from rest_framework import status as http
@@ -16,6 +16,7 @@ from rest_framework.response import Response
 from ..models import (
     Address,
     Case,
+    CaseStatus,
     CaseType,
     Client,
     ClientPhone,
@@ -110,7 +111,7 @@ SCOPE_TO_STAGES = {
     "logistics": ["kitchen_assignment"],
 }
 
-MEMBER_LIST_PREFETCH = ("insurances", "military_profile", "enrollments")
+MEMBER_LIST_PREFETCH = ("insurances", "military_profile", "enrollments", "member_profiles")
 
 
 def require_internal_service_primary(qs):
@@ -199,6 +200,25 @@ class MembersListView(PortalGenericAPIView):
         # Internal Service case (see require_internal_service_primary).
         if scope == "verification":
             qs = require_internal_service_primary(qs)
+
+        # Logistics (kitchen-assignment) page: drop members whose internal-
+        # service (meal/box) cases are ALL closed/cancelled -- they've finished
+        # service and shouldn't wait for a kitchen. Kept if ANY internal-service
+        # case is still open (blank/unknown status counts as open, so we never
+        # over-hide). The case is held by the household primary, so a household
+        # drops out once the primary's case is done; dependents follow via the
+        # roster build.
+        if scope == "logistics":
+            open_internal_case = (
+                Case.objects.filter(
+                    client=OuterRef("pk"),
+                    case_type=CaseType.INTERNAL_SERVICE,
+                )
+                .exclude(
+                    case_status__in=(CaseStatus.CLOSED, CaseStatus.CANCELLED)
+                )
+            )
+            qs = qs.filter(Exists(open_internal_case))
 
         status_val = (params.get("status") or "").strip()
         if status_val and status_val.lower() != "all":
@@ -368,7 +388,7 @@ class MembersListView(PortalGenericAPIView):
                 .select_related("household", "client")
                 .prefetch_related(
                     "client__insurances", "client__military_profile",
-                    "client__enrollments",
+                    "client__enrollments", "client__member_profiles",
                 )
                 .order_by("-is_primary", "added_at")
             )
