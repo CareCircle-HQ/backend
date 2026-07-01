@@ -59,6 +59,26 @@ _MEAL_PO_WEEKDAY = {0: 3, 3: 0, 1: 4, 4: 1}  # Mon<-Thu, Thu<-Mon, Tue<-Fri, Fri
 # Box delivery is Wednesday, ordered the Friday before.
 _BOX_PO_WEEKDAY = 4
 
+# Meals per member per delivery, fixed by the delivery weekday: Mon/Tue = 9,
+# Thu/Fri = 12 (21 meals/week/member across the two weekly deliveries). This is
+# NOT taken from any per-member stored value. Boxes use the per-member scheduled
+# quantity instead.
+_MEAL_QTY_BY_WEEKDAY = {0: 9, 1: 9, 3: 12, 4: 12}
+
+
+def meals_per_member_for_delivery(delivery_date):
+    """Fixed meal count a member receives on this delivery weekday (0 when the
+    weekday isn't a meal delivery day)."""
+    return _MEAL_QTY_BY_WEEKDAY.get(delivery_date.weekday(), 0)
+
+
+def delivery_quantity(kind, delivery_date, schedule):
+    """Quantity for one member's delivery line. Meals are fixed by the delivery
+    weekday; boxes use the member's scheduled quantity."""
+    if kind == ProductTypeKind.MEALS:
+        return meals_per_member_for_delivery(delivery_date)
+    return schedule.how_many_meals_or_boxes or 0
+
 # Delivery weekday (int) -> the DeliveryCadence the delivery belongs to.
 _WEEKDAY_CADENCE = {
     0: "mon_thu", 3: "mon_thu",
@@ -159,6 +179,31 @@ def _resolve_menu_type(code, index):
     )
 
 
+def _kitchen_offered_index():
+    """kitchen_id (str) -> set of normalized MenuType names the kitchen offers."""
+    idx = {}
+    for k in Kitchen.objects.prefetch_related("kitchen_menu_types__menu_type"):
+        idx[str(k.pk)] = {
+            _norm(kmt.menu_type.name)
+            for kmt in k.kitchen_menu_types.all()
+            if kmt.menu_type_id
+        }
+    return idx
+
+
+def _kitchen_supports_menu(kind, offered_norm, code):
+    """True when this kitchen offers the member's menu type. Boxes don't map to
+    KitchenMenuType rows, so they're always considered supported."""
+    if kind == ProductTypeKind.BOXES:
+        return True
+    wanted = _norm(_MENU_CODE_TO_NAME.get(code, code))
+    if not wanted:
+        return False
+    if wanted in offered_norm:
+        return True
+    return any(wanted in o or o in wanted for o in offered_norm)
+
+
 def _due_schedules(kind, delivery_date):
     """SCHEDULED OrderSchedule rows for the given kind that land on the date.
 
@@ -208,6 +253,8 @@ def preview_purchase_orders(kind, delivery_date):
     ):
         used[str(kid)] = used.get(str(kid), 0) + 1
 
+    offered_idx = _kitchen_offered_index()
+
     groups = {}  # kitchen_id (str) or "" -> group dict
     for s in schedules:
         k = s.kitchen
@@ -223,17 +270,25 @@ def preview_purchase_orders(kind, delivery_date):
                 "capacity_left": (cap - used.get(kid, 0)) if cap is not None else None,
                 "total_members": 0,
                 "total_meals": 0,
+                "unsupported_members": 0,
                 "menu_types": {},
                 "members": [],
+                "_offered": offered_idx.get(kid, set()),
             }
         is_batched = s.member and s.member.client_id in batched
-        qty = s.how_many_meals_or_boxes or 0
+        qty = delivery_quantity(kind, delivery_date, s)
         code = s.menu_type or ""
-        mt = g["menu_types"].setdefault(
-            code, {"code": code, "label": _MENU_CODE_TO_NAME.get(code, code or "—"), "members": 0, "meals": 0}
-        )
-        mt["members"] += 1
-        mt["meals"] += qty
+        # A menu type only appears in the breakdown when this kitchen offers it
+        # (meals only; boxes don't map to KitchenMenuType rows).
+        supported = _kitchen_supports_menu(kind, g["_offered"], code)
+        if supported:
+            mt = g["menu_types"].setdefault(
+                code, {"code": code, "label": _MENU_CODE_TO_NAME.get(code, code or "—"), "members": 0, "meals": 0}
+            )
+            mt["members"] += 1
+            mt["meals"] += qty
+        elif not is_batched:
+            g["unsupported_members"] += 1
         if not is_batched:
             g["total_members"] += 1
             g["total_meals"] += qty
@@ -245,10 +300,12 @@ def preview_purchase_orders(kind, delivery_date):
             "menu_type_label": _MENU_CODE_TO_NAME.get(code, code or "—"),
             "meals": qty,
             "batched": bool(is_batched),
+            "supported": bool(supported),
         })
 
     for g in groups.values():
         g["menu_types"] = list(g["menu_types"].values())
+        g.pop("_offered", None)
 
     return {
         "kind": kind,
@@ -304,7 +361,7 @@ def generate_purchase_order(kind, delivery_date, kitchen, schedule_ids, split_se
             member=s.member.client if s.member else None,
             group=s.household,
             status=DeliveryOrderStatus.PENDING,
-            quantity=s.how_many_meals_or_boxes,
+            quantity=delivery_quantity(kind, delivery_date, s),
             expected_delivery_date=delivery_date,
             kitchen=kitchen,
             default_kitchen=default_kitchen,

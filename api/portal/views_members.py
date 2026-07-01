@@ -28,6 +28,7 @@ from ..models import (
     Kitchen,
     MemberDietaryProfile,
     MemberStatus,
+    MenuType,
     Note,
     NoteSource,
     PurchaseOrder,
@@ -209,6 +210,15 @@ def apply_period_filter(qs, period):
     )
 
 
+class MenuTypesListView(PortalAPIView):
+    """Active menu types for the Members-page menu-type filter dropdown.
+    ``value`` matches ``MemberDietaryProfile.menu_type`` (the catalog name)."""
+
+    def get(self, request):
+        rows = MenuType.objects.filter(is_active=True).order_by("name")
+        return Response([{"value": mt.name, "label": mt.name} for mt in rows])
+
+
 class MembersListView(PortalGenericAPIView):
     serializer_class = s.MemberListSerializer
 
@@ -377,6 +387,13 @@ class MembersListView(PortalGenericAPIView):
                 qs = qs.filter(_hh_member_count__gt=1)
             else:  # single
                 qs = qs.filter(_hh_member_count__lte=1)
+
+        # Menu-type filter (Members page): the member's assigned catalog menu
+        # type. MemberDietaryProfile.menu_type stores the catalog NAME, so match
+        # on the name passed from the dropdown.
+        menu_type_val = (params.get("menu_type") or "").strip()
+        if menu_type_val and menu_type_val.lower() != "all":
+            qs = qs.filter(member_profiles__menu_type=menu_type_val)
 
         # Date-period filter (Verification page dropdown): narrow to households
         # whose enrollment record was OPENED within the selected window.
