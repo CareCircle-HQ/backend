@@ -65,6 +65,7 @@ INSTALLED_APPS = [
     'rest_framework_simplejwt',
     'corsheaders',
     'simple_history',
+    'storages',
 
     # Local
     'api',
@@ -163,15 +164,74 @@ USE_TZ = True
 STATIC_URL = 'static/'
 STATIC_ROOT = BASE_DIR / 'staticfiles'
 
+# ---------------------------------------------------------------------------
+# Object storage (S3)
+# ---------------------------------------------------------------------------
+# S3 is the DEFAULT file storage in production (large import uploads + future
+# document storage); local dev keeps the filesystem. Toggle with DJANGO_USE_S3
+# (defaults on whenever a bucket is configured and DEBUG is off). Credentials
+# are best supplied by the EC2 instance role -- leave the key envs unset and
+# boto3 will use the role automatically.
+AWS_STORAGE_BUCKET_NAME = os.getenv("AWS_STORAGE_BUCKET_NAME", "")
+AWS_S3_REGION_NAME = os.getenv("AWS_S3_REGION_NAME", "us-east-1")
+AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID", "") or None
+AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY", "") or None
+
+USE_S3 = os.getenv(
+    "DJANGO_USE_S3",
+    "true" if (AWS_STORAGE_BUCKET_NAME and not DEBUG) else "false",
+).lower() == "true"
+
+# Common S3 options: keep objects private and served via short-lived signed
+# URLs; never silently overwrite; import uploads live under the imports/ prefix
+# and are set per-file, general media under media/.
+AWS_DEFAULT_ACL = None            # bucket owner enforced / private
+AWS_QUERYSTRING_AUTH = True       # signed URLs for private objects
+AWS_S3_FILE_OVERWRITE = False
+AWS_S3_SIGNATURE_VERSION = "s3v4"
+AWS_LOCATION = "media"            # default prefix for FileField uploads
+
+if USE_S3:
+    _default_storage = {
+        'BACKEND': 'storages.backends.s3.S3Storage',
+        'OPTIONS': {
+            'bucket_name': AWS_STORAGE_BUCKET_NAME,
+            'region_name': AWS_S3_REGION_NAME,
+            'location': AWS_LOCATION,
+            'default_acl': AWS_DEFAULT_ACL,
+            'file_overwrite': AWS_S3_FILE_OVERWRITE,
+            'querystring_auth': AWS_QUERYSTRING_AUTH,
+            'signature_version': AWS_S3_SIGNATURE_VERSION,
+        },
+    }
+else:
+    _default_storage = {
+        'BACKEND': 'django.core.files.storage.FileSystemStorage',
+    }
+
 # WhiteNoise: serve static files in production with compression + manifest.
 STORAGES = {
-    'default': {
-        'BACKEND': 'django.core.files.storage.FileSystemStorage',
-    },
+    'default': _default_storage,
     'staticfiles': {
         'BACKEND': 'whitenoise.storage.CompressedManifestStaticFilesStorage',
     },
 }
+
+# ---------------------------------------------------------------------------
+# Celery (async imports + smart diagnostics)
+# ---------------------------------------------------------------------------
+# Redis broker/result backend. Starts on the same EC2 (redis://127.0.0.1);
+# point CELERY_BROKER_URL at ElastiCache later with no code change. Long imports
+# run in the worker, so we favour reliability (late ack, prefetch=1) over
+# throughput and recycle child processes to bound memory after big files.
+CELERY_BROKER_URL = os.getenv("CELERY_BROKER_URL", "redis://127.0.0.1:6379/0")
+CELERY_RESULT_BACKEND = os.getenv("CELERY_RESULT_BACKEND", "redis://127.0.0.1:6379/1")
+CELERY_TASK_ACKS_LATE = True
+CELERY_WORKER_PREFETCH_MULTIPLIER = 1
+CELERY_WORKER_MAX_TASKS_PER_CHILD = 100
+CELERY_TASK_TRACK_STARTED = True
+CELERY_BROKER_CONNECTION_RETRY_ON_STARTUP = True
+CELERY_TIMEZONE = "UTC"
 
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 

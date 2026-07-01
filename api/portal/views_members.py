@@ -55,6 +55,7 @@ from ..services.kitchens import kitchen_options
 from ..services.meal_rules import apply_to_member
 from ..services.lifecycle import InvalidTransition, advance_enrollment
 from ..services import timeline
+from ..serializers import ensure_household_with_primary
 from .base import PortalAPIView, PortalGenericAPIView, current_agent
 from . import serializers as s
 
@@ -1095,6 +1096,16 @@ class MemberVerificationCreateView(PortalAPIView):
         household = getattr(
             getattr(client, "household_membership", None), "household", None
         )
+        # Members the agent added via the Step-1 search carry a client_id that
+        # isn't the primary. If any are present we need a household to attach
+        # them to, so create one (with the primary) when the client has none.
+        extra_member_ids = [
+            str(m["client_id"])
+            for m in data["members"]
+            if m.get("client_id") and str(m["client_id"]) != str(client.pk)
+        ]
+        if extra_member_ids and household is None:
+            household = ensure_household_with_primary(client)
         # Start at PENDING_VERIFICATION; the guarded lifecycle transitions below
         # move it forward and write the history rows.
         enrollment = EnrollmentVerification.objects.create(
@@ -1138,6 +1149,34 @@ class MemberVerificationCreateView(PortalAPIView):
                 HouseholdMember.objects.filter(
                     client_id=member_client_id
                 ).update(mobile_app_username=mobile)
+
+        # Attach any members added via the Step-1 search to the household and
+        # record each addition on the primary's timeline. Skip clients already
+        # in another household (one-household-per-client) and existing members
+        # of THIS household (no duplicate row, no duplicate timeline event).
+        if household is not None and extra_member_ids:
+            agent = current_agent(request)
+            actor = (
+                f"agent:{agent.agent_code}" if agent and agent.agent_code else ""
+            )
+            for mid in extra_member_ids:
+                member_client = Client.objects.filter(pk=mid).first()
+                if member_client is None:
+                    continue
+                membership = HouseholdMember.objects.filter(
+                    client=member_client
+                ).first()
+                if membership is not None:
+                    continue  # already in a household (this or another) — leave it
+                HouseholdMember.objects.create(
+                    household=household, client=member_client, is_primary=False
+                )
+                try:
+                    timeline.event_for_household_member_added(
+                        client, member_client, enrollment=enrollment, actor=actor
+                    )
+                except Exception:  # never let history-logging break the save
+                    pass
 
         # Completing the wizard IS the verification: stamp the source-of-truth
         # fact (verified_at/verified_by), then force past the process gate. This
