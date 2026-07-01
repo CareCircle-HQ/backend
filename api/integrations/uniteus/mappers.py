@@ -246,6 +246,7 @@ def map_case(case_body_data, *, names=None, auth=None):
         set_("service_authorization_status_label", raw.replace("_", " ").title())
         set_("unite_us_authorization_id", auth.get("short_id"))
         set_("authorized_amount", cents_to_usd(auth.get("approved_cents")))
+        set_("service_authorization_requested_amount", cents_to_usd(auth.get("requested_cents")))
         set_("service_authorization_approval_starts_at", _dt(auth.get("approved_starts_at")))
         set_("service_authorization_approval_ends_at", _dt(auth.get("approved_ends_at")))
         set_("service_authorization_request_starts_at", _dt(auth.get("requested_starts_at")))
