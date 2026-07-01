@@ -46,7 +46,11 @@ from ..services.delivery import (
     update_household_cadence,
 )
 from ..services.client_diagnostic import diagnose_client
-from ..services.orders import generate_delivery_calendar
+from ..services.orders import (
+    generate_delivery_calendar,
+    resync_scheduled_orders,
+    sync_delivery_calendar,
+)
 from ..services.kitchens import kitchen_options
 from ..services.meal_rules import apply_to_member
 from ..services.lifecycle import InvalidTransition, advance_enrollment
@@ -868,6 +872,11 @@ class HouseholdMemberEditView(PortalAPIView):
         else:
             mv.save()
 
+        # Propagate the edited menu type / allergies onto this member's future
+        # SCHEDULED delivery occurrences so PO generation reflects the change
+        # (those rows snapshot the profile at calendar-build time).
+        resync_scheduled_orders(enrollment=mv.enrollment)
+
         return Response(s.PortalHouseholdMemberSerializer(mv).data)
 
 
@@ -1264,6 +1273,13 @@ class MemberAssignKitchenView(PortalAPIView):
         # (OrderSchedule) so the household shows up for PO generation.
         generate_delivery_calendar(enr)
 
+        # Re-assignment case: when the household ALREADY had a plan + calendar,
+        # the two builders above are idempotent no-ops. Push the newly chosen
+        # kitchen + refreshed meal-rule results onto the existing plans and
+        # future occurrences so PO generation reflects the change.
+        enr.delivery_schedules.update(kitchen=kitchen)
+        resync_scheduled_orders(enrollment=enr)
+
         advance_enrollment(
             enr, EnrollmentStage.SERVICE_ACTIVE, force=True,
             note=f"Kitchen assigned ({kitchen.name}); service activated.",
@@ -1291,6 +1307,10 @@ class MemberKitchenView(PortalAPIView):
         enr.kitchen = kitchen
         enr.save(update_fields=["kitchen"])
         enr.delivery_schedules.update(kitchen=kitchen)
+        # Also refresh the already-generated future delivery occurrences so PO
+        # generation groups this household under the NEW kitchen (the calendar
+        # snapshots the kitchen at build time and is otherwise never rebuilt).
+        resync_scheduled_orders(enrollment=enr)
         return Response({
             "kitchen_id": str(kitchen.pk) if kitchen else None,
             "kitchen_name": kitchen.name if kitchen else "",
@@ -1325,6 +1345,11 @@ class MemberCadenceView(PortalAPIView):
         update_household_cadence(
             enr, cadence=cadence, once_a_week_weekday=once_weekday, case=case
         )
+        # A cadence change moves the delivery DATES, so the existing dated
+        # calendar must be rebuilt (not just field-resynced): drop future
+        # occurrences no longer in the plan and add the new ones, leaving any
+        # date already batched into a PO untouched.
+        sync_delivery_calendar(enr)
         return Response({
             "cadence": current_household_cadence(enr) or cadence,
             "cadence_label": dict(DeliveryCadence.choices).get(cadence, ""),

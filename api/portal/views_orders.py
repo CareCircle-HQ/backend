@@ -23,6 +23,7 @@ from ..models import (
     PurchaseOrderKitchenStatus,
     PurchaseOrderStatus,
 )
+from ..services.orders import sync_active_calendars
 from ..services.purchase_orders import (
     build_kitchen_export_csv,
     build_po_summary_data,
@@ -291,6 +292,31 @@ class PurchaseOrderPreviewView(PortalAPIView):
                 status=http.HTTP_400_BAD_REQUEST,
             )
         return Response(preview_purchase_orders(kind, delivery_date))
+
+
+class PurchaseOrderPreviewRefreshView(PortalAPIView):
+    """Re-sync the future delivery occurrences for a date from live member data,
+    then return the fresh preview.
+
+    The PO popup's per-kitchen breakdown reads point-in-time snapshots on the
+    delivery calendar (kitchen + menu type). This endpoint backs the "Refresh"
+    button: it pulls the CURRENT menu type / allergies / assigned kitchen onto
+    the still-SCHEDULED occurrences on ``delivery_date`` so a reassigned member
+    lands under the right kitchen and a corrected menu stops showing as
+    "unsupported"."""
+
+    def post(self, request):
+        kind = _parse_kind(request.data.get("kind"))
+        delivery_date = _parse_date(request.data.get("delivery_date"))
+        if kind is None or delivery_date is None:
+            return Response(
+                {"detail": "kind (meals|boxes) and delivery_date (YYYY-MM-DD) are required."},
+                status=http.HTTP_400_BAD_REQUEST,
+            )
+        totals = sync_active_calendars()
+        data = preview_purchase_orders(kind, delivery_date)
+        data["refreshed"] = totals
+        return Response(data)
 
 
 class PurchaseOrderGenerateView(PortalAPIView):
