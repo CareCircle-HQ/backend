@@ -599,6 +599,14 @@ def _report_filename(po):
     return f"{stem}_summary.csv"
 
 
+def _kitchen_menu_label(do):
+    """The kitchen menu type for a delivery order (the meal-rule result sent to
+    the kitchen), falling back to the system menu type, then a dash."""
+    return (do.kitchen_meal_type or "").strip() or (
+        do.menu_type.name if do.menu_type else "—"
+    )
+
+
 def build_po_summary_data(po):
     """Structured summary of a single PurchaseOrder for the report view:
     overall totals, a per-menu-type breakdown, and per-household member lines.
@@ -614,10 +622,12 @@ def build_po_summary_data(po):
     total_members = len(orders)
     total_qty = sum((do.quantity or 0) for do in orders)
 
-    # Per-menu-type breakdown.
+    # Per-menu-type breakdown, keyed by the KITCHEN menu type (the meal-rule
+    # result the kitchen actually cooks), not the system menu type. Falls back
+    # to the system menu type when the kitchen snapshot is blank (e.g. boxes).
     by_menu = {}
     for do in orders:
-        label = do.menu_type.name if do.menu_type else "—"
+        label = _kitchen_menu_label(do)
         agg = by_menu.setdefault(label, {"members": 0, "quantity": 0})
         agg["members"] += 1
         agg["quantity"] += (do.quantity or 0)
@@ -637,7 +647,7 @@ def build_po_summary_data(po):
         h["members"].append({
             "name": name,
             "quantity": do.quantity if do.quantity is not None else 0,
-            "menu_type": do.menu_type.name if do.menu_type else "—",
+            "menu_type": _kitchen_menu_label(do),
         })
 
     return {
