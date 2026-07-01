@@ -84,6 +84,10 @@ class PurchaseOrdersView(PortalGenericAPIView):
         status_val = (p.get("status") or "").strip()
         if status_val and status_val.lower() != "all":
             qs = qs.filter(status=status_val.lower())
+        else:
+            # Cancelled POs are hidden from the default "All" view; they only
+            # appear when the Cancelled filter is explicitly selected.
+            qs = qs.exclude(status=PurchaseOrderStatus.CANCELLED)
         kind = (p.get("kind") or "").strip()
         if kind and kind.lower() != "all":
             qs = qs.filter(kind=kind.lower())
