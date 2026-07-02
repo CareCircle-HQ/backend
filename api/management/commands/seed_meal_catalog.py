@@ -4,7 +4,7 @@ meal-verification import (``import_meal_verifications``).
 Ensures:
   * the catalog ``MenuType`` rows exist, renaming the legacy ``Standart`` typo
     to ``Standard`` (and fixing any stored member references to it);
-  * the kitchens ENG / AST / Hicksvile / Williamsburg exist with the right
+  * the kitchens ENG / AST / Hicksville / Williamsburg exist with the right
     supported products and offered menu types (prices + allergy restrictions).
 
 Safe to re-run: existing rows are updated in place, nothing is deleted. Kitchen
@@ -44,7 +44,7 @@ _CATALOG = {
         "Halal": (None, []),
         "Kosher": (None, []),
     }),
-    "Hicksvile": (["box"], 50000, {
+    "Hicksville": (["box"], 50000, {
         "Standard": (None, []),
         "Fish Free": (None, []),
         "Vegetarian": (None, []),
@@ -83,6 +83,13 @@ class Command(BaseCommand):
             n2 = MemberDeliverySchedule.objects.filter(menu_type="Standart").update(menu_type="Standard")
             if n1 or n2:
                 log(f"  fixed stored 'Standart' refs: {n1} profiles, {n2} schedules")
+
+            # 1b. Fix the Hicksvile -> Hicksville kitchen typo (rename if present).
+            legacy_k = Kitchen.objects.filter(name="Hicksvile").first()
+            if legacy_k and not Kitchen.objects.filter(name="Hicksville").exists():
+                legacy_k.name = "Hicksville"
+                legacy_k.save(update_fields=["name"])
+                log("  renamed Kitchen 'Hicksvile' -> 'Hicksville'")
 
             # 2. Ensure MenuTypes.
             for name in _MENU_TYPES:

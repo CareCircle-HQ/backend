@@ -17,9 +17,12 @@ from .models import (
     IdentifiedSocialNeed,
     ImportRun,
     Insurance,
+    Kitchen,
+    KitchenMenuType,
     Lead,
     MemberDeliverySchedule,
     MemberDietaryProfile,
+    MenuType,
     MilitaryProfile,
     Note,
     ProductType,
@@ -543,3 +546,30 @@ class TimelineEventAdmin(admin.ModelAdmin):
     ordering = ("-occurred_at", "-created_at")
     raw_id_fields = ("client", "enrollment", "content_type")
     readonly_fields = ("created_at",)
+
+
+@admin.register(MenuType)
+class MenuTypeAdmin(admin.ModelAdmin):
+    list_display = ("name", "is_active")
+    list_filter = ("is_active",)
+    search_fields = ("name",)
+    ordering = ("name",)
+
+
+class KitchenMenuTypeInline(admin.TabularInline):
+    model = KitchenMenuType
+    extra = 0
+    autocomplete_fields = ("menu_type",)
+
+
+@admin.register(Kitchen)
+class KitchenAdmin(admin.ModelAdmin):
+    list_display = (
+        "name", "status", "supported_products", "max_orders_per_day",
+        "email", "updated_at",
+    )
+    list_filter = ("status",)
+    search_fields = ("name", "email", "address")
+    ordering = ("name",)
+    readonly_fields = ("created_at", "updated_at")
+    inlines = (KitchenMenuTypeInline,)
