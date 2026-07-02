@@ -52,6 +52,7 @@ def emit_timeline_event(
     actor="",
     entity=None,
     enrollment=None,
+    case=None,
     renewal_number=None,
     metadata=None,
     dedupe_key="",
@@ -91,6 +92,7 @@ def emit_timeline_event(
         "content_type": content_type,
         "object_id": object_id,
         "enrollment": enrollment,
+        "case": case,
         "renewal_number": renewal_number,
         "metadata": metadata or {},
     }
@@ -249,8 +251,96 @@ def event_for_case(case, *, source=ChangeSource.EXTENSION, actor=""):
         source=source,
         actor=actor,
         entity=case,
+        case=case,
         metadata={"case_type": case.case_type},
         dedupe_key=f"case_opened:{case.pk}",
+    )
+
+
+def event_for_case_status_change(
+    case, *, previous_status="", source=ChangeSource.EXTENSION, actor="",
+    import_run=None,
+):
+    """Emit a 'Case Status Changed' event when a case's status transitions
+    (e.g. Open -> Closed / Cancelled / Managed). One row per transition, keyed
+    on (case, new status, day) so a re-import of an unchanged file is a no-op."""
+    client = case.client
+    if client is None:
+        return None
+    occurred = case.case_closed_at or case.updated_at or timezone.now()
+    new_label = case.get_case_status_display()
+    prev_label = (previous_status or "").replace("_", " ").title()
+    subtitle = f"{prev_label} \u2192 {new_label}" if prev_label else new_label
+    day = occurred.date().isoformat() if occurred else ""
+    return emit_timeline_event(
+        client=client,
+        event_type=TimelineEventType.CASE_STATUS_CHANGED,
+        occurred_at=occurred,
+        title="Case Status Changed",
+        subtitle=subtitle,
+        badge_text=new_label,
+        badge_tone=_CASE_TONE.get(case.case_status, TimelineBadgeTone.NEUTRAL),
+        source=source,
+        actor=actor,
+        entity=case,
+        case=case,
+        metadata={
+            "previous_status": previous_status or "",
+            "new_status": case.case_status,
+            "import_run": import_run.pk if import_run is not None else None,
+        },
+        dedupe_key=f"case_status:{case.pk}:{case.case_status}:{day}",
+    )
+
+
+_AUTH_TONE = {
+    "approved": TimelineBadgeTone.SUCCESS,
+    "not_required": TimelineBadgeTone.SUCCESS,
+    "pending": TimelineBadgeTone.WARNING,
+    "expired": TimelineBadgeTone.WARNING,
+    "denied": TimelineBadgeTone.DANGER,
+}
+
+
+def event_for_case_authorization_change(
+    case, *, previous_auth="", source=ChangeSource.EXTENSION, actor="",
+    import_run=None,
+):
+    """Emit a 'Case Authorization Changed' event when a case's service
+    authorization status transitions (approved / denied / pending / expired).
+    One row per transition, keyed on (case, new auth, day)."""
+    client = case.client
+    if client is None:
+        return None
+    new_auth = case.service_authorization_status or ""
+    occurred = (
+        case.service_authorization_approval_starts_at
+        or case.updated_at
+        or timezone.now()
+    )
+    new_label = (case.service_authorization_status_label
+                 or new_auth.replace("_", " ").title())
+    prev_label = (previous_auth or "").replace("_", " ").title()
+    subtitle = f"{prev_label} \u2192 {new_label}" if prev_label else new_label
+    day = occurred.date().isoformat() if occurred else ""
+    return emit_timeline_event(
+        client=client,
+        event_type=TimelineEventType.CASE_AUTH_CHANGED,
+        occurred_at=occurred,
+        title="Authorization Changed",
+        subtitle=subtitle,
+        badge_text=new_label,
+        badge_tone=_AUTH_TONE.get(new_auth, TimelineBadgeTone.NEUTRAL),
+        source=source,
+        actor=actor,
+        entity=case,
+        case=case,
+        metadata={
+            "previous_auth": previous_auth or "",
+            "new_auth": new_auth,
+            "import_run": import_run.pk if import_run is not None else None,
+        },
+        dedupe_key=f"case_auth:{case.pk}:{new_auth}:{day}",
     )
 
 
@@ -395,6 +485,7 @@ def event_for_verification(enrollment, *, stage_event=None, source=ChangeSource.
         actor=actor,
         entity=enrollment,
         enrollment=enrollment,
+        case=enrollment.case,
         dedupe_key=dedupe,
     )
 
@@ -427,6 +518,7 @@ def event_for_ticket_created(ticket, *, source=ChangeSource.CRM, actor=""):
         source=source,
         actor=actor,
         entity=ticket,
+        case=ticket.case,
         metadata={
             "ticket_type": type_label,
             "severity": severity,

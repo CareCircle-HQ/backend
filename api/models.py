@@ -2460,11 +2460,28 @@ class ImportRun(models.Model):
         default=ImportRunStatus.PENDING, db_index=True,
     )
     triggered_by = models.CharField(max_length=120, blank=True)  # cron | agent:355 | manual
+    # For manual CSV uploads processed asynchronously (S3 + Celery): the dataset
+    # being imported, the S3 object key of the uploaded file (kept for history /
+    # re-run), and the original filename the agent uploaded. Blank for the daily
+    # API pull and legacy synchronous uploads.
+    export_type = models.CharField(max_length=40, blank=True)
+    file_key = models.CharField(max_length=512, blank=True)
+    original_filename = models.CharField(max_length=255, blank=True)
     started_at = models.DateTimeField(auto_now_add=True)
     finished_at = models.DateTimeField(null=True, blank=True)
     # Per-dataset breakdown, e.g.
     # {"cases": {"created": 1, "updated": 2, "skipped": 0, "errors": 0}, ...}
+    # For case imports, stats["actions"] also holds an aggregate of the
+    # follow-up actions detected (cases closed, auth changes, tickets), with
+    # "applied": false in preview mode (detected but not yet created).
     stats = models.JSONField(default=dict, blank=True)
+    # Preview of the individual follow-up tickets a case import WOULD open (or
+    # did open, when applied), so an agent can review before/after the run.
+    # A capped list of {case_id, client_id, action, reason}. Empty otherwise.
+    planned_actions = models.JSONField(default=list, blank=True)
+    # Total rows to process (pre-counted) so the UI can show a true percentage;
+    # null while unknown. ``processed_count`` below is the running numerator.
+    progress_total = models.PositiveIntegerField(null=True, blank=True)
     processed_count = models.PositiveIntegerField(default=0)
     created_count = models.PositiveIntegerField(default=0)
     updated_count = models.PositiveIntegerField(default=0)
@@ -2679,6 +2696,8 @@ class TimelineEventType(models.TextChoices):
     SCREENING = "screening", "Screening"
     ASSESSMENT = "assessment", "Assessment"
     CASE_OPENED = "case_opened", "Case"
+    CASE_STATUS_CHANGED = "case_status_changed", "Case Status Changed"
+    CASE_AUTH_CHANGED = "case_auth_changed", "Case Authorization Changed"
     # --- Verification / authorization stages: one granular type per stage so
     # the History tab reads each transition distinctly instead of a pile of
     # generic "Verification" rows. ---
@@ -2740,6 +2759,15 @@ class TimelineEvent(models.Model):
     # screening). Renewal grouping in the UI keys off (enrollment, renewal_number).
     enrollment = models.ForeignKey(
         "EnrollmentVerification", on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="timeline_events",
+    )
+    # The Case this event pertains to (set for case-scoped events: case opened /
+    # status change / auth change, verification stages via the enrollment's case,
+    # and tickets tied to a case). Enables a case-scoped history view and lets the
+    # client timeline group rows by case. Null for client-level events (consent,
+    # insurance, coverage).
+    case = models.ForeignKey(
+        "Case", on_delete=models.SET_NULL, null=True, blank=True,
         related_name="timeline_events",
     )
     # Renewal cycle the event occurred in: 1 = initial, 2 = first renewal, …

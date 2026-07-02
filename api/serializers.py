@@ -906,14 +906,22 @@ class CaseSerializer(serializers.ModelSerializer):
         if "household_type" not in validated_data:
             validated_data["household_type"] = derive_household_type(client)
 
-        # Capture the stored authorization status BEFORE the write so we can tell
-        # when this save is the transition that denies the case (for the ticket).
-        _prev_auth = (
+        # Capture the stored status + authorization BEFORE the write so callers
+        # can tell what changed (the internal-service denial ticket below, and
+        # the case-change tracking the viewset runs after save).
+        _prev = (
             Case.objects.filter(pk=case_id)
-            .values_list("service_authorization_status", flat=True)
+            .values("case_status", "service_authorization_status")
             .first()
         )
+        _prev_status = _prev["case_status"] if _prev else None
+        _prev_auth = _prev["service_authorization_status"] if _prev else None
         case, _ = Case.objects.update_or_create(case_id=case_id, defaults=validated_data)
+        # Stash the pre-save values on the instance so the write path (e.g.
+        # CaseViewSet, extension) can record the change + attribute it, without
+        # re-querying. Import/daily-sync paths capture prev themselves.
+        case._prev_status = _prev_status
+        case._prev_auth = _prev_auth
         # Best-effort: build the master Service catalog (service_type linked to
         # its Program). Never let a catalog error break the case save.
         try:
@@ -1176,6 +1184,7 @@ class TimelineEventSerializer(serializers.ModelSerializer):
             "actor",
             "renewal_number",
             "enrollment",
+            "case",
             "entity_type",
             "entity_id",
             "metadata",

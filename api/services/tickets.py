@@ -8,10 +8,11 @@ by the import orchestration after each entity is upserted.
 """
 
 import logging
+from dataclasses import dataclass
 
+from api.history import ChangeSource
 from api.models import (
     CaseStatus,
-    ContractedService,
     Insurance,
     RecordStatus,
     SocialCareCoverage,
@@ -41,14 +42,17 @@ def _resolve_ticket_type(ticket_type):
 
 
 def open_ticket(ticket_type, *, reason, severity=TicketSeverity.MEDIUM,
-                client=None, case=None, import_run=None):
+                client=None, case=None, import_run=None, source="", actor=""):
     """Create (or refresh) an open ticket of ``ticket_type`` for this subject.
 
     ``ticket_type`` may be a :class:`TicketType` instance or a code string
     (e.g. ``TicketTypeCode.CASE_CLOSED``).
 
     Returns (ticket, created). Idempotent: an existing open/in-progress ticket of
-    the same type for the same (client, case) is reused.
+    the same type for the same (client, case) is reused. On a NEW ticket a
+    'New Ticket Created' timeline event is emitted (attributed to ``source`` /
+    ``actor``) so every ticket -- from the import, the daily sync, or a live
+    extension write -- lands on the client's history.
     """
     type_obj = _resolve_ticket_type(ticket_type)
     # Dedupe on (type, client, case, reason): now that the import routes every
@@ -67,6 +71,17 @@ def open_ticket(ticket_type, *, reason, severity=TicketSeverity.MEDIUM,
         type=type_obj, reason=reason, severity=severity,
         client=client, case=case, import_run=import_run,
     )
+    # Mirror the new ticket onto the client's timeline (best-effort: a timeline
+    # hiccup must never fail the ticket write). Deduped on the ticket pk.
+    if client is not None:
+        try:
+            from api.services import timeline
+
+            timeline.event_for_ticket_created(
+                ticket, source=source or ChangeSource.SYSTEM, actor=actor,
+            )
+        except Exception:  # noqa: BLE001
+            logger.warning("open_ticket timeline emit failed", exc_info=True)
     return ticket, True
 
 
@@ -144,27 +159,55 @@ def evaluate_member_not_found(reference, import_run=None):
     )
 
 
-def evaluate_case(case, *, previous_status=None, previous_auth_status=None,
-                  import_run=None):
-    """Case closed, authorization changed, and case-with-no-services (spec §6)."""
+@dataclass
+class PlannedTicket:
+    """A ticket a rule WOULD open. Lets callers preview the work an import will
+    generate (report mode) before committing to creating it, and lets both the
+    preview and the real path share one source of truth for the conditions."""
+
+    type_code: str
+    reason: str
+    action: str  # machine label for aggregation, e.g. "case_closed"
+    severity: str = TicketSeverity.MEDIUM
+    client: object = None
+    case: object = None
+    # For the auth-changed action: the new authorization status (for breakdowns).
+    detail: str = ""
+
+    def open(self, import_run=None, source="", actor=""):
+        return open_ticket(
+            self.type_code, reason=self.reason, severity=self.severity,
+            client=self.client, case=self.case, import_run=import_run,
+            source=source, actor=actor,
+        )
+
+
+def plan_case_tickets(case, *, previous_status=None, previous_auth_status=None):
+    """The tickets :func:`evaluate_case` would open for this case, as a list of
+    :class:`PlannedTicket` (no DB writes). Case closed, authorization changed,
+    and case-with-no-services (spec §6)."""
+    plans = []
     if case.case_status == CaseStatus.CLOSED and previous_status != CaseStatus.CLOSED:
-        open_ticket(
-            TicketTypeCode.SYSTEM_CHANGE_DETECTED,
+        plans.append(PlannedTicket(
+            type_code=TicketTypeCode.SYSTEM_CHANGE_DETECTED,
+            action="cases_closed",
             reason=(
                 f"Case {case.case_id} changed to Closed in Unite Us. Review whether "
                 f"the member's meal/box service should be paused or closed, and "
                 f"follow up with the member to confirm the end of service."
             ),
-            client=case.client, case=case, import_run=import_run,
-        )
+            client=case.client, case=case,
+        ))
 
     if (
         previous_auth_status is not None
         and case.service_authorization_status
         and case.service_authorization_status != previous_auth_status
     ):
-        open_ticket(
-            TicketTypeCode.SYSTEM_CHANGE_DETECTED,
+        plans.append(PlannedTicket(
+            type_code=TicketTypeCode.SYSTEM_CHANGE_DETECTED,
+            action="auth_changed",
+            detail=case.service_authorization_status,
             reason=(
                 f"Service authorization for case {case.case_id} changed from "
                 f"'{previous_auth_status or '-'}' to "
@@ -172,20 +215,22 @@ def evaluate_case(case, *, previous_status=None, previous_auth_status=None,
                 f"authorization and adjust the member's service (activate, pause, "
                 f"or close) accordingly."
             ),
-            client=case.client, case=case, import_run=import_run,
-        )
+            client=case.client, case=case,
+        ))
+    # NOTE: a 'case has no contracted services' rule was intentionally removed --
+    # only the household primary holds internal-service (meal/box) cases, so it
+    # fired for essentially every member case and flooded the queue/timeline.
+    return plans
 
-    if not ContractedService.objects.filter(case=case).exists():
-        open_ticket(
-            TicketTypeCode.CASE_NO_SERVICES,
-            reason=(
-                f"Case {case.case_id} has no contracted (internal) services "
-                f"attached, so the member has no active internal-services "
-                f"contract. Confirm whether an internal-services contract needs to "
-                f"be added before meal/box service can proceed."
-            ),
-            client=case.client, case=case, import_run=import_run,
-        )
+
+def evaluate_case(case, *, previous_status=None, previous_auth_status=None,
+                  import_run=None):
+    """Open the tickets planned for this case (spec §6)."""
+    for plan in plan_case_tickets(
+        case, previous_status=previous_status,
+        previous_auth_status=previous_auth_status,
+    ):
+        plan.open(import_run=import_run)
 
 
 # NOTE: an expired/unreadable Unite Us credential is an integration problem

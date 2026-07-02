@@ -4,39 +4,63 @@ the Unite Us agents allowlist that gates which cases the import accepts."""
 import uuid
 
 from django.db.models import Count
+from django.utils import timezone
 from rest_framework import status as http
 from rest_framework.parsers import FormParser, MultiPartParser
 from rest_framework.response import Response
 
-from ..models import Case, ImportRun, UniteUsAgent
+from ..models import Case, ImportRun, ImportRunStatus, UniteUsAgent
+from ..services import import_storage
 from ..services.csv_import import (
     CSV_SOURCE,
     SUPPORTED_EXPORT_TYPES,
     run_csv_import,
 )
+from ..tasks import process_import
 from .base import PortalAPIView, current_agent
+
+
+def _progress_percent(run):
+    """Integer 0-100 for the UI bar; None while the denominator is unknown."""
+    total = run.progress_total
+    if not total:
+        return None
+    return min(100, round(100 * (run.processed_count or 0) / total))
 
 
 def _run_summary(run):
     return {
         "id": run.pk,
         "source": run.source,
-        # The stats dict is keyed by the imported dataset (clients/screenings/...);
-        # surface it so the UI can label the run correctly.
-        "dataset": next(iter((run.stats or {}).keys()), ""),
+        # Prefer the explicit export_type; fall back to the stats key (older runs
+        # predate the field) so the UI can always label the run correctly.
+        "dataset": run.export_type or next(iter((run.stats or {}).keys()), ""),
+        "export_type": run.export_type,
+        "original_filename": run.original_filename,
         "status": run.status,
         "status_label": run.get_status_display(),
         "triggered_by": run.triggered_by,
         "started_at": run.started_at,
         "finished_at": run.finished_at,
         "stats": run.stats,
+        # Case imports: aggregate of follow-up actions detected (preview) or
+        # applied, plus a capped list of the individual tickets for review.
+        "actions": (run.stats or {}).get("actions"),
+        "planned_actions": run.planned_actions or [],
         "processed": run.processed_count,
+        "progress_total": run.progress_total,
+        "progress_percent": _progress_percent(run),
         "created": run.created_count,
         "updated": run.updated_count,
         "skipped": run.skipped_count,
         "errors": run.error_count,
         "error_log": run.error_log,
     }
+
+
+def _triggered_by(request):
+    agent = current_agent(request)
+    return f"agent:{agent.agent_code}" if agent and agent.agent_code else "manual"
 
 
 # Max upload size. The clients export is a few MB, but the denormalized
@@ -88,6 +112,9 @@ class ImportUploadView(PortalAPIView):
         triggered_by = f"agent:{agent.agent_code}" if agent and agent.agent_code else "manual"
         run = run_csv_import(
             export_type=export_type, file_obj=upload, triggered_by=triggered_by,
+            # Open the follow-up tickets a case import detects (case closed /
+            # authorization changed); case_no_services is excluded.
+            create_tickets=True,
         )
         status_code = (
             http.HTTP_200_OK if run.status == "completed" else http.HTTP_400_BAD_REQUEST
@@ -99,13 +126,221 @@ class ImportRunsView(PortalAPIView):
     """GET the most recent CSV import runs (for the Settings > Import history)."""
 
     def get(self, request):
-        runs = ImportRun.objects.filter(source=CSV_SOURCE).order_by("-started_at")[:20]
+        # Only the current calendar month's imports, so the history list stays
+        # focused (older runs are still reachable via Import Activity).
+        month_start = timezone.localtime().replace(
+            day=1, hour=0, minute=0, second=0, microsecond=0
+        )
+        runs = (
+            ImportRun.objects.filter(source=CSV_SOURCE, started_at__gte=month_start)
+            .order_by("-started_at")
+        )
         return Response(
             {
                 "supported_export_types": list(SUPPORTED_EXPORT_TYPES),
+                # When true the UI uploads direct to S3 (presign -> PUT -> start)
+                # and polls; otherwise it falls back to the synchronous upload.
+                "async_uploads": import_storage.s3_enabled(),
+                "max_upload_bytes": _MAX_UPLOAD_BYTES,
                 "results": [_run_summary(r) for r in runs],
             }
         )
+
+
+class ImportRunDetailView(PortalAPIView):
+    """GET a single import run -- polled by the UI for live progress/status."""
+
+    def get(self, request, run_id):
+        run = ImportRun.objects.filter(pk=run_id, source=CSV_SOURCE).first()
+        if run is None:
+            return Response(status=http.HTTP_404_NOT_FOUND)
+        return Response(_run_summary(run))
+
+
+class ImportPresignView(PortalAPIView):
+    """Step 1 of the async upload: validate the request, create a pending
+    ImportRun, and return a short-lived presigned S3 PUT URL the browser uploads
+    the file directly to (bypassing gunicorn/nginx timeouts + body limits)."""
+
+    def post(self, request):
+        if not import_storage.s3_enabled():
+            return Response(
+                {"detail": "Direct uploads are not configured (no S3 bucket)."},
+                status=http.HTTP_400_BAD_REQUEST,
+            )
+
+        export_type = (request.data.get("export_type") or "").strip().lower()
+        if export_type not in SUPPORTED_EXPORT_TYPES:
+            return Response(
+                {"export_type": (
+                    f"Unsupported export type. Supported: "
+                    f"{', '.join(SUPPORTED_EXPORT_TYPES)}."
+                )},
+                status=http.HTTP_400_BAD_REQUEST,
+            )
+
+        filename = (request.data.get("filename") or "").strip()
+        if not filename.lower().endswith(".csv"):
+            return Response(
+                {"filename": "Please upload a .csv file."},
+                status=http.HTTP_400_BAD_REQUEST,
+            )
+
+        size = request.data.get("size")
+        try:
+            size = int(size) if size is not None else None
+        except (TypeError, ValueError):
+            size = None
+        if size is not None and size > _MAX_UPLOAD_BYTES:
+            return Response(
+                {"file": "File is too large (max 512 MB)."},
+                status=http.HTTP_400_BAD_REQUEST,
+            )
+
+        key = import_storage.build_key(filename)
+        run = ImportRun.objects.create(
+            source=CSV_SOURCE,
+            status=ImportRunStatus.PENDING,
+            triggered_by=_triggered_by(request),
+            export_type=export_type,
+            file_key=key,
+            original_filename=filename[:255],
+        )
+        try:
+            upload_url = import_storage.presign_put(key, content_type="text/csv")
+        except Exception as exc:  # noqa: BLE001 - surface a clean error to the UI
+            run.status = ImportRunStatus.FAILED
+            run.error_log = f"Could not presign upload: {exc}"
+            run.save(update_fields=["status", "error_log"])
+            return Response(
+                {"detail": "Could not create an upload URL."},
+                status=http.HTTP_502_BAD_GATEWAY,
+            )
+
+        return Response(
+            {
+                "run_id": run.pk,
+                "upload_url": upload_url,
+                "key": key,
+                # The browser MUST PUT with this exact Content-Type -- it's part
+                # of the signature.
+                "content_type": "text/csv",
+            },
+            status=http.HTTP_201_CREATED,
+        )
+
+
+class ImportStartView(PortalAPIView):
+    """Step 2 of the async upload: after the browser finishes the S3 PUT, verify
+    the object landed and enqueue the Celery worker to process it."""
+
+    def post(self, request, run_id):
+        run = ImportRun.objects.filter(pk=run_id, source=CSV_SOURCE).first()
+        if run is None:
+            return Response(status=http.HTTP_404_NOT_FOUND)
+        if run.status != ImportRunStatus.PENDING:
+            # Already started/finished -- return current state (idempotent).
+            return Response(_run_summary(run))
+        if not run.file_key or not import_storage.object_exists(run.file_key):
+            return Response(
+                {"detail": "Uploaded file was not found in storage."},
+                status=http.HTTP_400_BAD_REQUEST,
+            )
+        process_import.delay(run.pk)
+        return Response(_run_summary(run), status=http.HTTP_202_ACCEPTED)
+
+
+class ImportActivityView(PortalAPIView):
+    """Settings > Import Activity: a rollup of the follow-up actions detected
+    (and, once applied, created) across case imports -- cases closed,
+    authorization changes, and the tickets each would open -- so an agent can
+    review the work an import produces in one place before we start creating
+    tickets automatically."""
+
+    _RESULT_CAP = 500
+
+    def get(self, request):
+        # Every recent CSV import (not just action-bearing ones) so the dropdown
+        # can list clients/screenings/etc. too -- they show record counts even
+        # though only case imports produce follow-up actions.
+        base = ImportRun.objects.filter(source=CSV_SOURCE).order_by("-started_at")
+        recent = list(base[:50])
+        run_options = [{
+            "run_id": r.pk,
+            "started_at": r.started_at,
+            "dataset": r.export_type or next(iter((r.stats or {}).keys()), "") or "import",
+            "original_filename": r.original_filename,
+            "triggered_by": r.triggered_by,
+            "status": r.status,
+            "created": r.created_count,
+            "updated": r.updated_count,
+            "skipped": r.skipped_count,
+            "errors": r.error_count,
+            "applied": bool(((r.stats or {}).get("actions") or {}).get("applied")),
+            "tickets": int(((r.stats or {}).get("actions") or {}).get("tickets") or 0),
+        } for r in recent]
+
+        # Scope: a single run when ?run_id= is given (looked up directly so it
+        # works even for runs older than the recent-50 window), else all recent.
+        run_id = (request.query_params.get("run_id") or "").strip()
+        if run_id:
+            runs = list(base.filter(pk=run_id))
+        else:
+            runs = recent
+
+        totals = {
+            "runs": 0, "tickets": 0, "tickets_created": 0, "cases_closed": 0,
+            "auth_changed": 0, "timeline_events": 0,
+        }
+        # Record-level counts (meaningful for every import type, incl. clients).
+        record_totals = {"created": 0, "updated": 0, "skipped": 0, "errors": 0}
+        auth_to = {}
+        results = []
+        any_applied = False
+        for run in runs:
+            totals["runs"] += 1
+            record_totals["created"] += run.created_count
+            record_totals["updated"] += run.updated_count
+            record_totals["skipped"] += run.skipped_count
+            record_totals["errors"] += run.error_count
+
+            actions = (run.stats or {}).get("actions") or {}
+            if not actions:
+                continue
+            for key in ("tickets", "tickets_created", "cases_closed",
+                        "auth_changed", "timeline_events"):
+                totals[key] += int(actions.get(key) or 0)
+            for status, count in (actions.get("auth_changed_to") or {}).items():
+                auth_to[status] = auth_to.get(status, 0) + int(count or 0)
+            applied = bool(actions.get("applied"))
+            any_applied = any_applied or applied
+            for pa in (run.planned_actions or []):
+                if len(results) >= self._RESULT_CAP:
+                    break
+                results.append({
+                    "run_id": run.pk,
+                    "dataset": run.export_type or "cases",
+                    # Per-row: was THIS ticket actually created? (older runs
+                    # predate the field -> fall back to the run-level flag).
+                    "applied": bool(pa.get("created", applied)),
+                    "started_at": run.started_at,
+                    "triggered_by": run.triggered_by,
+                    "case_id": pa.get("case_id", ""),
+                    "client_id": pa.get("client_id", ""),
+                    "action": pa.get("action", ""),
+                    "detail": pa.get("detail", ""),
+                    "reason": pa.get("reason", ""),
+                })
+        totals["auth_changed_to"] = auth_to
+        return Response({
+            "totals": totals,
+            "record_totals": record_totals,
+            "results": results,
+            "capped": self._RESULT_CAP,
+            "any_applied": any_applied,
+            "runs": run_options,
+            "selected_run_id": int(run_id) if run_id.isdigit() else None,
+        })
 
 
 def _agent_dict(agent, case_count=None):

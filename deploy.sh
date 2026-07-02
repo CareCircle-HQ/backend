@@ -43,6 +43,12 @@ echo "==> Restarting services"
 sudo systemctl daemon-reload
 sudo systemctl restart gunicorn
 sudo systemctl restart nginx
+# Celery worker (async CSV imports). Only restart if the unit is installed, so
+# this script still works on hosts that haven't set up the worker yet.
+if systemctl list-unit-files | grep -q '^celery-worker\.service'; then
+  echo "==> Restarting celery-worker"
+  sudo systemctl restart celery-worker
+fi
 
 echo "==> Done. Quick health check:"
 curl -fsS https://www.carecircleinternal.com/ && echo

@@ -176,6 +176,10 @@ AWS_STORAGE_BUCKET_NAME = os.getenv("AWS_STORAGE_BUCKET_NAME", "")
 AWS_S3_REGION_NAME = os.getenv("AWS_S3_REGION_NAME", "us-east-1")
 AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID", "") or None
 AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY", "") or None
+# Optional custom endpoint (e.g. a local MinIO at http://127.0.0.1:9000) so the
+# full presign -> upload -> Celery flow can run against S3-compatible storage in
+# dev. Leave unset to use real AWS S3.
+AWS_S3_ENDPOINT_URL = os.getenv("AWS_S3_ENDPOINT_URL", "") or None
 
 USE_S3 = os.getenv(
     "DJANGO_USE_S3",
@@ -202,6 +206,7 @@ if USE_S3:
             'file_overwrite': AWS_S3_FILE_OVERWRITE,
             'querystring_auth': AWS_QUERYSTRING_AUTH,
             'signature_version': AWS_S3_SIGNATURE_VERSION,
+            **({'endpoint_url': AWS_S3_ENDPOINT_URL} if AWS_S3_ENDPOINT_URL else {}),
         },
     }
 else:

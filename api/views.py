@@ -47,6 +47,7 @@ from .serializers import (
     UserSerializer,
     ensure_household_with_primary,
 )
+from .history import ChangeSource
 from .services import timeline
 from .services.lifecycle import (
     InvalidTransition,
@@ -454,16 +455,41 @@ class CaseViewSet(BulkUpsertMixin, viewsets.ModelViewSet):
             qs = qs.filter(client_id=client)
         return qs
 
+    # No case-ticket actions are suppressed for extension writes (the
+    # case_no_services rule was removed globally). Kept as a hook for future use.
+    _SKIP_TICKET_ACTIONS = frozenset()
+
+    def _record_case_change(self, case):
+        """Emit case-change timeline events + open follow-up tickets for a case
+        written by the extension, attributed to the acting agent."""
+        from .services import case_events
+
+        try:
+            case_events.record_case_change(
+                case,
+                previous_status=getattr(case, "_prev_status", None),
+                previous_auth=getattr(case, "_prev_auth", None),
+                source=ChangeSource.EXTENSION,
+                actor=_agent_actor(self.request),
+                create_tickets=True,
+                skip_actions=self._SKIP_TICKET_ACTIONS,
+            )
+        except Exception:  # noqa: BLE001 - tracking must never break the write
+            logger.exception("record_case_change failed for %s", getattr(case, "pk", None))
+
     def perform_create(self, serializer):
         serializer.save()
         _safe_timeline(timeline.event_for_case, serializer.instance, self.request)
+        self._record_case_change(serializer.instance)
 
     def perform_update(self, serializer):
         serializer.save()
         _safe_timeline(timeline.event_for_case, serializer.instance, self.request)
+        self._record_case_change(serializer.instance)
 
     def post_upsert(self, obj):
         _safe_timeline(timeline.event_for_case, obj, self.request)
+        self._record_case_change(obj)
 
 
 class ContractedServiceViewSet(BulkUpsertMixin, viewsets.ModelViewSet):

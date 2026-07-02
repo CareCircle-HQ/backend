@@ -430,12 +430,18 @@ def _has_passing_process(enrollment, process_type):
 
 
 @transaction.atomic
-def advance_enrollment(enrollment, to_stage, *, actor=None, note="", force=False):
+def advance_enrollment(enrollment, to_stage, *, actor=None, actor_label="", note="", force=False):
     """Move an enrollment to ``to_stage`` with guard checks. Logs a StageEvent.
 
     Raises :class:`InvalidTransition` for illegal transitions or unmet process
     gates. Pass ``force=True`` to bypass the gate checks (still validates the
     transition map unless the current stage is terminal).
+
+    ``actor`` is the acting ``User`` (recorded on ``StageEvent.actor``).
+    ``actor_label`` is a free-form display string for callers whose actor isn't
+    a User (e.g. the support portal, where the actor is an ``Agent``): it drives
+    the timeline event's ``actor`` and is stored on ``StageEvent.metadata`` for
+    audit, so the history shows WHO advanced the enrollment.
     """
     to_stage = EnrollmentStage(to_stage)
     from_stage = EnrollmentStage(enrollment.stage)
@@ -474,6 +480,7 @@ def advance_enrollment(enrollment, to_stage, *, actor=None, note="", force=False
         source=StageEventSource.MANUAL,
         actor=actor,
         note=note,
+        metadata={"actor_label": actor_label} if actor_label else {},
     )
 
     # Delivery orders are NOT generated here. They are built at the manual
@@ -487,8 +494,9 @@ def advance_enrollment(enrollment, to_stage, *, actor=None, note="", force=False
     try:
         from api.services import timeline
 
-        actor_name = getattr(actor, "get_full_name", lambda: "")() or getattr(
-            actor, "username", ""
+        actor_name = actor_label or (
+            getattr(actor, "get_full_name", lambda: "")()
+            or getattr(actor, "username", "")
         )
         timeline.event_for_verification(
             enrollment, stage_event=stage_event, actor=actor_name or ""

@@ -215,9 +215,15 @@ class DailyPull:
             return
         self._process_contracted_services(case)
         self._process_notes(subject_id=str(case.case_id), client=client, case=case)
-        tickets.evaluate_case(
-            case, previous_status=prev_status, previous_auth_status=prev_auth,
-            import_run=self.run,
+        # Record the case change (timeline events + follow-up tickets) via the
+        # shared handler. Contracted services are loaded just above, so the
+        # case_no_services rule is meaningful here -- no skip (unlike CSV imports).
+        from api.services import case_events
+
+        case_events.record_case_change(
+            case, previous_status=prev_status, previous_auth=prev_auth,
+            source=ChangeSource.IMPORT, actor="system:unite-us-import",
+            create_tickets=True, import_run=self.run,
         )
         self._reconcile_enrollments(case)
         self._emit_timeline(timeline.event_for_case, case)
