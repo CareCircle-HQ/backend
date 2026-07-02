@@ -12,13 +12,18 @@ Rules (confirmed with product):
     another row) is never made a primary of a new household — those rows are skipped.
   * Quantity per delivery comes from the ProductType catalog (meals 3/day, box 1),
     NOT the sheet. Boxes always ship Wednesday; meals use the row's cadence.
+  * Cadence/Facility: the sheet value wins; when blank we fall back to the Cadence
+    CSV (``--cadence-csv``, keyed by client id). Rows still lacking a kitchen stay
+    verified-only (not activated).
+  * Delivery address: taken from the sheet; when blank it falls back to the
+    client's primary (current/home/mailing) address, copied into a DELIVERY record.
 
 Column mapping:
   A=primary id, B-E=address, F=address notes, I/J/K/L=primary meal cat / allergies /
   other-allergy / other-restrictions, M=general note, N=total members,
   HM#2..#10 in 5-col blocks (id, meal category, food allergies, other allergies,
   other restrictions), BH=Cadence (A->Mon/Thu, B->Tue/Fri, Boxes), BI=Facility
-  (ENG, AST, Boxes->Hicksvile).
+  (ENG, AST, Boxes->Hicksville).
 
 Usage:
     python manage.py import_meal_verifications                 # DRY RUN (rolls back)
@@ -26,6 +31,7 @@ Usage:
     python manage.py import_meal_verifications --limit 50       # first 50 rows
     python manage.py import_meal_verifications --file path.xlsx
 """
+import csv
 import re
 import zipfile
 from collections import Counter
@@ -59,6 +65,10 @@ from api.services.orders import generate_delivery_calendar
 
 _NS = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
 _DEFAULT_FILE = "tmp/verification/Meal Inputs Trustworthy.xlsx"
+# Fallback source for Cadence/Facility when the sheet leaves them blank: a CSV
+# keyed by Unite Us Client ID with `Cadence` (A/B/Boxes) and `Facility`
+# (ENG/AST/Hicksville) columns.
+_DEFAULT_CADENCE_CSV = "tmp/verification/Cadence.csv"
 
 # Per-member column blocks: (id, meal_category, food_allergies, other_allergies,
 # other_restrictions). Index 0 is the primary; 1..9 are HM #2..#10.
@@ -78,7 +88,7 @@ _COL_STREET, _COL_CITY, _COL_STATE, _COL_ZIP, _COL_ADDR_NOTES = "B", "C", "D", "
 _COL_TOTAL, _COL_CADENCE, _COL_FACILITY = "N", "BH", "BI"
 
 # Sheet Facility code -> Kitchen.name.
-_FACILITY_TO_KITCHEN = {"eng": "ENG", "ast": "AST", "boxes": "Hicksvile"}
+_FACILITY_TO_KITCHEN = {"eng": "ENG", "ast": "AST", "boxes": "Hicksville", "hicksville": "Hicksville"}
 # Sheet Cadence code -> meal DeliveryCadence (boxes/blank handled separately).
 _CADENCE_TO_DELIVERY = {"a": DeliveryCadence.MON_THU, "b": DeliveryCadence.TUE_FRI}
 
@@ -141,9 +151,49 @@ def _read_rows(path):
     return rows
 
 
+def _load_cadence_csv(path):
+    """Parse the Cadence CSV into ``{client_id_lower: (cadence, facility)}``.
+
+    Returns ``{}`` (and never raises) when the path is blank or missing so the
+    importer still runs on sheets that carry their own Cadence/Facility."""
+    mapping = {}
+    if not path:
+        return mapping
+    try:
+        with open(path, newline="", encoding="utf-8-sig") as fh:
+            reader = csv.reader(fh)
+            next(reader, None)  # header
+            for row in reader:
+                if not row:
+                    continue
+                cid = (row[0] or "").strip().lower()
+                cadence = (row[1] if len(row) > 1 else "").strip()
+                facility = (row[2] if len(row) > 2 else "").strip()
+                if cid:
+                    mapping[cid] = (cadence, facility)
+    except FileNotFoundError:
+        return mapping
+    return mapping
+
+
+_UUID_RE = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+)
+
+
 def _clean(value):
-    v = (value or "").strip().strip('"')
+    v = (value or "").strip().strip('"').strip("\u201c\u201d").strip()
     return "" if v.lower() in _BLANKS else v
+
+
+def _client_id(value):
+    """Return a cleaned value only if it is a well-formed UUID, else ''.
+
+    Sheets occasionally carry malformed ids (smart quotes, a trailing
+    ``/cases`` fragment, etc.); those must be skipped, not crash the row."""
+    v = _clean(value)
+    return v if _UUID_RE.match(v) else ""
 
 
 def _split_tokens(value):
@@ -226,6 +276,12 @@ class Command(BaseCommand):
     def add_arguments(self, parser):
         parser.add_argument("--apply", action="store_true", help="Commit changes.")
         parser.add_argument("--file", default=_DEFAULT_FILE, help="Path to the .xlsx.")
+        parser.add_argument(
+            "--cadence-csv",
+            default=_DEFAULT_CADENCE_CSV,
+            help="CSV (Client ID, Cadence, Facility) used to fill Cadence/Facility "
+            "when the sheet leaves them blank. Pass '' to disable.",
+        )
         parser.add_argument("--limit", type=int, default=0, help="Process first N rows.")
         parser.add_argument(
             "--cadence-a",
@@ -286,6 +342,9 @@ class Command(BaseCommand):
             else None
         )
 
+        # Cadence/Facility fallback keyed by client id (blank sheet cells only).
+        cadence_csv = _load_cadence_csv(options.get("cadence_csv") or "")
+
         kitchens = {k.name: k for k in Kitchen.objects.all()}
 
         # Pass 1: every client id listed as a household MEMBER (HM #2..#10) in any
@@ -293,7 +352,7 @@ class Command(BaseCommand):
         listed_as_member = set()
         for cells in rows:
             for block in _MEMBER_BLOCKS[1:]:
-                mid = _clean(cells.get(block[0]))
+                mid = _client_id(cells.get(block[0]))
                 if mid:
                     listed_as_member.add(mid)
 
@@ -303,18 +362,19 @@ class Command(BaseCommand):
 
         with transaction.atomic():
             for cells in rows:
-                primary_id = _clean(cells.get("A"))
+                primary_id = _client_id(cells.get("A"))
                 try:
                     with transaction.atomic():
                         outcome = self._process_row(
-                            cells, primary_id, kitchens, cadence_map, listed_as_member
+                            cells, primary_id, kitchens, cadence_map,
+                            listed_as_member, cadence_csv,
                         )
                 except Exception as exc:  # isolate a bad row, keep going
                     outcome = ("error", str(exc))
                 report[outcome[0]] += 1
                 reason = outcome[1] if len(outcome) > 1 else ""
-                if outcome[0] == "verified_only":
-                    verified_reasons[reason] += 1
+                if outcome[0] in ("kitchen_assignment", "needs_verification"):
+                    verified_reasons[f"{outcome[0]}: {reason}"] += 1
                 elif outcome[0] != "activated":
                     flags.append((primary_id, reason))
 
@@ -323,7 +383,8 @@ class Command(BaseCommand):
 
         self._report(report, verified_reasons, flags, apply, options["cadence_a"])
 
-    def _process_row(self, cells, primary_id, kitchens, cadence_map, listed_as_member):
+    def _process_row(self, cells, primary_id, kitchens, cadence_map,
+                     listed_as_member, cadence_csv):
         if not primary_id:
             return ("skip_no_primary_id",)
         primary = Client.objects.filter(client_id=primary_id).first()
@@ -373,7 +434,7 @@ class Command(BaseCommand):
         unresolved = 0
         in_other_household = 0
         for block in _MEMBER_BLOCKS[1:]:
-            mid = _clean(cells.get(block[0]))
+            mid = _client_id(cells.get(block[0]))
             if not mid or mid == primary_id or mid in block_for:
                 continue
             c = Client.objects.filter(client_id=mid).first()
@@ -428,6 +489,7 @@ class Command(BaseCommand):
 
         # --- Member dietary profiles ---
         primary_kind = None
+        primary_menu_type = ""
         for m in member_clients:
             block = block_for.get(str(m.client_id), _MEMBER_BLOCKS[0])
             fields, kind = _profile_fields(block, cells)
@@ -435,6 +497,7 @@ class Command(BaseCommand):
                 fields["menu_type"] = self.default_menu
             if m is primary:
                 primary_kind = kind
+                primary_menu_type = fields["menu_type"]
             MemberDietaryProfile.objects.create(
                 enrollment=enr,
                 client=m,
@@ -442,78 +505,144 @@ class Command(BaseCommand):
                 **fields,
             )
 
+        # A blank primary meal category with a default menu -> treat as meals.
+        if primary_kind is None and self.default_menu:
+            primary_kind = ProductTypeKind.MEALS
+
+        # --- Resolve kitchen + cadence (sheet wins; Cadence CSV fills blanks) ---
+        csv_cadence, csv_facility = cadence_csv.get((primary_id or "").lower(), ("", ""))
+        facility = (cells.get(_COL_FACILITY) or "").strip().lower() \
+            or (csv_facility or "").strip().lower()
+        kitchen = kitchens.get(_FACILITY_TO_KITCHEN.get(facility, ""))
+        if kitchen is None and self.default_facility:
+            kitchen = kitchens.get(self.default_facility)
+        is_boxes = primary_kind == ProductTypeKind.BOXES
+        cadence_code = (cells.get(_COL_CADENCE) or "").strip().lower() \
+            or (csv_cadence or "").strip().lower()
+        meal_cadence = cadence_map.get(cadence_code)
+        if meal_cadence is None and not is_boxes and self.default_cadence:
+            meal_cadence = self.default_cadence
+
+        # --- Tiered outcome by data completeness (auth gates ACTIVE only) ---
+        has_address = address is not None
+        has_menu = bool(primary_menu_type)
+        has_cadence = is_boxes or meal_cadence is not None
+        authorized = case.service_authorization_status in _AUTHORIZED
+
+        # Tier 3: missing delivery address OR menu type -> stays Pending
+        # Verification (enrollment already created at that stage; do not advance).
+        if not has_address or not has_menu:
+            missing = []
+            if not has_address:
+                missing.append("delivery address")
+            if not has_menu:
+                missing.append("menu type")
+            return ("needs_verification", "missing " + " + ".join(missing))
+
+        # Address + menu type present -> the household is Verified.
         advance_enrollment(
             enr, EnrollmentStage.VERIFIED, force=True,
             note="Imported from Meal Inputs verification sheet.",
         )
 
-        # A blank primary meal category with a default menu -> treat as meals.
-        if primary_kind is None and self.default_menu:
-            primary_kind = ProductTypeKind.MEALS
+        # Tier 1: data-complete (kitchen + cadence) AND authorized -> activate.
+        if kitchen is not None and has_cadence and authorized:
+            enr.kitchen = kitchen
+            enr.save(update_fields=["kitchen"])
+            for profile in enr.member_profiles.all():
+                apply_to_member(profile)
+            create_member_delivery_schedules(
+                enr,
+                case=case,
+                cadence=(meal_cadence or DeliveryCadence.ONCE_A_WEEK),
+                kitchen=kitchen,
+                product_kind=primary_kind,
+            )
+            generate_delivery_calendar(enr)
+            advance_enrollment(
+                enr, EnrollmentStage.SERVICE_ACTIVE, force=True,
+                note=f"Imported; kitchen assigned ({kitchen.name}); service activated.",
+            )
+            return ("activated",)
 
-        # --- Kitchen assignment + activation (only when authorized) ---
-        facility = (cells.get(_COL_FACILITY) or "").strip().lower()
-        kitchen = kitchens.get(_FACILITY_TO_KITCHEN.get(facility, ""))
-        if kitchen is None and self.default_facility:
-            kitchen = kitchens.get(self.default_facility)
-        is_boxes = primary_kind == ProductTypeKind.BOXES
-        cadence_code = (cells.get(_COL_CADENCE) or "").strip().lower()
-        meal_cadence = cadence_map.get(cadence_code)
-        if meal_cadence is None and not is_boxes and self.default_cadence:
-            meal_cadence = self.default_cadence
-        authorized = case.service_authorization_status in _AUTHORIZED
-        has_cadence = is_boxes or meal_cadence is not None
-
+        # Tier 2: verified but can't activate yet -> Kitchen Assignment.
         if not authorized:
-            return ("verified_only", "case not authorized")
-        if kitchen is None:
-            return ("verified_only", "no kitchen (blank/unmapped facility)")
-        if not has_cadence:
-            return ("verified_only", "meals row without a cadence")
-
-        enr.kitchen = kitchen
-        enr.save(update_fields=["kitchen"])
-        for profile in enr.member_profiles.all():
-            apply_to_member(profile)
-        create_member_delivery_schedules(
-            enr,
-            case=case,
-            cadence=(meal_cadence or DeliveryCadence.ONCE_A_WEEK),
-            kitchen=kitchen,
-            product_kind=primary_kind,
-        )
-        generate_delivery_calendar(enr)
+            reason = "case not authorized"
+        elif kitchen is None:
+            reason = "no kitchen (blank/unmapped facility)"
+        else:
+            reason = "meals row without a cadence"
         advance_enrollment(
-            enr, EnrollmentStage.SERVICE_ACTIVE, force=True,
-            note=f"Imported; kitchen assigned ({kitchen.name}); service activated.",
+            enr, EnrollmentStage.KITCHEN_ASSIGNMENT, force=True,
+            note=f"Imported; verified, awaiting kitchen assignment ({reason}).",
         )
-        return ("activated",)
+        return ("kitchen_assignment", reason)
 
     def _delivery_address(self, primary, cells):
         street = _clean(cells.get(_COL_STREET))
         city = _clean(cells.get(_COL_CITY))
-        if not (street or city):
-            return None
         now = timezone.now()
+        if street or city:
+            return Address.objects.create(
+                client=primary,
+                type=AddressType.DELIVERY,
+                street=street[:255],
+                city=city[:120],
+                state=_clean(cells.get(_COL_STATE))[:2],
+                zip=_clean(cells.get(_COL_ZIP))[:10],
+                notes=_clean(cells.get(_COL_ADDR_NOTES)),
+                created_at=now,
+                updated_at=now,
+            )
+        # No delivery address on the sheet -> fall back to the client's primary
+        # (current/home) address, copied into a DELIVERY record.
+        src = self._primary_address(primary)
+        if src is None:
+            return None
         return Address.objects.create(
             client=primary,
             type=AddressType.DELIVERY,
-            street=street[:255],
-            city=city[:120],
-            state=_clean(cells.get(_COL_STATE))[:2],
-            zip=_clean(cells.get(_COL_ZIP))[:10],
-            notes=_clean(cells.get(_COL_ADDR_NOTES)),
+            street=src.street,
+            unit=src.unit,
+            city=src.city,
+            county=src.county,
+            state=src.state,
+            zip=src.zip,
+            notes=src.notes,
             created_at=now,
             updated_at=now,
         )
+
+    # Address types (in priority order) that represent a client's "primary"
+    # residence we can deliver to when the sheet has no delivery address.
+    _PRIMARY_ADDRESS_TYPES = (
+        AddressType.CURRENT,
+        AddressType.HOME,
+        AddressType.MAILING,
+    )
+
+    def _primary_address(self, client):
+        """The client's best existing non-delivery address (with a street/city)."""
+        addrs = [
+            a for a in client.addresses.all()
+            if (a.street or a.city) and a.type != AddressType.DELIVERY
+        ]
+        if not addrs:
+            return None
+        for kind in self._PRIMARY_ADDRESS_TYPES:
+            for a in addrs:
+                if a.type == kind:
+                    return a
+        return addrs[0]
 
     def _report(self, report, verified_reasons, flags, apply, cadence_a):
         head = self.style.MIGRATE_HEADING
         self.stdout.write(head("\n=== Meal verification import ==="))
         self.stdout.write(f"Cadence 'A' -> {cadence_a} ('B' -> the other)")
         order = [
-            ("activated", "Activated (kitchen + service active)"),
-            ("verified_only", "Built + verified (not activated)"),
+            ("activated", "Service Active (verified + kitchen + activated)"),
+            ("kitchen_assignment", "Verified -> Kitchen Assignment (awaiting kitchen)"),
+            ("needs_verification", "Pending Verification (missing address/menu)"),
             ("skip_already_enrolled", "Skipped: already enrolled"),
             ("skip_no_internal_case", "Skipped: no internal-service case"),
             ("skip_member_of_other_household", "Skipped: single, already in a household"),
@@ -528,7 +657,7 @@ class Command(BaseCommand):
         self.stdout.write(f"  {'TOTAL rows':<44}: {sum(report.values())}")
 
         if verified_reasons:
-            self.stdout.write(head("\nVerified-only (not activated) by reason:"))
+            self.stdout.write(head("\nKitchen-assignment / pending-verification by reason:"))
             for reason, n in verified_reasons.most_common():
                 self.stdout.write(f"  {reason:<44}: {n}")
 

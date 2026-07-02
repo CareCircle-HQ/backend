@@ -416,7 +416,7 @@ def split_purchase_order(po, delivery_order_ids, new_delivery_date):
 
 # Boxes export columns, in order.
 _BOX_EXPORT_HEADERS = [
-    "Delivery Date", "OrderID", "HouseholdID", "Quantity", "MemberID", "Name",
+    "Delivery Date", "OrderID", "HouseholdGroup", "Quantity", "MemberID", "Name",
     "Address 1", "Address 2", "City", "State", "Postal", "Delivery Notes",
     "MenuType", "FOOD NOTE", "Email address", "Phone",
 ]
@@ -485,6 +485,18 @@ def kitchen_export_filename(po):
     po_part = _slug(po.po_number or str(po.pk))
     kitchen_part = _slug(po.kitchen.name if po.kitchen else "Unassigned")
     return f"{po_part}_{kitchen_part}.csv"
+
+
+def _household_group_code(household):
+    """Stable, unique-per-household grouping code for exports, e.g.
+    ``HH-2C1AFF529738``. Deterministic from the household UUID, so every member
+    of the same household shares the exact same code AND it stays identical
+    across different PO exports (lets the recipient reconcile a household over
+    time). 12 hex chars (48 bits) makes collisions effectively impossible.
+    Empty when the member isn't in a household (no group to identify)."""
+    if household is None:
+        return ""
+    return f"HH-{household.household_id.hex[:12].upper()}"
 
 
 def _household_label(household):
@@ -560,7 +572,7 @@ def build_kitchen_export_rows(po):
         rows.append([
             do.expected_delivery_date.isoformat() if do.expected_delivery_date else "",
             str(do.delivery_order_id),
-            _household_label(do.group),
+            _household_group_code(do.group),
             do.quantity if do.quantity is not None else "",
             str(c.client_id) if c else "",
             name,

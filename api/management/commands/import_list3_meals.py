@@ -20,7 +20,7 @@ Column mapping (shifted vs the Trustworthy sheet by the Output + AI-RE columns):
   H=Food Note Output, I-L=primary input meal cat/allergies/other-allergy/
   other-restrictions, M=general note, N-R=AI-RE (meal cat/allergies/restrictions/
   other-dietary/notes), S=total members, HM #2..#10 in 5-col blocks from T,
-  BM=Cadence (A/B/Boxes), BN=Facility (ENG/AST/Boxes->Hicksvile).
+  BM=Cadence (A/B/Boxes), BN=Facility (ENG/AST/Boxes->Hicksville).
 
 The PRIMARY's dietary profile is captured from the AI-RE columns (N-R);
 dependents (HM #2..#10) use their raw blocks.
@@ -89,7 +89,7 @@ _DEP_BLOCKS = [
 ]
 _COL_CADENCE, _COL_FACILITY = "BM", "BN"
 
-_FACILITY_TO_KITCHEN = {"eng": "ENG", "ast": "AST", "boxes": "Hicksvile"}
+_FACILITY_TO_KITCHEN = {"eng": "ENG", "ast": "AST", "boxes": "Hicksville", "hicksville": "Hicksville"}
 _AUTHORIZED = {
     ServiceAuthorizationStatus.APPROVED,
     ServiceAuthorizationStatus.NOT_REQUIRED,
