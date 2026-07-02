@@ -59,7 +59,7 @@ from api.serializers import (
     ScreeningSerializer,
     derive_case_type,
 )
-from api.services import timeline
+from api.services import timeline, tickets
 
 logger = logging.getLogger(__name__)
 
@@ -67,12 +67,12 @@ CSV_SOURCE = "csv_uniteus"
 TIMELINE_ACTOR = "system:csv-import"
 
 # Export types exposed in the Settings > Import web UI.
-SUPPORTED_EXPORT_TYPES = ("clients", "screening", "assessments", "cases")
+SUPPORTED_EXPORT_TYPES = ("clients", "screening", "assessments", "cases", "notes")
 
-# Every export type the engine understands. ``notes`` is intentionally CLI-only
-# (run via ``manage.py import_csv``) and NOT in SUPPORTED_EXPORT_TYPES, so the
-# Settings upload never offers it.
-CLI_EXPORT_TYPES = SUPPORTED_EXPORT_TYPES + ("notes",)
+# Every export type the engine understands. Now identical to the web-UI set --
+# notes is offered in Settings too (uploaded to S3 + processed by Celery like
+# the rest), not just via ``manage.py import_csv``.
+CLI_EXPORT_TYPES = SUPPORTED_EXPORT_TYPES
 
 
 # --- streaming helpers -----------------------------------------------------
@@ -583,7 +583,12 @@ def map_case_row(row):
 
 # --- importer --------------------------------------------------------------
 class CsvImporter:
-    def __init__(self, run, emit_side_effects=True):
+    # Case-ticket actions to detect but never auto-create from a CSV import.
+    # (Currently none: the case_no_services rule was removed because only the
+    # household primary holds internal-service cases, so it flooded members.)
+    SKIP_TICKET_ACTIONS = frozenset()
+
+    def __init__(self, run, emit_side_effects=True, create_tickets=False):
         self.run = run
         self.errors = []
         self.stats = {"created": 0, "updated": 0, "skipped": 0, "errors": 0}
@@ -598,9 +603,51 @@ class CsvImporter:
         # self-heals lifecycle_stage even on bulk loads (emit_side_effects=False)
         # and regardless of the order the client/case/screening files arrive in.
         self.touched_client_ids = set()
+        # --- live progress (for the async S3 + Celery flow) --------------------
+        # Every _count() call == one processed work item (a row for cases/notes,
+        # a grouped entity for clients/screenings/assessments). ``processed`` is
+        # the numerator; ``progress_total`` the denominator (set once known via
+        # _set_total). We flush both to the ImportRun row every ``flush_every``
+        # items with a cheap UPDATE so the UI can poll a real percentage that
+        # survives page reloads -- without touching the run object mid-stream.
+        self.processed = 0
+        self.progress_total = None
+        self.flush_every = 200
+        # --- follow-up actions (case imports only) ----------------------------
+        # create_tickets=False (default) => PREVIEW: detect the follow-up tickets
+        # a case import WOULD open and record them for review, WITHOUT writing any
+        # Ticket rows. =True => also open them (parity with the daily sync). The
+        # aggregate (stats["actions"]) + a capped detail list (planned_actions)
+        # are stored on the run either way so an agent can review before/after.
+        self.create_tickets = create_tickets
+        self._track_actions = False  # flipped on by import_cases
+        self._planned_cap = 1000
+        self.actions = {
+            "applied": create_tickets,   # ticket creation enabled for this run
+            "tickets": 0,                # detected (all rules)
+            "tickets_created": 0,        # actually opened
+            "cases_closed": 0,
+            "auth_changed": 0,
+            "timeline_events": 0,
+            "auth_changed_to": {},  # {new_status: count}
+        }
+        self.planned_actions = []
+
+    def _flush_progress(self):
+        ImportRun.objects.filter(pk=self.run.pk).update(
+            processed_count=self.processed, progress_total=self.progress_total,
+        )
+
+    def _set_total(self, total):
+        """Record the number of work items this run will process (denominator)."""
+        self.progress_total = int(total) if total is not None else None
+        self._flush_progress()
 
     def _count(self, kind):
         self.stats[kind] += 1
+        self.processed += 1
+        if self.processed % self.flush_every == 0:
+            self._flush_progress()
 
     def _mark_touched(self, client_id):
         if client_id:
@@ -655,6 +702,8 @@ class CsvImporter:
                 continue
             groups.setdefault(cid, []).append(row)
 
+        # Denominator = blank-key rows already skipped + one item per group.
+        self._set_total(self.processed + len(groups))
         for cid, rows in groups.items():
             existed = Client.objects.filter(pk=cid).exists()
             try:
@@ -709,6 +758,8 @@ class CsvImporter:
                 continue
             groups.setdefault(sid, []).append(row)
 
+        # Denominator = blank-key rows already skipped + one item per screen.
+        self._set_total(self.processed + len(groups))
         for sid, rows in groups.items():
             head = rows[0]
             # Facilitator allowlist (only enforced when the list is non-empty).
@@ -799,6 +850,8 @@ class CsvImporter:
                 continue
             groups.setdefault(sid, []).append(row)
 
+        # Denominator = blank-key rows already skipped + one item per submission.
+        self._set_total(self.processed + len(groups))
         for sid, rows in groups.items():
             head = rows[0]
             # Creator allowlist (only enforced when the list is non-empty).
@@ -926,6 +979,9 @@ class CsvImporter:
 
     def import_cases(self, reader, provider_id=None, provider_name=None):
         self.dataset = "cases"
+        # Case imports detect/preview follow-up actions (tickets, closes, auth
+        # changes) -- record them in stats["actions"] + planned_actions.
+        self._track_actions = self.emit_side_effects
         # Optional provider scope: import only rows serviced by the given
         # provider (id OR name, case-insensitive/trimmed). Non-matching rows are
         # counted as skipped. Used to load a single provider (e.g. Met Council)
@@ -984,7 +1040,12 @@ class CsvImporter:
             ) == CaseType.EXTERNAL_SERVICE:
                 self._count("skipped")
                 continue
-            existed = Case.objects.filter(pk=cid).exists()
+            # Capture the pre-save status/auth so we can detect what changed
+            # (case closed, authorization approved/denied/etc.) after upsert.
+            prev = Case.objects.filter(pk=cid).first()
+            existed = prev is not None
+            prev_status = prev.case_status if prev else None
+            prev_auth = prev.service_authorization_status if prev else None
             try:
                 payload = map_case_row(row)
                 ser = CaseSerializer(data=payload)
@@ -993,23 +1054,67 @@ class CsvImporter:
                 self._mark_touched(case.client_id)
                 self._count("updated" if existed else "created")
                 if self.emit_side_effects:
-                    self._post_save_case(case)
+                    self._post_save_case(case, prev_status, prev_auth)
             except Exception as exc:  # isolate one bad case from the run
                 self._count("errors")
                 self.errors.append(f"case {cid}: {exc}")
                 logger.warning("csv_import case %s failed: %s", cid, exc)
 
-    def _post_save_case(self, case):
-        """Emit the case timeline + recompute the funnel stage (cases drive the
-        Navigation stage). No tickets and no enrollment reconciliation / order
-        generation — this is a historical bulk load."""
+    def _post_save_case(self, case, previous_status=None, previous_auth_status=None):
+        """Emit the case timeline, record (and optionally open) the follow-up
+        tickets a change triggers, and recompute the funnel stage (cases drive
+        the Navigation stage). Tickets are only WRITTEN when create_tickets is
+        True; otherwise they're previewed for review. No enrollment
+        reconciliation / order generation — this is a historical bulk load."""
         try:
-            timeline.event_for_case(
+            event = timeline.event_for_case(
                 case, source=ChangeSource.IMPORT, actor=TIMELINE_ACTOR,
             )
+            if event is not None:
+                self.actions["timeline_events"] += 1
         except Exception:  # noqa: BLE001
             logger.warning("csv_import case timeline failed", exc_info=True)
+        self._record_case_actions(case, previous_status, previous_auth_status)
         self._recompute_stage(case.client_id, case.client)
+
+    def _record_case_actions(self, case, previous_status, previous_auth_status):
+        """Record the case change (timeline events + follow-up tickets) via the
+        shared handler, then aggregate the outcome into ``self.actions`` +
+        ``self.planned_actions`` for the Import Activity review. Tickets are
+        opened only when ``create_tickets`` is True and the action isn't excluded
+        for CSV imports (``SKIP_TICKET_ACTIONS``); everything is attributed to
+        the import and the uploading agent (``run.triggered_by``)."""
+        from api.services import case_events
+
+        res = case_events.record_case_change(
+            case,
+            previous_status=previous_status,
+            previous_auth=previous_auth_status,
+            source=ChangeSource.IMPORT,
+            actor=self.run.triggered_by or TIMELINE_ACTOR,
+            create_tickets=self.create_tickets,
+            skip_actions=self.SKIP_TICKET_ACTIONS,
+            import_run=self.run,
+        )
+        self.actions["timeline_events"] += res.timeline_events
+        self.actions["tickets_created"] += res.tickets_created
+        for p in res.planned:
+            self.actions["tickets"] += 1
+            if p["action"] in self.actions:
+                self.actions[p["action"]] += 1
+            if p["action"] == "auth_changed" and p["detail"]:
+                self.actions["auth_changed_to"][p["detail"]] = (
+                    self.actions["auth_changed_to"].get(p["detail"], 0) + 1
+                )
+            if len(self.planned_actions) < self._planned_cap:
+                self.planned_actions.append({
+                    "case_id": str(case.case_id),
+                    "client_id": str(case.client_id or ""),
+                    "action": p["action"],
+                    "detail": p["detail"],
+                    "reason": p["reason"],
+                    "created": p["created"],
+                })
 
     def recompute_touched(self):
         """Recompute the funnel stage for every client this run touched, once.
@@ -1035,19 +1140,147 @@ class CsvImporter:
 
     def finalize(self):
         self.run.stats = {self.dataset: dict(self.stats)}
+        # Case imports also record the follow-up actions detected (previewed or
+        # applied) so the UI can show what tickets/changes the run produced.
+        if self._track_actions:
+            self.run.stats["actions"] = dict(self.actions)
+            self.run.planned_actions = self.planned_actions
         self.run.created_count = self.stats["created"]
         self.run.updated_count = self.stats["updated"]
         self.run.skipped_count = self.stats["skipped"]
         self.run.error_count = self.stats["errors"]
         self.run.processed_count = sum(self.stats.values())
+        # Preserve the pre-counted denominator so the final row shows 100%
+        # (guards against run.save() overwriting the value set via _flush).
+        self.run.progress_total = self.progress_total
+
+
+def _precount_data_rows(file_obj):
+    """Count data rows (excluding the header) in a CSV, tolerant of quoted
+    fields that contain embedded newlines. Rewinds ``file_obj`` afterwards so
+    the real import pass reads from the top. Returns None if the stream can't
+    be rewound (so we simply fall back to an indeterminate progress bar)."""
+    wrapper = _text_stream(file_obj)
+    reader = csv.reader(wrapper)
+    try:
+        next(reader, None)  # header
+        total = sum(1 for _ in reader)
+    except Exception:  # noqa: BLE001 - never fail the import on a pre-count hiccup
+        return None
+    finally:
+        # Detach so the wrapper doesn't close the underlying file on GC -- the
+        # real import pass reads the same file_obj again right after this.
+        try:
+            wrapper.detach()
+        except Exception:  # noqa: BLE001 - StringIO fallback has no detach()
+            pass
+    raw = getattr(file_obj, "file", file_obj)
+    try:
+        raw.seek(0)
+    except (AttributeError, OSError, ValueError):
+        return None  # not rewindable -> skip the pre-count denominator
+    return total
+
+
+# Signature id-column that identifies each export type. Order matters: cases /
+# screening / assessments / notes all ALSO carry client_id, so their specific
+# key is checked first; clients (client_id only) is the fallback.
+_EXPORT_SIGNATURES = (
+    ("cases", "case_id"),
+    ("screening", "enhanced_screen_id"),
+    ("assessments", "submission_id"),
+    ("notes", "note_id"),
+    ("clients", "client_id"),
+)
+_SIGNATURE_COLUMN = dict(_EXPORT_SIGNATURES)
+
+# Columns each importer critically depends on. If the file is the right TYPE but
+# one of these is missing, the export schema likely changed (Unite Us renamed a
+# column) -- fail loudly rather than silently importing partial/blank data.
+_REQUIRED_COLUMNS = {
+    "clients": ("client_id", "first_name", "last_name", "client_consent_status"),
+    "cases": ("case_id", "client_id", "case_status", "program_name",
+              "service_subtype", "service_authorization_status"),
+    "screening": ("enhanced_screen_id", "client_id"),
+    "assessments": ("submission_id", "client_id"),
+    "notes": ("note_id", "client_id", "text"),
+}
+
+
+def _read_header(file_obj):
+    """Read the CSV header row (normalized: BOM-stripped, lowercased) and rewind
+    ``file_obj`` so the real import pass reads from the top. Returns [] on any
+    hiccup (so we skip the guard rather than block a valid import)."""
+    wrapper = _text_stream(file_obj)
+    reader = csv.reader(wrapper)
+    try:
+        header = next(reader, []) or []
+    except Exception:  # noqa: BLE001
+        header = []
+    finally:
+        try:
+            wrapper.detach()
+        except Exception:  # noqa: BLE001 - StringIO fallback has no detach()
+            pass
+    raw = getattr(file_obj, "file", file_obj)
+    try:
+        raw.seek(0)
+    except (AttributeError, OSError, ValueError):
+        pass
+    return [(h or "").strip().lstrip("\ufeff").lower() for h in header]
+
+
+def _detect_export_type(header):
+    cols = set(header)
+    for export_type, key in _EXPORT_SIGNATURES:
+        if key in cols:
+            return export_type
+    return None
+
+
+def _header_mismatch(export_type, header):
+    """Return a human error string if the CSV header doesn't match the selected
+    export type, else None. Guards against e.g. uploading a Cases export while
+    'Clients' is selected (which would reject every row)."""
+    if not header:
+        return None  # unreadable header -> let the import proceed / fail normally
+    detected = _detect_export_type(header)
+    if detected is None:
+        expected = _SIGNATURE_COLUMN.get(export_type, "id")
+        return (
+            f"This file doesn't look like a Unite Us {export_type} export "
+            f"(missing a '{expected}' column). Check the file and export type."
+        )
+    if detected != export_type:
+        return (
+            f"This looks like a {detected} export, but '{export_type}' is "
+            f"selected. Choose the '{detected}' export type (or upload the "
+            f"matching {export_type} file)."
+        )
+    # Right type: verify the columns the importer depends on are present, so a
+    # Unite Us schema change (renamed/removed column) fails loudly instead of
+    # silently importing blank/partial data.
+    cols = set(header)
+    missing = [c for c in _REQUIRED_COLUMNS.get(export_type, ()) if c not in cols]
+    if missing:
+        return (
+            f"This {export_type} export is missing expected column(s): "
+            f"{', '.join(missing)}. The Unite Us export format may have changed "
+            f"-- check the column names before importing."
+        )
+    return None
 
 
 def run_csv_import(*, export_type, file_obj, triggered_by="manual", emit_side_effects=True,
-                   provider_id=None, provider_name=None):
+                   provider_id=None, provider_name=None, run=None, create_tickets=False):
     """Import an uploaded Unite Us CSV ``file_obj`` of ``export_type``.
 
     Returns the persisted :class:`ImportRun`. ``file_obj`` may be any
     binary/text file-like object (e.g. a Django ``UploadedFile``).
+
+    Pass an existing ``run`` (created earlier, e.g. at S3-presign time) to
+    reuse it instead of creating a new one -- the async Celery flow does this so
+    the row the browser is already polling is the one that gets updated.
 
     When ``emit_side_effects`` is False, only the data rows are written --
     timeline events and funnel-stage recompute are skipped (useful for bulk
@@ -1059,11 +1292,40 @@ def run_csv_import(*, export_type, file_obj, triggered_by="manual", emit_side_ef
             f"Supported: {', '.join(CLI_EXPORT_TYPES)}."
         )
 
-    run = ImportRun.objects.create(
-        source=CSV_SOURCE, status=ImportRunStatus.RUNNING, triggered_by=triggered_by,
+    if run is None:
+        run = ImportRun.objects.create(
+            source=CSV_SOURCE, status=ImportRunStatus.RUNNING,
+            triggered_by=triggered_by, export_type=export_type,
+        )
+    else:
+        run.status = ImportRunStatus.RUNNING
+        if not run.export_type:
+            run.export_type = export_type
+        run.save(update_fields=["status", "export_type"])
+
+    # Guard: reject a file whose columns don't match the selected export type
+    # (e.g. a Cases export uploaded as "Clients") before doing any work, with a
+    # clear message instead of silently failing every row.
+    mismatch = _header_mismatch(export_type, _read_header(file_obj))
+    if mismatch is not None:
+        run.status = ImportRunStatus.FAILED
+        run.error_log = mismatch
+        run.finished_at = timezone.now()
+        run.save()
+        return run
+
+    importer = CsvImporter(
+        run, emit_side_effects=emit_side_effects, create_tickets=create_tickets,
     )
-    importer = CsvImporter(run, emit_side_effects=emit_side_effects)
     try:
+        # Row-per-entity exports (one _count() call per row) get an exact
+        # denominator up front. Grouped exports (clients/screenings/assessments)
+        # instead set their denominator to the group count after grouping, since
+        # rows there collapse many-to-one.
+        if export_type in ("cases", "notes"):
+            total = _precount_data_rows(file_obj)
+            if total is not None:
+                importer._set_total(total)
         # Stream the file as text (tolerating a UTF-8 BOM from spreadsheet
         # exports) rather than reading it all into memory -- the screening
         # export runs to several GB.

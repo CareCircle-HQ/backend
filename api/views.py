@@ -23,6 +23,7 @@ from .models import (
     EnrollmentVerification,
     FoodAllergy,
     HouseholdMember,
+    MemberDietaryProfile,
     MenuCategory,
     MenuType,
     Program,
@@ -46,7 +47,9 @@ from .serializers import (
     TimelineEventSerializer,
     UserSerializer,
     ensure_household_with_primary,
+    sync_household_members,
 )
+from .history import ChangeSource
 from .services import timeline
 from .services.lifecycle import (
     InvalidTransition,
@@ -415,6 +418,10 @@ class ClientViewSet(BulkUpsertMixin, viewsets.ModelViewSet):
         HouseholdMember.objects.create(
             household=household, client=member_client, is_primary=False
         )
+        # Mirror the member into the household's active enrollment as a dietary
+        # profile so they show + are editable on the CRM Household tab (and share
+        # the enrollment's address/service). No-op when there's no enrollment yet.
+        sync_household_members(primary)
         return self._household_response(primary)
 
     @action(detail=True, methods=["post"], url_path="household/remove")
@@ -436,6 +443,12 @@ class ClientViewSet(BulkUpsertMixin, viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST,
             )
         member.delete()
+        # Also drop the member's dietary profile(s) on this household's
+        # enrollments -- otherwise the read-side sync (which ties any profiled
+        # client back into the roster) would immediately re-add them.
+        MemberDietaryProfile.objects.filter(
+            client_id=member_id, enrollment__household=household
+        ).delete()
         return self._household_response(primary)
 
 
@@ -454,16 +467,41 @@ class CaseViewSet(BulkUpsertMixin, viewsets.ModelViewSet):
             qs = qs.filter(client_id=client)
         return qs
 
+    # No case-ticket actions are suppressed for extension writes (the
+    # case_no_services rule was removed globally). Kept as a hook for future use.
+    _SKIP_TICKET_ACTIONS = frozenset()
+
+    def _record_case_change(self, case):
+        """Emit case-change timeline events + open follow-up tickets for a case
+        written by the extension, attributed to the acting agent."""
+        from .services import case_events
+
+        try:
+            case_events.record_case_change(
+                case,
+                previous_status=getattr(case, "_prev_status", None),
+                previous_auth=getattr(case, "_prev_auth", None),
+                source=ChangeSource.EXTENSION,
+                actor=_agent_actor(self.request),
+                create_tickets=True,
+                skip_actions=self._SKIP_TICKET_ACTIONS,
+            )
+        except Exception:  # noqa: BLE001 - tracking must never break the write
+            logger.exception("record_case_change failed for %s", getattr(case, "pk", None))
+
     def perform_create(self, serializer):
         serializer.save()
         _safe_timeline(timeline.event_for_case, serializer.instance, self.request)
+        self._record_case_change(serializer.instance)
 
     def perform_update(self, serializer):
         serializer.save()
         _safe_timeline(timeline.event_for_case, serializer.instance, self.request)
+        self._record_case_change(serializer.instance)
 
     def post_upsert(self, obj):
         _safe_timeline(timeline.event_for_case, obj, self.request)
+        self._record_case_change(obj)
 
 
 class ContractedServiceViewSet(BulkUpsertMixin, viewsets.ModelViewSet):

@@ -9,6 +9,7 @@ on a dedupe_key, so re-running won't duplicate events.
     python manage.py backfill_timeline --client-id <uuid>   # one client (repeatable)
 """
 
+from django.contrib.contenttypes.models import ContentType
 from django.core.management.base import BaseCommand
 
 from api.history import ChangeSource
@@ -16,9 +17,12 @@ from api.models import (
     Assessment,
     Case,
     Client,
+    EnrollmentVerification,
     Insurance,
     Screening,
     SocialCareCoverage,
+    Ticket,
+    TimelineEvent,
 )
 from api.services import timeline
 
@@ -72,7 +76,48 @@ class Command(BaseCommand):
             if timeline.event_for_case(c, source=SRC, actor=ACTOR):
                 counts["case"] += 1
 
+        # Stamp the case FK on existing case-scoped rows that predate it (case
+        # events, verification events via the enrollment, ticket events). New
+        # rows are stamped at emit time; this fills the historical gap.
+        stamped = self._stamp_cases(options.get("client_id"))
+
         total = sum(counts.values())
         self.stdout.write(self.style.SUCCESS(
-            f"Backfilled {total} timeline events: {counts}"
+            f"Backfilled {total} timeline events: {counts}; case-stamped {stamped} rows"
         ))
+
+    def _stamp_cases(self, client_ids):
+        """Fill TimelineEvent.case on existing rows where it's null but derivable
+        from the linked entity (Case / EnrollmentVerification / Ticket)."""
+        base = TimelineEvent.objects.filter(case__isnull=True).exclude(object_id="")
+        if client_ids:
+            base = base.filter(client_id__in=client_ids)
+
+        stamped = 0
+        # Case events: the linked entity IS the case.
+        ct_case = ContentType.objects.get_for_model(Case)
+        for ev in base.filter(content_type=ct_case).iterator():
+            if Case.objects.filter(pk=ev.object_id).exists():
+                ev.case_id = ev.object_id
+                ev.save(update_fields=["case"])
+                stamped += 1
+
+        # Verification events: the case comes from the linked enrollment.
+        ct_enr = ContentType.objects.get_for_model(EnrollmentVerification)
+        for ev in base.filter(content_type=ct_enr).iterator():
+            enr = EnrollmentVerification.objects.filter(pk=ev.object_id).first()
+            if enr and enr.case_id:
+                ev.case_id = enr.case_id
+                ev.save(update_fields=["case"])
+                stamped += 1
+
+        # Ticket events: the case comes from the linked ticket.
+        ct_ticket = ContentType.objects.get_for_model(Ticket)
+        for ev in base.filter(content_type=ct_ticket).iterator():
+            tk = Ticket.objects.filter(pk=ev.object_id).first()
+            if tk and tk.case_id:
+                ev.case_id = tk.case_id
+                ev.save(update_fields=["case"])
+                stamped += 1
+
+        return stamped

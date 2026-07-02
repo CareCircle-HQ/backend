@@ -16,6 +16,8 @@ from .views_members import (
     HouseholdMemberEditView,
     MemberAssignKitchenView,
     MemberCadenceView,
+    MemberCaseAuditView,
+    MemberCaseHistoryView,
     MemberCasesView,
     MemberDetailView,
     MemberDiagnosticView,
@@ -59,8 +61,13 @@ from .views_orders import (
     SendToDeliveryView,
     SendToKitchenView,
 )
+from .views_activity import ActivityFiltersView, ActivityLogView
 from .views_imports import (
+    ImportActivityView,
+    ImportPresignView,
+    ImportRunDetailView,
     ImportRunsView,
+    ImportStartView,
     ImportUploadView,
     UniteUsAgentDetailView,
     UniteUsAgentsView,
@@ -127,6 +134,14 @@ urlpatterns = [
     path("members/<uuid:client_id>/resume/", MemberServiceResumeView.as_view()),
     path("members/<uuid:client_id>/notes/", MemberNotesView.as_view()),
     path("members/<uuid:client_id>/cases/", MemberCasesView.as_view()),
+    path(
+        "members/<uuid:client_id>/cases/<uuid:case_id>/history/",
+        MemberCaseHistoryView.as_view(),
+    ),
+    path(
+        "members/<uuid:client_id>/cases/<uuid:case_id>/audit/",
+        MemberCaseAuditView.as_view(),
+    ),
     path("members/<uuid:client_id>/tickets/", MemberTicketsView.as_view()),
     path("members/<uuid:client_id>/verification/", MemberVerificationCreateView.as_view()),
     path("members/<uuid:client_id>/diagnostic/", MemberDiagnosticView.as_view()),
@@ -166,6 +181,15 @@ urlpatterns = [
     # Settings > Import: manual Unite Us CSV upload + run history
     path("settings/imports/", ImportRunsView.as_view(), name="portal-import-runs"),
     path("settings/imports/upload/", ImportUploadView.as_view(), name="portal-import-upload"),
+    # Async S3 flow: presign -> browser PUTs to S3 -> start (enqueue) -> poll detail
+    path("settings/imports/presign/", ImportPresignView.as_view(), name="portal-import-presign"),
+    path("settings/imports/<int:run_id>/", ImportRunDetailView.as_view(), name="portal-import-detail"),
+    path("settings/imports/<int:run_id>/start/", ImportStartView.as_view(), name="portal-import-start"),
+    # Settings > Import Activity: rollup of follow-up actions across case imports
+    path("settings/import-activity/", ImportActivityView.as_view(), name="portal-import-activity"),
+    # Settings > Activity Log: cross-client timeline feed (admin audit view)
+    path("activity/", ActivityLogView.as_view(), name="portal-activity"),
+    path("activity/filters/", ActivityFiltersView.as_view(), name="portal-activity-filters"),
     # Settings > Import: Unite Us agents allowlist (gates which cases import)
     path("settings/unite-us-agents/", UniteUsAgentsView.as_view(), name="portal-unite-us-agents"),
     path(

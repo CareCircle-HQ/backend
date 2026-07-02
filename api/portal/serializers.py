@@ -451,13 +451,21 @@ class PortalSocialCoverageSerializer(serializers.ModelSerializer):
 class HistoryEventSummarySerializer(serializers.ModelSerializer):
     id = serializers.IntegerField(source="pk", read_only=True)
     event_type_label = serializers.CharField(source="get_event_type_display", read_only=True)
+    # Provenance (who/where) + a stable deep-link to the source entity so the UI
+    # can badge "via Import #73 by Jane" and click through to the case/ticket.
+    entity_type = serializers.SerializerMethodField()
+    entity_id = serializers.CharField(source="object_id", read_only=True)
 
     class Meta:
         model = TimelineEvent
         fields = [
             "id", "event_type", "event_type_label", "occurred_at", "title",
             "subtitle", "badge_text", "badge_tone", "renewal_number",
+            "source", "actor", "case", "entity_type", "entity_id", "metadata",
         ]
+
+    def get_entity_type(self, obj):
+        return obj.content_type.model if obj.content_type_id else None
 
 
 class HistoryEventDetailSerializer(serializers.ModelSerializer):
@@ -471,6 +479,25 @@ class HistoryEventDetailSerializer(serializers.ModelSerializer):
             "subtitle", "badge_text", "badge_tone", "renewal_number",
             "source", "actor", "metadata",
         ]
+
+
+class ActivityEventSerializer(HistoryEventSummarySerializer):
+    """A timeline event for the cross-client admin Activity Log -- adds the
+    client identity so each row links to the member profile."""
+
+    client_id = serializers.CharField(source="client.client_id", read_only=True)
+    client_name = serializers.SerializerMethodField()
+
+    class Meta(HistoryEventSummarySerializer.Meta):
+        fields = HistoryEventSummarySerializer.Meta.fields + [
+            "client_id", "client_name",
+        ]
+
+    def get_client_name(self, obj):
+        c = obj.client
+        if c is None:
+            return ""
+        return f"{c.first_name} {c.last_name}".strip()
 
 
 # ---------------------------------------------------------------------------

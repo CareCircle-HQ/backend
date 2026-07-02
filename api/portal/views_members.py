@@ -55,7 +55,7 @@ from ..services.kitchens import kitchen_options
 from ..services.meal_rules import apply_to_member
 from ..services.lifecycle import InvalidTransition, advance_enrollment
 from ..services import timeline
-from ..serializers import ensure_household_with_primary
+from ..serializers import ensure_household_with_primary, sync_household_members
 from .base import PortalAPIView, PortalGenericAPIView, current_agent
 from . import serializers as s
 
@@ -788,6 +788,11 @@ class MemberHouseholdView(PortalAPIView):
         enr = self._enrollment(client_id)
         if enr is None:
             return Response({"enrollment": None, "address": None, "members": []})
+        # Heal any drift between the household roster and this enrollment's
+        # per-member profiles, so members tied via the extension picker (which
+        # only writes a HouseholdMember row) appear here with dietary/menu/status
+        # and share the enrollment's address/service. Idempotent.
+        sync_household_members(enr.client, enrollment=enr)
         members = enr.member_profiles.select_related(
             "client__household_membership"
         ).all()
@@ -1044,6 +1049,71 @@ class MemberCasesView(PortalAPIView):
         return Response(s.PortalCaseOptionSerializer(cases, many=True).data)
 
 
+class MemberCaseHistoryView(PortalGenericAPIView):
+    """The client timeline scoped to a single case -- the 'Case history' shown on
+    the profile's Cases tab. Same event rows as the client history (with the same
+    provenance + deep-links), filtered to this case, newest-first + paginated."""
+
+    serializer_class = s.HistoryEventSummarySerializer
+
+    def get(self, request, client_id, case_id):
+        get_object_or_404(Client, pk=client_id)
+        get_object_or_404(Case, pk=case_id, client_id=client_id)
+        qs = TimelineEvent.objects.filter(client_id=client_id, case_id=case_id)
+        page = self.paginate_queryset(qs)
+        data = self.get_serializer(page, many=True).data
+        return self.get_paginated_response(data)
+
+
+# Noisy / internal fields to hide from the raw field-diff drill-down.
+_AUDIT_EXCLUDE = frozenset({
+    "updated_at", "created_at", "crm_sync_hash", "crm_synced_at",
+})
+
+
+def _audit_val(v):
+    return "" if v is None else str(v)
+
+
+class MemberCaseAuditView(PortalAPIView):
+    """Raw field-level change history for a case, from django-simple-history --
+    the 'forensic' drill-down behind the curated Case history. Each entry lists
+    the fields that changed (old -> new) with who/where (change_source/actor)."""
+
+    def get(self, request, client_id, case_id):
+        get_object_or_404(Client, pk=client_id)
+        case = get_object_or_404(Case, pk=case_id, client_id=client_id)
+        records = list(case.history.all())  # newest first
+        out = []
+        for i, rec in enumerate(records):
+            prev = records[i + 1] if i + 1 < len(records) else None
+            entry = {
+                "changed_at": rec.history_date,
+                "source": rec.change_source or "",
+                "actor": rec.change_actor or "",
+                "type": rec.get_history_type_display(),
+                "changes": [],
+            }
+            if prev is not None:
+                try:
+                    delta = rec.diff_against(prev, excluded_fields=_AUDIT_EXCLUDE)
+                except Exception:  # noqa: BLE001 - never fail the audit view
+                    delta = None
+                if delta is not None:
+                    entry["changes"] = [
+                        {
+                            "field": c.field,
+                            "old": _audit_val(c.old),
+                            "new": _audit_val(c.new),
+                        }
+                        for c in delta.changes
+                    ]
+                    if not entry["changes"]:
+                        continue  # unchanged snapshot -> skip
+            out.append(entry)
+        return Response({"results": out})
+
+
 class MemberTicketsView(PortalAPIView):
     def get(self, request, client_id):
         get_object_or_404(Client, pk=client_id)
@@ -1186,8 +1256,14 @@ class MemberVerificationCreateView(PortalAPIView):
         enrollment.verified_at = timezone.now()
         enrollment.verified_by = agent
         enrollment.save(update_fields=["verified_at", "verified_by"])
+        # Record WHO verified on the history timeline + StageEvent audit. The
+        # portal actor is an Agent (not a User), so pass it as a display label.
+        actor_label = (
+            agent.name or (f"agent:{agent.agent_code}" if agent.agent_code else "")
+        ) if agent else ""
         advance_enrollment(
             enrollment, EnrollmentStage.VERIFIED, force=True,
+            actor_label=actor_label,
             note="Verification completed via support portal.",
         )
 
@@ -1205,6 +1281,7 @@ class MemberVerificationCreateView(PortalAPIView):
         if accepted:
             advance_enrollment(
                 enrollment, EnrollmentStage.KITCHEN_ASSIGNMENT, force=True,
+                actor_label=actor_label,
                 note="Authorization accepted — awaiting kitchen assignment.",
             )
             # Best-effort link the case for reporting, but only when it isn't

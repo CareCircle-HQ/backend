@@ -1,0 +1,25 @@
+[Unit]
+Description=CareCircle Celery worker (async CSV imports)
+After=network.target redis-server.service
+Requires=redis-server.service
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/backend
+EnvironmentFile=/home/ubuntu/backend/.env
+# Long imports: reliability over throughput (late ack + prefetch=1 via settings),
+# recycle child processes after 100 tasks to bound memory after big files.
+ExecStart=/home/ubuntu/backend/venv/bin/celery -A backend worker \
+    --loglevel=info \
+    --concurrency=2 \
+    --max-tasks-per-child=100
+Restart=always
+RestartSec=5
+# Give an in-flight import time to finish on stop/redeploy.
+TimeoutStopSec=300
+KillSignal=SIGTERM
+
+[Install]
+WantedBy=multi-user.target
