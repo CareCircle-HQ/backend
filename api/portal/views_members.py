@@ -55,7 +55,7 @@ from ..services.kitchens import kitchen_options
 from ..services.meal_rules import apply_to_member
 from ..services.lifecycle import InvalidTransition, advance_enrollment
 from ..services import timeline
-from ..serializers import ensure_household_with_primary
+from ..serializers import ensure_household_with_primary, sync_household_members
 from .base import PortalAPIView, PortalGenericAPIView, current_agent
 from . import serializers as s
 
@@ -788,6 +788,11 @@ class MemberHouseholdView(PortalAPIView):
         enr = self._enrollment(client_id)
         if enr is None:
             return Response({"enrollment": None, "address": None, "members": []})
+        # Heal any drift between the household roster and this enrollment's
+        # per-member profiles, so members tied via the extension picker (which
+        # only writes a HouseholdMember row) appear here with dietary/menu/status
+        # and share the enrollment's address/service. Idempotent.
+        sync_household_members(enr.client, enrollment=enr)
         members = enr.member_profiles.select_related(
             "client__household_membership"
         ).all()

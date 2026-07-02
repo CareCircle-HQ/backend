@@ -35,6 +35,7 @@ from .models import (
     Lead,
     LeadNote,
     MemberDietaryProfile,
+    MemberStatus,
     MenuCategory,
     MenuType,
     MilitaryProfile,
@@ -469,6 +470,80 @@ def ensure_household_with_primary(client):
     household = Household.objects.create()
     HouseholdMember.objects.create(household=household, client=client, is_primary=True)
     return household
+
+
+@transaction.atomic
+def sync_household_members(client, enrollment=None):
+    """Reconcile a household's two member sources so every member -- however
+    added -- lands in the SAME place.
+
+    A household member can be created two ways: the extension's household picker
+    (``ClientViewSet.household_add`` -> a ``HouseholdMember`` roster row) or the
+    verification wizard (-> both a ``HouseholdMember`` row AND a
+    ``MemberDietaryProfile`` on the enrollment). Only ``MemberDietaryProfile``
+    rows carry dietary/menu/status and surface on the CRM Household tab, so a
+    member added via the picker alone is invisible there.
+
+    This makes the two converge for the client's active enrollment:
+      1. every roster member (``HouseholdMember``) gets a ``MemberDietaryProfile``
+         on the enrollment (empty dietary, Standard menu, active) if missing, so
+         they appear and are editable; the shared delivery address / service /
+         cadence already live once on the enrollment and apply to all;
+      2. every profiled member is tied into the roster (a ``HouseholdMember``
+         row) unless they already belong to a household.
+
+    Idempotent. Returns the number of dietary profiles created.
+    """
+    if enrollment is None:
+        # Local import: portal.serializers imports this module, so importing it
+        # at module load would be circular.
+        from .portal.serializers import active_enrollment
+        enrollment = active_enrollment(client)
+    if enrollment is None:
+        return 0
+
+    household = enrollment.household
+    if household is None:
+        membership = (
+            HouseholdMember.objects
+            .filter(client=enrollment.client)
+            .select_related("household")
+            .first()
+        )
+        household = membership.household if membership else None
+    if household is None:
+        return 0
+
+    roster = list(household.members.select_related("client").all())
+    profiles = {p.client_id: p for p in enrollment.member_profiles.all()}
+    roster_ids = {hm.client_id for hm in roster}
+
+    created = 0
+    # 1) roster -> ensure a dietary profile exists on this enrollment.
+    for hm in roster:
+        member = hm.client
+        if member is None or member.pk in profiles:
+            continue
+        MemberDietaryProfile.objects.create(
+            enrollment=enrollment,
+            client=member,
+            member_name=f"{member.first_name} {member.last_name}".strip(),
+            menu_type=catalog.menu_type_for_member(),  # "Standard" default
+            status=MemberStatus.ACTIVE,
+        )
+        created += 1
+
+    # 2) profiled members -> ensure a roster row (one-household-per-client).
+    for cid in profiles:
+        if not cid or cid in roster_ids:
+            continue
+        if HouseholdMember.objects.filter(client_id=cid).exists():
+            continue
+        HouseholdMember.objects.create(
+            household=household, client_id=cid, is_primary=False,
+        )
+
+    return created
 
 
 class HouseholdMemberSerializer(serializers.ModelSerializer):

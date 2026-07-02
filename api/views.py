@@ -23,6 +23,7 @@ from .models import (
     EnrollmentVerification,
     FoodAllergy,
     HouseholdMember,
+    MemberDietaryProfile,
     MenuCategory,
     MenuType,
     Program,
@@ -46,6 +47,7 @@ from .serializers import (
     TimelineEventSerializer,
     UserSerializer,
     ensure_household_with_primary,
+    sync_household_members,
 )
 from .history import ChangeSource
 from .services import timeline
@@ -416,6 +418,10 @@ class ClientViewSet(BulkUpsertMixin, viewsets.ModelViewSet):
         HouseholdMember.objects.create(
             household=household, client=member_client, is_primary=False
         )
+        # Mirror the member into the household's active enrollment as a dietary
+        # profile so they show + are editable on the CRM Household tab (and share
+        # the enrollment's address/service). No-op when there's no enrollment yet.
+        sync_household_members(primary)
         return self._household_response(primary)
 
     @action(detail=True, methods=["post"], url_path="household/remove")
@@ -437,6 +443,12 @@ class ClientViewSet(BulkUpsertMixin, viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST,
             )
         member.delete()
+        # Also drop the member's dietary profile(s) on this household's
+        # enrollments -- otherwise the read-side sync (which ties any profiled
+        # client back into the roster) would immediately re-add them.
+        MemberDietaryProfile.objects.filter(
+            client_id=member_id, enrollment__household=household
+        ).delete()
         return self._household_response(primary)
 
 
