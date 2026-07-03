@@ -1185,9 +1185,14 @@ def _precount_data_rows(file_obj):
 # Signature id-column that identifies each export type. Order matters: cases /
 # screening / assessments / notes all ALSO carry client_id, so their specific
 # key is checked first; clients (client_id only) is the fallback.
+#
+# Screening is checked BEFORE cases: the Unite Us "screening v2" export now
+# carries a ``case_id`` column too, so a cases-first order would mis-detect a
+# screening export as a cases export. Only screening carries
+# ``enhanced_screen_id``, so checking it first is unambiguous.
 _EXPORT_SIGNATURES = (
-    ("cases", "case_id"),
     ("screening", "enhanced_screen_id"),
+    ("cases", "case_id"),
     ("assessments", "submission_id"),
     ("notes", "note_id"),
     ("clients", "client_id"),
@@ -1201,7 +1206,9 @@ _REQUIRED_COLUMNS = {
     "clients": ("client_id", "first_name", "last_name", "client_consent_status"),
     "cases": ("case_id", "client_id", "case_status", "program_name",
               "service_subtype", "service_authorization_status"),
-    "screening": ("enhanced_screen_id", "client_id"),
+    # v2 screening exports identify the person via subject_id (+ subject_type),
+    # NOT client_id. map_screening_group reads subject_id, so require that.
+    "screening": ("enhanced_screen_id", "subject_id"),
     "assessments": ("submission_id", "client_id"),
     "notes": ("note_id", "client_id", "text"),
 }
