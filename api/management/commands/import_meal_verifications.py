@@ -70,22 +70,39 @@ _DEFAULT_FILE = "tmp/verification/Meal Inputs Trustworthy.xlsx"
 # (ENG/AST/Hicksville) columns.
 _DEFAULT_CADENCE_CSV = "tmp/verification/Cadence.csv"
 
-# Per-member column blocks: (id, meal_category, food_allergies, other_allergies,
-# other_restrictions). Index 0 is the primary; 1..9 are HM #2..#10.
-_MEMBER_BLOCKS = [
-    ("A", "I", "J", "K", "L"),
-    ("O", "P", "Q", "R", "S"),
-    ("T", "U", "V", "W", "X"),
-    ("Y", "Z", "AA", "AB", "AC"),
-    ("AD", "AE", "AF", "AG", "AH"),
-    ("AI", "AJ", "AK", "AL", "AM"),
-    ("AN", "AO", "AP", "AQ", "AR"),
-    ("AS", "AT", "AU", "AV", "AW"),
-    ("AX", "AY", "AZ", "BA", "BB"),
-    ("BC", "BD", "BE", "BF", "BG"),
-]
-_COL_STREET, _COL_CITY, _COL_STATE, _COL_ZIP, _COL_ADDR_NOTES = "B", "C", "D", "E", "F"
-_COL_TOTAL, _COL_CADENCE, _COL_FACILITY = "N", "BH", "BI"
+# Columns are resolved by HEADER LABEL, not fixed position: the "Meal Inputs"
+# export has shifted columns between versions (e.g. LIST8 inserted an
+# "Address-Apt" column and carries an "HM #1" block instead of "HM #10").
+_H_PRIMARY_ID = "Unite Us Client ID"
+_H_STREET = "Address - Street"
+_H_APT = "Address-Apt"
+_H_CITY = "Address - City"
+_H_STATE = "Address - State"
+_H_ZIP = "Address - Postal Code"
+_H_ADDR_NOTES = "Address Notes"
+_H_TOTAL = "Total Household Members"
+_H_CADENCE = "Cadence"
+_H_FACILITY = "Facility"
+
+# The primary member's diet columns are labelled differently from the HM blocks.
+_PRIMARY_BLOCK_NAMES = (
+    _H_PRIMARY_ID, "Meal Category (Input)", "Allergy Note (Input)",
+    "Other Allergy Note", "Other Restrictions",
+)
+# Max HM #k block index to probe; only blocks whose ID column is present are used.
+_MAX_HM = 12
+
+
+def _hm_block_names(k):
+    """Header labels for the HM #k block: (id, meal category, food allergies,
+    other allergies, other restrictions)."""
+    return (
+        f"HM #{k} - Enrollment Platform Client ID",
+        f"HM #{k} - Meal Category",
+        f"HM #{k} - Food Allergies",
+        f"HM #{k} - Other Allergies",
+        f"HM #{k} - Other Restrictions",
+    )
 
 # Sheet Facility code -> Kitchen.name.
 _FACILITY_TO_KITCHEN = {"eng": "ENG", "ast": "AST", "boxes": "Hicksville", "hicksville": "Hicksville"}
@@ -119,9 +136,13 @@ def _col(ref):
     return re.match(r"[A-Z]+", ref).group(0)
 
 
-def _read_rows(path):
-    """Parse the first worksheet into a list of {column_letter: value} dicts
-    (header row excluded). Pure stdlib so no openpyxl/pandas dependency."""
+def _read_sheet(path):
+    """Parse the first worksheet. Returns ``(name_to_col, rows)``:
+
+    * ``name_to_col`` -- ``{header label -> column letter}`` from row 1.
+    * ``rows`` -- list of ``{column_letter: value}`` for the data rows.
+
+    Pure stdlib so no openpyxl/pandas dependency."""
     try:
         z = zipfile.ZipFile(path)
     except (FileNotFoundError, zipfile.BadZipFile) as exc:
@@ -135,10 +156,8 @@ def _read_rows(path):
         n for n in z.namelist() if re.match(r"xl/worksheets/sheet\d+\.xml", n)
     )
     ws = ET.fromstring(z.read(sheets[0]))
-    rows = []
+    name_to_col, rows = {}, []
     for r in ws.iter(_NS + "row"):
-        if r.get("r") == "1":
-            continue
         cells = {}
         for c in r.findall(_NS + "c"):
             v = c.find(_NS + "v")
@@ -146,9 +165,19 @@ def _read_rows(path):
                 continue
             val = shared[int(v.text)] if c.get("t") == "s" else v.text
             cells[_col(c.get("r"))] = (val or "").strip()
+        if r.get("r") == "1":
+            for letter, val in cells.items():
+                if val:
+                    name_to_col[val] = letter
+            continue
         if cells:
             rows.append(cells)
-    return rows
+    return name_to_col, rows
+
+
+def _read_rows(path):
+    """Back-compat helper (used by other commands): just the data rows."""
+    return _read_sheet(path)[1]
 
 
 def _load_cadence_csv(path):
@@ -201,7 +230,12 @@ def _split_tokens(value):
 
 
 def _parse_meal_category(raw):
-    """'132 - Fresh (Meals)' -> ('Standard', 'fresh_meal', ProductTypeKind.MEALS)."""
+    """'132 - Fresh (Meals)' -> ('Standard', 'fresh_meal', ProductTypeKind.MEALS).
+
+    Newer sheets carry categories WITHOUT a ``(Meals)/(Boxes)`` suffix (e.g.
+    ``Standard/Fresh``, bare ``Kosher``/``Halal``/``Dairy Free``). When a menu is
+    recognised but no product kind is stated, default to MEALS (boxes always say
+    so explicitly)."""
     low = (raw or "").lower()
     kind = None
     if "(boxes)" in low or "box" in low:
@@ -213,6 +247,11 @@ def _parse_meal_category(raw):
         if keyword in low:
             menu, category = menu_name, cat
             break
+    # "standard" alone (no "fresh") still means the Standard menu.
+    if not menu and "standard" in low:
+        menu = "Standard"
+    if kind is None and menu:
+        kind = ProductTypeKind.MEALS
     return menu, category, kind
 
 
@@ -311,9 +350,42 @@ class Command(BaseCommand):
             "(implies the member is a meals member, e.g. 'Kosher').",
         )
 
+    def _build_columns(self, name2col):
+        """Resolve the columns we read by their HEADER LABEL (positions vary
+        between sheet versions). Sets the address/total/cadence/facility column
+        letters and the ordered member blocks (primary first, then every HM #k
+        block present)."""
+        def L(name):
+            return name2col.get(name)
+
+        self.col_street = L(_H_STREET)
+        self.col_apt = L(_H_APT)
+        self.col_city = L(_H_CITY)
+        self.col_state = L(_H_STATE)
+        self.col_zip = L(_H_ZIP)
+        self.col_addr_notes = L(_H_ADDR_NOTES)
+        self.col_total = L(_H_TOTAL)
+        self.col_cadence = L(_H_CADENCE)
+        self.col_facility = L(_H_FACILITY)
+
+        primary = tuple(L(n) for n in _PRIMARY_BLOCK_NAMES)
+        if primary[0] is None:
+            raise CommandError(
+                f"Sheet is missing the required '{_H_PRIMARY_ID}' column."
+            )
+        hm = []
+        for k in range(1, _MAX_HM + 1):
+            names = _hm_block_names(k)
+            if L(names[0]) is None:
+                continue  # this HM block isn't present in the sheet
+            hm.append(tuple(L(n) for n in names))
+        self.member_blocks = [primary] + hm
+        self.hm_blocks = hm
+
     def handle(self, *args, **options):
         apply = options["apply"]
-        rows = _read_rows(options["file"])
+        name2col, rows = _read_sheet(options["file"])
+        self._build_columns(name2col)
         if options["limit"]:
             rows = rows[: options["limit"]]
 
@@ -347,11 +419,12 @@ class Command(BaseCommand):
 
         kitchens = {k.name: k for k in Kitchen.objects.all()}
 
-        # Pass 1: every client id listed as a household MEMBER (HM #2..#10) in any
-        # row — used to skip their own single-member row (they belong to a household).
+        # Pass 1: every client id listed as a household MEMBER (any HM block) in
+        # any row — used to skip their own single-member row (they belong to a
+        # household).
         listed_as_member = set()
         for cells in rows:
-            for block in _MEMBER_BLOCKS[1:]:
+            for block in self.hm_blocks:
                 mid = _client_id(cells.get(block[0]))
                 if mid:
                     listed_as_member.add(mid)
@@ -398,7 +471,7 @@ class Command(BaseCommand):
             return ("skip_no_internal_case", "primary has no internal-service case")
 
         try:
-            total = int(float(cells.get(_COL_TOTAL) or 1))
+            total = int(float(cells.get(self.col_total) or 1))
         except ValueError:
             total = 1
 
@@ -429,11 +502,11 @@ class Command(BaseCommand):
             )
 
         # --- Fold dependents into the primary's household ---
-        block_for = {primary_id: _MEMBER_BLOCKS[0]}
+        block_for = {primary_id: self.member_blocks[0]}
         member_clients = [primary]
         unresolved = 0
         in_other_household = 0
-        for block in _MEMBER_BLOCKS[1:]:
+        for block in self.member_blocks[1:]:
             mid = _client_id(cells.get(block[0]))
             if not mid or mid == primary_id or mid in block_for:
                 continue
@@ -491,7 +564,7 @@ class Command(BaseCommand):
         primary_kind = None
         primary_menu_type = ""
         for m in member_clients:
-            block = block_for.get(str(m.client_id), _MEMBER_BLOCKS[0])
+            block = block_for.get(str(m.client_id), self.member_blocks[0])
             fields, kind = _profile_fields(block, cells)
             if self.default_menu and not fields["menu_type"]:
                 fields["menu_type"] = self.default_menu
@@ -511,13 +584,13 @@ class Command(BaseCommand):
 
         # --- Resolve kitchen + cadence (sheet wins; Cadence CSV fills blanks) ---
         csv_cadence, csv_facility = cadence_csv.get((primary_id or "").lower(), ("", ""))
-        facility = (cells.get(_COL_FACILITY) or "").strip().lower() \
+        facility = (cells.get(self.col_facility) or "").strip().lower() \
             or (csv_facility or "").strip().lower()
         kitchen = kitchens.get(_FACILITY_TO_KITCHEN.get(facility, ""))
         if kitchen is None and self.default_facility:
             kitchen = kitchens.get(self.default_facility)
         is_boxes = primary_kind == ProductTypeKind.BOXES
-        cadence_code = (cells.get(_COL_CADENCE) or "").strip().lower() \
+        cadence_code = (cells.get(self.col_cadence) or "").strip().lower() \
             or (csv_cadence or "").strip().lower()
         meal_cadence = cadence_map.get(cadence_code)
         if meal_cadence is None and not is_boxes and self.default_cadence:
@@ -579,18 +652,19 @@ class Command(BaseCommand):
         return ("kitchen_assignment", reason)
 
     def _delivery_address(self, primary, cells):
-        street = _clean(cells.get(_COL_STREET))
-        city = _clean(cells.get(_COL_CITY))
+        street = _clean(cells.get(self.col_street))
+        city = _clean(cells.get(self.col_city))
         now = timezone.now()
         if street or city:
             return Address.objects.create(
                 client=primary,
                 type=AddressType.DELIVERY,
                 street=street[:255],
+                unit=_clean(cells.get(self.col_apt))[:60] if self.col_apt else "",
                 city=city[:120],
-                state=_clean(cells.get(_COL_STATE))[:2],
-                zip=_clean(cells.get(_COL_ZIP))[:10],
-                notes=_clean(cells.get(_COL_ADDR_NOTES)),
+                state=_clean(cells.get(self.col_state))[:2],
+                zip=_clean(cells.get(self.col_zip))[:10],
+                notes=_clean(cells.get(self.col_addr_notes)),
                 created_at=now,
                 updated_at=now,
             )
