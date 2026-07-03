@@ -92,6 +92,8 @@ def _member_payload(profile):
         "member_id": profile.pk,
         "client_id": str(profile.client_id) if profile.client_id else None,
         "name": profile.member_name or "",
+        "status": profile.status,
+        "status_label": profile.get_status_display(),
         "menu_type": profile.menu_type,
         "menu_type_label": _MENU_CODE_TO_NAME.get(profile.menu_type, profile.menu_type or ""),
         "dietary_restrictions": list(profile.dietary_restrictions or []),
