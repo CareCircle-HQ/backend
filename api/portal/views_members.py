@@ -881,12 +881,31 @@ class HouseholdMemberEditView(PortalAPIView):
         ser = s.PortalMemberDietaryEditSerializer(data=request.data)
         ser.is_valid(raise_exception=True)
         data = dict(ser.validated_data)
-        # `reactivate` is a control flag, not a model field — handle separately.
+        # `reactivate` / `deactivate` are control flags, not model fields —
+        # handle them separately from the assignable dietary fields.
         reactivate = data.pop("reactivate", False)
+        deactivate = data.pop("deactivate", False)
         for field, value in data.items():
             setattr(mv, field, value)
 
-        if reactivate and mv.status == MemberStatus.OUT_OF_ORBIT:
+        if deactivate and mv.status == MemberStatus.ACTIVE:
+            # Manual agent override: pull the member Out of Orbit regardless of
+            # the meal rule. Clear the kitchen meal result so they're excluded
+            # from every delivery schedule / Purchase Order until reactivated.
+            mv.status = MemberStatus.OUT_OF_ORBIT
+            mv.kitchen_meal_type = ""
+            mv.kitchen_food_notes = ""
+            mv.save()
+            agent = current_agent(request)
+            actor = f"agent:{agent.agent_code}" if agent and agent.agent_code else ""
+            try:
+                timeline.event_for_out_of_orbit(
+                    mv, enrollment=mv.enrollment,
+                    reason="Manually set out of orbit by agent.", actor=actor,
+                )
+            except Exception:  # never let history-logging break the edit
+                pass
+        elif reactivate and mv.status == MemberStatus.OUT_OF_ORBIT:
             # Re-run the meal rule against the edited menu type/allergies. Only
             # return the member to Active if the new combination can actually be
             # fulfilled; otherwise the agent must pick a different menu type.
