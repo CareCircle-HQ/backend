@@ -921,6 +921,10 @@ class PortalMemberDietaryEditSerializer(serializers.Serializer):
     # reactivates if the new combination can be fulfilled (it is not a model
     # field, so the view pops it before assigning the rest).
     reactivate = serializers.BooleanField(required=False, default=False)
+    # When true, manually pull an active member Out of Orbit (agent override).
+    # Excludes them from delivery schedules / Purchase Orders until reactivated.
+    # Also a control flag, popped by the view before assigning model fields.
+    deactivate = serializers.BooleanField(required=False, default=False)
 
 
 # ---------------------------------------------------------------------------
