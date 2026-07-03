@@ -410,11 +410,24 @@ class ClientViewSet(BulkUpsertMixin, viewsets.ModelViewSet):
             return Response(
                 {"detail": "Client not found."}, status=status.HTTP_404_NOT_FOUND
             )
-        if HouseholdMember.objects.filter(client=member_client).exists():
-            return Response(
-                {"detail": "Client already belongs to a household."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
+        # One-household-per-client: if the client is already in ANOTHER
+        # household, move them here (detach from the previous household) instead
+        # of rejecting. A primary member can be moved too -- this typically
+        # happens when a solo client (primary of their own trivial household) is
+        # added to a relative's household.
+        existing = HouseholdMember.objects.filter(client=member_client).first()
+        if existing is not None:
+            old_household = existing.household
+            # Drop the member's dietary profile(s) on the previous household's
+            # enrollments (mirrors household/remove) so the read-side sync won't
+            # re-add them there.
+            MemberDietaryProfile.objects.filter(
+                client=member_client, enrollment__household=old_household
+            ).delete()
+            existing.delete()
+            # Clean up a now-empty previous household to avoid orphan rows.
+            if not old_household.members.exists():
+                old_household.delete()
         HouseholdMember.objects.create(
             household=household, client=member_client, is_primary=False
         )
