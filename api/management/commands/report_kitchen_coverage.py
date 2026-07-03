@@ -19,6 +19,7 @@ Usage:
     python manage.py report_kitchen_coverage --apply --yes
 """
 import csv
+import os
 import sys
 from collections import Counter
 from datetime import datetime
@@ -232,6 +233,11 @@ class Command(BaseCommand):
         return answer in ("y", "yes")
 
     def _write_csv(self, path, rows):
+        # Create the parent directory if it doesn't exist (e.g. ~/Desktop on a
+        # headless server), so a missing folder never loses the computed report.
+        parent = os.path.dirname(os.path.abspath(path))
+        if parent:
+            os.makedirs(parent, exist_ok=True)
         fields = [
             "member_id", "client_id", "member_name", "enrollment_code", "stage",
             "program", "menu_type", "food_allergies", "dietary_restrictions",
