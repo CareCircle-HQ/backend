@@ -55,7 +55,12 @@ from ..services.kitchens import kitchen_options
 from ..services.meal_rules import apply_to_member
 from ..services.lifecycle import InvalidTransition, advance_enrollment
 from ..services import timeline
-from ..serializers import ensure_household_with_primary, sync_household_members
+from ..serializers import (
+    add_client_to_household,
+    ensure_household_with_primary,
+    search_clients,
+    sync_household_members,
+)
 from .base import PortalAPIView, PortalGenericAPIView, current_agent
 from . import serializers as s
 
@@ -861,6 +866,76 @@ class MemberHouseholdView(PortalAPIView):
             {"street": addr.street, "unit": addr.unit, "city": addr.city,
              "state": addr.state, "zip": addr.zip, "notes": addr.notes}
         )
+
+
+class MemberHouseholdSearchView(PortalAPIView):
+    """Search existing clients (by client ID or Medicaid/insurance member ID) to
+    add to this member's household. Mirrors the extension's client picker."""
+
+    def get(self, request, client_id):
+        get_object_or_404(Client, pk=client_id)
+        return Response(search_clients(request.query_params.get("q")))
+
+
+class MemberHouseholdAddView(PortalAPIView):
+    """Add an existing client to this member's household. Moves the client out of
+    any other household first (one-household-per-client). No family-size cap on
+    the CRM -- agents are authoritative."""
+
+    def post(self, request, client_id):
+        primary = get_object_or_404(Client, pk=client_id)
+        member_id = request.data.get("client_id")
+        if not member_id:
+            return Response(
+                {"error": "client_id is required."},
+                status=http.HTTP_400_BAD_REQUEST,
+            )
+        try:
+            member_client = Client.objects.get(pk=member_id)
+        except (Client.DoesNotExist, ValueError):
+            return Response(
+                {"error": "Client not found."}, status=http.HTTP_404_NOT_FOUND
+            )
+        if str(member_client.pk) == str(primary.pk):
+            return Response(
+                {"error": "A client can't be added to their own household."},
+                status=http.HTTP_400_BAD_REQUEST,
+            )
+        add_client_to_household(primary, member_client)
+        agent = current_agent(request)
+        actor = f"agent:{agent.agent_code}" if agent and agent.agent_code else ""
+        try:
+            timeline.event_for_household_member_added(
+                primary, member_client,
+                enrollment=s.active_enrollment(primary), actor=actor,
+            )
+        except Exception:  # never let history-logging break the add
+            pass
+        return Response({"client_id": str(member_client.pk)}, status=http.HTTP_201_CREATED)
+
+
+class MemberInternalCaseDescriptionsView(PortalAPIView):
+    """TEMPORARY: the case descriptions of this client's INTERNAL_SERVICE cases,
+    surfaced on the Household tab. Read-only. Slated for removal in a few days."""
+
+    def get(self, request, client_id):
+        get_object_or_404(Client, pk=client_id)
+        cases = (
+            Case.objects.filter(
+                client_id=client_id, case_type=CaseType.INTERNAL_SERVICE,
+            )
+            .exclude(case_description="")
+            .order_by("-date_opened")
+        )
+        return Response([
+            {
+                "case_id": str(c.pk),
+                "program_name": c.program_name or c.service_type or "",
+                "status": c.get_case_status_display() if c.case_status else "",
+                "description": c.case_description,
+            }
+            for c in cases
+        ])
 
 
 class HouseholdMemberEditView(PortalAPIView):

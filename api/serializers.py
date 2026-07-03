@@ -1,9 +1,11 @@
 import logging
 import re
+import uuid
 
 from django.contrib.auth import get_user_model
 from django.contrib.auth.password_validation import validate_password
 from django.db import transaction
+from django.db.models import Q
 from django.utils import timezone
 from rest_framework import serializers
 
@@ -544,6 +546,86 @@ def sync_household_members(client, enrollment=None):
         )
 
     return created
+
+
+def search_clients(q):
+    """Find existing clients by member ID (client UUID) or by Medicaid /
+    insurance member ID (``external_member_id``). Used by the household member
+    pickers (extension + CRM). Returns lightweight dict rows, each flagged with
+    whether the client already belongs to a household."""
+    q = (q or "").strip()
+    if len(q) < 2:
+        return []
+
+    filters = (
+        Q(insurances__external_member_id__icontains=q)
+        | Q(social_care_coverages__external_member_id__icontains=q)
+    )
+    # client_id is a UUID column: only match it when q parses as a UUID.
+    try:
+        filters |= Q(client_id=uuid.UUID(q))
+    except (ValueError, AttributeError, TypeError):
+        pass
+
+    qs = (
+        Client.objects.filter(filters)
+        .distinct()
+        .prefetch_related("insurances", "social_care_coverages")[:25]
+    )
+
+    results = []
+    for c in qs:
+        member_ids = sorted({
+            mid
+            for src in (c.insurances.all(), c.social_care_coverages.all())
+            for mid in (x.external_member_id for x in src)
+            if mid
+        })
+        results.append({
+            "client_id": str(c.client_id),
+            "first_name": c.first_name,
+            "last_name": c.last_name,
+            "date_of_birth": c.date_of_birth.isoformat() if c.date_of_birth else None,
+            "member_ids": member_ids,
+            "in_household": HouseholdMember.objects.filter(client=c).exists(),
+        })
+    return results
+
+
+@transaction.atomic
+def add_client_to_household(primary, member_client):
+    """Add ``member_client`` to ``primary``'s household, MOVING them out of any
+    OTHER household first (one-household-per-client). Mirrors the member into the
+    household's active enrollment as a dietary profile so they show + are
+    editable on the CRM Household tab. Idempotent. Returns the household.
+
+    Does NOT enforce the family-size cap -- callers that need it (the extension
+    picker) check it before calling.
+    """
+    household = ensure_household_with_primary(primary)
+
+    # Idempotent: already a member of THIS household -> nothing to do.
+    if household.members.filter(client=member_client).exists():
+        return household
+
+    # If the client is already in ANOTHER household, move them here: detach from
+    # the previous household and drop their dietary profile(s) on its enrollments
+    # (so the read-side sync won't re-add them there), then clean up if empty.
+    existing = HouseholdMember.objects.filter(client=member_client).first()
+    if existing is not None:
+        old_household = existing.household
+        MemberDietaryProfile.objects.filter(
+            client=member_client, enrollment__household=old_household
+        ).delete()
+        existing.delete()
+        if not old_household.members.exists():
+            old_household.delete()
+
+    HouseholdMember.objects.create(
+        household=household, client=member_client, is_primary=False
+    )
+    sync_household_members(primary)
+    return household
 
 
 class HouseholdMemberSerializer(serializers.ModelSerializer):

@@ -23,7 +23,10 @@ from .views_members import (
     MemberDiagnosticView,
     MemberHistoryDetailView,
     MemberHistoryView,
+    MemberHouseholdAddView,
+    MemberHouseholdSearchView,
     MemberHouseholdView,
+    MemberInternalCaseDescriptionsView,
     MemberInsuranceView,
     MemberKitchenOptionsView,
     MemberKitchenView,
@@ -121,6 +124,13 @@ urlpatterns = [
     path("members/<uuid:client_id>/history/<int:event_id>/", MemberHistoryDetailView.as_view()),
     path("members/<uuid:client_id>/orders/", MemberOrdersView.as_view()),
     path("members/<uuid:client_id>/household/", MemberHouseholdView.as_view()),
+    path("members/<uuid:client_id>/household/search/", MemberHouseholdSearchView.as_view()),
+    path("members/<uuid:client_id>/household/add/", MemberHouseholdAddView.as_view()),
+    # TEMPORARY: internal-service case descriptions on the Household tab.
+    path(
+        "members/<uuid:client_id>/internal-case-descriptions/",
+        MemberInternalCaseDescriptionsView.as_view(),
+    ),
     path(
         "members/<uuid:client_id>/household/members/<int:member_id>/",
         HouseholdMemberEditView.as_view(),
