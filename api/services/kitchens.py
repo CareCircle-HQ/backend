@@ -87,6 +87,74 @@ def _member_allergy_codes(profile):
     ]
 
 
+def kitchen_offered_menu_index(kitchen):
+    """Index a kitchen's offered menu types by normalized catalog name."""
+    return {_norm(kmt.menu_type.name): kmt for kmt in kitchen.kitchen_menu_types.all()}
+
+
+def member_coverage_for_kitchen(profile, kitchen, offered=None):
+    """Whether ``kitchen`` can serve ``profile`` based on the member's menu type
+    and food allergies vs. the kitchen's offered menus and their restrictions.
+
+    Returns ``(covered: bool, reason: str, price)``. Does NOT consider the
+    kitchen's product kind or active status -- callers layer those on.
+    """
+    if offered is None:
+        offered = kitchen_offered_menu_index(kitchen)
+    menu_label = _MENU_CODE_TO_NAME.get(profile.menu_type, profile.menu_type)
+    wanted = _norm(menu_label)
+    kmt = offered.get(wanted)
+    if kmt is None:
+        # Looser contains-match on the menu name.
+        kmt = next(
+            (v for key, v in offered.items() if wanted and (wanted in key or key in wanted)),
+            None,
+        )
+    if kmt is None:
+        return False, f"No {menu_label or 'matching'} menu", None
+    restriction_names = [_norm(t.name) for t in kmt.restrictions.all()]
+    blocked = [
+        _ALLERGY_LABELS.get(c, c)
+        for c in _member_allergy_codes(profile)
+        if _allergy_blocked_by(c, restriction_names)
+    ]
+    if blocked:
+        return False, f"Can't handle: {', '.join(blocked)}", kmt.menu_type_price
+    return True, "", kmt.menu_type_price
+
+
+def required_product_for_program(program_name):
+    """Map a program name to the ``KitchenProductType`` (meal/box) a kitchen must
+    make to serve it, or ``None`` when it can't be determined."""
+    kind = product_type_kind_for_name(program_name or "")
+    return _KIND_TO_PRODUCT.get(kind)
+
+
+def serving_kitchens_for_member(profile, kitchens=None, *, required_product=None, active_only=True):
+    """List the kitchens that can serve ``profile`` (menu type + allergies).
+
+    Optionally require the kitchen to make a given product kind
+    (``required_product``, a ``KitchenProductType``) and/or be ACTIVE. Returns a
+    list of ``{"kitchen", "price"}`` dicts, in the kitchens' given order.
+    """
+    if kitchens is None:
+        kitchens = (
+            Kitchen.objects.all()
+            .prefetch_related("kitchen_menu_types__menu_type", "kitchen_menu_types__restrictions")
+            .order_by("name")
+        )
+    serving = []
+    for k in kitchens:
+        if active_only and k.status != KitchenStatus.ACTIVE:
+            continue
+        if required_product is not None and required_product not in (k.supported_products or []):
+            continue
+        covered, _reason, price = member_coverage_for_kitchen(profile, k)
+        if covered:
+            serving.append({"kitchen": k, "price": price})
+    return serving
+
+
 def _member_payload(profile):
     return {
         "member_id": profile.pk,
@@ -135,9 +203,7 @@ def kitchen_options(enrollment):
     results = []
     for k in kitchens:
         # Index this kitchen's offered menu types by normalized name.
-        offered = {}
-        for kmt in k.kitchen_menu_types.all():
-            offered[_norm(kmt.menu_type.name)] = kmt
+        offered = kitchen_offered_menu_index(k)
 
         supports_product = (
             required_product is None
@@ -147,29 +213,7 @@ def kitchen_options(enrollment):
         coverage = []
         warnings = []
         for m, payload in zip(members, member_payloads):
-            wanted = _norm(_MENU_CODE_TO_NAME.get(m.menu_type, m.menu_type))
-            kmt = offered.get(wanted)
-            if kmt is None:
-                # Fall back to a looser contains-match on the menu name.
-                kmt = next(
-                    (v for key, v in offered.items() if wanted and (wanted in key or key in wanted)),
-                    None,
-                )
-            covered, reason, price = True, "", None
-            if kmt is None:
-                covered = False
-                reason = f"No {payload['menu_type_label'] or 'matching'} menu"
-            else:
-                price = kmt.menu_type_price
-                restriction_names = [_norm(t.name) for t in kmt.restrictions.all()]
-                blocked = [
-                    _ALLERGY_LABELS.get(c, c)
-                    for c in _member_allergy_codes(m)
-                    if _allergy_blocked_by(c, restriction_names)
-                ]
-                if blocked:
-                    covered = False
-                    reason = f"Can't handle: {', '.join(blocked)}"
+            covered, reason, price = member_coverage_for_kitchen(m, k, offered=offered)
             if not covered:
                 warnings.append(f"{payload['name'] or 'Member'}: {reason}")
             coverage.append({
