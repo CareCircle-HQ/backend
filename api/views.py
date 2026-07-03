@@ -46,7 +46,9 @@ from .serializers import (
     ScreeningSerializer,
     TimelineEventSerializer,
     UserSerializer,
+    add_client_to_household,
     ensure_household_with_primary,
+    search_clients,
     sync_household_members,
 )
 from .history import ChangeSource
@@ -331,43 +333,7 @@ class ClientViewSet(BulkUpsertMixin, viewsets.ModelViewSet):
         """Find existing clients by member ID (client UUID) or by Medicaid /
         insurance member ID (external_member_id). Used by the household member
         picker. Returns lightweight rows, not the full client serializer."""
-        q = (request.query_params.get("q") or "").strip()
-        if len(q) < 2:
-            return Response([])
-
-        filters = (
-            Q(insurances__external_member_id__icontains=q)
-            | Q(social_care_coverages__external_member_id__icontains=q)
-        )
-        # client_id is a UUID column: only match it when q parses as a UUID.
-        try:
-            filters |= Q(client_id=uuid.UUID(q))
-        except (ValueError, AttributeError, TypeError):
-            pass
-
-        qs = (
-            Client.objects.filter(filters)
-            .distinct()
-            .prefetch_related("insurances", "social_care_coverages")[:25]
-        )
-
-        results = []
-        for c in qs:
-            member_ids = sorted({
-                mid
-                for src in (c.insurances.all(), c.social_care_coverages.all())
-                for mid in (x.external_member_id for x in src)
-                if mid
-            })
-            results.append({
-                "client_id": str(c.client_id),
-                "first_name": c.first_name,
-                "last_name": c.last_name,
-                "date_of_birth": c.date_of_birth.isoformat() if c.date_of_birth else None,
-                "member_ids": member_ids,
-                "in_household": HouseholdMember.objects.filter(client=c).exists(),
-            })
-        return Response(results)
+        return Response(search_clients(request.query_params.get("q")))
 
     def _household_response(self, client):
         household = ensure_household_with_primary(client)
@@ -410,31 +376,9 @@ class ClientViewSet(BulkUpsertMixin, viewsets.ModelViewSet):
             return Response(
                 {"detail": "Client not found."}, status=status.HTTP_404_NOT_FOUND
             )
-        # One-household-per-client: if the client is already in ANOTHER
-        # household, move them here (detach from the previous household) instead
-        # of rejecting. A primary member can be moved too -- this typically
-        # happens when a solo client (primary of their own trivial household) is
-        # added to a relative's household.
-        existing = HouseholdMember.objects.filter(client=member_client).first()
-        if existing is not None:
-            old_household = existing.household
-            # Drop the member's dietary profile(s) on the previous household's
-            # enrollments (mirrors household/remove) so the read-side sync won't
-            # re-add them there.
-            MemberDietaryProfile.objects.filter(
-                client=member_client, enrollment__household=old_household
-            ).delete()
-            existing.delete()
-            # Clean up a now-empty previous household to avoid orphan rows.
-            if not old_household.members.exists():
-                old_household.delete()
-        HouseholdMember.objects.create(
-            household=household, client=member_client, is_primary=False
-        )
-        # Mirror the member into the household's active enrollment as a dietary
-        # profile so they show + are editable on the CRM Household tab (and share
-        # the enrollment's address/service). No-op when there's no enrollment yet.
-        sync_household_members(primary)
+        # Add + move (detaches from any other household) + mirror into the
+        # active enrollment as a dietary profile. See add_client_to_household.
+        add_client_to_household(primary, member_client)
         return self._household_response(primary)
 
     @action(detail=True, methods=["post"], url_path="household/remove")
