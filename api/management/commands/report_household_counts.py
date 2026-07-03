@@ -1,19 +1,25 @@
-"""Report clients with an internal-service case whose assessment/screening
-household-count answer is > 1.
+"""Report clients with an internal-service case that looks multi-person.
 
 For every client that has at least one INTERNAL_SERVICE case (any status /
-authorization), we read the answer to the TOTAL household-count question from
-their assessments + screenings -- using the SAME question phrasings the
-extension matches (see ``TOTAL_HOUSEHOLD_QUESTION_PATTERNS`` /
-``eformTotalFamilyCount`` in ``extension/sidepanel/sidepanel.js``) -- and, when
-that count is > 1, print:
+authorization), we flag them when EITHER signal says the household is bigger
+than one person:
 
-    client_id | name | household_from_answer | current_household_members | internal_cases
+  * ANSWER  -- the TOTAL household-count answer on their assessments +
+    screenings is >= the threshold. We use the SAME question phrasings the
+    extension matches (see ``TOTAL_HOUSEHOLD_QUESTION_PATTERNS`` /
+    ``eformTotalFamilyCount`` in ``extension/sidepanel/sidepanel.js``).
+  * PROGRAM -- the internal-service case's ``program_name`` contains the word
+    "household".
 
-``household_from_answer`` is the count the client reported on the questionnaire;
-``current_household_members`` is how many HouseholdMember rows currently exist in
-their household (0 = no household group set up yet). This is a read-only report
--- nothing is written.
+For each matched client we print:
+
+    client_id | name | household_from_answer | current_household_members | internal_cases | match
+
+``household_from_answer`` is the count the client reported on the questionnaire
+(``-`` when not answered); ``current_household_members`` is how many
+HouseholdMember rows currently exist in their household (0 = no household group
+set up yet); ``match`` shows which signal(s) fired (answer/program). This is a
+read-only report -- nothing is written.
 
 Usage:
     python manage.py report_household_counts
@@ -94,6 +100,17 @@ class Command(BaseCommand):
         )
         case_counts = {row["client_id"]: row["n"] for row in internal if row["client_id"]}
 
+        # Collect the internal-service case program_names per client so we can
+        # flag any whose program name mentions "household".
+        program_names = {}
+        for cid, pname in (
+            Case.objects.filter(case_type=CaseType.INTERNAL_SERVICE)
+            .exclude(program_name="")
+            .values_list("client_id", "program_name")
+        ):
+            if cid:
+                program_names.setdefault(cid, set()).add(pname)
+
         clients = (
             Client.objects.filter(pk__in=case_counts.keys())
             .prefetch_related("assessments", "screenings", "household_membership__household__members")
@@ -110,26 +127,39 @@ class Command(BaseCommand):
                     items.append((qa.get("question") or "", qa.get("answer")))
 
             answer_count = _household_answer_count(items)
-            if answer_count is None or answer_count < threshold:
+            answer_match = answer_count is not None and answer_count >= threshold
+            program_match = any(
+                "household" in p.lower() for p in program_names.get(client.pk, ())
+            )
+            if not (answer_match or program_match):
                 continue
 
             membership = getattr(client, "household_membership", None)
             household = getattr(membership, "household", None)
             member_count = household.members.count() if household else 0
 
+            match = "+".join(
+                m for m, ok in (("answer", answer_match), ("program", program_match)) if ok
+            )
             name = f"{(client.first_name or '').strip()} {(client.last_name or '').strip()}".strip()
-            rows.append((str(client.pk), name, answer_count, member_count, case_counts[client.pk]))
+            rows.append((
+                str(client.pk), name, answer_count, member_count,
+                case_counts[client.pk], match,
+            ))
 
-        rows.sort(key=lambda r: r[2], reverse=True)
+        # Sort by reported answer (None last), then by name.
+        rows.sort(key=lambda r: (r[2] is None, -(r[2] or 0), r[1].lower()))
 
         self.stdout.write(self.style.MIGRATE_HEADING(
-            f"\n=== Internal-service clients with household answer > {threshold - 1} ==="
+            f"\n=== Internal-service clients that look multi-person "
+            f"(answer > {threshold - 1} or program mentions 'household') ==="
         ))
         self.stdout.write(
-            f"{'client_id':<38} {'name':<28} {'answer':>6} {'members':>8} {'cases':>6}"
+            f"{'client_id':<38} {'name':<28} {'answer':>6} {'members':>8} {'cases':>6}  match"
         )
-        for cid, name, answer_count, member_count, cases in rows:
+        for cid, name, answer_count, member_count, cases, match in rows:
+            answer_str = "-" if answer_count is None else str(answer_count)
             self.stdout.write(
-                f"{cid:<38} {name[:28]:<28} {answer_count:>6} {member_count:>8} {cases:>6}"
+                f"{cid:<38} {name[:28]:<28} {answer_str:>6} {member_count:>8} {cases:>6}  {match}"
             )
         self.stdout.write(self.style.SUCCESS(f"\nTOTAL matched clients: {len(rows)}"))

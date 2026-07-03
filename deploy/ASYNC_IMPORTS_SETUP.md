@@ -10,7 +10,7 @@ the agent closing the tab.
 # S3 (bucket for import uploads + media). In prod prefer the EC2 instance role
 # over keys: set the bucket/region and leave the key vars unset.
 AWS_STORAGE_BUCKET_NAME=carecircle-prod-uploads
-AWS_S3_REGION_NAME=us-east-1
+AWS_S3_REGION_NAME=us-east-2
 # AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY   # only if NOT using an instance role
 DJANGO_USE_S3=true
 
