@@ -1483,6 +1483,18 @@ class MemberAssignKitchenView(PortalAPIView):
             except (TypeError, ValueError):
                 continue
 
+        # Members the agent manually excluded from THIS assignment (pulled Out of
+        # Orbit), each with an optional customer-facing note. Applied AFTER the
+        # meal rule so the override wins even when the member could otherwise be
+        # served. Body: ``member_overrides: [{member_id, out_of_orbit, note?}]``.
+        exclude_notes = {}
+        for ov in request.data.get("member_overrides") or []:
+            try:
+                if ov.get("out_of_orbit"):
+                    exclude_notes[int(ov.get("member_id"))] = (ov.get("note") or "").strip()
+            except (TypeError, ValueError, AttributeError):
+                continue
+
         enr.kitchen = kitchen
         enr.save(update_fields=["kitchen"])
 
@@ -1492,6 +1504,34 @@ class MemberAssignKitchenView(PortalAPIView):
         agent = current_agent(request)
         actor = f"agent:{agent.agent_code}" if agent and agent.agent_code else ""
         for profile in enr.member_profiles.select_related("client").all():
+            if profile.pk in exclude_notes:
+                # Manual exclusion: force Out of Orbit and drop the kitchen meal
+                # result so they're excluded from schedules + POs, regardless of
+                # what the meal rule would decide.
+                note = exclude_notes[profile.pk]
+                profile.status = MemberStatus.OUT_OF_ORBIT
+                profile.kitchen_meal_type = ""
+                profile.kitchen_food_notes = ""
+                profile.save(update_fields=[
+                    "status", "kitchen_meal_type", "kitchen_food_notes", "updated_at",
+                ])
+                reason = note or "Excluded from kitchen assignment by agent."
+                try:
+                    timeline.event_for_out_of_orbit(
+                        profile, enrollment=enr, reason=reason, actor=actor,
+                    )
+                except Exception:  # never let history-logging break assignment
+                    pass
+                # Add a customer-facing note on the member's own client record.
+                if note and profile.client_id:
+                    try:
+                        Note.objects.create(
+                            client=profile.client, source=NoteSource.AGENT,
+                            author_name=agent.name if agent else "", body=note,
+                        )
+                    except Exception:  # never let note-writing break assignment
+                        pass
+                continue
             _result, became_out = apply_to_member(profile)
             if became_out:
                 try:
