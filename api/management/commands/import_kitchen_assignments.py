@@ -181,6 +181,11 @@ class Command(BaseCommand):
             rows = rows[: options["limit"]]
 
         self.kitchens = {k.name: k for k in Kitchen.objects.all()}
+        # Case/whitespace-insensitive lookup so a "Hicksville" facility matches a
+        # kitchen named "hicksville", "Hicksville Kitchen", etc.
+        self.kitchens_by_norm = {
+            k.name.strip().lower(): k for k in Kitchen.objects.all()
+        }
         self._offered_cache = {}
 
         report = Counter()
@@ -216,11 +221,17 @@ class Command(BaseCommand):
         if client is None:
             return ("skip_client_not_found", "client id not in DB")
 
-        # Facility -> kitchen (required to activate).
+        # Facility -> kitchen (required to activate). Match case/whitespace-
+        # insensitively; also allow the facility value itself to be a kitchen
+        # name not in the alias map.
         facility = _clean(row.get("facility")).lower()
-        kitchen = self.kitchens.get(_FACILITY_TO_KITCHEN.get(facility, ""))
+        target = _FACILITY_TO_KITCHEN.get(facility, facility).strip().lower()
+        kitchen = self.kitchens_by_norm.get(target)
         if kitchen is None:
-            return ("skip_no_kitchen", f"unmapped facility {facility!r}")
+            have = ", ".join(sorted(self.kitchens)) or "(none)"
+            return ("skip_no_kitchen",
+                    f"no kitchen for facility {facility!r} (looked for "
+                    f"{target!r}); kitchens in DB: {have}")
 
         # Cadence -> DeliveryCadence + product kind.
         cadence_code = _clean(row.get("cadence")).lower()
