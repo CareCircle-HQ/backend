@@ -7,7 +7,7 @@ from datetime import datetime, timedelta
 
 from django.db import transaction
 from django.utils import timezone
-from django.db.models import Count, Exists, OuterRef, Q
+from django.db.models import Count, Exists, F, OuterRef, Prefetch, Q
 from django.db.models.functions import Lower
 from django.shortcuts import get_object_or_404
 from rest_framework import status as http
@@ -50,12 +50,18 @@ from ..services.delivery import (
 )
 from ..services.client_diagnostic import diagnose_client
 from ..services.orders import (
+    _format_address,
     generate_delivery_calendar,
     resync_scheduled_orders,
     sync_delivery_calendar,
 )
-from ..services.kitchens import kitchen_offered_menu_index, kitchen_options
-from ..services.meal_rules import reconcile_member_kitchen_output
+from ..services.kitchens import (
+    kitchen_offered_menu_index,
+    kitchen_options,
+    required_product_for_program,
+    serving_kitchens_for_member,
+)
+from ..services.meal_rules import reconcile_member_kitchen_output, resolve_kitchen_meal
 from ..services.lifecycle import InvalidTransition, advance_enrollment
 from ..services import timeline
 from ..serializers import (
@@ -66,6 +72,28 @@ from ..serializers import (
 )
 from .base import PortalAPIView, PortalGenericAPIView, current_agent
 from . import serializers as s
+
+# System note left on a member when their menu type / dietary needs can't be
+# fulfilled by any (or the assigned) kitchen and they're pulled Out of Orbit.
+NO_KITCHEN_OUT_OF_ORBIT_NOTE = (
+    "No kitchen currently supports this member's dietary needs."
+)
+
+
+def _agent_actor(agent):
+    """Timeline ``actor`` attribution for an acting agent. Prefer the agent code
+    (``agent:<code>``, resolved to a name via a batched lookup), but many
+    portal agents (e.g. Management/CS) have no code -- fall back to the agent's
+    name (``user:<name>``) so the history still shows WHO performed the action
+    instead of a blank attribution."""
+    if agent is None:
+        return ""
+    if agent.agent_code:
+        return f"agent:{agent.agent_code}"
+    if agent.name:
+        return f"user:{agent.name}"
+    return ""
+
 
 # Reverse of serializers._STATUS_MAP: a filter value -> the lifecycle stages it covers.
 # Verification is a yes/no fact (Pending Verification / Verified), so those two
@@ -125,7 +153,19 @@ SCOPE_TO_STAGES = {
     "logistics": ["kitchen_assignment"],
 }
 
-MEMBER_LIST_PREFETCH = ("insurances", "military_profile", "enrollments", "member_profiles")
+# select_related the requested_by / verified_by agents on the enrollment prefetch
+# so the Verification list's agent columns don't trigger an extra query per row.
+MEMBER_LIST_PREFETCH = (
+    "insurances",
+    "military_profile",
+    Prefetch(
+        "enrollments",
+        queryset=EnrollmentVerification.objects.select_related(
+            "requested_by", "verified_by"
+        ),
+    ),
+    "member_profiles",
+)
 
 
 def require_internal_service_primary(qs):
@@ -159,6 +199,41 @@ def verification_completed_q():
     return Q(enrollments__verified_at__isnull=False) | Q(
         household_membership__household__enrollment_verifications__verified_at__isnull=False
     )
+
+
+def verification_scope_q():
+    """Base scope for the Verification page, keyed off the verification FACT so
+    the list reads as a full verification history: households still awaiting
+    verification (lifecycle ``pending_verification``) OR that have EVER been
+    verified (``verified_at`` set on a governing enrollment) -- kept even after
+    they advance to kitchen assignment / active / completed. The ``verified_at``
+    join is multi-valued, so the caller must ``.distinct()``."""
+    return Q(lifecycle_stage="pending_verification") | verification_completed_q()
+
+
+_ALLERGY_LABELS = dict(FoodAllergy.choices)
+
+
+def _allergy_labels(codes):
+    """Human labels for a member's food-allergy codes, dropping the no-op 'none'."""
+    return [_ALLERGY_LABELS.get(c, c) for c in (codes or []) if c and c != "none"]
+
+
+def predict_member_out_of_orbit(profile):
+    """Predict whether a member will be Out of Orbit once a kitchen is assigned,
+    from the GLOBAL meal rule + data completeness. Kitchen-agnostic (no kitchen
+    is assigned yet at the Logistics stage). Returns ``(out: bool, reason: str)``.
+
+    A member is predicted Out of Orbit when they have no menu type yet, or when
+    their menu type + food allergies can't be safely fulfilled by the meal rule
+    (see api.services.meal_rules). Kitchen-coverage is a separate, household-level
+    check (whether ANY kitchen can serve everyone)."""
+    if profile is None or not (profile.menu_type or "").strip():
+        return True, "No menu type assigned"
+    rule = resolve_kitchen_meal(profile.menu_type, profile.food_allergies)
+    if rule.out_of_orbit:
+        return True, "Menu + allergies can't be safely fulfilled"
+    return False, ""
 
 
 def _parse_date(value):
@@ -223,6 +298,44 @@ def apply_period_filter(qs, period):
     )
 
 
+def apply_enrollment_date_filter(qs, field, start, end):
+    """Restrict ``qs`` to clients whose governing enrollment -- their own or
+    their household's -- has the datetime ``field`` (e.g. ``opened_at`` for when
+    the verification was requested, ``verified_at`` for when it was completed)
+    within the inclusive [start, end] date window. Either bound may be None
+    (open-ended). No-op when both bounds are None. The conditions for a bound
+    are ANDed on the SAME joined row (matching ``apply_period_filter``); the
+    caller is responsible for ``.distinct()`` (this adds multi-valued joins)."""
+    if not start and not end:
+        return qs
+    hh = "household_membership__household__enrollment_verifications__"
+    own_cond, hh_cond = {}, {}
+    if start:
+        own_cond[f"enrollments__{field}__date__gte"] = start
+        hh_cond[f"{hh}{field}__date__gte"] = start
+    if end:
+        own_cond[f"enrollments__{field}__date__lte"] = end
+        hh_cond[f"{hh}{field}__date__lte"] = end
+    return qs.filter(Q(**own_cond) | Q(**hh_cond))
+
+
+def apply_verification_date_filters(qs, params):
+    """Apply the Verification-page requested/completed date-range filters from
+    query params (``requested_from``/``requested_to`` -> enrollment ``opened_at``;
+    ``completed_from``/``completed_to`` -> enrollment ``verified_at``). Returns
+    (qs, changed) where ``changed`` signals the caller to ``.distinct()``."""
+    changed = False
+    req_from, req_to = _parse_date(params.get("requested_from")), _parse_date(params.get("requested_to"))
+    if req_from or req_to:
+        qs = apply_enrollment_date_filter(qs, "opened_at", req_from, req_to)
+        changed = True
+    comp_from, comp_to = _parse_date(params.get("completed_from")), _parse_date(params.get("completed_to"))
+    if comp_from or comp_to:
+        qs = apply_enrollment_date_filter(qs, "verified_at", comp_from, comp_to)
+        changed = True
+    return qs, changed
+
+
 class MenuTypesListView(PortalAPIView):
     """Active menu types for the Members-page menu-type filter dropdown.
     ``value`` matches ``MemberDietaryProfile.menu_type`` (the catalog name)."""
@@ -265,17 +378,19 @@ class MembersListView(PortalGenericAPIView):
                 pass
             qs = qs.filter(cond)
 
-        # Page-level scope (Verification / Logistics) restricts which stages are
+        # Page-level scope (Verification / Logistics) restricts which members are
         # ever shown, before the per-status filter chips are applied.
         scope = (params.get("scope") or "").strip()
-        scope_stages = SCOPE_TO_STAGES.get(scope)
-        if scope_stages:
-            qs = qs.filter(lifecycle_stage__in=scope_stages)
-
-        # Verification page: only members whose household primary holds an
-        # Internal Service case (see require_internal_service_primary).
         if scope == "verification":
-            qs = require_internal_service_primary(qs)
+            # Full verification history: the pending queue + anything ever
+            # verified, regardless of the stage it later advanced to. Also
+            # restrict to members whose household primary holds an Internal
+            # Service case (see require_internal_service_primary).
+            qs = require_internal_service_primary(qs.filter(verification_scope_q()))
+        else:
+            scope_stages = SCOPE_TO_STAGES.get(scope)
+            if scope_stages:
+                qs = qs.filter(lifecycle_stage__in=scope_stages)
 
         # Logistics (kitchen-assignment) page: drop members whose internal-
         # service (meal/box) cases are ALL closed/cancelled -- they've finished
@@ -323,6 +438,18 @@ class MembersListView(PortalGenericAPIView):
                 # Verification page "Pending Verification" chip: pop-up NOT yet
                 # completed (verified_at null), regardless of any case auth status.
                 qs = qs.exclude(verification_completed_q())
+            elif status_val in ("On Hold", "on_hold"):
+                # On Hold is a service-state overlay (not a lifecycle_stage), so it
+                # is filtered on the member's/household's enrollment stage --
+                # independent of verification status or authorization.
+                qs = qs.filter(
+                    Q(enrollments__stage=EnrollmentStage.ON_HOLD)
+                    | Q(
+                        household_membership__household__enrollment_verifications__stage=(
+                            EnrollmentStage.ON_HOLD
+                        )
+                    )
+                )
             else:
                 stages = STATUS_TO_STAGES.get(status_val)
                 if stages:
@@ -425,6 +552,10 @@ class MembersListView(PortalGenericAPIView):
         # whose enrollment record was OPENED within the selected window.
         qs = apply_period_filter(qs, params.get("period"))
 
+        # Verification page requested/completed date-range filters (from/to on
+        # the enrollment's opened_at / verified_at respectively).
+        qs, _ = apply_verification_date_filters(qs, params)
+
         return qs.distinct()
 
     def _serialize_member(self, client, is_primary, relationship=""):
@@ -465,23 +596,30 @@ class MembersListView(PortalGenericAPIView):
         """Lightweight, ordered list of group identifiers for the filtered set
         WITHOUT serializing anyone. Each entry is
         ``{"type": "household"|"individual", "id", "name"}``. Households are
-        de-duplicated and ordered (with individuals) by the household/primary
-        name so pagination is stable and only the requested page is ever built
-        + serialized. A household is included when ANY member matches; its full
-        roster is loaded when the page is built."""
+        de-duplicated and ordered (with individuals) by most-recently-added
+        (created_at) so pagination is stable and only the requested page is ever
+        built + serialized. A household is included when ANY member matches; its
+        full roster is loaded when the page is built."""
         rows = self.get_queryset().values_list(
             "client_id", "household_membership__household_id",
-            "first_name", "last_name",
+            "first_name", "last_name", "created_at",
         )
         hh_ids, seen_hh, individuals = [], set(), []
-        for cid, hid, fn, ln in rows:
+        # Most-recent created_at seen among a household's matching members, used
+        # as the household's "added" sort timestamp.
+        hh_added = {}
+        for cid, hid, fn, ln, created in rows:
             if hid:
                 if hid not in seen_hh:
                     seen_hh.add(hid)
                     hh_ids.append(hid)
+                if created is not None and (
+                    hh_added.get(hid) is None or created > hh_added[hid]
+                ):
+                    hh_added[hid] = created
             else:
                 name = f"{(fn or '').strip()} {(ln or '').strip()}".strip()
-                individuals.append((cid, name))
+                individuals.append((cid, name, created))
 
         # Household sort name = household name, else its primary's name (one query).
         hh_names = {}
@@ -497,16 +635,169 @@ class MembersListView(PortalGenericAPIView):
                 )
 
         entries = [
-            {"type": "household", "id": hid, "name": hh_names.get(hid, "")}
+            {"type": "household", "id": hid, "name": hh_names.get(hid, ""),
+             "added": hh_added.get(hid)}
             for hid in hh_ids
         ] + [
-            {"type": "individual", "id": cid, "name": name}
-            for cid, name in individuals
+            {"type": "individual", "id": cid, "name": name, "added": created}
+            for cid, name, created in individuals
         ]
-        entries.sort(key=lambda e: (e["name"] or "").lower())
+
+        # Most recently added (created_at) first; groups with no created_at sort
+        # last; name breaks ties (case-insensitive) for stable pagination.
+        def _sort_key(e):
+            ts = e["added"]
+            name = (e["name"] or "").lower()
+            if ts is None:
+                return (1, 0.0, name)
+            return (0, -ts.timestamp(), name)
+
+        entries.sort(key=_sort_key)
         return entries
 
-    def _build_groups_for_page(self, entries):
+    def _logistics_kitchens(self):
+        """Active-and-inactive kitchens with their offered menus + restrictions
+        prefetched, loaded once per request for the serviceability checks
+        (serving_kitchens_for_member filters to ACTIVE itself)."""
+        return list(
+            Kitchen.objects.all().prefetch_related(
+                "kitchen_menu_types__menu_type",
+                "kitchen_menu_types__restrictions",
+            )
+        )
+
+    def _logistics_checks(self, primary_client, member_clients, kitchens, *, is_boxes):
+        """Compute the Logistics readiness checkers for one household/individual:
+        per-member menu type / allergies / predicted Out-of-Orbit, plus the
+        household-level delivery address, requested cadence (delivery weekdays),
+        and whether ANY single kitchen can serve every eligible member.
+
+        Returns ``(per_member: {client_id_str: {...}}, aggregate: {...})``."""
+        enr = s.active_enrollment(primary_client)
+        profiles = {}
+        if enr is not None:
+            for mp in enr.member_profiles.all():
+                if mp.client_id:
+                    profiles[mp.client_id] = mp
+        required = required_product_for_program(enr.program_name) if enr else None
+
+        per_member, serving_sets = {}, []
+        missing_menu = predicted_out = 0
+        for c in member_clients:
+            mp = profiles.get(c.client_id)
+            out, reason = predict_member_out_of_orbit(mp)
+            menu_type = (mp.menu_type if mp else "") or ""
+            if not menu_type:
+                missing_menu += 1
+            if out:
+                predicted_out += 1
+            else:
+                # Kitchens that can serve this member's menu + allergies for the
+                # household's product (meals/boxes). A household is servable only
+                # if ONE kitchen serves every eligible member (set intersection).
+                serving_sets.append({
+                    sk["kitchen"].pk
+                    for sk in serving_kitchens_for_member(
+                        mp, kitchens=kitchens, required_product=required,
+                    )
+                })
+            per_member[str(c.client_id)] = {
+                "menu_type": menu_type,
+                "allergies": _allergy_labels(mp.food_allergies if mp else []),
+                "predicted_out_of_orbit": out,
+                "predicted_reason": reason,
+            }
+
+        kitchen_available = bool(set.intersection(*serving_sets)) if serving_sets else False
+        address = _format_address(enr.delivery_address) if enr else ""
+        weekdays = list(enr.delivery_weekdays or []) if enr else []
+
+        # NB: delivery cadence (weekdays) is CHOSEN in the kitchen-assignment
+        # modal, so it is normally unset here -- it's shown as informational
+        # ("requested days", if any) and never counts as a readiness blocker.
+        blockers = []
+        if not address:
+            blockers.append("No delivery address")
+        if missing_menu:
+            blockers.append(f"{missing_menu} missing menu type")
+        if predicted_out:
+            blockers.append(f"{predicted_out} may get out of orbit")
+        if not kitchen_available:
+            blockers.append("Kitchen needs review")
+
+        aggregate = {
+            "delivery_address": address,
+            "delivery_weekdays": weekdays,
+            "is_boxes": is_boxes,
+            "kitchen_available": kitchen_available,
+            "menu_type_missing": missing_menu,
+            "predicted_out_of_orbit": predicted_out,
+            "ready": not blockers,
+            "blockers": blockers,
+        }
+        return per_member, aggregate
+
+    def _compute_logistics_checks(self, entries):
+        """Compute logistics checkers for EVERY entry (used by the readiness
+        filter, which must decide before pagination). Returns
+        ``{(type, id): (per_member, aggregate)}``."""
+        kitchens = self._logistics_kitchens()
+        out = {}
+        hh_ids = [e["id"] for e in entries if e["type"] == "household"]
+        ind_ids = [e["id"] for e in entries if e["type"] == "individual"]
+        if hh_ids:
+            members = (
+                HouseholdMember.objects.filter(household_id__in=hh_ids)
+                .select_related("client")
+                .prefetch_related("client__enrollments", "client__member_profiles",
+                                  "client__cases")
+            )
+            by_hh = {}
+            for hm in members:
+                by_hh.setdefault(hm.household_id, []).append(hm)
+            for hid in hh_ids:
+                hms = [
+                    h for h in by_hh.get(hid, [])
+                    if h.client and not self._hidden_in_logistics(h.client)
+                ]
+                if not hms:
+                    continue
+                primary_hm = next((h for h in hms if h.is_primary), hms[0])
+                is_boxes = self._service_type_for_client(primary_hm.client) == "boxes"
+                out[("household", hid)] = self._logistics_checks(
+                    primary_hm.client, [h.client for h in hms], kitchens, is_boxes=is_boxes,
+                )
+        if ind_ids:
+            clients = Client.objects.filter(client_id__in=ind_ids).prefetch_related(
+                "enrollments", "member_profiles", "cases",
+            )
+            for c in clients:
+                if self._hidden_in_logistics(c):
+                    continue
+                is_boxes = self._service_type_for_client(c) == "boxes"
+                out[("individual", c.client_id)] = self._logistics_checks(
+                    c, [c], kitchens, is_boxes=is_boxes,
+                )
+        return out
+
+    def _attach_logistics(self, group, primary_client, member_clients, member_data,
+                          kitchens, *, precomputed=None):
+        """Attach the logistics checkers to a group: per-member fields onto each
+        member dict and the household aggregate as ``group["logistics"]``. Uses
+        ``precomputed`` (from the readiness filter pass) when available, else
+        computes for this group."""
+        if precomputed is not None:
+            per_member, aggregate = precomputed
+        else:
+            per_member, aggregate = self._logistics_checks(
+                primary_client, member_clients, kitchens,
+                is_boxes=group.get("service_type") == "boxes",
+            )
+        for md in member_data:
+            md.update(per_member.get(md["id"], {}))
+        group["logistics"] = aggregate
+
+    def _build_groups_for_page(self, entries, checks=None):
         """Serialize ONLY the groups on the current page, preserving order."""
         hh_ids = [e["id"] for e in entries if e["type"] == "household"]
         ind_ids = [e["id"] for e in entries if e["type"] == "individual"]
@@ -514,6 +805,7 @@ class MembersListView(PortalGenericAPIView):
         # Logistics (kitchen-assignment) hides out-of-orbit / finished-case
         # members from each household roster (see _hidden_in_logistics).
         logistics = (self.request.query_params.get("scope") or "").strip() == "logistics"
+        kitchens = self._logistics_kitchens() if logistics else None
 
         if hh_ids:
             members = (
@@ -521,7 +813,13 @@ class MembersListView(PortalGenericAPIView):
                 .select_related("household", "client")
                 .prefetch_related(
                     "client__insurances", "client__military_profile",
-                    "client__enrollments", "client__member_profiles", "client__cases",
+                    Prefetch(
+                        "client__enrollments",
+                        queryset=EnrollmentVerification.objects.select_related(
+                            "requested_by", "verified_by"
+                        ),
+                    ),
+                    "client__member_profiles", "client__cases",
                 )
                 .order_by("-is_primary", "added_at")
             )
@@ -548,7 +846,7 @@ class MembersListView(PortalGenericAPIView):
                     (m for m in member_data if m["id"] == str(primary_hm.client_id)),
                     member_data[0],
                 )
-                groups_by_key[("household", hid)] = {
+                group = {
                     "id": str(hid),
                     "type": "household",
                     "name": primary_hm.household.name or primary_data["name"],
@@ -557,6 +855,13 @@ class MembersListView(PortalGenericAPIView):
                     "primary": primary_data,
                     "members": member_data,
                 }
+                if logistics:
+                    self._attach_logistics(
+                        group, primary_hm.client, [h.client for h in hms],
+                        member_data, kitchens,
+                        precomputed=(checks or {}).get(("household", hid)),
+                    )
+                groups_by_key[("household", hid)] = group
 
         if ind_ids:
             clients = Client.objects.filter(client_id__in=ind_ids).prefetch_related(
@@ -566,7 +871,7 @@ class MembersListView(PortalGenericAPIView):
                 if logistics and self._hidden_in_logistics(c):
                     continue  # out-of-orbit / finished-case individual
                 primary_data = self._serialize_member(c, True)
-                groups_by_key[("individual", c.client_id)] = {
+                group = {
                     "id": str(c.client_id),
                     "type": "individual",
                     "name": primary_data["name"],
@@ -575,6 +880,12 @@ class MembersListView(PortalGenericAPIView):
                     "primary": primary_data,
                     "members": [primary_data],
                 }
+                if logistics:
+                    self._attach_logistics(
+                        group, c, [c], [primary_data], kitchens,
+                        precomputed=(checks or {}).get(("individual", c.client_id)),
+                    )
+                groups_by_key[("individual", c.client_id)] = group
 
         # Preserve the paginated order from `entries`.
         return [
@@ -589,37 +900,65 @@ class MembersListView(PortalGenericAPIView):
         if request.query_params.get("flat"):
             # Order + paginate in SQL (LIMIT/OFFSET) so we only ever serialize
             # one page; serializing/sorting the whole clients table per request
-            # does not scale once the full member base is imported. Lower() on
-            # the name columns reproduces the previous case-insensitive
-            # "First Last" ordering.
-            qs = self.get_queryset().order_by(Lower("first_name"), Lower("last_name"))
+            # does not scale once the full member base is imported. Most recently
+            # added members (by created_at) first; rows without a created_at sort
+            # last; name (case-insensitive "First Last") breaks ties.
+            qs = self.get_queryset().order_by(
+                F("created_at").desc(nulls_last=True),
+                Lower("first_name"),
+                Lower("last_name"),
+            )
             page = self.paginate_queryset(qs)
             data = [s.MemberListSerializer(c).data for c in page]
             return self.get_paginated_response(data)
         # Grouped mode (Verification / Logistics): build the ordered group keys
         # cheaply, paginate THEM, and serialize only the current page's groups
         # (previously the whole scoped set was serialized on every request).
-        page = self.paginate_queryset(self._group_entries())
-        return self.get_paginated_response(self._build_groups_for_page(page or []))
+        entries = self._group_entries()
+        scope = (request.query_params.get("scope") or "").strip()
+        checks = None
+        # Logistics readiness filter: keep only households that are Ready to
+        # assign, or that have blockers. Readiness depends on computed checks
+        # (menu type / address / kitchen serviceability), so it must be resolved
+        # BEFORE pagination -- compute checks for every entry, then filter.
+        readiness = (request.query_params.get("readiness") or "").strip().lower()
+        if scope == "logistics" and readiness in ("ready", "blockers"):
+            checks = self._compute_logistics_checks(entries)
+            want_ready = readiness == "ready"
+            entries = [
+                e for e in entries
+                if bool((checks.get((e["type"], e["id"])) or (None, {"ready": False}))[1]["ready"])
+                == want_ready
+            ]
+        page = self.paginate_queryset(entries)
+        return self.get_paginated_response(
+            self._build_groups_for_page(page or [], checks=checks)
+        )
 
 
 class MembersStatsView(PortalAPIView):
     def get(self, request):
         qs = Client.objects.all()
         scope = (request.query_params.get("scope") or "").strip()
-        scope_stages = SCOPE_TO_STAGES.get(scope)
-        if scope_stages:
-            qs = qs.filter(lifecycle_stage__in=scope_stages)
-        # Mirror the Verification list's eligibility filter so the chip counts
-        # match the rows actually shown. The join makes rows non-unique, so all
-        # counts below must be DISTINCT on the client.
+        # Mirror the Verification list's scope so the chip counts match the rows
+        # actually shown: the full verification history (pending + ever-verified)
+        # plus the internal-service-primary eligibility filter. The joins make
+        # rows non-unique, so all counts below must be DISTINCT on the client.
         if scope == "verification":
-            qs = require_internal_service_primary(qs).distinct()
+            qs = require_internal_service_primary(
+                qs.filter(verification_scope_q())
+            ).distinct()
+        else:
+            scope_stages = SCOPE_TO_STAGES.get(scope)
+            if scope_stages:
+                qs = qs.filter(lifecycle_stage__in=scope_stages)
         # Date-period filter (mirrors the list) so the chip counts match the
         # rows shown for the selected window.
         period = request.query_params.get("period")
         qs = apply_period_filter(qs, period)
-        if period_date_range(period):
+        # Requested/completed date-range filters (mirror the list).
+        qs, date_filtered = apply_verification_date_filters(qs, request.query_params)
+        if period_date_range(period) or date_filtered:
             qs = qs.distinct()
         counts = {"total": qs.count()}
         for label, stages in STATUS_TO_STAGES.items():
@@ -764,7 +1103,9 @@ class MemberHistoryView(PortalGenericAPIView):
         get_object_or_404(Client, pk=client_id)
         qs = TimelineEvent.objects.filter(client_id=client_id)
         page = self.paginate_queryset(qs)
-        data = self.get_serializer(page, many=True).data
+        ctx = self.get_serializer_context()
+        ctx["actor_names"] = s.build_actor_name_map(page)
+        data = self.get_serializer(page, many=True, context=ctx).data
         return self.get_paginated_response(data)
 
 
@@ -917,9 +1258,9 @@ class MemberHouseholdAddView(PortalAPIView):
                 {"error": "A client can't be added to their own household."},
                 status=http.HTTP_400_BAD_REQUEST,
             )
-        add_client_to_household(primary, member_client)
         agent = current_agent(request)
-        actor = f"agent:{agent.agent_code}" if agent and agent.agent_code else ""
+        add_client_to_household(primary, member_client, agent=agent)
+        actor = _agent_actor(agent)
         try:
             timeline.event_for_household_member_added(
                 primary, member_client,
@@ -988,7 +1329,7 @@ class HouseholdMemberEditView(PortalAPIView):
             mv.kitchen_food_notes = ""
             mv.save()
             agent = current_agent(request)
-            actor = f"agent:{agent.agent_code}" if agent and agent.agent_code else ""
+            actor = _agent_actor(agent)
             try:
                 timeline.event_for_out_of_orbit(
                     mv, enrollment=mv.enrollment,
@@ -996,6 +1337,17 @@ class HouseholdMemberEditView(PortalAPIView):
                 )
             except Exception:  # never let history-logging break the edit
                 pass
+            # Leave a system note (same as the auto-out-of-orbit paths),
+            # attributed to the acting agent.
+            if mv.client_id:
+                try:
+                    Note.objects.create(
+                        client=mv.client, source=NoteSource.SYSTEM,
+                        author_name=agent.name if agent else "",
+                        body=NO_KITCHEN_OUT_OF_ORBIT_NOTE,
+                    )
+                except Exception:  # never let note-writing break the edit
+                    pass
         elif reactivate and mv.status == MemberStatus.OUT_OF_ORBIT:
             # Re-run the kitchen-aware rules against the edited menu type /
             # allergies. Only return the member to Active if the new combination
@@ -1011,7 +1363,7 @@ class HouseholdMemberEditView(PortalAPIView):
                 )
             mv.save()
             agent = current_agent(request)
-            actor = f"agent:{agent.agent_code}" if agent and agent.agent_code else ""
+            actor = _agent_actor(agent)
             try:
                 timeline.event_for_member_reactivated(
                     mv, enrollment=mv.enrollment, actor=actor,
@@ -1033,7 +1385,7 @@ class HouseholdMemberEditView(PortalAPIView):
             mv.save()
             if became_out:
                 agent = current_agent(request)
-                actor = f"agent:{agent.agent_code}" if agent and agent.agent_code else ""
+                actor = _agent_actor(agent)
                 try:
                     timeline.event_for_out_of_orbit(
                         mv, enrollment=mv.enrollment,
@@ -1042,6 +1394,17 @@ class HouseholdMemberEditView(PortalAPIView):
                     )
                 except Exception:  # never let history-logging break the edit
                     pass
+                # Leave a customer-facing note explaining why the edit pulled the
+                # member Out of Orbit, attributed to the acting agent.
+                if mv.client_id:
+                    try:
+                        Note.objects.create(
+                            client=mv.client, source=NoteSource.SYSTEM,
+                            author_name=agent.name if agent else "",
+                            body=NO_KITCHEN_OUT_OF_ORBIT_NOTE,
+                        )
+                    except Exception:  # never let note-writing break the edit
+                        pass
 
         # Propagate the edited menu type / allergies onto this member's future
         # SCHEDULED delivery occurrences so PO generation reflects the change
@@ -1196,7 +1559,9 @@ class MemberCaseHistoryView(PortalGenericAPIView):
         get_object_or_404(Case, pk=case_id, client_id=client_id)
         qs = TimelineEvent.objects.filter(client_id=client_id, case_id=case_id)
         page = self.paginate_queryset(qs)
-        data = self.get_serializer(page, many=True).data
+        ctx = self.get_serializer_context()
+        ctx["actor_names"] = s.build_actor_name_map(page)
+        data = self.get_serializer(page, many=True, context=ctx).data
         return self.get_paginated_response(data)
 
 
@@ -1312,7 +1677,9 @@ class MemberVerificationCreateView(PortalAPIView):
         if extra_member_ids and household is None:
             household = ensure_household_with_primary(client)
         # Start at PENDING_VERIFICATION; the guarded lifecycle transitions below
-        # move it forward and write the history rows.
+        # move it forward and write the history rows. The agent running the
+        # wizard both requests and (below) completes the verification.
+        acting_agent = current_agent(request)
         enrollment = EnrollmentVerification.objects.create(
             client=client,
             household=household,
@@ -1324,6 +1691,7 @@ class MemberVerificationCreateView(PortalAPIView):
             medicaid_type_verified=data.get("medicaid_type_verified"),
             delivery_address_verified=data.get("delivery_address_verified"),
             stage=EnrollmentStage.PENDING_VERIFICATION,
+            requested_by=acting_agent,
         )
 
         for m in data["members"]:
@@ -1361,9 +1729,7 @@ class MemberVerificationCreateView(PortalAPIView):
         # of THIS household (no duplicate row, no duplicate timeline event).
         if household is not None and extra_member_ids:
             agent = current_agent(request)
-            actor = (
-                f"agent:{agent.agent_code}" if agent and agent.agent_code else ""
-            )
+            actor = _agent_actor(agent)
             for mid in extra_member_ids:
                 member_client = Client.objects.filter(pk=mid).first()
                 if member_client is None:
@@ -1468,7 +1834,7 @@ def assign_kitchen_to_household(
     """
     member_quantities = member_quantities or {}
     exclude_notes = exclude_notes or {}
-    actor = f"agent:{agent.agent_code}" if agent and agent.agent_code else ""
+    actor = _agent_actor(agent)
 
     enr.kitchen = kitchen
     enr.save(update_fields=["kitchen"])
@@ -1524,6 +1890,17 @@ def assign_kitchen_to_household(
                 )
             except Exception:  # never let history-logging break assignment
                 pass
+            # Note explaining why the assigned kitchen couldn't serve them,
+            # attributed to the acting agent (blank for unattended bulk runs).
+            if profile.client_id:
+                try:
+                    Note.objects.create(
+                        client=profile.client, source=NoteSource.SYSTEM,
+                        author_name=agent.name if agent else "",
+                        body=NO_KITCHEN_OUT_OF_ORBIT_NOTE,
+                    )
+                except Exception:  # never let note-writing break assignment
+                    pass
 
     case = enr.case or s.primary_case(client)
     create_member_delivery_schedules(
@@ -1682,6 +2059,42 @@ def _box_cadence():
     return opts[0]["value"] if opts else DeliveryCadence.ONCE_A_WEEK
 
 
+def _prefetched_kitchens():
+    """Kitchens with their offered menus + restrictions prefetched, for reuse
+    across serviceability checks in one request."""
+    return list(
+        Kitchen.objects.all().prefetch_related(
+            "kitchen_menu_types__menu_type",
+            "kitchen_menu_types__restrictions",
+        )
+    )
+
+
+def enrollment_ready_for_assignment(enr, kitchens):
+    """Whether a household enrollment is 'Ready to assign' -- the same readiness
+    shown on the Logistics list: a delivery address is set, every member has a
+    menu type and isn't predicted Out of Orbit, and some single kitchen can serve
+    every member. Used by the bulk-assign 'only ready to assign' option."""
+    if enr.delivery_address_id is None:
+        return False
+    members = list(enr.member_profiles.all())
+    if not members:
+        return False
+    required = required_product_for_program(enr.program_name)
+    serving_sets = []
+    for mp in members:
+        out, _ = predict_member_out_of_orbit(mp)
+        if out:
+            return False
+        serving_sets.append({
+            sk["kitchen"].pk
+            for sk in serving_kitchens_for_member(
+                mp, kitchens=kitchens, required_product=required,
+            )
+        })
+    return bool(set.intersection(*serving_sets))
+
+
 class BulkAssignBoxesView(PortalAPIView):
     """Logistics: bulk-assign the single box kitchen to every household awaiting
     kitchen assignment for a boxes program.
@@ -1700,9 +2113,14 @@ class BulkAssignBoxesView(PortalAPIView):
                 supported_products__contains=[KitchenProductType.BOX]
             ).order_by("name")
         ]
+        box_enr = _awaiting_box_enrollments()
+        kitchens_ctx = _prefetched_kitchens()
         return Response({
             "kitchens": kitchens,
-            "awaiting_count": len(_awaiting_box_enrollments()),
+            "awaiting_count": len(box_enr),
+            "ready_count": sum(
+                1 for e in box_enr if enrollment_ready_for_assignment(e, kitchens_ctx)
+            ),
         })
 
     def post(self, request):
@@ -1721,6 +2139,14 @@ class BulkAssignBoxesView(PortalAPIView):
         cadence = _box_cadence()
         agent = current_agent(request)
         enrollments = _awaiting_box_enrollments()
+        # Optionally restrict to households that are Ready to assign (matches the
+        # Logistics list's readiness): skip any with blockers.
+        if request.data.get("ready_only"):
+            kitchens_ctx = _prefetched_kitchens()
+            enrollments = [
+                e for e in enrollments
+                if enrollment_ready_for_assignment(e, kitchens_ctx)
+            ]
 
         assigned, out_of_orbit, failed, errors = 0, 0, 0, []
         for enr in enrollments:
@@ -1827,10 +2253,15 @@ class BulkAssignMealsView(PortalAPIView):
                 supported_products__contains=[KitchenProductType.MEAL]
             ).order_by("name")
         ]
+        meal_enr = _awaiting_enrollments(ProductTypeKind.MEALS)
+        kitchens_ctx = _prefetched_kitchens()
         return Response({
             "kitchens": kitchens,
             "cadence_options": cadence_options_for_kind(ProductTypeKind.MEALS),
-            "awaiting_count": len(_awaiting_enrollments(ProductTypeKind.MEALS)),
+            "awaiting_count": len(meal_enr),
+            "ready_count": sum(
+                1 for e in meal_enr if enrollment_ready_for_assignment(e, kitchens_ctx)
+            ),
         })
 
     def _validated_inputs(self, request):
@@ -1868,6 +2299,14 @@ class BulkAssignMealsView(PortalAPIView):
             return err
 
         enrollments = _awaiting_enrollments(ProductTypeKind.MEALS)
+        # Optionally restrict to households that are Ready to assign (matches the
+        # Logistics list's readiness). Applies to both the preview and the apply.
+        if request.data.get("ready_only"):
+            kitchens_ctx = _prefetched_kitchens()
+            enrollments = [
+                e for e in enrollments
+                if enrollment_ready_for_assignment(e, kitchens_ctx)
+            ]
         offered = kitchen_offered_menu_index(kitchen)
 
         # Preview: dry-run only, report households that would have exclusions.

@@ -1659,6 +1659,14 @@ class EnrollmentVerification(models.Model):
     renewal_number = models.PositiveSmallIntegerField(default=1)
     stage_at = models.DateTimeField(null=True, blank=True)
     opened_at = models.DateTimeField(auto_now_add=True)
+    # The agent who REQUESTED the verification -- i.e. submitted the E-Form that
+    # created this enrollment (opened_at is the request time). Set on creation
+    # from the authenticated extension agent; NULL for bulk-imported enrollments
+    # where no acting agent is attributable.
+    requested_by = models.ForeignKey(
+        "Agent", on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="requested_enrollments",
+    )
     closed_at = models.DateTimeField(null=True, blank=True)
     note = models.TextField(blank=True)
 

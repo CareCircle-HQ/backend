@@ -22,6 +22,8 @@ from .models import (
     CaseType,
     Client,
     ClientLevel,
+    ClientPhone,
+    ClientPhoneSource,
     DietaryRestriction,
     EnrollmentStage,
     EnrollmentVerification,
@@ -41,6 +43,8 @@ from .models import (
     MenuCategory,
     MenuType,
     MilitaryProfile,
+    Note,
+    NoteSource,
     Program,
     ProgramEligibility,
     ProgramMainCategory,
@@ -325,6 +329,44 @@ class ClientSerializer(serializers.ModelSerializer):
             return False
         return expired_at < timezone.now()
 
+    @staticmethod
+    def _sync_client_phone(client, number, phone_type):
+        """Upsert the ext's primary ``client_phone_number`` into the ClientPhone
+        table so it shows in the member-profile "Phone Numbers" widget and is
+        reachable via caller-ID lookup. Idempotent on (client, normalized); the
+        synced number is (re)made primary. A blank/short number is a no-op."""
+        normalized = ClientPhone.normalize(number)
+        if not normalized:
+            return
+        label = (phone_type or "").strip()
+        phone, created = ClientPhone.objects.get_or_create(
+            client=client,
+            normalized=normalized,
+            defaults={
+                "raw": number,
+                "label": label,
+                "source": ClientPhoneSource.UNITEUS,
+            },
+        )
+        # Keep the stored raw/label fresh from the source without clobbering an
+        # agent-set label with a blank.
+        updates = {"last_seen_at": timezone.now()}
+        if number and phone.raw != number:
+            phone.raw = number
+            updates["raw"] = phone.raw
+        if label and phone.label != label:
+            phone.label = label
+            updates["label"] = phone.label
+        phone.last_seen_at = updates["last_seen_at"]
+        phone.save(update_fields=list(updates))
+        # The Unite Us primary number heads the list.
+        if not phone.is_primary:
+            ClientPhone.objects.filter(client=client, is_primary=True).exclude(
+                pk=phone.pk
+            ).update(is_primary=False)
+            phone.is_primary = True
+            phone.save(update_fields=["is_primary"])
+
     def _upsert(self, validated_data):
         military = validated_data.pop("military_profile", None)
         addresses = validated_data.pop("addresses", None)
@@ -354,6 +396,18 @@ class ClientSerializer(serializers.ModelSerializer):
         client, _ = Client.objects.update_or_create(
             client_id=client_id, defaults=validated_data
         )
+
+        # Mirror the ext's single Client.client_phone_number into the ClientPhone
+        # table (what the member-profile "Phone Numbers" widget + caller-ID read),
+        # but only when this write actually carried a phone -- a partial PATCH
+        # that omits it must not re-add a number an agent deleted. Idempotent on
+        # (client, normalized); made primary so it heads the list.
+        if "client_phone_number" in validated_data:
+            self._sync_client_phone(
+                client,
+                validated_data.get("client_phone_number"),
+                validated_data.get("phone_type"),
+            )
 
         if military is not None:
             MilitaryProfile.objects.update_or_create(
@@ -475,7 +529,7 @@ def ensure_household_with_primary(client):
 
 
 @transaction.atomic
-def sync_household_members(client, enrollment=None):
+def sync_household_members(client, enrollment=None, agent=None):
     """Reconcile a household's two member sources so every member -- however
     added -- lands in the SAME place.
 
@@ -529,7 +583,7 @@ def sync_household_members(client, enrollment=None):
         # New members carry NO default menu type / allergies and start Out of
         # Orbit: an agent must assign a menu type + restrictions, and only then
         # (on save) is the kitchen output computed and the member activated.
-        MemberDietaryProfile.objects.create(
+        profile = MemberDietaryProfile.objects.create(
             enrollment=enrollment,
             client=member,
             member_name=f"{member.first_name} {member.last_name}".strip(),
@@ -537,6 +591,41 @@ def sync_household_members(client, enrollment=None):
             status=MemberStatus.OUT_OF_ORBIT,
         )
         created += 1
+        # This member was added outside the verification wizard, so leave a
+        # system note explaining why they start Out of Orbit + what's needed to
+        # activate them, AND log the Out-of-Orbit event to the timeline (same as
+        # the other paths that set a member Out of Orbit). Best-effort: never let
+        # history/note-logging break the add.
+        reason = (
+            "New member added outside of the verification process. "
+            "This member needs a menu type and dietary preferences to be "
+            "active (added Out of Orbit by default)."
+        )
+        # Attribute the acting agent (who added the member) so the note author
+        # and the timeline actor show WHO performed the action instead of blank.
+        agent_author = (agent.name if agent else "") or ""
+        # Prefer the agent code (resolved to a name in the UI); fall back to the
+        # agent's name for code-less agents so the actor isn't blank.
+        if agent and agent.agent_code:
+            agent_actor = f"agent:{agent.agent_code}"
+        elif agent_author:
+            agent_actor = f"user:{agent_author}"
+        else:
+            agent_actor = ""
+        try:
+            Note.objects.create(
+                client=member, source=NoteSource.SYSTEM,
+                author_name=agent_author, body=reason,
+            )
+        except Exception:
+            logger.warning("household member note failed", exc_info=True)
+        try:
+            from .services import timeline
+            timeline.event_for_out_of_orbit(
+                profile, enrollment=enrollment, reason=reason, actor=agent_actor,
+            )
+        except Exception:
+            logger.warning("household member out-of-orbit event failed", exc_info=True)
 
     # 2) profiled members -> ensure a roster row (one-household-per-client).
     for cid in profiles:
@@ -596,7 +685,7 @@ def search_clients(q):
 
 
 @transaction.atomic
-def add_client_to_household(primary, member_client):
+def add_client_to_household(primary, member_client, agent=None):
     """Add ``member_client`` to ``primary``'s household, MOVING them out of any
     OTHER household first (one-household-per-client). Mirrors the member into the
     household's active enrollment as a dietary profile so they show + are
@@ -627,7 +716,7 @@ def add_client_to_household(primary, member_client):
     HouseholdMember.objects.create(
         household=household, client=member_client, is_primary=False
     )
-    sync_household_members(primary)
+    sync_household_members(primary, agent=agent)
     return household
 
 

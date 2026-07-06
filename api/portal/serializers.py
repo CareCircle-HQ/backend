@@ -18,6 +18,8 @@ from ..models import (
     Agent,
     Case,
     CaseType,
+    CommunicationChannel,
+    CommunicationTimeOfDay,
     DeliveryCompany,
     DeliveryCompanyIntegration,
     DeliveryOrder,
@@ -51,6 +53,29 @@ LIFETIME_SENTINEL_YEAR = 9999
 # ---------------------------------------------------------------------------
 def _full_name(client):
     return f"{client.first_name} {client.last_name}".strip()
+
+
+def _agent_name(agent):
+    """Display name for an Agent (falls back to first+last, then agent_code).
+    Returns None when there is no agent."""
+    if agent is None:
+        return None
+    name = (agent.name or "").strip()
+    if not name:
+        name = f"{(agent.first_name or '').strip()} {(agent.last_name or '').strip()}".strip()
+    return name or (agent.agent_code or None)
+
+
+_COMM_CHANNEL_LABELS = dict(CommunicationChannel.choices)
+_COMM_TIME_LABELS = dict(CommunicationTimeOfDay.choices)
+
+
+def _labels_for(codes, mapping):
+    """Map a stored list of enum codes to their human labels, keeping unknown
+    codes as-is. Returns a clean list (blank/None entries dropped)."""
+    if not codes:
+        return []
+    return [mapping.get(c, str(c)) for c in codes if c]
 
 
 def primary_insurance(client):
@@ -122,6 +147,33 @@ def verification_status(client):
     ):
         return "Pending Verification"
     return _STATUS_MAP.get(client.lifecycle_stage, client.get_lifecycle_stage_display())
+
+
+# Coarse pipeline PHASE for the Verification list's "Stage" column. Both
+# pending_verification and verified (awaiting authorization) are still in the
+# "Verification" phase; the case being approved advances to Kitchen Assignment,
+# then Active once the kitchen is assigned. On Hold overlays any phase.
+_STAGE_PHASE_LABELS = {
+    "pending_verification": "Verification",
+    "verified": "Verification",
+    "kitchen_assignment": "Kitchen Assignment",
+    "active": "Active",
+    "completed": "Completed",
+    "not_eligible": "Denied",
+}
+
+
+def pipeline_stage_label(client):
+    """The member's CURRENT pipeline phase, independent of the verification fact:
+    the On Hold overlay if paused, otherwise the coarse phase for the client's
+    lifecycle_stage. The whole verification window (pending OR verified-awaiting-
+    authorization) reads as "Verification"; approval moves it to Kitchen
+    Assignment, then Active. Used by the Verification list's "Stage" column."""
+    if service_hold_state(client)["on_hold"]:
+        return "On Hold"
+    return _STAGE_PHASE_LABELS.get(
+        client.lifecycle_stage, client.get_lifecycle_stage_display()
+    )
 
 
 def authorization_status(client):
@@ -266,9 +318,25 @@ class MemberListSerializer(serializers.Serializer):
     out_of_orbit = serializers.SerializerMethodField()
     start_date = serializers.SerializerMethodField()
     end_date = serializers.SerializerMethodField()
+    verification_requested_at = serializers.SerializerMethodField()
+    verification_completed_at = serializers.SerializerMethodField()
+    verification_requested_by = serializers.SerializerMethodField()
+    verification_completed_by = serializers.SerializerMethodField()
+    stage_label = serializers.SerializerMethodField()
+    verification_state = serializers.SerializerMethodField()
 
     def get_name(self, obj):
         return _full_name(obj)
+
+    def get_stage_label(self, obj):
+        return pipeline_stage_label(obj)
+
+    def get_verification_state(self, obj):
+        # Pure verification FACT for the Verification page's status column:
+        # Verified once the pop-up completed (verified_at set), else Pending
+        # Verification. The downstream pipeline position (Kitchen Assignment /
+        # Active / Completed / On Hold) lives in stage_label, not here.
+        return "Verified" if verification_completed(obj) else "Pending Verification"
 
     def get_out_of_orbit(self, obj):
         return member_out_of_orbit(obj)
@@ -295,6 +363,31 @@ class MemberListSerializer(serializers.Serializer):
     def get_end_date(self, obj):
         enr = active_enrollment(obj)
         return enr.closed_at.isoformat() if enr and enr.closed_at else None
+
+    def get_verification_requested_at(self, obj):
+        # A verification is "requested" when its enrollment is created (it opens
+        # at Pending Verification and fires the VERIFICATION_REQUESTED timeline),
+        # so opened_at is the request timestamp (date + time).
+        enr = active_enrollment(obj)
+        return enr.opened_at.isoformat() if enr and enr.opened_at else None
+
+    def get_verification_completed_at(self, obj):
+        # A verification is "done" when the pop-up completes and sets verified_at
+        # (the source of truth for "is this household verified?"). Null while the
+        # household is still Pending Verification.
+        enr = active_enrollment(obj)
+        return enr.verified_at.isoformat() if enr and enr.verified_at else None
+
+    def get_verification_requested_by(self, obj):
+        # Agent who submitted the E-Form that requested the verification. NULL for
+        # bulk-imported enrollments with no attributable agent.
+        enr = active_enrollment(obj)
+        return _agent_name(enr.requested_by) if enr else None
+
+    def get_verification_completed_by(self, obj):
+        # Agent who completed the verification pop-up (set alongside verified_at).
+        enr = active_enrollment(obj)
+        return _agent_name(enr.verified_by) if enr else None
 
 
 class MemberDetailSerializer(serializers.Serializer):
@@ -349,6 +442,7 @@ class MemberDetailSerializer(serializers.Serializer):
                 "ethnicity": client.ethnicity,
                 "language": client.language,
                 "preferred_spoken_language": client.preferred_spoken_language,
+                "preferred_written_language": client.preferred_written_language,
                 "household_size": client.household_size,
             },
             "contact": {
@@ -356,6 +450,16 @@ class MemberDetailSerializer(serializers.Serializer):
                 "phone_type": client.phone_type,
                 "email": client.client_email_address,
                 "preferred_contact_method": client.preferred_contact_method,
+                # Multi-select communication preferences captured by the ext.
+                # Codes are mapped to human labels; raw codes kept for any UI
+                # that needs them.
+                "communication_channels": _labels_for(
+                    client.communication_channels, _COMM_CHANNEL_LABELS
+                ),
+                "preferred_communication_times": _labels_for(
+                    client.preferred_communication_times, _COMM_TIME_LABELS
+                ),
+                "preferred_languages": list(client.preferred_languages or []),
             },
             "address": {
                 "street": current_addr.street if current_addr else "",
@@ -448,6 +552,44 @@ class PortalSocialCoverageSerializer(serializers.ModelSerializer):
 # ---------------------------------------------------------------------------
 # History (timeline)
 # ---------------------------------------------------------------------------
+def resolve_actor_name(actor, agent_names=None):
+    """Human-readable name for a timeline event's ``actor`` attribution string.
+
+    Actors are stored as ``agent:<agent_code>`` (portal/extension writes),
+    ``system:<job>`` (batch jobs), ``user:<name>`` or a raw display name. This
+    resolves an agent code to the Agent's name (via the optional prefetched
+    ``agent_names`` {code: name} map, else a direct lookup) so the history tab
+    can show WHO performed the action instead of an opaque code."""
+    if not actor:
+        return ""
+    if actor.startswith("agent:"):
+        code = actor[len("agent:"):]
+        if agent_names is not None:
+            return agent_names.get(code) or f"Agent {code}"
+        name = Agent.objects.filter(agent_code=code).values_list("name", flat=True).first()
+        return name or f"Agent {code}"
+    if actor.startswith("system:"):
+        return "System"
+    if actor.startswith("user:"):
+        return actor[len("user:"):]
+    return actor
+
+
+def build_actor_name_map(events):
+    """Prefetch a {agent_code: name} map for the agent actors in ``events`` so a
+    page of timeline rows resolves actor names in one query (no N+1)."""
+    codes = {
+        e.actor[len("agent:"):]
+        for e in events
+        if e.actor and e.actor.startswith("agent:")
+    }
+    if not codes:
+        return {}
+    return dict(
+        Agent.objects.filter(agent_code__in=codes).values_list("agent_code", "name")
+    )
+
+
 class HistoryEventSummarySerializer(serializers.ModelSerializer):
     id = serializers.IntegerField(source="pk", read_only=True)
     event_type_label = serializers.CharField(source="get_event_type_display", read_only=True)
@@ -455,30 +597,40 @@ class HistoryEventSummarySerializer(serializers.ModelSerializer):
     # can badge "via Import #73 by Jane" and click through to the case/ticket.
     entity_type = serializers.SerializerMethodField()
     entity_id = serializers.CharField(source="object_id", read_only=True)
+    # Resolved, human-readable actor (agent code -> agent name).
+    actor_name = serializers.SerializerMethodField()
 
     class Meta:
         model = TimelineEvent
         fields = [
             "id", "event_type", "event_type_label", "occurred_at", "title",
             "subtitle", "badge_text", "badge_tone", "renewal_number",
-            "source", "actor", "case", "entity_type", "entity_id", "metadata",
+            "source", "actor", "actor_name", "case", "entity_type", "entity_id",
+            "metadata",
         ]
 
     def get_entity_type(self, obj):
         return obj.content_type.model if obj.content_type_id else None
 
+    def get_actor_name(self, obj):
+        return resolve_actor_name(obj.actor, self.context.get("actor_names"))
+
 
 class HistoryEventDetailSerializer(serializers.ModelSerializer):
     id = serializers.IntegerField(source="pk", read_only=True)
     event_type_label = serializers.CharField(source="get_event_type_display", read_only=True)
+    actor_name = serializers.SerializerMethodField()
 
     class Meta:
         model = TimelineEvent
         fields = [
             "id", "event_type", "event_type_label", "occurred_at", "title",
             "subtitle", "badge_text", "badge_tone", "renewal_number",
-            "source", "actor", "metadata",
+            "source", "actor", "actor_name", "metadata",
         ]
+
+    def get_actor_name(self, obj):
+        return resolve_actor_name(obj.actor, self.context.get("actor_names"))
 
 
 class ActivityEventSerializer(HistoryEventSummarySerializer):
