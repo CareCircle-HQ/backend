@@ -19,6 +19,7 @@ from django.utils import timezone
 from api.models import (
     DeliveryOrder,
     MemberStatus,
+    SERVICE_EXCLUDED_MEMBER_STATUSES,
     OrderSchedule,
     OrderStatus,
     ScheduleStatus,
@@ -117,10 +118,10 @@ def generate_orders_for_enrollment(enrollment):
     if not dates:
         return []
 
-    # Out-of-orbit members are excluded from all delivery orders.
+    # Out-of-orbit and paused members are excluded from all delivery orders.
     members = list(
         enrollment.member_profiles.select_related("client")
-        .exclude(status=MemberStatus.OUT_OF_ORBIT)
+        .exclude(status__in=SERVICE_EXCLUDED_MEMBER_STATUSES)
         .all()
     )
     if not members:
@@ -315,10 +316,12 @@ def sync_delivery_calendar(enrollment, from_date=None):
         enrollment.delivery_schedules.filter(status=ScheduleStatus.SCHEDULED)
         .select_related("member_profile", "member_profile__client")
     )
-    # Skip out-of-orbit members: they carry a plan but are excluded from POs.
+    # Skip out-of-orbit / paused members: they carry a plan but are excluded
+    # from POs.
     plans = [
         p for p in plans
-        if p.member_profile and p.member_profile.status != MemberStatus.OUT_OF_ORBIT
+        if p.member_profile
+        and p.member_profile.status not in SERVICE_EXCLUDED_MEMBER_STATUSES
     ]
 
     existing = list(

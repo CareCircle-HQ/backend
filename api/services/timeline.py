@@ -640,3 +640,58 @@ def event_for_member_reactivated(
         enrollment=enrollment,
         metadata={"menu_type": profile.menu_type or ""},
     )
+
+
+def event_for_member_paused(
+    profile, *, enrollment=None, reason="", source=ChangeSource.ADMIN, actor="",
+):
+    """Emit a 'Member Paused' event when an agent manually pauses an individual
+    member (with a required reason). Like Out of Orbit, paused members are
+    excluded from delivery schedules / Purchase Orders until unpaused. Logged on
+    the member's own client. Not de-duped, so each pause/unpause cycle is
+    recorded."""
+    client = getattr(profile, "client", None)
+    if client is None:
+        return None
+    enrollment = enrollment or getattr(profile, "enrollment", None)
+    return emit_timeline_event(
+        client=client,
+        event_type=TimelineEventType.MEMBER_PAUSED,
+        occurred_at=timezone.now(),
+        title="Member Paused",
+        subtitle=profile.member_name or "",
+        badge_text="Paused",
+        badge_tone=TimelineBadgeTone.WARNING,
+        source=source,
+        actor=actor,
+        entity=profile,
+        enrollment=enrollment,
+        metadata={"reason": reason, "menu_type": profile.menu_type or ""},
+    )
+
+
+def event_for_member_unpaused(
+    profile, *, enrollment=None, reason="", source=ChangeSource.ADMIN, actor="",
+):
+    """Emit a 'Member Unpaused' event when an agent lifts a manual pause. The
+    caller re-runs the meal rule first, so the member may land back Active or
+    Out of Orbit; this records only that the pause was lifted. Logged on the
+    member's own client. Not de-duped."""
+    client = getattr(profile, "client", None)
+    if client is None:
+        return None
+    enrollment = enrollment or getattr(profile, "enrollment", None)
+    return emit_timeline_event(
+        client=client,
+        event_type=TimelineEventType.MEMBER_UNPAUSED,
+        occurred_at=timezone.now(),
+        title="Member Unpaused",
+        subtitle=profile.member_name or "",
+        badge_text="Unpaused",
+        badge_tone=TimelineBadgeTone.SUCCESS,
+        source=source,
+        actor=actor,
+        entity=profile,
+        enrollment=enrollment,
+        metadata={"reason": reason, "menu_type": profile.menu_type or ""},
+    )

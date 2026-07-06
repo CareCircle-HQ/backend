@@ -224,6 +224,22 @@ def member_out_of_orbit(client):
     return False
 
 
+def member_paused(client):
+    """True when the client's active-enrollment dietary profile is Paused (an
+    agent manually paused them). Paused members are excluded from delivery
+    schedules/POs. Scoped to the active enrollment so a stale profile from a
+    closed enrollment never mislabels a member."""
+    profiles = list(client.member_profiles.all())
+    if not profiles:
+        return False
+    enr = active_enrollment(client)
+    if enr is not None:
+        for mp in profiles:
+            if mp.enrollment_id == enr.pk:
+                return mp.status == MemberStatus.PAUSED
+    return False
+
+
 def service_hold_state(client):
     """Whether the client's household service is paused (enrollment On Hold).
 
@@ -316,6 +332,7 @@ class MemberListSerializer(serializers.Serializer):
     case_manager = serializers.CharField(source="agent_name")
     flags = serializers.SerializerMethodField()
     out_of_orbit = serializers.SerializerMethodField()
+    paused = serializers.SerializerMethodField()
     start_date = serializers.SerializerMethodField()
     end_date = serializers.SerializerMethodField()
     verification_requested_at = serializers.SerializerMethodField()
@@ -340,6 +357,9 @@ class MemberListSerializer(serializers.Serializer):
 
     def get_out_of_orbit(self, obj):
         return member_out_of_orbit(obj)
+
+    def get_paused(self, obj):
+        return member_paused(obj)
 
     def get_verification_status(self, obj):
         return verification_status(obj)
@@ -1077,6 +1097,24 @@ class PortalMemberDietaryEditSerializer(serializers.Serializer):
     # Excludes them from delivery schedules / Purchase Orders until reactivated.
     # Also a control flag, popped by the view before assigning model fields.
     deactivate = serializers.BooleanField(required=False, default=False)
+    # When true, manually PAUSE an active member (agent override). Requires
+    # ``pause_reason`` (stored as an agent note). Like Out of Orbit, paused
+    # members are excluded from delivery schedules / Purchase Orders until
+    # unpaused. Control flag, popped by the view before assigning model fields.
+    pause = serializers.BooleanField(required=False, default=False)
+    # When true, lift a member's manual pause. The view re-runs the meal rule so
+    # the member returns to Active (or Out of Orbit if now unfulfillable).
+    unpause = serializers.BooleanField(required=False, default=False)
+    # Required free-text reason when pausing (also accepted on unpause). Stored
+    # as an agent-authored note -- NOT a system note.
+    pause_reason = serializers.CharField(allow_blank=True, required=False)
+
+    def validate(self, attrs):
+        if attrs.get("pause") and not (attrs.get("pause_reason") or "").strip():
+            raise serializers.ValidationError(
+                {"pause_reason": "A reason is required to pause this member."}
+            )
+        return attrs
 
 
 # ---------------------------------------------------------------------------

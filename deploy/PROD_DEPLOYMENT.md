@@ -17,7 +17,7 @@ regional-endpoint pinned), and the `deploy.sh` celery-restart hook.
 ```bash
 sudo apt-get update && sudo apt-get install -y redis-server
 # /etc/redis/redis.conf: ensure  bind 127.0.0.1 ::1  ; add:
-#   maxmemory 128mb
+#   maxmemory 1
 #   maxmemory-policy noeviction
 sudo systemctl enable --now redis-server
 redis-cli ping        # -> PONG
