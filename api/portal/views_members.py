@@ -51,8 +51,8 @@ from ..services.orders import (
     resync_scheduled_orders,
     sync_delivery_calendar,
 )
-from ..services.kitchens import kitchen_options
-from ..services.meal_rules import apply_to_member
+from ..services.kitchens import kitchen_offered_menu_index, kitchen_options
+from ..services.meal_rules import reconcile_member_kitchen_output
 from ..services.lifecycle import InvalidTransition, advance_enrollment
 from ..services import timeline
 from ..serializers import (
@@ -981,11 +981,14 @@ class HouseholdMemberEditView(PortalAPIView):
             except Exception:  # never let history-logging break the edit
                 pass
         elif reactivate and mv.status == MemberStatus.OUT_OF_ORBIT:
-            # Re-run the meal rule against the edited menu type/allergies. Only
-            # return the member to Active if the new combination can actually be
-            # fulfilled; otherwise the agent must pick a different menu type.
-            result, _ = apply_to_member(mv, save=False)
-            if result.out_of_orbit:
+            # Re-run the kitchen-aware rules against the edited menu type /
+            # allergies. Only return the member to Active if the new combination
+            # can actually be fulfilled by the household's assigned kitchen;
+            # otherwise the agent must pick a different menu type.
+            out, _became, _reason = reconcile_member_kitchen_output(
+                mv, enr.kitchen, save=False,
+            )
+            if out:
                 return Response(
                     {"error": "Pick a different menu type to activate this member."},
                     status=http.HTTP_400_BAD_REQUEST,
@@ -1000,7 +1003,29 @@ class HouseholdMemberEditView(PortalAPIView):
             except Exception:  # never let history-logging break the edit
                 pass
         else:
+            # Normal save: reconcile the kitchen output against the global meal
+            # rules AND the household's assigned kitchen. An ACTIVE member whose
+            # new menu/allergies can't be fulfilled is auto-set Out of Orbit
+            # (excluded from schedules/POs). Out-of-orbit members are NOT
+            # auto-reactivated here -- that requires the explicit reactivate flag
+            # above, so a manual override is never silently undone by an edit.
+            became_out = False
+            if mv.status == MemberStatus.ACTIVE:
+                _out, became_out, reason = reconcile_member_kitchen_output(
+                    mv, enr.kitchen, save=False,
+                )
             mv.save()
+            if became_out:
+                agent = current_agent(request)
+                actor = f"agent:{agent.agent_code}" if agent and agent.agent_code else ""
+                try:
+                    timeline.event_for_out_of_orbit(
+                        mv, enrollment=mv.enrollment,
+                        reason=reason or "Menu/allergies can't be fulfilled by the assigned kitchen.",
+                        actor=actor,
+                    )
+                except Exception:  # never let history-logging break the edit
+                    pass
 
         # Propagate the edited menu type / allergies onto this member's future
         # SCHEDULED delivery occurrences so PO generation reflects the change
@@ -1500,9 +1525,12 @@ class MemberAssignKitchenView(PortalAPIView):
 
         # Apply the Meal Rules to each member: derive the kitchen meal type +
         # food notes (sent to the kitchen on the PO) or flag the member Out of
-        # Orbit. Out-of-orbit members are excluded from schedules + POs.
+        # Orbit. Reconciliation is kitchen-aware, so a member the CHOSEN kitchen
+        # can't fulfill (menu not offered / allergy it can't handle) is also set
+        # Out of Orbit. Out-of-orbit members are excluded from schedules + POs.
         agent = current_agent(request)
         actor = f"agent:{agent.agent_code}" if agent and agent.agent_code else ""
+        offered = kitchen_offered_menu_index(kitchen)
         for profile in enr.member_profiles.select_related("client").all():
             if profile.pk in exclude_notes:
                 # Manual exclusion: force Out of Orbit and drop the kitchen meal
@@ -1532,12 +1560,14 @@ class MemberAssignKitchenView(PortalAPIView):
                     except Exception:  # never let note-writing break assignment
                         pass
                 continue
-            _result, became_out = apply_to_member(profile)
+            _out, became_out, reason = reconcile_member_kitchen_output(
+                profile, kitchen, offered=offered,
+            )
             if became_out:
                 try:
                     timeline.event_for_out_of_orbit(
                         profile, enrollment=enr,
-                        reason="Allergy/menu combination cannot be safely fulfilled.",
+                        reason=reason or "Allergy/menu combination cannot be safely fulfilled.",
                         actor=actor,
                     )
                 except Exception:  # never let history-logging break assignment
