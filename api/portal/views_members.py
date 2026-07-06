@@ -50,12 +50,18 @@ from ..services.delivery import (
 )
 from ..services.client_diagnostic import diagnose_client
 from ..services.orders import (
+    _format_address,
     generate_delivery_calendar,
     resync_scheduled_orders,
     sync_delivery_calendar,
 )
-from ..services.kitchens import kitchen_offered_menu_index, kitchen_options
-from ..services.meal_rules import reconcile_member_kitchen_output
+from ..services.kitchens import (
+    kitchen_offered_menu_index,
+    kitchen_options,
+    required_product_for_program,
+    serving_kitchens_for_member,
+)
+from ..services.meal_rules import reconcile_member_kitchen_output, resolve_kitchen_meal
 from ..services.lifecycle import InvalidTransition, advance_enrollment
 from ..services import timeline
 from ..serializers import (
@@ -181,6 +187,31 @@ def verification_scope_q():
     they advance to kitchen assignment / active / completed. The ``verified_at``
     join is multi-valued, so the caller must ``.distinct()``."""
     return Q(lifecycle_stage="pending_verification") | verification_completed_q()
+
+
+_ALLERGY_LABELS = dict(FoodAllergy.choices)
+
+
+def _allergy_labels(codes):
+    """Human labels for a member's food-allergy codes, dropping the no-op 'none'."""
+    return [_ALLERGY_LABELS.get(c, c) for c in (codes or []) if c and c != "none"]
+
+
+def predict_member_out_of_orbit(profile):
+    """Predict whether a member will be Out of Orbit once a kitchen is assigned,
+    from the GLOBAL meal rule + data completeness. Kitchen-agnostic (no kitchen
+    is assigned yet at the Logistics stage). Returns ``(out: bool, reason: str)``.
+
+    A member is predicted Out of Orbit when they have no menu type yet, or when
+    their menu type + food allergies can't be safely fulfilled by the meal rule
+    (see api.services.meal_rules). Kitchen-coverage is a separate, household-level
+    check (whether ANY kitchen can serve everyone)."""
+    if profile is None or not (profile.menu_type or "").strip():
+        return True, "No menu type assigned"
+    rule = resolve_kitchen_meal(profile.menu_type, profile.food_allergies)
+    if rule.out_of_orbit:
+        return True, "Menu + allergies can't be safely fulfilled"
+    return False, ""
 
 
 def _parse_date(value):
@@ -602,7 +633,149 @@ class MembersListView(PortalGenericAPIView):
         entries.sort(key=_sort_key)
         return entries
 
-    def _build_groups_for_page(self, entries):
+    def _logistics_kitchens(self):
+        """Active-and-inactive kitchens with their offered menus + restrictions
+        prefetched, loaded once per request for the serviceability checks
+        (serving_kitchens_for_member filters to ACTIVE itself)."""
+        return list(
+            Kitchen.objects.all().prefetch_related(
+                "kitchen_menu_types__menu_type",
+                "kitchen_menu_types__restrictions",
+            )
+        )
+
+    def _logistics_checks(self, primary_client, member_clients, kitchens, *, is_boxes):
+        """Compute the Logistics readiness checkers for one household/individual:
+        per-member menu type / allergies / predicted Out-of-Orbit, plus the
+        household-level delivery address, requested cadence (delivery weekdays),
+        and whether ANY single kitchen can serve every eligible member.
+
+        Returns ``(per_member: {client_id_str: {...}}, aggregate: {...})``."""
+        enr = s.active_enrollment(primary_client)
+        profiles = {}
+        if enr is not None:
+            for mp in enr.member_profiles.all():
+                if mp.client_id:
+                    profiles[mp.client_id] = mp
+        required = required_product_for_program(enr.program_name) if enr else None
+
+        per_member, serving_sets = {}, []
+        missing_menu = predicted_out = 0
+        for c in member_clients:
+            mp = profiles.get(c.client_id)
+            out, reason = predict_member_out_of_orbit(mp)
+            menu_type = (mp.menu_type if mp else "") or ""
+            if not menu_type:
+                missing_menu += 1
+            if out:
+                predicted_out += 1
+            else:
+                # Kitchens that can serve this member's menu + allergies for the
+                # household's product (meals/boxes). A household is servable only
+                # if ONE kitchen serves every eligible member (set intersection).
+                serving_sets.append({
+                    sk["kitchen"].pk
+                    for sk in serving_kitchens_for_member(
+                        mp, kitchens=kitchens, required_product=required,
+                    )
+                })
+            per_member[str(c.client_id)] = {
+                "menu_type": menu_type,
+                "allergies": _allergy_labels(mp.food_allergies if mp else []),
+                "predicted_out_of_orbit": out,
+                "predicted_reason": reason,
+            }
+
+        kitchen_available = bool(set.intersection(*serving_sets)) if serving_sets else False
+        address = _format_address(enr.delivery_address) if enr else ""
+        weekdays = list(enr.delivery_weekdays or []) if enr else []
+
+        # NB: delivery cadence (weekdays) is CHOSEN in the kitchen-assignment
+        # modal, so it is normally unset here -- it's shown as informational
+        # ("requested days", if any) and never counts as a readiness blocker.
+        blockers = []
+        if not address:
+            blockers.append("No delivery address")
+        if missing_menu:
+            blockers.append(f"{missing_menu} missing menu type")
+        if predicted_out:
+            blockers.append(f"{predicted_out} will be out of orbit")
+        if not kitchen_available:
+            blockers.append("No kitchen can serve")
+
+        aggregate = {
+            "delivery_address": address,
+            "delivery_weekdays": weekdays,
+            "is_boxes": is_boxes,
+            "kitchen_available": kitchen_available,
+            "menu_type_missing": missing_menu,
+            "predicted_out_of_orbit": predicted_out,
+            "ready": not blockers,
+            "blockers": blockers,
+        }
+        return per_member, aggregate
+
+    def _compute_logistics_checks(self, entries):
+        """Compute logistics checkers for EVERY entry (used by the readiness
+        filter, which must decide before pagination). Returns
+        ``{(type, id): (per_member, aggregate)}``."""
+        kitchens = self._logistics_kitchens()
+        out = {}
+        hh_ids = [e["id"] for e in entries if e["type"] == "household"]
+        ind_ids = [e["id"] for e in entries if e["type"] == "individual"]
+        if hh_ids:
+            members = (
+                HouseholdMember.objects.filter(household_id__in=hh_ids)
+                .select_related("client")
+                .prefetch_related("client__enrollments", "client__member_profiles",
+                                  "client__cases")
+            )
+            by_hh = {}
+            for hm in members:
+                by_hh.setdefault(hm.household_id, []).append(hm)
+            for hid in hh_ids:
+                hms = [
+                    h for h in by_hh.get(hid, [])
+                    if h.client and not self._hidden_in_logistics(h.client)
+                ]
+                if not hms:
+                    continue
+                primary_hm = next((h for h in hms if h.is_primary), hms[0])
+                is_boxes = self._service_type_for_client(primary_hm.client) == "boxes"
+                out[("household", hid)] = self._logistics_checks(
+                    primary_hm.client, [h.client for h in hms], kitchens, is_boxes=is_boxes,
+                )
+        if ind_ids:
+            clients = Client.objects.filter(client_id__in=ind_ids).prefetch_related(
+                "enrollments", "member_profiles", "cases",
+            )
+            for c in clients:
+                if self._hidden_in_logistics(c):
+                    continue
+                is_boxes = self._service_type_for_client(c) == "boxes"
+                out[("individual", c.client_id)] = self._logistics_checks(
+                    c, [c], kitchens, is_boxes=is_boxes,
+                )
+        return out
+
+    def _attach_logistics(self, group, primary_client, member_clients, member_data,
+                          kitchens, *, precomputed=None):
+        """Attach the logistics checkers to a group: per-member fields onto each
+        member dict and the household aggregate as ``group["logistics"]``. Uses
+        ``precomputed`` (from the readiness filter pass) when available, else
+        computes for this group."""
+        if precomputed is not None:
+            per_member, aggregate = precomputed
+        else:
+            per_member, aggregate = self._logistics_checks(
+                primary_client, member_clients, kitchens,
+                is_boxes=group.get("service_type") == "boxes",
+            )
+        for md in member_data:
+            md.update(per_member.get(md["id"], {}))
+        group["logistics"] = aggregate
+
+    def _build_groups_for_page(self, entries, checks=None):
         """Serialize ONLY the groups on the current page, preserving order."""
         hh_ids = [e["id"] for e in entries if e["type"] == "household"]
         ind_ids = [e["id"] for e in entries if e["type"] == "individual"]
@@ -610,6 +783,7 @@ class MembersListView(PortalGenericAPIView):
         # Logistics (kitchen-assignment) hides out-of-orbit / finished-case
         # members from each household roster (see _hidden_in_logistics).
         logistics = (self.request.query_params.get("scope") or "").strip() == "logistics"
+        kitchens = self._logistics_kitchens() if logistics else None
 
         if hh_ids:
             members = (
@@ -650,7 +824,7 @@ class MembersListView(PortalGenericAPIView):
                     (m for m in member_data if m["id"] == str(primary_hm.client_id)),
                     member_data[0],
                 )
-                groups_by_key[("household", hid)] = {
+                group = {
                     "id": str(hid),
                     "type": "household",
                     "name": primary_hm.household.name or primary_data["name"],
@@ -659,6 +833,13 @@ class MembersListView(PortalGenericAPIView):
                     "primary": primary_data,
                     "members": member_data,
                 }
+                if logistics:
+                    self._attach_logistics(
+                        group, primary_hm.client, [h.client for h in hms],
+                        member_data, kitchens,
+                        precomputed=(checks or {}).get(("household", hid)),
+                    )
+                groups_by_key[("household", hid)] = group
 
         if ind_ids:
             clients = Client.objects.filter(client_id__in=ind_ids).prefetch_related(
@@ -668,7 +849,7 @@ class MembersListView(PortalGenericAPIView):
                 if logistics and self._hidden_in_logistics(c):
                     continue  # out-of-orbit / finished-case individual
                 primary_data = self._serialize_member(c, True)
-                groups_by_key[("individual", c.client_id)] = {
+                group = {
                     "id": str(c.client_id),
                     "type": "individual",
                     "name": primary_data["name"],
@@ -677,6 +858,12 @@ class MembersListView(PortalGenericAPIView):
                     "primary": primary_data,
                     "members": [primary_data],
                 }
+                if logistics:
+                    self._attach_logistics(
+                        group, c, [c], [primary_data], kitchens,
+                        precomputed=(checks or {}).get(("individual", c.client_id)),
+                    )
+                groups_by_key[("individual", c.client_id)] = group
 
         # Preserve the paginated order from `entries`.
         return [
@@ -705,8 +892,26 @@ class MembersListView(PortalGenericAPIView):
         # Grouped mode (Verification / Logistics): build the ordered group keys
         # cheaply, paginate THEM, and serialize only the current page's groups
         # (previously the whole scoped set was serialized on every request).
-        page = self.paginate_queryset(self._group_entries())
-        return self.get_paginated_response(self._build_groups_for_page(page or []))
+        entries = self._group_entries()
+        scope = (request.query_params.get("scope") or "").strip()
+        checks = None
+        # Logistics readiness filter: keep only households that are Ready to
+        # assign, or that have blockers. Readiness depends on computed checks
+        # (menu type / address / kitchen serviceability), so it must be resolved
+        # BEFORE pagination -- compute checks for every entry, then filter.
+        readiness = (request.query_params.get("readiness") or "").strip().lower()
+        if scope == "logistics" and readiness in ("ready", "blockers"):
+            checks = self._compute_logistics_checks(entries)
+            want_ready = readiness == "ready"
+            entries = [
+                e for e in entries
+                if bool((checks.get((e["type"], e["id"])) or (None, {"ready": False}))[1]["ready"])
+                == want_ready
+            ]
+        page = self.paginate_queryset(entries)
+        return self.get_paginated_response(
+            self._build_groups_for_page(page or [], checks=checks)
+        )
 
 
 class MembersStatsView(PortalAPIView):
