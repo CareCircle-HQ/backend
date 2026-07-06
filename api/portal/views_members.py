@@ -384,6 +384,19 @@ class MembersListView(PortalGenericAPIView):
                     household_membership__household__enrollment_verifications__stage=EnrollmentStage.ON_HOLD
                 )
             )
+        # TEMP diagnostic flags (to be removed): members missing dietary/logistics
+        # data. "no_menu_type" -> no dietary profile carries a menu type at all;
+        # "no_kitchen" -> neither the member's nor their household's enrollment has
+        # a kitchen assigned.
+        elif flag == "no_menu_type":
+            qs = qs.exclude(member_profiles__menu_type__gt="")
+        elif flag == "no_kitchen":
+            qs = qs.exclude(
+                Q(enrollments__kitchen_id__isnull=False)
+                | Q(
+                    household_membership__household__enrollment_verifications__kitchen_id__isnull=False
+                )
+            )
 
         # Household-composition filter:
         #   "multi"  -> members whose household has more than one member.
