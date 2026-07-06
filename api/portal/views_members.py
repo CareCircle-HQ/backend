@@ -1319,6 +1319,15 @@ class HouseholdMemberEditView(PortalAPIView):
                 )
             except Exception:  # never let history-logging break the edit
                 pass
+            # Leave a system note (same as the auto-out-of-orbit paths).
+            if mv.client_id:
+                try:
+                    Note.objects.create(
+                        client=mv.client, source=NoteSource.SYSTEM,
+                        body=NO_KITCHEN_OUT_OF_ORBIT_NOTE,
+                    )
+                except Exception:  # never let note-writing break the edit
+                    pass
         elif reactivate and mv.status == MemberStatus.OUT_OF_ORBIT:
             # Re-run the kitchen-aware rules against the edited menu type /
             # allergies. Only return the member to Active if the new combination
