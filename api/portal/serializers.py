@@ -18,6 +18,8 @@ from ..models import (
     Agent,
     Case,
     CaseType,
+    CommunicationChannel,
+    CommunicationTimeOfDay,
     DeliveryCompany,
     DeliveryCompanyIntegration,
     DeliveryOrder,
@@ -51,6 +53,18 @@ LIFETIME_SENTINEL_YEAR = 9999
 # ---------------------------------------------------------------------------
 def _full_name(client):
     return f"{client.first_name} {client.last_name}".strip()
+
+
+_COMM_CHANNEL_LABELS = dict(CommunicationChannel.choices)
+_COMM_TIME_LABELS = dict(CommunicationTimeOfDay.choices)
+
+
+def _labels_for(codes, mapping):
+    """Map a stored list of enum codes to their human labels, keeping unknown
+    codes as-is. Returns a clean list (blank/None entries dropped)."""
+    if not codes:
+        return []
+    return [mapping.get(c, str(c)) for c in codes if c]
 
 
 def primary_insurance(client):
@@ -349,6 +363,7 @@ class MemberDetailSerializer(serializers.Serializer):
                 "ethnicity": client.ethnicity,
                 "language": client.language,
                 "preferred_spoken_language": client.preferred_spoken_language,
+                "preferred_written_language": client.preferred_written_language,
                 "household_size": client.household_size,
             },
             "contact": {
@@ -356,6 +371,16 @@ class MemberDetailSerializer(serializers.Serializer):
                 "phone_type": client.phone_type,
                 "email": client.client_email_address,
                 "preferred_contact_method": client.preferred_contact_method,
+                # Multi-select communication preferences captured by the ext.
+                # Codes are mapped to human labels; raw codes kept for any UI
+                # that needs them.
+                "communication_channels": _labels_for(
+                    client.communication_channels, _COMM_CHANNEL_LABELS
+                ),
+                "preferred_communication_times": _labels_for(
+                    client.preferred_communication_times, _COMM_TIME_LABELS
+                ),
+                "preferred_languages": list(client.preferred_languages or []),
             },
             "address": {
                 "street": current_addr.street if current_addr else "",
