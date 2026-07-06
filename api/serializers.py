@@ -526,12 +526,15 @@ def sync_household_members(client, enrollment=None):
         member = hm.client
         if member is None or member.pk in profiles:
             continue
+        # New members carry NO default menu type / allergies and start Out of
+        # Orbit: an agent must assign a menu type + restrictions, and only then
+        # (on save) is the kitchen output computed and the member activated.
         MemberDietaryProfile.objects.create(
             enrollment=enrollment,
             client=member,
             member_name=f"{member.first_name} {member.last_name}".strip(),
-            menu_type=catalog.menu_type_for_member(),  # "Standard" default
-            status=MemberStatus.ACTIVE,
+            menu_type="",
+            status=MemberStatus.OUT_OF_ORBIT,
         )
         created += 1
 

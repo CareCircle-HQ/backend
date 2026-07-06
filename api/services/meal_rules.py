@@ -97,8 +97,12 @@ def resolve_kitchen_meal(menu_type, food_allergies):
 
 
 def apply_to_member(profile, *, save=True):
-    """Apply the meal rule to a :class:`MemberDietaryProfile`, writing
+    """Apply the GLOBAL meal rule to a :class:`MemberDietaryProfile`, writing
     ``status`` / ``kitchen_meal_type`` / ``kitchen_food_notes``.
+
+    Kitchen-agnostic (does not consider a specific kitchen's capabilities). For
+    the kitchen-aware version used on the Household tab and at kitchen
+    assignment, see :func:`reconcile_member_kitchen_output`.
 
     Returns ``(result, became_out_of_orbit)`` where ``became_out_of_orbit`` is
     True only on an ACTIVE -> OUT_OF_ORBIT transition (so the caller can emit a
@@ -118,3 +122,59 @@ def apply_to_member(profile, *, save=True):
             "status", "kitchen_meal_type", "kitchen_food_notes", "updated_at",
         ])
     return result, (result.out_of_orbit and not was_out)
+
+
+def reconcile_member_kitchen_output(profile, kitchen=None, *, offered=None, save=True):
+    """Reconcile a member's kitchen output against BOTH the global meal rules
+    and the ASSIGNED kitchen's capabilities, writing ``status`` /
+    ``kitchen_meal_type`` / ``kitchen_food_notes``.
+
+    A member is Out of Orbit when any of these hold:
+      * no menu type is assigned yet (nothing configured for them);
+      * the global meal rule can't safely fulfill the menu + food allergies;
+      * a ``kitchen`` is assigned and it doesn't offer the menu type / can't
+        handle the member's allergies (per ``member_coverage_for_kitchen``).
+
+    When no kitchen is assigned the kitchen-capability check is skipped (the
+    household hasn't reached kitchen assignment yet).
+
+    Returns ``(out_of_orbit, became_out, reason)`` where ``became_out`` is True
+    only on an ACTIVE -> OUT_OF_ORBIT transition (so the caller emits a single
+    timeline event) and ``reason`` explains an out-of-orbit outcome.
+    """
+    # Local import avoids any import cycle between services modules.
+    from api.services.kitchens import member_coverage_for_kitchen
+
+    was_out = profile.status == MemberStatus.OUT_OF_ORBIT
+    out, reason, meal_type, notes = False, "", "", ""
+
+    if not (profile.menu_type or "").strip():
+        out, reason = True, "No menu type assigned yet."
+    else:
+        result = resolve_kitchen_meal(profile.menu_type, profile.food_allergies)
+        if result.out_of_orbit:
+            out, reason = True, "Allergy/menu combination cannot be safely fulfilled."
+        else:
+            meal_type, notes = result.kitchen_meal_type, result.kitchen_food_notes
+            if kitchen is not None:
+                covered, cov_reason, _price = member_coverage_for_kitchen(
+                    profile, kitchen, offered=offered,
+                )
+                if not covered:
+                    out = True
+                    reason = f"Assigned kitchen can't fulfill this menu: {cov_reason}."
+                    meal_type, notes = "", ""
+
+    if out:
+        profile.status = MemberStatus.OUT_OF_ORBIT
+        profile.kitchen_meal_type = ""
+        profile.kitchen_food_notes = ""
+    else:
+        profile.status = MemberStatus.ACTIVE
+        profile.kitchen_meal_type = meal_type
+        profile.kitchen_food_notes = notes
+    if save:
+        profile.save(update_fields=[
+            "status", "kitchen_meal_type", "kitchen_food_notes", "updated_at",
+        ])
+    return out, (out and not was_out), reason
