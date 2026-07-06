@@ -28,6 +28,7 @@ from api.models import (
     HouseholdMember,
     MemberDeliverySchedule,
     MemberStatus,
+    SERVICE_EXCLUDED_MEMBER_STATUSES,
     ProductType,
     ProductTypeKind,
     ScheduleStatus,
@@ -207,7 +208,7 @@ def create_member_delivery_schedules(
     # get no delivery plan and are therefore excluded from all Purchase Orders.
     members = list(
         enrollment.member_profiles.select_related("client")
-        .exclude(status=MemberStatus.OUT_OF_ORBIT)
+        .exclude(status__in=SERVICE_EXCLUDED_MEMBER_STATUSES)
         .all()
     )
     if not members:

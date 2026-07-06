@@ -35,6 +35,7 @@ from api.models import (
     Kitchen,
     MemberDietaryProfile,
     MemberStatus,
+    SERVICE_EXCLUDED_MEMBER_STATUSES,
     MenuType,
     OrderSchedule,
     ProductType,
@@ -216,7 +217,7 @@ def _due_schedules(kind, delivery_date):
             status=ScheduleStatus.SCHEDULED,
         )
         .exclude(enrollment__stage=EnrollmentStage.ON_HOLD)
-        .exclude(member__status=MemberStatus.OUT_OF_ORBIT)
+        .exclude(member__status__in=SERVICE_EXCLUDED_MEMBER_STATUSES)
         .select_related("member", "member__client", "household", "kitchen")
     )
     out = []
@@ -327,7 +328,7 @@ def generate_purchase_order(kind, delivery_date, kitchen, schedule_ids, split_se
             order_id__in=schedule_ids, status=ScheduleStatus.SCHEDULED
         )
         .exclude(enrollment__stage=EnrollmentStage.ON_HOLD)
-        .exclude(member__status=MemberStatus.OUT_OF_ORBIT)
+        .exclude(member__status__in=SERVICE_EXCLUDED_MEMBER_STATUSES)
         .select_related("member", "member__client", "household", "kitchen")
     )
     already = _batched_client_ids(delivery_date)

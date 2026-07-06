@@ -504,6 +504,8 @@ class MembersListView(PortalGenericAPIView):
         flag = (params.get("flag") or "").strip().lower()
         if flag == "out_of_orbit":
             qs = qs.filter(member_profiles__status=MemberStatus.OUT_OF_ORBIT)
+        elif flag == "paused":
+            qs = qs.filter(member_profiles__status=MemberStatus.PAUSED)
         elif flag == "on_hold":
             qs = qs.filter(
                 Q(enrollments__stage=EnrollmentStage.ON_HOLD)
@@ -1313,14 +1315,68 @@ class HouseholdMemberEditView(PortalAPIView):
         ser = s.PortalMemberDietaryEditSerializer(data=request.data)
         ser.is_valid(raise_exception=True)
         data = dict(ser.validated_data)
-        # `reactivate` / `deactivate` are control flags, not model fields —
-        # handle them separately from the assignable dietary fields.
+        # `reactivate` / `deactivate` / `pause` / `unpause` are control flags,
+        # not model fields — handle them separately from the dietary fields.
         reactivate = data.pop("reactivate", False)
         deactivate = data.pop("deactivate", False)
+        pause = data.pop("pause", False)
+        unpause = data.pop("unpause", False)
+        pause_reason = (data.pop("pause_reason", "") or "").strip()
         for field, value in data.items():
             setattr(mv, field, value)
 
-        if deactivate and mv.status == MemberStatus.ACTIVE:
+        if pause and mv.status == MemberStatus.ACTIVE:
+            # Manual agent pause (requires a reason). Excludes the member from
+            # every delivery schedule / Purchase Order until unpaused.
+            mv.status = MemberStatus.PAUSED
+            mv.kitchen_meal_type = ""
+            mv.kitchen_food_notes = ""
+            mv.save()
+            agent = current_agent(request)
+            actor = _agent_actor(agent)
+            try:
+                timeline.event_for_member_paused(
+                    mv, enrollment=mv.enrollment, reason=pause_reason, actor=actor,
+                )
+            except Exception:  # never let history-logging break the edit
+                pass
+            # Agent-authored note with the required reason — NOT a system note.
+            if mv.client_id:
+                try:
+                    Note.objects.create(
+                        client=mv.client, source=NoteSource.AGENT,
+                        author_name=agent.name if agent else "",
+                        body=f"Member paused. Reason: {pause_reason}",
+                    )
+                except Exception:  # never let note-writing break the edit
+                    pass
+        elif unpause and mv.status == MemberStatus.PAUSED:
+            # Lift the manual pause: re-run the kitchen-aware meal rule so the
+            # member returns to Active, or falls to Out of Orbit if the current
+            # menu/allergies can't be fulfilled by the assigned kitchen.
+            reconcile_member_kitchen_output(mv, enr.kitchen, save=False)
+            mv.save()
+            agent = current_agent(request)
+            actor = _agent_actor(agent)
+            try:
+                timeline.event_for_member_unpaused(
+                    mv, enrollment=mv.enrollment, reason=pause_reason, actor=actor,
+                )
+            except Exception:  # never let history-logging break the edit
+                pass
+            if mv.client_id:
+                try:
+                    Note.objects.create(
+                        client=mv.client, source=NoteSource.AGENT,
+                        author_name=agent.name if agent else "",
+                        body=(
+                            f"Member unpaused. Reason: {pause_reason}"
+                            if pause_reason else "Member unpaused."
+                        ),
+                    )
+                except Exception:  # never let note-writing break the edit
+                    pass
+        elif deactivate and mv.status == MemberStatus.ACTIVE:
             # Manual agent override: pull the member Out of Orbit regardless of
             # the meal rule. Clear the kitchen meal result so they're excluded
             # from every delivery schedule / Purchase Order until reactivated.
@@ -1649,6 +1705,24 @@ class MemberVerificationCreateView(PortalAPIView):
         ser = s.VerificationCreateSerializer(data=request.data)
         ser.is_valid(raise_exception=True)
         data = ser.validated_data
+
+        # De-duplicate members by client_id (first occurrence wins). The same
+        # person can be submitted twice -- e.g. the primary is auto-included AND
+        # re-added via the Step-1 search -- which would violate the per-
+        # (enrollment, client) unique constraint on MemberDietaryProfile and
+        # raise an IntegrityError (500). Members without a client_id are kept
+        # as-is (a NULL client doesn't participate in the unique constraint).
+        seen_member_ids = set()
+        deduped_members = []
+        for m in data["members"]:
+            cid = m.get("client_id")
+            if cid is not None:
+                key = str(cid)
+                if key in seen_member_ids:
+                    continue
+                seen_member_ids.add(key)
+            deduped_members.append(m)
+        data["members"] = deduped_members
 
         # Delivery address (shared by the household). Unit/apt is stored in its
         # own field so the kitchen + delivery label can show it distinctly.

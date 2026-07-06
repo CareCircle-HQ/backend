@@ -1518,6 +1518,19 @@ class MemberStatus(models.TextChoices):
 
     ACTIVE = "active", "Active"
     OUT_OF_ORBIT = "out_of_orbit", "Out of Orbit"
+    # Agent-initiated manual pause (requires a reason note). Like OUT_OF_ORBIT,
+    # paused members are excluded from all delivery schedules and Purchase
+    # Orders until an agent unpauses them (which re-runs the meal rule).
+    PAUSED = "paused", "Paused"
+
+
+# Member statuses that exclude a member from every delivery schedule / order /
+# Purchase Order: OUT_OF_ORBIT (meal rule can't fulfill them) and PAUSED (agent
+# manually paused them). Only ACTIVE members receive deliveries.
+SERVICE_EXCLUDED_MEMBER_STATUSES = (
+    MemberStatus.OUT_OF_ORBIT,
+    MemberStatus.PAUSED,
+)
 
 
 # Kitchen meal type that is not a catalog MenuType: signals the kitchen to
@@ -2730,6 +2743,8 @@ class TimelineEventType(models.TextChoices):
     DELIVERY_ADDRESS_CHANGED = "delivery_address_changed", "Delivery Address Changed"
     OUT_OF_ORBIT = "out_of_orbit", "Out of Orbit"
     MEMBER_REACTIVATED = "member_reactivated", "Member Reactivated"
+    MEMBER_PAUSED = "member_paused", "Member Paused"
+    MEMBER_UNPAUSED = "member_unpaused", "Member Unpaused"
     HOUSEHOLD_MEMBER_ADDED = "household_member_added", "Household Member Added"
     # --- Legacy coarse types: retained so existing rows stay valid; no longer
     # emitted by the timeline service (a data migration remaps old rows). ---
