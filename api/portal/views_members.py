@@ -385,6 +385,18 @@ class MembersListView(PortalGenericAPIView):
                 # Verification page "Pending Verification" chip: pop-up NOT yet
                 # completed (verified_at null), regardless of any case auth status.
                 qs = qs.exclude(verification_completed_q())
+            elif status_val in ("On Hold", "on_hold"):
+                # On Hold is a service-state overlay (not a lifecycle_stage), so it
+                # is filtered on the member's/household's enrollment stage --
+                # independent of verification status or authorization.
+                qs = qs.filter(
+                    Q(enrollments__stage=EnrollmentStage.ON_HOLD)
+                    | Q(
+                        household_membership__household__enrollment_verifications__stage=(
+                            EnrollmentStage.ON_HOLD
+                        )
+                    )
+                )
             else:
                 stages = STATUS_TO_STAGES.get(status_val)
                 if stages:
