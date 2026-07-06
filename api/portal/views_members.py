@@ -2002,6 +2002,42 @@ def _box_cadence():
     return opts[0]["value"] if opts else DeliveryCadence.ONCE_A_WEEK
 
 
+def _prefetched_kitchens():
+    """Kitchens with their offered menus + restrictions prefetched, for reuse
+    across serviceability checks in one request."""
+    return list(
+        Kitchen.objects.all().prefetch_related(
+            "kitchen_menu_types__menu_type",
+            "kitchen_menu_types__restrictions",
+        )
+    )
+
+
+def enrollment_ready_for_assignment(enr, kitchens):
+    """Whether a household enrollment is 'Ready to assign' -- the same readiness
+    shown on the Logistics list: a delivery address is set, every member has a
+    menu type and isn't predicted Out of Orbit, and some single kitchen can serve
+    every member. Used by the bulk-assign 'only ready to assign' option."""
+    if enr.delivery_address_id is None:
+        return False
+    members = list(enr.member_profiles.all())
+    if not members:
+        return False
+    required = required_product_for_program(enr.program_name)
+    serving_sets = []
+    for mp in members:
+        out, _ = predict_member_out_of_orbit(mp)
+        if out:
+            return False
+        serving_sets.append({
+            sk["kitchen"].pk
+            for sk in serving_kitchens_for_member(
+                mp, kitchens=kitchens, required_product=required,
+            )
+        })
+    return bool(set.intersection(*serving_sets))
+
+
 class BulkAssignBoxesView(PortalAPIView):
     """Logistics: bulk-assign the single box kitchen to every household awaiting
     kitchen assignment for a boxes program.
@@ -2020,9 +2056,14 @@ class BulkAssignBoxesView(PortalAPIView):
                 supported_products__contains=[KitchenProductType.BOX]
             ).order_by("name")
         ]
+        box_enr = _awaiting_box_enrollments()
+        kitchens_ctx = _prefetched_kitchens()
         return Response({
             "kitchens": kitchens,
-            "awaiting_count": len(_awaiting_box_enrollments()),
+            "awaiting_count": len(box_enr),
+            "ready_count": sum(
+                1 for e in box_enr if enrollment_ready_for_assignment(e, kitchens_ctx)
+            ),
         })
 
     def post(self, request):
@@ -2041,6 +2082,14 @@ class BulkAssignBoxesView(PortalAPIView):
         cadence = _box_cadence()
         agent = current_agent(request)
         enrollments = _awaiting_box_enrollments()
+        # Optionally restrict to households that are Ready to assign (matches the
+        # Logistics list's readiness): skip any with blockers.
+        if request.data.get("ready_only"):
+            kitchens_ctx = _prefetched_kitchens()
+            enrollments = [
+                e for e in enrollments
+                if enrollment_ready_for_assignment(e, kitchens_ctx)
+            ]
 
         assigned, out_of_orbit, failed, errors = 0, 0, 0, []
         for enr in enrollments:
@@ -2147,10 +2196,15 @@ class BulkAssignMealsView(PortalAPIView):
                 supported_products__contains=[KitchenProductType.MEAL]
             ).order_by("name")
         ]
+        meal_enr = _awaiting_enrollments(ProductTypeKind.MEALS)
+        kitchens_ctx = _prefetched_kitchens()
         return Response({
             "kitchens": kitchens,
             "cadence_options": cadence_options_for_kind(ProductTypeKind.MEALS),
-            "awaiting_count": len(_awaiting_enrollments(ProductTypeKind.MEALS)),
+            "awaiting_count": len(meal_enr),
+            "ready_count": sum(
+                1 for e in meal_enr if enrollment_ready_for_assignment(e, kitchens_ctx)
+            ),
         })
 
     def _validated_inputs(self, request):
@@ -2188,6 +2242,14 @@ class BulkAssignMealsView(PortalAPIView):
             return err
 
         enrollments = _awaiting_enrollments(ProductTypeKind.MEALS)
+        # Optionally restrict to households that are Ready to assign (matches the
+        # Logistics list's readiness). Applies to both the preview and the apply.
+        if request.data.get("ready_only"):
+            kitchens_ctx = _prefetched_kitchens()
+            enrollments = [
+                e for e in enrollments
+                if enrollment_ready_for_assignment(e, kitchens_ctx)
+            ]
         offered = kitchen_offered_menu_index(kitchen)
 
         # Preview: dry-run only, report households that would have exclusions.
