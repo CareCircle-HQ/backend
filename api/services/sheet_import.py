@@ -17,6 +17,15 @@ from api.models import DeliveryCadence, FoodAllergy
 FACILITY_TO_KITCHEN = {"eng": "ENG", "ast": "AST", "hicksville": "Hicksville"}
 # Sheet Cadence code -> meal DeliveryCadence (Boxes handled separately).
 CADENCE_TO_DELIVERY = {"a": DeliveryCadence.MON_THU, "b": DeliveryCadence.TUE_FRI}
+# Sheet Cadence code -> enrollment.delivery_weekdays codes. Mirrors the canonical
+# mapping in api.services.delivery (CADENCE_WEEKDAYS + BOX_DELIVERY_WEEKDAY):
+# meals land Mon/Thu or Tue/Fri; boxes ship Wednesdays. The distinct weekday set
+# lets a reader recover the cadence (and meals-vs-boxes) from the DB alone.
+CADENCE_TO_WEEKDAYS = {
+    "a": ["mon", "thu"],
+    "b": ["tue", "fri"],
+    "boxes": ["wed"],
+}
 # Allergy label (lowercased) -> FoodAllergy code, built from the model choices.
 ALLERGY_BY_LABEL = {label.lower(): code for code, label in FoodAllergy.choices}
 ALLERGY_BY_LABEL["others"] = "other"  # sheet uses the plural
