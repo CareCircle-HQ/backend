@@ -1706,6 +1706,24 @@ class MemberVerificationCreateView(PortalAPIView):
         ser.is_valid(raise_exception=True)
         data = ser.validated_data
 
+        # De-duplicate members by client_id (first occurrence wins). The same
+        # person can be submitted twice -- e.g. the primary is auto-included AND
+        # re-added via the Step-1 search -- which would violate the per-
+        # (enrollment, client) unique constraint on MemberDietaryProfile and
+        # raise an IntegrityError (500). Members without a client_id are kept
+        # as-is (a NULL client doesn't participate in the unique constraint).
+        seen_member_ids = set()
+        deduped_members = []
+        for m in data["members"]:
+            cid = m.get("client_id")
+            if cid is not None:
+                key = str(cid)
+                if key in seen_member_ids:
+                    continue
+                seen_member_ids.add(key)
+            deduped_members.append(m)
+        data["members"] = deduped_members
+
         # Delivery address (shared by the household). Unit/apt is stored in its
         # own field so the kitchen + delivery label can show it distinctly.
         address = Address.objects.create(
