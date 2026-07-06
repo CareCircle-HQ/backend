@@ -7,7 +7,7 @@ from datetime import datetime, timedelta
 
 from django.db import transaction
 from django.utils import timezone
-from django.db.models import Count, Exists, OuterRef, Prefetch, Q
+from django.db.models import Count, Exists, F, OuterRef, Prefetch, Q
 from django.db.models.functions import Lower
 from django.shortcuts import get_object_or_404
 from rest_framework import status as http
@@ -531,23 +531,30 @@ class MembersListView(PortalGenericAPIView):
         """Lightweight, ordered list of group identifiers for the filtered set
         WITHOUT serializing anyone. Each entry is
         ``{"type": "household"|"individual", "id", "name"}``. Households are
-        de-duplicated and ordered (with individuals) by the household/primary
-        name so pagination is stable and only the requested page is ever built
-        + serialized. A household is included when ANY member matches; its full
-        roster is loaded when the page is built."""
+        de-duplicated and ordered (with individuals) by most-recently-added
+        (created_at) so pagination is stable and only the requested page is ever
+        built + serialized. A household is included when ANY member matches; its
+        full roster is loaded when the page is built."""
         rows = self.get_queryset().values_list(
             "client_id", "household_membership__household_id",
-            "first_name", "last_name",
+            "first_name", "last_name", "created_at",
         )
         hh_ids, seen_hh, individuals = [], set(), []
-        for cid, hid, fn, ln in rows:
+        # Most-recent created_at seen among a household's matching members, used
+        # as the household's "added" sort timestamp.
+        hh_added = {}
+        for cid, hid, fn, ln, created in rows:
             if hid:
                 if hid not in seen_hh:
                     seen_hh.add(hid)
                     hh_ids.append(hid)
+                if created is not None and (
+                    hh_added.get(hid) is None or created > hh_added[hid]
+                ):
+                    hh_added[hid] = created
             else:
                 name = f"{(fn or '').strip()} {(ln or '').strip()}".strip()
-                individuals.append((cid, name))
+                individuals.append((cid, name, created))
 
         # Household sort name = household name, else its primary's name (one query).
         hh_names = {}
@@ -563,13 +570,24 @@ class MembersListView(PortalGenericAPIView):
                 )
 
         entries = [
-            {"type": "household", "id": hid, "name": hh_names.get(hid, "")}
+            {"type": "household", "id": hid, "name": hh_names.get(hid, ""),
+             "added": hh_added.get(hid)}
             for hid in hh_ids
         ] + [
-            {"type": "individual", "id": cid, "name": name}
-            for cid, name in individuals
+            {"type": "individual", "id": cid, "name": name, "added": created}
+            for cid, name, created in individuals
         ]
-        entries.sort(key=lambda e: (e["name"] or "").lower())
+
+        # Most recently added (created_at) first; groups with no created_at sort
+        # last; name breaks ties (case-insensitive) for stable pagination.
+        def _sort_key(e):
+            ts = e["added"]
+            name = (e["name"] or "").lower()
+            if ts is None:
+                return (1, 0.0, name)
+            return (0, -ts.timestamp(), name)
+
+        entries.sort(key=_sort_key)
         return entries
 
     def _build_groups_for_page(self, entries):
@@ -661,10 +679,14 @@ class MembersListView(PortalGenericAPIView):
         if request.query_params.get("flat"):
             # Order + paginate in SQL (LIMIT/OFFSET) so we only ever serialize
             # one page; serializing/sorting the whole clients table per request
-            # does not scale once the full member base is imported. Lower() on
-            # the name columns reproduces the previous case-insensitive
-            # "First Last" ordering.
-            qs = self.get_queryset().order_by(Lower("first_name"), Lower("last_name"))
+            # does not scale once the full member base is imported. Most recently
+            # added members (by created_at) first; rows without a created_at sort
+            # last; name (case-insensitive "First Last") breaks ties.
+            qs = self.get_queryset().order_by(
+                F("created_at").desc(nulls_last=True),
+                Lower("first_name"),
+                Lower("last_name"),
+            )
             page = self.paginate_queryset(qs)
             data = [s.MemberListSerializer(c).data for c in page]
             return self.get_paginated_response(data)
