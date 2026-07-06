@@ -13,6 +13,8 @@ from .views_leads import (
     PortalScreenersView,
 )
 from .views_members import (
+    BulkAssignBoxesView,
+    BulkAssignMealsView,
     HouseholdMemberEditView,
     MemberAssignKitchenView,
     MemberCadenceView,
@@ -136,6 +138,8 @@ urlpatterns = [
         HouseholdMemberEditView.as_view(),
     ),
     # Logistics / kitchen assignment
+    path("members/bulk-assign-boxes/", BulkAssignBoxesView.as_view()),
+    path("members/bulk-assign-meals/", BulkAssignMealsView.as_view()),
     path("members/<uuid:client_id>/kitchen-options/", MemberKitchenOptionsView.as_view()),
     path("members/<uuid:client_id>/assign-kitchen/", MemberAssignKitchenView.as_view()),
     path("members/<uuid:client_id>/kitchen/", MemberKitchenView.as_view()),
