@@ -30,11 +30,11 @@ from api.models import (
     DeliveryOrder,
     DeliveryOrderStatus,
     DietaryRestriction,
-    EnrollmentStage,
     FoodAllergy,
     Kitchen,
     MemberDietaryProfile,
     MemberStatus,
+    SERVICE_EXCLUDED_ENROLLMENT_STAGES,
     SERVICE_EXCLUDED_MEMBER_STATUSES,
     MenuType,
     OrderSchedule,
@@ -208,15 +208,16 @@ def _kitchen_supports_menu(kind, offered_norm, code):
 def _due_schedules(kind, delivery_date):
     """SCHEDULED OrderSchedule rows for the given kind that land on the date.
 
-    Schedules whose enrollment is On Hold are excluded: a paused household must
-    not appear in any new Purchase Order until its service is resumed.
+    Schedules whose enrollment is On Hold or in a terminal stage
+    (Service Complete / Closed / Cancelled) are excluded, as are Out of Orbit /
+    Paused / Inactive members: none may appear in any new Purchase Order.
     """
     qs = (
         OrderSchedule.objects.filter(
             anticipated_delivery_date=delivery_date,
             status=ScheduleStatus.SCHEDULED,
         )
-        .exclude(enrollment__stage=EnrollmentStage.ON_HOLD)
+        .exclude(enrollment__stage__in=SERVICE_EXCLUDED_ENROLLMENT_STAGES)
         .exclude(member__status__in=SERVICE_EXCLUDED_MEMBER_STATUSES)
         .select_related("member", "member__client", "household", "kitchen")
     )
@@ -327,7 +328,7 @@ def generate_purchase_order(kind, delivery_date, kitchen, schedule_ids, split_se
         OrderSchedule.objects.filter(
             order_id__in=schedule_ids, status=ScheduleStatus.SCHEDULED
         )
-        .exclude(enrollment__stage=EnrollmentStage.ON_HOLD)
+        .exclude(enrollment__stage__in=SERVICE_EXCLUDED_ENROLLMENT_STAGES)
         .exclude(member__status__in=SERVICE_EXCLUDED_MEMBER_STATUSES)
         .select_related("member", "member__client", "household", "kitchen")
     )
