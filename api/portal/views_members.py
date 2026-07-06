@@ -73,6 +73,12 @@ from ..serializers import (
 from .base import PortalAPIView, PortalGenericAPIView, current_agent
 from . import serializers as s
 
+# System note left on a member when their menu type / dietary needs can't be
+# fulfilled by any (or the assigned) kitchen and they're pulled Out of Orbit.
+NO_KITCHEN_OUT_OF_ORBIT_NOTE = (
+    "No kitchen currently supports this member's dietary needs."
+)
+
 # Reverse of serializers._STATUS_MAP: a filter value -> the lifecycle stages it covers.
 # Verification is a yes/no fact (Pending Verification / Verified), so those two
 # chips are NOT in this map -- they are resolved via verification_completed_q()
@@ -1359,6 +1365,16 @@ class HouseholdMemberEditView(PortalAPIView):
                     )
                 except Exception:  # never let history-logging break the edit
                     pass
+                # Leave a customer-facing note explaining why the edit pulled the
+                # member Out of Orbit.
+                if mv.client_id:
+                    try:
+                        Note.objects.create(
+                            client=mv.client, source=NoteSource.SYSTEM,
+                            body=NO_KITCHEN_OUT_OF_ORBIT_NOTE,
+                        )
+                    except Exception:  # never let note-writing break the edit
+                        pass
 
         # Propagate the edited menu type / allergies onto this member's future
         # SCHEDULED delivery occurrences so PO generation reflects the change
@@ -1844,6 +1860,15 @@ def assign_kitchen_to_household(
                 )
             except Exception:  # never let history-logging break assignment
                 pass
+            # Note explaining why the assigned kitchen couldn't serve them.
+            if profile.client_id:
+                try:
+                    Note.objects.create(
+                        client=profile.client, source=NoteSource.SYSTEM,
+                        body=NO_KITCHEN_OUT_OF_ORBIT_NOTE,
+                    )
+                except Exception:  # never let note-writing break assignment
+                    pass
 
     case = enr.case or s.primary_case(client)
     create_member_delivery_schedules(

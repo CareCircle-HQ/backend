@@ -583,7 +583,7 @@ def sync_household_members(client, enrollment=None):
         # New members carry NO default menu type / allergies and start Out of
         # Orbit: an agent must assign a menu type + restrictions, and only then
         # (on save) is the kitchen output computed and the member activated.
-        MemberDietaryProfile.objects.create(
+        profile = MemberDietaryProfile.objects.create(
             enrollment=enrollment,
             client=member,
             member_name=f"{member.first_name} {member.last_name}".strip(),
@@ -593,19 +593,27 @@ def sync_household_members(client, enrollment=None):
         created += 1
         # This member was added outside the verification wizard, so leave a
         # system note explaining why they start Out of Orbit + what's needed to
-        # activate them. Best-effort: never let note-logging break the add.
+        # activate them, AND log the Out-of-Orbit event to the timeline (same as
+        # the other paths that set a member Out of Orbit). Best-effort: never let
+        # history/note-logging break the add.
+        reason = (
+            "New member added outside of the verification process. "
+            "This member needs a menu type and dietary preferences to be "
+            "active (added Out of Orbit by default)."
+        )
         try:
             Note.objects.create(
-                client=member,
-                source=NoteSource.SYSTEM,
-                body=(
-                    "New member added outside of the verification process. "
-                    "This member needs a menu type and dietary preferences to be "
-                    "active (added Out of Orbit by default)."
-                ),
+                client=member, source=NoteSource.SYSTEM, body=reason,
             )
         except Exception:
             logger.warning("household member note failed", exc_info=True)
+        try:
+            from .services import timeline
+            timeline.event_for_out_of_orbit(
+                profile, enrollment=enrollment, reason=reason,
+            )
+        except Exception:
+            logger.warning("household member out-of-orbit event failed", exc_info=True)
 
     # 2) profiled members -> ensure a roster row (one-household-per-client).
     for cid in profiles:
