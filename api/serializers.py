@@ -22,6 +22,8 @@ from .models import (
     CaseType,
     Client,
     ClientLevel,
+    ClientPhone,
+    ClientPhoneSource,
     DietaryRestriction,
     EnrollmentStage,
     EnrollmentVerification,
@@ -325,6 +327,44 @@ class ClientSerializer(serializers.ModelSerializer):
             return False
         return expired_at < timezone.now()
 
+    @staticmethod
+    def _sync_client_phone(client, number, phone_type):
+        """Upsert the ext's primary ``client_phone_number`` into the ClientPhone
+        table so it shows in the member-profile "Phone Numbers" widget and is
+        reachable via caller-ID lookup. Idempotent on (client, normalized); the
+        synced number is (re)made primary. A blank/short number is a no-op."""
+        normalized = ClientPhone.normalize(number)
+        if not normalized:
+            return
+        label = (phone_type or "").strip()
+        phone, created = ClientPhone.objects.get_or_create(
+            client=client,
+            normalized=normalized,
+            defaults={
+                "raw": number,
+                "label": label,
+                "source": ClientPhoneSource.UNITEUS,
+            },
+        )
+        # Keep the stored raw/label fresh from the source without clobbering an
+        # agent-set label with a blank.
+        updates = {"last_seen_at": timezone.now()}
+        if number and phone.raw != number:
+            phone.raw = number
+            updates["raw"] = phone.raw
+        if label and phone.label != label:
+            phone.label = label
+            updates["label"] = phone.label
+        phone.last_seen_at = updates["last_seen_at"]
+        phone.save(update_fields=list(updates))
+        # The Unite Us primary number heads the list.
+        if not phone.is_primary:
+            ClientPhone.objects.filter(client=client, is_primary=True).exclude(
+                pk=phone.pk
+            ).update(is_primary=False)
+            phone.is_primary = True
+            phone.save(update_fields=["is_primary"])
+
     def _upsert(self, validated_data):
         military = validated_data.pop("military_profile", None)
         addresses = validated_data.pop("addresses", None)
@@ -354,6 +394,18 @@ class ClientSerializer(serializers.ModelSerializer):
         client, _ = Client.objects.update_or_create(
             client_id=client_id, defaults=validated_data
         )
+
+        # Mirror the ext's single Client.client_phone_number into the ClientPhone
+        # table (what the member-profile "Phone Numbers" widget + caller-ID read),
+        # but only when this write actually carried a phone -- a partial PATCH
+        # that omits it must not re-add a number an agent deleted. Idempotent on
+        # (client, normalized); made primary so it heads the list.
+        if "client_phone_number" in validated_data:
+            self._sync_client_phone(
+                client,
+                validated_data.get("client_phone_number"),
+                validated_data.get("phone_type"),
+            )
 
         if military is not None:
             MilitaryProfile.objects.update_or_create(
