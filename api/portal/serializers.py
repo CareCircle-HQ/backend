@@ -281,6 +281,7 @@ class MemberListSerializer(serializers.Serializer):
     start_date = serializers.SerializerMethodField()
     end_date = serializers.SerializerMethodField()
     verification_requested_at = serializers.SerializerMethodField()
+    verification_completed_at = serializers.SerializerMethodField()
 
     def get_name(self, obj):
         return _full_name(obj)
@@ -317,6 +318,13 @@ class MemberListSerializer(serializers.Serializer):
         # so opened_at is the request timestamp (date + time).
         enr = active_enrollment(obj)
         return enr.opened_at.isoformat() if enr and enr.opened_at else None
+
+    def get_verification_completed_at(self, obj):
+        # A verification is "done" when the pop-up completes and sets verified_at
+        # (the source of truth for "is this household verified?"). Null while the
+        # household is still Pending Verification.
+        enr = active_enrollment(obj)
+        return enr.verified_at.isoformat() if enr and enr.verified_at else None
 
 
 class MemberDetailSerializer(serializers.Serializer):

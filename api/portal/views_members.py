@@ -223,6 +223,44 @@ def apply_period_filter(qs, period):
     )
 
 
+def apply_enrollment_date_filter(qs, field, start, end):
+    """Restrict ``qs`` to clients whose governing enrollment -- their own or
+    their household's -- has the datetime ``field`` (e.g. ``opened_at`` for when
+    the verification was requested, ``verified_at`` for when it was completed)
+    within the inclusive [start, end] date window. Either bound may be None
+    (open-ended). No-op when both bounds are None. The conditions for a bound
+    are ANDed on the SAME joined row (matching ``apply_period_filter``); the
+    caller is responsible for ``.distinct()`` (this adds multi-valued joins)."""
+    if not start and not end:
+        return qs
+    hh = "household_membership__household__enrollment_verifications__"
+    own_cond, hh_cond = {}, {}
+    if start:
+        own_cond[f"enrollments__{field}__date__gte"] = start
+        hh_cond[f"{hh}{field}__date__gte"] = start
+    if end:
+        own_cond[f"enrollments__{field}__date__lte"] = end
+        hh_cond[f"{hh}{field}__date__lte"] = end
+    return qs.filter(Q(**own_cond) | Q(**hh_cond))
+
+
+def apply_verification_date_filters(qs, params):
+    """Apply the Verification-page requested/completed date-range filters from
+    query params (``requested_from``/``requested_to`` -> enrollment ``opened_at``;
+    ``completed_from``/``completed_to`` -> enrollment ``verified_at``). Returns
+    (qs, changed) where ``changed`` signals the caller to ``.distinct()``."""
+    changed = False
+    req_from, req_to = _parse_date(params.get("requested_from")), _parse_date(params.get("requested_to"))
+    if req_from or req_to:
+        qs = apply_enrollment_date_filter(qs, "opened_at", req_from, req_to)
+        changed = True
+    comp_from, comp_to = _parse_date(params.get("completed_from")), _parse_date(params.get("completed_to"))
+    if comp_from or comp_to:
+        qs = apply_enrollment_date_filter(qs, "verified_at", comp_from, comp_to)
+        changed = True
+    return qs, changed
+
+
 class MenuTypesListView(PortalAPIView):
     """Active menu types for the Members-page menu-type filter dropdown.
     ``value`` matches ``MemberDietaryProfile.menu_type`` (the catalog name)."""
@@ -425,6 +463,10 @@ class MembersListView(PortalGenericAPIView):
         # whose enrollment record was OPENED within the selected window.
         qs = apply_period_filter(qs, params.get("period"))
 
+        # Verification page requested/completed date-range filters (from/to on
+        # the enrollment's opened_at / verified_at respectively).
+        qs, _ = apply_verification_date_filters(qs, params)
+
         return qs.distinct()
 
     def _serialize_member(self, client, is_primary, relationship=""):
@@ -619,7 +661,9 @@ class MembersStatsView(PortalAPIView):
         # rows shown for the selected window.
         period = request.query_params.get("period")
         qs = apply_period_filter(qs, period)
-        if period_date_range(period):
+        # Requested/completed date-range filters (mirror the list).
+        qs, date_filtered = apply_verification_date_filters(qs, request.query_params)
+        if period_date_range(period) or date_filtered:
             qs = qs.distinct()
         counts = {"total": qs.count()}
         for label, stages in STATUS_TO_STAGES.items():
