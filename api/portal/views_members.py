@@ -699,9 +699,9 @@ class MembersListView(PortalGenericAPIView):
         if missing_menu:
             blockers.append(f"{missing_menu} missing menu type")
         if predicted_out:
-            blockers.append(f"{predicted_out} will be out of orbit")
+            blockers.append(f"{predicted_out} may get out of orbit")
         if not kitchen_available:
-            blockers.append("No kitchen can serve")
+            blockers.append("Kitchen needs review")
 
         aggregate = {
             "delivery_address": address,
