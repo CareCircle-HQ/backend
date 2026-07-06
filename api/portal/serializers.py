@@ -280,6 +280,7 @@ class MemberListSerializer(serializers.Serializer):
     out_of_orbit = serializers.SerializerMethodField()
     start_date = serializers.SerializerMethodField()
     end_date = serializers.SerializerMethodField()
+    verification_requested_at = serializers.SerializerMethodField()
 
     def get_name(self, obj):
         return _full_name(obj)
@@ -309,6 +310,13 @@ class MemberListSerializer(serializers.Serializer):
     def get_end_date(self, obj):
         enr = active_enrollment(obj)
         return enr.closed_at.isoformat() if enr and enr.closed_at else None
+
+    def get_verification_requested_at(self, obj):
+        # A verification is "requested" when its enrollment is created (it opens
+        # at Pending Verification and fires the VERIFICATION_REQUESTED timeline),
+        # so opened_at is the request timestamp (date + time).
+        enr = active_enrollment(obj)
+        return enr.opened_at.isoformat() if enr and enr.opened_at else None
 
 
 class MemberDetailSerializer(serializers.Serializer):
