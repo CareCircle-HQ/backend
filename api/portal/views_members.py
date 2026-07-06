@@ -24,13 +24,16 @@ from ..models import (
     DeliveryCadence,
     EnrollmentStage,
     EnrollmentVerification,
+    FoodAllergy,
     HouseholdMember,
     Kitchen,
     MemberDietaryProfile,
+    KitchenProductType,
     MemberStatus,
     MenuType,
     Note,
     NoteSource,
+    ProductTypeKind,
     PurchaseOrder,
     ServiceAuthorizationStatus,
     StageEvent,
@@ -985,12 +988,12 @@ class HouseholdMemberEditView(PortalAPIView):
             # allergies. Only return the member to Active if the new combination
             # can actually be fulfilled by the household's assigned kitchen;
             # otherwise the agent must pick a different menu type.
-            out, _became, _reason = reconcile_member_kitchen_output(
+            out, _became, reason = reconcile_member_kitchen_output(
                 mv, enr.kitchen, save=False,
             )
             if out:
                 return Response(
-                    {"error": "Pick a different menu type to activate this member."},
+                    {"error": reason or "This menu type can't be fulfilled for this member."},
                     status=http.HTTP_400_BAD_REQUEST,
                 )
             mv.save()
@@ -1434,6 +1437,105 @@ def _logistics_enrollment(client_id):
     return client, enr, None
 
 
+def assign_kitchen_to_household(
+    enr, client, kitchen, *, cadence, once_weekday=None,
+    member_quantities=None, exclude_notes=None, agent=None,
+):
+    """Assign ``kitchen`` + ``cadence`` to a whole household, apply the kitchen
+    output rules to every member, build the delivery plan + calendar, and
+    activate service (Service Active).
+
+    Shared by the single-household Logistics assignment and the bulk boxes
+    assignment so the meal/kitchen output rules are applied identically. The
+    caller must have validated ``kitchen`` and ``cadence`` first.
+
+    ``exclude_notes`` maps a MemberDietaryProfile pk -> a customer-facing note
+    for members the agent manually pulled Out of Orbit (the override wins over
+    the meal rule). Returns a summary dict for reporting.
+    """
+    member_quantities = member_quantities or {}
+    exclude_notes = exclude_notes or {}
+    actor = f"agent:{agent.agent_code}" if agent and agent.agent_code else ""
+
+    enr.kitchen = kitchen
+    enr.save(update_fields=["kitchen"])
+
+    # Apply the Meal Rules to each member: derive the kitchen meal type + food
+    # notes (sent to the kitchen on the PO) or flag the member Out of Orbit.
+    # Reconciliation is kitchen-aware, so a member the CHOSEN kitchen can't
+    # fulfill (menu not offered / allergy it can't handle) is also set Out of
+    # Orbit. Out-of-orbit members are excluded from schedules + POs.
+    offered = kitchen_offered_menu_index(kitchen)
+    out_of_orbit = 0
+    for profile in enr.member_profiles.select_related("client").all():
+        if profile.pk in exclude_notes:
+            # Manual exclusion: force Out of Orbit and drop the kitchen meal
+            # result so they're excluded from schedules + POs, regardless of
+            # what the meal rule would decide.
+            note = exclude_notes[profile.pk]
+            profile.status = MemberStatus.OUT_OF_ORBIT
+            profile.kitchen_meal_type = ""
+            profile.kitchen_food_notes = ""
+            profile.save(update_fields=[
+                "status", "kitchen_meal_type", "kitchen_food_notes", "updated_at",
+            ])
+            out_of_orbit += 1
+            reason = note or "Excluded from kitchen assignment by agent."
+            try:
+                timeline.event_for_out_of_orbit(
+                    profile, enrollment=enr, reason=reason, actor=actor,
+                )
+            except Exception:  # never let history-logging break assignment
+                pass
+            # Add a customer-facing note on the member's own client record.
+            if note and profile.client_id:
+                try:
+                    Note.objects.create(
+                        client=profile.client, source=NoteSource.AGENT,
+                        author_name=agent.name if agent else "", body=note,
+                    )
+                except Exception:  # never let note-writing break assignment
+                    pass
+            continue
+        _out, became_out, reason = reconcile_member_kitchen_output(
+            profile, kitchen, offered=offered,
+        )
+        if profile.status == MemberStatus.OUT_OF_ORBIT:
+            out_of_orbit += 1
+        if became_out:
+            try:
+                timeline.event_for_out_of_orbit(
+                    profile, enrollment=enr,
+                    reason=reason or "Allergy/menu combination cannot be safely fulfilled.",
+                    actor=actor,
+                )
+            except Exception:  # never let history-logging break assignment
+                pass
+
+    case = enr.case or s.primary_case(client)
+    create_member_delivery_schedules(
+        enr, case=case, cadence=cadence, once_a_week_weekday=once_weekday,
+        kitchen=kitchen, member_quantities=member_quantities,
+    )
+
+    # Expand the per-member plans into the dated delivery calendar
+    # (OrderSchedule) so the household shows up for PO generation.
+    generate_delivery_calendar(enr)
+
+    # Re-assignment case: when the household ALREADY had a plan + calendar, the
+    # two builders above are idempotent no-ops. Push the newly chosen kitchen +
+    # refreshed meal-rule results onto the existing plans and future
+    # occurrences so PO generation reflects the change.
+    enr.delivery_schedules.update(kitchen=kitchen)
+    resync_scheduled_orders(enrollment=enr)
+
+    advance_enrollment(
+        enr, EnrollmentStage.SERVICE_ACTIVE, force=True,
+        note=f"Kitchen assigned ({kitchen.name}); service activated.",
+    )
+    return {"out_of_orbit": out_of_orbit}
+
+
 class MemberKitchenOptionsView(PortalAPIView):
     """Logistics: the household's members (read-only dietary), the available
     kitchens with per-member coverage warnings, cadence options and the
@@ -1520,85 +1622,296 @@ class MemberAssignKitchenView(PortalAPIView):
             except (TypeError, ValueError, AttributeError):
                 continue
 
-        enr.kitchen = kitchen
-        enr.save(update_fields=["kitchen"])
-
-        # Apply the Meal Rules to each member: derive the kitchen meal type +
-        # food notes (sent to the kitchen on the PO) or flag the member Out of
-        # Orbit. Reconciliation is kitchen-aware, so a member the CHOSEN kitchen
-        # can't fulfill (menu not offered / allergy it can't handle) is also set
-        # Out of Orbit. Out-of-orbit members are excluded from schedules + POs.
-        agent = current_agent(request)
-        actor = f"agent:{agent.agent_code}" if agent and agent.agent_code else ""
-        offered = kitchen_offered_menu_index(kitchen)
-        for profile in enr.member_profiles.select_related("client").all():
-            if profile.pk in exclude_notes:
-                # Manual exclusion: force Out of Orbit and drop the kitchen meal
-                # result so they're excluded from schedules + POs, regardless of
-                # what the meal rule would decide.
-                note = exclude_notes[profile.pk]
-                profile.status = MemberStatus.OUT_OF_ORBIT
-                profile.kitchen_meal_type = ""
-                profile.kitchen_food_notes = ""
-                profile.save(update_fields=[
-                    "status", "kitchen_meal_type", "kitchen_food_notes", "updated_at",
-                ])
-                reason = note or "Excluded from kitchen assignment by agent."
-                try:
-                    timeline.event_for_out_of_orbit(
-                        profile, enrollment=enr, reason=reason, actor=actor,
-                    )
-                except Exception:  # never let history-logging break assignment
-                    pass
-                # Add a customer-facing note on the member's own client record.
-                if note and profile.client_id:
-                    try:
-                        Note.objects.create(
-                            client=profile.client, source=NoteSource.AGENT,
-                            author_name=agent.name if agent else "", body=note,
-                        )
-                    except Exception:  # never let note-writing break assignment
-                        pass
-                continue
-            _out, became_out, reason = reconcile_member_kitchen_output(
-                profile, kitchen, offered=offered,
-            )
-            if became_out:
-                try:
-                    timeline.event_for_out_of_orbit(
-                        profile, enrollment=enr,
-                        reason=reason or "Allergy/menu combination cannot be safely fulfilled.",
-                        actor=actor,
-                    )
-                except Exception:  # never let history-logging break assignment
-                    pass
-
-        case = enr.case or s.primary_case(client)
-        create_member_delivery_schedules(
-            enr, case=case, cadence=cadence, once_a_week_weekday=once_weekday,
-            kitchen=kitchen, member_quantities=member_quantities,
-        )
-
-        # Expand the per-member plans into the dated delivery calendar
-        # (OrderSchedule) so the household shows up for PO generation.
-        generate_delivery_calendar(enr)
-
-        # Re-assignment case: when the household ALREADY had a plan + calendar,
-        # the two builders above are idempotent no-ops. Push the newly chosen
-        # kitchen + refreshed meal-rule results onto the existing plans and
-        # future occurrences so PO generation reflects the change.
-        enr.delivery_schedules.update(kitchen=kitchen)
-        resync_scheduled_orders(enrollment=enr)
-
-        advance_enrollment(
-            enr, EnrollmentStage.SERVICE_ACTIVE, force=True,
-            note=f"Kitchen assigned ({kitchen.name}); service activated.",
+        assign_kitchen_to_household(
+            enr, client, kitchen, cadence=cadence, once_weekday=once_weekday,
+            member_quantities=member_quantities, exclude_notes=exclude_notes,
+            agent=current_agent(request),
         )
         return Response({
             "id": enr.pk,
             "stage": enr.stage,
             "kitchen_id": str(kitchen.pk),
             "kitchen_name": kitchen.name,
+        })
+
+
+def _enrollment_kind(enr):
+    """Meals/Boxes kind for an enrollment, preferring the case's program name
+    (the source of truth) and falling back to the enrollment's own name."""
+    program_name = (
+        (enr.case.program.name if enr.case and enr.case.program_id else "")
+        or enr.program_name
+    )
+    return product_type_kind_for_name(program_name)
+
+
+def _awaiting_enrollments(kind):
+    """Enrollments awaiting kitchen assignment for a given product ``kind``
+    (meals/boxes). Mirrors the Logistics queue (stage=kitchen_assignment)
+    filtered to the kind, which is derived from the program name so meals/boxes
+    never mix."""
+    qs = (
+        EnrollmentVerification.objects.filter(stage=EnrollmentStage.KITCHEN_ASSIGNMENT)
+        .select_related("client", "case", "case__program")
+    )
+    return [e for e in qs if _enrollment_kind(e) == kind]
+
+
+def _awaiting_box_enrollments():
+    """Box households awaiting kitchen assignment (see :func:`_awaiting_enrollments`)."""
+    return _awaiting_enrollments(ProductTypeKind.BOXES)
+
+
+def _box_cadence():
+    """The delivery cadence used for boxes (they ship a fixed weekly Wednesday
+    schedule regardless, but a valid cadence value is still required)."""
+    opts = cadence_options_for_kind(ProductTypeKind.BOXES)
+    return opts[0]["value"] if opts else DeliveryCadence.ONCE_A_WEEK
+
+
+class BulkAssignBoxesView(PortalAPIView):
+    """Logistics: bulk-assign the single box kitchen to every household awaiting
+    kitchen assignment for a boxes program.
+
+    GET returns the box-capable kitchens (for the agent to pick from) and the
+    number of boxes households currently awaiting assignment. POST body
+    ``{kitchen_id}`` runs the SAME kitchen-output rules + activation as the
+    single-household assignment for each, one independent transaction per
+    household so one failure never rolls back the rest.
+    """
+
+    def get(self, request):
+        kitchens = [
+            {"id": str(k.pk), "name": k.name, "status": k.status}
+            for k in Kitchen.objects.filter(
+                supported_products__contains=[KitchenProductType.BOX]
+            ).order_by("name")
+        ]
+        return Response({
+            "kitchens": kitchens,
+            "awaiting_count": len(_awaiting_box_enrollments()),
+        })
+
+    def post(self, request):
+        kitchen_id = request.data.get("kitchen_id")
+        kitchen = get_object_or_404(Kitchen, pk=kitchen_id) if kitchen_id else None
+        if kitchen is None:
+            return Response(
+                {"error": "kitchen_id is required."}, status=http.HTTP_400_BAD_REQUEST
+            )
+        if KitchenProductType.BOX not in (kitchen.supported_products or []):
+            return Response(
+                {"error": f"{kitchen.name} does not make boxes."},
+                status=http.HTTP_400_BAD_REQUEST,
+            )
+
+        cadence = _box_cadence()
+        agent = current_agent(request)
+        enrollments = _awaiting_box_enrollments()
+
+        assigned, out_of_orbit, failed, errors = 0, 0, 0, []
+        for enr in enrollments:
+            try:
+                with transaction.atomic():
+                    result = assign_kitchen_to_household(
+                        enr, enr.client, kitchen, cadence=cadence, agent=agent,
+                    )
+                assigned += 1
+                out_of_orbit += result.get("out_of_orbit", 0)
+            except Exception as exc:  # isolate a bad household; keep going
+                failed += 1
+                errors.append({
+                    "client_id": str(enr.client_id) if enr.client_id else None,
+                    "enrollment": enr.code,
+                    "error": str(exc),
+                })
+
+        return Response({
+            "kitchen_id": str(kitchen.pk),
+            "kitchen_name": kitchen.name,
+            "total": len(enrollments),
+            "assigned": assigned,
+            "out_of_orbit": out_of_orbit,
+            "failed": failed,
+            "errors": errors,
+        })
+
+
+def _household_name(enr):
+    """Display name for a household: the primary client's name, else client id."""
+    c = enr.client
+    if c is not None:
+        name = f"{c.first_name or ''} {c.last_name or ''}".strip()
+        if name:
+            return name
+    return str(enr.client_id) if enr.client_id else enr.code
+
+
+_FOOD_ALLERGY_LABELS = dict(FoodAllergy.choices)
+
+
+def _member_allergy_labels(profile):
+    """Human-readable food-allergy labels for a member (drops the no-op 'none')."""
+    return [
+        _FOOD_ALLERGY_LABELS.get(c, c)
+        for c in (profile.food_allergies or [])
+        if c and c != "none"
+    ]
+
+
+def _preview_household_for_kitchen(enr, kitchen, offered):
+    """Dry-run the kitchen-output rules for every member of ``enr`` against
+    ``kitchen`` WITHOUT saving, so we can show the agent who would end up Out of
+    Orbit before committing. Uses the exact same resolver the apply path runs.
+
+    Returns ``{client_id, name, member_count, out_members, fully_covered}`` where
+    each out member carries their menu type + allergies so the agent can see WHY.
+    """
+    out_members = []
+    members = list(enr.member_profiles.select_related("client").all())
+    for m in members:
+        out, _became, reason = reconcile_member_kitchen_output(
+            m, kitchen, offered=offered, save=False,
+        )
+        if out:
+            out_members.append({
+                "name": m.member_name or "Member",
+                "reason": reason,
+                "menu_type": m.menu_type or "",
+                "allergies": _member_allergy_labels(m),
+            })
+    return {
+        "client_id": str(enr.client_id) if enr.client_id else None,
+        "name": _household_name(enr),
+        "member_count": len(members),
+        "out_members": out_members,
+        "fully_covered": not out_members,
+    }
+
+
+class BulkAssignMealsView(PortalAPIView):
+    """Logistics: preview + bulk-assign a meals kitchen to households awaiting
+    kitchen assignment for a meals program.
+
+    Unlike boxes, meals kitchens differ in menu/allergy coverage, so this is a
+    review-first flow:
+
+    * ``GET``  -> meal-capable kitchens, meals cadence options, awaiting count.
+    * ``POST`` ``{kitchen_id, cadence, once_a_week_weekday?, preview: true}``
+      -> a dry run (NO writes) reporting, per household, who would be set Out of
+      Orbit by the chosen kitchen.
+    * ``POST`` ``{kitchen_id, cadence, once_a_week_weekday?, only_covered}``
+      -> applies. ``only_covered`` (default true) skips households the kitchen
+      can't fully serve; set false to assign anyway (excluded members go Out of
+      Orbit). Runs the SAME output rules + activation as the single assignment,
+      one transaction per household.
+    """
+
+    def get(self, request):
+        kitchens = [
+            {"id": str(k.pk), "name": k.name, "status": k.status}
+            for k in Kitchen.objects.filter(
+                supported_products__contains=[KitchenProductType.MEAL]
+            ).order_by("name")
+        ]
+        return Response({
+            "kitchens": kitchens,
+            "cadence_options": cadence_options_for_kind(ProductTypeKind.MEALS),
+            "awaiting_count": len(_awaiting_enrollments(ProductTypeKind.MEALS)),
+        })
+
+    def _validated_inputs(self, request):
+        """Shared kitchen + cadence validation. Returns (kitchen, cadence,
+        once_weekday, error_response)."""
+        kitchen_id = request.data.get("kitchen_id")
+        cadence = (request.data.get("cadence") or "").strip()
+        once_weekday = (request.data.get("once_a_week_weekday") or "").strip() or None
+
+        kitchen = get_object_or_404(Kitchen, pk=kitchen_id) if kitchen_id else None
+        if kitchen is None:
+            return None, None, None, Response(
+                {"error": "kitchen_id is required."}, status=http.HTTP_400_BAD_REQUEST
+            )
+        if KitchenProductType.MEAL not in (kitchen.supported_products or []):
+            return None, None, None, Response(
+                {"error": f"{kitchen.name} does not make meals."},
+                status=http.HTTP_400_BAD_REQUEST,
+            )
+        if cadence not in DeliveryCadence.values:
+            return None, None, None, Response(
+                {"error": "A valid cadence is required."},
+                status=http.HTTP_400_BAD_REQUEST,
+            )
+        if cadence == DeliveryCadence.ONCE_A_WEEK and not once_weekday:
+            return None, None, None, Response(
+                {"error": "once_a_week_weekday is required for a weekly cadence."},
+                status=http.HTTP_400_BAD_REQUEST,
+            )
+        return kitchen, cadence, once_weekday, None
+
+    def post(self, request):
+        kitchen, cadence, once_weekday, err = self._validated_inputs(request)
+        if err is not None:
+            return err
+
+        enrollments = _awaiting_enrollments(ProductTypeKind.MEALS)
+        offered = kitchen_offered_menu_index(kitchen)
+
+        # Preview: dry-run only, report households that would have exclusions.
+        if request.data.get("preview"):
+            fully_covered, with_exclusions, households = 0, 0, []
+            for enr in enrollments:
+                prev = _preview_household_for_kitchen(enr, kitchen, offered)
+                if prev["fully_covered"]:
+                    fully_covered += 1
+                else:
+                    with_exclusions += 1
+                    households.append(prev)
+            return Response({
+                "kitchen_id": str(kitchen.pk),
+                "kitchen_name": kitchen.name,
+                "total": len(enrollments),
+                "fully_covered": fully_covered,
+                "with_exclusions": with_exclusions,
+                # Only the households needing attention (keeps the payload bounded).
+                "households": households,
+            })
+
+        # Apply.
+        only_covered = request.data.get("only_covered", True)
+        agent = current_agent(request)
+        assigned, skipped, out_of_orbit, failed, errors = 0, 0, 0, 0, []
+        for enr in enrollments:
+            if only_covered:
+                prev = _preview_household_for_kitchen(enr, kitchen, offered)
+                if not prev["fully_covered"]:
+                    skipped += 1
+                    continue
+            try:
+                with transaction.atomic():
+                    result = assign_kitchen_to_household(
+                        enr, enr.client, kitchen, cadence=cadence,
+                        once_weekday=once_weekday, agent=agent,
+                    )
+                assigned += 1
+                out_of_orbit += result.get("out_of_orbit", 0)
+            except Exception as exc:  # isolate a bad household; keep going
+                failed += 1
+                errors.append({
+                    "client_id": str(enr.client_id) if enr.client_id else None,
+                    "enrollment": enr.code,
+                    "error": str(exc),
+                })
+
+        return Response({
+            "kitchen_id": str(kitchen.pk),
+            "kitchen_name": kitchen.name,
+            "total": len(enrollments),
+            "assigned": assigned,
+            "skipped": skipped,
+            "out_of_orbit": out_of_orbit,
+            "failed": failed,
+            "errors": errors,
         })
 
 
