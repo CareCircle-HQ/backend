@@ -985,12 +985,12 @@ class HouseholdMemberEditView(PortalAPIView):
             # allergies. Only return the member to Active if the new combination
             # can actually be fulfilled by the household's assigned kitchen;
             # otherwise the agent must pick a different menu type.
-            out, _became, _reason = reconcile_member_kitchen_output(
+            out, _became, reason = reconcile_member_kitchen_output(
                 mv, enr.kitchen, save=False,
             )
             if out:
                 return Response(
-                    {"error": "Pick a different menu type to activate this member."},
+                    {"error": reason or "This menu type can't be fulfilled for this member."},
                     status=http.HTTP_400_BAD_REQUEST,
                 )
             mv.save()
