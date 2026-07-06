@@ -79,6 +79,22 @@ NO_KITCHEN_OUT_OF_ORBIT_NOTE = (
     "No kitchen currently supports this member's dietary needs."
 )
 
+
+def _agent_actor(agent):
+    """Timeline ``actor`` attribution for an acting agent. Prefer the agent code
+    (``agent:<code>``, resolved to a name via a batched lookup), but many
+    portal agents (e.g. Management/CS) have no code -- fall back to the agent's
+    name (``user:<name>``) so the history still shows WHO performed the action
+    instead of a blank attribution."""
+    if agent is None:
+        return ""
+    if agent.agent_code:
+        return f"agent:{agent.agent_code}"
+    if agent.name:
+        return f"user:{agent.name}"
+    return ""
+
+
 # Reverse of serializers._STATUS_MAP: a filter value -> the lifecycle stages it covers.
 # Verification is a yes/no fact (Pending Verification / Verified), so those two
 # chips are NOT in this map -- they are resolved via verification_completed_q()
@@ -1244,7 +1260,7 @@ class MemberHouseholdAddView(PortalAPIView):
             )
         agent = current_agent(request)
         add_client_to_household(primary, member_client, agent=agent)
-        actor = f"agent:{agent.agent_code}" if agent and agent.agent_code else ""
+        actor = _agent_actor(agent)
         try:
             timeline.event_for_household_member_added(
                 primary, member_client,
@@ -1313,7 +1329,7 @@ class HouseholdMemberEditView(PortalAPIView):
             mv.kitchen_food_notes = ""
             mv.save()
             agent = current_agent(request)
-            actor = f"agent:{agent.agent_code}" if agent and agent.agent_code else ""
+            actor = _agent_actor(agent)
             try:
                 timeline.event_for_out_of_orbit(
                     mv, enrollment=mv.enrollment,
@@ -1347,7 +1363,7 @@ class HouseholdMemberEditView(PortalAPIView):
                 )
             mv.save()
             agent = current_agent(request)
-            actor = f"agent:{agent.agent_code}" if agent and agent.agent_code else ""
+            actor = _agent_actor(agent)
             try:
                 timeline.event_for_member_reactivated(
                     mv, enrollment=mv.enrollment, actor=actor,
@@ -1369,7 +1385,7 @@ class HouseholdMemberEditView(PortalAPIView):
             mv.save()
             if became_out:
                 agent = current_agent(request)
-                actor = f"agent:{agent.agent_code}" if agent and agent.agent_code else ""
+                actor = _agent_actor(agent)
                 try:
                     timeline.event_for_out_of_orbit(
                         mv, enrollment=mv.enrollment,
@@ -1713,9 +1729,7 @@ class MemberVerificationCreateView(PortalAPIView):
         # of THIS household (no duplicate row, no duplicate timeline event).
         if household is not None and extra_member_ids:
             agent = current_agent(request)
-            actor = (
-                f"agent:{agent.agent_code}" if agent and agent.agent_code else ""
-            )
+            actor = _agent_actor(agent)
             for mid in extra_member_ids:
                 member_client = Client.objects.filter(pk=mid).first()
                 if member_client is None:
@@ -1820,7 +1834,7 @@ def assign_kitchen_to_household(
     """
     member_quantities = member_quantities or {}
     exclude_notes = exclude_notes or {}
-    actor = f"agent:{agent.agent_code}" if agent and agent.agent_code else ""
+    actor = _agent_actor(agent)
 
     enr.kitchen = kitchen
     enr.save(update_fields=["kitchen"])

@@ -604,9 +604,14 @@ def sync_household_members(client, enrollment=None, agent=None):
         # Attribute the acting agent (who added the member) so the note author
         # and the timeline actor show WHO performed the action instead of blank.
         agent_author = (agent.name if agent else "") or ""
-        agent_actor = (
-            f"agent:{agent.agent_code}" if agent and agent.agent_code else ""
-        )
+        # Prefer the agent code (resolved to a name in the UI); fall back to the
+        # agent's name for code-less agents so the actor isn't blank.
+        if agent and agent.agent_code:
+            agent_actor = f"agent:{agent.agent_code}"
+        elif agent_author:
+            agent_actor = f"user:{agent_author}"
+        else:
+            agent_actor = ""
         try:
             Note.objects.create(
                 client=member, source=NoteSource.SYSTEM,
