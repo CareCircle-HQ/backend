@@ -16,15 +16,18 @@ sheet cell is non-empty (a blank cell never wipes existing DB data):
   * allergies        -> member profile food_allergies (known codes; unknown
     labels folded into the restrictions note),
   * food_notes       -> member restrictions note,
-  * facility         -> enrollment.kitchen (FK only; no schedules/activation).
+  * facility         -> enrollment.kitchen (FK only; no schedules/activation),
+  * cadence          -> enrollment.delivery_weekdays (A->Mon/Thu, B->Tue/Fri,
+    Boxes->Wed), written ONLY when the enrollment has no delivery schedules yet
+    so already-activated members are never desynced from their live plan.
 
-Cadence (col I) and case_authorization_status (col H) are intentionally IGNORED
-here -- they belong to the lifecycle pass.
+case_authorization_status (col H) is intentionally IGNORED here -- stage/auth
+logic belongs to the lifecycle pass (Script 2).
 
 Sheet columns are read by LETTER (the file has duplicate header labels):
   A=client_id B=delivery_address C=menu_type D=food_notes E=allergies
   F=kitchen(unused) G=cadence(unused) H=case_authorization_status(ignored)
-  I=cadence(ignored) J=facility
+  I=cadence J=facility
 
 Usage:
     python manage.py sync_member_data                      # DRY RUN (rolls back)
@@ -46,6 +49,7 @@ from api.models import (
     MemberDietaryProfile,
 )
 from api.services.sheet_import import (
+    CADENCE_TO_WEEKDAYS,
     clean,
     parse_address,
     parse_allergies,
@@ -63,6 +67,7 @@ _C_ADDRESS = "B"
 _C_MENU = "C"
 _C_FOOD_NOTES = "D"
 _C_ALLERGIES = "E"
+_C_CADENCE = "I"
 _C_FACILITY = "J"
 
 
@@ -185,6 +190,22 @@ class Command(BaseCommand):
                     enr.save(update_fields=["kitchen"])
                     changed.append("kitchen")
 
+            # --- cadence -> delivery_weekdays (enrollment) ---
+            # Only when the household has NO live delivery plan yet: writing
+            # weekdays on an already-activated enrollment would desync it from
+            # its schedules. Active members keep the cadence they were activated
+            # with (their weekdays are already populated).
+            cadence_code = clean(row.get(_C_CADENCE)).lower()
+            weekdays = CADENCE_TO_WEEKDAYS.get(cadence_code)
+            if (
+                weekdays is not None
+                and enr.delivery_weekdays != weekdays
+                and not enr.delivery_schedules.exists()
+            ):
+                enr.delivery_weekdays = weekdays
+                enr.save(update_fields=["delivery_weekdays"])
+                changed.append("cadence")
+
         for c in changed:
             fields[c] += 1
         return ("updated",) if changed else ("no_change",)
@@ -236,7 +257,7 @@ class Command(BaseCommand):
         if fields:
             self.stdout.write(head("\nField updates:"))
             for name in ("menu_type", "food_allergies", "food_notes",
-                         "delivery_address", "kitchen"):
+                         "delivery_address", "kitchen", "cadence"):
                 if fields.get(name):
                     self.stdout.write(f"  {name:<46}: {fields[name]}")
 
