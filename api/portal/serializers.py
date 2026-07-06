@@ -149,15 +149,31 @@ def verification_status(client):
     return _STATUS_MAP.get(client.lifecycle_stage, client.get_lifecycle_stage_display())
 
 
+# Coarse pipeline PHASE for the Verification list's "Stage" column. Both
+# pending_verification and verified (awaiting authorization) are still in the
+# "Verification" phase; the case being approved advances to Kitchen Assignment,
+# then Active once the kitchen is assigned. On Hold overlays any phase.
+_STAGE_PHASE_LABELS = {
+    "pending_verification": "Verification",
+    "verified": "Verification",
+    "kitchen_assignment": "Kitchen Assignment",
+    "active": "Active",
+    "completed": "Completed",
+    "not_eligible": "Denied",
+}
+
+
 def pipeline_stage_label(client):
-    """The member's CURRENT pipeline stage, independent of the verification fact:
-    the On Hold overlay if paused, otherwise the human label for the client's
-    lifecycle_stage (Pending Verification / Verified / Kitchen Assignment /
-    Active / Completed / Denied). Used by the Verification list's "Stage" column
-    to show where a verified member has since advanced to."""
+    """The member's CURRENT pipeline phase, independent of the verification fact:
+    the On Hold overlay if paused, otherwise the coarse phase for the client's
+    lifecycle_stage. The whole verification window (pending OR verified-awaiting-
+    authorization) reads as "Verification"; approval moves it to Kitchen
+    Assignment, then Active. Used by the Verification list's "Stage" column."""
     if service_hold_state(client)["on_hold"]:
         return "On Hold"
-    return _STATUS_MAP.get(client.lifecycle_stage, client.get_lifecycle_stage_display())
+    return _STAGE_PHASE_LABELS.get(
+        client.lifecycle_stage, client.get_lifecycle_stage_display()
+    )
 
 
 def authorization_status(client):
@@ -307,12 +323,20 @@ class MemberListSerializer(serializers.Serializer):
     verification_requested_by = serializers.SerializerMethodField()
     verification_completed_by = serializers.SerializerMethodField()
     stage_label = serializers.SerializerMethodField()
+    verification_state = serializers.SerializerMethodField()
 
     def get_name(self, obj):
         return _full_name(obj)
 
     def get_stage_label(self, obj):
         return pipeline_stage_label(obj)
+
+    def get_verification_state(self, obj):
+        # Pure verification FACT for the Verification page's status column:
+        # Verified once the pop-up completed (verified_at set), else Pending
+        # Verification. The downstream pipeline position (Kitchen Assignment /
+        # Active / Completed / On Hold) lives in stage_label, not here.
+        return "Verified" if verification_completed(obj) else "Pending Verification"
 
     def get_out_of_orbit(self, obj):
         return member_out_of_orbit(obj)
