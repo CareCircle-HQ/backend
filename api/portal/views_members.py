@@ -173,6 +173,16 @@ def verification_completed_q():
     )
 
 
+def verification_scope_q():
+    """Base scope for the Verification page, keyed off the verification FACT so
+    the list reads as a full verification history: households still awaiting
+    verification (lifecycle ``pending_verification``) OR that have EVER been
+    verified (``verified_at`` set on a governing enrollment) -- kept even after
+    they advance to kitchen assignment / active / completed. The ``verified_at``
+    join is multi-valued, so the caller must ``.distinct()``."""
+    return Q(lifecycle_stage="pending_verification") | verification_completed_q()
+
+
 def _parse_date(value):
     for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%m-%d-%Y"):
         try:
@@ -315,17 +325,19 @@ class MembersListView(PortalGenericAPIView):
                 pass
             qs = qs.filter(cond)
 
-        # Page-level scope (Verification / Logistics) restricts which stages are
+        # Page-level scope (Verification / Logistics) restricts which members are
         # ever shown, before the per-status filter chips are applied.
         scope = (params.get("scope") or "").strip()
-        scope_stages = SCOPE_TO_STAGES.get(scope)
-        if scope_stages:
-            qs = qs.filter(lifecycle_stage__in=scope_stages)
-
-        # Verification page: only members whose household primary holds an
-        # Internal Service case (see require_internal_service_primary).
         if scope == "verification":
-            qs = require_internal_service_primary(qs)
+            # Full verification history: the pending queue + anything ever
+            # verified, regardless of the stage it later advanced to. Also
+            # restrict to members whose household primary holds an Internal
+            # Service case (see require_internal_service_primary).
+            qs = require_internal_service_primary(qs.filter(verification_scope_q()))
+        else:
+            scope_stages = SCOPE_TO_STAGES.get(scope)
+            if scope_stages:
+                qs = qs.filter(lifecycle_stage__in=scope_stages)
 
         # Logistics (kitchen-assignment) page: drop members whose internal-
         # service (meal/box) cases are ALL closed/cancelled -- they've finished
@@ -667,14 +679,18 @@ class MembersStatsView(PortalAPIView):
     def get(self, request):
         qs = Client.objects.all()
         scope = (request.query_params.get("scope") or "").strip()
-        scope_stages = SCOPE_TO_STAGES.get(scope)
-        if scope_stages:
-            qs = qs.filter(lifecycle_stage__in=scope_stages)
-        # Mirror the Verification list's eligibility filter so the chip counts
-        # match the rows actually shown. The join makes rows non-unique, so all
-        # counts below must be DISTINCT on the client.
+        # Mirror the Verification list's scope so the chip counts match the rows
+        # actually shown: the full verification history (pending + ever-verified)
+        # plus the internal-service-primary eligibility filter. The joins make
+        # rows non-unique, so all counts below must be DISTINCT on the client.
         if scope == "verification":
-            qs = require_internal_service_primary(qs).distinct()
+            qs = require_internal_service_primary(
+                qs.filter(verification_scope_q())
+            ).distinct()
+        else:
+            scope_stages = SCOPE_TO_STAGES.get(scope)
+            if scope_stages:
+                qs = qs.filter(lifecycle_stage__in=scope_stages)
         # Date-period filter (mirrors the list) so the chip counts match the
         # rows shown for the selected window.
         period = request.query_params.get("period")

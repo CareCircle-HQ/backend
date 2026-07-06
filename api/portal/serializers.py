@@ -149,6 +149,17 @@ def verification_status(client):
     return _STATUS_MAP.get(client.lifecycle_stage, client.get_lifecycle_stage_display())
 
 
+def pipeline_stage_label(client):
+    """The member's CURRENT pipeline stage, independent of the verification fact:
+    the On Hold overlay if paused, otherwise the human label for the client's
+    lifecycle_stage (Pending Verification / Verified / Kitchen Assignment /
+    Active / Completed / Denied). Used by the Verification list's "Stage" column
+    to show where a verified member has since advanced to."""
+    if service_hold_state(client)["on_hold"]:
+        return "On Hold"
+    return _STATUS_MAP.get(client.lifecycle_stage, client.get_lifecycle_stage_display())
+
+
 def authorization_status(client):
     """The meal/box case authorization that gates kitchen assignment, as a
     ``{status, status_label, is_accepted}`` snapshot. Sourced ONLY from the
@@ -295,9 +306,13 @@ class MemberListSerializer(serializers.Serializer):
     verification_completed_at = serializers.SerializerMethodField()
     verification_requested_by = serializers.SerializerMethodField()
     verification_completed_by = serializers.SerializerMethodField()
+    stage_label = serializers.SerializerMethodField()
 
     def get_name(self, obj):
         return _full_name(obj)
+
+    def get_stage_label(self, obj):
+        return pipeline_stage_label(obj)
 
     def get_out_of_orbit(self, obj):
         return member_out_of_orbit(obj)
