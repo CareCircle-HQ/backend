@@ -43,6 +43,8 @@ from .models import (
     MenuCategory,
     MenuType,
     MilitaryProfile,
+    Note,
+    NoteSource,
     Program,
     ProgramEligibility,
     ProgramMainCategory,
@@ -589,6 +591,21 @@ def sync_household_members(client, enrollment=None):
             status=MemberStatus.OUT_OF_ORBIT,
         )
         created += 1
+        # This member was added outside the verification wizard, so leave a
+        # system note explaining why they start Out of Orbit + what's needed to
+        # activate them. Best-effort: never let note-logging break the add.
+        try:
+            Note.objects.create(
+                client=member,
+                source=NoteSource.SYSTEM,
+                body=(
+                    "New member added outside of the verification process. "
+                    "This member needs a menu type and dietary preferences to be "
+                    "active (added Out of Orbit by default)."
+                ),
+            )
+        except Exception:
+            logger.warning("household member note failed", exc_info=True)
 
     # 2) profiled members -> ensure a roster row (one-household-per-client).
     for cid in profiles:
