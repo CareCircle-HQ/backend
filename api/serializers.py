@@ -529,7 +529,7 @@ def ensure_household_with_primary(client):
 
 
 @transaction.atomic
-def sync_household_members(client, enrollment=None):
+def sync_household_members(client, enrollment=None, agent=None):
     """Reconcile a household's two member sources so every member -- however
     added -- lands in the SAME place.
 
@@ -601,16 +601,23 @@ def sync_household_members(client, enrollment=None):
             "This member needs a menu type and dietary preferences to be "
             "active (added Out of Orbit by default)."
         )
+        # Attribute the acting agent (who added the member) so the note author
+        # and the timeline actor show WHO performed the action instead of blank.
+        agent_author = (agent.name if agent else "") or ""
+        agent_actor = (
+            f"agent:{agent.agent_code}" if agent and agent.agent_code else ""
+        )
         try:
             Note.objects.create(
-                client=member, source=NoteSource.SYSTEM, body=reason,
+                client=member, source=NoteSource.SYSTEM,
+                author_name=agent_author, body=reason,
             )
         except Exception:
             logger.warning("household member note failed", exc_info=True)
         try:
             from .services import timeline
             timeline.event_for_out_of_orbit(
-                profile, enrollment=enrollment, reason=reason,
+                profile, enrollment=enrollment, reason=reason, actor=agent_actor,
             )
         except Exception:
             logger.warning("household member out-of-orbit event failed", exc_info=True)
@@ -673,7 +680,7 @@ def search_clients(q):
 
 
 @transaction.atomic
-def add_client_to_household(primary, member_client):
+def add_client_to_household(primary, member_client, agent=None):
     """Add ``member_client`` to ``primary``'s household, MOVING them out of any
     OTHER household first (one-household-per-client). Mirrors the member into the
     household's active enrollment as a dietary profile so they show + are
@@ -704,7 +711,7 @@ def add_client_to_household(primary, member_client):
     HouseholdMember.objects.create(
         household=household, client=member_client, is_primary=False
     )
-    sync_household_members(primary)
+    sync_household_members(primary, agent=agent)
     return household
 
 

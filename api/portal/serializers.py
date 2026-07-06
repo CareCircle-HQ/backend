@@ -552,6 +552,44 @@ class PortalSocialCoverageSerializer(serializers.ModelSerializer):
 # ---------------------------------------------------------------------------
 # History (timeline)
 # ---------------------------------------------------------------------------
+def resolve_actor_name(actor, agent_names=None):
+    """Human-readable name for a timeline event's ``actor`` attribution string.
+
+    Actors are stored as ``agent:<agent_code>`` (portal/extension writes),
+    ``system:<job>`` (batch jobs), ``user:<name>`` or a raw display name. This
+    resolves an agent code to the Agent's name (via the optional prefetched
+    ``agent_names`` {code: name} map, else a direct lookup) so the history tab
+    can show WHO performed the action instead of an opaque code."""
+    if not actor:
+        return ""
+    if actor.startswith("agent:"):
+        code = actor[len("agent:"):]
+        if agent_names is not None:
+            return agent_names.get(code) or f"Agent {code}"
+        name = Agent.objects.filter(agent_code=code).values_list("name", flat=True).first()
+        return name or f"Agent {code}"
+    if actor.startswith("system:"):
+        return "System"
+    if actor.startswith("user:"):
+        return actor[len("user:"):]
+    return actor
+
+
+def build_actor_name_map(events):
+    """Prefetch a {agent_code: name} map for the agent actors in ``events`` so a
+    page of timeline rows resolves actor names in one query (no N+1)."""
+    codes = {
+        e.actor[len("agent:"):]
+        for e in events
+        if e.actor and e.actor.startswith("agent:")
+    }
+    if not codes:
+        return {}
+    return dict(
+        Agent.objects.filter(agent_code__in=codes).values_list("agent_code", "name")
+    )
+
+
 class HistoryEventSummarySerializer(serializers.ModelSerializer):
     id = serializers.IntegerField(source="pk", read_only=True)
     event_type_label = serializers.CharField(source="get_event_type_display", read_only=True)
@@ -559,30 +597,40 @@ class HistoryEventSummarySerializer(serializers.ModelSerializer):
     # can badge "via Import #73 by Jane" and click through to the case/ticket.
     entity_type = serializers.SerializerMethodField()
     entity_id = serializers.CharField(source="object_id", read_only=True)
+    # Resolved, human-readable actor (agent code -> agent name).
+    actor_name = serializers.SerializerMethodField()
 
     class Meta:
         model = TimelineEvent
         fields = [
             "id", "event_type", "event_type_label", "occurred_at", "title",
             "subtitle", "badge_text", "badge_tone", "renewal_number",
-            "source", "actor", "case", "entity_type", "entity_id", "metadata",
+            "source", "actor", "actor_name", "case", "entity_type", "entity_id",
+            "metadata",
         ]
 
     def get_entity_type(self, obj):
         return obj.content_type.model if obj.content_type_id else None
 
+    def get_actor_name(self, obj):
+        return resolve_actor_name(obj.actor, self.context.get("actor_names"))
+
 
 class HistoryEventDetailSerializer(serializers.ModelSerializer):
     id = serializers.IntegerField(source="pk", read_only=True)
     event_type_label = serializers.CharField(source="get_event_type_display", read_only=True)
+    actor_name = serializers.SerializerMethodField()
 
     class Meta:
         model = TimelineEvent
         fields = [
             "id", "event_type", "event_type_label", "occurred_at", "title",
             "subtitle", "badge_text", "badge_tone", "renewal_number",
-            "source", "actor", "metadata",
+            "source", "actor", "actor_name", "metadata",
         ]
+
+    def get_actor_name(self, obj):
+        return resolve_actor_name(obj.actor, self.context.get("actor_names"))
 
 
 class ActivityEventSerializer(HistoryEventSummarySerializer):

@@ -1087,7 +1087,9 @@ class MemberHistoryView(PortalGenericAPIView):
         get_object_or_404(Client, pk=client_id)
         qs = TimelineEvent.objects.filter(client_id=client_id)
         page = self.paginate_queryset(qs)
-        data = self.get_serializer(page, many=True).data
+        ctx = self.get_serializer_context()
+        ctx["actor_names"] = s.build_actor_name_map(page)
+        data = self.get_serializer(page, many=True, context=ctx).data
         return self.get_paginated_response(data)
 
 
@@ -1240,8 +1242,8 @@ class MemberHouseholdAddView(PortalAPIView):
                 {"error": "A client can't be added to their own household."},
                 status=http.HTTP_400_BAD_REQUEST,
             )
-        add_client_to_household(primary, member_client)
         agent = current_agent(request)
+        add_client_to_household(primary, member_client, agent=agent)
         actor = f"agent:{agent.agent_code}" if agent and agent.agent_code else ""
         try:
             timeline.event_for_household_member_added(
@@ -1319,11 +1321,13 @@ class HouseholdMemberEditView(PortalAPIView):
                 )
             except Exception:  # never let history-logging break the edit
                 pass
-            # Leave a system note (same as the auto-out-of-orbit paths).
+            # Leave a system note (same as the auto-out-of-orbit paths),
+            # attributed to the acting agent.
             if mv.client_id:
                 try:
                     Note.objects.create(
                         client=mv.client, source=NoteSource.SYSTEM,
+                        author_name=agent.name if agent else "",
                         body=NO_KITCHEN_OUT_OF_ORBIT_NOTE,
                     )
                 except Exception:  # never let note-writing break the edit
@@ -1375,11 +1379,12 @@ class HouseholdMemberEditView(PortalAPIView):
                 except Exception:  # never let history-logging break the edit
                     pass
                 # Leave a customer-facing note explaining why the edit pulled the
-                # member Out of Orbit.
+                # member Out of Orbit, attributed to the acting agent.
                 if mv.client_id:
                     try:
                         Note.objects.create(
                             client=mv.client, source=NoteSource.SYSTEM,
+                            author_name=agent.name if agent else "",
                             body=NO_KITCHEN_OUT_OF_ORBIT_NOTE,
                         )
                     except Exception:  # never let note-writing break the edit
@@ -1538,7 +1543,9 @@ class MemberCaseHistoryView(PortalGenericAPIView):
         get_object_or_404(Case, pk=case_id, client_id=client_id)
         qs = TimelineEvent.objects.filter(client_id=client_id, case_id=case_id)
         page = self.paginate_queryset(qs)
-        data = self.get_serializer(page, many=True).data
+        ctx = self.get_serializer_context()
+        ctx["actor_names"] = s.build_actor_name_map(page)
+        data = self.get_serializer(page, many=True, context=ctx).data
         return self.get_paginated_response(data)
 
 
@@ -1869,11 +1876,13 @@ def assign_kitchen_to_household(
                 )
             except Exception:  # never let history-logging break assignment
                 pass
-            # Note explaining why the assigned kitchen couldn't serve them.
+            # Note explaining why the assigned kitchen couldn't serve them,
+            # attributed to the acting agent (blank for unattended bulk runs).
             if profile.client_id:
                 try:
                     Note.objects.create(
                         client=profile.client, source=NoteSource.SYSTEM,
+                        author_name=agent.name if agent else "",
                         body=NO_KITCHEN_OUT_OF_ORBIT_NOTE,
                     )
                 except Exception:  # never let note-writing break assignment
