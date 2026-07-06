@@ -587,6 +587,14 @@ class EnrollmentVerificationViewSet(viewsets.ModelViewSet):
 
     def perform_create(self, serializer):
         serializer.save()
+        # Attribute the verification REQUEST to the authenticated ext agent (the
+        # one who submitted the E-Form). NULL when the request has no resolvable
+        # agent (e.g. bulk/system writes).
+        agent_id = getattr(getattr(self.request, "user", None), "agent_id", None)
+        if agent_id:
+            enrollment = serializer.instance
+            enrollment.requested_by_id = agent_id
+            enrollment.save(update_fields=["requested_by"])
         _safe_timeline(timeline.event_for_verification, serializer.instance, self.request)
         # A new enrollment (default Pending Verification) drives the WHOLE
         # household's lifecycle stage: the primary and every non-denied member

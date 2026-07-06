@@ -55,6 +55,17 @@ def _full_name(client):
     return f"{client.first_name} {client.last_name}".strip()
 
 
+def _agent_name(agent):
+    """Display name for an Agent (falls back to first+last, then agent_code).
+    Returns None when there is no agent."""
+    if agent is None:
+        return None
+    name = (agent.name or "").strip()
+    if not name:
+        name = f"{(agent.first_name or '').strip()} {(agent.last_name or '').strip()}".strip()
+    return name or (agent.agent_code or None)
+
+
 _COMM_CHANNEL_LABELS = dict(CommunicationChannel.choices)
 _COMM_TIME_LABELS = dict(CommunicationTimeOfDay.choices)
 
@@ -282,6 +293,8 @@ class MemberListSerializer(serializers.Serializer):
     end_date = serializers.SerializerMethodField()
     verification_requested_at = serializers.SerializerMethodField()
     verification_completed_at = serializers.SerializerMethodField()
+    verification_requested_by = serializers.SerializerMethodField()
+    verification_completed_by = serializers.SerializerMethodField()
 
     def get_name(self, obj):
         return _full_name(obj)
@@ -325,6 +338,17 @@ class MemberListSerializer(serializers.Serializer):
         # household is still Pending Verification.
         enr = active_enrollment(obj)
         return enr.verified_at.isoformat() if enr and enr.verified_at else None
+
+    def get_verification_requested_by(self, obj):
+        # Agent who submitted the E-Form that requested the verification. NULL for
+        # bulk-imported enrollments with no attributable agent.
+        enr = active_enrollment(obj)
+        return _agent_name(enr.requested_by) if enr else None
+
+    def get_verification_completed_by(self, obj):
+        # Agent who completed the verification pop-up (set alongside verified_at).
+        enr = active_enrollment(obj)
+        return _agent_name(enr.verified_by) if enr else None
 
 
 class MemberDetailSerializer(serializers.Serializer):

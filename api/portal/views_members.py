@@ -7,7 +7,7 @@ from datetime import datetime, timedelta
 
 from django.db import transaction
 from django.utils import timezone
-from django.db.models import Count, Exists, OuterRef, Q
+from django.db.models import Count, Exists, OuterRef, Prefetch, Q
 from django.db.models.functions import Lower
 from django.shortcuts import get_object_or_404
 from rest_framework import status as http
@@ -125,7 +125,19 @@ SCOPE_TO_STAGES = {
     "logistics": ["kitchen_assignment"],
 }
 
-MEMBER_LIST_PREFETCH = ("insurances", "military_profile", "enrollments", "member_profiles")
+# select_related the requested_by / verified_by agents on the enrollment prefetch
+# so the Verification list's agent columns don't trigger an extra query per row.
+MEMBER_LIST_PREFETCH = (
+    "insurances",
+    "military_profile",
+    Prefetch(
+        "enrollments",
+        queryset=EnrollmentVerification.objects.select_related(
+            "requested_by", "verified_by"
+        ),
+    ),
+    "member_profiles",
+)
 
 
 def require_internal_service_primary(qs):
@@ -563,7 +575,13 @@ class MembersListView(PortalGenericAPIView):
                 .select_related("household", "client")
                 .prefetch_related(
                     "client__insurances", "client__military_profile",
-                    "client__enrollments", "client__member_profiles", "client__cases",
+                    Prefetch(
+                        "client__enrollments",
+                        queryset=EnrollmentVerification.objects.select_related(
+                            "requested_by", "verified_by"
+                        ),
+                    ),
+                    "client__member_profiles", "client__cases",
                 )
                 .order_by("-is_primary", "added_at")
             )
@@ -1356,7 +1374,9 @@ class MemberVerificationCreateView(PortalAPIView):
         if extra_member_ids and household is None:
             household = ensure_household_with_primary(client)
         # Start at PENDING_VERIFICATION; the guarded lifecycle transitions below
-        # move it forward and write the history rows.
+        # move it forward and write the history rows. The agent running the
+        # wizard both requests and (below) completes the verification.
+        acting_agent = current_agent(request)
         enrollment = EnrollmentVerification.objects.create(
             client=client,
             household=household,
@@ -1368,6 +1388,7 @@ class MemberVerificationCreateView(PortalAPIView):
             medicaid_type_verified=data.get("medicaid_type_verified"),
             delivery_address_verified=data.get("delivery_address_verified"),
             stage=EnrollmentStage.PENDING_VERIFICATION,
+            requested_by=acting_agent,
         )
 
         for m in data["members"]:
