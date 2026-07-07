@@ -1,6 +1,7 @@
 import uuid
+from types import SimpleNamespace
 
-from django.test import TestCase
+from django.test import SimpleTestCase, TestCase
 from django.urls import reverse
 from django.utils import timezone
 from rest_framework.test import APIClient
@@ -821,3 +822,53 @@ class ExcludedZipSettingsTest(TestCase):
         det = reverse("portal-excluded-zip-code-detail", kwargs={"zip_id": zid})
         self.assertEqual(self.api.delete(det).status_code, 204)
         self.assertFalse(ExcludedZipCode.objects.filter(zip="11250").exists())
+
+
+class ProductKindResolverTest(SimpleTestCase):
+    """product_kind_for_enrollment resolves Meals/Boxes across name sources so a
+    keyword-less Program row name no longer yields an unresolved '—' kind and a
+    mixed meals+boxes cadence list (the Kitchen Assignment popup bug)."""
+
+    def _enr(self, *, program_name="", case=None, schedules=None):
+        # A stub delivery_schedules manager (branch 3) that returns nothing.
+        sched_mgr = SimpleNamespace(
+            filter=lambda **kw: SimpleNamespace(first=lambda: schedules)
+        )
+        return SimpleNamespace(
+            program_name=program_name, case=case, delivery_schedules=sched_mgr,
+        )
+
+    def test_enrollment_snapshot_name_used_when_program_row_lacks_keyword(self):
+        from .models import ProductTypeKind
+        from .services.catalog import product_kind_for_enrollment
+
+        # Linked Program row name has no meal/box keyword, but the enrollment's
+        # snapshot name does -> must resolve rather than return None.
+        program = SimpleNamespace(name="Enhanced Care Management", product_type_id=None)
+        case = SimpleNamespace(program_id=uuid.uuid4(), program=program,
+                               program_name="", service_type="")
+        enr = self._enr(
+            program_name="Medically Tailored Meals (MTM)", case=case,
+        )
+        self.assertEqual(product_kind_for_enrollment(enr), ProductTypeKind.MEALS)
+
+    def test_case_program_name_used_as_fallback(self):
+        from .models import ProductTypeKind
+        from .services.catalog import product_kind_for_enrollment
+
+        case = SimpleNamespace(
+            program_id=uuid.uuid4(),
+            program=SimpleNamespace(name="Navigation", product_type_id=None),
+            program_name="MTNA Food Prescription Boxes",
+            service_type="Food Assistance",
+        )
+        enr = self._enr(program_name="", case=case)
+        self.assertEqual(product_kind_for_enrollment(enr), ProductTypeKind.BOXES)
+
+    def test_unresolvable_returns_none(self):
+        from .services.catalog import product_kind_for_enrollment
+
+        case = SimpleNamespace(program_id=None, program=None,
+                               program_name="Housing", service_type="Housing")
+        enr = self._enr(program_name="", case=case, schedules=None)
+        self.assertIsNone(product_kind_for_enrollment(enr))

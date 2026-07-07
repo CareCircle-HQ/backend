@@ -27,7 +27,10 @@ from api.models import (
     KitchenStatus,
     ProductTypeKind,
 )
-from api.services.catalog import product_type_kind_for_name
+from api.services.catalog import (
+    product_kind_for_enrollment,
+    product_type_kind_for_name,
+)
 
 # Member menu-type CODE -> the catalog MenuType.name we expect to match against.
 # Hardcoded because the member-level ``MenuType`` TextChoices is shadowed in
@@ -188,10 +191,7 @@ def kitchen_options(enrollment):
     members = list(enrollment.member_profiles.select_related("client").all())
     member_payloads = [_member_payload(m) for m in members]
 
-    kind = product_type_kind_for_name(
-        (enrollment.case.program.name if enrollment.case and enrollment.case.program_id else "")
-        or enrollment.program_name
-    )
+    kind = product_kind_for_enrollment(enrollment)
     required_product = _KIND_TO_PRODUCT.get(kind)
 
     kitchens = (

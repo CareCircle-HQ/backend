@@ -145,6 +145,62 @@ def product_type_kind_for_name(program_name):
     return None
 
 
+def product_kind_for_enrollment(enrollment):
+    """Resolve the Meals/Boxes product kind for an enrollment as robustly as
+    possible.
+
+    A program NAME alone doesn't always contain a 'meal'/'box' keyword (notably
+    on production data), which previously left the kind unresolved (``None``) —
+    surfacing as a "—" service label and a mixed meals+boxes cadence list. This
+    tries, in order:
+
+      1. The linked Program's ProductType.type (authoritative when set).
+      2. The keyword heuristic on the case program / enrollment program name.
+      3. The kind of any existing delivery schedule's ProductType (the household
+         already has a plan, so its product is known).
+
+    Returns a ProductTypeKind value, or None only when it truly can't be
+    determined.
+    """
+    if enrollment is None:
+        return None
+    case = getattr(enrollment, "case", None)
+    program = case.program if (case is not None and getattr(case, "program_id", None)) else None
+    # 1. Program -> ProductType link (set for Internal Service programs).
+    if program is not None and getattr(program, "product_type_id", None):
+        pt = program.product_type
+        coerced = _coerce_product_kind(pt.type) if pt is not None else None
+        if coerced is not None:
+            return coerced
+    # 2. Keyword heuristic across every available name: the linked Program row,
+    #    the enrollment's snapshot name, and the case's own program/service
+    #    fields. The Program row name can be stripped of the meal/box keyword
+    #    (e.g. main-category parsing), so we must not stop at it — the richer
+    #    snapshot/case names often still carry it.
+    for candidate in (
+        program.name if program is not None else "",
+        enrollment.program_name,
+        getattr(case, "program_name", "") if case is not None else "",
+        getattr(case, "service_type", "") if case is not None else "",
+    ):
+        kind = product_type_kind_for_name(candidate)
+        if kind:
+            return kind
+    # 3. Fall back to the product of any existing delivery schedule.
+    sched = enrollment.delivery_schedules.filter(product_type__isnull=False).first()
+    if sched is not None and sched.product_type:
+        return _coerce_product_kind(sched.product_type.type)
+    return None
+
+
+def _coerce_product_kind(value):
+    """Coerce a raw product-type string into a ProductTypeKind, or None."""
+    try:
+        return ProductTypeKind(value)
+    except ValueError:
+        return None
+
+
 def assign_product_type_for_internal_service(program):
     """Link an Internal Service program to the right ProductType (Meals/Boxes)
     based on a keyword in its name. No-op when the program is None, the name has

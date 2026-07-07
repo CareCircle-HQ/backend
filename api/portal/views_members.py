@@ -41,7 +41,11 @@ from ..models import (
     TimelineEvent,
 )
 from ..views_phones import _phone_dict
-from ..services.catalog import menu_type_for_member, product_type_kind_for_name
+from ..services.catalog import (
+    menu_type_for_member,
+    product_kind_for_enrollment,
+    product_type_kind_for_name,
+)
 from ..services.delivery import (
     cadence_options_for_kind,
     create_member_delivery_schedules,
@@ -649,6 +653,17 @@ class MembersListView(PortalGenericAPIView):
         menu_type_val = (params.get("menu_type") or "").strip()
         if menu_type_val and menu_type_val.lower() != "all":
             qs = qs.filter(member_profiles__menu_type=menu_type_val)
+
+        # Created-date range filter (Members page): the member's own Client
+        # record ``created_at``. This is a direct column on Client (no join), so
+        # it needs no distinct of its own. Inclusive [from, to]; either bound may
+        # be omitted.
+        created_from = _parse_date(params.get("created_from"))
+        created_to = _parse_date(params.get("created_to"))
+        if created_from:
+            qs = qs.filter(created_at__date__gte=created_from)
+        if created_to:
+            qs = qs.filter(created_at__date__lte=created_to)
 
         # Date-period filter (Verification page dropdown): narrow to households
         # whose enrollment record was OPENED within the selected window.
@@ -1309,11 +1324,7 @@ class MemberHouseholdView(PortalAPIView):
             "client__household_membership"
         ).all()
         addr = enr.delivery_address
-        program_name = (
-            (enr.case.program.name if enr.case and enr.case.program_id else "")
-            or enr.program_name
-        )
-        kind = product_type_kind_for_name(program_name)
+        kind = product_kind_for_enrollment(enr)
         cadence = current_household_cadence(enr)
         return Response(
             {
@@ -2464,13 +2475,10 @@ class MemberAssignKitchenView(PortalAPIView):
 
 
 def _enrollment_kind(enr):
-    """Meals/Boxes kind for an enrollment, preferring the case's program name
-    (the source of truth) and falling back to the enrollment's own name."""
-    program_name = (
-        (enr.case.program.name if enr.case and enr.case.program_id else "")
-        or enr.program_name
-    )
-    return product_type_kind_for_name(program_name)
+    """Meals/Boxes kind for an enrollment. Uses the robust resolver so a program
+    name without a 'meal'/'box' keyword still resolves via the linked
+    ProductType or an existing delivery schedule."""
+    return product_kind_for_enrollment(enr)
 
 
 def _awaiting_enrollments(kind):

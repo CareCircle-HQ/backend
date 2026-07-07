@@ -7,12 +7,26 @@ pending renewals and the insurance distribution stay static on the frontend.)
 
 from datetime import timedelta
 
-from django.db.models import Count
+from django.db.models import Count, Max, Sum
 from django.db.models.functions import TruncMonth
 from django.utils import timezone
 from rest_framework.response import Response
 
-from ..models import Address, Case, Client, EnrollmentVerification, Ticket
+from ..models import (
+    Address,
+    Case,
+    Client,
+    ClientStage,
+    DeliveryOrder,
+    EnrollmentStage,
+    EnrollmentVerification,
+    ProductTypeKind,
+    PurchaseOrder,
+    PurchaseOrderStatus,
+    StageEntityType,
+    StageEvent,
+    Ticket,
+)
 from .base import PortalAPIView
 
 # Cumulative lifecycle ranks for funnel math.
@@ -39,15 +53,23 @@ FUNNEL_BARS = [
 ]
 
 
-def _period_start(period):
-    now = timezone.now()
-    if period == "today":
-        return now.replace(hour=0, minute=0, second=0, microsecond=0)
-    if period == "week":
-        return now - timedelta(days=7)
-    if period == "year":
-        return now - timedelta(days=365)
-    return now - timedelta(days=30)  # month (default)
+def period_window(period):
+    """Map a dashboard period code to an inclusive (start, end) date window on
+    the LOCAL calendar. Weeks start Monday; current periods end today. Defaults
+    to "today". ``last_month`` is the previous calendar month.
+    """
+    period = (period or "").strip().lower()
+    today = timezone.localdate()
+    if period == "week":  # This Week
+        return today - timedelta(days=today.weekday()), today
+    if period == "month":  # This Month
+        return today.replace(day=1), today
+    if period == "last_month":
+        end = today.replace(day=1) - timedelta(days=1)
+        return end.replace(day=1), end
+    if period == "year":  # This Year
+        return today.replace(month=1, day=1), today
+    return today, today  # today (default)
 
 
 def _at_least(clients_by_rank, rank):
@@ -56,8 +78,8 @@ def _at_least(clients_by_rank, rank):
 
 class DashboardView(PortalAPIView):
     def get(self, request):
-        period = (request.query_params.get("period") or "month").lower()
-        start = _period_start(period)
+        period = (request.query_params.get("period") or "today").lower()
+        win_start, win_end = period_window(period)
         now = timezone.now()
 
         # --- Funnel (cumulative lifecycle counts, split by household size) ---
@@ -108,7 +130,9 @@ class DashboardView(PortalAPIView):
         # --- Tickets KPIs ---
         tq = Ticket.objects.all()
         tickets = {
-            "new": tq.filter(created_at__gte=start).count(),
+            "new": tq.filter(
+                created_at__date__gte=win_start, created_at__date__lte=win_end
+            ).count(),
             "open": tq.filter(status="open").count(),
             "in_progress": tq.filter(status="in_progress").count(),
             "resolved": tq.filter(status="resolved").count(),
@@ -116,8 +140,80 @@ class DashboardView(PortalAPIView):
 
         # --- New enrollments in period ---
         new_enrollments = EnrollmentVerification.objects.filter(
-            opened_at__gte=start
+            opened_at__date__gte=win_start, opened_at__date__lte=win_end
         ).count()
+
+        # --- Member metrics (Members-focused dashboard) --------------------
+        # Period-scoped counts use the selected [win_start, win_end] window;
+        # the "serving" totals are LIVE snapshots of the most recent delivery
+        # week (independent of the period selector).
+        requested_verifications = EnrollmentVerification.objects.filter(
+            opened_at__date__gte=win_start, opened_at__date__lte=win_end
+        ).count()
+        verifications_done = EnrollmentVerification.objects.filter(
+            verified_at__date__gte=win_start, verified_at__date__lte=win_end
+        ).count()
+        # Members who transitioned INTO Active within the window (append-only
+        # StageEvent audit log; distinct members in case of repeat events).
+        became_active = (
+            StageEvent.objects.filter(
+                entity_type=StageEntityType.CLIENT,
+                to_stage=ClientStage.ACTIVE,
+                entered_at__date__gte=win_start,
+                entered_at__date__lte=win_end,
+            )
+            .values("client")
+            .distinct()
+            .count()
+        )
+        # Members currently awaiting a kitchen assignment (live count).
+        waiting_kitchen_assignment = Client.objects.filter(
+            lifecycle_stage=ClientStage.KITCHEN_ASSIGNMENT
+        ).count()
+
+        # "Actually served on the last PO": all non-cancelled delivery orders
+        # whose PO delivery_date falls in the most recent delivery WEEK (Mon-Sun
+        # containing the latest delivery_date). Meals vs boxes split by PO kind.
+        last_po_date = (
+            PurchaseOrder.objects.exclude(status=PurchaseOrderStatus.CANCELLED)
+            .filter(delivery_date__isnull=False)
+            .aggregate(m=Max("delivery_date"))["m"]
+        )
+        active_serving = meals_served = boxes_served = 0
+        last_delivery_week = None
+        if last_po_date is not None:
+            wk_start = last_po_date - timedelta(days=last_po_date.weekday())
+            wk_end = wk_start + timedelta(days=6)
+            last_delivery_week = {"start": wk_start, "end": wk_end}
+            served = DeliveryOrder.objects.filter(
+                purchase_order__delivery_date__gte=wk_start,
+                purchase_order__delivery_date__lte=wk_end,
+            ).exclude(purchase_order__status=PurchaseOrderStatus.CANCELLED)
+            active_serving = (
+                served.filter(member__isnull=False).values("member").distinct().count()
+            )
+            meals_served = (
+                served.filter(purchase_order__kind=ProductTypeKind.MEALS).aggregate(
+                    s=Sum("quantity")
+                )["s"]
+                or 0
+            )
+            boxes_served = (
+                served.filter(purchase_order__kind=ProductTypeKind.BOXES).aggregate(
+                    s=Sum("quantity")
+                )["s"]
+                or 0
+            )
+        members = {
+            "requested_verifications": requested_verifications,
+            "verifications_done": verifications_done,
+            "became_active": became_active,
+            "waiting_kitchen_assignment": waiting_kitchen_assignment,
+            "active_serving": active_serving,
+            "meals_served": meals_served,
+            "boxes_served": boxes_served,
+            "last_delivery_week": last_delivery_week,
+        }
 
         # --- Ticket activity trend (8 weeks: open created vs resolved) ---
         trend = []
@@ -189,6 +285,7 @@ class DashboardView(PortalAPIView):
                 "period": period,
                 "funnel": funnel,
                 "opportunity": opportunity,
+                "members": members,
                 "tickets": tickets,
                 "new_enrollments": new_enrollments,
                 "ticket_trend": trend,
