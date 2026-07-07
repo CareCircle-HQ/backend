@@ -95,6 +95,89 @@ def _agent_actor(agent):
     return ""
 
 
+def _enforce_delivery_coverage(enrollment, agent, *, allow_reactivate=False):
+    """Delivery Coverage Eligibility Check for every member of ``enrollment``.
+
+    A member whose enrollment's DELIVERY address OR their PRIMARY (Current/Home)
+    address ZIP is in the excluded-ZIP list is set Out of Orbit (reason "Delivery
+    Address Outside Coverage Area"), with a system note + timeline event
+    attributed to ``agent``. Manually Paused / Inactive members are left
+    untouched.
+
+    When ``allow_reactivate`` is True (the delivery ZIP just became serviceable)
+    an Out-of-Orbit member is re-checked against the kitchen-aware meal rule
+    (which itself re-checks both addresses) and returned to Active only if it now
+    passes (so a dietary/kitchen block or a still-excluded primary ZIP keeps them
+    Out of Orbit).
+
+    Returns the number of members newly set Out of Orbit.
+    """
+    from ..services.service_area import (
+        SERVICE_AREA_REASON,
+        excluded_zips,
+        member_excluded_info,
+        service_area_note_body,
+    )
+
+    excluded = excluded_zips()
+    actor = _agent_actor(agent)
+    author = agent.name if agent else ""
+    out_names = []
+    reactivated_names = []
+
+    def _member_name(m):
+        c = getattr(m, "client", None)
+        name = f"{getattr(c, 'first_name', '')} {getattr(c, 'last_name', '')}".strip()
+        return name or (str(c.pk) if c else "Member")
+
+    for mv in enrollment.member_profiles.select_related("client").all():
+        offending_zip, source = member_excluded_info(mv, excluded=excluded)
+        if offending_zip:
+            if mv.status != MemberStatus.ACTIVE:
+                continue  # never override Paused / Inactive / already Out of Orbit
+            mv.status = MemberStatus.OUT_OF_ORBIT
+            mv.kitchen_meal_type = ""
+            mv.kitchen_food_notes = ""
+            mv.save(update_fields=[
+                "status", "kitchen_meal_type", "kitchen_food_notes", "updated_at",
+            ])
+            out_names.append(_member_name(mv))
+            try:
+                timeline.event_for_out_of_orbit(
+                    mv, enrollment=enrollment, reason=SERVICE_AREA_REASON, actor=actor,
+                )
+            except Exception:  # never let history-logging break the save
+                pass
+            if mv.client_id:
+                try:
+                    Note.objects.create(
+                        client=mv.client, source=NoteSource.SYSTEM,
+                        author_name=author,
+                        body=service_area_note_body(offending_zip, source),
+                    )
+                except Exception:  # never let note-writing break the save
+                    pass
+        elif allow_reactivate and mv.status == MemberStatus.OUT_OF_ORBIT:
+            # ZIP is now serviceable: return to Active only if the meal rule
+            # (now ZIP-aware) also passes. A dietary/kitchen block leaves them
+            # Out of Orbit (reconcile mutates mv in memory; we only persist when
+            # it clears).
+            out, _became, _reason = reconcile_member_kitchen_output(
+                mv, enrollment.kitchen, save=False,
+            )
+            if not out:
+                mv.save()
+                reactivated_names.append(_member_name(mv))
+                try:
+                    timeline.event_for_member_reactivated(
+                        mv, enrollment=enrollment, actor=actor,
+                    )
+                except Exception:  # never let history-logging break the save
+                    pass
+
+    return {"out_of_orbit": out_names, "reactivated": reactivated_names}
+
+
 # Reverse of serializers._STATUS_MAP: a filter value -> the lifecycle stages it covers.
 # Verification is a yes/no fact (Pending Verification / Verified), so those two
 # chips are NOT in this map -- they are resolved via verification_completed_q()
@@ -1268,6 +1351,7 @@ class MemberHouseholdView(PortalAPIView):
         data = ser.validated_data
         addr = enr.delivery_address
         previous = timeline._format_address(addr) if addr is not None else ""
+        prev_zip = addr.zip if addr is not None else ""
         if addr is None:
             addr = Address.objects.create(client_id=client_id, type="temporary")
             enr.delivery_address = addr
@@ -1276,9 +1360,9 @@ class MemberHouseholdView(PortalAPIView):
             if field in data:
                 setattr(addr, field, data[field])
         addr.save()
+        agent = current_agent(request)
         new_addr = timeline._format_address(addr)
         if new_addr != previous:
-            agent = current_agent(request)
             try:
                 timeline.event_for_delivery_address_change(
                     enr.client, addr, previous=previous, enrollment=enr,
@@ -1286,10 +1370,35 @@ class MemberHouseholdView(PortalAPIView):
                 )
             except Exception:  # never let history-logging break the edit
                 pass
-        return Response(
-            {"street": addr.street, "unit": addr.unit, "city": addr.city,
-             "state": addr.state, "zip": addr.zip, "notes": addr.notes}
-        )
+        # Delivery Coverage Eligibility Check on the updated address: flag members
+        # Out of Orbit when the new ZIP is out of area; when the ZIP just became
+        # serviceable (was excluded, now isn't), return them to Active if the
+        # meal rule also passes.
+        from ..services.service_area import is_zip_excluded
+        new_excluded = is_zip_excluded(addr.zip)
+        coverage = None
+        if new_excluded:
+            coverage = _enforce_delivery_coverage(enr, agent)
+        elif is_zip_excluded(prev_zip):
+            coverage = _enforce_delivery_coverage(enr, agent, allow_reactivate=True)
+        resp = {
+            "street": addr.street, "unit": addr.unit, "city": addr.city,
+            "state": addr.state, "zip": addr.zip, "notes": addr.notes,
+        }
+        if coverage and coverage.get("out_of_orbit"):
+            names = coverage["out_of_orbit"]
+            resp["coverage_warning"] = (
+                f"ZIP {addr.zip} is outside the delivery coverage area — "
+                f"{len(names)} member(s) set Out of Orbit "
+                f"(excluded from deliveries): {', '.join(names)}."
+            )
+        if coverage and coverage.get("reactivated"):
+            names = coverage["reactivated"]
+            resp["coverage_info"] = (
+                f"ZIP {addr.zip} is now serviceable — "
+                f"{len(names)} member(s) returned to Active: {', '.join(names)}."
+            )
+        return Response(resp)
 
 
 class MemberHouseholdSearchView(PortalAPIView):
@@ -2027,6 +2136,12 @@ class MemberVerificationCreateView(PortalAPIView):
             note="Verification completed via support portal.",
         )
 
+        # Delivery Coverage Eligibility Check: the verification still completes,
+        # but any member whose delivery ZIP is outside the coverage area is set
+        # Out of Orbit here (system note + timeline event, attributed to the
+        # verifying agent).
+        _enforce_delivery_coverage(enrollment, agent)
+
         # Tie the enrollment to the agent-selected Internal Service case from the
         # pop-up (when provided + free) BEFORE the authorization projection, so
         # the switch sticks even while the case is still pending. A case already
@@ -2126,7 +2241,16 @@ def assign_kitchen_to_household(
     # Orbit. Out-of-orbit members are excluded from schedules + POs.
     offered = kitchen_offered_menu_index(kitchen)
     out_of_orbit = 0
+    out_names = []          # ACTIVE -> OUT_OF_ORBIT this run (new kitchen can't serve)
+    reactivated_names = []  # OUT_OF_ORBIT -> ACTIVE this run (new kitchen can serve)
+
+    def _member_name(p):
+        c = getattr(p, "client", None)
+        name = f"{getattr(c, 'first_name', '')} {getattr(c, 'last_name', '')}".strip()
+        return name or p.member_name or (str(c.pk) if c else "Member")
+
     for profile in enr.member_profiles.select_related("client").all():
+        was_out = profile.status == MemberStatus.OUT_OF_ORBIT
         if profile.pk in exclude_notes:
             # Manual exclusion: force Out of Orbit and drop the kitchen meal
             # result so they're excluded from schedules + POs, regardless of
@@ -2161,6 +2285,18 @@ def assign_kitchen_to_household(
         )
         if profile.status == MemberStatus.OUT_OF_ORBIT:
             out_of_orbit += 1
+            if became_out:
+                out_names.append(_member_name(profile))
+        elif was_out:
+            # The new kitchen (and a serviceable ZIP) can now fulfill a member
+            # who was previously Out of Orbit -> returned to Active.
+            reactivated_names.append(_member_name(profile))
+            try:
+                timeline.event_for_member_reactivated(
+                    profile, enrollment=enr, actor=actor,
+                )
+            except Exception:  # never let history-logging break assignment
+                pass
         if became_out:
             try:
                 timeline.event_for_out_of_orbit(
@@ -2203,7 +2339,11 @@ def assign_kitchen_to_household(
         enr, EnrollmentStage.SERVICE_ACTIVE, force=True,
         note=f"Kitchen assigned ({kitchen.name}); service activated.",
     )
-    return {"out_of_orbit": out_of_orbit}
+    return {
+        "out_of_orbit": out_of_orbit,
+        "out_names": out_names,
+        "reactivated_names": reactivated_names,
+    }
 
 
 class MemberKitchenOptionsView(PortalAPIView):
@@ -2292,17 +2432,35 @@ class MemberAssignKitchenView(PortalAPIView):
             except (TypeError, ValueError, AttributeError):
                 continue
 
-        assign_kitchen_to_household(
+        summary = assign_kitchen_to_household(
             enr, client, kitchen, cadence=cadence, once_weekday=once_weekday,
             member_quantities=member_quantities, exclude_notes=exclude_notes,
             agent=current_agent(request),
         )
-        return Response({
+        resp = {
             "id": enr.pk,
             "stage": enr.stage,
             "kitchen_id": str(kitchen.pk),
             "kitchen_name": kitchen.name,
-        })
+        }
+        # Surface which members changed status because of the new kitchen, so the
+        # Household tab can show a banner (mirrors the address-change coverage
+        # feedback): the ruleset (ZIP + menu/allergy fulfillment) is re-run for
+        # every member against the newly assigned kitchen.
+        out_names = summary.get("out_names") or []
+        reactivated = summary.get("reactivated_names") or []
+        if out_names:
+            resp["coverage_warning"] = (
+                f"{len(out_names)} member(s) set Out of Orbit — {kitchen.name} can't "
+                f"fulfill their menu/allergies (or their delivery ZIP is excluded): "
+                f"{', '.join(out_names)}."
+            )
+        if reactivated:
+            resp["coverage_info"] = (
+                f"{len(reactivated)} member(s) returned to Active — {kitchen.name} "
+                f"can now fulfill them: {', '.join(reactivated)}."
+            )
+        return Response(resp)
 
 
 def _enrollment_kind(enr):

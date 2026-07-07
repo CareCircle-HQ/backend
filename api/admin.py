@@ -7,6 +7,7 @@ from .models import (
     AgentLoginCode,
     AllowedZipCode,
     Assessment,
+    ExcludedZipCode,
     CadenceRule,
     Case,
     Client,
@@ -453,6 +454,13 @@ class AllowedZipCodeAdmin(admin.ModelAdmin):
     list_filter = ("is_active", "platform", "scn")
     search_fields = ("zip_code", "borough")
     ordering = ("zip_code",)
+
+
+@admin.register(ExcludedZipCode)
+class ExcludedZipCodeAdmin(admin.ModelAdmin):
+    list_display = ("zip", "label", "created_at")
+    search_fields = ("zip", "label")
+    ordering = ("zip",)
 
 
 @admin.register(ProgramPipeline)
