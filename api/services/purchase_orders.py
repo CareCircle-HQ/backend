@@ -229,10 +229,15 @@ def _due_schedules(kind, delivery_date):
 
 
 def _batched_client_ids(delivery_date):
-    """Client ids that already have a DeliveryOrder for this delivery date."""
+    """Client ids that already have a LIVE DeliveryOrder for this delivery date.
+
+    Cancelled delivery orders (e.g. from a cancelled PO) don't count -- those
+    members are free to be batched again, so they stay selected by default in a
+    new PO instead of being greyed out as "already ordered"."""
     return set(
         DeliveryOrder.objects.filter(expected_delivery_date=delivery_date)
         .exclude(member__isnull=True)
+        .exclude(status=DeliveryOrderStatus.CANCELLED)
         .values_list("member_id", flat=True)
     )
 
@@ -251,6 +256,7 @@ def preview_purchase_orders(kind, delivery_date):
     for kid in (
         DeliveryOrder.objects.filter(expected_delivery_date=delivery_date)
         .exclude(kitchen__isnull=True)
+        .exclude(status=DeliveryOrderStatus.CANCELLED)
         .values_list("kitchen_id", flat=True)
     ):
         used[str(kid)] = used.get(str(kid), 0) + 1
