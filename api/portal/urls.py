@@ -36,7 +36,9 @@ from .views_members import (
     MemberOrdersView,
     MemberPhoneDetailView,
     MemberPhonesView,
+    MemberServiceCancelView,
     MemberServiceHoldView,
+    MemberServiceReactivateView,
     MemberServiceResumeView,
     MemberSocialCoverageView,
     MemberTicketsView,
@@ -146,6 +148,8 @@ urlpatterns = [
     path("members/<uuid:client_id>/cadence/", MemberCadenceView.as_view()),
     path("members/<uuid:client_id>/hold/", MemberServiceHoldView.as_view()),
     path("members/<uuid:client_id>/resume/", MemberServiceResumeView.as_view()),
+    path("members/<uuid:client_id>/cancel/", MemberServiceCancelView.as_view()),
+    path("members/<uuid:client_id>/reactivate/", MemberServiceReactivateView.as_view()),
     path("members/<uuid:client_id>/notes/", MemberNotesView.as_view()),
     path("members/<uuid:client_id>/cases/", MemberCasesView.as_view()),
     path(

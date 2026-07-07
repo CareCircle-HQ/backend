@@ -506,6 +506,23 @@ class MembersListView(PortalGenericAPIView):
             qs = qs.filter(member_profiles__status=MemberStatus.OUT_OF_ORBIT)
         elif flag == "paused":
             qs = qs.filter(member_profiles__status=MemberStatus.PAUSED)
+        elif flag == "inactive":
+            # Members whose service ended (terminal member status). Set when a
+            # household is cancelled, so this surfaces off-boarded members.
+            qs = qs.filter(member_profiles__status=MemberStatus.INACTIVE)
+        elif flag == "cancelled":
+            # Cancelled households: the member's own OR their household's
+            # enrollment is at the terminal CANCELLED stage. Keyed off the
+            # enrollment stage (not lifecycle_stage, which collapses to
+            # not_eligible and can't be told apart from an eligibility denial).
+            qs = qs.filter(
+                Q(enrollments__stage=EnrollmentStage.CANCELLED)
+                | Q(
+                    household_membership__household__enrollment_verifications__stage=(
+                        EnrollmentStage.CANCELLED
+                    )
+                )
+            )
         elif flag == "on_hold":
             qs = qs.filter(
                 Q(enrollments__stage=EnrollmentStage.ON_HOLD)
@@ -1604,6 +1621,110 @@ class MemberServiceResumeView(PortalAPIView):
         Note.objects.create(
             client=client, source=NoteSource.AGENT, author_name=author,
             body=f"Service resumed.{suffix}",
+        )
+        return Response(s.MemberDetailSerializer(client).data)
+
+
+class MemberServiceCancelView(PortalAPIView):
+    """Cancel a member's household enrollment (hard off-ramp).
+
+    Moves the active enrollment to Cancelled (which logs a StageEvent and mirrors
+    a timeline entry), marks every member enrolled under the household Inactive,
+    and records a client note with the reason. A cancelled household is terminal:
+    it is excluded from all future delivery schedules and Purchase Orders and
+    moves to Not Eligible in the acquisition funnel.
+    """
+
+    def post(self, request, client_id):
+        client = get_object_or_404(Client, pk=client_id)
+        enr = s.active_enrollment(client)
+        if enr is None:
+            return Response(
+                {"error": "This member has no enrollment to cancel."},
+                status=http.HTTP_404_NOT_FOUND,
+            )
+        if EnrollmentStage(enr.stage) == EnrollmentStage.CANCELLED:
+            return Response(
+                {"error": "This household is already cancelled."},
+                status=http.HTTP_400_BAD_REQUEST,
+            )
+        reason = (request.data.get("reason") or "").strip()
+        if not reason:
+            return Response(
+                {"reason": "A reason is required to cancel a household."},
+                status=http.HTTP_400_BAD_REQUEST,
+            )
+        agent = current_agent(request)
+        author = agent.name if agent else ""
+        try:
+            # force=True: cancellation is a hard off-ramp; it is allowed from
+            # every non-terminal stage and must not be blocked by process gates.
+            advance_enrollment(
+                enr, EnrollmentStage.CANCELLED, force=True,
+                note=f"Household cancelled by {author or 'support portal'}. Reason: {reason}",
+            )
+        except InvalidTransition as exc:
+            return Response({"error": str(exc)}, status=http.HTTP_400_BAD_REQUEST)
+        # Mark every member enrolled under this household Inactive so they are
+        # excluded from delivery schedules / Purchase Orders at the member level
+        # too (mirrors the CANCELLED enrollment-stage exclusion).
+        enr.member_profiles.exclude(status=MemberStatus.INACTIVE).update(
+            status=MemberStatus.INACTIVE
+        )
+        Note.objects.create(
+            client=client, source=NoteSource.AGENT, author_name=author,
+            body=f"Household cancelled. Reason: {reason}",
+        )
+        return Response(s.MemberDetailSerializer(client).data)
+
+
+class MemberServiceReactivateView(PortalAPIView):
+    """Reverse a household cancellation (reinstatement / mistake correction).
+
+    Moves the CANCELLED enrollment back to the stage it was cancelled from
+    (defaulting to Pending Verification), clears the closure stamp, restores
+    every Inactive member to Active, and records a client note. Logs a
+    StageEvent + timeline entry via advance_enrollment.
+    """
+
+    def post(self, request, client_id):
+        client = get_object_or_404(Client, pk=client_id)
+        enr = s.active_enrollment(client)
+        if enr is None or EnrollmentStage(enr.stage) != EnrollmentStage.CANCELLED:
+            return Response(
+                {"error": "This household is not cancelled."},
+                status=http.HTTP_400_BAD_REQUEST,
+            )
+        # Reinstate to the stage it was cancelled from (most recent cancel event).
+        last_cancel = StageEvent.objects.filter(
+            enrollment=enr, to_stage=EnrollmentStage.CANCELLED
+        ).order_by("-entered_at").first()
+        target = EnrollmentStage.PENDING_VERIFICATION
+        if last_cancel and last_cancel.from_stage:
+            try:
+                target = EnrollmentStage(last_cancel.from_stage)
+            except ValueError:
+                target = EnrollmentStage.PENDING_VERIFICATION
+        reason = (request.data.get("reason") or "").strip()
+        agent = current_agent(request)
+        author = agent.name if agent else ""
+        note = f"Household reactivated by {author or 'support portal'}."
+        if reason:
+            note += f" Reason: {reason}"
+        try:
+            # force=True: reactivation deliberately leaves the terminal CANCELLED
+            # stage (which has no allowed forward transitions) and skips gates.
+            advance_enrollment(enr, target, force=True, note=note)
+        except InvalidTransition as exc:
+            return Response({"error": str(exc)}, status=http.HTTP_400_BAD_REQUEST)
+        # Restore members the cancellation marked Inactive back to Active.
+        enr.member_profiles.filter(status=MemberStatus.INACTIVE).update(
+            status=MemberStatus.ACTIVE
+        )
+        suffix = f" Reason: {reason}" if reason else ""
+        Note.objects.create(
+            client=client, source=NoteSource.AGENT, author_name=author,
+            body=f"Household reactivated.{suffix}",
         )
         return Response(s.MemberDetailSerializer(client).data)
 

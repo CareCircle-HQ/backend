@@ -37,6 +37,7 @@ from ..models import (
     PurchaseOrder,
     ServiceAuthorizationStatus,
     SocialCareCoverage,
+    StageEvent,
     Ticket,
     TicketNote,
     TicketSource,
@@ -169,6 +170,11 @@ def pipeline_stage_label(client):
     lifecycle_stage. The whole verification window (pending OR verified-awaiting-
     authorization) reads as "Verification"; approval moves it to Kitchen
     Assignment, then Active. Used by the Verification list's "Stage" column."""
+    # Cancelled is a terminal off-ramp that collapses lifecycle_stage to
+    # not_eligible; surface it explicitly (like the On Hold overlay) so the list
+    # Stage column reads "Cancelled" instead of "Not Eligible".
+    if service_cancelled_state(client)["cancelled"]:
+        return "Cancelled"
     if service_hold_state(client)["on_hold"]:
         return "On Hold"
     return _STAGE_PHASE_LABELS.get(
@@ -251,8 +257,49 @@ def service_hold_state(client):
     return {
         "has_enrollment": enr is not None,
         "on_hold": on_hold,
-        "can_hold": bool(enr is not None and not on_hold),
+        # Hold is only offered for a live, non-terminal enrollment -- never for a
+        # household that is already on hold, cancelled, closed or completed.
+        "can_hold": bool(
+            enr is not None
+            and enr.stage not in ("on_hold", "cancelled", "closed", "service_complete")
+        ),
         "enrollment_stage": enr.stage if enr else None,
+    }
+
+
+def service_cancelled_state(client):
+    """Whether the client's household enrollment was CANCELLED (a terminal hard
+    off-ramp). Drives the "Household Cancelled" pill + the terminal Cancelled
+    node on the stages progress bar (a cancellation collapses lifecycle_stage to
+    not_eligible, which alone can't be told apart from an eligibility denial, so
+    the UI keys off this instead).
+
+    ``can_cancel`` is true when there is an active enrollment that isn't already
+    terminal (cancelled / closed) or completed.
+    """
+    enr = active_enrollment(client)
+    cancelled = bool(enr and enr.stage == "cancelled")
+    cancelled_from = None
+    if cancelled:
+        # The enrollment stage the household was cancelled FROM, so the progress
+        # bar can still show how far they got (stages 1-5) before the terminal
+        # Cancelled node -- read off the most recent transition into Cancelled.
+        ev = (
+            StageEvent.objects.filter(enrollment=enr, to_stage="cancelled")
+            .order_by("-entered_at")
+            .first()
+        )
+        cancelled_from = ev.from_stage if ev else None
+    return {
+        "cancelled": cancelled,
+        "cancelled_at": (enr.stage_at.isoformat() if enr and enr.stage_at else None)
+        if cancelled
+        else None,
+        "cancelled_from": cancelled_from,
+        "can_cancel": bool(
+            enr is not None
+            and enr.stage not in ("cancelled", "closed", "service_complete")
+        ),
     }
 
 
@@ -455,6 +502,7 @@ class MemberDetailSerializer(serializers.Serializer):
                 if client.lifecycle_stage_at
                 else None,
                 "service_hold": service_hold_state(client),
+                "service_cancelled": service_cancelled_state(client),
             },
             # Read-only authorization status sourced from the client's GOVERNING
             # internal-service case (the meal/box case that gates kitchen
