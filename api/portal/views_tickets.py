@@ -1,5 +1,7 @@
 """Work queue (global tickets) + ticket detail/status/notes + agents list."""
 
+from datetime import datetime
+
 from django.db.models import Case as DBCase, IntegerField, Q, When
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
@@ -16,6 +18,16 @@ TICKET_SELECT = ("assigned_to", "client", "case", "type")
 
 # open -> in_progress -> resolved -> open
 STATUS_CYCLE = {"open": "in_progress", "in_progress": "resolved", "resolved": "open"}
+
+
+def _parse_date(value):
+    """Parse a YYYY-MM-DD (or common US) date string; None on failure/blank."""
+    for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%m-%d-%Y"):
+        try:
+            return datetime.strptime((value or "").strip(), fmt).date()
+        except ValueError:
+            continue
+    return None
 
 
 class WorkQueueView(PortalGenericAPIView):
@@ -56,6 +68,15 @@ class WorkQueueView(PortalGenericAPIView):
         assignee_val = (p.get("assignee") or "").strip()
         if assignee_val:
             qs = qs.filter(assigned_to_id=assignee_val)
+        # Date-created range (inclusive). ``created_at`` is a datetime; ``__date``
+        # extraction uses the active timezone (America/New_York), so the window
+        # matches the local calendar day the agent selects.
+        created_from = _parse_date(p.get("created_from"))
+        if created_from:
+            qs = qs.filter(created_at__date__gte=created_from)
+        created_to = _parse_date(p.get("created_to"))
+        if created_to:
+            qs = qs.filter(created_at__date__lte=created_to)
         # Stable ordering is REQUIRED for correct pagination (without an ORDER BY
         # the page contents are arbitrary and can repeat/skip across pages).
         # Default newest-first; honor the list's recent/oldest sort toggle.
@@ -127,25 +148,54 @@ class TicketDetailView(PortalAPIView):
 
     def patch(self, request, ticket_id):
         ticket = _load_ticket(ticket_id)
-        new_status = (request.data.get("status") or "").replace("-", "_").strip()
-        if not new_status:
-            new_status = STATUS_CYCLE.get(ticket.status, "open")
-        if new_status not in STATUS_CYCLE:
-            return Response(
-                {"error": "Invalid status."}, status=http.HTTP_400_BAD_REQUEST
-            )
-        ticket.status = new_status
-        if new_status == "resolved":
-            ticket.resolved_at = timezone.now()
-            agent = current_agent(request)
-            ticket.resolved_by = (
-                f"agent:{agent.agent_code}" if agent and agent.agent_code
-                else (agent.name if agent else "")
-            )
-        else:
-            ticket.resolved_at = None
-            ticket.resolved_by = ""
-        ticket.save(update_fields=["status", "resolved_at", "resolved_by", "updated_at"])
+        update_fields = []
+
+        # Reassignment: the presence of the `assignee_id` key signals intent to
+        # change the assignee (an empty/null value unassigns). Done independently
+        # of status, so reassigning never advances the ticket's status.
+        if "assignee_id" in request.data:
+            aid = request.data.get("assignee_id") or None
+            if aid:
+                agent = Agent.objects.filter(
+                    pk=aid, status="Active", group__in=ASSIGNABLE_GROUPS
+                ).first()
+                if agent is None:
+                    return Response(
+                        {"error": "Unknown or non-assignable agent."},
+                        status=http.HTTP_400_BAD_REQUEST,
+                    )
+                ticket.assigned_to = agent
+            else:
+                ticket.assigned_to = None
+            update_fields.append("assigned_to")
+
+        # Status change / cycle. Applied when a status is explicitly provided, or
+        # when this is a bare PATCH with no reassignment (preserves the list's
+        # status-cycle button, which sends an empty body).
+        if "status" in request.data or "assignee_id" not in request.data:
+            new_status = (request.data.get("status") or "").replace("-", "_").strip()
+            if not new_status:
+                new_status = STATUS_CYCLE.get(ticket.status, "open")
+            if new_status not in STATUS_CYCLE:
+                return Response(
+                    {"error": "Invalid status."}, status=http.HTTP_400_BAD_REQUEST
+                )
+            ticket.status = new_status
+            if new_status == "resolved":
+                ticket.resolved_at = timezone.now()
+                agent = current_agent(request)
+                ticket.resolved_by = (
+                    f"agent:{agent.agent_code}" if agent and agent.agent_code
+                    else (agent.name if agent else "")
+                )
+            else:
+                ticket.resolved_at = None
+                ticket.resolved_by = ""
+            update_fields += ["status", "resolved_at", "resolved_by"]
+
+        update_fields.append("updated_at")
+        ticket.save(update_fields=update_fields)
+        ticket = _load_ticket(ticket.pk)
         return Response(s.PortalTicketSerializer(ticket).data)
 
 
