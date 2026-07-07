@@ -69,6 +69,7 @@ from .views_orders import (
     SendToKitchenView,
 )
 from .views_activity import ActivityFiltersView, ActivityLogView
+from .views_service_area import ExcludedZipCodeDetailView, ExcludedZipCodesView
 from .views_imports import (
     ImportActivityView,
     ImportPresignView,
@@ -214,6 +215,17 @@ urlpatterns = [
         "settings/unite-us-agents/<uuid:agent_id>/",
         UniteUsAgentDetailView.as_view(),
         name="portal-unite-us-agent-detail",
+    ),
+    # Settings > Excluded ZIP Codes: delivery-coverage exclusion list
+    path(
+        "settings/excluded-zip-codes/",
+        ExcludedZipCodesView.as_view(),
+        name="portal-excluded-zip-codes",
+    ),
+    path(
+        "settings/excluded-zip-codes/<int:zip_id>/",
+        ExcludedZipCodeDetailView.as_view(),
+        name="portal-excluded-zip-code-detail",
     ),
 
     # Settings integration sub-resources (not covered by the viewset router)

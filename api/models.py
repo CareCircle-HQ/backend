@@ -2233,6 +2233,30 @@ class UniteUsAgent(models.Model):
         return f"{self.name or self.email or self.user_id}"
 
 
+class ExcludedZipCode(models.Model):
+    """A delivery ZIP code outside our service coverage area.
+
+    Editable from Settings (add/remove) so the service area can change without a
+    code change. Used by the Delivery Coverage Eligibility Check: a member whose
+    delivery-address ZIP is in this list is set Out of Orbit (reason
+    "Delivery Address Outside Coverage Area") and excluded from all delivery
+    schedules / Purchase Orders. Matched on the first 5 digits of the ZIP.
+    """
+
+    zip = models.CharField(max_length=5, unique=True, db_index=True)
+    # Optional free-text label (e.g. a neighborhood name) shown in Settings.
+    label = models.CharField(max_length=120, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["zip"]
+        verbose_name = "Excluded ZIP code"
+        verbose_name_plural = "Excluded ZIP codes"
+
+    def __str__(self):
+        return self.zip
+
+
 class AgentLoginCode(models.Model):
     """A short-lived, single-use 2FA code emailed to an agent's company email to
     complete extension login.

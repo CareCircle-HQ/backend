@@ -7,6 +7,7 @@ from .models import (
     AgentLoginCode,
     AllowedZipCode,
     Assessment,
+    ExcludedZipCode,
     CadenceRule,
     Case,
     Client,
@@ -142,8 +143,19 @@ class ClientAdmin(admin.ModelAdmin):
 
 @admin.register(Address)
 class AddressAdmin(admin.ModelAdmin):
-    list_display = ("client", "type", "city", "state")
+    list_display = ("client", "type", "street", "unit", "city", "state", "zip")
     list_filter = ("type", "state")
+    search_fields = (
+        "client__client_id",
+        "client__first_name",
+        "client__last_name",
+        "street",
+        "unit",
+        "city",
+        "zip",
+    )
+    list_select_related = ("client",)
+    ordering = ("-id",)
 
 
 @admin.register(Insurance)
@@ -442,6 +454,13 @@ class AllowedZipCodeAdmin(admin.ModelAdmin):
     list_filter = ("is_active", "platform", "scn")
     search_fields = ("zip_code", "borough")
     ordering = ("zip_code",)
+
+
+@admin.register(ExcludedZipCode)
+class ExcludedZipCodeAdmin(admin.ModelAdmin):
+    list_display = ("zip", "label", "created_at")
+    search_fields = ("zip", "label")
+    ordering = ("zip",)
 
 
 @admin.register(ProgramPipeline)

@@ -1,6 +1,7 @@
 import uuid
+from types import SimpleNamespace
 
-from django.test import TestCase
+from django.test import SimpleTestCase, TestCase
 from django.urls import reverse
 from django.utils import timezone
 from rest_framework.test import APIClient
@@ -576,3 +577,298 @@ class LogisticsRosterFilterTest(TestCase):
         hh_group = next(g for g in groups if g["type"] == "household")
         ids = {m["id"] for m in hh_group["members"]}
         self.assertIn(str(dep.client_id), ids)
+
+
+class DeliveryCoverageEligibilityTest(TestCase):
+    """Delivery Coverage Eligibility Check: a member whose delivery-address ZIP
+    is in the excluded list is Out of Orbit (reason "Delivery Address Outside
+    Coverage Area"), durably through the meal-rule reconcile, with a system note
+    + timeline event; and is returned to Active when the ZIP becomes serviceable
+    (only if the meal rule also passes)."""
+
+    def setUp(self):
+        from .models import ExcludedZipCode
+
+        ExcludedZipCode.objects.get_or_create(zip="11209")
+
+    def _profile(self, zip_code, *, primary_zip=None, status=None, menu_type="Standard"):
+        from .models import (
+            Address, AddressType, Client, EnrollmentStage, EnrollmentVerification,
+            Household, HouseholdMember, MemberDietaryProfile, MemberStatus,
+        )
+
+        client = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Cov", last_name="Erage",
+        )
+        hh = Household.objects.create(name="HH")
+        HouseholdMember.objects.create(household=hh, client=client, is_primary=True)
+        addr = Address.objects.create(client=client, type="temporary", zip=zip_code)
+        if primary_zip is not None:
+            Address.objects.create(
+                client=client, type=AddressType.CURRENT, zip=primary_zip
+            )
+        enr = EnrollmentVerification.objects.create(
+            client=client, household=hh, delivery_address=addr,
+            stage=EnrollmentStage.KITCHEN_ASSIGNMENT,
+        )
+        return MemberDietaryProfile.objects.create(
+            enrollment=enr, client=client, menu_type=menu_type,
+            status=status or MemberStatus.ACTIVE,
+        )
+
+    def test_reconcile_out_of_orbit_for_excluded_zip(self):
+        from .models import MemberStatus
+        from .services.meal_rules import reconcile_member_kitchen_output
+        from .services.service_area import SERVICE_AREA_REASON
+
+        mv = self._profile("11209")  # Standard menu is otherwise fulfillable
+        out, _became, reason = reconcile_member_kitchen_output(mv, None, save=True)
+        self.assertTrue(out)
+        self.assertEqual(reason, SERVICE_AREA_REASON)
+        mv.refresh_from_db()
+        self.assertEqual(mv.status, MemberStatus.OUT_OF_ORBIT)
+
+    def test_reconcile_active_for_serviceable_zip(self):
+        from .models import MemberStatus
+        from .services.meal_rules import reconcile_member_kitchen_output
+
+        mv = self._profile("10001")
+        out, _became, _reason = reconcile_member_kitchen_output(mv, None, save=True)
+        self.assertFalse(out)
+        mv.refresh_from_db()
+        self.assertEqual(mv.status, MemberStatus.ACTIVE)
+
+    def test_out_of_orbit_when_primary_address_excluded(self):
+        # Delivery ZIP serviceable, but the PRIMARY (Current) ZIP is excluded.
+        from .models import MemberStatus, Note, NoteSource
+        from .portal.views_members import _enforce_delivery_coverage
+        from .services.meal_rules import reconcile_member_kitchen_output
+        from .services.service_area import SERVICE_AREA_REASON
+
+        mv = self._profile("10001", primary_zip="11209")
+        out, _became, reason = reconcile_member_kitchen_output(mv, None, save=True)
+        self.assertTrue(out)
+        self.assertEqual(reason, SERVICE_AREA_REASON)
+
+        mv2 = self._profile("10001", primary_zip="11209")
+        _enforce_delivery_coverage(mv2.enrollment, None)
+        mv2.refresh_from_db()
+        self.assertEqual(mv2.status, MemberStatus.OUT_OF_ORBIT)
+        note = Note.objects.filter(client=mv2.client, source=NoteSource.SYSTEM).first()
+        self.assertIsNotNone(note)
+        self.assertIn("primary address", note.body)
+        self.assertIn("11209", note.body)
+
+    def test_enforce_sets_out_of_orbit_with_note_and_event(self):
+        from .models import MemberStatus, Note, NoteSource, TimelineEvent
+        from .portal.views_members import _enforce_delivery_coverage
+
+        mv = self._profile("11209")
+        result = _enforce_delivery_coverage(mv.enrollment, None)
+        self.assertEqual(len(result["out_of_orbit"]), 1)
+        mv.refresh_from_db()
+        self.assertEqual(mv.status, MemberStatus.OUT_OF_ORBIT)
+        note = Note.objects.filter(client=mv.client, source=NoteSource.SYSTEM).first()
+        self.assertIsNotNone(note)
+        self.assertIn("11209", note.body)
+        self.assertTrue(
+            TimelineEvent.objects.filter(
+                client=mv.client, event_type="out_of_orbit"
+            ).exists()
+        )
+
+    def test_enforce_does_not_override_paused(self):
+        from .models import MemberStatus
+        from .portal.views_members import _enforce_delivery_coverage
+
+        mv = self._profile("11209", status=MemberStatus.PAUSED)
+        _enforce_delivery_coverage(mv.enrollment, None)
+        mv.refresh_from_db()
+        self.assertEqual(mv.status, MemberStatus.PAUSED)
+
+    def test_reactivate_when_zip_becomes_serviceable(self):
+        from .models import MemberStatus
+        from .portal.views_members import _enforce_delivery_coverage
+
+        # Out of Orbit at a now-serviceable ZIP + fulfillable menu -> Active.
+        mv = self._profile("10001", status=MemberStatus.OUT_OF_ORBIT)
+        _enforce_delivery_coverage(mv.enrollment, None, allow_reactivate=True)
+        mv.refresh_from_db()
+        self.assertEqual(mv.status, MemberStatus.ACTIVE)
+
+
+class KitchenAwareMealRuleTest(TestCase):
+    """A capable kitchen makes an otherwise-"strict" menu (Kosher/Halal/
+    Vegetarian) serviceable: the kitchen-agnostic fallback would send the member
+    Out of Orbit, but when the assigned kitchen offers the menu and only
+    restricts allergens the member doesn't have, the member stays Active with the
+    menu type + per-allergen "X Free" notes (mirrors the Williamsburg seed)."""
+
+    def _kosher_kitchen(self):
+        from .models import (
+            DietaryTag, DietaryTagType, Kitchen, KitchenMenuType, KitchenStatus,
+            MenuType,
+        )
+
+        other = DietaryTag.objects.create(name="Other", type=DietaryTagType.ALLERGY)
+        kosher = MenuType.objects.create(name="Kosher")
+        kitchen = Kitchen.objects.create(name="Williamsburg", status=KitchenStatus.ACTIVE)
+        kmt = KitchenMenuType.objects.create(kitchen=kitchen, menu_type=kosher)
+        # The kitchen's ONLY restriction is the catch-all "Other" allergy.
+        kmt.restrictions.set([other])
+        return kitchen
+
+    def _profile(self, allergies, *, status=None):
+        from .models import (
+            Client, EnrollmentStage, EnrollmentVerification, Household,
+            HouseholdMember, MemberDietaryProfile, MemberStatus,
+        )
+
+        client = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Ko", last_name="Sher",
+        )
+        hh = Household.objects.create(name="HH")
+        HouseholdMember.objects.create(household=hh, client=client, is_primary=True)
+        enr = EnrollmentVerification.objects.create(
+            client=client, household=hh, stage=EnrollmentStage.KITCHEN_ASSIGNMENT,
+        )
+        return MemberDietaryProfile.objects.create(
+            enrollment=enr, client=client, menu_type="Kosher",
+            food_allergies=allergies, status=status or MemberStatus.OUT_OF_ORBIT,
+        )
+
+    def test_capable_kitchen_makes_kosher_with_allergies_serviceable(self):
+        from .models import MemberStatus
+        from .services.meal_rules import reconcile_member_kitchen_output
+
+        kitchen = self._kosher_kitchen()
+        mv = self._profile(["shellfish", "pork"])
+        out, _became, _reason = reconcile_member_kitchen_output(mv, kitchen, save=True)
+        self.assertFalse(out)
+        mv.refresh_from_db()
+        self.assertEqual(mv.status, MemberStatus.ACTIVE)
+        self.assertEqual(mv.kitchen_meal_type, "Kosher")
+        self.assertEqual(mv.kitchen_food_notes, "Pork Free, Shellfish Free")
+
+    def test_no_kitchen_assigned_but_capable_kitchen_exists_is_serviceable(self):
+        # The household hasn't been assigned a kitchen yet, but at least one
+        # ACTIVE kitchen can serve the Kosher + Pork/Shellfish combo -> the
+        # member stays serviceable (kitchen chosen later at assignment).
+        from .models import MemberStatus
+        from .services.meal_rules import reconcile_member_kitchen_output
+
+        self._kosher_kitchen()  # a capable kitchen exists in the system
+        mv = self._profile(["shellfish", "pork"])
+        out, _became, _reason = reconcile_member_kitchen_output(mv, None, save=True)
+        self.assertFalse(out)
+        mv.refresh_from_db()
+        self.assertEqual(mv.status, MemberStatus.ACTIVE)
+        self.assertEqual(mv.kitchen_meal_type, "Kosher")
+        self.assertEqual(mv.kitchen_food_notes, "Pork Free, Shellfish Free")
+
+    def test_no_kitchen_anywhere_falls_back_to_out_of_orbit(self):
+        # No kitchen assigned AND no kitchen in the system can serve the combo.
+        from .services.meal_rules import (
+            MENU_ALLERGY_REASON, reconcile_member_kitchen_output,
+        )
+
+        mv = self._profile(["shellfish", "pork"])
+        out, _became, reason = reconcile_member_kitchen_output(mv, None, save=True)
+        self.assertTrue(out)
+        self.assertEqual(reason, MENU_ALLERGY_REASON)
+
+    def test_other_allergy_out_of_orbit_even_with_capable_kitchen(self):
+        from .models import MemberStatus
+        from .services.meal_rules import reconcile_member_kitchen_output
+
+        kitchen = self._kosher_kitchen()
+        mv = self._profile(["pork", "other"])
+        out, _became, _reason = reconcile_member_kitchen_output(mv, kitchen, save=True)
+        self.assertTrue(out)
+        mv.refresh_from_db()
+        self.assertEqual(mv.status, MemberStatus.OUT_OF_ORBIT)
+
+
+class ExcludedZipSettingsTest(TestCase):
+    """Settings CRUD for the excluded-ZIP list."""
+
+    def setUp(self):
+        self.agent = Agent.objects.create(
+            name="Zed Agent", agent_code="900", group="Management"
+        )
+        access = AccessToken()
+        access["agent_id"] = str(self.agent.id)
+        access["agent_code"] = self.agent.agent_code
+        access["agent_name"] = self.agent.name
+        access["agent_group"] = self.agent.group
+        self.api = APIClient()
+        self.api.credentials(HTTP_AUTHORIZATION=f"Bearer {access}")
+
+    def test_add_reject_duplicate_and_delete(self):
+        from .models import ExcludedZipCode
+
+        url = reverse("portal-excluded-zip-codes")
+        # Invalid ZIP.
+        self.assertEqual(self.api.post(url, {"zip": "abc"}, format="json").status_code, 400)
+        # Add valid.
+        resp = self.api.post(url, {"zip": "11250", "label": "Test"}, format="json")
+        self.assertEqual(resp.status_code, 201, resp.content)
+        zid = resp.json()["id"]
+        # Duplicate rejected.
+        self.assertEqual(self.api.post(url, {"zip": "11250"}, format="json").status_code, 409)
+        # Listed.
+        self.assertTrue(any(z["zip"] == "11250" for z in self.api.get(url).json()["results"]))
+        # Delete.
+        det = reverse("portal-excluded-zip-code-detail", kwargs={"zip_id": zid})
+        self.assertEqual(self.api.delete(det).status_code, 204)
+        self.assertFalse(ExcludedZipCode.objects.filter(zip="11250").exists())
+
+
+class ProductKindResolverTest(SimpleTestCase):
+    """product_kind_for_enrollment resolves Meals/Boxes across name sources so a
+    keyword-less Program row name no longer yields an unresolved '—' kind and a
+    mixed meals+boxes cadence list (the Kitchen Assignment popup bug)."""
+
+    def _enr(self, *, program_name="", case=None, schedules=None):
+        # A stub delivery_schedules manager (branch 3) that returns nothing.
+        sched_mgr = SimpleNamespace(
+            filter=lambda **kw: SimpleNamespace(first=lambda: schedules)
+        )
+        return SimpleNamespace(
+            program_name=program_name, case=case, delivery_schedules=sched_mgr,
+        )
+
+    def test_enrollment_snapshot_name_used_when_program_row_lacks_keyword(self):
+        from .models import ProductTypeKind
+        from .services.catalog import product_kind_for_enrollment
+
+        # Linked Program row name has no meal/box keyword, but the enrollment's
+        # snapshot name does -> must resolve rather than return None.
+        program = SimpleNamespace(name="Enhanced Care Management", product_type_id=None)
+        case = SimpleNamespace(program_id=uuid.uuid4(), program=program,
+                               program_name="", service_type="")
+        enr = self._enr(
+            program_name="Medically Tailored Meals (MTM)", case=case,
+        )
+        self.assertEqual(product_kind_for_enrollment(enr), ProductTypeKind.MEALS)
+
+    def test_case_program_name_used_as_fallback(self):
+        from .models import ProductTypeKind
+        from .services.catalog import product_kind_for_enrollment
+
+        case = SimpleNamespace(
+            program_id=uuid.uuid4(),
+            program=SimpleNamespace(name="Navigation", product_type_id=None),
+            program_name="MTNA Food Prescription Boxes",
+            service_type="Food Assistance",
+        )
+        enr = self._enr(program_name="", case=case)
+        self.assertEqual(product_kind_for_enrollment(enr), ProductTypeKind.BOXES)
+
+    def test_unresolvable_returns_none(self):
+        from .services.catalog import product_kind_for_enrollment
+
+        case = SimpleNamespace(program_id=None, program=None,
+                               program_name="Housing", service_type="Housing")
+        enr = self._enr(program_name="", case=case, schedules=None)
+        self.assertIsNone(product_kind_for_enrollment(enr))
