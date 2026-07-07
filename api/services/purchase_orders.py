@@ -418,9 +418,9 @@ def split_purchase_order(po, delivery_order_ids, new_delivery_date):
 
 # Boxes export columns, in order.
 _BOX_EXPORT_HEADERS = [
-    "Delivery Date", "OrderID", "HouseholdGroup", "Quantity", "MemberID", "Name",
-    "Address 1", "Address 2", "City", "State", "Postal", "Delivery Notes",
-    "MenuType", "FOOD NOTE", "Email address", "Phone",
+    "Delivery Date", "OrderID", "HouseholdGroup", "PrimaryHousehold", "Quantity",
+    "MemberID", "Name", "Address 1", "Address 2", "City", "State", "Postal",
+    "Delivery Notes", "MenuType", "FOOD NOTE", "Email address", "Phone",
 ]
 
 
@@ -518,6 +518,19 @@ def _household_label(household):
     return f"HH-{household.household_id.hex[:8].upper()}"
 
 
+def _household_is_primary(client):
+    """Whether this member is the PRIMARY (head) of their household -- the single
+    ``True`` row per HouseholdGroup the kitchen can treat as the group's contact.
+    A member with no household record is a lone recipient and so counts as their
+    own primary (``True``)."""
+    if client is None:
+        return False
+    hm = getattr(client, "household_membership", None)
+    if hm is None:
+        return True
+    return bool(hm.is_primary)
+
+
 def _delivery_notes(client):
     """Delivery notes captured on the verification pop-up for this member: the
     ``notes`` on their enrollment's delivery address. Falls back to any note on
@@ -560,7 +573,9 @@ def build_kitchen_export_rows(po):
     # secondary key so members stay contiguous even when household names collide
     # or are blank.
     orders = (
-        po.delivery_orders.select_related("member", "group", "menu_type")
+        po.delivery_orders.select_related(
+            "member", "member__household_membership", "group", "menu_type"
+        )
         .prefetch_related("member__addresses")
         .order_by("group__name", "group_id", "member__last_name", "member__first_name")
     )
@@ -575,6 +590,7 @@ def build_kitchen_export_rows(po):
             do.expected_delivery_date.isoformat() if do.expected_delivery_date else "",
             str(do.delivery_order_id),
             _household_group_code(do.group),
+            _household_is_primary(c),
             do.quantity if do.quantity is not None else "",
             str(c.client_id) if c else "",
             name,
