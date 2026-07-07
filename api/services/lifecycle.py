@@ -272,9 +272,15 @@ def derive_client_stage(client):
             return _ENROLLMENT_DRIVES.get(held_from, client.lifecycle_stage or early)
         return client.lifecycle_stage or early
 
-    # Closed / cancelled: terminal off-ramp, but never downgrade a client that
-    # already reached Active / Completed.
-    if stage in (EnrollmentStage.CLOSED, EnrollmentStage.CANCELLED):
+    # Cancelled: hard off-ramp. A cancellation ends service outright, so it
+    # ALWAYS moves the client to Not Eligible -- even one who had reached
+    # Active / Completed (used to mark off-boarded / inactive members).
+    if stage == EnrollmentStage.CANCELLED:
+        return ClientStage.NOT_ELIGIBLE
+
+    # Closed: terminal off-ramp, but never downgrade a client that already
+    # reached Active / Completed (service ran its course).
+    if stage == EnrollmentStage.CLOSED:
         if client.lifecycle_stage in (ClientStage.ACTIVE, ClientStage.COMPLETED):
             return client.lifecycle_stage
         return ClientStage.NOT_ELIGIBLE

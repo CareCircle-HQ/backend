@@ -1522,14 +1522,32 @@ class MemberStatus(models.TextChoices):
     # paused members are excluded from all delivery schedules and Purchase
     # Orders until an agent unpauses them (which re-runs the meal rule).
     PAUSED = "paused", "Paused"
+    # Terminal off-ramp: the member was in service and no longer is. Like
+    # OUT_OF_ORBIT/PAUSED, inactive members are excluded from all delivery
+    # schedules and Purchase Orders. Unlike a pause this is an end state (their
+    # service ended), not a temporary hold.
+    INACTIVE = "inactive", "Inactive"
 
 
 # Member statuses that exclude a member from every delivery schedule / order /
-# Purchase Order: OUT_OF_ORBIT (meal rule can't fulfill them) and PAUSED (agent
-# manually paused them). Only ACTIVE members receive deliveries.
+# Purchase Order: OUT_OF_ORBIT (meal rule can't fulfill them), PAUSED (agent
+# manually paused them) and INACTIVE (service ended). Only ACTIVE members
+# receive deliveries.
 SERVICE_EXCLUDED_MEMBER_STATUSES = (
     MemberStatus.OUT_OF_ORBIT,
     MemberStatus.PAUSED,
+    MemberStatus.INACTIVE,
+)
+
+# Enrollment stages that exclude a whole household from Purchase Order / delivery
+# generation: ON_HOLD (temporarily paused) plus the terminal stages
+# SERVICE_COMPLETE / CLOSED / CANCELLED (service has ended -- e.g. a cancelled /
+# off-boarded household must never appear on a new PO or delivery).
+SERVICE_EXCLUDED_ENROLLMENT_STAGES = (
+    EnrollmentStage.ON_HOLD,
+    EnrollmentStage.SERVICE_COMPLETE,
+    EnrollmentStage.CLOSED,
+    EnrollmentStage.CANCELLED,
 )
 
 
