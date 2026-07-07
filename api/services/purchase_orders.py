@@ -31,6 +31,7 @@ from api.models import (
     DeliveryOrderStatus,
     DietaryRestriction,
     FoodAllergy,
+    HouseholdMember,
     Kitchen,
     MemberDietaryProfile,
     MemberStatus,
@@ -424,9 +425,10 @@ def split_purchase_order(po, delivery_order_ids, new_delivery_date):
 
 # Boxes export columns, in order.
 _BOX_EXPORT_HEADERS = [
-    "Delivery Date", "OrderID", "HouseholdGroup", "PrimaryHousehold", "Quantity",
-    "MemberID", "Name", "Address 1", "Address 2", "City", "State", "Postal",
-    "Delivery Notes", "MenuType", "FOOD NOTE", "Email address", "Phone",
+    "Delivery Date", "OrderID", "HouseholdGroup", "PrimaryMemberID",
+    "PrimaryHousehold", "Quantity", "MemberID", "Name", "Address 1", "Address 2",
+    "City", "State", "Postal", "Delivery Notes", "MenuType", "FOOD NOTE",
+    "Email address", "Phone",
 ]
 
 
@@ -578,13 +580,31 @@ def build_kitchen_export_rows(po):
     # all of one household's food as a single batch. ``group_id`` is the
     # secondary key so members stay contiguous even when household names collide
     # or are blank.
-    orders = (
+    orders = list(
         po.delivery_orders.select_related(
             "member", "member__household_membership", "group", "menu_type"
         )
         .prefetch_related("member__addresses")
         .order_by("group__name", "group_id", "member__last_name", "member__first_name")
     )
+    # Primary member's client id per household, repeated on every member row of
+    # that household so the kitchen can tie a group to its head-of-household id.
+    hh_ids = {do.group_id for do in orders if do.group_id}
+    primary_by_hh = dict(
+        HouseholdMember.objects.filter(household_id__in=hh_ids, is_primary=True)
+        .values_list("household_id", "client_id")
+    )
+
+    def _primary_member_id(do, client):
+        # Household: the group's primary client id (shared by all its members).
+        # A member with no household -- or a household with no primary row -- is
+        # its own primary, so fall back to the member's own id.
+        if do.group_id:
+            pid = primary_by_hh.get(do.group_id)
+            if pid:
+                return str(pid)
+        return str(client.client_id) if client else ""
+
     rows = []
     for do in orders:
         c = do.member
@@ -596,6 +616,7 @@ def build_kitchen_export_rows(po):
             do.expected_delivery_date.isoformat() if do.expected_delivery_date else "",
             str(do.delivery_order_id),
             _household_group_code(do.group),
+            _primary_member_id(do, c),
             _household_is_primary(c),
             do.quantity if do.quantity is not None else "",
             str(c.client_id) if c else "",
