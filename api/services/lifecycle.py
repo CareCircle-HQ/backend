@@ -455,8 +455,12 @@ def advance_enrollment(enrollment, to_stage, *, actor=None, actor_label="", note
     if from_stage == to_stage:
         return enrollment
 
+    # Terminal stages (Closed / Cancelled) have no outgoing transitions in the
+    # map, so leaving one (e.g. reactivating a cancelled household) is only
+    # possible with force -- a deliberate correction/reinstatement.
+    leaving_terminal = force and from_stage in _TERMINAL_STAGES
     allowed = ENROLLMENT_TRANSITIONS.get(from_stage, set())
-    if to_stage not in allowed:
+    if to_stage not in allowed and not leaving_terminal:
         raise InvalidTransition(
             f"Cannot move enrollment {enrollment.pk} from '{from_stage}' to '{to_stage}'."
         )
@@ -474,6 +478,11 @@ def advance_enrollment(enrollment, to_stage, *, actor=None, actor_label="", note
     update_fields = ["stage", "stage_at"]
     if to_stage in _TERMINAL_STAGES and enrollment.closed_at is None:
         enrollment.closed_at = now
+        update_fields.append("closed_at")
+    elif to_stage not in _TERMINAL_STAGES and enrollment.closed_at is not None:
+        # Re-opening a previously terminal enrollment: clear the closure stamp so
+        # it counts as active again (drives active_enrollment / PO inclusion).
+        enrollment.closed_at = None
         update_fields.append("closed_at")
     enrollment.save(update_fields=update_fields)
 

@@ -151,7 +151,15 @@ AUTH_PASSWORD_VALIDATORS = [
 
 LANGUAGE_CODE = 'en-us'
 
-TIME_ZONE = 'UTC'
+# The program operates on the New York calendar (Met Council / NYC), and the
+# server runs in America/New_York. With USE_TZ=True datetimes are still STORED
+# in UTC; TIME_ZONE only governs the *active* zone used for date extraction and
+# rendering -- i.e. `timezone.localdate()`, `localtime()`, and `__date` lookups.
+# Keeping this as UTC made the Verification page's Requested/Completed date
+# filters (and the "Today/Yesterday/..." period ranges) match the wrong day for
+# evening-EDT records (a 9pm EDT event stored as next-day UTC). Anchoring to
+# America/New_York makes those filters agree with the local calendar.
+TIME_ZONE = 'America/New_York'
 
 USE_I18N = True
 
