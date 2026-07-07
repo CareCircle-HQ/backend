@@ -4,6 +4,7 @@ import uuid
 
 from django.db import IntegrityError
 from django.db.models import Q
+from django.utils import timezone
 from rest_framework import generics, permissions, viewsets
 from rest_framework.exceptions import ValidationError
 from rest_framework.response import Response
@@ -16,6 +17,7 @@ from .models import (
     AllowedZipCode,
     Assessment,
     Case,
+    CaseType,
     Client,
     ContractedService,
     DietaryRestriction,
@@ -59,6 +61,7 @@ from .services.lifecycle import (
     recompute_client_stage,
     recompute_enrollment_household,
     reconcile_enrollment_authorization,
+    reconcile_internal_service_authorization,
 )
 
 logger = logging.getLogger(__name__)
@@ -76,6 +79,17 @@ def _safe_timeline(builder, obj, request):
         builder(obj, actor=_agent_actor(request))
     except Exception:  # noqa: BLE001
         logger.exception("timeline emit failed for %s", type(obj).__name__)
+
+
+def _safe_timeline_case_switch(enrollment, previous_case, request):
+    """Emit the verification 'case switched' timeline event, isolated from the
+    API write (carries the previous case for the history)."""
+    try:
+        timeline.event_for_verification_case_switched(
+            enrollment, previous_case=previous_case, actor=_agent_actor(request)
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception("case-switch timeline emit failed for %s", enrollment.pk)
 
 
 def _safe_recompute_stage(obj):
@@ -571,12 +585,44 @@ class EnrollmentVerificationViewSet(viewsets.ModelViewSet):
 
     def create(self, request, *args, **kwargs):
         # One verification per navigation case (also guarded by a DB constraint).
+        # But rather than hard-blocking a re-request, RENEW a still-pending
+        # (unverified) enrollment: the agent's action bumps requested_at + the
+        # acting agent so the CRM shows it as freshly requested. Only a verification
+        # that's already been COMPLETED (or advanced past pending) returns 409 --
+        # we never reset a real verification.
         case_id = request.data.get("case_id")
-        if case_id and EnrollmentVerification.objects.filter(case_id=case_id).exists():
-            return Response(
-                {"detail": "A verification has already been requested for this case."},
-                status=status.HTTP_409_CONFLICT,
+        client_id = request.data.get("client_id")
+        existing = None
+        if case_id:
+            existing = EnrollmentVerification.objects.filter(case_id=case_id).first()
+        if existing is None and client_id:
+            client_qs = EnrollmentVerification.objects.filter(client_id=client_id)
+            # A COMPLETED verification (verified_at set) must NEVER be reset or
+            # duplicated -- surface it first so we 409 below, even when the
+            # request carries no case_id. Otherwise fall back to a still-pending
+            # enrollment, which is renewable.
+            existing = (
+                client_qs.filter(verified_at__isnull=False)
+                .order_by("-opened_at")
+                .first()
+                or client_qs.filter(
+                    verified_at__isnull=True,
+                    stage=EnrollmentStage.PENDING_VERIFICATION,
+                )
+                .order_by("-opened_at")
+                .first()
             )
+        if existing is not None:
+            renewable = (
+                existing.verified_at is None
+                and existing.stage == EnrollmentStage.PENDING_VERIFICATION
+            )
+            if not renewable:
+                return Response(
+                    {"detail": "A verification has already been requested for this case."},
+                    status=status.HTTP_409_CONFLICT,
+                )
+            return self._renew(existing, request, case_id=case_id)
         try:
             return super().create(request, *args, **kwargs)
         except IntegrityError:
@@ -584,6 +630,116 @@ class EnrollmentVerificationViewSet(viewsets.ModelViewSet):
                 {"detail": "A verification has already been requested for this case."},
                 status=status.HTTP_409_CONFLICT,
             )
+
+    def _renew(self, enrollment, request, *, case_id=None):
+        """Renew a still-pending verification request: stamp a fresh
+        ``requested_at`` + acting agent (overwriting any prior requester -- the
+        history keeps every renewal), link the governing case if it was missing
+        (e.g. a bulk-imported enrollment), and re-drive the household. Returns the
+        renewed enrollment (200)."""
+        agent_id = getattr(getattr(request, "user", None), "agent_id", None)
+        enrollment.requested_at = timezone.now()
+        update_fields = ["requested_at"]
+        if agent_id:
+            enrollment.requested_by_id = agent_id
+            update_fields.append("requested_by")
+        if case_id and str(enrollment.case_id) != str(case_id):
+            case = Case.objects.filter(pk=case_id).first()
+            # Switch the enrollment onto the agent-selected case (fills a missing
+            # link OR re-points from a prior case). Never steal a case already
+            # tied to a DIFFERENT enrollment (per-case unique constraint).
+            taken = (
+                EnrollmentVerification.objects.filter(case_id=case_id)
+                .exclude(pk=enrollment.pk)
+                .exists()
+            )
+            if case is not None and not taken:
+                enrollment.case = case
+                update_fields.append("case")
+        enrollment.save(update_fields=update_fields)
+        _safe_timeline(timeline.event_for_verification_renewed, enrollment, request)
+        _safe_recompute_household(enrollment)
+        return Response(self.get_serializer(enrollment).data, status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=["post"], url_path="re-request")
+    def re_request(self, request, pk=None):
+        """Explicitly renew a pending verification request (fresh date + agent).
+        409 if the verification is already completed / advanced past pending."""
+        enrollment = self.get_object()
+        if (
+            enrollment.verified_at is not None
+            or enrollment.stage != EnrollmentStage.PENDING_VERIFICATION
+        ):
+            return Response(
+                {"detail": "Only a pending (unverified) verification can be renewed."},
+                status=status.HTTP_409_CONFLICT,
+            )
+        return self._renew(enrollment, request, case_id=enrollment.case_id)
+
+    @action(detail=True, methods=["post"], url_path="set-case")
+    def set_case(self, request, pk=None):
+        """Re-point the enrollment's governing internal-service case to the
+        agent-selected one (the client may hold several meal/box cases). Keeps
+        the SAME enrollment -- no duplicate verification is created -- so
+        accountability stays with the acting agent.
+
+        Guards: the target must be an internal-service case belonging to the same
+        client/household, and must not already be tied to another enrollment
+        (per-case unique constraint). Re-runs the authorization projection so an
+        approved/denied selection takes effect immediately.
+        """
+        enrollment = self.get_object()
+        case_id = request.data.get("case_id")
+        if not case_id:
+            return Response(
+                {"detail": "case_id is required."}, status=status.HTTP_400_BAD_REQUEST
+            )
+        case = Case.objects.filter(pk=case_id).first()
+        if case is None:
+            return Response(
+                {"detail": "Case not found."}, status=status.HTTP_404_NOT_FOUND
+            )
+        if case.case_type != CaseType.INTERNAL_SERVICE:
+            return Response(
+                {"detail": "Only an Internal Service case can govern a verification."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if enrollment.client_id and case.client_id != enrollment.client_id:
+            return Response(
+                {"detail": "Case belongs to a different client."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        taken = (
+            EnrollmentVerification.objects.filter(case_id=case_id)
+            .exclude(pk=enrollment.pk)
+            .exists()
+        )
+        if taken:
+            return Response(
+                {"detail": "That case is already tied to another verification."},
+                status=status.HTTP_409_CONFLICT,
+            )
+        if str(enrollment.case_id) == str(case_id):
+            return Response(self.get_serializer(enrollment).data)
+
+        previous_case = enrollment.case
+        enrollment.case = case
+        enrollment.save(update_fields=["case"])
+        _safe_timeline_case_switch(enrollment, previous_case, request)
+        # Project the newly-selected case's authorization (approved -> advance;
+        # denied -> pause) and re-drive the household.
+        try:
+            reconcile_enrollment_authorization(
+                enrollment, actor=getattr(request, "user", None)
+            )
+            reconcile_internal_service_authorization(
+                enrollment.client, actor=getattr(request, "user", None)
+            )
+        except Exception:  # never let reconcile break the switch
+            logger.exception("reconcile after set-case failed for %s", enrollment.pk)
+        _safe_recompute_household(enrollment)
+        enrollment.refresh_from_db()
+        return Response(self.get_serializer(enrollment).data)
 
     def perform_create(self, serializer):
         serializer.save()

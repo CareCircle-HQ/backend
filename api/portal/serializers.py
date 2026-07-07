@@ -283,6 +283,16 @@ def internal_service_case(client):
     return max(cases, key=governing_case_key)
 
 
+def internal_service_cases(client):
+    """All of the client's Internal Service cases, most-governing first (by
+    :func:`governing_case_key`). The verification can attach to any of them; the
+    agent picks which one in the verification pop-up when there's more than one."""
+    cases = [
+        c for c in client.cases.all() if c.case_type == CaseType.INTERNAL_SERVICE
+    ]
+    return sorted(cases, key=governing_case_key, reverse=True)
+
+
 def case_authorization(case):
     """Read-only authorization snapshot for a case: normalized status, the raw
     display label (e.g. "Accepted"), and whether it counts as accepted."""
@@ -386,10 +396,14 @@ class MemberListSerializer(serializers.Serializer):
 
     def get_verification_requested_at(self, obj):
         # A verification is "requested" when its enrollment is created (it opens
-        # at Pending Verification and fires the VERIFICATION_REQUESTED timeline),
-        # so opened_at is the request timestamp (date + time).
+        # at Pending Verification and fires the VERIFICATION_REQUESTED timeline).
+        # A renewed/re-requested enrollment stamps requested_at, so prefer it and
+        # fall back to opened_at (creation) when it was never re-requested.
         enr = active_enrollment(obj)
-        return enr.opened_at.isoformat() if enr and enr.opened_at else None
+        if not enr:
+            return None
+        when = enr.requested_at or enr.opened_at
+        return when.isoformat() if when else None
 
     def get_verification_completed_at(self, obj):
         # A verification is "done" when the pop-up completes and sets verified_at
@@ -454,6 +468,19 @@ class MemberDetailSerializer(serializers.Serializer):
                 "program_name": svc_case.program_name if svc_case else "",
                 "service_type": svc_case.service_type if svc_case else "",
                 "case_id": str(svc_case.case_id) if svc_case else None,
+                # Every Internal Service case the verification can attach to, so
+                # the pop-up can let the agent switch the governing case when the
+                # client holds more than one. `governing` marks the default pick.
+                "cases": [
+                    {
+                        "case_id": str(c.case_id),
+                        "program_name": c.program_name or "",
+                        "service_type": c.service_type or "",
+                        "authorization": case_authorization(c),
+                        "governing": bool(svc_case and c.case_id == svc_case.case_id),
+                    }
+                    for c in internal_service_cases(client)
+                ],
             },
             "demographics": {
                 "gender": client.gender,

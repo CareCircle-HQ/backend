@@ -690,17 +690,20 @@ def _resume_auto_paused_enrollment(enrollment, *, actor=None):
 def reconcile_internal_service_authorization(client, *, actor=None):
     """React to a change in the client's internal-service case authorization.
 
-    Full-stop rule: a client with EXACTLY ONE internal-service (meal/box) case
-    whose authorization is DENIED is paused -- every post-verification enrollment
-    is moved to On Hold (mirrors the manual Place-on-Hold), which drops them off
-    the kitchen-assignment queue and pauses delivery. Reversible: when the
-    governing internal-service authorization later becomes favorable (the sole
-    case is re-approved, or a second approved case supersedes it) the enrollment
-    auto-resumes to the stage it was held from.
+    Full-stop rule: a client whose GOVERNING internal-service (meal/box)
+    authorization is DENIED is paused -- every post-verification enrollment is
+    moved to On Hold (mirrors the manual Place-on-Hold), which drops them off the
+    kitchen-assignment queue and pauses delivery. Reversible: when the governing
+    internal-service authorization later becomes favorable (the case is
+    re-approved, or an approved case supersedes it) the enrollment auto-resumes to
+    the stage it was held from.
 
-    With ZERO or TWO-plus internal-service cases we NEVER full-stop: an
-    approved/pending parallel meal/box program keeps the household in service
-    (``governing_case_key`` already prefers the favorable case).
+    Because ``governing_case_key`` ranks an approval/pending case ABOVE a denial,
+    "the governing case is denied" already means NO approved/pending meal/box
+    program exists -- so this fires whether the client has one denied case or
+    several (e.g. two parallel cases that were BOTH denied, possibly on different
+    days). An approved/pending parallel program keeps the household in service
+    (it becomes the governing case, so gov_status is not DENIED).
 
     Best-effort and idempotent. Returns ``{"sole_denied": bool, "paused": bool}``.
     """
@@ -712,10 +715,11 @@ def reconcile_internal_service_authorization(client, *, actor=None):
 
     governing = max(cases, key=governing_case_key)
     gov_status = governing.service_authorization_status
-    sole = len(cases) == 1
 
-    if sole and gov_status == ServiceAuthorizationStatus.DENIED:
-        # Single denied meal/box case -> full stop: pause every servable enrollment.
+    if gov_status == ServiceAuthorizationStatus.DENIED:
+        # Governing meal/box authorization is denied (no favorable/pending case
+        # exists, whether one case or several) -> full stop: pause every
+        # servable enrollment.
         result["sole_denied"] = True
         for enr in _governing_enrollments(client):
             if EnrollmentStage(enr.stage) in _DENIAL_PAUSE_STAGES:
