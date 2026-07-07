@@ -142,8 +142,19 @@ class ClientAdmin(admin.ModelAdmin):
 
 @admin.register(Address)
 class AddressAdmin(admin.ModelAdmin):
-    list_display = ("client", "type", "city", "state")
+    list_display = ("client", "type", "street", "unit", "city", "state", "zip")
     list_filter = ("type", "state")
+    search_fields = (
+        "client__client_id",
+        "client__first_name",
+        "client__last_name",
+        "street",
+        "unit",
+        "city",
+        "zip",
+    )
+    list_select_related = ("client",)
+    ordering = ("-id",)
 
 
 @admin.register(Insurance)
