@@ -23,7 +23,7 @@ from ..models import (
     PurchaseOrderKitchenStatus,
     PurchaseOrderStatus,
 )
-from ..services.orders import sync_active_calendars
+from ..services.orders import resync_scheduled_orders
 from ..services.purchase_orders import (
     build_kitchen_export_csv,
     build_po_summary_data,
@@ -313,9 +313,14 @@ class PurchaseOrderPreviewRefreshView(PortalAPIView):
                 {"detail": "kind (meals|boxes) and delivery_date (YYYY-MM-DD) are required."},
                 status=http.HTTP_400_BAD_REQUEST,
             )
-        totals = sync_active_calendars()
+        # Only re-pull live kitchen / menu / allergy snapshots onto the SCHEDULED
+        # occurrences ON THIS DATE (what the preview reads). The full-calendar
+        # reconcile (sync_active_calendars) walked every active enrollment's
+        # entire future window and timed out the request (504), which surfaces in
+        # the browser as a missing-CORS error.
+        updated = resync_scheduled_orders(delivery_date=delivery_date)
         data = preview_purchase_orders(kind, delivery_date)
-        data["refreshed"] = totals
+        data["refreshed"] = {"updated": updated}
         return Response(data)
 
 
