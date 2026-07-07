@@ -739,6 +739,43 @@ class MembersListView(PortalGenericAPIView):
         }
         return per_member, aggregate
 
+    def _renderable_keys(self, entries):
+        """Set of ``(type, id)`` group keys that will actually RENDER on the
+        Logistics page -- i.e. have at least one member not hidden from the
+        kitchen-assignment queue (see ``_hidden_in_logistics``). Mirrors the
+        member-drop in ``_build_groups_for_page`` but skips the expensive kitchen
+        serviceability calc, so it can run over EVERY entry before pagination to
+        keep count / total_pages / results consistent (otherwise hidden
+        households are counted but dropped at serialization, e.g. "4 of 674")."""
+        hh_ids = [e["id"] for e in entries if e["type"] == "household"]
+        ind_ids = [e["id"] for e in entries if e["type"] == "individual"]
+        keys = set()
+        if hh_ids:
+            members = (
+                HouseholdMember.objects.filter(household_id__in=hh_ids)
+                .select_related("client")
+                .prefetch_related(
+                    "client__enrollments", "client__member_profiles", "client__cases"
+                )
+            )
+            by_hh = {}
+            for hm in members:
+                by_hh.setdefault(hm.household_id, []).append(hm)
+            for hid in hh_ids:
+                if any(
+                    h.client and not self._hidden_in_logistics(h.client)
+                    for h in by_hh.get(hid, [])
+                ):
+                    keys.add(("household", hid))
+        if ind_ids:
+            clients = Client.objects.filter(client_id__in=ind_ids).prefetch_related(
+                "enrollments", "member_profiles", "cases"
+            )
+            for c in clients:
+                if not self._hidden_in_logistics(c):
+                    keys.add(("individual", c.client_id))
+        return keys
+
     def _compute_logistics_checks(self, entries):
         """Compute logistics checkers for EVERY entry (used by the readiness
         filter, which must decide before pagination). Returns
@@ -919,19 +956,30 @@ class MembersListView(PortalGenericAPIView):
         entries = self._group_entries()
         scope = (request.query_params.get("scope") or "").strip()
         checks = None
-        # Logistics readiness filter: keep only households that are Ready to
-        # assign, or that have blockers. Readiness depends on computed checks
-        # (menu type / address / kitchen serviceability), so it must be resolved
-        # BEFORE pagination -- compute checks for every entry, then filter.
-        readiness = (request.query_params.get("readiness") or "").strip().lower()
-        if scope == "logistics" and readiness in ("ready", "blockers"):
-            checks = self._compute_logistics_checks(entries)
-            want_ready = readiness == "ready"
-            entries = [
-                e for e in entries
-                if bool((checks.get((e["type"], e["id"])) or (None, {"ready": False}))[1]["ready"])
-                == want_ready
-            ]
+        if scope == "logistics":
+            # Every logistics request must drop groups that would render EMPTY
+            # (all members hidden from the kitchen-assignment queue) BEFORE
+            # pagination, so count / total_pages / results agree. Without this the
+            # hidden groups inflate the count but vanish at serialization, so a
+            # page shows only a handful of rows (e.g. "Showing 4 of 674").
+            readiness = (request.query_params.get("readiness") or "").strip().lower()
+            if readiness in ("ready", "blockers"):
+                # Readiness split needs the full checks (menu / address / kitchen
+                # serviceability), reused when serializing the page. Hidden groups
+                # have NO checks entry, so they're excluded from both ready and
+                # blockers here.
+                checks = self._compute_logistics_checks(entries)
+                want_ready = readiness == "ready"
+                entries = [
+                    e for e in entries
+                    if (e["type"], e["id"]) in checks
+                    and checks[(e["type"], e["id"])][1]["ready"] == want_ready
+                ]
+            else:
+                # No readiness filter: cheap hidden-only pass (skips the kitchen
+                # calc); the page's checks are computed per-page below.
+                renderable = self._renderable_keys(entries)
+                entries = [e for e in entries if (e["type"], e["id"]) in renderable]
         page = self.paginate_queryset(entries)
         return self.get_paginated_response(
             self._build_groups_for_page(page or [], checks=checks)
