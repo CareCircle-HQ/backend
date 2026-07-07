@@ -490,6 +490,63 @@ def event_for_verification(enrollment, *, stage_event=None, source=ChangeSource.
     )
 
 
+def event_for_verification_renewed(enrollment, *, source=ChangeSource.CRM, actor=""):
+    """Emit a 'Verification Re-requested' event each time an agent renews a
+    still-pending verification request (stamps a fresh ``requested_at`` + acting
+    agent). Deliberately NOT de-duped, so every renewal -- and the prior
+    requester -- stays preserved in the client's history."""
+    client = enrollment.client
+    if client is None:
+        return None
+    return emit_timeline_event(
+        client=client,
+        event_type=TimelineEventType.VERIFICATION_REQUESTED,
+        occurred_at=enrollment.requested_at or timezone.now(),
+        title="Verification Re-requested",
+        subtitle=enrollment.program_name or "",
+        badge_text="Verification Requested",
+        badge_tone=TimelineBadgeTone.INFO,
+        source=source,
+        actor=actor,
+        entity=enrollment,
+        enrollment=enrollment,
+        case=enrollment.case,
+        dedupe_key="",  # never dedupe: keep every renewal in the history
+    )
+
+
+def event_for_verification_case_switched(enrollment, *, previous_case=None, source=ChangeSource.CRM, actor=""):
+    """Emit a 'Verification Case Switched' event when an agent re-points the
+    enrollment's governing internal-service case (e.g. the client has two meal/box
+    cases and the agent selects which one this verification is tied to). Not
+    de-duped, so each switch is preserved in the history."""
+    client = enrollment.client
+    if client is None:
+        return None
+    prev = ""
+    if previous_case is not None:
+        prev = previous_case.program_name or previous_case.service_type or str(previous_case.case_id)
+    new = ""
+    if enrollment.case_id:
+        new = enrollment.case.program_name or enrollment.case.service_type or str(enrollment.case_id)
+    return emit_timeline_event(
+        client=client,
+        event_type=TimelineEventType.VERIFICATION_REQUESTED,
+        occurred_at=timezone.now(),
+        title="Verification Case Switched",
+        subtitle=new or "",
+        badge_text="Case Switched",
+        badge_tone=TimelineBadgeTone.INFO,
+        source=source,
+        actor=actor,
+        entity=enrollment,
+        enrollment=enrollment,
+        case=enrollment.case,
+        metadata={"previous_case": prev, "new_case": new},
+        dedupe_key="",  # never dedupe: keep every switch in the history
+    )
+
+
 _TICKET_SEVERITY_TONE = {
     "high": TimelineBadgeTone.DANGER,
     "medium": TimelineBadgeTone.WARNING,

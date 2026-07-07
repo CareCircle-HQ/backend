@@ -1706,6 +1706,22 @@ class MemberVerificationCreateView(PortalAPIView):
         ser.is_valid(raise_exception=True)
         data = ser.validated_data
 
+        # The agent may pick WHICH Internal Service case this verification is tied
+        # to in the pop-up (the client can hold several). Resolve it here; falls
+        # back to the client's governing case below when not provided.
+        selected_case = None
+        sel_case_id = request.data.get("case_id")
+        if sel_case_id:
+            selected_case = next(
+                (
+                    c
+                    for c in client.cases.all()
+                    if str(c.case_id) == str(sel_case_id)
+                    and c.case_type == CaseType.INTERNAL_SERVICE
+                ),
+                None,
+            )
+
         # De-duplicate members by client_id (first occurrence wins). The same
         # person can be submitted twice -- e.g. the primary is auto-included AND
         # re-added via the Step-1 search -- which would violate the per-
@@ -1842,14 +1858,35 @@ class MemberVerificationCreateView(PortalAPIView):
             note="Verification completed via support portal.",
         )
 
+        # Tie the enrollment to the agent-selected Internal Service case from the
+        # pop-up (when provided + free) BEFORE the authorization projection, so
+        # the switch sticks even while the case is still pending. A case already
+        # owned by another enrollment is skipped (per-case unique constraint).
+        if (
+            selected_case is not None
+            and enrollment.case_id is None
+            and not EnrollmentVerification.objects.filter(case=selected_case)
+            .exclude(pk=enrollment.pk)
+            .exists()
+        ):
+            enrollment.case = selected_case
+            enrollment.save(update_fields=["case"])
+            try:
+                timeline.event_for_verification_case_switched(
+                    enrollment, previous_case=None, actor=actor_label
+                )
+            except Exception:  # never let history-logging break the save
+                pass
+
         # The authorization outcome is sourced from the client's case (NOT the
         # client/frontend): only an Accepted (APPROVED) case advances the
         # household to "Kitchen Assignment". Any other status leaves the client
-        # at "Verified". The member is NOT auto-activated and no delivery
-        # schedule/orders are generated here — that happens later when the
-        # kitchen assignment is executed manually (separate page), which is what
-        # moves the household into service.
-        case = s.primary_case(client)
+        # at "Verified". The agent-selected case wins over the governing default
+        # so responsibility stays with them. The member is NOT auto-activated and
+        # no delivery schedule/orders are generated here — that happens later when
+        # the kitchen assignment is executed manually (separate page), which is
+        # what moves the household into service.
+        case = selected_case or s.primary_case(client)
         accepted = bool(
             case and case.service_authorization_status == ServiceAuthorizationStatus.APPROVED
         )

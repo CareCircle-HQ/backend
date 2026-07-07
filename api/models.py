@@ -1698,6 +1698,12 @@ class EnrollmentVerification(models.Model):
         "Agent", on_delete=models.SET_NULL, null=True, blank=True,
         related_name="requested_enrollments",
     )
+    # When the verification was last REQUESTED. Distinct from opened_at (row
+    # creation): re-requesting/renewing an existing unverified enrollment stamps
+    # this to now() and repoints requested_by, so the CRM's "Requested" column
+    # reflects the latest request (and acting agent) without falsifying the
+    # creation time. Falls back to opened_at when never explicitly stamped.
+    requested_at = models.DateTimeField(null=True, blank=True, db_index=True)
     closed_at = models.DateTimeField(null=True, blank=True)
     note = models.TextField(blank=True)
 
