@@ -252,6 +252,9 @@ MEMBER_LIST_PREFETCH = (
         ),
     ),
     "member_profiles",
+    # Roster of the client's household so the serializer can resolve the primary
+    # member's client_id (household_primary_id) without an extra query per row.
+    "household_membership__household__members",
 )
 
 

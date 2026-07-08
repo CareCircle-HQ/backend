@@ -213,37 +213,37 @@ def active_enrollment(client):
     return sorted(pool, key=lambda e: e.opened_at or timezone.now(), reverse=True)[0]
 
 
+def active_member_profile(client):
+    """The client's dietary profile for their ACTIVE enrollment (drives the
+    per-member Out of Orbit / Paused sub-status). None when there's no profile
+    on the active enrollment, so a stale profile from a closed enrollment never
+    mislabels a member."""
+    profiles = list(client.member_profiles.all())
+    if not profiles:
+        return None
+    enr = active_enrollment(client)
+    if enr is None:
+        return None
+    for mp in profiles:
+        if mp.enrollment_id == enr.pk:
+            return mp
+    return None
+
+
 def member_out_of_orbit(client):
     """True when the client's active-enrollment dietary profile is Out of Orbit
     (the meal rule couldn't be safely fulfilled). Out-of-orbit members are
-    excluded from delivery schedules/POs, so the Logistics roster hides them.
-    Scoped to the active enrollment so a stale profile from a closed enrollment
-    never hides a member."""
-    profiles = list(client.member_profiles.all())
-    if not profiles:
-        return False
-    enr = active_enrollment(client)
-    if enr is not None:
-        for mp in profiles:
-            if mp.enrollment_id == enr.pk:
-                return mp.status == MemberStatus.OUT_OF_ORBIT
-    return False
+    excluded from delivery schedules/POs, so the Logistics roster hides them."""
+    mp = active_member_profile(client)
+    return mp is not None and mp.status == MemberStatus.OUT_OF_ORBIT
 
 
 def member_paused(client):
     """True when the client's active-enrollment dietary profile is Paused (an
     agent manually paused them). Paused members are excluded from delivery
-    schedules/POs. Scoped to the active enrollment so a stale profile from a
-    closed enrollment never mislabels a member."""
-    profiles = list(client.member_profiles.all())
-    if not profiles:
-        return False
-    enr = active_enrollment(client)
-    if enr is not None:
-        for mp in profiles:
-            if mp.enrollment_id == enr.pk:
-                return mp.status == MemberStatus.PAUSED
-    return False
+    schedules/POs."""
+    mp = active_member_profile(client)
+    return mp is not None and mp.status == MemberStatus.PAUSED
 
 
 def service_hold_state(client):
@@ -398,19 +398,55 @@ class MemberListSerializer(serializers.Serializer):
     verification_completed_by = serializers.SerializerMethodField()
     stage_label = serializers.SerializerMethodField()
     verification_state = serializers.SerializerMethodField()
+    household_primary_id = serializers.SerializerMethodField()
+    last_updated = serializers.DateTimeField(source="updated_at")
+    authorization_status_at = serializers.SerializerMethodField()
+    stage_at = serializers.DateTimeField(source="lifecycle_stage_at")
+    on_hold_at = serializers.SerializerMethodField()
+    cancelled_at = serializers.SerializerMethodField()
+    out_of_orbit_at = serializers.SerializerMethodField()
+    paused_at = serializers.SerializerMethodField()
 
     def get_name(self, obj):
         return _full_name(obj)
+
+    def get_household_primary_id(self, obj):
+        # client_id of the household's PRIMARY member, used by the Members list
+        # to open the household head in the CRM. Returned for every member of a
+        # household (including the primary itself, which links to itself); None
+        # when the client has no household.
+        membership = getattr(obj, "household_membership", None)
+        if membership is None:
+            return None
+        for m in membership.household.members.all():
+            if m.is_primary:
+                return str(m.client_id)
+        return None
 
     def get_stage_label(self, obj):
         return pipeline_stage_label(obj)
 
     def get_verification_state(self, obj):
-        # Pure verification FACT for the Verification page's status column:
-        # Verified once the pop-up completed (verified_at set), else Pending
-        # Verification. The downstream pipeline position (Kitchen Assignment /
-        # Active / Completed / On Hold) lives in stage_label, not here.
-        return "Verified" if verification_completed(obj) else "Pending Verification"
+        # Verification FACT column. Verified once the pop-up completed
+        # (verified_at set). "Pending Verification" applies ONLY to members
+        # actually in the verification window (a governing enrollment exists);
+        # a bare client with no case/screening/enrollment is NOT pending -- it
+        # has simply never entered verification, so surface its real lifecycle
+        # stage instead (e.g. Inactive / Screened). Without this gate the
+        # Members page mislabels every non-verified client as Pending
+        # Verification. The downstream pipeline position lives in stage_label.
+        if verification_completed(obj):
+            return "Verified"
+        if obj.lifecycle_stage in (
+            "pending_verification",
+            "verified",
+            "kitchen_assignment",
+        ):
+            return "Pending Verification"
+        # Not in the verification window (Inactive / Consent / Screened / etc.):
+        # leave the Verification Status blank rather than echoing the lifecycle
+        # stage -- these members have simply never entered verification.
+        return ""
 
     def get_out_of_orbit(self, obj):
         return member_out_of_orbit(obj)
@@ -426,6 +462,40 @@ class MemberListSerializer(serializers.Serializer):
 
     def get_authorization_status_label(self, obj):
         return authorization_status(obj)["status_label"]
+
+    def get_authorization_status_at(self, obj):
+        # No dedicated "status decided at" field exists on the Case; the source's
+        # last-update time (Case.updated_at) is the closest proxy for when we got
+        # the current authorization status. Sourced from the internal-service case.
+        case = internal_service_case(obj)
+        return case.updated_at.isoformat() if case and case.updated_at else None
+
+    def get_on_hold_at(self, obj):
+        # Precise moment the household enrollment entered On Hold (enrollment
+        # stage_at), or null when not currently on hold.
+        if not service_hold_state(obj)["on_hold"]:
+            return None
+        enr = active_enrollment(obj)
+        return enr.stage_at.isoformat() if enr and enr.stage_at else None
+
+    def get_cancelled_at(self, obj):
+        # Precise moment the enrollment was cancelled (already computed by
+        # service_cancelled_state from stage_at); null when not cancelled.
+        return service_cancelled_state(obj)["cancelled_at"]
+
+    def get_out_of_orbit_at(self, obj):
+        # When the member's active-enrollment profile last flipped status; only
+        # meaningful while currently Out of Orbit.
+        mp = active_member_profile(obj)
+        if mp is None or mp.status != MemberStatus.OUT_OF_ORBIT:
+            return None
+        return mp.status_changed_at.isoformat() if mp.status_changed_at else None
+
+    def get_paused_at(self, obj):
+        mp = active_member_profile(obj)
+        if mp is None or mp.status != MemberStatus.PAUSED:
+            return None
+        return mp.status_changed_at.isoformat() if mp.status_changed_at else None
 
     def get_medicaid_id(self, obj):
         return medicaid_member_id(obj)

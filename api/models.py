@@ -1780,6 +1780,10 @@ class MemberDietaryProfile(models.Model):
     general_verification_notes = models.TextField(blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
+    # When ``status`` last changed (e.g. Active -> Out of Orbit / Paused).
+    # Distinct from ``updated_at`` (any edit); stamped in ``save()`` only when the
+    # status value actually flips, so the UI can show "Paused/Out of Orbit since".
+    status_changed_at = models.DateTimeField(null=True, blank=True)
 
     class Meta:
         ordering = ["created_at"]
@@ -1792,6 +1796,25 @@ class MemberDietaryProfile(models.Model):
         indexes = [
             models.Index(fields=["enrollment"]),
         ]
+
+    @classmethod
+    def from_db(cls, db, field_names, values):
+        instance = super().from_db(db, field_names, values)
+        # Remember the persisted status so save() can detect a change without an
+        # extra query.
+        instance._loaded_status = instance.status
+        return instance
+
+    def save(self, *args, **kwargs):
+        loaded = getattr(self, "_loaded_status", None)
+        changed = self._state.adding or loaded is None or loaded != self.status
+        if changed:
+            self.status_changed_at = timezone.now()
+            update_fields = kwargs.get("update_fields")
+            if update_fields is not None and "status_changed_at" not in update_fields:
+                kwargs["update_fields"] = list(update_fields) + ["status_changed_at"]
+        super().save(*args, **kwargs)
+        self._loaded_status = self.status
 
     def __str__(self):
         return f"Dietary profile for {self.member_name or self.client_id} (enrollment {self.enrollment_id})"
