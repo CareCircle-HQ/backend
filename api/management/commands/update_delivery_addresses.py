@@ -27,6 +27,7 @@ Usage:
     python manage.py update_delivery_addresses --apply         # commit
     python manage.py update_delivery_addresses --file other.xlsx
 """
+import datetime
 import uuid
 from collections import Counter
 
@@ -56,8 +57,19 @@ _MAXLEN = {"street": 255, "unit": 60, "city": 120, "state": 2, "zip": 10}
 
 
 def _norm(v):
-    """Trim ends but preserve internal newlines (delivery notes are multi-line)."""
-    return "" if v is None else str(v).strip()
+    """Trim ends but preserve internal newlines (delivery notes are multi-line).
+
+    Excel auto-formats a cell typed as e.g. ``8/1`` into a *date*; with
+    ``data_only=True`` openpyxl hands that back as a ``datetime``. Rendering it
+    with ``str()`` would write garbage like ``2026-08-01 00:00:00`` into the
+    address, so recover the intended ``m/d`` unit and drop the spurious
+    year/time. (``datetime`` is a subclass of ``date``.)
+    """
+    if v is None:
+        return ""
+    if isinstance(v, datetime.date):
+        return f"{v.month}/{v.day}"
+    return str(v).strip()
 
 
 def _zip(v):
@@ -113,6 +125,7 @@ class Command(BaseCommand):
         self.malformed = []      # (row_no, raw_id)
         self.not_found = []      # raw_id
         self.truncated = Counter()
+        self.date_coerced = []   # (row_no, key, original, rendered)
         samples = []             # first N planned changes for the dry-run preview
 
         def cell(r, key):
@@ -138,6 +151,14 @@ class Command(BaseCommand):
                     continue
 
                 report["matched"] += 1
+
+                # Flag any Excel-date-coerced text cells (e.g. a unit typed as
+                # "8/1" that Excel stored as a date) so they can be verified.
+                for key in ("street", "unit", "city", "state", "notes"):
+                    raw = cell(r, key)
+                    if isinstance(raw, datetime.date):
+                        report["date_coerced"] += 1
+                        self.date_coerced.append((row_no, key, raw, _norm(raw)))
 
                 new = {
                     "street": _norm(cell(r, "street")),
@@ -239,6 +260,15 @@ class Command(BaseCommand):
             self.stdout.write(self.style.WARNING(
                 f"  truncated fields  : {dict(self.truncated)}"
             ))
+        if self.date_coerced:
+            self.stdout.write(self.style.WARNING(
+                f"  date-coerced cells: {report['date_coerced']} "
+                f"(Excel stored a value as a date; recovered as m/d — verify)"
+            ))
+            for row_no, key, original, rendered in self.date_coerced[:10]:
+                self.stdout.write(
+                    f"      row {row_no} [{key}]: {original} -> {rendered!r}"
+                )
         self.stdout.write("")
         if apply:
             self.stdout.write(self.style.SUCCESS("Committed."))

@@ -622,7 +622,7 @@ def build_kitchen_export_rows(po):
             str(c.client_id) if c else "",
             name,
             addr.street if addr else "",
-            "",  # Address 2 — not modeled separately today
+            addr.unit if addr else "",  # Address 2 = unit/apt (kept separate)
             addr.city if addr else "",
             addr.state if addr else "",
             addr.zip if addr else "",
