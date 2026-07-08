@@ -15,6 +15,7 @@ from .views_leads import (
 from .views_members import (
     BulkAssignBoxesView,
     BulkAssignMealsView,
+    FoodAllergiesListView,
     HouseholdMemberEditView,
     MemberAssignKitchenView,
     MemberCadenceView,
@@ -117,6 +118,7 @@ urlpatterns = [
     path("members/", MembersListView.as_view(), name="portal-members"),
     path("members/stats/", MembersStatsView.as_view(), name="portal-members-stats"),
     path("menu-types/", MenuTypesListView.as_view(), name="portal-menu-types"),
+    path("food-allergies/", FoodAllergiesListView.as_view(), name="portal-food-allergies"),
     path("members/<uuid:client_id>/", MemberDetailView.as_view(), name="portal-member-detail"),
     path("members/<uuid:client_id>/insurance/", MemberInsuranceView.as_view()),
     path("members/<uuid:client_id>/social-coverage/", MemberSocialCoverageView.as_view()),

@@ -432,6 +432,21 @@ class MenuTypesListView(PortalAPIView):
         return Response([{"value": mt.name, "label": mt.name} for mt in rows])
 
 
+class FoodAllergiesListView(PortalAPIView):
+    """Food-allergy options for the Members-page allergy filter dropdown, built
+    from the FoodAllergy enum so the list stays in sync with the backend. The
+    no-op 'none' sentinel is dropped (nothing to filter on). ``value`` is the
+    enum code; the list filter matches both the code and its label because the
+    stored ``food_allergies`` data is mixed (mostly codes, some labels)."""
+
+    def get(self, request):
+        return Response([
+            {"value": code, "label": label}
+            for code, label in FoodAllergy.choices
+            if code != "none"
+        ])
+
+
 class MembersListView(PortalGenericAPIView):
     serializer_class = s.MemberListSerializer
 
@@ -653,6 +668,27 @@ class MembersListView(PortalGenericAPIView):
         menu_type_val = (params.get("menu_type") or "").strip()
         if menu_type_val and menu_type_val.lower() != "all":
             qs = qs.filter(member_profiles__menu_type=menu_type_val)
+
+        # Allergy filter (Members page, multi-select): keep members whose dietary
+        # profile lists EVERY selected allergy (ALL/AND semantics). Values arrive
+        # as a comma-separated list of FoodAllergy codes (or repeated ?allergy=).
+        # ``food_allergies`` is a Postgres JSONField, so use the ``contains``
+        # lookup; because the stored data is mixed (mostly codes, a few labels)
+        # each selected code matches EITHER its code OR its label. Chaining one
+        # ``filter`` per allergy ANDs them together.
+        allergy_vals = [v.strip() for v in params.getlist("allergy") if v.strip()]
+        if not allergy_vals:
+            allergy_vals = [
+                v.strip() for v in (params.get("allergy") or "").split(",") if v.strip()
+            ]
+        if allergy_vals:
+            allergy_labels = dict(FoodAllergy.choices)
+            for code in allergy_vals:
+                label = allergy_labels.get(code, code)
+                qs = qs.filter(
+                    Q(member_profiles__food_allergies__contains=[code])
+                    | Q(member_profiles__food_allergies__contains=[label])
+                )
 
         # Created-date range filter (Members page): the member's own Client
         # record ``created_at``. This is a direct column on Client (no join), so
