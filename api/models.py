@@ -2658,6 +2658,17 @@ class TicketSource(models.TextChoices):
     OTHER = "other", "Other"
 
 
+class TicketOrigin(models.TextChoices):
+    """Who raised the ticket. Persisted on every ticket so the Work Queue can
+    tell auto-detected (import / daily-sync) tickets apart from ones an agent
+    created by hand. System is the default -- every automated path (the
+    ``open_ticket`` helper and the batch management commands) leaves it as-is;
+    the manual create path (``WorkQueueView.post``) explicitly sets AGENT."""
+
+    SYSTEM = "system", "System"
+    AGENT = "agent", "Agent"
+
+
 class TicketStatus(models.TextChoices):
     OPEN = "open", "Open"
     IN_PROGRESS = "in_progress", "In Progress"
@@ -2718,6 +2729,14 @@ class Ticket(models.Model):
     # system-raised tickets such as SYSTEM_CHANGE_DETECTED).
     source = models.CharField(
         max_length=20, choices=TicketSource.choices, blank=True, default=""
+    )
+    # Who raised the ticket: SYSTEM (import / daily-sync / batch commands) or
+    # AGENT (created by hand via the Work Queue). Defaults to SYSTEM so every
+    # automated path is correct without a code change; the manual create path
+    # sets AGENT explicitly.
+    origin = models.CharField(
+        max_length=10, choices=TicketOrigin.choices,
+        default=TicketOrigin.SYSTEM, db_index=True,
     )
     reason = models.TextField(blank=True)  # human-readable explanation
     client = models.ForeignKey(
