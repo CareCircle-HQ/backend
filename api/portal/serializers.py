@@ -797,6 +797,7 @@ class PortalTicketSerializer(serializers.ModelSerializer):
     case_code = serializers.SerializerMethodField()
     assignee = serializers.SerializerMethodField()
     assignee_id = serializers.SerializerMethodField()
+    origin = serializers.CharField(read_only=True)
     notes = PortalTicketNoteSerializer(many=True, read_only=True)
 
     class Meta:
@@ -804,8 +805,8 @@ class PortalTicketSerializer(serializers.ModelSerializer):
         fields = [
             "id", "code", "type", "type_label", "status", "status_label",
             "severity", "source", "source_label", "reason", "client_id",
-            "client_name", "case_code", "assignee", "assignee_id", "created_at",
-            "updated_at", "resolved_at", "notes",
+            "client_name", "case_code", "assignee", "assignee_id", "origin",
+            "created_at", "updated_at", "resolved_at", "notes",
         ]
 
     def get_code(self, obj):

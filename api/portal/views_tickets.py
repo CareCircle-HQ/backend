@@ -8,7 +8,7 @@ from django.utils import timezone
 from rest_framework import status as http
 from rest_framework.response import Response
 
-from ..models import Agent, Ticket, TicketNote, TicketType
+from ..models import Agent, Ticket, TicketNote, TicketOrigin, TicketType
 from ..services import timeline
 from .base import PortalAPIView, PortalGenericAPIView, current_agent
 from . import serializers as s
@@ -60,6 +60,12 @@ class WorkQueueView(PortalGenericAPIView):
         type_val = (p.get("type") or "").strip()
         if type_val and type_val.lower() not in ("all", "all types"):
             qs = qs.filter(type__code=type_val)
+        origin_val = (p.get("origin") or "").strip()
+        if origin_val and origin_val.lower() not in ("all", "all origins"):
+            qs = qs.filter(origin=origin_val)
+        source_val = (p.get("source") or "").strip()
+        if source_val and source_val.lower() not in ("all", "all sources"):
+            qs = qs.filter(source=source_val)
         mine = (p.get("mine") or "").strip().lower()
         if mine in ("1", "true", "yes"):
             agent = current_agent(self.request)
@@ -97,6 +103,7 @@ class WorkQueueView(PortalGenericAPIView):
             type=data["type"],
             severity=data.get("severity", "medium"),
             source=data.get("source", ""),
+            origin=TicketOrigin.AGENT,
             reason=data["reason"],
             client_id=data.get("client_id"),
             case_id=data.get("case_id"),
