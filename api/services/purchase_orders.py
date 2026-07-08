@@ -426,9 +426,9 @@ def split_purchase_order(po, delivery_order_ids, new_delivery_date):
 # Boxes export columns, in order.
 _BOX_EXPORT_HEADERS = [
     "Delivery Date", "OrderID", "HouseholdGroup", "PrimaryMemberID",
-    "PrimaryHousehold", "Quantity", "MemberID", "Name", "Address 1", "Address 2",
-    "City", "State", "Postal", "Delivery Notes", "MenuType", "FOOD NOTE",
-    "Email address", "Phone",
+    "PrimaryHousehold", "Quantity", "MemberID", "Name",
+    "Street Address", "Unit / Apt", "City", "State", "Zipcode",
+    "Delivery Notes", "MenuType", "FOOD NOTE", "Email address", "Phone",
 ]
 
 
@@ -450,6 +450,26 @@ def _member_address(client):
         if t in by_type:
             return by_type[t]
     return addrs[0]
+
+
+def _export_address(client):
+    """The address to put on the kitchen export for a member.
+
+    Source of truth is the member's active ``EnrollmentVerification.delivery_address``
+    -- the exact record captured on the verification pop-up, shown/edited on the
+    member profile Household tab, and used by the delivery-order serializer. Only
+    when the enrollment has no delivery address do we fall back to the member's
+    best standalone Address (legacy behavior), so we never regress to blank.
+    """
+    if client is None:
+        return None
+    # Lazy import to avoid a service <-> portal.serializers import cycle.
+    from api.portal.serializers import active_enrollment
+
+    enr = active_enrollment(client)
+    if enr is not None and enr.delivery_address is not None:
+        return enr.delivery_address
+    return _member_address(client)
 
 
 # Values that carry no dietary information and should be dropped from the note
@@ -608,7 +628,7 @@ def build_kitchen_export_rows(po):
     rows = []
     for do in orders:
         c = do.member
-        addr = _member_address(c)
+        addr = _export_address(c)
         name = (
             f"{c.first_name} {c.last_name}".strip() if c else ""
         )
