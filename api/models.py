@@ -308,6 +308,11 @@ class Client(models.Model):
         default=ClientStage.INACTIVE, db_index=True,
     )
     lifecycle_stage_at = models.DateTimeField(null=True, blank=True)
+    # Set when an agent DISREGARDS this member's pending verification. Suppresses
+    # the "run verification" button until a NEW request arrives from the ext (a
+    # governing pending enrollment), so a dismissed request can't be re-run
+    # straight from the CRM. Never blocks a live request.
+    verification_disregarded_at = models.DateTimeField(null=True, blank=True)
 
     # --- CRM Sync (External - GoHighLevel) ---
     crm_contact_id = models.CharField(max_length=64, blank=True, db_index=True)
@@ -1452,6 +1457,14 @@ class EnrollmentStage(models.TextChoices):
     # Retained for backward-compatibility with existing rows / cancellations;
     # not part of the verification wizard flow.
     CANCELLED = "cancelled", "Cancelled"
+    # A pending verification REQUEST an agent dismissed from the pop-up (the
+    # member shouldn't be verified -- e.g. requested in error). Non-terminal:
+    # the row is KEPT for history (dietary profiles, delivery address + case
+    # link preserved) but is excluded from lifecycle governance and the
+    # Verification list, so the member reverts to their pre-verification funnel
+    # stage. A fresh request (from the ext) creates a NEW enrollment. See
+    # api.services.lifecycle + api.portal.views_members.
+    DISREGARDED = "disregarded", "Disregarded"
 
 
 class DietaryRestriction(models.TextChoices):
@@ -1518,6 +1531,13 @@ class MemberStatus(models.TextChoices):
 
     ACTIVE = "active", "Active"
     OUT_OF_ORBIT = "out_of_orbit", "Out of Orbit"
+    # Set automatically when the member's DELIVERY or PRIMARY address ZIP is
+    # outside the service coverage area (the editable ExcludedZipCode list). Like
+    # OUT_OF_ORBIT, out-of-range members are excluded from all delivery schedules
+    # and Purchase Orders. Unlike Out of Orbit (a dietary/kitchen fulfillment
+    # block), Out of Range also opens a Case Closure ticket and holds the whole
+    # household -- see api.portal.views_members._enforce_delivery_coverage.
+    OUT_OF_RANGE = "out_of_range", "Out of Range"
     # Agent-initiated manual pause (requires a reason note). Like OUT_OF_ORBIT,
     # paused members are excluded from all delivery schedules and Purchase
     # Orders until an agent unpauses them (which re-runs the meal rule).
@@ -1530,17 +1550,20 @@ class MemberStatus(models.TextChoices):
 
 
 # Member statuses that exclude a member from every delivery schedule / order /
-# Purchase Order: OUT_OF_ORBIT (meal rule can't fulfill them), PAUSED (agent
-# manually paused them) and INACTIVE (service ended). Only ACTIVE members
-# receive deliveries.
+# Purchase Order: OUT_OF_ORBIT (meal rule can't fulfill them), OUT_OF_RANGE
+# (delivery/primary ZIP outside coverage), PAUSED (agent manually paused them)
+# and INACTIVE (service ended). Only ACTIVE members receive deliveries.
 SERVICE_EXCLUDED_MEMBER_STATUSES = (
     MemberStatus.OUT_OF_ORBIT,
+    MemberStatus.OUT_OF_RANGE,
     MemberStatus.PAUSED,
     MemberStatus.INACTIVE,
 )
 
 # Enrollment stages that exclude a whole household from Purchase Order / delivery
-# generation: ON_HOLD (temporarily paused) plus the terminal stages
+# generation: ON_HOLD (a problem was detected and the case is under review, and
+# may be heading to closure -- distinct from a benign, temporary MemberStatus.PAUSED)
+# plus the terminal stages
 # SERVICE_COMPLETE / CLOSED / CANCELLED (service has ended -- e.g. a cancelled /
 # off-boarded household must never appear on a new PO or delivery).
 SERVICE_EXCLUDED_ENROLLMENT_STAGES = (
@@ -1714,11 +1737,14 @@ class EnrollmentVerification(models.Model):
             models.Index(fields=["household", "stage"]),
         ]
         constraints = [
-            # At most one verification per (navigation) case. Renewals reuse the
-            # same row, so this never blocks a renewal. NULL case is unconstrained.
+            # At most one LIVE verification per (navigation) case. Renewals reuse
+            # the same row, so this never blocks a renewal. Disregarded and
+            # cancelled rows are kept for history and excluded here, so a fresh
+            # request can reuse the same case. NULL case is unconstrained.
             models.UniqueConstraint(
                 fields=["case"],
-                condition=models.Q(case__isnull=False),
+                condition=models.Q(case__isnull=False)
+                & ~models.Q(stage__in=["disregarded", "cancelled"]),
                 name="uniq_enrollment_verification_per_case",
             ),
         ]
@@ -1780,6 +1806,10 @@ class MemberDietaryProfile(models.Model):
     general_verification_notes = models.TextField(blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
+    # When ``status`` last changed (e.g. Active -> Out of Orbit / Paused).
+    # Distinct from ``updated_at`` (any edit); stamped in ``save()`` only when the
+    # status value actually flips, so the UI can show "Paused/Out of Orbit since".
+    status_changed_at = models.DateTimeField(null=True, blank=True)
 
     class Meta:
         ordering = ["created_at"]
@@ -1792,6 +1822,25 @@ class MemberDietaryProfile(models.Model):
         indexes = [
             models.Index(fields=["enrollment"]),
         ]
+
+    @classmethod
+    def from_db(cls, db, field_names, values):
+        instance = super().from_db(db, field_names, values)
+        # Remember the persisted status so save() can detect a change without an
+        # extra query.
+        instance._loaded_status = instance.status
+        return instance
+
+    def save(self, *args, **kwargs):
+        loaded = getattr(self, "_loaded_status", None)
+        changed = self._state.adding or loaded is None or loaded != self.status
+        if changed:
+            self.status_changed_at = timezone.now()
+            update_fields = kwargs.get("update_fields")
+            if update_fields is not None and "status_changed_at" not in update_fields:
+                kwargs["update_fields"] = list(update_fields) + ["status_changed_at"]
+        super().save(*args, **kwargs)
+        self._loaded_status = self.status
 
     def __str__(self):
         return f"Dietary profile for {self.member_name or self.client_id} (enrollment {self.enrollment_id})"
@@ -2809,6 +2858,7 @@ class TimelineEventType(models.TextChoices):
     TICKET_CREATED = "ticket_created", "New Ticket Created"
     DELIVERY_ADDRESS_CHANGED = "delivery_address_changed", "Delivery Address Changed"
     OUT_OF_ORBIT = "out_of_orbit", "Out of Orbit"
+    OUT_OF_RANGE = "out_of_range", "Out of Range"
     MEMBER_REACTIVATED = "member_reactivated", "Member Reactivated"
     MEMBER_PAUSED = "member_paused", "Member Paused"
     MEMBER_UNPAUSED = "member_unpaused", "Member Unpaused"
@@ -2817,6 +2867,8 @@ class TimelineEventType(models.TextChoices):
     # emitted by the timeline service (a data migration remaps old rows). ---
     VERIFICATION = "verification", "Verification"
     SERVICE = "service", "Service"
+    # A pending verification request was disregarded (dismissed) by an agent.
+    VERIFICATION_DISREGARDED = "verification_disregarded", "Verification Disregarded"
 
 
 class TimelineBadgeTone(models.TextChoices):

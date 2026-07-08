@@ -4,7 +4,7 @@ from django.urls import include, path
 from rest_framework.routers import SimpleRouter
 
 from .auth import PortalRequestCodeView, PortalVerifyCodeView
-from .views_dashboard import DashboardView
+from .views_dashboard import DashboardServingListView, DashboardView
 from .views_leads import (
     PortalLeadDetailView,
     PortalLeadNotesView,
@@ -15,6 +15,7 @@ from .views_leads import (
 from .views_members import (
     BulkAssignBoxesView,
     BulkAssignMealsView,
+    FoodAllergiesListView,
     HouseholdMemberEditView,
     MemberAssignKitchenView,
     MemberCadenceView,
@@ -43,6 +44,7 @@ from .views_members import (
     MemberSocialCoverageView,
     MemberTicketsView,
     MemberVerificationCreateView,
+    MemberVerificationDisregardView,
     MembersListView,
     MembersStatsView,
     MenuTypesListView,
@@ -117,6 +119,7 @@ urlpatterns = [
     path("members/", MembersListView.as_view(), name="portal-members"),
     path("members/stats/", MembersStatsView.as_view(), name="portal-members-stats"),
     path("menu-types/", MenuTypesListView.as_view(), name="portal-menu-types"),
+    path("food-allergies/", FoodAllergiesListView.as_view(), name="portal-food-allergies"),
     path("members/<uuid:client_id>/", MemberDetailView.as_view(), name="portal-member-detail"),
     path("members/<uuid:client_id>/insurance/", MemberInsuranceView.as_view()),
     path("members/<uuid:client_id>/social-coverage/", MemberSocialCoverageView.as_view()),
@@ -163,6 +166,10 @@ urlpatterns = [
     ),
     path("members/<uuid:client_id>/tickets/", MemberTicketsView.as_view()),
     path("members/<uuid:client_id>/verification/", MemberVerificationCreateView.as_view()),
+    path(
+        "members/<uuid:client_id>/verification/disregard/",
+        MemberVerificationDisregardView.as_view(),
+    ),
     path("members/<uuid:client_id>/diagnostic/", MemberDiagnosticView.as_view()),
 
     # Work queue (global tickets)
@@ -249,6 +256,11 @@ urlpatterns = [
 
     # Dashboard
     path("dashboard/", DashboardView.as_view(), name="portal-dashboard"),
+    path(
+        "dashboard/serving/<str:reason>/",
+        DashboardServingListView.as_view(),
+        name="portal-dashboard-serving-list",
+    ),
 
     # Settings CRUD viewsets
     path("", include(router.urls)),

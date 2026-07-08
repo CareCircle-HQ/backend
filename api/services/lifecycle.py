@@ -154,6 +154,9 @@ _ENROLLMENT_RANK = {
     EnrollmentStage.ON_HOLD: 8,
     EnrollmentStage.CLOSED: 0,
     EnrollmentStage.CANCELLED: 0,
+    # Disregarded rows are excluded from governance entirely (see
+    # _governing_enrollments); ranked 0 as a defensive fallback.
+    EnrollmentStage.DISREGARDED: 0,
     EnrollmentStage.PENDING_VALIDATION: 1,
     EnrollmentStage.VALIDATED: 2,
     EnrollmentStage.PENDING_VERIFICATION: 3,
@@ -194,7 +197,10 @@ def _governing_enrollments(client):
         enr = mp.enrollment
         if enr is not None:
             seen.setdefault(enr.pk, enr)
-    return list(seen.values())
+    # A DISREGARDED enrollment is a dismissed verification request kept only for
+    # history: it must never govern the client's stage, so the member reverts to
+    # their pre-verification funnel stage and leaves the Verification page.
+    return [e for e in seen.values() if e.stage != EnrollmentStage.DISREGARDED]
 
 
 def _primary_enrollment(client):
@@ -244,6 +250,30 @@ def verification_completed(client):
     return any(
         e.verified_at is not None for e in _governing_enrollments(client)
     )
+
+
+def governing_pending_enrollment(client):
+    """A governing enrollment sitting at ``PENDING_VERIFICATION`` (and not yet
+    verified), else None.
+
+    Scans ALL of the client's governing enrollments -- their own, their
+    household's, and any linked via a MemberDietaryProfile -- rather than only
+    the single most-advanced one. A member may now hold several enrollments, so
+    the pending request that puts them on the Verification page is not
+    necessarily the highest-ranked (``_primary_enrollment``) row. A CRM action
+    -- e.g. disregarding a request -- must target whichever governing enrollment
+    is actually pending. When more than one qualifies, the most recently
+    requested/updated wins.
+    """
+    candidates = [
+        e
+        for e in _governing_enrollments(client)
+        if e.verified_at is None
+        and EnrollmentStage(e.stage) == EnrollmentStage.PENDING_VERIFICATION
+    ]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda e: e.stage_at or e.opened_at)
 
 
 def derive_client_stage(client):
@@ -382,6 +412,8 @@ ENROLLMENT_TRANSITIONS = {
         EnrollmentStage.VERIFIED,
         EnrollmentStage.ON_HOLD,
         EnrollmentStage.CANCELLED,
+        # An agent can disregard (dismiss) a pending verification request.
+        EnrollmentStage.DISREGARDED,
     },
     EnrollmentStage.VERIFIED: {
         # An approved authorization advances a verified household to Kitchen
@@ -416,6 +448,11 @@ ENROLLMENT_TRANSITIONS = {
     },
     EnrollmentStage.CLOSED: set(),
     EnrollmentStage.CANCELLED: set(),
+    # Disregarded is non-terminal: a re-request moves it back to pending
+    # verification (the ext normally creates a fresh enrollment instead).
+    EnrollmentStage.DISREGARDED: {
+        EnrollmentStage.PENDING_VERIFICATION,
+    },
 }
 
 # Stages that require a passing process before they can be entered.

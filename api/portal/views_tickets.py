@@ -70,9 +70,12 @@ class WorkQueueView(PortalGenericAPIView):
         if mine in ("1", "true", "yes"):
             agent = current_agent(self.request)
             qs = qs.filter(assigned_to=agent) if agent else qs.none()
-        # Filter by a specific assignee (manager view: inspect one agent's queue).
+        # Filter by a specific assignee (manager view: inspect one agent's queue),
+        # or the "unassigned" sentinel to surface tickets nobody owns yet.
         assignee_val = (p.get("assignee") or "").strip()
-        if assignee_val:
+        if assignee_val.lower() == "unassigned":
+            qs = qs.filter(assigned_to__isnull=True)
+        elif assignee_val:
             qs = qs.filter(assigned_to_id=assignee_val)
         # Date-created range (inclusive). ``created_at`` is a datetime; ``__date``
         # extraction uses the active timezone (America/New_York), so the window
