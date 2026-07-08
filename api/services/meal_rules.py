@@ -144,12 +144,17 @@ def apply_to_member(profile, *, save=True):
     from api.services.service_area import profile_excluded_zip
 
     result = resolve_kitchen_meal(profile.menu_type, profile.food_allergies)
-    was_out = profile.status == MemberStatus.OUT_OF_ORBIT
-    # Delivery Coverage takes priority: an out-of-area delivery ZIP forces Out
-    # of Orbit even when the meal rule alone could fulfill the member.
-    out = bool(profile_excluded_zip(profile)) or result.out_of_orbit
+    was_out = profile.status in (MemberStatus.OUT_OF_ORBIT, MemberStatus.OUT_OF_RANGE)
+    # Delivery Coverage takes priority: an out-of-area delivery/primary ZIP forces
+    # the member out of service even when the meal rule alone could fulfill them.
+    # A ZIP outside coverage is Out of Range (a distinct status); a dietary/kitchen
+    # fulfillment failure is Out of Orbit.
+    zip_excluded = bool(profile_excluded_zip(profile))
+    out = zip_excluded or result.out_of_orbit
     if out:
-        profile.status = MemberStatus.OUT_OF_ORBIT
+        profile.status = (
+            MemberStatus.OUT_OF_RANGE if zip_excluded else MemberStatus.OUT_OF_ORBIT
+        )
         profile.kitchen_meal_type = ""
         profile.kitchen_food_notes = ""
     else:
@@ -189,14 +194,17 @@ def reconcile_member_kitchen_output(profile, kitchen=None, *, offered=None, save
     )
     from api.services.service_area import SERVICE_AREA_REASON, profile_excluded_zip
 
-    was_out = profile.status == MemberStatus.OUT_OF_ORBIT
+    was_out = profile.status in (MemberStatus.OUT_OF_ORBIT, MemberStatus.OUT_OF_RANGE)
     out, reason, meal_type, notes = False, "", "", ""
+    # A ZIP outside coverage is Out of Range (a distinct status); every other
+    # exclusion below is a dietary/kitchen fulfillment block -> Out of Orbit.
+    out_of_range = False
 
     # Delivery Coverage Eligibility Check (highest priority): a member whose
-    # delivery ZIP is outside the coverage area is Out of Orbit regardless of
-    # their menu/allergy fulfillment, and stays that way across re-runs.
+    # delivery/primary ZIP is outside the coverage area is Out of Range regardless
+    # of their menu/allergy fulfillment, and stays that way across re-runs.
     if profile_excluded_zip(profile):
-        out, reason = True, SERVICE_AREA_REASON
+        out, reason, out_of_range = True, SERVICE_AREA_REASON, True
     elif not (profile.menu_type or "").strip():
         out, reason = True, "No menu type assigned yet."
     else:
@@ -241,7 +249,9 @@ def reconcile_member_kitchen_output(profile, kitchen=None, *, offered=None, save
             out, reason = True, MENU_ALLERGY_REASON
 
     if out:
-        profile.status = MemberStatus.OUT_OF_ORBIT
+        profile.status = (
+            MemberStatus.OUT_OF_RANGE if out_of_range else MemberStatus.OUT_OF_ORBIT
+        )
         profile.kitchen_meal_type = ""
         profile.kitchen_food_notes = ""
     else:

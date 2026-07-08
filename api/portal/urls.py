@@ -4,7 +4,7 @@ from django.urls import include, path
 from rest_framework.routers import SimpleRouter
 
 from .auth import PortalRequestCodeView, PortalVerifyCodeView
-from .views_dashboard import DashboardView
+from .views_dashboard import DashboardServingListView, DashboardView
 from .views_leads import (
     PortalLeadDetailView,
     PortalLeadNotesView,
@@ -44,6 +44,7 @@ from .views_members import (
     MemberSocialCoverageView,
     MemberTicketsView,
     MemberVerificationCreateView,
+    MemberVerificationDisregardView,
     MembersListView,
     MembersStatsView,
     MenuTypesListView,
@@ -165,6 +166,10 @@ urlpatterns = [
     ),
     path("members/<uuid:client_id>/tickets/", MemberTicketsView.as_view()),
     path("members/<uuid:client_id>/verification/", MemberVerificationCreateView.as_view()),
+    path(
+        "members/<uuid:client_id>/verification/disregard/",
+        MemberVerificationDisregardView.as_view(),
+    ),
     path("members/<uuid:client_id>/diagnostic/", MemberDiagnosticView.as_view()),
 
     # Work queue (global tickets)
@@ -251,6 +256,11 @@ urlpatterns = [
 
     # Dashboard
     path("dashboard/", DashboardView.as_view(), name="portal-dashboard"),
+    path(
+        "dashboard/serving/<str:reason>/",
+        DashboardServingListView.as_view(),
+        name="portal-dashboard-serving-list",
+    ),
 
     # Settings CRUD viewsets
     path("", include(router.urls)),

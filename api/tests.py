@@ -616,7 +616,7 @@ class DeliveryCoverageEligibilityTest(TestCase):
             status=status or MemberStatus.ACTIVE,
         )
 
-    def test_reconcile_out_of_orbit_for_excluded_zip(self):
+    def test_reconcile_out_of_range_for_excluded_zip(self):
         from .models import MemberStatus
         from .services.meal_rules import reconcile_member_kitchen_output
         from .services.service_area import SERVICE_AREA_REASON
@@ -626,7 +626,7 @@ class DeliveryCoverageEligibilityTest(TestCase):
         self.assertTrue(out)
         self.assertEqual(reason, SERVICE_AREA_REASON)
         mv.refresh_from_db()
-        self.assertEqual(mv.status, MemberStatus.OUT_OF_ORBIT)
+        self.assertEqual(mv.status, MemberStatus.OUT_OF_RANGE)
 
     def test_reconcile_active_for_serviceable_zip(self):
         from .models import MemberStatus
@@ -653,45 +653,110 @@ class DeliveryCoverageEligibilityTest(TestCase):
         mv2 = self._profile("10001", primary_zip="11209")
         _enforce_delivery_coverage(mv2.enrollment, None)
         mv2.refresh_from_db()
-        self.assertEqual(mv2.status, MemberStatus.OUT_OF_ORBIT)
+        self.assertEqual(mv2.status, MemberStatus.OUT_OF_RANGE)
         note = Note.objects.filter(client=mv2.client, source=NoteSource.SYSTEM).first()
         self.assertIsNotNone(note)
         self.assertIn("primary address", note.body)
         self.assertIn("11209", note.body)
 
-    def test_enforce_sets_out_of_orbit_with_note_and_event(self):
-        from .models import MemberStatus, Note, NoteSource, TimelineEvent
+    def test_enforce_sets_out_of_range_with_note_ticket_hold_and_event(self):
+        from .models import (
+            EnrollmentStage, MemberStatus, Note, NoteSource, Ticket,
+            TicketStatus, TicketTypeCode, TimelineEvent,
+        )
         from .portal.views_members import _enforce_delivery_coverage
 
         mv = self._profile("11209")
         result = _enforce_delivery_coverage(mv.enrollment, None)
-        self.assertEqual(len(result["out_of_orbit"]), 1)
+        self.assertEqual(len(result["out_of_range"]), 1)
         mv.refresh_from_db()
-        self.assertEqual(mv.status, MemberStatus.OUT_OF_ORBIT)
+        self.assertEqual(mv.status, MemberStatus.OUT_OF_RANGE)
         note = Note.objects.filter(client=mv.client, source=NoteSource.SYSTEM).first()
         self.assertIsNotNone(note)
         self.assertIn("11209", note.body)
         self.assertTrue(
             TimelineEvent.objects.filter(
-                client=mv.client, event_type="out_of_orbit"
+                client=mv.client, event_type="out_of_range"
             ).exists()
         )
+        # A Case Closure ticket was opened on the household primary...
+        ticket = Ticket.objects.filter(
+            client=mv.client, type__code=TicketTypeCode.CASE_CLOSURE,
+        ).exclude(status=TicketStatus.RESOLVED).first()
+        self.assertIsNotNone(ticket)
+        self.assertIn("11209", ticket.reason)
+        # ...and the whole household was placed On Hold.
+        mv.enrollment.refresh_from_db()
+        self.assertEqual(
+            EnrollmentStage(mv.enrollment.stage), EnrollmentStage.ON_HOLD
+        )
 
-    def test_enforce_does_not_override_paused(self):
-        from .models import MemberStatus
+    def test_reactivate_resolves_ticket_and_resumes_hold(self):
+        from .models import (
+            EnrollmentStage, MemberStatus, Ticket, TicketStatus, TicketTypeCode,
+        )
         from .portal.views_members import _enforce_delivery_coverage
 
-        mv = self._profile("11209", status=MemberStatus.PAUSED)
+        # Excluded ZIP -> Out of Range + ticket + hold.
+        mv = self._profile("11209")
         _enforce_delivery_coverage(mv.enrollment, None)
+        # Fix the ZIP to a serviceable one and re-run with reactivation.
+        addr = mv.enrollment.delivery_address
+        addr.zip = "10001"
+        addr.save(update_fields=["zip"])
+        _enforce_delivery_coverage(mv.enrollment, None, allow_reactivate=True)
         mv.refresh_from_db()
-        self.assertEqual(mv.status, MemberStatus.PAUSED)
+        self.assertEqual(mv.status, MemberStatus.ACTIVE)
+        # Ticket resolved + hold resumed.
+        open_tickets = Ticket.objects.filter(
+            client=mv.client, type__code=TicketTypeCode.CASE_CLOSURE,
+        ).exclude(status=TicketStatus.RESOLVED)
+        self.assertFalse(open_tickets.exists())
+        mv.enrollment.refresh_from_db()
+        self.assertNotEqual(
+            EnrollmentStage(mv.enrollment.stage), EnrollmentStage.ON_HOLD
+        )
+
+    def test_out_of_range_flags_every_non_terminal_household_member(self):
+        # An out-of-range DELIVERY ZIP is a household-wide geographic block: every
+        # non-terminal member (Active, manually Paused, Out of Orbit) is set Out of
+        # Range so each is individually excluded from POs/deliveries and countable.
+        # Only terminal INACTIVE members are left alone.
+        from .models import (
+            Client, HouseholdMember, MemberDietaryProfile, MemberStatus,
+        )
+        from .portal.views_members import _enforce_delivery_coverage
+
+        primary = self._profile("11209")  # excluded delivery ZIP, Active
+        enr, hh = primary.enrollment, primary.enrollment.household
+
+        def _add_member(status):
+            c = Client.objects.create(
+                client_id=str(uuid.uuid4()), first_name="Dep", last_name="Endent",
+            )
+            HouseholdMember.objects.create(household=hh, client=c, is_primary=False)
+            return MemberDietaryProfile.objects.create(
+                enrollment=enr, client=c, menu_type="Standard", status=status,
+            )
+
+        paused = _add_member(MemberStatus.PAUSED)
+        orbit = _add_member(MemberStatus.OUT_OF_ORBIT)
+        inactive = _add_member(MemberStatus.INACTIVE)
+
+        _enforce_delivery_coverage(enr, None)
+
+        for mv in (primary, paused, orbit):
+            mv.refresh_from_db()
+            self.assertEqual(mv.status, MemberStatus.OUT_OF_RANGE)
+        inactive.refresh_from_db()
+        self.assertEqual(inactive.status, MemberStatus.INACTIVE)  # terminal, untouched
 
     def test_reactivate_when_zip_becomes_serviceable(self):
         from .models import MemberStatus
         from .portal.views_members import _enforce_delivery_coverage
 
-        # Out of Orbit at a now-serviceable ZIP + fulfillable menu -> Active.
-        mv = self._profile("10001", status=MemberStatus.OUT_OF_ORBIT)
+        # Out of Range at a now-serviceable ZIP + fulfillable menu -> Active.
+        mv = self._profile("10001", status=MemberStatus.OUT_OF_RANGE)
         _enforce_delivery_coverage(mv.enrollment, None, allow_reactivate=True)
         mv.refresh_from_db()
         self.assertEqual(mv.status, MemberStatus.ACTIVE)
@@ -872,3 +937,277 @@ class ProductKindResolverTest(SimpleTestCase):
                                program_name="Housing", service_type="Housing")
         enr = self._enr(program_name="", case=case, schedules=None)
         self.assertIsNone(product_kind_for_enrollment(enr))
+
+
+class VerificationDisregardTest(TestCase):
+    """POST /api/portal/members/<id>/verification/disregard/ moves a pending
+    request to the non-terminal DISREGARDED stage, reverting the member out of
+    the verification window while KEEPING the row (profiles, address, case) as
+    history."""
+
+    def setUp(self):
+        self.agent = Agent.objects.create(
+            name="Vera Verifier", agent_code="900", group="Verifiers"
+        )
+        access = AccessToken()
+        access["agent_id"] = str(self.agent.id)
+        access["agent_code"] = self.agent.agent_code
+        access["agent_name"] = self.agent.name
+        access["agent_group"] = self.agent.group
+        self.api = APIClient()
+        self.api.credentials(HTTP_AUTHORIZATION=f"Bearer {access}")
+
+    def _client(self, first="Pat", last="Primary"):
+        return Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name=first, last_name=last
+        )
+
+    def _pending_enrollment(self, client, *, case=None, with_profile=True):
+        from .models import (
+            Address,
+            EnrollmentStage,
+            EnrollmentVerification,
+            MemberDietaryProfile,
+        )
+
+        addr = Address.objects.create(client=client, type="delivery", street="1 Main St")
+        enr = EnrollmentVerification.objects.create(
+            client=client,
+            case=case,
+            stage=EnrollmentStage.PENDING_VERIFICATION,
+            delivery_address=addr,
+        )
+        if with_profile:
+            MemberDietaryProfile.objects.create(enrollment=enr, client=client)
+        # Put the client into the verification window.
+        from .services.lifecycle import recompute_client_stage
+        recompute_client_stage(client)
+        return enr, addr
+
+    def _url(self, client):
+        return f"/api/portal/members/{client.client_id}/verification/disregard/"
+
+    def test_disregard_reverts_stage_and_keeps_data(self):
+        from .models import (
+            ClientStage,
+            EnrollmentStage,
+            MemberDietaryProfile,
+            TimelineEvent,
+            TimelineEventType,
+        )
+
+        client = self._client()
+        enr, addr = self._pending_enrollment(client)
+        client.refresh_from_db()
+        self.assertEqual(client.lifecycle_stage, ClientStage.PENDING_VERIFICATION)
+
+        resp = self.api.post(self._url(client), {"reason": "Requested in error"}, format="json")
+        self.assertEqual(resp.status_code, 200, resp.content)
+
+        enr.refresh_from_db()
+        client.refresh_from_db()
+        self.assertEqual(enr.stage, EnrollmentStage.DISREGARDED)
+        # Row + its data are kept.
+        self.assertIsNone(enr.closed_at)
+        self.assertIsNotNone(enr.delivery_address_id)
+        self.assertTrue(MemberDietaryProfile.objects.filter(enrollment=enr).exists())
+        self.assertIn("Requested in error", enr.note)
+        # Client reverts OUT of the verification window.
+        self.assertNotEqual(client.lifecycle_stage, ClientStage.PENDING_VERIFICATION)
+        # Timeline event carries the reason.
+        ev = TimelineEvent.objects.filter(
+            client=client, event_type=TimelineEventType.VERIFICATION_DISREGARDED
+        ).first()
+        self.assertIsNotNone(ev)
+        self.assertIn("Requested in error", ev.subtitle)
+
+    def test_reason_required(self):
+        client = self._client()
+        self._pending_enrollment(client)
+        resp = self.api.post(self._url(client), {"reason": "   "}, format="json")
+        self.assertEqual(resp.status_code, 400, resp.content)
+
+    def test_disregard_stage_only_pending_client_without_enrollment(self):
+        # Many members are Pending Verification purely via lifecycle_stage (set by
+        # the data import) with NO EnrollmentVerification row. Disregard must still
+        # work: revert the client's stage out of the verification window.
+        from .models import ClientStage, TimelineEvent, TimelineEventType
+
+        client = self._client()
+        client.lifecycle_stage = ClientStage.PENDING_VERIFICATION
+        client.save(update_fields=["lifecycle_stage"])
+
+        resp = self.api.post(self._url(client), {"reason": "Imported in error"}, format="json")
+        self.assertEqual(resp.status_code, 200, resp.content)
+
+        client.refresh_from_db()
+        self.assertNotEqual(client.lifecycle_stage, ClientStage.PENDING_VERIFICATION)
+        ev = TimelineEvent.objects.filter(
+            client=client, event_type=TimelineEventType.VERIFICATION_DISREGARDED
+        ).first()
+        self.assertIsNotNone(ev)
+        self.assertIn("Imported in error", ev.subtitle)
+
+    def test_button_visibility_follows_pending_request(self):
+        # The Verification button shows ONLY while a pending request exists. After
+        # a disregard there is none, so it hides; a fresh request shows it again.
+        from .models import EnrollmentStage, EnrollmentVerification
+        from .portal.serializers import verification_pending
+
+        client = self._client()
+        self._pending_enrollment(client)
+        self.assertTrue(verification_pending(client))
+
+        resp = self.api.post(self._url(client), {"reason": "dupe"}, format="json")
+        self.assertEqual(resp.status_code, 200, resp.content)
+        client.refresh_from_db()
+        self.assertIsNotNone(client.verification_disregarded_at)  # audit stamp
+        self.assertFalse(verification_pending(client))  # button hides
+
+        # A fresh request from the ext shows the button again.
+        EnrollmentVerification.objects.create(
+            client=client, stage=EnrollmentStage.PENDING_VERIFICATION
+        )
+        self.assertTrue(verification_pending(client))
+
+    def test_rejects_when_no_pending_request(self):
+        from .models import EnrollmentStage
+        from .services.lifecycle import advance_enrollment
+
+        client = self._client()
+        enr, _ = self._pending_enrollment(client)
+        advance_enrollment(enr, EnrollmentStage.VERIFIED, force=True)
+        resp = self.api.post(self._url(client), {"reason": "x"}, format="json")
+        self.assertEqual(resp.status_code, 409, resp.content)
+
+    def test_same_case_can_be_re_requested_after_disregard(self):
+        # Keeping the case on the disregarded row must NOT block a fresh live
+        # enrollment for the same case (constraint excludes disregarded rows).
+        from .models import CaseType, Case, EnrollmentStage, EnrollmentVerification
+
+        client = self._client()
+        case = Case.objects.create(
+            case_id=str(uuid.uuid4()), client=client, case_type=CaseType.INTERNAL_SERVICE,
+        )
+        enr, _ = self._pending_enrollment(client, case=case)
+        resp = self.api.post(self._url(client), {"reason": "dupe"}, format="json")
+        self.assertEqual(resp.status_code, 200, resp.content)
+        enr.refresh_from_db()
+        self.assertEqual(enr.stage, EnrollmentStage.DISREGARDED)
+        self.assertEqual(enr.case_id, case.case_id)  # case link preserved
+
+        # A new LIVE enrollment on the same case is allowed.
+        fresh = EnrollmentVerification.objects.create(
+            client=client, case=case, stage=EnrollmentStage.PENDING_VERIFICATION,
+        )
+        self.assertEqual(
+            EnrollmentVerification.objects.filter(case=case).count(), 2
+        )
+        self.assertNotEqual(fresh.pk, enr.pk)
+
+
+class DashboardServingClientIdsTests(TestCase):
+    """serving_client_ids() is the single source of truth for both the dashboard
+    counts and the drill-down list. These cover the reasons whose membership rules
+    are non-obvious: Services Paused (member Paused OR household On Hold) and the
+    insurance/social-coverage watchlist. Uses all-time (start=None), a live
+    snapshot over every member profile."""
+
+    def _member(self, *, status=None, stage=None):
+        from .models import (
+            Client, EnrollmentStage, EnrollmentVerification, Household,
+            HouseholdMember, MemberDietaryProfile, MemberStatus,
+        )
+
+        client = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Dash", last_name="Board",
+        )
+        hh = Household.objects.create(name="HH")
+        HouseholdMember.objects.create(household=hh, client=client, is_primary=True)
+        enr = EnrollmentVerification.objects.create(
+            client=client, household=hh,
+            stage=stage or EnrollmentStage.KITCHEN_ASSIGNMENT,
+        )
+        MemberDietaryProfile.objects.create(
+            enrollment=enr, client=client, menu_type="Standard",
+            status=status or MemberStatus.ACTIVE,
+        )
+        return client
+
+    def test_services_paused_covers_member_paused_and_household_on_hold(self):
+        from .models import EnrollmentStage, MemberStatus
+        from .portal.views_dashboard import serving_client_ids
+
+        paused = self._member(status=MemberStatus.PAUSED)
+        on_hold = self._member(stage=EnrollmentStage.ON_HOLD)  # status Active
+        active = self._member()
+
+        ids = serving_client_ids("services_paused", start=None, end=None)
+        self.assertIn(paused.client_id, ids)
+        self.assertIn(on_hold.client_id, ids)
+        self.assertNotIn(active.client_id, ids)
+
+    def test_no_insurance_clears_when_active_plan_added(self):
+        from .models import Insurance, InsurancePlanType, RecordStatus
+        from .portal.views_dashboard import serving_client_ids
+
+        c = self._member()
+        self.assertIn(
+            c.client_id, serving_client_ids("no_insurance", start=None, end=None)
+        )
+        Insurance.objects.create(
+            client=c, plan_type=InsurancePlanType.MEDICAID,
+            status=RecordStatus.ACTIVE,
+        )
+        self.assertNotIn(
+            c.client_id, serving_client_ids("no_insurance", start=None, end=None)
+        )
+
+    def test_no_social_coverage_clears_when_enrolled_coverage_added(self):
+        from .models import SocialCareCoverage, SocialCareCoverageStatus
+        from .portal.views_dashboard import serving_client_ids
+
+        c = self._member()
+        self.assertIn(
+            c.client_id,
+            serving_client_ids("no_social_coverage", start=None, end=None),
+        )
+        SocialCareCoverage.objects.create(
+            client=c, status=SocialCareCoverageStatus.ENROLLED,
+        )
+        self.assertNotIn(
+            c.client_id,
+            serving_client_ids("no_social_coverage", start=None, end=None),
+        )
+
+    def test_insurance_expiring_only_flags_active_medicaid_within_30_days(self):
+        from datetime import timedelta
+
+        from django.utils import timezone
+
+        from .models import Insurance, InsurancePlanType, RecordStatus
+        from .portal.views_dashboard import serving_client_ids
+
+        soon = self._member()
+        Insurance.objects.create(
+            client=soon, plan_type=InsurancePlanType.MEDICAID,
+            status=RecordStatus.ACTIVE,
+            expired_at=timezone.now() + timedelta(days=10),
+        )
+        far = self._member()
+        Insurance.objects.create(
+            client=far, plan_type=InsurancePlanType.MEDICAID,
+            status=RecordStatus.ACTIVE,
+            expired_at=timezone.now() + timedelta(days=200),
+        )
+        commercial = self._member()
+        Insurance.objects.create(
+            client=commercial, plan_type=InsurancePlanType.COMMERCIAL,
+            status=RecordStatus.ACTIVE,
+            expired_at=timezone.now() + timedelta(days=10),
+        )
+
+        ids = serving_client_ids("insurance_expiring", start=None, end=None)
+        self.assertIn(soon.client_id, ids)
+        self.assertNotIn(far.client_id, ids)         # expires too far out
+        self.assertNotIn(commercial.client_id, ids)  # not Medicaid

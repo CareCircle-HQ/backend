@@ -21,6 +21,7 @@ from ..models import (
     Client,
     ClientPhone,
     ClientPhoneSource,
+    ClientStage,
     DeliveryCadence,
     EnrollmentStage,
     EnrollmentVerification,
@@ -38,7 +39,14 @@ from ..models import (
     ServiceAuthorizationStatus,
     StageEvent,
     Ticket,
+    TicketSeverity,
+    TicketSource,
+    TicketStatus,
+    TicketType,
+    TicketTypeCode,
+    TimelineBadgeTone,
     TimelineEvent,
+    TimelineEventType,
 )
 from ..views_phones import _phone_dict
 from ..services.catalog import (
@@ -66,7 +74,12 @@ from ..services.kitchens import (
     serving_kitchens_for_member,
 )
 from ..services.meal_rules import reconcile_member_kitchen_output, resolve_kitchen_meal
-from ..services.lifecycle import InvalidTransition, advance_enrollment
+from ..services.lifecycle import (
+    InvalidTransition,
+    advance_enrollment,
+    governing_pending_enrollment,
+    recompute_client_stage,
+)
 from ..services import timeline
 from ..serializers import (
     add_client_to_household,
@@ -99,27 +112,136 @@ def _agent_actor(agent):
     return ""
 
 
+# Marker prefix on the auto-generated Out-of-Range Case Closure ticket's reason,
+# used to find (and later resolve) the ticket THIS process opened without
+# clobbering an unrelated Case Closure ticket an agent raised by hand.
+_OUT_OF_RANGE_TICKET_MARKER = "Out-of-range ZIP code:"
+
+
+def _case_closure_ticket_type():
+    """The Case Closure TicketType (seeded on the fly if not present)."""
+    obj, _ = TicketType.objects.get_or_create(
+        code=TicketTypeCode.CASE_CLOSURE,
+        defaults={"label": TicketTypeCode.CASE_CLOSURE.label},
+    )
+    return obj
+
+
+def _open_out_of_range_ticket(enrollment, reason):
+    """Open a Case Closure ticket on the household primary for an out-of-range
+    ZIP unless an unresolved out-of-range one already exists. Returns True if a
+    ticket was created."""
+    client = getattr(enrollment, "client", None)
+    if client is None:
+        return False
+    type_obj = _case_closure_ticket_type()
+    exists = (
+        Ticket.objects.filter(
+            client=client, type=type_obj,
+            reason__startswith=_OUT_OF_RANGE_TICKET_MARKER,
+        )
+        .exclude(status=TicketStatus.RESOLVED)
+        .exists()
+    )
+    if exists:
+        return False
+    Ticket.objects.create(
+        type=type_obj,
+        status=TicketStatus.OPEN,
+        severity=TicketSeverity.HIGH,
+        source=TicketSource.OTHER,
+        reason=reason,
+        client=client,
+        case=getattr(enrollment, "case", None),
+    )
+    return True
+
+
+def _resolve_out_of_range_tickets(enrollment, actor=""):
+    """Mark this household's open Out-of-Range Case Closure ticket(s) resolved
+    (called when the ZIP becomes serviceable again). Returns the count resolved."""
+    client = getattr(enrollment, "client", None)
+    if client is None:
+        return 0
+    qs = Ticket.objects.filter(
+        client=client, type__code=TicketTypeCode.CASE_CLOSURE,
+        reason__startswith=_OUT_OF_RANGE_TICKET_MARKER,
+    ).exclude(status=TicketStatus.RESOLVED)
+    return qs.update(
+        status=TicketStatus.RESOLVED,
+        resolved_at=timezone.now(),
+        resolved_by=actor,
+    )
+
+
+def _hold_household_for_range(enrollment, author):
+    """Place the whole household On Hold for an out-of-range ZIP (no-op when it
+    is already On Hold or the transition isn't allowed)."""
+    if EnrollmentStage(enrollment.stage) == EnrollmentStage.ON_HOLD:
+        return False
+    try:
+        advance_enrollment(
+            enrollment, EnrollmentStage.ON_HOLD,
+            note=(
+                f"Automatically placed on hold — delivery ZIP outside coverage "
+                f"area (Out of Range).{f' Actioned via {author}.' if author else ''}"
+            ),
+        )
+        return True
+    except InvalidTransition:
+        return False
+
+
+def _resume_household_after_range(enrollment):
+    """Resume a household that was auto-held for an out-of-range ZIP, back to the
+    stage it was held from (defaulting to Service Active). No-op when it isn't
+    currently On Hold."""
+    if EnrollmentStage(enrollment.stage) != EnrollmentStage.ON_HOLD:
+        return False
+    last_hold = StageEvent.objects.filter(
+        enrollment=enrollment, to_stage=EnrollmentStage.ON_HOLD,
+    ).first()
+    target = EnrollmentStage.SERVICE_ACTIVE
+    if last_hold and last_hold.from_stage:
+        try:
+            target = EnrollmentStage(last_hold.from_stage)
+        except ValueError:
+            target = EnrollmentStage.SERVICE_ACTIVE
+    try:
+        advance_enrollment(
+            enrollment, target, force=True,
+            note="Service resumed — delivery ZIP now within coverage area.",
+        )
+        return True
+    except InvalidTransition:
+        return False
+
+
 def _enforce_delivery_coverage(enrollment, agent, *, allow_reactivate=False):
     """Delivery Coverage Eligibility Check for every member of ``enrollment``.
 
     A member whose enrollment's DELIVERY address OR their PRIMARY (Current/Home)
-    address ZIP is in the excluded-ZIP list is set Out of Orbit (reason "Delivery
+    address ZIP is in the excluded-ZIP list is set Out of Range (reason "Delivery
     Address Outside Coverage Area"), with a system note + timeline event
     attributed to ``agent``. Manually Paused / Inactive members are left
-    untouched.
+    untouched. When any member is newly set Out of Range the whole household is
+    placed On Hold and a Case Closure ticket is opened (pre-filled with the
+    offending ZIP) for an agent to review.
 
     When ``allow_reactivate`` is True (the delivery ZIP just became serviceable)
-    an Out-of-Orbit member is re-checked against the kitchen-aware meal rule
+    an Out-of-Range member is re-checked against the kitchen-aware meal rule
     (which itself re-checks both addresses) and returned to Active only if it now
     passes (so a dietary/kitchen block or a still-excluded primary ZIP keeps them
-    Out of Orbit).
+    excluded). If that clears every member, the auto-hold is resumed and the
+    Out-of-Range Case Closure ticket is resolved.
 
-    Returns the number of members newly set Out of Orbit.
+    Returns ``{"out_of_range": [...], "reactivated": [...]}``.
     """
     from ..services.service_area import (
         SERVICE_AREA_REASON,
         excluded_zips,
         member_excluded_info,
+        out_of_range_ticket_reason,
         service_area_note_body,
     )
 
@@ -128,6 +250,8 @@ def _enforce_delivery_coverage(enrollment, agent, *, allow_reactivate=False):
     author = agent.name if agent else ""
     out_names = []
     reactivated_names = []
+    # The first offending ZIP/source seen, used to pre-fill the closure ticket.
+    ticket_zip, ticket_source = "", "delivery address"
 
     def _member_name(m):
         c = getattr(m, "client", None)
@@ -137,18 +261,27 @@ def _enforce_delivery_coverage(enrollment, agent, *, allow_reactivate=False):
     for mv in enrollment.member_profiles.select_related("client").all():
         offending_zip, source = member_excluded_info(mv, excluded=excluded)
         if offending_zip:
-            if mv.status != MemberStatus.ACTIVE:
-                continue  # never override Paused / Inactive / already Out of Orbit
-            mv.status = MemberStatus.OUT_OF_ORBIT
+            # An out-of-range ZIP is a household-wide geographic block: the whole
+            # household shares the delivery address, so EVERY non-terminal member
+            # is set Out of Range (individually excluded from future POs /
+            # deliveries and individually countable), not just the Active ones.
+            # We skip only INACTIVE (terminal off-boarded) and members already
+            # Out of Range (idempotent -- avoids duplicate note/timeline rows).
+            if mv.status in (MemberStatus.INACTIVE, MemberStatus.OUT_OF_RANGE):
+                continue
+            mv.status = MemberStatus.OUT_OF_RANGE
             mv.kitchen_meal_type = ""
             mv.kitchen_food_notes = ""
             mv.save(update_fields=[
                 "status", "kitchen_meal_type", "kitchen_food_notes", "updated_at",
             ])
             out_names.append(_member_name(mv))
+            if not ticket_zip:
+                ticket_zip, ticket_source = offending_zip, source
             try:
-                timeline.event_for_out_of_orbit(
-                    mv, enrollment=enrollment, reason=SERVICE_AREA_REASON, actor=actor,
+                timeline.event_for_out_of_range(
+                    mv, enrollment=enrollment, reason=SERVICE_AREA_REASON,
+                    zip_code=offending_zip, actor=actor,
                 )
             except Exception:  # never let history-logging break the save
                 pass
@@ -161,11 +294,11 @@ def _enforce_delivery_coverage(enrollment, agent, *, allow_reactivate=False):
                     )
                 except Exception:  # never let note-writing break the save
                     pass
-        elif allow_reactivate and mv.status == MemberStatus.OUT_OF_ORBIT:
+        elif allow_reactivate and mv.status == MemberStatus.OUT_OF_RANGE:
             # ZIP is now serviceable: return to Active only if the meal rule
             # (now ZIP-aware) also passes. A dietary/kitchen block leaves them
-            # Out of Orbit (reconcile mutates mv in memory; we only persist when
-            # it clears).
+            # excluded (reconcile mutates mv in memory; we only persist when it
+            # clears).
             out, _became, _reason = reconcile_member_kitchen_output(
                 mv, enrollment.kitchen, save=False,
             )
@@ -179,7 +312,36 @@ def _enforce_delivery_coverage(enrollment, agent, *, allow_reactivate=False):
                 except Exception:  # never let history-logging break the save
                     pass
 
-    return {"out_of_orbit": out_names, "reactivated": reactivated_names}
+    # Side effects: opening members drive a household hold + Case Closure ticket;
+    # a full reactivation (no member still Out of Range) resumes the hold and
+    # resolves the ticket.
+    if out_names:
+        try:
+            _open_out_of_range_ticket(
+                enrollment,
+                out_of_range_ticket_reason(ticket_zip, ticket_source, out_names),
+            )
+        except Exception:  # never let ticket-writing break the coverage check
+            pass
+        try:
+            _hold_household_for_range(enrollment, author)
+        except Exception:  # never let the hold break the coverage check
+            pass
+    elif reactivated_names:
+        still_out = enrollment.member_profiles.filter(
+            status=MemberStatus.OUT_OF_RANGE,
+        ).exists()
+        if not still_out:
+            try:
+                _resume_household_after_range(enrollment)
+            except Exception:
+                pass
+            try:
+                _resolve_out_of_range_tickets(enrollment, actor=actor)
+            except Exception:
+                pass
+
+    return {"out_of_range": out_names, "reactivated": reactivated_names}
 
 
 # Reverse of serializers._STATUS_MAP: a filter value -> the lifecycle stages it covers.
@@ -609,6 +771,8 @@ class MembersListView(PortalGenericAPIView):
         flag = (params.get("flag") or "").strip().lower()
         if flag == "out_of_orbit":
             qs = qs.filter(member_profiles__status=MemberStatus.OUT_OF_ORBIT)
+        elif flag == "out_of_range":
+            qs = qs.filter(member_profiles__status=MemberStatus.OUT_OF_RANGE)
         elif flag == "paused":
             qs = qs.filter(member_profiles__status=MemberStatus.PAUSED)
         elif flag == "inactive":
@@ -1435,18 +1599,20 @@ class MemberHouseholdView(PortalAPIView):
             "street": addr.street, "unit": addr.unit, "city": addr.city,
             "state": addr.state, "zip": addr.zip, "notes": addr.notes,
         }
-        if coverage and coverage.get("out_of_orbit"):
-            names = coverage["out_of_orbit"]
+        if coverage and coverage.get("out_of_range"):
+            names = coverage["out_of_range"]
             resp["coverage_warning"] = (
                 f"ZIP {addr.zip} is outside the delivery coverage area — "
-                f"{len(names)} member(s) set Out of Orbit "
-                f"(excluded from deliveries): {', '.join(names)}."
+                f"{len(names)} member(s) set Out of Range (excluded from "
+                f"deliveries): {', '.join(names)}. The household has been placed "
+                f"on hold and a Case Closure ticket opened for review."
             )
         if coverage and coverage.get("reactivated"):
             names = coverage["reactivated"]
             resp["coverage_info"] = (
                 f"ZIP {addr.zip} is now serviceable — "
-                f"{len(names)} member(s) returned to Active: {', '.join(names)}."
+                f"{len(names)} member(s) returned to Active: {', '.join(names)}. "
+                f"The household hold was resumed and the Out-of-Range ticket resolved."
             )
         return Response(resp)
 
@@ -2186,12 +2352,6 @@ class MemberVerificationCreateView(PortalAPIView):
             note="Verification completed via support portal.",
         )
 
-        # Delivery Coverage Eligibility Check: the verification still completes,
-        # but any member whose delivery ZIP is outside the coverage area is set
-        # Out of Orbit here (system note + timeline event, attributed to the
-        # verifying agent).
-        _enforce_delivery_coverage(enrollment, agent)
-
         # Tie the enrollment to the agent-selected Internal Service case from the
         # pop-up (when provided + free) BEFORE the authorization projection, so
         # the switch sticks even while the case is still pending. A case already
@@ -2243,10 +2403,122 @@ class MemberVerificationCreateView(PortalAPIView):
                 enrollment.case = case
                 enrollment.save(update_fields=["case"])
 
+        # Delivery Coverage Eligibility Check (LAST, so its side effects are the
+        # final state): the verification still completes, but any member whose
+        # delivery/primary ZIP is outside the coverage area is set Out of Range
+        # (system note + timeline event), the whole household is placed On Hold,
+        # and a Case Closure ticket is opened for review. Running this after the
+        # authorization/kitchen projection ensures an accepted-auth advance can't
+        # pull the household back out of the auto-hold.
+        _enforce_delivery_coverage(enrollment, agent)
+        enrollment.refresh_from_db()
+
         return Response(
             {"id": enrollment.pk, "code": enrollment.code, "stage": enrollment.stage},
             status=http.HTTP_201_CREATED,
         )
+
+
+class MemberVerificationDisregardView(PortalAPIView):
+    """POST: disregard a member's PENDING verification request.
+
+    An agent opening the verification pop-up can DISMISS a request that shouldn't
+    be pursued (e.g. the member was requested in error). Two shapes of "pending"
+    are handled:
+
+    * A governing EnrollmentVerification at ``PENDING_VERIFICATION`` is moved to
+      the non-terminal ``Disregarded`` stage -- its dietary profiles, delivery
+      address and case link are KEPT for history but it stops governing the
+      client's lifecycle stage. A future request (from the ext) creates a NEW
+      enrollment.
+    * A client with NO enrollment whose ``lifecycle_stage`` was set to
+      pending_verification directly (e.g. by the data import) is simply reverted
+      to their derived pre-verification funnel stage.
+
+    Either way the member drops off the Verification page. A reason is REQUIRED
+    and recorded on the client's notes and timeline/history.
+    """
+
+    @transaction.atomic
+    def post(self, request, client_id):
+        client = get_object_or_404(Client, pk=client_id)
+        # A member is "pending verification" in one of two ways:
+        #   1. A real EnrollmentVerification is at the PENDING_VERIFICATION stage
+        #      (a request raised from the ext). We move that row to Disregarded.
+        #   2. No enrollment exists, but the client's lifecycle_stage was set to
+        #      pending_verification directly (e.g. by the data import). There is
+        #      no request row to move, so we simply revert the client's stage.
+        # Both must be dismissible, since the Verification page shows both.
+        enr = governing_pending_enrollment(client)
+        is_stage_only_pending = (
+            enr is None and client.lifecycle_stage == ClientStage.PENDING_VERIFICATION
+        )
+        if enr is None and not is_stage_only_pending:
+            return Response(
+                {"error": "This member has no pending verification request to disregard."},
+                status=http.HTTP_409_CONFLICT,
+            )
+        reason = (request.data.get("reason") or "").strip()
+        if not reason:
+            return Response(
+                {"reason": "A reason is required to disregard a verification request."},
+                status=http.HTTP_400_BAD_REQUEST,
+            )
+        agent = current_agent(request)
+        author = agent.name if agent else ""
+        actor_label = (
+            agent.name or (f"agent:{agent.agent_code}" if agent.agent_code else "")
+        ) if agent else ""
+
+        if enr is not None:
+            # Case 1: move the governing pending enrollment to Disregarded. The
+            # row (dietary profiles, delivery address, case link) is KEPT for
+            # history; advance_enrollment logs a StageEvent + timeline event and
+            # recomputes the household so every member leaves the window.
+            note = (
+                f"Verification request disregarded by {author or 'support portal'}. "
+                f"Reason: {reason}"
+            )
+            enr.note = f"{enr.note}\n{note}" if enr.note else note
+            enr.save(update_fields=["note"])
+            try:
+                advance_enrollment(
+                    enr, EnrollmentStage.DISREGARDED,
+                    actor_label=actor_label, note=note,
+                )
+            except InvalidTransition as exc:
+                return Response({"error": str(exc)}, status=http.HTTP_400_BAD_REQUEST)
+        else:
+            # Case 2: no enrollment -- the pending state lives only on the client's
+            # lifecycle_stage. Revert it to the derived (pre-verification) funnel
+            # stage, which drops the member off the Verification page, and record a
+            # timeline entry carrying the reason (there's no StageEvent note path
+            # here, so emit the event directly).
+            # actor is a Django User FK on StageEvent (not our Agent); agent
+            # attribution is captured on the Note + timeline event instead.
+            recompute_client_stage(client)
+            timeline.emit_timeline_event(
+                client=client,
+                event_type=TimelineEventType.VERIFICATION_DISREGARDED,
+                occurred_at=timezone.now(),
+                title="Verification Request Disregarded",
+                subtitle=f"Reason: {reason}",
+                badge_tone=TimelineBadgeTone.WARNING,
+                source="portal",
+                actor=actor_label,
+            )
+
+        # Audit stamp: record WHEN this member's request was last disregarded.
+        # (The Verification button visibility is driven by whether a pending
+        # request exists, not by this field.)
+        client.verification_disregarded_at = timezone.now()
+        client.save(update_fields=["verification_disregarded_at"])
+
+        Note.objects.create(
+            client=client, source=NoteSource.AGENT, author_name=author,
+            body=f"Verification request disregarded. Reason: {reason}",
+        )
+        return Response(s.MemberDetailSerializer(client).data)
 
 
 def _logistics_enrollment(client_id):

@@ -3,16 +3,18 @@
 Second eligibility process (alongside the Service Fulfillment / meal rules):
 verify a member's addresses are inside the service coverage area. A member
 whose DELIVERY address OR PRIMARY (Current/Home) address ZIP is in the editable
-:class:`ExcludedZipCode` list is set Out of Orbit (reason "Delivery Address
+:class:`ExcludedZipCode` list is set Out of Range (reason "Delivery Address
 Outside Coverage Area") and excluded from all delivery schedules / Purchase
-Orders.
+Orders. Out of Range additionally opens a Case Closure ticket and holds the
+whole household (see api.portal.views_members._enforce_delivery_coverage).
 
 The excluded-ZIP list is admin-editable from Settings (no code change), so this
 reads it from the DB. Matching is on the first 5 digits of the ZIP.
 """
 
-# Standardized Out-of-Orbit reason label for this process (shown in the note
-# body + timeline metadata).
+# Standardized reason label for this process (shown in the note body + timeline
+# metadata). A ZIP outside the coverage area now sets members Out of Range (a
+# dedicated status), distinct from the dietary/kitchen "Out of Orbit" block.
 SERVICE_AREA_REASON = "Delivery Address Outside Coverage Area"
 
 
@@ -106,6 +108,24 @@ def service_area_note_body(zip_code, source="delivery address"):
     """System-note body explaining an out-of-coverage exclusion. ``source`` names
     which address triggered it ("delivery address" / "primary address")."""
     return (
-        f"Automatically set Out of Orbit — the {source} ZIP {zip_code} is "
+        f"Automatically set Out of Range — the {source} ZIP {zip_code} is "
         f"outside the current delivery coverage area."
+    )
+
+
+def out_of_range_ticket_reason(zip_code, source="delivery address", member_names=None):
+    """Pre-filled Case Closure ticket description for an out-of-range household.
+
+    Explains that the household's ``source`` ZIP is outside the delivery
+    coverage area, so service can't be provided and the case should be reviewed
+    for closure. ``member_names`` (optional) lists the affected members.
+    """
+    who = ""
+    if member_names:
+        who = f" Affected member(s): {', '.join(member_names)}."
+    return (
+        f"Out-of-range ZIP code: the {source} ZIP {zip_code} is outside our "
+        f"delivery coverage area, so this household cannot be served. The "
+        f"household has been placed on hold and every member set Out of Range. "
+        f"Please review this case for closure.{who}"
     )

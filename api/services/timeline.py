@@ -416,6 +416,7 @@ _VERIFICATION_STAGE_TONE = {
     EnrollmentStage.ON_HOLD: TimelineBadgeTone.WARNING,
     EnrollmentStage.CLOSED: TimelineBadgeTone.NEUTRAL,
     EnrollmentStage.CANCELLED: TimelineBadgeTone.DANGER,
+    EnrollmentStage.DISREGARDED: TimelineBadgeTone.WARNING,
 }
 
 
@@ -434,6 +435,9 @@ _STAGE_TIMELINE = {
     EnrollmentStage.ON_HOLD: (TimelineEventType.SERVICE_ON_HOLD, "Service On Hold"),
     EnrollmentStage.CLOSED: (TimelineEventType.SERVICE_CLOSED, "Service Closed"),
     EnrollmentStage.CANCELLED: (TimelineEventType.SERVICE_CANCELLED, "Service Cancelled"),
+    EnrollmentStage.DISREGARDED: (
+        TimelineEventType.VERIFICATION_DISREGARDED, "Verification Request Disregarded",
+    ),
 }
 
 
@@ -473,12 +477,21 @@ def event_for_verification(enrollment, *, stage_event=None, source=ChangeSource.
     event_type, title = fields if fields else (TimelineEventType.VERIFICATION, label or "Verification")
     tone = _VERIFICATION_STAGE_TONE.get(enrollment.stage, TimelineBadgeTone.NEUTRAL)
     dedupe = f"verification_stage:{stage_event.pk}" if stage_event is not None else ""
+    # For a disregarded request, surface the agent's reason (recorded on the
+    # StageEvent note) directly on the timeline row instead of the program name.
+    subtitle = enrollment.program_name or ""
+    if (
+        enrollment.stage == EnrollmentStage.DISREGARDED
+        and stage_event is not None
+        and stage_event.note
+    ):
+        subtitle = stage_event.note
     return emit_timeline_event(
         client=client,
         event_type=event_type,
         occurred_at=occurred,
         title=title,
-        subtitle=enrollment.program_name or "",
+        subtitle=subtitle,
         badge_text=label,
         badge_tone=tone,
         source=source,
@@ -641,6 +654,34 @@ def event_for_out_of_orbit(
         entity=profile,
         enrollment=enrollment,
         metadata={"reason": reason, "menu_type": profile.menu_type or ""},
+        dedupe_key=dedupe,
+    )
+
+
+def event_for_out_of_range(
+    profile, *, enrollment=None, reason="", zip_code="", source=ChangeSource.SYSTEM, actor="",
+):
+    """Emit an 'Out of Range' event for a member whose delivery/primary ZIP is
+    outside the service coverage area. Logged on the member's own client; de-duped
+    per enrollment so re-running the coverage check doesn't duplicate the row."""
+    client = getattr(profile, "client", None)
+    if client is None:
+        return None
+    enrollment = enrollment or getattr(profile, "enrollment", None)
+    dedupe = f"out_of_range:{enrollment.pk}:{profile.pk}" if enrollment is not None else ""
+    return emit_timeline_event(
+        client=client,
+        event_type=TimelineEventType.OUT_OF_RANGE,
+        occurred_at=timezone.now(),
+        title="Member set as Out of Range",
+        subtitle=profile.member_name or "",
+        badge_text="Out of Range",
+        badge_tone=TimelineBadgeTone.WARNING,
+        source=source,
+        actor=actor,
+        entity=profile,
+        enrollment=enrollment,
+        metadata={"reason": reason, "zip": zip_code},
         dedupe_key=dedupe,
     )
 

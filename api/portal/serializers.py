@@ -11,7 +11,11 @@ from datetime import timedelta
 from django.utils import timezone
 from rest_framework import serializers
 
-from api.services.lifecycle import governing_case_key, verification_completed
+from api.services.lifecycle import (
+    governing_case_key,
+    governing_pending_enrollment,
+    verification_completed,
+)
 
 from ..models import (
     Address,
@@ -150,6 +154,22 @@ def verification_status(client):
     return _STATUS_MAP.get(client.lifecycle_stage, client.get_lifecycle_stage_display())
 
 
+def verification_pending(client):
+    """True when the member has a PENDING verification request -- the only state
+    in which the "run verification" pop-up is offered. Requests originate from
+    the ext (the CRM never initiates one), so the button appears only to
+    complete or disregard an existing request.
+
+    Pending means either a governing enrollment sits at ``pending_verification``,
+    or (for imported members with no enrollment row) the client's lifecycle_stage
+    is pending_verification. Everything else -- navigation, verified, disregarded,
+    cancelled -- has no live request, so the button hides.
+    """
+    if governing_pending_enrollment(client) is not None:
+        return True
+    return client.lifecycle_stage == "pending_verification"
+
+
 # Coarse pipeline PHASE for the Verification list's "Stage" column. Both
 # pending_verification and verified (awaiting authorization) are still in the
 # "Verification" phase; the case being approved advances to Kitchen Assignment,
@@ -201,11 +221,19 @@ def active_enrollment(client):
     while every other member falls back to the coarser ``lifecycle_stage`` (e.g.
     showing "Waiting Authorization" instead of "Authorization Denied").
     """
-    enrollments = list(client.enrollments.all())
+    # DISREGARDED enrollments are dismissed verification requests kept only for
+    # history -- never treat them as the client's active enrollment.
+    enrollments = [
+        e for e in client.enrollments.all() if e.stage != "disregarded"
+    ]
     if not enrollments:
         membership = getattr(client, "household_membership", None)
         if membership is not None:
-            enrollments = list(membership.household.enrollment_verifications.all())
+            enrollments = [
+                e
+                for e in membership.household.enrollment_verifications.all()
+                if e.stage != "disregarded"
+            ]
     if not enrollments:
         return None
     open_ones = [e for e in enrollments if e.closed_at is None]
@@ -236,6 +264,14 @@ def member_out_of_orbit(client):
     excluded from delivery schedules/POs, so the Logistics roster hides them."""
     mp = active_member_profile(client)
     return mp is not None and mp.status == MemberStatus.OUT_OF_ORBIT
+
+
+def member_out_of_range(client):
+    """True when the client's active-enrollment dietary profile is Out of Range
+    (delivery/primary ZIP outside the coverage area). Out-of-range members are
+    excluded from delivery schedules/POs, so the Logistics roster hides them."""
+    mp = active_member_profile(client)
+    return mp is not None and mp.status == MemberStatus.OUT_OF_RANGE
 
 
 def member_paused(client):
@@ -389,6 +425,7 @@ class MemberListSerializer(serializers.Serializer):
     case_manager = serializers.CharField(source="agent_name")
     flags = serializers.SerializerMethodField()
     out_of_orbit = serializers.SerializerMethodField()
+    out_of_range = serializers.SerializerMethodField()
     paused = serializers.SerializerMethodField()
     start_date = serializers.SerializerMethodField()
     end_date = serializers.SerializerMethodField()
@@ -405,6 +442,7 @@ class MemberListSerializer(serializers.Serializer):
     on_hold_at = serializers.SerializerMethodField()
     cancelled_at = serializers.SerializerMethodField()
     out_of_orbit_at = serializers.SerializerMethodField()
+    out_of_range_at = serializers.SerializerMethodField()
     paused_at = serializers.SerializerMethodField()
 
     def get_name(self, obj):
@@ -451,6 +489,9 @@ class MemberListSerializer(serializers.Serializer):
     def get_out_of_orbit(self, obj):
         return member_out_of_orbit(obj)
 
+    def get_out_of_range(self, obj):
+        return member_out_of_range(obj)
+
     def get_paused(self, obj):
         return member_paused(obj)
 
@@ -488,6 +529,14 @@ class MemberListSerializer(serializers.Serializer):
         # meaningful while currently Out of Orbit.
         mp = active_member_profile(obj)
         if mp is None or mp.status != MemberStatus.OUT_OF_ORBIT:
+            return None
+        return mp.status_changed_at.isoformat() if mp.status_changed_at else None
+
+    def get_out_of_range_at(self, obj):
+        # When the member's active-enrollment profile last flipped status; only
+        # meaningful while currently Out of Range.
+        mp = active_member_profile(obj)
+        if mp is None or mp.status != MemberStatus.OUT_OF_RANGE:
             return None
         return mp.status_changed_at.isoformat() if mp.status_changed_at else None
 
@@ -564,6 +613,14 @@ class MemberDetailSerializer(serializers.Serializer):
                 "gender": client.gender,
                 "medicaid_id": medicaid_member_id(client),
                 "verification_status": verification_status(client),
+                # True once the verification pop-up has been COMPLETED (verified_at
+                # set) -- stays true through the post-verification service stages.
+                # Drives the header's "run verification" button, which is offered
+                # only while the household is still pre-verification.
+                "verification_completed": verification_completed(client),
+                # True only while a PENDING verification request exists -- the
+                # sole state in which the "run verification" pop-up is offered.
+                "verification_pending": verification_pending(client),
             },
             "lifecycle": {
                 "stage": client.lifecycle_stage,
