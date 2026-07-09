@@ -91,9 +91,11 @@ class POBlockersFixView(PortalAPIView):
     """POST /api/portal/po-blockers/fix/ -- apply the one-click fix for a member.
 
     Body: ``{enrollment_id, reason}``. Fixable reasons (lapsed window / calendar
-    not generated / cadence-weekday mismatch / stale case link) are remediated
-    server-side (recompute the delivery plan + rebuild the calendar, or repoint
-    the case). Non-fixable reasons return ``fixed=False`` with guidance.
+    not generated / cadence-weekday mismatch / program switched / stale case
+    link) are remediated server-side (recompute the delivery plan + rebuild the
+    calendar, or repoint the case). Non-fixable reasons -- including the
+    informational ``program_switch_pending`` / ``duplicate_open_cases`` -- return
+    ``fixed=False`` with guidance.
     """
 
     @transaction.atomic

@@ -18,6 +18,7 @@ from django.db import transaction
 from django.utils import timezone
 
 from api.models import (
+    CaseStatus,
     CaseType,
     ClientStage,
     EnrollmentStage,
@@ -599,19 +600,36 @@ _AUTH_FAVOR_RANK = {
 # dated case) instead of raising on a None comparison.
 _DT_FLOOR = datetime.min.replace(tzinfo=dt_timezone.utc)
 
+# A closed/cancelled case no longer confers authorization for FUTURE deliveries.
+_CLOSED_CASE_STATUSES = {CaseStatus.CLOSED, CaseStatus.CANCELLED}
+
+
+def _case_open_rank(case):
+    """1 for an open case, 0 for a closed/cancelled one. Used as a governance
+    tiebreak so an OPEN approved case outranks a CLOSED approved one."""
+    return 0 if case.case_status in _CLOSED_CASE_STATUSES else 1
+
 
 def governing_case_key(case):
     """Descending sort key for picking the governing case among several.
 
     Priority: most favorable authorization first (an approval beats a denial no
-    matter the dates), then most recently opened, then most recently updated,
-    then case_id -- a stable, environment-independent final tiebreak so the same
-    case is chosen everywhere. The previous date-only sort left exact
-    ``date_opened`` ties to arbitrary DB row order, which could pick a denied
-    case over an approved one for the same household.
+    matter the dates), then OPEN over closed/cancelled (so a lingering
+    superseded case can't keep governing a switch), then most recently opened,
+    then most recently updated, then case_id -- a stable,
+    environment-independent final tiebreak so the same case is chosen
+    everywhere. The previous date-only sort left exact ``date_opened`` ties to
+    arbitrary DB row order, which could pick a denied case over an approved one
+    for the same household.
+
+    The open-ness rank sits BELOW authorization favor, so an approved case
+    (open or closed) still beats a pending one -- during a meals->boxes switch
+    the still-approved meals case keeps governing until the boxes case is
+    approved, and among two approved cases the open (newer) one wins.
     """
     return (
         _AUTH_FAVOR_RANK.get(case.service_authorization_status, 0),
+        _case_open_rank(case),
         case.date_opened or _DT_FLOOR,
         case.updated_at or _DT_FLOOR,
         str(case.case_id),
@@ -721,6 +739,95 @@ def _internal_service_cases(client):
     return [c for c in client.cases.all() if c.case_type == CaseType.INTERNAL_SERVICE]
 
 
+def open_internal_service_cases(client):
+    """Internal-service cases that are still OPEN (not closed/cancelled)."""
+    if client is None:
+        return []
+    return [
+        c for c in _internal_service_cases(client)
+        if c.case_status not in _CLOSED_CASE_STATUSES
+    ]
+
+
+def pending_switch_case(enrollment, governing_kind=None):
+    """An OPEN internal-service case with a PENDING authorization -- i.e. an
+    in-flight authorization the agent is waiting on (a product switch being
+    approved, or a renewal). Returns the case, or None.
+
+    When ``governing_kind`` is given, only a DIFFERENT-kind pending case counts
+    (a genuine meals<->boxes switch); otherwise any pending open case counts
+    (also covers a same-kind renewal). Used to (a) keep serving the current kind
+    during the gap rather than truncating, and (b) surface ``program_switch_pending``
+    in PO Blockers.
+    """
+    if enrollment is None:
+        return None
+    from api.services.catalog import product_type_kind_for_name
+
+    for c in open_internal_service_cases(enrollment.client):
+        if c.service_authorization_status != ServiceAuthorizationStatus.PENDING:
+            continue
+        if governing_kind is None:
+            return c
+        k = product_type_kind_for_name(c.program_name)
+        if k is not None and k != governing_kind:
+            return c
+    return None
+
+
+def reconcile_delivery_state(enrollment, *, actor=None):
+    """Keep an active enrollment's delivery calendar consistent after a case /
+    authorization change -- WITHOUT ever auto-switching product kind.
+
+    * Governing case is approved + open with a future window AND the product kind
+      is unchanged -> auto-heal a window drift (extend/adjust dates) via
+      :func:`orders.heal_delivery_window`. A meals<->boxes switch is left for the
+      human-confirmed ``program_switched`` fix in PO Blockers.
+    * No favorable open authorization covers the future:
+        - an in-flight switch/renewal is pending (open PENDING case) -> keep
+          serving the current kind (no change), surfaced as ``program_switch_pending``;
+        - otherwise -> truncate future non-batched occurrences to today via
+          :func:`orders.truncate_future_deliveries` so a closed/expired case stops
+          over-delivering.
+
+    Best-effort and idempotent; heavy work only runs when something actually
+    drifted. Terminal / on-hold enrollments are skipped.
+    """
+    from api.models import ScheduleStatus
+    from api.services.orders import heal_delivery_window, truncate_future_deliveries
+
+    if EnrollmentStage(enrollment.stage) in _TERMINAL_STAGES:
+        return
+    if EnrollmentStage(enrollment.stage) == EnrollmentStage.ON_HOLD:
+        return
+    if not enrollment.delivery_schedules.filter(status=ScheduleStatus.SCHEDULED).exists():
+        return
+
+    gov = governing_internal_case(enrollment)
+    end = getattr(gov, "service_authorization_approval_ends_at", None) if gov else None
+    gov_end = end.date() if end else None
+    favorable = gov is not None and gov.service_authorization_status in (
+        ServiceAuthorizationStatus.APPROVED,
+        ServiceAuthorizationStatus.NOT_REQUIRED,
+    )
+    is_open = gov is not None and gov.case_status not in _CLOSED_CASE_STATUSES
+    today = timezone.localdate()
+    authorizes_future = favorable and is_open and gov_end is not None and gov_end >= today
+
+    if authorizes_future:
+        # Same-kind window drift heals automatically; a kind switch is a no-op
+        # here (heal_delivery_window refuses to flip kind) and waits for the
+        # human-confirmed PO Blockers fix.
+        heal_delivery_window(enrollment)
+        return
+
+    # No open+approved authorization covering the future. Keep serving during an
+    # in-flight switch/renewal; otherwise stop over-delivering.
+    if pending_switch_case(enrollment) is not None:
+        return
+    truncate_future_deliveries(enrollment)
+
+
 def _resume_auto_paused_enrollment(enrollment, *, actor=None):
     """Resume an enrollment that THIS rule auto-paused (ON_HOLD) back to the
     stage it was held from. No-op when the most recent hold was NOT an auto-pause
@@ -801,6 +908,17 @@ def reconcile_internal_service_authorization(client, *, actor=None):
         for enr in _governing_enrollments(client):
             if EnrollmentStage(enr.stage) == EnrollmentStage.ON_HOLD:
                 _resume_auto_paused_enrollment(enr, actor=actor)
+
+    # Keep the delivery calendar in step with the (possibly changed) governing
+    # authorization: auto-heal a same-kind window extension, or truncate future
+    # deliveries when a case closed with no authorization / pending successor.
+    # Never auto-flips product kind -- a meals<->boxes switch stays a
+    # human-confirmed PO Blockers fix. Best-effort so a hiccup can't abort import.
+    for enr in _governing_enrollments(client):
+        try:
+            reconcile_delivery_state(enr, actor=actor)
+        except Exception:  # pragma: no cover - defensive
+            pass
 
     recompute_client_stage(client, actor=actor)
     return result

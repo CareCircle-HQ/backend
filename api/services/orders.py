@@ -498,3 +498,73 @@ def recompute_delivery_plan(enrollment, from_date=None):
         case=case, product_kind=kind,
     )
     return sync_delivery_calendar(enrollment, from_date=from_date)
+
+
+def plan_built_kind(plan):
+    """The product kind a delivery plan was BUILT as, read from its own snapshot
+    (``meals_per_day`` for meals, ``prod_per_delivery`` for boxes) -- independent
+    of the governing case, so it can be compared against the case's current kind
+    to detect a meals<->boxes switch. Returns a ProductTypeKind or None."""
+    from api.models import ProductTypeKind
+
+    if plan is None:
+        return None
+    if plan.meals_per_day:
+        return ProductTypeKind.MEALS
+    if plan.prod_per_delivery:
+        return ProductTypeKind.BOXES
+    return None
+
+
+@transaction.atomic
+def heal_delivery_window(enrollment, from_date=None):
+    """Auto-heal a SAME-KIND delivery-window drift.
+
+    When the governing approved authorization window differs from the plan window
+    (e.g. a re-approval extended the end date) AND the product kind is unchanged,
+    recompute the plan + rebuild the calendar so the new dates flow into POs with
+    no manual step. Returns the sync result, or ``None`` when there's nothing to
+    do.
+
+    NEVER switches product kind: a meals<->boxes change is human-confirmed via
+    the PO Blockers 'program_switched' fix, not applied silently here.
+    """
+    from api.services.catalog import product_kind_for_enrollment
+    from api.services.lifecycle import governing_internal_case
+
+    plan = enrollment.delivery_schedules.first()
+    if plan is None:
+        return None
+    gov = governing_internal_case(enrollment)
+    end = getattr(gov, "service_authorization_approval_ends_at", None) if gov else None
+    gov_end = end.date() if end else None
+    if gov_end is None:
+        return None
+
+    gov_kind = product_kind_for_enrollment(enrollment)
+    plan_kind = plan_built_kind(plan)
+    if gov_kind is not None and plan_kind is not None and gov_kind != plan_kind:
+        return None  # kind switch -> human confirm, never auto-flip
+    if plan.ends_on == gov_end:
+        return None  # window already in sync -- nothing to heal
+    return recompute_delivery_plan(enrollment, from_date=from_date)
+
+
+@transaction.atomic
+def truncate_future_deliveries(enrollment, on_or_after=None):
+    """Stop future deliveries by shortening every plan window to just before
+    ``on_or_after`` (default today), then rebuilding the calendar.
+
+    Used when a case closes with no authorization covering the future (and no
+    in-flight switch), to prevent over-delivery past the authorization. Shortening
+    the plan window -- not just deleting occurrences -- is required so the nightly
+    ``sync_active_calendars`` doesn't regenerate them. PO-batched occurrences are
+    preserved by :func:`sync_delivery_calendar`. Returns the sync result.
+    """
+    cutoff = on_or_after or timezone.localdate()
+    prev = cutoff - timedelta(days=1)
+    for p in enrollment.delivery_schedules.all():
+        if p.ends_on is None or p.ends_on >= cutoff:
+            p.ends_on = prev
+            p.save(update_fields=["ends_on"])
+    return sync_delivery_calendar(enrollment, from_date=cutoff)

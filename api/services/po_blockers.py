@@ -30,7 +30,12 @@ from api.models import (
 )
 from api.services.catalog import product_kind_for_enrollment, product_type_kind_for_name
 from api.services.delivery import BOX_DELIVERY_WEEKDAY, weekdays_for_cadence
-from api.services.lifecycle import governing_internal_case
+from api.services.lifecycle import (
+    governing_internal_case,
+    open_internal_service_cases,
+    pending_switch_case,
+)
+from api.services.orders import plan_built_kind
 
 # Authorization statuses that permit us to (re)generate future deliveries.
 _AUTHORIZED = {
@@ -44,9 +49,12 @@ REASON_ORDER = [
     "no_kitchen",
     "lapsed_window_fixable",
     "needs_reauth",
+    "program_switched",
     "no_future_generated",
     "cadence_weekday_mismatch",
     "kind_unresolved",
+    "program_switch_pending",
+    "duplicate_open_cases",
     "stale_case_link",
     "ok",
 ]
@@ -57,16 +65,25 @@ BLOCKED_REASONS = [r for r in REASON_ORDER if r != "ok"]
 # stale_case_link is healed by repointing the enrollment's case.
 _RECOMPUTE_REASONS = {
     "lapsed_window_fixable", "no_future_generated", "cadence_weekday_mismatch",
+    "program_switched",
 }
 FIXABLE_REASONS = _RECOMPUTE_REASONS | {"stale_case_link"}
+
+# Informational buckets: service is continuing correctly, but the state warrants
+# visibility (an in-flight switch, or duplicate open cases to clean up in Unite
+# Us). Not auto-fixable by us -- surfaced so logistics/agents can act.
+INFO_REASONS = {"program_switch_pending", "duplicate_open_cases"}
 
 REASON_LABELS = {
     "no_kitchen": "No kitchen assigned",
     "lapsed_window_fixable": "Lapsed window (fixable)",
     "needs_reauth": "Needs re-authorization",
+    "program_switched": "Program switched (fixable)",
     "no_future_generated": "Calendar not generated",
     "cadence_weekday_mismatch": "Cadence/weekday mismatch",
     "kind_unresolved": "Product kind unresolved",
+    "program_switch_pending": "Program switch pending",
+    "duplicate_open_cases": "Duplicate open cases",
     "stale_case_link": "Stale case link",
     "ok": "OK",
 }
@@ -78,13 +95,17 @@ REASON_DESCRIPTIONS = {
     "no_future_generated": "The plan window covers the future yet no occurrences exist. A sync_delivery_calendars run should regenerate them.",
     "cadence_weekday_mismatch": "The delivery weekdays don't match the plan's cadence (e.g. a boxes→meals switch that left deliveries on Wednesday), so occurrences land on days no PO is cut for. Recompute realigns them.",
     "kind_unresolved": "Has future occurrences but the product kind (meals/boxes) can't be resolved, so PO generation drops them. Needs a data/case fix.",
+    "program_switched": "The governing case's product kind (meals/boxes) now differs from the delivery plan — a switch was authorized (e.g. meals→boxes). The plan still delivers the old product. Apply the switch to rebuild the calendar for the new kind, window, and quantities.",
+    "program_switch_pending": "Service is continuing on the current product, but a different-kind internal-service case is open and awaiting authorization (an in-flight switch). No action needed until Unite Us approves it; then apply the switch.",
+    "duplicate_open_cases": "The household has more than one open internal-service case. Service is governed by the most favorable/newest one, but the superseded case should be closed in Unite Us for hygiene.",
     "stale_case_link": "Deliverable, but the enrollment's case doesn't point at the governing internal-service case (hygiene; not blocking after the preview fix).",
     "ok": "Has future occurrences with a resolvable product kind.",
 }
 
 
 def _classify_reason(*, kitchen_id, future, has_future_auth, plan_ends_on,
-                     kind, weekday_mismatch, enrollment_case_id,
+                     kind, plan_kind, governing_kind, weekday_mismatch,
+                     switch_pending, open_case_count, enrollment_case_id,
                      governing_case_id, today):
     if kitchen_id is None:
         return "no_kitchen"
@@ -96,8 +117,21 @@ def _classify_reason(*, kitchen_id, future, has_future_auth, plan_ends_on,
         return "no_future_generated"
     if kind is None:
         return "kind_unresolved"
+    # An authorized meals<->boxes switch: the governing case's kind now differs
+    # from what the plan was built as. Ready to apply (fixable) -- checked before
+    # the weekday mismatch, which is just the visible symptom of the same flip.
+    if (
+        plan_kind is not None and governing_kind is not None
+        and plan_kind != governing_kind
+    ):
+        return "program_switched"
     if weekday_mismatch:
         return "cadence_weekday_mismatch"
+    # Informational: service is continuing correctly on the current kind.
+    if switch_pending:
+        return "program_switch_pending"
+    if open_case_count > 1:
+        return "duplicate_open_cases"
     if governing_case_id and str(enrollment_case_id) != str(governing_case_id):
         return "stale_case_link"
     return "ok"
@@ -160,6 +194,7 @@ def classify_po_blockers(from_date=None, include_ok=False):
     )
 
     gov_cache = {}
+    enr_meta = {}  # enrollment pk -> (governing_kind, open_case_count, switch_pending)
     rows = []
     # chunk_size is REQUIRED by Django when iterator() follows prefetch_related()
     # (raises ValueError otherwise on newer Django).
@@ -168,12 +203,18 @@ def classify_po_blockers(from_date=None, include_ok=False):
         m = p.member_profile
         if enr.pk not in gov_cache:
             gov_cache[enr.pk] = governing_internal_case(enr)
+            governing_kind = product_kind_for_enrollment(enr)
+            open_cases = open_internal_service_cases(enr.client)
+            switch_pending = pending_switch_case(enr, governing_kind) is not None
+            enr_meta[enr.pk] = (governing_kind, len(open_cases), switch_pending)
         gov = gov_cache[enr.pk]
+        governing_kind, open_case_count, switch_pending = enr_meta[enr.pk]
         auth_status = getattr(gov, "service_authorization_status", "") or ""
         auth_end = getattr(gov, "service_authorization_approval_ends_at", None)
         auth_end = auth_end.date() if auth_end else None
         future = occ_counts.get(p.member_profile_id, 0)
-        kind = product_type_kind_for_name(enr.program_name) or product_kind_for_enrollment(enr)
+        kind = product_type_kind_for_name(enr.program_name) or governing_kind
+        plan_kind = plan_built_kind(p)
         has_future_auth = (
             auth_status in _AUTHORIZED and auth_end is not None and auth_end >= today
         )
@@ -183,7 +224,9 @@ def classify_po_blockers(from_date=None, include_ok=False):
         reason = _classify_reason(
             kitchen_id=enr.kitchen_id, future=future,
             has_future_auth=has_future_auth, plan_ends_on=p.ends_on,
-            kind=kind, weekday_mismatch=mismatch, enrollment_case_id=enr.case_id,
+            kind=kind, plan_kind=plan_kind, governing_kind=governing_kind,
+            weekday_mismatch=mismatch, switch_pending=switch_pending,
+            open_case_count=open_case_count, enrollment_case_id=enr.case_id,
             governing_case_id=gov_case_id, today=today,
         )
         if reason == "ok" and not include_ok:
@@ -250,6 +293,9 @@ def remediate_enrollment_blocker(enr, reason, from_date=None):
                 return {"fixed": False, "message": f"Could not repoint case: {exc}"}
         res = sync_delivery_calendar(enr, from_date=from_date)
         return {"fixed": True, "action": action, "result": res}
+
+    if reason in INFO_REASONS:
+        return {"fixed": False, "message": REASON_DESCRIPTIONS.get(reason, "")}
 
     return {
         "fixed": False,
