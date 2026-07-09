@@ -164,7 +164,20 @@ def product_kind_for_enrollment(enrollment):
     """
     if enrollment is None:
         return None
+    # The authoritative program lives on the GOVERNING internal-service case (the
+    # verification's case), which is often not the same row as ``enrollment.case``
+    # (frequently null). Prefer it so the kind still resolves when the
+    # enrollment's snapshot program name lacks a meal/box keyword. Lazy import
+    # avoids a circular dependency with api.services.lifecycle.
     case = getattr(enrollment, "case", None)
+    try:
+        from api.services.lifecycle import governing_internal_case
+
+        gov = governing_internal_case(enrollment)
+    except Exception:
+        gov = None
+    if gov is not None:
+        case = gov
     program = case.program if (case is not None and getattr(case, "program_id", None)) else None
     # 1. Program -> ProductType link (set for Internal Service programs).
     if program is not None and getattr(program, "product_type_id", None):
