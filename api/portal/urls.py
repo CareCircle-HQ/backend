@@ -71,6 +71,7 @@ from .views_orders import (
     SendToDeliveryView,
     SendToKitchenView,
 )
+from .views_po_blockers import POBlockersStatsView, POBlockersView
 from .views_activity import ActivityFiltersView, ActivityLogView
 from .views_service_area import ExcludedZipCodeDetailView, ExcludedZipCodesView
 from .views_imports import (
@@ -205,6 +206,10 @@ urlpatterns = [
     path("purchase-orders/<uuid:po_id>/send-to-delivery/", SendToDeliveryView.as_view()),
     path("kitchens/", KitchensListView.as_view(), name="portal-kitchens"),
     path("delivery-companies/", DeliveryCompaniesListView.as_view(), name="portal-delivery-companies"),
+
+    # PO Blockers: members with a live plan that won't reach a Purchase Order
+    path("po-blockers/", POBlockersView.as_view(), name="portal-po-blockers"),
+    path("po-blockers/stats/", POBlockersStatsView.as_view(), name="portal-po-blockers-stats"),
 
     # Settings > Import: manual Unite Us CSV upload + run history
     path("settings/imports/", ImportRunsView.as_view(), name="portal-import-runs"),
