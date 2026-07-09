@@ -59,51 +59,58 @@ class Command(BaseCommand):
 
     def handle(self, *args, **opts):
         apply = opts["apply"]
-        qs = (
+        # Materialize the eligible PKs up front so each enrollment is processed in
+        # its OWN transaction below (a single bad row must not abort the batch).
+        ids = list(
             EnrollmentVerification.objects.filter(stage__in=ELIGIBLE_STAGES)
-            .select_related("case")
             .order_by("id")
+            .values_list("id", flat=True)
         )
         if opts["limit"]:
-            qs = qs[: opts["limit"]]
+            ids = ids[: opts["limit"]]
 
         transitions = Counter()
         scanned = 0
         changed = 0
+        errors = 0
 
-        def _process():
-            nonlocal scanned, changed
-            for enr in qs.iterator():
-                scanned += 1
-                before = enr.stage
-                try:
-                    reconcile_enrollment_authorization(enr)
-                except Exception as exc:  # noqa: BLE001 - report, don't abort the batch
-                    self.stderr.write(f"  enrollment {enr.pk}: {exc}")
-                    continue
-                after = EnrollmentVerification.objects.get(pk=enr.pk).stage
-                if after != before:
-                    changed += 1
-                    transitions[f"{before} -> {after}"] += 1
+        # Dry-run rolls back each enrollment's own transaction so nothing
+        # persists; --apply commits per enrollment.
+        class _Rollback(Exception):
+            pass
 
-        if apply:
-            _process()
-        else:
-            # Dry-run: do the real projection inside a transaction, read back the
-            # (uncommitted) results, then roll the whole thing back.
-            class _Rollback(Exception):
-                pass
-
+        for pk in ids:
+            scanned += 1
+            before = after = None
             try:
+                # Per-enrollment atomic block: an IntegrityError (e.g. a case
+                # already claimed by another live enrollment) rolls back ONLY this
+                # enrollment and leaves the connection healthy for the next one.
                 with transaction.atomic():
-                    _process()
-                    raise _Rollback()
+                    enr = (
+                        EnrollmentVerification.objects.select_related("case").get(pk=pk)
+                    )
+                    before = enr.stage
+                    reconcile_enrollment_authorization(enr)
+                    after = (
+                        EnrollmentVerification.objects.values_list("stage", flat=True)
+                        .get(pk=pk)
+                    )
+                    if not apply:
+                        raise _Rollback()
             except _Rollback:
                 pass
+            except Exception as exc:  # noqa: BLE001 - report, don't abort the batch
+                errors += 1
+                self.stderr.write(f"  enrollment {pk}: {exc}")
+                continue
+            if before is not None and after is not None and after != before:
+                changed += 1
+                transitions[f"{before} -> {after}"] += 1
 
         verb = "changed" if apply else "would change"
         self.stdout.write(
-            f"Scanned {scanned} eligible enrollments; {changed} {verb}."
+            f"Scanned {scanned} eligible enrollments; {changed} {verb}; {errors} error(s)."
         )
         for transition, n in sorted(transitions.items(), key=lambda kv: -kv[1]):
             self.stdout.write(f"  {transition}: {n}")

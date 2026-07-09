@@ -79,6 +79,7 @@ from ..services.lifecycle import (
     advance_enrollment,
     governing_pending_enrollment,
     recompute_client_stage,
+    reconcile_enrollment_authorization,
 )
 from ..services import timeline
 from ..serializers import (
@@ -2372,36 +2373,25 @@ class MemberVerificationCreateView(PortalAPIView):
             except Exception:  # never let history-logging break the save
                 pass
 
-        # The authorization outcome is sourced from the client's case (NOT the
-        # client/frontend): only an Accepted (APPROVED) case advances the
-        # household to "Kitchen Assignment". Any other status leaves the client
-        # at "Verified". The agent-selected case wins over the governing default
-        # so responsibility stays with them. The member is NOT auto-activated and
-        # no delivery schedule/orders are generated here — that happens later when
-        # the kitchen assignment is executed manually (separate page), which is
+        # Project the case authorization onto the stage through the SINGLE
+        # canonical chokepoint (reconcile_enrollment_authorization): an APPROVED
+        # governing internal-service case advances the verified household to
+        # "Kitchen Assignment"; pending/denied/expired leaves it at "Verified"
+        # (the outcome is shown separately, from the Case). Using reconcile here
+        # -- instead of a bespoke check on selected_case/primary_case -- keeps the
+        # portal in lock-step with the nightly Unite Us import and the
+        # reconcile_authorizations backfill, picks the most-favorable
+        # internal-service case (so an approval always advances), and reuses the
+        # guard that never steals a case already owned by another live enrollment
+        # (the uniq_enrollment_verification_per_case constraint). The member is
+        # NOT auto-activated and no delivery schedule / orders are generated here
+        # -- that happens later at the manual kitchen-assignment step, which is
         # what moves the household into service.
-        case = selected_case or s.primary_case(client)
-        accepted = bool(
-            case and case.service_authorization_status == ServiceAuthorizationStatus.APPROVED
+        reconcile_enrollment_authorization(
+            enrollment,
+            actor_label=actor_label,
+            note="Authorization accepted — awaiting kitchen assignment.",
         )
-        if accepted:
-            advance_enrollment(
-                enrollment, EnrollmentStage.KITCHEN_ASSIGNMENT, force=True,
-                actor_label=actor_label,
-                note="Authorization accepted — awaiting kitchen assignment.",
-            )
-            # Best-effort link the case for reporting, but only when it isn't
-            # already owned by another enrollment (a case maps to at most one
-            # enrollment — uniq_enrollment_verification_per_case).
-            if (
-                case is not None
-                and enrollment.case_id is None
-                and not EnrollmentVerification.objects.filter(case=case)
-                .exclude(pk=enrollment.pk)
-                .exists()
-            ):
-                enrollment.case = case
-                enrollment.save(update_fields=["case"])
 
         # Delivery Coverage Eligibility Check (LAST, so its side effects are the
         # final state): the verification still completes, but any member whose

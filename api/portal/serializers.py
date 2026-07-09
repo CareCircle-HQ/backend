@@ -437,6 +437,7 @@ class MemberListSerializer(serializers.Serializer):
     verification_state = serializers.SerializerMethodField()
     household_primary_id = serializers.SerializerMethodField()
     last_updated = serializers.DateTimeField(source="updated_at")
+    created_at = serializers.DateTimeField()
     authorization_status_at = serializers.SerializerMethodField()
     stage_at = serializers.DateTimeField(source="lifecycle_stage_at")
     on_hold_at = serializers.SerializerMethodField()
@@ -646,6 +647,9 @@ class MemberDetailSerializer(serializers.Serializer):
                 # Every Internal Service case the verification can attach to, so
                 # the pop-up can let the agent switch the governing case when the
                 # client holds more than one. `governing` marks the default pick.
+                # DENIED-authorization cases are excluded: a denied meal/box case
+                # can't be verified against, so it must not be an option in the
+                # pop-up's case dropdown (any other status is still selectable).
                 "cases": [
                     {
                         "case_id": str(c.case_id),
@@ -655,6 +659,7 @@ class MemberDetailSerializer(serializers.Serializer):
                         "governing": bool(svc_case and c.case_id == svc_case.case_id),
                     }
                     for c in internal_service_cases(client)
+                    if c.service_authorization_status != ServiceAuthorizationStatus.DENIED
                 ],
             },
             "demographics": {
