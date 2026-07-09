@@ -176,6 +176,10 @@ def _member_payload(profile):
         "meals_per_delivery": profile.meals_per_delivery,
         "other_dietary_restrictions": profile.other_dietary_restrictions or "",
         "verification_notes": profile.general_verification_notes or "",
+        # Williamsburg exception flag (from the linked Client's lead source), so
+        # the kitchen-assignment pop-up can recognize these members at a glance.
+        "is_williamsburg": bool(getattr(profile.client, "is_williamsburg", False)),
+        "lead_source": getattr(profile.client, "lead_source", "") or "",
     }
 
 

@@ -2205,10 +2205,20 @@ class MemberVerificationCreateView(PortalAPIView):
 
     @transaction.atomic
     def post(self, request, client_id):
+        from ..services.williamsburg import (
+            WILLIAMSBURG_KITCHEN_NAME,
+            WILLIAMSBURG_MENU_TYPE,
+        )
+
         client = get_object_or_404(Client, pk=client_id)
         ser = s.VerificationCreateSerializer(data=request.data)
         ser.is_valid(raise_exception=True)
         data = ser.validated_data
+
+        # Williamsburg exception (lead source == "Williamsburg"): the whole
+        # household is served the Kosher menu and, on save, the Williamsburg
+        # kitchen is auto-assigned and service activated directly (see below).
+        is_williamsburg = bool(getattr(client, "is_williamsburg", False))
 
         # The agent may pick WHICH Internal Service case this verification is tied
         # to in the pop-up (the client can hold several). Resolve it here; falls
@@ -2297,12 +2307,18 @@ class MemberVerificationCreateView(PortalAPIView):
                 food_allergies=m.get("food_allergies", []),
                 other_dietary_restrictions=m.get("other_dietary_restrictions", ""),
                 meal_category=m.get("meal_category", ""),
-                # Menu type is derived from the member's dietary data (allergy
+                # Williamsburg households are always served the Kosher menu (the
+                # agent's allergies/restrictions are still honored). Otherwise the
+                # menu type is derived from the member's dietary data (allergy
                 # overrides win, else meal_category) when not explicitly sent.
-                menu_type=m.get("menu_type")
-                or menu_type_for_member(
-                    food_allergies=m.get("food_allergies", []),
-                    meal_category=m.get("meal_category", ""),
+                menu_type=(
+                    WILLIAMSBURG_MENU_TYPE
+                    if is_williamsburg
+                    else m.get("menu_type")
+                    or menu_type_for_member(
+                        food_allergies=m.get("food_allergies", []),
+                        meal_category=m.get("meal_category", ""),
+                    )
                 ),
                 general_verification_notes=m.get("notes", ""),
             )
@@ -2382,25 +2398,40 @@ class MemberVerificationCreateView(PortalAPIView):
             except Exception:  # never let history-logging break the save
                 pass
 
-        # Project the case authorization onto the stage through the SINGLE
-        # canonical chokepoint (reconcile_enrollment_authorization): an APPROVED
-        # governing internal-service case advances the verified household to
-        # "Kitchen Assignment"; pending/denied/expired leaves it at "Verified"
-        # (the outcome is shown separately, from the Case). Using reconcile here
-        # -- instead of a bespoke check on selected_case/primary_case -- keeps the
-        # portal in lock-step with the nightly Unite Us import and the
-        # reconcile_authorizations backfill, picks the most-favorable
-        # internal-service case (so an approval always advances), and reuses the
-        # guard that never steals a case already owned by another live enrollment
-        # (the uniq_enrollment_verification_per_case constraint). The member is
-        # NOT auto-activated and no delivery schedule / orders are generated here
-        # -- that happens later at the manual kitchen-assignment step, which is
-        # what moves the household into service.
-        reconcile_enrollment_authorization(
-            enrollment,
-            actor_label=actor_label,
-            note="Authorization accepted — awaiting kitchen assignment.",
+        # Branch the post-verification projection. Williamsburg households are
+        # fast-tracked to Service Active with the Williamsburg kitchen; everyone
+        # else goes through the standard authorization projection (which uses the
+        # single canonical chokepoint reconcile_enrollment_authorization to stay
+        # in lock-step with the nightly Unite Us import and the
+        # reconcile_authorizations backfill, and reuses the per-case guard).
+        wburg_kitchen = (
+            Kitchen.objects.filter(name__iexact=WILLIAMSBURG_KITCHEN_NAME).first()
+            if is_williamsburg
+            else None
         )
+        if is_williamsburg and wburg_kitchen is not None:
+            # Williamsburg exception: skip the manual kitchen-assignment step
+            # entirely. Auto-assign the Williamsburg kitchen and activate service
+            # directly (Mon/Thu). assign_kitchen_to_household applies the kitchen
+            # meal rules per member (Kosher menu + any "X Free" allergy notes),
+            # builds the delivery plan + calendar and advances to Service Active.
+            assign_kitchen_to_household(
+                enrollment, client, wburg_kitchen,
+                cadence=DeliveryCadence.MON_THU, agent=agent,
+            )
+        else:
+            # Standard flow: project the case authorization onto the stage. An
+            # APPROVED governing internal-service case advances the verified
+            # household to "Kitchen Assignment"; pending/denied/expired leaves it
+            # at "Verified" (the outcome is shown separately, from the Case). The
+            # member is NOT auto-activated here -- that happens later at the manual
+            # kitchen-assignment step. (Falls back here for a Williamsburg client
+            # too when no Williamsburg kitchen is configured.)
+            reconcile_enrollment_authorization(
+                enrollment,
+                actor_label=actor_label,
+                note="Authorization accepted — awaiting kitchen assignment.",
+            )
 
         # Delivery Coverage Eligibility Check (LAST, so its side effects are the
         # final state): the verification still completes, but any member whose
