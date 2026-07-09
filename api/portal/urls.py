@@ -72,6 +72,7 @@ from .views_orders import (
     SendToKitchenView,
 )
 from .views_delivery_calendar import MemberDeliveryCalendarView
+from .views_kitchen_output import KitchenOutputView
 from .views_po_blockers import POBlockersFixView, POBlockersStatsView, POBlockersView
 from .views_activity import ActivityFiltersView, ActivityLogView
 from .views_service_area import ExcludedZipCodeDetailView, ExcludedZipCodesView
@@ -211,6 +212,13 @@ urlpatterns = [
     path("purchase-orders/<uuid:po_id>/send-to-delivery/", SendToDeliveryView.as_view()),
     path("kitchens/", KitchensListView.as_view(), name="portal-kitchens"),
     path("delivery-companies/", DeliveryCompaniesListView.as_view(), name="portal-delivery-companies"),
+
+    # Kitchen Output: one member's verification inputs vs resolved kitchen output
+    path(
+        "kitchen-output/<uuid:client_id>/",
+        KitchenOutputView.as_view(),
+        name="portal-kitchen-output",
+    ),
 
     # PO Blockers: members with a live plan that won't reach a Purchase Order
     path("po-blockers/", POBlockersView.as_view(), name="portal-po-blockers"),
