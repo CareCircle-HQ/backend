@@ -452,3 +452,49 @@ def sync_active_calendars(from_date=None):
         totals["removed"] += res["removed"]
         totals["updated"] += res["updated"]
     return totals
+
+
+@transaction.atomic
+def recompute_delivery_plan(enrollment, from_date=None):
+    """Re-derive a household's delivery plan from its current inputs, then rebuild
+    the dated calendar. THE single fix for delivery-date drift.
+
+    Recomputes, in order:
+      1. product **kind** (meals/boxes) via the robust resolver;
+      2. **delivery weekdays** from that kind + the plan's cadence (boxes -> fixed
+         Wednesday; meals -> the cadence's weekdays) -- healing a weekday/kind
+         mismatch (e.g. a boxes->meals switch that left weekdays on Wednesday);
+      3. the plan **window** (starts_on/ends_on) from the GOVERNING authorization
+         -- healing an unset/elapsed window;
+      4. product_type + per-delivery quantities.
+
+    Then :func:`sync_delivery_calendar` rebuilds the future occurrences (dropping
+    dates no longer planned, adding the new ones), never touching a date already
+    batched into a PO. Returns the sync result dict ``{added, removed, updated}``.
+
+    No-op-safe: if the household has no plan yet, it just reconciles whatever
+    exists.
+    """
+    from api.services.catalog import product_kind_for_enrollment
+    from api.services.delivery import current_household_cadence, update_household_cadence
+    from api.services.lifecycle import governing_internal_case
+    from api.models import DeliveryCadence
+
+    cadence = current_household_cadence(enrollment)
+    if not cadence:
+        return sync_delivery_calendar(enrollment, from_date=from_date)
+
+    case = governing_internal_case(enrollment) or enrollment.case
+    kind = product_kind_for_enrollment(enrollment)
+    # Preserve the agent-chosen weekday for a weekly cadence (any single weekday
+    # is valid for once_a_week), so recompute never fights an intentional choice.
+    once_weekday = None
+    if cadence == DeliveryCadence.ONCE_A_WEEK:
+        wd = [w for w in (enrollment.delivery_weekdays or []) if w in _WEEKDAY_CODES]
+        once_weekday = wd[0] if wd else None
+
+    update_household_cadence(
+        enrollment, cadence=cadence, once_a_week_weekday=once_weekday,
+        case=case, product_kind=kind,
+    )
+    return sync_delivery_calendar(enrollment, from_date=from_date)

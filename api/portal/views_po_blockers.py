@@ -4,14 +4,20 @@ Read-only surface over :func:`api.services.po_blockers.classify_po_blockers` --
 the members who have a live delivery plan but won't reach a Purchase Order,
 bucketed by cause. Backs the Logistics > PO Blockers page.
 """
+from django.db import transaction
+from django.shortcuts import get_object_or_404
+from rest_framework import status as http
 from rest_framework.response import Response
 
+from api.models import EnrollmentVerification
 from api.services.po_blockers import (
     BLOCKED_REASONS,
+    FIXABLE_REASONS,
     REASON_DESCRIPTIONS,
     REASON_LABELS,
     REASON_ORDER,
     classify_po_blockers,
+    remediate_enrollment_blocker,
     summarize_po_blockers,
 )
 
@@ -71,6 +77,7 @@ class POBlockersStatsView(PortalAPIView):
                 "label": REASON_LABELS.get(r, r),
                 "description": REASON_DESCRIPTIONS.get(r, ""),
                 "count": counts.get(r, 0),
+                "fixable": r in FIXABLE_REASONS,
             }
             for r in BLOCKED_REASONS
         ]
@@ -78,3 +85,27 @@ class POBlockersStatsView(PortalAPIView):
             "total": len(rows),
             "reasons": reasons,
         })
+
+
+class POBlockersFixView(PortalAPIView):
+    """POST /api/portal/po-blockers/fix/ -- apply the one-click fix for a member.
+
+    Body: ``{enrollment_id, reason}``. Fixable reasons (lapsed window / calendar
+    not generated / cadence-weekday mismatch / stale case link) are remediated
+    server-side (recompute the delivery plan + rebuild the calendar, or repoint
+    the case). Non-fixable reasons return ``fixed=False`` with guidance.
+    """
+
+    @transaction.atomic
+    def post(self, request):
+        enrollment_id = request.data.get("enrollment_id")
+        reason = (request.data.get("reason") or "").strip()
+        if not enrollment_id or not reason:
+            return Response(
+                {"error": "enrollment_id and reason are required."},
+                status=http.HTTP_400_BAD_REQUEST,
+            )
+        enr = get_object_or_404(EnrollmentVerification, pk=enrollment_id)
+        result = remediate_enrollment_blocker(enr, reason)
+        status_code = http.HTTP_200_OK if result.get("fixed") else http.HTTP_422_UNPROCESSABLE_ENTITY
+        return Response(result, status=status_code)

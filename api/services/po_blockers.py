@@ -19,14 +19,17 @@ from django.utils import timezone
 from api.models import (
     Case,
     CaseType,
+    DeliveryCadence,
     MemberDeliverySchedule,
     OrderSchedule,
+    ProductTypeKind,
     ScheduleStatus,
     ServiceAuthorizationStatus,
     SERVICE_EXCLUDED_ENROLLMENT_STAGES,
     SERVICE_EXCLUDED_MEMBER_STATUSES,
 )
 from api.services.catalog import product_kind_for_enrollment, product_type_kind_for_name
+from api.services.delivery import BOX_DELIVERY_WEEKDAY, weekdays_for_cadence
 from api.services.lifecycle import governing_internal_case
 
 # Authorization statuses that permit us to (re)generate future deliveries.
@@ -42,17 +45,27 @@ REASON_ORDER = [
     "lapsed_window_fixable",
     "needs_reauth",
     "no_future_generated",
+    "cadence_weekday_mismatch",
     "kind_unresolved",
     "stale_case_link",
     "ok",
 ]
 BLOCKED_REASONS = [r for r in REASON_ORDER if r != "ok"]
 
+# Reasons a one-click fix can resolve server-side. The first group is healed by
+# recompute_delivery_plan (weekdays + window + product, then calendar rebuild);
+# stale_case_link is healed by repointing the enrollment's case.
+_RECOMPUTE_REASONS = {
+    "lapsed_window_fixable", "no_future_generated", "cadence_weekday_mismatch",
+}
+FIXABLE_REASONS = _RECOMPUTE_REASONS | {"stale_case_link"}
+
 REASON_LABELS = {
     "no_kitchen": "No kitchen assigned",
     "lapsed_window_fixable": "Lapsed window (fixable)",
     "needs_reauth": "Needs re-authorization",
     "no_future_generated": "Calendar not generated",
+    "cadence_weekday_mismatch": "Cadence/weekday mismatch",
     "kind_unresolved": "Product kind unresolved",
     "stale_case_link": "Stale case link",
     "ok": "OK",
@@ -63,6 +76,7 @@ REASON_DESCRIPTIONS = {
     "lapsed_window_fixable": "Authorized with a future approval window, but the delivery plan window is unset or elapsed. Run backfill_delivery_calendar to regenerate.",
     "needs_reauth": "No approved authorization extending into the future. The case must be re-authorized (or the member off-boarded) before deliveries resume.",
     "no_future_generated": "The plan window covers the future yet no occurrences exist. A sync_delivery_calendars run should regenerate them.",
+    "cadence_weekday_mismatch": "The delivery weekdays don't match the plan's cadence (e.g. a boxes→meals switch that left deliveries on Wednesday), so occurrences land on days no PO is cut for. Recompute realigns them.",
     "kind_unresolved": "Has future occurrences but the product kind (meals/boxes) can't be resolved, so PO generation drops them. Needs a data/case fix.",
     "stale_case_link": "Deliverable, but the enrollment's case doesn't point at the governing internal-service case (hygiene; not blocking after the preview fix).",
     "ok": "Has future occurrences with a resolvable product kind.",
@@ -70,7 +84,8 @@ REASON_DESCRIPTIONS = {
 
 
 def _classify_reason(*, kitchen_id, future, has_future_auth, plan_ends_on,
-                     kind, enrollment_case_id, governing_case_id, today):
+                     kind, weekday_mismatch, enrollment_case_id,
+                     governing_case_id, today):
     if kitchen_id is None:
         return "no_kitchen"
     if future == 0:
@@ -81,9 +96,28 @@ def _classify_reason(*, kitchen_id, future, has_future_auth, plan_ends_on,
         return "no_future_generated"
     if kind is None:
         return "kind_unresolved"
+    if weekday_mismatch:
+        return "cadence_weekday_mismatch"
     if governing_case_id and str(enrollment_case_id) != str(governing_case_id):
         return "stale_case_link"
     return "ok"
+
+
+def _weekday_mismatch(enr, cadence, kind):
+    """True when the enrollment's delivery_weekdays don't match what the plan's
+    cadence + kind imply (e.g. a meals member on a mon_thu cadence whose weekdays
+    are stuck on Wednesday from a prior boxes setup). A weekly cadence accepts
+    any single weekday, so it never flags."""
+    actual = set(enr.delivery_weekdays or [])
+    if not actual or not cadence:
+        return False
+    if kind == ProductTypeKind.BOXES:
+        expected = {BOX_DELIVERY_WEEKDAY}
+    elif cadence != DeliveryCadence.ONCE_A_WEEK:
+        expected = set(weekdays_for_cadence(cadence, None))
+    else:
+        return False  # once_a_week: any single weekday is valid
+    return bool(expected) and actual != expected
 
 
 def classify_po_blockers(from_date=None, include_ok=False):
@@ -144,11 +178,12 @@ def classify_po_blockers(from_date=None, include_ok=False):
             auth_status in _AUTHORIZED and auth_end is not None and auth_end >= today
         )
         gov_case_id = getattr(gov, "case_id", None) if gov else None
+        mismatch = _weekday_mismatch(enr, p.delivery_days_cadence or "", kind)
 
         reason = _classify_reason(
             kitchen_id=enr.kitchen_id, future=future,
             has_future_auth=has_future_auth, plan_ends_on=p.ends_on,
-            kind=kind, enrollment_case_id=enr.case_id,
+            kind=kind, weekday_mismatch=mismatch, enrollment_case_id=enr.case_id,
             governing_case_id=gov_case_id, today=today,
         )
         if reason == "ok" and not include_ok:
@@ -158,6 +193,7 @@ def classify_po_blockers(from_date=None, include_ok=False):
         rows.append({
             "reason": reason,
             "reason_label": REASON_LABELS.get(reason, reason),
+            "fixable": reason in FIXABLE_REASONS,
             "client_id": str(getattr(m, "client_id", "") or "") if m else "",
             "member_name": p.member_name or (m.member_name if m else ""),
             "enrollment_id": enr.pk,
@@ -183,3 +219,42 @@ def summarize_po_blockers(rows):
     for r in rows:
         counts[r["reason"]] = counts.get(r["reason"], 0) + 1
     return counts
+
+
+def remediate_enrollment_blocker(enr, reason, from_date=None):
+    """Apply the server-side fix for a fixable blocker ``reason`` on ``enr``.
+
+    * recompute reasons (lapsed window / not generated / weekday mismatch) ->
+      :func:`recompute_delivery_plan` (weekdays + window + product, then rebuild).
+    * ``stale_case_link`` -> repoint the enrollment to the governing case, then
+      resync the calendar.
+
+    Non-fixable reasons (no_kitchen / needs_reauth / kind_unresolved) return
+    ``fixed=False`` with guidance. Returns a result dict.
+    """
+    from api.services.orders import recompute_delivery_plan, sync_delivery_calendar
+
+    if reason in _RECOMPUTE_REASONS:
+        res = recompute_delivery_plan(enr, from_date=from_date)
+        return {"fixed": True, "action": "recompute_delivery_plan", "result": res}
+
+    if reason == "stale_case_link":
+        gov = governing_internal_case(enr)
+        action = "sync"
+        if gov is not None and str(enr.case_id) != str(gov.case_id):
+            try:
+                enr.case = gov
+                enr.save(update_fields=["case"])
+                action = "repoint_case"
+            except Exception as exc:  # unique-per-case constraint, etc.
+                return {"fixed": False, "message": f"Could not repoint case: {exc}"}
+        res = sync_delivery_calendar(enr, from_date=from_date)
+        return {"fixed": True, "action": action, "result": res}
+
+    return {
+        "fixed": False,
+        "message": (
+            f"'{reason}' isn't auto-fixable — it needs a manual action "
+            f"(assign a kitchen, re-authorize the case, or fix the program)."
+        ),
+    }

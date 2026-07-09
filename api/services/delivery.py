@@ -319,7 +319,8 @@ def current_household_cadence(enrollment):
 
 
 @transaction.atomic
-def update_household_cadence(enrollment, cadence, once_a_week_weekday=None, case=None):
+def update_household_cadence(enrollment, cadence, once_a_week_weekday=None, case=None,
+                            product_kind=None):
     """Re-apply a manually chosen cadence to a household that already has a
     delivery plan.
 
@@ -328,19 +329,24 @@ def update_household_cadence(enrollment, cadence, once_a_week_weekday=None, case
     total, and writes them onto the enrollment and every existing
     MemberDeliverySchedule. Boxes keep their fixed Wednesday schedule (the
     cadence weekday is ignored, though the cadence value is still recorded).
+
+    ``product_kind`` overrides the program-name keyword detection (which fails
+    when a program name lacks a 'meal'/'box' keyword). Pass the robustly
+    resolved kind (``product_kind_for_enrollment``) so weekdays are never
+    computed against the wrong kind.
     """
     if case is None:
         case = enrollment.case
     program = case.program if case is not None else None
     program_name = (program.name if program is not None else "") or enrollment.program_name
-    kind = product_type_kind_for_name(program_name)
+    kind = product_kind or product_type_kind_for_name(program_name)
     is_boxes = kind == ProductTypeKind.BOXES
 
     if is_boxes:
         delivery_weekdays = [BOX_DELIVERY_WEEKDAY]
     else:
         delivery_weekdays = weekdays_for_cadence(cadence, once_a_week_weekday)
-    product_type = _resolve_product_type(program_name, cadence)
+    product_type = _resolve_product_type(program_name, cadence, kind=kind)
 
     enrollment.delivery_weekdays = delivery_weekdays
     enrollment.save(update_fields=["delivery_weekdays"])
