@@ -11,6 +11,7 @@ https://docs.djangoproject.com/en/6.0/ref/settings/
 """
 
 import os
+import sys
 from datetime import timedelta
 from pathlib import Path
 
@@ -125,6 +126,34 @@ if os.getenv('DB_SSLMODE'):
     DATABASES['default']['OPTIONS'] = {
         'sslmode': os.getenv('DB_SSLMODE'),
     }
+
+# ---------------------------------------------------------------------------
+# Test database
+# ---------------------------------------------------------------------------
+# Production runs on PostgreSQL. Building the test schema from scratch on SQLite
+# trips a historical migration (0036_rename_eligibility_to_assessment): it
+# relies on Postgres' in-place column rename, whereas SQLite's table-remake path
+# rebuilds a stale index reference and raises FieldDoesNotExist. That migration
+# is already applied everywhere and is correct on Postgres, so we don't rewrite
+# it. Instead, when running the test suite we use a fast in-memory SQLite DB and
+# build the schema DIRECTLY from the current models (migrations disabled), which
+# sidesteps the SQLite-only remake issue and also speeds tests up. Opt in
+# automatically for `manage.py test`, or explicitly via DISABLE_MIGRATIONS=1.
+RUNNING_TESTS = "test" in sys.argv or os.getenv("DISABLE_MIGRATIONS") == "1"
+if RUNNING_TESTS:
+    DATABASES["default"] = {
+        "ENGINE": "django.db.backends.sqlite3",
+        "NAME": ":memory:",
+    }
+
+    class _DisableMigrations:
+        def __contains__(self, item):
+            return True
+
+        def __getitem__(self, item):
+            return None  # None -> create tables straight from model state
+
+    MIGRATION_MODULES = _DisableMigrations()
 
 
 # Password validation

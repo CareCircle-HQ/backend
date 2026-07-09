@@ -104,9 +104,9 @@ REASON_DESCRIPTIONS = {
 
 
 def _classify_reason(*, kitchen_id, future, has_future_auth, plan_ends_on,
-                     kind, plan_kind, governing_kind, weekday_mismatch,
-                     switch_pending, open_case_count, enrollment_case_id,
-                     governing_case_id, today):
+                     kind, plan_kind, governing_kind, plan_kind_authorized,
+                     weekday_mismatch, switch_pending, open_case_count,
+                     enrollment_case_id, governing_case_id, today):
     if kitchen_id is None:
         return "no_kitchen"
     if future == 0:
@@ -120,9 +120,18 @@ def _classify_reason(*, kitchen_id, future, has_future_auth, plan_ends_on,
     # An authorized meals<->boxes switch: the governing case's kind now differs
     # from what the plan was built as. Ready to apply (fixable) -- checked before
     # the weekday mismatch, which is just the visible symptom of the same flip.
+    #
+    # Guard against a FALSE switch: if an open, favorable case still matches the
+    # plan's kind (``plan_kind_authorized``), the plan is still authorized and
+    # the member simply has a parallel different-kind case -- that's a
+    # ``duplicate_open_cases`` state, not a switch. Only when the plan-kind
+    # program is truly retired (no open approved case of that kind) does the
+    # governing different-kind case represent a real switch. This also keeps the
+    # one-click fix from destructively flipping a correctly-served member.
     if (
         plan_kind is not None and governing_kind is not None
         and plan_kind != governing_kind
+        and not plan_kind_authorized
     ):
         return "program_switched"
     if weekday_mismatch:
@@ -135,6 +144,33 @@ def _classify_reason(*, kitchen_id, future, has_future_auth, plan_ends_on,
     if governing_case_id and str(enrollment_case_id) != str(governing_case_id):
         return "stale_case_link"
     return "ok"
+
+
+def _case_product_kind(case):
+    """Best-effort Meals/Boxes kind for a SINGLE case (no enrollment context):
+    the linked Program's ProductType, then a keyword on the program / service
+    names. Returns a ProductTypeKind or None. Used to tell whether an open
+    favorable case still backs the plan's kind (a real switch vs a parallel
+    duplicate case)."""
+    if case is None:
+        return None
+    program = case.program if getattr(case, "program_id", None) else None
+    if program is not None and getattr(program, "product_type_id", None):
+        pt = program.product_type
+        if pt is not None:
+            try:
+                return ProductTypeKind(pt.type)
+            except ValueError:
+                pass
+    for candidate in (
+        program.name if program is not None else "",
+        getattr(case, "program_name", "") or "",
+        getattr(case, "service_type", "") or "",
+    ):
+        k = product_type_kind_for_name(candidate)
+        if k:
+            return k
+    return None
 
 
 def _weekday_mismatch(enr, cadence, kind):
@@ -175,10 +211,11 @@ def classify_po_blockers(from_date=None, include_ok=False):
     )
 
     # Prefetch each client's cases so governing_internal_case() doesn't fire a
-    # query per enrollment.
+    # query per enrollment. select_related the program + its product type so the
+    # per-case kind resolution (_case_product_kind) stays query-free.
     internal_cases = Prefetch(
         "enrollment__client__cases",
-        queryset=Case.objects.all(),
+        queryset=Case.objects.select_related("program", "program__product_type"),
     )
 
     plans = (
@@ -194,7 +231,9 @@ def classify_po_blockers(from_date=None, include_ok=False):
     )
 
     gov_cache = {}
-    enr_meta = {}  # enrollment pk -> (governing_kind, open_case_count, switch_pending)
+    # enrollment pk -> (governing_kind, open_case_count, switch_pending,
+    #                   favorable_open_kinds)
+    enr_meta = {}
     rows = []
     # chunk_size is REQUIRED by Django when iterator() follows prefetch_related()
     # (raises ValueError otherwise on newer Django).
@@ -206,9 +245,21 @@ def classify_po_blockers(from_date=None, include_ok=False):
             governing_kind = product_kind_for_enrollment(enr)
             open_cases = open_internal_service_cases(enr.client)
             switch_pending = pending_switch_case(enr, governing_kind) is not None
-            enr_meta[enr.pk] = (governing_kind, len(open_cases), switch_pending)
+            # Kinds still backed by an OPEN, favorable (approved/not-required)
+            # case. If the plan's kind is in here, the plan is still authorized
+            # and a different-kind governing case is a parallel duplicate, NOT a
+            # switch.
+            favorable_open_kinds = {
+                _case_product_kind(c) for c in open_cases
+                if c.service_authorization_status in _AUTHORIZED
+            }
+            favorable_open_kinds.discard(None)
+            enr_meta[enr.pk] = (
+                governing_kind, len(open_cases), switch_pending,
+                favorable_open_kinds,
+            )
         gov = gov_cache[enr.pk]
-        governing_kind, open_case_count, switch_pending = enr_meta[enr.pk]
+        governing_kind, open_case_count, switch_pending, favorable_open_kinds = enr_meta[enr.pk]
         auth_status = getattr(gov, "service_authorization_status", "") or ""
         auth_end = getattr(gov, "service_authorization_approval_ends_at", None)
         auth_end = auth_end.date() if auth_end else None
@@ -221,10 +272,16 @@ def classify_po_blockers(from_date=None, include_ok=False):
         gov_case_id = getattr(gov, "case_id", None) if gov else None
         mismatch = _weekday_mismatch(enr, p.delivery_days_cadence or "", kind)
 
+        # The plan's own kind is still authorized when an open, favorable case
+        # of that kind exists -> a different-kind governing case is a parallel
+        # duplicate, not a switch.
+        plan_kind_authorized = plan_kind is not None and plan_kind in favorable_open_kinds
+
         reason = _classify_reason(
             kitchen_id=enr.kitchen_id, future=future,
             has_future_auth=has_future_auth, plan_ends_on=p.ends_on,
             kind=kind, plan_kind=plan_kind, governing_kind=governing_kind,
+            plan_kind_authorized=plan_kind_authorized,
             weekday_mismatch=mismatch, switch_pending=switch_pending,
             open_case_count=open_case_count, enrollment_case_id=enr.case_id,
             governing_case_id=gov_case_id, today=today,
