@@ -87,6 +87,7 @@ from .views_imports import (
     UniteUsAgentsView,
 )
 from .views_settings import (
+    CadenceViewSet,
     CrmAgentViewSet,
     DeliveryCompanyIntegrationDetailView,
     DeliveryCompanyIntegrationSetPrimaryView,
@@ -108,6 +109,7 @@ from .views_tickets import (
 router = SimpleRouter()
 router.register("settings/menu-types", MenuTypeViewSet, basename="portal-menu-type")
 router.register("settings/dietary-tags", DietaryTagViewSet, basename="portal-dietary-tag")
+router.register("settings/cadences", CadenceViewSet, basename="portal-cadence")
 router.register("settings/kitchens", KitchenViewSet, basename="portal-kitchen")
 router.register(
     "settings/delivery-companies", DeliveryCompanyViewSet, basename="portal-delivery-company"

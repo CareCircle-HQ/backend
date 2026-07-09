@@ -8,6 +8,7 @@ from rest_framework.response import Response
 
 from ..models import (
     Agent,
+    Cadence,
     DeliveryCompany,
     DeliveryCompanyIntegration,
     DietaryTag,
@@ -17,6 +18,7 @@ from ..models import (
     KitchenMenuType,
     MenuType,
     MenuTypeTag,
+    ProductType,
 )
 from .base import PortalAPIView
 from .permissions import IsPortalAgent
@@ -66,10 +68,34 @@ class DietaryTagViewSet(viewsets.ModelViewSet):
         return super().destroy(request, *args, **kwargs)
 
 
+class CadenceViewSet(viewsets.ModelViewSet):
+    """Settings > Delivery Cadences: manage the configurable delivery cadences
+    (label + delivery weekdays). Configuration only for now -- surfaced in
+    Settings and selectable per-kitchen; the scheduling core still reads the
+    legacy enum/weekday map."""
+
+    permission_classes = [IsPortalAgent]
+    queryset = Cadence.objects.all()
+    serializer_class = s.PortalCadenceSerializer
+    pagination_class = None
+
+    def destroy(self, request, *args, **kwargs):
+        cadence = self.get_object()
+        # Don't remove a cadence a ProductType is still built on -- deleting it
+        # would orphan the option a live schedule depends on.
+        if ProductType.objects.filter(delivery_days_cadence=cadence.code).exists():
+            return Response(
+                {"error": "A product type still uses this cadence. Reassign it before deleting."},
+                status=http.HTTP_409_CONFLICT,
+            )
+        return super().destroy(request, *args, **kwargs)
+
+
 class KitchenViewSet(viewsets.ModelViewSet):
     permission_classes = [IsPortalAgent]
     queryset = Kitchen.objects.all().prefetch_related(
         "menu_types",
+        "cadences",
         "integrations",
         "kitchen_menu_types__menu_type",
         "kitchen_menu_types__restrictions",
@@ -80,6 +106,15 @@ class KitchenViewSet(viewsets.ModelViewSet):
     def menu_types(self, request, pk=None):
         kitchen = self.get_object()
         kitchen.menu_types.set(request.data.get("menu_type_ids", []))
+        kitchen.refresh_from_db()
+        return Response(self.get_serializer(kitchen).data)
+
+    @action(detail=True, methods=["put"])
+    def cadences(self, request, pk=None):
+        """Set which delivery cadences this kitchen takes orders for.
+        Body: {"cadence_ids": [...]}. Configuration only (not yet enforced)."""
+        kitchen = self.get_object()
+        kitchen.cadences.set(request.data.get("cadence_ids", []))
         kitchen.refresh_from_db()
         return Response(self.get_serializer(kitchen).data)
 
