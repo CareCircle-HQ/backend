@@ -45,7 +45,7 @@ from api.models import (
     PurchaseOrderStatus,
     ScheduleStatus,
 )
-from api.services.catalog import product_type_kind_for_name
+from api.services.catalog import product_kind_for_enrollment, product_type_kind_for_name
 from api.services.kitchens import _MENU_CODE_TO_NAME, _norm
 from api.services.orders import _WEEKDAY_CODES
 
@@ -220,11 +220,25 @@ def _due_schedules(kind, delivery_date):
         )
         .exclude(enrollment__stage__in=SERVICE_EXCLUDED_ENROLLMENT_STAGES)
         .exclude(member__status__in=SERVICE_EXCLUDED_MEMBER_STATUSES)
-        .select_related("member", "member__client", "household", "kitchen")
+        .select_related(
+            "member", "member__client", "household", "kitchen",
+            "enrollment", "enrollment__case", "enrollment__case__program",
+        )
     )
+    # The schedule's snapshot ``program_name`` doesn't always carry a meal/box
+    # keyword (e.g. "Enhanced Care Management ..."), so fall back to the robust
+    # per-enrollment resolver -- which reads the GOVERNING internal-service case
+    # (the verification's case) -- before dropping a schedule. Cached per
+    # enrollment to avoid re-resolving the same household.
+    enr_kind = {}
     out = []
     for s in qs:
-        if product_type_kind_for_name(s.program_name) == kind:
+        schedule_kind = product_type_kind_for_name(s.program_name)
+        if schedule_kind is None:
+            if s.enrollment_id not in enr_kind:
+                enr_kind[s.enrollment_id] = product_kind_for_enrollment(s.enrollment)
+            schedule_kind = enr_kind[s.enrollment_id]
+        if schedule_kind == kind:
             out.append(s)
     return out
 
