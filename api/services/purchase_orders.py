@@ -442,7 +442,7 @@ _BOX_EXPORT_HEADERS = [
     "Delivery Date", "OrderID", "HouseholdGroup", "PrimaryMemberID",
     "PrimaryHousehold", "Quantity", "MemberID", "Name",
     "Street Address", "Unit / Apt", "City", "State", "Zipcode",
-    "Delivery Notes", "MenuType", "FOOD NOTE", "Email address", "Phone",
+    "Delivery Notes", "MenuType", "Allergies", "FOOD NOTE", "Email address", "Phone",
 ]
 
 
@@ -522,6 +522,31 @@ def _food_note(client):
     if (prof.other_dietary_restrictions or "").strip():
         add(prof.other_dietary_restrictions)
     return "; ".join(parts)
+
+
+def _allergies_note(client):
+    """Comma-joined verification food-allergy labels from the member's latest
+    dietary profile. Drops "none"-like placeholders and de-duplicates while
+    preserving order."""
+    if client is None:
+        return ""
+    prof = (
+        MemberDietaryProfile.objects.filter(client=client)
+        .order_by("-updated_at")
+        .first()
+    )
+    if prof is None:
+        return ""
+    parts = []
+    seen = set()
+    for code in (prof.food_allergies or []):
+        label = (_ALLERGY_LABELS.get(code, code) or "").strip()
+        key = label.lower()
+        if not label or key in _NONE_LIKE or key in seen:
+            continue
+        seen.add(key)
+        parts.append(label)
+    return ", ".join(parts)
 
 
 def kitchen_export_filename(po):
@@ -661,8 +686,9 @@ def build_kitchen_export_rows(po):
             addr.state if addr else "",
             addr.zip if addr else "",
             _delivery_notes(c),
-            do.kitchen_meal_type or (do.menu_type.name if do.menu_type else ""),
-            do.kitchen_food_notes,
+            do.menu_type.name if do.menu_type else "",
+            _allergies_note(c),
+            _food_note(c),
             c.client_email_address if c else "",
             _format_phone(c.client_phone_number) if c else "",
         ])
