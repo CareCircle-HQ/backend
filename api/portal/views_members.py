@@ -622,6 +622,51 @@ class FoodAllergiesListView(PortalAPIView):
         ])
 
 
+class LeadSourcesListView(PortalAPIView):
+    """Lead-source options for the Members-page filter dropdown.
+
+    Mirrors the extension's Lead Source picker, which is populated from the
+    CallTools queues (``value`` = queue id). Merged with any distinct
+    ``Client.lead_source`` values already stored (so legacy/free-text values
+    such as "Williamsburg" stay filterable even when they aren't a queue id).
+    """
+
+    def get(self, request):
+        options = []
+        seen = set()
+        # CallTools queues -- the same source the extension's Lead Source uses.
+        try:
+            from ..integrations.calltools import config as ct_config
+            from ..integrations.calltools import queues as ct_queues
+
+            if ct_config.is_enabled():
+                for q in ct_queues.list_queue_options():
+                    qid = str(q.get("id") or "").strip()
+                    if not qid or qid in seen:
+                        continue
+                    seen.add(qid)
+                    name = q.get("name") or qid
+                    label = name if q.get("active", True) else f"{name} (inactive)"
+                    options.append({"value": qid, "label": label})
+        except Exception:  # never let a CallTools hiccup break the filter
+            pass
+        # Merge in distinct stored lead_source values not already covered by a
+        # queue id (surfaces legacy free-text values like "Williamsburg").
+        stored = (
+            Client.objects.exclude(lead_source="")
+            .values_list("lead_source", flat=True)
+            .distinct()
+        )
+        for val in stored:
+            v = (val or "").strip()
+            if not v or v in seen:
+                continue
+            seen.add(v)
+            options.append({"value": v, "label": v})
+        options.sort(key=lambda o: (o["label"] or "").lower())
+        return Response(options)
+
+
 class MembersListView(PortalGenericAPIView):
     serializer_class = s.MemberListSerializer
 
@@ -771,6 +816,14 @@ class MembersListView(PortalGenericAPIView):
                     household_membership__household__enrollment_verifications__kitchen_id=kitchen_id
                 )
             )
+
+        # Lead-source filter (Members page): the client's stored lead source
+        # (a CallTools queue id, or legacy free-text such as "Williamsburg").
+        # ``lead_source`` is a direct Client column, so no extra join/distinct.
+        # Exact, case-insensitive match on the value chosen from the dropdown.
+        lead_source_val = (params.get("lead_source") or "").strip()
+        if lead_source_val:
+            qs = qs.filter(lead_source__iexact=lead_source_val)
 
         # Special status flags that aren't lifecycle stages:
         #   * out_of_orbit -> the member has a MemberDietaryProfile the meal rule

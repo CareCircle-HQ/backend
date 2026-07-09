@@ -3,7 +3,8 @@ orders, and the send-to-kitchen / send-to-delivery actions."""
 
 import uuid
 
-from django.db.models import Q
+from django.db.models import Q, TextField
+from django.db.models.functions import Cast
 from django.http import HttpResponse
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
@@ -145,6 +146,31 @@ class PurchaseOrderDeliveryOrdersView(PortalGenericAPIView):
             .select_related("member", "group", "kitchen", "menu_type", "delivery_company")
             .prefetch_related("custom_dietary_tags")
         )
+        # Member search within the PO: match the delivery order's member by
+        # Client ID (the primary use), and also by first/last name. Searches the
+        # whole PO, not just the current page.
+        search = (request.query_params.get("search") or "").strip()
+        if search:
+            cond = (
+                Q(member__first_name__icontains=search)
+                | Q(member__last_name__icontains=search)
+            )
+            parts = search.split()
+            if len(parts) >= 2:
+                cond |= Q(member__first_name__icontains=parts[0]) & Q(
+                    member__last_name__icontains=parts[-1]
+                )
+            # Client ID: exact match when a full UUID; otherwise a partial match
+            # on the textual form of the member's client_id (UUIDField can't be
+            # searched with icontains directly, so cast it to text first).
+            try:
+                cond |= Q(member__client_id=uuid.UUID(search))
+            except (ValueError, TypeError, AttributeError):
+                qs = qs.annotate(
+                    _member_cid=Cast("member__client_id", output_field=TextField())
+                )
+                cond |= Q(_member_cid__icontains=search)
+            qs = qs.filter(cond)
         page = self.paginate_queryset(qs)
         return self.get_paginated_response(self.get_serializer(page, many=True).data)
 
