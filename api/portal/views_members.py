@@ -379,16 +379,25 @@ def apply_authorization_filter(qs, value):
     if not spec:
         return qs
     match_statuses, outrank = spec
+    # Correlated per-client subquery over the SAME internal-service case row.
+    # NB: a plain ``.exclude(cases__case_type=INTERNAL, cases__status__in=...)``
+    # does NOT tie the two conditions to the same case (Django's multi-valued
+    # exclude splits them), so it wrongly drops a member whose meal case is
+    # pending but whose *eligibility* case happens to be approved/not_required.
+    # Anchoring both on one Case via Exists keeps the match/outrank semantics
+    # scoped to the internal-service (meal/box) case that actually governs.
+    internal_cases = Case.objects.filter(
+        client=OuterRef("pk"),
+        case_type=CaseType.INTERNAL_SERVICE,
+    )
     qs = qs.filter(
-        cases__case_type=CaseType.INTERNAL_SERVICE,
-        cases__service_authorization_status__in=match_statuses,
+        Exists(internal_cases.filter(service_authorization_status__in=match_statuses))
     )
     if outrank:
         # Drop clients holding a more favorable internal-service authorization
         # (that more favorable case would be the governing one instead).
         qs = qs.exclude(
-            cases__case_type=CaseType.INTERNAL_SERVICE,
-            cases__service_authorization_status__in=outrank,
+            Exists(internal_cases.filter(service_authorization_status__in=outrank))
         )
     return qs
 
