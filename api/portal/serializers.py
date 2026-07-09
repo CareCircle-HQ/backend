@@ -622,6 +622,11 @@ class MemberDetailSerializer(serializers.Serializer):
                 # True only while a PENDING verification request exists -- the
                 # sole state in which the "run verification" pop-up is offered.
                 "verification_pending": verification_pending(client),
+                # Williamsburg exception (lead source == "Williamsburg"): the
+                # verification wizard forces the Kosher menu and the save
+                # auto-assigns the Williamsburg kitchen + activates directly.
+                "is_williamsburg": bool(getattr(client, "is_williamsburg", False)),
+                "lead_source": client.lead_source or "",
             },
             "lifecycle": {
                 "stage": client.lifecycle_stage,
