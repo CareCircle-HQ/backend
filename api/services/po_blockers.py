@@ -127,7 +127,9 @@ def classify_po_blockers(from_date=None, include_ok=False):
 
     gov_cache = {}
     rows = []
-    for p in plans.iterator():
+    # chunk_size is REQUIRED by Django when iterator() follows prefetch_related()
+    # (raises ValueError otherwise on newer Django).
+    for p in plans.iterator(chunk_size=1000):
         enr = p.enrollment
         m = p.member_profile
         if enr.pk not in gov_cache:
