@@ -639,7 +639,7 @@ def governing_internal_case(enrollment):
     return enrollment.case
 
 
-def reconcile_enrollment_authorization(enrollment, *, actor=None, note=""):
+def reconcile_enrollment_authorization(enrollment, *, actor=None, actor_label="", note=""):
     """Project the governing Case's authorization status onto the enrollment stage.
 
     This is the single chokepoint for the externally-driven "Accepted" outcome:
@@ -664,10 +664,24 @@ def reconcile_enrollment_authorization(enrollment, *, actor=None, note=""):
     if case is None:
         return enrollment
     # Keep enrollment.case pointing at the governing (current) case so the
-    # order/delivery authorization window is read from the right case.
+    # order/delivery authorization window is read from the right case -- but ONLY
+    # when that case isn't already claimed by another LIVE enrollment. The
+    # per-case unique constraint (uniq_enrollment_verification_per_case) forbids
+    # two live enrollments sharing a case, so stealing it would raise
+    # IntegrityError and abort the whole reconcile. When it's taken we leave the
+    # FK as-is and still read the authorization outcome from `case` below, so the
+    # stage still advances.
     if enrollment.case_id != case.case_id:
-        enrollment.case = case
-        enrollment.save(update_fields=["case"])
+        taken = (
+            case.enrollments.exclude(pk=enrollment.pk)
+            .exclude(
+                stage__in=(EnrollmentStage.DISREGARDED, EnrollmentStage.CANCELLED)
+            )
+            .exists()
+        )
+        if not taken:
+            enrollment.case = case
+            enrollment.save(update_fields=["case"])
 
     target = _AUTH_STATUS_TO_STAGE.get(case.service_authorization_status)
     if target is None:
@@ -678,7 +692,9 @@ def reconcile_enrollment_authorization(enrollment, *, actor=None, note=""):
     if EnrollmentStage(enrollment.stage) == target:
         return enrollment
     try:
-        return advance_enrollment(enrollment, target, actor=actor, note=note)
+        return advance_enrollment(
+            enrollment, target, actor=actor, actor_label=actor_label, note=note
+        )
     except InvalidTransition:
         # Defensive: an illegal projection (e.g. terminal stage) is a no-op.
         return enrollment
