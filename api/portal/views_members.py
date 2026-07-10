@@ -1373,7 +1373,12 @@ class MembersListView(PortalGenericAPIView):
                 Lower("last_name"),
             )
             page = self.paginate_queryset(qs)
-            data = [s.MemberListSerializer(c).data for c in page]
+            data = []
+            for c in page:
+                row = s.MemberListSerializer(c).data
+                # Meals/Boxes kind (household-wide) for the row's service label.
+                row["service_type"] = self._service_type_for_client(c)
+                data.append(row)
             return self.get_paginated_response(data)
         # Grouped mode (Verification / Logistics): build the ordered group keys
         # cheaply, paginate THEM, and serialize only the current page's groups
