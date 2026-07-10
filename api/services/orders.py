@@ -18,6 +18,7 @@ from django.utils import timezone
 
 from api.models import (
     DeliveryOrder,
+    DeliveryOrderStatus,
     EnrollmentStage,
     MemberStatus,
     SERVICE_EXCLUDED_MEMBER_STATUSES,
@@ -336,7 +337,11 @@ def sync_delivery_calendar(enrollment, from_date=None):
         (o.member_id, o.anticipated_delivery_date): o for o in existing
     }
 
-    # (client_id, date) pairs already committed to a DeliveryOrder -- untouchable.
+    # (client_id, date) pairs already committed to a LIVE DeliveryOrder --
+    # untouchable. Cancelled delivery orders (e.g. from a cancelled PO) do NOT
+    # count: the date is free again, so a stale wrong-day occurrence tied only to
+    # a cancelled order must still be removable (otherwise it lingers forever and
+    # keeps showing up on the wrong day's PO).
     client_by_profile = {
         p.member_profile_id: p.member_profile.client_id for p in plans
     }
@@ -344,7 +349,9 @@ def sync_delivery_calendar(enrollment, from_date=None):
     batched = set(
         DeliveryOrder.objects.filter(
             member_id__in=all_client_ids, expected_delivery_date__gte=from_date,
-        ).values_list("member_id", "expected_delivery_date")
+        )
+        .exclude(status=DeliveryOrderStatus.CANCELLED)
+        .values_list("member_id", "expected_delivery_date")
     )
 
     group_code = (

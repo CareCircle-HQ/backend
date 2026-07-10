@@ -1509,3 +1509,41 @@ class CalendarKeepsOccurrencesOnExclusionTest(TestCase):
 
         sync_active_calendars()
         self.assertEqual(self._future_count(enr), n0)  # regenerated
+
+    def test_cancelled_delivery_order_does_not_protect_stale_wrong_day(self):
+        """A stale occurrence on a weekday the plan no longer delivers on, whose
+        ONLY DeliveryOrder is CANCELLED, must be removable -- otherwise it lingers
+        forever and shows up on the wrong day's PO. (A LIVE order still protects.)"""
+        from datetime import timedelta
+
+        from .models import (
+            DeliveryOrder, DeliveryOrderStatus, OrderSchedule, OrderStatus,
+            PurchaseOrder, PurchaseOrderStatus,
+        )
+        from .services.orders import sync_delivery_calendar
+
+        enr, member = self._make_active_enrollment()
+        # Narrow the plan to Mondays only so any non-Monday date is "wrong-day".
+        enr.delivery_weekdays = ["mon"]
+        enr.save(update_fields=["delivery_weekdays"])
+
+        # A stale occurrence on the next Tuesday (not a plan weekday).
+        today = timezone.localdate()
+        tue = today + timedelta(days=(1 - today.weekday()) % 7 or 7)
+        stale = OrderSchedule.objects.create(
+            enrollment=enr, member=member, member_name="Hold Er",
+            anticipated_delivery_date=tue, status=OrderStatus.SCHEDULED,
+            household_group_code="G", kitchen=enr.kitchen,
+        )
+        # Only a CANCELLED delivery order references that date.
+        po = PurchaseOrder.objects.create(status=PurchaseOrderStatus.DRAFT)
+        DeliveryOrder.objects.create(
+            purchase_order=po, member=member.client, expected_delivery_date=tue,
+            status=DeliveryOrderStatus.CANCELLED,
+        )
+
+        sync_delivery_calendar(enr)
+        self.assertFalse(
+            OrderSchedule.objects.filter(pk=stale.pk).exists(),
+            "cancelled order must not protect a stale wrong-day occurrence",
+        )
