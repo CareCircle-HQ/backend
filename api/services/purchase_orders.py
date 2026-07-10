@@ -125,6 +125,43 @@ def cadence_for_delivery_date(delivery_date):
     return _WEEKDAY_CADENCE.get(delivery_date.weekday(), "")
 
 
+def cadences_for_delivery_date(kind, delivery_date):
+    """Every active cadence (scoped to this product ``kind``) that delivers on
+    ``delivery_date``'s weekday, each with its OWN PO/cutoff date.
+
+    A single weekday can belong to more than one cadence (e.g. Tuesday is a
+    delivery day for both ``tue_fri`` and ``tue_only``), and each cadence can be
+    ordered on a different cutoff weekday -- so the PO popup must show them all
+    rather than a single hardcoded cadence. Returns a list of
+    ``{code, label, po_date}`` sorted by label.
+    """
+    from api.models import Cadence
+    from api.services.delivery import cadence_codes_for_kind
+
+    wd = delivery_date.weekday()
+    delivery_code = _WEEKDAY_NAMES.get(wd)
+    kind_codes = cadence_codes_for_kind(kind)
+    out = []
+    for c in Cadence.objects.filter(is_active=True):
+        if kind_codes and c.code not in kind_codes:
+            continue
+        weekdays = [w for w in (c.weekdays or []) if w in _WEEKDAY_CODES]
+        if weekdays and delivery_code not in weekdays:
+            continue
+        po_code = (c.po_weekdays or {}).get(delivery_code)
+        if po_code and po_code in _WEEKDAY_CODES:
+            po = _prev_weekday(delivery_date, _WEEKDAY_CODES[po_code])
+        else:
+            po = po_date_for_delivery(kind, delivery_date)
+        out.append({
+            "code": c.code,
+            "label": c.label or c.code,
+            "po_date": po.isoformat() if po else None,
+        })
+    out.sort(key=lambda x: (x["label"] or "").lower())
+    return out
+
+
 def _product_type_for(kind, delivery_date):
     """The ProductType matching the kind + the cadence implied by the weekday."""
     if kind is None:
@@ -378,6 +415,7 @@ def preview_purchase_orders(kind, delivery_date):
         "delivery_date": delivery_date.isoformat(),
         "po_date": po_date.isoformat() if po_date else None,
         "cadence": cadence_for_delivery_date(delivery_date),
+        "cadences": cadences_for_delivery_date(kind, delivery_date),
         "kitchens": sorted(groups.values(), key=lambda x: (x["kitchen_name"] or "").lower()),
     }
 
