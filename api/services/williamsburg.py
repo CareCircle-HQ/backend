@@ -74,7 +74,7 @@ def fast_track_williamsburg_enrollment(enrollment, *, actor=None, agent=None):
     from api.serializers import ensure_household_with_primary
     from api.portal.serializers import primary_case
     from api.services.delivery import create_member_delivery_schedules
-    from api.services.lifecycle import advance_enrollment
+    from api.services.lifecycle import ENROLLMENT_TRANSITIONS, advance_enrollment
     from api.services.orders import generate_delivery_calendar
 
     client = enrollment.client
@@ -131,17 +131,26 @@ def fast_track_williamsburg_enrollment(enrollment, *, actor=None, agent=None):
     #    delivery plan + dated calendar in between (same work the manual
     #    kitchen-assignment step does); PO generation stays separate.
     case = enrollment.case or primary_case(client)
-    advance_enrollment(
-        enrollment, EnrollmentStage.VERIFIED, actor=actor, force=True,
-        note="Williamsburg exception: auto-verified on extension request.",
-    )
+    # Advance to VERIFIED only if the enrollment hasn't already passed it. A
+    # freshly-created (Pending Verification) enrollment moves up; an enrollment
+    # already at/after Kitchen Assignment can't move BACK to Verified (the
+    # transition map is forward-only), so we skip straight to the activation
+    # steps below. The verification facts were already stamped above regardless.
+    if EnrollmentStage.VERIFIED in ENROLLMENT_TRANSITIONS.get(enrollment.stage, set()):
+        advance_enrollment(
+            enrollment, EnrollmentStage.VERIFIED, actor=actor, force=True,
+            note="Williamsburg exception: auto-verified on extension request.",
+        )
     create_member_delivery_schedules(
         enrollment, case=case, cadence=DeliveryCadence.MON_THU, kitchen=kitchen,
     )
     generate_delivery_calendar(enrollment)
-    advance_enrollment(
-        enrollment, EnrollmentStage.SERVICE_ACTIVE, actor=actor, force=True,
-        note=f"Williamsburg exception: activated directly ({WILLIAMSBURG_KITCHEN_NAME}).",
-    )
+    # Activate unless already Service Active (avoid an illegal self-transition on
+    # an enrollment that somehow reached Service Active without a kitchen).
+    if enrollment.stage != EnrollmentStage.SERVICE_ACTIVE:
+        advance_enrollment(
+            enrollment, EnrollmentStage.SERVICE_ACTIVE, actor=actor, force=True,
+            note=f"Williamsburg exception: activated directly ({WILLIAMSBURG_KITCHEN_NAME}).",
+        )
     enrollment.refresh_from_db()
     return enrollment
