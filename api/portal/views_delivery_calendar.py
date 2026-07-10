@@ -17,8 +17,10 @@ from ..models import (
     Client,
     DeliveryCadence,
     DeliveryOrder,
+    EnrollmentStage,
     MemberDeliverySchedule,
     MemberDietaryProfile,
+    MemberStatus,
     OrderSchedule,
     ScheduleStatus,
 )
@@ -50,6 +52,34 @@ def _do_state(status):
     return "committed"  # pending / ready_for_delivery / out_for_delivery / on_hold
 
 
+# Member status -> (calendar state, label) for an UPCOMING scheduled date that
+# won't be delivered because the member is currently excluded.
+_MEMBER_EXCLUSION = {
+    MemberStatus.PAUSED: ("paused", "Paused"),
+    MemberStatus.OUT_OF_ORBIT: ("out_of_orbit", "Out of Orbit"),
+    MemberStatus.OUT_OF_RANGE: ("out_of_range", "Out of Range"),
+    MemberStatus.INACTIVE: ("inactive", "Inactive"),
+}
+_TERMINAL_STAGES = (
+    EnrollmentStage.SERVICE_COMPLETE, EnrollmentStage.CLOSED, EnrollmentStage.CANCELLED,
+)
+
+
+def _exclusion_state(enrollment, member):
+    """Why an upcoming SCHEDULED date won't be delivered, as ``(state, label)``.
+
+    The household On Hold / terminal takes precedence over an individual
+    member's Paused / Out-of-Orbit / Out-of-Range / Inactive status. Returns
+    ``None`` when nothing excludes the date (a normal Scheduled delivery).
+    """
+    stage = getattr(enrollment, "stage", None)
+    if stage == EnrollmentStage.ON_HOLD:
+        return ("on_hold", "On Hold")
+    if stage in _TERMINAL_STAGES:
+        return ("cancelled", "Service Ended")
+    return _MEMBER_EXCLUSION.get(getattr(member, "status", None))
+
+
 class MemberDeliveryCalendarView(PortalAPIView):
     """GET /api/portal/members/<client_id>/delivery-calendar/"""
 
@@ -63,7 +93,7 @@ class MemberDeliveryCalendarView(PortalAPIView):
 
         occurrences = list(
             OrderSchedule.objects.filter(member_id__in=profile_ids)
-            .select_related("kitchen", "enrollment")
+            .select_related("kitchen", "enrollment", "member")
             .order_by("anticipated_delivery_date")
         ) if profile_ids else []
 
@@ -111,10 +141,30 @@ class MemberDeliveryCalendarView(PortalAPIView):
                 quantity = o.how_many_meals_or_boxes
                 po_number, po_id, delivered_at, proof = "", None, None, []
 
+                if o.status == ScheduleStatus.SCHEDULED and d and today:
+                    if d >= today:
+                        # Overlay the CURRENT exclusion reason onto a still-
+                        # scheduled FUTURE date, so the calendar says On Hold /
+                        # Paused / Out of Orbit / Out of Range instead of a
+                        # misleading "Scheduled". The occurrence is kept (not
+                        # deleted) and reverts to Scheduled once the exclusion is
+                        # lifted; PO generation still excludes it.
+                        ex = _exclusion_state(o.enrollment, o.member)
+                        if ex is not None:
+                            state, status_label, status = ex[0], ex[1], ex[0]
+                    else:
+                        # A PAST date still marked Scheduled was never fulfilled
+                        # (no delivery order was ever committed for it) -- it has
+                        # expired, so don't keep showing a misleading "Scheduled".
+                        state, status_label, status = "expired", "Expired", "expired"
+
             counts["total"] += 1
             if state in counts:
                 counts[state] += 1
-            if d and today and d >= today and state not in ("cancelled", "delivered"):
+            # Only genuinely deliverable dates count as "upcoming" / drive the
+            # next-delivery date -- an excluded (on-hold / paused / ...) date is
+            # shown but is not counted as forthcoming service.
+            if d and today and d >= today and state in ("scheduled", "committed"):
                 counts["upcoming"] += 1
                 if next_delivery is None or d < next_delivery:
                     next_delivery = d

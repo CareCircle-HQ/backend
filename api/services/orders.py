@@ -317,13 +317,15 @@ def sync_delivery_calendar(enrollment, from_date=None):
         enrollment.delivery_schedules.filter(status=ScheduleStatus.SCHEDULED)
         .select_related("member_profile", "member_profile__client")
     )
-    # Skip out-of-orbit / paused members: they carry a plan but are excluded
-    # from POs.
-    plans = [
-        p for p in plans
-        if p.member_profile
-        and p.member_profile.status not in SERVICE_EXCLUDED_MEMBER_STATUSES
-    ]
+    # Exclusion (On Hold / terminal stage, or a Paused / Out-of-Orbit /
+    # Out-of-Range / Inactive member) is a STATUS OVERLAY on the calendar plus a
+    # PO-time filter -- NOT a calendar deletion. Occurrences are KEPT (built from
+    # every planned member regardless of current status/stage) so the member
+    # profile can show WHY a date won't be delivered and the row reverts to
+    # Scheduled the moment the exclusion is lifted. PO preview/generation still
+    # exclude these via live member-status + enrollment-stage checks, so an
+    # excluded member/household never actually lands on a Purchase Order.
+    plans = [p for p in plans if p.member_profile]
 
     existing = list(
         enrollment.orders.filter(
@@ -428,22 +430,44 @@ def sync_delivery_calendar(enrollment, from_date=None):
 
 
 def sync_active_calendars(from_date=None):
-    """Reconcile the delivery calendar for every enrollment that currently has
-    future occurrences (see :func:`sync_delivery_calendar`).
+    """Reconcile the delivery calendar for every enrollment that either has
+    future occurrences OR still has a live plan covering future dates (see
+    :func:`sync_delivery_calendar`).
 
     Backs the PO popup "Refresh" and the ``sync_delivery_calendars`` command so
     no eligible member is ever missing from a Purchase Order: any member added
     to an already-active household, and any cadence/kitchen/dietary drift, is
     picked up. Brand-new households get their calendar at kitchen-assignment
-    time, so they are already covered. Returns aggregate counts.
+    time, so they are already covered.
+
+    Crucially, this ALSO heals a calendar that has fully lapsed (0 future
+    occurrences) while its authorization/plan window still extends into the
+    future -- otherwise such a member would be skipped forever and silently stop
+    receiving deliveries. Returns aggregate counts.
     """
-    from api.models import EnrollmentVerification
+    from django.db.models import Q
+
+    from api.models import (
+        EnrollmentVerification,
+        MemberDeliverySchedule,
+        ScheduleStatus,
+        SERVICE_EXCLUDED_ENROLLMENT_STAGES,
+    )
 
     from_date = from_date or timezone.localdate()
-    enr_ids = list(
+    # Enrollments that already have future occurrences ...
+    enr_ids = set(
         OrderSchedule.objects.filter(
             status=OrderStatus.SCHEDULED, anticipated_delivery_date__gte=from_date,
-        ).values_list("enrollment_id", flat=True).distinct()
+        ).values_list("enrollment_id", flat=True)
+    )
+    # ... PLUS active enrollments whose plan window still covers today/future but
+    # whose calendar has lapsed (no future occurrences), so it can self-heal.
+    enr_ids |= set(
+        MemberDeliverySchedule.objects.filter(status=ScheduleStatus.SCHEDULED)
+        .filter(Q(ends_on__isnull=True) | Q(ends_on__gte=from_date))
+        .exclude(enrollment__stage__in=SERVICE_EXCLUDED_ENROLLMENT_STAGES)
+        .values_list("enrollment_id", flat=True)
     )
     totals = {"enrollments": 0, "added": 0, "removed": 0, "updated": 0}
     for enr in EnrollmentVerification.objects.filter(pk__in=enr_ids).iterator():
