@@ -26,6 +26,7 @@ from ..models import (
 )
 from ..services.orders import resync_scheduled_orders
 from ..services.purchase_orders import (
+    backfill_late_occurrences,
     build_kitchen_export_csv,
     build_po_summary_data,
     build_po_summary_report,
@@ -347,6 +348,31 @@ class PurchaseOrderPreviewRefreshView(PortalAPIView):
         updated = resync_scheduled_orders(delivery_date=delivery_date)
         data = preview_purchase_orders(kind, delivery_date)
         data["refreshed"] = {"updated": updated}
+        return Response(data)
+
+
+class PurchaseOrderPreviewLateView(PortalAPIView):
+    """Backfill occurrences for a date whose PO cutoff has already passed, then
+    return the preview.
+
+    When a cadence change lands after a delivery date's cutoff, that date is
+    skipped by the calendar (the plan's first delivery moves to the next
+    orderable date), so the preview is empty and no LATE PO can be cut. This
+    endpoint synthesizes SCHEDULED occurrences for members whose cadence delivers
+    that weekday -- skipping anyone already covered by a live delivery that week
+    (no double-delivery) -- so the agent can still batch a late PO."""
+
+    def post(self, request):
+        kind = _parse_kind(request.data.get("kind"))
+        delivery_date = _parse_date(request.data.get("delivery_date"))
+        if kind is None or delivery_date is None:
+            return Response(
+                {"detail": "kind (meals|boxes) and delivery_date (YYYY-MM-DD) are required."},
+                status=http.HTTP_400_BAD_REQUEST,
+            )
+        added = backfill_late_occurrences(kind, delivery_date)
+        data = preview_purchase_orders(kind, delivery_date)
+        data["late_backfill"] = {"added": added}
         return Response(data)
 
 

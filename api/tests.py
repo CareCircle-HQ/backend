@@ -1547,3 +1547,76 @@ class CalendarKeepsOccurrencesOnExclusionTest(TestCase):
             OrderSchedule.objects.filter(pk=stale.pk).exists(),
             "cancelled order must not protect a stale wrong-day occurrence",
         )
+
+    def _next_weekday(self, wd):
+        from datetime import timedelta
+        today = timezone.localdate()
+        return today + timedelta(days=(wd - today.weekday()) % 7)
+
+    def test_backfill_late_occurrences_creates_skipped_due_date(self):
+        """A date skipped because its cutoff passed (plan starts the following
+        week) is backfilled so a late PO can be cut."""
+        from datetime import timedelta
+        from unittest.mock import patch
+
+        from .models import OrderSchedule, OrderStatus, ProductTypeKind
+        from . import services  # noqa
+        from .services import purchase_orders as po
+
+        enr, member = self._make_active_enrollment()
+        tue = self._next_weekday(1)  # a Tuesday >= today
+        enr.delivery_weekdays = ["tue"]
+        enr.save(update_fields=["delivery_weekdays"])
+        # Plan starts the FOLLOWING Tuesday -> `tue` was skipped by the calendar.
+        plan = enr.delivery_schedules.first()
+        plan.starts_on = tue + timedelta(days=7)
+        plan.ends_on = tue + timedelta(days=60)
+        plan.save(update_fields=["starts_on", "ends_on"])
+
+        with patch.object(po, "product_kind_for_enrollment", return_value=ProductTypeKind.MEALS):
+            added = po.backfill_late_occurrences(ProductTypeKind.MEALS, tue)
+        self.assertEqual(added, 1)
+        self.assertTrue(
+            OrderSchedule.objects.filter(
+                enrollment=enr, member=member, anticipated_delivery_date=tue,
+                status=OrderStatus.SCHEDULED,
+            ).exists()
+        )
+
+    def test_backfill_skips_member_covered_that_week(self):
+        """A member already covered by a live delivery that week is not
+        backfilled (no double-delivery)."""
+        from datetime import timedelta
+        from unittest.mock import patch
+
+        from .models import (
+            DeliveryOrder, DeliveryOrderStatus, OrderSchedule, ProductTypeKind,
+            PurchaseOrder, PurchaseOrderStatus,
+        )
+        from .services import purchase_orders as po
+
+        enr, member = self._make_active_enrollment()
+        tue = self._next_weekday(1)
+        enr.delivery_weekdays = ["tue"]
+        enr.save(update_fields=["delivery_weekdays"])
+        plan = enr.delivery_schedules.first()
+        plan.starts_on = tue + timedelta(days=7)
+        plan.ends_on = tue + timedelta(days=60)
+        plan.save(update_fields=["starts_on", "ends_on"])
+
+        # A live delivery the SAME week (on the Wednesday) covers this member.
+        ppo = PurchaseOrder.objects.create(status=PurchaseOrderStatus.DRAFT)
+        DeliveryOrder.objects.create(
+            purchase_order=ppo, member=member.client,
+            expected_delivery_date=tue + timedelta(days=1),
+            status=DeliveryOrderStatus.PENDING,
+        )
+
+        with patch.object(po, "product_kind_for_enrollment", return_value=ProductTypeKind.MEALS):
+            added = po.backfill_late_occurrences(ProductTypeKind.MEALS, tue)
+        self.assertEqual(added, 0)
+        self.assertFalse(
+            OrderSchedule.objects.filter(
+                enrollment=enr, anticipated_delivery_date=tue,
+            ).exists()
+        )

@@ -33,6 +33,7 @@ from api.models import (
     FoodAllergy,
     HouseholdMember,
     Kitchen,
+    MemberDeliverySchedule,
     MemberDietaryProfile,
     MemberStatus,
     SERVICE_EXCLUDED_ENROLLMENT_STAGES,
@@ -44,10 +45,16 @@ from api.models import (
     PurchaseOrder,
     PurchaseOrderStatus,
     ScheduleStatus,
+    generate_household_group_code,
 )
 from api.services.catalog import product_kind_for_enrollment, product_type_kind_for_name
 from api.services.kitchens import _MENU_CODE_TO_NAME, _norm
-from api.services.orders import _WEEKDAY_CODES
+from api.services.orders import (
+    _WEEKDAY_CODES,
+    _format_address,
+    _weekday_ints,
+    meals_for_delivery,
+)
 
 _DIETARY_LABELS = dict(DietaryRestriction.choices)
 _ALLERGY_LABELS = dict(FoodAllergy.choices)
@@ -335,6 +342,125 @@ def _batched_client_ids(delivery_date):
         .exclude(status=DeliveryOrderStatus.CANCELLED)
         .values_list("member_id", flat=True)
     )
+
+
+def _delivery_week_range(d):
+    """Monday..Sunday of the ISO week containing ``d``."""
+    monday = d - timedelta(days=d.weekday())
+    return monday, monday + timedelta(days=6)
+
+
+@transaction.atomic
+def backfill_late_occurrences(kind, delivery_date):
+    """Create SCHEDULED occurrences on ``delivery_date`` for active members whose
+    cadence delivers that weekday but whose calendar SKIPPED the date because its
+    PO cutoff had already passed (e.g. a cadence change that landed after the
+    cutoff pushed the first delivery to the next orderable date).
+
+    This lets an agent still cut a LATE purchase order for a passed-cutoff date.
+    It never double-books: a member already covered by a LIVE DeliveryOrder in
+    the SAME delivery week is skipped, and any member who already has an
+    occurrence on the date is left untouched. Members whose service hasn't
+    effectively started (plan starts well after the date) or has ended are not
+    backfilled. Returns the number of occurrences created.
+    """
+    wd = delivery_date.weekday()
+    delivery_code = _WEEKDAY_NAMES.get(wd)
+    if delivery_code is None:
+        return 0
+
+    week_start, week_end = _delivery_week_range(delivery_date)
+    # Clients already covered by a live delivery that week -- never double-book.
+    covered = set(
+        DeliveryOrder.objects.filter(
+            expected_delivery_date__gte=week_start,
+            expected_delivery_date__lte=week_end,
+        )
+        .exclude(member__isnull=True)
+        .exclude(status=DeliveryOrderStatus.CANCELLED)
+        .values_list("member_id", flat=True)
+    )
+    # Members already having an occurrence on the exact date (any status).
+    existing_members = set(
+        OrderSchedule.objects.filter(anticipated_delivery_date=delivery_date)
+        .exclude(member__isnull=True)
+        .values_list("member_id", flat=True)
+    )
+
+    plans = (
+        MemberDeliverySchedule.objects.filter(status=ScheduleStatus.SCHEDULED)
+        .exclude(enrollment__stage__in=SERVICE_EXCLUDED_ENROLLMENT_STAGES)
+        .exclude(member_profile__status__in=SERVICE_EXCLUDED_MEMBER_STATUSES)
+        .select_related(
+            "enrollment", "enrollment__household", "enrollment__delivery_address",
+            "member_profile", "member_profile__client",
+        )
+    )
+
+    enr_kind = {}
+    group_codes = {}
+    to_create = []
+    for plan in plans:
+        enr = plan.enrollment
+        # Cadence must actually deliver on this weekday.
+        if delivery_code not in (enr.delivery_weekdays or []):
+            continue
+        # Plan window: not ended, and the date isn't long before service starts.
+        if plan.ends_on and delivery_date > plan.ends_on:
+            continue
+        if plan.starts_on and delivery_date < plan.starts_on - timedelta(days=14):
+            continue
+        # Right product kind (cached per enrollment).
+        if enr.pk not in enr_kind:
+            enr_kind[enr.pk] = product_kind_for_enrollment(enr)
+        if enr_kind[enr.pk] != kind:
+            continue
+        m = plan.member_profile
+        if m is None or m.pk in existing_members:
+            continue
+        client = getattr(m, "client", None)
+        client_id = getattr(client, "client_id", None)
+        if client_id is not None and client_id in covered:
+            continue  # already delivered/ordered this week -- no double delivery
+
+        if enr.pk not in group_codes:
+            first = (
+                enr.orders.exclude(household_group_code="")
+                .values_list("household_group_code", flat=True)
+                .first()
+            )
+            group_codes[enr.pk] = first or generate_household_group_code()
+
+        if plan.meals_per_day:
+            qty = meals_for_delivery(
+                wd, _weekday_ints(enr.delivery_weekdays or []), plan.meals_per_day
+            )
+        else:
+            qty = plan.prod_per_delivery
+        to_create.append(OrderSchedule(
+            enrollment=enr,
+            program_name=enr.program_name,
+            member=m,
+            member_name=plan.member_name or m.member_name,
+            anticipated_delivery_date=delivery_date,
+            household=enr.household,
+            household_group_code=group_codes[enr.pk],
+            kitchen_id=enr.kitchen_id,
+            status=ScheduleStatus.SCHEDULED,
+            delivery_address=_format_address(enr.delivery_address),
+            allergies=list(m.food_allergies or []),
+            restrictions=list(m.dietary_restrictions or []),
+            menu_type=m.menu_type or "",
+            kitchen_meal_type=m.kitchen_meal_type or "",
+            kitchen_food_notes=m.kitchen_food_notes or "",
+            member_phone=getattr(client, "client_phone_number", "") or "",
+            member_email=getattr(client, "client_email_address", "") or "",
+            how_many_meals_or_boxes=qty,
+        ))
+
+    if to_create:
+        OrderSchedule.objects.bulk_create(to_create)
+    return len(to_create)
 
 
 def preview_purchase_orders(kind, delivery_date):
