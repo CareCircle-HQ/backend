@@ -83,7 +83,7 @@ class Command(BaseCommand):
         )
         enr_ids = set()
         affected_members = 0
-        for mv in profiles.iterator():
+        for mv in profiles.iterator(chunk_size=1000):
             zip_code, _src = member_excluded_info(mv, excluded=excluded)
             if zip_code:
                 affected_members += 1
