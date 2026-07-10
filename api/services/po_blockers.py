@@ -20,6 +20,7 @@ from api.models import (
     Case,
     CaseType,
     DeliveryCadence,
+    EnrollmentVerification,
     MemberDeliverySchedule,
     OrderSchedule,
     ProductTypeKind,
@@ -319,6 +320,24 @@ def summarize_po_blockers(rows):
     return counts
 
 
+def duplicate_enrollment_keeper(enr, governing_case=None):
+    """When ``enr`` is a spurious DUPLICATE, return the enrollment that already
+    owns the governing internal-service case (the one to KEEP); else None.
+
+    ``enr`` is a duplicate when the client's governing internal-service case is
+    owned by a DIFFERENT enrollment -- so ``enr`` can't be repointed to it
+    (unique-per-case constraint) and should be closed instead.
+    """
+    gov = governing_case or governing_internal_case(enr)
+    if gov is None or str(getattr(enr, "case_id", None)) == str(gov.case_id):
+        return None
+    return (
+        EnrollmentVerification.objects.filter(case_id=gov.case_id)
+        .exclude(pk=enr.pk)
+        .first()
+    )
+
+
 def remediate_enrollment_blocker(enr, reason, from_date=None):
     """Apply the server-side fix for a fixable blocker ``reason`` on ``enr``.
 
@@ -340,6 +359,38 @@ def remediate_enrollment_blocker(enr, reason, from_date=None):
         gov = governing_internal_case(enr)
         action = "sync"
         if gov is not None and str(enr.case_id) != str(gov.case_id):
+            keeper = duplicate_enrollment_keeper(enr, gov)
+            if keeper is not None:
+                # The governing case is already owned by ANOTHER enrollment, so
+                # this one is a spurious DUPLICATE -- repointing would violate the
+                # unique-per-case constraint. Only close it when the case-linked
+                # keeper is ACTUALLY serving (has a live plan); otherwise closing
+                # this enrollment would remove the client's only deliveries. That
+                # tangled state (the serving enrollment is caseless while the
+                # case-linked one is empty/pending) needs manual consolidation.
+                keeper_serving = keeper.delivery_schedules.filter(
+                    status=ScheduleStatus.SCHEDULED
+                ).exists()
+                if not keeper_serving:
+                    return {
+                        "fixed": False,
+                        "message": (
+                            "Can't auto-fix: this client has multiple active "
+                            "enrollments and the case-linked one isn't the one "
+                            "delivering. Consolidate manually -- keep the correct "
+                            "serving enrollment, close the extra(s), and link it to "
+                            "the governing case."
+                        ),
+                    }
+                from api.services.orders import close_duplicate_enrollment
+
+                res = close_duplicate_enrollment(enr, from_date=from_date)
+                return {
+                    "fixed": True,
+                    "action": "closed_duplicate_enrollment",
+                    "kept_enrollment_id": keeper.pk,
+                    "result": res,
+                }
             try:
                 enr.case = gov
                 enr.save(update_fields=["case"])

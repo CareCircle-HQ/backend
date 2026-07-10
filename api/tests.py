@@ -1324,3 +1324,43 @@ class RecomputeSwitchesPlanKindTest(TestCase):
         self.assertEqual(sched.prod_per_delivery, 1)      # boxes qty
         self.assertEqual(sched.product_type_id, boxes_pt.pk)
         self.assertEqual(plan_built_kind(sched), ProductTypeKind.BOXES)
+
+
+class PurchaseOrderDedupeByClientTest(SimpleTestCase):
+    """The PO guardrail collapses two occurrences of the SAME client on a date to
+    one line, preferring the case-linked (legit) enrollment. Guards against the
+    duplicate-enrollment anomaly doubling a member in a Purchase Order."""
+
+    @staticmethod
+    def _sched(order_id, client_id, case_id):
+        return SimpleNamespace(
+            order_id=order_id,
+            member=SimpleNamespace(client_id=client_id),
+            enrollment=SimpleNamespace(case_id=case_id),
+        )
+
+    def test_same_client_collapses_prefers_case_linked(self):
+        from api.services.purchase_orders import _dedupe_by_client
+
+        caseless = self._sched("o-a", "client-1", None)
+        legit = self._sched("o-b", "client-1", "case-1")
+        out = _dedupe_by_client([caseless, legit])
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0].order_id, "o-b")  # kept the case-linked one
+
+    def test_distinct_clients_all_kept(self):
+        from api.services.purchase_orders import _dedupe_by_client
+
+        a = self._sched("o-a", "client-1", "case-1")
+        b = self._sched("o-b", "client-2", "case-2")
+        out = _dedupe_by_client([a, b])
+        self.assertEqual({s.order_id for s in out}, {"o-a", "o-b"})
+
+    def test_unassigned_member_rows_are_kept(self):
+        from api.services.purchase_orders import _dedupe_by_client
+
+        row = SimpleNamespace(
+            order_id="o-a", member=None, enrollment=SimpleNamespace(case_id=None),
+        )
+        out = _dedupe_by_client([row])
+        self.assertEqual(len(out), 1)
