@@ -1970,7 +1970,10 @@ class HouseholdMemberEditView(PortalAPIView):
 
         # Propagate the edited menu type / allergies onto this member's future
         # SCHEDULED delivery occurrences so PO generation reflects the change
-        # (those rows snapshot the profile at calendar-build time).
+        # (those rows snapshot the profile at calendar-build time). The
+        # occurrences are KEPT even when the member is Paused / Out of Orbit /
+        # Out of Range -- the delivery calendar overlays that status and PO
+        # generation excludes them via the live member-status filter.
         resync_scheduled_orders(enrollment=mv.enrollment)
 
         return Response(s.PortalHouseholdMemberSerializer(mv).data)

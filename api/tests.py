@@ -1364,3 +1364,148 @@ class PurchaseOrderDedupeByClientTest(SimpleTestCase):
         )
         out = _dedupe_by_client([row])
         self.assertEqual(len(out), 1)
+
+
+class ExclusionStateOverlayTest(SimpleTestCase):
+    """The delivery-calendar overlay maps the live household stage / member
+    status to the reason a scheduled future date won't be delivered."""
+
+    def test_on_hold_household_takes_precedence(self):
+        from api.models import EnrollmentStage, MemberStatus
+        from api.portal.views_delivery_calendar import _exclusion_state
+
+        enr = SimpleNamespace(stage=EnrollmentStage.ON_HOLD)
+        member = SimpleNamespace(status=MemberStatus.PAUSED)
+        self.assertEqual(_exclusion_state(enr, member), ("on_hold", "On Hold"))
+
+    def test_member_statuses(self):
+        from api.models import EnrollmentStage, MemberStatus
+        from api.portal.views_delivery_calendar import _exclusion_state
+
+        enr = SimpleNamespace(stage=EnrollmentStage.SERVICE_ACTIVE)
+        cases = {
+            MemberStatus.PAUSED: ("paused", "Paused"),
+            MemberStatus.OUT_OF_ORBIT: ("out_of_orbit", "Out of Orbit"),
+            MemberStatus.OUT_OF_RANGE: ("out_of_range", "Out of Range"),
+            MemberStatus.INACTIVE: ("inactive", "Inactive"),
+        }
+        for status, expected in cases.items():
+            self.assertEqual(
+                _exclusion_state(enr, SimpleNamespace(status=status)), expected
+            )
+
+    def test_active_member_active_household_has_no_overlay(self):
+        from api.models import EnrollmentStage, MemberStatus
+        from api.portal.views_delivery_calendar import _exclusion_state
+
+        enr = SimpleNamespace(stage=EnrollmentStage.SERVICE_ACTIVE)
+        member = SimpleNamespace(status=MemberStatus.ACTIVE)
+        self.assertIsNone(_exclusion_state(enr, member))
+
+
+class CalendarKeepsOccurrencesOnExclusionTest(TestCase):
+    """Excluding a household (On Hold) or member (Paused) must KEEP the future
+    delivery occurrences (so the calendar can overlay the reason), NOT delete
+    them -- while PO generation still excludes them via live status/stage.
+    """
+
+    def _make_active_enrollment(self):
+        from datetime import timedelta
+
+        from .models import (
+            Case, CaseStatus, CaseType, Client, DeliveryCadence,
+            EnrollmentStage, EnrollmentVerification, Household, HouseholdMember,
+            MemberDeliverySchedule, MemberDietaryProfile, MemberStatus,
+            ScheduleStatus, ServiceAuthorizationStatus,
+        )
+
+        today = timezone.localdate()
+        client = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Hold", last_name="Er",
+        )
+        hh = Household.objects.create(name="HH")
+        HouseholdMember.objects.create(household=hh, client=client, is_primary=True)
+        now = timezone.now()
+        case = Case.objects.create(
+            case_id=str(uuid.uuid4()), client=client,
+            case_type=CaseType.INTERNAL_SERVICE, case_status=CaseStatus.OPEN,
+            service_authorization_status=ServiceAuthorizationStatus.APPROVED,
+            service_authorization_approval_starts_at=now,
+            service_authorization_approval_ends_at=now + timedelta(days=60),
+            date_opened=now,
+        )
+        enr = EnrollmentVerification.objects.create(
+            client=client, household=hh, case=case,
+            stage=EnrollmentStage.SERVICE_ACTIVE,
+            delivery_weekdays=["mon", "tue", "wed", "thu", "fri"],
+        )
+        member = MemberDietaryProfile.objects.create(
+            enrollment=enr, client=client, menu_type="Standard",
+            status=MemberStatus.ACTIVE,
+        )
+        MemberDeliverySchedule.objects.create(
+            enrollment=enr, member_profile=member, member_name="Hold Er",
+            delivery_days_cadence=DeliveryCadence.ONCE_A_WEEK,
+            meals_per_day=3, prod_per_delivery=0, meals_boxes_total=12,
+            status=ScheduleStatus.SCHEDULED,
+            starts_on=today, ends_on=today + timedelta(days=30),
+        )
+        return enr, member
+
+    def _future_count(self, enr):
+        from .models import OrderStatus, OrderSchedule
+
+        return OrderSchedule.objects.filter(
+            enrollment=enr, status=OrderStatus.SCHEDULED,
+            anticipated_delivery_date__gte=timezone.localdate(),
+        ).count()
+
+    def test_hold_keeps_future_occurrences(self):
+        from .models import EnrollmentStage
+        from .services.lifecycle import advance_enrollment
+        from .services.orders import sync_delivery_calendar
+
+        enr, _member = self._make_active_enrollment()
+        sync_delivery_calendar(enr)
+        n0 = self._future_count(enr)
+        self.assertGreater(n0, 0)
+
+        # On Hold must NOT delete the calendar -- the occurrences are kept so the
+        # profile can overlay "On Hold"; a follow-up sync must not drop them.
+        advance_enrollment(enr, EnrollmentStage.ON_HOLD)
+        sync_delivery_calendar(enr)
+        self.assertEqual(self._future_count(enr), n0)
+
+    def test_member_pause_keeps_future_occurrences(self):
+        from .models import MemberStatus
+        from .services.orders import sync_delivery_calendar
+
+        enr, member = self._make_active_enrollment()
+        sync_delivery_calendar(enr)
+        n0 = self._future_count(enr)
+        self.assertGreater(n0, 0)
+
+        # Pausing a member keeps their occurrences (overlaid "Paused"), even
+        # after a resync -- they're only excluded from POs, not deleted.
+        member.status = MemberStatus.PAUSED
+        member.save(update_fields=["status"])
+        sync_delivery_calendar(enr)
+        self.assertEqual(self._future_count(enr), n0)
+
+    def test_sync_active_calendars_heals_fully_lapsed_calendar(self):
+        from .models import OrderSchedule
+        from .services.orders import sync_active_calendars, sync_delivery_calendar
+
+        enr, _member = self._make_active_enrollment()
+        sync_delivery_calendar(enr)
+        n0 = self._future_count(enr)
+        self.assertGreater(n0, 0)
+
+        # Simulate a fully-lapsed calendar (0 future occurrences) whose plan
+        # window still covers the future -- previously skipped by the nightly
+        # refresh forever.
+        OrderSchedule.objects.filter(enrollment=enr).delete()
+        self.assertEqual(self._future_count(enr), 0)
+
+        sync_active_calendars()
+        self.assertEqual(self._future_count(enr), n0)  # regenerated
