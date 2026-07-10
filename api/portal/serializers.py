@@ -1387,7 +1387,7 @@ class PortalCadenceSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = Cadence
-        fields = ["id", "code", "label", "weekdays", "is_active", "kitchen_count"]
+        fields = ["id", "code", "label", "weekdays", "po_weekdays", "is_active", "kitchen_count"]
         extra_kwargs = {"code": {"required": False}}
 
     def get_kitchen_count(self, obj):
@@ -1403,6 +1403,22 @@ class PortalCadenceSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError(f"Invalid weekday code(s): {', '.join(bad)}.")
         # De-dupe while preserving canonical weekday order.
         return [w for w in CADENCE_WEEKDAY_CODES if w in value]
+
+    def validate_po_weekdays(self, value):
+        """A {delivery_weekday: po_weekday} map: the day each delivery's purchase
+        order is cut on. Both keys and values must be valid weekday codes."""
+        from ..models import CADENCE_WEEKDAY_CODES
+
+        if not isinstance(value, dict):
+            raise serializers.ValidationError("po_weekdays must be a map of weekday codes.")
+        clean = {}
+        for delivery_code, po_code in value.items():
+            if delivery_code not in CADENCE_WEEKDAY_CODES:
+                raise serializers.ValidationError(f"Invalid delivery weekday: {delivery_code}.")
+            if po_code not in CADENCE_WEEKDAY_CODES:
+                raise serializers.ValidationError(f"Invalid PO weekday: {po_code}.")
+            clean[delivery_code] = po_code
+        return clean
 
     def _slugify_code(self, label):
         from django.utils.text import slugify

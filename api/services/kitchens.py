@@ -200,7 +200,11 @@ def kitchen_options(enrollment):
 
     kitchens = (
         Kitchen.objects.all()
-        .prefetch_related("kitchen_menu_types__menu_type", "kitchen_menu_types__restrictions")
+        .prefetch_related(
+            "kitchen_menu_types__menu_type",
+            "kitchen_menu_types__restrictions",
+            "cadences",
+        )
         .order_by("name")
     )
 
@@ -234,6 +238,7 @@ def kitchen_options(enrollment):
         if k.status != KitchenStatus.ACTIVE:
             warnings.insert(0, f"Kitchen is {k.get_status_display().lower()}")
 
+        cadence_codes = [c.code for c in k.cadences.all() if c.is_active]
         results.append({
             "id": str(k.pk),
             "name": k.name,
@@ -243,6 +248,9 @@ def kitchen_options(enrollment):
             "supported_products": list(k.supported_products or []),
             "supports_product": supports_product,
             "eligible": eligible,
+            # The delivery cadences this kitchen runs. The popup picks a cadence
+            # first, then shows only the kitchens that run it.
+            "cadence_codes": cadence_codes,
             "coverage": coverage,
             "warnings": warnings,
         })

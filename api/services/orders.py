@@ -18,6 +18,7 @@ from django.utils import timezone
 
 from api.models import (
     DeliveryOrder,
+    EnrollmentStage,
     MemberStatus,
     SERVICE_EXCLUDED_MEMBER_STATUSES,
     OrderSchedule,
@@ -568,3 +569,37 @@ def truncate_future_deliveries(enrollment, on_or_after=None):
             p.ends_on = prev
             p.save(update_fields=["ends_on"])
     return sync_delivery_calendar(enrollment, from_date=cutoff)
+
+
+@transaction.atomic
+def close_duplicate_enrollment(enrollment, from_date=None):
+    """Close a spurious DUPLICATE enrollment (a second enrollment for a client
+    who already has the real, case-linked one).
+
+    Cancels its delivery plans so the nightly sync won't regenerate anything,
+    removes its FUTURE non-batched occurrences (occurrences already committed to
+    a DeliveryOrder are left intact by :func:`sync_delivery_calendar`), and sets
+    the enrollment to CANCELLED so it drops out of PO/delivery generation.
+
+    The caller is responsible for confirming this enrollment is the duplicate to
+    close (e.g. it is NOT the one on the governing internal-service case).
+    Returns a summary dict.
+    """
+    cutoff = from_date or timezone.localdate()
+    plans_cancelled = (
+        enrollment.delivery_schedules.exclude(status=ScheduleStatus.CANCELLED)
+        .update(status=ScheduleStatus.CANCELLED)
+    )
+    # With no SCHEDULED plans left, this drops every future non-batched
+    # occurrence for the enrollment.
+    calendar = sync_delivery_calendar(enrollment, from_date=cutoff)
+    previous_stage = enrollment.stage
+    if enrollment.stage != EnrollmentStage.CANCELLED:
+        enrollment.stage = EnrollmentStage.CANCELLED
+        enrollment.save(update_fields=["stage"])
+    return {
+        "enrollment_id": enrollment.pk,
+        "previous_stage": previous_stage,
+        "plans_cancelled": plans_cancelled,
+        "calendar": calendar,
+    }

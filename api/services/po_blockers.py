@@ -20,6 +20,7 @@ from api.models import (
     Case,
     CaseType,
     DeliveryCadence,
+    EnrollmentVerification,
     MemberDeliverySchedule,
     OrderSchedule,
     ProductTypeKind,
@@ -29,7 +30,7 @@ from api.models import (
     SERVICE_EXCLUDED_MEMBER_STATUSES,
 )
 from api.services.catalog import product_kind_for_enrollment, product_type_kind_for_name
-from api.services.delivery import BOX_DELIVERY_WEEKDAY, weekdays_for_cadence
+from api.services.delivery import cadence_delivery_weekdays
 from api.services.lifecycle import (
     governing_internal_case,
     open_internal_service_cases,
@@ -175,19 +176,17 @@ def _case_product_kind(case):
 
 def _weekday_mismatch(enr, cadence, kind):
     """True when the enrollment's delivery_weekdays don't match what the plan's
-    cadence + kind imply (e.g. a meals member on a mon_thu cadence whose weekdays
-    are stuck on Wednesday from a prior boxes setup). A weekly cadence accepts
-    any single weekday, so it never flags."""
+    cadence implies (e.g. a meals member on a mon_thu cadence whose weekdays are
+    stuck on Wednesday from a prior boxes setup). The expected weekdays come from
+    the Cadence settings table. A cadence with no fixed weekdays (once-a-week
+    style) accepts any single weekday, so it never flags."""
     actual = set(enr.delivery_weekdays or [])
     if not actual or not cadence:
         return False
-    if kind == ProductTypeKind.BOXES:
-        expected = {BOX_DELIVERY_WEEKDAY}
-    elif cadence != DeliveryCadence.ONCE_A_WEEK:
-        expected = set(weekdays_for_cadence(cadence, None))
-    else:
-        return False  # once_a_week: any single weekday is valid
-    return bool(expected) and actual != expected
+    expected = set(cadence_delivery_weekdays(cadence))
+    if not expected:
+        return False  # once-a-week style: any single weekday is valid
+    return actual != expected
 
 
 def classify_po_blockers(from_date=None, include_ok=False):
@@ -321,6 +320,24 @@ def summarize_po_blockers(rows):
     return counts
 
 
+def duplicate_enrollment_keeper(enr, governing_case=None):
+    """When ``enr`` is a spurious DUPLICATE, return the enrollment that already
+    owns the governing internal-service case (the one to KEEP); else None.
+
+    ``enr`` is a duplicate when the client's governing internal-service case is
+    owned by a DIFFERENT enrollment -- so ``enr`` can't be repointed to it
+    (unique-per-case constraint) and should be closed instead.
+    """
+    gov = governing_case or governing_internal_case(enr)
+    if gov is None or str(getattr(enr, "case_id", None)) == str(gov.case_id):
+        return None
+    return (
+        EnrollmentVerification.objects.filter(case_id=gov.case_id)
+        .exclude(pk=enr.pk)
+        .first()
+    )
+
+
 def remediate_enrollment_blocker(enr, reason, from_date=None):
     """Apply the server-side fix for a fixable blocker ``reason`` on ``enr``.
 
@@ -342,6 +359,38 @@ def remediate_enrollment_blocker(enr, reason, from_date=None):
         gov = governing_internal_case(enr)
         action = "sync"
         if gov is not None and str(enr.case_id) != str(gov.case_id):
+            keeper = duplicate_enrollment_keeper(enr, gov)
+            if keeper is not None:
+                # The governing case is already owned by ANOTHER enrollment, so
+                # this one is a spurious DUPLICATE -- repointing would violate the
+                # unique-per-case constraint. Only close it when the case-linked
+                # keeper is ACTUALLY serving (has a live plan); otherwise closing
+                # this enrollment would remove the client's only deliveries. That
+                # tangled state (the serving enrollment is caseless while the
+                # case-linked one is empty/pending) needs manual consolidation.
+                keeper_serving = keeper.delivery_schedules.filter(
+                    status=ScheduleStatus.SCHEDULED
+                ).exists()
+                if not keeper_serving:
+                    return {
+                        "fixed": False,
+                        "message": (
+                            "Can't auto-fix: this client has multiple active "
+                            "enrollments and the case-linked one isn't the one "
+                            "delivering. Consolidate manually -- keep the correct "
+                            "serving enrollment, close the extra(s), and link it to "
+                            "the governing case."
+                        ),
+                    }
+                from api.services.orders import close_duplicate_enrollment
+
+                res = close_duplicate_enrollment(enr, from_date=from_date)
+                return {
+                    "fixed": True,
+                    "action": "closed_duplicate_enrollment",
+                    "kept_enrollment_id": keeper.pk,
+                    "result": res,
+                }
             try:
                 enr.case = gov
                 enr.save(update_fields=["case"])

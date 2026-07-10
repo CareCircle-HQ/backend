@@ -96,8 +96,21 @@ def _prev_weekday(d, weekday):
 
 
 def po_date_for_delivery(kind, delivery_date):
-    """The PO/cutoff date for a given product ``kind`` and delivery date."""
+    """The PO/cutoff date for a given product ``kind`` and delivery date.
+
+    Reads the configurable PO cutoff weekday from the Cadence settings table
+    (``Cadence.po_weekdays``); falls back to the legacy hardcoded map when a
+    cadence doesn't declare one, so existing behavior is preserved.
+    """
+    from api.services.delivery import cadence_po_weekday
+
     wd = delivery_date.weekday()
+    delivery_code = _WEEKDAY_NAMES.get(wd)
+    po_code = cadence_po_weekday(kind, delivery_code) if delivery_code else None
+    if po_code and po_code in _WEEKDAY_CODES:
+        return _prev_weekday(delivery_date, _WEEKDAY_CODES[po_code])
+
+    # Legacy fallback: hardcoded meal map / box Friday.
     if kind == ProductTypeKind.BOXES:
         po_wd = _BOX_PO_WEEKDAY
     else:
@@ -206,12 +219,42 @@ def _kitchen_supports_menu(kind, offered_norm, code):
     return any(wanted in o or o in wanted for o in offered_norm)
 
 
+def _dedupe_by_client(schedules):
+    """Collapse multiple occurrences of the SAME client on one date to a single
+    schedule.
+
+    A client with two active enrollments (a data anomaly -- e.g. a spurious
+    caseless duplicate alongside the real, case-linked one) builds two delivery
+    calendars, so the same person can land twice on a date and get two lines in
+    one PO. Keep one occurrence per client, preferring the one whose enrollment
+    is linked to a case (the governing/legit enrollment); ``order_id`` is the
+    stable final tiebreak so the choice is deterministic.
+    """
+    ordered = sorted(
+        schedules,
+        key=lambda s: (
+            0 if getattr(s.enrollment, "case_id", None) else 1,
+            str(s.order_id),
+        ),
+    )
+    seen, out = set(), []
+    for s in ordered:
+        cid = s.member.client_id if s.member else None
+        if cid is not None:
+            if cid in seen:
+                continue
+            seen.add(cid)
+        out.append(s)
+    return out
+
+
 def _due_schedules(kind, delivery_date):
     """SCHEDULED OrderSchedule rows for the given kind that land on the date.
 
     Schedules whose enrollment is On Hold or in a terminal stage
     (Service Complete / Closed / Cancelled) are excluded, as are Out of Orbit /
-    Paused / Inactive members: none may appear in any new Purchase Order.
+    Paused / Inactive members: none may appear in any new Purchase Order. Also
+    de-duped per client so a duplicate-enrollment anomaly never doubles a line.
     """
     qs = (
         OrderSchedule.objects.filter(
@@ -240,7 +283,7 @@ def _due_schedules(kind, delivery_date):
             schedule_kind = enr_kind[s.enrollment_id]
         if schedule_kind == kind:
             out.append(s)
-    return out
+    return _dedupe_by_client(out)
 
 
 def _batched_client_ids(delivery_date):
@@ -358,6 +401,9 @@ def generate_purchase_order(kind, delivery_date, kitchen, schedule_ids, split_se
         s for s in schedules
         if not (s.member and s.member.client_id in already)
     ]
+    # Collapse duplicate occurrences of the same client (two active enrollments
+    # both building a calendar) so a client never gets two lines in one PO.
+    schedules = _dedupe_by_client(schedules)
     if not schedules:
         return None
 

@@ -15,6 +15,7 @@ from rest_framework.response import Response
 
 from ..models import (
     Address,
+    Cadence,
     Case,
     CaseStatus,
     CaseType,
@@ -55,6 +56,8 @@ from ..services.catalog import (
     product_type_kind_for_name,
 )
 from ..services.delivery import (
+    active_cadence_codes,
+    cadence_needs_weekday,
     cadence_options_for_kind,
     create_member_delivery_schedules,
     current_household_cadence,
@@ -1641,6 +1644,7 @@ class MemberHouseholdView(PortalAPIView):
         addr = enr.delivery_address
         kind = product_kind_for_enrollment(enr)
         cadence = current_household_cadence(enr)
+        cadence_row = Cadence.objects.filter(code=cadence).first() if cadence else None
         return Response(
             {
                 "enrollment": {
@@ -1650,7 +1654,7 @@ class MemberHouseholdView(PortalAPIView):
                     "service_type": kind.value if kind else "",
                     "service_type_label": kind.label if kind else "",
                     "cadence": cadence,
-                    "cadence_label": dict(DeliveryCadence.choices).get(cadence, ""),
+                    "cadence_label": (cadence_row.label if cadence_row else "") or cadence,
                     "cadence_options": cadence_options_for_kind(kind),
                 },
                 "address": {
@@ -2773,19 +2777,29 @@ def assign_kitchen_to_household(
                     pass
 
     case = enr.case or s.primary_case(client)
-    create_member_delivery_schedules(
+    created = create_member_delivery_schedules(
         enr, case=case, cadence=cadence, once_a_week_weekday=once_weekday,
         kitchen=kitchen, member_quantities=member_quantities,
     )
 
-    # Expand the per-member plans into the dated delivery calendar
-    # (OrderSchedule) so the household shows up for PO generation.
-    generate_delivery_calendar(enr)
+    if created:
+        # First-time plan: expand the per-member plans into the dated delivery
+        # calendar (OrderSchedule) so the household shows up for PO generation.
+        generate_delivery_calendar(enr)
+    else:
+        # Re-assignment: the household ALREADY had a plan, so the builder above
+        # was a no-op and would otherwise keep the OLD cadence's delivery days.
+        # Re-apply the chosen cadence to the existing schedules (recomputes
+        # weekdays, first delivery, per-delivery quantity + totals) and rebuild
+        # the dated calendar so delivery DATES move with the cadence.
+        update_household_cadence(
+            enr, cadence=cadence, once_a_week_weekday=once_weekday, case=case,
+            product_kind=product_kind_for_enrollment(enr),
+        )
+        sync_delivery_calendar(enr)
 
-    # Re-assignment case: when the household ALREADY had a plan + calendar, the
-    # two builders above are idempotent no-ops. Push the newly chosen kitchen +
-    # refreshed meal-rule results onto the existing plans and future
-    # occurrences so PO generation reflects the change.
+    # Push the newly chosen kitchen + refreshed meal-rule results onto the plans
+    # and future occurrences so PO generation reflects the change.
     enr.delivery_schedules.update(kitchen=kitchen)
     resync_scheduled_orders(enrollment=enr)
 
@@ -2854,14 +2868,19 @@ class MemberAssignKitchenView(PortalAPIView):
             return Response(
                 {"error": "kitchen_id is required."}, status=http.HTTP_400_BAD_REQUEST
             )
-        if cadence not in DeliveryCadence.values:
+        if cadence not in active_cadence_codes():
             return Response(
                 {"error": "A valid cadence is required."},
                 status=http.HTTP_400_BAD_REQUEST,
             )
-        if cadence == DeliveryCadence.ONCE_A_WEEK and not once_weekday:
+        if cadence not in {c.code for c in kitchen.cadences.all()}:
             return Response(
-                {"error": "once_a_week_weekday is required for a weekly cadence."},
+                {"error": f"{kitchen.name} isn't configured for the selected cadence. Set the kitchen's cadences in Settings."},
+                status=http.HTTP_400_BAD_REQUEST,
+            )
+        if cadence_needs_weekday(cadence) and not once_weekday:
+            return Response(
+                {"error": "A delivery day is required for this cadence."},
                 status=http.HTTP_400_BAD_REQUEST,
             )
 
@@ -2941,13 +2960,6 @@ def _awaiting_box_enrollments():
     return _awaiting_enrollments(ProductTypeKind.BOXES)
 
 
-def _box_cadence():
-    """The delivery cadence used for boxes (they ship a fixed weekly Wednesday
-    schedule regardless, but a valid cadence value is still required)."""
-    opts = cadence_options_for_kind(ProductTypeKind.BOXES)
-    return opts[0]["value"] if opts else DeliveryCadence.ONCE_A_WEEK
-
-
 def _prefetched_kitchens():
     """Kitchens with their offered menus + restrictions prefetched, for reuse
     across serviceability checks in one request."""
@@ -2997,15 +3009,21 @@ class BulkAssignBoxesView(PortalAPIView):
 
     def get(self, request):
         kitchens = [
-            {"id": str(k.pk), "name": k.name, "status": k.status}
+            {
+                "id": str(k.pk),
+                "name": k.name,
+                "status": k.status,
+                "cadence_codes": [c.code for c in k.cadences.all() if c.is_active],
+            }
             for k in Kitchen.objects.filter(
                 supported_products__contains=[KitchenProductType.BOX]
-            ).order_by("name")
+            ).prefetch_related("cadences").order_by("name")
         ]
         box_enr = _awaiting_box_enrollments()
         kitchens_ctx = _prefetched_kitchens()
         return Response({
             "kitchens": kitchens,
+            "cadence_options": cadence_options_for_kind(ProductTypeKind.BOXES),
             "awaiting_count": len(box_enr),
             "ready_count": sum(
                 1 for e in box_enr if enrollment_ready_for_assignment(e, kitchens_ctx)
@@ -3025,7 +3043,35 @@ class BulkAssignBoxesView(PortalAPIView):
                 status=http.HTTP_400_BAD_REQUEST,
             )
 
-        cadence = _box_cadence()
+        # The cadence (and thus the delivery weekday) comes from the SELECTED
+        # kitchen -- box kitchens can deliver on different days. Auto-use it when
+        # the kitchen runs exactly one; otherwise the agent picks which.
+        kitchen_cadences = [c.code for c in kitchen.cadences.all() if c.is_active]
+        cadence = (request.data.get("cadence") or "").strip()
+        once_weekday = (request.data.get("once_a_week_weekday") or "").strip() or None
+        if not cadence:
+            if len(kitchen_cadences) == 1:
+                cadence = kitchen_cadences[0]
+            elif kitchen_cadences:
+                return Response(
+                    {"error": f"{kitchen.name} runs multiple cadences — select one."},
+                    status=http.HTTP_400_BAD_REQUEST,
+                )
+            else:
+                return Response(
+                    {"error": f"{kitchen.name} has no cadence configured. Set its cadences in Settings."},
+                    status=http.HTTP_400_BAD_REQUEST,
+                )
+        if cadence not in active_cadence_codes():
+            return Response(
+                {"error": "A valid cadence is required."},
+                status=http.HTTP_400_BAD_REQUEST,
+            )
+        if cadence not in kitchen_cadences:
+            return Response(
+                {"error": f"{kitchen.name} isn't configured for the selected cadence."},
+                status=http.HTTP_400_BAD_REQUEST,
+            )
         agent = current_agent(request)
         enrollments = _awaiting_box_enrollments()
         # Optionally restrict to households that are Ready to assign (matches the
@@ -3042,7 +3088,8 @@ class BulkAssignBoxesView(PortalAPIView):
             try:
                 with transaction.atomic():
                     result = assign_kitchen_to_household(
-                        enr, enr.client, kitchen, cadence=cadence, agent=agent,
+                        enr, enr.client, kitchen, cadence=cadence,
+                        once_weekday=once_weekday, agent=agent,
                     )
                 assigned += 1
                 out_of_orbit += result.get("out_of_orbit", 0)
@@ -3137,10 +3184,15 @@ class BulkAssignMealsView(PortalAPIView):
 
     def get(self, request):
         kitchens = [
-            {"id": str(k.pk), "name": k.name, "status": k.status}
+            {
+                "id": str(k.pk),
+                "name": k.name,
+                "status": k.status,
+                "cadence_codes": [c.code for c in k.cadences.all() if c.is_active],
+            }
             for k in Kitchen.objects.filter(
                 supported_products__contains=[KitchenProductType.MEAL]
-            ).order_by("name")
+            ).prefetch_related("cadences").order_by("name")
         ]
         meal_enr = _awaiting_enrollments(ProductTypeKind.MEALS)
         kitchens_ctx = _prefetched_kitchens()
@@ -3170,14 +3222,19 @@ class BulkAssignMealsView(PortalAPIView):
                 {"error": f"{kitchen.name} does not make meals."},
                 status=http.HTTP_400_BAD_REQUEST,
             )
-        if cadence not in DeliveryCadence.values:
+        if cadence not in active_cadence_codes():
             return None, None, None, Response(
                 {"error": "A valid cadence is required."},
                 status=http.HTTP_400_BAD_REQUEST,
             )
-        if cadence == DeliveryCadence.ONCE_A_WEEK and not once_weekday:
+        if cadence not in {c.code for c in kitchen.cadences.all()}:
             return None, None, None, Response(
-                {"error": "once_a_week_weekday is required for a weekly cadence."},
+                {"error": f"{kitchen.name} isn't configured for the selected cadence. Set the kitchen's cadences in Settings."},
+                status=http.HTTP_400_BAD_REQUEST,
+            )
+        if cadence_needs_weekday(cadence) and not once_weekday:
+            return None, None, None, Response(
+                {"error": "A delivery day is required for this cadence."},
                 status=http.HTTP_400_BAD_REQUEST,
             )
         return kitchen, cadence, once_weekday, None
@@ -3268,6 +3325,19 @@ class MemberKitchenView(PortalAPIView):
             return err
         kitchen_id = request.data.get("kitchen_id")
         kitchen = get_object_or_404(Kitchen, pk=kitchen_id) if kitchen_id else None
+        # Changing the kitchen must keep a valid cadence: the household's current
+        # cadence has to be one the new kitchen runs, otherwise the delivery plan
+        # would point at a cadence the kitchen doesn't fulfill. Ask the agent to
+        # reassign via the cadence-first Kitchen Assignment popup instead.
+        if kitchen is not None:
+            current_cadence = current_household_cadence(enr)
+            if current_cadence and current_cadence not in {
+                c.code for c in kitchen.cadences.all()
+            }:
+                return Response(
+                    {"error": f"{kitchen.name} doesn't run this household's current cadence. Reassign the kitchen from the Kitchen Assignment popup to pick a compatible cadence."},
+                    status=http.HTTP_400_BAD_REQUEST,
+                )
         enr.kitchen = kitchen
         enr.save(update_fields=["kitchen"])
         enr.delivery_schedules.update(kitchen=kitchen)
@@ -3285,8 +3355,9 @@ class MemberCadenceView(PortalAPIView):
     """Change the household's delivery cadence from the member profile editor.
 
     Household-wide: recomputes the delivery plan (weekdays, first delivery,
-    per-delivery quantity, totals) on every existing schedule. Boxes keep their
-    fixed Wednesday schedule. PATCH body: ``{cadence, once_a_week_weekday?}``."""
+    per-delivery quantity, totals) on every existing schedule. Delivery weekdays
+    come from the chosen cadence for both meals and boxes. PATCH body:
+    ``{cadence, once_a_week_weekday?}``."""
 
     @transaction.atomic
     def patch(self, request, client_id):
@@ -3295,14 +3366,19 @@ class MemberCadenceView(PortalAPIView):
             return err
         cadence = (request.data.get("cadence") or "").strip()
         once_weekday = (request.data.get("once_a_week_weekday") or "").strip() or None
-        if cadence not in DeliveryCadence.values:
+        if cadence not in active_cadence_codes():
             return Response(
                 {"error": "A valid cadence is required."},
                 status=http.HTTP_400_BAD_REQUEST,
             )
-        if cadence == DeliveryCadence.ONCE_A_WEEK and not once_weekday:
+        if enr.kitchen_id and cadence not in {c.code for c in enr.kitchen.cadences.all()}:
             return Response(
-                {"error": "once_a_week_weekday is required for a weekly cadence."},
+                {"error": f"{enr.kitchen.name} isn't configured for the selected cadence. Change the kitchen or update its cadences in Settings."},
+                status=http.HTTP_400_BAD_REQUEST,
+            )
+        if cadence_needs_weekday(cadence) and not once_weekday:
+            return Response(
+                {"error": "A delivery day is required for this cadence."},
                 status=http.HTTP_400_BAD_REQUEST,
             )
         case = enr.case or s.primary_case(client)
@@ -3314,9 +3390,10 @@ class MemberCadenceView(PortalAPIView):
         # occurrences no longer in the plan and add the new ones, leaving any
         # date already batched into a PO untouched.
         sync_delivery_calendar(enr)
+        row = Cadence.objects.filter(code=cadence).first()
         return Response({
             "cadence": current_household_cadence(enr) or cadence,
-            "cadence_label": dict(DeliveryCadence.choices).get(cadence, ""),
+            "cadence_label": (row.label if row else "") or cadence,
         })
 
 

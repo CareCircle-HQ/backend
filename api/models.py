@@ -857,6 +857,12 @@ class Cadence(models.Model):
     # Delivery weekday codes (subset of CADENCE_WEEKDAY_CODES). Empty means the
     # weekday is chosen per-member at assignment time (once-a-week style).
     weekdays = models.JSONField(default=list, blank=True)
+    # PO / cutoff weekday per delivery day: maps a delivery weekday code to the
+    # weekday its purchase order is cut on, e.g. {"mon": "thu", "thu": "mon"} for
+    # a Mon/Thu meal cadence or {"tue": "fri"} for a Tuesday box cadence. The PO
+    # date is the most recent occurrence of that weekday strictly before the
+    # delivery. Empty falls back to the legacy hardcoded map in purchase_orders.
+    po_weekdays = models.JSONField(default=dict, blank=True)
     is_active = models.BooleanField(default=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
