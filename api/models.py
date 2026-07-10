@@ -404,6 +404,16 @@ class Client(models.Model):
             models.Index(fields=["date_of_birth"]),
         ]
 
+    def save(self, *args, **kwargs):
+        # ``created_at`` is nullable because it's normally populated from the
+        # Unite Us source record. Members created in-app (e.g. via the extension
+        # sync/CRM) carry no source timestamp, so stamp it on FIRST insert only.
+        # Without this they have created_at=NULL and never match the Members
+        # page created-date filter (and show a blank "Created" column).
+        if self._state.adding and self.created_at is None:
+            self.created_at = timezone.now()
+        super().save(*args, **kwargs)
+
     def __str__(self):
         return f"{self.first_name} {self.last_name} ({self.client_id})"
 

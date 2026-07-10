@@ -1367,11 +1367,18 @@ class MembersListView(PortalGenericAPIView):
         if request.query_params.get("flat"):
             # Order + paginate in SQL (LIMIT/OFFSET) so we only ever serialize
             # one page; serializing/sorting the whole clients table per request
-            # does not scale once the full member base is imported. Most recently
-            # added members (by created_at) first; rows without a created_at sort
-            # last; name (case-insensitive "First Last") breaks ties.
+            # does not scale once the full member base is imported. Sortable by
+            # the Created / Last Updated columns (``sort`` + ``dir``); default is
+            # most-recently-created first. Rows with a null date sort last; name
+            # (case-insensitive "First Last") breaks ties.
+            sort_field = {
+                "created": "created_at", "updated": "updated_at",
+            }.get((request.query_params.get("sort") or "created").strip().lower(), "created_at")
+            descending = (request.query_params.get("dir") or "desc").strip().lower() != "asc"
+            col = F(sort_field)
+            primary = col.desc(nulls_last=True) if descending else col.asc(nulls_last=True)
             qs = self.get_queryset().order_by(
-                F("created_at").desc(nulls_last=True),
+                primary,
                 Lower("first_name"),
                 Lower("last_name"),
             )
