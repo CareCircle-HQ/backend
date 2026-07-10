@@ -42,6 +42,7 @@ from .views_members import (
     MemberServiceHoldView,
     MemberServiceReactivateView,
     MemberServiceResumeView,
+    MemberDismissAttentionView,
     MemberSocialCoverageView,
     MemberTicketsView,
     MemberVerificationCreateView,
@@ -182,6 +183,10 @@ urlpatterns = [
     path(
         "members/<uuid:client_id>/verification/disregard/",
         MemberVerificationDisregardView.as_view(),
+    ),
+    path(
+        "members/<uuid:client_id>/dismiss-attention/",
+        MemberDismissAttentionView.as_view(),
     ),
     path("members/<uuid:client_id>/diagnostic/", MemberDiagnosticView.as_view()),
 

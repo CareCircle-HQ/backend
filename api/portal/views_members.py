@@ -2710,6 +2710,30 @@ class MemberVerificationDisregardView(PortalAPIView):
         return Response(s.MemberDetailSerializer(client).data)
 
 
+class MemberDismissAttentionView(PortalAPIView):
+    """POST: dismiss a client from the Urgent Care ("Need Attention") list.
+
+    Clears the ``is_new`` flag so a client that no longer needs verification
+    attention (e.g. verified through another path, or flagged in error) drops
+    off the list. Normally ``is_new`` clears automatically when a verification
+    completes; this is the manual escape hatch for the stragglers that aren't
+    pending verification. Idempotent (a no-op when already clear). Records an
+    audit Note."""
+
+    def post(self, request, client_id):
+        client = get_object_or_404(Client, pk=client_id)
+        if client.is_new:
+            client.is_new = False
+            client.save(update_fields=["is_new"])
+            agent = current_agent(request)
+            author = agent.name if agent else ""
+            Note.objects.create(
+                client=client, source=NoteSource.AGENT, author_name=author,
+                body="Dismissed from the Urgent Care list.",
+            )
+        return Response(s.MemberDetailSerializer(client).data)
+
+
 def _logistics_enrollment(client_id):
     """The active enrollment for a member, or (None, error_response)."""
     client = get_object_or_404(Client, pk=client_id)
