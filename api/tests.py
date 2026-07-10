@@ -1211,3 +1211,116 @@ class DashboardServingClientIdsTests(TestCase):
         self.assertIn(soon.client_id, ids)
         self.assertNotIn(far.client_id, ids)         # expires too far out
         self.assertNotIn(commercial.client_id, ids)  # not Medicaid
+
+
+class ProgramSwitchClassificationTest(SimpleTestCase):
+    """The program_switched blocker must fire only on a REAL meals<->boxes
+    switch (the old kind is retired), not when a parallel different-kind case is
+    also open + approved -- that would wrongly (and destructively) flip a
+    correctly-served member. Pure-function coverage of the guard."""
+
+    def _classify(self, **overrides):
+        from .models import ProductTypeKind
+        from .services.po_blockers import _classify_reason
+
+        base = dict(
+            kitchen_id="k", future=4, has_future_auth=True, plan_ends_on=None,
+            kind=ProductTypeKind.MEALS, plan_kind=ProductTypeKind.MEALS,
+            governing_kind=ProductTypeKind.BOXES, plan_kind_authorized=False,
+            weekday_mismatch=False, switch_pending=False, open_case_count=2,
+            enrollment_case_id="c1", governing_case_id="c1",
+            today=timezone.localdate(),
+        )
+        base.update(overrides)
+        return _classify_reason(**base)
+
+    def test_real_switch_when_plan_kind_no_longer_authorized(self):
+        # Governing case is boxes, plan is meals, and NO open approved meals
+        # case remains -> the meals program is retired: a genuine switch.
+        self.assertEqual(self._classify(plan_kind_authorized=False), "program_switched")
+
+    def test_parallel_open_case_is_not_a_switch(self):
+        # The meals plan is still backed by an open approved meals case; the
+        # boxes case is a parallel duplicate -> duplicate_open_cases, not a
+        # switch (so the fix never destructively flips the member).
+        self.assertEqual(
+            self._classify(plan_kind_authorized=True, open_case_count=2),
+            "duplicate_open_cases",
+        )
+
+    def test_same_kind_is_never_a_switch(self):
+        from .models import ProductTypeKind
+
+        self.assertNotEqual(
+            self._classify(governing_kind=ProductTypeKind.MEALS,
+                           plan_kind_authorized=True, open_case_count=1),
+            "program_switched",
+        )
+
+
+class RecomputeSwitchesPlanKindTest(TestCase):
+    """Regression: applying the PO Blockers 'program_switched' fix must actually
+    flip the plan's KIND snapshot. update_household_cadence previously updated
+    prod_per_delivery but never meals_per_day; since plan_built_kind reads
+    meals_per_day first, a meals->boxes fix left the plan reading as meals, so
+    the blocker never cleared (the row remained after every fix)."""
+
+    def test_meals_to_boxes_flips_meals_per_day(self):
+        from datetime import timedelta
+
+        from .models import (
+            Case, CaseStatus, CaseType, Client, DeliveryCadence,
+            EnrollmentStage, EnrollmentVerification, Household, HouseholdMember,
+            MemberDeliverySchedule, MemberDietaryProfile, ProductType,
+            ProductTypeKind, ScheduleStatus, ServiceAuthorizationStatus,
+        )
+        from .services.delivery import update_household_cadence
+        from .services.orders import plan_built_kind
+
+        # Boxes product the switch should land on.
+        boxes_pt = ProductType.objects.create(
+            type=ProductTypeKind.BOXES, prod_per_delivery=1, meals_per_day=0,
+            delivery_days_cadence=DeliveryCadence.ONCE_A_WEEK,
+        )
+
+        client = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Sw", last_name="Itch",
+        )
+        hh = Household.objects.create(name="HH")
+        HouseholdMember.objects.create(household=hh, client=client, is_primary=True)
+        now = timezone.now()
+        case = Case.objects.create(
+            case_id=str(uuid.uuid4()), client=client,
+            case_type=CaseType.INTERNAL_SERVICE, case_status=CaseStatus.OPEN,
+            service_authorization_status=ServiceAuthorizationStatus.APPROVED,
+            service_authorization_approval_starts_at=now,
+            service_authorization_approval_ends_at=now + timedelta(days=60),
+            date_opened=now,
+        )
+        enr = EnrollmentVerification.objects.create(
+            client=client, household=hh, case=case,
+            stage=EnrollmentStage.SERVICE_ACTIVE,
+        )
+        member = MemberDietaryProfile.objects.create(
+            enrollment=enr, client=client, menu_type="Standard",
+        )
+        # A live MEALS plan (meals_per_day set, prod_per_delivery 0).
+        sched = MemberDeliverySchedule.objects.create(
+            enrollment=enr, member_profile=member, member_name="Sw Itch",
+            delivery_days_cadence=DeliveryCadence.ONCE_A_WEEK,
+            meals_per_day=3, prod_per_delivery=0, meals_boxes_total=12,
+            status=ScheduleStatus.SCHEDULED,
+        )
+        self.assertEqual(plan_built_kind(sched), ProductTypeKind.MEALS)
+
+        # Apply the switch to BOXES (what the fix does).
+        update_household_cadence(
+            enr, cadence=DeliveryCadence.ONCE_A_WEEK, case=case,
+            product_kind=ProductTypeKind.BOXES,
+        )
+
+        sched.refresh_from_db()
+        self.assertEqual(sched.meals_per_day, 0)          # was 3 -> flipped
+        self.assertEqual(sched.prod_per_delivery, 1)      # boxes qty
+        self.assertEqual(sched.product_type_id, boxes_pt.pk)
+        self.assertEqual(plan_built_kind(sched), ProductTypeKind.BOXES)

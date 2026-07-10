@@ -20,6 +20,7 @@ from api.services.lifecycle import (
 from ..models import (
     Address,
     Agent,
+    Cadence,
     Case,
     CaseType,
     CommunicationChannel,
@@ -423,6 +424,7 @@ class MemberListSerializer(serializers.Serializer):
     authorization_status_label = serializers.SerializerMethodField()
     medicaid_id = serializers.SerializerMethodField()
     case_manager = serializers.CharField(source="agent_name")
+    lead_source = serializers.SerializerMethodField()
     flags = serializers.SerializerMethodField()
     out_of_orbit = serializers.SerializerMethodField()
     out_of_range = serializers.SerializerMethodField()
@@ -448,6 +450,9 @@ class MemberListSerializer(serializers.Serializer):
 
     def get_name(self, obj):
         return _full_name(obj)
+
+    def get_lead_source(self, obj):
+        return getattr(obj, "lead_source", "") or ""
 
     def get_household_primary_id(self, obj):
         # client_id of the household's PRIMARY member, used by the Members list
@@ -1371,6 +1376,55 @@ class PortalMenuTypeSerializer(serializers.ModelSerializer):
         return [str(t.pk) for t in obj.tags.all()]
 
 
+class PortalCadenceSerializer(serializers.ModelSerializer):
+    """Settings > Delivery Cadences: a configurable delivery cadence (label +
+    the weekday codes it delivers on). ``code`` is a stable slug derived from
+    the label on create when not supplied; it's read-only afterwards so the
+    stored ProductType/schedule codes never drift."""
+
+    id = serializers.UUIDField(source="pk", read_only=True)
+    kitchen_count = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Cadence
+        fields = ["id", "code", "label", "weekdays", "is_active", "kitchen_count"]
+        extra_kwargs = {"code": {"required": False}}
+
+    def get_kitchen_count(self, obj):
+        return obj.kitchens.count()
+
+    def validate_weekdays(self, value):
+        from ..models import CADENCE_WEEKDAY_CODES
+
+        if not isinstance(value, list):
+            raise serializers.ValidationError("weekdays must be a list of weekday codes.")
+        bad = [w for w in value if w not in CADENCE_WEEKDAY_CODES]
+        if bad:
+            raise serializers.ValidationError(f"Invalid weekday code(s): {', '.join(bad)}.")
+        # De-dupe while preserving canonical weekday order.
+        return [w for w in CADENCE_WEEKDAY_CODES if w in value]
+
+    def _slugify_code(self, label):
+        from django.utils.text import slugify
+
+        base = slugify(label).replace("-", "_")[:40] or "cadence"
+        code, i = base, 2
+        while Cadence.objects.filter(code=code).exists():
+            code = f"{base}_{i}"[:40]
+            i += 1
+        return code
+
+    def create(self, validated_data):
+        if not validated_data.get("code"):
+            validated_data["code"] = self._slugify_code(validated_data.get("label", ""))
+        return super().create(validated_data)
+
+    def update(self, instance, validated_data):
+        # Code is immutable after creation (it keys stored schedules/products).
+        validated_data.pop("code", None)
+        return super().update(instance, validated_data)
+
+
 class PortalKitchenIntegrationSerializer(serializers.ModelSerializer):
     id = serializers.UUIDField(source="pk", read_only=True)
     config = serializers.SerializerMethodField()
@@ -1414,13 +1468,16 @@ class PortalKitchenSerializer(serializers.ModelSerializer):
     )
     product_options = serializers.SerializerMethodField()
     integrations = PortalKitchenIntegrationSerializer(many=True, read_only=True)
+    cadence_ids = serializers.SerializerMethodField()
+    cadences = PortalCadenceSerializer(many=True, read_only=True)
 
     class Meta:
         model = Kitchen
         fields = [
             "id", "name", "address", "phone", "email", "status", "status_label",
             "max_orders_per_day", "supported_products", "product_options",
-            "menu_type_ids", "menu_types", "integrations",
+            "menu_type_ids", "menu_types", "cadence_ids", "cadences",
+            "integrations",
         ]
 
     def get_menu_type_ids(self, obj):
@@ -1428,6 +1485,9 @@ class PortalKitchenSerializer(serializers.ModelSerializer):
 
     def get_product_options(self, obj):
         return [{"value": v, "label": l} for v, l in KitchenProductType.choices]
+
+    def get_cadence_ids(self, obj):
+        return [str(c.pk) for c in obj.cadences.all()]
 
 
 class PortalDeliveryCompanyIntegrationSerializer(serializers.ModelSerializer):

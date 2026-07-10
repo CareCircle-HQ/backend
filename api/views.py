@@ -117,30 +117,6 @@ def _safe_recompute_household(enrollment):
         )
 
 
-def _maybe_fast_track_williamsburg(enrollment, request):
-    """Williamsburg exception: when the verification is requested for a
-    Williamsburg client, skip the manual pipeline and activate the household
-    directly. Never lets a failure break the verification request -- on error
-    the enrollment simply stays at Pending Verification (normal flow)."""
-    client = getattr(enrollment, "client", None)
-    if client is None or not getattr(client, "is_williamsburg", False):
-        return
-    try:
-        from .models import Agent
-        from .services.williamsburg import fast_track_williamsburg_enrollment
-
-        agent_id = getattr(getattr(request, "user", None), "agent_id", None)
-        agent = Agent.objects.filter(pk=agent_id).first() if agent_id else None
-        fast_track_williamsburg_enrollment(
-            enrollment, actor=getattr(request, "user", None), agent=agent
-        )
-    except Exception:  # noqa: BLE001
-        logger.exception(
-            "Williamsburg fast-track failed for enrollment %s",
-            getattr(enrollment, "pk", None),
-        )
-
-
 class RegisterView(generics.CreateAPIView):
     """Public endpoint to create a new user."""
 
@@ -581,6 +557,9 @@ class EnrollmentVerificationViewSet(viewsets.ModelViewSet):
         household = self.request.query_params.get("household")
         if household:
             qs = qs.filter(household_id=household)
+        case = self.request.query_params.get("case")
+        if case:
+            qs = qs.filter(case_id=case)
         return qs
 
     def create(self, request, *args, **kwargs):
@@ -756,9 +735,6 @@ class EnrollmentVerificationViewSet(viewsets.ModelViewSet):
         # household's lifecycle stage: the primary and every non-denied member
         # move to Pending Verification together, not just the primary.
         _safe_recompute_household(serializer.instance)
-        # Williamsburg exception: flagged clients skip the manual pipeline and
-        # are activated directly (no-op for everyone else).
-        _maybe_fast_track_williamsburg(serializer.instance, self.request)
 
     @action(detail=False, methods=["get"])
     def choices(self, request):

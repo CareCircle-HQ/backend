@@ -364,7 +364,25 @@ def update_household_cadence(enrollment, cadence, once_a_week_weekday=None, case
             for w in delivery_weekdays if w in _WEEKDAY_CODES
         ]
         start = min(candidates) if candidates else anchor
-    num_dates = len(_delivery_dates(start, end, delivery_weekdays))
+    delivery_dates = _delivery_dates(start, end, delivery_weekdays)
+    num_dates = len(delivery_dates)
+    weekday_ints = _weekday_ints(delivery_weekdays)
+    # Meals use a per-day rate (per-delivery quantity varies by coverage); boxes
+    # use a flat per-delivery count. Recompute the per-day rate too (0 for boxes)
+    # so a meals<->boxes switch actually flips the plan's KIND snapshot --
+    # plan_built_kind reads meals_per_day first, so leaving it stale kept the
+    # plan on its old kind and the PO Blockers 'program_switched' fix never
+    # cleared (the row remained after every fix). Mirrors the creation path.
+    meals_per_day = (
+        product_type.meals_per_day if (product_type and not is_boxes) else 0
+    )
+    meals_total = (
+        sum(
+            meals_for_delivery(d.weekday(), weekday_ints, meals_per_day)
+            for d in delivery_dates
+        )
+        if meals_per_day else 0
+    )
 
     for sched in enrollment.delivery_schedules.all():
         prod = product_type.prod_per_delivery if product_type else sched.prod_per_delivery
@@ -372,11 +390,12 @@ def update_household_cadence(enrollment, cadence, once_a_week_weekday=None, case
         if product_type is not None:
             sched.product_type = product_type
         sched.prod_per_delivery = prod
-        sched.meals_boxes_total = (prod or 0) * num_dates
+        sched.meals_per_day = meals_per_day
+        sched.meals_boxes_total = meals_total if meals_per_day else (prod or 0) * num_dates
         sched.starts_on = start
         sched.ends_on = end
         sched.save(update_fields=[
             "delivery_days_cadence", "product_type", "prod_per_delivery",
-            "meals_boxes_total", "starts_on", "ends_on",
+            "meals_per_day", "meals_boxes_total", "starts_on", "ends_on",
         ])
     return enrollment

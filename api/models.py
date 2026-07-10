@@ -365,6 +365,13 @@ class Client(models.Model):
     # fast-tracked straight to Service Active (see api.services.williamsburg)
     # instead of waiting on the manual verification + kitchen-assignment steps.
     is_williamsburg = models.BooleanField(default=False, db_index=True)
+    # "New client needs verification attention" flag. Set True when the client's
+    # first internal-service Case is created (via the ext OR the CSV data import),
+    # cleared to False once a verification completes (enrollment reaches VERIFIED).
+    # Drives the Verification > "Need Attention" list and the ext screening
+    # warnings. See api.services.lifecycle.advance_enrollment (clear) and
+    # api.serializers.CaseSerializer (set).
+    is_new = models.BooleanField(default=False, db_index=True)
     is_a_family = models.BooleanField(default=False)
     total_family_members = models.PositiveSmallIntegerField(null=True, blank=True)
     attestation_needed = models.BooleanField(default=False)
@@ -821,6 +828,44 @@ class DeliveryCadence(models.TextChoices):
     MON_THU = "mon_thu", "Mon/Thu"
     TUE_FRI = "tue_fri", "Tue/Fri"
     ONCE_A_WEEK = "once_a_week", "Once a Week"
+
+
+# Canonical weekday codes a cadence can deliver on (matches the codes used by
+# the scheduling core in api.services.delivery).
+CADENCE_WEEKDAY_CODES = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
+
+
+class Cadence(models.Model):
+    """A configurable delivery cadence (how often + on which weekdays a product
+    is delivered each week), managed from Settings > Delivery Cadences.
+
+    Seeded from the legacy :class:`DeliveryCadence` enum so the existing set
+    (Mon/Thu, Tue/Fri, Once a Week) is available out of the box; new cadences
+    can be added here. ``code`` is a stable slug that matches the value stored
+    on ``ProductType.delivery_days_cadence`` / ``MemberDeliverySchedule`` so the
+    two stay in sync. ``weekdays`` holds the delivery weekday codes (empty for a
+    once-a-week cadence, where the agent picks the single day).
+
+    NOTE: This table is currently configuration only -- the scheduling core
+    still reads the legacy enum/weekday map. Wiring the scheduler to consult
+    this table is a follow-up.
+    """
+
+    cadence_id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    code = models.SlugField(max_length=40, unique=True)
+    label = models.CharField(max_length=80)
+    # Delivery weekday codes (subset of CADENCE_WEEKDAY_CODES). Empty means the
+    # weekday is chosen per-member at assignment time (once-a-week style).
+    weekdays = models.JSONField(default=list, blank=True)
+    is_active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["label"]
+
+    def __str__(self):
+        return self.label or self.code
 
 
 class ProductType(models.Model):
@@ -3094,6 +3139,13 @@ class Kitchen(models.Model):
     menu_types = models.ManyToManyField(
         MenuType,
         through="KitchenMenuType",
+        related_name="kitchens",
+        blank=True,
+    )
+    # Delivery cadences this kitchen takes orders for. Configuration only for
+    # now (surfaced in Settings); not yet enforced in kitchen assignment.
+    cadences = models.ManyToManyField(
+        "Cadence",
         related_name="kitchens",
         blank=True,
     )

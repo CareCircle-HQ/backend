@@ -74,6 +74,7 @@ from .views_orders import (
 from .views_delivery_calendar import MemberDeliveryCalendarView
 from .views_kitchen_output import KitchenOutputView
 from .views_po_blockers import POBlockersFixView, POBlockersStatsView, POBlockersView
+from .views_reports import MembersByLeadSourceReportView
 from .views_activity import ActivityFiltersView, ActivityLogView
 from .views_service_area import ExcludedZipCodeDetailView, ExcludedZipCodesView
 from .views_imports import (
@@ -87,6 +88,7 @@ from .views_imports import (
     UniteUsAgentsView,
 )
 from .views_settings import (
+    CadenceViewSet,
     CrmAgentViewSet,
     DeliveryCompanyIntegrationDetailView,
     DeliveryCompanyIntegrationSetPrimaryView,
@@ -108,6 +110,7 @@ from .views_tickets import (
 router = SimpleRouter()
 router.register("settings/menu-types", MenuTypeViewSet, basename="portal-menu-type")
 router.register("settings/dietary-tags", DietaryTagViewSet, basename="portal-dietary-tag")
+router.register("settings/cadences", CadenceViewSet, basename="portal-cadence")
 router.register("settings/kitchens", KitchenViewSet, basename="portal-kitchen")
 router.register(
     "settings/delivery-companies", DeliveryCompanyViewSet, basename="portal-delivery-company"
@@ -274,6 +277,13 @@ urlpatterns = [
     # extension's doctor-address autocomplete; key stays server-side).
     path("places/autocomplete/", PortalPlacesAutocompleteView.as_view(), name="portal-places-autocomplete"),
     path("places/details/", PortalPlacesDetailsView.as_view(), name="portal-places-details"),
+
+    # Reports (Admin > Reports): management-only CSV exports
+    path(
+        "reports/members-by-lead-source/",
+        MembersByLeadSourceReportView.as_view(),
+        name="portal-report-members-by-lead-source",
+    ),
 
     # Dashboard
     path("dashboard/", DashboardView.as_view(), name="portal-dashboard"),
