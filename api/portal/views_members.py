@@ -427,6 +427,9 @@ MEMBER_LIST_PREFETCH = (
     # Roster of the client's household so the serializer can resolve the primary
     # member's client_id (household_primary_id) without an extra query per row.
     "household_membership__household__members",
+    # Household-level enrollments, so the Meals/Boxes kind resolves for a
+    # dependent who has no enrollment of their own (kind is household-wide).
+    "household_membership__household__enrollment_verifications",
 )
 
 
@@ -976,6 +979,7 @@ class MembersListView(PortalGenericAPIView):
         data = s.MemberListSerializer(client).data
         data["is_primary"] = is_primary
         data["relationship"] = relationship
+        data["service_type"] = self._service_type_for_client(client)
         return data
 
     @staticmethod
@@ -999,11 +1003,20 @@ class MembersListView(PortalGenericAPIView):
     @staticmethod
     def _service_type_for_client(client):
         """Meals/Boxes kind derived from the client's enrollment program name
-        (prefetched). Empty when neither keyword is present."""
+        (prefetched), falling back to the household's enrollments so a dependent
+        with no enrollment of their own still resolves (the kind is household-
+        wide). Empty when neither keyword is present anywhere."""
         for enr in client.enrollments.all():
             kind = product_type_kind_for_name(enr.program_name)
             if kind:
                 return kind
+        membership = getattr(client, "household_membership", None)
+        household = getattr(membership, "household", None) if membership else None
+        if household is not None:
+            for enr in household.enrollment_verifications.all():
+                kind = product_type_kind_for_name(enr.program_name)
+                if kind:
+                    return kind
         return ""
 
     def _group_entries(self):
