@@ -29,7 +29,7 @@ from api.models import (
     SERVICE_EXCLUDED_MEMBER_STATUSES,
 )
 from api.services.catalog import product_kind_for_enrollment, product_type_kind_for_name
-from api.services.delivery import BOX_DELIVERY_WEEKDAY, weekdays_for_cadence
+from api.services.delivery import cadence_delivery_weekdays
 from api.services.lifecycle import (
     governing_internal_case,
     open_internal_service_cases,
@@ -175,19 +175,17 @@ def _case_product_kind(case):
 
 def _weekday_mismatch(enr, cadence, kind):
     """True when the enrollment's delivery_weekdays don't match what the plan's
-    cadence + kind imply (e.g. a meals member on a mon_thu cadence whose weekdays
-    are stuck on Wednesday from a prior boxes setup). A weekly cadence accepts
-    any single weekday, so it never flags."""
+    cadence implies (e.g. a meals member on a mon_thu cadence whose weekdays are
+    stuck on Wednesday from a prior boxes setup). The expected weekdays come from
+    the Cadence settings table. A cadence with no fixed weekdays (once-a-week
+    style) accepts any single weekday, so it never flags."""
     actual = set(enr.delivery_weekdays or [])
     if not actual or not cadence:
         return False
-    if kind == ProductTypeKind.BOXES:
-        expected = {BOX_DELIVERY_WEEKDAY}
-    elif cadence != DeliveryCadence.ONCE_A_WEEK:
-        expected = set(weekdays_for_cadence(cadence, None))
-    else:
-        return False  # once_a_week: any single weekday is valid
-    return bool(expected) and actual != expected
+    expected = set(cadence_delivery_weekdays(cadence))
+    if not expected:
+        return False  # once-a-week style: any single weekday is valid
+    return actual != expected
 
 
 def classify_po_blockers(from_date=None, include_ok=False):

@@ -49,52 +49,142 @@ CADENCE_WEEKDAYS = {
     DeliveryCadence.ONCE_A_WEEK: [],
 }
 
-# Boxes ship on a fixed weekly schedule that ignores the agent-picked cadence
-# weekday: every Wednesday, with the purchase order cut the Friday before.
+# Boxes are ordered on a purchase order cut the Friday before delivery. The
+# delivery weekday itself is now data-driven (per the kitchen's cadence): box
+# kitchens can deliver on different days. Wednesday remains the default when a
+# box cadence carries no fixed weekday.
 BOX_DELIVERY_WEEKDAY = "wed"
 BOX_PO_WEEKDAY = "fri"
 
 
-def cadence_options_for_kind(kind):
-    """The delivery cadences available for a product ``kind`` (meals/boxes),
-    each with the predefined per-delivery quantity from its ProductType row.
+def cadence_delivery_weekdays(cadence):
+    """The fixed delivery weekday codes configured for a cadence, read from the
+    Cadence settings table. Empty means a once-a-week style cadence where the
+    agent picks the single delivery day at assignment time.
 
-    Derived from the ProductType rows of that kind so the Logistics page only
-    offers Meals cadences for a meals program and Boxes cadences for a boxes
-    program (the two never mix). Falls back to every cadence (no default qty)
-    when the kind is unknown or no ProductTypes are configured for it.
+    Falls back to the legacy hardcoded map only when the Cadence table has no
+    (active) row for the code, so an un-seeded environment still schedules.
     """
-    labels = dict(DeliveryCadence.choices)
+    from api.models import Cadence
+
+    row = Cadence.objects.filter(code=cadence, is_active=True).first()
+    if row is not None:
+        return [w for w in (row.weekdays or []) if w in _WEEKDAY_CODES]
+    if cadence == DeliveryCadence.ONCE_A_WEEK:
+        return []
+    return list(CADENCE_WEEKDAYS.get(cadence, []))
+
+
+def cadence_options_for_kind(kind):
+    """The delivery cadences a household of this product ``kind`` (meals/boxes)
+    can be assigned, each with its delivery weekdays and the predefined
+    per-delivery quantity.
+
+    A cadence is offered when a kitchen that MAKES this product (``supported_
+    products``) is linked to it (``Kitchen.cadences``) -- so the two never mix
+    and the agent only sees cadences some capable kitchen actually runs. The
+    per-delivery quantity comes from the matching ProductType row. When the
+    kind is unknown, every active cadence is returned.
+    """
+    from api.models import Cadence, Kitchen, KitchenProductType
+
+    active = list(Cadence.objects.filter(is_active=True))
+    by_code = {c.code: c for c in active}
+
+    qty = {}
     if kind is not None:
-        opts, seen = [], set()
-        rows = (
-            ProductType.objects.filter(type=kind)
-            .exclude(delivery_days_cadence="")
-            .order_by("delivery_days_cadence")
-        )
-        for r in rows:
-            if r.delivery_days_cadence in seen:
-                continue
-            seen.add(r.delivery_days_cadence)
-            opts.append({
-                "value": r.delivery_days_cadence,
-                "label": labels.get(r.delivery_days_cadence, r.delivery_days_cadence),
-                "prod_per_delivery": r.prod_per_delivery,
-            })
-        if opts:
-            return opts
+        for r in (
+            ProductType.objects.filter(type=kind).exclude(delivery_days_cadence="")
+        ):
+            qty.setdefault(r.delivery_days_cadence, r.prod_per_delivery)
+
+    product = {
+        ProductTypeKind.MEALS: KitchenProductType.MEAL,
+        ProductTypeKind.BOXES: KitchenProductType.BOX,
+    }.get(kind)
+
+    if product is None:
+        chosen = active
+    else:
+        codes = set()
+        for k in Kitchen.objects.filter(
+            supported_products__contains=[product]
+        ).prefetch_related("cadences"):
+            codes.update(c.code for c in k.cadences.all() if c.is_active)
+        chosen = [by_code[c] for c in codes if c in by_code]
+
+    chosen.sort(key=lambda c: (c.label or c.code).lower())
     return [
-        {"value": v, "label": l, "prod_per_delivery": None}
-        for v, l in DeliveryCadence.choices
+        {
+            "value": c.code,
+            "label": c.label or c.code,
+            "weekdays": [w for w in (c.weekdays or []) if w in _WEEKDAY_CODES],
+            "prod_per_delivery": qty.get(c.code),
+        }
+        for c in chosen
     ]
 
 
 def weekdays_for_cadence(cadence, once_a_week_weekday=None):
-    """Resolve the delivery weekday codes for a manually chosen cadence. For
-    ``once_a_week`` the agent-picked single weekday is used."""
-    if cadence == DeliveryCadence.ONCE_A_WEEK:
-        return [once_a_week_weekday] if once_a_week_weekday in _WEEKDAY_CODES else []
-    return list(CADENCE_WEEKDAYS.get(cadence, []))
+    """Resolve the delivery weekday codes for a chosen cadence. A cadence with no
+    fixed weekdays (once-a-week style) uses the agent-picked single day."""
+    fixed = cadence_delivery_weekdays(cadence)
+    if fixed:
+        return fixed
+    return [once_a_week_weekday] if once_a_week_weekday in _WEEKDAY_CODES else []
+
+
+def active_cadence_codes():
+    """The set of active Cadence codes an assignment may use."""
+    from api.models import Cadence
+
+    return set(Cadence.objects.filter(is_active=True).values_list("code", flat=True))
+
+
+def cadence_needs_weekday(cadence):
+    """True when a cadence has no fixed delivery weekdays, so the agent must pick
+    the single delivery day at assignment time (once-a-week style)."""
+    return not cadence_delivery_weekdays(cadence)
+
+
+def cadence_codes_for_kind(kind):
+    """The set of active Cadence codes run by kitchens that make this product
+    ``kind`` (meals/boxes). Empty when the kind is unknown."""
+    from api.models import Kitchen, KitchenProductType
+
+    product = {
+        ProductTypeKind.MEALS: KitchenProductType.MEAL,
+        ProductTypeKind.BOXES: KitchenProductType.BOX,
+    }.get(kind)
+    if product is None:
+        return set()
+    codes = set()
+    for k in Kitchen.objects.filter(
+        supported_products__contains=[product]
+    ).prefetch_related("cadences"):
+        codes.update(c.code for c in k.cadences.all() if c.is_active)
+    return codes
+
+
+def cadence_po_weekday(kind, delivery_weekday_code):
+    """The configured PO/cutoff weekday code for a delivery weekday under this
+    product ``kind``, read from the Cadence settings table
+    (``Cadence.po_weekdays``). Returns None when nothing is configured, so the
+    caller falls back to its legacy default.
+
+    Scoped to cadences run by kitchens of this kind so a meals delivery day and
+    a boxes delivery day that share a weekday don't cross-configure each other.
+    """
+    from api.models import Cadence
+
+    kind_codes = cadence_codes_for_kind(kind)
+    for c in Cadence.objects.filter(is_active=True):
+        if kind_codes and c.code not in kind_codes:
+            continue
+        po = (c.po_weekdays or {}).get(delivery_weekday_code)
+        if po:
+            return po
+    return None
 
 
 def _accept_date(case):
@@ -131,20 +221,21 @@ def _next_weekday(d, weekday):
     return d + timedelta(days=days or 7)
 
 
-def box_first_delivery(assignment_date):
+def box_first_delivery(assignment_date, delivery_weekdays=None):
     """First box delivery date for an assignment made on ``assignment_date``.
 
-    Boxes are delivered every Wednesday and their purchase order is cut the
-    Friday before. To make a Friday's PO batch the assignment must land BEFORE
-    that Friday, so we take the next Friday strictly after the assignment date
-    (assigning on Friday or the weekend rolls to the following Friday) and
-    return the first Wednesday after it. In practice:
-
-    * assigned Mon-Thu -> this week's Friday PO -> next week's Wednesday;
-    * assigned Fri/Sat/Sun -> next week's Friday PO -> the Wednesday after that.
+    A box purchase order is cut the Friday before delivery, so the assignment
+    must land BEFORE that Friday: we take the next Friday strictly after the
+    assignment date (assigning on Friday or the weekend rolls to the following
+    Friday) and return the first CONFIGURED delivery weekday after it. The
+    delivery weekday(s) come from the kitchen's cadence, so box kitchens can
+    deliver on different days; Wednesday is the default when none is configured.
     """
+    weekdays = [w for w in (delivery_weekdays or []) if w in _WEEKDAY_CODES] or [
+        BOX_DELIVERY_WEEKDAY
+    ]
     po_friday = _next_weekday(assignment_date, _WEEKDAY_CODES[BOX_PO_WEEKDAY])
-    return _next_weekday(po_friday, _WEEKDAY_CODES[BOX_DELIVERY_WEEKDAY])
+    return min(_next_weekday(po_friday, _WEEKDAY_CODES[w]) for w in weekdays)
 
 
 def cadence_rule_for(product_kind, accept_date):
@@ -218,16 +309,17 @@ def create_member_delivery_schedules(
     program_name = (program.name if program is not None else "") or enrollment.program_name
     member_quantities = member_quantities or {}
 
-    # Boxes ship on a fixed weekly schedule (Wednesdays, PO cut the Friday
-    # before) that ignores the agent-picked weekday; meals use the chosen
-    # cadence. Product type is still matched by program-kind AND cadence so
-    # meals/boxes (and their per-delivery quantities) never mix.
+    # Delivery weekdays come from the chosen cadence for meals AND boxes (box
+    # kitchens can run different days); boxes still have their PO cut the Friday
+    # before and default to Wednesday when the cadence carries no weekday.
+    # Product type is still matched by program-kind AND cadence so meals/boxes
+    # (and their per-delivery quantities) never mix.
     kind = product_kind or product_type_kind_for_name(program_name)
     is_boxes = kind == ProductTypeKind.BOXES
-    if is_boxes:
+    delivery_weekdays = weekdays_for_cadence(cadence, once_a_week_weekday)
+    if is_boxes and not delivery_weekdays:
+        # Box cadence with no configured weekday defaults to Wednesday.
         delivery_weekdays = [BOX_DELIVERY_WEEKDAY]
-    else:
-        delivery_weekdays = weekdays_for_cadence(cadence, once_a_week_weekday)
     product_type = _resolve_product_type(program_name, cadence, kind=kind)
 
     # Persist the delivery weekdays onto the enrollment so any downstream order
@@ -239,8 +331,8 @@ def create_member_delivery_schedules(
     end = _window_end(case)
     if is_boxes:
         # First box delivery is anchored on the assignment date (today): the
-        # first Wednesday after the next PO Friday.
-        start = box_first_delivery(timezone.localdate())
+        # first configured box weekday after the next PO Friday.
+        start = box_first_delivery(timezone.localdate(), delivery_weekdays)
     else:
         # First meal delivery = the soonest chosen weekday strictly after the
         # anchor (the later of today and the auth window start), so a case
@@ -342,10 +434,10 @@ def update_household_cadence(enrollment, cadence, once_a_week_weekday=None, case
     kind = product_kind or product_type_kind_for_name(program_name)
     is_boxes = kind == ProductTypeKind.BOXES
 
-    if is_boxes:
+    delivery_weekdays = weekdays_for_cadence(cadence, once_a_week_weekday)
+    if is_boxes and not delivery_weekdays:
+        # Box cadence with no configured weekday defaults to Wednesday.
         delivery_weekdays = [BOX_DELIVERY_WEEKDAY]
-    else:
-        delivery_weekdays = weekdays_for_cadence(cadence, once_a_week_weekday)
     product_type = _resolve_product_type(program_name, cadence, kind=kind)
 
     enrollment.delivery_weekdays = delivery_weekdays
@@ -353,7 +445,7 @@ def update_household_cadence(enrollment, cadence, once_a_week_weekday=None, case
 
     end = _window_end(case)
     if is_boxes:
-        start = box_first_delivery(timezone.localdate())
+        start = box_first_delivery(timezone.localdate(), delivery_weekdays)
     else:
         # Anchor the first meal delivery on the later of today and the auth
         # window start (see _meal_delivery_anchor) so a past-dated authorization

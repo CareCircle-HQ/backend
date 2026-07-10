@@ -96,8 +96,21 @@ def _prev_weekday(d, weekday):
 
 
 def po_date_for_delivery(kind, delivery_date):
-    """The PO/cutoff date for a given product ``kind`` and delivery date."""
+    """The PO/cutoff date for a given product ``kind`` and delivery date.
+
+    Reads the configurable PO cutoff weekday from the Cadence settings table
+    (``Cadence.po_weekdays``); falls back to the legacy hardcoded map when a
+    cadence doesn't declare one, so existing behavior is preserved.
+    """
+    from api.services.delivery import cadence_po_weekday
+
     wd = delivery_date.weekday()
+    delivery_code = _WEEKDAY_NAMES.get(wd)
+    po_code = cadence_po_weekday(kind, delivery_code) if delivery_code else None
+    if po_code and po_code in _WEEKDAY_CODES:
+        return _prev_weekday(delivery_date, _WEEKDAY_CODES[po_code])
+
+    # Legacy fallback: hardcoded meal map / box Friday.
     if kind == ProductTypeKind.BOXES:
         po_wd = _BOX_PO_WEEKDAY
     else:
