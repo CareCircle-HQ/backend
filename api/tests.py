@@ -1087,7 +1087,7 @@ class VerificationDisregardTest(TestCase):
 
         client = self._client()
         case = Case.objects.create(
-            case_id=str(uuid.uuid4()), client=client, case_type=CaseType.INTERNAL_SERVICE,
+            case_id=uuid.uuid4(), client=client, case_type=CaseType.INTERNAL_SERVICE,
         )
         enr, _ = self._pending_enrollment(client, case=case)
         resp = self.api.post(self._url(client), {"reason": "dupe"}, format="json")
@@ -1120,7 +1120,7 @@ class DashboardServingClientIdsTests(TestCase):
         )
 
         client = Client.objects.create(
-            client_id=str(uuid.uuid4()), first_name="Dash", last_name="Board",
+            client_id=uuid.uuid4(), first_name="Dash", last_name="Board",
         )
         hh = Household.objects.create(name="HH")
         HouseholdMember.objects.create(household=hh, client=client, is_primary=True)
