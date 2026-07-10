@@ -15,6 +15,7 @@ from api.models import (
     CaseStatus,
     Insurance,
     RecordStatus,
+    ServiceAuthorizationStatus,
     SocialCareCoverage,
     SocialCareCoverageStatus,
     Ticket,
@@ -124,6 +125,9 @@ def evaluate_client_coverage(client, import_run=None):
 
 
 def evaluate_new_insurance(client, import_run=None):
+    # PAUSED: the "new insurance record created" system-change ticket is disabled
+    # (too noisy on import). Remove this early return to re-enable.
+    return
     open_ticket(
         TicketTypeCode.SYSTEM_CHANGE_DETECTED,
         reason=(
@@ -136,6 +140,9 @@ def evaluate_new_insurance(client, import_run=None):
 
 
 def evaluate_new_coverage(client, import_run=None):
+    # PAUSED: the "new social care coverage record created" system-change ticket
+    # is disabled (too noisy on import). Remove this early return to re-enable.
+    return
     open_ticket(
         TicketTypeCode.SYSTEM_CHANGE_DETECTED,
         reason=(
@@ -203,6 +210,10 @@ def plan_case_tickets(case, *, previous_status=None, previous_auth_status=None):
         previous_auth_status is not None
         and case.service_authorization_status
         and case.service_authorization_status != previous_auth_status
+        # PAUSED for Approved/Pending (and other outcomes): only a change TO
+        # Denied raises a ticket now -- approved/pending auth changes were too
+        # noisy. Widen this condition to re-enable the others.
+        and case.service_authorization_status == ServiceAuthorizationStatus.DENIED
     ):
         plans.append(PlannedTicket(
             type_code=TicketTypeCode.SYSTEM_CHANGE_DETECTED,

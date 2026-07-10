@@ -1193,6 +1193,24 @@ class CaseSerializer(serializers.ModelSerializer):
                 ensure_household_with_primary(client)
         except Exception:
             logger.exception("ensure_household_with_primary failed for internal service case")
+        # "New client needs verification attention": creating the client's FIRST
+        # internal-service case (via the ext OR the CSV data import) flags them
+        # is_new=True so they surface on the Verification > "Need Attention" list
+        # and the ext shows the right screening warning. Only when the case is
+        # newly created (``_prev`` is None) AND the client isn't already verified
+        # (so a historical bulk import never re-flags long-verified members). The
+        # flag is cleared once a verification completes (lifecycle.advance_enrollment
+        # -> VERIFIED). Best-effort: never let the flag break the case save.
+        try:
+            if case.case_type == CaseType.INTERNAL_SERVICE and _prev is None:
+                already_verified = EnrollmentVerification.objects.filter(
+                    client=client, verified_at__isnull=False
+                ).exists()
+                if not already_verified and not client.is_new:
+                    client.is_new = True
+                    client.save(update_fields=["is_new"])
+        except Exception:
+            logger.exception("is_new flag set failed for internal service case %s", case_id)
         # Internal-service authorization full-stop rule: a client with a SINGLE
         # internal-service (meal/box) case that is denied is auto-paused (On Hold)
         # so service stops and they drop off kitchen assignment; a later favorable

@@ -464,6 +464,15 @@ _PROCESS_GATES = {
 
 _TERMINAL_STAGES = {EnrollmentStage.CLOSED, EnrollmentStage.CANCELLED}
 
+# Reaching any of these means the household's verification is complete, so the
+# "new client needs verification attention" flag (Client.is_new) is cleared.
+_VERIFIED_OR_BEYOND = {
+    EnrollmentStage.VERIFIED,
+    EnrollmentStage.KITCHEN_ASSIGNMENT,
+    EnrollmentStage.SERVICE_ACTIVE,
+    EnrollmentStage.SERVICE_COMPLETE,
+}
+
 
 def _has_passing_process(enrollment, process_type):
     return enrollment.processes.filter(
@@ -523,6 +532,16 @@ def advance_enrollment(enrollment, to_stage, *, actor=None, actor_label="", note
         enrollment.closed_at = None
         update_fields.append("closed_at")
     enrollment.save(update_fields=update_fields)
+
+    # Verification complete -> clear the "new client needs attention" flag. The
+    # flag was set when the client's first internal-service case was created
+    # (see CaseSerializer); reaching VERIFIED (or beyond) means the verification
+    # it was tracking is done, so drop them off the "Need Attention" list.
+    if to_stage in _VERIFIED_OR_BEYOND:
+        client = enrollment.client
+        if client is not None and client.is_new:
+            client.is_new = False
+            client.save(update_fields=["is_new"])
 
     stage_event = StageEvent.objects.create(
         entity_type=StageEntityType.ENROLLMENT,

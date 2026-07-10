@@ -365,6 +365,13 @@ class Client(models.Model):
     # fast-tracked straight to Service Active (see api.services.williamsburg)
     # instead of waiting on the manual verification + kitchen-assignment steps.
     is_williamsburg = models.BooleanField(default=False, db_index=True)
+    # "New client needs verification attention" flag. Set True when the client's
+    # first internal-service Case is created (via the ext OR the CSV data import),
+    # cleared to False once a verification completes (enrollment reaches VERIFIED).
+    # Drives the Verification > "Need Attention" list and the ext screening
+    # warnings. See api.services.lifecycle.advance_enrollment (clear) and
+    # api.serializers.CaseSerializer (set).
+    is_new = models.BooleanField(default=False, db_index=True)
     is_a_family = models.BooleanField(default=False)
     total_family_members = models.PositiveSmallIntegerField(null=True, blank=True)
     attestation_needed = models.BooleanField(default=False)

@@ -3,7 +3,11 @@
 A single aggregate endpoint (management-only) reporting on the internal-service
 (meal/box) program. Every metric is scoped by the selected date range to
 internal-service cases OPENED within that window (``All Time`` applies no date
-filter). See :class:`DashboardView` for the exact metric definitions.
+filter). The one exception is the ``needs_verification`` serving reason, which
+mirrors the Verification page's "Pending + Requested-date" filter exactly --
+windowed by WHEN VERIFICATION WAS REQUESTED (enrollment.opened_at) rather than the
+case's date_opened, and counted by HOUSEHOLD. See :class:`DashboardView` for the
+exact metric definitions.
 """
 
 from datetime import timedelta
@@ -126,9 +130,28 @@ def serving_client_ids(reason, *, start, end):
         return _scope_members(qs, start, end)
 
     if reason == "needs_verification":
-        return set(scope(
-            mdp.filter(enrollment__stage=EnrollmentStage.PENDING_VERIFICATION)
-        ).values_list("client_id", flat=True))
+        # Mirror the Verification page's "Pending + Requested-date" filter EXACTLY
+        # (same helpers) so this card can never drift from what agents see there:
+        # members in the verification scope (their household primary holds an
+        # internal-service case) whose verification is NOT yet completed
+        # (verified_at null), windowed by WHEN VERIFICATION WAS REQUESTED
+        # (enrollment.opened_at). Counted by HOUSEHOLD -- collapse each qualifying
+        # member to its household primary (the actionable case holder), so the
+        # count equals the Verification page's "Showing N households".
+        from .views_members import (
+            apply_enrollment_date_filter,
+            require_internal_service_primary,
+            verification_completed_q,
+            verification_scope_q,
+        )
+
+        clients = require_internal_service_primary(
+            Client.objects.filter(verification_scope_q())
+        ).exclude(verification_completed_q())
+        if start is not None:
+            clients = apply_enrollment_date_filter(clients, "opened_at", start, end)
+        member_ids = set(clients.values_list("client_id", flat=True))
+        return set(_primary_map(member_ids).values())
     if reason == "rejected_case":
         return set(scope(mdp.filter(
             enrollment__case__service_authorization_status=(

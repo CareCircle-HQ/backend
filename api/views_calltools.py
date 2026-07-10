@@ -11,7 +11,7 @@ from django.core.cache import cache
 from rest_framework import permissions, status, views
 from rest_framework.response import Response
 
-from .integrations.calltools import client, config, presence, queues
+from .integrations.calltools import campaigns, client, config, presence, queues
 from .models import Agent, ClientPhone
 from .portal.base import current_agent
 from .views_phones import _client_match
@@ -25,9 +25,14 @@ _CACHE_TTL = 300  # seconds
 class CallToolsQueuesView(views.APIView):
     """GET /api/calltools/queues/
 
-    Returns ``[{id, uuid, name, active}]`` for the Lead Source dropdown.
-    Query param ``active_only=true`` restricts to active queues.
-    Query param ``refresh=true`` bypasses the cache.
+    Returns ``[{id, uuid, name, active}]`` for the Lead Source dropdown, merging
+    CallTools QUEUES and CAMPAIGNS (both are valid lead sources). Query param
+    ``active_only=true`` restricts to active entries; ``refresh=true`` bypasses
+    the cache.
+
+    NB (simple label-merge): queue and campaign ids live in separate namespaces,
+    so a stored lead_source id is not guaranteed to disambiguate between the two.
+    Labels are what agents pick, and collisions are rare/accepted for now.
     """
 
     permission_classes = [permissions.IsAuthenticated]
@@ -55,6 +60,16 @@ class CallToolsQueuesView(views.APIView):
             return Response(
                 {"detail": str(exc)}, status=status.HTTP_502_BAD_GATEWAY
             )
+
+        # Merge in campaigns. A campaign outage must not drop the queues, so a
+        # failure here is logged and swallowed (queues still returned).
+        try:
+            options = options + campaigns.list_campaign_options(active_only=active_only)
+        except client.CallToolsError as exc:
+            logger.warning("CallTools campaigns fetch failed: %s", exc)
+
+        # Combined sort: active first, then alphabetical by name.
+        options.sort(key=lambda o: (not o.get("active", True), (o.get("name") or "").lower()))
 
         cache.set(cache_key, options, _CACHE_TTL)
         return Response(options)

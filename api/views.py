@@ -557,6 +557,9 @@ class EnrollmentVerificationViewSet(viewsets.ModelViewSet):
         household = self.request.query_params.get("household")
         if household:
             qs = qs.filter(household_id=household)
+        case = self.request.query_params.get("case")
+        if case:
+            qs = qs.filter(case_id=case)
         return qs
 
     def create(self, request, *args, **kwargs):

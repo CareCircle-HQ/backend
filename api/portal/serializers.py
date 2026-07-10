@@ -424,6 +424,7 @@ class MemberListSerializer(serializers.Serializer):
     authorization_status_label = serializers.SerializerMethodField()
     medicaid_id = serializers.SerializerMethodField()
     case_manager = serializers.CharField(source="agent_name")
+    lead_source = serializers.SerializerMethodField()
     flags = serializers.SerializerMethodField()
     out_of_orbit = serializers.SerializerMethodField()
     out_of_range = serializers.SerializerMethodField()
@@ -449,6 +450,9 @@ class MemberListSerializer(serializers.Serializer):
 
     def get_name(self, obj):
         return _full_name(obj)
+
+    def get_lead_source(self, obj):
+        return getattr(obj, "lead_source", "") or ""
 
     def get_household_primary_id(self, obj):
         # client_id of the household's PRIMARY member, used by the Members list

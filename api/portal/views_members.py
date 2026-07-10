@@ -633,36 +633,62 @@ class LeadSourcesListView(PortalAPIView):
 
     def get(self, request):
         options = []
-        seen = set()
-        # CallTools queues -- the same source the extension's Lead Source uses.
-        try:
-            from ..integrations.calltools import config as ct_config
-            from ..integrations.calltools import queues as ct_queues
+        # De-dupe by LABEL (case-insensitive) so a CallTools queue and a stored
+        # free-text value that share a name (e.g. the "Williamsburg" queue id
+        # 5975 vs. the stored value "Williamsburg") collapse to ONE option.
+        seen_labels = set()
 
-            if ct_config.is_enabled():
-                for q in ct_queues.list_queue_options():
-                    qid = str(q.get("id") or "").strip()
-                    if not qid or qid in seen:
-                        continue
-                    seen.add(qid)
-                    name = q.get("name") or qid
-                    label = name if q.get("active", True) else f"{name} (inactive)"
-                    options.append({"value": qid, "label": label})
-        except Exception:  # never let a CallTools hiccup break the filter
-            pass
-        # Merge in distinct stored lead_source values not already covered by a
-        # queue id (surfaces legacy free-text values like "Williamsburg").
+        # Stored Client.lead_source values FIRST: these are what the filter
+        # actually matches (``lead_source__iexact=value``), so when a label
+        # collides we keep the stored value and drop the queue-id twin. Ordering
+        # is cleared so .distinct() collapses properly (the model's Meta.ordering
+        # would otherwise leak into SELECT DISTINCT and return duplicates).
         stored = (
             Client.objects.exclude(lead_source="")
+            .order_by()
             .values_list("lead_source", flat=True)
             .distinct()
         )
         for val in stored:
             v = (val or "").strip()
-            if not v or v in seen:
+            key = v.lower()
+            if not v or key in seen_labels:
                 continue
-            seen.add(v)
+            seen_labels.add(key)
             options.append({"value": v, "label": v})
+
+        # CallTools QUEUES + CAMPAIGNS -- the same sources the extension's Lead
+        # Source picker uses. Skip any whose name already exists as a stored
+        # value (label collision). Simple label-merge: queue/campaign ids share
+        # no namespace, but agents pick by label so collisions are acceptable.
+        try:
+            from ..integrations.calltools import campaigns as ct_campaigns
+            from ..integrations.calltools import config as ct_config
+            from ..integrations.calltools import queues as ct_queues
+
+            if ct_config.is_enabled():
+                ct_options = []
+                try:
+                    ct_options += ct_queues.list_queue_options()
+                except Exception:
+                    pass
+                try:
+                    ct_options += ct_campaigns.list_campaign_options()
+                except Exception:
+                    pass
+                for q in ct_options:
+                    # Store/filter by NAME (free text) to match what the ext now
+                    # saves into Client.lead_source -- the queue/campaign name,
+                    # not its CallTools id.
+                    name = (q.get("name") or "").strip()
+                    if not name or name.lower() in seen_labels:
+                        continue
+                    seen_labels.add(name.lower())
+                    label = name if q.get("active", True) else f"{name} (inactive)"
+                    options.append({"value": name, "label": label})
+        except Exception:  # never let a CallTools hiccup break the filter
+            pass
+
         options.sort(key=lambda o: (o["label"] or "").lower())
         return Response(options)
 
@@ -709,6 +735,11 @@ class MembersListView(PortalGenericAPIView):
             # restrict to members whose household primary holds an Internal
             # Service case (see require_internal_service_primary).
             qs = require_internal_service_primary(qs.filter(verification_scope_q()))
+        elif scope == "need_attention":
+            # "Need Attention": new clients whose first internal-service case was
+            # created but whose verification isn't complete yet (Client.is_new).
+            # Set on case creation, cleared when the enrollment reaches VERIFIED.
+            qs = qs.filter(is_new=True)
         else:
             scope_stages = SCOPE_TO_STAGES.get(scope)
             if scope_stages:
