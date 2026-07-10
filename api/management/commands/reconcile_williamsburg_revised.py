@@ -183,7 +183,9 @@ class Command(BaseCommand):
         if membership is not None and not membership.is_primary:
             return ("dependent", "non-primary member of another household")
 
-        cadence = _CADENCE_MAP.get(cad.upper())
+        # Williamsburg's default cadence is Mon/Thu (code "A"); a sheet without a
+        # Cadence column (or a blank cell) falls back to it rather than flagging.
+        cadence = _CADENCE_MAP.get((cad or "A").upper())
         if cadence is None:
             return ("review", f"unsupported cadence code {cad!r}")
         _cadence_enum, desired_weekdays = cadence
