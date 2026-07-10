@@ -121,11 +121,22 @@ class Command(BaseCommand):
                 "reviewed them."
             ),
         )
+        parser.add_argument(
+            "--assign-missing-kitchen", action="store_true",
+            help=(
+                "Also fast-track ENROLLED clients that have NO kitchen and NO "
+                "existing schedule and are cleanly active: assign the Williamsburg "
+                "kitchen, set Mon/Thu, rebuild every member to Kosher, build the "
+                "delivery schedule + calendar, and activate to Service Active. "
+                "On Hold / Out-of-Orbit / Paused are left for manual review."
+            ),
+        )
 
     def handle(self, *args, **options):
         path = options["file"]
         apply = options["apply"]
         force = options["force"]
+        self.assign_missing_kitchen = options["assign_missing_kitchen"]
         # Clients found NOT cleanly active, surfaced as a prominent warning so a
         # prod operator sees them BEFORE committing.
         self.warn = {"on_hold": [], "out_of_orbit": [], "paused": []}
@@ -158,7 +169,7 @@ class Command(BaseCommand):
                 except Exception as exc:  # isolate a bad row
                     bucket, note = ("error", str(exc))
                 report[bucket] += 1
-                if bucket in ("missing", "dependent", "review", "error"):
+                if bucket in ("missing", "dependent", "review", "error", "assigned"):
                     flags.append((cid, bucket, note))
 
             has_warnings = any(self.warn.values())
@@ -237,6 +248,39 @@ class Command(BaseCommand):
         if self._flag_williamsburg(client):
             fixed.append("set is_williamsburg")
 
+        on_hold = enr.stage == EnrollmentStage.ON_HOLD
+        has_ooo = enr.member_profiles.filter(status=MemberStatus.OUT_OF_ORBIT).exists()
+        has_paused = enr.member_profiles.filter(status=MemberStatus.PAUSED).exists()
+
+        # Assign a MISSING kitchen (--assign-missing-kitchen): an enrolled client
+        # with no kitchen and no existing schedule that is cleanly active runs the
+        # same fast-track as a backfill -- assign the Williamsburg kitchen, set
+        # Mon/Thu, rebuild every member to Kosher, build the delivery schedule AND
+        # dated calendar, and activate to Service Active. There are no live
+        # schedules to destroy, so this is non-destructive. On Hold / Out-of-Orbit
+        # / Paused are excluded (left for manual review below).
+        if (
+            self.assign_missing_kitchen
+            and enr.kitchen_id is None
+            and not enr.delivery_schedules.exists()
+            and not on_hold and not has_ooo and not has_paused
+        ):
+            fast_track_williamsburg_enrollment(enr, actor=None, agent=None)
+            enr.refresh_from_db()
+            n_sched = enr.delivery_schedules.count()
+            n_orders = enr.orders.count()
+            note = (
+                f"assigned Williamsburg kitchen + Mon/Thu, built {n_sched} schedule(s) "
+                f"+ {n_orders} calendar order(s), activated"
+            )
+            if n_orders == 0:
+                # Activated but the delivery calendar is EMPTY -- almost always a
+                # missing case authorization window. Surface it: the client is NOT
+                # truly ready to serve until the case has an approval window.
+                return ("assigned", note + " -- WARNING: 0 calendar orders "
+                        "(check case authorization window)")
+            return ("assigned", note)
+
         # Missing delivery address -> default to the primary's current address.
         if enr.delivery_address_id is None:
             addr = _primary_current_address(client)
@@ -249,21 +293,23 @@ class Command(BaseCommand):
 
         # Discrepancies we DON'T auto-fix (would destroy live schedules): kitchen,
         # cadence, non-Kosher menu, out-of-orbit member, On Hold.
-        if enr.stage == EnrollmentStage.ON_HOLD:
+        if on_hold:
             review.append("enrollment On Hold")
         if enr.kitchen_id is None:
             review.append("no kitchen assigned")
         elif enr.kitchen_id != wburg.pk:
             review.append("kitchen is not Williamsburg")
-        if tuple(enr.delivery_weekdays or []) != tuple(desired_weekdays):
+        # Case-insensitive: the DB may store weekdays capitalized ("Mon"/"Thu").
+        current_weekdays = [str(d).lower() for d in (enr.delivery_weekdays or [])]
+        if tuple(current_weekdays) != tuple(desired_weekdays):
             review.append(
                 f"cadence {enr.delivery_weekdays or []} != desired {desired_weekdays}"
             )
         if enr.member_profiles.exclude(menu_type__iexact=WILLIAMSBURG_MENU_TYPE).exists():
             review.append("has non-Kosher member profile")
-        if enr.member_profiles.filter(status=MemberStatus.OUT_OF_ORBIT).exists():
+        if has_ooo:
             review.append("has out-of-orbit member")
-        if enr.member_profiles.filter(status=MemberStatus.PAUSED).exists():
+        if has_paused:
             review.append("has paused member")
 
         if review:
@@ -325,6 +371,7 @@ class Command(BaseCommand):
         self.stdout.write(head("\n=== Reconcile Williamsburg (revised) ==="))
         order = [
             ("backfilled", "Backfilled (activated Service Active)"),
+            ("assigned", "Assigned kitchen + built schedule/calendar (activated)"),
             ("corrected", "Corrected (safe fixes applied)"),
             ("ok", "OK (already correct)"),
             ("review", "Needs manual review (see flags)"),
