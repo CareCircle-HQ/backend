@@ -1022,34 +1022,70 @@ class MembersListView(PortalGenericAPIView):
                     return kind
         return ""
 
-    def _group_entries(self):
+    def _group_entries(self, sort_field="created", descending=True):
         """Lightweight, ordered list of group identifiers for the filtered set
         WITHOUT serializing anyone. Each entry is
         ``{"type": "household"|"individual", "id", "name"}``. Households are
-        de-duplicated and ordered (with individuals) by most-recently-added
-        (created_at) so pagination is stable and only the requested page is ever
-        built + serialized. A household is included when ANY member matches; its
-        full roster is loaded when the page is built."""
+        de-duplicated and ordered (with individuals) so pagination is stable and
+        only the requested page is ever built + serialized. A household is
+        included when ANY member matches; its full roster is loaded when the page
+        is built.
+
+        ``sort_field`` selects the timestamp the groups are ordered by:
+          * ``created``   -> Client.created_at (default; most-recently-added)
+          * ``requested`` -> the enrollment's requested_at/opened_at (Verification
+            page "Requested" column)
+          * ``completed`` -> the enrollment's verified_at ("Completed" column)
+        Timestamps are aggregated as the MAX across a client's enrollments and
+        then across a household's matching members. Groups with no timestamp sort
+        last regardless of direction; name (case-insensitive) breaks ties."""
+        # The enrollment join is multi-valued (a client can have several), so a
+        # client appears on several rows -- aggregate per client below.
         rows = self.get_queryset().values_list(
             "client_id", "household_membership__household_id",
             "first_name", "last_name", "created_at",
+            "enrollments__requested_at", "enrollments__opened_at",
+            "enrollments__verified_at",
         )
+
+        def _max_dt(a, b):
+            if a is None:
+                return b
+            if b is None:
+                return a
+            return a if a >= b else b
+
+        clients = {}  # cid -> {hid, name, created, requested, completed}
+        for cid, hid, fn, ln, created, req, opened, verified in rows:
+            requested = req or opened
+            c = clients.get(cid)
+            if c is None:
+                clients[cid] = {
+                    "hid": hid,
+                    "name": f"{(fn or '').strip()} {(ln or '').strip()}".strip(),
+                    "created": created,
+                    "requested": requested,
+                    "completed": verified,
+                }
+            else:
+                c["requested"] = _max_dt(c["requested"], requested)
+                c["completed"] = _max_dt(c["completed"], verified)
+
         hh_ids, seen_hh, individuals = [], set(), []
-        # Most-recent created_at seen among a household's matching members, used
-        # as the household's "added" sort timestamp.
-        hh_added = {}
-        for cid, hid, fn, ln, created in rows:
+        hh_ts = {}  # hid -> {created, requested, completed} aggregated across members
+        for cid, c in clients.items():
+            hid = c["hid"]
             if hid:
                 if hid not in seen_hh:
                     seen_hh.add(hid)
                     hh_ids.append(hid)
-                if created is not None and (
-                    hh_added.get(hid) is None or created > hh_added[hid]
-                ):
-                    hh_added[hid] = created
+                agg = hh_ts.setdefault(
+                    hid, {"created": None, "requested": None, "completed": None}
+                )
+                for k in ("created", "requested", "completed"):
+                    agg[k] = _max_dt(agg[k], c[k])
             else:
-                name = f"{(fn or '').strip()} {(ln or '').strip()}".strip()
-                individuals.append((cid, name, created))
+                individuals.append((cid, c["name"], c))
 
         # Household sort name = household name, else its primary's name (one query).
         hh_names = {}
@@ -1064,23 +1100,24 @@ class MembersListView(PortalGenericAPIView):
                     hname or f"{(fn or '').strip()} {(ln or '').strip()}".strip()
                 )
 
+        field = sort_field if sort_field in ("created", "requested", "completed") else "created"
         entries = [
             {"type": "household", "id": hid, "name": hh_names.get(hid, ""),
-             "added": hh_added.get(hid)}
+             "sort_ts": hh_ts[hid][field]}
             for hid in hh_ids
         ] + [
-            {"type": "individual", "id": cid, "name": name, "added": created}
-            for cid, name, created in individuals
+            {"type": "individual", "id": cid, "name": name, "sort_ts": c[field]}
+            for cid, name, c in individuals
         ]
 
-        # Most recently added (created_at) first; groups with no created_at sort
-        # last; name breaks ties (case-insensitive) for stable pagination.
+        # Chosen timestamp first (nulls always last), then name (case-insensitive)
+        # for stable pagination.
         def _sort_key(e):
-            ts = e["added"]
+            ts = e["sort_ts"]
             name = (e["name"] or "").lower()
             if ts is None:
                 return (1, 0.0, name)
-            return (0, -ts.timestamp(), name)
+            return (0, -ts.timestamp() if descending else ts.timestamp(), name)
 
         entries.sort(key=_sort_key)
         return entries
@@ -1393,7 +1430,13 @@ class MembersListView(PortalGenericAPIView):
         # Grouped mode (Verification / Logistics): build the ordered group keys
         # cheaply, paginate THEM, and serialize only the current page's groups
         # (previously the whole scoped set was serialized on every request).
-        entries = self._group_entries()
+        # Sortable by the Verification page Requested / Completed columns
+        # (``sort`` + ``dir``); default is most-recently-created first.
+        group_sort = {
+            "requested": "requested", "completed": "completed",
+        }.get((request.query_params.get("sort") or "").strip().lower(), "created")
+        group_desc = (request.query_params.get("dir") or "desc").strip().lower() != "asc"
+        entries = self._group_entries(group_sort, group_desc)
         scope = (request.query_params.get("scope") or "").strip()
         checks = None
         if scope == "logistics":
