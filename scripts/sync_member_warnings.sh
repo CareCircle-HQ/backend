@@ -13,14 +13,29 @@
 # Any extra args are passed through, e.g.:
 #   scripts/sync_member_warnings.sh --limit 100
 #
-# Install (run daily at 03:00, after the 02:00 daily_pull):
+# Install (run daily at 03:00, after the 02:00 daily_pull) with the ABSOLUTE
+# path to this script on the target machine, e.g. on the server:
 #   crontab -e
-#   0 3 * * * /Users/alex/Projects/ext/backend/scripts/sync_member_warnings.sh
+#   0 3 * * * /home/ubuntu/backend/scripts/sync_member_warnings.sh
 #
 set -uo pipefail
 
-BACKEND_DIR="/Users/alex/Projects/ext/backend"
-PYTHON="$BACKEND_DIR/.venv/bin/python"
+# Resolve the backend dir from THIS script's own location so the same script
+# works locally and on the server without editing a hardcoded path.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BACKEND_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+# Pick the interpreter: an explicit $PYTHON_BIN override, else the project venv
+# (named ".venv" locally, "venv" on the server), else system python3.
+if [ -n "${PYTHON_BIN:-}" ]; then
+  PYTHON="$PYTHON_BIN"
+elif [ -x "$BACKEND_DIR/.venv/bin/python" ]; then
+  PYTHON="$BACKEND_DIR/.venv/bin/python"
+elif [ -x "$BACKEND_DIR/venv/bin/python" ]; then
+  PYTHON="$BACKEND_DIR/venv/bin/python"
+else
+  PYTHON="python3"
+fi
 LOG_DIR="$BACKEND_DIR/logs"
 LOG_FILE="$LOG_DIR/sync_member_warnings.log"
 
