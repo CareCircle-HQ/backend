@@ -1428,6 +1428,34 @@ class CsvCaseMappingTest(SimpleTestCase):
             )
 
 
+class UniteUsCaseMapperTest(SimpleTestCase):
+    """map_case must mirror the extension: a non-null closed_date means the case
+    is CLOSED even though Unite Us leaves state='managed' on closed cases. The
+    on-demand refresh previously left such cases reading MANAGED."""
+
+    def _map(self, *, state, closed_date=None):
+        from api.integrations.uniteus.mappers import map_case
+
+        rec = {
+            "id": "case-1",
+            "attributes": {"state": state, "closed_date": closed_date},
+            "relationships": {"person": {"data": {"id": "person-1"}}},
+        }
+        return map_case(rec)
+
+    def test_closed_date_marks_case_closed_despite_managed_state(self):
+        out = self._map(state="managed", closed_date="2026-01-02T00:00:00Z")
+        self.assertEqual(out["case_status"], "closed")
+
+    def test_managed_without_closed_date_stays_managed(self):
+        out = self._map(state="managed")
+        self.assertEqual(out["case_status"], "managed")
+
+    def test_unknown_state_without_closed_date_falls_back_open(self):
+        out = self._map(state="requested")
+        self.assertEqual(out["case_status"], "open")
+
+
 class RecomputeSwitchesPlanKindTest(TestCase):
     """Regression: applying the PO Blockers 'program_switched' fix must actually
     flip the plan's KIND snapshot. update_household_cadence previously updated
