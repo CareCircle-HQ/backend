@@ -1894,3 +1894,73 @@ class MemberWarningsTest(TestCase):
         first = MemberWarning.objects.filter(client=c).count()
         sync_household_warnings(enr)
         self.assertEqual(MemberWarning.objects.filter(client=c).count(), first)
+
+
+class CareManagementListTest(TestCase):
+    """The Care Management queue endpoint. Verifies that households which are not
+    being served (On Hold / Cancelled / Closed / Service Complete) are excluded
+    even when they carry an active warning snapshot."""
+
+    def setUp(self):
+        self.agent = Agent.objects.create(
+            name="Cam CS", agent_code="777", group="CS"
+        )
+        access = AccessToken()
+        access["agent_id"] = str(self.agent.id)
+        access["agent_code"] = self.agent.agent_code
+        access["agent_name"] = self.agent.name
+        access["agent_group"] = self.agent.group
+        self.api = APIClient()
+        self.api.credentials(HTTP_AUTHORIZATION=f"Bearer {access}")
+
+    def _household_with_warning(self, stage, first="Woe", last="Warn"):
+        from .models import (
+            EnrollmentStage, EnrollmentVerification, Household, HouseholdMember,
+            MemberDietaryProfile, MemberWarning, WarningStatus,
+        )
+        from .services.warnings import sync_household_warnings
+
+        c = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name=first, last_name=last
+        )
+        hh = Household.objects.create(name="HH")
+        HouseholdMember.objects.create(household=hh, client=c, is_primary=True)
+        # Build ACTIVE (no kitchen/cadence) so a warning is guaranteed, persist
+        # the snapshot, THEN move the household to the target stage WITHOUT
+        # re-syncing -- so the active warning row survives and the view is the
+        # only thing that can exclude it.
+        enr = EnrollmentVerification.objects.create(
+            client=c, household=hh, stage=EnrollmentStage.SERVICE_ACTIVE,
+        )
+        MemberDietaryProfile.objects.create(enrollment=enr, client=c)
+        sync_household_warnings(enr)
+        assert MemberWarning.objects.filter(
+            enrollment=enr, status=WarningStatus.ACTIVE
+        ).exists()
+        if stage and stage != EnrollmentStage.SERVICE_ACTIVE:
+            enr.stage = stage
+            enr.save(update_fields=["stage"])
+        return c, enr
+
+    def _ids(self, body):
+        return {r["client_id"] for r in body["results"]}
+
+    def test_excludes_on_hold_and_terminal_households(self):
+        from .models import EnrollmentStage
+
+        served, _ = self._household_with_warning(
+            EnrollmentStage.SERVICE_ACTIVE, first="Ser", last="Ved"
+        )
+        on_hold, _ = self._household_with_warning(
+            EnrollmentStage.ON_HOLD, first="Hal", last="Hold"
+        )
+        cancelled, _ = self._household_with_warning(
+            EnrollmentStage.CANCELLED, first="Cam", last="Cancel"
+        )
+
+        resp = self.api.get(reverse("portal-care-management"))
+        self.assertEqual(resp.status_code, 200, resp.content)
+        ids = self._ids(resp.json())
+        self.assertIn(str(served.pk), ids)
+        self.assertNotIn(str(on_hold.pk), ids)
+        self.assertNotIn(str(cancelled.pk), ids)

@@ -11,7 +11,12 @@ snapshot, so it is cheap and never recomputes across the whole DB.
 from django.db.models import Q
 from rest_framework.response import Response
 
-from api.models import MemberWarning, WarningSeverity, WarningStatus
+from api.models import (
+    MemberWarning,
+    SERVICE_EXCLUDED_ENROLLMENT_STAGES,
+    WarningSeverity,
+    WarningStatus,
+)
 from .base import PortalAPIView, current_agent
 
 # Care Management is a CS queue: CS + Management (and manager override).
@@ -64,8 +69,14 @@ class CareManagementListView(PortalAPIView):
         except (TypeError, ValueError):
             page = 1
 
+        # Never surface households that aren't being served: On Hold (case under
+        # review), Cancelled, Closed or Service Complete. Filtered here (not just
+        # at detection) so a stale snapshot can never leak them into the queue.
+        # Rows with no enrollment link (fallback client grouping) have a NULL
+        # stage and are kept.
         rows = (
             MemberWarning.objects.filter(status=WarningStatus.ACTIVE)
+            .exclude(enrollment__stage__in=SERVICE_EXCLUDED_ENROLLMENT_STAGES)
             .select_related(
                 "client", "enrollment", "enrollment__client", "enrollment__kitchen"
             )
