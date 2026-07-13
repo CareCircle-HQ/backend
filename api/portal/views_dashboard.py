@@ -529,6 +529,56 @@ class DashboardView(PortalAPIView):
             },
         }
 
+        # --- Second-row service cards (ALL TIME) --------------------------
+        # Member-level (distinct client) breakdowns. Leaf counts are queried and
+        # the card TOTALS derived by summing them, so the displayed math is
+        # always exactly additive and can never disagree with its parts.
+        def _members(**flt):
+            return mdp.filter(**flt).values("client_id").distinct().count()
+
+        _ACTIVE_ENR = [EnrollmentStage.SERVICE_ACTIVE, EnrollmentStage.ON_HOLD]
+
+        # Receiving Meals: status ACTIVE in a live (Service Active) enrollment.
+        receiving = active_delivery_members
+        # Still in the active-service pipeline but not currently receiving:
+        # individually Paused, or the whole household is On Hold (members keep
+        # ACTIVE status while the enrollment sits at On Hold).
+        paused = _members(status=MemberStatus.PAUSED, enrollment__stage__in=_ACTIVE_ENR)
+        on_hold = _members(
+            status=MemberStatus.ACTIVE, enrollment__stage=EnrollmentStage.ON_HOLD
+        )
+        active_pipeline = receiving + paused + on_hold
+
+        # Total Enrolled: the active-delivery pipeline plus the two delivery-
+        # blocked buckets (dietary Out of Orbit, geographic Out of Range).
+        enrolled = {
+            "active": active_pipeline,
+            "out_of_orbit": _count("out_of_orbit"),
+            "out_of_range": _count("out_of_range"),
+        }
+        enrolled["total"] = (
+            enrolled["active"] + enrolled["out_of_orbit"] + enrolled["out_of_range"]
+        )
+
+        receiving_meals = {
+            "active": active_pipeline,
+            "paused": paused,
+            "on_hold": on_hold,
+            "total": receiving,  # active_pipeline - paused - on_hold
+        }
+
+        # Pending Meals: verified households not yet being served -- awaiting a
+        # manual kitchen assignment (case auth approved), or still awaiting the
+        # case authorization decision (verified, auth Pending).
+        kitchen_assignment = _members(
+            enrollment__stage=EnrollmentStage.KITCHEN_ASSIGNMENT
+        )
+        pending = {
+            "kitchen_assignment": kitchen_assignment,
+            "verified_pending_auth": pending_meals,
+            "total": kitchen_assignment + pending_meals,
+        }
+
         return Response(
             {
                 "period": period,
@@ -544,6 +594,9 @@ class DashboardView(PortalAPIView):
                 "meals_boxes": meals_boxes,
                 "cancel_rate": cancel_rate,
                 "serving": serving,
+                "enrolled": enrolled,
+                "receiving": receiving_meals,
+                "pending": pending,
             }
         )
 
