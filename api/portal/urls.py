@@ -10,6 +10,7 @@ from .views_dashboard_verification import (
     VerificationDashboardView,
 )
 from .views_dashboard_logistics import (
+    DistributionOverviewView,
     LogisticsDashboardListView,
     LogisticsDashboardView,
 )
@@ -326,6 +327,11 @@ urlpatterns = [
         "dashboard/logistics/<str:reason>/",
         LogisticsDashboardListView.as_view(),
         name="portal-dashboard-logistics-list",
+    ),
+    path(
+        "dashboard/distribution/",
+        DistributionOverviewView.as_view(),
+        name="portal-dashboard-distribution",
     ),
 
     # Settings CRUD viewsets

@@ -27,7 +27,7 @@ Assignment unit is the household (enrollment). Volume is meals/boxes via
 
 from datetime import timedelta
 
-from django.db.models import Avg, Count, DurationField, ExpressionWrapper, F, Sum
+from django.db.models import Avg, Count, DurationField, ExpressionWrapper, F, Q, Sum
 from django.utils import timezone
 from rest_framework.request import Request
 from rest_framework.response import Response
@@ -47,6 +47,7 @@ from ..models import (
     OrderSchedule,
     OrderStatus,
     ProductTypeKind,
+    ScheduleStatus,
     PurchaseOrder,
     PurchaseOrderKitchenStatus,
     PurchaseOrderStatus,
@@ -595,3 +596,152 @@ class LogisticsDashboardListView(PortalAPIView):
                 detail += " · " + ", ".join(r["blockers"])
             results.append({"id": r["client_id"], "name": r["name"], "detail": detail})
         return Response({"reason": reason, "count": len(results), "results": results})
+
+
+class DistributionOverviewView(PortalAPIView):
+    """Distribution Overview (Logistics / Management).
+
+    A CADENCE x KITCHEN matrix of how many clients are set up in each delivery
+    cadence at each kitchen, split by product KIND (meals/boxes). Source of truth
+    is the per-member delivery PLAN (:class:`MemberDeliverySchedule`): cadence is
+    ``delivery_days_cadence`` and the kitchen is the household's LIVE assignment
+    (``enrollment.kitchen``), so reassignments are reflected immediately.
+
+    Query param ``scope``:
+    * ``active`` (default) -- only ``SCHEDULED`` plans whose window covers today.
+    * ``all``              -- every plan regardless of status/window.
+
+    The response lists ALL cadences (the configurable :class:`Cadence` table plus
+    any codes present in the data) and ALL kitchens (with fleet status + product
+    coverage), including zero-count ones, plus ``Unassigned`` row/column when the
+    data has plans with no cadence / no kitchen. Counts are DISTINCT clients
+    (member profiles) per cell.
+    """
+
+    UNASSIGNED = "unassigned"
+
+    def get(self, request):
+        agent = current_agent(request)
+        if not _is_privileged(agent):
+            return Response(
+                {"detail": "Logistics dashboard access required."}, status=403
+            )
+
+        scope = (request.query_params.get("scope") or "active").lower()
+        if scope not in ("active", "all"):
+            scope = "active"
+        today = timezone.localdate()
+
+        qs = MemberDeliverySchedule.objects.all()
+        if scope == "active":
+            qs = (
+                qs.filter(status=ScheduleStatus.SCHEDULED)
+                .filter(Q(starts_on__isnull=True) | Q(starts_on__lte=today))
+                .filter(Q(ends_on__isnull=True) | Q(ends_on__gte=today))
+            )
+
+        grouped = qs.values(
+            "delivery_days_cadence",
+            "enrollment__kitchen_id",
+            "enrollment__kitchen__name",
+            "product_type__type",
+            "meals_per_day",
+        ).annotate(n=Count("member_profile_id", distinct=True))
+
+        # cell key -> {meals, boxes, total}; track which cadences/kitchens appear.
+        cells = {}
+        cadence_present = set()
+        kitchen_present = set()
+
+        def bump(cell, is_box, n):
+            cell["boxes" if is_box else "meals"] += n
+            cell["total"] += n
+
+        for row in grouped:
+            code = row["delivery_days_cadence"] or ""
+            kid = row["enrollment__kitchen_id"]
+            kkey = str(kid) if kid else self.UNASSIGNED
+            ptype = row["product_type__type"]
+            if ptype:
+                is_box = ptype == ProductTypeKind.BOXES
+            else:
+                # No product_type snapshot: infer from the meal rate (meals set a
+                # per-day rate; boxes don't).
+                is_box = not row["meals_per_day"]
+            n = row["n"] or 0
+            cadence_present.add(code)
+            kitchen_present.add(kkey)
+            cell = cells.setdefault(
+                f"{code or self.UNASSIGNED}|{kkey}",
+                {"meals": 0, "boxes": 0, "total": 0},
+            )
+            bump(cell, is_box, n)
+
+        # -- Cadence rows: all configurable cadences + any codes seen in data. ---
+        cadence_rows = []
+        seen_codes = set()
+        for c in Cadence.objects.all().order_by("-is_active", "label"):
+            if not c.code:
+                continue
+            cadence_rows.append(
+                {"code": c.code, "label": c.label or c.code, "is_active": c.is_active}
+            )
+            seen_codes.add(c.code)
+        legacy_labels = dict(DeliveryCadence.choices)
+        for code in sorted(cadence_present):
+            if not code or code in seen_codes:
+                continue
+            cadence_rows.append({
+                "code": code,
+                "label": legacy_labels.get(code) or code.replace("_", " ").title(),
+                "is_active": True,
+            })
+            seen_codes.add(code)
+        if "" in cadence_present:
+            cadence_rows.append(
+                {"code": self.UNASSIGNED, "label": "Unassigned", "is_active": True}
+            )
+
+        # -- Kitchen columns: every kitchen + fleet context, then Unassigned. ---
+        kitchen_cols = []
+        for k in Kitchen.objects.all().order_by("name"):
+            kitchen_cols.append({
+                "key": str(k.pk),
+                "name": k.name,
+                "status": k.status,
+                "products": k.supported_products or [],
+            })
+        if self.UNASSIGNED in kitchen_present:
+            kitchen_cols.append({
+                "key": self.UNASSIGNED,
+                "name": "Unassigned",
+                "status": None,
+                "products": [],
+            })
+
+        # -- Totals (row / column / grand). -------------------------------------
+        def zero():
+            return {"meals": 0, "boxes": 0, "total": 0}
+
+        row_totals = {r["code"]: zero() for r in cadence_rows}
+        col_totals = {c["key"]: zero() for c in kitchen_cols}
+        grand = zero()
+        for row in cadence_rows:
+            for col in kitchen_cols:
+                cell = cells.get(f"{row['code']}|{col['key']}")
+                if not cell:
+                    continue
+                for field in ("meals", "boxes", "total"):
+                    row_totals[row["code"]][field] += cell[field]
+                    col_totals[col["key"]][field] += cell[field]
+                    grand[field] += cell[field]
+
+        return Response({
+            "scope": scope,
+            "cadences": cadence_rows,
+            "kitchens": kitchen_cols,
+            "cells": cells,
+            "row_totals": row_totals,
+            "col_totals": col_totals,
+            "grand_total": grand,
+        })
