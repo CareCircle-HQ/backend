@@ -1,13 +1,12 @@
 """Management dashboard analytics.
 
 A single aggregate endpoint (management-only) reporting on the internal-service
-(meal/box) program. Every metric is scoped by the selected date range to
-internal-service cases OPENED within that window (``All Time`` applies no date
-filter). The one exception is the ``needs_verification`` serving reason, which
-mirrors the Verification page's "Pending + Requested-date" filter exactly --
-windowed by WHEN VERIFICATION WAS REQUESTED (enrollment.opened_at) rather than the
-case's date_opened, and counted by HOUSEHOLD. See :class:`DashboardView` for the
-exact metric definitions.
+(meal/box) program. Only three metrics are scoped by the selected date range (to
+internal-service cases OPENED within that window): Total Open Cases, Total
+Members, and Cancel Rate. Every other metric -- Total Enrolled, Active Delivery
+Members, Meals vs Boxes, and the whole Section-2 serving breakdown -- is an
+all-time live snapshot regardless of the selected range. ``All Time`` applies no
+date filter to any metric. See :class:`DashboardView` for the exact definitions.
 """
 
 from datetime import timedelta
@@ -167,10 +166,21 @@ def serving_client_ids(reason, *, start, end):
             mdp.filter(status=MemberStatus.OUT_OF_ORBIT)
         ).values_list("client_id", flat=True))
     if reason == "services_paused":
-        # Member-level Pause (benign) OR household ON_HOLD (problem/review).
+        # Mirror the Receiving Meals card's pipeline split EXACTLY so the two
+        # cards reconcile (services_paused == receiving.paused + receiving.on_hold):
+        # a member individually Paused within the active-service pipeline, OR an
+        # otherwise-Active member whose household is On Hold. Out-of-Orbit /
+        # Out-of-Range members of on-hold households are deliberately excluded --
+        # they surface under their own reasons, so counting them here too would
+        # double-count them.
         return set(scope(mdp.filter(
-            Q(status=MemberStatus.PAUSED)
-            | Q(enrollment__stage=EnrollmentStage.ON_HOLD)
+            Q(
+                status=MemberStatus.PAUSED,
+                enrollment__stage__in=[
+                    EnrollmentStage.SERVICE_ACTIVE, EnrollmentStage.ON_HOLD,
+                ],
+            )
+            | Q(status=MemberStatus.ACTIVE, enrollment__stage=EnrollmentStage.ON_HOLD)
         )).values_list("client_id", flat=True))
     if reason == "multiple_cases":
         open_cases = _scope_by_opened(
@@ -347,25 +357,30 @@ def _serving_details(reason, client_ids, *, start, end):
 class DashboardView(PortalAPIView):
     """Management-only program dashboard.
 
-    Every metric is scoped to Internal Service cases OPENED within the selected
-    date range (``period``); ``all`` applies no date filter. Metric definitions:
+    Three metrics are TIME-FRAME SENSITIVE -- scoped to Internal Service cases
+    OPENED within the selected date range (``period``; ``all`` applies no date
+    filter): open_cases, members, and cancel_rate. Every other metric is an
+    ALL-TIME live snapshot. Metric definitions:
 
-    * open_cases  -- non-terminal (not Closed/Cancelled) internal-service cases,
-      broken down by service-authorization outcome: Accepted (approved),
-      Requested (pending), Rejected (denied).
-    * members     -- distinct clients across those open cases' households, split
-      into Primary members (household heads / case holders) vs Members of
-      Household. A client with several open cases counts once.
-    * total_enrolled -- distinct members in the households of ALL in-range
+    * open_cases  -- [TIME-FRAME] non-terminal (not Closed/Cancelled)
+      internal-service cases, broken down by service-authorization outcome:
+      Accepted (approved), Requested (pending), Rejected (denied).
+    * members     -- [TIME-FRAME] distinct clients across those open cases'
+      households, split into Primary members (household heads / case holders)
+      vs Members of Household. A client with several open cases counts once.
+    * cancel_rate -- [TIME-FRAME] attrition: distinct members who are Paused,
+      have their household On Hold, are Out of Orbit / Out of Range, or hold a
+      Cancelled enrollment, summed, as a percentage of the distinct members
+      enrolled in accepted-authorization (open + APPROVED) internal-service
+      cases (the base). Can exceed 100% since the lost buckets are not a strict
+      subset of the accepted-case base.
+    * total_enrolled -- [ALL TIME] distinct members in the households of ALL
       internal-service cases, regardless of status.
-    * active_delivery_members -- distinct members currently ACTIVE in a
-      Service-Active enrollment (Accepted + Verified + being served).
-    * meals_boxes -- open cases split by product kind (Meals/Boxes) and, within
-      each, Individual vs Household.
-    * cancel_rate -- (closed + cancelled + on-hold) internal-service cases as a
-      proportion of all in-range internal-service cases opened. On-hold counts
-      here because it flags a problem case under review that may close (distinct
-      from a benign, temporary member-level Pause).
+    * active_delivery_members -- [ALL TIME] distinct members currently ACTIVE in
+      a Service-Active enrollment (Accepted + Verified + being served).
+    * meals_boxes -- [ALL TIME] currently-open cases split by product kind
+      (Meals/Boxes) and, within each, Individual vs Household.
+    * serving -- [ALL TIME] Section-2 member serving-status breakdown.
     """
 
     def get(self, request):
@@ -381,18 +396,10 @@ class DashboardView(PortalAPIView):
         ic_in_range = _scope_by_opened(ic, start, end)
         open_cases = ic_in_range.exclude(case_status__in=_TERMINAL_CASE_STATUSES)
 
-        # --- 1.1 Open cases + authorization breakdown ----------------------
-        # 1.5 Meals vs Boxes shares this same open-case set, so pull the rows
-        # once and bucket in Python.
-        case_rows = list(
-            open_cases.values(
-                "client_id",
-                "household_type",
-                "service_authorization_status",
-                "program__product_type__type",
-                "program_name",
-                "service_type",
-            )
+        # --- 1.1 Open cases + authorization breakdown (TIME-FRAME SENSITIVE)
+        # Scoped to cases opened in the selected date range.
+        scoped_rows = list(
+            open_cases.values("client_id", "service_authorization_status")
         )
         auth_counts = {"accepted": 0, "requested": 0, "rejected": 0, "other": 0}
         _AUTH_BUCKET = {
@@ -400,13 +407,31 @@ class DashboardView(PortalAPIView):
             ServiceAuthorizationStatus.PENDING: "requested",
             ServiceAuthorizationStatus.DENIED: "rejected",
         }
-        # meals/boxes/unknown -> {individual, household}
+        for row in scoped_rows:
+            auth_counts[_AUTH_BUCKET.get(row["service_authorization_status"], "other")] += 1
+
+        open_cases_payload = {
+            "total": len(scoped_rows),
+            "accepted": auth_counts["accepted"],
+            "requested": auth_counts["requested"],
+            "rejected": auth_counts["rejected"],
+            "other": auth_counts["other"],
+        }
+
+        # --- 1.5 Meals vs Boxes (ALL TIME) --------------------------------
+        # Product mix across EVERY currently-open internal-service case,
+        # regardless of the selected date range.
         mb = {
             k: {"individual": 0, "household": 0}
             for k in ("meals", "boxes", "unknown")
         }
-        for row in case_rows:
-            auth_counts[_AUTH_BUCKET.get(row["service_authorization_status"], "other")] += 1
+        all_open_rows = ic.exclude(case_status__in=_TERMINAL_CASE_STATUSES).values(
+            "household_type",
+            "program__product_type__type",
+            "program_name",
+            "service_type",
+        )
+        for row in all_open_rows:
             kind = _case_product_kind(
                 row["program__product_type__type"],
                 row["program_name"],
@@ -419,14 +444,6 @@ class DashboardView(PortalAPIView):
                 else "individual"
             )
             mb[kind_key][hh_key] += 1
-
-        open_cases_payload = {
-            "total": len(case_rows),
-            "accepted": auth_counts["accepted"],
-            "requested": auth_counts["requested"],
-            "rejected": auth_counts["rejected"],
-            "other": auth_counts["other"],
-        }
         meals_boxes = {
             kind: {
                 "individual": counts["individual"],
@@ -437,46 +454,70 @@ class DashboardView(PortalAPIView):
         }
 
         # --- 1.2 Members across open cases (Primary vs Household) ----------
-        open_client_ids = {row["client_id"] for row in case_rows}
+        # TIME-FRAME SENSITIVE: households of the in-range open cases above.
+        open_client_ids = {row["client_id"] for row in scoped_rows}
         members_payload = self._members_breakdown(open_client_ids)
 
-        # --- 1.3 Total enrolled (all in-range cases, any status) -----------
-        enrolled_client_ids = set(
-            ic_in_range.values_list("client_id", flat=True)
-        )
+        # --- 1.3 Total enrolled (ALL TIME, any status) --------------------
+        enrolled_client_ids = set(ic.values_list("client_id", flat=True))
         total_enrolled = self._household_member_count(enrolled_client_ids)
 
-        # --- 1.4 Active delivery members (Accepted + Verified + serving) ---
-        active_qs = MemberDietaryProfile.objects.filter(
-            status=MemberStatus.ACTIVE,
-            enrollment__stage=EnrollmentStage.SERVICE_ACTIVE,
-        )
-        if start is not None:
-            active_qs = active_qs.filter(
-                enrollment__case__case_type=CaseType.INTERNAL_SERVICE,
-                enrollment__case__date_opened__date__gte=start,
-                enrollment__case__date_opened__date__lte=end,
+        # --- 1.4 Active delivery members (ALL TIME) -----------------------
+        # Members currently ACTIVE in a Service-Active enrollment, regardless
+        # of when their case was opened.
+        active_delivery_members = (
+            MemberDietaryProfile.objects.filter(
+                status=MemberStatus.ACTIVE,
+                enrollment__stage=EnrollmentStage.SERVICE_ACTIVE,
             )
-        active_delivery_members = active_qs.values("client_id").distinct().count()
-
-        # --- 1.6 Cancel / churn rate --------------------------------------
-        total_opened = ic_in_range.count()
-        closed = ic_in_range.filter(case_status=CaseStatus.CLOSED).count()
-        cancelled = ic_in_range.filter(case_status=CaseStatus.CANCELLED).count()
-        paused = (
-            ic_in_range.exclude(case_status__in=_TERMINAL_CASE_STATUSES)
-            .filter(enrollments__stage=EnrollmentStage.ON_HOLD)
+            .values("client_id")
             .distinct()
             .count()
         )
-        churned = closed + cancelled + paused
+
+        # --- 1.6 Cancel rate (TIME-FRAME SENSITIVE) -----------------------
+        # Attrition: distinct members who fell out of / are blocked from active
+        # service (Paused, household On Hold, Out of Orbit, Out of Range, or a
+        # Cancelled enrollment) as a share of the members enrolled in
+        # accepted-authorization (open + APPROVED) cases.
+        mdp = MemberDietaryProfile.objects
+
+        def _lost(**flt):
+            return (
+                _scope_members(mdp.filter(**flt), start, end)
+                .values("client_id").distinct().count()
+            )
+
+        cr_paused = _lost(status=MemberStatus.PAUSED)
+        cr_on_hold = _lost(enrollment__stage=EnrollmentStage.ON_HOLD)
+        cr_out_of_orbit = _lost(status=MemberStatus.OUT_OF_ORBIT)
+        cr_out_of_range = _lost(status=MemberStatus.OUT_OF_RANGE)
+        cr_cancelled = _lost(enrollment__stage=EnrollmentStage.CANCELLED)
+        lost_total = (
+            cr_paused + cr_on_hold + cr_out_of_orbit + cr_out_of_range + cr_cancelled
+        )
+
+        # Base: distinct members across the households of accepted-authorization
+        # (open + APPROVED) internal-service cases in range.
+        accepted_case_clients = set(
+            open_cases.filter(
+                service_authorization_status=ServiceAuthorizationStatus.APPROVED
+            ).values_list("client_id", flat=True)
+        )
+        accepted_members = self._household_member_count(accepted_case_clients)
+
         cancel_rate = {
-            "closed": closed,
-            "cancelled": cancelled,
-            "paused": paused,
-            "churned": churned,
-            "total_opened": total_opened,
-            "rate": round(churned / total_opened * 100, 1) if total_opened else 0.0,
+            "paused": cr_paused,
+            "on_hold": cr_on_hold,
+            "out_of_orbit": cr_out_of_orbit,
+            "out_of_range": cr_out_of_range,
+            "cancelled": cr_cancelled,
+            "lost_total": lost_total,
+            "base": accepted_members,
+            "rate": (
+                round(lost_total / accepted_members * 100, 1)
+                if accepted_members else 0.0
+            ),
         }
 
         # --- Section 2: member serving-status breakdown --------------------
@@ -484,6 +525,7 @@ class DashboardView(PortalAPIView):
         # count is derived from serving_client_ids(), the same source of truth the
         # drill-down list endpoint uses, so a count can never disagree with its
         # list. pending_meals stays inline (it has no drill-down list of its own).
+        # ALL TIME: Section-2 counts are live snapshots, ignoring the range.
         mdp = MemberDietaryProfile.objects
         pending_meals = mdp.filter(
             enrollment__verified_at__isnull=False,
@@ -491,11 +533,10 @@ class DashboardView(PortalAPIView):
                 ServiceAuthorizationStatus.PENDING
             ),
         )
-        pending_meals = _scope_members(pending_meals, start, end)
         pending_meals = pending_meals.values("client_id").distinct().count()
 
         def _count(reason):
-            return len(serving_client_ids(reason, start=start, end=end))
+            return len(serving_client_ids(reason, start=None, end=None))
 
         serving = {
             # 2.1 Accepted case + Verified + being served.
@@ -526,6 +567,56 @@ class DashboardView(PortalAPIView):
             },
         }
 
+        # --- Second-row service cards (ALL TIME) --------------------------
+        # Member-level (distinct client) breakdowns. Leaf counts are queried and
+        # the card TOTALS derived by summing them, so the displayed math is
+        # always exactly additive and can never disagree with its parts.
+        def _members(**flt):
+            return mdp.filter(**flt).values("client_id").distinct().count()
+
+        _ACTIVE_ENR = [EnrollmentStage.SERVICE_ACTIVE, EnrollmentStage.ON_HOLD]
+
+        # Receiving Meals: status ACTIVE in a live (Service Active) enrollment.
+        receiving = active_delivery_members
+        # Still in the active-service pipeline but not currently receiving:
+        # individually Paused, or the whole household is On Hold (members keep
+        # ACTIVE status while the enrollment sits at On Hold).
+        paused = _members(status=MemberStatus.PAUSED, enrollment__stage__in=_ACTIVE_ENR)
+        on_hold = _members(
+            status=MemberStatus.ACTIVE, enrollment__stage=EnrollmentStage.ON_HOLD
+        )
+        active_pipeline = receiving + paused + on_hold
+
+        # Total Enrolled: the active-delivery pipeline plus the two delivery-
+        # blocked buckets (dietary Out of Orbit, geographic Out of Range).
+        enrolled = {
+            "active": active_pipeline,
+            "out_of_orbit": _count("out_of_orbit"),
+            "out_of_range": _count("out_of_range"),
+        }
+        enrolled["total"] = (
+            enrolled["active"] + enrolled["out_of_orbit"] + enrolled["out_of_range"]
+        )
+
+        receiving_meals = {
+            "active": active_pipeline,
+            "paused": paused,
+            "on_hold": on_hold,
+            "total": receiving,  # active_pipeline - paused - on_hold
+        }
+
+        # Pending Meals: verified households not yet being served -- awaiting a
+        # manual kitchen assignment (case auth approved), or still awaiting the
+        # case authorization decision (verified, auth Pending).
+        kitchen_assignment = _members(
+            enrollment__stage=EnrollmentStage.KITCHEN_ASSIGNMENT
+        )
+        pending = {
+            "kitchen_assignment": kitchen_assignment,
+            "verified_pending_auth": pending_meals,
+            "total": kitchen_assignment + pending_meals,
+        }
+
         return Response(
             {
                 "period": period,
@@ -541,6 +632,9 @@ class DashboardView(PortalAPIView):
                 "meals_boxes": meals_boxes,
                 "cancel_rate": cancel_rate,
                 "serving": serving,
+                "enrolled": enrolled,
+                "receiving": receiving_meals,
+                "pending": pending,
             }
         )
 
@@ -609,9 +703,9 @@ class DashboardServingListView(PortalAPIView):
         if reason not in _SERVING_REASONS:
             return Response({"detail": "Unknown reason."}, status=404)
 
-        period = (request.query_params.get("period") or "all").lower()
-        start, end = period_window(period)
-
+        # Section-2 serving metrics are all-time (they mirror the dashboard
+        # cards, which ignore the selected range), so the drill-down is too.
+        start, end = None, None
         client_ids = serving_client_ids(reason, start=start, end=end) or set()
         details = _serving_details(reason, client_ids, start=start, end=end)
         # multiple_cases links to the member's own profile (it is about that
