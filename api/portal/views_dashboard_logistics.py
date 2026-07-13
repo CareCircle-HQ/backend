@@ -807,6 +807,9 @@ class DistributionKitchenMembersView(PortalAPIView):
         except (TypeError, ValueError):
             page = 1
         search = (request.query_params.get("search") or "").strip()
+        kind_filter = (request.query_params.get("kind") or "").lower()
+        if kind_filter not in ("meals", "boxes"):
+            kind_filter = ""
         today = timezone.localdate()
 
         qs = _distribution_plan_qs(scope, today)
@@ -848,12 +851,8 @@ class DistributionKitchenMembersView(PortalAPIView):
             "product_type__type",
             "program__name",
         )
-        total = rows.count()
-        start = (page - 1) * self.PAGE_SIZE
-        window = list(rows[start:start + self.PAGE_SIZE])
 
-        results = []
-        for r in window:
+        def to_row(r):
             first = (r["member_profile__client__first_name"] or "").strip()
             last = (r["member_profile__client__last_name"] or "").strip()
             name = (f"{first} {last}".strip()) or r["member_name"] or "Unknown"
@@ -861,22 +860,36 @@ class DistributionKitchenMembersView(PortalAPIView):
             is_box = _plan_is_box(
                 r["product_type__type"], r["program__name"], kitchen_products
             )
-            results.append({
+            return {
                 "client_id": str(r["member_profile__client_id"])
                 if r["member_profile__client_id"] else None,
                 "name": name,
                 "cadence_code": code or "unassigned",
                 "cadence_label": cadence_label(code),
                 "kind": "boxes" if is_box else "meals",
-            })
+            }
+
+        start = (page - 1) * self.PAGE_SIZE
+        if kind_filter:
+            # meals/boxes can't be filtered purely in SQL (the classifier falls
+            # back to the program name + kitchen fleet), so classify the kitchen's
+            # full ordered set and paginate the matching subset in Python. Kitchen
+            # row counts are bounded, so this stays cheap.
+            matched = [row for row in map(to_row, rows) if row["kind"] == kind_filter]
+            total = len(matched)
+            results = matched[start:start + self.PAGE_SIZE]
+        else:
+            total = rows.count()
+            results = [to_row(r) for r in rows[start:start + self.PAGE_SIZE]]
 
         return Response({
             "kitchen": kitchen,
             "kitchen_name": kitchen_name,
             "scope": scope,
+            "kind": kind_filter,
             "page": page,
             "page_size": self.PAGE_SIZE,
             "total": total,
-            "has_more": start + len(window) < total,
+            "has_more": start + len(results) < total,
             "results": results,
         })
