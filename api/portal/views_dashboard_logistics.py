@@ -8,10 +8,12 @@ drill-down list endpoint. Sections:
   + the renderable-group drop) so the count reconciles with that page; aging by
   ``stage_at``, at-risk/unassignable households (no active kitchen can serve every
   member), and PO-blocker stats (see :func:`po_blocker_stats`).
-* capacity   -- SNAPSHOT + FORECAST: per-kitchen active load, kitchens by
-  status, and over-capacity delivery days in the next week.
+* capacity   -- SNAPSHOT: lightweight kitchen fleet status (active/inactive/
+  suspended) and product coverage (how many kitchens make meals vs boxes).
+  Per-kitchen daily capacity/load is intentionally not reported.
 * forecast   -- FORECAST (next 7 / 14 days, ignores the date selector):
-  scheduled deliveries + meals per day, menu-type mix, and per-kitchen load.
+  scheduled deliveries + meals/boxes per day, plus next-7-day breakdowns by
+  delivery CADENCE, product KIND (meals/boxes), KITCHEN and menu-type mix.
 * kitchen_orders -- RANGE (by PurchaseOrder.delivery_date): POs by status +
   volume per kitchen, the kitchen fulfillment funnel (kitchen_status), rerouted
   deliveries, and time-to-send.
@@ -32,13 +34,14 @@ from rest_framework.response import Response
 from rest_framework.test import APIRequestFactory
 
 from ..models import (
+    Cadence,
     Client,
+    DeliveryCadence,
     DeliveryOrder,
     DeliveryOrderStatus,
-    EnrollmentStage,
-    EnrollmentVerification,
     HouseholdMember,
     Kitchen,
+    MemberDeliverySchedule,
     MemberDietaryProfile,
     MemberStatus,
     OrderSchedule,
@@ -234,61 +237,21 @@ class LogisticsDashboardView(PortalAPIView):
             "po_blockers": po_blocker_stats(),
         }
 
-    # -- Section 2: kitchen capacity & load (snapshot + forecast) ------------
+    # -- Section 2: kitchen fleet (snapshot) --------------------------------
     def _capacity(self, today):
-        window_end = today + timedelta(days=6)
-        # Orders due per (kitchen, date) in the next 7 days -> over-capacity days.
-        due = (
-            OrderSchedule.objects.filter(
-                status=OrderStatus.SCHEDULED,
-                anticipated_delivery_date__gte=today,
-                anticipated_delivery_date__lte=window_end,
-            )
-            .exclude(kitchen__isnull=True)
-            .values("kitchen_id", "anticipated_delivery_date")
-            .annotate(n=Count("order_id"))
-        )
-        due_by_kitchen = {}
-        for row in due:
-            due_by_kitchen.setdefault(str(row["kitchen_id"]), []).append(row["n"])
-
-        # Current active load (households in service) per kitchen.
-        load = {
-            str(row["kitchen_id"]): row["n"]
-            for row in EnrollmentVerification.objects.filter(
-                stage=EnrollmentStage.SERVICE_ACTIVE, kitchen__isnull=False
-            )
-            .values("kitchen_id")
-            .annotate(n=Count("id"))
-        }
-
-        kitchens = []
+        # Per-kitchen daily capacity/load is intentionally not reported here.
+        # We keep only the lightweight fleet snapshot: how many kitchens are
+        # active/inactive/suspended and how many support meals vs boxes.
         status_counts = {"active": 0, "inactive": 0, "suspended": 0}
         meals_kitchens = boxes_kitchens = 0
-        for k in Kitchen.objects.all().order_by("name"):
+        for k in Kitchen.objects.all():
             status_counts[k.status] = status_counts.get(k.status, 0) + 1
             products = k.supported_products or []
             if "meal" in products:
                 meals_kitchens += 1
             if "box" in products:
                 boxes_kitchens += 1
-            cap = k.max_orders_per_day
-            per_day = due_by_kitchen.get(str(k.pk), [])
-            over_days = sum(1 for n in per_day if cap is not None and n > cap)
-            kitchens.append({
-                "id": str(k.pk),
-                "name": k.name,
-                "status": k.status,
-                "capacity": cap,
-                "active_load": load.get(str(k.pk), 0),
-                "supported_products": products,
-                "over_capacity_days": over_days,
-                "peak_due": max(per_day) if per_day else 0,
-            })
-        # Busiest / most-loaded kitchens first.
-        kitchens.sort(key=lambda r: (-r["active_load"], r["name"].lower()))
         return {
-            "kitchens": kitchens,
             "status_counts": status_counts,
             "product_coverage": {"meals": meals_kitchens, "boxes": boxes_kitchens},
         }
@@ -339,38 +302,78 @@ class LogisticsDashboardView(PortalAPIView):
             }
 
         end7 = today + timedelta(days=6)
-        # Menu-type mix + per-kitchen load over the next 7 days.
-        menu_mix = [
-            {"code": r["menu_type"] or "—", "meals": r["qty"] or 0, "deliveries": r["n"]}
-            for r in OrderSchedule.objects.filter(
+        # Breakdowns over the next 7 days, split by delivery CADENCE, product
+        # KIND (meals/boxes) and KITCHEN. Cadence is not stored on OrderSchedule,
+        # so we join each occurrence to the member's delivery PLAN
+        # (MemberDeliverySchedule) via (enrollment_id, member_profile_id).
+        orders7 = list(
+            OrderSchedule.objects.filter(
                 status=OrderStatus.SCHEDULED,
                 anticipated_delivery_date__gte=today,
                 anticipated_delivery_date__lte=end7,
+            ).values(
+                "enrollment_id", "member_id", "program_name",
+                "kitchen_id", "kitchen__name", "menu_type",
+                "how_many_meals_or_boxes",
             )
-            .values("menu_type")
-            .annotate(qty=Sum("how_many_meals_or_boxes"), n=Count("order_id"))
-            .order_by("-n")
-        ]
-        by_kitchen = [
-            {
-                "id": str(r["kitchen_id"]) if r["kitchen_id"] else None,
-                "name": r["kitchen__name"] or "Unassigned",
-                "deliveries": r["n"],
-                "meals": r["qty"] or 0,
-            }
-            for r in OrderSchedule.objects.filter(
-                status=OrderStatus.SCHEDULED,
-                anticipated_delivery_date__gte=today,
-                anticipated_delivery_date__lte=end7,
+        )
+        cadence_of = {
+            (r["enrollment_id"], r["member_profile_id"]): r["delivery_days_cadence"]
+            for r in MemberDeliverySchedule.objects.filter(
+                enrollment_id__in={o["enrollment_id"] for o in orders7}
+            ).values("enrollment_id", "member_profile_id", "delivery_days_cadence")
+        }
+        # Labels: legacy enum + any configurable Cadence rows (by code).
+        cadence_labels = dict(DeliveryCadence.choices)
+        cadence_labels.update(
+            {c.code: c.label for c in Cadence.objects.all() if c.code}
+        )
+
+        def cadence_label(code):
+            if not code:
+                return "Unassigned"
+            return cadence_labels.get(code) or code.replace("_", " ").title()
+
+        by_cadence, by_kitchen_map, menu_map = {}, {}, {}
+        for o in orders7:
+            qty = o["how_many_meals_or_boxes"] or 0
+            is_box = kind_of(o["program_name"]) == ProductTypeKind.BOXES
+            code = cadence_of.get((o["enrollment_id"], o["member_id"])) or ""
+            cb = by_cadence.setdefault(code, {"meals": 0, "boxes": 0, "deliveries": 0})
+            kid = str(o["kitchen_id"]) if o["kitchen_id"] else None
+            kb = by_kitchen_map.setdefault(
+                kid,
+                {"id": kid, "name": o["kitchen__name"] or "Unassigned",
+                 "meals": 0, "boxes": 0, "deliveries": 0},
             )
-            .values("kitchen_id", "kitchen__name")
-            .annotate(n=Count("order_id"), qty=Sum("how_many_meals_or_boxes"))
-            .order_by("-n")[:10]
-        ]
+            mt = (o["menu_type"] or "").strip() or "—"
+            mm = menu_map.setdefault(
+                mt, {"code": mt, "meals": 0, "boxes": 0, "deliveries": 0}
+            )
+            for bucket in (cb, kb, mm):
+                bucket["deliveries"] += 1
+                bucket["boxes" if is_box else "meals"] += qty
+
+        by_cadence_list = sorted(
+            (
+                {
+                    "code": code or "unknown",
+                    "label": cadence_label(code),
+                    "meals": v["meals"], "boxes": v["boxes"],
+                    "deliveries": v["deliveries"],
+                }
+                for code, v in by_cadence.items()
+            ),
+            key=lambda r: -r["deliveries"],
+        )
+        by_kitchen = sorted(by_kitchen_map.values(), key=lambda r: -r["deliveries"])[:10]
+        menu_mix = sorted(menu_map.values(), key=lambda r: -r["deliveries"])[:8]
+
         return {
             "days": days,
             "next_7": totals(days[:7]),
             "next_14": totals(days),
+            "by_cadence": by_cadence_list,
             "menu_mix": menu_mix,
             "by_kitchen": by_kitchen,
         }
