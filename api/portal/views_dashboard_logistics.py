@@ -613,12 +613,17 @@ def _plan_is_box(ptype, program_name, kitchen_products):
 
 def _distribution_plan_qs(scope, today):
     """Base MemberDeliverySchedule queryset for the distribution views, scoped to
-    ``active`` (SCHEDULED plans whose window covers today) or ``all``."""
+    ``active`` or ``all``.
+
+    ``active`` = any live (SCHEDULED) plan that hasn't ended yet, INCLUDING plans
+    whose first delivery is still upcoming. A household assigned to a kitchen is
+    an active assignment the moment it's set up, even if its first delivery date
+    is next week -- so we intentionally do NOT require ``starts_on <= today``
+    (that would hide freshly-assigned kitchens until their window opened)."""
     qs = MemberDeliverySchedule.objects.all()
     if scope == "active":
         qs = (
             qs.filter(status=ScheduleStatus.SCHEDULED)
-            .filter(Q(starts_on__isnull=True) | Q(starts_on__lte=today))
             .filter(Q(ends_on__isnull=True) | Q(ends_on__gte=today))
         )
     return qs
