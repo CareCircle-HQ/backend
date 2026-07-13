@@ -1359,12 +1359,32 @@ class UniteUsRefreshTest(TestCase):
         from .services.uniteus_import import _summarize_refresh
 
         run = ImportRun.objects.create(
-            source="uniteus", status=ImportRunStatus.COMPLETED, updated_count=2,
+            source="uniteus", status=ImportRunStatus.COMPLETED, updated_count=1,
+            stats={
+                "cases": {"updated": 1},
+                "changes": [
+                    {"kind": "authorization",
+                     "label": "Authorization: Pending → Approved", "tone": "success"},
+                ],
+            },
         )
         res = _summarize_refresh(run, scope="member")
         self.assertTrue(res["ok"])
         self.assertFalse(res["needs_reconnect"])
-        self.assertIn("2", res["message"])
+        self.assertEqual(len(res["changes"]), 1)
+        self.assertIn("1 update", res["message"])
+
+    def test_summary_ok_no_changes(self):
+        from .models import ImportRun, ImportRunStatus
+        from .services.uniteus_import import _summarize_refresh
+
+        run = ImportRun.objects.create(
+            source="uniteus", status=ImportRunStatus.COMPLETED,
+        )
+        res = _summarize_refresh(run, scope="case")
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["changes"], [])
+        self.assertIn("No changes", res["message"])
 
 
 class RecomputeSwitchesPlanKindTest(TestCase):

@@ -49,6 +49,18 @@ from api.services import tickets, timeline
 logger = logging.getLogger(__name__)
 
 
+# Tone hints (frontend colors) for the on-demand refresh "what changed" list.
+_AUTH_CHANGE_TONE = {
+    "approved": "success", "not_required": "success",
+    "pending": "warning", "expired": "warning", "denied": "danger",
+}
+_STATUS_CHANGE_TONE = {"cancelled": "danger"}
+
+
+def _pretty(code):
+    return (code or "").replace("_", " ").title() or "—"
+
+
 class DailyPull:
     def __init__(self, run):
         self.run = run
@@ -56,10 +68,60 @@ class DailyPull:
         self.name_cache = {}
         self.errors = []
         self.stats = defaultdict(lambda: defaultdict(int))
+        # On-demand refresh: human-readable list of what THIS run changed
+        # (auth transitions, case-status transitions, new Medicaid insurance).
+        # Persisted to run.stats["changes"] and surfaced by refresh_from_uniteus.
+        self.changes = []
 
     # -- counters ----------------------------------------------------------
     def _count(self, dataset, kind):
         self.stats[dataset][kind] += 1
+
+    # -- refresh change tracking -------------------------------------------
+    _CHANGES_CAP = 50
+
+    def _add_change(self, **item):
+        if len(self.changes) < self._CHANGES_CAP:
+            self.changes.append(item)
+
+    def _record_case_changes(self, case, prev_status, prev_auth, result):
+        """Translate a CaseChangeResult into refresh 'what changed' items."""
+        program = case.program_name or "Internal service case"
+        if result.auth_changed:
+            new = case.service_authorization_status or ""
+            self._add_change(
+                kind="authorization",
+                case_id=str(case.case_id),
+                program=program,
+                to=new,
+                label=f"Authorization: {_pretty(prev_auth)} → {_pretty(new)}",
+                tone=_AUTH_CHANGE_TONE.get(new, "info"),
+            )
+        if result.status_changed:
+            self._add_change(
+                kind="case_status",
+                case_id=str(case.case_id),
+                program=program,
+                to=case.case_status or "",
+                label=f"Case status: {_pretty(prev_status)} → {case.get_case_status_display()}",
+                tone=_STATUS_CHANGE_TONE.get(case.case_status, "info"),
+            )
+
+    def _record_new_medicaid(self, client, new_insurance_ids):
+        """Add a change item for each newly-added Medicaid insurance."""
+        from api.models import Insurance, InsurancePlanType
+
+        meds = Insurance.objects.filter(
+            client=client, insurance_id__in=list(new_insurance_ids),
+            plan_type__in=(InsurancePlanType.MEDICAID, InsurancePlanType.DUAL),
+        )
+        for ins in meds:
+            self._add_change(
+                kind="insurance_medicaid",
+                label="New Medicaid insurance added",
+                detail=ins.plan_name or "",
+                tone="success",
+            )
 
     def _save(self, serializer_cls, data, dataset, existed):
         try:
@@ -220,11 +282,12 @@ class DailyPull:
         # case_no_services rule is meaningful here -- no skip (unlike CSV imports).
         from api.services import case_events
 
-        case_events.record_case_change(
+        change = case_events.record_case_change(
             case, previous_status=prev_status, previous_auth=prev_auth,
             source=ChangeSource.IMPORT, actor="system:unite-us-import",
             create_tickets=True, import_run=self.run,
         )
+        self._record_case_changes(case, prev_status, prev_auth, change)
         self._reconcile_enrollments(case)
         self._emit_timeline(timeline.event_for_case, case)
 
@@ -280,8 +343,10 @@ class DailyPull:
             return
 
         post_ins = set(Insurance.objects.filter(client=client).values_list("insurance_id", flat=True))
-        if post_ins - pre_ins:
+        new_ins_ids = post_ins - pre_ins
+        if new_ins_ids:
             tickets.evaluate_new_insurance(client, self.run)
+            self._record_new_medicaid(client, new_ins_ids)
         post_scc = set(SocialCareCoverage.objects.filter(client=client).values_list("coverage_id", flat=True))
         if post_scc - pre_scc:
             tickets.evaluate_new_coverage(client, self.run)
@@ -365,6 +430,10 @@ class DailyPull:
                 if kind in agg:
                     agg[kind] += n
         self.run.stats = {d: dict(k) for d, k in self.stats.items()}
+        if self.changes:
+            # Appended LAST so next(iter(stats)) -- the dataset label the Import
+            # Activity UI reads -- still resolves to a real dataset, not "changes".
+            self.run.stats["changes"] = self.changes
         self.run.created_count = agg["created"]
         self.run.updated_count = agg["updated"]
         self.run.skipped_count = agg["skipped"]
@@ -464,6 +533,7 @@ def _summarize_refresh(run, *, scope):
     """Normalize an ImportRun into the dict the portal endpoint returns."""
     err = (run.error_log or "").lower()
     needs_reconnect = any(m in err for m in _RECONNECT_MARKERS)
+    changes = (run.stats or {}).get("changes") or []
     ok = (
         run.status == ImportRunStatus.COMPLETED
         and run.error_count == 0
@@ -476,17 +546,17 @@ def _summarize_refresh(run, *, scope):
         )
     elif not ok:
         message = "Refresh finished with errors. Check the import log."
+    elif changes:
+        n = len(changes)
+        message = f"Refreshed from Unite Us — {n} update{'s' if n != 1 else ''} detected."
     else:
-        changed = run.updated_count + run.created_count
-        message = (
-            f"Refreshed from Unite Us ({changed} record{'s' if changed != 1 else ''} updated)."
-            if changed else "Refreshed from Unite Us. No changes."
-        )
+        message = "Refreshed from Unite Us. No changes."
     return {
         "ok": ok,
         "scope": scope,
         "needs_reconnect": needs_reconnect,
         "message": message,
+        "changes": changes,
         "import_run_id": run.pk,
         "status": run.status,
         "created": run.created_count,
