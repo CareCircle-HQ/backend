@@ -1724,6 +1724,15 @@ class EnrollmentVerification(models.Model):
         "Kitchen", on_delete=models.SET_NULL, null=True, blank=True,
         related_name="enrollment_verifications",
     )
+    # Manual meals/boxes correction for THIS household. Product kind is normally
+    # derived (program -> ProductType link, then program-name keyword); when that
+    # detection is wrong (e.g. a boxes case classified as meals), an agent sets
+    # this on the Household tab and the resolver (product_kind_for_enrollment)
+    # honors it FIRST. NULL = use the derived kind.
+    product_type_override = models.ForeignKey(
+        "ProductType", on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="override_enrollments",
+    )
     stage = models.CharField(
         max_length=25, choices=EnrollmentStage.choices,
         default=EnrollmentStage.PENDING_VERIFICATION, db_index=True,
@@ -2924,6 +2933,7 @@ class TimelineEventType(models.TextChoices):
     MEMBER_PAUSED = "member_paused", "Member Paused"
     MEMBER_UNPAUSED = "member_unpaused", "Member Unpaused"
     HOUSEHOLD_MEMBER_ADDED = "household_member_added", "Household Member Added"
+    PRODUCT_TYPE_CHANGED = "product_type_changed", "Product Type Changed"
     # --- Legacy coarse types: retained so existing rows stay valid; no longer
     # emitted by the timeline service (a data migration remaps old rows). ---
     VERIFICATION = "verification", "Verification"
@@ -3027,6 +3037,79 @@ class TimelineEvent(models.Model):
 
     def __str__(self):
         return f"{self.event_type} for {self.client_id} @ {self.occurred_at:%Y-%m-%d}"
+
+
+# ---------------------------------------------------------------------------
+# Member / household warnings (care-management flags)
+# ---------------------------------------------------------------------------
+class WarningSeverity(models.TextChoices):
+    """Severity band for a member/household warning; drives the UI colour.
+    Ordered vocabulary -- add more levels here without touching the checks."""
+
+    RED = "red", "Red"
+    ORANGE = "orange", "Orange"
+
+
+class WarningStatus(models.TextChoices):
+    ACTIVE = "active", "Active"
+    RESOLVED = "resolved", "Resolved"
+
+
+class MemberWarning(models.Model):
+    """A persisted snapshot of a detected member/household problem.
+
+    Detection logic lives in ``api.services.warnings`` (the rule registry);
+    ``sync_household_warnings`` reconciles this table from the evaluator so it
+    can power the profile header and the Care Management page without
+    recomputing across the whole DB. One row per (client, code): re-evaluation
+    UPSERTS (reactivates + refreshes ``last_seen_at``), and a warning that is no
+    longer detected is marked RESOLVED (kept for the audit trail, not deleted).
+
+    ``client`` is the member the warning attaches to (the household primary for
+    household-scope warnings; the affected member for member-scope ones).
+    ``enrollment`` is the household context used to group rows on the Care
+    Management page (one row per household).
+    """
+
+    client = models.ForeignKey(
+        Client, on_delete=models.CASCADE, related_name="warnings"
+    )
+    enrollment = models.ForeignKey(
+        "EnrollmentVerification", on_delete=models.SET_NULL,
+        null=True, blank=True, related_name="warnings",
+    )
+    code = models.CharField(max_length=64)
+    severity = models.CharField(max_length=16, choices=WarningSeverity.choices)
+    scope = models.CharField(max_length=16)  # "household" | "member"
+    title = models.CharField(max_length=120)
+    detail = models.TextField(blank=True)
+    # Deep-link / diagnostic references (case_ids, kitchen_id, end_date, ...).
+    context = models.JSONField(default=dict, blank=True)
+    status = models.CharField(
+        max_length=16, choices=WarningStatus.choices,
+        default=WarningStatus.ACTIVE, db_index=True,
+    )
+    first_detected_at = models.DateTimeField(auto_now_add=True)
+    # Last time the check DETECTED this problem (not touched on resolve).
+    last_seen_at = models.DateTimeField(default=timezone.now)
+    resolved_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["-severity", "first_detected_at"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["client", "code"],
+                name="uniq_member_warning_client_code",
+            )
+        ]
+        indexes = [
+            models.Index(fields=["status", "severity"]),
+            models.Index(fields=["enrollment", "status"]),
+            models.Index(fields=["code"]),
+        ]
+
+    def __str__(self):
+        return f"{self.code} ({self.status}) for {self.client_id}"
 
 
 # ---------------------------------------------------------------------------

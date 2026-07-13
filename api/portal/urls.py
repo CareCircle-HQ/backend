@@ -4,6 +4,7 @@ from django.urls import include, path
 from rest_framework.routers import SimpleRouter
 
 from .auth import PortalRequestCodeView, PortalVerifyCodeView
+from .views_care_management import CareManagementListView
 from .views_dashboard import DashboardServingListView, DashboardView
 from .views_dashboard_verification import (
     VerificationDashboardListView,
@@ -40,6 +41,8 @@ from .views_members import (
     MemberHouseholdAddView,
     MemberHouseholdSearchView,
     MemberHouseholdView,
+    MemberProductTypeView,
+    MemberWarningsView,
     MemberInternalCaseDescriptionsView,
     MemberInsuranceView,
     MemberKitchenOptionsView,
@@ -158,6 +161,14 @@ urlpatterns = [
     path("members/<uuid:client_id>/household/", MemberHouseholdView.as_view()),
     path("members/<uuid:client_id>/household/search/", MemberHouseholdSearchView.as_view()),
     path("members/<uuid:client_id>/household/add/", MemberHouseholdAddView.as_view()),
+    path(
+        "members/<uuid:client_id>/product-type/",
+        MemberProductTypeView.as_view(),
+    ),
+    path(
+        "members/<uuid:client_id>/warnings/",
+        MemberWarningsView.as_view(),
+    ),
     # TEMPORARY: internal-service case descriptions on the Household tab.
     path(
         "members/<uuid:client_id>/internal-case-descriptions/",
@@ -300,6 +311,13 @@ urlpatterns = [
         "reports/members-by-lead-source/",
         MembersByLeadSourceReportView.as_view(),
         name="portal-report-members-by-lead-source",
+    ),
+
+    # Care Management (Customer Service)
+    path(
+        "care-management/",
+        CareManagementListView.as_view(),
+        name="portal-care-management",
     ),
 
     # Dashboard

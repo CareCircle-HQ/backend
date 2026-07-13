@@ -1,4 +1,5 @@
 import uuid
+from datetime import timedelta
 from types import SimpleNamespace
 
 from django.test import SimpleTestCase, TestCase
@@ -1628,3 +1629,238 @@ class CalendarKeepsOccurrencesOnExclusionTest(TestCase):
                 enrollment=enr, anticipated_delivery_date=tue,
             ).exists()
         )
+
+
+class MemberWarningsTest(TestCase):
+    """The member/household warning evaluator (api.services.warnings). Each check
+    is exercised in isolation on a purpose-built household, plus a clean
+    household that must produce no warnings and a multi-warning household."""
+
+    def _client(self, first="Woe", last="Warn"):
+        return Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name=first, last_name=last
+        )
+
+    def _enrollment(self, client, *, stage=None, kitchen=None, program_name=""):
+        from .models import (
+            EnrollmentStage, EnrollmentVerification, Household, HouseholdMember,
+            MemberDietaryProfile,
+        )
+
+        hh = Household.objects.create(name="HH")
+        HouseholdMember.objects.create(household=hh, client=client, is_primary=True)
+        enr = EnrollmentVerification.objects.create(
+            client=client, household=hh,
+            stage=stage or EnrollmentStage.SERVICE_ACTIVE,
+            kitchen=kitchen, program_name=program_name,
+        )
+        MemberDietaryProfile.objects.create(enrollment=enr, client=client)
+        return enr
+
+    def _internal_case(self, client, *, program="Medically Tailored Meals",
+                       status=None, auth_status="", auth_ends=None):
+        from .models import Case, CaseStatus, CaseType
+
+        return Case.objects.create(
+            case_id=uuid.uuid4(), client=client,
+            case_type=CaseType.INTERNAL_SERVICE,
+            case_status=status or CaseStatus.OPEN,
+            program_name=program,
+            service_authorization_status=auth_status,
+            service_authorization_approval_ends_at=auth_ends,
+        )
+
+    def _cadence(self, enr, code):
+        from .models import MemberDeliverySchedule, ScheduleStatus
+
+        mp = enr.member_profiles.first()
+        MemberDeliverySchedule.objects.create(
+            enrollment=enr, member_profile=mp, delivery_days_cadence=code,
+            status=ScheduleStatus.SCHEDULED,
+        )
+
+    def _codes(self, enr):
+        from .services.warnings import evaluate_enrollment_warnings
+
+        return {w.code for w in evaluate_enrollment_warnings(enr)}
+
+    def test_no_cadence_only_when_service_active(self):
+        from .models import EnrollmentStage
+        from .services.warnings import NO_CADENCE
+
+        active = self._enrollment(self._client(), stage=EnrollmentStage.SERVICE_ACTIVE)
+        self.assertIn(NO_CADENCE, self._codes(active))
+
+        pending = self._enrollment(
+            self._client(), stage=EnrollmentStage.KITCHEN_ASSIGNMENT
+        )
+        self.assertNotIn(NO_CADENCE, self._codes(pending))
+
+    def test_multiple_open_cases(self):
+        from .services.warnings import MULTIPLE_OPEN_CASES
+
+        c = self._client()
+        enr = self._enrollment(c)
+        self._internal_case(c)
+        self.assertNotIn(MULTIPLE_OPEN_CASES, self._codes(enr))
+        self._internal_case(c)
+        self.assertIn(MULTIPLE_OPEN_CASES, self._codes(enr))
+
+    def test_conflicting_product_types(self):
+        from .services.warnings import CONFLICTING_PRODUCT_TYPES
+
+        c = self._client()
+        enr = self._enrollment(c)
+        self._internal_case(c, program="Medically Tailored Meals")
+        self._internal_case(c, program="Grocery Boxes Program")
+        self.assertIn(CONFLICTING_PRODUCT_TYPES, self._codes(enr))
+
+    def test_kitchen_missing_product(self):
+        from .models import Kitchen, KitchenProductType, KitchenStatus
+        from .services.warnings import KITCHEN_MISSING_PRODUCT
+
+        box_only = Kitchen.objects.create(
+            name="BoxCo", status=KitchenStatus.ACTIVE,
+            supported_products=[KitchenProductType.BOX],
+        )
+        c = self._client()
+        enr = self._enrollment(c, kitchen=box_only)
+        self._internal_case(c, program="Medically Tailored Meals")  # meals kind
+        self.assertIn(KITCHEN_MISSING_PRODUCT, self._codes(enr))
+
+    def test_cadence_not_supported_by_kitchen(self):
+        from .models import Cadence, Kitchen, KitchenProductType, KitchenStatus
+        from .services.warnings import CADENCE_NOT_SUPPORTED_BY_KITCHEN
+
+        tue = Cadence.objects.create(code="tue_only", label="Tue", is_active=True)
+        kitchen = Kitchen.objects.create(
+            name="MealCo", status=KitchenStatus.ACTIVE,
+            supported_products=[KitchenProductType.MEAL],
+        )
+        kitchen.cadences.set([tue])
+        c = self._client()
+        enr = self._enrollment(c, kitchen=kitchen, program_name="Medically Tailored Meals")
+        self._cadence(enr, "mon_thu")  # not one the kitchen runs
+        self.assertIn(CADENCE_NOT_SUPPORTED_BY_KITCHEN, self._codes(enr))
+
+    def test_cadence_kind_mismatch(self):
+        from .models import ProductType, ProductTypeKind
+        from .services.warnings import CADENCE_KIND_MISMATCH
+
+        # 'once_a_week' is configured for BOXES; a meals household on it mismatches.
+        ProductType.objects.create(
+            type=ProductTypeKind.BOXES, delivery_days_cadence="once_a_week",
+        )
+        c = self._client()
+        enr = self._enrollment(c, program_name="Medically Tailored Meals")
+        self._cadence(enr, "once_a_week")
+        self.assertIn(CADENCE_KIND_MISMATCH, self._codes(enr))
+
+    def test_insurance_expiring_and_expired(self):
+        from .models import Insurance
+        from .services.warnings import INSURANCE_EXPIRING
+
+        soon = self._client()
+        enr = self._enrollment(soon)
+        Insurance.objects.create(
+            client=soon, plan_name="P", external_member_id="1",
+            expired_at=timezone.now() + timedelta(days=10),
+        )
+        self.assertIn(INSURANCE_EXPIRING, self._codes(enr))
+
+        healthy = self._client()
+        enr2 = self._enrollment(healthy)
+        Insurance.objects.create(
+            client=healthy, plan_name="P", external_member_id="2",
+            expired_at=timezone.now() + timedelta(days=120),
+        )
+        self.assertNotIn(INSURANCE_EXPIRING, self._codes(enr2))
+
+    def test_internal_case_expired(self):
+        from .services.warnings import INTERNAL_CASE_EXPIRED
+
+        c = self._client()
+        enr = self._enrollment(c)
+        self._internal_case(
+            c, program="Medically Tailored Meals",
+            auth_ends=timezone.now() - timedelta(days=3),
+        )
+        self.assertIn(INTERNAL_CASE_EXPIRED, self._codes(enr))
+
+    def test_clean_household_has_no_warnings(self):
+        from .models import Cadence, Kitchen, KitchenProductType, KitchenStatus, ProductType, ProductTypeKind
+
+        mon_thu = Cadence.objects.create(code="mon_thu", label="Mon/Thu", is_active=True)
+        ProductType.objects.create(
+            type=ProductTypeKind.MEALS, delivery_days_cadence="mon_thu",
+        )
+        kitchen = Kitchen.objects.create(
+            name="GoodCo", status=KitchenStatus.ACTIVE,
+            supported_products=[KitchenProductType.MEAL],
+        )
+        kitchen.cadences.set([mon_thu])
+        c = self._client()
+        enr = self._enrollment(c, kitchen=kitchen, program_name="Medically Tailored Meals")
+        self._cadence(enr, "mon_thu")
+        self._internal_case(
+            c, program="Medically Tailored Meals", auth_status="approved",
+            auth_ends=timezone.now() + timedelta(days=90),
+        )
+        self.assertEqual(self._codes(enr), set())
+
+    # --- Phase 2: persisted snapshot (sync) --------------------------------
+    def test_sync_persists_active_warnings(self):
+        from .models import MemberWarning, WarningStatus
+        from .services.warnings import NO_CADENCE, sync_household_warnings
+
+        c = self._client()
+        enr = self._enrollment(c)  # active, no cadence -> NO_CADENCE
+        sync_household_warnings(enr)
+        row = MemberWarning.objects.get(client=c, code=NO_CADENCE)
+        self.assertEqual(row.status, WarningStatus.ACTIVE)
+        self.assertEqual(row.enrollment_id, enr.pk)
+        self.assertIsNone(row.resolved_at)
+
+    def test_sync_resolves_when_problem_fixed(self):
+        from .models import MemberWarning, WarningStatus
+        from .services.warnings import NO_CADENCE, sync_household_warnings
+
+        c = self._client()
+        enr = self._enrollment(c)
+        sync_household_warnings(enr)
+        # Fix it: give the household a cadence, then re-sync.
+        self._cadence(enr, "mon_thu")
+        sync_household_warnings(enr)
+        row = MemberWarning.objects.get(client=c, code=NO_CADENCE)
+        self.assertEqual(row.status, WarningStatus.RESOLVED)
+        self.assertIsNotNone(row.resolved_at)
+
+    def test_sync_reactivates_resolved_row(self):
+        from .models import MemberWarning, WarningStatus
+        from .services.warnings import NO_CADENCE, sync_household_warnings
+
+        c = self._client()
+        enr = self._enrollment(c)
+        sync_household_warnings(enr)
+        self._cadence(enr, "mon_thu")
+        sync_household_warnings(enr)
+        # Regression: remove the cadence again -> the SAME row reactivates.
+        enr.delivery_schedules.all().delete()
+        sync_household_warnings(enr)
+        rows = MemberWarning.objects.filter(client=c, code=NO_CADENCE)
+        self.assertEqual(rows.count(), 1)
+        self.assertEqual(rows.first().status, WarningStatus.ACTIVE)
+        self.assertIsNone(rows.first().resolved_at)
+
+    def test_sync_is_idempotent(self):
+        from .models import MemberWarning
+        from .services.warnings import sync_household_warnings
+
+        c = self._client()
+        enr = self._enrollment(c)
+        self._internal_case(c)
+        self._internal_case(c)  # multiple_open_cases + no_cadence
+        sync_household_warnings(enr)
+        first = MemberWarning.objects.filter(client=c).count()
+        sync_household_warnings(enr)
+        self.assertEqual(MemberWarning.objects.filter(client=c).count(), first)

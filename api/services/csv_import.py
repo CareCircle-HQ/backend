@@ -1126,6 +1126,7 @@ class CsvImporter:
         never survive an upload. Each client is isolated from the others.
         """
         from api.services.lifecycle import recompute_client_stage
+        from api.services.warnings import sync_client_warnings
 
         for cid in self.touched_client_ids:
             client = Client.objects.filter(pk=cid).first()
@@ -1137,6 +1138,9 @@ class CsvImporter:
                 logger.warning(
                     "recompute_client_stage failed for %s", cid, exc_info=True
                 )
+            # Refresh the member/household warning snapshot from the imported
+            # data (catches insurance/client-only rows too). Best-effort.
+            sync_client_warnings(client)
 
     def finalize(self):
         self.run.stats = {self.dataset: dict(self.stats)}
