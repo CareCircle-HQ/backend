@@ -3,9 +3,11 @@
 A single aggregate endpoint reporting on the fulfillment pipeline, plus a
 drill-down list endpoint. Sections:
 
-* queue      -- SNAPSHOT: households awaiting kitchen assignment (stage
-  KITCHEN_ASSIGNMENT, open case, not On Hold), aging by ``stage_at``, and the
-  at-risk/unassignable households (no active kitchen can serve every member).
+* queue      -- SNAPSHOT: households awaiting kitchen assignment, using the
+  EXACT definition the Logistics page renders (``MembersListView`` scope=logistics
+  + the renderable-group drop) so the count reconciles with that page; aging by
+  ``stage_at``, at-risk/unassignable households (no active kitchen can serve every
+  member), and PO-blocker stats (see :func:`po_blocker_stats`).
 * capacity   -- SNAPSHOT + FORECAST: per-kitchen active load, kitchens by
   status, and over-capacity delivery days in the next week.
 * forecast   -- FORECAST (next 7 / 14 days, ignores the date selector):
@@ -23,20 +25,20 @@ Assignment unit is the household (enrollment). Volume is meals/boxes via
 
 from datetime import timedelta
 
-from django.db.models import Avg, Count, DurationField, ExpressionWrapper, F, Q, Sum
+from django.db.models import Avg, Count, DurationField, ExpressionWrapper, F, Sum
 from django.utils import timezone
+from rest_framework.request import Request
 from rest_framework.response import Response
+from rest_framework.test import APIRequestFactory
 
 from ..models import (
-    Case,
-    CaseStatus,
     Client,
     DeliveryOrder,
     DeliveryOrderStatus,
     EnrollmentStage,
     EnrollmentVerification,
+    HouseholdMember,
     Kitchen,
-    KitchenStatus,
     MemberDietaryProfile,
     MemberStatus,
     OrderSchedule,
@@ -46,12 +48,19 @@ from ..models import (
     PurchaseOrderKitchenStatus,
     PurchaseOrderStatus,
 )
-from ..services.catalog import product_kind_for_enrollment, product_type_kind_for_name
-from ..services.kitchens import member_coverage_for_kitchen, required_product_for_program
+from .serializers import active_enrollment
+from ..services.catalog import product_type_kind_for_name
+from ..services.po_blockers import (
+    BLOCKED_REASONS,
+    FIXABLE_REASONS,
+    REASON_DESCRIPTIONS,
+    REASON_LABELS,
+    classify_po_blockers,
+    summarize_po_blockers,
+)
 from .base import PortalAPIView, current_agent
 from .views_dashboard import period_window
-
-_TERMINAL_CASE_STATUSES = [CaseStatus.CLOSED, CaseStatus.CANCELLED]
+from .views_members import MembersListView
 
 # A PO not yet sent whose delivery is within this many days is "at risk".
 _IMMINENT_DAYS = 2
@@ -73,78 +82,113 @@ def _is_privileged(agent):
     )
 
 
-def _queue_base():
-    """Households awaiting kitchen assignment: enrollments at KITCHEN_ASSIGNMENT
-    whose governing internal-service case is still open (not Closed/Cancelled).
-    On Hold is a different stage, so it is already excluded."""
-    return (
-        EnrollmentVerification.objects.filter(
-            stage=EnrollmentStage.KITCHEN_ASSIGNMENT
-        )
-        .filter(Q(case__isnull=True) | ~Q(case__case_status__in=_TERMINAL_CASE_STATUSES))
-        .select_related("client", "case")
+def _age_bucket(stage_at, today):
+    """Aging bucket key for a household that entered the queue on ``stage_at``.
+    Missing timestamps count as freshly-queued (d0_2)."""
+    if stage_at is None:
+        return "d0_2"
+    days = (today - timezone.localtime(stage_at).date()).days
+    if days <= 2:
+        return "d0_2"
+    if days <= 7:
+        return "d3_7"
+    if days <= 14:
+        return "d8_14"
+    return "d15_plus"
+
+
+def queue_group_rows():
+    """The households/individuals awaiting kitchen assignment, using the EXACT
+    definition the Logistics page renders (``MembersListView`` scope=logistics +
+    the renderable-group drop that hides households whose every member is
+    out-of-orbit or has a finished internal-service case). This is why the count
+    reconciles with the Logistics page instead of the raw enrollment stage count.
+
+    Each row: ``{key, client_id, name, stage_at, kitchen_available, blockers}``
+    where ``key`` is the ``(type, id)`` group key and ``client_id`` is the
+    household primary (for the member drill-down link)."""
+    view = MembersListView()
+    view.request = Request(
+        APIRequestFactory().get("/portal/members/", {"scope": "logistics"})
+    )
+    view.kwargs = {}
+    entries = view._group_entries()
+    keys = view._renderable_keys(entries)
+    entries = [e for e in entries if (e["type"], e["id"]) in keys]
+    if not entries:
+        return []
+    # Readiness checkers (per group) -- reuses the page's serviceability calc, so
+    # "kitchen_available" here is identical to the page's "Kitchen needs review".
+    checks = view._compute_logistics_checks(entries)
+
+    hh_ids = [e["id"] for e in entries if e["type"] == "household"]
+    ind_ids = [e["id"] for e in entries if e["type"] == "individual"]
+    primary_by_hh = {}
+    if hh_ids:
+        for hm in HouseholdMember.objects.filter(
+            household_id__in=hh_ids, is_primary=True
+        ).select_related("client"):
+            primary_by_hh[hm.household_id] = hm.client
+    ind_clients = (
+        {c.client_id: c for c in Client.objects.filter(client_id__in=ind_ids)}
+        if ind_ids else {}
     )
 
-
-def _active_kitchens():
-    return list(
-        Kitchen.objects.filter(status=KitchenStatus.ACTIVE).prefetch_related(
-            "kitchen_menu_types__menu_type", "kitchen_menu_types__restrictions"
+    rows = []
+    for e in entries:
+        key = (e["type"], e["id"])
+        client = (
+            primary_by_hh.get(e["id"]) if e["type"] == "household"
+            else ind_clients.get(e["id"])
         )
-    )
-
-
-def _household_serviceable(enrollment, kitchens, members=None):
-    """True when at least one of ``kitchens`` supports the enrollment's product
-    kind AND covers every member (menu type + food allergies)."""
-    members = members if members is not None else list(enrollment.member_profiles.all())
-    if not members:
-        return True  # nothing to serve yet -> not "at risk"
-    required = required_product_for_program(enrollment.program_name)
-    for k in kitchens:
-        if required is not None and required not in (k.supported_products or []):
+        if client is None:
             continue
-        if all(member_coverage_for_kitchen(m, k)[0] for m in members):
-            return True
-    return False
+        enr = active_enrollment(client)
+        agg = checks.get(key, (None, {}))[1] or {}
+        rows.append({
+            "key": key,
+            "client_id": str(client.client_id),
+            "name": e["name"] or f"{client.first_name} {client.last_name}".strip(),
+            "stage_at": getattr(enr, "stage_at", None),
+            "kitchen_available": agg.get("kitchen_available", True),
+            "blockers": agg.get("blockers", []),
+        })
+    return rows
 
 
-def _at_risk_enrollment_ids():
-    """Queued households that NO active kitchen can fully serve (would go Out of
-    Orbit at assignment). Returns a list of EnrollmentVerification pks."""
-    kitchens = _active_kitchens()
-    at_risk = []
-    for enr in _queue_base().prefetch_related("member_profiles"):
-        members = list(enr.member_profiles.all())
-        if not _household_serviceable(enr, kitchens, members):
-            at_risk.append(enr.pk)
-    return at_risk
-
-
-def logistics_enrollments(reason):
-    """Return the queue-side drill-down queryset for ``reason`` (assignment
-    queue + aging buckets + at-risk). Snapshot by design."""
+def logistics_queue_rows(reason):
+    """Filter :func:`queue_group_rows` to the queue-side drill-down ``reason``."""
     today = timezone.localdate()
-    base = _queue_base()
+    rows = queue_group_rows()
     if reason == "awaiting":
-        return base
-    if reason == "aging_0_2":
-        return base.filter(stage_at__date__gte=today - timedelta(days=2))
-    if reason == "aging_3_7":
-        return base.filter(
-            stage_at__date__gte=today - timedelta(days=7),
-            stage_at__date__lte=today - timedelta(days=3),
-        )
-    if reason == "aging_8_14":
-        return base.filter(
-            stage_at__date__gte=today - timedelta(days=14),
-            stage_at__date__lte=today - timedelta(days=8),
-        )
-    if reason == "aging_15_plus":
-        return base.filter(stage_at__date__lte=today - timedelta(days=15))
+        return rows
     if reason == "at_risk":
-        return base.filter(pk__in=_at_risk_enrollment_ids())
-    return EnrollmentVerification.objects.none()
+        return [r for r in rows if not r["kitchen_available"]]
+    if reason in ("aging_0_2", "aging_3_7", "aging_8_14", "aging_15_plus"):
+        want = reason.replace("aging_", "d")
+        return [r for r in rows if _age_bucket(r["stage_at"], today) == want]
+    return []
+
+
+def po_blocker_stats():
+    """Per-reason PO-blocker counts + metadata (mirrors POBlockersStatsView) for
+    the At-Risk / Unassignable section: active members with a live delivery plan
+    that can't reach a Purchase Order."""
+    rows = classify_po_blockers(include_ok=False)
+    counts = summarize_po_blockers(rows)
+    reasons = [
+        {
+            "reason": r,
+            "label": REASON_LABELS.get(r, r),
+            "description": REASON_DESCRIPTIONS.get(r, ""),
+            "count": counts.get(r, 0),
+            "fixable": r in FIXABLE_REASONS,
+        }
+        for r in BLOCKED_REASONS
+        if counts.get(r, 0) > 0
+    ]
+    reasons.sort(key=lambda x: -x["count"])
+    return {"total": len(rows), "reasons": reasons}
 
 
 class LogisticsDashboardView(PortalAPIView):
@@ -176,16 +220,18 @@ class LogisticsDashboardView(PortalAPIView):
 
     # -- Section 1: assignment queue (snapshot) ------------------------------
     def _queue(self, today):
-        base = _queue_base()
+        rows = queue_group_rows()
+        aging = {"d0_2": 0, "d3_7": 0, "d8_14": 0, "d15_plus": 0}
+        at_risk = 0
+        for r in rows:
+            aging[_age_bucket(r["stage_at"], today)] += 1
+            if not r["kitchen_available"]:
+                at_risk += 1
         return {
-            "awaiting": base.count(),
-            "aging": {
-                "d0_2": logistics_enrollments("aging_0_2").count(),
-                "d3_7": logistics_enrollments("aging_3_7").count(),
-                "d8_14": logistics_enrollments("aging_8_14").count(),
-                "d15_plus": logistics_enrollments("aging_15_plus").count(),
-            },
-            "at_risk": len(_at_risk_enrollment_ids()),
+            "awaiting": len(rows),
+            "aging": aging,
+            "at_risk": at_risk,
+            "po_blockers": po_blocker_stats(),
         }
 
     # -- Section 2: kitchen capacity & load (snapshot + forecast) ------------
@@ -532,19 +578,17 @@ class LogisticsDashboardListView(PortalAPIView):
             results.sort(key=lambda r: r["name"].lower())
             return Response({"reason": reason, "count": len(results), "results": results})
 
-        # Queue-side reasons (enrollment-based).
-        qs = logistics_enrollments(reason).order_by("stage_at")[:200]
+        # Queue-side reasons (household-based; mirrors the Logistics page).
+        rows = logistics_queue_rows(reason)
+        rows.sort(key=lambda r: (r["stage_at"] is not None, r["stage_at"] or today))
         results = []
-        for e in qs:
-            client = e.client
-            cid = str(e.client_id) if e.client_id else str(e.pk)
-            name = (
-                f"{client.first_name} {client.last_name}".strip() if client else cid
-            ) or cid
-            days = (today - timezone.localtime(e.stage_at).date()).days if e.stage_at else 0
-            results.append({
-                "id": cid,
-                "name": name,
-                "detail": f"Waiting {days} day{'s' if days != 1 else ''}",
-            })
+        for r in rows[:200]:
+            days = (
+                (today - timezone.localtime(r["stage_at"]).date()).days
+                if r["stage_at"] else 0
+            )
+            detail = f"Waiting {days} day{'s' if days != 1 else ''}"
+            if reason == "at_risk" and r["blockers"]:
+                detail += " · " + ", ".join(r["blockers"])
+            results.append({"id": r["client_id"], "name": r["name"], "detail": detail})
         return Response({"reason": reason, "count": len(results), "results": results})
