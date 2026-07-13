@@ -107,11 +107,20 @@ REASON_DESCRIPTIONS = {
 def _classify_reason(*, kitchen_id, future, has_future_auth, plan_ends_on,
                      kind, plan_kind, governing_kind, plan_kind_authorized,
                      weekday_mismatch, switch_pending, open_case_count,
-                     enrollment_case_id, governing_case_id, today):
+                     enrollment_case_id, governing_case_id, today,
+                     awaiting_auth=False):
     if kitchen_id is None:
         return "no_kitchen"
     if future == 0:
         if not has_future_auth:
+            # A member still AWAITING authorization (an open, pending
+            # internal-service case that has never been approved) is not a PO
+            # blocker: there is nothing to remediate until Unite Us decides, so
+            # they shouldn't sit in the queue as "needs re-authorization". Only
+            # a member whose authorization actually lapsed (expired/denied, with
+            # no pending case in flight) is a real re-auth blocker.
+            if awaiting_auth:
+                return "ok"
             return "needs_reauth"
         if plan_ends_on is None or plan_ends_on < today:
             return "lapsed_window_fixable"
@@ -253,12 +262,20 @@ def classify_po_blockers(from_date=None, include_ok=False):
                 if c.service_authorization_status in _AUTHORIZED
             }
             favorable_open_kinds.discard(None)
+            # Awaiting authorization: an open internal-service case whose
+            # authorization is still PENDING (initial or renewal). Such a member
+            # has no active service case yet and must not be flagged needs_reauth.
+            awaiting_auth = any(
+                c.service_authorization_status == ServiceAuthorizationStatus.PENDING
+                for c in open_cases
+            )
             enr_meta[enr.pk] = (
                 governing_kind, len(open_cases), switch_pending,
-                favorable_open_kinds,
+                favorable_open_kinds, awaiting_auth,
             )
         gov = gov_cache[enr.pk]
-        governing_kind, open_case_count, switch_pending, favorable_open_kinds = enr_meta[enr.pk]
+        (governing_kind, open_case_count, switch_pending, favorable_open_kinds,
+         awaiting_auth) = enr_meta[enr.pk]
         auth_status = getattr(gov, "service_authorization_status", "") or ""
         auth_end = getattr(gov, "service_authorization_approval_ends_at", None)
         auth_end = auth_end.date() if auth_end else None
@@ -284,6 +301,7 @@ def classify_po_blockers(from_date=None, include_ok=False):
             weekday_mismatch=mismatch, switch_pending=switch_pending,
             open_case_count=open_case_count, enrollment_case_id=enr.case_id,
             governing_case_id=gov_case_id, today=today,
+            awaiting_auth=awaiting_auth,
         )
         if reason == "ok" and not include_ok:
             continue

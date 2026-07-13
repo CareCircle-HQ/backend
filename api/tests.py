@@ -1267,6 +1267,33 @@ class ProgramSwitchClassificationTest(SimpleTestCase):
         )
 
 
+class NeedsReauthClassificationTest(SimpleTestCase):
+    """A member with no future authorization is only a ``needs_reauth`` blocker
+    when their authorization actually LAPSED. A member still AWAITING an
+    authorization decision (an open pending case) must NOT be flagged -- there's
+    nothing to remediate until Unite Us decides."""
+
+    def _classify(self, **overrides):
+        from .services.po_blockers import _classify_reason
+
+        base = dict(
+            kitchen_id="k", future=0, has_future_auth=False, plan_ends_on=None,
+            kind=None, plan_kind=None, governing_kind=None,
+            plan_kind_authorized=False, weekday_mismatch=False,
+            switch_pending=False, open_case_count=1, enrollment_case_id="c1",
+            governing_case_id="c1", today=timezone.localdate(),
+            awaiting_auth=False,
+        )
+        base.update(overrides)
+        return _classify_reason(**base)
+
+    def test_awaiting_authorization_is_not_a_blocker(self):
+        self.assertEqual(self._classify(awaiting_auth=True), "ok")
+
+    def test_lapsed_without_pending_case_is_needs_reauth(self):
+        self.assertEqual(self._classify(awaiting_auth=False), "needs_reauth")
+
+
 class RecomputeSwitchesPlanKindTest(TestCase):
     """Regression: applying the PO Blockers 'program_switched' fix must actually
     flip the plan's KIND snapshot. update_household_cadence previously updated
