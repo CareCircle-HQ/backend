@@ -1896,6 +1896,52 @@ class MemberWarningsTest(TestCase):
         self.assertEqual(MemberWarning.objects.filter(client=c).count(), first)
 
 
+class AddressQualityTest(SimpleTestCase):
+    """The delivery-address format detector (api.services.address_quality)."""
+
+    def _codes(self, **kw):
+        from .services.address_quality import detect_address_issues
+        return set(detect_address_issues(**kw))
+
+    def test_unit_in_street_when_unit_field_empty(self):
+        from .services.address_quality import UNIT_IN_STREET
+        codes = self._codes(street="123 Main St Apt 4B", unit="", city="Brooklyn", state="NY")
+        self.assertIn(UNIT_IN_STREET, codes)
+
+    def test_hash_unit_in_street(self):
+        from .services.address_quality import UNIT_IN_STREET
+        codes = self._codes(street="123 Main St #3", unit="", city="Brooklyn", state="NY")
+        self.assertIn(UNIT_IN_STREET, codes)
+
+    def test_duplicate_unit_when_both_populated(self):
+        from .services.address_quality import DUPLICATE_UNIT, UNIT_IN_STREET
+        codes = self._codes(street="115 Clymer St Apt 7D", unit="7D", city="Brooklyn", state="NY")
+        self.assertIn(DUPLICATE_UNIT, codes)
+        self.assertNotIn(UNIT_IN_STREET, codes)
+
+    def test_po_box(self):
+        from .services.address_quality import PO_BOX
+        codes = self._codes(street="PO Box 123", unit="", city="Brooklyn", state="NY")
+        self.assertIn(PO_BOX, codes)
+
+    def test_missing_components(self):
+        from .services.address_quality import MISSING_CITY, MISSING_STATE
+        codes = self._codes(street="123 Main St", unit="", city="", state="")
+        self.assertIn(MISSING_CITY, codes)
+        self.assertIn(MISSING_STATE, codes)
+
+    def test_clean_address_has_no_issues(self):
+        codes = self._codes(street="123 Main St", unit="4B", city="Brooklyn", state="NY", zip_code="11201")
+        self.assertEqual(codes, set())
+
+    def test_street_name_with_unitlike_word_not_flagged(self):
+        # "Flatbush" / "Lott" must NOT trip the \bfl\b / \blot\b markers.
+        codes = self._codes(street="1500 Flatbush Ave", unit="", city="Brooklyn", state="NY")
+        self.assertEqual(codes, set())
+        codes2 = self._codes(street="25 Lott Pl", unit="", city="Brooklyn", state="NY")
+        self.assertEqual(codes2, set())
+
+
 class CareManagementListTest(TestCase):
     """The Care Management queue endpoint. Verifies that households which are not
     being served (On Hold / Cancelled / Closed / Service Complete) are excluded

@@ -1,9 +1,13 @@
-"""Customer Service -> Delivery Address: every active-service household's
-delivery address in one editable table.
+"""Customer Service -> Delivery Address: active-service households whose delivery
+address has a DETECTED FORMAT PROBLEM, in one editable table.
 
 The delivery address is HOUSEHOLD-WIDE (one :class:`~api.models.Address` per
-enrollment, shared by all members), so this returns ONE ROW PER HOUSEHOLD. Edits
-are saved through the existing ``MemberHouseholdView`` PATCH
+enrollment, shared by all members), so this returns ONE ROW PER HOUSEHOLD. Only
+households whose address fails a format check (unit embedded in the street line,
+duplicate unit, PO box, missing street/city/state) are returned -- clean
+addresses are omitted. Detection lives in ``api.services.address_quality``.
+
+Edits are saved through the existing ``MemberHouseholdView`` PATCH
 (``/members/<client_id>/household/``) so the delivery-coverage check + timeline
 logging stay in one place -- this module is read-only.
 """
@@ -12,6 +16,7 @@ from django.db.models import Count, Q
 from rest_framework.response import Response
 
 from api.models import EnrollmentStage, EnrollmentVerification
+from api.services.address_quality import detect_address_issues, issue_label
 from .base import PortalAPIView, current_agent
 
 # Delivery Address is a CS tool: CS + Management (and manager override).
@@ -41,12 +46,15 @@ def _address_string(addr):
 
 
 class DeliveryAddressListView(PortalAPIView):
-    """GET /portal/delivery-addresses/ — active-service households + their
-    delivery address, for the CS Delivery Address table.
+    """GET /portal/delivery-addresses/ — active-service households whose delivery
+    address has a detected format problem, for the CS Delivery Address table.
 
     Query params:
       * ``search`` = member name, client id, or any part of the address
+      * ``issue``  = a specific issue code (e.g. ``unit_in_street``)
       * ``page``
+    Returns a summary (counts by issue code across the full match) plus a page
+    of household rows, each carrying the issues it triggered.
     """
 
     def get(self, request):
@@ -58,6 +66,7 @@ class DeliveryAddressListView(PortalAPIView):
 
         params = request.query_params
         search = (params.get("search") or "").strip()
+        issue = (params.get("issue") or "").strip()
         try:
             page = max(1, int(params.get("page") or 1))
         except (TypeError, ValueError):
@@ -65,7 +74,7 @@ class DeliveryAddressListView(PortalAPIView):
 
         qs = (
             EnrollmentVerification.objects
-            .filter(stage=EnrollmentStage.SERVICE_ACTIVE)
+            .filter(stage=EnrollmentStage.SERVICE_ACTIVE, delivery_address__isnull=False)
             .select_related("client", "delivery_address", "kitchen")
             .annotate(member_count=Count("member_profiles", distinct=True))
         )
@@ -80,13 +89,32 @@ class DeliveryAddressListView(PortalAPIView):
             )
         qs = qs.order_by("client__last_name", "client__first_name", "pk")
 
-        total = qs.count()
+        # Detection is Python-side (regex heuristics), so scan the matched set,
+        # keep only households WITH an issue, and tally counts by code. The scan
+        # is cheap (a few thousand short strings).
+        by_code = {}
+        flagged_households = 0
+        matched = []
+        for enr in qs.iterator():
+            addr = enr.delivery_address
+            codes = detect_address_issues(
+                addr.street, addr.unit, addr.city, addr.state, addr.zip
+            )
+            if not codes:
+                continue
+            flagged_households += 1
+            for c in codes:
+                by_code[c] = by_code.get(c, 0) + 1
+            if issue and issue not in codes:
+                continue
+            matched.append((enr, addr, codes))
+
+        total = len(matched)
         start = (page - 1) * PAGE_SIZE
-        rows = qs[start:start + PAGE_SIZE]
+        page_rows = matched[start:start + PAGE_SIZE]
 
         results = []
-        for enr in rows:
-            addr = enr.delivery_address
+        for enr, addr, codes in page_rows:
             results.append({
                 "enrollment_id": enr.pk,
                 "client_id": str(enr.client_id) if enr.client_id else None,
@@ -101,14 +129,19 @@ class DeliveryAddressListView(PortalAPIView):
                     "state": addr.state,
                     "zip": addr.zip,
                     "notes": addr.notes,
-                } if addr is not None else None,
+                },
                 "address_string": _address_string(addr),
+                "issues": [{"code": c, "label": issue_label(c)} for c in codes],
             })
 
         return Response({
+            "summary": {
+                "flagged": flagged_households,
+                "by_code": by_code,
+            },
             "page": page,
             "page_size": PAGE_SIZE,
             "total": total,
-            "has_more": start + len(results) < total,
+            "has_more": start + len(page_rows) < total,
             "results": results,
         })
