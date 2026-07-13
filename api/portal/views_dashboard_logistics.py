@@ -51,6 +51,8 @@ from ..models import (
     PurchaseOrder,
     PurchaseOrderKitchenStatus,
     PurchaseOrderStatus,
+    SERVICE_EXCLUDED_ENROLLMENT_STAGES,
+    SERVICE_EXCLUDED_MEMBER_STATUSES,
 )
 from .serializers import active_enrollment
 from ..services.catalog import product_type_kind_for_name
@@ -599,15 +601,23 @@ class LogisticsDashboardListView(PortalAPIView):
 
 
 def _plan_is_box(ptype, program_name, kitchen_products):
-    """Meals-vs-boxes for a delivery plan, most reliable signal first:
-    (1) the plan's ``product_type.type``; (2) a meal/box keyword in the program
-    name (matches the forecast page); (3) the kitchen fleet -- a box-only kitchen
-    implies boxes, otherwise meals. Never infers boxes from missing data."""
-    if ptype:
-        return ptype == ProductTypeKind.BOXES
+    """Meals-vs-boxes for a delivery plan, matching the precedence Purchase Order
+    generation uses (``_due_schedules``): the PROGRAM NAME is authoritative.
+
+    1. A meal/box keyword in the program name (``product_type_kind_for_name``) --
+       same as the PO resolver, and the source of truth an agent sees.
+    2. Fallback to the plan's ``product_type.type`` snapshot when the program name
+       carries no keyword.
+    3. Last resort: the kitchen fleet (box-only kitchen => boxes, else meals).
+
+    Trusting ``product_type.type`` first was wrong: some Meals-program plans carry
+    a stale ``boxes`` snapshot, which mislabeled real meal clients as boxes.
+    Never infers boxes from missing data."""
     kind = product_type_kind_for_name(program_name)
     if kind is not None:
         return kind == ProductTypeKind.BOXES
+    if ptype:
+        return ptype == ProductTypeKind.BOXES
     return "box" in (kitchen_products or []) and "meal" not in (kitchen_products or [])
 
 
@@ -619,12 +629,21 @@ def _distribution_plan_qs(scope, today):
     whose first delivery is still upcoming. A household assigned to a kitchen is
     an active assignment the moment it's set up, even if its first delivery date
     is next week -- so we intentionally do NOT require ``starts_on <= today``
-    (that would hide freshly-assigned kitchens until their window opened)."""
+    (that would hide freshly-assigned kitchens until their window opened).
+
+    ``active`` also applies the SAME exclusions Purchase Order generation uses, so
+    the counts reflect who would actually be served: households On Hold or in a
+    terminal stage (``SERVICE_EXCLUDED_ENROLLMENT_STAGES``) and Paused / Out of
+    Orbit / Out of Range / Inactive members (``SERVICE_EXCLUDED_MEMBER_STATUSES``)
+    are dropped. ``all`` is the unfiltered superset (every plan, any status/date)
+    for auditing."""
     qs = MemberDeliverySchedule.objects.all()
     if scope == "active":
         qs = (
             qs.filter(status=ScheduleStatus.SCHEDULED)
             .filter(Q(ends_on__isnull=True) | Q(ends_on__gte=today))
+            .exclude(enrollment__stage__in=SERVICE_EXCLUDED_ENROLLMENT_STAGES)
+            .exclude(member_profile__status__in=SERVICE_EXCLUDED_MEMBER_STATUSES)
         )
     return qs
 
