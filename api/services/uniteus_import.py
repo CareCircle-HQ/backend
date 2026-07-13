@@ -397,3 +397,144 @@ def run_daily_pull(*, triggered_by="cron", client_limit=None, provider_id=None,
             run.error_log = "\n".join(puller.errors)[:10000]
         run.save()
     return run
+
+
+# ---------------------------------------------------------------------------
+# On-demand refresh (agent-triggered from the CRM "Refresh from Unite Us"
+# button). Reuses the exact daily-pull pipeline so a refresh runs the same
+# map -> serializer -> case_events -> reconcile_enrollment_authorization path,
+# meaning an authorization that flipped to Accepted advances the enrollment and
+# generates deliveries just like the nightly run.
+# ---------------------------------------------------------------------------
+
+# Substrings that mean "the Unite Us session is unusable -> the agent must
+# re-login in the browser so the extension re-captures a token" (vs a transient
+# per-record error). Matched case-insensitively against the run's error log.
+_RECONNECT_MARKERS = ("expired", "unusable", "not usable", "no active unite us")
+
+
+def _select_active_credential(provider_id=None):
+    """Pick the credential for an on-demand refresh: the most-recently-captured
+    active one (freshest token), optionally scoped to a provider."""
+    qs = UniteUsCredential.objects.filter(status=UniteUsCredentialStatus.ACTIVE)
+    if provider_id:
+        qs = qs.filter(provider_id=provider_id)
+    return qs.order_by("-last_captured_at", "-updated_at").first()
+
+
+def _refresh_single_case(puller, client_id, case_id, provider_id):
+    """Refresh ONE internal-service case through the full per-case pipeline."""
+    cred = _select_active_credential(provider_id=provider_id)
+    if cred is None:
+        puller.errors.append("No active Unite Us credentials; nothing to pull.")
+        return
+    try:
+        _ = cred.refresh_token  # force decrypt; skip a corrupt/rotated-key cred
+    except Exception as exc:  # noqa: BLE001
+        puller.errors.append(f"credential {cred.pk} unusable: {exc}")
+        return
+
+    puller.api = uu_api.UniteUsClient(cred)
+    puller.name_cache = {}
+    client = Client.objects.filter(pk=client_id).first()
+    if client is None:
+        puller.errors.append(f"client {client_id} not found locally")
+        return
+
+    records = puller.api.list_cases(client_id)
+    rec = next((r for r in records if str(r.get("id")) == str(case_id)), None)
+    if rec is None:
+        puller.errors.append(
+            f"case {case_id} not returned by Unite Us for client {client_id} "
+            "(it may be closed or outside the managed/pending filter)"
+        )
+        return
+
+    puller._process_case(rec, client)
+    # Keep the acquisition funnel consistent after an approval flips the case.
+    try:
+        from api.services.lifecycle import recompute_client_stage
+
+        recompute_client_stage(client)
+    except Exception:  # noqa: BLE001
+        logger.warning("recompute_client_stage failed for %s", client_id, exc_info=True)
+
+
+def _summarize_refresh(run, *, scope):
+    """Normalize an ImportRun into the dict the portal endpoint returns."""
+    err = (run.error_log or "").lower()
+    needs_reconnect = any(m in err for m in _RECONNECT_MARKERS)
+    ok = (
+        run.status == ImportRunStatus.COMPLETED
+        and run.error_count == 0
+        and not needs_reconnect
+    )
+    if needs_reconnect:
+        message = (
+            "Unite Us session expired. Open Unite Us in the browser to reconnect, "
+            "then try again."
+        )
+    elif not ok:
+        message = "Refresh finished with errors. Check the import log."
+    else:
+        changed = run.updated_count + run.created_count
+        message = (
+            f"Refreshed from Unite Us ({changed} record{'s' if changed != 1 else ''} updated)."
+            if changed else "Refreshed from Unite Us. No changes."
+        )
+    return {
+        "ok": ok,
+        "scope": scope,
+        "needs_reconnect": needs_reconnect,
+        "message": message,
+        "import_run_id": run.pk,
+        "status": run.status,
+        "created": run.created_count,
+        "updated": run.updated_count,
+        "skipped": run.skipped_count,
+        "errors": run.error_count,
+        "error_log": run.error_log or "",
+    }
+
+
+def refresh_from_uniteus(client_id, *, case_id=None, provider_id=None,
+                         triggered_by="portal:refresh"):
+    """On-demand Unite Us refresh for one client.
+
+    With ``case_id`` only that internal-service case is refreshed; otherwise the
+    whole member (all cases + coverage + notes) via :func:`run_daily_pull`.
+    Returns a summary dict (see :func:`_summarize_refresh`) whose
+    ``needs_reconnect`` flag tells the UI when the agent must re-login to Unite Us.
+    """
+    client_id = str(client_id)
+
+    if not case_id:
+        run = run_daily_pull(
+            triggered_by=triggered_by, provider_id=provider_id,
+            client_ids=[client_id],
+        )
+        return _summarize_refresh(run, scope="member")
+
+    run = ImportRun.objects.create(
+        source="uniteus", status=ImportRunStatus.RUNNING, triggered_by=triggered_by,
+    )
+    puller = DailyPull(run)
+    try:
+        with change_context(ChangeSource.IMPORT, "system:unite-us-import"):
+            _refresh_single_case(puller, client_id, str(case_id), provider_id)
+        run.status = ImportRunStatus.COMPLETED
+    except UniteUsAuthExpired as exc:
+        run.status = ImportRunStatus.FAILED
+        puller.errors.append(f"credential expired: {exc}")
+        logger.warning("refresh single case: credential expired: %s", exc)
+    except Exception as exc:  # noqa: BLE001
+        run.status = ImportRunStatus.FAILED
+        puller.errors.append(f"FATAL: {exc}")
+        logger.exception("refresh single case aborted")
+    finally:
+        puller.finalize()
+        run.finished_at = timezone.now()
+        if puller.errors:
+            run.error_log = "\n".join(puller.errors)[:10000]
+        run.save()
+    return _summarize_refresh(run, scope="case")

@@ -2,7 +2,7 @@ import uuid
 from datetime import timedelta
 from types import SimpleNamespace
 
-from django.test import SimpleTestCase, TestCase
+from django.test import SimpleTestCase, TestCase, override_settings
 from django.urls import reverse
 from django.utils import timezone
 from rest_framework.test import APIClient
@@ -1292,6 +1292,79 @@ class NeedsReauthClassificationTest(SimpleTestCase):
 
     def test_lapsed_without_pending_case_is_needs_reauth(self):
         self.assertEqual(self._classify(awaiting_auth=False), "needs_reauth")
+
+
+class UniteUsRefreshTest(TestCase):
+    """The on-demand Unite Us refresh: the capture-aware server-refresh guard
+    (so we don't steal a rotating refresh token from a live agent session) and
+    the result summary that tells the UI when to prompt a reconnect."""
+
+    def _cred(self, **kw):
+        from .models import UniteUsCredential, UniteUsCredentialStatus
+
+        base = dict(
+            provider_id="p", employee_id="e", access_token="tok",
+            refresh_token="r", status=UniteUsCredentialStatus.ACTIVE,
+        )
+        base.update(kw)
+        return UniteUsCredential.objects.create(**base)
+
+    def test_recent_capture_skips_server_refresh(self):
+        from datetime import timedelta
+        from .models import UniteUsCredentialStatus
+        from .integrations.uniteus import client as uu_client
+
+        cred = self._cred(
+            access_expires_at=timezone.now() - timedelta(minutes=1),  # "expired"
+            last_captured_at=timezone.now(),                          # but just captured
+        )
+        # Expired by the clock, but a fresh capture means the browser is keeping
+        # the shared rotating chain alive -> use the token as-is, don't refresh.
+        self.assertTrue(uu_client.ensure_fresh(cred))
+        cred.refresh_from_db()
+        self.assertEqual(cred.status, UniteUsCredentialStatus.ACTIVE)
+
+    @override_settings(UNITEUS_TOKEN_URL="")
+    def test_stale_capture_refreshes_and_expires_without_token_url(self):
+        from datetime import timedelta
+        from .models import UniteUsCredentialStatus
+        from .integrations.uniteus import client as uu_client
+
+        cred = self._cred(
+            access_expires_at=timezone.now() - timedelta(minutes=1),
+            last_captured_at=timezone.now() - timedelta(hours=2),  # stale (off-hours)
+        )
+        # Stale capture -> the guard allows a server refresh. With no token URL
+        # configured, refresh_credential can't call out, so it marks the
+        # credential EXPIRED and returns False (no network hit).
+        self.assertFalse(uu_client.ensure_fresh(cred))
+        cred.refresh_from_db()
+        self.assertEqual(cred.status, UniteUsCredentialStatus.EXPIRED)
+
+    def test_summary_flags_reconnect_on_expired(self):
+        from .models import ImportRun, ImportRunStatus
+        from .services.uniteus_import import _summarize_refresh
+
+        run = ImportRun.objects.create(
+            source="uniteus", status=ImportRunStatus.FAILED,
+        )
+        run.error_log = "credential expired: nope"
+        run.save()
+        res = _summarize_refresh(run, scope="case")
+        self.assertTrue(res["needs_reconnect"])
+        self.assertFalse(res["ok"])
+
+    def test_summary_ok_reports_change_count(self):
+        from .models import ImportRun, ImportRunStatus
+        from .services.uniteus_import import _summarize_refresh
+
+        run = ImportRun.objects.create(
+            source="uniteus", status=ImportRunStatus.COMPLETED, updated_count=2,
+        )
+        res = _summarize_refresh(run, scope="member")
+        self.assertTrue(res["ok"])
+        self.assertFalse(res["needs_reconnect"])
+        self.assertIn("2", res["message"])
 
 
 class RecomputeSwitchesPlanKindTest(TestCase):

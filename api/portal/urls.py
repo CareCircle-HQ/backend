@@ -6,6 +6,7 @@ from rest_framework.routers import SimpleRouter
 from .auth import PortalRequestCodeView, PortalVerifyCodeView
 from .views_care_management import CareManagementListView
 from .views_delivery_address import DeliveryAddressListView
+from .views_member_uniteus import MemberUniteUsRefreshView
 from .views_dashboard import DashboardServingListView, DashboardView
 from .views_dashboard_verification import (
     VerificationDashboardListView,
@@ -192,6 +193,11 @@ urlpatterns = [
     path("members/<uuid:client_id>/reactivate/", MemberServiceReactivateView.as_view()),
     path("members/<uuid:client_id>/notes/", MemberNotesView.as_view()),
     path("members/<uuid:client_id>/cases/", MemberCasesView.as_view()),
+    path(
+        "members/<uuid:client_id>/refresh-uniteus/",
+        MemberUniteUsRefreshView.as_view(),
+        name="portal-member-refresh-uniteus",
+    ),
     path(
         "members/<uuid:client_id>/cases/<uuid:case_id>/history/",
         MemberCaseHistoryView.as_view(),
