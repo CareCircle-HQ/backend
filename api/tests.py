@@ -1387,6 +1387,47 @@ class UniteUsRefreshTest(TestCase):
         self.assertIn("No changes", res["message"])
 
 
+class CsvCaseMappingTest(SimpleTestCase):
+    """map_case_row must reliably translate the Unite Us cases-export
+    case_status + service_authorization_status onto our enums so a re-import
+    actually updates those fields (not just create new rows)."""
+
+    def _map(self, **row):
+        from .services.csv_import import map_case_row
+
+        base = {
+            "case_id": "c1", "client_id": "cl1", "program_name": "Meals",
+            "service_subtype": "Home Delivered Meals",
+        }
+        base.update(row)
+        return map_case_row(base)
+
+    def test_case_status_known_values_map_through(self):
+        self.assertEqual(self._map(case_status="managed")["case_status"], "managed")
+        self.assertEqual(self._map(case_status="off_platform")["case_status"], "off_platform")
+        self.assertEqual(self._map(case_status="closed")["case_status"], "closed")
+
+    def test_case_status_unknown_falls_back_to_open(self):
+        self.assertEqual(self._map(case_status="somethingelse")["case_status"], "open")
+
+    def test_auth_aliases_map(self):
+        self.assertEqual(
+            self._map(service_authorization_status="accepted")["service_authorization_status"],
+            "approved",
+        )
+        self.assertEqual(
+            self._map(service_authorization_status="requested")["service_authorization_status"],
+            "pending",
+        )
+
+    def test_auth_direct_enum_values(self):
+        for raw in ("pending", "approved", "denied", "expired", "not_required"):
+            self.assertEqual(
+                self._map(service_authorization_status=raw)["service_authorization_status"],
+                raw,
+            )
+
+
 class RecomputeSwitchesPlanKindTest(TestCase):
     """Regression: applying the PO Blockers 'program_switched' fix must actually
     flip the plan's KIND snapshot. update_household_cadence previously updated
