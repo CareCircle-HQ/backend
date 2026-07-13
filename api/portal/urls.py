@@ -5,6 +5,7 @@ from rest_framework.routers import SimpleRouter
 
 from .auth import PortalRequestCodeView, PortalVerifyCodeView
 from .views_care_management import CareManagementListView
+from .views_delivery_address import DeliveryAddressListView
 from .views_dashboard import DashboardServingListView, DashboardView
 from .views_dashboard_verification import (
     VerificationDashboardListView,
@@ -318,6 +319,13 @@ urlpatterns = [
         "care-management/",
         CareManagementListView.as_view(),
         name="portal-care-management",
+    ),
+
+    # Delivery Address (Customer Service)
+    path(
+        "delivery-addresses/",
+        DeliveryAddressListView.as_view(),
+        name="portal-delivery-addresses",
     ),
 
     # Dashboard
