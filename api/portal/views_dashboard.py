@@ -368,10 +368,12 @@ class DashboardView(PortalAPIView):
     * members     -- [TIME-FRAME] distinct clients across those open cases'
       households, split into Primary members (household heads / case holders)
       vs Members of Household. A client with several open cases counts once.
-    * cancel_rate -- [TIME-FRAME] (closed + cancelled + on-hold) internal-service
-      cases as a proportion of all in-range internal-service cases opened.
-      On-hold counts here because it flags a problem case under review that may
-      close (distinct from a benign, temporary member-level Pause).
+    * cancel_rate -- [TIME-FRAME] attrition: distinct members who are Paused,
+      have their household On Hold, are Out of Orbit / Out of Range, or hold a
+      Cancelled enrollment, summed, as a percentage of the distinct members
+      enrolled in accepted-authorization (open + APPROVED) internal-service
+      cases (the base). Can exceed 100% since the lost buckets are not a strict
+      subset of the accepted-case base.
     * total_enrolled -- [ALL TIME] distinct members in the households of ALL
       internal-service cases, regardless of status.
     * active_delivery_members -- [ALL TIME] distinct members currently ACTIVE in
@@ -473,24 +475,49 @@ class DashboardView(PortalAPIView):
             .count()
         )
 
-        # --- 1.6 Cancel / churn rate --------------------------------------
-        total_opened = ic_in_range.count()
-        closed = ic_in_range.filter(case_status=CaseStatus.CLOSED).count()
-        cancelled = ic_in_range.filter(case_status=CaseStatus.CANCELLED).count()
-        paused = (
-            ic_in_range.exclude(case_status__in=_TERMINAL_CASE_STATUSES)
-            .filter(enrollments__stage=EnrollmentStage.ON_HOLD)
-            .distinct()
-            .count()
+        # --- 1.6 Cancel rate (TIME-FRAME SENSITIVE) -----------------------
+        # Attrition: distinct members who fell out of / are blocked from active
+        # service (Paused, household On Hold, Out of Orbit, Out of Range, or a
+        # Cancelled enrollment) as a share of the members enrolled in
+        # accepted-authorization (open + APPROVED) cases.
+        mdp = MemberDietaryProfile.objects
+
+        def _lost(**flt):
+            return (
+                _scope_members(mdp.filter(**flt), start, end)
+                .values("client_id").distinct().count()
+            )
+
+        cr_paused = _lost(status=MemberStatus.PAUSED)
+        cr_on_hold = _lost(enrollment__stage=EnrollmentStage.ON_HOLD)
+        cr_out_of_orbit = _lost(status=MemberStatus.OUT_OF_ORBIT)
+        cr_out_of_range = _lost(status=MemberStatus.OUT_OF_RANGE)
+        cr_cancelled = _lost(enrollment__stage=EnrollmentStage.CANCELLED)
+        lost_total = (
+            cr_paused + cr_on_hold + cr_out_of_orbit + cr_out_of_range + cr_cancelled
         )
-        churned = closed + cancelled + paused
+
+        # Base: distinct members across the households of accepted-authorization
+        # (open + APPROVED) internal-service cases in range.
+        accepted_case_clients = set(
+            open_cases.filter(
+                service_authorization_status=ServiceAuthorizationStatus.APPROVED
+            ).values_list("client_id", flat=True)
+        )
+        accepted_members = self._household_member_count(accepted_case_clients)
+
         cancel_rate = {
-            "closed": closed,
-            "cancelled": cancelled,
-            "paused": paused,
-            "churned": churned,
-            "total_opened": total_opened,
-            "rate": round(churned / total_opened * 100, 1) if total_opened else 0.0,
+            "paused": cr_paused,
+            "on_hold": cr_on_hold,
+            "out_of_orbit": cr_out_of_orbit,
+            "out_of_range": cr_out_of_range,
+            "cancelled": cr_cancelled,
+            "lost_total": lost_total,
+            "base": accepted_members,
+            "rate": (
+                round(lost_total / accepted_members * 100, 1)
+                if accepted_members else 0.0
+            ),
         }
 
         # --- Section 2: member serving-status breakdown --------------------
