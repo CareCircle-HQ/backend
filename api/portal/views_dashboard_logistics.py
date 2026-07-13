@@ -39,6 +39,7 @@ from ..models import (
     DeliveryCadence,
     DeliveryOrder,
     DeliveryOrderStatus,
+    EnrollmentStage,
     HouseholdMember,
     Kitchen,
     MemberDeliverySchedule,
@@ -635,14 +636,17 @@ def _distribution_plan_qs(scope, today):
     the counts reflect who would actually be served: households On Hold or in a
     terminal stage (``SERVICE_EXCLUDED_ENROLLMENT_STAGES``) and Paused / Out of
     Orbit / Out of Range / Inactive members (``SERVICE_EXCLUDED_MEMBER_STATUSES``)
-    are dropped. ``all`` is the unfiltered superset (every plan, any status/date)
-    for auditing."""
+    are dropped. Households still in ``KITCHEN_ASSIGNMENT`` (waiting to be assigned
+    a kitchen) are also dropped: they aren't distributed yet, so counting them
+    only inflated the Unassigned bucket. ``all`` is the unfiltered superset (every
+    plan, any status/date) for auditing."""
     qs = MemberDeliverySchedule.objects.all()
     if scope == "active":
         qs = (
             qs.filter(status=ScheduleStatus.SCHEDULED)
             .filter(Q(ends_on__isnull=True) | Q(ends_on__gte=today))
             .exclude(enrollment__stage__in=SERVICE_EXCLUDED_ENROLLMENT_STAGES)
+            .exclude(enrollment__stage=EnrollmentStage.KITCHEN_ASSIGNMENT)
             .exclude(member_profile__status__in=SERVICE_EXCLUDED_MEMBER_STATUSES)
         )
     return qs
