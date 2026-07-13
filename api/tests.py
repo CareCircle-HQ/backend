@@ -1138,14 +1138,22 @@ class DashboardServingClientIdsTests(TestCase):
         from .models import EnrollmentStage, MemberStatus
         from .portal.views_dashboard import serving_client_ids
 
-        paused = self._member(status=MemberStatus.PAUSED)
+        paused = self._member(
+            status=MemberStatus.PAUSED, stage=EnrollmentStage.SERVICE_ACTIVE
+        )
         on_hold = self._member(stage=EnrollmentStage.ON_HOLD)  # status Active
         active = self._member()
+        # Out-of-Range members of an on-hold household surface under their own
+        # reason, so they must NOT also be counted here (no double counting).
+        oor_on_hold = self._member(
+            status=MemberStatus.OUT_OF_RANGE, stage=EnrollmentStage.ON_HOLD
+        )
 
         ids = serving_client_ids("services_paused", start=None, end=None)
         self.assertIn(paused.client_id, ids)
         self.assertIn(on_hold.client_id, ids)
         self.assertNotIn(active.client_id, ids)
+        self.assertNotIn(oor_on_hold.client_id, ids)
 
     def test_no_insurance_clears_when_active_plan_added(self):
         from .models import Insurance, InsurancePlanType, RecordStatus

@@ -166,10 +166,21 @@ def serving_client_ids(reason, *, start, end):
             mdp.filter(status=MemberStatus.OUT_OF_ORBIT)
         ).values_list("client_id", flat=True))
     if reason == "services_paused":
-        # Member-level Pause (benign) OR household ON_HOLD (problem/review).
+        # Mirror the Receiving Meals card's pipeline split EXACTLY so the two
+        # cards reconcile (services_paused == receiving.paused + receiving.on_hold):
+        # a member individually Paused within the active-service pipeline, OR an
+        # otherwise-Active member whose household is On Hold. Out-of-Orbit /
+        # Out-of-Range members of on-hold households are deliberately excluded --
+        # they surface under their own reasons, so counting them here too would
+        # double-count them.
         return set(scope(mdp.filter(
-            Q(status=MemberStatus.PAUSED)
-            | Q(enrollment__stage=EnrollmentStage.ON_HOLD)
+            Q(
+                status=MemberStatus.PAUSED,
+                enrollment__stage__in=[
+                    EnrollmentStage.SERVICE_ACTIVE, EnrollmentStage.ON_HOLD,
+                ],
+            )
+            | Q(status=MemberStatus.ACTIVE, enrollment__stage=EnrollmentStage.ON_HOLD)
         )).values_list("client_id", flat=True))
     if reason == "multiple_cases":
         open_cases = _scope_by_opened(
