@@ -5,6 +5,10 @@ from rest_framework.routers import SimpleRouter
 
 from .auth import PortalRequestCodeView, PortalVerifyCodeView
 from .views_dashboard import DashboardServingListView, DashboardView
+from .views_dashboard_verification import (
+    VerificationDashboardListView,
+    VerificationDashboardView,
+)
 from .views_leads import (
     PortalLeadDetailView,
     PortalLeadNotesView,
@@ -298,6 +302,16 @@ urlpatterns = [
         "dashboard/serving/<str:reason>/",
         DashboardServingListView.as_view(),
         name="portal-dashboard-serving-list",
+    ),
+    path(
+        "dashboard/verification/",
+        VerificationDashboardView.as_view(),
+        name="portal-dashboard-verification",
+    ),
+    path(
+        "dashboard/verification/<str:reason>/",
+        VerificationDashboardListView.as_view(),
+        name="portal-dashboard-verification-list",
     ),
 
     # Settings CRUD viewsets
