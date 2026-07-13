@@ -46,10 +46,15 @@ class MemberUniteUsRefreshView(PortalAPIView):
 
         # Prefer the requesting agent's captured session, else the freshest active
         # provider credential (the daily cron pull uses every active cred anyway).
+        # Defer the encrypted token columns so merely SELECTING a credential never
+        # eagerly decrypts (a wrong/rotated FIELD_ENCRYPTION_KEY would otherwise
+        # 500 here); decryption is attempted later where it's handled gracefully.
         agent = current_agent(request)
-        active = UniteUsCredential.objects.filter(
-            status=UniteUsCredentialStatus.ACTIVE
-        ).order_by("-last_captured_at", "-updated_at")
+        active = (
+            UniteUsCredential.objects.filter(status=UniteUsCredentialStatus.ACTIVE)
+            .defer("access_token", "refresh_token")
+            .order_by("-last_captured_at", "-updated_at")
+        )
         cred = (active.filter(agent=agent).first() if agent else None) or active.first()
         if cred is None:
             return Response(

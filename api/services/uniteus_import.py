@@ -484,8 +484,14 @@ _RECONNECT_MARKERS = ("expired", "unusable", "not usable", "no active unite us")
 
 def _select_active_credential(provider_id=None):
     """Pick the credential for an on-demand refresh: the most-recently-captured
-    active one (freshest token), optionally scoped to a provider."""
-    qs = UniteUsCredential.objects.filter(status=UniteUsCredentialStatus.ACTIVE)
+    active one (freshest token), optionally scoped to a provider.
+
+    Defers the encrypted token columns so selecting a credential never eagerly
+    decrypts -- a wrong/rotated FIELD_ENCRYPTION_KEY is surfaced later (in
+    _refresh_single_case, wrapped) as a clean 'reconnect' result, not a 500."""
+    qs = UniteUsCredential.objects.filter(
+        status=UniteUsCredentialStatus.ACTIVE
+    ).defer("access_token", "refresh_token")
     if provider_id:
         qs = qs.filter(provider_id=provider_id)
     return qs.order_by("-last_captured_at", "-updated_at").first()
