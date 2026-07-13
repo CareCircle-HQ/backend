@@ -598,6 +598,32 @@ class LogisticsDashboardListView(PortalAPIView):
         return Response({"reason": reason, "count": len(results), "results": results})
 
 
+def _plan_is_box(ptype, program_name, kitchen_products):
+    """Meals-vs-boxes for a delivery plan, most reliable signal first:
+    (1) the plan's ``product_type.type``; (2) a meal/box keyword in the program
+    name (matches the forecast page); (3) the kitchen fleet -- a box-only kitchen
+    implies boxes, otherwise meals. Never infers boxes from missing data."""
+    if ptype:
+        return ptype == ProductTypeKind.BOXES
+    kind = product_type_kind_for_name(program_name)
+    if kind is not None:
+        return kind == ProductTypeKind.BOXES
+    return "box" in (kitchen_products or []) and "meal" not in (kitchen_products or [])
+
+
+def _distribution_plan_qs(scope, today):
+    """Base MemberDeliverySchedule queryset for the distribution views, scoped to
+    ``active`` (SCHEDULED plans whose window covers today) or ``all``."""
+    qs = MemberDeliverySchedule.objects.all()
+    if scope == "active":
+        qs = (
+            qs.filter(status=ScheduleStatus.SCHEDULED)
+            .filter(Q(starts_on__isnull=True) | Q(starts_on__lte=today))
+            .filter(Q(ends_on__isnull=True) | Q(ends_on__gte=today))
+        )
+    return qs
+
+
 class DistributionOverviewView(PortalAPIView):
     """Distribution Overview (Logistics / Management).
 
@@ -632,13 +658,7 @@ class DistributionOverviewView(PortalAPIView):
             scope = "active"
         today = timezone.localdate()
 
-        qs = MemberDeliverySchedule.objects.all()
-        if scope == "active":
-            qs = (
-                qs.filter(status=ScheduleStatus.SCHEDULED)
-                .filter(Q(starts_on__isnull=True) | Q(starts_on__lte=today))
-                .filter(Q(ends_on__isnull=True) | Q(ends_on__gte=today))
-            )
+        qs = _distribution_plan_qs(scope, today)
 
         # Kitchen fleet products, used as a last-resort kind hint below.
         kitchen_products = {
@@ -663,30 +683,13 @@ class DistributionOverviewView(PortalAPIView):
             cell["boxes" if is_box else "meals"] += n
             cell["total"] += n
 
-        def classify_box(ptype, program_name, kkey):
-            """Meals-vs-boxes for a plan, most reliable signal first.
-
-            1. The plan's ``product_type.type`` (authoritative when snapshotted).
-            2. A meal/box keyword in the program name (matches the forecast page).
-            3. The kitchen fleet: a box-only kitchen implies boxes, otherwise
-               meals. Never treat "no data" as boxes -- most plans are meals and
-               ``meals_per_day`` is frequently 0/unset on meal plans, which is
-               what previously inflated the box counts.
-            """
-            if ptype:
-                return ptype == ProductTypeKind.BOXES
-            kind = product_type_kind_for_name(program_name)
-            if kind is not None:
-                return kind == ProductTypeKind.BOXES
-            prods = kitchen_products.get(kkey, [])
-            return "box" in prods and "meal" not in prods
-
         for row in grouped:
             code = row["delivery_days_cadence"] or ""
             kid = row["enrollment__kitchen_id"]
             kkey = str(kid) if kid else self.UNASSIGNED
-            is_box = classify_box(
-                row["product_type__type"], row["program__name"], kkey
+            is_box = _plan_is_box(
+                row["product_type__type"], row["program__name"],
+                kitchen_products.get(kkey, []),
             )
             n = row["n"] or 0
             cadence_present.add(code)
@@ -764,4 +767,111 @@ class DistributionOverviewView(PortalAPIView):
             "row_totals": row_totals,
             "col_totals": col_totals,
             "grand_total": grand,
+        })
+
+
+class DistributionKitchenMembersView(PortalAPIView):
+    """Drill-down for the Distribution Overview: the members (clients) assigned
+    to one kitchen, ordered by cadence then name, paginated for lazy loading.
+
+    ``GET /portal/dashboard/distribution/<kitchen>/members/`` where ``kitchen``
+    is a Kitchen pk or the literal ``unassigned``. Query params:
+    * ``scope``  -- ``active`` (default) | ``all`` (mirrors the matrix).
+    * ``page``   -- 1-based page number (default 1).
+    * ``search`` -- case-insensitive name filter.
+
+    Each row carries the Client id (for the CRM deep-link), name, cadence and the
+    resolved meals/boxes kind. Grouping by cadence is done client-side; ordering
+    by cadence keeps groups contiguous across pages.
+    """
+
+    PAGE_SIZE = 100
+
+    def get(self, request, kitchen):
+        agent = current_agent(request)
+        if not _is_privileged(agent):
+            return Response(
+                {"detail": "Logistics dashboard access required."}, status=403
+            )
+
+        scope = (request.query_params.get("scope") or "active").lower()
+        if scope not in ("active", "all"):
+            scope = "active"
+        try:
+            page = max(1, int(request.query_params.get("page") or 1))
+        except (TypeError, ValueError):
+            page = 1
+        search = (request.query_params.get("search") or "").strip()
+        today = timezone.localdate()
+
+        qs = _distribution_plan_qs(scope, today)
+        if kitchen == "unassigned":
+            qs = qs.filter(enrollment__kitchen__isnull=True)
+            kitchen_name = "Unassigned"
+            kitchen_products = []
+        else:
+            k = Kitchen.objects.filter(pk=kitchen).first()
+            if k is None:
+                return Response({"detail": "Kitchen not found."}, status=404)
+            qs = qs.filter(enrollment__kitchen_id=kitchen)
+            kitchen_name = k.name
+            kitchen_products = k.supported_products or []
+
+        if search:
+            qs = qs.filter(
+                Q(member_name__icontains=search)
+                | Q(member_profile__client__first_name__icontains=search)
+                | Q(member_profile__client__last_name__icontains=search)
+            )
+
+        cadence_labels = dict(DeliveryCadence.choices)
+        cadence_labels.update(
+            {c.code: c.label for c in Cadence.objects.all() if c.code}
+        )
+
+        def cadence_label(code):
+            if not code:
+                return "Unassigned"
+            return cadence_labels.get(code) or code.replace("_", " ").title()
+
+        rows = qs.order_by("delivery_days_cadence", "member_name").values(
+            "member_profile__client_id",
+            "member_profile__client__first_name",
+            "member_profile__client__last_name",
+            "member_name",
+            "delivery_days_cadence",
+            "product_type__type",
+            "program__name",
+        )
+        total = rows.count()
+        start = (page - 1) * self.PAGE_SIZE
+        window = list(rows[start:start + self.PAGE_SIZE])
+
+        results = []
+        for r in window:
+            first = (r["member_profile__client__first_name"] or "").strip()
+            last = (r["member_profile__client__last_name"] or "").strip()
+            name = (f"{first} {last}".strip()) or r["member_name"] or "Unknown"
+            code = r["delivery_days_cadence"] or ""
+            is_box = _plan_is_box(
+                r["product_type__type"], r["program__name"], kitchen_products
+            )
+            results.append({
+                "client_id": str(r["member_profile__client_id"])
+                if r["member_profile__client_id"] else None,
+                "name": name,
+                "cadence_code": code or "unassigned",
+                "cadence_label": cadence_label(code),
+                "kind": "boxes" if is_box else "meals",
+            })
+
+        return Response({
+            "kitchen": kitchen,
+            "kitchen_name": kitchen_name,
+            "scope": scope,
+            "page": page,
+            "page_size": self.PAGE_SIZE,
+            "total": total,
+            "has_more": start + len(window) < total,
+            "results": results,
         })
