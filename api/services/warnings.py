@@ -61,12 +61,23 @@ INSURANCE_EXPIRING_DAYS = 30
 # --- Stable warning codes --------------------------------------------------
 MULTIPLE_OPEN_CASES = "multiple_open_cases"
 CONFLICTING_PRODUCT_TYPES = "conflicting_product_types"
+NO_KITCHEN = "no_kitchen"
 NO_CADENCE = "no_cadence"
 CADENCE_NOT_SUPPORTED_BY_KITCHEN = "cadence_not_supported_by_kitchen"
 KITCHEN_MISSING_PRODUCT = "kitchen_missing_product"
 CADENCE_KIND_MISMATCH = "cadence_kind_mismatch"
 INSURANCE_EXPIRING = "insurance_expiring"
 INTERNAL_CASE_EXPIRED = "internal_case_expired"
+
+# Stages where a household is expected to have a kitchen + cadence: it is being
+# assigned (KITCHEN_ASSIGNMENT) or already running (SERVICE_ACTIVE). These are
+# the same stages the Distribution Overview counts, so an unassigned member
+# surfaced there is now also surfaced on Care Management. During assignment a
+# gap is expected work (ORANGE); once active a gap is broken service (RED).
+_ASSIGNMENT_STAGES = (
+    EnrollmentStage.KITCHEN_ASSIGNMENT,
+    EnrollmentStage.SERVICE_ACTIVE,
+)
 
 # Meals/Boxes ProductTypeKind -> the KitchenProductType a kitchen must support.
 _KIND_TO_KITCHEN_PRODUCT = {
@@ -192,15 +203,38 @@ def check_conflicting_product_types(ctx):
     )]
 
 
-def check_no_cadence(ctx):
-    if ctx.stage != EnrollmentStage.SERVICE_ACTIVE or ctx.cadence:
+def check_no_kitchen(ctx):
+    if ctx.stage not in _ASSIGNMENT_STAGES or ctx.kitchen is not None:
         return []
+    active = ctx.stage == EnrollmentStage.SERVICE_ACTIVE
+    return [Warning(
+        code=NO_KITCHEN,
+        severity=RED if active else ORANGE,
+        scope="household",
+        title="No kitchen assigned",
+        detail=(
+            "This household is active but has no kitchen assigned."
+            if active else
+            "This household is awaiting kitchen assignment."
+        ),
+        client_id=ctx.client.pk,
+    )]
+
+
+def check_no_cadence(ctx):
+    if ctx.stage not in _ASSIGNMENT_STAGES or ctx.cadence:
+        return []
+    active = ctx.stage == EnrollmentStage.SERVICE_ACTIVE
     return [Warning(
         code=NO_CADENCE,
-        severity=RED,
+        severity=RED if active else ORANGE,
         scope="household",
         title="No cadence assigned",
-        detail="This household is active but has no delivery cadence set.",
+        detail=(
+            "This household is active but has no delivery cadence set."
+            if active else
+            "This household is awaiting a delivery cadence."
+        ),
         client_id=ctx.client.pk,
     )]
 
@@ -342,6 +376,7 @@ def check_internal_case_expired(ctx):
 # Registry — add a new check here and it flows everywhere. Order is display
 # order within a severity band; the UI re-sorts by severity (red first).
 WARNING_CHECKS = [
+    check_no_kitchen,
     check_no_cadence,
     check_cadence_not_supported_by_kitchen,
     check_kitchen_missing_product,

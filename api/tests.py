@@ -1684,17 +1684,47 @@ class MemberWarningsTest(TestCase):
 
         return {w.code for w in evaluate_enrollment_warnings(enr)}
 
-    def test_no_cadence_only_when_service_active(self):
+    def test_no_cadence_flagged_across_assignment_stages(self):
         from .models import EnrollmentStage
         from .services.warnings import NO_CADENCE
 
+        # Both the assignment stage and active service must surface an
+        # unassigned cadence, matching what Distribution Overview counts.
         active = self._enrollment(self._client(), stage=EnrollmentStage.SERVICE_ACTIVE)
         self.assertIn(NO_CADENCE, self._codes(active))
 
         pending = self._enrollment(
             self._client(), stage=EnrollmentStage.KITCHEN_ASSIGNMENT
         )
-        self.assertNotIn(NO_CADENCE, self._codes(pending))
+        self.assertIn(NO_CADENCE, self._codes(pending))
+
+        # A household not yet at assignment must NOT be flagged.
+        verified = self._enrollment(
+            self._client(), stage=EnrollmentStage.VERIFIED
+        )
+        self.assertNotIn(NO_CADENCE, self._codes(verified))
+
+    def test_no_kitchen_flagged_across_assignment_stages(self):
+        from .models import EnrollmentStage, Kitchen, KitchenProductType, KitchenStatus
+        from .services.warnings import NO_KITCHEN
+
+        # Active + assignment stages with no kitchen are unassigned (surfaced
+        # on Distribution Overview) and must appear on Care Management.
+        active = self._enrollment(self._client(), stage=EnrollmentStage.SERVICE_ACTIVE)
+        self.assertIn(NO_KITCHEN, self._codes(active))
+
+        pending = self._enrollment(
+            self._client(), stage=EnrollmentStage.KITCHEN_ASSIGNMENT
+        )
+        self.assertIn(NO_KITCHEN, self._codes(pending))
+
+        # A household with a kitchen assigned is not flagged.
+        kitchen = Kitchen.objects.create(
+            name="AnyCo", status=KitchenStatus.ACTIVE,
+            supported_products=[KitchenProductType.MEAL],
+        )
+        assigned = self._enrollment(self._client(), kitchen=kitchen)
+        self.assertNotIn(NO_KITCHEN, self._codes(assigned))
 
     def test_multiple_open_cases(self):
         from .services.warnings import MULTIPLE_OPEN_CASES
