@@ -640,12 +640,18 @@ class DistributionOverviewView(PortalAPIView):
                 .filter(Q(ends_on__isnull=True) | Q(ends_on__gte=today))
             )
 
+        # Kitchen fleet products, used as a last-resort kind hint below.
+        kitchen_products = {
+            str(k.pk): (k.supported_products or [])
+            for k in Kitchen.objects.all()
+        }
+
         grouped = qs.values(
             "delivery_days_cadence",
             "enrollment__kitchen_id",
             "enrollment__kitchen__name",
             "product_type__type",
-            "meals_per_day",
+            "program__name",
         ).annotate(n=Count("member_profile_id", distinct=True))
 
         # cell key -> {meals, boxes, total}; track which cadences/kitchens appear.
@@ -657,17 +663,31 @@ class DistributionOverviewView(PortalAPIView):
             cell["boxes" if is_box else "meals"] += n
             cell["total"] += n
 
+        def classify_box(ptype, program_name, kkey):
+            """Meals-vs-boxes for a plan, most reliable signal first.
+
+            1. The plan's ``product_type.type`` (authoritative when snapshotted).
+            2. A meal/box keyword in the program name (matches the forecast page).
+            3. The kitchen fleet: a box-only kitchen implies boxes, otherwise
+               meals. Never treat "no data" as boxes -- most plans are meals and
+               ``meals_per_day`` is frequently 0/unset on meal plans, which is
+               what previously inflated the box counts.
+            """
+            if ptype:
+                return ptype == ProductTypeKind.BOXES
+            kind = product_type_kind_for_name(program_name)
+            if kind is not None:
+                return kind == ProductTypeKind.BOXES
+            prods = kitchen_products.get(kkey, [])
+            return "box" in prods and "meal" not in prods
+
         for row in grouped:
             code = row["delivery_days_cadence"] or ""
             kid = row["enrollment__kitchen_id"]
             kkey = str(kid) if kid else self.UNASSIGNED
-            ptype = row["product_type__type"]
-            if ptype:
-                is_box = ptype == ProductTypeKind.BOXES
-            else:
-                # No product_type snapshot: infer from the meal rate (meals set a
-                # per-day rate; boxes don't).
-                is_box = not row["meals_per_day"]
+            is_box = classify_box(
+                row["product_type__type"], row["program__name"], kkey
+            )
             n = row["n"] or 0
             cadence_present.add(code)
             kitchen_present.add(kkey)
