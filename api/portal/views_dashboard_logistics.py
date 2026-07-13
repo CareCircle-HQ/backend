@@ -829,20 +829,34 @@ class DistributionKitchenMembersView(PortalAPIView):
         kind_filter = (request.query_params.get("kind") or "").lower()
         if kind_filter not in ("meals", "boxes"):
             kind_filter = ""
+        # Optional cadence filter. The literal "unassigned" selects plans with no
+        # delivery cadence set (the matrix's Unassigned cadence row).
+        cadence_filter = (request.query_params.get("cadence") or "").strip()
         today = timezone.localdate()
 
+        # Kitchen fleet products keyed by pk, used to classify meals/boxes per row
+        # (needed when kitchen == "all", where rows span kitchens).
+        kitchen_products_map = {
+            str(k.pk): (k.supported_products or []) for k in Kitchen.objects.all()
+        }
+
         qs = _distribution_plan_qs(scope, today)
-        if kitchen == "unassigned":
+        if kitchen == "all":
+            kitchen_name = "All kitchens"
+        elif kitchen == "unassigned":
             qs = qs.filter(enrollment__kitchen__isnull=True)
             kitchen_name = "Unassigned"
-            kitchen_products = []
         else:
             k = Kitchen.objects.filter(pk=kitchen).first()
             if k is None:
                 return Response({"detail": "Kitchen not found."}, status=404)
             qs = qs.filter(enrollment__kitchen_id=kitchen)
             kitchen_name = k.name
-            kitchen_products = k.supported_products or []
+
+        if cadence_filter == "unassigned":
+            qs = qs.filter(delivery_days_cadence="")
+        elif cadence_filter:
+            qs = qs.filter(delivery_days_cadence=cadence_filter)
 
         if search:
             qs = qs.filter(
@@ -861,7 +875,9 @@ class DistributionKitchenMembersView(PortalAPIView):
                 return "Unassigned"
             return cadence_labels.get(code) or code.replace("_", " ").title()
 
-        rows = qs.order_by("delivery_days_cadence", "member_name").values(
+        rows = qs.order_by(
+            "enrollment__kitchen__name", "delivery_days_cadence", "member_name"
+        ).values(
             "member_profile__client_id",
             "member_profile__client__first_name",
             "member_profile__client__last_name",
@@ -869,6 +885,8 @@ class DistributionKitchenMembersView(PortalAPIView):
             "delivery_days_cadence",
             "product_type__type",
             "program__name",
+            "enrollment__kitchen_id",
+            "enrollment__kitchen__name",
         )
 
         def to_row(r):
@@ -876,8 +894,10 @@ class DistributionKitchenMembersView(PortalAPIView):
             last = (r["member_profile__client__last_name"] or "").strip()
             name = (f"{first} {last}".strip()) or r["member_name"] or "Unknown"
             code = r["delivery_days_cadence"] or ""
+            kid = r["enrollment__kitchen_id"]
             is_box = _plan_is_box(
-                r["product_type__type"], r["program__name"], kitchen_products
+                r["product_type__type"], r["program__name"],
+                kitchen_products_map.get(str(kid), []) if kid else [],
             )
             return {
                 "client_id": str(r["member_profile__client_id"])
@@ -885,6 +905,7 @@ class DistributionKitchenMembersView(PortalAPIView):
                 "name": name,
                 "cadence_code": code or "unassigned",
                 "cadence_label": cadence_label(code),
+                "kitchen_name": r["enrollment__kitchen__name"] or "Unassigned",
                 "kind": "boxes" if is_box else "meals",
             }
 
