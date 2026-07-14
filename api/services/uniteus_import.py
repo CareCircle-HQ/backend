@@ -29,6 +29,7 @@ from api.integrations.uniteus.api import (
 )
 from api.models import (
     Case,
+    CaseType,
     Client,
     ContractedService,
     ImportRun,
@@ -388,7 +389,18 @@ class DailyPull:
         if client_ids:
             client_ids = [str(c) for c in client_ids]
         else:
-            client_ids = [str(c) for c in Client.objects.values_list("client_id", flat=True)]
+            # Only refresh members who have at least one internal-service case --
+            # those are the ones whose Unite Us case status / authorization can
+            # change. Members with no internal-service case have nothing for the
+            # pull to update, so skipping them avoids needless API calls.
+            client_ids = [
+                str(c)
+                for c in Client.objects.filter(
+                    cases__case_type=CaseType.INTERNAL_SERVICE
+                )
+                .distinct()
+                .values_list("client_id", flat=True)
+            ]
             if client_limit:
                 client_ids = client_ids[:client_limit]
 

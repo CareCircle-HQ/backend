@@ -1456,6 +1456,62 @@ class UniteUsCaseMapperTest(SimpleTestCase):
         self.assertEqual(out["case_status"], "open")
 
 
+class DailyPullClientSelectionTest(TestCase):
+    """The nightly pull must iterate ONLY members who have at least one
+    internal-service case (whose Unite Us status/authorization can change), not
+    every stored client -- skipping the rest avoids needless API calls."""
+
+    def test_only_members_with_internal_service_case_are_pulled(self):
+        import uuid
+
+        from .models import (
+            Case, CaseType, Client, UniteUsCredential, UniteUsCredentialStatus,
+        )
+        from .services import uniteus_import
+
+        UniteUsCredential.objects.create(
+            provider_id="p", employee_id="e", access_token="tok",
+            refresh_token="r", status=UniteUsCredentialStatus.ACTIVE,
+        )
+        internal = Client.objects.create(
+            client_id=uuid.uuid4(), first_name="Ina", last_name="Ternal"
+        )
+        external = Client.objects.create(
+            client_id=uuid.uuid4(), first_name="Ex", last_name="Ternal"
+        )
+        # No cases at all -> must be skipped.
+        Client.objects.create(
+            client_id=uuid.uuid4(), first_name="No", last_name="Case"
+        )
+        Case.objects.create(
+            case_id=uuid.uuid4(), client=internal,
+            case_type=CaseType.INTERNAL_SERVICE,
+        )
+        Case.objects.create(
+            case_id=uuid.uuid4(), client=external,
+            case_type=CaseType.EXTERNAL_SERVICE,
+        )
+
+        seen = []
+
+        class RecordingClient:
+            def __init__(self, credential):
+                pass
+
+            def get_person(self, person_id, include="addresses"):
+                seen.append(str(person_id))
+                return {"data": {}}  # empty -> skipped, no further API calls
+
+        original = uniteus_import.uu_api.UniteUsClient
+        uniteus_import.uu_api.UniteUsClient = RecordingClient
+        try:
+            uniteus_import.run_daily_pull(triggered_by="test")
+        finally:
+            uniteus_import.uu_api.UniteUsClient = original
+
+        self.assertEqual(seen, [str(internal.client_id)])
+
+
 class RecomputeSwitchesPlanKindTest(TestCase):
     """Regression: applying the PO Blockers 'program_switched' fix must actually
     flip the plan's KIND snapshot. update_household_cadence previously updated
