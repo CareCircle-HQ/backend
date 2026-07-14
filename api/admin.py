@@ -560,7 +560,14 @@ class TimelineEventAdmin(admin.ModelAdmin):
         "occurred_at", "event_type", "client", "title", "badge_text",
         "badge_tone", "renewal_number", "source", "actor",
     )
-    list_filter = ("event_type", "badge_tone", "source", "renewal_number")
+    list_filter = (
+        "event_type", "badge_tone", "source", "renewal_number",
+        # Filter by INSERTION date (when a row was written) as well as the
+        # drill-down on occurred_at -- lets you isolate the rows a given import
+        # created (e.g. to bulk-delete a bad import's timeline events).
+        ("created_at", admin.DateFieldListFilter),
+        ("occurred_at", admin.DateFieldListFilter),
+    )
     search_fields = (
         "client__client_id", "client__first_name", "client__last_name",
         "title", "subtitle", "actor", "dedupe_key", "object_id",
