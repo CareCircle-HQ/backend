@@ -438,6 +438,11 @@ MEMBER_LIST_PREFETCH = (
         ),
     ),
     "member_profiles",
+    # The serializer's authorization_status/authorization_status_at read the
+    # client's Internal Service case via ``client.cases.all()`` (internal_service_case
+    # / primary_case). Prefetch here so the whole page costs ONE cases query
+    # instead of one-or-more per row (N+1).
+    "cases",
     # Roster of the client's household so the serializer can resolve the primary
     # member's client_id (household_primary_id) without an extra query per row.
     "household_membership__household__members",
@@ -1335,6 +1340,12 @@ class MembersListView(PortalGenericAPIView):
                         ),
                     ),
                     "client__member_profiles", "client__cases",
+                    # Household roster + household-level enrollments for the
+                    # serializer's household_primary_id and active_enrollment
+                    # dependent fallback -- prefetch so they cost a few queries
+                    # per page instead of one-or-more per member row (N+1).
+                    "client__household_membership__household__members",
+                    "client__household_membership__household__enrollment_verifications",
                 )
                 .order_by("-is_primary", "added_at")
             )
@@ -1380,7 +1391,7 @@ class MembersListView(PortalGenericAPIView):
 
         if ind_ids:
             clients = Client.objects.filter(client_id__in=ind_ids).prefetch_related(
-                *MEMBER_LIST_PREFETCH, "cases"
+                *MEMBER_LIST_PREFETCH
             )
             for c in clients:
                 if logistics and self._hidden_in_logistics(c):
