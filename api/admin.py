@@ -526,7 +526,11 @@ class TicketAdmin(SimpleHistoryAdmin):
         "id", "type", "status", "severity", "client", "case",
         "assigned_to", "created_at",
     )
-    list_filter = ("status", "type", "severity")
+    list_filter = ("status", "type", "severity", ("created_at", admin.DateFieldListFilter))
+    # Drill-down bar (year -> month -> day) at the top of the changelist: click a
+    # specific date to show only that day's tickets, then use the header
+    # "select all" checkbox / "Select all N tickets" link to bulk-select them.
+    date_hierarchy = "created_at"
     list_select_related = ("type", "client", "case", "assigned_to")
     search_fields = ("reason",)
     autocomplete_fields = ("type", "client", "case", "assigned_to", "import_run")
