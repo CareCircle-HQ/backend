@@ -2613,6 +2613,11 @@ class UniteUsCredential(models.Model):
     )
     last_captured_at = models.DateTimeField(null=True, blank=True)  # last extension push
     last_refreshed_at = models.DateTimeField(null=True, blank=True)
+    # When true this credential is the DEDICATED automation session (e.g. a Unite
+    # Us service account). Background jobs (exports automation) prefer it so a
+    # server-side token refresh never rotates -- and logs out -- a real agent's
+    # live browser session. Only one should be flagged at a time.
+    for_automation = models.BooleanField(default=False, db_index=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -2683,6 +2688,64 @@ class ImportRun(models.Model):
 
     def __str__(self):
         return f"ImportRun {self.pk} {self.source} ({self.status})"
+
+
+class UniteUsExportStatus(models.TextChoices):
+    """Our processing lifecycle for a requested Unite Us export (distinct from
+    Unite Us' own ``state``, which we mirror in ``unite_state``)."""
+
+    REQUESTED = "requested", "Requested"        # POSTed; waiting for Unite Us to generate
+    READY = "ready", "Ready"                    # Unite Us state=completed; file available
+    IMPORTING = "importing", "Importing"        # downloaded + handed to the import pipeline
+    IMPORTED = "imported", "Imported"           # ImportRun finished
+    FAILED = "failed", "Failed"
+
+
+class UniteUsExport(models.Model):
+    """One requested Unite Us export (Exports page) tracked through
+    request -> poll -> download -> import. Anchors idempotency (never import the
+    same export twice) and links to the ImportRun that ingested its CSV."""
+
+    # Unite Us export record UUID (from POST /v1/exports). Unique so the poller
+    # is idempotent.
+    export_id = models.CharField(max_length=64, unique=True, db_index=True)
+    # Unite Us export_type (e.g. "clients", "screeningsv2") and the CSV importer
+    # type we map it to (e.g. "screening").
+    export_type = models.CharField(max_length=64)
+    importer_type = models.CharField(max_length=40, blank=True)
+    # Requested reporting window.
+    start_date = models.DateField(null=True, blank=True)
+    end_date = models.DateField(null=True, blank=True)
+    # Raw Unite Us state (requested/processing/completed/failed/...) and OUR
+    # processing status.
+    unite_state = models.CharField(max_length=40, blank=True)
+    status = models.CharField(
+        max_length=20, choices=UniteUsExportStatus.choices,
+        default=UniteUsExportStatus.REQUESTED, db_index=True,
+    )
+    # The file_uploads record + filename once generated.
+    file_upload_id = models.CharField(max_length=64, blank=True)
+    filename = models.CharField(max_length=255, blank=True)
+    # Which credential/provider requested it, and who triggered our request.
+    provider_id = models.CharField(max_length=64, blank=True)
+    triggered_by = models.CharField(max_length=120, blank=True)  # cron | agent:355 | manual
+    # The import this export fed into (set once we hand the CSV to the pipeline).
+    import_run = models.ForeignKey(
+        "ImportRun", on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="uniteus_exports",
+    )
+    error_log = models.TextField(blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    downloaded_at = models.DateTimeField(null=True, blank=True)
+    imported_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        indexes = [models.Index(fields=["status", "created_at"])]
+
+    def __str__(self):
+        return f"UniteUsExport {self.export_type} {self.export_id} ({self.status})"
 
 
 # ===========================================================================

@@ -103,6 +103,8 @@ from .views_imports import (
     ImportUploadView,
     UniteUsAgentDetailView,
     UniteUsAgentsView,
+    UniteUsExportPollView,
+    UniteUsExportsView,
 )
 from .views_settings import (
     CadenceViewSet,
@@ -272,6 +274,9 @@ urlpatterns = [
     path("settings/imports/<int:run_id>/start/", ImportStartView.as_view(), name="portal-import-start"),
     # Settings > Import Activity: rollup of follow-up actions across case imports
     path("settings/import-activity/", ImportActivityView.as_view(), name="portal-import-activity"),
+    # Settings > Import: automated Unite Us exports (request -> poll -> import)
+    path("settings/uniteus-exports/", UniteUsExportsView.as_view(), name="portal-uniteus-exports"),
+    path("settings/uniteus-exports/poll/", UniteUsExportPollView.as_view(), name="portal-uniteus-exports-poll"),
     # Settings > Activity Log: cross-client timeline feed (admin audit view)
     path("activity/", ActivityLogView.as_view(), name="portal-activity"),
     path("activity/filters/", ActivityFiltersView.as_view(), name="portal-activity-filters"),
