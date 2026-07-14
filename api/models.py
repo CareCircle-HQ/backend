@@ -2933,6 +2933,7 @@ class TimelineEventType(models.TextChoices):
     MEMBER_PAUSED = "member_paused", "Member Paused"
     MEMBER_UNPAUSED = "member_unpaused", "Member Unpaused"
     HOUSEHOLD_MEMBER_ADDED = "household_member_added", "Household Member Added"
+    HOUSEHOLD_MEMBER_REMOVED = "household_member_removed", "Household Member Removed"
     PRODUCT_TYPE_CHANGED = "product_type_changed", "Product Type Changed"
     # --- Legacy coarse types: retained so existing rows stay valid; no longer
     # emitted by the timeline service (a data migration remaps old rows). ---
