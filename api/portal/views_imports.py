@@ -443,7 +443,72 @@ class UniteUsAgentsView(PortalAPIView):
 
 
 class UniteUsAgentDetailView(PortalAPIView):
-    """DELETE a Unite Us agent from the allowlist (remove from settings)."""
+    """Edit (PATCH) or remove (DELETE) a Unite Us agent in the allowlist."""
+
+    def patch(self, request, agent_id):
+        agent = UniteUsAgent.objects.filter(pk=agent_id).first()
+        if agent is None:
+            return Response(status=http.HTTP_404_NOT_FOUND)
+
+        data = request.data
+
+        # user_id is the natural key that joins to Case.created_by_id. It's
+        # editable (e.g. to fix a typo) but must stay a valid, unique UUID.
+        if "user_id" in data:
+            raw_user_id = (data.get("user_id") or "").strip()
+            try:
+                user_id = uuid.UUID(raw_user_id)
+            except (ValueError, AttributeError, TypeError):
+                return Response(
+                    {"user_id": "Must be a valid Unite Us user id (UUID)."},
+                    status=http.HTTP_400_BAD_REQUEST,
+                )
+            if (
+                UniteUsAgent.objects.filter(user_id=user_id)
+                .exclude(pk=agent.pk)
+                .exists()
+            ):
+                return Response(
+                    {"user_id": "This Unite Us agent is already in the list."},
+                    status=http.HTTP_409_CONFLICT,
+                )
+            agent.user_id = user_id
+
+        if "first_name" in data:
+            agent.first_name = (data.get("first_name") or "").strip()
+        if "last_name" in data:
+            agent.last_name = (data.get("last_name") or "").strip()
+        if "name" in data:
+            agent.name = (data.get("name") or "").strip()
+        if "email" in data:
+            agent.email = (data.get("email") or "").strip().lower()
+        if "work_title" in data:
+            agent.work_title = (data.get("work_title") or "").strip()
+        if "status" in data:
+            agent.status = (data.get("status") or "active").strip().lower()
+        if "is_us" in data:
+            agent.is_us = bool(data.get("is_us"))
+        if "originating_team" in data:
+            agent.originating_team = (
+                (data.get("originating_team") or "").strip() or "Met Council Team"
+            )
+
+        # Keep the display name in sync when only the name parts changed and no
+        # explicit name is set.
+        if (
+            "name" not in data
+            and ("first_name" in data or "last_name" in data)
+            and not agent.name
+        ):
+            agent.name = " ".join(
+                p for p in [agent.first_name, agent.last_name] if p
+            )
+
+        agent.save()
+        counts = _case_counts_by_creator()
+        return Response(
+            _agent_dict(agent, counts.get(str(agent.user_id).lower(), 0))
+        )
 
     def delete(self, request, agent_id):
         agent = UniteUsAgent.objects.filter(pk=agent_id).first()

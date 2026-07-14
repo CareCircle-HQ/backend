@@ -91,7 +91,10 @@ from .views_orders import (
 from .views_delivery_calendar import MemberDeliveryCalendarView
 from .views_kitchen_output import KitchenOutputView
 from .views_po_blockers import POBlockersFixView, POBlockersStatsView, POBlockersView
-from .views_reports import MembersByLeadSourceReportView
+from .views_reports import (
+    MembersByLeadSourceReportView,
+    MembersPendingVerificationReportView,
+)
 from .views_activity import ActivityFiltersView, ActivityLogView
 from .views_service_area import ExcludedZipCodeDetailView, ExcludedZipCodesView
 from .views_imports import (
@@ -323,6 +326,11 @@ urlpatterns = [
         "reports/members-by-lead-source/",
         MembersByLeadSourceReportView.as_view(),
         name="portal-report-members-by-lead-source",
+    ),
+    path(
+        "reports/members-pending-verification/",
+        MembersPendingVerificationReportView.as_view(),
+        name="portal-report-members-pending-verification",
     ),
 
     # Care Management (Customer Service)

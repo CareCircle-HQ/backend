@@ -14,7 +14,13 @@ from django.http import HttpResponse
 from django.utils import timezone
 from rest_framework.response import Response
 
-from ..models import Case, CaseType, Client
+from ..models import (
+    Case,
+    CaseType,
+    Client,
+    EnrollmentStage,
+    EnrollmentVerification,
+)
 from .base import PortalAPIView, current_agent
 from .serializers import medicaid_member_id
 from .views_members import _parse_date
@@ -149,5 +155,101 @@ class MembersByLeadSourceReportView(PortalAPIView):
                 household_count,
                 source_label,
             ])
+
+        return response
+
+
+def _enrollment_member_clients(enrollment):
+    """Distinct member clients of an enrollment's household (incl. the primary).
+
+    A verification applies to the whole household, so every household member is
+    'waiting for verification'. De-duplicated by client id."""
+    clients = {}
+    household = enrollment.household
+    if household is not None:
+        for hm in household.members.all():
+            if hm.client_id:
+                clients[hm.client_id] = hm.client
+    for mp in enrollment.member_profiles.all():
+        if mp.client_id:
+            clients.setdefault(mp.client_id, mp.client)
+    if enrollment.client_id:
+        clients.setdefault(enrollment.client_id, enrollment.client)
+    return list(clients.values())
+
+
+def _client_phone_numbers(client):
+    """All phone numbers on file for a client (primary first), '; '-joined.
+    Falls back to the single ``client_phone_number`` field when none are on
+    the related phones table."""
+    numbers = []
+    for p in client.phones.all():
+        raw = (p.raw or p.normalized or "").strip()
+        if raw and raw not in numbers:
+            numbers.append(raw)
+    if not numbers and (client.client_phone_number or "").strip():
+        numbers.append(client.client_phone_number.strip())
+    return "; ".join(numbers)
+
+
+class MembersPendingVerificationReportView(PortalAPIView):
+    """Management-only CSV export of members whose household enrollment is
+    awaiting verification (stage ``pending_verification``), filtered by the
+    enrollment's created date (``opened_at``).
+
+    Columns: Client ID, First Name, Last Name, Phone Numbers.
+
+    Query params:
+        created_from -- optional inclusive lower bound on the enrollment's
+                        created (opened_at) date.
+        created_to   -- optional inclusive upper bound on the enrollment's
+                        created (opened_at) date.
+    """
+
+    def get(self, request):
+        agent = current_agent(request)
+        if not (agent and (agent.group == "Management" or getattr(agent, "is_manager", False))):
+            return Response({"detail": "Management access required."}, status=403)
+
+        created_from = _parse_date(request.query_params.get("created_from"))
+        created_to = _parse_date(request.query_params.get("created_to"))
+
+        qs = (
+            EnrollmentVerification.objects.filter(
+                stage=EnrollmentStage.PENDING_VERIFICATION
+            )
+            .select_related("client", "household")
+            .prefetch_related(
+                "member_profiles__client__phones",
+                "household__members__client__phones",
+            )
+            .order_by("opened_at")
+        )
+        if created_from:
+            qs = qs.filter(opened_at__date__gte=created_from)
+        if created_to:
+            qs = qs.filter(opened_at__date__lte=created_to)
+
+        response = HttpResponse(content_type="text/csv")
+        filename = (
+            f"members_pending_verification_{timezone.localdate().isoformat()}.csv"
+        )
+        response["Content-Disposition"] = f'attachment; filename="{filename}"'
+
+        writer = csv.writer(response)
+        writer.writerow(["Client ID", "First Name", "Last Name", "Phone Numbers"])
+
+        seen = set()
+        for enr in qs:
+            for client in _enrollment_member_clients(enr):
+                if client is None or client.pk in seen:
+                    continue
+                seen.add(client.pk)
+                writer.writerow([
+                    str(client.client_id),
+                    client.first_name or "",
+                    client.last_name or "",
+                    _client_phone_numbers(client),
+                ])
 
         return response
