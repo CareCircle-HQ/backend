@@ -168,13 +168,29 @@ DATABASES = {
         'PASSWORD': os.getenv('DB_PASSWORD', ''),
         'HOST': os.getenv('DB_HOST', ''),
         'PORT': os.getenv('DB_PORT', ''),
+        # Persistent connections: reuse a connection across requests instead of
+        # opening a NEW one (TCP + TLS + Postgres auth handshake to RDS) on every
+        # single request. With CONN_MAX_AGE=0 (the Django default) that per-request
+        # handshake dominated latency and, when it stalled, blocked gunicorn
+        # workers -- making the whole app slow while CPU and query-time stayed
+        # near zero. Env-tunable; 0 restores per-request connections.
+        'CONN_MAX_AGE': int(os.getenv('DB_CONN_MAX_AGE', '60')),
+        # Verify a reused connection is still usable at the start of each request
+        # and transparently reconnect if the server dropped it (RDS idle timeout,
+        # failover, restart). Prevents persistent connections from serving a dead
+        # socket. (Django 4.1+.)
+        'CONN_HEALTH_CHECKS': os.getenv('DB_CONN_HEALTH_CHECKS', 'true').lower() == 'true',
     }
 }
 
-# Add SSL options for RDS PostgreSQL connections
+# PostgreSQL/RDS connection options (only when SSL is configured, i.e. not the
+# local sqlite default). ``connect_timeout`` makes a stalled connection attempt
+# fail in seconds instead of tying up a gunicorn worker until its 300s timeout
+# when RDS is slow to accept a new connection.
 if os.getenv('DB_SSLMODE'):
     DATABASES['default']['OPTIONS'] = {
         'sslmode': os.getenv('DB_SSLMODE'),
+        'connect_timeout': int(os.getenv('DB_CONNECT_TIMEOUT', '10')),
     }
 
 # ---------------------------------------------------------------------------
