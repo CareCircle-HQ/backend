@@ -10,6 +10,7 @@ refresh-token grant (api.integrations.uniteus.client).
 import logging
 from datetime import timedelta
 
+from django.conf import settings
 from django.utils import timezone
 from django.utils.dateparse import parse_datetime
 from rest_framework import status, views
@@ -106,6 +107,25 @@ class UniteUsRunUpdateView(views.APIView):
     permission_classes = [IsAuthenticated]
 
     def post(self, request):
+        # On-demand ("Sync Now") pulls run the full Unite Us import inline and
+        # can pin a gunicorn worker thread for minutes; a few concurrent clicks
+        # exhaust every worker and take the whole site down (the ALB health
+        # check then times out and flaps the target Unhealthy -> 504s). Disabled
+        # by default: the nightly `manage.py daily_pull` cron keeps data fresh.
+        # Set UNITEUS_ONDEMAND_SYNC_ENABLED=true to re-enable (ideally only once
+        # this runs off the request path, e.g. via Celery).
+        if not getattr(settings, "UNITEUS_ONDEMAND_SYNC_ENABLED", False):
+            return Response(
+                {
+                    "error": (
+                        "On-demand Unite Us sync is disabled. Data refreshes "
+                        "automatically in the nightly pull."
+                    ),
+                    "disabled": True,
+                },
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+
         agent_id = getattr(request.user, "agent_id", None)
         if not agent_id:
             return Response(

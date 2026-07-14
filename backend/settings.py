@@ -491,6 +491,13 @@ UNITEUS_API_BASE = os.getenv('UNITEUS_API_BASE', 'https://core.uniteus.io')
 UNITEUS_TIMEOUT = int(os.getenv('UNITEUS_TIMEOUT', '30'))
 # Refresh the access token when it expires within this many seconds.
 UNITEUS_REFRESH_SKEW = int(os.getenv('UNITEUS_REFRESH_SKEW', '120'))
+# On-demand ("Sync Now") pull from the extension. OFF by default: it runs the
+# full import inline in a gunicorn worker thread and can exhaust all workers
+# (site-wide 504s + ALB health-check flapping). The nightly `daily_pull` cron
+# keeps data fresh. Only re-enable once the pull runs off the request path.
+UNITEUS_ONDEMAND_SYNC_ENABLED = (
+    os.getenv('UNITEUS_ONDEMAND_SYNC_ENABLED', 'False').lower() == 'true'
+)
 
 
 # ---------------------------------------------------------------------------
