@@ -2,6 +2,7 @@
 (insurance, social coverage, history, orders, household, notes, tickets) plus
 the verification wizard write."""
 
+import logging
 import uuid
 from datetime import datetime, timedelta
 
@@ -34,7 +35,9 @@ from ..models import (
     MemberStatus,
     MenuType,
     Note,
+    MemberWarning,
     NoteSource,
+    ProductType,
     ProductTypeKind,
     PurchaseOrder,
     ServiceAuthorizationStatus,
@@ -48,9 +51,12 @@ from ..models import (
     TimelineBadgeTone,
     TimelineEvent,
     TimelineEventType,
+    WarningStatus,
 )
 from ..views_phones import _phone_dict
 from ..services.catalog import (
+    assign_product_type_for_internal_service,
+    detected_product_kind_for_enrollment,
     menu_type_for_member,
     product_kind_for_enrollment,
     product_type_kind_for_name,
@@ -67,6 +73,7 @@ from ..services.client_diagnostic import diagnose_client
 from ..services.orders import (
     _format_address,
     generate_delivery_calendar,
+    recompute_delivery_plan,
     resync_scheduled_orders,
     sync_delivery_calendar,
 )
@@ -80,11 +87,13 @@ from ..services.meal_rules import reconcile_member_kitchen_output, resolve_kitch
 from ..services.lifecycle import (
     InvalidTransition,
     advance_enrollment,
+    governing_internal_case,
     governing_pending_enrollment,
     recompute_client_stage,
     reconcile_enrollment_authorization,
 )
 from ..services import timeline
+from ..services.warnings import sync_household_warnings
 from ..serializers import (
     add_client_to_household,
     ensure_household_with_primary,
@@ -93,6 +102,8 @@ from ..serializers import (
 )
 from .base import PortalAPIView, PortalGenericAPIView, current_agent
 from . import serializers as s
+
+logger = logging.getLogger(__name__)
 
 # System note left on a member when their menu type / dietary needs can't be
 # fulfilled by any (or the assigned) kitchen and they're pulled Out of Orbit.
@@ -1693,6 +1704,16 @@ class MemberHouseholdView(PortalAPIView):
         ).all()
         addr = enr.delivery_address
         kind = product_kind_for_enrollment(enr)
+        detected = detected_product_kind_for_enrollment(enr)
+        is_overridden = enr.product_type_override_id is not None
+        # Flag a misclassification (shown in red) only when the agent hasn't
+        # already corrected it: the name-derived kind is definite AND disagrees
+        # with the effective kind (or the effective kind is unknown).
+        mismatch = (
+            not is_overridden
+            and detected is not None
+            and (kind is None or kind != detected)
+        )
         cadence = current_household_cadence(enr)
         cadence_row = Cadence.objects.filter(code=cadence).first() if cadence else None
         return Response(
@@ -1703,6 +1724,13 @@ class MemberHouseholdView(PortalAPIView):
                     "kitchen_name": enr.kitchen.name if enr.kitchen_id else "",
                     "service_type": kind.value if kind else "",
                     "service_type_label": kind.label if kind else "",
+                    "product_type_overridden": is_overridden,
+                    "product_type_detected": detected.value if detected else "",
+                    "product_type_detected_label": detected.label if detected else "",
+                    "product_type_mismatch": mismatch,
+                    "product_type_options": [
+                        {"value": k.value, "label": k.label} for k in ProductTypeKind
+                    ],
                     "cadence": cadence,
                     "cadence_label": (cadence_row.label if cadence_row else "") or cadence,
                     "cadence_options": cadence_options_for_kind(kind),
@@ -1781,6 +1809,144 @@ class MemberHouseholdView(PortalAPIView):
                 f"The household hold was resumed and the Out-of-Range ticket resolved."
             )
         return Response(resp)
+
+
+class MemberWarningsView(PortalAPIView):
+    """GET /members/<client_id>/warnings/ — active care-management warnings for
+    the member's profile header.
+
+    Runs a LIVE scan on open (``sync_household_warnings``) so the header is
+    always fresh and self-healing, then returns the household's active warnings:
+    every household-scope warning plus this member's own member-scope ones."""
+
+    def get(self, request, client_id):
+        client = get_object_or_404(Client, pk=client_id)
+        enr = s.active_enrollment(client)
+        if enr is None:
+            return Response({"warnings": []})
+        try:
+            sync_household_warnings(enr)
+        except Exception:  # never let the snapshot sync break the profile load
+            logger.exception("warning sync failed for client %s", client_id)
+        rows = (
+            MemberWarning.objects.filter(
+                enrollment=enr, status=WarningStatus.ACTIVE,
+            )
+            .filter(Q(scope="household") | Q(client_id=client_id))
+            .order_by("-severity", "first_detected_at")
+        )
+        return Response({"warnings": [
+            {
+                "code": r.code,
+                "severity": r.severity,
+                "scope": r.scope,
+                "title": r.title,
+                "detail": r.detail,
+                "context": r.context or {},
+                "client_id": str(r.client_id),
+                "first_detected_at": r.first_detected_at.isoformat(),
+            }
+            for r in rows
+        ]})
+
+
+class MemberProductTypeView(PortalAPIView):
+    """POST /members/<client_id>/product-type/ — correct a household's meals/boxes
+    classification from the Household tab.
+
+    Product kind is normally derived; when that detection is wrong (e.g. a boxes
+    case classified as meals) an agent picks the right kind here. This:
+      1. stores a per-household override on the enrollment (resolver honors it
+         first), so THIS household is fixed immediately;
+      2. re-points the governing internal-service case's Program -> ProductType
+         (the same link case-save sets) so future/other members detect correctly;
+      3. rebuilds this household's delivery plan for the corrected kind; and
+      4. logs a 'Product Type Changed' timeline event + a client note.
+    """
+
+    def post(self, request, client_id):
+        client = get_object_or_404(Client, pk=client_id)
+        enr = s.active_enrollment(client)
+        if enr is None:
+            return Response(
+                {"error": "No active enrollment for this member."},
+                status=http.HTTP_404_NOT_FOUND,
+            )
+        raw = (request.data.get("product_type") or "").strip().lower()
+        try:
+            kind = ProductTypeKind(raw)
+        except ValueError:
+            return Response(
+                {"error": "product_type must be 'meals' or 'boxes'."},
+                status=http.HTTP_400_BAD_REQUEST,
+            )
+        product_type = ProductType.objects.filter(type=kind).first()
+        if product_type is None:
+            return Response(
+                {"error": f"No {kind.label} product type is configured."},
+                status=http.HTTP_400_BAD_REQUEST,
+            )
+
+        previous_kind = product_kind_for_enrollment(enr)
+        previous_label = previous_kind.label if previous_kind else "Unknown"
+        if previous_kind == kind and enr.product_type_override_id == product_type.pk:
+            return Response(
+                {"error": f"Product type is already {kind.label}."},
+                status=http.HTTP_400_BAD_REQUEST,
+            )
+
+        agent = current_agent(request)
+        actor = _agent_actor(agent)
+        with transaction.atomic():
+            # 1. Per-household override (resolver honors this first).
+            enr.product_type_override = product_type
+            enr.save(update_fields=["product_type_override"])
+            # 2. Re-point the governing case's Program to the matching ProductType
+            #    so the shared catalog detection is corrected too.
+            gov = governing_internal_case(enr) or enr.case
+            program = getattr(gov, "program", None)
+            if program is not None and program.product_type_id != product_type.pk:
+                program.product_type = product_type
+                program.save(update_fields=["product_type"])
+            # 3. Rebuild the delivery plan for the corrected kind (no-op-safe when
+            #    the household has no plan/cadence yet).
+            try:
+                recompute_delivery_plan(enr)
+            except Exception:  # never let a plan rebuild break the correction
+                logger.exception(
+                    "recompute_delivery_plan failed after product-type change "
+                    "for enrollment %s", enr.pk,
+                )
+            # 4. Timeline event + client note.
+            try:
+                timeline.event_for_product_type_changed(
+                    enr, previous_label=previous_label, new_label=kind.label,
+                    actor=actor,
+                )
+            except Exception:  # never let history-logging break the correction
+                pass
+            try:
+                Note.objects.create(
+                    client=client, source=NoteSource.SYSTEM,
+                    author_name=agent.name if agent else "",
+                    body=(
+                        f"Product type corrected from {previous_label} to "
+                        f"{kind.label} on the Household tab."
+                    ),
+                )
+            except Exception:  # never let note-writing break the correction
+                pass
+
+        return Response({
+            "product_type": kind.value,
+            "product_type_label": kind.label,
+            "previous": previous_label,
+            "kitchen_review": (
+                enr.kitchen_id is not None
+                and previous_kind is not None
+                and previous_kind != kind
+            ),
+        })
 
 
 class MemberHouseholdSearchView(PortalAPIView):

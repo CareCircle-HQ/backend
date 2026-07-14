@@ -4,7 +4,20 @@ from django.urls import include, path
 from rest_framework.routers import SimpleRouter
 
 from .auth import PortalRequestCodeView, PortalVerifyCodeView
+from .views_care_management import CareManagementListView
+from .views_delivery_address import DeliveryAddressListView
+from .views_member_uniteus import MemberUniteUsRefreshView
 from .views_dashboard import DashboardServingListView, DashboardView
+from .views_dashboard_verification import (
+    VerificationDashboardListView,
+    VerificationDashboardView,
+)
+from .views_dashboard_logistics import (
+    DistributionKitchenMembersView,
+    DistributionOverviewView,
+    LogisticsDashboardListView,
+    LogisticsDashboardView,
+)
 from .views_leads import (
     PortalLeadDetailView,
     PortalLeadNotesView,
@@ -30,6 +43,8 @@ from .views_members import (
     MemberHouseholdAddView,
     MemberHouseholdSearchView,
     MemberHouseholdView,
+    MemberProductTypeView,
+    MemberWarningsView,
     MemberInternalCaseDescriptionsView,
     MemberInsuranceView,
     MemberKitchenOptionsView,
@@ -148,6 +163,14 @@ urlpatterns = [
     path("members/<uuid:client_id>/household/", MemberHouseholdView.as_view()),
     path("members/<uuid:client_id>/household/search/", MemberHouseholdSearchView.as_view()),
     path("members/<uuid:client_id>/household/add/", MemberHouseholdAddView.as_view()),
+    path(
+        "members/<uuid:client_id>/product-type/",
+        MemberProductTypeView.as_view(),
+    ),
+    path(
+        "members/<uuid:client_id>/warnings/",
+        MemberWarningsView.as_view(),
+    ),
     # TEMPORARY: internal-service case descriptions on the Household tab.
     path(
         "members/<uuid:client_id>/internal-case-descriptions/",
@@ -170,6 +193,11 @@ urlpatterns = [
     path("members/<uuid:client_id>/reactivate/", MemberServiceReactivateView.as_view()),
     path("members/<uuid:client_id>/notes/", MemberNotesView.as_view()),
     path("members/<uuid:client_id>/cases/", MemberCasesView.as_view()),
+    path(
+        "members/<uuid:client_id>/refresh-uniteus/",
+        MemberUniteUsRefreshView.as_view(),
+        name="portal-member-refresh-uniteus",
+    ),
     path(
         "members/<uuid:client_id>/cases/<uuid:case_id>/history/",
         MemberCaseHistoryView.as_view(),
@@ -292,12 +320,56 @@ urlpatterns = [
         name="portal-report-members-by-lead-source",
     ),
 
+    # Care Management (Customer Service)
+    path(
+        "care-management/",
+        CareManagementListView.as_view(),
+        name="portal-care-management",
+    ),
+
+    # Delivery Address (Customer Service)
+    path(
+        "delivery-addresses/",
+        DeliveryAddressListView.as_view(),
+        name="portal-delivery-addresses",
+    ),
+
     # Dashboard
     path("dashboard/", DashboardView.as_view(), name="portal-dashboard"),
     path(
         "dashboard/serving/<str:reason>/",
         DashboardServingListView.as_view(),
         name="portal-dashboard-serving-list",
+    ),
+    path(
+        "dashboard/verification/",
+        VerificationDashboardView.as_view(),
+        name="portal-dashboard-verification",
+    ),
+    path(
+        "dashboard/verification/<str:reason>/",
+        VerificationDashboardListView.as_view(),
+        name="portal-dashboard-verification-list",
+    ),
+    path(
+        "dashboard/logistics/",
+        LogisticsDashboardView.as_view(),
+        name="portal-dashboard-logistics",
+    ),
+    path(
+        "dashboard/logistics/<str:reason>/",
+        LogisticsDashboardListView.as_view(),
+        name="portal-dashboard-logistics-list",
+    ),
+    path(
+        "dashboard/distribution/",
+        DistributionOverviewView.as_view(),
+        name="portal-dashboard-distribution",
+    ),
+    path(
+        "dashboard/distribution/<str:kitchen>/members/",
+        DistributionKitchenMembersView.as_view(),
+        name="portal-dashboard-distribution-members",
     ),
 
     # Settings CRUD viewsets

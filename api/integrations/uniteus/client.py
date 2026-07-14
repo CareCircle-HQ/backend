@@ -41,6 +41,24 @@ def needs_refresh(cred):
     )
 
 
+# Unite Us refresh tokens ROTATE (single-use): the server and the live browser
+# session share ONE rotating chain, so if the server refreshes while an agent is
+# actively working in Unite Us, it invalidates the browser's copy and forces a
+# re-login. While a capture is recent the extension is keeping the token fresh
+# for us anyway, so we skip the server-side refresh and use the captured token.
+CAPTURE_FRESH_WINDOW = timedelta(minutes=15)
+
+
+def recently_captured(cred):
+    """True when the extension pushed a session within CAPTURE_FRESH_WINDOW --
+    i.e. an agent is actively in Unite Us and the token is being kept fresh for
+    us. In that window we must not steal a rotation with a server-side refresh."""
+    return (
+        cred.last_captured_at is not None
+        and timezone.now() - cred.last_captured_at < CAPTURE_FRESH_WINDOW
+    )
+
+
 def _mark_expired(cred):
     cred.status = UniteUsCredentialStatus.EXPIRED
     cred.save(update_fields=["status", "updated_at"])
@@ -112,9 +130,17 @@ def ensure_fresh(cred):
     """Ensure ``cred`` has a usable access token. Returns True if usable."""
     if cred.status == UniteUsCredentialStatus.REVOKED:
         return False
-    if needs_refresh(cred):
-        return refresh_credential(cred)
-    return True
+    if not needs_refresh(cred):
+        return True
+    # Don't steal a rotation from an actively-working agent: if the extension
+    # captured a session very recently the browser is keeping the (shared,
+    # single-use) refresh-token chain alive, so a server-side refresh here would
+    # invalidate the agent's session. Use the captured token as-is; if it has
+    # truly expired the live call 401s and the UniteUsAuthExpired re-login path
+    # takes over. Off-hours (no recent capture) we refresh normally.
+    if recently_captured(cred):
+        return bool(cred.access_token)
+    return refresh_credential(cred)
 
 
 def auth_headers(cred):

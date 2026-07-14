@@ -940,4 +940,15 @@ def reconcile_internal_service_authorization(client, *, actor=None):
             pass
 
     recompute_client_stage(client, actor=actor)
+
+    # Refresh the member/household warning snapshot after a case-driven change
+    # (fires on both extension case saves and CSV imports, which route through
+    # CaseSerializer -> here). Best-effort; lazy import avoids a circular dep.
+    try:
+        from api.services.warnings import sync_client_warnings
+
+        sync_client_warnings(client)
+    except Exception:  # pragma: no cover - defensive
+        pass
+
     return result

@@ -713,6 +713,34 @@ def event_for_household_member_added(
     )
 
 
+def event_for_product_type_changed(
+    enrollment, *, previous_label="", new_label="", source=ChangeSource.CRM, actor="",
+):
+    """Emit a 'Product Type Changed' event when an agent corrects a household's
+    meals/boxes classification on the Household tab. Logged on the primary
+    client. Not de-duped, so every correction is recorded."""
+    client = getattr(enrollment, "client", None)
+    if client is None:
+        return None
+    prev = (previous_label or "").strip()
+    new = (new_label or "").strip() or "—"
+    subtitle = f"{prev} \u2192 {new}" if prev else new
+    return emit_timeline_event(
+        client=client,
+        event_type=TimelineEventType.PRODUCT_TYPE_CHANGED,
+        occurred_at=timezone.now(),
+        title="Product Type Changed",
+        subtitle=subtitle,
+        badge_text=new,
+        badge_tone=TimelineBadgeTone.INFO,
+        source=source,
+        actor=actor,
+        entity=enrollment,
+        enrollment=enrollment,
+        metadata={"previous": prev, "new": new},
+    )
+
+
 def event_for_member_reactivated(
     profile, *, enrollment=None, source=ChangeSource.SYSTEM, actor="",
 ):

@@ -164,6 +164,13 @@ def product_kind_for_enrollment(enrollment):
     """
     if enrollment is None:
         return None
+    # 0. A manual per-household override wins over every derived signal. An agent
+    #    sets this on the Household tab to correct a misclassified kind.
+    override = getattr(enrollment, "product_type_override", None)
+    if override is not None:
+        coerced = _coerce_product_kind(override.type)
+        if coerced is not None:
+            return coerced
     # The authoritative program lives on the GOVERNING internal-service case (the
     # verification's case), which is often not the same row as ``enrollment.case``
     # (frequently null). Prefer it so the kind still resolves when the
@@ -203,6 +210,37 @@ def product_kind_for_enrollment(enrollment):
     sched = enrollment.delivery_schedules.filter(product_type__isnull=False).first()
     if sched is not None and sched.product_type:
         return _coerce_product_kind(sched.product_type.type)
+    return None
+
+
+def detected_product_kind_for_enrollment(enrollment):
+    """The meals/boxes kind DETECTED from names (the program-name keyword) for
+    the governing internal-service case, IGNORING any manual override and the
+    Program->ProductType link. This is the same signal ``assign_product_type_for
+    _internal_service`` uses on case save, and is what the Household tab compares
+    the effective kind against to flag a misclassification. Returns a
+    ProductTypeKind, or None when no keyword is present."""
+    if enrollment is None:
+        return None
+    case = getattr(enrollment, "case", None)
+    try:
+        from api.services.lifecycle import governing_internal_case
+
+        gov = governing_internal_case(enrollment)
+    except Exception:
+        gov = None
+    if gov is not None:
+        case = gov
+    program = case.program if (case is not None and getattr(case, "program_id", None)) else None
+    for candidate in (
+        program.name if program is not None else "",
+        enrollment.program_name,
+        getattr(case, "program_name", "") if case is not None else "",
+        getattr(case, "service_type", "") if case is not None else "",
+    ):
+        kind = product_type_kind_for_name(candidate)
+        if kind:
+            return kind
     return None
 
 

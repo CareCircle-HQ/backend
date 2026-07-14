@@ -1062,10 +1062,15 @@ class CsvImporter:
 
     def _post_save_case(self, case, previous_status=None, previous_auth_status=None):
         """Emit the case timeline, record (and optionally open) the follow-up
-        tickets a change triggers, and recompute the funnel stage (cases drive
-        the Navigation stage). Tickets are only WRITTEN when create_tickets is
-        True; otherwise they're previewed for review. No enrollment
-        reconciliation / order generation — this is a historical bulk load."""
+        tickets a change triggers, re-project the (possibly updated)
+        authorization onto the member's enrollments, and recompute the funnel
+        stage. Tickets are only WRITTEN when create_tickets is True; otherwise
+        they're previewed for review.
+
+        Runs ONLY when ``emit_side_effects`` is True (the manual Settings
+        upload). Bulk historical CLI loads (``emit_side_effects=False``) skip
+        this entirely, so a backfill never mass-advances stages / regenerates
+        deliveries."""
         try:
             event = timeline.event_for_case(
                 case, source=ChangeSource.IMPORT, actor=TIMELINE_ACTOR,
@@ -1075,7 +1080,25 @@ class CsvImporter:
         except Exception:  # noqa: BLE001
             logger.warning("csv_import case timeline failed", exc_info=True)
         self._record_case_actions(case, previous_status, previous_auth_status)
+        self._reconcile_enrollments(case)
         self._recompute_stage(case.client_id, case.client)
+
+    def _reconcile_enrollments(self, case):
+        """Project the case's (possibly updated) authorization onto the client's
+        enrollments so a re-import shows on the member -- e.g. a case that
+        flipped to Accepted advances the enrollment (verified -> kitchen
+        assignment). Mirrors the daily Unite Us pull's reconcile. Best-effort:
+        one enrollment hiccup never fails the import row."""
+        from api.services.lifecycle import reconcile_enrollment_authorization
+
+        for enrollment in case.enrollments.all():
+            try:
+                reconcile_enrollment_authorization(enrollment)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "csv_import reconcile enrollment %s failed: %s",
+                    enrollment.pk, exc,
+                )
 
     def _record_case_actions(self, case, previous_status, previous_auth_status):
         """Record the case change (timeline events + follow-up tickets) via the
@@ -1126,6 +1149,7 @@ class CsvImporter:
         never survive an upload. Each client is isolated from the others.
         """
         from api.services.lifecycle import recompute_client_stage
+        from api.services.warnings import sync_client_warnings
 
         for cid in self.touched_client_ids:
             client = Client.objects.filter(pk=cid).first()
@@ -1137,6 +1161,9 @@ class CsvImporter:
                 logger.warning(
                     "recompute_client_stage failed for %s", cid, exc_info=True
                 )
+            # Refresh the member/household warning snapshot from the imported
+            # data (catches insurance/client-only rows too). Best-effort.
+            sync_client_warnings(client)
 
     def finalize(self):
         self.run.stats = {self.dataset: dict(self.stats)}

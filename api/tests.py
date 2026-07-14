@@ -1,7 +1,8 @@
 import uuid
+from datetime import timedelta
 from types import SimpleNamespace
 
-from django.test import SimpleTestCase, TestCase
+from django.test import SimpleTestCase, TestCase, override_settings
 from django.urls import reverse
 from django.utils import timezone
 from rest_framework.test import APIClient
@@ -1266,6 +1267,195 @@ class ProgramSwitchClassificationTest(SimpleTestCase):
         )
 
 
+class NeedsReauthClassificationTest(SimpleTestCase):
+    """A member with no future authorization is only a ``needs_reauth`` blocker
+    when their authorization actually LAPSED. A member still AWAITING an
+    authorization decision (an open pending case) must NOT be flagged -- there's
+    nothing to remediate until Unite Us decides."""
+
+    def _classify(self, **overrides):
+        from .services.po_blockers import _classify_reason
+
+        base = dict(
+            kitchen_id="k", future=0, has_future_auth=False, plan_ends_on=None,
+            kind=None, plan_kind=None, governing_kind=None,
+            plan_kind_authorized=False, weekday_mismatch=False,
+            switch_pending=False, open_case_count=1, enrollment_case_id="c1",
+            governing_case_id="c1", today=timezone.localdate(),
+            awaiting_auth=False,
+        )
+        base.update(overrides)
+        return _classify_reason(**base)
+
+    def test_awaiting_authorization_is_not_a_blocker(self):
+        self.assertEqual(self._classify(awaiting_auth=True), "ok")
+
+    def test_lapsed_without_pending_case_is_needs_reauth(self):
+        self.assertEqual(self._classify(awaiting_auth=False), "needs_reauth")
+
+
+class UniteUsRefreshTest(TestCase):
+    """The on-demand Unite Us refresh: the capture-aware server-refresh guard
+    (so we don't steal a rotating refresh token from a live agent session) and
+    the result summary that tells the UI when to prompt a reconnect."""
+
+    def _cred(self, **kw):
+        from .models import UniteUsCredential, UniteUsCredentialStatus
+
+        base = dict(
+            provider_id="p", employee_id="e", access_token="tok",
+            refresh_token="r", status=UniteUsCredentialStatus.ACTIVE,
+        )
+        base.update(kw)
+        return UniteUsCredential.objects.create(**base)
+
+    def test_recent_capture_skips_server_refresh(self):
+        from datetime import timedelta
+        from .models import UniteUsCredentialStatus
+        from .integrations.uniteus import client as uu_client
+
+        cred = self._cred(
+            access_expires_at=timezone.now() - timedelta(minutes=1),  # "expired"
+            last_captured_at=timezone.now(),                          # but just captured
+        )
+        # Expired by the clock, but a fresh capture means the browser is keeping
+        # the shared rotating chain alive -> use the token as-is, don't refresh.
+        self.assertTrue(uu_client.ensure_fresh(cred))
+        cred.refresh_from_db()
+        self.assertEqual(cred.status, UniteUsCredentialStatus.ACTIVE)
+
+    @override_settings(UNITEUS_TOKEN_URL="")
+    def test_stale_capture_refreshes_and_expires_without_token_url(self):
+        from datetime import timedelta
+        from .models import UniteUsCredentialStatus
+        from .integrations.uniteus import client as uu_client
+
+        cred = self._cred(
+            access_expires_at=timezone.now() - timedelta(minutes=1),
+            last_captured_at=timezone.now() - timedelta(hours=2),  # stale (off-hours)
+        )
+        # Stale capture -> the guard allows a server refresh. With no token URL
+        # configured, refresh_credential can't call out, so it marks the
+        # credential EXPIRED and returns False (no network hit).
+        self.assertFalse(uu_client.ensure_fresh(cred))
+        cred.refresh_from_db()
+        self.assertEqual(cred.status, UniteUsCredentialStatus.EXPIRED)
+
+    def test_summary_flags_reconnect_on_expired(self):
+        from .models import ImportRun, ImportRunStatus
+        from .services.uniteus_import import _summarize_refresh
+
+        run = ImportRun.objects.create(
+            source="uniteus", status=ImportRunStatus.FAILED,
+        )
+        run.error_log = "credential expired: nope"
+        run.save()
+        res = _summarize_refresh(run, scope="case")
+        self.assertTrue(res["needs_reconnect"])
+        self.assertFalse(res["ok"])
+
+    def test_summary_ok_reports_change_count(self):
+        from .models import ImportRun, ImportRunStatus
+        from .services.uniteus_import import _summarize_refresh
+
+        run = ImportRun.objects.create(
+            source="uniteus", status=ImportRunStatus.COMPLETED, updated_count=1,
+            stats={
+                "cases": {"updated": 1},
+                "changes": [
+                    {"kind": "authorization",
+                     "label": "Authorization: Pending → Approved", "tone": "success"},
+                ],
+            },
+        )
+        res = _summarize_refresh(run, scope="member")
+        self.assertTrue(res["ok"])
+        self.assertFalse(res["needs_reconnect"])
+        self.assertEqual(len(res["changes"]), 1)
+        self.assertIn("1 update", res["message"])
+
+    def test_summary_ok_no_changes(self):
+        from .models import ImportRun, ImportRunStatus
+        from .services.uniteus_import import _summarize_refresh
+
+        run = ImportRun.objects.create(
+            source="uniteus", status=ImportRunStatus.COMPLETED,
+        )
+        res = _summarize_refresh(run, scope="case")
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["changes"], [])
+        self.assertIn("No changes", res["message"])
+
+
+class CsvCaseMappingTest(SimpleTestCase):
+    """map_case_row must reliably translate the Unite Us cases-export
+    case_status + service_authorization_status onto our enums so a re-import
+    actually updates those fields (not just create new rows)."""
+
+    def _map(self, **row):
+        from .services.csv_import import map_case_row
+
+        base = {
+            "case_id": "c1", "client_id": "cl1", "program_name": "Meals",
+            "service_subtype": "Home Delivered Meals",
+        }
+        base.update(row)
+        return map_case_row(base)
+
+    def test_case_status_known_values_map_through(self):
+        self.assertEqual(self._map(case_status="managed")["case_status"], "managed")
+        self.assertEqual(self._map(case_status="off_platform")["case_status"], "off_platform")
+        self.assertEqual(self._map(case_status="closed")["case_status"], "closed")
+
+    def test_case_status_unknown_falls_back_to_open(self):
+        self.assertEqual(self._map(case_status="somethingelse")["case_status"], "open")
+
+    def test_auth_aliases_map(self):
+        self.assertEqual(
+            self._map(service_authorization_status="accepted")["service_authorization_status"],
+            "approved",
+        )
+        self.assertEqual(
+            self._map(service_authorization_status="requested")["service_authorization_status"],
+            "pending",
+        )
+
+    def test_auth_direct_enum_values(self):
+        for raw in ("pending", "approved", "denied", "expired", "not_required"):
+            self.assertEqual(
+                self._map(service_authorization_status=raw)["service_authorization_status"],
+                raw,
+            )
+
+
+class UniteUsCaseMapperTest(SimpleTestCase):
+    """map_case must mirror the extension: a non-null closed_date means the case
+    is CLOSED even though Unite Us leaves state='managed' on closed cases. The
+    on-demand refresh previously left such cases reading MANAGED."""
+
+    def _map(self, *, state, closed_date=None):
+        from api.integrations.uniteus.mappers import map_case
+
+        rec = {
+            "id": "case-1",
+            "attributes": {"state": state, "closed_date": closed_date},
+            "relationships": {"person": {"data": {"id": "person-1"}}},
+        }
+        return map_case(rec)
+
+    def test_closed_date_marks_case_closed_despite_managed_state(self):
+        out = self._map(state="managed", closed_date="2026-01-02T00:00:00Z")
+        self.assertEqual(out["case_status"], "closed")
+
+    def test_managed_without_closed_date_stays_managed(self):
+        out = self._map(state="managed")
+        self.assertEqual(out["case_status"], "managed")
+
+    def test_unknown_state_without_closed_date_falls_back_open(self):
+        out = self._map(state="requested")
+        self.assertEqual(out["case_status"], "open")
+
+
 class RecomputeSwitchesPlanKindTest(TestCase):
     """Regression: applying the PO Blockers 'program_switched' fix must actually
     flip the plan's KIND snapshot. update_household_cadence previously updated
@@ -1628,3 +1818,384 @@ class CalendarKeepsOccurrencesOnExclusionTest(TestCase):
                 enrollment=enr, anticipated_delivery_date=tue,
             ).exists()
         )
+
+
+class MemberWarningsTest(TestCase):
+    """The member/household warning evaluator (api.services.warnings). Each check
+    is exercised in isolation on a purpose-built household, plus a clean
+    household that must produce no warnings and a multi-warning household."""
+
+    def _client(self, first="Woe", last="Warn"):
+        return Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name=first, last_name=last
+        )
+
+    def _enrollment(self, client, *, stage=None, kitchen=None, program_name=""):
+        from .models import (
+            EnrollmentStage, EnrollmentVerification, Household, HouseholdMember,
+            MemberDietaryProfile,
+        )
+
+        hh = Household.objects.create(name="HH")
+        HouseholdMember.objects.create(household=hh, client=client, is_primary=True)
+        enr = EnrollmentVerification.objects.create(
+            client=client, household=hh,
+            stage=stage or EnrollmentStage.SERVICE_ACTIVE,
+            kitchen=kitchen, program_name=program_name,
+        )
+        MemberDietaryProfile.objects.create(enrollment=enr, client=client)
+        return enr
+
+    def _internal_case(self, client, *, program="Medically Tailored Meals",
+                       status=None, auth_status="", auth_ends=None):
+        from .models import Case, CaseStatus, CaseType
+
+        return Case.objects.create(
+            case_id=uuid.uuid4(), client=client,
+            case_type=CaseType.INTERNAL_SERVICE,
+            case_status=status or CaseStatus.OPEN,
+            program_name=program,
+            service_authorization_status=auth_status,
+            service_authorization_approval_ends_at=auth_ends,
+        )
+
+    def _cadence(self, enr, code):
+        from .models import MemberDeliverySchedule, ScheduleStatus
+
+        mp = enr.member_profiles.first()
+        MemberDeliverySchedule.objects.create(
+            enrollment=enr, member_profile=mp, delivery_days_cadence=code,
+            status=ScheduleStatus.SCHEDULED,
+        )
+
+    def _codes(self, enr):
+        from .services.warnings import evaluate_enrollment_warnings
+
+        return {w.code for w in evaluate_enrollment_warnings(enr)}
+
+    def test_no_cadence_flagged_across_assignment_stages(self):
+        from .models import EnrollmentStage
+        from .services.warnings import NO_CADENCE
+
+        # Both the assignment stage and active service must surface an
+        # unassigned cadence, matching what Distribution Overview counts.
+        active = self._enrollment(self._client(), stage=EnrollmentStage.SERVICE_ACTIVE)
+        self.assertIn(NO_CADENCE, self._codes(active))
+
+        pending = self._enrollment(
+            self._client(), stage=EnrollmentStage.KITCHEN_ASSIGNMENT
+        )
+        self.assertIn(NO_CADENCE, self._codes(pending))
+
+        # A household not yet at assignment must NOT be flagged.
+        verified = self._enrollment(
+            self._client(), stage=EnrollmentStage.VERIFIED
+        )
+        self.assertNotIn(NO_CADENCE, self._codes(verified))
+
+    def test_no_kitchen_flagged_across_assignment_stages(self):
+        from .models import EnrollmentStage, Kitchen, KitchenProductType, KitchenStatus
+        from .services.warnings import NO_KITCHEN
+
+        # Active + assignment stages with no kitchen are unassigned (surfaced
+        # on Distribution Overview) and must appear on Care Management.
+        active = self._enrollment(self._client(), stage=EnrollmentStage.SERVICE_ACTIVE)
+        self.assertIn(NO_KITCHEN, self._codes(active))
+
+        pending = self._enrollment(
+            self._client(), stage=EnrollmentStage.KITCHEN_ASSIGNMENT
+        )
+        self.assertIn(NO_KITCHEN, self._codes(pending))
+
+        # A household with a kitchen assigned is not flagged.
+        kitchen = Kitchen.objects.create(
+            name="AnyCo", status=KitchenStatus.ACTIVE,
+            supported_products=[KitchenProductType.MEAL],
+        )
+        assigned = self._enrollment(self._client(), kitchen=kitchen)
+        self.assertNotIn(NO_KITCHEN, self._codes(assigned))
+
+    def test_multiple_open_cases(self):
+        from .services.warnings import MULTIPLE_OPEN_CASES
+
+        c = self._client()
+        enr = self._enrollment(c)
+        self._internal_case(c)
+        self.assertNotIn(MULTIPLE_OPEN_CASES, self._codes(enr))
+        self._internal_case(c)
+        self.assertIn(MULTIPLE_OPEN_CASES, self._codes(enr))
+
+    def test_conflicting_product_types(self):
+        from .services.warnings import CONFLICTING_PRODUCT_TYPES
+
+        c = self._client()
+        enr = self._enrollment(c)
+        self._internal_case(c, program="Medically Tailored Meals")
+        self._internal_case(c, program="Grocery Boxes Program")
+        self.assertIn(CONFLICTING_PRODUCT_TYPES, self._codes(enr))
+
+    def test_kitchen_missing_product(self):
+        from .models import Kitchen, KitchenProductType, KitchenStatus
+        from .services.warnings import KITCHEN_MISSING_PRODUCT
+
+        box_only = Kitchen.objects.create(
+            name="BoxCo", status=KitchenStatus.ACTIVE,
+            supported_products=[KitchenProductType.BOX],
+        )
+        c = self._client()
+        enr = self._enrollment(c, kitchen=box_only)
+        self._internal_case(c, program="Medically Tailored Meals")  # meals kind
+        self.assertIn(KITCHEN_MISSING_PRODUCT, self._codes(enr))
+
+    def test_cadence_not_supported_by_kitchen(self):
+        from .models import Cadence, Kitchen, KitchenProductType, KitchenStatus
+        from .services.warnings import CADENCE_NOT_SUPPORTED_BY_KITCHEN
+
+        tue = Cadence.objects.create(code="tue_only", label="Tue", is_active=True)
+        kitchen = Kitchen.objects.create(
+            name="MealCo", status=KitchenStatus.ACTIVE,
+            supported_products=[KitchenProductType.MEAL],
+        )
+        kitchen.cadences.set([tue])
+        c = self._client()
+        enr = self._enrollment(c, kitchen=kitchen, program_name="Medically Tailored Meals")
+        self._cadence(enr, "mon_thu")  # not one the kitchen runs
+        self.assertIn(CADENCE_NOT_SUPPORTED_BY_KITCHEN, self._codes(enr))
+
+    def test_cadence_kind_mismatch(self):
+        from .models import ProductType, ProductTypeKind
+        from .services.warnings import CADENCE_KIND_MISMATCH
+
+        # 'once_a_week' is configured for BOXES; a meals household on it mismatches.
+        ProductType.objects.create(
+            type=ProductTypeKind.BOXES, delivery_days_cadence="once_a_week",
+        )
+        c = self._client()
+        enr = self._enrollment(c, program_name="Medically Tailored Meals")
+        self._cadence(enr, "once_a_week")
+        self.assertIn(CADENCE_KIND_MISMATCH, self._codes(enr))
+
+    def test_insurance_expiring_and_expired(self):
+        from .models import Insurance
+        from .services.warnings import INSURANCE_EXPIRING
+
+        soon = self._client()
+        enr = self._enrollment(soon)
+        Insurance.objects.create(
+            client=soon, plan_name="P", external_member_id="1",
+            expired_at=timezone.now() + timedelta(days=10),
+        )
+        self.assertIn(INSURANCE_EXPIRING, self._codes(enr))
+
+        healthy = self._client()
+        enr2 = self._enrollment(healthy)
+        Insurance.objects.create(
+            client=healthy, plan_name="P", external_member_id="2",
+            expired_at=timezone.now() + timedelta(days=120),
+        )
+        self.assertNotIn(INSURANCE_EXPIRING, self._codes(enr2))
+
+    def test_internal_case_expired(self):
+        from .services.warnings import INTERNAL_CASE_EXPIRED
+
+        c = self._client()
+        enr = self._enrollment(c)
+        self._internal_case(
+            c, program="Medically Tailored Meals",
+            auth_ends=timezone.now() - timedelta(days=3),
+        )
+        self.assertIn(INTERNAL_CASE_EXPIRED, self._codes(enr))
+
+    def test_clean_household_has_no_warnings(self):
+        from .models import Cadence, Kitchen, KitchenProductType, KitchenStatus, ProductType, ProductTypeKind
+
+        mon_thu = Cadence.objects.create(code="mon_thu", label="Mon/Thu", is_active=True)
+        ProductType.objects.create(
+            type=ProductTypeKind.MEALS, delivery_days_cadence="mon_thu",
+        )
+        kitchen = Kitchen.objects.create(
+            name="GoodCo", status=KitchenStatus.ACTIVE,
+            supported_products=[KitchenProductType.MEAL],
+        )
+        kitchen.cadences.set([mon_thu])
+        c = self._client()
+        enr = self._enrollment(c, kitchen=kitchen, program_name="Medically Tailored Meals")
+        self._cadence(enr, "mon_thu")
+        self._internal_case(
+            c, program="Medically Tailored Meals", auth_status="approved",
+            auth_ends=timezone.now() + timedelta(days=90),
+        )
+        self.assertEqual(self._codes(enr), set())
+
+    # --- Phase 2: persisted snapshot (sync) --------------------------------
+    def test_sync_persists_active_warnings(self):
+        from .models import MemberWarning, WarningStatus
+        from .services.warnings import NO_CADENCE, sync_household_warnings
+
+        c = self._client()
+        enr = self._enrollment(c)  # active, no cadence -> NO_CADENCE
+        sync_household_warnings(enr)
+        row = MemberWarning.objects.get(client=c, code=NO_CADENCE)
+        self.assertEqual(row.status, WarningStatus.ACTIVE)
+        self.assertEqual(row.enrollment_id, enr.pk)
+        self.assertIsNone(row.resolved_at)
+
+    def test_sync_resolves_when_problem_fixed(self):
+        from .models import MemberWarning, WarningStatus
+        from .services.warnings import NO_CADENCE, sync_household_warnings
+
+        c = self._client()
+        enr = self._enrollment(c)
+        sync_household_warnings(enr)
+        # Fix it: give the household a cadence, then re-sync.
+        self._cadence(enr, "mon_thu")
+        sync_household_warnings(enr)
+        row = MemberWarning.objects.get(client=c, code=NO_CADENCE)
+        self.assertEqual(row.status, WarningStatus.RESOLVED)
+        self.assertIsNotNone(row.resolved_at)
+
+    def test_sync_reactivates_resolved_row(self):
+        from .models import MemberWarning, WarningStatus
+        from .services.warnings import NO_CADENCE, sync_household_warnings
+
+        c = self._client()
+        enr = self._enrollment(c)
+        sync_household_warnings(enr)
+        self._cadence(enr, "mon_thu")
+        sync_household_warnings(enr)
+        # Regression: remove the cadence again -> the SAME row reactivates.
+        enr.delivery_schedules.all().delete()
+        sync_household_warnings(enr)
+        rows = MemberWarning.objects.filter(client=c, code=NO_CADENCE)
+        self.assertEqual(rows.count(), 1)
+        self.assertEqual(rows.first().status, WarningStatus.ACTIVE)
+        self.assertIsNone(rows.first().resolved_at)
+
+    def test_sync_is_idempotent(self):
+        from .models import MemberWarning
+        from .services.warnings import sync_household_warnings
+
+        c = self._client()
+        enr = self._enrollment(c)
+        self._internal_case(c)
+        self._internal_case(c)  # multiple_open_cases + no_cadence
+        sync_household_warnings(enr)
+        first = MemberWarning.objects.filter(client=c).count()
+        sync_household_warnings(enr)
+        self.assertEqual(MemberWarning.objects.filter(client=c).count(), first)
+
+
+class AddressQualityTest(SimpleTestCase):
+    """The delivery-address format detector (api.services.address_quality)."""
+
+    def _codes(self, **kw):
+        from .services.address_quality import detect_address_issues
+        return set(detect_address_issues(**kw))
+
+    def test_unit_in_street_when_unit_field_empty(self):
+        from .services.address_quality import UNIT_IN_STREET
+        codes = self._codes(street="123 Main St Apt 4B", unit="", city="Brooklyn", state="NY")
+        self.assertIn(UNIT_IN_STREET, codes)
+
+    def test_hash_unit_in_street(self):
+        from .services.address_quality import UNIT_IN_STREET
+        codes = self._codes(street="123 Main St #3", unit="", city="Brooklyn", state="NY")
+        self.assertIn(UNIT_IN_STREET, codes)
+
+    def test_duplicate_unit_when_both_populated(self):
+        from .services.address_quality import DUPLICATE_UNIT, UNIT_IN_STREET
+        codes = self._codes(street="115 Clymer St Apt 7D", unit="7D", city="Brooklyn", state="NY")
+        self.assertIn(DUPLICATE_UNIT, codes)
+        self.assertNotIn(UNIT_IN_STREET, codes)
+
+    def test_po_box(self):
+        from .services.address_quality import PO_BOX
+        codes = self._codes(street="PO Box 123", unit="", city="Brooklyn", state="NY")
+        self.assertIn(PO_BOX, codes)
+
+    def test_missing_components(self):
+        from .services.address_quality import MISSING_CITY, MISSING_STATE
+        codes = self._codes(street="123 Main St", unit="", city="", state="")
+        self.assertIn(MISSING_CITY, codes)
+        self.assertIn(MISSING_STATE, codes)
+
+    def test_clean_address_has_no_issues(self):
+        codes = self._codes(street="123 Main St", unit="4B", city="Brooklyn", state="NY", zip_code="11201")
+        self.assertEqual(codes, set())
+
+    def test_street_name_with_unitlike_word_not_flagged(self):
+        # "Flatbush" / "Lott" must NOT trip the \bfl\b / \blot\b markers.
+        codes = self._codes(street="1500 Flatbush Ave", unit="", city="Brooklyn", state="NY")
+        self.assertEqual(codes, set())
+        codes2 = self._codes(street="25 Lott Pl", unit="", city="Brooklyn", state="NY")
+        self.assertEqual(codes2, set())
+
+
+class CareManagementListTest(TestCase):
+    """The Care Management queue endpoint. Verifies that households which are not
+    being served (On Hold / Cancelled / Closed / Service Complete) are excluded
+    even when they carry an active warning snapshot."""
+
+    def setUp(self):
+        self.agent = Agent.objects.create(
+            name="Cam CS", agent_code="777", group="CS"
+        )
+        access = AccessToken()
+        access["agent_id"] = str(self.agent.id)
+        access["agent_code"] = self.agent.agent_code
+        access["agent_name"] = self.agent.name
+        access["agent_group"] = self.agent.group
+        self.api = APIClient()
+        self.api.credentials(HTTP_AUTHORIZATION=f"Bearer {access}")
+
+    def _household_with_warning(self, stage, first="Woe", last="Warn"):
+        from .models import (
+            EnrollmentStage, EnrollmentVerification, Household, HouseholdMember,
+            MemberDietaryProfile, MemberWarning, WarningStatus,
+        )
+        from .services.warnings import sync_household_warnings
+
+        c = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name=first, last_name=last
+        )
+        hh = Household.objects.create(name="HH")
+        HouseholdMember.objects.create(household=hh, client=c, is_primary=True)
+        # Build ACTIVE (no kitchen/cadence) so a warning is guaranteed, persist
+        # the snapshot, THEN move the household to the target stage WITHOUT
+        # re-syncing -- so the active warning row survives and the view is the
+        # only thing that can exclude it.
+        enr = EnrollmentVerification.objects.create(
+            client=c, household=hh, stage=EnrollmentStage.SERVICE_ACTIVE,
+        )
+        MemberDietaryProfile.objects.create(enrollment=enr, client=c)
+        sync_household_warnings(enr)
+        assert MemberWarning.objects.filter(
+            enrollment=enr, status=WarningStatus.ACTIVE
+        ).exists()
+        if stage and stage != EnrollmentStage.SERVICE_ACTIVE:
+            enr.stage = stage
+            enr.save(update_fields=["stage"])
+        return c, enr
+
+    def _ids(self, body):
+        return {r["client_id"] for r in body["results"]}
+
+    def test_excludes_on_hold_and_terminal_households(self):
+        from .models import EnrollmentStage
+
+        served, _ = self._household_with_warning(
+            EnrollmentStage.SERVICE_ACTIVE, first="Ser", last="Ved"
+        )
+        on_hold, _ = self._household_with_warning(
+            EnrollmentStage.ON_HOLD, first="Hal", last="Hold"
+        )
+        cancelled, _ = self._household_with_warning(
+            EnrollmentStage.CANCELLED, first="Cam", last="Cancel"
+        )
+
+        resp = self.api.get(reverse("portal-care-management"))
+        self.assertEqual(resp.status_code, 200, resp.content)
+        ids = self._ids(resp.json())
+        self.assertIn(str(served.pk), ids)
+        self.assertNotIn(str(on_hold.pk), ids)
+        self.assertNotIn(str(cancelled.pk), ids)

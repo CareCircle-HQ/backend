@@ -222,11 +222,19 @@ def map_case(case_body_data, *, names=None, auth=None):
         if v not in (None, ""):
             out[k] = v
 
+    # Unite Us leaves state="managed" even after a case is closed; the only
+    # reliable "closed" signal is a non-null closed_date. Mirror the browser
+    # extension (buildCaseDetailFromApi) so a refreshed case reads CLOSED instead
+    # of staying MANAGED/active.
+    closed_at = _dt(a.get("closed_date"))
     state = str(a.get("state") or "").lower()
-    out["case_status"] = state if state in CaseStatus.values else CaseStatus.OPEN
+    if closed_at:
+        out["case_status"] = CaseStatus.CLOSED
+    else:
+        out["case_status"] = state if state in CaseStatus.values else CaseStatus.OPEN
     set_("case_description", a.get("description"))
     set_("date_opened", _dt(a.get("opened_date")))
-    set_("case_closed_at", _dt(a.get("closed_date")))
+    set_("case_closed_at", closed_at)
     set_("updated_at", _dt(a.get("updated_at")))
 
     set_("service_type", names.get("service"))
