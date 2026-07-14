@@ -17,6 +17,7 @@ from api.models import (
     WarningSeverity,
     WarningStatus,
 )
+from api.services.warnings import CARE_MANAGEMENT_CODES
 from .base import PortalAPIView, current_agent
 
 # Care Management is a CS queue: CS + Management (and manager override).
@@ -69,13 +70,23 @@ class CareManagementListView(PortalAPIView):
         except (TypeError, ValueError):
             page = 1
 
-        # Never surface households that aren't being served: On Hold (case under
-        # review), Cancelled, Closed or Service Complete. Filtered here (not just
-        # at detection) so a stale snapshot can never leak them into the queue.
-        # Rows with no enrollment link (fallback client grouping) have a NULL
-        # stage and are kept.
+        # Only surface warnings CS can actually REMEDIATE here. Informational
+        # member/household states (out of orbit/range, paused, on hold,
+        # cancelled) are excluded via the CARE_MANAGEMENT_CODES allowlist so a
+        # household is never flagged onto this queue for a problem that can't be
+        # fixed on this page. Filtering at the row level (before grouping) also
+        # keeps those informational rows from cluttering a household surfaced for
+        # a real issue.
+        #
+        # Also never surface households that aren't being served: On Hold (case
+        # under review), Cancelled, Closed or Service Complete. Filtered here (not
+        # just at detection) so a stale snapshot can never leak them into the
+        # queue. Rows with no enrollment link (fallback client grouping) have a
+        # NULL stage and are kept.
         rows = (
-            MemberWarning.objects.filter(status=WarningStatus.ACTIVE)
+            MemberWarning.objects.filter(
+                status=WarningStatus.ACTIVE, code__in=CARE_MANAGEMENT_CODES
+            )
             .exclude(enrollment__stage__in=SERVICE_EXCLUDED_ENROLLMENT_STAGES)
             .select_related(
                 "client", "enrollment", "enrollment__client", "enrollment__kitchen"

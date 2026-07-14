@@ -33,8 +33,10 @@ from django.utils import timezone
 from api.models import (
     EnrollmentStage,
     KitchenProductType,
+    MemberStatus,
     ProductType,
     ProductTypeKind,
+    SERVICE_EXCLUDED_MEMBER_STATUSES,
     ServiceAuthorizationStatus,
 )
 from api.services.catalog import (
@@ -68,6 +70,54 @@ KITCHEN_MISSING_PRODUCT = "kitchen_missing_product"
 CADENCE_KIND_MISMATCH = "cadence_kind_mismatch"
 INSURANCE_EXPIRING = "insurance_expiring"
 INTERNAL_CASE_EXPIRED = "internal_case_expired"
+# Per-member service status (member-scope).
+MEMBER_PAUSED = "member_paused"
+# Household service state (household-scope).
+HOUSEHOLD_ON_HOLD = "household_on_hold"
+HOUSEHOLD_CANCELLED = "household_cancelled"
+# Household roll-up counts of members not being served (household-scope).
+HOUSEHOLD_MEMBERS_OUT_OF_ORBIT = "household_members_out_of_orbit"
+HOUSEHOLD_MEMBERS_OUT_OF_RANGE = "household_members_out_of_range"
+
+# --- Warning categories -----------------------------------------------------
+# Every warning is categorized so each surface can choose what to show:
+#   * SERVICE_CONFIG   -- a broken service configuration Customer Service can
+#                         REMEDIATE (kitchen/cadence/case/insurance). These are
+#                         the only warnings that flag a household onto the Care
+#                         Management queue.
+#   * MEMBER_STATE     -- an informational per-member state (paused, out of
+#                         orbit/range) that is NOT fixable on Care Management.
+#   * HOUSEHOLD_STATE  -- an informational household state (on hold, cancelled).
+# Both informational categories still appear on the member profile header; they
+# are just kept off the Care Management remediation queue. A code that is not
+# mapped here defaults to informational, so a new warning can never silently
+# flag members onto the queue.
+SERVICE_CONFIG = "service_config"
+MEMBER_STATE = "member_state"
+HOUSEHOLD_STATE = "household_state"
+
+WARNING_CATEGORY = {
+    NO_KITCHEN: SERVICE_CONFIG,
+    NO_CADENCE: SERVICE_CONFIG,
+    CADENCE_NOT_SUPPORTED_BY_KITCHEN: SERVICE_CONFIG,
+    KITCHEN_MISSING_PRODUCT: SERVICE_CONFIG,
+    CADENCE_KIND_MISMATCH: SERVICE_CONFIG,
+    INTERNAL_CASE_EXPIRED: SERVICE_CONFIG,
+    INSURANCE_EXPIRING: SERVICE_CONFIG,
+    MULTIPLE_OPEN_CASES: SERVICE_CONFIG,
+    CONFLICTING_PRODUCT_TYPES: SERVICE_CONFIG,
+    MEMBER_PAUSED: MEMBER_STATE,
+    HOUSEHOLD_MEMBERS_OUT_OF_ORBIT: MEMBER_STATE,
+    HOUSEHOLD_MEMBERS_OUT_OF_RANGE: MEMBER_STATE,
+    HOUSEHOLD_ON_HOLD: HOUSEHOLD_STATE,
+    HOUSEHOLD_CANCELLED: HOUSEHOLD_STATE,
+}
+
+# Allowlist of codes CS can act on -> the only warnings shown on Care Management.
+CARE_MANAGEMENT_CODES = frozenset(
+    code for code, category in WARNING_CATEGORY.items()
+    if category == SERVICE_CONFIG
+)
 
 # Stages where a household is expected to have a kitchen + cadence: it is being
 # assigned (KITCHEN_ASSIGNMENT) or already running (SERVICE_ACTIVE). These are
@@ -113,6 +163,7 @@ class _Context:
     governing_case: object        # Case | None
     open_cases: list              # open internal-service cases
     members: list                 # household member clients (incl. primary)
+    has_servable_member: bool     # >=1 member is ACTIVE (being served)
 
 
 def _coerce_kind(value):
@@ -147,6 +198,21 @@ def _household_members(enrollment):
     return list(seen.values())
 
 
+def _has_servable_member(enrollment):
+    """True when >=1 household member is being served (status ACTIVE). When every
+    member is out of orbit / out of range / paused / inactive there is no
+    delivery plan to configure, so a missing kitchen/cadence (or a stale
+    cadence/kitchen mismatch) is expected-absent, not an actionable problem.
+    Empty membership returns True so we never over-suppress on unknown data."""
+    statuses = [
+        mp.status for mp in enrollment.member_profiles.all()
+        if mp.client_id is not None
+    ]
+    if not statuses:
+        return True
+    return any(s not in SERVICE_EXCLUDED_MEMBER_STATUSES for s in statuses)
+
+
 def _build_context(enrollment):
     client = enrollment.client
     try:
@@ -164,6 +230,7 @@ def _build_context(enrollment):
         governing_case=governing_internal_case(enrollment),
         open_cases=open_internal_service_cases(client),
         members=_household_members(enrollment),
+        has_servable_member=_has_servable_member(enrollment),
     )
 
 
@@ -204,6 +271,10 @@ def check_conflicting_product_types(ctx):
 
 
 def check_no_kitchen(ctx):
+    # No servable member -> the household isn't being served, so a missing
+    # kitchen is expected (out-of-orbit/range members carry no delivery plan).
+    if not ctx.has_servable_member:
+        return []
     if ctx.stage not in _ASSIGNMENT_STAGES or ctx.kitchen is not None:
         return []
     active = ctx.stage == EnrollmentStage.SERVICE_ACTIVE
@@ -222,6 +293,10 @@ def check_no_kitchen(ctx):
 
 
 def check_no_cadence(ctx):
+    # No servable member -> the household isn't being served, so a missing
+    # cadence is expected (out-of-orbit/range members carry no delivery plan).
+    if not ctx.has_servable_member:
+        return []
     if ctx.stage not in _ASSIGNMENT_STAGES or ctx.cadence:
         return []
     active = ctx.stage == EnrollmentStage.SERVICE_ACTIVE
@@ -240,7 +315,7 @@ def check_no_cadence(ctx):
 
 
 def check_cadence_not_supported_by_kitchen(ctx):
-    if not ctx.cadence or ctx.kitchen is None:
+    if not ctx.has_servable_member or not ctx.cadence or ctx.kitchen is None:
         return []
     kitchen_codes = {
         c.code for c in ctx.kitchen.cadences.all() if c.is_active
@@ -262,7 +337,7 @@ def check_cadence_not_supported_by_kitchen(ctx):
 
 
 def check_kitchen_missing_product(ctx):
-    if ctx.kitchen is None or ctx.product_kind is None:
+    if not ctx.has_servable_member or ctx.kitchen is None or ctx.product_kind is None:
         return []
     needed = _KIND_TO_KITCHEN_PRODUCT.get(ctx.product_kind)
     supported = ctx.kitchen.supported_products or []
@@ -286,7 +361,7 @@ def check_kitchen_missing_product(ctx):
 
 
 def check_cadence_kind_mismatch(ctx):
-    if not ctx.cadence or ctx.product_kind is None:
+    if not ctx.has_servable_member or not ctx.cadence or ctx.product_kind is None:
         return []
     cadence_kinds = set(
         ProductType.objects.filter(delivery_days_cadence=ctx.cadence)
@@ -373,9 +448,102 @@ def check_internal_case_expired(ctx):
     )]
 
 
+def check_member_service_status(ctx):
+    """Member-scope: flag the viewed member when they're manually PAUSED. (Out of
+    orbit / out of range are surfaced as a single household roll-up count instead
+    -- see ``check_household_out_of_service_counts``.) Skipped for a cancelled
+    household (terminal; the household warning covers it)."""
+    if ctx.stage == EnrollmentStage.CANCELLED:
+        return []
+    out = []
+    for mp in ctx.enrollment.member_profiles.all():
+        if mp.client_id is None or mp.status != MemberStatus.PAUSED:
+            continue
+        out.append(Warning(
+            code=MEMBER_PAUSED, severity=ORANGE, scope="member",
+            title="Member paused",
+            detail="This member is paused and excluded from deliveries and orders.",
+            client_id=mp.client_id, refs={"status": mp.status},
+        ))
+    return out
+
+
+def check_household_on_hold(ctx):
+    """Household-scope: the whole household's service is on hold."""
+    if ctx.stage != EnrollmentStage.ON_HOLD:
+        return []
+    return [Warning(
+        code=HOUSEHOLD_ON_HOLD, severity=ORANGE, scope="household",
+        title="Household on hold",
+        detail="Service for this household is currently on hold.",
+        client_id=ctx.client.pk,
+    )]
+
+
+def check_household_cancelled(ctx):
+    """Household-scope: the household's service has been cancelled."""
+    if ctx.stage != EnrollmentStage.CANCELLED:
+        return []
+    return [Warning(
+        code=HOUSEHOLD_CANCELLED, severity=RED, scope="household",
+        title="Household cancelled",
+        detail="This household's service has been cancelled.",
+        client_id=ctx.client.pk,
+    )]
+
+
+def _plural(n, noun):
+    return f"{n} {noun}" if n == 1 else f"{n} {noun}s"
+
+
+def check_household_out_of_service_counts(ctx):
+    """Household-scope roll-up: how many household members are out of orbit
+    (dietary/kitchen) or out of range (coverage). Shown on every member so an
+    agent sees the household-wide impact, not just the member they're viewing.
+    Skipped for a cancelled household (terminal)."""
+    if ctx.stage == EnrollmentStage.CANCELLED:
+        return []
+    n_orbit = n_range = 0
+    for mp in ctx.enrollment.member_profiles.all():
+        if mp.client_id is None:
+            continue
+        if mp.status == MemberStatus.OUT_OF_ORBIT:
+            n_orbit += 1
+        elif mp.status == MemberStatus.OUT_OF_RANGE:
+            n_range += 1
+    out = []
+    if n_orbit:
+        out.append(Warning(
+            code=HOUSEHOLD_MEMBERS_OUT_OF_ORBIT, severity=ORANGE, scope="household",
+            title=f"{n_orbit} Out of Orbit",
+            detail=(
+                f"{_plural(n_orbit, 'household member')} can't be safely fulfilled "
+                "(menu/allergy) and are excluded from deliveries and orders."
+            ),
+            client_id=ctx.client.pk,
+            refs={"count": n_orbit},
+        ))
+    if n_range:
+        out.append(Warning(
+            code=HOUSEHOLD_MEMBERS_OUT_OF_RANGE, severity=ORANGE, scope="household",
+            title=f"{n_range} Out of Range",
+            detail=(
+                f"{_plural(n_range, 'household member')} have an address outside the "
+                "service coverage area and are excluded from deliveries and orders."
+            ),
+            client_id=ctx.client.pk,
+            refs={"count": n_range},
+        ))
+    return out
+
+
 # Registry — add a new check here and it flows everywhere. Order is display
 # order within a severity band; the UI re-sorts by severity (red first).
 WARNING_CHECKS = [
+    check_household_cancelled,
+    check_household_on_hold,
+    check_household_out_of_service_counts,
+    check_member_service_status,
     check_no_kitchen,
     check_no_cadence,
     check_cadence_not_supported_by_kitchen,
