@@ -35,7 +35,57 @@ SECRET_KEY = os.getenv(
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = os.getenv("DJANGO_DEBUG", "True").lower() == "true"
 
-ALLOWED_HOSTS = os.getenv("DJANGO_ALLOWED_HOSTS", "localhost,127.0.0.1").split(",")
+ALLOWED_HOSTS = [
+    h.strip()
+    for h in os.getenv("DJANGO_ALLOWED_HOSTS", "localhost,127.0.0.1").split(",")
+    if h.strip()
+]
+
+
+def _ec2_private_ip():
+    """Best-effort EC2 instance private IPv4, so ELB/ALB health checks -- which
+    hit the instance by IP (not the domain) -- don't 400 with DisallowedHost and
+    mark the target unhealthy. The IP can change on stop/start, so we resolve it
+    at startup rather than pinning it in .env. Returns "" off EC2 / on failure.
+
+    Tries IMDSv2 first (token-required), then IMDSv1, then a hostname lookup."""
+    import urllib.request
+
+    imds = "http://169.254.169.254/latest"
+    try:
+        token_req = urllib.request.Request(
+            f"{imds}/api/token",
+            method="PUT",
+            headers={"X-aws-ec2-metadata-token-ttl-seconds": "60"},
+        )
+        token = urllib.request.urlopen(token_req, timeout=0.3).read().decode()
+        ip_req = urllib.request.Request(
+            f"{imds}/meta-data/local-ipv4",
+            headers={"X-aws-ec2-metadata-token": token},
+        )
+        return urllib.request.urlopen(ip_req, timeout=0.3).read().decode().strip()
+    except Exception:
+        pass
+    try:  # IMDSv1 (older instances / IMDSv2 not enforced)
+        return urllib.request.urlopen(
+            f"{imds}/meta-data/local-ipv4", timeout=0.3
+        ).read().decode().strip()
+    except Exception:
+        pass
+    try:  # last resort: whatever the hostname resolves to
+        import socket
+
+        return socket.gethostbyname(socket.gethostname())
+    except OSError:
+        return ""
+
+
+# Only bother when not explicitly disabled (e.g. local dev sets it to skip the
+# metadata probe). Appended, never replacing the operator-provided hosts.
+if os.getenv("DJANGO_AUTODETECT_HOST_IP", "True").lower() == "true":
+    _ip = _ec2_private_ip()
+    if _ip and _ip not in ALLOWED_HOSTS:
+        ALLOWED_HOSTS.append(_ip)
 
 # Origins (scheme + host) trusted for unsafe requests (admin/browsable-API
 # POSTs over HTTPS). Required in production, e.g.

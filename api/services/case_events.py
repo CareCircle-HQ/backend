@@ -47,6 +47,7 @@ def record_case_change(
     source=ChangeSource.SYSTEM,
     actor="",
     create_tickets=False,
+    emit_timeline=True,
     skip_actions=frozenset(),
     import_run=None,
 ):
@@ -62,22 +63,26 @@ def record_case_change(
     """
     result = CaseChangeResult()
 
-    # 1) Case status transition (any -> Closed/Managed/Cancelled/...).
+    # 1) Case status transition (any -> Closed/Managed/Cancelled/...). Detection
+    #    is independent of ``emit_timeline`` so a caller that suppresses the
+    #    timeline (imports / cron -> Care Management is the source of truth) still
+    #    gets an accurate change summary in the result.
     if (
         previous_status is not None
         and case.case_status
         and case.case_status != previous_status
     ):
-        try:
-            ev = timeline.event_for_case_status_change(
-                case, previous_status=previous_status, source=source,
-                actor=actor, import_run=import_run,
-            )
-            if ev is not None:
-                result.status_changed = True
-                result.timeline_events += 1
-        except Exception:  # noqa: BLE001
-            logger.warning("record_case_change: status event failed", exc_info=True)
+        result.status_changed = True
+        if emit_timeline:
+            try:
+                ev = timeline.event_for_case_status_change(
+                    case, previous_status=previous_status, source=source,
+                    actor=actor, import_run=import_run,
+                )
+                if ev is not None:
+                    result.timeline_events += 1
+            except Exception:  # noqa: BLE001
+                logger.warning("record_case_change: status event failed", exc_info=True)
 
     # 2) Service-authorization transition (approved/denied/pending/expired).
     if (
@@ -85,17 +90,18 @@ def record_case_change(
         and case.service_authorization_status
         and case.service_authorization_status != previous_auth
     ):
-        try:
-            ev = timeline.event_for_case_authorization_change(
-                case, previous_auth=previous_auth, source=source,
-                actor=actor, import_run=import_run,
-            )
-            if ev is not None:
-                result.auth_changed = True
-                result.new_auth = case.service_authorization_status
-                result.timeline_events += 1
-        except Exception:  # noqa: BLE001
-            logger.warning("record_case_change: auth event failed", exc_info=True)
+        result.auth_changed = True
+        result.new_auth = case.service_authorization_status
+        if emit_timeline:
+            try:
+                ev = timeline.event_for_case_authorization_change(
+                    case, previous_auth=previous_auth, source=source,
+                    actor=actor, import_run=import_run,
+                )
+                if ev is not None:
+                    result.timeline_events += 1
+            except Exception:  # noqa: BLE001
+                logger.warning("record_case_change: auth event failed", exc_info=True)
 
     # 3) Follow-up tickets. Detect always (so callers can preview); open only
     #    when enabled + not excluded. open_ticket emits its own timeline event.

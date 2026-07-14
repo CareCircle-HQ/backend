@@ -43,10 +43,12 @@ def process_import(self, run_id):
             file_obj=tmp,
             triggered_by=run.triggered_by or "manual",
             run=run,
-            # Manual case imports now open the follow-up tickets they detect
-            # (case closed / authorization changed); case_no_services is
-            # excluded via CsvImporter.SKIP_TICKET_ACTIONS.
-            create_tickets=True,
+            # Imports keep the derived state fresh (enrollment reconcile, funnel,
+            # Care Management warnings) but do NOT open follow-up tickets or write
+            # audit timeline events -- Care Management is the source of truth for
+            # what needs attention, and those writes were the bulk of the DB load.
+            create_tickets=False,
+            emit_timeline=False,
         )
     except Exception as exc:  # download / decode / unexpected failure
         logger.exception("process_import %s failed", run_id)

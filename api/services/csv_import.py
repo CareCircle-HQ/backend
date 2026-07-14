@@ -588,8 +588,14 @@ class CsvImporter:
     # household primary holds internal-service cases, so it flooded members.)
     SKIP_TICKET_ACTIONS = frozenset()
 
-    def __init__(self, run, emit_side_effects=True, create_tickets=False):
+    def __init__(self, run, emit_side_effects=True, create_tickets=False,
+                 emit_timeline=True):
         self.run = run
+        # Write per-record audit timeline events. Separate from create_tickets so
+        # an import can keep the derived state fresh (enrollment reconcile, funnel,
+        # Care Management warnings) WITHOUT the high-volume timeline writes -- Care
+        # Management is the source of truth for what needs attention.
+        self.emit_timeline = emit_timeline
         self.errors = []
         self.stats = {"created": 0, "updated": 0, "skipped": 0, "errors": 0}
         self.dataset = "clients"  # stats label; set per import_* method
@@ -1071,14 +1077,15 @@ class CsvImporter:
         upload). Bulk historical CLI loads (``emit_side_effects=False``) skip
         this entirely, so a backfill never mass-advances stages / regenerates
         deliveries."""
-        try:
-            event = timeline.event_for_case(
-                case, source=ChangeSource.IMPORT, actor=TIMELINE_ACTOR,
-            )
-            if event is not None:
-                self.actions["timeline_events"] += 1
-        except Exception:  # noqa: BLE001
-            logger.warning("csv_import case timeline failed", exc_info=True)
+        if self.emit_timeline:
+            try:
+                event = timeline.event_for_case(
+                    case, source=ChangeSource.IMPORT, actor=TIMELINE_ACTOR,
+                )
+                if event is not None:
+                    self.actions["timeline_events"] += 1
+            except Exception:  # noqa: BLE001
+                logger.warning("csv_import case timeline failed", exc_info=True)
         self._record_case_actions(case, previous_status, previous_auth_status)
         self._reconcile_enrollments(case)
         self._recompute_stage(case.client_id, case.client)
@@ -1116,6 +1123,7 @@ class CsvImporter:
             source=ChangeSource.IMPORT,
             actor=self.run.triggered_by or TIMELINE_ACTOR,
             create_tickets=self.create_tickets,
+            emit_timeline=self.emit_timeline,
             skip_actions=self.SKIP_TICKET_ACTIONS,
             import_run=self.run,
         )
@@ -1306,7 +1314,8 @@ def _header_mismatch(export_type, header):
 
 
 def run_csv_import(*, export_type, file_obj, triggered_by="manual", emit_side_effects=True,
-                   provider_id=None, provider_name=None, run=None, create_tickets=False):
+                   provider_id=None, provider_name=None, run=None, create_tickets=False,
+                   emit_timeline=True):
     """Import an uploaded Unite Us CSV ``file_obj`` of ``export_type``.
 
     Returns the persisted :class:`ImportRun`. ``file_obj`` may be any
@@ -1350,6 +1359,7 @@ def run_csv_import(*, export_type, file_obj, triggered_by="manual", emit_side_ef
 
     importer = CsvImporter(
         run, emit_side_effects=emit_side_effects, create_tickets=create_tickets,
+        emit_timeline=emit_timeline,
     )
     try:
         # Row-per-entity exports (one _count() call per row) get an exact

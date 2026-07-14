@@ -112,9 +112,12 @@ class ImportUploadView(PortalAPIView):
         triggered_by = f"agent:{agent.agent_code}" if agent and agent.agent_code else "manual"
         run = run_csv_import(
             export_type=export_type, file_obj=upload, triggered_by=triggered_by,
-            # Open the follow-up tickets a case import detects (case closed /
-            # authorization changed); case_no_services is excluded.
-            create_tickets=True,
+            # Imports keep the derived state fresh (enrollment reconcile, funnel,
+            # Care Management warnings) but do NOT open follow-up tickets or write
+            # audit timeline events -- Care Management is the source of truth for
+            # what needs attention.
+            create_tickets=False,
+            emit_timeline=False,
         )
         status_code = (
             http.HTTP_200_OK if run.status == "completed" else http.HTTP_400_BAD_REQUEST

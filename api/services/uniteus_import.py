@@ -63,8 +63,15 @@ def _pretty(code):
 
 
 class DailyPull:
-    def __init__(self, run):
+    def __init__(self, run, emit_side_effects=False):
         self.run = run
+        # When False (the default for cron + on-demand refresh), the pull syncs
+        # data and keeps the derived state fresh (enrollment reconciliation,
+        # funnel stage, Care Management warnings) but does NOT write audit
+        # timeline events or open follow-up tickets -- Care Management (member
+        # warnings) is the source of truth for what needs attention, and the
+        # per-record timeline writes were the bulk of the pull's DB load.
+        self.emit_side_effects = emit_side_effects
         self.api = None
         self.name_cache = {}
         self.errors = []
@@ -286,11 +293,13 @@ class DailyPull:
         change = case_events.record_case_change(
             case, previous_status=prev_status, previous_auth=prev_auth,
             source=ChangeSource.IMPORT, actor="system:unite-us-import",
-            create_tickets=True, import_run=self.run,
+            create_tickets=self.emit_side_effects,
+            emit_timeline=self.emit_side_effects, import_run=self.run,
         )
         self._record_case_changes(case, prev_status, prev_auth, change)
         self._reconcile_enrollments(case)
-        self._emit_timeline(timeline.event_for_case, case)
+        if self.emit_side_effects:
+            self._emit_timeline(timeline.event_for_case, case)
 
     def _reconcile_enrollments(self, case):
         """Project the (possibly updated) case authorization onto any verified
@@ -310,7 +319,8 @@ class DailyPull:
         person = self.api.get_person(client_id)
         data = person.get("data") or {}
         if not data:
-            tickets.evaluate_member_not_found(client_id, self.run)
+            if self.emit_side_effects:
+                tickets.evaluate_member_not_found(client_id, self.run)
             self._count("clients", "skipped")
             return
 
@@ -346,20 +356,23 @@ class DailyPull:
         post_ins = set(Insurance.objects.filter(client=client).values_list("insurance_id", flat=True))
         new_ins_ids = post_ins - pre_ins
         if new_ins_ids:
-            tickets.evaluate_new_insurance(client, self.run)
+            if self.emit_side_effects:
+                tickets.evaluate_new_insurance(client, self.run)
+            # Always record new Medicaid for the refresh summary (no DB write).
             self._record_new_medicaid(client, new_ins_ids)
         post_scc = set(SocialCareCoverage.objects.filter(client=client).values_list("coverage_id", flat=True))
-        if post_scc - pre_scc:
+        if post_scc - pre_scc and self.emit_side_effects:
             tickets.evaluate_new_coverage(client, self.run)
 
-        tickets.evaluate_client_coverage(client, self.run)
+        if self.emit_side_effects:
+            tickets.evaluate_client_coverage(client, self.run)
 
-        # Timeline events for the consent + each insurance / coverage record.
-        self._emit_timeline(timeline.event_for_consent, client)
-        for ins in Insurance.objects.filter(client=client):
-            self._emit_timeline(timeline.event_for_insurance, ins)
-        for scc in SocialCareCoverage.objects.filter(client=client):
-            self._emit_timeline(timeline.event_for_social_care_coverage, scc)
+            # Timeline events for the consent + each insurance / coverage record.
+            self._emit_timeline(timeline.event_for_consent, client)
+            for ins in Insurance.objects.filter(client=client):
+                self._emit_timeline(timeline.event_for_insurance, ins)
+            for scc in SocialCareCoverage.objects.filter(client=client):
+                self._emit_timeline(timeline.event_for_social_care_coverage, scc)
 
         self._process_notes(subject_id=client_id, client=client, case=None)
 
