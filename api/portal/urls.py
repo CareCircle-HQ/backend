@@ -5,6 +5,11 @@ from rest_framework.routers import SimpleRouter
 
 from .auth import PortalRequestCodeView, PortalVerifyCodeView
 from .views_care_management import CareManagementListView
+from .views_cs_dashboard import (
+    CSDashboardSummaryView,
+    CSDashboardTrendsView,
+    CSTicketManagerStatsView,
+)
 from .views_delivery_address import DeliveryAddressListView
 from .views_member_uniteus import MemberUniteUsRefreshView
 from .views_dashboard import DashboardServingListView, DashboardView
@@ -92,6 +97,7 @@ from .views_delivery_calendar import MemberDeliveryCalendarView
 from .views_kitchen_output import KitchenOutputView
 from .views_po_blockers import POBlockersFixView, POBlockersStatsView, POBlockersView
 from .views_reports import (
+    AllMembersReportView,
     MembersByLeadSourceReportView,
     MembersPendingVerificationReportView,
 )
@@ -334,6 +340,11 @@ urlpatterns = [
         MembersPendingVerificationReportView.as_view(),
         name="portal-report-members-pending-verification",
     ),
+    path(
+        "reports/all-members/",
+        AllMembersReportView.as_view(),
+        name="portal-report-all-members",
+    ),
 
     # Care Management (Customer Service)
     path(
@@ -347,6 +358,23 @@ urlpatterns = [
         "delivery-addresses/",
         DeliveryAddressListView.as_view(),
         name="portal-delivery-addresses",
+    ),
+
+    # CS Dashboard (Customer Service command center)
+    path(
+        "cs-dashboard/",
+        CSDashboardSummaryView.as_view(),
+        name="portal-cs-dashboard",
+    ),
+    path(
+        "cs-dashboard/trends/",
+        CSDashboardTrendsView.as_view(),
+        name="portal-cs-dashboard-trends",
+    ),
+    path(
+        "cs-dashboard/ticket-stats/",
+        CSTicketManagerStatsView.as_view(),
+        name="portal-cs-dashboard-ticket-stats",
     ),
 
     # Dashboard
