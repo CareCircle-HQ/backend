@@ -84,3 +84,20 @@ def download_to_temp(key):
     tmp.flush()
     tmp.seek(0)
     return tmp
+
+
+def upload_fileobj(key, fileobj, *, content_type="text/csv"):
+    """Server-side upload of a file-like to S3 under the imports/ prefix.
+
+    The manual-upload flow presigns a URL for the browser to PUT to; the Unite
+    Us export automation instead downloads the export server-side and uploads it
+    here so it can be processed by the same Celery/import pipeline. Rewinds the
+    file first and streams it (no full in-memory read)."""
+    try:
+        fileobj.seek(0)
+    except (AttributeError, OSError, ValueError):
+        pass
+    _client().upload_fileobj(
+        fileobj, _bucket(), key, ExtraArgs={"ContentType": content_type}
+    )
+    return key

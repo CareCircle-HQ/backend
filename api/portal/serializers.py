@@ -1270,6 +1270,7 @@ class PortalHouseholdMemberSerializer(serializers.ModelSerializer):
     name = serializers.SerializerMethodField()
     mobile_number = serializers.SerializerMethodField()
     status_label = serializers.CharField(source="get_status_display", read_only=True)
+    is_primary = serializers.SerializerMethodField()
 
     class Meta:
         model = MemberDietaryProfile
@@ -1278,10 +1279,16 @@ class PortalHouseholdMemberSerializer(serializers.ModelSerializer):
             "dietary_restrictions", "food_allergies", "other_dietary_restrictions",
             "meal_category", "menu_type", "general_verification_notes",
             "status", "status_label", "kitchen_meal_type", "kitchen_food_notes",
+            "is_primary",
         ]
 
     def get_client_id(self, obj):
         return str(obj.client_id) if obj.client_id else None
+
+    def get_is_primary(self, obj):
+        # The primary household member can't be removed from the Household tab.
+        membership = getattr(obj.client, "household_membership", None) if obj.client_id else None
+        return bool(getattr(membership, "is_primary", False))
 
     def get_name(self, obj):
         return obj.member_name or (_full_name(obj.client) if obj.client else "")

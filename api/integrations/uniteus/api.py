@@ -38,9 +38,15 @@ class UniteUsAuthExpired(UniteUsApiError):
 class UniteUsClient:
     """Thin core-API client bound to a single ``UniteUsCredential``."""
 
-    def __init__(self, credential):
+    def __init__(self, credential, allow_refresh=True):
         self.cred = credential
-        self.base = f"{config.api_base().rstrip('/')}/v1"
+        # allow_refresh=False uses the stored access token as-is and never does a
+        # server-side refresh-token rotation. Unite Us refresh tokens are
+        # single-use and shared with the live browser session, so a refresh from
+        # here can log the agent out; probes/read-only tools pass False.
+        self.allow_refresh = allow_refresh
+        self.host = config.api_base().rstrip("/")  # e.g. https://core.uniteus.io
+        self.base = f"{self.host}/v1"
         self.timeout = config.timeout()
         self._session = requests.Session()
 
@@ -52,10 +58,16 @@ class UniteUsClient:
 
     def core_get(self, path, params=None):
         """GET ``<base><path>`` and return parsed JSON. Refreshes the token
-        first; raises UniteUsAuthExpired on 401/403."""
-        if not creds_client.ensure_fresh(self.cred):
+        first (unless ``allow_refresh`` is False); raises UniteUsAuthExpired on
+        401/403."""
+        if self.allow_refresh:
+            if not creds_client.ensure_fresh(self.cred):
+                raise UniteUsAuthExpired(
+                    f"credential {self.cred.pk} is not usable (provider={self.cred.provider_id})"
+                )
+        elif not self.cred.access_token:
             raise UniteUsAuthExpired(
-                f"credential {self.cred.pk} is not usable (provider={self.cred.provider_id})"
+                f"credential {self.cred.pk} has no access token (provider={self.cred.provider_id})"
             )
         url = f"{self.base}{path}"
         try:
@@ -72,6 +84,36 @@ class UniteUsClient:
             return resp.json()
         except ValueError as exc:
             raise UniteUsApiError(f"GET {path} returned non-JSON: {exc}")
+
+    def core_post(self, path, json_body):
+        """POST ``<base><path>`` with a JSON body and return parsed JSON.
+        Same auth/refresh semantics as :meth:`core_get`."""
+        if self.allow_refresh:
+            if not creds_client.ensure_fresh(self.cred):
+                raise UniteUsAuthExpired(
+                    f"credential {self.cred.pk} is not usable (provider={self.cred.provider_id})"
+                )
+        elif not self.cred.access_token:
+            raise UniteUsAuthExpired(
+                f"credential {self.cred.pk} has no access token (provider={self.cred.provider_id})"
+            )
+        headers = self._headers()
+        headers["content-type"] = "application/json"
+        url = f"{self.base}{path}"
+        try:
+            resp = self._session.post(
+                url, headers=headers, json=json_body, timeout=self.timeout
+            )
+        except requests.RequestException as exc:
+            raise UniteUsApiError(f"POST {path} failed: {exc}")
+        if resp.status_code in (401, 403):
+            raise UniteUsAuthExpired(f"POST {path} -> {resp.status_code}")
+        if resp.status_code >= 400:
+            raise UniteUsApiError(f"POST {path} -> {resp.status_code}: {resp.text[:500]}")
+        try:
+            return resp.json()
+        except ValueError as exc:
+            raise UniteUsApiError(f"POST {path} returned non-JSON: {exc}")
 
     def _paginate(self, path, base_params=None, page_size=50):
         """Yield every ``data`` record across JSON:API ``page[number]`` pages."""
@@ -188,6 +230,108 @@ class UniteUsClient:
                 page_size=100,
             )
         )
+
+    # -- exports (bulk report files) --------------------------------------
+    # The "Exports" page (app.uniteus.io/exports) is backed by these core-API
+    # endpoints. An export is requested (POST /exports), generated async by
+    # Unite Us, then its downloadable file is exposed as a ``file_uploads``
+    # record tied to the export (record.type=export).
+    EXPORT_TYPES = (
+        "assessments", "screenings", "screeningsv2", "cases", "clients",
+        "referrals", "users", "notes", "assistance_requests",
+        "assistance_requests_supplemental_responses", "invoices",
+        "resource_list_shares",
+    )
+
+    def list_exports(self, export_types=None, provider_id=None, page_size=100):
+        """List the provider's exports (most-recent first if the API sorts).
+
+        Mirrors the results-table poll:
+        ``GET /exports?filter[requester.provider]=<pid>&filter[export_type]=…``
+        Returns the raw JSON:API ``data`` list (each has attributes incl. the
+        generation state + a link/relationship to the file once ready)."""
+        pid = provider_id or self.cred.provider_id
+        types = ",".join(export_types or self.EXPORT_TYPES)
+        return list(
+            self._paginate(
+                "/exports",
+                {
+                    "filter[requester.provider]": pid,
+                    "filter[export_type]": types,
+                },
+                page_size=page_size,
+            )
+        )
+
+    def request_export(self, export_type, start_date, end_date, requester_id=None):
+        """Request a new export (the "Request Export" button). ``start_date`` /
+        ``end_date`` are ``YYYY-MM-DD`` strings. Returns the created export
+        record (``data``) -- poll its ``attributes.state`` until ``completed``.
+
+        ``requester_id`` defaults to this credential's employee id (the API
+        requires a requester employee)."""
+        requester = requester_id or self.cred.employee_id
+        body = {
+            "jsonapi": {"version": "1.0"},
+            "data": {
+                "type": "export",
+                "attributes": {
+                    "export_type": export_type,
+                    "state": "requested",
+                    "details": {"start_date": start_date, "end_date": end_date},
+                },
+                "relationships": {
+                    "requester": {"data": {"type": "employee", "id": requester}},
+                },
+            },
+        }
+        return (self.core_post("/exports", body) or {}).get("data") or {}
+
+    def get_export(self, export_id):
+        """Fetch a single export record (to poll its state)."""
+        return (self.core_get(f"/exports/{export_id}") or {}).get("data") or {}
+
+    def list_export_file_uploads(self, export_id):
+        """The file_uploads record(s) for one export -- holds the download URL
+        and upload state once Unite Us finishes generating the file.
+        ``GET /file_uploads?filter[record]=<export_id>&filter[record.type]=export``"""
+        return self.core_get(
+            "/file_uploads",
+            params={
+                "filter[record]": export_id,
+                "filter[record.type]": "export",
+            },
+        )
+
+    def download_export_file(self, path, dest_fileobj):
+        """Stream a completed export's CSV to ``dest_fileobj``.
+
+        ``path`` is the ``file_uploads`` ``attributes.path`` (a Rails
+        ActiveStorage signed redirect under the core host, e.g.
+        ``/rails/active_storage/blobs/redirect/...``). The signed link expires
+        ~30 min after generation, so resolve file_uploads then call this
+        promptly. Returns the number of bytes written.
+
+        requests drops the Authorization header on the cross-host redirect to
+        the signed blob store, so no credentials leak to S3/GCS."""
+        url = path if path.startswith("http") else f"{self.host}{path}"
+        try:
+            resp = self._session.get(
+                url, headers=self._headers(), timeout=self.timeout,
+                stream=True, allow_redirects=True,
+            )
+        except requests.RequestException as exc:
+            raise UniteUsApiError(f"download export file failed: {exc}")
+        if resp.status_code in (401, 403):
+            raise UniteUsAuthExpired(f"download -> {resp.status_code}")
+        if resp.status_code >= 400:
+            raise UniteUsApiError(f"download -> {resp.status_code}: {resp.text[:300]}")
+        written = 0
+        for chunk in resp.iter_content(chunk_size=1024 * 256):
+            if chunk:
+                dest_fileobj.write(chunk)
+                written += len(chunk)
+        return written
 
     # -- generic related lookups ------------------------------------------
     def get_resource(self, resource_path, resource_id):

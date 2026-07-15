@@ -26,7 +26,6 @@ def root(_request):
         "status": "ok",
         "endpoints": {
             "api": "/api/",
-            "admin": "/admin/",
         },
     })
 

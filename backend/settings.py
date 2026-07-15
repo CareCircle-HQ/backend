@@ -341,6 +341,17 @@ CELERY_TASK_TRACK_STARTED = True
 CELERY_BROKER_CONNECTION_RETRY_ON_STARTUP = True
 CELERY_TIMEZONE = "UTC"
 
+# Beat schedule. The Unite Us export poller advances requested exports through
+# download -> S3 -> import; exports take a few minutes to generate, so a short
+# cadence keeps latency low without hammering the API. Requesting exports is
+# UI/manual-triggered (or via api.tasks.request_uniteus_exports on demand).
+CELERY_BEAT_SCHEDULE = {
+    "poll-uniteus-exports": {
+        "task": "api.tasks.poll_uniteus_exports",
+        "schedule": float(os.getenv("UNITEUS_EXPORT_POLL_SECONDS", "300")),
+    },
+}
+
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
 # Django REST Framework

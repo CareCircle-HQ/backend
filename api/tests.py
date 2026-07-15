@@ -1971,6 +1971,42 @@ class MemberWarningsTest(TestCase):
         assigned = self._enrollment(self._client(), kitchen=kitchen)
         self.assertNotIn(NO_KITCHEN, self._codes(assigned))
 
+    def test_plan_warnings_suppressed_when_no_servable_member(self):
+        # An active household whose only member is Out of Orbit has no delivery
+        # plan by design -- do NOT flag "no kitchen / no cadence". It should
+        # still surface as the household out-of-orbit count instead.
+        from .models import MemberStatus
+        from .services.warnings import (
+            HOUSEHOLD_MEMBERS_OUT_OF_ORBIT, NO_CADENCE, NO_KITCHEN,
+        )
+
+        c = self._client()
+        enr = self._enrollment(c)  # SERVICE_ACTIVE, no kitchen/cadence
+        mp = enr.member_profiles.first()
+        mp.status = MemberStatus.OUT_OF_ORBIT
+        mp.save(update_fields=["status"])
+
+        codes = self._codes(enr)
+        self.assertNotIn(NO_CADENCE, codes)
+        self.assertNotIn(NO_KITCHEN, codes)
+        self.assertIn(HOUSEHOLD_MEMBERS_OUT_OF_ORBIT, codes)
+
+    def test_plan_warnings_still_flag_when_a_member_is_servable(self):
+        # A mixed household (one ACTIVE member + one Out of Orbit) still needs a
+        # kitchen for the served member, so the warning must remain.
+        from .models import HouseholdMember, MemberDietaryProfile, MemberStatus
+        from .services.warnings import NO_KITCHEN
+
+        primary = self._client(first="Prim", last="Ary")
+        enr = self._enrollment(primary)  # ACTIVE primary, no kitchen
+        other = self._client(first="Orb", last="It")
+        HouseholdMember.objects.create(household=enr.household, client=other)
+        mp2 = MemberDietaryProfile.objects.create(enrollment=enr, client=other)
+        mp2.status = MemberStatus.OUT_OF_ORBIT
+        mp2.save(update_fields=["status"])
+
+        self.assertIn(NO_KITCHEN, self._codes(enr))
+
     def test_multiple_open_cases(self):
         from .services.warnings import MULTIPLE_OPEN_CASES
 
@@ -2061,6 +2097,76 @@ class MemberWarningsTest(TestCase):
             auth_ends=timezone.now() - timedelta(days=3),
         )
         self.assertIn(INTERNAL_CASE_EXPIRED, self._codes(enr))
+
+    def test_member_paused_warning(self):
+        from .models import MemberStatus
+        from .services.warnings import MEMBER_PAUSED
+
+        enr = self._enrollment(self._client())
+        mp = enr.member_profiles.first()
+        mp.status = MemberStatus.PAUSED
+        mp.save(update_fields=["status"])
+        self.assertIn(MEMBER_PAUSED, self._codes(enr))
+
+    def test_out_of_orbit_range_are_household_counts_not_member_warnings(self):
+        # Out of orbit / out of range surface as a SINGLE household count
+        # warning, never a separate per-member warning.
+        from .models import MemberStatus
+        from .services.warnings import HOUSEHOLD_MEMBERS_OUT_OF_ORBIT
+
+        enr = self._enrollment(self._client())
+        mp = enr.member_profiles.first()
+        mp.status = MemberStatus.OUT_OF_ORBIT
+        mp.save(update_fields=["status"])
+        codes = self._codes(enr)
+        self.assertIn(HOUSEHOLD_MEMBERS_OUT_OF_ORBIT, codes)
+        self.assertNotIn("member_out_of_orbit", codes)
+
+    def test_household_on_hold(self):
+        from .models import EnrollmentStage
+        from .services.warnings import HOUSEHOLD_ON_HOLD
+
+        enr = self._enrollment(self._client(), stage=EnrollmentStage.ON_HOLD)
+        self.assertIn(HOUSEHOLD_ON_HOLD, self._codes(enr))
+
+    def test_household_cancelled_suppresses_member_status(self):
+        from .models import EnrollmentStage, MemberStatus
+        from .services.warnings import HOUSEHOLD_CANCELLED, MEMBER_PAUSED
+
+        enr = self._enrollment(self._client(), stage=EnrollmentStage.CANCELLED)
+        mp = enr.member_profiles.first()
+        mp.status = MemberStatus.PAUSED
+        mp.save(update_fields=["status"])
+        codes = self._codes(enr)
+        self.assertIn(HOUSEHOLD_CANCELLED, codes)
+        # Member-status warnings are suppressed for a terminal (cancelled) household.
+        self.assertNotIn(MEMBER_PAUSED, codes)
+
+    def test_household_out_of_service_counts(self):
+        from .models import MemberDietaryProfile, MemberStatus
+        from .services.warnings import (
+            HOUSEHOLD_MEMBERS_OUT_OF_ORBIT, HOUSEHOLD_MEMBERS_OUT_OF_RANGE,
+            evaluate_enrollment_warnings,
+        )
+
+        c = self._client()
+        enr = self._enrollment(c)
+        # Primary out of orbit; add a second out-of-orbit member and one
+        # out-of-range member (all on the same enrollment/household).
+        mp = enr.member_profiles.first()
+        mp.status = MemberStatus.OUT_OF_ORBIT
+        mp.save(update_fields=["status"])
+        MemberDietaryProfile.objects.create(
+            enrollment=enr, client=self._client(), status=MemberStatus.OUT_OF_ORBIT,
+        )
+        MemberDietaryProfile.objects.create(
+            enrollment=enr, client=self._client(), status=MemberStatus.OUT_OF_RANGE,
+        )
+        warns = {w.code: w for w in evaluate_enrollment_warnings(enr)}
+        self.assertEqual(warns[HOUSEHOLD_MEMBERS_OUT_OF_ORBIT].refs["count"], 2)
+        self.assertEqual(warns[HOUSEHOLD_MEMBERS_OUT_OF_RANGE].refs["count"], 1)
+        self.assertEqual(warns[HOUSEHOLD_MEMBERS_OUT_OF_ORBIT].title, "2 Out of Orbit")
+        self.assertEqual(warns[HOUSEHOLD_MEMBERS_OUT_OF_RANGE].title, "1 Out of Range")
 
     def test_clean_household_has_no_warnings(self):
         from .models import Cadence, Kitchen, KitchenProductType, KitchenStatus, ProductType, ProductTypeKind
@@ -2255,3 +2361,69 @@ class CareManagementListTest(TestCase):
         self.assertIn(str(served.pk), ids)
         self.assertNotIn(str(on_hold.pk), ids)
         self.assertNotIn(str(cancelled.pk), ids)
+
+    def _make_row(self, code, first, last, *, scope="household"):
+        """A served household carrying a single ACTIVE warning of ``code``
+        (created directly so the test targets the view's allowlist, not the
+        detection setup)."""
+        from .models import (
+            EnrollmentStage, EnrollmentVerification, Household, HouseholdMember,
+            MemberWarning, WarningSeverity, WarningStatus,
+        )
+
+        c = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name=first, last_name=last
+        )
+        hh = Household.objects.create(name="HH")
+        HouseholdMember.objects.create(household=hh, client=c, is_primary=True)
+        enr = EnrollmentVerification.objects.create(
+            client=c, household=hh, stage=EnrollmentStage.SERVICE_ACTIVE,
+        )
+        MemberWarning.objects.create(
+            client=c, enrollment=enr, code=code, severity=WarningSeverity.ORANGE,
+            scope=scope, title=code, detail="", status=WarningStatus.ACTIVE,
+        )
+        return c, enr
+
+    def test_excludes_non_actionable_member_and_household_state_warnings(self):
+        # Only service-config problems CS can remediate flag a household onto the
+        # queue; informational states (out of orbit/range, paused) do not.
+        from .services.warnings import (
+            HOUSEHOLD_MEMBERS_OUT_OF_ORBIT, HOUSEHOLD_MEMBERS_OUT_OF_RANGE,
+            MEMBER_PAUSED, NO_KITCHEN,
+        )
+
+        actionable, _ = self._make_row(NO_KITCHEN, "Act", "Ionable")
+        orbit, _ = self._make_row(HOUSEHOLD_MEMBERS_OUT_OF_ORBIT, "Or", "Bit")
+        rng, _ = self._make_row(HOUSEHOLD_MEMBERS_OUT_OF_RANGE, "Ra", "Nge")
+        paused, _ = self._make_row(MEMBER_PAUSED, "Pau", "Sed", scope="member")
+
+        resp = self.api.get(reverse("portal-care-management"))
+        self.assertEqual(resp.status_code, 200, resp.content)
+        ids = self._ids(resp.json())
+        self.assertIn(str(actionable.pk), ids)
+        self.assertNotIn(str(orbit.pk), ids)
+        self.assertNotIn(str(rng.pk), ids)
+        self.assertNotIn(str(paused.pk), ids)
+
+    def test_actionable_household_hides_informational_rows(self):
+        # A household surfaced for a real issue must not carry informational
+        # (out-of-orbit) rows in its warning list.
+        from .models import MemberWarning, WarningSeverity, WarningStatus
+        from .services.warnings import HOUSEHOLD_MEMBERS_OUT_OF_ORBIT, NO_KITCHEN
+
+        c, enr = self._make_row(NO_KITCHEN, "Mix", "Ed")
+        MemberWarning.objects.create(
+            client=c, enrollment=enr, code=HOUSEHOLD_MEMBERS_OUT_OF_ORBIT,
+            severity=WarningSeverity.ORANGE, scope="household",
+            title="1 Out of Orbit", detail="", status=WarningStatus.ACTIVE,
+        )
+
+        resp = self.api.get(reverse("portal-care-management"))
+        self.assertEqual(resp.status_code, 200, resp.content)
+        row = next(
+            r for r in resp.json()["results"] if r["client_id"] == str(c.pk)
+        )
+        codes = {w["code"] for w in row["warnings"]}
+        self.assertIn(NO_KITCHEN, codes)
+        self.assertNotIn(HOUSEHOLD_MEMBERS_OUT_OF_ORBIT, codes)

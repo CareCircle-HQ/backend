@@ -687,29 +687,77 @@ def event_for_out_of_range(
 
 
 def event_for_household_member_added(
-    primary_client, member_client, *, enrollment=None, source=ChangeSource.CRM, actor="",
+    primary_client, member_client, *, enrollment=None, source=ChangeSource.CRM,
+    actor="", added_from="",
 ):
     """Emit a 'Household Member Added' event on the PRIMARY client's timeline
     when an agent adds another member to the household (e.g. via the
     verification wizard's member search). De-duped per primary+member so
-    re-saving the verification doesn't duplicate the row."""
+    re-saving the verification doesn't duplicate the row.
+
+    ``added_from`` is a human-readable origin (e.g. "the Household tab", "the
+    verification pop-up") appended to the description so it's clear WHERE the
+    member was added.
+    """
     if primary_client is None or member_client is None:
         return None
-    name = f"{member_client.first_name} {member_client.last_name}".strip()
+    name = f"{member_client.first_name} {member_client.last_name}".strip() or "New member"
+    subtitle = f"{name} · added from {added_from}" if added_from else name
     return emit_timeline_event(
         client=primary_client,
         event_type=TimelineEventType.HOUSEHOLD_MEMBER_ADDED,
         occurred_at=timezone.now(),
         title="Household Member Added",
-        subtitle=name or "New member",
+        subtitle=subtitle,
         badge_text="Added",
         badge_tone=TimelineBadgeTone.INFO,
         source=source,
         actor=actor,
         entity=member_client,
         enrollment=enrollment,
-        metadata={"member_client_id": str(member_client.pk)},
+        metadata={
+            "member_client_id": str(member_client.pk),
+            "added_from": added_from,
+        },
         dedupe_key=f"household_member_added:{primary_client.pk}:{member_client.pk}",
+    )
+
+
+def event_for_household_member_removed(
+    primary_client, member_client, *, member_name="", enrollment=None,
+    source=ChangeSource.CRM, actor="", removed_from="",
+):
+    """Emit a 'Household Member Removed' event on the PRIMARY client's timeline
+    when an agent removes a member from the household.
+
+    ``removed_from`` is a human-readable origin (e.g. "the Household tab")
+    appended to the description so it's clear WHERE the member was removed.
+    Not de-duped: each removal is a distinct point on the timeline (a member can
+    be removed, re-added and removed again).
+    """
+    if primary_client is None:
+        return None
+    name = member_name
+    if not name and member_client is not None:
+        name = f"{member_client.first_name} {member_client.last_name}".strip()
+    name = name or "Member"
+    subtitle = f"{name} · removed from {removed_from}" if removed_from else name
+    return emit_timeline_event(
+        client=primary_client,
+        event_type=TimelineEventType.HOUSEHOLD_MEMBER_REMOVED,
+        occurred_at=timezone.now(),
+        title="Household Member Removed",
+        subtitle=subtitle,
+        badge_text="Removed",
+        badge_tone=TimelineBadgeTone.WARNING,
+        source=source,
+        actor=actor,
+        entity=member_client,
+        enrollment=enrollment,
+        metadata={
+            "member_client_id": str(member_client.pk) if member_client else "",
+            "removed_from": removed_from,
+        },
     )
 
 

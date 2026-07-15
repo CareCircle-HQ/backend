@@ -10,13 +10,13 @@ from rest_framework.parsers import FormParser, MultiPartParser
 from rest_framework.response import Response
 
 from ..models import Case, ImportRun, ImportRunStatus, UniteUsAgent
-from ..services import import_storage
+from ..services import import_storage, uniteus_exports
 from ..services.csv_import import (
     CSV_SOURCE,
     SUPPORTED_EXPORT_TYPES,
     run_csv_import,
 )
-from ..tasks import process_import
+from ..tasks import poll_uniteus_exports, process_import
 from .base import PortalAPIView, current_agent
 
 
@@ -443,7 +443,72 @@ class UniteUsAgentsView(PortalAPIView):
 
 
 class UniteUsAgentDetailView(PortalAPIView):
-    """DELETE a Unite Us agent from the allowlist (remove from settings)."""
+    """Edit (PATCH) or remove (DELETE) a Unite Us agent in the allowlist."""
+
+    def patch(self, request, agent_id):
+        agent = UniteUsAgent.objects.filter(pk=agent_id).first()
+        if agent is None:
+            return Response(status=http.HTTP_404_NOT_FOUND)
+
+        data = request.data
+
+        # user_id is the natural key that joins to Case.created_by_id. It's
+        # editable (e.g. to fix a typo) but must stay a valid, unique UUID.
+        if "user_id" in data:
+            raw_user_id = (data.get("user_id") or "").strip()
+            try:
+                user_id = uuid.UUID(raw_user_id)
+            except (ValueError, AttributeError, TypeError):
+                return Response(
+                    {"user_id": "Must be a valid Unite Us user id (UUID)."},
+                    status=http.HTTP_400_BAD_REQUEST,
+                )
+            if (
+                UniteUsAgent.objects.filter(user_id=user_id)
+                .exclude(pk=agent.pk)
+                .exists()
+            ):
+                return Response(
+                    {"user_id": "This Unite Us agent is already in the list."},
+                    status=http.HTTP_409_CONFLICT,
+                )
+            agent.user_id = user_id
+
+        if "first_name" in data:
+            agent.first_name = (data.get("first_name") or "").strip()
+        if "last_name" in data:
+            agent.last_name = (data.get("last_name") or "").strip()
+        if "name" in data:
+            agent.name = (data.get("name") or "").strip()
+        if "email" in data:
+            agent.email = (data.get("email") or "").strip().lower()
+        if "work_title" in data:
+            agent.work_title = (data.get("work_title") or "").strip()
+        if "status" in data:
+            agent.status = (data.get("status") or "active").strip().lower()
+        if "is_us" in data:
+            agent.is_us = bool(data.get("is_us"))
+        if "originating_team" in data:
+            agent.originating_team = (
+                (data.get("originating_team") or "").strip() or "Met Council Team"
+            )
+
+        # Keep the display name in sync when only the name parts changed and no
+        # explicit name is set.
+        if (
+            "name" not in data
+            and ("first_name" in data or "last_name" in data)
+            and not agent.name
+        ):
+            agent.name = " ".join(
+                p for p in [agent.first_name, agent.last_name] if p
+            )
+
+        agent.save()
+        counts = _case_counts_by_creator()
+        return Response(
+            _agent_dict(agent, counts.get(str(agent.user_id).lower(), 0))
+        )
 
     def delete(self, request, agent_id):
         agent = UniteUsAgent.objects.filter(pk=agent_id).first()
@@ -451,3 +516,149 @@ class UniteUsAgentDetailView(PortalAPIView):
             return Response(status=http.HTTP_404_NOT_FOUND)
         agent.delete()
         return Response(status=http.HTTP_204_NO_CONTENT)
+
+
+# ---------------------------------------------------------------------------
+# Settings > Import: automated Unite Us "Exports" (request -> poll -> import)
+# ---------------------------------------------------------------------------
+# Human labels for the export types the Request Export UI offers.
+_UNITEUS_EXPORT_LABELS = {
+    "clients": "Clients",
+    "assessments": "Assessments",
+    "cases": "Cases",
+    "notes": "Notes",
+    "screeningsv2": "Screenings V2.0",
+}
+
+
+def _export_summary(exp):
+    run = exp.import_run
+    return {
+        "id": exp.pk,
+        "export_id": exp.export_id,
+        "export_type": exp.export_type,
+        "export_type_label": _UNITEUS_EXPORT_LABELS.get(exp.export_type, exp.export_type),
+        "importer_type": exp.importer_type,
+        "start_date": exp.start_date,
+        "end_date": exp.end_date,
+        "unite_state": exp.unite_state,
+        "status": exp.status,
+        "status_label": exp.get_status_display(),
+        "filename": exp.filename,
+        "triggered_by": exp.triggered_by,
+        "error_log": exp.error_log,
+        "created_at": exp.created_at,
+        "downloaded_at": exp.downloaded_at,
+        "imported_at": exp.imported_at,
+        # Link the import run so the UI can show counts/progress inline.
+        "import_run": _run_summary(run) if run is not None else None,
+    }
+
+
+class UniteUsExportsView(PortalAPIView):
+    """Settings > Import: automated Unite Us exports.
+
+    GET  — supported types + this month's requested exports (with status).
+    POST — request one or more exports (``export_types`` list or ``export_type``)
+           for a date window (``start_date``/``end_date``, min 7 days). Each
+           requested export is tracked and auto-downloaded + imported once Unite
+           Us finishes generating it.
+    """
+
+    def get(self, request):
+        from ..models import UniteUsExport
+
+        month_start = timezone.localtime().replace(
+            day=1, hour=0, minute=0, second=0, microsecond=0
+        )
+        exports = (
+            UniteUsExport.objects.select_related("import_run")
+            .filter(created_at__gte=month_start)
+            .order_by("-created_at")
+        )
+        return Response({
+            "supported_types": [
+                {"value": v, "label": _UNITEUS_EXPORT_LABELS.get(v, v)}
+                for v in uniteus_exports.SUPPORTED_EXPORT_TYPES
+            ],
+            "min_window_days": uniteus_exports.MIN_WINDOW_DAYS,
+            "results": [_export_summary(e) for e in exports],
+        })
+
+    def post(self, request):
+        from django.utils.dateparse import parse_date
+
+        raw_types = request.data.get("export_types")
+        if not raw_types:
+            single = (request.data.get("export_type") or "").strip()
+            raw_types = [single] if single else []
+        export_types = [t for t in (raw_types or []) if t]
+        if not export_types:
+            return Response(
+                {"detail": "Select at least one export type."},
+                status=http.HTTP_400_BAD_REQUEST,
+            )
+        bad = [t for t in export_types if t not in uniteus_exports.SUPPORTED_EXPORT_TYPES]
+        if bad:
+            return Response(
+                {"detail": f"Unsupported export type(s): {', '.join(bad)}."},
+                status=http.HTTP_400_BAD_REQUEST,
+            )
+
+        start = parse_date((request.data.get("start_date") or "").strip())
+        end = parse_date((request.data.get("end_date") or "").strip())
+        if start is None or end is None:
+            return Response(
+                {"detail": "start_date and end_date (YYYY-MM-DD) are required."},
+                status=http.HTTP_400_BAD_REQUEST,
+            )
+        if (end - start).days < uniteus_exports.MIN_WINDOW_DAYS:
+            return Response(
+                {"detail": f"The date range must be at least {uniteus_exports.MIN_WINDOW_DAYS} days."},
+                status=http.HTTP_400_BAD_REQUEST,
+            )
+
+        triggered_by = _triggered_by(request)
+        created, errors = [], {}
+        for etype in export_types:
+            try:
+                exp = uniteus_exports.request_export(
+                    etype, start, end, triggered_by=triggered_by,
+                )
+                created.append(_export_summary(exp))
+            except (ValueError, RuntimeError) as exc:
+                errors[etype] = str(exc)
+            except Exception as exc:  # noqa: BLE001 - surface API/transport errors cleanly
+                errors[etype] = str(exc)
+
+        # Kick the poller so requested exports start advancing without waiting
+        # for the next beat tick (best-effort; the beat schedule covers it too).
+        if created:
+            try:
+                poll_uniteus_exports.delay()
+            except Exception:  # noqa: BLE001 - no broker in some envs; beat/cron still runs
+                pass
+
+        body = {"created": created, "errors": errors}
+        if not created and errors:
+            # Nothing requested -- surface WHY (e.g. expired token, no credential)
+            # via ``detail`` so the UI shows it instead of a generic 400.
+            body["detail"] = "; ".join(f"{t}: {m}" for t, m in errors.items())
+        status_code = (
+            http.HTTP_201_CREATED if created else http.HTTP_400_BAD_REQUEST
+        )
+        return Response(body, status=status_code)
+
+
+class UniteUsExportPollView(PortalAPIView):
+    """POST — trigger an immediate poll of pending Unite Us exports (the UI's
+    "Refresh" button), so the user doesn't wait for the next scheduled tick."""
+
+    def post(self, request):
+        try:
+            poll_uniteus_exports.delay()
+            queued = True
+        except Exception:  # noqa: BLE001 - no broker: fall back to inline
+            uniteus_exports.poll_pending()
+            queued = False
+        return Response({"queued": queued}, status=http.HTTP_202_ACCEPTED)

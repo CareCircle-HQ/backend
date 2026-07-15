@@ -2000,6 +2000,7 @@ class MemberHouseholdAddView(PortalAPIView):
             timeline.event_for_household_member_added(
                 primary, member_client,
                 enrollment=s.active_enrollment(primary), actor=actor,
+                added_from="the Household tab",
             )
         except Exception:  # never let history-logging break the add
             pass
@@ -2204,6 +2205,75 @@ class HouseholdMemberEditView(PortalAPIView):
         resync_scheduled_orders(enrollment=mv.enrollment)
 
         return Response(s.PortalHouseholdMemberSerializer(mv).data)
+
+    def delete(self, request, client_id, member_id):
+        """Remove a member from this client's household (Household tab).
+
+        Drops the member's dietary profile on the active enrollment AND their
+        household roster row (so the read-side sync won't re-add them),
+        mirroring the extension's ``household_remove``. The primary member
+        cannot be removed. Logs a 'Household Member Removed' timeline event on
+        the primary's history, tagged with the source ("the Household tab").
+        """
+        client = get_object_or_404(Client, pk=client_id)
+        enr = s.active_enrollment(client)
+        mv = get_object_or_404(MemberDietaryProfile, pk=member_id, enrollment=enr)
+
+        household = getattr(enr, "household", None)
+        if household is None and mv.client_id:
+            membership = (
+                HouseholdMember.objects.filter(client_id=mv.client_id)
+                .select_related("household")
+                .first()
+            )
+            household = membership.household if membership else None
+
+        member_client = mv.client
+        member_name = mv.member_name or (
+            f"{member_client.first_name} {member_client.last_name}".strip()
+            if member_client else ""
+        )
+
+        # The household's primary member owns the timeline and can't be removed.
+        primary_membership = (
+            household.members.filter(is_primary=True).select_related("client").first()
+            if household is not None else None
+        )
+        primary_client = (
+            primary_membership.client if primary_membership is not None else client
+        )
+        if (
+            member_client is not None
+            and primary_membership is not None
+            and member_client.pk == primary_membership.client_id
+        ):
+            return Response(
+                {"error": "The primary member cannot be removed."},
+                status=http.HTTP_400_BAD_REQUEST,
+            )
+
+        agent = current_agent(request)
+        actor = _agent_actor(agent)
+        with transaction.atomic():
+            if mv.client_id and household is not None:
+                HouseholdMember.objects.filter(
+                    client_id=mv.client_id, household=household
+                ).delete()
+                MemberDietaryProfile.objects.filter(
+                    client_id=mv.client_id, enrollment__household=household
+                ).delete()
+            else:
+                # Profile-only member (no client link): just drop this profile.
+                mv.delete()
+            try:
+                timeline.event_for_household_member_removed(
+                    primary_client, member_client, member_name=member_name,
+                    enrollment=enr, actor=actor, removed_from="the Household tab",
+                )
+            except Exception:  # never let history-logging break the removal
+                pass
+
+        return Response(status=http.HTTP_204_NO_CONTENT)
 
 
 class MemberServiceHoldView(PortalAPIView):
@@ -2690,7 +2760,8 @@ class MemberVerificationCreateView(PortalAPIView):
                 )
                 try:
                     timeline.event_for_household_member_added(
-                        client, member_client, enrollment=enrollment, actor=actor
+                        client, member_client, enrollment=enrollment, actor=actor,
+                        added_from="the verification pop-up",
                     )
                 except Exception:  # never let history-logging break the save
                     pass

@@ -91,7 +91,10 @@ from .views_orders import (
 from .views_delivery_calendar import MemberDeliveryCalendarView
 from .views_kitchen_output import KitchenOutputView
 from .views_po_blockers import POBlockersFixView, POBlockersStatsView, POBlockersView
-from .views_reports import MembersByLeadSourceReportView
+from .views_reports import (
+    MembersByLeadSourceReportView,
+    MembersPendingVerificationReportView,
+)
 from .views_activity import ActivityFiltersView, ActivityLogView
 from .views_service_area import ExcludedZipCodeDetailView, ExcludedZipCodesView
 from .views_imports import (
@@ -103,6 +106,8 @@ from .views_imports import (
     ImportUploadView,
     UniteUsAgentDetailView,
     UniteUsAgentsView,
+    UniteUsExportPollView,
+    UniteUsExportsView,
 )
 from .views_settings import (
     CadenceViewSet,
@@ -272,6 +277,9 @@ urlpatterns = [
     path("settings/imports/<int:run_id>/start/", ImportStartView.as_view(), name="portal-import-start"),
     # Settings > Import Activity: rollup of follow-up actions across case imports
     path("settings/import-activity/", ImportActivityView.as_view(), name="portal-import-activity"),
+    # Settings > Import: automated Unite Us exports (request -> poll -> import)
+    path("settings/uniteus-exports/", UniteUsExportsView.as_view(), name="portal-uniteus-exports"),
+    path("settings/uniteus-exports/poll/", UniteUsExportPollView.as_view(), name="portal-uniteus-exports-poll"),
     # Settings > Activity Log: cross-client timeline feed (admin audit view)
     path("activity/", ActivityLogView.as_view(), name="portal-activity"),
     path("activity/filters/", ActivityFiltersView.as_view(), name="portal-activity-filters"),
@@ -318,6 +326,11 @@ urlpatterns = [
         "reports/members-by-lead-source/",
         MembersByLeadSourceReportView.as_view(),
         name="portal-report-members-by-lead-source",
+    ),
+    path(
+        "reports/members-pending-verification/",
+        MembersPendingVerificationReportView.as_view(),
+        name="portal-report-members-pending-verification",
     ),
 
     # Care Management (Customer Service)

@@ -64,3 +64,35 @@ def process_import(self, run_id):
                 os.unlink(tmp.name)
             except OSError:
                 pass
+
+
+@shared_task(bind=True, ignore_result=True)
+def poll_uniteus_exports(self, limit=50):
+    """Advance every pending Unite Us export (poll state -> download -> import ->
+    reconcile). Scheduled on Celery beat; also safe to call ad-hoc."""
+    from .services import uniteus_exports
+    processed = uniteus_exports.poll_pending(limit=limit)
+    logger.info("poll_uniteus_exports: processed %s export(s)", len(processed))
+
+
+@shared_task(bind=True, ignore_result=True)
+def request_uniteus_exports(self, export_types=None, days=7, triggered_by="cron:uniteus-export"):
+    """Request a rolling-window export for each of ``export_types`` (default: all
+    supported), then kick a poll. Used by the nightly schedule; the UI requests
+    inline instead."""
+    from datetime import timedelta
+    from django.utils import timezone
+    from .services import uniteus_exports
+
+    types = export_types or list(uniteus_exports.SUPPORTED_EXPORT_TYPES)
+    end = timezone.localdate()
+    start = end - timedelta(days=max(days, uniteus_exports.MIN_WINDOW_DAYS))
+    for etype in types:
+        try:
+            uniteus_exports.request_export(
+                etype, start, end, triggered_by=triggered_by,
+            )
+        except Exception:  # noqa: BLE001 - one type failing shouldn't stop the rest
+            logger.exception("request_uniteus_exports: %s failed", etype)
+    # Nudge the poller so freshly-requested exports start advancing.
+    poll_uniteus_exports.delay()
