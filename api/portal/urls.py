@@ -106,6 +106,7 @@ from .views_imports import (
     ImportUploadView,
     UniteUsAgentDetailView,
     UniteUsAgentsView,
+    UniteUsExportDetailView,
     UniteUsExportPollView,
     UniteUsExportsView,
 )
@@ -280,6 +281,7 @@ urlpatterns = [
     # Settings > Import: automated Unite Us exports (request -> poll -> import)
     path("settings/uniteus-exports/", UniteUsExportsView.as_view(), name="portal-uniteus-exports"),
     path("settings/uniteus-exports/poll/", UniteUsExportPollView.as_view(), name="portal-uniteus-exports-poll"),
+    path("settings/uniteus-exports/<int:export_pk>/", UniteUsExportDetailView.as_view(), name="portal-uniteus-export-detail"),
     # Settings > Activity Log: cross-client timeline feed (admin audit view)
     path("activity/", ActivityLogView.as_view(), name="portal-activity"),
     path("activity/filters/", ActivityFiltersView.as_view(), name="portal-activity-filters"),

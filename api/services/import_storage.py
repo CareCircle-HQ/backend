@@ -86,6 +86,19 @@ def download_to_temp(key):
     return tmp
 
 
+def delete_object(key):
+    """Best-effort delete of an object under the imports/ prefix. Returns True
+    when a delete request was issued, False when skipped (no key / no bucket) or
+    it failed (logged by the caller). Never raises."""
+    if not key or not s3_enabled():
+        return False
+    try:
+        _client().delete_object(Bucket=_bucket(), Key=key)
+        return True
+    except (BotoCoreError, ClientError):
+        return False
+
+
 def upload_fileobj(key, fileobj, *, content_type="text/csv"):
     """Server-side upload of a file-like to S3 under the imports/ prefix.
 

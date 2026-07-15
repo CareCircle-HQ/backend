@@ -3,6 +3,7 @@ the Unite Us agents allowlist that gates which cases the import accepts."""
 
 import uuid
 
+from django.db import transaction
 from django.db.models import Count
 from django.utils import timezone
 from rest_framework import status as http
@@ -662,3 +663,25 @@ class UniteUsExportPollView(PortalAPIView):
             uniteus_exports.poll_pending()
             queued = False
         return Response({"queued": queued}, status=http.HTTP_202_ACCEPTED)
+
+
+class UniteUsExportDetailView(PortalAPIView):
+    """DELETE — remove a requested export and the pipeline artifacts it created
+    (its ImportRun + downloaded CSV in S3; tickets are unlinked, not deleted).
+    Imported domain data is left in place. Deleting also stops the poller from
+    ever re-processing this export."""
+
+    def delete(self, request, export_pk):
+        from ..models import UniteUsExport
+
+        exp = UniteUsExport.objects.select_related("import_run").filter(
+            pk=export_pk
+        ).first()
+        if exp is None:
+            return Response(
+                {"detail": "Export request not found."},
+                status=http.HTTP_404_NOT_FOUND,
+            )
+        with transaction.atomic():
+            summary = uniteus_exports.delete_export(exp)
+        return Response({"deleted": True, **summary}, status=http.HTTP_200_OK)

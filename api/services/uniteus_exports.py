@@ -261,3 +261,44 @@ def _fail(exp, message):
     exp.status = UniteUsExportStatus.FAILED
     exp.error_log = (message or "")[:5000]
     exp.save(update_fields=["status", "error_log", "updated_at"])
+
+
+def delete_export(exp):
+    """Delete a requested export and the pipeline artifacts it created.
+
+    Removes the :class:`UniteUsExport` row, its linked ``ImportRun`` (and the
+    downloaded CSV in S3), and unlinks any tickets that import opened (their
+    ``import_run`` FK is ``SET_NULL``, so they survive as standalone tickets).
+    The domain records the import ingested (Clients/Cases/Screenings/...) are
+    upserts of shared data and are intentionally LEFT IN PLACE. Deleting the row
+    also stops the poller from ever re-processing this export.
+
+    Returns a small dict describing what was cleaned up. Safe/idempotent enough
+    to call once per row; wrap the caller in a transaction.
+    """
+    summary = {
+        "export_id": exp.export_id,
+        "import_run_deleted": False,
+        "s3_file_deleted": False,
+        "tickets_unlinked": 0,
+    }
+    run = exp.import_run
+    if run is not None:
+        # Drop the request's own reference first so deleting the run doesn't try
+        # to cascade back through this row.
+        exp.import_run = None
+        exp.save(update_fields=["import_run", "updated_at"])
+
+        if run.file_key:
+            summary["s3_file_deleted"] = import_storage.delete_object(run.file_key)
+
+        # Detach tickets before the run goes away (FK is SET_NULL, but count them
+        # for the caller's report).
+        summary["tickets_unlinked"] = run.tickets.count()
+
+        run.delete()
+        summary["import_run_deleted"] = True
+
+    exp.delete()
+    logger.info("Deleted Unite Us export %s (%s)", summary["export_id"], summary)
+    return summary
