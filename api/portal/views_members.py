@@ -758,10 +758,19 @@ class MembersListView(PortalGenericAPIView):
             # Service case (see require_internal_service_primary).
             qs = require_internal_service_primary(qs.filter(verification_scope_q()))
         elif scope == "need_attention":
-            # "Need Attention": new clients whose first internal-service case was
-            # created but whose verification isn't complete yet (Client.is_new).
-            # Set on case creation, cleared when the enrollment reaches VERIFIED.
-            qs = qs.filter(is_new=True)
+            # "Need Attention" (Urgent Care): brand-new members whose first
+            # internal-service case was created by the ext (Client.is_new) and who
+            # have NOT yet entered the verification pipeline at all. Exclude anyone
+            # who already has ANY enrollment -- their own OR their household's -- in
+            # any stage (pending verification, verified-or-beyond, on hold,
+            # cancelled, disregarded): the existence of an enrollment means a
+            # verification was already requested/handled, so a stale is_new flag
+            # must never keep them on the list. Leaves only members with no
+            # enrollment yet.
+            qs = qs.filter(is_new=True).exclude(
+                Q(enrollments__isnull=False)
+                | Q(household_membership__household__enrollment_verifications__isnull=False)
+            ).distinct()
         else:
             scope_stages = SCOPE_TO_STAGES.get(scope)
             if scope_stages:

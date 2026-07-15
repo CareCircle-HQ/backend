@@ -58,6 +58,7 @@ from .services import timeline
 from .services.lifecycle import (
     InvalidTransition,
     advance_enrollment,
+    clear_new_flag_on_verification_request,
     recompute_client_stage,
     recompute_enrollment_household,
     reconcile_enrollment_authorization,
@@ -636,6 +637,9 @@ class EnrollmentVerificationViewSet(viewsets.ModelViewSet):
                 enrollment.case = case
                 update_fields.append("case")
         enrollment.save(update_fields=update_fields)
+        # Re-requesting means the household is being handled again -> drop it off
+        # the Urgent Care list.
+        clear_new_flag_on_verification_request(enrollment)
         _safe_timeline(timeline.event_for_verification_renewed, enrollment, request)
         _safe_recompute_household(enrollment)
         return Response(self.get_serializer(enrollment).data, status=status.HTTP_200_OK)
@@ -731,6 +735,9 @@ class EnrollmentVerificationViewSet(viewsets.ModelViewSet):
             enrollment.requested_by_id = agent_id
             enrollment.save(update_fields=["requested_by"])
         _safe_timeline(timeline.event_for_verification, serializer.instance, self.request)
+        # Requesting a verification means the household is now being handled, so
+        # clear the primary's is_new flag -> drop it off the Urgent Care list.
+        clear_new_flag_on_verification_request(serializer.instance)
         # A new enrollment (default Pending Verification) drives the WHOLE
         # household's lifecycle stage: the primary and every non-denied member
         # move to Pending Verification together, not just the primary.
