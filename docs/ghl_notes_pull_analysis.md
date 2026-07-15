@@ -135,8 +135,14 @@ Throttle to ~8 req/s (LeadConnector burst limit ≈ 100 req / 10s).
 **Phase 1 — mapping.** Fix blocker #2 (or map by email/phone) so a member
 resolves to its contact id; optionally backfill `Client.crm_contact_id`.
 
-**Phase 2 — surface.** Decide live passthrough vs. mirrored store (like
-`crm_contact_id`) and render notes on the member profile.
+**Phase 2 — surface (BUILT 2026-07-15).** `import_ghl_notes` management command
+mirrors GHL timeline notes into our `Note` model on the primary household
+`Client`: idempotent upsert keyed by GHL note id (`source='ghl'`,
+`source_note_id`), `body = "{title}\n\n{bodyText}"`, `source_created_at =` the
+note's GHL `dateAdded`. Contacts without the external id are skipped. Supports
+`--contact <id>` (targeted) and `--dry-run`. Notes then render on the member
+profile via the existing `MemberNotesView`. Requires the new `NoteSource.GHL`
+choice (migration `0134`).
 
 ---
 
