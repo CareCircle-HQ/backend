@@ -90,6 +90,7 @@ from ..services.lifecycle import (
     governing_internal_case,
     governing_pending_enrollment,
     recompute_client_stage,
+    recompute_enrollment_household,
     reconcile_enrollment_authorization,
 )
 from ..services import timeline
@@ -2040,6 +2041,77 @@ class MemberInternalCaseDescriptionsView(PortalAPIView):
         ])
 
 
+def _promote_removed_member_to_own_household(
+    member_client, active_case, *, diet_snapshot, member_name, agent, actor,
+):
+    """A member removed from a household who still holds an ACTIVE internal-
+    service case can't just be dropped -- their meal/box case still needs a
+    verification. Make them the PRIMARY of a fresh household and open a
+    Pending-Verification enrollment on that case (carrying over their dietary
+    data), so they surface on the Verification queue as their own household.
+
+    Assumes the member has already been detached from their prior household
+    (their old ``HouseholdMember`` row + dietary profile removed) so
+    ``ensure_household_with_primary`` creates a new household with them primary.
+
+    Idempotent-safe: if the member already has a live enrollment, we only ensure
+    the household + recompute their stage. Returns the new enrollment (or the
+    existing live one) so the caller can report it.
+    """
+    terminal = (EnrollmentStage.DISREGARDED, EnrollmentStage.CANCELLED)
+    household = ensure_household_with_primary(member_client)
+
+    # Already enrolled (their own live enrollment): don't double-create -- just
+    # make sure their household + stage are consistent.
+    live = (
+        member_client.enrollments.exclude(stage__in=terminal)
+        .order_by("-opened_at")
+        .first()
+    )
+    if live is not None:
+        recompute_enrollment_household(live)
+        return live
+
+    # Attach the case only when no other live enrollment already claims it (the
+    # per-case unique constraint forbids two live enrollments sharing a case).
+    case_free = not active_case.enrollments.exclude(stage__in=terminal).exists()
+    program = active_case.program if active_case.program_id else None
+    enr = EnrollmentVerification.objects.create(
+        client=member_client,
+        household=household,
+        case=active_case if case_free else None,
+        program_name=(program.name if program else "") or (active_case.program_name or ""),
+        service_type=active_case.service_type or "",
+        household_size=1,
+        stage=EnrollmentStage.PENDING_VERIFICATION,
+        requested_by=agent,
+        requested_at=timezone.now(),
+    )
+    # Carry the member's dietary snapshot onto the new enrollment so they land on
+    # the Household tab with their menu/allergies intact (not reset Out of Orbit).
+    MemberDietaryProfile.objects.create(
+        enrollment=enr,
+        client=member_client,
+        member_name=member_name or (
+            f"{member_client.first_name} {member_client.last_name}".strip()
+        ),
+        dietary_restrictions=diet_snapshot.get("dietary_restrictions") or [],
+        food_allergies=diet_snapshot.get("food_allergies") or [],
+        other_dietary_restrictions=diet_snapshot.get("other_dietary_restrictions") or "",
+        meal_category=diet_snapshot.get("meal_category") or "",
+        menu_type=diet_snapshot.get("menu_type") or "",
+        general_verification_notes=diet_snapshot.get("general_verification_notes") or "",
+        status=diet_snapshot.get("status") or MemberStatus.ACTIVE,
+    )
+    # Drives the whole (new, single-member) household to Pending Verification.
+    recompute_enrollment_household(enr)
+    try:  # log the verification request on the promoted member's own history
+        timeline.event_for_verification(enr, actor=actor)
+    except Exception:  # never let history-logging break the removal
+        pass
+    return enr
+
+
 class HouseholdMemberEditView(PortalAPIView):
     """PATCH a single household member's dietary info (MemberDietaryProfile)."""
 
@@ -2223,6 +2295,12 @@ class HouseholdMemberEditView(PortalAPIView):
         mirroring the extension's ``household_remove``. The primary member
         cannot be removed. Logs a 'Household Member Removed' timeline event on
         the primary's history, tagged with the source ("the Household tab").
+
+        If the removed member still holds an ACTIVE internal-service (meal/box)
+        case, they can't just be dropped -- their case needs its own
+        verification. They're promoted to PRIMARY of a fresh household and a
+        Pending-Verification enrollment is opened on that case (see
+        :func:`_promote_removed_member_to_own_household`).
         """
         client = get_object_or_404(Client, pk=client_id)
         enr = s.active_enrollment(client)
@@ -2242,6 +2320,32 @@ class HouseholdMemberEditView(PortalAPIView):
             f"{member_client.first_name} {member_client.last_name}".strip()
             if member_client else ""
         )
+        # Snapshot the member's dietary data before we drop their profile, so a
+        # promotion (below) can carry it onto their new household's enrollment.
+        diet_snapshot = {
+            "dietary_restrictions": list(mv.dietary_restrictions or []),
+            "food_allergies": list(mv.food_allergies or []),
+            "other_dietary_restrictions": mv.other_dietary_restrictions or "",
+            "meal_category": mv.meal_category or "",
+            "menu_type": mv.menu_type or "",
+            "general_verification_notes": mv.general_verification_notes or "",
+            "status": mv.status,
+        }
+        # Does the member being removed still hold an ACTIVE internal-service
+        # (meal/box) case? "Active" = an internal-service case that isn't
+        # Closed/Cancelled (blank/unknown counts as active, matching the rest of
+        # the members query). If so, they get promoted to their own household.
+        active_case = None
+        if member_client is not None:
+            active_case = (
+                Case.objects.filter(
+                    client=member_client, case_type=CaseType.INTERNAL_SERVICE
+                )
+                .exclude(case_status__in=(CaseStatus.CLOSED, CaseStatus.CANCELLED))
+                .select_related("program")
+                .order_by("-date_opened")
+                .first()
+            )
 
         # The household's primary member owns the timeline and can't be removed.
         primary_membership = (
@@ -2263,6 +2367,7 @@ class HouseholdMemberEditView(PortalAPIView):
 
         agent = current_agent(request)
         actor = _agent_actor(agent)
+        promoted = None
         with transaction.atomic():
             if mv.client_id and household is not None:
                 HouseholdMember.objects.filter(
@@ -2281,7 +2386,25 @@ class HouseholdMemberEditView(PortalAPIView):
                 )
             except Exception:  # never let history-logging break the removal
                 pass
+            # Now detached: promote a member who still has an active internal-
+            # service case into their own household + Pending Verification.
+            if active_case is not None and member_client is not None:
+                promoted = _promote_removed_member_to_own_household(
+                    member_client, active_case,
+                    diet_snapshot=diet_snapshot, member_name=member_name,
+                    agent=agent, actor=actor,
+                )
 
+        if promoted is not None:
+            return Response(
+                {
+                    "promoted": True,
+                    "enrollment_id": promoted.pk,
+                    "stage": promoted.stage,
+                    "client_id": str(member_client.pk),
+                },
+                status=http.HTTP_200_OK,
+            )
         return Response(status=http.HTTP_204_NO_CONTENT)
 
 

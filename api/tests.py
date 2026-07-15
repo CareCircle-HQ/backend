@@ -2427,3 +2427,90 @@ class CareManagementListTest(TestCase):
         codes = {w["code"] for w in row["warnings"]}
         self.assertIn(NO_KITCHEN, codes)
         self.assertNotIn(HOUSEHOLD_MEMBERS_OUT_OF_ORBIT, codes)
+
+
+class RemovedMemberPromotionTest(TestCase):
+    """Removing a non-primary household member who still holds an ACTIVE
+    internal-service case promotes them to primary of their OWN household with a
+    fresh Pending-Verification enrollment (rather than dropping them)."""
+
+    def _client(self, first="A", last="B"):
+        return Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name=first, last_name=last
+        )
+
+    def test_member_with_active_internal_case_is_promoted(self):
+        from .models import (
+            Case, CaseStatus, CaseType, ClientStage, EnrollmentStage,
+            EnrollmentVerification, Household, HouseholdMember,
+            MemberDietaryProfile, MemberStatus,
+        )
+        from .portal.views_members import _promote_removed_member_to_own_household
+
+        primary = self._client("Pat", "Primary")
+        dep = self._client("Dee", "Dependent")
+        hh = Household.objects.create(name="Old HH")
+        HouseholdMember.objects.create(household=hh, client=primary, is_primary=True)
+        HouseholdMember.objects.create(household=hh, client=dep, is_primary=False)
+        enr = EnrollmentVerification.objects.create(
+            client=primary, household=hh, stage=EnrollmentStage.SERVICE_ACTIVE,
+        )
+        case = Case.objects.create(
+            case_id=str(uuid.uuid4()), client=dep,
+            case_type=CaseType.INTERNAL_SERVICE, case_status=CaseStatus.MANAGED,
+            program_name="Medically Tailored Meals",
+        )
+
+        # Simulate the delete's detach step, then promote.
+        HouseholdMember.objects.filter(client=dep, household=hh).delete()
+        MemberDietaryProfile.objects.filter(
+            client=dep, enrollment__household=hh
+        ).delete()
+        new_enr = _promote_removed_member_to_own_household(
+            dep, case,
+            diet_snapshot={"menu_type": "Standard", "status": MemberStatus.ACTIVE,
+                           "food_allergies": ["fish"]},
+            member_name="Dee Dependent", agent=None, actor="",
+        )
+
+        dep.refresh_from_db()
+        hm = HouseholdMember.objects.get(client=dep)
+        self.assertEqual(new_enr.stage, EnrollmentStage.PENDING_VERIFICATION)
+        self.assertEqual(str(new_enr.case_id), str(case.case_id))
+        self.assertTrue(hm.is_primary)
+        self.assertNotEqual(hm.household_id, hh.household_id)
+        self.assertEqual(dep.lifecycle_stage, ClientStage.PENDING_VERIFICATION)
+        prof = new_enr.member_profiles.get(client=dep)
+        self.assertEqual(prof.menu_type, "Standard")
+        self.assertEqual(prof.food_allergies, ["fish"])
+        # Old household + primary untouched.
+        self.assertTrue(
+            HouseholdMember.objects.filter(household=hh, client=primary).exists()
+        )
+
+    def test_existing_live_enrollment_is_not_duplicated(self):
+        from .models import (
+            Case, CaseStatus, CaseType, EnrollmentStage, EnrollmentVerification,
+            Household, HouseholdMember, MemberStatus,
+        )
+        from .portal.views_members import _promote_removed_member_to_own_household
+
+        dep = self._client("Dee", "Dependent")
+        hh = Household.objects.create(name="Own HH")
+        HouseholdMember.objects.create(household=hh, client=dep, is_primary=True)
+        existing = EnrollmentVerification.objects.create(
+            client=dep, household=hh, stage=EnrollmentStage.PENDING_VERIFICATION,
+        )
+        case = Case.objects.create(
+            case_id=str(uuid.uuid4()), client=dep,
+            case_type=CaseType.INTERNAL_SERVICE, case_status=CaseStatus.MANAGED,
+        )
+
+        result = _promote_removed_member_to_own_household(
+            dep, case, diet_snapshot={}, member_name="Dee Dependent",
+            agent=None, actor="",
+        )
+        self.assertEqual(result.pk, existing.pk)
+        self.assertEqual(
+            EnrollmentVerification.objects.filter(client=dep).count(), 1
+        )
