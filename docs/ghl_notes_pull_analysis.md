@@ -57,6 +57,50 @@ Contact `TJ5dZdafNpomNydJRgto`:
 
 ---
 
+## Phase 0 results (updated 2026-07-15)
+Built `api/management/commands/scan_ghl_notes.py` — a read-only, throttled,
+location-wide scan that pages all contacts (`searchAfter` deep pagination),
+pulls `/contacts/{id}/notes`, and — for each **note-bearing** contact — also
+`GET`s the contact to extract mapping fields and resolve our local `Client`.
+Dumps JSONL (`tmp/ghl_notes_dump.jsonl`) + a `.summary.json`.
+
+### Confirmed live
+- **Notes carry no member id** — only `contactId` + `userId`. Mapping requires a
+  second `GET /contacts/{contactId}`.
+- **There is NO "Unite Us member id" field.** The contact instead stores **our
+  own Enrollment Platform Client ID(s)** = local `Client` UUIDs. So a note maps
+  straight to our DB, no Unite Us id needed.
+- **A GHL contact = a whole household.** It has `enrollment_client_id` (primary)
+  + `HM #2..#10 - Enrollment Platform Client ID` (10 member-id fields total) +
+  per-service Case IDs (`Enrollment Platform Case ID - Internal Services / …`).
+  **Notes are therefore household-level, not member-level.**
+- **`body` is HTML** (`<p style="…">value</p>`); **`bodyText` is the clean
+  plaintext** — prefer `bodyText`; only sanitize `body` if rich text is wanted.
+
+### Mapping reliability (the "clean up" problem)
+Resolve a note's contact to a local `Client` with a fallback ladder (implemented
+in `scan_ghl_notes._match_local_client`): `enrollment_client_id` → `HM #N` id →
+`email` → `phone`. Observed caveats on real data:
+- **Only the primary `enrollment_client_id` is usually populated**; the `HM #N`
+  fields were empty on every household checked → non-primary members not
+  resolvable from custom fields (need phone/email).
+- **The stored id can be stale** — 3 of 4 email-matched members had an
+  `enrollment_client_id` pointing to a *different* local `Client` UUID (older/
+  duplicate rows, or the email belongs to a non-primary member).
+- **Note-bearing leads have nothing populated** (phone-only contacts); they
+  still map via the **phone** fallback (verified: a lead resolved to a local
+  `Client` by phone).
+- Watch for **our own duplicate `Client` rows** (same person across enrollments)
+  when choosing which record to attach a note to.
+
+### Throughput reality
+Effective rate is **~1 contact/sec** (network round-trip latency dominates, not
+the 8–9 req/s throttle). A full 36,361-contact scan is therefore **several
+hours**, not ~75 min. Run it detached (nohup/screen) or in batches. It flushes
+per note-bearing contact, so partial runs keep their dump.
+
+---
+
 ## Blockers to fix (the "couple of things")
 1. **Member→contact mapping is not wired.**
    - **No local `Client` has `crm_contact_id`** (0 of 32,108) because outbound

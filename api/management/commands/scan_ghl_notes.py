@@ -18,9 +18,15 @@ lost if interrupted). A ``*.summary.json`` sidecar records the run totals.
 Read-only against GHL; it does NOT honor CRM_SYNC_DISCONNECTED (that gate only
 guards OUTBOUND writes). It only needs a valid GHL_PRIVATE_TOKEN (+ location).
 
-Each dumped note line carries:
-    id, contactId, contactName, title, bodyText, body_len, dateAdded, userId,
-    pinned
+Each dumped note line carries the note itself:
+    id, contactId, contactName, title, body (raw HTML), bodyText, body_len,
+    dateAdded, userId, pinned, color
+plus a ``mapping`` object resolved from the note's contact (one extra
+``GET /contacts/{id}`` per note-bearing contact, since notes are sparse):
+    email, phone, enrollment_client_id (primary member = local Client UUID),
+    hm_client_ids (household members #2..#10), case_ids, local_client_id
+    (matched in our DB) and match_method (enrollment_client_id | hm_client_id |
+    email | phone | none).
 
 Notes are documented as sparse: the default search order front-loads old,
 note-less lead contacts, so the first note-bearing contact only appeared after
@@ -29,15 +35,23 @@ then a full run for real numbers.
 """
 import json
 import os
+import re
 import time
+import uuid
 from collections import Counter
 
 import requests
 from django.conf import settings
 from django.core.management.base import BaseCommand, CommandError
+from django.db.models import Q
 from django.utils import timezone
 
 from api.integrations.ghl import config
+from api.models import Client
+
+# The primary member's Enrollment Platform Client ID custom field
+# (contact.enrollment_client_id); value = local Client UUID.
+PRIMARY_ID_FIELD = "xac7ac5fVHKyutg0mrB6"
 
 # LeadConnector burst limit is ~100 requests / 10s; default to a safe 8 req/s.
 DEFAULT_RATE = 8.0
@@ -154,6 +168,96 @@ class Command(BaseCommand):
         last = contact.get("lastName") or ""
         return f"{first} {last}".strip()
 
+    # -- contact enrichment / member mapping --------------------------------
+    def _load_field_catalog(self):
+        """Fetch the location's contact custom-field catalog and index the id
+        fields we map on: the household-member Enrollment Platform Client ID
+        fields (primary + HM #2..#10) and the per-service Case ID fields."""
+        self._member_id_fields = {}   # field id -> label (client-UUID fields)
+        self._case_id_fields = {}     # field id -> label
+        url = f"{config.API_BASE}/locations/{config.LOCATION_ID}/customFields"
+        resp = self._request("GET", url, params={"model": "contact"})
+        if resp is None or resp.status_code != 200:
+            self.stderr.write(self.style.WARNING(
+                "Could not load custom-field catalog; mapping will be limited."
+            ))
+            return
+        for f in resp.json().get("customFields", []):
+            fid = f.get("id")
+            key = (f.get("fieldKey") or "")
+            name = (f.get("name") or key)
+            if not fid:
+                continue
+            if key == "contact.enrollment_client_id" or "enrollment_platform_client_id" in key:
+                self._member_id_fields[fid] = name
+            elif "enrollment_platform_case_id" in key:
+                self._case_id_fields[fid] = name
+
+    @staticmethod
+    def _digits(value):
+        return re.sub(r"\D", "", value or "")
+
+    def _match_local_client(self, primary_id, hm_ids, email, phone):
+        """Resolve the note's contact to a local Client, trying the strongest
+        signal first. Returns (client_id_str|None, method)."""
+        def _exists(val):
+            try:
+                uuid.UUID(str(val))
+            except (ValueError, TypeError, AttributeError):
+                return False
+            return Client.objects.filter(pk=val).exists()
+
+        if primary_id and _exists(primary_id):
+            return str(primary_id), "enrollment_client_id"
+        for hid in hm_ids:
+            if _exists(hid):
+                return str(hid), "hm_client_id"
+        if email:
+            c = Client.objects.filter(client_email_address__iexact=email).first()
+            if c:
+                return str(c.pk), "email"
+        tail = self._digits(phone)[-10:]
+        if len(tail) == 10:
+            c = Client.objects.filter(client_phone_number__contains=tail).first()
+            if c:
+                return str(c.pk), "phone"
+        return None, "none"
+
+    def _mapping_for(self, contact_id):
+        """GET the full contact and extract the member-mapping fields + resolve
+        our local Client. Called only for note-bearing contacts."""
+        url = f"{config.API_BASE}/contacts/{contact_id}"
+        resp = self._request("GET", url)
+        if resp is None or resp.status_code != 200:
+            return {"error": f"contact fetch {getattr(resp, 'status_code', 'err')}"}
+        contact = resp.json().get("contact", {})
+        primary_id, hm_ids, case_ids = None, [], {}
+        for cf in contact.get("customFields") or []:
+            fid = cf.get("id")
+            val = cf.get("value")
+            if val is None:
+                val = cf.get("fieldValue")
+            if not val:
+                continue
+            if fid == PRIMARY_ID_FIELD:
+                primary_id = val
+            elif fid in self._member_id_fields:
+                hm_ids.append(val)
+            elif fid in self._case_id_fields:
+                case_ids[self._case_id_fields[fid]] = val
+        email = (contact.get("email") or "").strip()
+        phone = (contact.get("phone") or "").strip()
+        local_id, method = self._match_local_client(primary_id, hm_ids, email, phone)
+        return {
+            "email": email,
+            "phone": phone,
+            "enrollment_client_id": primary_id,
+            "hm_client_ids": hm_ids,
+            "case_ids": case_ids,
+            "local_client_id": local_id,
+            "match_method": method,
+        }
+
     # -- main ---------------------------------------------------------------
     def handle(self, *args, **options):
         if not config.PRIVATE_TOKEN:
@@ -174,13 +278,17 @@ class Command(BaseCommand):
 
         stats = Counter()
         color_tally = Counter()
+        match_tally = Counter()
         started = timezone.now()
         search_after = None
         total_reported = None
         first_note_after = None  # #contacts scanned before the first note appeared
 
+        self._load_field_catalog()
         self.stdout.write(
-            f"Scanning GHL notes -> {out_path} (rate {rate}/s, page {page_size})"
+            f"Scanning GHL notes -> {out_path} (rate {rate}/s, page {page_size}); "
+            f"{len(self._member_id_fields)} member-id fields, "
+            f"{len(self._case_id_fields)} case-id fields indexed."
         )
 
         with open(out_path, "w", encoding="utf-8") as fh:
@@ -208,6 +316,11 @@ class Command(BaseCommand):
                             if first_note_after is None:
                                 first_note_after = stats["contacts_scanned"]
                             cname = self._contact_name(contact)
+                            # Resolve the contact -> our member ONCE per contact.
+                            mapping = self._mapping_for(cid)
+                            match_tally[mapping.get("match_method", "none")] += 1
+                            if mapping.get("local_client_id"):
+                                stats["contacts_mapped"] += 1
                             for n in notes:
                                 stats["notes_total"] += 1
                                 if n.get("pinned"):
@@ -219,11 +332,14 @@ class Command(BaseCommand):
                                     "contactId": n.get("contactId") or cid,
                                     "contactName": cname,
                                     "title": n.get("title") or "",
+                                    "body": body,
                                     "bodyText": n.get("bodyText") or "",
                                     "body_len": len(body),
                                     "dateAdded": n.get("dateAdded") or "",
                                     "userId": n.get("userId") or "",
                                     "pinned": bool(n.get("pinned")),
+                                    "color": n.get("color") or "",
+                                    "mapping": mapping,
                                 }
                                 fh.write(json.dumps(line, ensure_ascii=False) + "\n")
                             fh.flush()
@@ -253,8 +369,10 @@ class Command(BaseCommand):
             "notes_total": stats["notes_total"],
             "notes_pinned": stats["notes_pinned"],
             "note_fetch_errors": stats["note_fetch_errors"],
+            "contacts_mapped_to_local_client": stats["contacts_mapped"],
             "first_note_after_n_contacts": first_note_after,
             "note_colors": dict(color_tally),
+            "mapping_methods": dict(match_tally),
             "dump_path": out_path,
             "max_contacts": max_contacts or None,
             "rate_per_sec": rate,
@@ -273,6 +391,11 @@ class Command(BaseCommand):
             self.stdout.write(f"  location reports {total_reported} total contacts.")
         if first_note_after:
             self.stdout.write(f"  first note appeared after {first_note_after} contacts.")
+        self.stdout.write(
+            f"  note-bearing contacts mapped to a local Client: "
+            f"{stats['contacts_mapped']}/{stats['contacts_with_notes']} "
+            f"({dict(match_tally)})"
+        )
         self.stdout.write(f"  dump    : {out_path}")
         self.stdout.write(f"  summary : {summary_path}")
 
