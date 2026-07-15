@@ -74,24 +74,30 @@ Dumps JSONL (`tmp/ghl_notes_dump.jsonl`) + a `.summary.json`.
   + `HM #2..#10 - Enrollment Platform Client ID` (10 member-id fields total) +
   per-service Case IDs (`Enrollment Platform Case ID - Internal Services / …`).
   **Notes are therefore household-level, not member-level.**
-- **`body` is HTML** (`<p style="…">value</p>`); **`bodyText` is the clean
-  plaintext** — prefer `bodyText`; only sanitize `body` if rich text is wanted.
+- **`body` is HTML** (`<p style="…">value</p>`); **use `bodyText`** — it's the
+  clean plaintext (decision: no HTML/JS stripping needed).
 
-### Mapping reliability (the "clean up" problem)
-Resolve a note's contact to a local `Client` with a fallback ladder (implemented
-in `scan_ghl_notes._match_local_client`): `enrollment_client_id` → `HM #N` id →
-`email` → `phone`. Observed caveats on real data:
-- **Only the primary `enrollment_client_id` is usually populated**; the `HM #N`
-  fields were empty on every household checked → non-primary members not
-  resolvable from custom fields (need phone/email).
-- **The stored id can be stale** — 3 of 4 email-matched members had an
-  `enrollment_client_id` pointing to a *different* local `Client` UUID (older/
-  duplicate rows, or the email belongs to a non-primary member).
-- **Note-bearing leads have nothing populated** (phone-only contacts); they
-  still map via the **phone** fallback (verified: a lead resolved to a local
-  `Client` by phone).
-- Watch for **our own duplicate `Client` rows** (same person across enrollments)
-  when choosing which record to attach a note to.
+### Mapping — id-only (decision 2026-07-15)
+Map a note's contact to a local `Client` using **ONLY the external id GHL stores
+on the contact**: the Enrollment Platform Client ID
+(`contact.enrollment_client_id`, primary) then the `HM #N` variants. That value
+**is our `Client.pk`** (the Unite Us client id). **No phone/email fuzzy
+matching** — an unmatched contact stays unmapped (`match_method: none`).
+Implemented in `scan_ghl_notes._match_local_client`. Verified: a real member
+contact resolves via `enrollment_client_id`; a phone-only lead returns `none`.
+
+Notes:
+- **`Client.pk` (`client_id`) is the Unite Us client id** ("source external_id"),
+  and it's exactly what GHL calls "Enrollment Platform Client ID" — so the map is
+  deterministic and needs no Unite Us-specific field.
+- Notes are **household-level**: `enrollment_client_id` holds the household
+  **head's** id, so a note attaches to the primary `Client`. (Earlier "mismatch"
+  observations were an artifact of searching by a household member's email while
+  the contact carries the head's id — not staleness.)
+- `HM #N - Enrollment Platform Client ID` fields exist (households up to 10) but
+  are usually empty; kept in the ladder for when they're populated.
+- Contacts without the id (e.g. phone-only leads) are intentionally left
+  unmapped rather than guessed.
 
 ### Throughput reality
 Effective rate is **~1 contact/sec** (network round-trip latency dominates, not

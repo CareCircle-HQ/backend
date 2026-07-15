@@ -23,10 +23,12 @@ Each dumped note line carries the note itself:
     dateAdded, userId, pinned, color
 plus a ``mapping`` object resolved from the note's contact (one extra
 ``GET /contacts/{id}`` per note-bearing contact, since notes are sparse):
-    email, phone, enrollment_client_id (primary member = local Client UUID),
+    enrollment_client_id (primary member = our Client.pk / Unite Us client id),
     hm_client_ids (household members #2..#10), case_ids, local_client_id
     (matched in our DB) and match_method (enrollment_client_id | hm_client_id |
-    email | phone | none).
+    none). Mapping uses ONLY the external id GHL stores on the contact -- no
+    phone/email fuzzy matching (email/phone are recorded for reference only).
+Use ``bodyText`` as the clean note content (``body`` is HTML).
 
 Notes are documented as sparse: the default search order front-loads old,
 note-less lead contacts, so the first note-bearing contact only appeared after
@@ -35,7 +37,6 @@ then a full run for real numbers.
 """
 import json
 import os
-import re
 import time
 import uuid
 from collections import Counter
@@ -43,7 +44,6 @@ from collections import Counter
 import requests
 from django.conf import settings
 from django.core.management.base import BaseCommand, CommandError
-from django.db.models import Q
 from django.utils import timezone
 
 from api.integrations.ghl import config
@@ -193,13 +193,12 @@ class Command(BaseCommand):
             elif "enrollment_platform_case_id" in key:
                 self._case_id_fields[fid] = name
 
-    @staticmethod
-    def _digits(value):
-        return re.sub(r"\D", "", value or "")
-
-    def _match_local_client(self, primary_id, hm_ids, email, phone):
-        """Resolve the note's contact to a local Client, trying the strongest
-        signal first. Returns (client_id_str|None, method)."""
+    def _match_local_client(self, primary_id, hm_ids):
+        """Resolve the note's contact to a local Client using ONLY the external
+        id GHL stores on the contact: the Enrollment Platform Client ID (=our
+        Client.pk / Unite Us client id). Primary first, then household members.
+        No phone/email fuzzy matching -- an unmatched id yields ("", "none").
+        Returns (client_id_str, method)."""
         def _exists(val):
             try:
                 uuid.UUID(str(val))
@@ -212,16 +211,7 @@ class Command(BaseCommand):
         for hid in hm_ids:
             if _exists(hid):
                 return str(hid), "hm_client_id"
-        if email:
-            c = Client.objects.filter(client_email_address__iexact=email).first()
-            if c:
-                return str(c.pk), "email"
-        tail = self._digits(phone)[-10:]
-        if len(tail) == 10:
-            c = Client.objects.filter(client_phone_number__contains=tail).first()
-            if c:
-                return str(c.pk), "phone"
-        return None, "none"
+        return "", "none"
 
     def _mapping_for(self, contact_id):
         """GET the full contact and extract the member-mapping fields + resolve
@@ -245,17 +235,18 @@ class Command(BaseCommand):
                 hm_ids.append(val)
             elif fid in self._case_id_fields:
                 case_ids[self._case_id_fields[fid]] = val
+        # email/phone kept for reference/debugging only -- NOT used for matching.
         email = (contact.get("email") or "").strip()
         phone = (contact.get("phone") or "").strip()
-        local_id, method = self._match_local_client(primary_id, hm_ids, email, phone)
+        local_id, method = self._match_local_client(primary_id, hm_ids)
         return {
-            "email": email,
-            "phone": phone,
             "enrollment_client_id": primary_id,
             "hm_client_ids": hm_ids,
             "case_ids": case_ids,
             "local_client_id": local_id,
             "match_method": method,
+            "email": email,
+            "phone": phone,
         }
 
     # -- main ---------------------------------------------------------------
