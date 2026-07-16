@@ -49,6 +49,17 @@ def clear_change_context():
         del _local.ctx
 
 
+def current_change_source():
+    """The active ``change_context`` source on this thread, or "".
+
+    Lets non-history code (e.g. the ``is_new`` flag in CaseSerializer) tell that
+    it's running inside an IMPORT/CRM/etc. block. HTTP writes don't set this
+    thread-local (they're attributed lazily from the request), so it's "" there.
+    """
+    ctx = getattr(_local, "ctx", None)
+    return (ctx or {}).get("source", "")
+
+
 @contextmanager
 def change_context(source="", actor=""):
     """Attribute all history rows created in this block to (source, actor).

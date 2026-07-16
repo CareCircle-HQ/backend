@@ -496,12 +496,13 @@ class ClientSerializer(serializers.ModelSerializer):
                 )
 
         # Saving the profile may have changed the client's household data, which
-        # drives each case's Individual/Household classification. Refresh any of
-        # this client's cases whose household_type no longer matches.
-        new_household_type = derive_household_type(client)
-        Case.objects.filter(client=client).exclude(
-            household_type=new_household_type
-        ).update(household_type=new_household_type)
+        # (together with each case's own program "(Household)" pathway) drives
+        # the Individual/Household classification. Recompute PER CASE, since the
+        # program token differs between a client's cases.
+        for case in Case.objects.filter(client=client):
+            ht = derive_household_type(client, case.program_name)
+            if case.household_type != ht:
+                Case.objects.filter(pk=case.pk).update(household_type=ht)
 
         # NOTE: the client's household is NOT created here. It is created when
         # an Internal Service case is saved (see CaseSerializer), since a
@@ -1030,11 +1031,17 @@ def derive_case_type(service_type, program_name=None):
     return CaseType.NAVIGATION
 
 
-def derive_household_type(client):
-    """Individual vs Household from the client's household data: a household
-    when the client is flagged as a family or has more than one member."""
-    is_household = bool(getattr(client, "is_a_family", False)) or (
-        (getattr(client, "household_size", None) or 0) > 1
+def derive_household_type(client, program_name=None):
+    """Individual vs Household for a case.
+
+    A household case when EITHER the program is a Met Council "(Household)"
+    eligibility pathway (the token appears in the program name, e.g. "MTM -
+    (Household) High-Risk Children Under 18 - Brooklyn") OR the client's own
+    household data says so (flagged a family, or more than one member)."""
+    is_household = (
+        "(household)" in (program_name or "").casefold()
+        or bool(getattr(client, "is_a_family", False))
+        or (getattr(client, "household_size", None) or 0) > 1
     )
     return (
         CaseHouseholdType.HOUSEHOLD if is_household else CaseHouseholdType.INDIVIDUAL
@@ -1153,7 +1160,9 @@ class CaseSerializer(serializers.ModelSerializer):
             if derived_type is not None:
                 validated_data["case_type"] = derived_type
         if "household_type" not in validated_data:
-            validated_data["household_type"] = derive_household_type(client)
+            validated_data["household_type"] = derive_household_type(
+                client, validated_data.get("program_name")
+            )
 
         # Capture the stored status + authorization BEFORE the write so callers
         # can tell what changed (the internal-service denial ticket below, and
@@ -1193,20 +1202,29 @@ class CaseSerializer(serializers.ModelSerializer):
                 ensure_household_with_primary(client)
         except Exception:
             logger.exception("ensure_household_with_primary failed for internal service case")
-        # "New client needs verification attention": the browser extension saving
-        # the client's FIRST internal-service case flags them is_new=True so they
-        # surface on the Urgent Care ("Need Attention") list and the ext shows the
-        # right screening warning. Gated to EXT-ONLY writes -- the serializer only
-        # carries a request in its context on the DRF/ext path; the CSV import and
-        # nightly Unite Us API sync build it context-less, so they never flag.
-        # Also requires the case to be newly created (``_prev`` is None) AND the
-        # client not already verified (so nothing re-flags a long-verified member).
-        # Cleared once a verification completes (lifecycle.advance_enrollment ->
+        # "New client needs verification attention": creating a client's FIRST
+        # internal-service case flags them is_new=True so they surface on the
+        # Urgent Care ("Need Attention") list and the ext shows the right
+        # screening warning. Fires for the two legitimate ingestion sources:
+        #   * EXTENSION -- the request user carries an ``agent_code`` (an
+        #     AgentUser from the agent JWT, see api.authentication).
+        #   * IMPORT    -- the CSV import / nightly Unite Us sync run inside a
+        #     ``change_context(ChangeSource.IMPORT, ...)`` block (case imports are
+        #     now Met Council-only, so only our own cases reach here).
+        # Django-admin / CRM writes are excluded (no agent_code, no IMPORT
+        # context). Also requires the case to be newly created (``_prev`` is None)
+        # AND the client not already verified (so nothing re-flags a long-verified
+        # member). Cleared once a verification completes (advance_enrollment ->
         # VERIFIED). Best-effort: never let the flag break the case save.
         try:
-            is_ext_write = self.context.get("request") is not None
+            from api.history import ChangeSource, current_change_source
+
+            request = self.context.get("request")
+            request_user = getattr(request, "user", None) if request is not None else None
+            is_ext_write = bool(getattr(request_user, "agent_code", None))
+            is_import_write = current_change_source() == ChangeSource.IMPORT
             if (
-                is_ext_write
+                (is_ext_write or is_import_write)
                 and case.case_type == CaseType.INTERNAL_SERVICE
                 and _prev is None
             ):

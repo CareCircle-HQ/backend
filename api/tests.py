@@ -2099,14 +2099,16 @@ class MemberWarningsTest(TestCase):
         self.assertIn(INTERNAL_CASE_EXPIRED, self._codes(enr))
 
     def test_member_paused_warning(self):
+        # Pausing ANY household member surfaces a single household-scope roll-up
+        # count (shown on every member), like out of orbit / out of range.
         from .models import MemberStatus
-        from .services.warnings import MEMBER_PAUSED
+        from .services.warnings import HOUSEHOLD_MEMBERS_PAUSED
 
         enr = self._enrollment(self._client())
         mp = enr.member_profiles.first()
         mp.status = MemberStatus.PAUSED
         mp.save(update_fields=["status"])
-        self.assertIn(MEMBER_PAUSED, self._codes(enr))
+        self.assertIn(HOUSEHOLD_MEMBERS_PAUSED, self._codes(enr))
 
     def test_out_of_orbit_range_are_household_counts_not_member_warnings(self):
         # Out of orbit / out of range surface as a SINGLE household count
@@ -2131,7 +2133,7 @@ class MemberWarningsTest(TestCase):
 
     def test_household_cancelled_suppresses_member_status(self):
         from .models import EnrollmentStage, MemberStatus
-        from .services.warnings import HOUSEHOLD_CANCELLED, MEMBER_PAUSED
+        from .services.warnings import HOUSEHOLD_CANCELLED, HOUSEHOLD_MEMBERS_PAUSED
 
         enr = self._enrollment(self._client(), stage=EnrollmentStage.CANCELLED)
         mp = enr.member_profiles.first()
@@ -2139,20 +2141,22 @@ class MemberWarningsTest(TestCase):
         mp.save(update_fields=["status"])
         codes = self._codes(enr)
         self.assertIn(HOUSEHOLD_CANCELLED, codes)
-        # Member-status warnings are suppressed for a terminal (cancelled) household.
-        self.assertNotIn(MEMBER_PAUSED, codes)
+        # Member-status roll-up counts are suppressed for a terminal (cancelled)
+        # household.
+        self.assertNotIn(HOUSEHOLD_MEMBERS_PAUSED, codes)
 
     def test_household_out_of_service_counts(self):
         from .models import MemberDietaryProfile, MemberStatus
         from .services.warnings import (
             HOUSEHOLD_MEMBERS_OUT_OF_ORBIT, HOUSEHOLD_MEMBERS_OUT_OF_RANGE,
-            evaluate_enrollment_warnings,
+            HOUSEHOLD_MEMBERS_PAUSED, evaluate_enrollment_warnings,
         )
 
         c = self._client()
         enr = self._enrollment(c)
-        # Primary out of orbit; add a second out-of-orbit member and one
-        # out-of-range member (all on the same enrollment/household).
+        # Primary out of orbit; add a second out-of-orbit member, one
+        # out-of-range member, and one paused member (all on the same
+        # enrollment/household).
         mp = enr.member_profiles.first()
         mp.status = MemberStatus.OUT_OF_ORBIT
         mp.save(update_fields=["status"])
@@ -2162,11 +2166,48 @@ class MemberWarningsTest(TestCase):
         MemberDietaryProfile.objects.create(
             enrollment=enr, client=self._client(), status=MemberStatus.OUT_OF_RANGE,
         )
+        MemberDietaryProfile.objects.create(
+            enrollment=enr, client=self._client(), status=MemberStatus.PAUSED,
+        )
         warns = {w.code: w for w in evaluate_enrollment_warnings(enr)}
         self.assertEqual(warns[HOUSEHOLD_MEMBERS_OUT_OF_ORBIT].refs["count"], 2)
         self.assertEqual(warns[HOUSEHOLD_MEMBERS_OUT_OF_RANGE].refs["count"], 1)
+        self.assertEqual(warns[HOUSEHOLD_MEMBERS_PAUSED].refs["count"], 1)
         self.assertEqual(warns[HOUSEHOLD_MEMBERS_OUT_OF_ORBIT].title, "2 Out of Orbit")
         self.assertEqual(warns[HOUSEHOLD_MEMBERS_OUT_OF_RANGE].title, "1 Out of Range")
+        self.assertEqual(warns[HOUSEHOLD_MEMBERS_PAUSED].title, "1 Paused")
+        # Every roll-up count is household-scope so it shows on EVERY member.
+        self.assertEqual(warns[HOUSEHOLD_MEMBERS_PAUSED].scope, "household")
+
+    def test_household_open_tickets_count(self):
+        # Open (Open / In Progress) follow-up tickets for ANY household member
+        # roll up into a single household-scope count shown on every member;
+        # resolved tickets don't count and the warning clears when none remain.
+        from .models import Ticket, TicketStatus, TicketType, TicketTypeCode
+        from .services.warnings import (
+            HOUSEHOLD_OPEN_TICKETS, evaluate_enrollment_warnings,
+        )
+
+        c = self._client()
+        enr = self._enrollment(c)
+        ttype, _ = TicketType.objects.get_or_create(
+            code=TicketTypeCode.SYSTEM_CHANGE_DETECTED,
+            defaults={"label": "System Change Detected"},
+        )
+        Ticket.objects.create(type=ttype, client=c, status=TicketStatus.OPEN)
+        Ticket.objects.create(type=ttype, client=c, status=TicketStatus.IN_PROGRESS)
+        Ticket.objects.create(type=ttype, client=c, status=TicketStatus.RESOLVED)
+
+        warns = {w.code: w for w in evaluate_enrollment_warnings(enr)}
+        self.assertIn(HOUSEHOLD_OPEN_TICKETS, warns)
+        self.assertEqual(warns[HOUSEHOLD_OPEN_TICKETS].refs["count"], 2)
+        self.assertEqual(warns[HOUSEHOLD_OPEN_TICKETS].title, "2 open tickets")
+        self.assertEqual(warns[HOUSEHOLD_OPEN_TICKETS].scope, "household")
+
+        # Resolving the open tickets clears the warning (self-healing).
+        Ticket.objects.filter(client=c).update(status=TicketStatus.RESOLVED)
+        codes = self._codes(enr)
+        self.assertNotIn(HOUSEHOLD_OPEN_TICKETS, codes)
 
     def test_clean_household_has_no_warnings(self):
         from .models import Cadence, Kitchen, KitchenProductType, KitchenStatus, ProductType, ProductTypeKind
@@ -2390,13 +2431,13 @@ class CareManagementListTest(TestCase):
         # queue; informational states (out of orbit/range, paused) do not.
         from .services.warnings import (
             HOUSEHOLD_MEMBERS_OUT_OF_ORBIT, HOUSEHOLD_MEMBERS_OUT_OF_RANGE,
-            MEMBER_PAUSED, NO_KITCHEN,
+            HOUSEHOLD_MEMBERS_PAUSED, NO_KITCHEN,
         )
 
         actionable, _ = self._make_row(NO_KITCHEN, "Act", "Ionable")
         orbit, _ = self._make_row(HOUSEHOLD_MEMBERS_OUT_OF_ORBIT, "Or", "Bit")
         rng, _ = self._make_row(HOUSEHOLD_MEMBERS_OUT_OF_RANGE, "Ra", "Nge")
-        paused, _ = self._make_row(MEMBER_PAUSED, "Pau", "Sed", scope="member")
+        paused, _ = self._make_row(HOUSEHOLD_MEMBERS_PAUSED, "Pau", "Sed")
 
         resp = self.api.get(reverse("portal-care-management"))
         self.assertEqual(resp.status_code, 200, resp.content)
@@ -2665,3 +2706,243 @@ class CSDashboardTest(TestCase):
         self.assertTrue(any(row["open"] for row in body["by_type"]))
         solved = {row["name"]: row["resolved"] for row in body["solved_by_agent"]}
         self.assertEqual(solved.get(agent.name), 1)
+
+
+class IsNewFlagTest(TestCase):
+    """Client.is_new (the Urgent Care / 'Need Attention' flag) is raised when a
+    client's first internal-service case is created via the EXTENSION (request
+    user has an agent_code) or an IMPORT (inside change_context(IMPORT)) -- never
+    by admin/CRM writes, and never re-raised once the client is verified."""
+
+    def _client(self):
+        return Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="New", last_name="Member"
+        )
+
+    def _save_internal_case(self, client, *, context):
+        from .models import CaseType
+        from .serializers import CaseSerializer
+
+        data = {
+            "case_id": str(uuid.uuid4()),
+            "client_id": str(client.client_id),
+            "case_type": CaseType.INTERNAL_SERVICE,
+            "program_name": "Medically Tailored Meals",
+        }
+        ser = CaseSerializer(data=data, context=context)
+        ser.is_valid(raise_exception=True)
+        return ser.save()
+
+    def test_extension_write_sets_is_new(self):
+        # An extension request: the user carries an agent_code (AgentUser).
+        client = self._client()
+        request = SimpleNamespace(user=SimpleNamespace(agent_code="123"))
+        self._save_internal_case(client, context={"request": request})
+        client.refresh_from_db()
+        self.assertTrue(client.is_new)
+
+    def test_admin_write_does_not_set_is_new(self):
+        # A Django-admin/session write: request present, but the user has no
+        # agent_code -- must NOT flag.
+        client = self._client()
+        request = SimpleNamespace(user=SimpleNamespace(username="staff"))
+        self._save_internal_case(client, context={"request": request})
+        client.refresh_from_db()
+        self.assertFalse(client.is_new)
+
+    def test_import_context_sets_is_new(self):
+        # The CSV / Unite Us importers wrap writes in change_context(IMPORT);
+        # a new internal-service case there flags the client (case imports are
+        # Met Council-only, so only our own cases reach the serializer).
+        from .history import ChangeSource, change_context
+
+        client = self._client()
+        with change_context(ChangeSource.IMPORT, "system:test"):
+            self._save_internal_case(client, context={})
+        client.refresh_from_db()
+        self.assertTrue(client.is_new)
+
+    def test_bare_write_does_not_set_is_new(self):
+        # No request, no change_context (e.g. a plain server-side / CRM write):
+        # neither an ext nor an import signal -- must NOT flag.
+        client = self._client()
+        self._save_internal_case(client, context={})
+        client.refresh_from_db()
+        self.assertFalse(client.is_new)
+
+    def test_already_verified_client_not_reflagged(self):
+        from .models import EnrollmentVerification, Household, HouseholdMember
+
+        client = self._client()
+        hh = Household.objects.create(name="HH")
+        HouseholdMember.objects.create(household=hh, client=client, is_primary=True)
+        EnrollmentVerification.objects.create(
+            client=client, household=hh, verified_at=timezone.now(),
+        )
+        request = SimpleNamespace(user=SimpleNamespace(agent_code="123"))
+        self._save_internal_case(client, context={"request": request})
+        client.refresh_from_db()
+        self.assertFalse(client.is_new)
+
+
+class CsvImportRulesTest(TestCase):
+    """Client + case import data-quality rules: ZIP/phone normalization, the
+    Meals/Boxes + household classification, and the strict Met Council-only
+    case gate (originating_provider_id)."""
+
+    MET = "12706c81-03a1-4cdb-954a-579929cd05df"
+
+    def test_zip5_normalization(self):
+        from .services.csv_import import _zip5
+
+        self.assertEqual(_zip5("11201"), "11201")
+        self.assertEqual(_zip5("11201-6789"), "11201")   # ZIP+4 -> base
+        self.assertEqual(_zip5("112016789"), "11201")     # 9 straight digits
+        self.assertEqual(_zip5("1120"), "")               # too short -> dropped
+        self.assertEqual(_zip5("1120167"), "")            # 7 digits -> dropped
+        self.assertEqual(_zip5(""), "")
+
+    def test_format_phone(self):
+        from .services.csv_import import _format_phone
+
+        self.assertEqual(_format_phone("3473701726"), "(347) 370-1726")
+        self.assertEqual(_format_phone("13473701726"), "(347) 370-1726")
+        self.assertEqual(_format_phone("+1 (347) 370-1726"), "(347) 370-1726")
+        self.assertEqual(_format_phone("347.370.1726"), "(347) 370-1726")
+        # Unparseable (extension / foreign) is kept verbatim.
+        self.assertEqual(_format_phone("347-370-1726 x12"), "347-370-1726 x12")
+
+    def test_product_kind_voucher_is_boxes(self):
+        from .models import ProductTypeKind
+        from .services.catalog import product_type_kind_for_name
+
+        self.assertEqual(
+            product_type_kind_for_name("Medically Tailored Meals (MTM) - Brooklyn"),
+            ProductTypeKind.MEALS,
+        )
+        self.assertEqual(
+            product_type_kind_for_name(
+                "Medically Tailored or Nutritionally Appropriate Food "
+                "Prescriptions: Voucher - Other Eligible Populations - Queens"
+            ),
+            ProductTypeKind.BOXES,
+        )
+        self.assertEqual(
+            product_type_kind_for_name("...Food Prescriptions: Boxes - Brooklyn"),
+            ProductTypeKind.BOXES,
+        )
+        self.assertIsNone(product_type_kind_for_name("Health and Wellness"))
+
+    def test_household_type_from_program_token(self):
+        from .models import CaseHouseholdType, Client
+        from .serializers import derive_household_type
+
+        indiv = Client(client_id=uuid.uuid4(), first_name="A", last_name="B")
+        self.assertEqual(
+            derive_household_type(indiv, "MTM - Other Eligible Populations - Brooklyn"),
+            CaseHouseholdType.INDIVIDUAL,
+        )
+        self.assertEqual(
+            derive_household_type(
+                indiv, "MTM - (Household) High-Risk Children Under 18 - Brooklyn"
+            ),
+            CaseHouseholdType.HOUSEHOLD,
+        )
+        # Client household data still counts even without the token.
+        fam = Client(client_id=uuid.uuid4(), first_name="A", last_name="B", is_a_family=True)
+        self.assertEqual(
+            derive_household_type(fam, "MTM - Brooklyn"), CaseHouseholdType.HOUSEHOLD
+        )
+
+    def _case_row(self, client_id, originating_provider_id, **over):
+        row = {
+            "case_id": str(uuid.uuid4()),
+            "client_id": str(client_id),
+            "originating_provider_id": originating_provider_id,
+            "program_name": "Medically Tailored Meals (MTM) - (Household) "
+                            "High-Risk Children Under 18 - Brooklyn",
+            "service_subtype": "Medically Tailored Meals",
+            "case_status": "open",
+        }
+        row.update(over)
+        return row
+
+    def test_is_met_council_case_union(self):
+        from .services.lifecycle import is_met_council_case
+
+        # Originating OR managing provider counts.
+        self.assertTrue(is_met_council_case(originating_provider_id=self.MET))
+        self.assertTrue(is_met_council_case(provider_id=self.MET))
+        self.assertTrue(is_met_council_case(provider_name="Met Council - SCN - PHS"))
+        self.assertTrue(is_met_council_case(provider_name="met council - scn - phs"))
+        # No Met Council signal at all -> not Met Council.
+        self.assertFalse(is_met_council_case(
+            originating_provider_id=str(uuid.uuid4()),
+            provider_id=str(uuid.uuid4()),
+            provider_name="Selfhelp Community Services",
+        ))
+        self.assertFalse(is_met_council_case())
+
+    def test_import_cases_met_council_only(self):
+        from .models import Case, CaseHouseholdType, CaseType, Client, ImportRun, ImportRunStatus
+        from .services.csv_import import CsvImporter
+
+        client = Client.objects.create(
+            client_id=uuid.uuid4(), first_name="New", last_name="Member"
+        )
+        run = ImportRun.objects.create(source="csv_uniteus", status=ImportRunStatus.RUNNING)
+        importer = CsvImporter(run, emit_side_effects=False)
+
+        mine = self._case_row(client.client_id, self.MET)
+        # Originated elsewhere but MANAGED by Met Council -> kept (union rule).
+        managed = self._case_row(
+            client.client_id, str(uuid.uuid4()),
+            provider_name="Met Council - SCN - PHS",
+        )
+        external = self._case_row(client.client_id, str(uuid.uuid4()))
+        blank = self._case_row(client.client_id, "")
+        importer.import_cases([mine, managed, external, blank])
+
+        # Met Council-originated AND Met Council-managed are imported; the rest not.
+        self.assertTrue(Case.objects.filter(pk=mine["case_id"]).exists())
+        self.assertTrue(Case.objects.filter(pk=managed["case_id"]).exists())
+        self.assertFalse(Case.objects.filter(pk=external["case_id"]).exists())
+        self.assertFalse(Case.objects.filter(pk=blank["case_id"]).exists())
+        self.assertEqual(importer.stats["created"], 2)
+        self.assertEqual(importer.stats["skipped"], 2)
+
+        # And it's classified correctly: internal-service + household (token).
+        case = Case.objects.get(pk=mine["case_id"])
+        self.assertEqual(case.case_type, CaseType.INTERNAL_SERVICE)
+        self.assertEqual(case.household_type, CaseHouseholdType.HOUSEHOLD)
+
+    def test_delete_non_metcouncil_cases_command(self):
+        from django.core.management import call_command
+        from .models import Case, CaseStatus, Client, Provider
+
+        client = Client.objects.create(
+            client_id=uuid.uuid4(), first_name="A", last_name="B"
+        )
+        met = Provider.objects.create(provider_id=self.MET, name="Met Council - SCN - PHS")
+        keep_orig = Case.objects.create(
+            case_id=uuid.uuid4(), client=client, case_status=CaseStatus.OPEN,
+            originating_provider=met,
+        )
+        keep_managed = Case.objects.create(
+            case_id=uuid.uuid4(), client=client, case_status=CaseStatus.OPEN,
+            provider_name="Met Council - SCN - PHS",
+        )
+        drop = Case.objects.create(
+            case_id=uuid.uuid4(), client=client, case_status=CaseStatus.OPEN,
+            provider_name="Selfhelp Community Services",
+        )
+
+        # Dry run: nothing deleted.
+        call_command("delete_non_metcouncil_cases")
+        self.assertEqual(Case.objects.count(), 3)
+
+        # Apply: only the external-org case is removed.
+        call_command("delete_non_metcouncil_cases", "--apply")
+        self.assertTrue(Case.objects.filter(pk=keep_orig.pk).exists())
+        self.assertTrue(Case.objects.filter(pk=keep_managed.pk).exists())
+        self.assertFalse(Case.objects.filter(pk=drop.pk).exists())

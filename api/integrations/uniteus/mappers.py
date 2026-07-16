@@ -244,6 +244,12 @@ def map_case(case_body_data, *, names=None, auth=None):
     set_("network_id", names.get("network_id"))
     set_("primary_worker_name", names.get("primary_worker"))
     set_("primary_worker_id", names.get("primary_worker_id"))
+    # Managing organization (the case's "provider" relationship, e.g. "Met
+    # Council - SCN - PHS"). Needed so the Met Council org filter can run on the
+    # live-API path too -- the API case record exposes the managing provider but
+    # not the originating provider (unlike the CSV export).
+    set_("provider_id", names.get("provider_id"))
+    set_("provider_name", names.get("provider"))
 
     if auth:
         raw = str(auth.get("state") or "")

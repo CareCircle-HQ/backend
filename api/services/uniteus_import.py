@@ -254,6 +254,9 @@ class DailyPull:
 
     # -- cases -------------------------------------------------------------
     def _process_case(self, case_rec, client):
+        from api.services.lifecycle import is_met_council_case
+
+        provider_id = mappers._rel_id(case_rec, "provider")
         names = {
             "service": self._name("/services", mappers._rel_id(case_rec, "service")),
             "program": self._name("/programs", mappers._rel_id(case_rec, "program")),
@@ -264,7 +267,19 @@ class DailyPull:
                 "/employees", mappers._rel_id(case_rec, "primary_worker"), ("full_name", "name")
             ),
             "primary_worker_id": mappers._rel_id(case_rec, "primary_worker"),
+            # Managing organization (the case's "provider"): id from the
+            # relationship, name resolved for display + the Met Council filter.
+            "provider_id": provider_id,
+            "provider": self._name("/providers", provider_id),
         }
+        # STRICT Met Council org gate (same union rule as the CSV import). The
+        # live API only exposes the managing provider, so a person coordinated
+        # across a shared network can carry other orgs' cases -- drop them.
+        if not is_met_council_case(
+            provider_id=provider_id, provider_name=names["provider"],
+        ):
+            self._count("cases", "skipped")
+            return
         auth_attrs = None
         auth_id = mappers._rel_id(case_rec, "service_authorization")
         if auth_id:

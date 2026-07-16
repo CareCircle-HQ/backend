@@ -38,6 +38,8 @@ from api.models import (
     ProductTypeKind,
     SERVICE_EXCLUDED_MEMBER_STATUSES,
     ServiceAuthorizationStatus,
+    Ticket,
+    TicketStatus,
 )
 from api.services.catalog import (
     product_kind_for_enrollment,
@@ -70,14 +72,17 @@ KITCHEN_MISSING_PRODUCT = "kitchen_missing_product"
 CADENCE_KIND_MISMATCH = "cadence_kind_mismatch"
 INSURANCE_EXPIRING = "insurance_expiring"
 INTERNAL_CASE_EXPIRED = "internal_case_expired"
-# Per-member service status (member-scope).
-MEMBER_PAUSED = "member_paused"
 # Household service state (household-scope).
 HOUSEHOLD_ON_HOLD = "household_on_hold"
 HOUSEHOLD_CANCELLED = "household_cancelled"
-# Household roll-up counts of members not being served (household-scope).
+# Household roll-up counts of members not being served (household-scope). Shown
+# on EVERY member of the household so an agent sees the household-wide impact,
+# not just the member they're currently viewing.
 HOUSEHOLD_MEMBERS_OUT_OF_ORBIT = "household_members_out_of_orbit"
 HOUSEHOLD_MEMBERS_OUT_OF_RANGE = "household_members_out_of_range"
+HOUSEHOLD_MEMBERS_PAUSED = "household_members_paused"
+# Household roll-up count of open agent follow-up tickets (household-scope).
+HOUSEHOLD_OPEN_TICKETS = "household_open_tickets"
 
 # --- Warning categories -----------------------------------------------------
 # Every warning is categorized so each surface can choose what to show:
@@ -106,11 +111,12 @@ WARNING_CATEGORY = {
     INSURANCE_EXPIRING: SERVICE_CONFIG,
     MULTIPLE_OPEN_CASES: SERVICE_CONFIG,
     CONFLICTING_PRODUCT_TYPES: SERVICE_CONFIG,
-    MEMBER_PAUSED: MEMBER_STATE,
     HOUSEHOLD_MEMBERS_OUT_OF_ORBIT: MEMBER_STATE,
     HOUSEHOLD_MEMBERS_OUT_OF_RANGE: MEMBER_STATE,
+    HOUSEHOLD_MEMBERS_PAUSED: MEMBER_STATE,
     HOUSEHOLD_ON_HOLD: HOUSEHOLD_STATE,
     HOUSEHOLD_CANCELLED: HOUSEHOLD_STATE,
+    HOUSEHOLD_OPEN_TICKETS: HOUSEHOLD_STATE,
 }
 
 # Allowlist of codes CS can act on -> the only warnings shown on Care Management.
@@ -448,26 +454,6 @@ def check_internal_case_expired(ctx):
     )]
 
 
-def check_member_service_status(ctx):
-    """Member-scope: flag the viewed member when they're manually PAUSED. (Out of
-    orbit / out of range are surfaced as a single household roll-up count instead
-    -- see ``check_household_out_of_service_counts``.) Skipped for a cancelled
-    household (terminal; the household warning covers it)."""
-    if ctx.stage == EnrollmentStage.CANCELLED:
-        return []
-    out = []
-    for mp in ctx.enrollment.member_profiles.all():
-        if mp.client_id is None or mp.status != MemberStatus.PAUSED:
-            continue
-        out.append(Warning(
-            code=MEMBER_PAUSED, severity=ORANGE, scope="member",
-            title="Member paused",
-            detail="This member is paused and excluded from deliveries and orders.",
-            client_id=mp.client_id, refs={"status": mp.status},
-        ))
-    return out
-
-
 def check_household_on_hold(ctx):
     """Household-scope: the whole household's service is on hold."""
     if ctx.stage != EnrollmentStage.ON_HOLD:
@@ -498,12 +484,14 @@ def _plural(n, noun):
 
 def check_household_out_of_service_counts(ctx):
     """Household-scope roll-up: how many household members are out of orbit
-    (dietary/kitchen) or out of range (coverage). Shown on every member so an
-    agent sees the household-wide impact, not just the member they're viewing.
+    (dietary/kitchen), out of range (coverage), or paused (agent hold). Each is a
+    single count shown on EVERY member, so pausing / out-of-orbit / out-of-range
+    for ANY household member surfaces on every member's profile (and clears for
+    all of them the moment the member is unpaused / back in orbit / in range).
     Skipped for a cancelled household (terminal)."""
     if ctx.stage == EnrollmentStage.CANCELLED:
         return []
-    n_orbit = n_range = 0
+    n_orbit = n_range = n_paused = 0
     for mp in ctx.enrollment.member_profiles.all():
         if mp.client_id is None:
             continue
@@ -511,6 +499,8 @@ def check_household_out_of_service_counts(ctx):
             n_orbit += 1
         elif mp.status == MemberStatus.OUT_OF_RANGE:
             n_range += 1
+        elif mp.status == MemberStatus.PAUSED:
+            n_paused += 1
     out = []
     if n_orbit:
         out.append(Warning(
@@ -534,7 +524,43 @@ def check_household_out_of_service_counts(ctx):
             client_id=ctx.client.pk,
             refs={"count": n_range},
         ))
+    if n_paused:
+        out.append(Warning(
+            code=HOUSEHOLD_MEMBERS_PAUSED, severity=ORANGE, scope="household",
+            title=f"{n_paused} Paused",
+            detail=(
+                f"{_plural(n_paused, 'household member')} are paused and excluded "
+                "from deliveries and orders."
+            ),
+            client_id=ctx.client.pk,
+            refs={"count": n_paused},
+        ))
     return out
+
+
+def check_household_open_tickets(ctx):
+    """Household-scope roll-up: how many OPEN (Open / In Progress) agent
+    follow-up tickets exist across the household's members. Shown on every
+    member; clears automatically once the tickets are resolved."""
+    member_ids = [m.pk for m in ctx.members if getattr(m, "pk", None) is not None]
+    if not member_ids:
+        return []
+    n = Ticket.objects.filter(
+        client_id__in=member_ids,
+        status__in=(TicketStatus.OPEN, TicketStatus.IN_PROGRESS),
+    ).count()
+    if not n:
+        return []
+    return [Warning(
+        code=HOUSEHOLD_OPEN_TICKETS, severity=ORANGE, scope="household",
+        title=_plural(n, "open ticket"),
+        detail=(
+            f"{_plural(n, 'open follow-up ticket')} for this household need agent "
+            "attention."
+        ),
+        client_id=ctx.client.pk,
+        refs={"count": n},
+    )]
 
 
 # Registry — add a new check here and it flows everywhere. Order is display
@@ -543,7 +569,7 @@ WARNING_CHECKS = [
     check_household_cancelled,
     check_household_on_hold,
     check_household_out_of_service_counts,
-    check_member_service_status,
+    check_household_open_tickets,
     check_no_kitchen,
     check_no_cadence,
     check_cadence_not_supported_by_kitchen,
