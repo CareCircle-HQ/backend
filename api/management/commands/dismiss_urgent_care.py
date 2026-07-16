@@ -41,6 +41,11 @@ class Command(BaseCommand):
                  "(instead of the default: list members with no internal-service case).",
         )
         parser.add_argument(
+            "--all", action="store_true", dest="all_flagged",
+            help="Target EVERY client with is_new=True, no conditions "
+                 "(ignores verification and case status). Wipes the whole flag.",
+        )
+        parser.add_argument(
             "--apply", action="store_true",
             help="Actually clear is_new. Without this the command only previews.",
         )
@@ -49,7 +54,10 @@ class Command(BaseCommand):
             help="Max rows to print in the preview (default 50). Counts are always full.",
         )
 
-    def _queryset(self, verified):
+    def _queryset(self, verified, all_flagged):
+        if all_flagged:
+            # Every flagged client, no conditions.
+            return Client.objects.filter(is_new=True)
         if verified:
             # is_new clients already verified: a governing enrollment (own or
             # household) has verified_at set. The flag should have cleared on
@@ -73,12 +81,14 @@ class Command(BaseCommand):
 
     def handle(self, *args, **opts):
         verified = opts["verified"]
-        cohort = (
-            "is_new client(s) already verified"
-            if verified
-            else "Urgent Care client(s) with no internal-service case"
-        )
-        qs = self._queryset(verified)
+        all_flagged = opts["all_flagged"]
+        if all_flagged:
+            cohort = "client(s) flagged is_new (all, unconditional)"
+        elif verified:
+            cohort = "is_new client(s) already verified"
+        else:
+            cohort = "Urgent Care client(s) with no internal-service case"
+        qs = self._queryset(verified, all_flagged)
         total = qs.count()
 
         if total == 0:
