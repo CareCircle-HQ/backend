@@ -2711,12 +2711,33 @@ class CSDashboardTest(TestCase):
 class IsNewFlagTest(TestCase):
     """Client.is_new (the Urgent Care / 'Need Attention' flag) is raised when a
     client's first internal-service case is created via the EXTENSION (request
-    user has an agent_code) or an IMPORT (inside change_context(IMPORT)) -- never
-    by admin/CRM writes, and never re-raised once the client is verified."""
+    user has an agent_code) or an IMPORT (inside change_context(IMPORT)) -- but
+    ONLY when the client also meets the coverage gate (valid Medicaid + valid
+    social care). Never by admin/CRM writes, and never re-raised once verified."""
 
-    def _client(self):
-        return Client.objects.create(
+    def _client(self, *, coverage=True):
+        client = Client.objects.create(
             client_id=str(uuid.uuid4()), first_name="New", last_name="Member"
+        )
+        if coverage:
+            self._add_medicaid(client)
+            self._add_social_care(client)
+        return client
+
+    def _add_medicaid(self, client):
+        from .models import Insurance, InsurancePlanType, RecordStatus
+
+        return Insurance.objects.create(
+            client=client, plan_type=InsurancePlanType.MEDICAID,
+            status=RecordStatus.ACTIVE, plan_name="NY Medicaid",
+        )
+
+    def _add_social_care(self, client):
+        from .models import SocialCareCoverage, SocialCareCoverageStatus
+
+        return SocialCareCoverage.objects.create(
+            client=client, status=SocialCareCoverageStatus.ENROLLED,
+            plan_name="Social Care",
         )
 
     def _save_internal_case(self, client, *, context):
@@ -2743,9 +2764,27 @@ class IsNewFlagTest(TestCase):
 
     def test_admin_write_does_not_set_is_new(self):
         # A Django-admin/session write: request present, but the user has no
-        # agent_code -- must NOT flag.
+        # agent_code -- must NOT flag (even with full coverage).
         client = self._client()
         request = SimpleNamespace(user=SimpleNamespace(username="staff"))
+        self._save_internal_case(client, context={"request": request})
+        client.refresh_from_db()
+        self.assertFalse(client.is_new)
+
+    def test_no_medicaid_not_flagged(self):
+        # Extension write, valid social care but NO Medicaid -> gate blocks.
+        client = self._client(coverage=False)
+        self._add_social_care(client)
+        request = SimpleNamespace(user=SimpleNamespace(agent_code="123"))
+        self._save_internal_case(client, context={"request": request})
+        client.refresh_from_db()
+        self.assertFalse(client.is_new)
+
+    def test_no_social_care_not_flagged(self):
+        # Extension write, valid Medicaid but NO social care -> gate blocks.
+        client = self._client(coverage=False)
+        self._add_medicaid(client)
+        request = SimpleNamespace(user=SimpleNamespace(agent_code="123"))
         self._save_internal_case(client, context={"request": request})
         client.refresh_from_db()
         self.assertFalse(client.is_new)
@@ -2783,6 +2822,194 @@ class IsNewFlagTest(TestCase):
         self._save_internal_case(client, context={"request": request})
         client.refresh_from_db()
         self.assertFalse(client.is_new)
+
+
+class RequestVerificationEndpointTest(TestCase):
+    """POST /api/portal/members/<id>/request-verification/ creates the Pending
+    Verification enrollment when the client meets the Urgent Care gate, and is
+    hard-gated (400) on missing coverage / already-requested."""
+
+    def setUp(self):
+        self.agent = Agent.objects.create(
+            name="Req Agent", agent_code="910", group="Management"
+        )
+        access = AccessToken()
+        access["agent_id"] = str(self.agent.id)
+        access["agent_code"] = self.agent.agent_code
+        access["agent_name"] = self.agent.name
+        access["agent_group"] = self.agent.group
+        self.api = APIClient()
+        self.api.credentials(HTTP_AUTHORIZATION=f"Bearer {access}")
+
+    def _candidate(self, *, medicaid=True, social=True, case=True):
+        from .models import (
+            Case, CaseStatus, CaseType, InsurancePlanType, RecordStatus,
+            SocialCareCoverage, SocialCareCoverageStatus,
+        )
+
+        client = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Urgent", last_name="Care",
+            is_new=True,
+        )
+        if medicaid:
+            Insurance.objects.create(
+                client=client, plan_type=InsurancePlanType.MEDICAID,
+                status=RecordStatus.ACTIVE, plan_name="Medicaid",
+            )
+        if social:
+            SocialCareCoverage.objects.create(
+                client=client, status=SocialCareCoverageStatus.ENROLLED,
+                plan_name="Social Care",
+            )
+        if case:
+            Case.objects.create(
+                case_id=str(uuid.uuid4()), client=client,
+                case_type=CaseType.INTERNAL_SERVICE,
+                case_status=CaseStatus.OPEN, program_name="Medically Tailored Meals",
+            )
+        return client
+
+    def _url(self, client):
+        return f"/api/portal/members/{client.client_id}/request-verification/"
+
+    def test_request_creates_enrollment_and_clears_is_new(self):
+        from .models import EnrollmentStage, EnrollmentVerification
+
+        client = self._candidate()
+        resp = self.api.post(self._url(client))
+        self.assertEqual(resp.status_code, 200, resp.content)
+        client.refresh_from_db()
+        self.assertFalse(client.is_new)
+        enr = EnrollmentVerification.objects.filter(client=client).first()
+        self.assertIsNotNone(enr)
+        self.assertEqual(enr.stage, EnrollmentStage.PENDING_VERIFICATION)
+        self.assertEqual(enr.requested_by_id, self.agent.id)
+
+    def test_missing_medicaid_rejected(self):
+        from .models import EnrollmentVerification
+
+        client = self._candidate(medicaid=False)
+        resp = self.api.post(self._url(client))
+        self.assertEqual(resp.status_code, 400, resp.content)
+        self.assertIn("Medicaid", resp.json()["error"])
+        self.assertFalse(EnrollmentVerification.objects.filter(client=client).exists())
+
+    def test_missing_social_care_rejected(self):
+        client = self._candidate(social=False)
+        resp = self.api.post(self._url(client))
+        self.assertEqual(resp.status_code, 400, resp.content)
+        self.assertIn("social care", resp.json()["error"])
+
+    def test_already_requested_rejected(self):
+        from .models import EnrollmentStage, EnrollmentVerification, Household, HouseholdMember
+
+        client = self._candidate()
+        hh = Household.objects.create(name="HH")
+        HouseholdMember.objects.create(household=hh, client=client, is_primary=True)
+        EnrollmentVerification.objects.create(
+            client=client, household=hh, stage=EnrollmentStage.PENDING_VERIFICATION,
+        )
+        resp = self.api.post(self._url(client))
+        self.assertEqual(resp.status_code, 400, resp.content)
+
+
+class WorkQueueVipTest(TestCase):
+    """The Work Queue VIP flag: created via the ticket POST (default False),
+    exposed on the serializer, and filterable via ?vip=1."""
+
+    def setUp(self):
+        self.agent = Agent.objects.create(
+            name="Q Agent", agent_code="920", group="CS"
+        )
+        access = AccessToken()
+        access["agent_id"] = str(self.agent.id)
+        access["agent_code"] = self.agent.agent_code
+        access["agent_name"] = self.agent.name
+        access["agent_group"] = self.agent.group
+        self.api = APIClient()
+        self.api.credentials(HTTP_AUTHORIZATION=f"Bearer {access}")
+        from .models import TicketType
+
+        self.tt, _ = TicketType.objects.get_or_create(
+            code="verification", defaults={"label": "Verification"}
+        )
+
+    def _create(self, **body):
+        payload = {"type": "verification", "severity": "medium", "reason": "r"}
+        payload.update(body)
+        return self.api.post(reverse("portal-tickets"), payload, format="json")
+
+    def test_create_defaults_vip_false(self):
+        resp = self._create()
+        self.assertEqual(resp.status_code, 201, resp.content)
+        self.assertFalse(resp.json()["vip"])
+
+    def test_create_with_vip_true(self):
+        resp = self._create(vip=True)
+        self.assertEqual(resp.status_code, 201, resp.content)
+        self.assertTrue(resp.json()["vip"])
+
+    def test_vip_filter(self):
+        self._create(vip=True)
+        self._create(vip=False)
+        resp = self.api.get(reverse("portal-tickets") + "?vip=1")
+        self.assertEqual(resp.status_code, 200, resp.content)
+        results = resp.json()["results"]
+        self.assertTrue(len(results) >= 1)
+        self.assertTrue(all(t["vip"] for t in results))
+
+
+class ReviewUrgentCareCommandTest(TestCase):
+    """The review_urgent_care_candidates command flags is_new for members who
+    meet the gate but were missed, and only with --apply."""
+
+    def _candidate(self, *, is_new=False, medicaid=True, social=True):
+        from .models import (
+            Case, CaseStatus, CaseType, InsurancePlanType, RecordStatus,
+            SocialCareCoverage, SocialCareCoverageStatus,
+        )
+
+        client = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Miss", last_name="Ed",
+            is_new=is_new,
+        )
+        if medicaid:
+            Insurance.objects.create(
+                client=client, plan_type=InsurancePlanType.MEDICAID,
+                status=RecordStatus.ACTIVE, plan_name="Medicaid",
+            )
+        if social:
+            SocialCareCoverage.objects.create(
+                client=client, status=SocialCareCoverageStatus.ENROLLED,
+                plan_name="Social Care",
+            )
+        Case.objects.create(
+            case_id=str(uuid.uuid4()), client=client,
+            case_type=CaseType.INTERNAL_SERVICE, case_status=CaseStatus.OPEN,
+            program_name="Medically Tailored Meals",
+        )
+        return client
+
+    def test_dry_run_does_not_flag(self):
+        from django.core.management import call_command
+        from io import StringIO
+
+        client = self._candidate()
+        call_command("review_urgent_care_candidates", stdout=StringIO())
+        client.refresh_from_db()
+        self.assertFalse(client.is_new)
+
+    def test_apply_flags_only_candidates(self):
+        from django.core.management import call_command
+        from io import StringIO
+
+        good = self._candidate()
+        no_med = self._candidate(medicaid=False)
+        call_command("review_urgent_care_candidates", "--apply", stdout=StringIO())
+        good.refresh_from_db()
+        no_med.refresh_from_db()
+        self.assertTrue(good.is_new)
+        self.assertFalse(no_med.is_new)
 
 
 class CsvImportRulesTest(TestCase):

@@ -14,6 +14,9 @@ from rest_framework import serializers
 from api.services.lifecycle import (
     governing_case_key,
     governing_pending_enrollment,
+    has_open_internal_service_case,
+    has_valid_medicaid,
+    has_valid_social_care,
     verification_completed,
 )
 
@@ -379,17 +382,25 @@ def internal_service_cases(client):
 
 def case_authorization(case):
     """Read-only authorization snapshot for a case: normalized status, the raw
-    display label (e.g. "Accepted"), and whether it counts as accepted."""
+    display label (e.g. "Accepted"), whether it counts as accepted, and the
+    authorization approval window (approved_from -> approved_to). The end date
+    maps the lifetime sentinel to the "Lifetime" label."""
     if case is None:
-        return {"status": "", "status_label": "", "is_accepted": False}
+        return {
+            "status": "", "status_label": "", "is_accepted": False,
+            "approved_from": None, "approved_to": None,
+        }
     status = case.service_authorization_status or ""
     label = case.service_authorization_status_label or (
         case.get_service_authorization_status_display() if status else ""
     )
+    starts = case.service_authorization_approval_starts_at
     return {
         "status": status,
         "status_label": label,
         "is_accepted": status == ServiceAuthorizationStatus.APPROVED,
+        "approved_from": starts.isoformat() if starts else None,
+        "approved_to": _fmt_end(case.service_authorization_approval_ends_at),
     }
 
 
@@ -422,6 +433,7 @@ class MemberListSerializer(serializers.Serializer):
     verification_status = serializers.SerializerMethodField()
     authorization_status = serializers.SerializerMethodField()
     authorization_status_label = serializers.SerializerMethodField()
+    authorization_date = serializers.SerializerMethodField()
     medicaid_id = serializers.SerializerMethodField()
     case_manager = serializers.CharField(source="agent_name")
     lead_source = serializers.SerializerMethodField()
@@ -437,6 +449,13 @@ class MemberListSerializer(serializers.Serializer):
     verification_completed_by = serializers.SerializerMethodField()
     stage_label = serializers.SerializerMethodField()
     verification_state = serializers.SerializerMethodField()
+    # Urgent Care ("Need Attention") coverage gate: whether the client has a
+    # valid Medicaid insurance + valid social care coverage, and whether a
+    # verification can be requested (open internal-service case + both coverages).
+    # Drives the "Request Verification" button's enabled state on that page.
+    has_valid_medicaid = serializers.SerializerMethodField()
+    has_valid_social_care = serializers.SerializerMethodField()
+    can_request_verification = serializers.SerializerMethodField()
     household_primary_id = serializers.SerializerMethodField()
     last_updated = serializers.DateTimeField(source="updated_at")
     created_at = serializers.DateTimeField()
@@ -453,6 +472,25 @@ class MemberListSerializer(serializers.Serializer):
 
     def get_lead_source(self, obj):
         return getattr(obj, "lead_source", "") or ""
+
+    def get_has_valid_medicaid(self, obj):
+        return has_valid_medicaid(obj)
+
+    def get_has_valid_social_care(self, obj):
+        return has_valid_social_care(obj)
+
+    def get_can_request_verification(self, obj):
+        # Coverage/case prerequisites for the Urgent Care "Request Verification"
+        # action: an open internal-service case + valid Medicaid + valid social
+        # care. The "no verification requested yet" half of the full gate is
+        # guaranteed by the need_attention list scope (and re-checked
+        # authoritatively by the endpoint), so it's omitted here to avoid an
+        # extra per-row enrollment query on the shared members list.
+        return (
+            has_open_internal_service_case(obj)
+            and has_valid_medicaid(obj)
+            and has_valid_social_care(obj)
+        )
 
     def get_household_primary_id(self, obj):
         # client_id of the household's PRIMARY member, used by the Members list
@@ -509,6 +547,15 @@ class MemberListSerializer(serializers.Serializer):
 
     def get_authorization_status_label(self, obj):
         return authorization_status(obj)["status_label"]
+
+    def get_authorization_date(self, obj):
+        # The date the internal-service case's authorization takes effect (its
+        # approval-window start) -- i.e. when the case was authorized. Shown
+        # under the authorization status on the Verification page. Null when the
+        # case has no approved authorization date (pending / denied).
+        case = internal_service_case(obj)
+        dt = getattr(case, "service_authorization_approval_starts_at", None) if case else None
+        return dt.date().isoformat() if dt else None
 
     def get_authorization_status_at(self, obj):
         # No dedicated "status decided at" field exists on the Case; the source's
@@ -948,7 +995,7 @@ class PortalTicketSerializer(serializers.ModelSerializer):
             "id", "code", "type", "type_label", "status", "status_label",
             "severity", "source", "source_label", "reason", "client_id",
             "client_name", "case_code", "assignee", "assignee_id", "origin",
-            "created_at", "updated_at", "resolved_at", "notes",
+            "vip", "created_at", "updated_at", "resolved_at", "notes",
         ]
 
     def get_code(self, obj):
@@ -1065,6 +1112,7 @@ class PortalTicketCreateSerializer(serializers.Serializer):
         choices=TicketSource.values, required=False, allow_blank=True, default=""
     )
     reason = serializers.CharField()
+    vip = serializers.BooleanField(required=False, default=False)
     client_id = serializers.UUIDField(required=False, allow_null=True)
     case_id = serializers.UUIDField(required=False, allow_null=True)
     assignee_id = serializers.UUIDField(required=False, allow_null=True)
