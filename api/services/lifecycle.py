@@ -482,6 +482,18 @@ def _has_passing_process(enrollment, process_type):
     ).exists()
 
 
+def clear_new_flag_on_verification_request(enrollment):
+    """Requesting (or re-requesting) a verification means the household is now
+    being handled, so drop its primary off the Urgent Care ("Need Attention")
+    list by clearing ``Client.is_new``. Complements the completion-time clear in
+    ``advance_enrollment`` (VERIFIED+). Idempotent + best-effort: a no-op when
+    already clear, and a hiccup never breaks the request."""
+    client = getattr(enrollment, "client", None)
+    if client is not None and client.is_new:
+        client.is_new = False
+        client.save(update_fields=["is_new"])
+
+
 @transaction.atomic
 def advance_enrollment(enrollment, to_stage, *, actor=None, actor_label="", note="", force=False):
     """Move an enrollment to ``to_stage`` with guard checks. Logs a StageEvent.

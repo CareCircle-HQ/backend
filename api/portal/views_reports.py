@@ -15,14 +15,16 @@ from django.utils import timezone
 from rest_framework.response import Response
 
 from ..models import (
+    AddressType,
     Case,
+    CaseStatus,
     CaseType,
     Client,
     EnrollmentStage,
     EnrollmentVerification,
 )
 from .base import PortalAPIView, current_agent
-from .serializers import medicaid_member_id
+from .serializers import internal_service_case, medicaid_member_id
 from .views_members import _parse_date
 
 
@@ -251,5 +253,204 @@ class MembersPendingVerificationReportView(PortalAPIView):
                     client.last_name or "",
                     _client_phone_numbers(client),
                 ])
+
+        return response
+
+
+_CLOSED_CASE_STATUSES = (CaseStatus.CLOSED, CaseStatus.CANCELLED)
+
+
+def _primary_phone(client):
+    """A single best phone number for the member: the canonical
+    ``client_phone_number`` if set, else the first number on the phones table."""
+    number = (client.client_phone_number or "").strip()
+    if number:
+        return number
+    for p in client.phones.all():
+        raw = (p.raw or p.normalized or "").strip()
+        if raw:
+            return raw
+    return ""
+
+
+def _active_medicaid_id(client):
+    """Member id from an ACTIVE Medicaid plan (primary preferred). Falls back to
+    :func:`medicaid_member_id` (any Medicaid / primary insurance) when no active
+    Medicaid plan carries an id."""
+    plans = list(client.insurances.all())
+    active = [
+        p for p in plans
+        if p.plan_type == "medicaid" and p.status == "active" and p.external_member_id
+    ]
+    if active:
+        primary = next((p for p in active if p.is_primary), active[0])
+        return primary.external_member_id
+    return medicaid_member_id(client)
+
+
+def _pick_address(client):
+    """The member's best own address: Current, then Home, then any. None when
+    the member has no address on file."""
+    addresses = list(client.addresses.all())
+    if not addresses:
+        return None
+    for wanted in (AddressType.CURRENT, AddressType.HOME):
+        for a in addresses:
+            if a.type == wanted:
+                return a
+    return addresses[0]
+
+
+def _household_primary(household):
+    """The primary member client of a household (or None)."""
+    if household is None:
+        return None
+    for hm in household.members.all():
+        if hm.is_primary and hm.client_id:
+            return hm.client
+    return None
+
+
+class AllMembersReportView(PortalAPIView):
+    """Management-only CSV export of every member (Client), one row per member.
+
+    Household-scoped columns (primary member id, total members) repeat the
+    household's value across each of its members; a member with no household is
+    treated as their own single-member household. Address falls back to the
+    household primary's address when the member has none of their own (household
+    members share a delivery address).
+
+    Columns: Household Primary Member ID, Member ID, Medicaid ID (active), Name,
+    Phone Number, Street Address, Apt, City, State, Zip, DOB, Internal Service
+    Program Name, Is there Screening, Is there Eligibility, Is there Navigation,
+    Is there Internal Service Case, Total members in household, Lead Source in
+    CRM, Authorized amount for the open internal service case.
+    """
+
+    def get(self, request):
+        agent = current_agent(request)
+        if not (agent and (agent.group == "Management" or getattr(agent, "is_manager", False))):
+            return Response({"detail": "Management access required."}, status=403)
+
+        qs = (
+            Client.objects.all()
+            .prefetch_related(
+                "insurances",
+                "screenings",
+                "cases",
+                "addresses",
+                "phones",
+                "household_membership__household__members__client__addresses",
+            )
+            .order_by(
+                "household_membership__household__household_id",
+                "-household_membership__is_primary",
+                "last_name",
+                "first_name",
+                "created_at",
+            )
+        )
+
+        label_map = _lead_source_label_map()
+
+        response = HttpResponse(content_type="text/csv")
+        filename = f"all_members_{timezone.localdate().isoformat()}.csv"
+        response["Content-Disposition"] = f'attachment; filename="{filename}"'
+
+        writer = csv.writer(response)
+        writer.writerow([
+            "Household Primary Member ID",
+            "Member ID",
+            "Medicaid ID (active)",
+            "Name",
+            "Phone Number",
+            "Street Address",
+            "Apt",
+            "City",
+            "State",
+            "Zip",
+            "DOB",
+            "Internal Service Program Name",
+            "Is there Screening",
+            "Is there Eligibility",
+            "Is there Navigation",
+            "Is there Internal Service Case",
+            "Total members in household",
+            "Lead Source in CRM",
+            "Authorized amount for the open internal service case",
+        ])
+
+        for client in qs:
+            cases = list(client.cases.all())
+            has_screening = len(list(client.screenings.all())) > 0
+            has_eligibility = any(c.case_type == CaseType.ELIGIBILITY for c in cases)
+            has_navigation = any(c.case_type == CaseType.NAVIGATION for c in cases)
+            has_internal_service = any(
+                c.case_type == CaseType.INTERNAL_SERVICE for c in cases
+            )
+
+            # Household context: primary id repeats across a household's members;
+            # a member with no household is their own single-member household.
+            membership = getattr(client, "household_membership", None)
+            household = membership.household if membership is not None else None
+            primary_client = _household_primary(household) or client
+            member_total = (
+                len(list(household.members.all())) if household is not None else 1
+            )
+
+            # Internal-service program name (governing case, any status) + the
+            # authorized amount from the OPEN internal-service case.
+            gov_internal = internal_service_case(client)
+            program_name = ""
+            if gov_internal is not None:
+                program_name = gov_internal.program_name or (
+                    gov_internal.program.name if gov_internal.program_id else ""
+                )
+            open_internal = None
+            if gov_internal is not None and gov_internal.case_status not in _CLOSED_CASE_STATUSES:
+                open_internal = gov_internal
+            else:
+                opens = [
+                    c for c in cases
+                    if c.case_type == CaseType.INTERNAL_SERVICE
+                    and c.case_status not in _CLOSED_CASE_STATUSES
+                ]
+                if opens:
+                    open_internal = max(
+                        opens,
+                        key=lambda c: c.date_opened.timestamp() if c.date_opened else 0,
+                    )
+            authorized_amount = open_internal.authorized_amount if open_internal else ""
+
+            # Address: the member's own (Current/Home/any), else the household
+            # primary's (household members share a delivery address).
+            addr = _pick_address(client)
+            if addr is None and primary_client is not client:
+                addr = _pick_address(primary_client)
+
+            raw_source = (client.lead_source or "").strip()
+            source_label = label_map.get(raw_source, raw_source)
+
+            writer.writerow([
+                str(primary_client.client_id),
+                str(client.client_id),
+                _active_medicaid_id(client),
+                f"{client.first_name or ''} {client.last_name or ''}".strip(),
+                _primary_phone(client),
+                (addr.street if addr else ""),
+                (addr.unit if addr else ""),
+                (addr.city if addr else ""),
+                (addr.state if addr else ""),
+                (addr.zip if addr else ""),
+                client.date_of_birth.isoformat() if client.date_of_birth else "",
+                program_name,
+                "Yes" if has_screening else "No",
+                "Yes" if has_eligibility else "No",
+                "Yes" if has_navigation else "No",
+                "Yes" if has_internal_service else "No",
+                member_total,
+                source_label,
+                authorized_amount,
+            ])
 
         return response

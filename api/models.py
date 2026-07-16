@@ -2755,6 +2755,7 @@ class NoteSource(models.TextChoices):
     UNITE_US = "unite_us", "Unite Us"
     AGENT = "agent", "Agent"
     SYSTEM = "system", "System"
+    GHL = "ghl", "GoHighLevel"
 
 
 class Note(models.Model):

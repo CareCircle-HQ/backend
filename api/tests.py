@@ -2427,3 +2427,241 @@ class CareManagementListTest(TestCase):
         codes = {w["code"] for w in row["warnings"]}
         self.assertIn(NO_KITCHEN, codes)
         self.assertNotIn(HOUSEHOLD_MEMBERS_OUT_OF_ORBIT, codes)
+
+
+class RemovedMemberPromotionTest(TestCase):
+    """Removing a non-primary household member who still holds an ACTIVE
+    internal-service case promotes them to primary of their OWN household with a
+    fresh Pending-Verification enrollment (rather than dropping them)."""
+
+    def _client(self, first="A", last="B"):
+        return Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name=first, last_name=last
+        )
+
+    def test_member_with_active_internal_case_is_promoted(self):
+        from .models import (
+            Case, CaseStatus, CaseType, ClientStage, EnrollmentStage,
+            EnrollmentVerification, Household, HouseholdMember,
+            MemberDietaryProfile, MemberStatus,
+        )
+        from .portal.views_members import _promote_removed_member_to_own_household
+
+        primary = self._client("Pat", "Primary")
+        dep = self._client("Dee", "Dependent")
+        hh = Household.objects.create(name="Old HH")
+        HouseholdMember.objects.create(household=hh, client=primary, is_primary=True)
+        HouseholdMember.objects.create(household=hh, client=dep, is_primary=False)
+        enr = EnrollmentVerification.objects.create(
+            client=primary, household=hh, stage=EnrollmentStage.SERVICE_ACTIVE,
+        )
+        case = Case.objects.create(
+            case_id=str(uuid.uuid4()), client=dep,
+            case_type=CaseType.INTERNAL_SERVICE, case_status=CaseStatus.MANAGED,
+            program_name="Medically Tailored Meals",
+        )
+
+        # Simulate the delete's detach step, then promote.
+        HouseholdMember.objects.filter(client=dep, household=hh).delete()
+        MemberDietaryProfile.objects.filter(
+            client=dep, enrollment__household=hh
+        ).delete()
+        new_enr = _promote_removed_member_to_own_household(
+            dep, case,
+            diet_snapshot={"menu_type": "Standard", "status": MemberStatus.ACTIVE,
+                           "food_allergies": ["fish"]},
+            member_name="Dee Dependent", agent=None, actor="",
+        )
+
+        dep.refresh_from_db()
+        hm = HouseholdMember.objects.get(client=dep)
+        self.assertEqual(new_enr.stage, EnrollmentStage.PENDING_VERIFICATION)
+        self.assertEqual(str(new_enr.case_id), str(case.case_id))
+        self.assertTrue(hm.is_primary)
+        self.assertNotEqual(hm.household_id, hh.household_id)
+        self.assertEqual(dep.lifecycle_stage, ClientStage.PENDING_VERIFICATION)
+        prof = new_enr.member_profiles.get(client=dep)
+        self.assertEqual(prof.menu_type, "Standard")
+        self.assertEqual(prof.food_allergies, ["fish"])
+        # Old household + primary untouched.
+        self.assertTrue(
+            HouseholdMember.objects.filter(household=hh, client=primary).exists()
+        )
+
+    def test_existing_live_enrollment_is_not_duplicated(self):
+        from .models import (
+            Case, CaseStatus, CaseType, EnrollmentStage, EnrollmentVerification,
+            Household, HouseholdMember, MemberStatus,
+        )
+        from .portal.views_members import _promote_removed_member_to_own_household
+
+        dep = self._client("Dee", "Dependent")
+        hh = Household.objects.create(name="Own HH")
+        HouseholdMember.objects.create(household=hh, client=dep, is_primary=True)
+        existing = EnrollmentVerification.objects.create(
+            client=dep, household=hh, stage=EnrollmentStage.PENDING_VERIFICATION,
+        )
+        case = Case.objects.create(
+            case_id=str(uuid.uuid4()), client=dep,
+            case_type=CaseType.INTERNAL_SERVICE, case_status=CaseStatus.MANAGED,
+        )
+
+        result = _promote_removed_member_to_own_household(
+            dep, case, diet_snapshot={}, member_name="Dee Dependent",
+            agent=None, actor="",
+        )
+        self.assertEqual(result.pk, existing.pk)
+        self.assertEqual(
+            EnrollmentVerification.objects.filter(client=dep).count(), 1
+        )
+
+
+class CSDashboardTest(TestCase):
+    """The CS command-center endpoints: summary, trends, and manager ticket
+    stats. Covers access gating and the core aggregations."""
+
+    def _auth(self, group="CS", agent_code="900", is_manager=False):
+        agent = Agent.objects.create(
+            name=f"{group} Agent", agent_code=agent_code, group=group,
+            is_manager=is_manager,
+        )
+        access = AccessToken()
+        access["agent_id"] = str(agent.id)
+        access["agent_code"] = agent.agent_code
+        access["agent_name"] = agent.name
+        access["agent_group"] = agent.group
+        access["agent_is_manager"] = agent.is_manager
+        api = APIClient()
+        api.credentials(HTTP_AUTHORIZATION=f"Bearer {access}")
+        return agent, api
+
+    def _client(self, first="A", last="B"):
+        return Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name=first, last_name=last
+        )
+
+    def _ticket_type(self):
+        from .models import TicketType
+
+        tt, _ = TicketType.objects.get_or_create(
+            code="verification", defaults={"label": "Verification"}
+        )
+        return tt
+
+    def _open_ticket(self, tt, **kw):
+        from .models import Ticket, TicketStatus
+
+        defaults = {"type": tt, "status": TicketStatus.OPEN, "severity": "high"}
+        defaults.update(kw)
+        return Ticket.objects.create(**defaults)
+
+    # ── access gating ─────────────────────────────────────────────────────
+    def test_summary_requires_cs_access(self):
+        _, verifier = self._auth(group="Verifiers", agent_code="901")
+        resp = verifier.get(reverse("portal-cs-dashboard"))
+        self.assertEqual(resp.status_code, 403, resp.content)
+
+    def test_ticket_stats_requires_manager(self):
+        _, cs = self._auth(group="CS", agent_code="902")
+        resp = cs.get(reverse("portal-cs-dashboard-ticket-stats"))
+        self.assertEqual(resp.status_code, 403, resp.content)
+
+    # ── summary ───────────────────────────────────────────────────────────
+    def test_summary_aggregates_triage_verification_and_personal_slice(self):
+        from .models import (
+            EnrollmentStage, EnrollmentVerification, Household, HouseholdMember,
+            MemberWarning, Ticket, TicketStatus, WarningSeverity, WarningStatus,
+        )
+        from .services.warnings import NO_KITCHEN
+
+        agent, api = self._auth(group="CS", agent_code="903")
+        tt = self._ticket_type()
+
+        # A served household on the Care Management queue (actionable warning).
+        c = self._client("Care", "Queue")
+        hh = Household.objects.create(name="HH")
+        HouseholdMember.objects.create(household=hh, client=c, is_primary=True)
+        enr = EnrollmentVerification.objects.create(
+            client=c, household=hh, stage=EnrollmentStage.SERVICE_ACTIVE,
+        )
+        MemberWarning.objects.create(
+            client=c, enrollment=enr, code=NO_KITCHEN,
+            severity=WarningSeverity.RED, scope="household", title="No kitchen",
+            detail="", status=WarningStatus.ACTIVE,
+        )
+        # A pending-verification enrollment for the backlog count.
+        pc = self._client("Pend", "Verify")
+        phh = Household.objects.create(name="PHH")
+        HouseholdMember.objects.create(household=phh, client=pc, is_primary=True)
+        EnrollmentVerification.objects.create(
+            client=pc, household=phh, stage=EnrollmentStage.PENDING_VERIFICATION,
+        )
+        # One open ticket assigned to me + one resolved by me today.
+        self._open_ticket(tt, assigned_to=agent, status=TicketStatus.OPEN)
+        Ticket.objects.create(
+            type=tt, status=TicketStatus.RESOLVED, severity="low",
+            resolved_at=timezone.now(), resolved_by=f"agent:{agent.agent_code}",
+        )
+
+        resp = api.get(reverse("portal-cs-dashboard"))
+        self.assertEqual(resp.status_code, 200, resp.content)
+        body = resp.json()
+        self.assertEqual(body["triage"]["households"], 1)
+        self.assertEqual(body["triage"]["red"], 1)
+        self.assertEqual(body["triage"]["unassigned_kitchen"], 1)
+        self.assertEqual(body["verification"]["pending"], 1)
+        self.assertGreaterEqual(body["tickets"]["open"], 1)
+        self.assertEqual(body["me"]["open_assigned"], 1)
+        self.assertEqual(body["me"]["resolved_today"], 1)
+
+    # ── trends ────────────────────────────────────────────────────────────
+    def test_trends_returns_dense_series_and_resolution(self):
+        from .models import Ticket, TicketStatus
+
+        _, api = self._auth(group="CS", agent_code="904")
+        tt = self._ticket_type()
+        now = timezone.now()
+        t = Ticket.objects.create(
+            type=tt, status=TicketStatus.RESOLVED, severity="low",
+            resolved_at=now,
+        )
+        Ticket.objects.filter(pk=t.pk).update(
+            created_at=now - timedelta(hours=4)
+        )
+
+        resp = api.get(reverse("portal-cs-dashboard-trends"), {"days": 14})
+        self.assertEqual(resp.status_code, 200, resp.content)
+        body = resp.json()
+        self.assertEqual(body["days"], 14)
+        self.assertEqual(len(body["series"]), 14)
+        self.assertEqual(body["resolution"]["count"], 1)
+        self.assertGreater(body["resolution"]["avg_hours"], 0)
+
+    # ── manager ticket stats ──────────────────────────────────────────────
+    def test_ticket_stats_breakdowns_and_solved_by_agent(self):
+        from .models import Ticket, TicketStatus
+
+        agent, api = self._auth(
+            group="Management", agent_code="905", is_manager=True
+        )
+        tt = self._ticket_type()
+        # Open, high, unassigned.
+        self._open_ticket(tt, status=TicketStatus.OPEN, severity="high")
+        # Resolved in range, attributed to agent 905.
+        now = timezone.now()
+        r = Ticket.objects.create(
+            type=tt, status=TicketStatus.RESOLVED, severity="medium",
+            resolved_at=now, resolved_by="agent:905",
+        )
+        Ticket.objects.filter(pk=r.pk).update(created_at=now - timedelta(hours=2))
+
+        resp = api.get(reverse("portal-cs-dashboard-ticket-stats"))
+        self.assertEqual(resp.status_code, 200, resp.content)
+        body = resp.json()
+        self.assertEqual(body["backlog"]["open"], 1)
+        self.assertEqual(body["backlog"]["high_open"], 1)
+        self.assertEqual(body["backlog"]["unassigned_open"], 1)
+        self.assertEqual(body["backlog"]["resolved_in_range"], 1)
+        self.assertTrue(any(row["open"] for row in body["by_type"]))
+        solved = {row["name"]: row["resolved"] for row in body["solved_by_agent"]}
+        self.assertEqual(solved.get(agent.name), 1)

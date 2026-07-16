@@ -57,6 +57,56 @@ Contact `TJ5dZdafNpomNydJRgto`:
 
 ---
 
+## Phase 0 results (updated 2026-07-15)
+Built `api/management/commands/scan_ghl_notes.py` — a read-only, throttled,
+location-wide scan that pages all contacts (`searchAfter` deep pagination),
+pulls `/contacts/{id}/notes`, and — for each **note-bearing** contact — also
+`GET`s the contact to extract mapping fields and resolve our local `Client`.
+Dumps JSONL (`tmp/ghl_notes_dump.jsonl`) + a `.summary.json`.
+
+### Confirmed live
+- **Notes carry no member id** — only `contactId` + `userId`. Mapping requires a
+  second `GET /contacts/{contactId}`.
+- **There is NO "Unite Us member id" field.** The contact instead stores **our
+  own Enrollment Platform Client ID(s)** = local `Client` UUIDs. So a note maps
+  straight to our DB, no Unite Us id needed.
+- **A GHL contact = a whole household.** It has `enrollment_client_id` (primary)
+  + `HM #2..#10 - Enrollment Platform Client ID` (10 member-id fields total) +
+  per-service Case IDs (`Enrollment Platform Case ID - Internal Services / …`).
+  **Notes are therefore household-level, not member-level.**
+- **`body` is HTML** (`<p style="…">value</p>`); **use `bodyText`** — it's the
+  clean plaintext (decision: no HTML/JS stripping needed).
+
+### Mapping — id-only (decision 2026-07-15)
+Map a note's contact to a local `Client` using **ONLY the external id GHL stores
+on the contact**: the Enrollment Platform Client ID
+(`contact.enrollment_client_id`, primary) then the `HM #N` variants. That value
+**is our `Client.pk`** (the Unite Us client id). **No phone/email fuzzy
+matching** — an unmatched contact stays unmapped (`match_method: none`).
+Implemented in `scan_ghl_notes._match_local_client`. Verified: a real member
+contact resolves via `enrollment_client_id`; a phone-only lead returns `none`.
+
+Notes:
+- **`Client.pk` (`client_id`) is the Unite Us client id** ("source external_id"),
+  and it's exactly what GHL calls "Enrollment Platform Client ID" — so the map is
+  deterministic and needs no Unite Us-specific field.
+- Notes are **household-level**: `enrollment_client_id` holds the household
+  **head's** id, so a note attaches to the primary `Client`. (Earlier "mismatch"
+  observations were an artifact of searching by a household member's email while
+  the contact carries the head's id — not staleness.)
+- `HM #N - Enrollment Platform Client ID` fields exist (households up to 10) but
+  are usually empty; kept in the ladder for when they're populated.
+- Contacts without the id (e.g. phone-only leads) are intentionally left
+  unmapped rather than guessed.
+
+### Throughput reality
+Effective rate is **~1 contact/sec** (network round-trip latency dominates, not
+the 8–9 req/s throttle). A full 36,361-contact scan is therefore **several
+hours**, not ~75 min. Run it detached (nohup/screen) or in batches. It flushes
+per note-bearing contact, so partial runs keep their dump.
+
+---
+
 ## Blockers to fix (the "couple of things")
 1. **Member→contact mapping is not wired.**
    - **No local `Client` has `crm_contact_id`** (0 of 32,108) because outbound
@@ -85,8 +135,14 @@ Throttle to ~8 req/s (LeadConnector burst limit ≈ 100 req / 10s).
 **Phase 1 — mapping.** Fix blocker #2 (or map by email/phone) so a member
 resolves to its contact id; optionally backfill `Client.crm_contact_id`.
 
-**Phase 2 — surface.** Decide live passthrough vs. mirrored store (like
-`crm_contact_id`) and render notes on the member profile.
+**Phase 2 — surface (BUILT 2026-07-15).** `import_ghl_notes` management command
+mirrors GHL timeline notes into our `Note` model on the primary household
+`Client`: idempotent upsert keyed by GHL note id (`source='ghl'`,
+`source_note_id`), `body = "{title}\n\n{bodyText}"`, `source_created_at =` the
+note's GHL `dateAdded`. Contacts without the external id are skipped. Supports
+`--contact <id>` (targeted) and `--dry-run`. Notes then render on the member
+profile via the existing `MemberNotesView`. Requires the new `NoteSource.GHL`
+choice (migration `0134`).
 
 ---
 

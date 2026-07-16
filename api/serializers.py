@@ -1193,16 +1193,23 @@ class CaseSerializer(serializers.ModelSerializer):
                 ensure_household_with_primary(client)
         except Exception:
             logger.exception("ensure_household_with_primary failed for internal service case")
-        # "New client needs verification attention": creating the client's FIRST
-        # internal-service case (via the ext OR the CSV data import) flags them
-        # is_new=True so they surface on the Verification > "Need Attention" list
-        # and the ext shows the right screening warning. Only when the case is
-        # newly created (``_prev`` is None) AND the client isn't already verified
-        # (so a historical bulk import never re-flags long-verified members). The
-        # flag is cleared once a verification completes (lifecycle.advance_enrollment
-        # -> VERIFIED). Best-effort: never let the flag break the case save.
+        # "New client needs verification attention": the browser extension saving
+        # the client's FIRST internal-service case flags them is_new=True so they
+        # surface on the Urgent Care ("Need Attention") list and the ext shows the
+        # right screening warning. Gated to EXT-ONLY writes -- the serializer only
+        # carries a request in its context on the DRF/ext path; the CSV import and
+        # nightly Unite Us API sync build it context-less, so they never flag.
+        # Also requires the case to be newly created (``_prev`` is None) AND the
+        # client not already verified (so nothing re-flags a long-verified member).
+        # Cleared once a verification completes (lifecycle.advance_enrollment ->
+        # VERIFIED). Best-effort: never let the flag break the case save.
         try:
-            if case.case_type == CaseType.INTERNAL_SERVICE and _prev is None:
+            is_ext_write = self.context.get("request") is not None
+            if (
+                is_ext_write
+                and case.case_type == CaseType.INTERNAL_SERVICE
+                and _prev is None
+            ):
                 already_verified = EnrollmentVerification.objects.filter(
                     client=client, verified_at__isnull=False
                 ).exists()
