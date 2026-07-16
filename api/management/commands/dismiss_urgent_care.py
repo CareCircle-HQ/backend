@@ -6,14 +6,21 @@ own AND none on their household (mirrors the ``scope=need_attention`` query in
 ``api.portal.views_members.MembersListView``). "Dismissing" a client just
 clears ``is_new`` so they drop off the list.
 
-This command targets the stragglers on that list who have NO internal-service
-case, and clears their ``is_new`` flag in bulk. It writes ONLY the flag -- no
-audit Note and no timeline event (unlike the per-member dismiss endpoint).
+Two selection modes (both write ONLY the flag -- no audit Note and no timeline
+event, unlike the per-member dismiss endpoint):
+
+  * default    -- is_new clients on the list who have NO internal-service case.
+  * --verified -- is_new clients whose verification is already COMPLETE (a
+                  governing enrollment, their own or their household's, has
+                  ``verified_at`` set). These are stale flags that should have
+                  cleared on verification; this sweeps them off the list.
 
 Preview first (default), then commit:
 
-    python manage.py dismiss_urgent_care            # dry run: prints who WOULD be dismissed
-    python manage.py dismiss_urgent_care --apply     # actually clears is_new
+    python manage.py dismiss_urgent_care                     # dry run (no-case mode)
+    python manage.py dismiss_urgent_care --apply             # commit no-case mode
+    python manage.py dismiss_urgent_care --verified          # dry run (verified mode)
+    python manage.py dismiss_urgent_care --verified --apply  # commit verified mode
 """
 from django.core.management.base import BaseCommand
 from django.db.models import Q
@@ -29,6 +36,11 @@ class Command(BaseCommand):
 
     def add_arguments(self, parser):
         parser.add_argument(
+            "--verified", action="store_true",
+            help="Target is_new clients whose verification is already complete "
+                 "(instead of the default: list members with no internal-service case).",
+        )
+        parser.add_argument(
             "--apply", action="store_true",
             help="Actually clear is_new. Without this the command only previews.",
         )
@@ -37,7 +49,16 @@ class Command(BaseCommand):
             help="Max rows to print in the preview (default 50). Counts are always full.",
         )
 
-    def _queryset(self):
+    def _queryset(self, verified):
+        if verified:
+            # is_new clients already verified: a governing enrollment (own or
+            # household) has verified_at set. The flag should have cleared on
+            # verification; this sweeps the stragglers.
+            verified_q = (
+                Q(enrollments__verified_at__isnull=False)
+                | Q(household_membership__household__enrollment_verifications__verified_at__isnull=False)
+            )
+            return Client.objects.filter(is_new=True).filter(verified_q).distinct()
         # Mirror the Need Attention list: is_new AND no enrollment (own or
         # household), then narrow to those with no internal-service case.
         return (
@@ -51,19 +72,23 @@ class Command(BaseCommand):
         )
 
     def handle(self, *args, **opts):
-        qs = self._queryset()
+        verified = opts["verified"]
+        cohort = (
+            "is_new client(s) already verified"
+            if verified
+            else "Urgent Care client(s) with no internal-service case"
+        )
+        qs = self._queryset(verified)
         total = qs.count()
 
         if total == 0:
             self.stdout.write(self.style.SUCCESS(
-                "No Urgent Care clients without an internal-service case. Nothing to do."
+                f"No {cohort}. Nothing to do."
             ))
             return
 
         limit = opts["limit"]
-        self.stdout.write(
-            f"{total} Urgent Care client(s) with no internal-service case:"
-        )
+        self.stdout.write(f"{total} {cohort}:")
         for cid, first, last in qs.values_list(
             "client_id", "first_name", "last_name"
         )[:limit]:
