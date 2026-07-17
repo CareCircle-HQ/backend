@@ -433,13 +433,12 @@ class ClientSerializer(serializers.ModelSerializer):
         if insurances is not None:
             seen_pks = []
             for ins in insurances:
-                # Trust the source-provided status: the import/extension always
-                # sends the record's real status (insurance_record_status), so
-                # NEVER override it here. Only DERIVE a status from the end date
-                # as a fallback when the source didn't provide one -- otherwise a
-                # client with active insurance was being flipped to Expired by a
-                # stale/legacy end date. No end date or the 9999 sentinel
-                # ("never expires") => Active; a past end date => Expired.
+                # The source-provided status (e.g. insurance_record_status) is
+                # AUTHORITATIVE: a policy the source marks Active is NOT flipped
+                # to Expired just because its stored end date is in the past. Only
+                # DERIVE the status from the end date when the source didn't send
+                # one: no end date / the 9999 sentinel ("never expires") => Active;
+                # a past end date => Expired.
                 if not ins.get("status"):
                     exp = ins.get("expired_at")
                     if exp is None or getattr(exp, "year", None) == 9999:
@@ -480,9 +479,10 @@ class ClientSerializer(serializers.ModelSerializer):
         if social_care_coverages is not None:
             seen_scc_pks = []
             for scc in social_care_coverages:
-                # Same rule as insurance: trust the source-provided status and
-                # only DERIVE Expired from the end date when the source left it
-                # blank -- never override a real enrolled/non-enrolled status.
+                # The source-provided status (insurance_status) is AUTHORITATIVE.
+                # Only derive Expired from the end date when the source didn't
+                # send a status -- an Enrolled coverage is not flipped to Expired
+                # just because its stored end date is in the past.
                 if not scc.get("status") and self._is_expired(scc.get("expired_at")):
                     scc["status"] = SocialCareCoverageStatus.EXPIRED
                 key = scc.get("coverage_id")

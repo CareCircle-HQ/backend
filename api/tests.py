@@ -124,13 +124,72 @@ class InsuranceReconcileTest(TestCase):
             RecordStatus.ACTIVE,
         )
 
+    def test_active_status_not_flipped_to_expired_by_past_end_date(self):
+        # The source status is authoritative: an Active policy with a stale past
+        # end date must NOT be stored as Expired.
+        cid = str(uuid.uuid4())
+        self._save({
+            "client_id": cid,
+            "insurances": [{
+                "plan_name": "Medicaid", "external_member_id": "1",
+                "status": "active",
+                "expired_at": (timezone.now() - timedelta(days=30)).isoformat(),
+            }],
+        })
+        self.assertEqual(
+            Insurance.objects.get(client__client_id=cid, plan_name="Medicaid").status,
+            RecordStatus.ACTIVE,
+        )
+
+    def test_blank_status_derives_expired_from_past_end_date(self):
+        # Back-compat: when the source sends no status, derive it from the date.
+        cid = str(uuid.uuid4())
+        self._save({
+            "client_id": cid,
+            "insurances": [{
+                "plan_name": "P", "external_member_id": "1",
+                "expired_at": (timezone.now() - timedelta(days=1)).isoformat(),
+            }],
+        })
+        self.assertEqual(
+            Insurance.objects.get(client__client_id=cid, plan_name="P").status,
+            RecordStatus.EXPIRED,
+        )
+
+    def test_blank_status_no_end_date_derives_active(self):
+        cid = str(uuid.uuid4())
+        self._save({
+            "client_id": cid,
+            "insurances": [{"plan_name": "P", "external_member_id": "1"}],
+        })
+        self.assertEqual(
+            Insurance.objects.get(client__client_id=cid, plan_name="P").status,
+            RecordStatus.ACTIVE,
+        )
+
+    def test_enrolled_social_care_not_flipped_to_expired_by_past_end_date(self):
+        from .models import SocialCareCoverage, SocialCareCoverageStatus
+
+        cid = str(uuid.uuid4())
+        self._save({
+            "client_id": cid,
+            "social_care_coverages": [{
+                "plan_name": "SCC", "external_member_id": "1",
+                "status": "enrolled",
+                "expired_at": (timezone.now() - timedelta(days=30)).isoformat(),
+            }],
+        })
+        self.assertEqual(
+            SocialCareCoverage.objects.get(
+                client__client_id=cid, plan_name="SCC"
+            ).status,
+            SocialCareCoverageStatus.ENROLLED,
+        )
+
     def test_source_active_status_not_overridden_by_past_end_date(self):
         # Regression: a source status of Active must survive a stale/past end
         # date (previously the date logic flipped it to Expired, so clients with
         # active insurance showed Expired).
-        from django.utils import timezone
-        from datetime import timedelta
-
         cid = str(uuid.uuid4())
         Client.objects.create(client_id=cid)
         self._save({
@@ -148,9 +207,6 @@ class InsuranceReconcileTest(TestCase):
     def test_blank_status_still_derived_from_end_date(self):
         # Fallback preserved: when the source sends NO status, derive it from the
         # end date (past => Expired, none => Active).
-        from django.utils import timezone
-        from datetime import timedelta
-
         cid = str(uuid.uuid4())
         Client.objects.create(client_id=cid)
         self._save({
@@ -171,8 +227,6 @@ class InsuranceReconcileTest(TestCase):
     def test_social_care_source_status_not_overridden(self):
         # Same rule for social care coverage: an enrolled status survives a past
         # end date.
-        from django.utils import timezone
-        from datetime import timedelta
         from .models import SocialCareCoverage, SocialCareCoverageStatus
 
         cid = str(uuid.uuid4())
@@ -2729,6 +2783,74 @@ class MemberWarningsTest(TestCase):
             expired_at=timezone.now() + timedelta(days=120),
         )
         self.assertNotIn(INSURANCE_EXPIRING, self._codes(enr2))
+
+    def _titles(self, enr):
+        from .services.warnings import evaluate_enrollment_warnings
+
+        return [w.title for w in evaluate_enrollment_warnings(enr)]
+
+    def test_active_insurance_never_shows_expired(self):
+        # An active Medicaid alongside an OLD expired policy: the member is
+        # covered now, so no "Insurance expired" (nor "expiring") warning.
+        from .models import Insurance, RecordStatus
+
+        c = self._client()
+        enr = self._enrollment(c)
+        Insurance.objects.create(
+            client=c, plan_name="Medicaid", external_member_id="1",
+            status=RecordStatus.ACTIVE,
+        )
+        Insurance.objects.create(
+            client=c, plan_name="Old", external_member_id="2",
+            status=RecordStatus.EXPIRED,
+            expired_at=timezone.now() - timedelta(days=100),
+        )
+        titles = self._titles(enr)
+        self.assertNotIn("Insurance expired", titles)
+        self.assertNotIn("Insurance expiring", titles)
+
+    def test_active_insurance_with_stale_past_end_date_not_expired(self):
+        # Active policy carrying a stale past end date: status wins, no warning.
+        from .models import Insurance, RecordStatus
+
+        c = self._client()
+        enr = self._enrollment(c)
+        Insurance.objects.create(
+            client=c, plan_name="Medicaid", external_member_id="1",
+            status=RecordStatus.ACTIVE,
+            expired_at=timezone.now() - timedelta(days=5),
+        )
+        self.assertNotIn("Insurance expired", self._titles(enr))
+
+    def test_active_insurance_expiring_soon_still_warns(self):
+        # An active policy genuinely lapsing within 30 days still warns (expiring).
+        from .models import Insurance, RecordStatus
+        from .services.warnings import INSURANCE_EXPIRING, evaluate_enrollment_warnings
+
+        c = self._client()
+        enr = self._enrollment(c)
+        Insurance.objects.create(
+            client=c, plan_name="Medicaid", external_member_id="1",
+            status=RecordStatus.ACTIVE,
+            expired_at=timezone.now() + timedelta(days=10),
+        )
+        ws = [w for w in evaluate_enrollment_warnings(enr) if w.code == INSURANCE_EXPIRING]
+        self.assertEqual([w.title for w in ws], ["Insurance expiring"])
+
+    def test_no_active_expired_policy_shows_expired(self):
+        # With no active policy, a past end date still surfaces "Insurance expired".
+        from .models import Insurance, RecordStatus
+        from .services.warnings import INSURANCE_EXPIRING, evaluate_enrollment_warnings
+
+        c = self._client()
+        enr = self._enrollment(c)
+        Insurance.objects.create(
+            client=c, plan_name="Medicaid", external_member_id="1",
+            status=RecordStatus.EXPIRED,
+            expired_at=timezone.now() - timedelta(days=3),
+        )
+        ws = [w for w in evaluate_enrollment_warnings(enr) if w.code == INSURANCE_EXPIRING]
+        self.assertEqual([w.title for w in ws], ["Insurance expired"])
 
     def test_internal_case_expired(self):
         from .services.warnings import INTERNAL_CASE_EXPIRED

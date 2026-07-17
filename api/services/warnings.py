@@ -36,6 +36,7 @@ from api.models import (
     MemberStatus,
     ProductType,
     ProductTypeKind,
+    RecordStatus,
     SERVICE_EXCLUDED_MEMBER_STATUSES,
     ServiceAuthorizationStatus,
     Ticket,
@@ -194,13 +195,18 @@ def _case_kind(case):
 def _household_members(enrollment):
     """Distinct household member clients for an enrollment (incl. the primary),
     read from the enrollment's member profiles; falls back to the anchor."""
+    # Normalize the de-dupe key to str(pk): a client's UUID pk can surface as a
+    # UUID (DB-loaded relation) or a str (in-memory/raw FK value), and mixing the
+    # two key types would let the primary slip past the de-dupe and be counted
+    # (and warned about) twice.
     seen = {}
     for mp in enrollment.member_profiles.all():
         c = getattr(mp, "client", None)
-        if c is not None and c.pk not in seen:
-            seen[c.pk] = c
-    if enrollment.client_id and enrollment.client_id not in seen:
-        seen[enrollment.client_id] = enrollment.client
+        if c is not None:
+            seen.setdefault(str(c.pk), c)
+    anchor = enrollment.client
+    if anchor is not None:
+        seen.setdefault(str(anchor.pk), anchor)
     return list(seen.values())
 
 
@@ -401,10 +407,44 @@ def _latest_coverage_end(client):
     return max(ends) if ends else None
 
 
+def _latest_active_coverage_end(client):
+    """The latest end date among the client's ACTIVE insurances (max
+    expired_at), or None when no active policy carries a dated end."""
+    ends = [
+        ins.expired_at for ins in client.insurances.all()
+        if ins.status == RecordStatus.ACTIVE and ins.expired_at is not None
+    ]
+    return max(ends) if ends else None
+
+
 def check_insurance_expiring(ctx):
     out = []
     cutoff = ctx.today + timedelta(days=INSURANCE_EXPIRING_DAYS)
     for member in ctx.members:
+        # The insurance STATUS is authoritative. An ACTIVE policy means the
+        # member is covered now, so never flag them as "expired" -- not even when
+        # an old expired policy sits alongside the active one, and not when the
+        # active policy carries a stale past end date. Only warn when that active
+        # policy is genuinely about to lapse (end date within the next 30 days).
+        if any(i.status == RecordStatus.ACTIVE for i in member.insurances.all()):
+            end_dt = _latest_active_coverage_end(member)
+            if end_dt is None:
+                continue  # active with no end date => covered, nothing to flag
+            end = end_dt.date() if hasattr(end_dt, "date") else end_dt
+            if end < ctx.today or end > cutoff:
+                continue
+            out.append(Warning(
+                code=INSURANCE_EXPIRING,
+                severity=RED,
+                scope="member",
+                title="Insurance expiring",
+                detail=f"Insurance expires on {end.isoformat()}.",
+                client_id=member.pk,
+                refs={"end_date": end.isoformat()},
+            ))
+            continue
+
+        # No active policy on file: flag from the latest coverage end date.
         end_dt = _latest_coverage_end(member)
         if end_dt is None:
             continue
