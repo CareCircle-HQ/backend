@@ -2186,6 +2186,69 @@ class ProgramCreationRestrictionTest(TestCase):
         self.assertEqual(upsert_program("Existing Meals").pk, p.pk)
 
 
+class ExternalServiceCaseBlockedTest(TestCase):
+    """External Service cases are never persisted -- neither an explicit type nor
+    one derived from the program's ProgramPipeline category can be saved. The
+    other three types (Navigation, Internal Service, Eligibility) still save."""
+
+    def _client(self):
+        return Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="C", last_name="D"
+        )
+
+    def test_explicit_external_service_rejected(self):
+        from rest_framework.exceptions import ValidationError
+
+        from .models import Case, CaseType
+        from .serializers import CaseSerializer
+
+        c = self._client()
+        cid = str(uuid.uuid4())
+        ser = CaseSerializer(data={
+            "case_id": cid, "client_id": str(c.client_id),
+            "case_type": CaseType.EXTERNAL_SERVICE, "service_type": "Legal Aid",
+        })
+        ser.is_valid(raise_exception=True)
+        with self.assertRaises(ValidationError):
+            ser.save()
+        self.assertFalse(Case.objects.filter(case_id=cid).exists())
+
+    def test_derived_external_service_rejected(self):
+        from rest_framework.exceptions import ValidationError
+
+        from .models import Case, ProgramPipeline
+        from .serializers import CaseSerializer
+
+        c = self._client()
+        ProgramPipeline.objects.create(
+            program_name="Legal Aid", case_category="External Service",
+            pipeline_id="p1",
+        )
+        cid = str(uuid.uuid4())
+        ser = CaseSerializer(data={
+            "case_id": cid, "client_id": str(c.client_id),
+            "program_name": "Legal Aid",
+        })
+        ser.is_valid(raise_exception=True)
+        with self.assertRaises(ValidationError):
+            ser.save()
+        self.assertFalse(Case.objects.filter(case_id=cid).exists())
+
+    def test_navigation_case_allowed(self):
+        from .models import CaseType
+        from .serializers import CaseSerializer
+
+        c = self._client()
+        cid = str(uuid.uuid4())
+        ser = CaseSerializer(data={
+            "case_id": cid, "client_id": str(c.client_id),
+            "case_type": CaseType.NAVIGATION, "service_type": "Something",
+        })
+        ser.is_valid(raise_exception=True)
+        case = ser.save()
+        self.assertEqual(case.case_type, CaseType.NAVIGATION)
+
+
 class MemberWarningsTest(TestCase):
     """The member/household warning evaluator (api.services.warnings). Each check
     is exercised in isolation on a purpose-built household, plus a clean

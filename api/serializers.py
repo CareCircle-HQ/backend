@@ -1170,6 +1170,16 @@ class CaseSerializer(serializers.ModelSerializer):
                 client, validated_data.get("program_name")
             )
 
+        # External Service cases are out of scope -- we never track them. Reject
+        # the write outright (whether the type was set explicitly or derived from
+        # the program). This is the universal backstop: import paths pre-skip
+        # external-service rows, so in practice this only rejects a direct /
+        # extension / admin save.
+        if validated_data.get("case_type") == CaseType.EXTERNAL_SERVICE:
+            raise serializers.ValidationError(
+                {"case_type": "External Service cases are not tracked and cannot be saved."}
+            )
+
         # Capture the stored status + authorization BEFORE the write so callers
         # can tell what changed (the internal-service denial ticket below, and
         # the case-change tracking the viewset runs after save).
