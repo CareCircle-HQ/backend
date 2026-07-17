@@ -3970,3 +3970,77 @@ class CsvImportRulesTest(TestCase):
         self.assertTrue(Case.objects.filter(pk=keep_orig.pk).exists())
         self.assertTrue(Case.objects.filter(pk=keep_managed.pk).exists())
         self.assertFalse(Case.objects.filter(pk=drop.pk).exists())
+
+
+class MemberCaseRemoveTest(TestCase):
+    """The Cases tab Remove action: DELETE /members/<id>/cases/<case_id>/ removes
+    a NON-Met-Council (external) case but refuses a Met Council case (400), and
+    the list serializer exposes ``is_met_council`` so the UI knows when to show
+    the button."""
+
+    MET = "12706c81-03a1-4cdb-954a-579929cd05df"
+
+    def setUp(self):
+        self.agent = Agent.objects.create(
+            name="Case Agent", agent_code="930", group="CS"
+        )
+        access = AccessToken()
+        access["agent_id"] = str(self.agent.id)
+        access["agent_code"] = self.agent.agent_code
+        access["agent_name"] = self.agent.name
+        access["agent_group"] = self.agent.group
+        self.api = APIClient()
+        self.api.credentials(HTTP_AUTHORIZATION=f"Bearer {access}")
+
+        self.client_obj = Client.objects.create(
+            client_id=uuid.uuid4(), first_name="Case", last_name="Owner"
+        )
+
+    def _case(self, **kwargs):
+        from .models import Case, CaseStatus
+
+        return Case.objects.create(
+            case_id=uuid.uuid4(), client=self.client_obj,
+            case_status=CaseStatus.OPEN, **kwargs,
+        )
+
+    def _url(self, case):
+        return f"/api/portal/members/{self.client_obj.client_id}/cases/{case.case_id}/"
+
+    def test_detail_list_exposes_is_met_council(self):
+        self._case(provider_name="Met Council - SCN - PHS")
+        self._case(provider_name="Selfhelp Community Services")
+        resp = self.api.get(
+            f"/api/portal/members/{self.client_obj.client_id}/cases/?detail=1"
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        flags = {row["provider_name"]: row["is_met_council"] for row in resp.json()}
+        self.assertTrue(flags["Met Council - SCN - PHS"])
+        self.assertFalse(flags["Selfhelp Community Services"])
+
+    def test_remove_external_case(self):
+        from .models import Case
+
+        external = self._case(provider_name="Selfhelp Community Services")
+        resp = self.api.delete(self._url(external))
+        self.assertEqual(resp.status_code, 204, resp.content)
+        self.assertFalse(Case.objects.filter(pk=external.pk).exists())
+
+    def test_remove_metcouncil_case_refused(self):
+        from .models import Case
+
+        managed = self._case(provider_name="Met Council - SCN - PHS")
+        resp = self.api.delete(self._url(managed))
+        self.assertEqual(resp.status_code, 400, resp.content)
+        self.assertTrue(Case.objects.filter(pk=managed.pk).exists())
+
+    def test_remove_metcouncil_by_originating_provider_refused(self):
+        from .models import Case, Provider
+
+        met = Provider.objects.create(
+            provider_id=self.MET, name="Met Council - SCN - PHS"
+        )
+        originated = self._case(originating_provider=met)
+        resp = self.api.delete(self._url(originated))
+        self.assertEqual(resp.status_code, 400, resp.content)
+        self.assertTrue(Case.objects.filter(pk=originated.pk).exists())

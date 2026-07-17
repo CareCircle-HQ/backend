@@ -39,6 +39,7 @@ from .views_members import (
     MemberAssignKitchenView,
     MemberCadenceView,
     MemberCaseAuditView,
+    MemberCaseDetailView,
     MemberCaseHistoryView,
     MemberCasesView,
     MemberDetailView,
@@ -212,6 +213,10 @@ urlpatterns = [
     path("members/<uuid:client_id>/reactivate/", MemberServiceReactivateView.as_view()),
     path("members/<uuid:client_id>/notes/", MemberNotesView.as_view()),
     path("members/<uuid:client_id>/cases/", MemberCasesView.as_view()),
+    path(
+        "members/<uuid:client_id>/cases/<uuid:case_id>/",
+        MemberCaseDetailView.as_view(),
+    ),
     path(
         "members/<uuid:client_id>/refresh-uniteus/",
         MemberUniteUsRefreshView.as_view(),

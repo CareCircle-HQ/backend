@@ -1075,6 +1075,7 @@ class PortalMemberCaseSerializer(serializers.ModelSerializer):
     resolution_label = serializers.CharField(
         source="get_outcome_resolution_type_display", read_only=True
     )
+    is_met_council = serializers.SerializerMethodField()
 
     class Meta:
         model = Case
@@ -1090,11 +1091,24 @@ class PortalMemberCaseSerializer(serializers.ModelSerializer):
             "service_authorization_request_starts_at",
             "service_authorization_request_ends_at",
             "outcome_description", "resolution_type", "resolution_label",
-            "case_description",
+            "case_description", "is_met_council",
         ]
 
     def get_code(self, obj):
         return f"CSE-{str(obj.case_id)[:8]}"
+
+    def get_is_met_council(self, obj):
+        # UNION rule (created OR managed by Met Council); see
+        # api.services.lifecycle.is_met_council_case. Non-Met-Council cases are
+        # external orgs' work that shouldn't live in the member base -- the
+        # Cases tab surfaces a Remove action for them.
+        from api.services.lifecycle import is_met_council_case
+
+        return is_met_council_case(
+            originating_provider_id=obj.originating_provider_id,
+            provider_id=obj.provider_id,
+            provider_name=obj.provider_name,
+        )
 
     def get_auth_status_label(self, obj):
         return obj.service_authorization_status_label or (
