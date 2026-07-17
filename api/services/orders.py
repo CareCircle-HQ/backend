@@ -476,13 +476,19 @@ def sync_active_calendars(from_date=None):
         .exclude(enrollment__stage__in=SERVICE_EXCLUDED_ENROLLMENT_STAGES)
         .values_list("enrollment_id", flat=True)
     )
-    totals = {"enrollments": 0, "added": 0, "removed": 0, "updated": 0}
+    totals = {"enrollments": 0, "added": 0, "removed": 0, "updated": 0,
+              "plans_created": 0}
     for enr in EnrollmentVerification.objects.filter(pk__in=enr_ids).iterator():
-        res = sync_delivery_calendar(enr, from_date=from_date)
+        # rebuild (not just sync) so a member ADDED to an already-active
+        # household -- who never got a delivery plan and is therefore missing
+        # from the calendar + every future PO -- is created and scheduled. This
+        # is the batch self-heal counterpart to the per-edit activation heal.
+        res = rebuild_delivery_calendar(enr, from_date=from_date)
         totals["enrollments"] += 1
         totals["added"] += res["added"]
         totals["removed"] += res["removed"]
         totals["updated"] += res["updated"]
+        totals["plans_created"] += res.get("plans_created", 0)
     return totals
 
 
@@ -530,6 +536,30 @@ def recompute_delivery_plan(enrollment, from_date=None):
         case=case, product_kind=kind,
     )
     return sync_delivery_calendar(enrollment, from_date=from_date)
+
+
+@transaction.atomic
+def rebuild_delivery_calendar(enrollment, from_date=None):
+    """Create a delivery plan for any active household member that is missing one,
+    then reconcile the dated calendar.
+
+    THE fix for members added to an already-active household not appearing on
+    future Purchase Orders: unlike :func:`sync_delivery_calendar` (which only
+    expands EXISTING plans), this first calls
+    :func:`~api.services.delivery.ensure_member_delivery_schedules` so a newly
+    added/activated member gets a plan, then expands the calendar. PO-batched
+    dates are preserved by :func:`sync_delivery_calendar`.
+
+    Backs the manual "Rebuild calendar" action on the member profile and the
+    auto-heal when a member is activated. Returns the sync result dict
+    ``{added, removed, updated}`` plus ``plans_created``.
+    """
+    from api.services.delivery import ensure_member_delivery_schedules
+
+    created = ensure_member_delivery_schedules(enrollment)
+    result = sync_delivery_calendar(enrollment, from_date=from_date)
+    result["plans_created"] = len(created)
+    return result
 
 
 def plan_built_kind(plan):

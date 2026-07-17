@@ -1,12 +1,15 @@
 """Reconcile the delivery calendar for every active household.
 
-Ensures no eligible member is missing from upcoming Purchase Orders: for each
-enrollment that currently has future delivery occurrences, it re-syncs the dated
-:class:`~api.models.OrderSchedule` calendar with the current member plans +
-dietary profiles -- adding occurrences for members/dates that are missing (e.g.
-a member added to an existing household, or new dates from a cadence change),
-removing occurrences no longer planned, and refreshing the kitchen / menu /
-allergy snapshots. Dates already batched into a PO are never touched.
+Ensures no eligible member is missing from upcoming Purchase Orders. For each
+active enrollment it:
+  * CREATES a delivery plan for any active member missing one (a member added to
+    an already-active household never got a plan at kitchen-assignment time, so
+    they were absent from the calendar + every future PO), then
+  * re-syncs the dated :class:`~api.models.OrderSchedule` calendar with the
+    current member plans + dietary profiles -- adding occurrences for
+    members/dates that are missing, removing occurrences no longer planned, and
+    refreshing the kitchen / menu / allergy snapshots.
+Dates already batched into a PO are never touched.
 
 This is the batch/ops counterpart to the per-edit resync that the portal runs
 automatically (kitchen/menu/cadence edits) and the PO popup "Refresh" button.
@@ -53,6 +56,7 @@ class Command(BaseCommand):
         totals = sync_active_calendars(from_date=from_date)
         self.stdout.write(self.style.SUCCESS(
             f"Done: {totals['enrollments']} enrollments · "
+            f"{totals.get('plans_created', 0)} member plans created · "
             f"{totals['added']} occurrences added · "
             f"{totals['removed']} removed · {totals['updated']} updated."
         ))

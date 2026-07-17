@@ -491,3 +491,134 @@ def update_household_cadence(enrollment, cadence, once_a_week_weekday=None, case
             "meals_per_day", "meals_boxes_total", "starts_on", "ends_on",
         ])
     return enrollment
+
+
+@transaction.atomic
+def ensure_member_delivery_schedules(enrollment, case=None, product_kind=None):
+    """Create a MemberDeliverySchedule for every household member that is MISSING
+    one, snapshotting the household's ALREADY-CHOSEN cadence / kitchen / window.
+
+    This closes the gap that hides members added to a household AFTER its first
+    kitchen assignment: :func:`create_member_delivery_schedules` is a per-
+    enrollment no-op once any plan exists, and every reconcile path
+    (:func:`sync_delivery_calendar`, :func:`update_household_cadence`,
+    ``recompute_delivery_plan``) only iterates EXISTING plans. So a newly added
+    (and later activated) member never got a plan -- and, with no plan, never
+    landed on the delivery calendar or any Purchase Order.
+
+    Backs the manual "Rebuild calendar" action and the auto-heal that runs when a
+    member is activated in an already-active household.
+
+    No-op (returns ``[]``) when the household has no plan yet (nothing to
+    snapshot from -- the first plan is created at kitchen assignment) or when
+    every eligible member already has one. Out-of-orbit / paused / excluded
+    members are skipped, exactly like the creation path, so an unserviceable
+    member is not force-scheduled. Returns the created MemberDeliverySchedule
+    rows.
+    """
+    cadence = current_household_cadence(enrollment)
+    if not cadence:
+        # No household plan exists yet -- the household hasn't been through
+        # kitchen assignment, so there is nothing to extend.
+        return []
+
+    if case is None:
+        # Prefer the governing authorization case (its window drives the plan),
+        # falling back to the enrollment's own case.
+        from api.services.lifecycle import governing_internal_case
+
+        case = governing_internal_case(enrollment) or enrollment.case
+
+    planned_profile_ids = set(
+        enrollment.delivery_schedules.values_list("member_profile_id", flat=True)
+    )
+    members = list(
+        enrollment.member_profiles.select_related("client")
+        .exclude(status__in=SERVICE_EXCLUDED_MEMBER_STATUSES)
+        .all()
+    )
+    missing = [m for m in members if m.pk not in planned_profile_ids]
+    if not missing:
+        return []
+
+    program = case.program if case is not None else None
+    program_name = (program.name if program is not None else "") or enrollment.program_name
+    kind = product_kind
+    if kind is None:
+        from api.services.catalog import product_kind_for_enrollment
+
+        kind = product_kind_for_enrollment(enrollment) or product_type_kind_for_name(
+            program_name
+        )
+    is_boxes = kind == ProductTypeKind.BOXES
+
+    # Preserve the agent-chosen single weekday for a once-a-week cadence.
+    once_weekday = None
+    if cadence == DeliveryCadence.ONCE_A_WEEK:
+        wd = [w for w in (enrollment.delivery_weekdays or []) if w in _WEEKDAY_CODES]
+        once_weekday = wd[0] if wd else None
+
+    delivery_weekdays = weekdays_for_cadence(cadence, once_weekday)
+    if is_boxes and not delivery_weekdays:
+        delivery_weekdays = [BOX_DELIVERY_WEEKDAY]
+    product_type = _resolve_product_type(program_name, cadence, kind=kind)
+    kitchen = enrollment.kitchen  # household-level assignment
+
+    end = _window_end(case)
+    if is_boxes:
+        start = box_first_delivery(timezone.localdate(), delivery_weekdays)
+    else:
+        anchor = _meal_delivery_anchor(case)
+        candidates = [
+            _next_weekday(anchor, _WEEKDAY_CODES[w])
+            for w in delivery_weekdays if w in _WEEKDAY_CODES
+        ]
+        start = min(candidates) if candidates else anchor
+    delivery_dates = _delivery_dates(start, end, delivery_weekdays)
+    num_dates = len(delivery_dates)
+    weekday_ints = _weekday_ints(delivery_weekdays)
+    meals_per_day = (
+        product_type.meals_per_day if (product_type and not is_boxes) else 0
+    )
+
+    schedules = []
+    for m in missing:
+        household_member = (
+            HouseholdMember.objects.filter(client_id=m.client_id).first()
+            if m.client_id
+            else None
+        )
+        prod_per_delivery = m.meals_per_delivery
+        if prod_per_delivery is None:
+            prod_per_delivery = product_type.prod_per_delivery if product_type else 0
+        if meals_per_day:
+            total = sum(
+                meals_for_delivery(d.weekday(), weekday_ints, meals_per_day)
+                for d in delivery_dates
+            )
+        else:
+            total = prod_per_delivery * num_dates
+        schedules.append(
+            MemberDeliverySchedule(
+                enrollment=enrollment,
+                household_member=household_member,
+                member_profile=m,
+                member_name=m.member_name,
+                program=program,
+                product_type=product_type,
+                kitchen=kitchen,
+                delivery_days_cadence=cadence,
+                prod_per_delivery=prod_per_delivery,
+                meals_per_day=meals_per_day,
+                meals_boxes_total=total,
+                menu_type=m.menu_type or menu_type_for_member(
+                    food_allergies=m.food_allergies, meal_category=m.meal_category,
+                ),
+                kitchen_meal_type=m.kitchen_meal_type,
+                kitchen_food_notes=m.kitchen_food_notes,
+                starts_on=start,
+                ends_on=end,
+                status=ScheduleStatus.SCHEDULED,
+            )
+        )
+    return MemberDeliverySchedule.objects.bulk_create(schedules)

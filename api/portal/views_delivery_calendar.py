@@ -25,7 +25,9 @@ from ..models import (
     ScheduleStatus,
 )
 from ..services.catalog import product_kind_for_enrollment
+from ..services.orders import rebuild_delivery_calendar
 from .base import PortalAPIView
+from .serializers import active_enrollment
 
 _WEEKDAY_CODES = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
 
@@ -190,6 +192,45 @@ class MemberDeliveryCalendarView(PortalAPIView):
         summary["counts"] = counts
 
         return Response({"summary": summary, "occurrences": rows})
+
+    def post(self, request, client_id):
+        """Manually rebuild this household's delivery calendar.
+
+        Creates a delivery plan for any active household member missing one (the
+        fix for members added after the first kitchen assignment) and reconciles
+        the dated calendar, never touching a date already batched into a PO.
+        """
+        get_object_or_404(Client, pk=client_id)
+        enr = self._enrollment_for(client_id)
+        if enr is None:
+            return Response(
+                {"detail": "This member has no active enrollment, so there is "
+                           "no delivery calendar to rebuild."},
+                status=400,
+            )
+        result = rebuild_delivery_calendar(enr)
+        return Response({
+            "rebuilt": True,
+            "plans_created": result.get("plans_created", 0),
+            "added": result.get("added", 0),
+            "removed": result.get("removed", 0),
+            "updated": result.get("updated", 0),
+        })
+
+    def _enrollment_for(self, client_id):
+        """The household enrollment this member belongs to. Prefers the member's
+        own dietary-profile enrollment (works for non-primary members too),
+        falling back to the client's active enrollment."""
+        profile = (
+            MemberDietaryProfile.objects.filter(client_id=client_id)
+            .select_related("enrollment")
+            .order_by("-enrollment__opened_at")
+            .first()
+        )
+        if profile is not None and profile.enrollment_id:
+            return profile.enrollment
+        client = Client.objects.filter(pk=client_id).first()
+        return active_enrollment(client) if client else None
 
     def _summary(self, client_id, profile_ids, occurrences):
         plan = (

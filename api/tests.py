@@ -1876,6 +1876,158 @@ class CalendarKeepsOccurrencesOnExclusionTest(TestCase):
         )
 
 
+class RebuildDeliveryCalendarTest(TestCase):
+    """A member added to an already-active household never got a delivery plan
+    (plans are created once, at kitchen assignment), so they never landed on the
+    delivery calendar or any Purchase Order. rebuild_delivery_calendar (the
+    manual button + the activation auto-heal) must create the missing plan and
+    expand the calendar; out-of-orbit / unserviceable members stay excluded."""
+
+    def _make_active_enrollment(self):
+        from datetime import timedelta
+
+        from .models import (
+            Case, CaseStatus, CaseType, Client, DeliveryCadence,
+            EnrollmentStage, EnrollmentVerification, Household, HouseholdMember,
+            MemberDeliverySchedule, MemberDietaryProfile, MemberStatus,
+            ScheduleStatus, ServiceAuthorizationStatus,
+        )
+
+        today = timezone.localdate()
+        client = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Prim", last_name="Ary",
+        )
+        hh = Household.objects.create(name="HH")
+        HouseholdMember.objects.create(household=hh, client=client, is_primary=True)
+        now = timezone.now()
+        case = Case.objects.create(
+            case_id=str(uuid.uuid4()), client=client,
+            case_type=CaseType.INTERNAL_SERVICE, case_status=CaseStatus.OPEN,
+            service_authorization_status=ServiceAuthorizationStatus.APPROVED,
+            service_authorization_approval_starts_at=now,
+            service_authorization_approval_ends_at=now + timedelta(days=60),
+            date_opened=now,
+        )
+        enr = EnrollmentVerification.objects.create(
+            client=client, household=hh, case=case,
+            stage=EnrollmentStage.SERVICE_ACTIVE,
+            delivery_weekdays=["mon", "tue", "wed", "thu", "fri"],
+        )
+        member = MemberDietaryProfile.objects.create(
+            enrollment=enr, client=client, member_name="Prim Ary",
+            menu_type="Standard", status=MemberStatus.ACTIVE,
+        )
+        MemberDeliverySchedule.objects.create(
+            enrollment=enr, member_profile=member, member_name="Prim Ary",
+            delivery_days_cadence=DeliveryCadence.ONCE_A_WEEK,
+            meals_per_day=3, prod_per_delivery=0, meals_boxes_total=12,
+            status=ScheduleStatus.SCHEDULED,
+            starts_on=today, ends_on=today + timedelta(days=30),
+        )
+        return enr, hh
+
+    def _add_member(self, enr, hh, *, status):
+        from .models import (
+            Client, HouseholdMember, MemberDietaryProfile, MemberStatus,
+        )
+
+        c = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="New", last_name="Member",
+        )
+        HouseholdMember.objects.create(household=hh, client=c, is_primary=False)
+        return MemberDietaryProfile.objects.create(
+            enrollment=enr, client=c, member_name="New Member",
+            menu_type="Standard", status=status,
+        )
+
+    def _future_count(self, member):
+        from .models import OrderSchedule, OrderStatus
+
+        return OrderSchedule.objects.filter(
+            member=member, status=OrderStatus.SCHEDULED,
+            anticipated_delivery_date__gte=timezone.localdate(),
+        ).count()
+
+    def test_rebuild_creates_plan_and_calendar_for_added_active_member(self):
+        from .models import MemberDeliverySchedule, MemberStatus
+        from .services.orders import rebuild_delivery_calendar
+
+        enr, hh = self._make_active_enrollment()
+        new_member = self._add_member(enr, hh, status=MemberStatus.ACTIVE)
+
+        # Before: the added member has no plan and no calendar occurrences.
+        self.assertFalse(
+            MemberDeliverySchedule.objects.filter(member_profile=new_member).exists()
+        )
+        self.assertEqual(self._future_count(new_member), 0)
+
+        result = rebuild_delivery_calendar(enr)
+
+        self.assertEqual(result["plans_created"], 1)
+        self.assertTrue(
+            MemberDeliverySchedule.objects.filter(member_profile=new_member).exists()
+        )
+        self.assertGreater(self._future_count(new_member), 0)
+
+    def test_rebuild_skips_out_of_orbit_member(self):
+        from .models import MemberDeliverySchedule, MemberStatus
+        from .services.orders import rebuild_delivery_calendar
+
+        enr, hh = self._make_active_enrollment()
+        oob = self._add_member(enr, hh, status=MemberStatus.OUT_OF_ORBIT)
+
+        result = rebuild_delivery_calendar(enr)
+
+        self.assertEqual(result["plans_created"], 0)
+        self.assertFalse(
+            MemberDeliverySchedule.objects.filter(member_profile=oob).exists()
+        )
+        self.assertEqual(self._future_count(oob), 0)
+
+    def test_endpoint_rebuilds_calendar_for_member(self):
+        from rest_framework.test import APIClient
+        from rest_framework_simplejwt.tokens import AccessToken
+
+        from .models import Agent, MemberDeliverySchedule, MemberStatus
+
+        enr, hh = self._make_active_enrollment()
+        new_member = self._add_member(enr, hh, status=MemberStatus.ACTIVE)
+
+        agent = Agent.objects.create(name="Q", agent_code="950", group="CS")
+        access = AccessToken()
+        access["agent_id"] = str(agent.id)
+        access["agent_code"] = agent.agent_code
+        access["agent_name"] = agent.name
+        access["agent_group"] = agent.group
+        api = APIClient()
+        api.credentials(HTTP_AUTHORIZATION=f"Bearer {access}")
+
+        url = f"/api/portal/members/{new_member.client_id}/delivery-calendar/"
+        resp = api.post(url)
+        self.assertEqual(resp.status_code, 200, resp.content)
+        self.assertEqual(resp.json()["plans_created"], 1)
+        self.assertTrue(
+            MemberDeliverySchedule.objects.filter(member_profile=new_member).exists()
+        )
+
+    def test_sync_active_calendars_creates_missing_plan(self):
+        # The nightly self-heal (sync_delivery_calendars command) must now also
+        # CREATE the missing plan for a member added to an active household, not
+        # just reconcile existing plans.
+        from .models import MemberDeliverySchedule, MemberStatus
+        from .services.orders import sync_active_calendars
+
+        enr, hh = self._make_active_enrollment()
+        new_member = self._add_member(enr, hh, status=MemberStatus.ACTIVE)
+
+        totals = sync_active_calendars()
+
+        self.assertGreaterEqual(totals["plans_created"], 1)
+        self.assertTrue(
+            MemberDeliverySchedule.objects.filter(member_profile=new_member).exists()
+        )
+
+
 class MemberWarningsTest(TestCase):
     """The member/household warning evaluator (api.services.warnings). Each check
     is exercised in isolation on a purpose-built household, plus a clean
