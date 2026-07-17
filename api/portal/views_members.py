@@ -87,8 +87,13 @@ from ..services.meal_rules import reconcile_member_kitchen_output, resolve_kitch
 from ..services.lifecycle import (
     InvalidTransition,
     advance_enrollment,
+    clear_new_flag_on_verification_request,
     governing_internal_case,
     governing_pending_enrollment,
+    has_open_internal_service_case,
+    has_valid_medicaid,
+    has_valid_social_care,
+    is_urgent_care_candidate,
     recompute_client_stage,
     recompute_enrollment_household,
     reconcile_enrollment_authorization,
@@ -431,6 +436,10 @@ SCOPE_TO_STAGES = {
 # so the Verification list's agent columns don't trigger an extra query per row.
 MEMBER_LIST_PREFETCH = (
     "insurances",
+    # Social care coverage, so the Urgent Care coverage gate
+    # (has_valid_social_care / can_request_verification) resolves without an
+    # extra query per row.
+    "social_care_coverages",
     "military_profile",
     Prefetch(
         "enrollments",
@@ -604,11 +613,37 @@ def apply_enrollment_date_filter(qs, field, start, end):
     return qs.filter(Q(**own_cond) | Q(**hh_cond))
 
 
+def apply_authorization_date_filter(qs, start, end):
+    """Restrict ``qs`` to clients whose GOVERNING internal-service case has an
+    authorization approval-start date (``service_authorization_approval_starts_at``
+    -- i.e. when the case was authorized) within the inclusive [start, end]
+    window. Either bound may be None (open-ended); no-op when both are None.
+
+    Uses ``Exists`` on the internal-service case (mirroring
+    ``apply_authorization_filter``), so it introduces no join duplicates and
+    needs no ``.distinct()`` of its own. As with the authorization status
+    filter, the case is held by the household primary, so a matching primary
+    brings its household into the grouped result."""
+    if not start and not end:
+        return qs
+    cases = Case.objects.filter(
+        client=OuterRef("pk"),
+        case_type=CaseType.INTERNAL_SERVICE,
+    )
+    if start:
+        cases = cases.filter(service_authorization_approval_starts_at__date__gte=start)
+    if end:
+        cases = cases.filter(service_authorization_approval_starts_at__date__lte=end)
+    return qs.filter(Exists(cases))
+
+
 def apply_verification_date_filters(qs, params):
-    """Apply the Verification-page requested/completed date-range filters from
-    query params (``requested_from``/``requested_to`` -> enrollment ``opened_at``;
-    ``completed_from``/``completed_to`` -> enrollment ``verified_at``). Returns
-    (qs, changed) where ``changed`` signals the caller to ``.distinct()``."""
+    """Apply the Verification-page requested/completed/authorized date-range
+    filters from query params (``requested_from``/``requested_to`` -> enrollment
+    ``opened_at``; ``completed_from``/``completed_to`` -> enrollment
+    ``verified_at``; ``authorized_from``/``authorized_to`` -> internal-service
+    case ``service_authorization_approval_starts_at``). Returns (qs, changed)
+    where ``changed`` signals the caller to ``.distinct()``."""
     changed = False
     req_from, req_to = _parse_date(params.get("requested_from")), _parse_date(params.get("requested_to"))
     if req_from or req_to:
@@ -618,6 +653,11 @@ def apply_verification_date_filters(qs, params):
     if comp_from or comp_to:
         qs = apply_enrollment_date_filter(qs, "verified_at", comp_from, comp_to)
         changed = True
+    auth_from, auth_to = _parse_date(params.get("authorized_from")), _parse_date(params.get("authorized_to"))
+    if auth_from or auth_to:
+        qs = apply_authorization_date_filter(qs, auth_from, auth_to)
+        # Exists-based, so no distinct is required for this bound alone; but the
+        # requested/completed joins above may still need it.
     return qs, changed
 
 
@@ -1248,6 +1288,15 @@ class MembersListView(PortalGenericAPIView):
 
         kitchen_available = bool(set.intersection(*serving_sets)) if serving_sets else False
         address = _format_address(enr.delivery_address) if enr else ""
+        # Split the address into two lines so the Logistics column can render
+        # street+apt on one row and city/state/zip on the next (narrower column).
+        addr_obj = enr.delivery_address if enr else None
+        if addr_obj is not None:
+            address_line1 = ", ".join(p for p in [addr_obj.street, addr_obj.unit] if p)
+            _region = " ".join(p for p in [addr_obj.state, addr_obj.zip] if p)
+            address_line2 = ", ".join(p for p in [addr_obj.city, _region] if p)
+        else:
+            address_line1 = address_line2 = ""
         weekdays = list(enr.delivery_weekdays or []) if enr else []
 
         # NB: delivery cadence (weekdays) is CHOSEN in the kitchen-assignment
@@ -1265,6 +1314,8 @@ class MembersListView(PortalGenericAPIView):
 
         aggregate = {
             "delivery_address": address,
+            "delivery_address_line1": address_line1,
+            "delivery_address_line2": address_line2,
             "delivery_weekdays": weekdays,
             "is_boxes": is_boxes,
             "kitchen_available": kitchen_available,
@@ -3159,6 +3210,75 @@ class MemberDismissAttentionView(PortalAPIView):
                 client=client, source=NoteSource.AGENT, author_name=author,
                 body="Dismissed from the Urgent Care list.",
             )
+        return Response(s.MemberDetailSerializer(client).data)
+
+
+class MemberRequestVerificationView(PortalAPIView):
+    """POST: request a verification for a brand-new Urgent Care client.
+
+    Creates the Pending-Verification enrollment (mirroring the extension's
+    E-Form request) so the whole household moves to Pending Verification and the
+    client drops off the Urgent Care list. HARD-GATED on the same conditions
+    that flag ``is_new`` (``is_urgent_care_candidate``): an open internal-service
+    case, no verification requested yet, and valid Medicaid + social care
+    coverage. Returns 400 with the specific missing prerequisites otherwise."""
+
+    def post(self, request, client_id):
+        client = get_object_or_404(Client, pk=client_id)
+
+        # Gate: reject with the specific missing prerequisite(s) so the UI can
+        # explain why. Mirrors is_urgent_care_candidate but itemized.
+        missing = []
+        if not has_open_internal_service_case(client):
+            missing.append("no open Internal Service case")
+        if not has_valid_medicaid(client):
+            missing.append("no valid Medicaid insurance")
+        if not has_valid_social_care(client):
+            missing.append("no valid social care coverage")
+        if missing:
+            return Response(
+                {"error": "Can't request verification: " + ", ".join(missing) + "."},
+                status=http.HTTP_400_BAD_REQUEST,
+            )
+        # Already requested/handled (own or household enrollment) -- nothing to do.
+        if not is_urgent_care_candidate(client):
+            return Response(
+                {"error": "A verification has already been requested for this client."},
+                status=http.HTTP_400_BAD_REQUEST,
+            )
+
+        agent = current_agent(request)
+        actor = _agent_actor(agent)
+        terminal = (EnrollmentStage.DISREGARDED, EnrollmentStage.CANCELLED)
+        with transaction.atomic():
+            household = ensure_household_with_primary(client)
+            case = s.internal_service_case(client)
+            case_free = case is not None and not case.enrollments.exclude(
+                stage__in=terminal
+            ).exists()
+            program = case.program if (case and case.program_id) else None
+            enr = EnrollmentVerification.objects.create(
+                client=client,
+                household=household,
+                case=case if case_free else None,
+                program_name=(program.name if program else "")
+                or (case.program_name if case else ""),
+                service_type=(case.service_type if case else "") or "",
+                household_size=household.members.count() or 1,
+                stage=EnrollmentStage.PENDING_VERIFICATION,
+                requested_by=agent,
+                requested_at=timezone.now(),
+            )
+            # Drives the whole household to Pending Verification and drops the
+            # primary off the Urgent Care list (clears is_new).
+            recompute_enrollment_household(enr)
+            clear_new_flag_on_verification_request(enr)
+            try:
+                timeline.event_for_verification(enr, actor=actor)
+            except Exception:  # never let history-logging break the request
+                logger.warning("request-verification timeline emit failed", exc_info=True)
+
+        client.refresh_from_db()
         return Response(s.MemberDetailSerializer(client).data)
 
 

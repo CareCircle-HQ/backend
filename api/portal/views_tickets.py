@@ -63,6 +63,10 @@ class WorkQueueView(PortalGenericAPIView):
         origin_val = (p.get("origin") or "").strip()
         if origin_val and origin_val.lower() not in ("all", "all origins"):
             qs = qs.filter(origin=origin_val)
+        # VIP filter: ?vip=1 restricts to VIP-flagged tickets.
+        vip_val = (p.get("vip") or "").strip().lower()
+        if vip_val in ("1", "true", "yes"):
+            qs = qs.filter(vip=True)
         source_val = (p.get("source") or "").strip()
         if source_val and source_val.lower() not in ("all", "all sources"):
             qs = qs.filter(source=source_val)
@@ -107,6 +111,7 @@ class WorkQueueView(PortalGenericAPIView):
             severity=data.get("severity", "medium"),
             source=data.get("source", ""),
             origin=TicketOrigin.AGENT,
+            vip=data.get("vip", False),
             reason=data["reason"],
             client_id=data.get("client_id"),
             case_id=data.get("case_id"),

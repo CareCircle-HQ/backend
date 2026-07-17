@@ -22,11 +22,14 @@ from api.models import (
     CaseType,
     ClientStage,
     EnrollmentStage,
+    InsurancePlanType,
     ProcessResult,
     ProcessStatus,
     ProcessType,
+    RecordStatus,
     ScreenStatus,
     ServiceAuthorizationStatus,
+    SocialCareCoverageStatus,
     StageEntityType,
     StageEvent,
     StageEventSource,
@@ -526,6 +529,94 @@ def clear_new_flag_on_verification_request(enrollment):
     if client is not None and client.is_new:
         client.is_new = False
         client.save(update_fields=["is_new"])
+
+
+# ---------------------------------------------------------------------------
+# Urgent Care ("Need Attention") eligibility
+#
+# A brand-new client is surfaced on the Urgent Care list -- and offered the
+# "Request Verification" action -- only when ALL of these hold: an OPEN
+# internal-service (meal/box) case, NO verification requested yet, a VALID
+# Medicaid insurance, and a VALID social care coverage. This single gate is the
+# source of truth for the ``is_new`` flag: the import sets it (see
+# api.serializers.CaseSerializer + the daily Unite Us pull) and the
+# ``review_urgent_care_candidates`` command backfills anyone missed.
+# ---------------------------------------------------------------------------
+
+# Insurance plan types that count as "Medicaid" for the verification gate
+# (straight Medicaid or a Dual Medicare/Medicaid plan).
+MEDICAID_PLAN_TYPES = frozenset({InsurancePlanType.MEDICAID, InsurancePlanType.DUAL})
+
+
+def has_valid_medicaid(client):
+    """True when the client has at least one ACTIVE Medicaid (or Dual
+    Medicare/Medicaid) insurance on file. Expired/inactive/pending don't count,
+    and a non-Medicaid active plan (e.g. commercial) doesn't satisfy this."""
+    return any(
+        i.plan_type in MEDICAID_PLAN_TYPES and i.status == RecordStatus.ACTIVE
+        for i in client.insurances.all()
+    )
+
+
+def has_valid_social_care(client):
+    """True when the client has at least one ENROLLED social care coverage
+    (expired / non-enrolled records don't count)."""
+    return any(
+        c.status == SocialCareCoverageStatus.ENROLLED
+        for c in client.social_care_coverages.all()
+    )
+
+
+def has_open_internal_service_case(client):
+    """True when the client holds an internal-service (meal/box) case that is
+    not closed/cancelled -- the case the verification + delivery attach to."""
+    return any(
+        c.case_type == CaseType.INTERNAL_SERVICE
+        and c.case_status not in (CaseStatus.CLOSED, CaseStatus.CANCELLED)
+        for c in client.cases.all()
+    )
+
+
+def has_verification_request(client):
+    """True when a verification has already been requested -- an enrollment
+    exists on the client OR on their household. Mirrors the Urgent Care
+    (need_attention) exclusion in views_members: the mere existence of an
+    enrollment (any stage) means verification is already requested/handled."""
+    if client.enrollments.exists():
+        return True
+    membership = getattr(client, "household_membership", None)
+    if membership is not None and membership.household.enrollment_verifications.exists():
+        return True
+    return False
+
+
+def is_urgent_care_candidate(client):
+    """Whether ``client`` meets every condition to be flagged is_new and offered
+    the "Request Verification" action: an open internal-service case, no
+    verification requested yet (which also excludes anyone already verified),
+    and valid Medicaid + valid social care coverage. Single gate shared by the
+    import, the Request Verification endpoint, and the backfill command."""
+    return (
+        has_open_internal_service_case(client)
+        and not has_verification_request(client)
+        and has_valid_medicaid(client)
+        and has_valid_social_care(client)
+    )
+
+
+def evaluate_is_new_flag(client):
+    """Set ``Client.is_new`` when the client is an Urgent Care candidate.
+
+    SET-ONLY: never clears the flag (is_new is cleared elsewhere -- when a
+    verification is requested via ``clear_new_flag_on_verification_request`` or
+    completed via ``advance_enrollment``). Returns True when it flipped the flag
+    on. Idempotent + safe to call repeatedly from the import + the backfill
+    command."""
+    if not client.is_new and is_urgent_care_candidate(client):
+        client.is_new = True
+        client.save(update_fields=["is_new"])
+        return True
+    return False
 
 
 @transaction.atomic

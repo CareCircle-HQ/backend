@@ -1212,12 +1212,18 @@ class CaseSerializer(serializers.ModelSerializer):
         #     ``change_context(ChangeSource.IMPORT, ...)`` block (case imports are
         #     now Met Council-only, so only our own cases reach here).
         # Django-admin / CRM writes are excluded (no agent_code, no IMPORT
-        # context). Also requires the case to be newly created (``_prev`` is None)
-        # AND the client not already verified (so nothing re-flags a long-verified
-        # member). Cleared once a verification completes (advance_enrollment ->
-        # VERIFIED). Best-effort: never let the flag break the case save.
+        # context). Requires the case to be newly created (``_prev`` is None) and
+        # the client to meet the FULL Urgent Care gate (open internal-service
+        # case, no verification requested, valid Medicaid + social care) --
+        # ``evaluate_is_new_flag`` enforces all of that. For the CSV/Unite Us
+        # import, clients (with their insurance + coverage) are loaded before
+        # their cases, so the gate can see the coverage here; anything the import
+        # misses is caught by the ``review_urgent_care_candidates`` command.
+        # Cleared once a verification completes (advance_enrollment -> VERIFIED).
+        # Best-effort: never let the flag break the case save.
         try:
             from api.history import ChangeSource, current_change_source
+            from api.services.lifecycle import evaluate_is_new_flag
 
             request = self.context.get("request")
             request_user = getattr(request, "user", None) if request is not None else None
@@ -1228,12 +1234,7 @@ class CaseSerializer(serializers.ModelSerializer):
                 and case.case_type == CaseType.INTERNAL_SERVICE
                 and _prev is None
             ):
-                already_verified = EnrollmentVerification.objects.filter(
-                    client=client, verified_at__isnull=False
-                ).exists()
-                if not already_verified and not client.is_new:
-                    client.is_new = True
-                    client.save(update_fields=["is_new"])
+                evaluate_is_new_flag(client)
         except Exception:
             logger.exception("is_new flag set failed for internal service case %s", case_id)
         # Internal-service authorization full-stop rule: a client with a SINGLE

@@ -402,6 +402,19 @@ class DailyPull:
         except Exception:  # noqa: BLE001 - never abort the import on a funnel hiccup
             logger.warning("recompute_client_stage failed for %s", client_id, exc_info=True)
 
+        # Flag Urgent Care candidates: now that this client's insurance, social
+        # care coverage AND cases are all synced, set is_new when they meet the
+        # full verification gate (open internal-service case, no verification
+        # requested, valid Medicaid + social care). Catches members whose
+        # coverage only just became valid (the case itself may not be newly
+        # created this run, so CaseSerializer wouldn't have re-evaluated).
+        try:
+            from api.services.lifecycle import evaluate_is_new_flag
+
+            evaluate_is_new_flag(client)
+        except Exception:  # noqa: BLE001 - never abort the import on a flag hiccup
+            logger.warning("evaluate_is_new_flag failed for %s", client_id, exc_info=True)
+
     # -- entry -------------------------------------------------------------
     def execute(self, client_limit=None, provider_id=None, client_ids=None):
         creds = UniteUsCredential.objects.filter(

@@ -2921,6 +2921,9 @@ class Ticket(models.Model):
         max_length=10, choices=TicketOrigin.choices,
         default=TicketOrigin.SYSTEM, db_index=True,
     )
+    # VIP flag: an agent marks a ticket VIP (priority handling) when opening it.
+    # Defaults to False; surfaced + filterable on the Work Queue.
+    vip = models.BooleanField(default=False, db_index=True)
     reason = models.TextField(blank=True)  # human-readable explanation
     client = models.ForeignKey(
         "Client", on_delete=models.SET_NULL, null=True, blank=True,
