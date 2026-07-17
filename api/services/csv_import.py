@@ -67,6 +67,13 @@ logger = logging.getLogger(__name__)
 CSV_SOURCE = "csv_uniteus"
 TIMELINE_ACTOR = "system:csv-import"
 
+# Unite Us creator/author allowlist scope: only cases/assessments/screenings/
+# notes authored by a UniteUsAgent on one of these CareCircle teams are imported
+# (matched on originating_team, sourced from the CareCircle roster). Everyone
+# else -- notably Met Council Team -- is excluded. An EMPTY match set means no
+# gate (accept all), so imports keep working until the roster is populated.
+CARECIRCLE_ALLOWLIST_TEAMS = ("CareCircle Call Center", "CareCircle Street Team")
+
 # Export types exposed in the Settings > Import web UI.
 SUPPORTED_EXPORT_TYPES = ("clients", "screening", "assessments", "cases", "notes")
 
@@ -774,18 +781,19 @@ class CsvImporter:
         want_id = (str(provider_id).strip() if provider_id else "")
         want_name = (provider_name or "").strip().casefold()
         provider_filter = bool(want_id or want_name)
-        # Unite Us facilitator allowlist: when any US-flagged UniteUsAgent rows
+        # Unite Us facilitator allowlist: when any allowlisted UniteUsAgent rows
         # exist, only import screens whose ``facilitator_id`` is one of them.
         # NB: the screening export's ``facilitator_id`` maps to
         # ``UniteUsAgent.employee_id`` (NOT ``user_id``, which is what the cases
-        # export's ``case_created_by_id`` maps to). Only agents with the US flag
-        # (is_us=True) count -- Met Council Team agents are excluded. An EMPTY
-        # list means no gate -- accept all -- so imports keep working until the
-        # allowlist is populated.
+        # export's ``case_created_by_id`` maps to). Only agents on a CareCircle
+        # team (CARECIRCLE_ALLOWLIST_TEAMS) count -- Met Council Team agents are
+        # excluded. An EMPTY list means no gate -- accept all -- so imports keep
+        # working until the roster is populated.
         allow_facilitator_ids = {
             str(e).lower()
             for e in UniteUsAgent.objects.filter(
-                is_us=True, employee_id__isnull=False
+                originating_team__in=CARECIRCLE_ALLOWLIST_TEAMS,
+                employee_id__isnull=False,
             ).values_list("employee_id", flat=True)
         }
         # Group the denormalized (one-row-per-answer) export by screen. The Unite
@@ -872,19 +880,19 @@ class CsvImporter:
         want_id = (str(provider_id).strip() if provider_id else "")
         want_name = (provider_name or "").strip().casefold()
         provider_filter = bool(want_id or want_name)
-        # Unite Us creator allowlist: when any US-flagged UniteUsAgent rows exist,
-        # only import submissions whose ``submission_created_by_id`` is one of
-        # them. This maps to ``UniteUsAgent.user_id`` (the SAME key the cases
-        # export's ``case_created_by_id`` uses -- unlike screenings, whose
-        # ``facilitator_id`` maps to ``employee_id``). Only agents with the US
-        # flag (is_us=True) count -- Met Council Team agents are excluded. An
-        # EMPTY list means no gate -- accept all -- so imports keep working until
-        # the allowlist is populated.
+        # Unite Us creator allowlist: when any allowlisted UniteUsAgent rows
+        # exist, only import submissions whose ``submission_created_by_id`` is
+        # one of them. This maps to ``UniteUsAgent.user_id`` (the SAME key the
+        # cases export's ``case_created_by_id`` uses -- unlike screenings, whose
+        # ``facilitator_id`` maps to ``employee_id``). Only agents on a CareCircle
+        # team (CARECIRCLE_ALLOWLIST_TEAMS) count -- Met Council Team agents are
+        # excluded. An EMPTY list means no gate -- accept all -- so imports keep
+        # working until the roster is populated.
         allow_creator_ids = {
             str(u).lower()
-            for u in UniteUsAgent.objects.filter(is_us=True).values_list(
-                "user_id", flat=True
-            )
+            for u in UniteUsAgent.objects.filter(
+                originating_team__in=CARECIRCLE_ALLOWLIST_TEAMS
+            ).values_list("user_id", flat=True)
         }
         # Group the denormalized (one-row-per-question) rows by submission.
         groups = OrderedDict()
@@ -945,15 +953,17 @@ class CsvImporter:
         # maps to ``UniteUsAgent.employee_id`` (the SAME key the screening
         # export's ``facilitator_id`` uses). We also use the matched agent to
         # translate the author into a readable name -- the notes export carries
-        # no author-name column. Only agents with the US flag (is_us=True) count.
-        # An EMPTY allowlist means no gate -- accept all -- but author_name is
-        # then only filled when the employee id happens to match an agent.
+        # no author-name column. Only agents on a CareCircle team
+        # (CARECIRCLE_ALLOWLIST_TEAMS) count. An EMPTY allowlist means no gate --
+        # accept all -- but author_name is then only filled when the employee id
+        # happens to match an agent.
         agents_by_emp = {
             str(a.employee_id).lower(): a
             for a in UniteUsAgent.objects.exclude(employee_id__isnull=True)
         }
         allow_author_ids = {
-            emp for emp, a in agents_by_emp.items() if a.is_us
+            emp for emp, a in agents_by_emp.items()
+            if a.originating_team in CARECIRCLE_ALLOWLIST_TEAMS
         }
         # Pre-load existing Unite Us note ids so re-runs are a cheap set lookup
         # (the model has no unique constraint on source_note_id).
@@ -1034,17 +1044,17 @@ class CsvImporter:
         want_id = (str(provider_id).strip() if provider_id else "")
         want_name = (provider_name or "").strip().casefold()
         provider_filter = bool(want_id or want_name)
-        # Unite Us creator allowlist: when any US-flagged UniteUsAgent rows are
+        # Unite Us creator allowlist: when any allowlisted UniteUsAgent rows are
         # configured, only import cases whose ``case_created_by_id`` is in that
-        # list (it maps exactly to Case.created_by_id). Only agents with the US
-        # flag (is_us=True) count -- Met Council Team agents are excluded. An
-        # EMPTY list means no gate -- accept all -- so existing imports keep
-        # working until the list is populated.
+        # list (it maps exactly to Case.created_by_id). Only agents on a
+        # CareCircle team (CARECIRCLE_ALLOWLIST_TEAMS) count -- Met Council Team
+        # agents are excluded. An EMPTY list means no gate -- accept all -- so
+        # existing imports keep working until the roster is populated.
         allow_creator_ids = {
             str(u).lower()
-            for u in UniteUsAgent.objects.filter(is_us=True).values_list(
-                "user_id", flat=True
-            )
+            for u in UniteUsAgent.objects.filter(
+                originating_team__in=CARECIRCLE_ALLOWLIST_TEAMS
+            ).values_list("user_id", flat=True)
         }
         # STRICT Met Council org gate (union rule, see lifecycle.is_met_council_case):
         # keep a case only if Met Council either CREATED it (originating_provider_id)
