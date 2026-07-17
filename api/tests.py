@@ -3054,6 +3054,36 @@ class MemberWarningsTest(TestCase):
         self.assertEqual(row.status, WarningStatus.RESOLVED)
         self.assertIsNotNone(row.resolved_at)
 
+    def test_sync_resolves_no_kitchen_when_kitchen_assigned(self):
+        # Regression: a household flagged "No kitchen assigned" that then gets a
+        # kitchen must have the stale ACTIVE row RESOLVED on re-sync -- otherwise
+        # it lingers on Care Management as a false positive (member shows as not
+        # kitchen-assigned despite a real kitchen). The kitchen-assignment /
+        # kitchen-edit paths now call sync_household_warnings for exactly this.
+        from .models import (
+            Kitchen, KitchenProductType, KitchenStatus, MemberWarning,
+            WarningStatus,
+        )
+        from .services.warnings import NO_KITCHEN, sync_household_warnings
+
+        c = self._client()
+        enr = self._enrollment(c)  # active, servable, no kitchen -> NO_KITCHEN
+        sync_household_warnings(enr)
+        self.assertEqual(
+            MemberWarning.objects.get(client=c, code=NO_KITCHEN).status,
+            WarningStatus.ACTIVE,
+        )
+        # Assign a kitchen, then re-sync (what the assign path now does).
+        enr.kitchen = Kitchen.objects.create(
+            name="K", status=KitchenStatus.ACTIVE,
+            supported_products=[KitchenProductType.MEAL],
+        )
+        enr.save(update_fields=["kitchen"])
+        sync_household_warnings(enr)
+        row = MemberWarning.objects.get(client=c, code=NO_KITCHEN)
+        self.assertEqual(row.status, WarningStatus.RESOLVED)
+        self.assertIsNotNone(row.resolved_at)
+
     def test_sync_reactivates_resolved_row(self):
         from .models import MemberWarning, WarningStatus
         from .services.warnings import NO_CADENCE, sync_household_warnings

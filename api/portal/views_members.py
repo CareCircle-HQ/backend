@@ -3523,6 +3523,19 @@ def assign_kitchen_to_household(
         enr, EnrollmentStage.SERVICE_ACTIVE, force=True,
         note=f"Kitchen assigned ({kitchen.name}); service activated.",
     )
+
+    # Reconcile the warning snapshot now that a kitchen + cadence are assigned:
+    # a household that was flagged "No kitchen assigned" / "No cadence assigned"
+    # no longer matches those checks, so their stale ACTIVE MemberWarning rows
+    # are resolved here instead of lingering on Care Management as a false
+    # positive until the nightly sweep. Best-effort -- never break assignment.
+    try:
+        sync_household_warnings(enr)
+    except Exception:  # pragma: no cover - defensive
+        logger.exception(
+            "warning sync failed after kitchen assignment for enrollment %s", enr.pk
+        )
+
     return {
         "out_of_orbit": out_of_orbit,
         "out_names": out_names,
@@ -4061,6 +4074,16 @@ class MemberKitchenView(PortalAPIView):
         # generation groups this household under the NEW kitchen (the calendar
         # snapshots the kitchen at build time and is otherwise never rebuilt).
         resync_scheduled_orders(enrollment=enr)
+        # Changing the kitchen changes the inputs to the kitchen warnings, so
+        # reconcile the snapshot: a now-assigned kitchen clears a stale "No
+        # kitchen assigned" row (and a compatible one clears the mismatch),
+        # instead of lingering on Care Management. Best-effort.
+        try:
+            sync_household_warnings(enr)
+        except Exception:  # pragma: no cover - defensive
+            logger.exception(
+                "warning sync failed after kitchen change for enrollment %s", enr.pk
+            )
         return Response({
             "kitchen_id": str(kitchen.pk) if kitchen else None,
             "kitchen_name": kitchen.name if kitchen else "",
@@ -4106,6 +4129,15 @@ class MemberCadenceView(PortalAPIView):
         # occurrences no longer in the plan and add the new ones, leaving any
         # date already batched into a PO untouched.
         sync_delivery_calendar(enr)
+        # A cadence change changes the inputs to the cadence warnings, so
+        # reconcile the snapshot (clears a stale "No cadence assigned" or a
+        # cadence/kitchen mismatch) rather than waiting for the nightly sweep.
+        try:
+            sync_household_warnings(enr)
+        except Exception:  # pragma: no cover - defensive
+            logger.exception(
+                "warning sync failed after cadence change for enrollment %s", enr.pk
+            )
         row = Cadence.objects.filter(code=cadence).first()
         return Response({
             "cadence": current_household_cadence(enr) or cadence,
