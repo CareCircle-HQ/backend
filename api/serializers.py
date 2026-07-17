@@ -19,6 +19,7 @@ from .models import (
     Agent,
     Case,
     CaseHouseholdType,
+    CaseStatus,
     CaseType,
     Client,
     ClientLevel,
@@ -52,6 +53,7 @@ from .models import (
     Provider,
     RecordStatus,
     Screening,
+    ServiceAuthorizationStatus,
     ServiceType,
     SocialCareCoverage,
     SocialCareCoverageStatus,
@@ -431,14 +433,19 @@ class ClientSerializer(serializers.ModelSerializer):
         if insurances is not None:
             seen_pks = []
             for ins in insurances:
-                # Status from the end date: no end date or the 9999 sentinel
+                # Trust the source-provided status: the import/extension always
+                # sends the record's real status (insurance_record_status), so
+                # NEVER override it here. Only DERIVE a status from the end date
+                # as a fallback when the source didn't provide one -- otherwise a
+                # client with active insurance was being flipped to Expired by a
+                # stale/legacy end date. No end date or the 9999 sentinel
                 # ("never expires") => Active; a past end date => Expired.
-                # Otherwise keep the incoming status.
-                exp = ins.get("expired_at")
-                if exp is None or getattr(exp, "year", None) == 9999:
-                    ins["status"] = RecordStatus.ACTIVE
-                elif self._is_expired(exp):
-                    ins["status"] = RecordStatus.EXPIRED
+                if not ins.get("status"):
+                    exp = ins.get("expired_at")
+                    if exp is None or getattr(exp, "year", None) == 9999:
+                        ins["status"] = RecordStatus.ACTIVE
+                    elif self._is_expired(exp):
+                        ins["status"] = RecordStatus.EXPIRED
                 key = ins.get("insurance_id")
                 if key:
                     obj, _ = _safe_update_or_create(
@@ -473,8 +480,10 @@ class ClientSerializer(serializers.ModelSerializer):
         if social_care_coverages is not None:
             seen_scc_pks = []
             for scc in social_care_coverages:
-                # Auto-derive Expired from the end date.
-                if self._is_expired(scc.get("expired_at")):
+                # Same rule as insurance: trust the source-provided status and
+                # only DERIVE Expired from the end date when the source left it
+                # blank -- never override a real enrolled/non-enrolled status.
+                if not scc.get("status") and self._is_expired(scc.get("expired_at")):
                     scc["status"] = SocialCareCoverageStatus.EXPIRED
                 key = scc.get("coverage_id")
                 if key:
@@ -1190,6 +1199,26 @@ class CaseSerializer(serializers.ModelSerializer):
         )
         _prev_status = _prev["case_status"] if _prev else None
         _prev_auth = _prev["service_authorization_status"] if _prev else None
+
+        # Business rule (enforced on EVERY case write -- extension, CSV import,
+        # daily Unite Us pull, admin/direct API -- since they all funnel through
+        # here): the service authorization DRIVES the case status. A Denied /
+        # Rejected authorization ends the case, so it becomes Closed regardless
+        # of its current status (Open, Managed, ...). Other auth states
+        # (Requested/Pending, Approved, ...) never force a status change here.
+        # Compute the EFFECTIVE status/auth from the incoming payload, falling
+        # back to the stored values (a partial update may omit one field), so the
+        # rule holds no matter which field the write changed; downstream
+        # (record_case_change / tickets / delivery truncation) then sees a normal
+        # transition to Closed. An explicitly Cancelled case stays Cancelled.
+        eff_status = validated_data.get("case_status", _prev_status)
+        eff_auth = validated_data.get("service_authorization_status", _prev_auth)
+        if (
+            eff_auth == ServiceAuthorizationStatus.DENIED
+            and eff_status != CaseStatus.CANCELLED
+        ):
+            validated_data["case_status"] = CaseStatus.CLOSED
+
         case, _ = Case.objects.update_or_create(case_id=case_id, defaults=validated_data)
         # Stash the pre-save values on the instance so the write path (e.g.
         # CaseViewSet, extension) can record the change + attribute it, without
@@ -1262,7 +1291,6 @@ class CaseSerializer(serializers.ModelSerializer):
         try:
             if case.case_type == CaseType.INTERNAL_SERVICE:
                 from .models import (
-                    ServiceAuthorizationStatus,
                     TicketSeverity,
                     TicketTypeCode,
                 )

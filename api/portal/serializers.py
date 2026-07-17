@@ -1423,6 +1423,13 @@ class PortalMemberDietaryEditSerializer(serializers.Serializer):
     # When true, lift a member's manual pause. The view re-runs the meal rule so
     # the member returns to Active (or Out of Orbit if now unfulfillable).
     unpause = serializers.BooleanField(required=False, default=False)
+    # When true, return an Out-of-Range member to service. The view re-checks
+    # delivery coverage + the meal rule (both ZIP-aware) and only reactivates if
+    # the member's delivery/primary ZIP is now serviceable; if the household was
+    # auto-held for the out-of-range ZIP and no member remains Out of Range, the
+    # hold is resumed and the Out-of-Range ticket resolved. Control flag, popped
+    # by the view before assigning model fields.
+    restore_range = serializers.BooleanField(required=False, default=False)
     # Required free-text reason when pausing (also accepted on unpause). Stored
     # as an agent-authored note -- NOT a system note.
     pause_reason = serializers.CharField(allow_blank=True, required=False)
