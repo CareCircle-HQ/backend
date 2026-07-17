@@ -37,6 +37,40 @@ from api.models import (
 MET_COUNCIL_PROVIDER_ID = getattr(
     settings, "MET_COUNCIL_PROVIDER_ID", "12706c81-03a1-4cdb-954a-579929cd05df"
 )
+# Met Council's managing-organization display name (the case "Organization" in
+# Unite Us). Overridable via settings.
+MET_COUNCIL_PROVIDER_NAME = getattr(
+    settings, "MET_COUNCIL_PROVIDER_NAME", "Met Council - SCN - PHS"
+)
+
+
+def is_met_council_case(*, originating_provider_id=None, provider_id=None,
+                        provider_name=None):
+    """Whether a case belongs to Met Council under the UNION rule: it was either
+    CREATED by Met Council (``originating_provider_id`` == the Met Council id) OR
+    is MANAGED/serviced by Met Council (``provider_id`` == the id, or
+    ``provider_name`` == "Met Council - SCN - PHS").
+
+    This is the single gate for keeping external-org cases out of the member
+    base -- used by every ingestion path (CSV import, nightly Unite Us pull,
+    on-demand refresh) and the cleanup command. STRICT: a case with no Met
+    Council signal at all is NOT Met Council (so a blank/other-org case is
+    dropped). Note the different sources carry different signals -- the CSV
+    export has the originating + provider columns, while the live Unite Us API
+    only exposes the managing ``provider`` -- so the union keeps all three."""
+    met_id = str(MET_COUNCIL_PROVIDER_ID).strip().lower()
+    met_name = MET_COUNCIL_PROVIDER_NAME.strip().casefold()
+
+    def _id(v):
+        return str(v).strip().lower() if v not in (None, "") else ""
+
+    if _id(originating_provider_id) == met_id:
+        return True
+    if _id(provider_id) == met_id:
+        return True
+    if (provider_name or "").strip().casefold() == met_name:
+        return True
+    return False
 
 
 class InvalidTransition(ValueError):

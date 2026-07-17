@@ -1011,6 +1011,51 @@ class MembersListView(PortalGenericAPIView):
         data["service_type"] = self._service_type_for_client(client)
         return data
 
+    # Human labels for the creation source recorded on each record's first
+    # history row (see api.history.ChangeSource).
+    _ADDED_VIA_LABELS = {
+        "extension": "Extension",
+        "import": "Import",
+        "admin": "Admin",
+        "crm": "CRM",
+        "system": "System",
+    }
+
+    def _stamp_added_via(self, groups):
+        """Annotate each member dict in ``groups`` with how the client was first
+        created: ``added_via`` (raw ChangeSource code) + ``added_via_label``.
+
+        Derived from the EARLIEST historical row (history_type='+') of the
+        Client, whose ``change_source`` records whether the extension, the CSV /
+        Unite Us import, admin, etc. created the record. Batched into ONE query
+        over the page's client ids to avoid an N+1. Blank source (e.g. records
+        that predate change-source stamping) surfaces as 'Unknown'."""
+        ids = {
+            m["id"]
+            for g in groups
+            for m in g.get("members", [])
+        }
+        if not ids:
+            return
+        hist_model = Client.history.model
+        src_by_id = {}
+        for cid, src in (
+            hist_model.objects.filter(history_type="+", client_id__in=ids)
+            .order_by("history_date")
+            .values_list("client_id", "change_source")
+        ):
+            key = str(cid)
+            # First create row wins (ordered oldest-first).
+            if key not in src_by_id:
+                src_by_id[key] = src or ""
+        for g in groups:
+            for m in g.get("members", []):
+                src = src_by_id.get(m["id"], "")
+                m["added_via"] = src
+                m["added_via_label"] = self._ADDED_VIA_LABELS.get(
+                    src, src.replace("_", " ").title() if src else "Unknown"
+                )
+
     @staticmethod
     def _hidden_in_logistics(client):
         """Members that shouldn't wait in the kitchen-assignment queue and so are
@@ -1496,9 +1541,12 @@ class MembersListView(PortalGenericAPIView):
                 renderable = self._renderable_keys(entries)
                 entries = [e for e in entries if (e["type"], e["id"]) in renderable]
         page = self.paginate_queryset(entries)
-        return self.get_paginated_response(
-            self._build_groups_for_page(page or [], checks=checks)
-        )
+        groups = self._build_groups_for_page(page or [], checks=checks)
+        # Urgent Care ("Need Attention"): show how each member was first added
+        # (extension vs import) so agents can triage the list at a glance.
+        if scope == "need_attention":
+            self._stamp_added_via(groups)
+        return self.get_paginated_response(groups)
 
 
 class MembersStatsView(PortalAPIView):

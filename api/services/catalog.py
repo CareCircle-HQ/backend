@@ -135,12 +135,24 @@ def upsert_programs(names):
 
 
 def product_type_kind_for_name(program_name):
-    """Map a program name to a ProductTypeKind by keyword: 'meals' -> Meals,
-    'box'/'boxes' -> Boxes. Returns None when neither keyword is present."""
+    """Map a program name to a ProductTypeKind by keyword.
+
+    Meals: any 'meal'/'meals'. Boxes: the box family, which in the Met Council
+    program names appears as 'box'/'boxes' but ALSO as 'voucher' / 'produce
+    prescription' / 'food prescription' / 'pantry' / 'groceries' (all the
+    Produce Prescription/Voucher product, e.g. "...Food Prescriptions: Voucher
+    - ..."). Returns None when nothing matches. Meals is checked first; box
+    programs never contain 'meal'."""
     name = (program_name or "").casefold()
-    if "meals" in name or "meal" in name:
+    if "meal" in name:
         return ProductTypeKind.MEALS
-    if "boxes" in name or "box" in name:
+    if any(
+        kw in name
+        for kw in (
+            "box", "voucher", "produce prescription",
+            "food prescription", "pantry", "groceries",
+        )
+    ):
         return ProductTypeKind.BOXES
     return None
 

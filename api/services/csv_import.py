@@ -20,6 +20,7 @@ into an :class:`~api.models.ImportRun`.
 import csv
 import io
 import logging
+import re
 from collections import OrderedDict
 
 from django.core.exceptions import ValidationError
@@ -193,6 +194,33 @@ def _enum(value, allowed, default=""):
     return v if v in allowed else default
 
 
+def _zip5(value):
+    """A clean 5-digit US ZIP, or "" when the source can't yield one.
+
+    Business rule: never import a ZIP with more than 5 digits. A ZIP+4
+    ("12345-6789" / 9 straight digits) is reduced to its 5-digit base; anything
+    that isn't a 5- or 9-digit code (garbage, partial, foreign) is dropped."""
+    digits = re.sub(r"\D", "", value or "")
+    if len(digits) in (5, 9):
+        return digits[:5]
+    return ""
+
+
+def _format_phone(value):
+    """Auto-format a US phone number to '(XXX) XXX-XXXX'.
+
+    Strips a leading country code ('1') and any punctuation; a clean 10-digit
+    number is formatted, otherwise the trimmed original is kept (so we never
+    lose an unparseable number, e.g. an extension or a foreign format)."""
+    raw = (value or "").strip()
+    digits = re.sub(r"\D", "", raw)
+    if len(digits) == 11 and digits.startswith("1"):
+        digits = digits[1:]
+    if len(digits) == 10:
+        return f"({digits[:3]}) {digits[3:6]}-{digits[6:]}"
+    return raw
+
+
 # Email validity check — the export occasionally contains junk (e.g. a phone
 # number, "n/a", or a malformed address like "foo@bar..com") in the email
 # column, which the EmailField would reject and fail the whole client. We drop
@@ -226,7 +254,7 @@ def _address_from_row(row):
         "city": _s(row, "client_address_city"),
         "county": _s(row, "client_address_county"),
         "state": _s(row, "client_address_state")[:2],
-        "zip": _s(row, "client_address_postal_code"),
+        "zip": _zip5(_s(row, "client_address_postal_code")),
         "created_at": _dt(row, "client_address_created_at"),
         "updated_at": _dt(row, "client_address_updated_at"),
         "_is_current": _bool(row, "client_address_is_current"),
@@ -300,7 +328,7 @@ def map_client_group(client_id, rows):
         "ethnicity": _s(profile, "ethnicity"),
         "sexuality": _s(profile, "sexuality"),
         "citizenship": _s(profile, "citizenship"),
-        "client_phone_number": _s(profile, "client_phone_number"),
+        "client_phone_number": _format_phone(_s(profile, "client_phone_number")),
         "phone_type": _s(profile, "phone_type"),
         "client_email_address": _s(profile, "client_email_address"),
         "consent_status": _s(profile, "client_consent_status").lower(),
@@ -1007,10 +1035,26 @@ class CsvImporter:
                 "user_id", flat=True
             )
         }
+        # STRICT Met Council org gate (union rule, see lifecycle.is_met_council_case):
+        # keep a case only if Met Council either CREATED it (originating_provider_id)
+        # or MANAGES/services it (provider_id / provider_name). Any case with no Met
+        # Council signal is out of scope and dropped -- the authoritative filter that
+        # keeps external-org cases out of the member base, applied on every import
+        # path.
+        from api.services.lifecycle import is_met_council_case
+
         # One row per case — stream directly, no grouping needed.
         for row in reader:
             cid = (row.get("case_id") or "").strip()
             if not cid:
+                self._count("skipped")
+                continue
+            # Reject any case with no Met Council involvement (strict union).
+            if not is_met_council_case(
+                originating_provider_id=row.get("originating_provider_id"),
+                provider_id=row.get("provider_id"),
+                provider_name=row.get("provider_name"),
+            ):
                 self._count("skipped")
                 continue
             # Creator allowlist (only enforced when the list is non-empty).

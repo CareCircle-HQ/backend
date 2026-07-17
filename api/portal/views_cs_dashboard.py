@@ -44,8 +44,8 @@ from api.services.warnings import (
     CARE_MANAGEMENT_CODES,
     HOUSEHOLD_MEMBERS_OUT_OF_ORBIT,
     HOUSEHOLD_MEMBERS_OUT_OF_RANGE,
+    HOUSEHOLD_MEMBERS_PAUSED,
     HOUSEHOLD_ON_HOLD,
-    MEMBER_PAUSED,
 )
 from .base import PortalAPIView, current_agent
 
@@ -161,7 +161,7 @@ def _coverage_counts():
     codes = [
         HOUSEHOLD_MEMBERS_OUT_OF_ORBIT,
         HOUSEHOLD_MEMBERS_OUT_OF_RANGE,
-        MEMBER_PAUSED,
+        HOUSEHOLD_MEMBERS_PAUSED,
         HOUSEHOLD_ON_HOLD,
     ]
     counts = {c: 0 for c in codes}
@@ -175,7 +175,7 @@ def _coverage_counts():
     return {
         "out_of_orbit": counts[HOUSEHOLD_MEMBERS_OUT_OF_ORBIT],
         "out_of_range": counts[HOUSEHOLD_MEMBERS_OUT_OF_RANGE],
-        "paused": counts[MEMBER_PAUSED],
+        "paused": counts[HOUSEHOLD_MEMBERS_PAUSED],
         "on_hold": counts[HOUSEHOLD_ON_HOLD],
     }
 

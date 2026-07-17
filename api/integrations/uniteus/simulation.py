@@ -121,6 +121,7 @@ def build_scenario(*, case_closed=False, with_coverage=True, with_insurance=True
             "program": {"data": {"id": ids["program"], "type": "program"}},
             "network": {"data": {"id": ids["network"], "type": "network"}},
             "primary_worker": {"data": {"id": ids["worker"], "type": "employee"}},
+            "provider": {"data": {"id": ids["provider"], "type": "provider"}},
             "service_authorization": {"data": {"id": ids["auth"], "type": "service_authorization"}},
         },
     }
@@ -179,6 +180,7 @@ def build_scenario(*, case_closed=False, with_coverage=True, with_insurance=True
         ("/programs", ids["program"]): {"data": {"attributes": {"name": "Clinically Appropriate Meals"}}},
         ("/networks", ids["network"]): {"data": {"attributes": {"name": "NY Health Network"}}},
         ("/employees", ids["worker"]): {"data": {"attributes": {"full_name": "Jane Coordinator"}}},
+        ("/providers", ids["provider"]): {"data": {"attributes": {"name": "Met Council - SCN - PHS"}}},
     }
 
     SCENARIO.clear()
