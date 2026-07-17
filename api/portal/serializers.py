@@ -287,6 +287,24 @@ def member_paused(client):
     return mp is not None and mp.status == MemberStatus.PAUSED
 
 
+def _main_stage_value(client):
+    """The client's headline "main stage" value (see lifecycle.main_stage)."""
+    from ..services.lifecycle import main_stage
+
+    return main_stage(client)
+
+
+def _main_stage_label(client):
+    """Human label for the client's main stage."""
+    from api.models import ClientStage
+    from ..services.lifecycle import main_stage
+
+    try:
+        return ClientStage(main_stage(client)).label
+    except ValueError:
+        return ""
+
+
 def service_hold_state(client):
     """Whether the client's household service is paused (enrollment On Hold).
 
@@ -692,6 +710,11 @@ class MemberDetailSerializer(serializers.Serializer):
                 "stage_at": client.lifecycle_stage_at.isoformat()
                 if client.lifecycle_stage_at
                 else None,
+                # The 7 headline "main stages" (Consent -> ... -> Eligible ->
+                # Enrolled, terminal Cancelled): the granular funnel + the
+                # client's enrollments rolled up for the profile stage bar.
+                "main_stage": _main_stage_value(client),
+                "main_stage_label": _main_stage_label(client),
                 "service_hold": service_hold_state(client),
                 "service_cancelled": service_cancelled_state(client),
             },
