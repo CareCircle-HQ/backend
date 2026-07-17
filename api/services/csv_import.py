@@ -533,6 +533,8 @@ _AUTH_STATE_MAP = {
     "accepted": "approved",
     "requested": "pending",
     "deferred": "pending",
+    # A rejected authorization is a denial (drives the case to Closed).
+    "rejected": "denied",
 }
 
 
@@ -566,12 +568,21 @@ def map_case_row(row):
     set_("case_processed_at", _dt(row, "case_processed_at"))
     set_("case_managed_at", _dt(row, "case_managed_at"))
     set_("case_off_platform_at", _dt(row, "case_off_platform_at"))
-    set_("case_closed_at", _dt(row, "case_closed_at") or _dt(row, "user_entered_closed_date"))
+    closed_at = _dt(row, "case_closed_at") or _dt(row, "user_entered_closed_date")
+    set_("case_closed_at", closed_at)
     set_("closed_note", _s(row, "closed_note"))
     set_("case_description", _s(row, "case_description"))
 
     status = _s(row, "case_status").lower()
-    out["case_status"] = status if status in CaseStatus.values else CaseStatus.OPEN
+    resolved = status if status in CaseStatus.values else CaseStatus.OPEN
+    # Unite Us keeps the exported case state as "managed" even after a case is
+    # closed; a populated closed date is the only reliable "closed" signal
+    # (mirrors the daily API import's map_case + the browser extension). Force
+    # CLOSED when a closed date is present, but never override an explicit
+    # terminal state already in the export (closed / cancelled).
+    if closed_at and resolved not in (CaseStatus.CLOSED, CaseStatus.CANCELLED):
+        resolved = CaseStatus.CLOSED
+    out["case_status"] = resolved
     set_("started_as_assistance_request", _bool(row, "started_as_assistance_request"))
     set_("case_is_referred", _bool(row, "case_is_referred"))
 
