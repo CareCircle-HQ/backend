@@ -15,6 +15,7 @@ import sys
 from datetime import timedelta
 from pathlib import Path
 
+from celery.schedules import crontab
 from dotenv import load_dotenv
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
@@ -339,7 +340,11 @@ CELERY_WORKER_PREFETCH_MULTIPLIER = 1
 CELERY_WORKER_MAX_TASKS_PER_CHILD = 100
 CELERY_TASK_TRACK_STARTED = True
 CELERY_BROKER_CONNECTION_RETRY_ON_STARTUP = True
-CELERY_TIMEZONE = "UTC"
+# The daily warning-snapshot sweep is scheduled by wall-clock time, so anchor
+# Beat to the program's operating calendar (America/New_York). Interval-based
+# entries (e.g. the export poller) are unaffected; only crontab entries follow
+# this zone. Beat still tracks DST automatically.
+CELERY_TIMEZONE = "America/New_York"
 
 # Beat schedule. The Unite Us export poller advances requested exports through
 # download -> S3 -> import; exports take a few minutes to generate, so a short
@@ -349,6 +354,13 @@ CELERY_BEAT_SCHEDULE = {
     "poll-uniteus-exports": {
         "task": "api.tasks.poll_uniteus_exports",
         "schedule": float(os.getenv("UNITEUS_EXPORT_POLL_SECONDS", "300")),
+    },
+    # Daily safety-net sweep so time-based warnings (e.g. an insurance or
+    # authorization that lapses with the passing of a day) re-evaluate even when
+    # no write re-triggers them. Runs at 11:00 America/New_York.
+    "sync-member-warnings": {
+        "task": "api.tasks.sync_member_warnings",
+        "schedule": crontab(minute=0, hour=11),
     },
 }
 
