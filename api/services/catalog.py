@@ -22,6 +22,21 @@ from api.models import (
 
 logger = logging.getLogger(__name__)
 
+# Programs are organization-scoped and opt-in: the master list only ever GAINS
+# programs for the primary provider below. Cases from other providers, and the
+# name-based paths (assessment eligibility / service catalog) never create new
+# Program rows -- they only link to a program that already exists. Existing rows
+# are never removed by this rule.
+ALLOWED_PROGRAM_PROVIDER_NAME = "Met Council - SCN - PHS"
+
+
+def is_allowed_program_provider(provider):
+    """True when ``provider`` is the org whose programs we add. Accepts a
+    Provider instance or a name string; None/other providers return False."""
+    name = getattr(provider, "name", provider) or ""
+    return str(name).strip() == ALLOWED_PROGRAM_PROVIDER_NAME
+
+
 # Member-level menu type NAMES. ``MemberDietaryProfile.menu_type`` stores the
 # admin-managed catalog ``MenuType`` name (e.g. "Standard", "Kosher"), so the
 # derived fallback below returns names too.
@@ -117,9 +132,11 @@ def upsert_program(name):
     # raise MultipleObjectsReturned.
     program = Program.objects.filter(name=program_name).order_by("pk").first()
     if program is None:
-        program = Program.objects.create(
-            name=program_name, program_id=uuid.uuid4()
-        )
+        # Programs are only ADDED via the Case sync path, and only for the
+        # allowed organization (Met Council - SCN - PHS). This provider-less,
+        # name-based path (assessment eligibility / service catalog) no longer
+        # creates rows -- it only links to a program that already exists.
+        return None
     if category_name:
         category, _ = ProgramMainCategory.objects.get_or_create(name=category_name)
         if program.main_category_id != category.pk:

@@ -2139,6 +2139,53 @@ class ProgramSettingsTest(TestCase):
         self.assertFalse(Program.objects.filter(pk=p.program_id).exists())
 
 
+class ProgramCreationRestrictionTest(TestCase):
+    """Programs are only ADDED for the allowed org (Met Council - SCN - PHS).
+    Other providers' cases and the provider-less name-based paths (assessment
+    eligibility / service catalog) never create new rows -- they only update or
+    link to a program that already exists."""
+
+    def test_resolve_program_creates_only_for_allowed_provider(self):
+        from .models import Program, Provider
+        from .serializers import _resolve_program
+
+        met = Provider.objects.create(
+            provider_id=uuid.uuid4(), name="Met Council - SCN - PHS"
+        )
+        other = Provider.objects.create(provider_id=uuid.uuid4(), name="Other Org")
+        pid_allowed = uuid.uuid4()
+        pid_blocked = uuid.uuid4()
+
+        # Allowed org -> created.
+        prog = _resolve_program(pid_allowed, name="HDM", provider=met)
+        self.assertIsNotNone(prog)
+        self.assertTrue(Program.objects.filter(program_id=pid_allowed).exists())
+
+        # Other org, unknown program -> not created.
+        self.assertIsNone(_resolve_program(pid_blocked, name="X", provider=other))
+        self.assertFalse(Program.objects.filter(program_id=pid_blocked).exists())
+
+        # A program we already know is still updated (even from another provider).
+        prog2 = _resolve_program(pid_allowed, name="HDM v2", provider=other)
+        self.assertIsNotNone(prog2)
+        prog.refresh_from_db()
+        self.assertEqual(prog.name, "HDM v2")
+
+    def test_upsert_program_never_creates(self):
+        from .models import Program
+        from .services.catalog import upsert_program
+
+        # Unknown name -> nothing created (was previously auto-created).
+        self.assertIsNone(upsert_program("Some Eligible Service"))
+        self.assertFalse(
+            Program.objects.filter(name="Some Eligible Service").exists()
+        )
+
+        # Existing program -> linked/returned, never duplicated.
+        p = Program.objects.create(name="Existing Meals")
+        self.assertEqual(upsert_program("Existing Meals").pk, p.pk)
+
+
 class MemberWarningsTest(TestCase):
     """The member/household warning evaluator (api.services.warnings). Each check
     is exercised in isolation on a purpose-built household, plus a clean
