@@ -18,6 +18,7 @@ from ..models import (
     DeliveryCadence,
     DeliveryOrder,
     EnrollmentStage,
+    HouseholdMember,
     MemberDeliverySchedule,
     MemberDietaryProfile,
     MemberStatus,
@@ -88,8 +89,27 @@ class MemberDeliveryCalendarView(PortalAPIView):
     def get(self, request, client_id):
         get_object_or_404(Client, pk=client_id)
 
+        # Scope: the PRIMARY's calendar reflects the WHOLE household (every
+        # member's deliveries), so the total delivery load is visible in one
+        # place. An individual (non-primary) member's calendar shows only their
+        # own deliveries.
+        membership = (
+            HouseholdMember.objects.filter(client_id=client_id)
+            .select_related("household")
+            .first()
+        )
+        is_primary = bool(membership and membership.is_primary)
+        if is_primary and membership.household_id:
+            client_ids = list(
+                HouseholdMember.objects.filter(household_id=membership.household_id)
+                .values_list("client_id", flat=True)
+            )
+        else:
+            client_ids = [client_id]
+        is_household = is_primary and len(client_ids) > 1
+
         profile_ids = list(
-            MemberDietaryProfile.objects.filter(client_id=client_id)
+            MemberDietaryProfile.objects.filter(client_id__in=client_ids)
             .values_list("pk", flat=True)
         )
 
@@ -99,19 +119,21 @@ class MemberDeliveryCalendarView(PortalAPIView):
             .order_by("anticipated_delivery_date")
         ) if profile_ids else []
 
-        # Committed deliveries for this client, keyed by date. Prefer a
-        # non-cancelled row when several exist for the same date.
-        do_by_date = {}
+        # Committed deliveries for the in-scope client(s), keyed by
+        # (client, date) so multiple household members on the SAME date don't
+        # collide. Prefer a non-cancelled row when several exist for a member+date.
+        do_by_key = {}
         for do in (
-            DeliveryOrder.objects.filter(member_id=client_id)
+            DeliveryOrder.objects.filter(member_id__in=client_ids)
             .select_related("purchase_order", "kitchen", "menu_type")
         ):
             d = do.expected_delivery_date
             if d is None:
                 continue
-            existing = do_by_date.get(d)
+            key = (do.member_id, d)
+            existing = do_by_key.get(key)
             if existing is None or (existing.status == "cancelled" and do.status != "cancelled"):
-                do_by_date[d] = do
+                do_by_key[key] = do
 
         today = timezone.localdate()
 
@@ -121,7 +143,8 @@ class MemberDeliveryCalendarView(PortalAPIView):
         next_delivery = None
         for o in occurrences:
             d = o.anticipated_delivery_date
-            do = do_by_date.get(d)
+            member_client_id = o.member.client_id if o.member_id else None
+            do = do_by_key.get((member_client_id, d))
             if do is not None:
                 state = _do_state(do.status)
                 status = do.status
@@ -174,6 +197,8 @@ class MemberDeliveryCalendarView(PortalAPIView):
             rows.append({
                 "date": d.isoformat() if d else None,
                 "weekday": d.strftime("%a") if d else "",
+                "member_name": (o.member.member_name if o.member_id else "") or "",
+                "member_id": str(member_client_id) if member_client_id else None,
                 "quantity": quantity,
                 "menu_type": menu_type or "",
                 "kitchen_name": kitchen_name or "",
@@ -190,6 +215,8 @@ class MemberDeliveryCalendarView(PortalAPIView):
         summary = self._summary(client_id, profile_ids, occurrences)
         summary["next_delivery"] = next_delivery.isoformat() if next_delivery else None
         summary["counts"] = counts
+        summary["is_household"] = is_household
+        summary["member_count"] = len({r["member_id"] for r in rows if r["member_id"]})
 
         return Response({"summary": summary, "occurrences": rows})
 

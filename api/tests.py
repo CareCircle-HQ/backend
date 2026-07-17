@@ -2027,6 +2027,45 @@ class RebuildDeliveryCalendarTest(TestCase):
             MemberDeliverySchedule.objects.filter(member_profile=new_member).exists()
         )
 
+    def test_primary_calendar_is_household_wide_dependent_is_self(self):
+        # The PRIMARY's delivery calendar aggregates the WHOLE household; an
+        # individual (non-primary) member's calendar shows only their own.
+        from rest_framework.test import APIClient
+        from rest_framework_simplejwt.tokens import AccessToken
+
+        from .models import Agent, MemberStatus
+        from .services.orders import rebuild_delivery_calendar
+
+        enr, hh = self._make_active_enrollment()
+        dep = self._add_member(enr, hh, status=MemberStatus.ACTIVE)
+        rebuild_delivery_calendar(enr)  # build the calendar for both members
+
+        agent = Agent.objects.create(name="Q", agent_code="951", group="CS")
+        access = AccessToken()
+        access["agent_id"] = str(agent.id)
+        access["agent_code"] = agent.agent_code
+        access["agent_name"] = agent.name
+        access["agent_group"] = agent.group
+        api = APIClient()
+        api.credentials(HTTP_AUTHORIZATION=f"Bearer {access}")
+
+        # Primary view -> whole household (both members present).
+        r = api.get(f"/api/portal/members/{enr.client_id}/delivery-calendar/")
+        self.assertEqual(r.status_code, 200, r.content)
+        data = r.json()
+        self.assertTrue(data["summary"]["is_household"])
+        member_ids = {row["member_id"] for row in data["occurrences"]}
+        self.assertIn(str(enr.client_id), member_ids)
+        self.assertIn(str(dep.client_id), member_ids)
+
+        # Dependent view -> only their own deliveries.
+        r2 = api.get(f"/api/portal/members/{dep.client_id}/delivery-calendar/")
+        self.assertEqual(r2.status_code, 200, r2.content)
+        data2 = r2.json()
+        self.assertFalse(data2["summary"]["is_household"])
+        member_ids2 = {row["member_id"] for row in data2["occurrences"]}
+        self.assertEqual(member_ids2, {str(dep.client_id)})
+
 
 class MemberWarningsTest(TestCase):
     """The member/household warning evaluator (api.services.warnings). Each check
