@@ -406,9 +406,14 @@ def case_authorization(case):
 
 
 def is_insurance_expiring(plan):
+    # "Expiring" means an active plan whose end date is in the NEAR FUTURE.
+    # A null end date never expires; a PAST end date is already expired (it
+    # renders as terminated/expired), so bound the window on both sides -- a
+    # stale past date must not be mislabelled "expiring soon".
     if plan.status != "active" or not plan.expired_at:
         return False
-    return plan.expired_at <= timezone.now() + timedelta(days=EXPIRING_WINDOW_DAYS)
+    now = timezone.now()
+    return now <= plan.expired_at <= now + timedelta(days=EXPIRING_WINDOW_DAYS)
 
 
 def _fmt_end(dt):
