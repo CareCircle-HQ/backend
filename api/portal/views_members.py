@@ -73,6 +73,7 @@ from ..services.client_diagnostic import diagnose_client
 from ..services.orders import (
     _format_address,
     generate_delivery_calendar,
+    rebuild_delivery_calendar,
     recompute_delivery_plan,
     resync_scheduled_orders,
     sync_delivery_calendar,
@@ -2383,6 +2384,28 @@ class HouseholdMemberEditView(PortalAPIView):
         # Out of Range -- the delivery calendar overlays that status and PO
         # generation excludes them via the live member-status filter.
         resync_scheduled_orders(enrollment=mv.enrollment)
+
+        # Auto-heal: a member added to an already-in-service household never got
+        # a delivery plan (plans are created once, at kitchen assignment), so
+        # once they are ACTIVE they would still be missing from the calendar and
+        # every future PO. When this edit leaves the member Active WITHOUT a
+        # plan -- and the household is already in service (has other plans) --
+        # build the missing plan + calendar now. rebuild_delivery_calendar is a
+        # no-op for members who already have a plan and preserves PO-batched
+        # dates, so it is safe to run on every such save.
+        if (
+            mv.status == MemberStatus.ACTIVE
+            and mv.enrollment_id
+            and mv.enrollment.delivery_schedules.exists()
+            and not mv.enrollment.delivery_schedules.filter(member_profile=mv).exists()
+        ):
+            try:
+                rebuild_delivery_calendar(mv.enrollment)
+            except Exception:  # never let an auto-rebuild break the member edit
+                logger.exception(
+                    "auto rebuild_delivery_calendar failed after activating "
+                    "member %s on enrollment %s", mv.pk, mv.enrollment_id,
+                )
 
         return Response(s.PortalHouseholdMemberSerializer(mv).data)
 
