@@ -64,17 +64,52 @@ class ClientStage(models.TextChoices):
     # --- Early funnel (derived from synced data) ---
     INACTIVE = "inactive", "Inactive"  # default: no consent / not pursued / disposed
     CONSENT = "consent", "Consent"  # consent accepted
-    SCREENED = "screened", "Screened"  # >=1 completed Met Council screening
+    SCREENED = "screened", "Screening"  # >=1 completed Met Council screening
     ASSESSMENT = "assessment", "Assessment"  # completed assessment, eligible
     NAVIGATION = "navigation", "Navigation"  # >=1 Met Council case
+    # Screening identified a social need under an ACTIVE program we serve (see
+    # api.services.lifecycle._is_eligible). Ranks above Navigation.
+    ELIGIBLE = "eligible", "Eligible"
     # --- Enrollment-driven (mirror EnrollmentVerification.stage) ---
     PENDING_VERIFICATION = "pending_verification", "Pending Verification"
     VERIFIED = "verified", "Verified"
     KITCHEN_ASSIGNMENT = "kitchen_assignment", "Kitchen Assignment"  # approved auth, awaiting manual kitchen assignment
     ACTIVE = "active", "Active"  # receiving deliveries
     COMPLETED = "completed", "Completed"  # after last delivery
+    # "Main stage" grouping value: any member holding a live enrollment
+    # (pending_verification..completed / on_hold) rolls up to Enrolled for the
+    # member-profile funnel; the per-program detail lives on ProgramStatus. Not
+    # produced by the stored funnel derivation -- used by the display grouping
+    # (api.services.lifecycle.main_stage) only.
+    ENROLLED = "enrolled", "Enrolled"
+    # Terminal main-stage grouping: every enrollment cancelled.
+    CANCELLED = "cancelled", "Cancelled"
     # --- Terminal off-ramp ---
     NOT_ELIGIBLE = "not_eligible", "Not Eligible"  # ineligible / closed without service
+
+
+class ProgramStatus(models.TextChoices):
+    """Display-only per-program (EnrollmentVerification) status.
+
+    NEVER stored: computed by ``api.services.lifecycle.program_status()`` from an
+    enrollment's stage + its governing internal-service case authorization +
+    approval window. Merges the verification stage and the case-authorization
+    dimension into one linear per-program timeline for the member Programs tab.
+    """
+
+    PENDING_VERIFICATION = "pending_verification", "Pending Verification"
+    VERIFIED = "verified", "Verified"
+    WAITING_AUTHORIZATION = "waiting_authorization", "Waiting Authorization"
+    AUTHORIZED = "authorized", "Authorized"
+    DENIED = "denied", "Denied"
+    KITCHEN_ASSIGNMENT = "kitchen_assignment", "Kitchen Assignment"
+    ACTIVE = "active", "Active"
+    ON_HOLD = "on_hold", "On Hold"
+    # Final: the approval window's end date passed. A re-authorization arrives on
+    # a NEW case (a new program row), never on this expired one.
+    AUTHORIZATION_EXPIRED = "authorization_expired", "Authorization Expired"
+    # Final: the governing case is closed.
+    CLOSED = "closed", "Closed"
 
 
 class CommunicationChannel(models.TextChoices):

@@ -145,6 +145,16 @@ def fast_track_williamsburg_enrollment(enrollment, *, actor=None, agent=None):
         enrollment, case=case, cadence=DeliveryCadence.MON_THU, kitchen=kitchen,
     )
     generate_delivery_calendar(enrollment)
+    # Activate through the MANDATORY Kitchen Assignment step -- no enrollment may
+    # jump Verified -> Service Active directly. The Williamsburg kitchen is
+    # assigned above, so step Verified -> Kitchen Assignment -> Service Active.
+    if EnrollmentStage.KITCHEN_ASSIGNMENT in ENROLLMENT_TRANSITIONS.get(
+        enrollment.stage, set()
+    ):
+        advance_enrollment(
+            enrollment, EnrollmentStage.KITCHEN_ASSIGNMENT, actor=actor, force=True,
+            note=f"Williamsburg exception: kitchen assigned ({WILLIAMSBURG_KITCHEN_NAME}).",
+        )
     # Activate unless already Service Active (avoid an illegal self-transition on
     # an enrollment that somehow reached Service Active without a kitchen).
     if enrollment.stage != EnrollmentStage.SERVICE_ACTIVE:

@@ -140,17 +140,56 @@ def _assessment_outcome(client):
     return None
 
 
+def _active_main_category_names():
+    """Lowercased names of the ProgramMainCategory rows an admin has marked
+    active (Settings > Programs). Empty until at least one is activated."""
+    from api.models import ProgramMainCategory
+
+    return {
+        (c.name or "").strip().casefold()
+        for c in ProgramMainCategory.objects.filter(is_active=True)
+        if (c.name or "").strip()
+    }
+
+
+def _is_eligible(client):
+    """True when a screening identified a social need under an ACTIVE program we
+    serve: any ``Screening.identified_social_needs`` entry whose name matches an
+    active :class:`ProgramMainCategory` (screening need labels ARE the category
+    names, see api.services.catalog.upsert_main_categories).
+
+    Returns False when no category is active (the default), so the Eligible
+    stage only appears once admins opt programs in.
+    """
+    active = _active_main_category_names()
+    if not active:
+        return False
+    for s in client.screenings.all():
+        for need in (s.identified_social_needs or []):
+            name = need if isinstance(need, str) else (
+                (need or {}).get("name") if isinstance(need, dict) else ""
+            )
+            if (name or "").strip().casefold() in active:
+                return True
+    return False
+
+
 def _derive_early_funnel(client):
     """Early funnel stage from synced Unite Us data (no writes).
 
-    Priority (highest first): navigation > assessment > not_eligible > screened >
-    consent > inactive.
+    Priority (highest first): eligible > navigation > assessment > not_eligible >
+    screened > consent > inactive.
 
     A case's authorization status NEVER advances the funnel here: authorization
     is a separate dimension on the Case (it gates kitchen assignment for an
     already-verified household), not a funnel stage. A client with an
     internal-service case but no completed verification stays at Navigation.
     """
+    # Eligible ranks above Navigation: a screening need under an active program
+    # we serve is the strongest early-funnel signal (drives Urgent Care).
+    if _is_eligible(client):
+        return ClientStage.ELIGIBLE
+
     if _has_met_council_case(client):
         return ClientStage.NAVIGATION
 
@@ -457,9 +496,10 @@ ENROLLMENT_TRANSITIONS = {
         # An approved authorization advances a verified household to Kitchen
         # Assignment (reconcile_enrollment_authorization). A pending/denied/
         # expired authorization leaves it at VERIFIED -- the outcome is shown
-        # separately (from the Case), never as a stage.
+        # separately (from the Case), never as a stage. There is NO direct
+        # Verified -> Service Active: kitchen assignment is mandatory before a
+        # program can become active.
         EnrollmentStage.KITCHEN_ASSIGNMENT,
-        EnrollmentStage.SERVICE_ACTIVE,
         EnrollmentStage.ON_HOLD,
         EnrollmentStage.CANCELLED,
     },
@@ -595,13 +635,24 @@ def is_urgent_care_candidate(client):
     the "Request Verification" action: an open internal-service case, no
     verification requested yet (which also excludes anyone already verified),
     and valid Medicaid + valid social care coverage. Single gate shared by the
-    import, the Request Verification endpoint, and the backfill command."""
-    return (
+    import, the Request Verification endpoint, and the backfill command.
+
+    Once at least one program category is opted in (Settings > Programs), the
+    member must ALSO be Eligible -- a screening need under an active program --
+    to surface. Before any program is activated this extra check is a no-op, so
+    the existing Urgent Care behavior is preserved until programs are turned on.
+    """
+    base = (
         has_open_internal_service_case(client)
         and not has_verification_request(client)
         and has_valid_medicaid(client)
         and has_valid_social_care(client)
     )
+    if not base:
+        return False
+    if _active_main_category_names() and not _is_eligible(client):
+        return False
+    return True
 
 
 def evaluate_is_new_flag(client):
@@ -811,6 +862,133 @@ def governing_internal_case(enrollment):
         if cases:
             return max(cases, key=governing_case_key)
     return enrollment.case
+
+
+# Enrollment stages that are "pre-verification" for the per-program status.
+_PRE_VERIFICATION_STAGES = frozenset({
+    EnrollmentStage.PENDING_VALIDATION,
+    EnrollmentStage.VALIDATED,
+    EnrollmentStage.PENDING_VERIFICATION,
+    EnrollmentStage.DISREGARDED,
+})
+
+# Post-verification stages whose authorization window, once past its end date,
+# means the program is terminally Authorization Expired.
+_AUTH_WINDOW_STAGES = frozenset({
+    EnrollmentStage.VERIFIED,
+    EnrollmentStage.KITCHEN_ASSIGNMENT,
+    EnrollmentStage.SERVICE_ACTIVE,
+    EnrollmentStage.SERVICE_COMPLETE,
+})
+
+
+def program_status(enrollment):
+    """Display-only per-program status (see :class:`~api.models.ProgramStatus`).
+
+    Folds the enrollment stage together with its GOVERNING internal-service
+    case's authorization + approval window into one linear per-program timeline:
+
+        Pending Verification -> Verified -> Waiting Authorization / Denied ->
+        Authorized -> Kitchen Assignment -> Active
+        (terminal: On Hold*, Authorization Expired, Closed)
+
+    Never stored -- recomputed on read. ``*`` On Hold is shown while the
+    enrollment is paused, regardless of the underlying authorization.
+    """
+    from api.models import ProgramStatus
+
+    stage = EnrollmentStage(enrollment.stage)
+
+    # A paused program shows On Hold above everything else.
+    if stage == EnrollmentStage.ON_HOLD:
+        return ProgramStatus.ON_HOLD
+
+    gov = governing_internal_case(enrollment)
+    auth = getattr(gov, "service_authorization_status", "") if gov else ""
+    case_closed = bool(gov and gov.case_status in _CLOSED_CASE_STATUSES)
+    end = getattr(gov, "service_authorization_approval_ends_at", None) if gov else None
+    window_expired = bool(end and end.date() < timezone.localdate())
+    auth_expired = auth == ServiceAuthorizationStatus.EXPIRED or window_expired
+
+    # Terminal displays.
+    if stage in (EnrollmentStage.CLOSED, EnrollmentStage.CANCELLED) or case_closed:
+        return ProgramStatus.CLOSED
+    if auth_expired and stage in _AUTH_WINDOW_STAGES:
+        return ProgramStatus.AUTHORIZATION_EXPIRED
+
+    if stage in _PRE_VERIFICATION_STAGES:
+        return ProgramStatus.PENDING_VERIFICATION
+    if stage == EnrollmentStage.SERVICE_COMPLETE:
+        return ProgramStatus.CLOSED
+    if stage == EnrollmentStage.SERVICE_ACTIVE:
+        return ProgramStatus.ACTIVE
+    if stage == EnrollmentStage.KITCHEN_ASSIGNMENT:
+        # Authorized until a kitchen is actually assigned; then Kitchen Assignment.
+        return (
+            ProgramStatus.KITCHEN_ASSIGNMENT
+            if enrollment.kitchen_id
+            else ProgramStatus.AUTHORIZED
+        )
+    if stage == EnrollmentStage.VERIFIED:
+        if auth in (
+            ServiceAuthorizationStatus.APPROVED,
+            ServiceAuthorizationStatus.NOT_REQUIRED,
+        ):
+            return ProgramStatus.AUTHORIZED
+        if auth == ServiceAuthorizationStatus.DENIED:
+            return ProgramStatus.DENIED
+        if auth == ServiceAuthorizationStatus.PENDING:
+            return ProgramStatus.WAITING_AUTHORIZATION
+        return ProgramStatus.VERIFIED
+
+    return ProgramStatus.PENDING_VERIFICATION
+
+
+# Enrollment stages that roll a member up to the "Enrolled" main stage.
+_ENROLLED_LEVEL_STAGES = frozenset({
+    EnrollmentStage.PENDING_VERIFICATION,
+    EnrollmentStage.VERIFIED,
+    EnrollmentStage.KITCHEN_ASSIGNMENT,
+    EnrollmentStage.SERVICE_ACTIVE,
+    EnrollmentStage.SERVICE_COMPLETE,
+    EnrollmentStage.ON_HOLD,
+})
+
+
+def main_stage(client):
+    """The member-profile "main stage" (display grouping):
+
+        Consent -> Screening -> Assessment -> Navigation -> Eligible ->
+        Enrolled   (terminal: Cancelled)
+
+    Rolls the granular ``Client.lifecycle_stage`` + the client's enrollments up
+    into the seven headline stages. Enrolled whenever the client holds a live
+    enrollment (pending_verification..completed / on_hold); Cancelled only when
+    every enrollment is cancelled. Falls back to the stored early-funnel stage.
+    Never stored.
+    """
+    enrollments = _governing_enrollments(client)
+    if enrollments:
+        if any(
+            EnrollmentStage(e.stage) in _ENROLLED_LEVEL_STAGES for e in enrollments
+        ):
+            return ClientStage.ENROLLED
+        if all(
+            EnrollmentStage(e.stage) == EnrollmentStage.CANCELLED for e in enrollments
+        ):
+            return ClientStage.CANCELLED
+
+    stage = client.lifecycle_stage
+    # Map any residual enrollment-driven stored value up to Enrolled.
+    if stage in (
+        ClientStage.PENDING_VERIFICATION,
+        ClientStage.VERIFIED,
+        ClientStage.KITCHEN_ASSIGNMENT,
+        ClientStage.ACTIVE,
+        ClientStage.COMPLETED,
+    ):
+        return ClientStage.ENROLLED
+    return stage or ClientStage.INACTIVE
 
 
 def reconcile_enrollment_authorization(enrollment, *, actor=None, actor_label="", note=""):

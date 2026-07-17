@@ -1837,10 +1837,23 @@ class MemberHouseholdView(PortalAPIView):
         )
         cadence = current_household_cadence(enr)
         cadence_row = Cadence.objects.filter(code=cadence).first() if cadence else None
+        from ..services.lifecycle import program_status
+        ps = program_status(enr)
         return Response(
             {
                 "enrollment": {
                     "id": enr.pk, "code": enr.code, "stage": enr.stage,
+                    # Computed per-program status (merges verification stage +
+                    # governing case authorization) shown on the accordion row.
+                    "program_status": ps.value,
+                    "program_status_label": ps.label,
+                    # Per-program On Hold controls (the household-wide hold was
+                    # replaced by a per-program hold on the accordion row).
+                    "on_hold": enr.stage == EnrollmentStage.ON_HOLD,
+                    "can_hold": enr.stage not in (
+                        EnrollmentStage.ON_HOLD, EnrollmentStage.CANCELLED,
+                        EnrollmentStage.CLOSED, EnrollmentStage.SERVICE_COMPLETE,
+                    ),
                     "kitchen_id": str(enr.kitchen_id) if enr.kitchen_id else None,
                     "kitchen_name": enr.kitchen.name if enr.kitchen_id else "",
                     "service_type": kind.value if kind else "",

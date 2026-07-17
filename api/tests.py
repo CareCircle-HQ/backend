@@ -341,6 +341,7 @@ class HouseholdEnrollmentActivationTest(TestCase):
         enrollment = self._household_enrollment([primary, spouse, child])
 
         advance_enrollment(enrollment, EnrollmentStage.VERIFIED, force=True)
+        advance_enrollment(enrollment, EnrollmentStage.KITCHEN_ASSIGNMENT, force=True)
         advance_enrollment(enrollment, EnrollmentStage.SERVICE_ACTIVE, force=True)
 
         for c in (primary, spouse, child):
@@ -363,6 +364,7 @@ class HouseholdEnrollmentActivationTest(TestCase):
         )
 
         advance_enrollment(enrollment, EnrollmentStage.VERIFIED, force=True)
+        advance_enrollment(enrollment, EnrollmentStage.KITCHEN_ASSIGNMENT, force=True)
         advance_enrollment(enrollment, EnrollmentStage.SERVICE_ACTIVE, force=True)
 
         for c in (primary, spouse):
@@ -3540,3 +3542,70 @@ class CsvImportRulesTest(TestCase):
         self.assertTrue(Case.objects.filter(pk=keep_orig.pk).exists())
         self.assertTrue(Case.objects.filter(pk=keep_managed.pk).exists())
         self.assertFalse(Case.objects.filter(pk=drop.pk).exists())
+
+
+class ProgramStatusComputationTest(TestCase):
+    """The computed per-program status (lifecycle.program_status) folds the
+    enrollment stage + governing case authorization into one display value."""
+
+    def _enrollment(self, stage, *, kitchen=None):
+        from .models import Client, Household, HouseholdMember, EnrollmentVerification
+
+        client = Client.objects.create(
+            client_id=uuid.uuid4(), first_name="P", last_name="Q"
+        )
+        hh = Household.objects.create()
+        HouseholdMember.objects.create(household=hh, client=client, is_primary=True)
+        return EnrollmentVerification.objects.create(
+            client=client, household=hh, stage=stage, kitchen=kitchen,
+        )
+
+    def test_on_hold_overrides_everything(self):
+        from .models import EnrollmentStage, ProgramStatus
+        from .services.lifecycle import program_status
+
+        enr = self._enrollment(EnrollmentStage.ON_HOLD)
+        self.assertEqual(program_status(enr), ProgramStatus.ON_HOLD)
+
+    def test_pending_verification(self):
+        from .models import EnrollmentStage, ProgramStatus
+        from .services.lifecycle import program_status
+
+        enr = self._enrollment(EnrollmentStage.PENDING_VERIFICATION)
+        self.assertEqual(program_status(enr), ProgramStatus.PENDING_VERIFICATION)
+
+    def test_verified_without_authorization_is_verified(self):
+        from .models import EnrollmentStage, ProgramStatus
+        from .services.lifecycle import program_status
+
+        enr = self._enrollment(EnrollmentStage.VERIFIED)
+        self.assertEqual(program_status(enr), ProgramStatus.VERIFIED)
+
+    def test_kitchen_assignment_without_kitchen_is_authorized(self):
+        from .models import EnrollmentStage, ProgramStatus
+        from .services.lifecycle import program_status
+
+        enr = self._enrollment(EnrollmentStage.KITCHEN_ASSIGNMENT)
+        self.assertEqual(program_status(enr), ProgramStatus.AUTHORIZED)
+
+    def test_kitchen_assignment_with_kitchen(self):
+        from .models import EnrollmentStage, ProgramStatus, Kitchen
+        from .services.lifecycle import program_status
+
+        kitchen = Kitchen.objects.create(name="K1")
+        enr = self._enrollment(EnrollmentStage.KITCHEN_ASSIGNMENT, kitchen=kitchen)
+        self.assertEqual(program_status(enr), ProgramStatus.KITCHEN_ASSIGNMENT)
+
+    def test_service_active_is_active(self):
+        from .models import EnrollmentStage, ProgramStatus
+        from .services.lifecycle import program_status
+
+        enr = self._enrollment(EnrollmentStage.SERVICE_ACTIVE)
+        self.assertEqual(program_status(enr), ProgramStatus.ACTIVE)
+
+    def test_cancelled_is_closed(self):
+        from .models import EnrollmentStage, ProgramStatus
+        from .services.lifecycle import program_status
+
+        enr = self._enrollment(EnrollmentStage.CANCELLED)
+        self.assertEqual(program_status(enr), ProgramStatus.CLOSED)
