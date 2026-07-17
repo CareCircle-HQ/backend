@@ -245,6 +245,38 @@ class InsuranceReconcileTest(TestCase):
         )
 
 
+class InsuranceExpiringFlagTest(TestCase):
+    """`is_insurance_expiring` flags only an ACTIVE plan whose end date is in the
+    near future -- never a null end date, and never a stale PAST date (which is
+    already expired/terminated, not "expiring soon")."""
+
+    def _plan(self, status, expired_at):
+        from .models import Insurance
+
+        return Insurance(status=status, expired_at=expired_at)
+
+    def _expiring(self, status, expired_at):
+        from .portal.serializers import is_insurance_expiring
+
+        return is_insurance_expiring(self._plan(status, expired_at))
+
+    def test_active_no_end_date_not_expiring(self):
+        self.assertFalse(self._expiring("active", None))
+
+    def test_active_future_within_window_is_expiring(self):
+        self.assertTrue(self._expiring("active", timezone.now() + timedelta(days=10)))
+
+    def test_active_future_beyond_window_not_expiring(self):
+        self.assertFalse(self._expiring("active", timezone.now() + timedelta(days=120)))
+
+    def test_active_past_end_date_not_expiring(self):
+        # Regression: a plan that already terminated must NOT read as "expiring".
+        self.assertFalse(self._expiring("active", timezone.now() - timedelta(days=400)))
+
+    def test_inactive_not_expiring(self):
+        self.assertFalse(self._expiring("inactive", timezone.now() + timedelta(days=10)))
+
+
 class ExtensionTimelineTest(TestCase):
     """Drive the real extension HTTP endpoints as an authenticated agent and
     assert that TimelineEvents are emitted."""
