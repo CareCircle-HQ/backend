@@ -2067,10 +2067,10 @@ class RebuildDeliveryCalendarTest(TestCase):
         self.assertEqual(member_ids2, {str(dep.client_id)})
 
 
-class ProgramSettingsTest(TestCase):
-    """Settings > Programs: edit / activate / delete the Unite Us-sourced program
-    master list. Programs are INACTIVE by default and cannot be created (they
-    originate from Unite Us)."""
+class ProgramCategorySettingsTest(TestCase):
+    """Settings > Program Categories: edit / activate / delete the program
+    main-category master list. Categories are INACTIVE by default and cannot be
+    created (they are built from screening results)."""
 
     def _api(self):
         from rest_framework.test import APIClient
@@ -2088,55 +2088,49 @@ class ProgramSettingsTest(TestCase):
         api.credentials(HTTP_AUTHORIZATION=f"Bearer {access}")
         return api
 
-    def test_program_inactive_by_default(self):
-        from .models import Program
+    URL = "/api/portal/settings/program-main-categories/"
 
-        self.assertFalse(Program.objects.create(name="Food Boxes").active)
+    def test_category_inactive_by_default(self):
+        from .models import ProgramMainCategory
+
+        self.assertFalse(ProgramMainCategory.objects.create(name="Food").is_active)
 
     def test_list_edit_toggle_delete_and_no_create(self):
-        from .models import Program, Provider
+        from .models import Program, ProgramMainCategory
 
-        prov = Provider.objects.create(
-            provider_id=uuid.uuid4(), name="Met Council - SCN - PHS"
-        )
-        p = Program.objects.create(name="Home Delivered Meals", provider=prov)
+        cat = ProgramMainCategory.objects.create(name="Food")
+        Program.objects.create(name="Home Delivered Meals", main_category=cat)
         api = self._api()
 
-        # List: shape + read-only provider name + inactive by default.
-        r = api.get("/api/portal/settings/programs/")
+        # List: shape + program_count + inactive by default.
+        r = api.get(self.URL)
         self.assertEqual(r.status_code, 200, r.content)
         body = r.json()
         self.assertEqual(body["count"], 1)
         self.assertEqual(body["active_count"], 0)
-        self.assertEqual(body["results"][0]["provider_name"], "Met Council - SCN - PHS")
+        self.assertEqual(body["results"][0]["name"], "Food")
+        self.assertEqual(body["results"][0]["program_count"], 1)
 
-        # Create is disallowed -- programs come from Unite Us.
-        rc = api.post("/api/portal/settings/programs/", {"name": "New"}, format="json")
+        # Create is disallowed -- categories come from screening results.
+        rc = api.post(self.URL, {"name": "New"}, format="json")
         self.assertEqual(rc.status_code, 405, rc.content)
 
         # Activate (the opt-in toggle).
-        ra = api.patch(
-            f"/api/portal/settings/programs/{p.program_id}/",
-            {"active": True}, format="json",
-        )
+        ra = api.patch(f"{self.URL}{cat.id}/", {"is_active": True}, format="json")
         self.assertEqual(ra.status_code, 200, ra.content)
-        p.refresh_from_db()
-        self.assertTrue(p.active)
+        cat.refresh_from_db()
+        self.assertTrue(cat.is_active)
 
-        # Edit name + description.
-        re_ = api.patch(
-            f"/api/portal/settings/programs/{p.program_id}/",
-            {"name": "HDM", "description": "d"}, format="json",
-        )
+        # Rename.
+        re_ = api.patch(f"{self.URL}{cat.id}/", {"name": "Food & Meals"}, format="json")
         self.assertEqual(re_.status_code, 200, re_.content)
-        p.refresh_from_db()
-        self.assertEqual(p.name, "HDM")
-        self.assertEqual(p.description, "d")
+        cat.refresh_from_db()
+        self.assertEqual(cat.name, "Food & Meals")
 
         # Delete.
-        rd = api.delete(f"/api/portal/settings/programs/{p.program_id}/")
+        rd = api.delete(f"{self.URL}{cat.id}/")
         self.assertEqual(rd.status_code, 204, rd.content)
-        self.assertFalse(Program.objects.filter(pk=p.program_id).exists())
+        self.assertFalse(ProgramMainCategory.objects.filter(pk=cat.id).exists())
 
 
 class ProgramCreationRestrictionTest(TestCase):

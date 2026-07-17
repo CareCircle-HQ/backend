@@ -19,7 +19,7 @@ from ..models import (
     MenuType,
     MenuTypeTag,
     ProductType,
-    Program,
+    ProgramMainCategory,
 )
 from .base import PortalAPIView
 from .permissions import IsPortalAgent
@@ -281,35 +281,35 @@ class CrmAgentViewSet(viewsets.ModelViewSet):
         )
 
 
-class ProgramViewSet(viewsets.ModelViewSet):
-    """Settings > Programs: edit / activate / delete the program master list.
+class ProgramMainCategoryViewSet(viewsets.ModelViewSet):
+    """Settings > Program Categories: edit / activate / delete the program
+    main-category master list.
 
-    Programs originate from Unite Us, so there is NO create -- rows are seeded by
-    the sync. They are opt-in: inactive by default, an admin activates the ones
-    this org actually serves. Full list (no pagination for client-side search)
-    with optional ``?search=`` (name/provider) and ``?active=true|false``.
+    Categories are built up from Screening results, so there is NO create. They
+    are opt-in: inactive by default, an admin activates the ones this org
+    actually serves. Full list (no pagination for client-side search) with
+    optional ``?search=`` (name) and ``?active=true|false``. Each row carries a
+    read-only ``program_count`` (programs linked to the category).
     """
 
     permission_classes = [IsPortalAgent]
-    serializer_class = s.PortalProgramSerializer
+    serializer_class = s.PortalProgramMainCategorySerializer
     pagination_class = None
     http_method_names = ["get", "patch", "put", "delete", "head", "options"]
 
     def get_queryset(self):
-        qs = Program.objects.select_related("provider", "main_category").all()
+        from django.db.models import Count
+
+        qs = ProgramMainCategory.objects.annotate(program_count=Count("programs"))
         params = self.request.query_params
         search = (params.get("search") or "").strip()
         if search:
-            from django.db.models import Q
-
-            qs = qs.filter(
-                Q(name__icontains=search) | Q(provider__name__icontains=search)
-            )
+            qs = qs.filter(name__icontains=search)
         active = (params.get("active") or "").strip().lower()
         if active in ("true", "1"):
-            qs = qs.filter(active=True)
+            qs = qs.filter(is_active=True)
         elif active in ("false", "0"):
-            qs = qs.filter(active=False)
+            qs = qs.filter(is_active=False)
         return qs
 
     def list(self, request, *args, **kwargs):
@@ -318,7 +318,7 @@ class ProgramViewSet(viewsets.ModelViewSet):
         return Response(
             {
                 "count": len(data),
-                "active_count": sum(1 for p in data if p["active"]),
+                "active_count": sum(1 for c in data if c["is_active"]),
                 "results": data,
             }
         )

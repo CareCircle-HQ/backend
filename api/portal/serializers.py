@@ -42,7 +42,7 @@ from ..models import (
     MemberStatus,
     MenuType,
     Note,
-    Program,
+    ProgramMainCategory,
     PurchaseOrder,
     ServiceAuthorizationStatus,
     SocialCareCoverage,
@@ -1192,32 +1192,20 @@ class PortalCrmAgentSerializer(serializers.ModelSerializer):
 
 
 # ---------------------------------------------------------------------------
-# Programs (Settings CRUD over the Unite Us-sourced program master list)
+# Program Main Categories (Settings CRUD over the category master list)
 # ---------------------------------------------------------------------------
-class PortalProgramSerializer(serializers.ModelSerializer):
-    """Edit/activate the program master list. Programs come from Unite Us, so
-    the provider / category are read-only (owned by the sync); only the name,
-    description and the ``active`` opt-in flag are editable."""
+class PortalProgramMainCategorySerializer(serializers.ModelSerializer):
+    """Edit / activate / delete the program main-category master list. Categories
+    are built up from Screening results; they are opt-in (inactive by default),
+    an admin activates the ones this org actually serves. ``program_count`` (the
+    number of programs linked to the category) is read-only."""
 
-    id = serializers.UUIDField(source="program_id", read_only=True)
-    provider_name = serializers.CharField(
-        source="provider.name", read_only=True, default=""
-    )
-    main_category_name = serializers.CharField(
-        source="main_category.name", read_only=True, default=""
-    )
+    program_count = serializers.IntegerField(read_only=True)
 
     class Meta:
-        model = Program
-        fields = [
-            "id",
-            "name",
-            "description",
-            "active",
-            "provider_name",
-            "main_category_name",
-        ]
-        read_only_fields = ["id", "provider_name", "main_category_name"]
+        model = ProgramMainCategory
+        fields = ["id", "name", "is_active", "program_count"]
+        read_only_fields = ["id", "program_count"]
 
 
 # ---------------------------------------------------------------------------
