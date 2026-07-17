@@ -431,14 +431,18 @@ class ClientSerializer(serializers.ModelSerializer):
         if insurances is not None:
             seen_pks = []
             for ins in insurances:
-                # Status from the end date: no end date or the 9999 sentinel
-                # ("never expires") => Active; a past end date => Expired.
-                # Otherwise keep the incoming status.
-                exp = ins.get("expired_at")
-                if exp is None or getattr(exp, "year", None) == 9999:
-                    ins["status"] = RecordStatus.ACTIVE
-                elif self._is_expired(exp):
-                    ins["status"] = RecordStatus.EXPIRED
+                # The source-provided status (e.g. insurance_record_status) is
+                # AUTHORITATIVE: a policy the source marks Active is NOT flipped
+                # to Expired just because its stored end date is in the past. Only
+                # DERIVE the status from the end date when the source didn't send
+                # one: no end date / the 9999 sentinel ("never expires") => Active;
+                # a past end date => Expired.
+                if not ins.get("status"):
+                    exp = ins.get("expired_at")
+                    if exp is None or getattr(exp, "year", None) == 9999:
+                        ins["status"] = RecordStatus.ACTIVE
+                    elif self._is_expired(exp):
+                        ins["status"] = RecordStatus.EXPIRED
                 key = ins.get("insurance_id")
                 if key:
                     obj, _ = _safe_update_or_create(
@@ -473,8 +477,11 @@ class ClientSerializer(serializers.ModelSerializer):
         if social_care_coverages is not None:
             seen_scc_pks = []
             for scc in social_care_coverages:
-                # Auto-derive Expired from the end date.
-                if self._is_expired(scc.get("expired_at")):
+                # The source-provided status (insurance_status) is AUTHORITATIVE.
+                # Only derive Expired from the end date when the source didn't
+                # send a status -- an Enrolled coverage is not flipped to Expired
+                # just because its stored end date is in the past.
+                if not scc.get("status") and self._is_expired(scc.get("expired_at")):
                     scc["status"] = SocialCareCoverageStatus.EXPIRED
                 key = scc.get("coverage_id")
                 if key:
