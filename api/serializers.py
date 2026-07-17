@@ -19,6 +19,7 @@ from .models import (
     Agent,
     Case,
     CaseHouseholdType,
+    CaseStatus,
     CaseType,
     Client,
     ClientLevel,
@@ -52,6 +53,7 @@ from .models import (
     Provider,
     RecordStatus,
     Screening,
+    ServiceAuthorizationStatus,
     ServiceType,
     SocialCareCoverage,
     SocialCareCoverageStatus,
@@ -1197,6 +1199,26 @@ class CaseSerializer(serializers.ModelSerializer):
         )
         _prev_status = _prev["case_status"] if _prev else None
         _prev_auth = _prev["service_authorization_status"] if _prev else None
+
+        # Business rule (enforced on EVERY case write -- extension, CSV import,
+        # daily Unite Us pull, admin/direct API -- since they all funnel through
+        # here): the service authorization DRIVES the case status. A Denied /
+        # Rejected authorization ends the case, so it becomes Closed regardless
+        # of its current status (Open, Managed, ...). Other auth states
+        # (Requested/Pending, Approved, ...) never force a status change here.
+        # Compute the EFFECTIVE status/auth from the incoming payload, falling
+        # back to the stored values (a partial update may omit one field), so the
+        # rule holds no matter which field the write changed; downstream
+        # (record_case_change / tickets / delivery truncation) then sees a normal
+        # transition to Closed. An explicitly Cancelled case stays Cancelled.
+        eff_status = validated_data.get("case_status", _prev_status)
+        eff_auth = validated_data.get("service_authorization_status", _prev_auth)
+        if (
+            eff_auth == ServiceAuthorizationStatus.DENIED
+            and eff_status != CaseStatus.CANCELLED
+        ):
+            validated_data["case_status"] = CaseStatus.CLOSED
+
         case, _ = Case.objects.update_or_create(case_id=case_id, defaults=validated_data)
         # Stash the pre-save values on the instance so the write path (e.g.
         # CaseViewSet, extension) can record the change + attribute it, without
@@ -1269,7 +1291,6 @@ class CaseSerializer(serializers.ModelSerializer):
         try:
             if case.case_type == CaseType.INTERNAL_SERVICE:
                 from .models import (
-                    ServiceAuthorizationStatus,
                     TicketSeverity,
                     TicketTypeCode,
                 )

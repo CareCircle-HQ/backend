@@ -198,8 +198,17 @@ def map_coverage_record(rec, plan_info, medicaid_ids):
 
 
 # --- case ------------------------------------------------------------------
-# Unite Us authorization `state` -> our ServiceAuthorizationStatus.
-_AUTH_STATE_MAP = {"accepted": "approved"}
+# Unite Us authorization `state` -> our ServiceAuthorizationStatus. Mirrors the
+# CSV import's _AUTH_STATE_MAP so both importers normalize the pre-decision
+# states (requested/deferred) to Pending instead of leaving the status blank
+# (which would preserve a stale value on re-import).
+_AUTH_STATE_MAP = {
+    "accepted": "approved",
+    "requested": "pending",
+    "deferred": "pending",
+    # A rejected authorization is a denial (drives the case to Closed).
+    "rejected": "denied",
+}
 
 
 def map_case(case_body_data, *, names=None, auth=None):
