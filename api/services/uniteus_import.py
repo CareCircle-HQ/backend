@@ -295,6 +295,16 @@ class DailyPull:
         prev_auth = prev.service_authorization_status if prev else None
 
         data = mappers.map_case(case_rec, names=names, auth=auth_attrs)
+        # External-service cases are out of scope -- skip cleanly (mirrors the
+        # CSV import gate + the CaseSerializer backstop).
+        from api.models import CaseType
+        from api.serializers import derive_case_type
+
+        if derive_case_type(
+            data.get("service_type"), data.get("program_name")
+        ) == CaseType.EXTERNAL_SERVICE:
+            self._count("cases", "skipped")
+            return
         case = self._save(CaseSerializer, data, "cases", existed=bool(prev))
         if case is None:
             return

@@ -107,6 +107,12 @@ def _resolve_provider(provider_id, name=None, network_id=None, network_name=None
 def _resolve_program(program_id, name=None, provider=None):
     if not program_id:
         return None
+    existing = Program.objects.filter(program_id=program_id).first()
+    # Programs are only ADDED for the allowed organization (Met Council - SCN -
+    # PHS). A program from any other provider is ignored (the case's program FK
+    # is left null); a program we already know is still updated.
+    if existing is None and not catalog.is_allowed_program_provider(provider):
+        return None
     defaults = {}
     if name is not None:
         defaults["name"] = name or ""
@@ -1162,6 +1168,16 @@ class CaseSerializer(serializers.ModelSerializer):
         if "household_type" not in validated_data:
             validated_data["household_type"] = derive_household_type(
                 client, validated_data.get("program_name")
+            )
+
+        # External Service cases are out of scope -- we never track them. Reject
+        # the write outright (whether the type was set explicitly or derived from
+        # the program). This is the universal backstop: import paths pre-skip
+        # external-service rows, so in practice this only rejects a direct /
+        # extension / admin save.
+        if validated_data.get("case_type") == CaseType.EXTERNAL_SERVICE:
+            raise serializers.ValidationError(
+                {"case_type": "External Service cases are not tracked and cannot be saved."}
             )
 
         # Capture the stored status + authorization BEFORE the write so callers

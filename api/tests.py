@@ -2067,6 +2067,188 @@ class RebuildDeliveryCalendarTest(TestCase):
         self.assertEqual(member_ids2, {str(dep.client_id)})
 
 
+class ProgramSettingsTest(TestCase):
+    """Settings > Programs: edit / activate / delete the Unite Us-sourced program
+    master list. Programs are INACTIVE by default and cannot be created (they
+    originate from Unite Us)."""
+
+    def _api(self):
+        from rest_framework.test import APIClient
+        from rest_framework_simplejwt.tokens import AccessToken
+
+        from .models import Agent
+
+        agent = Agent.objects.create(name="P", agent_code="960", group="CS")
+        access = AccessToken()
+        access["agent_id"] = str(agent.id)
+        access["agent_code"] = agent.agent_code
+        access["agent_name"] = agent.name
+        access["agent_group"] = agent.group
+        api = APIClient()
+        api.credentials(HTTP_AUTHORIZATION=f"Bearer {access}")
+        return api
+
+    def test_program_inactive_by_default(self):
+        from .models import Program
+
+        self.assertFalse(Program.objects.create(name="Food Boxes").active)
+
+    def test_list_edit_toggle_delete_and_no_create(self):
+        from .models import Program, Provider
+
+        prov = Provider.objects.create(
+            provider_id=uuid.uuid4(), name="Met Council - SCN - PHS"
+        )
+        p = Program.objects.create(name="Home Delivered Meals", provider=prov)
+        api = self._api()
+
+        # List: shape + read-only provider name + inactive by default.
+        r = api.get("/api/portal/settings/programs/")
+        self.assertEqual(r.status_code, 200, r.content)
+        body = r.json()
+        self.assertEqual(body["count"], 1)
+        self.assertEqual(body["active_count"], 0)
+        self.assertEqual(body["results"][0]["provider_name"], "Met Council - SCN - PHS")
+
+        # Create is disallowed -- programs come from Unite Us.
+        rc = api.post("/api/portal/settings/programs/", {"name": "New"}, format="json")
+        self.assertEqual(rc.status_code, 405, rc.content)
+
+        # Activate (the opt-in toggle).
+        ra = api.patch(
+            f"/api/portal/settings/programs/{p.program_id}/",
+            {"active": True}, format="json",
+        )
+        self.assertEqual(ra.status_code, 200, ra.content)
+        p.refresh_from_db()
+        self.assertTrue(p.active)
+
+        # Edit name + description.
+        re_ = api.patch(
+            f"/api/portal/settings/programs/{p.program_id}/",
+            {"name": "HDM", "description": "d"}, format="json",
+        )
+        self.assertEqual(re_.status_code, 200, re_.content)
+        p.refresh_from_db()
+        self.assertEqual(p.name, "HDM")
+        self.assertEqual(p.description, "d")
+
+        # Delete.
+        rd = api.delete(f"/api/portal/settings/programs/{p.program_id}/")
+        self.assertEqual(rd.status_code, 204, rd.content)
+        self.assertFalse(Program.objects.filter(pk=p.program_id).exists())
+
+
+class ProgramCreationRestrictionTest(TestCase):
+    """Programs are only ADDED for the allowed org (Met Council - SCN - PHS).
+    Other providers' cases and the provider-less name-based paths (assessment
+    eligibility / service catalog) never create new rows -- they only update or
+    link to a program that already exists."""
+
+    def test_resolve_program_creates_only_for_allowed_provider(self):
+        from .models import Program, Provider
+        from .serializers import _resolve_program
+
+        met = Provider.objects.create(
+            provider_id=uuid.uuid4(), name="Met Council - SCN - PHS"
+        )
+        other = Provider.objects.create(provider_id=uuid.uuid4(), name="Other Org")
+        pid_allowed = uuid.uuid4()
+        pid_blocked = uuid.uuid4()
+
+        # Allowed org -> created.
+        prog = _resolve_program(pid_allowed, name="HDM", provider=met)
+        self.assertIsNotNone(prog)
+        self.assertTrue(Program.objects.filter(program_id=pid_allowed).exists())
+
+        # Other org, unknown program -> not created.
+        self.assertIsNone(_resolve_program(pid_blocked, name="X", provider=other))
+        self.assertFalse(Program.objects.filter(program_id=pid_blocked).exists())
+
+        # A program we already know is still updated (even from another provider).
+        prog2 = _resolve_program(pid_allowed, name="HDM v2", provider=other)
+        self.assertIsNotNone(prog2)
+        prog.refresh_from_db()
+        self.assertEqual(prog.name, "HDM v2")
+
+    def test_upsert_program_never_creates(self):
+        from .models import Program
+        from .services.catalog import upsert_program
+
+        # Unknown name -> nothing created (was previously auto-created).
+        self.assertIsNone(upsert_program("Some Eligible Service"))
+        self.assertFalse(
+            Program.objects.filter(name="Some Eligible Service").exists()
+        )
+
+        # Existing program -> linked/returned, never duplicated.
+        p = Program.objects.create(name="Existing Meals")
+        self.assertEqual(upsert_program("Existing Meals").pk, p.pk)
+
+
+class ExternalServiceCaseBlockedTest(TestCase):
+    """External Service cases are never persisted -- neither an explicit type nor
+    one derived from the program's ProgramPipeline category can be saved. The
+    other three types (Navigation, Internal Service, Eligibility) still save."""
+
+    def _client(self):
+        return Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="C", last_name="D"
+        )
+
+    def test_explicit_external_service_rejected(self):
+        from rest_framework.exceptions import ValidationError
+
+        from .models import Case, CaseType
+        from .serializers import CaseSerializer
+
+        c = self._client()
+        cid = str(uuid.uuid4())
+        ser = CaseSerializer(data={
+            "case_id": cid, "client_id": str(c.client_id),
+            "case_type": CaseType.EXTERNAL_SERVICE, "service_type": "Legal Aid",
+        })
+        ser.is_valid(raise_exception=True)
+        with self.assertRaises(ValidationError):
+            ser.save()
+        self.assertFalse(Case.objects.filter(case_id=cid).exists())
+
+    def test_derived_external_service_rejected(self):
+        from rest_framework.exceptions import ValidationError
+
+        from .models import Case, ProgramPipeline
+        from .serializers import CaseSerializer
+
+        c = self._client()
+        ProgramPipeline.objects.create(
+            program_name="Legal Aid", case_category="External Service",
+            pipeline_id="p1",
+        )
+        cid = str(uuid.uuid4())
+        ser = CaseSerializer(data={
+            "case_id": cid, "client_id": str(c.client_id),
+            "program_name": "Legal Aid",
+        })
+        ser.is_valid(raise_exception=True)
+        with self.assertRaises(ValidationError):
+            ser.save()
+        self.assertFalse(Case.objects.filter(case_id=cid).exists())
+
+    def test_navigation_case_allowed(self):
+        from .models import CaseType
+        from .serializers import CaseSerializer
+
+        c = self._client()
+        cid = str(uuid.uuid4())
+        ser = CaseSerializer(data={
+            "case_id": cid, "client_id": str(c.client_id),
+            "case_type": CaseType.NAVIGATION, "service_type": "Something",
+        })
+        ser.is_valid(raise_exception=True)
+        case = ser.save()
+        self.assertEqual(case.case_type, CaseType.NAVIGATION)
+
+
 class MemberWarningsTest(TestCase):
     """The member/household warning evaluator (api.services.warnings). Each check
     is exercised in isolation on a purpose-built household, plus a clean
