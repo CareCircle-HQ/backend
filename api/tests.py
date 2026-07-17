@@ -124,6 +124,72 @@ class InsuranceReconcileTest(TestCase):
             RecordStatus.ACTIVE,
         )
 
+    def test_source_active_status_not_overridden_by_past_end_date(self):
+        # Regression: a source status of Active must survive a stale/past end
+        # date (previously the date logic flipped it to Expired, so clients with
+        # active insurance showed Expired).
+        from django.utils import timezone
+        from datetime import timedelta
+
+        cid = str(uuid.uuid4())
+        Client.objects.create(client_id=cid)
+        self._save({
+            "client_id": cid,
+            "insurances": [{
+                "insurance_id": "INS1", "plan_name": "A",
+                "status": "active",
+                "expired_at": (timezone.now() - timedelta(days=30)).isoformat(),
+            }],
+        })
+        self.assertEqual(
+            Insurance.objects.get(insurance_id="INS1").status, RecordStatus.ACTIVE
+        )
+
+    def test_blank_status_still_derived_from_end_date(self):
+        # Fallback preserved: when the source sends NO status, derive it from the
+        # end date (past => Expired, none => Active).
+        from django.utils import timezone
+        from datetime import timedelta
+
+        cid = str(uuid.uuid4())
+        Client.objects.create(client_id=cid)
+        self._save({
+            "client_id": cid,
+            "insurances": [
+                {"insurance_id": "PAST", "plan_name": "P", "status": "",
+                 "expired_at": (timezone.now() - timedelta(days=1)).isoformat()},
+                {"insurance_id": "OPEN", "plan_name": "O", "status": ""},
+            ],
+        })
+        self.assertEqual(
+            Insurance.objects.get(insurance_id="PAST").status, RecordStatus.EXPIRED
+        )
+        self.assertEqual(
+            Insurance.objects.get(insurance_id="OPEN").status, RecordStatus.ACTIVE
+        )
+
+    def test_social_care_source_status_not_overridden(self):
+        # Same rule for social care coverage: an enrolled status survives a past
+        # end date.
+        from django.utils import timezone
+        from datetime import timedelta
+        from .models import SocialCareCoverage, SocialCareCoverageStatus
+
+        cid = str(uuid.uuid4())
+        Client.objects.create(client_id=cid)
+        self._save({
+            "client_id": cid,
+            "social_care_coverages": [{
+                "coverage_id": "SCC1", "plan_name": "S",
+                "status": SocialCareCoverageStatus.ENROLLED,
+                "expired_at": (timezone.now() - timedelta(days=30)).isoformat(),
+            }],
+        })
+        self.assertEqual(
+            SocialCareCoverage.objects.get(coverage_id="SCC1").status,
+            SocialCareCoverageStatus.ENROLLED,
+        )
+
 
 class ExtensionTimelineTest(TestCase):
     """Drive the real extension HTTP endpoints as an authenticated agent and
@@ -890,6 +956,78 @@ class ExcludedZipSettingsTest(TestCase):
         self.assertFalse(ExcludedZipCode.objects.filter(zip="11250").exists())
 
 
+class RestoreOutOfRangeMemberTest(TestCase):
+    """Manual per-member 'Return to service' on the Programs/Household tab
+    (restore_range flag): reactivates an Out-of-Range member only when their ZIP
+    is now serviceable, otherwise refuses."""
+
+    def setUp(self):
+        from .models import ExcludedZipCode
+
+        ExcludedZipCode.objects.get_or_create(zip="11209")
+        self.agent = Agent.objects.create(
+            name="R Agent", agent_code="911", group="CS"
+        )
+        access = AccessToken()
+        access["agent_id"] = str(self.agent.id)
+        access["agent_code"] = self.agent.agent_code
+        access["agent_name"] = self.agent.name
+        access["agent_group"] = self.agent.group
+        self.api = APIClient()
+        self.api.credentials(HTTP_AUTHORIZATION=f"Bearer {access}")
+
+    def _member(self, delivery_zip, *, status):
+        from .models import (
+            Address, AddressType, Client, EnrollmentStage, EnrollmentVerification,
+            Household, HouseholdMember, MemberDietaryProfile,
+        )
+
+        client = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Ada", last_name="Range"
+        )
+        hh = Household.objects.create()
+        HouseholdMember.objects.create(household=hh, client=client, is_primary=True)
+        addr = Address.objects.create(
+            client=client, type=AddressType.CURRENT, zip=delivery_zip
+        )
+        enr = EnrollmentVerification.objects.create(
+            client=client, household=hh, delivery_address=addr,
+            stage=EnrollmentStage.KITCHEN_ASSIGNMENT,
+        )
+        mv = MemberDietaryProfile.objects.create(
+            enrollment=enr, client=client, menu_type="Standard", status=status,
+        )
+        return client, mv
+
+    def _url(self, client, mv):
+        return (
+            f"/api/portal/members/{client.client_id}"
+            f"/household/members/{mv.pk}/"
+        )
+
+    def test_restore_reactivates_when_zip_now_serviceable(self):
+        from .models import MemberStatus
+
+        client, mv = self._member("10001", status=MemberStatus.OUT_OF_RANGE)
+        resp = self.api.patch(
+            self._url(client, mv), {"restore_range": True}, format="json"
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        mv.refresh_from_db()
+        self.assertEqual(mv.status, MemberStatus.ACTIVE)
+
+    def test_restore_refused_when_zip_still_excluded(self):
+        from .models import MemberStatus
+
+        client, mv = self._member("11209", status=MemberStatus.OUT_OF_RANGE)
+        resp = self.api.patch(
+            self._url(client, mv), {"restore_range": True}, format="json"
+        )
+        self.assertEqual(resp.status_code, 400, resp.content)
+        mv.refresh_from_db()
+        self.assertEqual(mv.status, MemberStatus.OUT_OF_RANGE)
+
+
 class ProductKindResolverTest(SimpleTestCase):
     """product_kind_for_enrollment resolves Meals/Boxes across name sources so a
     keyword-less Program row name no longer yields an unresolved '—' kind and a
@@ -1410,6 +1548,24 @@ class CsvCaseMappingTest(SimpleTestCase):
     def test_case_status_unknown_falls_back_to_open(self):
         self.assertEqual(self._map(case_status="somethingelse")["case_status"], "open")
 
+    def test_closed_date_forces_closed_despite_managed_state(self):
+        # Unite Us leaves the exported state "managed" even after closure; a
+        # populated closed date is the reliable "closed" signal (mirrors the API
+        # import). Previously the CSV import left these reading Managed.
+        out = self._map(case_status="managed", case_closed_at="2026-01-02T00:00:00Z")
+        self.assertEqual(out["case_status"], "closed")
+        out = self._map(
+            case_status="managed", user_entered_closed_date="2026-01-02"
+        )
+        self.assertEqual(out["case_status"], "closed")
+
+    def test_closed_date_does_not_override_explicit_cancelled(self):
+        out = self._map(case_status="cancelled", case_closed_at="2026-01-02T00:00:00Z")
+        self.assertEqual(out["case_status"], "cancelled")
+
+    def test_managed_without_closed_date_stays_managed(self):
+        self.assertEqual(self._map(case_status="managed")["case_status"], "managed")
+
     def test_auth_aliases_map(self):
         self.assertEqual(
             self._map(service_authorization_status="accepted")["service_authorization_status"],
@@ -1418,6 +1574,11 @@ class CsvCaseMappingTest(SimpleTestCase):
         self.assertEqual(
             self._map(service_authorization_status="requested")["service_authorization_status"],
             "pending",
+        )
+        # A rejected authorization is a denial (which then drives Closed).
+        self.assertEqual(
+            self._map(service_authorization_status="rejected")["service_authorization_status"],
+            "denied",
         )
 
     def test_auth_direct_enum_values(self):
@@ -1433,7 +1594,7 @@ class UniteUsCaseMapperTest(SimpleTestCase):
     is CLOSED even though Unite Us leaves state='managed' on closed cases. The
     on-demand refresh previously left such cases reading MANAGED."""
 
-    def _map(self, *, state, closed_date=None):
+    def _map(self, *, state, closed_date=None, auth=None):
         from api.integrations.uniteus.mappers import map_case
 
         rec = {
@@ -1441,11 +1602,28 @@ class UniteUsCaseMapperTest(SimpleTestCase):
             "attributes": {"state": state, "closed_date": closed_date},
             "relationships": {"person": {"data": {"id": "person-1"}}},
         }
-        return map_case(rec)
+        return map_case(rec, auth=auth)
 
     def test_closed_date_marks_case_closed_despite_managed_state(self):
         out = self._map(state="managed", closed_date="2026-01-02T00:00:00Z")
         self.assertEqual(out["case_status"], "closed")
+
+    def test_auth_pre_decision_states_map_to_pending(self):
+        # requested / deferred are pre-decision authorization states; both must
+        # normalize to Pending so the daily pull updates the status instead of
+        # leaving it blank/stale (mirrors the CSV import).
+        for raw in ("requested", "deferred"):
+            out = self._map(state="managed", auth={"state": raw})
+            self.assertEqual(out["service_authorization_status"], "pending")
+
+    def test_auth_accepted_maps_to_approved(self):
+        out = self._map(state="managed", auth={"state": "accepted"})
+        self.assertEqual(out["service_authorization_status"], "approved")
+
+    def test_auth_rejected_maps_to_denied(self):
+        # A rejected authorization normalizes to Denied (which drives Closed).
+        out = self._map(state="managed", auth={"state": "rejected"})
+        self.assertEqual(out["service_authorization_status"], "denied")
 
     def test_managed_without_closed_date_stays_managed(self):
         out = self._map(state="managed")
@@ -1454,6 +1632,104 @@ class UniteUsCaseMapperTest(SimpleTestCase):
     def test_unknown_state_without_closed_date_falls_back_open(self):
         out = self._map(state="requested")
         self.assertEqual(out["case_status"], "open")
+
+
+class AuthDrivesCaseStatusTest(TestCase):
+    """The service authorization drives the case status: a Denied (Rejected)
+    authorization closes the case regardless of its current status; other auth
+    states (Pending/Approved) never force a status change. Enforced in
+    CaseSerializer._upsert, so it holds on EVERY write path (extension, CSV
+    import, daily Unite Us pull, admin/direct API) since they all funnel there."""
+
+    def _client(self):
+        return Client.objects.create(
+            client_id=uuid.uuid4(), first_name="Man", last_name="Aged"
+        )
+
+    def _save(self, client, case_id=None, **fields):
+        from .serializers import CaseSerializer
+
+        data = {
+            "case_id": case_id or str(uuid.uuid4()),
+            "client_id": str(client.client_id),
+            **fields,
+        }
+        ser = CaseSerializer(data=data)
+        ser.is_valid(raise_exception=True)
+        return ser.save()
+
+    def test_managed_plus_denied_closes(self):
+        from .models import CaseStatus
+
+        c = self._client()
+        case = self._save(
+            c, program_name="Medically Tailored Meals",
+            service_type="Home Delivered Meals",
+            case_status="managed", service_authorization_status="denied",
+        )
+        self.assertEqual(case.case_status, CaseStatus.CLOSED)
+
+    def test_managed_plus_approved_stays_managed(self):
+        from .models import CaseStatus
+
+        c = self._client()
+        case = self._save(
+            c, program_name="Medically Tailored Meals",
+            service_type="Home Delivered Meals",
+            case_status="managed", service_authorization_status="approved",
+        )
+        self.assertEqual(case.case_status, CaseStatus.MANAGED)
+
+    def test_open_plus_denied_closes(self):
+        # The authorization drives the status: denial closes the case from ANY
+        # current status, including Open.
+        from .models import CaseStatus
+
+        c = self._client()
+        case = self._save(
+            c, program_name="Medically Tailored Meals",
+            service_type="Home Delivered Meals",
+            case_status="open", service_authorization_status="denied",
+        )
+        self.assertEqual(case.case_status, CaseStatus.CLOSED)
+
+    def test_open_plus_pending_stays_open(self):
+        from .models import CaseStatus
+
+        c = self._client()
+        case = self._save(
+            c, program_name="Medically Tailored Meals",
+            service_type="Home Delivered Meals",
+            case_status="open", service_authorization_status="pending",
+        )
+        self.assertEqual(case.case_status, CaseStatus.OPEN)
+
+    def test_open_plus_approved_stays_open(self):
+        from .models import CaseStatus
+
+        c = self._client()
+        case = self._save(
+            c, program_name="Medically Tailored Meals",
+            service_type="Home Delivered Meals",
+            case_status="open", service_authorization_status="approved",
+        )
+        self.assertEqual(case.case_status, CaseStatus.OPEN)
+
+    def test_denial_on_existing_managed_case_closes_via_partial_write(self):
+        # A later write that flips ONLY the authorization to Denied (status
+        # omitted) must still close the stored Managed case -- the rule falls back
+        # to the stored status.
+        from .models import CaseStatus
+
+        c = self._client()
+        cid = str(uuid.uuid4())
+        self._save(
+            c, case_id=cid, program_name="Medically Tailored Meals",
+            service_type="Home Delivered Meals",
+            case_status="managed", service_authorization_status="approved",
+        )
+        case = self._save(c, case_id=cid, service_authorization_status="denied")
+        self.assertEqual(case.case_status, CaseStatus.CLOSED)
 
 
 class DailyPullClientSelectionTest(TestCase):
@@ -2067,10 +2343,10 @@ class RebuildDeliveryCalendarTest(TestCase):
         self.assertEqual(member_ids2, {str(dep.client_id)})
 
 
-class ProgramSettingsTest(TestCase):
-    """Settings > Programs: edit / activate / delete the Unite Us-sourced program
-    master list. Programs are INACTIVE by default and cannot be created (they
-    originate from Unite Us)."""
+class ProgramCategorySettingsTest(TestCase):
+    """Settings > Program Categories: edit / activate / delete the program
+    main-category master list. Categories are INACTIVE by default and cannot be
+    created (they are built from screening results)."""
 
     def _api(self):
         from rest_framework.test import APIClient
@@ -2088,55 +2364,49 @@ class ProgramSettingsTest(TestCase):
         api.credentials(HTTP_AUTHORIZATION=f"Bearer {access}")
         return api
 
-    def test_program_inactive_by_default(self):
-        from .models import Program
+    URL = "/api/portal/settings/program-main-categories/"
 
-        self.assertFalse(Program.objects.create(name="Food Boxes").active)
+    def test_category_inactive_by_default(self):
+        from .models import ProgramMainCategory
+
+        self.assertFalse(ProgramMainCategory.objects.create(name="Food").is_active)
 
     def test_list_edit_toggle_delete_and_no_create(self):
-        from .models import Program, Provider
+        from .models import Program, ProgramMainCategory
 
-        prov = Provider.objects.create(
-            provider_id=uuid.uuid4(), name="Met Council - SCN - PHS"
-        )
-        p = Program.objects.create(name="Home Delivered Meals", provider=prov)
+        cat = ProgramMainCategory.objects.create(name="Food")
+        Program.objects.create(name="Home Delivered Meals", main_category=cat)
         api = self._api()
 
-        # List: shape + read-only provider name + inactive by default.
-        r = api.get("/api/portal/settings/programs/")
+        # List: shape + program_count + inactive by default.
+        r = api.get(self.URL)
         self.assertEqual(r.status_code, 200, r.content)
         body = r.json()
         self.assertEqual(body["count"], 1)
         self.assertEqual(body["active_count"], 0)
-        self.assertEqual(body["results"][0]["provider_name"], "Met Council - SCN - PHS")
+        self.assertEqual(body["results"][0]["name"], "Food")
+        self.assertEqual(body["results"][0]["program_count"], 1)
 
-        # Create is disallowed -- programs come from Unite Us.
-        rc = api.post("/api/portal/settings/programs/", {"name": "New"}, format="json")
+        # Create is disallowed -- categories come from screening results.
+        rc = api.post(self.URL, {"name": "New"}, format="json")
         self.assertEqual(rc.status_code, 405, rc.content)
 
         # Activate (the opt-in toggle).
-        ra = api.patch(
-            f"/api/portal/settings/programs/{p.program_id}/",
-            {"active": True}, format="json",
-        )
+        ra = api.patch(f"{self.URL}{cat.id}/", {"is_active": True}, format="json")
         self.assertEqual(ra.status_code, 200, ra.content)
-        p.refresh_from_db()
-        self.assertTrue(p.active)
+        cat.refresh_from_db()
+        self.assertTrue(cat.is_active)
 
-        # Edit name + description.
-        re_ = api.patch(
-            f"/api/portal/settings/programs/{p.program_id}/",
-            {"name": "HDM", "description": "d"}, format="json",
-        )
+        # Rename.
+        re_ = api.patch(f"{self.URL}{cat.id}/", {"name": "Food & Meals"}, format="json")
         self.assertEqual(re_.status_code, 200, re_.content)
-        p.refresh_from_db()
-        self.assertEqual(p.name, "HDM")
-        self.assertEqual(p.description, "d")
+        cat.refresh_from_db()
+        self.assertEqual(cat.name, "Food & Meals")
 
         # Delete.
-        rd = api.delete(f"/api/portal/settings/programs/{p.program_id}/")
+        rd = api.delete(f"{self.URL}{cat.id}/")
         self.assertEqual(rd.status_code, 204, rd.content)
-        self.assertFalse(Program.objects.filter(pk=p.program_id).exists())
+        self.assertFalse(ProgramMainCategory.objects.filter(pk=cat.id).exists())
 
 
 class ProgramCreationRestrictionTest(TestCase):

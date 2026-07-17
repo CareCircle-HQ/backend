@@ -2236,6 +2236,7 @@ class HouseholdMemberEditView(PortalAPIView):
         deactivate = data.pop("deactivate", False)
         pause = data.pop("pause", False)
         unpause = data.pop("unpause", False)
+        restore_range = data.pop("restore_range", False)
         pause_reason = (data.pop("pause_reason", "") or "").strip()
         for field, value in data.items():
             setattr(mv, field, value)
@@ -2341,6 +2342,49 @@ class HouseholdMemberEditView(PortalAPIView):
                 )
             except Exception:  # never let history-logging break the edit
                 pass
+        elif restore_range and mv.status == MemberStatus.OUT_OF_RANGE:
+            # Return an Out-of-Range member to service. Re-check delivery coverage
+            # AND the meal rule (reconcile_member_kitchen_output is ZIP-aware): the
+            # member is only reactivated when their delivery/primary ZIP is now
+            # serviceable (e.g. the ZIP was removed from the excluded list, or the
+            # address was corrected) and the kitchen can fulfill them. If the ZIP
+            # is still out of coverage the member stays Out of Range and we refuse
+            # with a clear reason.
+            out, _became, reason = reconcile_member_kitchen_output(
+                mv, enr.kitchen, save=False,
+            )
+            if out:
+                return Response(
+                    {"error": reason or (
+                        "This member's delivery ZIP is still outside the coverage "
+                        "area. Update the delivery address (or the excluded-ZIP "
+                        "list) before returning them to service."
+                    )},
+                    status=http.HTTP_400_BAD_REQUEST,
+                )
+            mv.save()
+            agent = current_agent(request)
+            actor = _agent_actor(agent)
+            try:
+                timeline.event_for_member_reactivated(
+                    mv, enrollment=mv.enrollment, actor=actor,
+                )
+            except Exception:  # never let history-logging break the edit
+                pass
+            # If no member remains Out of Range, resume the auto-hold placed for
+            # the out-of-range ZIP and resolve the Out-of-Range closure ticket.
+            still_out = enr.member_profiles.filter(
+                status=MemberStatus.OUT_OF_RANGE,
+            ).exists()
+            if not still_out:
+                try:
+                    _resume_household_after_range(enr)
+                except Exception:  # never let the resume break the edit
+                    pass
+                try:
+                    _resolve_out_of_range_tickets(enr, actor=actor)
+                except Exception:  # never let ticket resolution break the edit
+                    pass
         else:
             # Normal save: reconcile the kitchen output against the global meal
             # rules AND the household's assigned kitchen. An ACTIVE member whose

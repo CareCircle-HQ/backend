@@ -127,7 +127,7 @@ from .views_settings import (
     KitchenIntegrationDetailView,
     KitchenViewSet,
     MenuTypeViewSet,
-    ProgramViewSet,
+    ProgramMainCategoryViewSet,
 )
 from .views_tickets import (
     AgentsListView,
@@ -147,7 +147,11 @@ router.register(
     "settings/delivery-companies", DeliveryCompanyViewSet, basename="portal-delivery-company"
 )
 router.register("settings/agents", CrmAgentViewSet, basename="portal-crm-agent")
-router.register("settings/programs", ProgramViewSet, basename="portal-program")
+router.register(
+    "settings/program-main-categories",
+    ProgramMainCategoryViewSet,
+    basename="portal-program-main-category",
+)
 
 urlpatterns = [
     # Auth

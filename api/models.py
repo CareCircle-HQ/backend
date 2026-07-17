@@ -814,6 +814,10 @@ class ProgramMainCategory(models.Model):
     """
 
     name = models.CharField(max_length=255, unique=True)
+    # Opt-in flag: categories are inactive by default; an admin activates the
+    # ones this org actually serves (mirrors Program.active). Managed from
+    # Settings > Program Categories.
+    is_active = models.BooleanField(default=False)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
