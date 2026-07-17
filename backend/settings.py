@@ -362,6 +362,14 @@ CELERY_BEAT_SCHEDULE = {
         "task": "api.tasks.sync_member_warnings",
         "schedule": crontab(minute=0, hour=11),
     },
+    # Daily delivery-calendar reconcile so no eligible member is missing from
+    # upcoming Purchase Orders (members added get scheduled; paused/removed get
+    # dropped). Runs at 05:00 America/New_York, after the 02:00 daily_pull import
+    # so overnight member changes are reflected before the day's PO work.
+    "sync-delivery-calendars": {
+        "task": "api.tasks.sync_delivery_calendars",
+        "schedule": crontab(minute=0, hour=5),
+    },
 }
 
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'

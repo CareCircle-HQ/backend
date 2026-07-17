@@ -89,6 +89,22 @@ def sync_member_warnings(self, limit=None):
 
 
 @shared_task(bind=True, ignore_result=True)
+def sync_delivery_calendars(self, from_date=None):
+    """Reconcile the delivery calendar for every active household so no eligible
+    member is missing from upcoming Purchase Orders: a member ADDED to an
+    already-active household gets a plan + occurrences, and PAUSED/removed
+    members have their future occurrences dropped (dates already batched into a
+    PO are never touched). Scheduled daily on Celery beat; also safe to call
+    ad-hoc. Delegates to the management command so the logic lives in one
+    place."""
+    from django.core.management import call_command
+
+    call_command(
+        "sync_delivery_calendars", *(["--from", str(from_date)] if from_date else [])
+    )
+
+
+@shared_task(bind=True, ignore_result=True)
 def request_uniteus_exports(self, export_types=None, days=7, triggered_by="cron:uniteus-export"):
     """Request a rolling-window export for each of ``export_types`` (default: all
     supported), then kick a poll. Used by the nightly schedule; the UI requests
