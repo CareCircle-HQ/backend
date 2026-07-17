@@ -42,6 +42,7 @@ from ..models import (
     MemberStatus,
     MenuType,
     Note,
+    Program,
     PurchaseOrder,
     ServiceAuthorizationStatus,
     SocialCareCoverage,
@@ -1188,6 +1189,35 @@ class PortalCrmAgentSerializer(serializers.ModelSerializer):
         # Normalize empty string to NULL so the unique constraint treats
         # code-less agents as distinct (matches the model's nullable design).
         return (value or "").strip() or None
+
+
+# ---------------------------------------------------------------------------
+# Programs (Settings CRUD over the Unite Us-sourced program master list)
+# ---------------------------------------------------------------------------
+class PortalProgramSerializer(serializers.ModelSerializer):
+    """Edit/activate the program master list. Programs come from Unite Us, so
+    the provider / category are read-only (owned by the sync); only the name,
+    description and the ``active`` opt-in flag are editable."""
+
+    id = serializers.UUIDField(source="program_id", read_only=True)
+    provider_name = serializers.CharField(
+        source="provider.name", read_only=True, default=""
+    )
+    main_category_name = serializers.CharField(
+        source="main_category.name", read_only=True, default=""
+    )
+
+    class Meta:
+        model = Program
+        fields = [
+            "id",
+            "name",
+            "description",
+            "active",
+            "provider_name",
+            "main_category_name",
+        ]
+        read_only_fields = ["id", "provider_name", "main_category_name"]
 
 
 # ---------------------------------------------------------------------------

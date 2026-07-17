@@ -1033,7 +1033,9 @@ class Program(models.Model):
     # Optional eligibility questions surfaced to the member (list of question
     # definitions).
     eligibility_questions = models.JSONField(default=list, blank=True)
-    active = models.BooleanField(default=True)
+    # Programs come from Unite Us but are opt-in: inactive by default, an admin
+    # activates the ones this org actually serves (Settings > Programs).
+    active = models.BooleanField(default=False)
 
     class Meta:
         ordering = ["name"]

@@ -2067,6 +2067,78 @@ class RebuildDeliveryCalendarTest(TestCase):
         self.assertEqual(member_ids2, {str(dep.client_id)})
 
 
+class ProgramSettingsTest(TestCase):
+    """Settings > Programs: edit / activate / delete the Unite Us-sourced program
+    master list. Programs are INACTIVE by default and cannot be created (they
+    originate from Unite Us)."""
+
+    def _api(self):
+        from rest_framework.test import APIClient
+        from rest_framework_simplejwt.tokens import AccessToken
+
+        from .models import Agent
+
+        agent = Agent.objects.create(name="P", agent_code="960", group="CS")
+        access = AccessToken()
+        access["agent_id"] = str(agent.id)
+        access["agent_code"] = agent.agent_code
+        access["agent_name"] = agent.name
+        access["agent_group"] = agent.group
+        api = APIClient()
+        api.credentials(HTTP_AUTHORIZATION=f"Bearer {access}")
+        return api
+
+    def test_program_inactive_by_default(self):
+        from .models import Program
+
+        self.assertFalse(Program.objects.create(name="Food Boxes").active)
+
+    def test_list_edit_toggle_delete_and_no_create(self):
+        from .models import Program, Provider
+
+        prov = Provider.objects.create(
+            provider_id=uuid.uuid4(), name="Met Council - SCN - PHS"
+        )
+        p = Program.objects.create(name="Home Delivered Meals", provider=prov)
+        api = self._api()
+
+        # List: shape + read-only provider name + inactive by default.
+        r = api.get("/api/portal/settings/programs/")
+        self.assertEqual(r.status_code, 200, r.content)
+        body = r.json()
+        self.assertEqual(body["count"], 1)
+        self.assertEqual(body["active_count"], 0)
+        self.assertEqual(body["results"][0]["provider_name"], "Met Council - SCN - PHS")
+
+        # Create is disallowed -- programs come from Unite Us.
+        rc = api.post("/api/portal/settings/programs/", {"name": "New"}, format="json")
+        self.assertEqual(rc.status_code, 405, rc.content)
+
+        # Activate (the opt-in toggle).
+        ra = api.patch(
+            f"/api/portal/settings/programs/{p.program_id}/",
+            {"active": True}, format="json",
+        )
+        self.assertEqual(ra.status_code, 200, ra.content)
+        p.refresh_from_db()
+        self.assertTrue(p.active)
+
+        # Edit name + description.
+        re_ = api.patch(
+            f"/api/portal/settings/programs/{p.program_id}/",
+            {"name": "HDM", "description": "d"}, format="json",
+        )
+        self.assertEqual(re_.status_code, 200, re_.content)
+        p.refresh_from_db()
+        self.assertEqual(p.name, "HDM")
+        self.assertEqual(p.description, "d")
+
+        # Delete.
+        rd = api.delete(f"/api/portal/settings/programs/{p.program_id}/")
+        self.assertEqual(rd.status_code, 204, rd.content)
+        self.assertFalse(Program.objects.filter(pk=p.program_id).exists())
+
+
 class MemberWarningsTest(TestCase):
     """The member/household warning evaluator (api.services.warnings). Each check
     is exercised in isolation on a purpose-built household, plus a clean

@@ -19,6 +19,7 @@ from ..models import (
     MenuType,
     MenuTypeTag,
     ProductType,
+    Program,
 )
 from .base import PortalAPIView
 from .permissions import IsPortalAgent
@@ -275,6 +276,49 @@ class CrmAgentViewSet(viewsets.ModelViewSet):
             {
                 "count": len(data),
                 "groups": [g[0] for g in Agent.AGENT_GROUPS],
+                "results": data,
+            }
+        )
+
+
+class ProgramViewSet(viewsets.ModelViewSet):
+    """Settings > Programs: edit / activate / delete the program master list.
+
+    Programs originate from Unite Us, so there is NO create -- rows are seeded by
+    the sync. They are opt-in: inactive by default, an admin activates the ones
+    this org actually serves. Full list (no pagination for client-side search)
+    with optional ``?search=`` (name/provider) and ``?active=true|false``.
+    """
+
+    permission_classes = [IsPortalAgent]
+    serializer_class = s.PortalProgramSerializer
+    pagination_class = None
+    http_method_names = ["get", "patch", "put", "delete", "head", "options"]
+
+    def get_queryset(self):
+        qs = Program.objects.select_related("provider", "main_category").all()
+        params = self.request.query_params
+        search = (params.get("search") or "").strip()
+        if search:
+            from django.db.models import Q
+
+            qs = qs.filter(
+                Q(name__icontains=search) | Q(provider__name__icontains=search)
+            )
+        active = (params.get("active") or "").strip().lower()
+        if active in ("true", "1"):
+            qs = qs.filter(active=True)
+        elif active in ("false", "0"):
+            qs = qs.filter(active=False)
+        return qs
+
+    def list(self, request, *args, **kwargs):
+        qs = self.filter_queryset(self.get_queryset())
+        data = self.get_serializer(qs, many=True).data
+        return Response(
+            {
+                "count": len(data),
+                "active_count": sum(1 for p in data if p["active"]),
                 "results": data,
             }
         )
