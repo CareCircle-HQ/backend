@@ -2811,6 +2811,30 @@ class MemberCasesView(PortalAPIView):
         return Response(s.PortalCaseOptionSerializer(cases, many=True).data)
 
 
+class MemberCaseDetailView(PortalAPIView):
+    """Remove a single case from a member's profile. Guardrail: only NON-Met-
+    Council cases may be deleted -- these are external orgs' work that shouldn't
+    live in the member base. Met Council cases (created OR managed by Met
+    Council) are the program's own records and are refused (400) so the source
+    of truth stays intact."""
+
+    def delete(self, request, client_id, case_id):
+        get_object_or_404(Client, pk=client_id)
+        case = get_object_or_404(Case, pk=case_id, client_id=client_id)
+        from api.services.lifecycle import is_met_council_case
+
+        if is_met_council_case(
+            originating_provider_id=case.originating_provider_id,
+            provider_id=case.provider_id,
+            provider_name=case.provider_name,
+        ):
+            return Response(
+                {"detail": "Met Council cases cannot be removed."}, status=400
+            )
+        case.delete()
+        return Response(status=204)
+
+
 class MemberCaseHistoryView(PortalGenericAPIView):
     """The client timeline scoped to a single case -- the 'Case history' shown on
     the profile's Cases tab. Same event rows as the client history (with the same
