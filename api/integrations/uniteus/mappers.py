@@ -108,6 +108,13 @@ def map_person_to_client(person_body, *, consent=None, languages=None):
     if addresses:
         out["addresses"] = addresses
 
+    # Source timestamps: use the Unite Us person's own created/updated dates so
+    # the member's "Created" date matches Unite Us (Client.created_at is a plain
+    # nullable field, NOT auto_now_add). Mirrors the CSV import's
+    # ``client_created_at`` -> ``created_at`` mapping.
+    set_("created_at", _dt(a.get("created_at")))
+    set_("updated_at", _dt(a.get("updated_at")))
+
     if consent:
         out.update(consent)
     if languages:
@@ -242,7 +249,11 @@ def map_case(case_body_data, *, names=None, auth=None):
     else:
         out["case_status"] = state if state in CaseStatus.values else CaseStatus.OPEN
     set_("case_description", a.get("description"))
-    set_("date_opened", _dt(a.get("opened_date")))
+    # Prefer the agent-entered opened date; fall back to the Unite Us case
+    # created timestamp so date_opened is never blank when the API omits
+    # opened_date (mirrors the CSV import's user_entered_opened_date ->
+    # case_created_at fallback).
+    set_("date_opened", _dt(a.get("opened_date")) or _dt(a.get("created_at")))
     set_("case_closed_at", closed_at)
     set_("updated_at", _dt(a.get("updated_at")))
 
