@@ -1968,6 +1968,94 @@ class NoNavigationMembersListView(UnlinkedMembersListView):
         return qs.order_by(Lower("first_name"), Lower("last_name")).distinct()
 
 
+class NeedAttestationMembersListView(UnlinkedMembersListView):
+    """Urgent Care -> Need Attestation tab.
+
+    Members the ext flagged as needing a provider (doctor) attestation:
+    ``Client.attestation_needed=True``. On the ext this is set when an
+    eligibility Assessment's ``"<Population> - Verification Method"`` answer is
+    ``"Provider Attestation"`` (replayed onto our data by the
+    ``backfill_attestation_needed`` command). Reuses the row serialization +
+    eligibility/navigation column helpers from :class:`UnlinkedMembersListView`;
+    only the population differs.
+    """
+
+    # The eligibility-assessment answer that means "provider/doctor attestation
+    # required" (mirrors backfill_attestation_needed).
+    _PROVIDER_ATTESTATION = "provider attestation"
+    _VERIFICATION_METHOD_SUFFIX = "verification method"
+
+    def get_queryset(self):
+        params = self.request.query_params
+
+        qs = Client.objects.filter(attestation_needed=True).prefetch_related(
+            "insurances", "cases", "assessments"
+        )
+
+        search = (params.get("search") or "").strip()
+        if search:
+            cond = (
+                Q(first_name__icontains=search)
+                | Q(last_name__icontains=search)
+                | Q(insurances__external_member_id__icontains=search)
+            )
+            parts = search.split()
+            if len(parts) >= 2:
+                cond |= Q(first_name__icontains=parts[0]) & Q(
+                    last_name__icontains=parts[-1]
+                )
+            try:
+                cond |= Q(client_id=uuid.UUID(search))
+            except (ValueError, TypeError, AttributeError):
+                pass
+            qs = qs.filter(cond)
+
+        return qs.order_by(Lower("first_name"), Lower("last_name")).distinct()
+
+    @classmethod
+    def _attestation_qa(cls, client):
+        """The eligibility-assessment question + answer that flags this member as
+        needing provider attestation (a ``"… - Verification Method"`` answered
+        ``"Provider Attestation"``). None when not found on any assessment."""
+        for a in client.assessments.all():
+            for qa in a.questions_answers or []:
+                question = (qa.get("question") or "").strip()
+                answer = (qa.get("answer") or "").strip()
+                if question.lower().endswith(cls._VERIFICATION_METHOD_SUFFIX) and (
+                    answer.lower() == cls._PROVIDER_ATTESTATION
+                ):
+                    return {
+                        "question": question,
+                        "answer": answer,
+                        "form_name": a.form_name or "",
+                    }
+        return None
+
+    def get(self, request):
+        page = self.paginate_queryset(self.get_queryset())
+        rows = []
+        for c in page or []:
+            rows.append(
+                {
+                    "id": str(c.client_id),
+                    "name": s._full_name(c),
+                    "date_of_birth": c.date_of_birth.isoformat()
+                    if c.date_of_birth
+                    else None,
+                    "medicaid_id": s.medicaid_member_id(c) or "",
+                    "eligibility_case": self._case_cell(
+                        self._case_of_type(c, CaseType.ELIGIBILITY)
+                    ),
+                    "navigation_case": self._case_cell(
+                        self._case_of_type(c, CaseType.NAVIGATION)
+                    ),
+                    # The screening question + answer we keyed the flag on.
+                    "attestation": self._attestation_qa(c),
+                }
+            )
+        return self.get_paginated_response(rows)
+
+
 class MembersStatsView(PortalAPIView):
     def get(self, request):
         qs = Client.objects.all()
@@ -2050,6 +2138,27 @@ class MemberSocialCoverageView(PortalAPIView):
         client = get_object_or_404(Client, pk=client_id)
         plans = client.social_care_coverages.all()
         return Response(s.PortalSocialCoverageSerializer(plans, many=True).data)
+
+
+class MemberDoctorView(PortalAPIView):
+    """GET/PATCH /members/<client_id>/doctor/ — the member's Doctor/PCP
+    (attestation) information shown and edited on the profile's Attestation tab.
+
+    The doctor fields are collected by the ext when a member needs a provider
+    attestation (``attestation_needed=True``); this lets an agent view, enter or
+    correct them directly. PATCH accepts any subset of the doctor fields.
+    """
+
+    def get(self, request, client_id):
+        client = get_object_or_404(Client, pk=client_id)
+        return Response(s.PortalDoctorSerializer(client).data)
+
+    def patch(self, request, client_id):
+        client = get_object_or_404(Client, pk=client_id)
+        ser = s.PortalDoctorSerializer(client, data=request.data, partial=True)
+        ser.is_valid(raise_exception=True)
+        ser.save()
+        return Response(ser.data)
 
 
 class MemberPhonesView(PortalAPIView):

@@ -5,9 +5,10 @@ A single aggregate endpoint (management-only) reporting on the internal-service
 (to internal-service cases OPENED within that window): Total Open Cases, Total
 Members, Cancel Rate, Total Enrolled, Total Receiving Meals, and Total Pending
 Meals. The date window is either a named ``period`` preset or an explicit custom
-``start``/``end`` range (see :func:`resolve_window`). Meals vs Boxes and the
-Section-2 serving breakdown remain all-time live snapshots. ``All Time`` applies
-no date filter to any metric. See :class:`DashboardView` for exact definitions.
+``start``/``end`` range (see :func:`resolve_window`). Meals vs Boxes is also
+scoped to cases opened in the range; the Section-2 serving breakdown remains an
+all-time live snapshot. ``All Time`` applies no date filter to any metric. See
+:class:`DashboardView` for exact definitions.
 """
 
 from datetime import date, timedelta
@@ -407,9 +408,12 @@ class DashboardView(PortalAPIView):
       members tied to an internal-service case opened in the selected range.
     * active_delivery_members -- [ALL TIME] distinct members currently ACTIVE in
       a Service-Active enrollment (Accepted + Verified + being served).
-    * meals_boxes -- [ALL TIME] currently-open cases split by product kind
-      (Meals/Boxes) and, within each, Individual vs Household.
-    * serving -- [ALL TIME] Section-2 member serving-status breakdown.
+    * meals_boxes -- [TIME-FRAME] currently-open cases opened in the selected
+      range, split by product kind (Meals/Boxes) and, within each, Individual
+      vs Household.
+    * serving -- Section-2 member serving-status breakdown. The Not Being Served
+      + Needs Follow-up (watchlist) counts are [TIME-FRAME] (scoped to the range
+      via serving_client_ids); receiving_meals + pending_meals are [ALL TIME].
     """
 
     def get(self, request):
@@ -451,14 +455,14 @@ class DashboardView(PortalAPIView):
             "other": auth_counts["other"],
         }
 
-        # --- 1.5 Meals vs Boxes (ALL TIME) --------------------------------
-        # Product mix across EVERY currently-open internal-service case,
-        # regardless of the selected date range.
+        # --- 1.5 Meals vs Boxes (TIME-FRAME SENSITIVE) --------------------
+        # Product mix across currently-open internal-service cases OPENED in the
+        # selected date range (All Time => every open case).
         mb = {
             k: {"individual": 0, "household": 0}
             for k in ("meals", "boxes", "unknown")
         }
-        all_open_rows = ic.exclude(case_status__in=_TERMINAL_CASE_STATUSES).values(
+        all_open_rows = open_cases.values(
             "household_type",
             "program__product_type__type",
             "program_name",
@@ -571,7 +575,9 @@ class DashboardView(PortalAPIView):
         # count is derived from serving_client_ids(), the same source of truth the
         # drill-down list endpoint uses, so a count can never disagree with its
         # list. pending_meals stays inline (it has no drill-down list of its own).
-        # ALL TIME: Section-2 counts are live snapshots, ignoring the range.
+        # TIME-FRAME: the Not Being Served + Needs Follow-up counts are scoped to
+        # the selected range (members tied to an internal-service case opened in
+        # the window); All Time applies no date filter.
         mdp = MemberDietaryProfile.objects
         pending_meals = mdp.filter(
             enrollment__verified_at__isnull=False,
@@ -582,7 +588,7 @@ class DashboardView(PortalAPIView):
         pending_meals = pending_meals.values("client_id").distinct().count()
 
         def _count(reason):
-            return len(serving_client_ids(reason, start=None, end=None))
+            return len(serving_client_ids(reason, start=start, end=end))
 
         serving = {
             # 2.1 Accepted case + Verified + being served.
@@ -808,9 +814,10 @@ class DashboardServingListView(PortalAPIView):
         if reason not in _SERVING_REASONS:
             return Response({"detail": "Unknown reason."}, status=404)
 
-        # Section-2 serving metrics are all-time (they mirror the dashboard
-        # cards, which ignore the selected range), so the drill-down is too.
-        start, end = None, None
+        # Scope the drill-down to the SAME date range as the dashboard cards
+        # (Not Being Served / Needs Follow-up are range-scoped), so a count and
+        # its member list can never disagree. All Time => no date filter.
+        start, end = resolve_window(request)
         client_ids = serving_client_ids(reason, start=start, end=end) or set()
         details = _serving_details(reason, client_ids, start=start, end=end)
         # multiple_cases links to the member's own profile (it is about that

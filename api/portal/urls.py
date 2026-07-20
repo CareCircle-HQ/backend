@@ -64,6 +64,7 @@ from .views_members import (
     MemberServiceReactivateView,
     MemberServiceResumeView,
     MemberDismissAttentionView,
+    MemberDoctorView,
     MemberRequestVerificationView,
     MemberSocialCoverageView,
     MemberTicketsView,
@@ -71,6 +72,9 @@ from .views_members import (
     MemberVerificationDisregardView,
     MembersListView,
     MembersStatsView,
+    NeedAttestationMembersListView,
+    NoNavigationMembersListView,
+    UnlinkedMembersListView,
     MenuTypesListView,
 )
 from .views_places import (
@@ -162,12 +166,16 @@ urlpatterns = [
     # Members + sub-resources
     path("members/", MembersListView.as_view(), name="portal-members"),
     path("members/stats/", MembersStatsView.as_view(), name="portal-members-stats"),
+    path("members/unlinked/", UnlinkedMembersListView.as_view(), name="portal-members-unlinked"),
+    path("members/no-navigation/", NoNavigationMembersListView.as_view(), name="portal-members-no-navigation"),
+    path("members/need-attestation/", NeedAttestationMembersListView.as_view(), name="portal-members-need-attestation"),
     path("menu-types/", MenuTypesListView.as_view(), name="portal-menu-types"),
     path("food-allergies/", FoodAllergiesListView.as_view(), name="portal-food-allergies"),
     path("lead-sources/", LeadSourcesListView.as_view(), name="portal-lead-sources"),
     path("members/<uuid:client_id>/", MemberDetailView.as_view(), name="portal-member-detail"),
     path("members/<uuid:client_id>/insurance/", MemberInsuranceView.as_view()),
     path("members/<uuid:client_id>/social-coverage/", MemberSocialCoverageView.as_view()),
+    path("members/<uuid:client_id>/doctor/", MemberDoctorView.as_view(), name="portal-member-doctor"),
     path("members/<uuid:client_id>/phones/", MemberPhonesView.as_view()),
     path(
         "members/<uuid:client_id>/phones/<uuid:client_phone_id>/",

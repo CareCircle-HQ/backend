@@ -26,6 +26,7 @@ from ..models import (
     Cadence,
     Case,
     CaseType,
+    Client,
     CommunicationChannel,
     CommunicationTimeOfDay,
     DeliveryCompany,
@@ -728,6 +729,9 @@ class MemberDetailSerializer(serializers.Serializer):
                 # auto-assigns the Williamsburg kitchen + activates directly.
                 "is_williamsburg": bool(getattr(client, "is_williamsburg", False)),
                 "lead_source": client.lead_source or "",
+                # Flagged by the ext when the member needs a provider (doctor)
+                # attestation -- drives the profile's Attestation warning banner.
+                "attestation_needed": bool(getattr(client, "attestation_needed", False)),
             },
             "lifecycle": {
                 "stage": client.lifecycle_stage,
@@ -840,6 +844,27 @@ class MemberDetailSerializer(serializers.Serializer):
                     }
                 )
         return alerts
+
+
+class PortalDoctorSerializer(serializers.ModelSerializer):
+    """Doctor / PCP (attestation) information on the Client, shown and edited on
+    the member profile's Attestation tab. All fields optional so a PATCH can set
+    any subset."""
+
+    class Meta:
+        model = Client
+        fields = [
+            "attestation_needed",
+            "doctor_name",
+            "doctor_street",
+            "doctor_city",
+            "doctor_state",
+            "doctor_zip",
+            "doctor_phone",
+            "doctor_fax",
+            "doctor_email",
+        ]
+        extra_kwargs = {f: {"required": False} for f in fields if f != "attestation_needed"}
 
 
 # ---------------------------------------------------------------------------
