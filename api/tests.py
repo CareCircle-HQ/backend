@@ -4058,6 +4058,14 @@ class CsvImportRulesTest(TestCase):
         self.assertEqual(case.case_type, CaseType.INTERNAL_SERVICE)
         self.assertEqual(case.household_type, CaseHouseholdType.HOUSEHOLD)
 
+        # Both imported cases are Internal Service; the count is surfaced in the
+        # cases dataset stats (for the Settings import UI) without inflating the
+        # processed/created totals.
+        self.assertEqual(importer.internal_service_count, 2)
+        importer.finalize()
+        self.assertEqual(run.stats["cases"]["internal_service"], 2)
+        self.assertEqual(run.created_count, 2)
+
     def test_delete_non_metcouncil_cases_command(self):
         from django.core.management import call_command
         from .models import Case, CaseStatus, Client, Provider
