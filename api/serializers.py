@@ -1225,6 +1225,31 @@ class CaseSerializer(serializers.ModelSerializer):
         # re-querying. Import/daily-sync paths capture prev themselves.
         case._prev_status = _prev_status
         case._prev_auth = _prev_auth
+        # Extension attribution: stamp the AUTHENTICATED agent as the case
+        # creator the FIRST time a case is saved (``_prev is None``). Unite Us
+        # imports carry their own source ``created_by`` in the payload, so the
+        # "only when blank" guard preserves it; Django-admin / CRM writes have no
+        # ``agent_code`` and are skipped. This is what fills the Urgent Care
+        # "Created By" column for cases logged through the extension.
+        try:
+            request = self.context.get("request")
+            agent = getattr(request, "user", None) if request is not None else None
+            if (
+                _prev is None
+                and getattr(agent, "agent_code", None)
+                and not case.created_by_name
+            ):
+                stamped = []
+                if getattr(agent, "name", None):
+                    case.created_by_name = agent.name
+                    stamped.append("created_by_name")
+                if getattr(agent, "agent_id", None) and case.created_by_id is None:
+                    case.created_by_id = agent.agent_id
+                    stamped.append("created_by_id")
+                if stamped:
+                    case.save(update_fields=stamped)
+        except Exception:
+            logger.exception("agent created_by stamp failed for case %s", case_id)
         # Best-effort: build the master Service catalog (service_type linked to
         # its Program). Never let a catalog error break the case save.
         try:

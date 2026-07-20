@@ -3652,6 +3652,54 @@ class IsNewFlagTest(TestCase):
         client.refresh_from_db()
         self.assertFalse(client.is_new)
 
+    def test_extension_write_stamps_created_by(self):
+        # An extension write (AgentUser with name + agent_id) stamps the acting
+        # agent as the case creator, filling the Urgent Care "Created By" column.
+        import uuid as _uuid
+
+        client = self._client()
+        agent_id = _uuid.uuid4()
+        request = SimpleNamespace(
+            user=SimpleNamespace(agent_code="123", name="Ada Agent", agent_id=agent_id)
+        )
+        case = self._save_internal_case(client, context={"request": request})
+        case.refresh_from_db()
+        self.assertEqual(case.created_by_name, "Ada Agent")
+        self.assertEqual(case.created_by_id, agent_id)
+
+    def test_extension_write_preserves_existing_created_by(self):
+        # A payload that already carries created_by (e.g. a Unite Us import row)
+        # must NOT be overwritten by the ext stamp.
+        from .models import CaseType
+        from .serializers import CaseSerializer
+
+        client = self._client()
+        request = SimpleNamespace(
+            user=SimpleNamespace(agent_code="123", name="Ada Agent")
+        )
+        ser = CaseSerializer(
+            data={
+                "case_id": str(uuid.uuid4()),
+                "client_id": str(client.client_id),
+                "case_type": CaseType.INTERNAL_SERVICE,
+                "program_name": "Medically Tailored Meals",
+                "created_by_name": "Source Creator",
+            },
+            context={"request": request},
+        )
+        ser.is_valid(raise_exception=True)
+        case = ser.save()
+        case.refresh_from_db()
+        self.assertEqual(case.created_by_name, "Source Creator")
+
+    def test_admin_write_does_not_stamp_created_by(self):
+        # A Django-admin/session write (no agent_code) leaves created_by blank.
+        client = self._client()
+        request = SimpleNamespace(user=SimpleNamespace(username="staff"))
+        case = self._save_internal_case(client, context={"request": request})
+        case.refresh_from_db()
+        self.assertEqual(case.created_by_name, "")
+
 
 class RequestVerificationEndpointTest(TestCase):
     """POST /api/portal/members/<id>/request-verification/ creates the Pending
