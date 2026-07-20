@@ -1085,22 +1085,16 @@ class MembersListView(PortalGenericAPIView):
         "system": "System",
     }
 
-    def _stamp_added_via(self, groups):
-        """Annotate each member dict in ``groups`` with how the client was first
-        created: ``added_via`` (raw ChangeSource code) + ``added_via_label``.
-
-        Derived from the EARLIEST historical row (history_type='+') of the
+    def _added_via_map(self, ids):
+        """{client_id(str): (source_code, label)} for how each client was first
+        created, from the EARLIEST historical row (history_type='+') of the
         Client, whose ``change_source`` records whether the extension, the CSV /
         Unite Us import, admin, etc. created the record. Batched into ONE query
-        over the page's client ids to avoid an N+1. Blank source (e.g. records
+        over the given client ids to avoid an N+1. Blank source (e.g. records
         that predate change-source stamping) surfaces as 'Unknown'."""
-        ids = {
-            m["id"]
-            for g in groups
-            for m in g.get("members", [])
-        }
+        result = {}
         if not ids:
-            return
+            return result
         hist_model = Client.history.model
         src_by_id = {}
         for cid, src in (
@@ -1112,13 +1106,29 @@ class MembersListView(PortalGenericAPIView):
             # First create row wins (ordered oldest-first).
             if key not in src_by_id:
                 src_by_id[key] = src or ""
+        for key, src in src_by_id.items():
+            result[key] = (
+                src,
+                self._ADDED_VIA_LABELS.get(
+                    src, src.replace("_", " ").title() if src else "Unknown"
+                ),
+            )
+        return result
+
+    def _stamp_added_via(self, groups):
+        """Annotate each member dict in ``groups`` with how the client was first
+        created: ``added_via`` (raw ChangeSource code) + ``added_via_label``."""
+        ids = {
+            m["id"]
+            for g in groups
+            for m in g.get("members", [])
+        }
+        via = self._added_via_map(ids)
         for g in groups:
             for m in g.get("members", []):
-                src = src_by_id.get(m["id"], "")
+                src, label = via.get(m["id"], ("", "Unknown"))
                 m["added_via"] = src
-                m["added_via_label"] = self._ADDED_VIA_LABELS.get(
-                    src, src.replace("_", " ").title() if src else "Unknown"
-                )
+                m["added_via_label"] = label
 
     @staticmethod
     def _hidden_in_logistics(client):
@@ -1583,6 +1593,14 @@ class MembersListView(PortalGenericAPIView):
                 # Meals/Boxes kind (household-wide) for the row's service label.
                 row["service_type"] = self._service_type_for_client(c)
                 data.append(row)
+            # Stamp how each member was first created (Extension / Import / …),
+            # shown under the lead source in the Source column. Batched over the
+            # page's client ids to avoid an N+1.
+            via = self._added_via_map([r["id"] for r in data])
+            for row in data:
+                src, label = via.get(row["id"], ("", "Unknown"))
+                row["added_via"] = src
+                row["added_via_label"] = label
             return self.get_paginated_response(data)
         # Grouped mode (Verification / Logistics): build the ordered group keys
         # cheaply, paginate THEM, and serialize only the current page's groups
