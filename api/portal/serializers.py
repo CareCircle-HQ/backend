@@ -526,8 +526,20 @@ class MemberListSerializer(serializers.Serializer):
         return case.date_opened.isoformat() if (case and case.date_opened) else None
 
     def get_case_created_by(self, obj):
+        # Prefer the case's own creator; fall back for older cases whose
+        # created_by wasn't captured (e.g. pre-stamp extension saves): the case's
+        # Unite Us primary worker, then the ext-supplied agent_code, then the
+        # client's assigned case manager. Blank only when nothing is known.
         case = internal_service_case(obj)
-        return (case.created_by_name or "") if case else ""
+        if case is None:
+            return ""
+        return (
+            case.created_by_name
+            or case.primary_worker_name
+            or case.agent_code
+            or getattr(obj, "agent_name", "")
+            or ""
+        )
 
     def get_household_primary_id(self, obj):
         # client_id of the household's PRIMARY member, used by the Members list
