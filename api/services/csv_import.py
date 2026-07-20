@@ -684,6 +684,11 @@ class CsvImporter:
             "auth_changed_to": {},  # {new_status: count}
         }
         self.planned_actions = []
+        # Case imports only: how many of the imported (created/updated) cases are
+        # Internal Service (the ones that drive the member base). Tracked apart
+        # from ``stats`` so it never inflates the processed/total counts; surfaced
+        # in the cases dataset stats at ``finalize``.
+        self.internal_service_count = 0
 
     def _flush_progress(self):
         ImportRun.objects.filter(pk=self.run.pk).update(
@@ -1124,6 +1129,8 @@ class CsvImporter:
                 case = ser.save()
                 self._mark_touched(case.client_id)
                 self._count("updated" if existed else "created")
+                if case.case_type == CaseType.INTERNAL_SERVICE:
+                    self.internal_service_count += 1
                 if self.emit_side_effects:
                     self._post_save_case(case, prev_status, prev_auth)
             except Exception as exc:  # isolate one bad case from the run
@@ -1239,7 +1246,15 @@ class CsvImporter:
             sync_client_warnings(client)
 
     def finalize(self):
-        self.run.stats = {self.dataset: dict(self.stats)}
+        dataset_stats = dict(self.stats)
+        # Case imports also surface how many of the imported cases are Internal
+        # Service (the member-base drivers), alongside created/updated/skipped/
+        # errors. Kept out of ``stats`` proper so it never inflates
+        # processed_count (which sums self.stats). Gated on the dataset (not
+        # side effects) so bulk loads report it too.
+        if self.dataset == "cases":
+            dataset_stats["internal_service"] = self.internal_service_count
+        self.run.stats = {self.dataset: dataset_stats}
         # Case imports also record the follow-up actions detected (previewed or
         # applied) so the UI can show what tickets/changes the run produced.
         if self._track_actions:

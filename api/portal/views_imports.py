@@ -44,6 +44,12 @@ def _run_summary(run):
         "started_at": run.started_at,
         "finished_at": run.finished_at,
         "stats": run.stats,
+        # Case imports: how many of the imported cases are Internal Service (the
+        # member-base drivers). Read from the per-dataset stats; None for
+        # non-case runs (and older case runs predating this field).
+        "internal_service": (
+            (run.stats or {}).get("cases") or {}
+        ).get("internal_service"),
         # Case imports: aggregate of follow-up actions detected (preview) or
         # applied, plus a capped list of the individual tickets for review.
         "actions": (run.stats or {}).get("actions"),
