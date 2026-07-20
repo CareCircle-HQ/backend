@@ -1677,20 +1677,58 @@ class CsvCaseMappingTest(SimpleTestCase):
             )
 
 
+class UniteUsPersonMapperTest(SimpleTestCase):
+    """map_person_to_client carries the Unite Us person's own created/updated
+    timestamps onto the Client so the member's "Created" date matches Unite Us
+    (Client.created_at is nullable, not auto_now_add)."""
+
+    def _map(self, attrs):
+        from api.integrations.uniteus.mappers import map_person_to_client
+
+        return map_person_to_client({"data": {"id": "p1", "attributes": attrs}})
+
+    def test_created_and_updated_mapped_from_source(self):
+        out = self._map({
+            "first_name": "Ada", "last_name": "Lovelace",
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-02-02T00:00:00Z",
+        })
+        self.assertEqual(out["created_at"].date().isoformat(), "2026-01-01")
+        self.assertEqual(out["updated_at"].date().isoformat(), "2026-02-02")
+
+    def test_missing_timestamps_omitted(self):
+        out = self._map({"first_name": "Ada", "last_name": "Lovelace"})
+        self.assertNotIn("created_at", out)
+        self.assertNotIn("updated_at", out)
+
+
 class UniteUsCaseMapperTest(SimpleTestCase):
     """map_case must mirror the extension: a non-null closed_date means the case
     is CLOSED even though Unite Us leaves state='managed' on closed cases. The
     on-demand refresh previously left such cases reading MANAGED."""
 
-    def _map(self, *, state, closed_date=None, auth=None):
+    def _map(self, *, state, closed_date=None, auth=None, attrs=None):
         from api.integrations.uniteus.mappers import map_case
 
         rec = {
             "id": "case-1",
-            "attributes": {"state": state, "closed_date": closed_date},
+            "attributes": {"state": state, "closed_date": closed_date, **(attrs or {})},
             "relationships": {"person": {"data": {"id": "person-1"}}},
         }
         return map_case(rec, auth=auth)
+
+    def test_date_opened_prefers_opened_date(self):
+        out = self._map(
+            state="open",
+            attrs={"opened_date": "2026-01-05T00:00:00Z", "created_at": "2026-01-01T00:00:00Z"},
+        )
+        self.assertEqual(out["date_opened"].date().isoformat(), "2026-01-05")
+
+    def test_date_opened_falls_back_to_created_at(self):
+        # No opened_date -> use the Unite Us case created timestamp so date_opened
+        # is never blank (mirrors the CSV import fallback).
+        out = self._map(state="open", attrs={"created_at": "2026-01-01T00:00:00Z"})
+        self.assertEqual(out["date_opened"].date().isoformat(), "2026-01-01")
 
     def test_closed_date_marks_case_closed_despite_managed_state(self):
         out = self._map(state="managed", closed_date="2026-01-02T00:00:00Z")
