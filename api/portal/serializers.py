@@ -480,6 +480,11 @@ class MemberListSerializer(serializers.Serializer):
     has_valid_medicaid = serializers.SerializerMethodField()
     has_valid_social_care = serializers.SerializerMethodField()
     can_request_verification = serializers.SerializerMethodField()
+    # Urgent Care triage: when + by whom the governing internal-service case was
+    # created (date_opened + created_by_name), so agents can see who logged a
+    # case and when. Null when the client has no internal-service case.
+    case_created_at = serializers.SerializerMethodField()
+    case_created_by = serializers.SerializerMethodField()
     household_primary_id = serializers.SerializerMethodField()
     last_updated = serializers.DateTimeField(source="updated_at")
     created_at = serializers.DateTimeField()
@@ -515,6 +520,14 @@ class MemberListSerializer(serializers.Serializer):
             and has_valid_medicaid(obj)
             and has_valid_social_care(obj)
         )
+
+    def get_case_created_at(self, obj):
+        case = internal_service_case(obj)
+        return case.date_opened.isoformat() if (case and case.date_opened) else None
+
+    def get_case_created_by(self, obj):
+        case = internal_service_case(obj)
+        return (case.created_by_name or "") if case else ""
 
     def get_household_primary_id(self, obj):
         # client_id of the household's PRIMARY member, used by the Members list

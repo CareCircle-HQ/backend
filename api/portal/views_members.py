@@ -813,6 +813,22 @@ class MembersListView(PortalGenericAPIView):
                 Q(enrollments__isnull=False)
                 | Q(household_membership__household__enrollment_verifications__isnull=False)
             ).distinct()
+            # Optional case-created date-range filter (Urgent Care triage): keep
+            # only members whose governing internal-service case was OPENED within
+            # [case_from, case_to]. Matched against the internal-service case's
+            # date_opened so it lines up with the "Created" column shown on the
+            # page. Either bound may be omitted for an open-ended range.
+            case_from = _parse_date(params.get("case_from"))
+            case_to = _parse_date(params.get("case_to"))
+            if case_from or case_to:
+                date_q = Q()
+                if case_from:
+                    date_q &= Q(cases__date_opened__date__gte=case_from)
+                if case_to:
+                    date_q &= Q(cases__date_opened__date__lte=case_to)
+                qs = qs.filter(
+                    Q(cases__case_type=CaseType.INTERNAL_SERVICE) & date_q
+                ).distinct()
         else:
             scope_stages = SCOPE_TO_STAGES.get(scope)
             if scope_stages:
