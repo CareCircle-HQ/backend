@@ -1838,14 +1838,25 @@ class UnlinkedMembersListView(PortalGenericAPIView):
 
     @staticmethod
     def _description_match(client):
-        """If this member's Medicaid ID or member id (client UUID) appears in
-        ANOTHER member's case description, return that owning case's info so the
-        agent can open it. None when there's no reference."""
+        """If this member's member id (client UUID) or ANY of their Medicaid IDs
+        appears in ANOTHER member's case description, return that owning case's
+        info so the agent can open it. None when there's no reference.
+
+        A member can carry more than one Medicaid insurance row, so we probe
+        EVERY Medicaid id -- not just the single canonical one -- to stay in
+        step with the referenced-in filter (``_referenced_client_ids``), which
+        also scans all of them. Probing only the canonical id left members that
+        were referenced by a secondary Medicaid id showing an empty column."""
         cid = str(client.client_id)
-        medicaid = s.medicaid_member_id(client) or ""
+        medicaid_ids = [
+            mid
+            for i in client.insurances.all()
+            if i.plan_type == InsurancePlanType.MEDICAID
+            and (mid := (i.external_member_id or "").strip())
+        ]
         cond = Q(case_description__icontains=cid)
-        if medicaid:
-            cond |= Q(case_description__icontains=medicaid)
+        for mid in medicaid_ids:
+            cond |= Q(case_description__icontains=mid)
         match = (
             Case.objects.filter(cond)
             .exclude(client_id=client.client_id)
@@ -1856,8 +1867,12 @@ class UnlinkedMembersListView(PortalGenericAPIView):
         )
         if match is None:
             return None
-        desc = match.case_description or ""
-        matched_on = "medicaid" if (medicaid and medicaid in desc) else "member_id"
+        desc = (match.case_description or "").lower()
+        matched_on = (
+            "medicaid"
+            if any(mid.lower() in desc for mid in medicaid_ids)
+            else "member_id"
+        )
         return {
             "owner_id": str(match.client_id),
             "owner_name": s._full_name(match.client) if match.client else "",
