@@ -8,7 +8,7 @@ from datetime import datetime, timedelta
 
 from django.db import transaction
 from django.utils import timezone
-from django.db.models import Count, Exists, F, OuterRef, Prefetch, Q, Subquery
+from django.db.models import Count, Exists, F, OuterRef, Prefetch, Q
 from django.db.models.functions import Lower
 from django.shortcuts import get_object_or_404
 from rest_framework import status as http
@@ -1561,28 +1561,17 @@ class MembersListView(PortalGenericAPIView):
             # most-recently-created first. Rows with a null date sort last; name
             # (case-insensitive "First Last") breaks ties.
             #
-            # The Created column shows the member's INTERNAL-SERVICE case creation
-            # date (its ``date_opened``), so sort on that same date -- annotated
-            # here as the most-recent internal-service case's date_opened -- rather
-            # than the Client record's own ``created_at``. Keeps the column, its
-            # sort, and the created-date filter all on one date.
-            qs = self.get_queryset().annotate(
-                internal_case_created=Subquery(
-                    Case.objects.filter(
-                        client=OuterRef("pk"),
-                        case_type=CaseType.INTERNAL_SERVICE,
-                    )
-                    .order_by("-date_opened")
-                    .values("date_opened")[:1]
-                )
-            )
+            # The Created column shows the member's own Client ``created_at``, so
+            # sort on that. (The created-date FILTER is a separate control that
+            # searches the internal-service case date; the column + its sort stay
+            # on the member created date.)
             sort_field = {
-                "created": "internal_case_created", "updated": "updated_at",
-            }.get((request.query_params.get("sort") or "created").strip().lower(), "internal_case_created")
+                "created": "created_at", "updated": "updated_at",
+            }.get((request.query_params.get("sort") or "created").strip().lower(), "created_at")
             descending = (request.query_params.get("dir") or "desc").strip().lower() != "asc"
             col = F(sort_field)
             primary = col.desc(nulls_last=True) if descending else col.asc(nulls_last=True)
-            qs = qs.order_by(
+            qs = self.get_queryset().order_by(
                 primary,
                 Lower("first_name"),
                 Lower("last_name"),
