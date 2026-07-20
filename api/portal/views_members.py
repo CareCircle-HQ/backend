@@ -8,7 +8,7 @@ from datetime import datetime, timedelta
 
 from django.db import transaction
 from django.utils import timezone
-from django.db.models import Count, Exists, F, OuterRef, Prefetch, Q
+from django.db.models import Count, Exists, F, OuterRef, Prefetch, Q, Subquery
 from django.db.models.functions import Lower
 from django.shortcuts import get_object_or_404
 from rest_framework import status as http
@@ -1040,16 +1040,23 @@ class MembersListView(PortalGenericAPIView):
                     | Q(member_profiles__food_allergies__contains=[label])
                 )
 
-        # Created-date range filter (Members page): the member's own Client
-        # record ``created_at``. This is a direct column on Client (no join), so
-        # it needs no distinct of its own. Inclusive [from, to]; either bound may
-        # be omitted.
+        # Created-date range filter (Members page): filters on the date the
+        # member's INTERNAL-SERVICE case was created (its ``date_opened``) --
+        # NOT the Client record's own ``created_at``. Mirrors the Urgent Care
+        # triage filter above and the ``case_created_at`` column, so the range
+        # searches the internal-service case creation date. Both bounds are
+        # applied to the SAME internal-service case row (one .filter() over the
+        # multi-valued relation); the trailing .distinct() dedupes the join.
+        # Inclusive [from, to]; either bound may be omitted.
         created_from = _parse_date(params.get("created_from"))
         created_to = _parse_date(params.get("created_to"))
-        if created_from:
-            qs = qs.filter(created_at__date__gte=created_from)
-        if created_to:
-            qs = qs.filter(created_at__date__lte=created_to)
+        if created_from or created_to:
+            case_date_q = Q(cases__case_type=CaseType.INTERNAL_SERVICE)
+            if created_from:
+                case_date_q &= Q(cases__date_opened__date__gte=created_from)
+            if created_to:
+                case_date_q &= Q(cases__date_opened__date__lte=created_to)
+            qs = qs.filter(case_date_q)
 
         # Date-period filter (Verification page dropdown): narrow to households
         # whose enrollment record was OPENED within the selected window.
@@ -1553,13 +1560,29 @@ class MembersListView(PortalGenericAPIView):
             # the Created / Last Updated columns (``sort`` + ``dir``); default is
             # most-recently-created first. Rows with a null date sort last; name
             # (case-insensitive "First Last") breaks ties.
+            #
+            # The Created column shows the member's INTERNAL-SERVICE case creation
+            # date (its ``date_opened``), so sort on that same date -- annotated
+            # here as the most-recent internal-service case's date_opened -- rather
+            # than the Client record's own ``created_at``. Keeps the column, its
+            # sort, and the created-date filter all on one date.
+            qs = self.get_queryset().annotate(
+                internal_case_created=Subquery(
+                    Case.objects.filter(
+                        client=OuterRef("pk"),
+                        case_type=CaseType.INTERNAL_SERVICE,
+                    )
+                    .order_by("-date_opened")
+                    .values("date_opened")[:1]
+                )
+            )
             sort_field = {
-                "created": "created_at", "updated": "updated_at",
-            }.get((request.query_params.get("sort") or "created").strip().lower(), "created_at")
+                "created": "internal_case_created", "updated": "updated_at",
+            }.get((request.query_params.get("sort") or "created").strip().lower(), "internal_case_created")
             descending = (request.query_params.get("dir") or "desc").strip().lower() != "asc"
             col = F(sort_field)
             primary = col.desc(nulls_last=True) if descending else col.asc(nulls_last=True)
-            qs = self.get_queryset().order_by(
+            qs = qs.order_by(
                 primary,
                 Lower("first_name"),
                 Lower("last_name"),
