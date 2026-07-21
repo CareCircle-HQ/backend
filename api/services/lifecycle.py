@@ -48,11 +48,20 @@ MET_COUNCIL_PROVIDER_NAME = getattr(
 
 
 def is_met_council_case(*, originating_provider_id=None, provider_id=None,
-                        provider_name=None):
-    """Whether a case belongs to Met Council under the UNION rule: it was either
-    CREATED by Met Council (``originating_provider_id`` == the Met Council id) OR
-    is MANAGED/serviced by Met Council (``provider_id`` == the id, or
-    ``provider_name`` == "Met Council - SCN - PHS").
+                        provider_name=None, allow_originating=True):
+    """Whether a case belongs to Met Council. It is Met Council when it is
+    MANAGED/serviced by Met Council (``provider_id`` == the Met Council id, or
+    ``provider_name`` == "Met Council - SCN - PHS"), and -- when
+    ``allow_originating`` is True -- also when it was merely CREATED by Met
+    Council (``originating_provider_id`` == the Met Council id).
+
+    ``allow_originating`` gates the UNION rule. It is True only for
+    INTERNAL-SERVICE (meal/box) cases: Met Council originating a meal case keeps
+    it in scope even if the managing-provider column is blank on the export. For
+    every other case type (Eligibility / Navigation / External) it must be
+    False, so a case Met Council merely REFERRED OUT to another org (ECM
+    eligibility assessments, etc.) is dropped -- Met Council has to actually
+    manage it to be in scope.
 
     This is the single gate for keeping external-org cases out of the member
     base -- used by every ingestion path (CSV import, nightly Unite Us pull,
@@ -60,18 +69,47 @@ def is_met_council_case(*, originating_provider_id=None, provider_id=None,
     Council signal at all is NOT Met Council (so a blank/other-org case is
     dropped). Note the different sources carry different signals -- the CSV
     export has the originating + provider columns, while the live Unite Us API
-    only exposes the managing ``provider`` -- so the union keeps all three."""
+    only exposes the managing ``provider``."""
     met_id = str(MET_COUNCIL_PROVIDER_ID).strip().lower()
     met_name = MET_COUNCIL_PROVIDER_NAME.strip().casefold()
 
     def _id(v):
         return str(v).strip().lower() if v not in (None, "") else ""
 
-    if _id(originating_provider_id) == met_id:
+    if allow_originating and _id(originating_provider_id) == met_id:
         return True
     if _id(provider_id) == met_id:
         return True
     if (provider_name or "").strip().casefold() == met_name:
+        return True
+    return False
+
+
+def case_is_met_council(case):
+    """Whether a STORED ``Case`` belongs to Met Council, applying the full
+    per-case-type rule (the single source of truth for the Cases-tab badge, the
+    Remove action, and the cleanup command).
+
+    * INTERNAL-SERVICE (meal/box) cases are Met Council's own programs. They are
+      kept when Met Council manages/originated them OR when they carry NO named
+      managing org at all (many legitimate meal cases were imported with blank
+      provider columns). Only a meal case explicitly attributed to a DIFFERENT
+      named org (e.g. God's Love We Deliver) is NOT Met Council's.
+    * Every OTHER case type must be MANAGED by Met Council -- originating alone
+      (a referral out) does not count.
+    """
+    from api.models import CaseType
+
+    is_internal = case.case_type == CaseType.INTERNAL_SERVICE
+    if is_met_council_case(
+        originating_provider_id=case.originating_provider_id,
+        provider_id=case.provider_id,
+        provider_name=case.provider_name,
+        allow_originating=is_internal,
+    ):
+        return True
+    # An internal-service case with no named managing org is Met Council's.
+    if is_internal and not case.provider_id and not (case.provider_name or "").strip():
         return True
     return False
 

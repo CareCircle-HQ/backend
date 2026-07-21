@@ -54,6 +54,7 @@ from api.models import (
     VerifiedSocialNeed,
 )
 from api.serializers import (
+    INTERNAL_SERVICE_SUBTYPES,
     AssessmentSerializer,
     CaseSerializer,
     ClientSerializer,
@@ -1075,11 +1076,22 @@ class CsvImporter:
             if not cid:
                 self._count("skipped")
                 continue
-            # Reject any case with no Met Council involvement (strict union).
+            # STRICT Met Council org gate. Internal-service (meal/box) cases use
+            # the UNION rule (Met Council originated OR manages); every other
+            # case type (Eligibility / Navigation / External) must be MANAGED by
+            # Met Council -- a case Met Council merely referred out to another
+            # org (e.g. an ECM eligibility assessment) is out of scope. The
+            # internal-service test keys on the meal/box service subtype (same
+            # rule as derive_case_type), so no ProgramPipeline lookup is needed.
+            is_internal = (
+                (row.get("service_subtype") or "").strip().casefold()
+                in INTERNAL_SERVICE_SUBTYPES
+            )
             if not is_met_council_case(
                 originating_provider_id=row.get("originating_provider_id"),
                 provider_id=row.get("provider_id"),
                 provider_name=row.get("provider_name"),
+                allow_originating=is_internal,
             ):
                 self._count("skipped")
                 continue
