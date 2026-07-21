@@ -199,6 +199,30 @@ class ZipCodeCheckView(APIView):
         })
 
 
+class StateCheckView(APIView):
+    """Check whether a US state is one we accept clients/cases from.
+
+    GET /api/states/check/?state=NY -> {"state": "NY", "allowed": true}
+
+    ``allowed`` is True for a served state, an unknown/blank state (can't judge),
+    or when no states are configured at all (feature inert until an admin opts
+    in). This is a soft signal the extension surfaces as a warning; it never
+    blocks.
+    """
+
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        from .services.state_area import is_state_allowed, normalize_state
+
+        raw = (request.query_params.get("state") or "").strip()
+        code = normalize_state(raw)
+        return Response({
+            "state": code or raw.upper(),
+            "allowed": is_state_allowed(raw),
+        })
+
+
 class BulkUpsertMixin:
     """Adds a /bulk/ action accepting a list of records for batch upsert.
 

@@ -876,6 +876,280 @@ class LogisticsRosterFilterTest(TestCase):
         self.assertIn(str(dep.client_id), ids)
 
 
+class VerificationCaseOptionsTest(TestCase):
+    """The verification pop-up's Internal Service case dropdown
+    (MemberDetailSerializer -> service.cases) lists only cases that are a live
+    target for a verification: DENIED-authorization cases and CLOSED/CANCELLED
+    cases are excluded."""
+
+    def _client(self):
+        return Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Case", last_name="Options",
+        )
+
+    def _internal_case(self, client, *, status=None, auth=None, program="Medically Tailored Meals"):
+        from .models import Case, CaseStatus, CaseType
+
+        return Case.objects.create(
+            case_id=uuid.uuid4(), client=client,
+            case_type=CaseType.INTERNAL_SERVICE,
+            case_status=status or CaseStatus.OPEN,
+            service_authorization_status=auth or "",
+            program_name=program,
+        )
+
+    def _case_ids(self, client):
+        from .portal.serializers import MemberDetailSerializer
+
+        data = MemberDetailSerializer(client).data
+        return {c["case_id"] for c in data["service"]["cases"]}
+
+    def test_open_case_is_listed(self):
+        client = self._client()
+        case = self._internal_case(client)
+        self.assertIn(str(case.case_id), self._case_ids(client))
+
+    def test_closed_case_excluded(self):
+        from .models import CaseStatus
+
+        client = self._client()
+        open_case = self._internal_case(client, program="Meals A")
+        closed_case = self._internal_case(
+            client, status=CaseStatus.CLOSED, program="Meals B"
+        )
+        ids = self._case_ids(client)
+        self.assertIn(str(open_case.case_id), ids)
+        self.assertNotIn(str(closed_case.case_id), ids)
+
+    def test_cancelled_case_excluded(self):
+        from .models import CaseStatus
+
+        client = self._client()
+        cancelled = self._internal_case(client, status=CaseStatus.CANCELLED)
+        self.assertNotIn(str(cancelled.case_id), self._case_ids(client))
+
+    def test_denied_case_excluded(self):
+        from .models import ServiceAuthorizationStatus
+
+        client = self._client()
+        denied = self._internal_case(
+            client, auth=ServiceAuthorizationStatus.DENIED
+        )
+        self.assertNotIn(str(denied.case_id), self._case_ids(client))
+
+
+class EnsurePrimaryOfOwnHouseholdTest(TestCase):
+    """A client who holds their own Internal Service case must be the PRIMARY of
+    their own household. `ensure_primary_of_own_household` splits a non-primary
+    dependent out into a fresh household (as primary) while leaving the rest of
+    the old household intact, and is a no-op for a client who is already primary
+    or has no household yet."""
+
+    def _client(self, first, last):
+        return Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name=first, last_name=last,
+        )
+
+    def test_non_primary_dependent_is_split_into_own_household(self):
+        from .models import Household, HouseholdMember
+        from .serializers import ensure_primary_of_own_household
+
+        primary = self._client("Pat", "Primary")
+        dep = self._client("Dee", "Dependent")
+        hh = Household.objects.create(name="Shared HH")
+        HouseholdMember.objects.create(household=hh, client=primary, is_primary=True)
+        HouseholdMember.objects.create(household=hh, client=dep, is_primary=False)
+
+        new_hh = ensure_primary_of_own_household(dep)
+
+        self.assertNotEqual(new_hh.household_id, hh.household_id)
+        dep_membership = HouseholdMember.objects.get(client=dep)
+        self.assertEqual(dep_membership.household_id, new_hh.household_id)
+        self.assertTrue(dep_membership.is_primary)
+        # The old household is untouched apart from losing the dependent.
+        self.assertTrue(
+            HouseholdMember.objects.filter(
+                household=hh, client=primary, is_primary=True
+            ).exists()
+        )
+        self.assertFalse(
+            HouseholdMember.objects.filter(household=hh, client=dep).exists()
+        )
+
+    def test_dependent_dietary_profile_detached_from_old_enrollment(self):
+        from .models import (
+            EnrollmentStage, EnrollmentVerification, Household, HouseholdMember,
+            MemberDietaryProfile, MemberStatus,
+        )
+        from .serializers import ensure_primary_of_own_household
+
+        primary = self._client("Pat", "Primary")
+        dep = self._client("Dee", "Dependent")
+        hh = Household.objects.create(name="Shared HH")
+        HouseholdMember.objects.create(household=hh, client=primary, is_primary=True)
+        HouseholdMember.objects.create(household=hh, client=dep, is_primary=False)
+        enr = EnrollmentVerification.objects.create(
+            client=primary, household=hh, stage=EnrollmentStage.SERVICE_ACTIVE,
+        )
+        MemberDietaryProfile.objects.create(
+            enrollment=enr, client=dep, status=MemberStatus.ACTIVE,
+        )
+
+        ensure_primary_of_own_household(dep)
+
+        self.assertFalse(
+            MemberDietaryProfile.objects.filter(
+                client=dep, enrollment=enr
+            ).exists()
+        )
+
+    def test_already_primary_is_noop(self):
+        from .models import Household, HouseholdMember
+        from .serializers import ensure_primary_of_own_household
+
+        c = self._client("Sol", "Solo")
+        hh = Household.objects.create(name="Own HH")
+        HouseholdMember.objects.create(household=hh, client=c, is_primary=True)
+
+        result = ensure_primary_of_own_household(c)
+
+        self.assertEqual(result.household_id, hh.household_id)
+        self.assertEqual(HouseholdMember.objects.filter(client=c).count(), 1)
+
+    def test_no_household_yet_creates_one_as_primary(self):
+        from .models import HouseholdMember
+        from .serializers import ensure_primary_of_own_household
+
+        c = self._client("New", "Client")
+
+        result = ensure_primary_of_own_household(c)
+
+        membership = HouseholdMember.objects.get(client=c)
+        self.assertEqual(membership.household_id, result.household_id)
+        self.assertTrue(membership.is_primary)
+
+    def test_empty_old_household_is_removed(self):
+        from .models import Household, HouseholdMember
+        from .serializers import ensure_primary_of_own_household
+
+        # A shared household whose ONLY row is the (non-primary) dependent -- e.g.
+        # the primary was already removed. Splitting the dependent out leaves the
+        # old household empty, so it's cleaned up.
+        dep = self._client("Lone", "Dependent")
+        hh = Household.objects.create(name="Orphan HH")
+        HouseholdMember.objects.create(household=hh, client=dep, is_primary=False)
+
+        ensure_primary_of_own_household(dep)
+
+        self.assertFalse(Household.objects.filter(household_id=hh.household_id).exists())
+
+
+class RemovalAndVerificationGuardsTest(TestCase):
+    """Two hard invariants shared by the removal + verification surfaces:
+
+    * The PRIMARY member can never be removed (the ext, the program tab and the
+      verification pop-up all route through ``HouseholdMemberEditView.delete``).
+    * A member who doesn't OWN an open Internal Service case can't be the subject
+      of a verification (``MemberVerificationCreateView`` / the pop-up wizard).
+    """
+
+    def _client(self, first, last):
+        return Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name=first, last_name=last,
+        )
+
+    def _internal_case(self, client, status=None):
+        from .models import Case, CaseStatus, CaseType
+
+        return Case.objects.create(
+            case_id=str(uuid.uuid4()), client=client,
+            case_type=CaseType.INTERNAL_SERVICE,
+            case_status=status or CaseStatus.OPEN,
+        )
+
+    def test_cannot_remove_primary_member(self):
+        from rest_framework.test import APIRequestFactory
+
+        from .models import (
+            EnrollmentStage, EnrollmentVerification, Household, HouseholdMember,
+            MemberDietaryProfile,
+        )
+        from .portal.views_members import HouseholdMemberEditView
+
+        primary = self._client("Pat", "Primary")
+        hh = Household.objects.create(name="HH")
+        HouseholdMember.objects.create(household=hh, client=primary, is_primary=True)
+        enr = EnrollmentVerification.objects.create(
+            client=primary, household=hh, stage=EnrollmentStage.SERVICE_ACTIVE,
+        )
+        mv = MemberDietaryProfile.objects.create(enrollment=enr, client=primary)
+
+        req = APIRequestFactory().delete("/")
+        resp = HouseholdMemberEditView().delete(req, primary.pk, mv.pk)
+
+        self.assertEqual(resp.status_code, 400)
+        # The primary's roster row + dietary profile survive the refused removal.
+        self.assertTrue(
+            HouseholdMember.objects.filter(client=primary, is_primary=True).exists()
+        )
+        self.assertTrue(MemberDietaryProfile.objects.filter(pk=mv.pk).exists())
+
+    def test_can_remove_non_primary_member(self):
+        from rest_framework.test import APIRequestFactory
+
+        from .models import (
+            EnrollmentStage, EnrollmentVerification, Household, HouseholdMember,
+            MemberDietaryProfile,
+        )
+        from .portal.views_members import HouseholdMemberEditView
+
+        primary = self._client("Pat", "Primary")
+        dep = self._client("Dee", "Dependent")
+        hh = Household.objects.create(name="HH")
+        HouseholdMember.objects.create(household=hh, client=primary, is_primary=True)
+        HouseholdMember.objects.create(household=hh, client=dep, is_primary=False)
+        enr = EnrollmentVerification.objects.create(
+            client=primary, household=hh, stage=EnrollmentStage.SERVICE_ACTIVE,
+        )
+        MemberDietaryProfile.objects.create(enrollment=enr, client=primary)
+        dep_mv = MemberDietaryProfile.objects.create(enrollment=enr, client=dep)
+
+        req = APIRequestFactory().delete("/")
+        resp = HouseholdMemberEditView().delete(req, primary.pk, dep_mv.pk)
+
+        self.assertIn(resp.status_code, (200, 204))
+        self.assertFalse(HouseholdMember.objects.filter(client=dep).exists())
+
+    def test_cannot_verify_member_without_internal_service_case(self):
+        from rest_framework.test import APIRequestFactory
+
+        from .models import EnrollmentVerification
+        from .portal.views_members import MemberVerificationCreateView
+
+        client = self._client("No", "Case")
+
+        req = APIRequestFactory().post("/", {}, format="json")
+        resp = MemberVerificationCreateView().post(req, client.pk)
+
+        self.assertEqual(resp.status_code, 400)
+        self.assertFalse(EnrollmentVerification.objects.filter(client=client).exists())
+
+    def test_cannot_verify_member_whose_only_case_is_closed(self):
+        from rest_framework.test import APIRequestFactory
+
+        from .models import CaseStatus, EnrollmentVerification
+        from .portal.views_members import MemberVerificationCreateView
+
+        client = self._client("Closed", "Case")
+        self._internal_case(client, status=CaseStatus.CLOSED)
+
+        req = APIRequestFactory().post("/", {}, format="json")
+        resp = MemberVerificationCreateView().post(req, client.pk)
+
+        self.assertEqual(resp.status_code, 400)
+        self.assertFalse(EnrollmentVerification.objects.filter(client=client).exists())
+
+
 class DeliveryCoverageEligibilityTest(TestCase):
     """Delivery Coverage Eligibility Check: a member whose delivery-address ZIP
     is in the excluded list is Out of Orbit (reason "Delivery Address Outside

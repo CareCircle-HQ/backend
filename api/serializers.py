@@ -545,6 +545,37 @@ def ensure_household_with_primary(client):
 
 
 @transaction.atomic
+def ensure_primary_of_own_household(client):
+    """Ensure ``client`` is the PRIMARY of their own household.
+
+    A client who holds their own Internal Service (meal/box) case goes through
+    verification + delivery as a household head, so they must be the primary of
+    their household. If they're currently a NON-primary member of a (shared)
+    household -- e.g. an agent added them as a relative's dependent before their
+    own case existed -- split them out into a fresh household as primary,
+    detaching their dietary profile(s) from the old household's enrollments
+    (mirroring :func:`add_client_to_household`'s move semantics). Idempotent: a
+    client who is already primary (or has no household yet) is handled by
+    :func:`ensure_household_with_primary`.
+    """
+    membership = (
+        HouseholdMember.objects.filter(client=client)
+        .select_related("household")
+        .first()
+    )
+    if membership is None or membership.is_primary:
+        return ensure_household_with_primary(client)
+    old_household = membership.household
+    MemberDietaryProfile.objects.filter(
+        client=client, enrollment__household=old_household
+    ).delete()
+    membership.delete()
+    if not old_household.members.exists():
+        old_household.delete()
+    return ensure_household_with_primary(client)
+
+
+@transaction.atomic
 def sync_household_members(client, enrollment=None, agent=None):
     """Reconcile a household's two member sources so every member -- however
     added -- lands in the SAME place.
@@ -1288,14 +1319,17 @@ class CaseSerializer(serializers.ModelSerializer):
         except Exception:
             logger.exception("catalog.assign_product_type_for_internal_service failed")
         # Internal Service cases are the ones that go through verification and
-        # meal/box delivery, so ensure the client has a household (with this
-        # client as primary) here — on case save — rather than on profile save.
-        # Get-or-create, so re-saving the case never duplicates the household.
+        # meal/box delivery, so ensure the client is the PRIMARY of their own
+        # household here — on case save — rather than on profile save. A client
+        # who was added as a relative's dependent BEFORE their own case existed
+        # is split out into their own household as primary (they can't remain a
+        # non-primary member while holding their own case). Idempotent, so
+        # re-saving the case never duplicates or re-splits the household.
         try:
             if case.case_type == CaseType.INTERNAL_SERVICE:
-                ensure_household_with_primary(client)
+                ensure_primary_of_own_household(client)
         except Exception:
-            logger.exception("ensure_household_with_primary failed for internal service case")
+            logger.exception("ensure_primary_of_own_household failed for internal service case")
         # "New client needs verification attention": creating a client's FIRST
         # internal-service case flags them is_new=True so they surface on the
         # Urgent Care ("Need Attention") list and the ext shows the right

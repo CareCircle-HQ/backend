@@ -3142,6 +3142,19 @@ class HouseholdMemberEditView(PortalAPIView):
             household = membership.household if membership else None
 
         member_client = mv.client
+        # Never remove a primary member -- enforced here for EVERY removal
+        # surface routed through this endpoint (the program tab, the Household
+        # tab and the verification pop-up). A primary owns their household's
+        # timeline + enrollment, so they can't be dropped. Checked directly
+        # against the HouseholdMember roster so it holds regardless of which
+        # household context the enrollment resolves to.
+        if member_client is not None and HouseholdMember.objects.filter(
+            client=member_client, is_primary=True
+        ).exists():
+            return Response(
+                {"error": "The primary member cannot be removed."},
+                status=http.HTTP_400_BAD_REQUEST,
+            )
         member_name = mv.member_name or (
             f"{member_client.first_name} {member_client.last_name}".strip()
             if member_client else ""
@@ -3173,7 +3186,9 @@ class HouseholdMemberEditView(PortalAPIView):
                 .first()
             )
 
-        # The household's primary member owns the timeline and can't be removed.
+        # The household's primary owns the timeline; the removed-member event is
+        # logged on their history (the primary can't themselves be removed -- that
+        # is guarded above, against the roster, before any of this runs).
         primary_membership = (
             household.members.filter(is_primary=True).select_related("client").first()
             if household is not None else None
@@ -3181,15 +3196,6 @@ class HouseholdMemberEditView(PortalAPIView):
         primary_client = (
             primary_membership.client if primary_membership is not None else client
         )
-        if (
-            member_client is not None
-            and primary_membership is not None
-            and member_client.pk == primary_membership.client_id
-        ):
-            return Response(
-                {"error": "The primary member cannot be removed."},
-                status=http.HTTP_400_BAD_REQUEST,
-            )
 
         agent = current_agent(request)
         actor = _agent_actor(agent)
@@ -3595,6 +3601,17 @@ class MemberVerificationCreateView(PortalAPIView):
         )
 
         client = get_object_or_404(Client, pk=client_id)
+        # Only a member who OWNS an (open) Internal Service case can be verified --
+        # the verification + meal/box delivery attach to that case. A member who
+        # doesn't hold their own internal-service case (e.g. a dependent) can't be
+        # the SUBJECT of a verification, even if the pop-up is somehow opened on
+        # them. Mirrors the same gate on MemberRequestVerificationView.
+        if not has_open_internal_service_case(client):
+            return Response(
+                {"error": "This member doesn't own an open Internal Service case, "
+                          "so they can't be verified."},
+                status=http.HTTP_400_BAD_REQUEST,
+            )
         ser = s.VerificationCreateSerializer(data=request.data)
         ser.is_valid(raise_exception=True)
         data = ser.validated_data

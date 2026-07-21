@@ -5,6 +5,7 @@ from .models import (
     Address,
     Agent,
     AgentLoginCode,
+    AllowedState,
     AllowedZipCode,
     Assessment,
     ExcludedZipCode,
@@ -454,6 +455,13 @@ class AllowedZipCodeAdmin(admin.ModelAdmin):
     list_filter = ("is_active", "platform", "scn")
     search_fields = ("zip_code", "borough")
     ordering = ("zip_code",)
+
+
+@admin.register(AllowedState)
+class AllowedStateAdmin(admin.ModelAdmin):
+    list_display = ("code", "name", "created_at")
+    search_fields = ("code", "name")
+    ordering = ("code",)
 
 
 @admin.register(ExcludedZipCode)

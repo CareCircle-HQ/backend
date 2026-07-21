@@ -807,6 +807,8 @@ class MemberDetailSerializer(serializers.Serializer):
                 # DENIED-authorization cases are excluded: a denied meal/box case
                 # can't be verified against, so it must not be an option in the
                 # pop-up's case dropdown (any other status is still selectable).
+                # CLOSED/CANCELLED cases are likewise excluded -- a finished case
+                # is no longer a live target for a verification.
                 "cases": [
                     {
                         "case_id": str(c.case_id),
@@ -817,6 +819,7 @@ class MemberDetailSerializer(serializers.Serializer):
                     }
                     for c in internal_service_cases(client)
                     if c.service_authorization_status != ServiceAuthorizationStatus.DENIED
+                    and c.case_status not in (CaseStatus.CLOSED, CaseStatus.CANCELLED)
                 ],
             },
             "demographics": {

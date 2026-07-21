@@ -2628,6 +2628,31 @@ class AllowedZipCode(models.Model):
         return f"{self.zip_code} ({self.borough})" if self.borough else self.zip_code
 
 
+class AllowedState(models.Model):
+    """A US state we accept clients/cases from (allow-list).
+
+    Editable from Settings (enable/disable) so the served states can change
+    without a code change. A row's PRESENCE means the state is enabled; there is
+    no row for a disabled state. By default only New York (NY) is enabled.
+
+    Used to warn agents when a client's PRIMARY-address state is not one we take
+    clients from: surfaced on the Verification modal (portal) and as a banner in
+    the extension. Matching is on the 2-letter USPS code (case-insensitive).
+    """
+
+    code = models.CharField(max_length=2, unique=True, db_index=True)  # USPS, e.g. "NY"
+    name = models.CharField(max_length=64)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["code"]
+        verbose_name = "Allowed state"
+        verbose_name_plural = "Allowed states"
+
+    def __str__(self):
+        return self.code
+
+
 # ===========================================================================
 # UNITE US INTEGRATION / DAILY PULL
 # ===========================================================================
