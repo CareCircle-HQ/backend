@@ -76,6 +76,7 @@ from .views_members import (
     NoNavigationMembersListView,
     UnlinkedMembersListView,
     MenuTypesListView,
+    TeamsListView,
 )
 from .views_places import (
     PortalPlacesAutocompleteView,
@@ -172,6 +173,7 @@ urlpatterns = [
     path("menu-types/", MenuTypesListView.as_view(), name="portal-menu-types"),
     path("food-allergies/", FoodAllergiesListView.as_view(), name="portal-food-allergies"),
     path("lead-sources/", LeadSourcesListView.as_view(), name="portal-lead-sources"),
+    path("teams/", TeamsListView.as_view(), name="portal-teams"),
     path("members/<uuid:client_id>/", MemberDetailView.as_view(), name="portal-member-detail"),
     path("members/<uuid:client_id>/insurance/", MemberInsuranceView.as_view()),
     path("members/<uuid:client_id>/social-coverage/", MemberSocialCoverageView.as_view()),

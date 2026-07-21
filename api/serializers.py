@@ -1200,24 +1200,12 @@ class CaseSerializer(serializers.ModelSerializer):
         _prev_status = _prev["case_status"] if _prev else None
         _prev_auth = _prev["service_authorization_status"] if _prev else None
 
-        # Business rule (enforced on EVERY case write -- extension, CSV import,
-        # daily Unite Us pull, admin/direct API -- since they all funnel through
-        # here): the service authorization DRIVES the case status. A Denied /
-        # Rejected authorization ends the case, so it becomes Closed regardless
-        # of its current status (Open, Managed, ...). Other auth states
-        # (Requested/Pending, Approved, ...) never force a status change here.
-        # Compute the EFFECTIVE status/auth from the incoming payload, falling
-        # back to the stored values (a partial update may omit one field), so the
-        # rule holds no matter which field the write changed; downstream
-        # (record_case_change / tickets / delivery truncation) then sees a normal
-        # transition to Closed. An explicitly Cancelled case stays Cancelled.
-        eff_status = validated_data.get("case_status", _prev_status)
-        eff_auth = validated_data.get("service_authorization_status", _prev_auth)
-        if (
-            eff_auth == ServiceAuthorizationStatus.DENIED
-            and eff_status != CaseStatus.CANCELLED
-        ):
-            validated_data["case_status"] = CaseStatus.CLOSED
+        # Case status is Open/Closed ONLY, driven by the closed date (mirrors the
+        # extension + the CSV/API mappers). Authorization status is an INDEPENDENT
+        # dimension and no longer forces the case status -- a denied authorization
+        # leaves the case Open and instead pauses the household via the
+        # internal-service reconcile below. (The old "denied -> Closed" coupling
+        # was removed so authorization never drives case status.)
 
         case, _ = Case.objects.update_or_create(case_id=case_id, defaults=validated_data)
         # Stash the pre-save values on the instance so the write path (e.g.
@@ -1307,44 +1295,25 @@ class CaseSerializer(serializers.ModelSerializer):
                 evaluate_is_new_flag(client)
         except Exception:
             logger.exception("is_new flag set failed for internal service case %s", case_id)
-        # Internal-service authorization full-stop rule: a client with a SINGLE
-        # internal-service (meal/box) case that is denied is auto-paused (On Hold)
-        # so service stops and they drop off kitchen assignment; a later favorable
-        # authorization resumes them. Two-plus internal-service cases are never a
-        # full stop. Raise a HIGH follow-up ticket the first time the sole case
-        # flips to denied. Best-effort: never let this break the case save.
+        # Internal-service case-driven lifecycle reconcile (the single
+        # chokepoint for ALL save paths -- extension, CSV import, bulk CLI):
+        #   * favorable governing authorization -> advance a verified household to
+        #     Kitchen Assignment / resume an auto-paused hold;
+        #   * denied governing authorization -> pause the household (On Hold);
+        #   * the last open internal-service case closing -> pause + truncate
+        #     deliveries + note the primary, then cancel + a second note.
+        # Opens NO tickets: visibility comes from StageEvents, the member
+        # timeline, the primary notes, and the Import Activity page. Attributed to
+        # the acting agent when present. Best-effort: never break the case save.
         try:
             if case.case_type == CaseType.INTERNAL_SERVICE:
-                from .models import (
-                    TicketSeverity,
-                    TicketTypeCode,
-                )
-                from .services import tickets
                 from .services.lifecycle import (
                     reconcile_internal_service_authorization,
                 )
 
-                outcome = reconcile_internal_service_authorization(client)
-                newly_denied = (
-                    outcome["sole_denied"]
-                    and _prev_auth != ServiceAuthorizationStatus.DENIED
-                    and case.service_authorization_status
-                    == ServiceAuthorizationStatus.DENIED
-                )
-                if newly_denied:
-                    tickets.open_ticket(
-                        TicketTypeCode.SYSTEM_CHANGE_DETECTED,
-                        reason=(
-                            f"The member's only internal-service (meal/box) case "
-                            f"{case.case_id} was denied. Service has been paused "
-                            f"(placed On Hold) and the member removed from kitchen "
-                            f"assignment. Confirm the denial and follow up with the "
-                            f"member; if it is overturned, resume service."
-                        ),
-                        severity=TicketSeverity.HIGH,
-                        client=client,
-                        case=case,
-                    )
+                request = self.context.get("request")
+                agent = getattr(request, "user", None) if request is not None else None
+                reconcile_internal_service_authorization(client, actor=agent)
         except Exception:
             logger.exception(
                 "internal-service authorization reconcile failed for case %s", case_id

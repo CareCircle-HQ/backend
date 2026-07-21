@@ -572,13 +572,15 @@ class SoleInternalServiceDenialTest(TestCase):
         enr.refresh_from_db()
         self.assertEqual(enr.stage, EnrollmentStage.KITCHEN_ASSIGNMENT)
 
-        # Deny the sole internal-service case -> full stop (On Hold) + ticket.
+        # Deny the sole internal-service case -> full stop (On Hold). The case
+        # stays OPEN (authorization no longer drives case status) and NO ticket
+        # is opened -- the pause is surfaced via the timeline + reconcile only.
         self._save_case(client, case_id, "denied")
         enr.refresh_from_db()
         self.assertEqual(enr.stage, EnrollmentStage.ON_HOLD)
         self.assertEqual(verification_status(client), "On Hold")
         self.assertEqual(
-            Ticket.objects.filter(client=client, case_id=case_id).count(), 1
+            Ticket.objects.filter(client=client, case_id=case_id).count(), 0
         )
 
     def test_two_internal_cases_denied_does_not_pause(self):
@@ -605,6 +607,93 @@ class SoleInternalServiceDenialTest(TestCase):
         self._save_case(client, case_id, "approved")
         enr.refresh_from_db()
         self.assertEqual(enr.stage, EnrollmentStage.KITCHEN_ASSIGNMENT)
+
+
+class InternalServiceClosureFullStopTest(TestCase):
+    """When a client's LAST open internal-service (meal/box) case CLOSES it is a
+    full stop: future deliveries truncated, the household paused (On Hold) then
+    CANCELLED, with system notes on the primary and NO tickets. Idempotent on
+    re-import."""
+
+    def _client(self):
+        return Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Clo", last_name="Sure"
+        )
+
+    def _enrollment(self, client, stage):
+        from .models import EnrollmentVerification, Household, HouseholdMember
+
+        household = Household.objects.create(name="HH")
+        HouseholdMember.objects.create(
+            household=household, client=client, is_primary=True
+        )
+        return EnrollmentVerification.objects.create(
+            client=client, household=household, stage=stage,
+            verified_at=timezone.now(),
+        )
+
+    def _save_case(self, client, case_id, *, auth="approved",
+                   case_status="open", closed_at=None):
+        from .serializers import CaseSerializer
+
+        data = {
+            "case_id": case_id,
+            "client_id": str(client.client_id),
+            "case_type": "internal_service",
+            "program_name": "Medically Tailored Meals",
+            "service_authorization_status": auth,
+            "case_status": case_status,
+            "date_opened": timezone.now().isoformat(),
+        }
+        if closed_at is not None:
+            data["case_closed_at"] = closed_at.isoformat()
+        ser = CaseSerializer(data=data)
+        ser.is_valid(raise_exception=True)
+        return ser.save()
+
+    def test_last_open_case_closing_cancels_household(self):
+        from .models import EnrollmentStage, Note, NoteSource, Ticket
+
+        client = self._client()
+        enr = self._enrollment(client, EnrollmentStage.KITCHEN_ASSIGNMENT)
+        case_id = str(uuid.uuid4())
+        # Open + approved -> served (Rule 2 keeps it on the queue).
+        self._save_case(client, case_id, auth="approved", case_status="open")
+        enr.refresh_from_db()
+        self.assertEqual(enr.stage, EnrollmentStage.KITCHEN_ASSIGNMENT)
+
+        # Close the sole open case -> full stop -> CANCELLED.
+        self._save_case(
+            client, case_id, auth="approved", case_status="closed",
+            closed_at=timezone.now(),
+        )
+        enr.refresh_from_db()
+        self.assertEqual(enr.stage, EnrollmentStage.CANCELLED)
+        # System notes on the primary (paused + cancelled); NO tickets.
+        self.assertGreaterEqual(
+            Note.objects.filter(client=client, source=NoteSource.SYSTEM).count(), 2
+        )
+        self.assertEqual(Ticket.objects.filter(client=client).count(), 0)
+
+    def test_close_out_is_idempotent(self):
+        from .models import EnrollmentStage, Note, NoteSource
+
+        client = self._client()
+        enr = self._enrollment(client, EnrollmentStage.KITCHEN_ASSIGNMENT)
+        case_id = str(uuid.uuid4())
+        self._save_case(
+            client, case_id, case_status="closed", closed_at=timezone.now()
+        )
+        enr.refresh_from_db()
+        self.assertEqual(enr.stage, EnrollmentStage.CANCELLED)
+        n1 = Note.objects.filter(client=client, source=NoteSource.SYSTEM).count()
+
+        # Re-import the same closed case -> nothing actionable -> no new notes.
+        self._save_case(
+            client, case_id, case_status="closed", closed_at=timezone.now()
+        )
+        n2 = Note.objects.filter(client=client, source=NoteSource.SYSTEM).count()
+        self.assertEqual(n1, n2)
 
 
 class LogisticsRosterFilterTest(TestCase):
@@ -1628,13 +1717,20 @@ class CsvCaseMappingTest(SimpleTestCase):
         base.update(row)
         return map_case_row(base)
 
-    def test_case_status_known_values_map_through(self):
-        self.assertEqual(self._map(case_status="managed")["case_status"], "managed")
-        self.assertEqual(self._map(case_status="off_platform")["case_status"], "off_platform")
-        self.assertEqual(self._map(case_status="closed")["case_status"], "closed")
-
-    def test_case_status_unknown_falls_back_to_open(self):
+    def test_case_status_is_open_or_closed_only(self):
+        # Case status is Open/Closed ONLY, driven by the closed date. Without a
+        # closed date EVERY raw state (managed/off_platform/cancelled/unknown)
+        # maps to Open; the authorization status is a separate dimension.
+        self.assertEqual(self._map(case_status="managed")["case_status"], "open")
+        self.assertEqual(self._map(case_status="off_platform")["case_status"], "open")
         self.assertEqual(self._map(case_status="somethingelse")["case_status"], "open")
+        # A closed date is the only thing that yields Closed.
+        self.assertEqual(
+            self._map(case_status="managed", case_closed_at="2026-01-02T00:00:00Z")[
+                "case_status"
+            ],
+            "closed",
+        )
 
     def test_closed_date_forces_closed_despite_managed_state(self):
         # Unite Us leaves the exported state "managed" even after closure; a
@@ -1647,12 +1743,14 @@ class CsvCaseMappingTest(SimpleTestCase):
         )
         self.assertEqual(out["case_status"], "closed")
 
-    def test_closed_date_does_not_override_explicit_cancelled(self):
+    def test_closed_date_yields_closed_regardless_of_raw_state(self):
+        # Even a raw "cancelled" state with a closed date is stored as Closed --
+        # case status is Open/Closed ONLY.
         out = self._map(case_status="cancelled", case_closed_at="2026-01-02T00:00:00Z")
-        self.assertEqual(out["case_status"], "cancelled")
+        self.assertEqual(out["case_status"], "closed")
 
-    def test_managed_without_closed_date_stays_managed(self):
-        self.assertEqual(self._map(case_status="managed")["case_status"], "managed")
+    def test_no_closed_date_stays_open(self):
+        self.assertEqual(self._map(case_status="managed")["case_status"], "open")
 
     def test_auth_aliases_map(self):
         self.assertEqual(
@@ -1693,8 +1791,10 @@ class UniteUsPersonMapperTest(SimpleTestCase):
             "created_at": "2026-01-01T00:00:00Z",
             "updated_at": "2026-02-02T00:00:00Z",
         })
-        self.assertEqual(out["created_at"].date().isoformat(), "2026-01-01")
-        self.assertEqual(out["updated_at"].date().isoformat(), "2026-02-02")
+        # The mapper passes ISO strings through (DRF's DateTimeField parses them
+        # on save), so assert the string form.
+        self.assertTrue(out["created_at"].startswith("2026-01-01"))
+        self.assertTrue(out["updated_at"].startswith("2026-02-02"))
 
     def test_missing_timestamps_omitted(self):
         out = self._map({"first_name": "Ada", "last_name": "Lovelace"})
@@ -1722,13 +1822,14 @@ class UniteUsCaseMapperTest(SimpleTestCase):
             state="open",
             attrs={"opened_date": "2026-01-05T00:00:00Z", "created_at": "2026-01-01T00:00:00Z"},
         )
-        self.assertEqual(out["date_opened"].date().isoformat(), "2026-01-05")
+        # map_case passes the ISO string through (DRF parses it on save).
+        self.assertTrue(out["date_opened"].startswith("2026-01-05"))
 
     def test_date_opened_falls_back_to_created_at(self):
         # No opened_date -> use the Unite Us case created timestamp so date_opened
         # is never blank (mirrors the CSV import fallback).
         out = self._map(state="open", attrs={"created_at": "2026-01-01T00:00:00Z"})
-        self.assertEqual(out["date_opened"].date().isoformat(), "2026-01-01")
+        self.assertTrue(out["date_opened"].startswith("2026-01-01"))
 
     def test_closed_date_marks_case_closed_despite_managed_state(self):
         out = self._map(state="managed", closed_date="2026-01-02T00:00:00Z")
@@ -1751,9 +1852,11 @@ class UniteUsCaseMapperTest(SimpleTestCase):
         out = self._map(state="managed", auth={"state": "rejected"})
         self.assertEqual(out["service_authorization_status"], "denied")
 
-    def test_managed_without_closed_date_stays_managed(self):
+    def test_managed_without_closed_date_is_open(self):
+        # Case status is Open/Closed ONLY: no closed date -> Open (regardless of
+        # the raw Unite Us state).
         out = self._map(state="managed")
-        self.assertEqual(out["case_status"], "managed")
+        self.assertEqual(out["case_status"], "open")
 
     def test_unknown_state_without_closed_date_falls_back_open(self):
         out = self._map(state="requested")
@@ -1761,9 +1864,10 @@ class UniteUsCaseMapperTest(SimpleTestCase):
 
 
 class AuthDrivesCaseStatusTest(TestCase):
-    """The service authorization drives the case status: a Denied (Rejected)
-    authorization closes the case regardless of its current status; other auth
-    states (Pending/Approved) never force a status change. Enforced in
+    """Authorization is INDEPENDENT of case status: no auth state (denied,
+    approved, pending, ...) ever changes the stored case_status. Case status is
+    Open/Closed only, driven by the closed date. A denial instead pauses the
+    household via the internal-service reconcile (covered elsewhere). Enforced in
     CaseSerializer._upsert, so it holds on EVERY write path (extension, CSV
     import, daily Unite Us pull, admin/direct API) since they all funnel there."""
 
@@ -1784,7 +1888,9 @@ class AuthDrivesCaseStatusTest(TestCase):
         ser.is_valid(raise_exception=True)
         return ser.save()
 
-    def test_managed_plus_denied_closes(self):
+    def test_denied_does_not_change_case_status(self):
+        # Authorization no longer drives case status: a denial leaves the case in
+        # whatever status it was written with (here Managed), NOT Closed.
         from .models import CaseStatus
 
         c = self._client()
@@ -1793,7 +1899,7 @@ class AuthDrivesCaseStatusTest(TestCase):
             service_type="Home Delivered Meals",
             case_status="managed", service_authorization_status="denied",
         )
-        self.assertEqual(case.case_status, CaseStatus.CLOSED)
+        self.assertEqual(case.case_status, CaseStatus.MANAGED)
 
     def test_managed_plus_approved_stays_managed(self):
         from .models import CaseStatus
@@ -1806,9 +1912,9 @@ class AuthDrivesCaseStatusTest(TestCase):
         )
         self.assertEqual(case.case_status, CaseStatus.MANAGED)
 
-    def test_open_plus_denied_closes(self):
-        # The authorization drives the status: denial closes the case from ANY
-        # current status, including Open.
+    def test_open_plus_denied_stays_open(self):
+        # A denial does NOT close an open case -- authorization is independent of
+        # case status.
         from .models import CaseStatus
 
         c = self._client()
@@ -1817,7 +1923,7 @@ class AuthDrivesCaseStatusTest(TestCase):
             service_type="Home Delivered Meals",
             case_status="open", service_authorization_status="denied",
         )
-        self.assertEqual(case.case_status, CaseStatus.CLOSED)
+        self.assertEqual(case.case_status, CaseStatus.OPEN)
 
     def test_open_plus_pending_stays_open(self):
         from .models import CaseStatus
@@ -1841,10 +1947,9 @@ class AuthDrivesCaseStatusTest(TestCase):
         )
         self.assertEqual(case.case_status, CaseStatus.OPEN)
 
-    def test_denial_on_existing_managed_case_closes_via_partial_write(self):
+    def test_denial_on_existing_managed_case_leaves_status_unchanged(self):
         # A later write that flips ONLY the authorization to Denied (status
-        # omitted) must still close the stored Managed case -- the rule falls back
-        # to the stored status.
+        # omitted) must NOT change the stored case status -- it stays Managed.
         from .models import CaseStatus
 
         c = self._client()
@@ -1855,7 +1960,7 @@ class AuthDrivesCaseStatusTest(TestCase):
             case_status="managed", service_authorization_status="approved",
         )
         case = self._save(c, case_id=cid, service_authorization_status="denied")
-        self.assertEqual(case.case_status, CaseStatus.CLOSED)
+        self.assertEqual(case.case_status, CaseStatus.MANAGED)
 
 
 class DailyPullClientSelectionTest(TestCase):

@@ -420,8 +420,11 @@ class CaseViewSet(BulkUpsertMixin, viewsets.ModelViewSet):
     _SKIP_TICKET_ACTIONS = frozenset()
 
     def _record_case_change(self, case):
-        """Emit case-change timeline events + open follow-up tickets for a case
-        written by the extension, attributed to the acting agent."""
+        """Emit case-change TIMELINE events for a case written by the extension,
+        attributed to the acting agent. Opens NO follow-up tickets: case
+        status/authorization changes (closed, denied, approved, ...) are surfaced
+        via the member timeline + the lifecycle reconcile (pause/cancel/resume),
+        not tickets."""
         from .services import case_events
 
         try:
@@ -431,7 +434,7 @@ class CaseViewSet(BulkUpsertMixin, viewsets.ModelViewSet):
                 previous_auth=getattr(case, "_prev_auth", None),
                 source=ChangeSource.EXTENSION,
                 actor=_agent_actor(self.request),
-                create_tickets=True,
+                create_tickets=False,
                 skip_actions=self._SKIP_TICKET_ACTIONS,
             )
         except Exception:  # noqa: BLE001 - tracking must never break the write

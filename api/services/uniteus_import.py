@@ -321,15 +321,16 @@ class DailyPull:
             return
         self._process_contracted_services(case)
         self._process_notes(subject_id=str(case.case_id), client=client, case=case)
-        # Record the case change (timeline events + follow-up tickets) via the
-        # shared handler. Contracted services are loaded just above, so the
-        # case_no_services rule is meaningful here -- no skip (unlike CSV imports).
+        # Record the case change (TIMELINE events only) via the shared handler.
+        # Opens NO follow-up tickets: case status/authorization changes are
+        # surfaced via the member timeline + the lifecycle reconcile
+        # (pause/cancel/resume) + the Import Activity page, not tickets.
         from api.services import case_events
 
         change = case_events.record_case_change(
             case, previous_status=prev_status, previous_auth=prev_auth,
             source=ChangeSource.IMPORT, actor="system:unite-us-import",
-            create_tickets=self.emit_side_effects,
+            create_tickets=False,
             emit_timeline=self.emit_side_effects, import_run=self.run,
         )
         self._record_case_changes(case, prev_status, prev_auth, change)

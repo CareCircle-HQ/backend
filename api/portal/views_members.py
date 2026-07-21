@@ -61,6 +61,7 @@ from ..models import (
     TimelineBadgeTone,
     TimelineEvent,
     TimelineEventType,
+    UniteUsAgent,
     WarningStatus,
 )
 from ..views_phones import _phone_dict
@@ -793,6 +794,25 @@ class LeadSourcesListView(PortalAPIView):
         return Response(options)
 
 
+class TeamsListView(PortalAPIView):
+    """Team options for the Members-page Team filter dropdown.
+
+    Distinct CareCircle originating teams across the Unite Us agents (the team
+    each case creator belongs to). ``value`` == ``label`` == the stored
+    ``UniteUsAgent.originating_team`` string the filter matches
+    (``team__iexact=value``)."""
+
+    def get(self, request):
+        teams = (
+            UniteUsAgent.objects.exclude(originating_team="")
+            .order_by()
+            .values_list("originating_team", flat=True)
+            .distinct()
+        )
+        options = sorted({(t or "").strip() for t in teams if (t or "").strip()})
+        return Response([{"value": t, "label": t} for t in options])
+
+
 class MembersListView(PortalGenericAPIView):
     serializer_class = s.MemberListSerializer
 
@@ -1076,6 +1096,22 @@ class MembersListView(PortalGenericAPIView):
                     | Q(member_profiles__food_allergies__contains=[label])
                 )
 
+        # Team filter (Members page): keep members whose INTERNAL-SERVICE case
+        # was CREATED by a Unite Us agent on the selected CareCircle originating
+        # team. Case.created_by_id == UniteUsAgent.user_id, so resolve the team's
+        # agent user_ids first, then match the case creator. Composes with the
+        # other filters; the trailing .distinct() dedupes the case join.
+        team_val = (params.get("team") or "").strip()
+        if team_val:
+            team_creator_ids = list(
+                UniteUsAgent.objects.filter(originating_team__iexact=team_val)
+                .values_list("user_id", flat=True)
+            )
+            qs = qs.filter(
+                cases__case_type=CaseType.INTERNAL_SERVICE,
+                cases__created_by_id__in=team_creator_ids,
+            )
+
         # Created-date range filter (Members page): filters on the date the
         # member's INTERNAL-SERVICE case was created (its ``date_opened``) --
         # NOT the Client record's own ``created_at``. Mirrors the Urgent Care
@@ -1151,6 +1187,33 @@ class MembersListView(PortalGenericAPIView):
             )
         return result
 
+    def _case_team_map(self, page):
+        """{client_id(str): originating_team} for the page -- the CareCircle team
+        of the Unite Us agent who CREATED each member's governing internal-service
+        case (Case.created_by_id == UniteUsAgent.user_id). Batched into ONE
+        UniteUsAgent query over the page's distinct creator ids to avoid an N+1.
+        Blank when the case has no known creator or the creator isn't a known
+        Unite Us agent."""
+        creator_by_client = {}
+        creator_ids = set()
+        for c in page:
+            case = s.internal_service_case(c)
+            if case is not None and case.created_by_id:
+                creator_by_client[str(c.client_id)] = str(case.created_by_id).lower()
+                creator_ids.add(case.created_by_id)
+        team_by_uid = {}
+        if creator_ids:
+            team_by_uid = {
+                str(uid).lower(): (team or "")
+                for uid, team in UniteUsAgent.objects.filter(
+                    user_id__in=creator_ids
+                ).values_list("user_id", "originating_team")
+            }
+        return {
+            cid: team_by_uid.get(uid, "")
+            for cid, uid in creator_by_client.items()
+        }
+
     def _stamp_added_via(self, groups):
         """Annotate each member dict in ``groups`` with how the client was first
         created: ``added_via`` (raw ChangeSource code) + ``added_via_label``."""
@@ -1165,6 +1228,25 @@ class MembersListView(PortalGenericAPIView):
                 src, label = via.get(m["id"], ("", "Unknown"))
                 m["added_via"] = src
                 m["added_via_label"] = label
+
+    def _stamp_case_teams(self, groups):
+        """Annotate each member dict in ``groups`` with ``case_created_by_team``
+        -- the CareCircle originating team of their internal-service case creator
+        (see :meth:`_case_team_map`). Batched: ONE query to reload the page's
+        clients (with cases) + ONE UniteUsAgent query, so the whole page costs
+        two queries rather than an N+1. Used by the Urgent Care list."""
+        ids = {
+            m["id"]
+            for g in groups
+            for m in g.get("members", [])
+        }
+        if not ids:
+            return
+        clients = Client.objects.filter(client_id__in=ids).prefetch_related("cases")
+        team_by_client = self._case_team_map(clients)
+        for g in groups:
+            for m in g.get("members", []):
+                m["case_created_by_team"] = team_by_client.get(m["id"], "")
 
     @staticmethod
     def _hidden_in_logistics(client):
@@ -1637,6 +1719,11 @@ class MembersListView(PortalGenericAPIView):
                 src, label = via.get(row["id"], ("", "Unknown"))
                 row["added_via"] = src
                 row["added_via_label"] = label
+            # Stamp the CareCircle team of each member's internal-service case
+            # creator, shown next to the creator name in the Created column.
+            teams = self._case_team_map(page)
+            for row in data:
+                row["case_created_by_team"] = teams.get(row["id"], "")
             return self.get_paginated_response(data)
         # Grouped mode (Verification / Logistics): build the ordered group keys
         # cheaply, paginate THEM, and serialize only the current page's groups
@@ -1680,6 +1767,9 @@ class MembersListView(PortalGenericAPIView):
         # (extension vs import) so agents can triage the list at a glance.
         if scope == "need_attention":
             self._stamp_added_via(groups)
+            # Also stamp the case creator's CareCircle team so the Urgent Care
+            # list can flag Street Team-created cases under the Created By column.
+            self._stamp_case_teams(groups)
         return self.get_paginated_response(groups)
 
 

@@ -581,16 +581,12 @@ def map_case_row(row):
     set_("closed_note", _s(row, "closed_note"))
     set_("case_description", _s(row, "case_description"))
 
-    status = _s(row, "case_status").lower()
-    resolved = status if status in CaseStatus.values else CaseStatus.OPEN
-    # Unite Us keeps the exported case state as "managed" even after a case is
-    # closed; a populated closed date is the only reliable "closed" signal
-    # (mirrors the daily API import's map_case + the browser extension). Force
-    # CLOSED when a closed date is present, but never override an explicit
-    # terminal state already in the export (closed / cancelled).
-    if closed_at and resolved not in (CaseStatus.CLOSED, CaseStatus.CANCELLED):
-        resolved = CaseStatus.CLOSED
-    out["case_status"] = resolved
+    # Case status is Open/Closed ONLY, driven by the closed date. Unite Us keeps
+    # the exported state as "managed" even after closing, so a populated closed
+    # date is the only reliable "closed" signal (mirrors the daily API import's
+    # map_case + the browser extension); everything else is Open. Authorization
+    # status is tracked separately and NEVER drives the case status.
+    out["case_status"] = CaseStatus.CLOSED if closed_at else CaseStatus.OPEN
     set_("started_as_assistance_request", _bool(row, "started_as_assistance_request"))
     set_("case_is_referred", _bool(row, "case_is_referred"))
 
