@@ -91,10 +91,11 @@ def case_is_met_council(case):
     Remove action, and the cleanup command).
 
     * INTERNAL-SERVICE (meal/box) cases are Met Council's own programs. They are
-      kept when Met Council manages/originated them OR when they carry NO named
-      managing org at all (many legitimate meal cases were imported with blank
-      provider columns). Only a meal case explicitly attributed to a DIFFERENT
-      named org (e.g. God's Love We Deliver) is NOT Met Council's.
+      kept when Met Council MANAGES them OR when they carry NO named managing org
+      at all (many legitimate meal cases were imported with blank provider
+      columns). A meal case explicitly attributed to a DIFFERENT named org (e.g.
+      God's Love We Deliver) is NOT Met Council's -- even if Met Council merely
+      ORIGINATED (referred) it; the managing org owns it.
     * Every OTHER case type must be MANAGED by Met Council -- originating alone
       (a referral out) does not count.
     """
@@ -102,10 +103,9 @@ def case_is_met_council(case):
 
     is_internal = case.case_type == CaseType.INTERNAL_SERVICE
     if is_met_council_case(
-        originating_provider_id=case.originating_provider_id,
         provider_id=case.provider_id,
         provider_name=case.provider_name,
-        allow_originating=is_internal,
+        allow_originating=False,
     ):
         return True
     # An internal-service case with no named managing org is Met Council's.

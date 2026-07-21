@@ -1076,23 +1076,34 @@ class CsvImporter:
             if not cid:
                 self._count("skipped")
                 continue
-            # STRICT Met Council org gate. Internal-service (meal/box) cases use
-            # the UNION rule (Met Council originated OR manages); every other
-            # case type (Eligibility / Navigation / External) must be MANAGED by
-            # Met Council -- a case Met Council merely referred out to another
-            # org (e.g. an ECM eligibility assessment) is out of scope. The
-            # internal-service test keys on the meal/box service subtype (same
-            # rule as derive_case_type), so no ProgramPipeline lookup is needed.
+            # STRICT Met Council org gate. A case is kept when Met Council
+            # MANAGES it (provider id/name). For INTERNAL-SERVICE (meal/box)
+            # cases only, Met Council merely ORIGINATING it also keeps it -- but
+            # ONLY when no OTHER named org manages it. A meal case Met Council
+            # referred OUT to another provider (e.g. God's Love We Deliver, Boro
+            # Park) is that org's case, not ours, even though Met Council
+            # originated it. Every non-internal type must be MANAGED by Met
+            # Council (originating alone -- an ECM referral out -- never counts).
+            # The internal test keys on the meal/box service subtype (same rule
+            # as derive_case_type), so no ProgramPipeline lookup is needed.
             is_internal = (
                 (row.get("service_subtype") or "").strip().casefold()
                 in INTERNAL_SERVICE_SUBTYPES
             )
-            if not is_met_council_case(
+            prov_id = (row.get("provider_id") or "").strip()
+            prov_name = (row.get("provider_name") or "").strip()
+            has_named_manager = bool(prov_id or prov_name)
+            managed_by_met = is_met_council_case(
+                provider_id=prov_id, provider_name=prov_name, allow_originating=False,
+            )
+            originated_by_met = is_met_council_case(
                 originating_provider_id=row.get("originating_provider_id"),
-                provider_id=row.get("provider_id"),
-                provider_name=row.get("provider_name"),
-                allow_originating=is_internal,
-            ):
+                allow_originating=True,
+            )
+            keep = managed_by_met or (
+                is_internal and originated_by_met and not has_named_manager
+            )
+            if not keep:
                 self._count("skipped")
                 continue
             # Creator allowlist (only enforced when the list is non-empty).

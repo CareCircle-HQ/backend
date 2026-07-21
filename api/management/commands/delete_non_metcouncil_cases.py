@@ -52,10 +52,11 @@ class Command(BaseCommand):
         mirrors api.services.lifecycle.case_is_met_council in the ORM).
 
         Kept when Met Council MANAGES the case (provider id/name), OR -- for
-        INTERNAL-SERVICE (meal/box) cases -- when Met Council ORIGINATED it OR it
-        carries NO named managing org at all (many legit meal cases were
-        imported with blank provider columns; only a meal case attributed to a
-        DIFFERENT named org is dropped).
+        INTERNAL-SERVICE (meal/box) cases -- when it carries NO named managing
+        org at all (many legit meal cases were imported with blank provider
+        columns). A meal case attributed to a DIFFERENT named org is dropped
+        even if Met Council merely ORIGINATED (referred) it -- the managing org
+        owns it.
         """
         managed = (
             Q(provider_id=MET_COUNCIL_PROVIDER_ID)
@@ -63,10 +64,7 @@ class Command(BaseCommand):
         )
         internal = Q(case_type=CaseType.INTERNAL_SERVICE)
         no_named_manager = Q(provider_id__isnull=True) & Q(provider_name="")
-        keep = managed | (
-            internal
-            & (no_named_manager | Q(originating_provider_id=MET_COUNCIL_PROVIDER_ID))
-        )
+        keep = managed | (internal & no_named_manager)
         return Case.objects.exclude(keep)
 
     def handle(self, *args, **opts):

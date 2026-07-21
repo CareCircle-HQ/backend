@@ -4065,16 +4065,26 @@ class CsvImportRulesTest(TestCase):
             service_subtype="Social Service Case Management",
             program_name="Navigation Services - Eligibility Assessment Level 1 - Brooklyn",
         )
-        importer.import_cases([mine, managed, external, blank, referred_out])
+        # Internal-service MEAL case Met Council ORIGINATED but a DIFFERENT named
+        # org MANAGES (referred out to God's Love): dropped -- the managing org
+        # owns it, so originating must NOT rescue it.
+        referred_meal = self._case_row(
+            client.client_id, self.MET,
+            provider_name="God's Love We Deliver - SCN - PHS",
+        )
+        importer.import_cases([mine, managed, external, blank, referred_out, referred_meal])
 
-        # Met Council-originated AND Met Council-managed are imported; the rest not.
+        # Met Council-originated (blank manager) AND Met Council-managed are
+        # imported; the rest -- including the meal case referred out to another
+        # named org -- are not.
         self.assertTrue(Case.objects.filter(pk=mine["case_id"]).exists())
         self.assertTrue(Case.objects.filter(pk=managed["case_id"]).exists())
         self.assertFalse(Case.objects.filter(pk=external["case_id"]).exists())
         self.assertFalse(Case.objects.filter(pk=blank["case_id"]).exists())
         self.assertFalse(Case.objects.filter(pk=referred_out["case_id"]).exists())
+        self.assertFalse(Case.objects.filter(pk=referred_meal["case_id"]).exists())
         self.assertEqual(importer.stats["created"], 2)
-        self.assertEqual(importer.stats["skipped"], 3)
+        self.assertEqual(importer.stats["skipped"], 4)
 
         # And it's classified correctly: internal-service + household (token).
         case = Case.objects.get(pk=mine["case_id"])
@@ -4137,6 +4147,82 @@ class CsvImportRulesTest(TestCase):
         self.assertTrue(Case.objects.filter(pk=keep_blank_internal.pk).exists())
         self.assertFalse(Case.objects.filter(pk=drop.pk).exists())
         self.assertFalse(Case.objects.filter(pk=drop_referred_out.pk).exists())
+
+
+class ReconcileInternalCasesAgainstExportTest(TestCase):
+    """The export-anchored cleanup removes blank-provider internal-service cases
+    that are ACTIVE but absent from Met Council's export -- while keeping ones in
+    the export, closed history, and any actively-served member's case."""
+
+    def _blank_internal(self, status, **over):
+        from .models import Case, CaseStatus, CaseType
+
+        return Case.objects.create(
+            case_id=uuid.uuid4(), client=over.pop("client", self.client_obj),
+            case_type=CaseType.INTERNAL_SERVICE, case_status=status,
+            provider_name="", program_name="MTM Boxes - Queens", **over,
+        )
+
+    def _export(self, case_ids):
+        import csv
+        import tempfile
+
+        fh = tempfile.NamedTemporaryFile(
+            "w", suffix=".csv", delete=False, newline=""
+        )
+        w = csv.DictWriter(fh, fieldnames=["case_id", "case_status"])
+        w.writeheader()
+        for cid in case_ids:
+            w.writerow({"case_id": str(cid), "case_status": "managed"})
+        fh.close()
+        return fh.name
+
+    def setUp(self):
+        self.client_obj = Client.objects.create(
+            client_id=uuid.uuid4(), first_name="Aiden", last_name="Buguia"
+        )
+        self.served_client = Client.objects.create(
+            client_id=uuid.uuid4(), first_name="Served", last_name="Member"
+        )
+
+    def test_reconcile_partitions_correctly(self):
+        from django.core.management import call_command
+        from .models import (
+            Case, CaseStatus, EnrollmentStage, EnrollmentVerification,
+            Household, HouseholdMember,
+        )
+
+        in_export = self._blank_internal(CaseStatus.MANAGED)
+        active_absent = self._blank_internal(CaseStatus.MANAGED)
+        closed_absent = self._blank_internal(CaseStatus.CLOSED)
+
+        # A served member's active+absent case must be PROTECTED.
+        hh = Household.objects.create()
+        HouseholdMember.objects.create(
+            household=hh, client=self.served_client, is_primary=True
+        )
+        EnrollmentVerification.objects.create(
+            client=self.served_client, household=hh,
+            stage=EnrollmentStage.SERVICE_ACTIVE,
+        )
+        served_absent = self._blank_internal(
+            CaseStatus.MANAGED, client=self.served_client
+        )
+
+        export_path = self._export([in_export.case_id])  # only this one is "ours"
+
+        # Dry run changes nothing.
+        call_command("reconcile_internal_cases_against_export", "--export", export_path)
+        self.assertEqual(Case.objects.count(), 4)
+
+        # Apply: only the active, absent, UN-served case is removed.
+        call_command(
+            "reconcile_internal_cases_against_export", "--export", export_path, "--apply"
+        )
+        self.assertTrue(Case.objects.filter(pk=in_export.pk).exists())
+        self.assertTrue(Case.objects.filter(pk=closed_absent.pk).exists())
+        self.assertTrue(Case.objects.filter(pk=served_absent.pk).exists())
+        self.assertFalse(Case.objects.filter(pk=active_absent.pk).exists())
 
 
 class MemberCaseRemoveTest(TestCase):
