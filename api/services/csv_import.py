@@ -581,16 +581,12 @@ def map_case_row(row):
     set_("closed_note", _s(row, "closed_note"))
     set_("case_description", _s(row, "case_description"))
 
-    status = _s(row, "case_status").lower()
-    resolved = status if status in CaseStatus.values else CaseStatus.OPEN
-    # Unite Us keeps the exported case state as "managed" even after a case is
-    # closed; a populated closed date is the only reliable "closed" signal
-    # (mirrors the daily API import's map_case + the browser extension). Force
-    # CLOSED when a closed date is present, but never override an explicit
-    # terminal state already in the export (closed / cancelled).
-    if closed_at and resolved not in (CaseStatus.CLOSED, CaseStatus.CANCELLED):
-        resolved = CaseStatus.CLOSED
-    out["case_status"] = resolved
+    # Case status is Open/Closed ONLY, driven by the closed date. Unite Us keeps
+    # the exported state as "managed" even after closing, so a populated closed
+    # date is the only reliable "closed" signal (mirrors the daily API import's
+    # map_case + the browser extension); everything else is Open. Authorization
+    # status is tracked separately and NEVER drives the case status.
+    out["case_status"] = CaseStatus.CLOSED if closed_at else CaseStatus.OPEN
     set_("started_as_assistance_request", _bool(row, "started_as_assistance_request"))
     set_("case_is_referred", _bool(row, "case_is_referred"))
 
@@ -726,16 +722,22 @@ class CsvImporter:
             logger.warning("recompute_client_stage failed for %s", client_id, exc_info=True)
 
     def _post_save(self, client):
-        """Derive the funnel stage + emit timeline events (no tickets).
+        """Emit per-client timeline events (no tickets).
 
-        Mirrors the daily API import's per-client side effects so a CSV load
-        leaves the same trail: the clients export only carries consent, so the
-        stage lands at Consent (accepted) or Inactive. Consent / insurance /
-        coverage timeline events are deduped, so re-imports won't duplicate
-        them. Each side effect is isolated — it must never fail the import row.
+        Mirrors the daily API import's per-client trail: the clients export only
+        carries consent, so this records the consent + insurance + coverage
+        events (deduped, so re-imports won't duplicate them). Each emit is
+        isolated — it must never fail the import row.
+
+        Gated on ``emit_timeline``: these consent/insurance/coverage writes are
+        the bulk of the import's DB load, and the Settings-page upload disables
+        them (Care Management is the source of truth for what needs attention).
+        The funnel stage is NOT recomputed here — ``recompute_touched()`` derives
+        it once at the end of the run from the full picture, so an in-loop
+        recompute would just double the per-client stage-derivation queries.
         """
-        self._recompute_stage(client.pk, client)
-
+        if not self.emit_timeline:
+            return
         for builder, obj in self._timeline_targets(client):
             try:
                 builder(obj, source=ChangeSource.IMPORT, actor=TIMELINE_ACTOR)
@@ -1076,23 +1078,34 @@ class CsvImporter:
             if not cid:
                 self._count("skipped")
                 continue
-            # STRICT Met Council org gate. Internal-service (meal/box) cases use
-            # the UNION rule (Met Council originated OR manages); every other
-            # case type (Eligibility / Navigation / External) must be MANAGED by
-            # Met Council -- a case Met Council merely referred out to another
-            # org (e.g. an ECM eligibility assessment) is out of scope. The
-            # internal-service test keys on the meal/box service subtype (same
-            # rule as derive_case_type), so no ProgramPipeline lookup is needed.
+            # STRICT Met Council org gate. A case is kept when Met Council
+            # MANAGES it (provider id/name). For INTERNAL-SERVICE (meal/box)
+            # cases only, Met Council merely ORIGINATING it also keeps it -- but
+            # ONLY when no OTHER named org manages it. A meal case Met Council
+            # referred OUT to another provider (e.g. God's Love We Deliver, Boro
+            # Park) is that org's case, not ours, even though Met Council
+            # originated it. Every non-internal type must be MANAGED by Met
+            # Council (originating alone -- an ECM referral out -- never counts).
+            # The internal test keys on the meal/box service subtype (same rule
+            # as derive_case_type), so no ProgramPipeline lookup is needed.
             is_internal = (
                 (row.get("service_subtype") or "").strip().casefold()
                 in INTERNAL_SERVICE_SUBTYPES
             )
-            if not is_met_council_case(
+            prov_id = (row.get("provider_id") or "").strip()
+            prov_name = (row.get("provider_name") or "").strip()
+            has_named_manager = bool(prov_id or prov_name)
+            managed_by_met = is_met_council_case(
+                provider_id=prov_id, provider_name=prov_name, allow_originating=False,
+            )
+            originated_by_met = is_met_council_case(
                 originating_provider_id=row.get("originating_provider_id"),
-                provider_id=row.get("provider_id"),
-                provider_name=row.get("provider_name"),
-                allow_originating=is_internal,
-            ):
+                allow_originating=True,
+            )
+            keep = managed_by_met or (
+                is_internal and originated_by_met and not has_named_manager
+            )
+            if not keep:
                 self._count("skipped")
                 continue
             # Creator allowlist (only enforced when the list is non-empty).
@@ -1243,19 +1256,32 @@ class CsvImporter:
         from api.services.lifecycle import recompute_client_stage
         from api.services.warnings import sync_client_warnings
 
-        for cid in self.touched_client_ids:
-            client = Client.objects.filter(pk=cid).first()
-            if client is None:
-                continue
-            try:
-                recompute_client_stage(client)
-            except Exception:  # noqa: BLE001 - a funnel hiccup must not fail the run
-                logger.warning(
-                    "recompute_client_stage failed for %s", cid, exc_info=True
-                )
-            # Refresh the member/household warning snapshot from the imported
-            # data (catches insurance/client-only rows too). Best-effort.
-            sync_client_warnings(client)
+        # Fetch the touched clients in bulk with the relations the stage +
+        # warning derivations traverse prefetched, so each client costs a handful
+        # of shared queries per chunk instead of an N+1 (one point-lookup plus
+        # several relation queries PER client). Chunked to keep the prefetch
+        # working set bounded on very large imports.
+        ids = list(self.touched_client_ids)
+        chunk = 500
+        for start in range(0, len(ids), chunk):
+            batch = ids[start:start + chunk]
+            clients = Client.objects.filter(pk__in=batch).prefetch_related(
+                "enrollments",
+                "member_profiles__enrollment",
+                "cases",
+                "household_membership__household__members",
+                "household_membership__household__enrollment_verifications",
+            )
+            for client in clients:
+                try:
+                    recompute_client_stage(client)
+                except Exception:  # noqa: BLE001 - a funnel hiccup must not fail the run
+                    logger.warning(
+                        "recompute_client_stage failed for %s", client.pk, exc_info=True
+                    )
+                # Refresh the member/household warning snapshot from the imported
+                # data (catches insurance/client-only rows too). Best-effort.
+                sync_client_warnings(client)
 
     def finalize(self):
         dataset_stats = dict(self.stats)

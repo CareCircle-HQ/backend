@@ -76,6 +76,7 @@ from .views_members import (
     NoNavigationMembersListView,
     UnlinkedMembersListView,
     MenuTypesListView,
+    TeamsListView,
 )
 from .views_places import (
     PortalPlacesAutocompleteView,
@@ -108,7 +109,12 @@ from .views_reports import (
     MembersPendingVerificationReportView,
 )
 from .views_activity import ActivityFiltersView, ActivityLogView
-from .views_service_area import ExcludedZipCodeDetailView, ExcludedZipCodesView
+from .views_service_area import (
+    AllowedStateDetailView,
+    AllowedStatesView,
+    ExcludedZipCodeDetailView,
+    ExcludedZipCodesView,
+)
 from .views_imports import (
     ImportActivityView,
     ImportPresignView,
@@ -172,6 +178,7 @@ urlpatterns = [
     path("menu-types/", MenuTypesListView.as_view(), name="portal-menu-types"),
     path("food-allergies/", FoodAllergiesListView.as_view(), name="portal-food-allergies"),
     path("lead-sources/", LeadSourcesListView.as_view(), name="portal-lead-sources"),
+    path("teams/", TeamsListView.as_view(), name="portal-teams"),
     path("members/<uuid:client_id>/", MemberDetailView.as_view(), name="portal-member-detail"),
     path("members/<uuid:client_id>/insurance/", MemberInsuranceView.as_view()),
     path("members/<uuid:client_id>/social-coverage/", MemberSocialCoverageView.as_view()),
@@ -332,6 +339,17 @@ urlpatterns = [
         "settings/excluded-zip-codes/<int:zip_id>/",
         ExcludedZipCodeDetailView.as_view(),
         name="portal-excluded-zip-code-detail",
+    ),
+    # Settings > Allowed States: served-states allow-list
+    path(
+        "settings/allowed-states/",
+        AllowedStatesView.as_view(),
+        name="portal-allowed-states",
+    ),
+    path(
+        "settings/allowed-states/<str:code>/",
+        AllowedStateDetailView.as_view(),
+        name="portal-allowed-state-detail",
     ),
 
     # Settings integration sub-resources (not covered by the viewset router)

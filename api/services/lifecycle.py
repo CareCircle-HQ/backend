@@ -91,10 +91,11 @@ def case_is_met_council(case):
     Remove action, and the cleanup command).
 
     * INTERNAL-SERVICE (meal/box) cases are Met Council's own programs. They are
-      kept when Met Council manages/originated them OR when they carry NO named
-      managing org at all (many legitimate meal cases were imported with blank
-      provider columns). Only a meal case explicitly attributed to a DIFFERENT
-      named org (e.g. God's Love We Deliver) is NOT Met Council's.
+      kept when Met Council MANAGES them OR when they carry NO named managing org
+      at all (many legitimate meal cases were imported with blank provider
+      columns). A meal case explicitly attributed to a DIFFERENT named org (e.g.
+      God's Love We Deliver) is NOT Met Council's -- even if Met Council merely
+      ORIGINATED (referred) it; the managing org owns it.
     * Every OTHER case type must be MANAGED by Met Council -- originating alone
       (a referral out) does not count.
     """
@@ -102,10 +103,9 @@ def case_is_met_council(case):
 
     is_internal = case.case_type == CaseType.INTERNAL_SERVICE
     if is_met_council_case(
-        originating_provider_id=case.originating_provider_id,
         provider_id=case.provider_id,
         provider_name=case.provider_name,
-        allow_originating=is_internal,
+        allow_originating=False,
     ):
         return True
     # An internal-service case with no named managing org is Met Council's.
@@ -1106,6 +1106,152 @@ _DENIAL_PAUSE_STAGES = {
 # never a manual Place-on-Hold.
 _DENIAL_HOLD_NOTE = "Auto-paused: sole internal-service meal/box case denied."
 
+# Stamped on the pause / cancel StageEvents raised by the case-CLOSURE full stop
+# (distinct from the denial note above so the two rules stay independently
+# auditable).
+_CLOSURE_HOLD_NOTE = "Auto-paused: last open internal-service meal/box case closed."
+_CLOSURE_CANCEL_NOTE = "Auto-cancelled: no open internal-service meal/box case remains."
+
+
+def _actor_name(actor):
+    """Best-effort display name for an acting User/Agent (falls back to System)."""
+    if actor is None:
+        return "System"
+    return (
+        getattr(actor, "get_full_name", lambda: "")()
+        or getattr(actor, "name", "")
+        or getattr(actor, "username", "")
+        or "System"
+    )
+
+
+def _household_primary(client):
+    """The primary member of the client's household, else the client itself."""
+    membership = getattr(client, "household_membership", None)
+    if membership is not None:
+        hm = (
+            membership.household.members.filter(is_primary=True)
+            .select_related("client")
+            .first()
+        )
+        if hm is not None and hm.client_id:
+            return hm.client
+    return client
+
+
+def _write_primary_system_note(client, body, *, author_name="System"):
+    """Append a deduped SYSTEM note to the household primary (best-effort). The
+    content_hash guard means re-running with the SAME body never duplicates."""
+    import hashlib
+
+    from api.models import Note, NoteSource
+
+    primary = _household_primary(client)
+    if primary is None:
+        return
+    chash = hashlib.sha256(body.encode("utf-8")).hexdigest()
+    if Note.objects.filter(
+        client=primary, source=NoteSource.SYSTEM, content_hash=chash
+    ).exists():
+        return
+    Note.objects.create(
+        client=primary,
+        source=NoteSource.SYSTEM,
+        author_name=author_name or "System",
+        body=body,
+        content_hash=chash,
+    )
+
+
+def _full_stop_close_out(client, governing, *, actor=None, actor_label=""):
+    """Pause-then-cancel every actionable governing enrollment when the client's
+    LAST open internal-service case has closed.
+
+    Steps (mirrors the product spec): truncate future deliveries + pause the
+    household (On Hold) + note the primary, THEN cancel the enrollment(s) + a
+    second note. Idempotent: once every governing enrollment is terminal there is
+    nothing ``actionable`` left, so a re-import is a no-op (no duplicate
+    notes/events). Opens NO tickets -- visibility comes from StageEvents, the
+    timeline, and the primary notes.
+    """
+    from api.services.orders import truncate_future_deliveries
+
+    result = {"paused": False, "cancelled": False}
+    govs = _governing_enrollments(client)
+    actionable = [
+        e
+        for e in govs
+        if EnrollmentStage(e.stage) not in _TERMINAL_STAGES
+        and EnrollmentStage(e.stage) != EnrollmentStage.SERVICE_COMPLETE
+    ]
+    if not actionable:
+        return result
+
+    author = actor_label or _actor_name(actor)
+    today = timezone.localdate().isoformat()
+    closed_at = getattr(governing, "case_closed_at", None) or getattr(
+        governing, "updated_at", None
+    )
+    closed_on = closed_at.date().isoformat() if closed_at else "an unknown date"
+    label = getattr(governing, "program_name", "") or "meal/box"
+
+    # 1) Truncate future deliveries (before pausing, so no ON_HOLD skip) + pause.
+    for enr in actionable:
+        try:
+            truncate_future_deliveries(enr)
+        except Exception:  # pragma: no cover - defensive
+            pass
+        if EnrollmentStage(enr.stage) in _DENIAL_PAUSE_STAGES:
+            try:
+                advance_enrollment(
+                    enr,
+                    EnrollmentStage.ON_HOLD,
+                    actor=actor,
+                    actor_label=actor_label,
+                    note=_CLOSURE_HOLD_NOTE,
+                )
+                result["paused"] = True
+            except InvalidTransition:
+                pass
+
+    _write_primary_system_note(
+        client,
+        (
+            f"Service paused on {today}: the member's last open internal-service "
+            f"case ({governing.case_id} - {label}) closed on {closed_on}. Future "
+            f"deliveries were stopped and the household was placed On Hold."
+        ),
+        author_name=author,
+    )
+
+    # 2) Cancel the household (hard off-ramp). SERVICE_COMPLETE / terminal rows
+    #    are left as-is (force=False -> illegal cancels are skipped).
+    for enr in _governing_enrollments(client):
+        if EnrollmentStage(enr.stage) in _TERMINAL_STAGES:
+            continue
+        try:
+            advance_enrollment(
+                enr,
+                EnrollmentStage.CANCELLED,
+                actor=actor,
+                actor_label=actor_label,
+                note=_CLOSURE_CANCEL_NOTE,
+            )
+            result["cancelled"] = True
+        except InvalidTransition:
+            pass
+
+    if result["cancelled"]:
+        _write_primary_system_note(
+            client,
+            (
+                f"Member cancelled on {today}: no open internal-service case "
+                f"remains after case {governing.case_id} closed."
+            ),
+            author_name=author,
+        )
+    return result
+
 
 def _internal_service_cases(client):
     return [c for c in client.cases.all() if c.case_type == CaseType.INTERNAL_SERVICE]
@@ -1228,7 +1374,7 @@ def _resume_auto_paused_enrollment(enrollment, *, actor=None):
         return enrollment
 
 
-def reconcile_internal_service_authorization(client, *, actor=None):
+def reconcile_internal_service_authorization(client, *, actor=None, actor_label=""):
     """React to a change in the client's internal-service case authorization.
 
     Full-stop rule: a client whose GOVERNING internal-service (meal/box)
@@ -1246,28 +1392,44 @@ def reconcile_internal_service_authorization(client, *, actor=None):
     days). An approved/pending parallel program keeps the household in service
     (it becomes the governing case, so gov_status is not DENIED).
 
-    Best-effort and idempotent. Returns ``{"sole_denied": bool, "paused": bool}``.
+    Best-effort and idempotent. Returns ``{"sole_denied", "paused",
+    "closed_out", "cancelled"}``.
     """
-    result = {"sole_denied": False, "paused": False}
+    result = {
+        "sole_denied": False, "paused": False,
+        "closed_out": False, "cancelled": False,
+    }
     cases = _internal_service_cases(client)
     if not cases:
         recompute_client_stage(client, actor=actor)
         return result
 
+    open_cases = open_internal_service_cases(client)
     governing = max(cases, key=governing_case_key)
     gov_status = governing.service_authorization_status
 
-    if gov_status == ServiceAuthorizationStatus.DENIED:
-        # Governing meal/box authorization is denied (no favorable/pending case
-        # exists, whether one case or several) -> full stop: pause every
-        # servable enrollment.
+    if not open_cases:
+        # CLOSURE full stop: the client's LAST open internal-service case has
+        # closed. Pause + truncate future deliveries + note the primary, THEN
+        # cancel + a second note. Opens NO tickets -- the timeline, StageEvents
+        # and primary notes carry the visibility.
+        outcome = _full_stop_close_out(
+            client, governing, actor=actor, actor_label=actor_label,
+        )
+        result["closed_out"] = True
+        result["paused"] = outcome["paused"]
+        result["cancelled"] = outcome["cancelled"]
+    elif gov_status == ServiceAuthorizationStatus.DENIED:
+        # Governing meal/box authorization is denied (no favorable/pending open
+        # case exists, whether one case or several) -> full stop: pause every
+        # servable enrollment (incl. Active -- Rule 3).
         result["sole_denied"] = True
         for enr in _governing_enrollments(client):
             if EnrollmentStage(enr.stage) in _DENIAL_PAUSE_STAGES:
                 try:
                     advance_enrollment(
                         enr, EnrollmentStage.ON_HOLD, actor=actor,
-                        note=_DENIAL_HOLD_NOTE,
+                        actor_label=actor_label, note=_DENIAL_HOLD_NOTE,
                     )
                     result["paused"] = True
                 except InvalidTransition:
@@ -1276,21 +1438,33 @@ def reconcile_internal_service_authorization(client, *, actor=None):
         ServiceAuthorizationStatus.APPROVED,
         ServiceAuthorizationStatus.NOT_REQUIRED,
     ):
-        # Favorable authorization -> un-pause anything this rule auto-paused.
+        # Favorable authorization -> resume anything this rule auto-paused AND
+        # advance a verified household to Kitchen Assignment (Rule 2). Routing
+        # the advance through here means it fires on EVERY case-save path
+        # (extension, manual import, bulk CLI), not just the manual import.
         for enr in _governing_enrollments(client):
             if EnrollmentStage(enr.stage) == EnrollmentStage.ON_HOLD:
                 _resume_auto_paused_enrollment(enr, actor=actor)
+            else:
+                try:
+                    reconcile_enrollment_authorization(
+                        enr, actor=actor, actor_label=actor_label,
+                    )
+                except Exception:  # pragma: no cover - defensive
+                    pass
 
     # Keep the delivery calendar in step with the (possibly changed) governing
     # authorization: auto-heal a same-kind window extension, or truncate future
     # deliveries when a case closed with no authorization / pending successor.
     # Never auto-flips product kind -- a meals<->boxes switch stays a
-    # human-confirmed PO Blockers fix. Best-effort so a hiccup can't abort import.
-    for enr in _governing_enrollments(client):
-        try:
-            reconcile_delivery_state(enr, actor=actor)
-        except Exception:  # pragma: no cover - defensive
-            pass
+    # human-confirmed PO Blockers fix. Skipped on a close-out (deliveries were
+    # already truncated and the enrollments cancelled). Best-effort.
+    if not result["closed_out"]:
+        for enr in _governing_enrollments(client):
+            try:
+                reconcile_delivery_state(enr, actor=actor)
+            except Exception:  # pragma: no cover - defensive
+                pass
 
     recompute_client_stage(client, actor=actor)
 

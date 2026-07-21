@@ -2331,6 +2331,11 @@ class Agent(models.Model):
     is_agent = models.BooleanField(default=True)
     is_manager = models.BooleanField(default=False)
     is_account_owner = models.BooleanField(default=False)
+    # Williamsburg agent: every client this agent saves is forced to
+    # lead_source="Williamsburg" (which derives Client.is_williamsburg and
+    # fast-tracks verification). Set from Settings > Williamsburg Setup and
+    # enforced in api.views.ClientViewSet on save.
+    is_williamsburg_agent = models.BooleanField(default=False, db_index=True)
     calltools_synced_at = models.DateTimeField(null=True, blank=True)
 
     created_at = models.DateTimeField(auto_now_add=True)
@@ -2623,6 +2628,31 @@ class AllowedZipCode(models.Model):
         return f"{self.zip_code} ({self.borough})" if self.borough else self.zip_code
 
 
+class AllowedState(models.Model):
+    """A US state we accept clients/cases from (allow-list).
+
+    Editable from Settings (enable/disable) so the served states can change
+    without a code change. A row's PRESENCE means the state is enabled; there is
+    no row for a disabled state. By default only New York (NY) is enabled.
+
+    Used to warn agents when a client's PRIMARY-address state is not one we take
+    clients from: surfaced on the Verification modal (portal) and as a banner in
+    the extension. Matching is on the 2-letter USPS code (case-insensitive).
+    """
+
+    code = models.CharField(max_length=2, unique=True, db_index=True)  # USPS, e.g. "NY"
+    name = models.CharField(max_length=64)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["code"]
+        verbose_name = "Allowed state"
+        verbose_name_plural = "Allowed states"
+
+    def __str__(self):
+        return self.code
+
+
 # ===========================================================================
 # UNITE US INTEGRATION / DAILY PULL
 # ===========================================================================
@@ -2866,6 +2896,7 @@ class TicketTypeCode(models.TextChoices):
     CANCELLATION = "cancellation", "Cancellation"
     MISSING_WRONG_ORDER = "missing_wrong_order", "Missing / Wrong Order"
     NUTRITIONAL_COUNSELING = "nutritional_counseling", "Nutritional Counseling"
+    KITCHEN_SWITCH = "kitchen_switch", "Kitchen Switch"
     # Raised by the daily import when an internal-service case has no contracted
     # services (the member has no active internal-services contract).
     CASE_NO_SERVICES = "case_no_services", "No Internal services Case"

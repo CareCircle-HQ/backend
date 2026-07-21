@@ -16,6 +16,7 @@ from django.db.models import (
     OuterRef,
     Prefetch,
     Q,
+    Subquery,
 )
 from django.db.models.functions import Lower
 from django.shortcuts import get_object_or_404
@@ -61,6 +62,7 @@ from ..models import (
     TimelineBadgeTone,
     TimelineEvent,
     TimelineEventType,
+    UniteUsAgent,
     WarningStatus,
 )
 from ..views_phones import _phone_dict
@@ -793,6 +795,35 @@ class LeadSourcesListView(PortalAPIView):
         return Response(options)
 
 
+class TeamsListView(PortalAPIView):
+    """Team options for the Members-page Team filter dropdown.
+
+    Distinct CareCircle originating teams across the Unite Us agents (the team
+    each case creator belongs to). ``value`` == ``label`` == the stored
+    ``UniteUsAgent.originating_team`` string the filter matches
+    (``team__iexact=value``)."""
+
+    # "Met Council Team" is the default originating_team assigned to everyone
+    # not on the CareCircle roster (i.e. non-US staff), so it isn't a real
+    # filterable CareCircle team -- hide it from the Team filter dropdown.
+    _EXCLUDED_TEAMS = {"met council team"}
+
+    def get(self, request):
+        teams = (
+            UniteUsAgent.objects.exclude(originating_team="")
+            .order_by()
+            .values_list("originating_team", flat=True)
+            .distinct()
+        )
+        options = sorted({
+            (t or "").strip()
+            for t in teams
+            if (t or "").strip()
+            and (t or "").strip().lower() not in self._EXCLUDED_TEAMS
+        })
+        return Response([{"value": t, "label": t} for t in options])
+
+
 class MembersListView(PortalGenericAPIView):
     serializer_class = s.MemberListSerializer
 
@@ -950,6 +981,23 @@ class MembersListView(PortalGenericAPIView):
             "1", "true", "yes",
         ):
             qs = qs.filter(cases__case_type=CaseType.INTERNAL_SERVICE)
+            # Open/closed sub-filter: ONLY active when Internal Service is on
+            # (it narrows that set). Mirrors the "current case" the Created column
+            # shows: a member is OPEN if they have any non-terminal internal-
+            # service case (actively serviced), else CLOSED. So "closed" means the
+            # member has NO open internal-service case (all done) -- NOT merely
+            # "has a closed case", since members with an open case also usually
+            # have older closed ones and would otherwise wrongly show as closed.
+            internal_status = (params.get("internal_status") or "").strip().lower()
+            if internal_status in ("open", "closed"):
+                terminal = (CaseStatus.CLOSED, CaseStatus.CANCELLED)
+                open_case = Case.objects.filter(
+                    client=OuterRef("pk"), case_type=CaseType.INTERNAL_SERVICE,
+                ).exclude(case_status__in=terminal)
+                if internal_status == "open":
+                    qs = qs.filter(Exists(open_case))
+                else:
+                    qs = qs.exclude(Exists(open_case))
 
         # Product-kind filter (Meals vs Boxes), keyed off the household's program
         # name. A household is always one kind, so meals/boxes never mix.
@@ -1076,6 +1124,22 @@ class MembersListView(PortalGenericAPIView):
                     | Q(member_profiles__food_allergies__contains=[label])
                 )
 
+        # Team filter (Members page): keep members whose INTERNAL-SERVICE case
+        # was CREATED by a Unite Us agent on the selected CareCircle originating
+        # team. Case.created_by_id == UniteUsAgent.user_id, so resolve the team's
+        # agent user_ids first, then match the case creator. Composes with the
+        # other filters; the trailing .distinct() dedupes the case join.
+        team_val = (params.get("team") or "").strip()
+        if team_val:
+            team_creator_ids = list(
+                UniteUsAgent.objects.filter(originating_team__iexact=team_val)
+                .values_list("user_id", flat=True)
+            )
+            qs = qs.filter(
+                cases__case_type=CaseType.INTERNAL_SERVICE,
+                cases__created_by_id__in=team_creator_ids,
+            )
+
         # Created-date range filter (Members page): filters on the date the
         # member's INTERNAL-SERVICE case was created (its ``date_opened``) --
         # NOT the Client record's own ``created_at``. Mirrors the Urgent Care
@@ -1093,6 +1157,24 @@ class MembersListView(PortalGenericAPIView):
             if created_to:
                 case_date_q &= Q(cases__date_opened__date__lte=created_to)
             qs = qs.filter(case_date_q)
+
+        # Closed-date range filter (Members page): filters on the date the
+        # member's INTERNAL-SERVICE case was CLOSED (its ``case_closed_at``, the
+        # C: date shown in the "Created" column). Mirrors the created-date filter
+        # above but on the close date, so an ops user can pull members whose
+        # service case was closed within a window (e.g. "closed today") and then
+        # cross-check paused/active status via the status filter. Both bounds
+        # apply to the SAME internal-service case row; .distinct() dedupes the
+        # join. Inclusive [from, to]; either bound may be omitted.
+        closed_from = _parse_date(params.get("closed_from"))
+        closed_to = _parse_date(params.get("closed_to"))
+        if closed_from or closed_to:
+            case_closed_q = Q(cases__case_type=CaseType.INTERNAL_SERVICE)
+            if closed_from:
+                case_closed_q &= Q(cases__case_closed_at__date__gte=closed_from)
+            if closed_to:
+                case_closed_q &= Q(cases__case_closed_at__date__lte=closed_to)
+            qs = qs.filter(case_closed_q)
 
         # Date-period filter (Verification page dropdown): narrow to households
         # whose enrollment record was OPENED within the selected window.
@@ -1151,6 +1233,33 @@ class MembersListView(PortalGenericAPIView):
             )
         return result
 
+    def _case_team_map(self, page):
+        """{client_id(str): originating_team} for the page -- the CareCircle team
+        of the Unite Us agent who CREATED each member's governing internal-service
+        case (Case.created_by_id == UniteUsAgent.user_id). Batched into ONE
+        UniteUsAgent query over the page's distinct creator ids to avoid an N+1.
+        Blank when the case has no known creator or the creator isn't a known
+        Unite Us agent."""
+        creator_by_client = {}
+        creator_ids = set()
+        for c in page:
+            case = s.internal_service_case(c)
+            if case is not None and case.created_by_id:
+                creator_by_client[str(c.client_id)] = str(case.created_by_id).lower()
+                creator_ids.add(case.created_by_id)
+        team_by_uid = {}
+        if creator_ids:
+            team_by_uid = {
+                str(uid).lower(): (team or "")
+                for uid, team in UniteUsAgent.objects.filter(
+                    user_id__in=creator_ids
+                ).values_list("user_id", "originating_team")
+            }
+        return {
+            cid: team_by_uid.get(uid, "")
+            for cid, uid in creator_by_client.items()
+        }
+
     def _stamp_added_via(self, groups):
         """Annotate each member dict in ``groups`` with how the client was first
         created: ``added_via`` (raw ChangeSource code) + ``added_via_label``."""
@@ -1165,6 +1274,25 @@ class MembersListView(PortalGenericAPIView):
                 src, label = via.get(m["id"], ("", "Unknown"))
                 m["added_via"] = src
                 m["added_via_label"] = label
+
+    def _stamp_case_teams(self, groups):
+        """Annotate each member dict in ``groups`` with ``case_created_by_team``
+        -- the CareCircle originating team of their internal-service case creator
+        (see :meth:`_case_team_map`). Batched: ONE query to reload the page's
+        clients (with cases) + ONE UniteUsAgent query, so the whole page costs
+        two queries rather than an N+1. Used by the Urgent Care list."""
+        ids = {
+            m["id"]
+            for g in groups
+            for m in g.get("members", [])
+        }
+        if not ids:
+            return
+        clients = Client.objects.filter(client_id__in=ids).prefetch_related("cases")
+        team_by_client = self._case_team_map(clients)
+        for g in groups:
+            for m in g.get("members", []):
+                m["case_created_by_team"] = team_by_client.get(m["id"], "")
 
     @staticmethod
     def _hidden_in_logistics(client):
@@ -1213,20 +1341,35 @@ class MembersListView(PortalGenericAPIView):
         is built.
 
         ``sort_field`` selects the timestamp the groups are ordered by:
-          * ``created``   -> Client.created_at (default; most-recently-added)
-          * ``requested`` -> the enrollment's requested_at/opened_at (Verification
-            page "Requested" column)
-          * ``completed`` -> the enrollment's verified_at ("Completed" column)
+          * ``created``      -> Client.created_at (default; most-recently-added)
+          * ``requested``    -> the enrollment's requested_at/opened_at
+            (Verification page "Requested" column)
+          * ``completed``    -> the enrollment's verified_at ("Completed" column)
+          * ``case_created`` -> the member's latest internal-service case
+            date_opened (Urgent Care "Case Created" column)
         Timestamps are aggregated as the MAX across a client's enrollments and
         then across a household's matching members. Groups with no timestamp sort
         last regardless of direction; name (case-insensitive) breaks ties."""
+        # Latest internal-service case date_opened per client, as a scalar
+        # subquery so the multi-valued cases relation can't multiply rows (it
+        # matches the "Case Created" column the Urgent Care list renders).
+        latest_case_opened = (
+            Case.objects.filter(
+                client=OuterRef("pk"),
+                case_type=CaseType.INTERNAL_SERVICE,
+            )
+            .order_by("-date_opened")
+            .values("date_opened")[:1]
+        )
         # The enrollment join is multi-valued (a client can have several), so a
         # client appears on several rows -- aggregate per client below.
-        rows = self.get_queryset().values_list(
+        rows = self.get_queryset().annotate(
+            _case_opened=Subquery(latest_case_opened)
+        ).values_list(
             "client_id", "household_membership__household_id",
             "first_name", "last_name", "created_at",
             "enrollments__requested_at", "enrollments__opened_at",
-            "enrollments__verified_at",
+            "enrollments__verified_at", "_case_opened",
         )
 
         def _max_dt(a, b):
@@ -1236,8 +1379,8 @@ class MembersListView(PortalGenericAPIView):
                 return a
             return a if a >= b else b
 
-        clients = {}  # cid -> {hid, name, created, requested, completed}
-        for cid, hid, fn, ln, created, req, opened, verified in rows:
+        clients = {}  # cid -> {hid, name, created, requested, completed, case_created}
+        for cid, hid, fn, ln, created, req, opened, verified, case_opened in rows:
             requested = req or opened
             c = clients.get(cid)
             if c is None:
@@ -1247,13 +1390,16 @@ class MembersListView(PortalGenericAPIView):
                     "created": created,
                     "requested": requested,
                     "completed": verified,
+                    # Scalar per client (subquery), identical on every row.
+                    "case_created": case_opened,
                 }
             else:
                 c["requested"] = _max_dt(c["requested"], requested)
                 c["completed"] = _max_dt(c["completed"], verified)
 
         hh_ids, seen_hh, individuals = [], set(), []
-        hh_ts = {}  # hid -> {created, requested, completed} aggregated across members
+        # hid -> {created, requested, completed, case_created} aggregated across members
+        hh_ts = {}
         for cid, c in clients.items():
             hid = c["hid"]
             if hid:
@@ -1261,9 +1407,11 @@ class MembersListView(PortalGenericAPIView):
                     seen_hh.add(hid)
                     hh_ids.append(hid)
                 agg = hh_ts.setdefault(
-                    hid, {"created": None, "requested": None, "completed": None}
+                    hid,
+                    {"created": None, "requested": None, "completed": None,
+                     "case_created": None},
                 )
-                for k in ("created", "requested", "completed"):
+                for k in ("created", "requested", "completed", "case_created"):
                     agg[k] = _max_dt(agg[k], c[k])
             else:
                 individuals.append((cid, c["name"], c))
@@ -1281,7 +1429,7 @@ class MembersListView(PortalGenericAPIView):
                     hname or f"{(fn or '').strip()} {(ln or '').strip()}".strip()
                 )
 
-        field = sort_field if sort_field in ("created", "requested", "completed") else "created"
+        field = sort_field if sort_field in ("created", "requested", "completed", "case_created") else "created"
         entries = [
             {"type": "household", "id": hid, "name": hh_names.get(hid, ""),
              "sort_ts": hh_ts[hid][field]}
@@ -1607,17 +1755,30 @@ class MembersListView(PortalGenericAPIView):
             # most-recently-created first. Rows with a null date sort last; name
             # (case-insensitive "First Last") breaks ties.
             #
-            # The Created column shows the member's own Client ``created_at``, so
-            # sort on that. (The created-date FILTER is a separate control that
-            # searches the internal-service case date; the column + its sort stay
-            # on the member created date.)
-            sort_field = {
-                "created": "created_at", "updated": "updated_at",
-            }.get((request.query_params.get("sort") or "created").strip().lower(), "created_at")
+            # The Created column now sorts by the member's most-recently-opened
+            # INTERNAL-SERVICE case date (matching the O: rows it renders), NOT
+            # the Client record's own ``created_at``. A correlated subquery pulls
+            # that one date per client so ordering over the multi-valued cases
+            # relation can't multiply rows. ``updated`` still sorts on the member
+            # ``updated_at``. Rows with a null sort key sort last; name breaks ties.
+            sort_key = (request.query_params.get("sort") or "created").strip().lower()
             descending = (request.query_params.get("dir") or "desc").strip().lower() != "asc"
-            col = F(sort_field)
+            qs = self.get_queryset()
+            if sort_key == "updated":
+                col = F("updated_at")
+            else:
+                latest_case_opened = (
+                    Case.objects.filter(
+                        client=OuterRef("pk"),
+                        case_type=CaseType.INTERNAL_SERVICE,
+                    )
+                    .order_by("-date_opened")
+                    .values("date_opened")[:1]
+                )
+                qs = qs.annotate(_case_opened=Subquery(latest_case_opened))
+                col = F("_case_opened")
             primary = col.desc(nulls_last=True) if descending else col.asc(nulls_last=True)
-            qs = self.get_queryset().order_by(
+            qs = qs.order_by(
                 primary,
                 Lower("first_name"),
                 Lower("last_name"),
@@ -1637,14 +1798,21 @@ class MembersListView(PortalGenericAPIView):
                 src, label = via.get(row["id"], ("", "Unknown"))
                 row["added_via"] = src
                 row["added_via_label"] = label
+            # Stamp the CareCircle team of each member's internal-service case
+            # creator, shown next to the creator name in the Created column.
+            teams = self._case_team_map(page)
+            for row in data:
+                row["case_created_by_team"] = teams.get(row["id"], "")
             return self.get_paginated_response(data)
         # Grouped mode (Verification / Logistics): build the ordered group keys
         # cheaply, paginate THEM, and serialize only the current page's groups
         # (previously the whole scoped set was serialized on every request).
-        # Sortable by the Verification page Requested / Completed columns
-        # (``sort`` + ``dir``); default is most-recently-created first.
+        # Sortable by the Verification page Requested / Completed columns and the
+        # Urgent Care "Case Created" column (``sort`` + ``dir``); default is
+        # most-recently-created first.
         group_sort = {
             "requested": "requested", "completed": "completed",
+            "case_created": "case_created",
         }.get((request.query_params.get("sort") or "").strip().lower(), "created")
         group_desc = (request.query_params.get("dir") or "desc").strip().lower() != "asc"
         entries = self._group_entries(group_sort, group_desc)
@@ -1680,6 +1848,9 @@ class MembersListView(PortalGenericAPIView):
         # (extension vs import) so agents can triage the list at a glance.
         if scope == "need_attention":
             self._stamp_added_via(groups)
+            # Also stamp the case creator's CareCircle team so the Urgent Care
+            # list can flag Street Team-created cases under the Created By column.
+            self._stamp_case_teams(groups)
         return self.get_paginated_response(groups)
 
 
@@ -2971,6 +3142,19 @@ class HouseholdMemberEditView(PortalAPIView):
             household = membership.household if membership else None
 
         member_client = mv.client
+        # Never remove a primary member -- enforced here for EVERY removal
+        # surface routed through this endpoint (the program tab, the Household
+        # tab and the verification pop-up). A primary owns their household's
+        # timeline + enrollment, so they can't be dropped. Checked directly
+        # against the HouseholdMember roster so it holds regardless of which
+        # household context the enrollment resolves to.
+        if member_client is not None and HouseholdMember.objects.filter(
+            client=member_client, is_primary=True
+        ).exists():
+            return Response(
+                {"error": "The primary member cannot be removed."},
+                status=http.HTTP_400_BAD_REQUEST,
+            )
         member_name = mv.member_name or (
             f"{member_client.first_name} {member_client.last_name}".strip()
             if member_client else ""
@@ -3002,7 +3186,9 @@ class HouseholdMemberEditView(PortalAPIView):
                 .first()
             )
 
-        # The household's primary member owns the timeline and can't be removed.
+        # The household's primary owns the timeline; the removed-member event is
+        # logged on their history (the primary can't themselves be removed -- that
+        # is guarded above, against the roster, before any of this runs).
         primary_membership = (
             household.members.filter(is_primary=True).select_related("client").first()
             if household is not None else None
@@ -3010,15 +3196,6 @@ class HouseholdMemberEditView(PortalAPIView):
         primary_client = (
             primary_membership.client if primary_membership is not None else client
         )
-        if (
-            member_client is not None
-            and primary_membership is not None
-            and member_client.pk == primary_membership.client_id
-        ):
-            return Response(
-                {"error": "The primary member cannot be removed."},
-                status=http.HTTP_400_BAD_REQUEST,
-            )
 
         agent = current_agent(request)
         actor = _agent_actor(agent)
@@ -3424,6 +3601,17 @@ class MemberVerificationCreateView(PortalAPIView):
         )
 
         client = get_object_or_404(Client, pk=client_id)
+        # Only a member who OWNS an (open) Internal Service case can be verified --
+        # the verification + meal/box delivery attach to that case. A member who
+        # doesn't hold their own internal-service case (e.g. a dependent) can't be
+        # the SUBJECT of a verification, even if the pop-up is somehow opened on
+        # them. Mirrors the same gate on MemberRequestVerificationView.
+        if not has_open_internal_service_case(client):
+            return Response(
+                {"error": "This member doesn't own an open Internal Service case, "
+                          "so they can't be verified."},
+                status=http.HTTP_400_BAD_REQUEST,
+            )
         ser = s.VerificationCreateSerializer(data=request.data)
         ser.is_valid(raise_exception=True)
         data = ser.validated_data

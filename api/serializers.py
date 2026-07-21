@@ -545,6 +545,37 @@ def ensure_household_with_primary(client):
 
 
 @transaction.atomic
+def ensure_primary_of_own_household(client):
+    """Ensure ``client`` is the PRIMARY of their own household.
+
+    A client who holds their own Internal Service (meal/box) case goes through
+    verification + delivery as a household head, so they must be the primary of
+    their household. If they're currently a NON-primary member of a (shared)
+    household -- e.g. an agent added them as a relative's dependent before their
+    own case existed -- split them out into a fresh household as primary,
+    detaching their dietary profile(s) from the old household's enrollments
+    (mirroring :func:`add_client_to_household`'s move semantics). Idempotent: a
+    client who is already primary (or has no household yet) is handled by
+    :func:`ensure_household_with_primary`.
+    """
+    membership = (
+        HouseholdMember.objects.filter(client=client)
+        .select_related("household")
+        .first()
+    )
+    if membership is None or membership.is_primary:
+        return ensure_household_with_primary(client)
+    old_household = membership.household
+    MemberDietaryProfile.objects.filter(
+        client=client, enrollment__household=old_household
+    ).delete()
+    membership.delete()
+    if not old_household.members.exists():
+        old_household.delete()
+    return ensure_household_with_primary(client)
+
+
+@transaction.atomic
 def sync_household_members(client, enrollment=None, agent=None):
     """Reconcile a household's two member sources so every member -- however
     added -- lands in the SAME place.
@@ -1098,6 +1129,17 @@ class CaseSerializer(serializers.ModelSerializer):
     originating_provider_id = serializers.UUIDField(required=False, allow_null=True)
     provider_id = serializers.UUIDField(required=False, allow_null=True)
     program_id = serializers.UUIDField(required=False, allow_null=True)
+    # Accept a RAW Unite Us authorization state (e.g. "requested", "deferred",
+    # "accepted", "rejected") in addition to our own enum values. Declared as a
+    # plain CharField to bypass the auto ChoiceField's strict validation so
+    # ``to_internal_value`` can normalize it -- mirroring the CSV / daily-import
+    # mappers, which pre-map via ``_AUTH_STATE_MAP`` before hitting this
+    # serializer. Without this, an extension save that sent a raw/denied state
+    # never updated the stored enum (the bug: a rejected auth still read
+    # "requested"/pending).
+    service_authorization_status = serializers.CharField(
+        required=False, allow_blank=True
+    )
 
     class Meta:
         model = Case
@@ -1108,6 +1150,31 @@ class CaseSerializer(serializers.ModelSerializer):
             "provider",
             "program",
         )
+
+    def to_internal_value(self, data):
+        ret = super().to_internal_value(data)
+        # Normalize the authorization status so EVERY write path (extension,
+        # import, admin) persists the same enum. The extension writes straight
+        # through this serializer with no mapping, so a raw Unite Us state
+        # ("rejected"/"requested"/"accepted"/"deferred") must be translated here
+        # or the stored enum never updates. Mirrors mappers._AUTH_STATE_MAP.
+        raw = data.get("service_authorization_status") if hasattr(data, "get") else None
+        if raw not in (None, ""):
+            from api.integrations.uniteus.mappers import (
+                _AUTH_STATE_MAP,
+                _enum_or_blank,
+            )
+
+            ret["service_authorization_status"] = _enum_or_blank(
+                raw, ServiceAuthorizationStatus.values, _AUTH_STATE_MAP
+            )
+            # Preserve the human-readable raw label when the caller didn't send
+            # one, so the UI keeps fidelity (e.g. "Rejected").
+            if not (data.get("service_authorization_status_label") or "").strip():
+                ret["service_authorization_status_label"] = (
+                    str(raw).replace("_", " ").title()
+                )
+        return ret
 
     @transaction.atomic
     def create(self, validated_data):
@@ -1200,24 +1267,12 @@ class CaseSerializer(serializers.ModelSerializer):
         _prev_status = _prev["case_status"] if _prev else None
         _prev_auth = _prev["service_authorization_status"] if _prev else None
 
-        # Business rule (enforced on EVERY case write -- extension, CSV import,
-        # daily Unite Us pull, admin/direct API -- since they all funnel through
-        # here): the service authorization DRIVES the case status. A Denied /
-        # Rejected authorization ends the case, so it becomes Closed regardless
-        # of its current status (Open, Managed, ...). Other auth states
-        # (Requested/Pending, Approved, ...) never force a status change here.
-        # Compute the EFFECTIVE status/auth from the incoming payload, falling
-        # back to the stored values (a partial update may omit one field), so the
-        # rule holds no matter which field the write changed; downstream
-        # (record_case_change / tickets / delivery truncation) then sees a normal
-        # transition to Closed. An explicitly Cancelled case stays Cancelled.
-        eff_status = validated_data.get("case_status", _prev_status)
-        eff_auth = validated_data.get("service_authorization_status", _prev_auth)
-        if (
-            eff_auth == ServiceAuthorizationStatus.DENIED
-            and eff_status != CaseStatus.CANCELLED
-        ):
-            validated_data["case_status"] = CaseStatus.CLOSED
+        # Case status is Open/Closed ONLY, driven by the closed date (mirrors the
+        # extension + the CSV/API mappers). Authorization status is an INDEPENDENT
+        # dimension and no longer forces the case status -- a denied authorization
+        # leaves the case Open and instead pauses the household via the
+        # internal-service reconcile below. (The old "denied -> Closed" coupling
+        # was removed so authorization never drives case status.)
 
         case, _ = Case.objects.update_or_create(case_id=case_id, defaults=validated_data)
         # Stash the pre-save values on the instance so the write path (e.g.
@@ -1264,14 +1319,17 @@ class CaseSerializer(serializers.ModelSerializer):
         except Exception:
             logger.exception("catalog.assign_product_type_for_internal_service failed")
         # Internal Service cases are the ones that go through verification and
-        # meal/box delivery, so ensure the client has a household (with this
-        # client as primary) here — on case save — rather than on profile save.
-        # Get-or-create, so re-saving the case never duplicates the household.
+        # meal/box delivery, so ensure the client is the PRIMARY of their own
+        # household here — on case save — rather than on profile save. A client
+        # who was added as a relative's dependent BEFORE their own case existed
+        # is split out into their own household as primary (they can't remain a
+        # non-primary member while holding their own case). Idempotent, so
+        # re-saving the case never duplicates or re-splits the household.
         try:
             if case.case_type == CaseType.INTERNAL_SERVICE:
-                ensure_household_with_primary(client)
+                ensure_primary_of_own_household(client)
         except Exception:
-            logger.exception("ensure_household_with_primary failed for internal service case")
+            logger.exception("ensure_primary_of_own_household failed for internal service case")
         # "New client needs verification attention": creating a client's FIRST
         # internal-service case flags them is_new=True so they surface on the
         # Urgent Care ("Need Attention") list and the ext shows the right
@@ -1307,44 +1365,25 @@ class CaseSerializer(serializers.ModelSerializer):
                 evaluate_is_new_flag(client)
         except Exception:
             logger.exception("is_new flag set failed for internal service case %s", case_id)
-        # Internal-service authorization full-stop rule: a client with a SINGLE
-        # internal-service (meal/box) case that is denied is auto-paused (On Hold)
-        # so service stops and they drop off kitchen assignment; a later favorable
-        # authorization resumes them. Two-plus internal-service cases are never a
-        # full stop. Raise a HIGH follow-up ticket the first time the sole case
-        # flips to denied. Best-effort: never let this break the case save.
+        # Internal-service case-driven lifecycle reconcile (the single
+        # chokepoint for ALL save paths -- extension, CSV import, bulk CLI):
+        #   * favorable governing authorization -> advance a verified household to
+        #     Kitchen Assignment / resume an auto-paused hold;
+        #   * denied governing authorization -> pause the household (On Hold);
+        #   * the last open internal-service case closing -> pause + truncate
+        #     deliveries + note the primary, then cancel + a second note.
+        # Opens NO tickets: visibility comes from StageEvents, the member
+        # timeline, the primary notes, and the Import Activity page. Attributed to
+        # the acting agent when present. Best-effort: never break the case save.
         try:
             if case.case_type == CaseType.INTERNAL_SERVICE:
-                from .models import (
-                    TicketSeverity,
-                    TicketTypeCode,
-                )
-                from .services import tickets
                 from .services.lifecycle import (
                     reconcile_internal_service_authorization,
                 )
 
-                outcome = reconcile_internal_service_authorization(client)
-                newly_denied = (
-                    outcome["sole_denied"]
-                    and _prev_auth != ServiceAuthorizationStatus.DENIED
-                    and case.service_authorization_status
-                    == ServiceAuthorizationStatus.DENIED
-                )
-                if newly_denied:
-                    tickets.open_ticket(
-                        TicketTypeCode.SYSTEM_CHANGE_DETECTED,
-                        reason=(
-                            f"The member's only internal-service (meal/box) case "
-                            f"{case.case_id} was denied. Service has been paused "
-                            f"(placed On Hold) and the member removed from kitchen "
-                            f"assignment. Confirm the denial and follow up with the "
-                            f"member; if it is overturned, resume service."
-                        ),
-                        severity=TicketSeverity.HIGH,
-                        client=client,
-                        case=case,
-                    )
+                request = self.context.get("request")
+                agent = getattr(request, "user", None) if request is not None else None
+                reconcile_internal_service_authorization(client, actor=agent)
         except Exception:
             logger.exception(
                 "internal-service authorization reconcile failed for case %s", case_id

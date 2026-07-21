@@ -444,6 +444,59 @@ class ExtensionTimelineTest(TestCase):
         self.assertEqual(occurred, sorted(occurred, reverse=True))
 
 
+class WilliamsburgAgentLeadSourceTest(TestCase):
+    """Settings > Williamsburg Setup: a client saved by an agent flagged
+    ``is_williamsburg_agent`` is forced to lead_source="Williamsburg" (which
+    derives Client.is_williamsburg), overriding whatever lead source the
+    extension sent. A normal agent's save is left untouched."""
+
+    def _api_for(self, agent):
+        access = AccessToken()
+        access["agent_id"] = str(agent.id)
+        access["agent_code"] = agent.agent_code
+        access["agent_name"] = agent.name
+        access["agent_group"] = agent.group
+        api = APIClient()
+        api.credentials(HTTP_AUTHORIZATION=f"Bearer {access}")
+        return api
+
+    def _post_client(self, api, lead_source=None):
+        cid = str(uuid.uuid4())
+        body = {"client_id": cid, "first_name": "Willie", "last_name": "Burg"}
+        if lead_source is not None:
+            body["lead_source"] = lead_source
+        resp = api.post(reverse("client-list"), body, format="json")
+        self.assertEqual(resp.status_code, 201, resp.content)
+        return Client.objects.get(pk=cid)
+
+    def test_williamsburg_agent_forces_lead_source(self):
+        agent = Agent.objects.create(
+            name="Will Agent", agent_code="700", group="Screeners",
+            is_williamsburg_agent=True,
+        )
+        # Even with a different lead source picked in the ext, it's overridden.
+        client = self._post_client(self._api_for(agent), lead_source="Some Queue")
+        self.assertEqual(client.lead_source, "Williamsburg")
+        self.assertTrue(client.is_williamsburg)
+
+    def test_williamsburg_agent_forces_lead_source_when_blank(self):
+        agent = Agent.objects.create(
+            name="Will Agent", agent_code="701", group="Screeners",
+            is_williamsburg_agent=True,
+        )
+        client = self._post_client(self._api_for(agent))
+        self.assertEqual(client.lead_source, "Williamsburg")
+        self.assertTrue(client.is_williamsburg)
+
+    def test_normal_agent_lead_source_untouched(self):
+        agent = Agent.objects.create(
+            name="Reg Agent", agent_code="702", group="Screeners",
+        )
+        client = self._post_client(self._api_for(agent), lead_source="Some Queue")
+        self.assertEqual(client.lead_source, "Some Queue")
+        self.assertFalse(client.is_williamsburg)
+
+
 class HouseholdEnrollmentActivationTest(TestCase):
     """When a household enrollment advances, every participant — not just the
     primary — should follow the enrollment's lifecycle stage. The household is
@@ -572,13 +625,15 @@ class SoleInternalServiceDenialTest(TestCase):
         enr.refresh_from_db()
         self.assertEqual(enr.stage, EnrollmentStage.KITCHEN_ASSIGNMENT)
 
-        # Deny the sole internal-service case -> full stop (On Hold) + ticket.
+        # Deny the sole internal-service case -> full stop (On Hold). The case
+        # stays OPEN (authorization no longer drives case status) and NO ticket
+        # is opened -- the pause is surfaced via the timeline + reconcile only.
         self._save_case(client, case_id, "denied")
         enr.refresh_from_db()
         self.assertEqual(enr.stage, EnrollmentStage.ON_HOLD)
         self.assertEqual(verification_status(client), "On Hold")
         self.assertEqual(
-            Ticket.objects.filter(client=client, case_id=case_id).count(), 1
+            Ticket.objects.filter(client=client, case_id=case_id).count(), 0
         )
 
     def test_two_internal_cases_denied_does_not_pause(self):
@@ -605,6 +660,93 @@ class SoleInternalServiceDenialTest(TestCase):
         self._save_case(client, case_id, "approved")
         enr.refresh_from_db()
         self.assertEqual(enr.stage, EnrollmentStage.KITCHEN_ASSIGNMENT)
+
+
+class InternalServiceClosureFullStopTest(TestCase):
+    """When a client's LAST open internal-service (meal/box) case CLOSES it is a
+    full stop: future deliveries truncated, the household paused (On Hold) then
+    CANCELLED, with system notes on the primary and NO tickets. Idempotent on
+    re-import."""
+
+    def _client(self):
+        return Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Clo", last_name="Sure"
+        )
+
+    def _enrollment(self, client, stage):
+        from .models import EnrollmentVerification, Household, HouseholdMember
+
+        household = Household.objects.create(name="HH")
+        HouseholdMember.objects.create(
+            household=household, client=client, is_primary=True
+        )
+        return EnrollmentVerification.objects.create(
+            client=client, household=household, stage=stage,
+            verified_at=timezone.now(),
+        )
+
+    def _save_case(self, client, case_id, *, auth="approved",
+                   case_status="open", closed_at=None):
+        from .serializers import CaseSerializer
+
+        data = {
+            "case_id": case_id,
+            "client_id": str(client.client_id),
+            "case_type": "internal_service",
+            "program_name": "Medically Tailored Meals",
+            "service_authorization_status": auth,
+            "case_status": case_status,
+            "date_opened": timezone.now().isoformat(),
+        }
+        if closed_at is not None:
+            data["case_closed_at"] = closed_at.isoformat()
+        ser = CaseSerializer(data=data)
+        ser.is_valid(raise_exception=True)
+        return ser.save()
+
+    def test_last_open_case_closing_cancels_household(self):
+        from .models import EnrollmentStage, Note, NoteSource, Ticket
+
+        client = self._client()
+        enr = self._enrollment(client, EnrollmentStage.KITCHEN_ASSIGNMENT)
+        case_id = str(uuid.uuid4())
+        # Open + approved -> served (Rule 2 keeps it on the queue).
+        self._save_case(client, case_id, auth="approved", case_status="open")
+        enr.refresh_from_db()
+        self.assertEqual(enr.stage, EnrollmentStage.KITCHEN_ASSIGNMENT)
+
+        # Close the sole open case -> full stop -> CANCELLED.
+        self._save_case(
+            client, case_id, auth="approved", case_status="closed",
+            closed_at=timezone.now(),
+        )
+        enr.refresh_from_db()
+        self.assertEqual(enr.stage, EnrollmentStage.CANCELLED)
+        # System notes on the primary (paused + cancelled); NO tickets.
+        self.assertGreaterEqual(
+            Note.objects.filter(client=client, source=NoteSource.SYSTEM).count(), 2
+        )
+        self.assertEqual(Ticket.objects.filter(client=client).count(), 0)
+
+    def test_close_out_is_idempotent(self):
+        from .models import EnrollmentStage, Note, NoteSource
+
+        client = self._client()
+        enr = self._enrollment(client, EnrollmentStage.KITCHEN_ASSIGNMENT)
+        case_id = str(uuid.uuid4())
+        self._save_case(
+            client, case_id, case_status="closed", closed_at=timezone.now()
+        )
+        enr.refresh_from_db()
+        self.assertEqual(enr.stage, EnrollmentStage.CANCELLED)
+        n1 = Note.objects.filter(client=client, source=NoteSource.SYSTEM).count()
+
+        # Re-import the same closed case -> nothing actionable -> no new notes.
+        self._save_case(
+            client, case_id, case_status="closed", closed_at=timezone.now()
+        )
+        n2 = Note.objects.filter(client=client, source=NoteSource.SYSTEM).count()
+        self.assertEqual(n1, n2)
 
 
 class LogisticsRosterFilterTest(TestCase):
@@ -732,6 +874,280 @@ class LogisticsRosterFilterTest(TestCase):
         hh_group = next(g for g in groups if g["type"] == "household")
         ids = {m["id"] for m in hh_group["members"]}
         self.assertIn(str(dep.client_id), ids)
+
+
+class VerificationCaseOptionsTest(TestCase):
+    """The verification pop-up's Internal Service case dropdown
+    (MemberDetailSerializer -> service.cases) lists only cases that are a live
+    target for a verification: DENIED-authorization cases and CLOSED/CANCELLED
+    cases are excluded."""
+
+    def _client(self):
+        return Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Case", last_name="Options",
+        )
+
+    def _internal_case(self, client, *, status=None, auth=None, program="Medically Tailored Meals"):
+        from .models import Case, CaseStatus, CaseType
+
+        return Case.objects.create(
+            case_id=uuid.uuid4(), client=client,
+            case_type=CaseType.INTERNAL_SERVICE,
+            case_status=status or CaseStatus.OPEN,
+            service_authorization_status=auth or "",
+            program_name=program,
+        )
+
+    def _case_ids(self, client):
+        from .portal.serializers import MemberDetailSerializer
+
+        data = MemberDetailSerializer(client).data
+        return {c["case_id"] for c in data["service"]["cases"]}
+
+    def test_open_case_is_listed(self):
+        client = self._client()
+        case = self._internal_case(client)
+        self.assertIn(str(case.case_id), self._case_ids(client))
+
+    def test_closed_case_excluded(self):
+        from .models import CaseStatus
+
+        client = self._client()
+        open_case = self._internal_case(client, program="Meals A")
+        closed_case = self._internal_case(
+            client, status=CaseStatus.CLOSED, program="Meals B"
+        )
+        ids = self._case_ids(client)
+        self.assertIn(str(open_case.case_id), ids)
+        self.assertNotIn(str(closed_case.case_id), ids)
+
+    def test_cancelled_case_excluded(self):
+        from .models import CaseStatus
+
+        client = self._client()
+        cancelled = self._internal_case(client, status=CaseStatus.CANCELLED)
+        self.assertNotIn(str(cancelled.case_id), self._case_ids(client))
+
+    def test_denied_case_excluded(self):
+        from .models import ServiceAuthorizationStatus
+
+        client = self._client()
+        denied = self._internal_case(
+            client, auth=ServiceAuthorizationStatus.DENIED
+        )
+        self.assertNotIn(str(denied.case_id), self._case_ids(client))
+
+
+class EnsurePrimaryOfOwnHouseholdTest(TestCase):
+    """A client who holds their own Internal Service case must be the PRIMARY of
+    their own household. `ensure_primary_of_own_household` splits a non-primary
+    dependent out into a fresh household (as primary) while leaving the rest of
+    the old household intact, and is a no-op for a client who is already primary
+    or has no household yet."""
+
+    def _client(self, first, last):
+        return Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name=first, last_name=last,
+        )
+
+    def test_non_primary_dependent_is_split_into_own_household(self):
+        from .models import Household, HouseholdMember
+        from .serializers import ensure_primary_of_own_household
+
+        primary = self._client("Pat", "Primary")
+        dep = self._client("Dee", "Dependent")
+        hh = Household.objects.create(name="Shared HH")
+        HouseholdMember.objects.create(household=hh, client=primary, is_primary=True)
+        HouseholdMember.objects.create(household=hh, client=dep, is_primary=False)
+
+        new_hh = ensure_primary_of_own_household(dep)
+
+        self.assertNotEqual(new_hh.household_id, hh.household_id)
+        dep_membership = HouseholdMember.objects.get(client=dep)
+        self.assertEqual(dep_membership.household_id, new_hh.household_id)
+        self.assertTrue(dep_membership.is_primary)
+        # The old household is untouched apart from losing the dependent.
+        self.assertTrue(
+            HouseholdMember.objects.filter(
+                household=hh, client=primary, is_primary=True
+            ).exists()
+        )
+        self.assertFalse(
+            HouseholdMember.objects.filter(household=hh, client=dep).exists()
+        )
+
+    def test_dependent_dietary_profile_detached_from_old_enrollment(self):
+        from .models import (
+            EnrollmentStage, EnrollmentVerification, Household, HouseholdMember,
+            MemberDietaryProfile, MemberStatus,
+        )
+        from .serializers import ensure_primary_of_own_household
+
+        primary = self._client("Pat", "Primary")
+        dep = self._client("Dee", "Dependent")
+        hh = Household.objects.create(name="Shared HH")
+        HouseholdMember.objects.create(household=hh, client=primary, is_primary=True)
+        HouseholdMember.objects.create(household=hh, client=dep, is_primary=False)
+        enr = EnrollmentVerification.objects.create(
+            client=primary, household=hh, stage=EnrollmentStage.SERVICE_ACTIVE,
+        )
+        MemberDietaryProfile.objects.create(
+            enrollment=enr, client=dep, status=MemberStatus.ACTIVE,
+        )
+
+        ensure_primary_of_own_household(dep)
+
+        self.assertFalse(
+            MemberDietaryProfile.objects.filter(
+                client=dep, enrollment=enr
+            ).exists()
+        )
+
+    def test_already_primary_is_noop(self):
+        from .models import Household, HouseholdMember
+        from .serializers import ensure_primary_of_own_household
+
+        c = self._client("Sol", "Solo")
+        hh = Household.objects.create(name="Own HH")
+        HouseholdMember.objects.create(household=hh, client=c, is_primary=True)
+
+        result = ensure_primary_of_own_household(c)
+
+        self.assertEqual(result.household_id, hh.household_id)
+        self.assertEqual(HouseholdMember.objects.filter(client=c).count(), 1)
+
+    def test_no_household_yet_creates_one_as_primary(self):
+        from .models import HouseholdMember
+        from .serializers import ensure_primary_of_own_household
+
+        c = self._client("New", "Client")
+
+        result = ensure_primary_of_own_household(c)
+
+        membership = HouseholdMember.objects.get(client=c)
+        self.assertEqual(membership.household_id, result.household_id)
+        self.assertTrue(membership.is_primary)
+
+    def test_empty_old_household_is_removed(self):
+        from .models import Household, HouseholdMember
+        from .serializers import ensure_primary_of_own_household
+
+        # A shared household whose ONLY row is the (non-primary) dependent -- e.g.
+        # the primary was already removed. Splitting the dependent out leaves the
+        # old household empty, so it's cleaned up.
+        dep = self._client("Lone", "Dependent")
+        hh = Household.objects.create(name="Orphan HH")
+        HouseholdMember.objects.create(household=hh, client=dep, is_primary=False)
+
+        ensure_primary_of_own_household(dep)
+
+        self.assertFalse(Household.objects.filter(household_id=hh.household_id).exists())
+
+
+class RemovalAndVerificationGuardsTest(TestCase):
+    """Two hard invariants shared by the removal + verification surfaces:
+
+    * The PRIMARY member can never be removed (the ext, the program tab and the
+      verification pop-up all route through ``HouseholdMemberEditView.delete``).
+    * A member who doesn't OWN an open Internal Service case can't be the subject
+      of a verification (``MemberVerificationCreateView`` / the pop-up wizard).
+    """
+
+    def _client(self, first, last):
+        return Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name=first, last_name=last,
+        )
+
+    def _internal_case(self, client, status=None):
+        from .models import Case, CaseStatus, CaseType
+
+        return Case.objects.create(
+            case_id=str(uuid.uuid4()), client=client,
+            case_type=CaseType.INTERNAL_SERVICE,
+            case_status=status or CaseStatus.OPEN,
+        )
+
+    def test_cannot_remove_primary_member(self):
+        from rest_framework.test import APIRequestFactory
+
+        from .models import (
+            EnrollmentStage, EnrollmentVerification, Household, HouseholdMember,
+            MemberDietaryProfile,
+        )
+        from .portal.views_members import HouseholdMemberEditView
+
+        primary = self._client("Pat", "Primary")
+        hh = Household.objects.create(name="HH")
+        HouseholdMember.objects.create(household=hh, client=primary, is_primary=True)
+        enr = EnrollmentVerification.objects.create(
+            client=primary, household=hh, stage=EnrollmentStage.SERVICE_ACTIVE,
+        )
+        mv = MemberDietaryProfile.objects.create(enrollment=enr, client=primary)
+
+        req = APIRequestFactory().delete("/")
+        resp = HouseholdMemberEditView().delete(req, primary.pk, mv.pk)
+
+        self.assertEqual(resp.status_code, 400)
+        # The primary's roster row + dietary profile survive the refused removal.
+        self.assertTrue(
+            HouseholdMember.objects.filter(client=primary, is_primary=True).exists()
+        )
+        self.assertTrue(MemberDietaryProfile.objects.filter(pk=mv.pk).exists())
+
+    def test_can_remove_non_primary_member(self):
+        from rest_framework.test import APIRequestFactory
+
+        from .models import (
+            EnrollmentStage, EnrollmentVerification, Household, HouseholdMember,
+            MemberDietaryProfile,
+        )
+        from .portal.views_members import HouseholdMemberEditView
+
+        primary = self._client("Pat", "Primary")
+        dep = self._client("Dee", "Dependent")
+        hh = Household.objects.create(name="HH")
+        HouseholdMember.objects.create(household=hh, client=primary, is_primary=True)
+        HouseholdMember.objects.create(household=hh, client=dep, is_primary=False)
+        enr = EnrollmentVerification.objects.create(
+            client=primary, household=hh, stage=EnrollmentStage.SERVICE_ACTIVE,
+        )
+        MemberDietaryProfile.objects.create(enrollment=enr, client=primary)
+        dep_mv = MemberDietaryProfile.objects.create(enrollment=enr, client=dep)
+
+        req = APIRequestFactory().delete("/")
+        resp = HouseholdMemberEditView().delete(req, primary.pk, dep_mv.pk)
+
+        self.assertIn(resp.status_code, (200, 204))
+        self.assertFalse(HouseholdMember.objects.filter(client=dep).exists())
+
+    def test_cannot_verify_member_without_internal_service_case(self):
+        from rest_framework.test import APIRequestFactory
+
+        from .models import EnrollmentVerification
+        from .portal.views_members import MemberVerificationCreateView
+
+        client = self._client("No", "Case")
+
+        req = APIRequestFactory().post("/", {}, format="json")
+        resp = MemberVerificationCreateView().post(req, client.pk)
+
+        self.assertEqual(resp.status_code, 400)
+        self.assertFalse(EnrollmentVerification.objects.filter(client=client).exists())
+
+    def test_cannot_verify_member_whose_only_case_is_closed(self):
+        from rest_framework.test import APIRequestFactory
+
+        from .models import CaseStatus, EnrollmentVerification
+        from .portal.views_members import MemberVerificationCreateView
+
+        client = self._client("Closed", "Case")
+        self._internal_case(client, status=CaseStatus.CLOSED)
+
+        req = APIRequestFactory().post("/", {}, format="json")
+        resp = MemberVerificationCreateView().post(req, client.pk)
+
+        self.assertEqual(resp.status_code, 400)
+        self.assertFalse(EnrollmentVerification.objects.filter(client=client).exists())
 
 
 class DeliveryCoverageEligibilityTest(TestCase):
@@ -1628,13 +2044,20 @@ class CsvCaseMappingTest(SimpleTestCase):
         base.update(row)
         return map_case_row(base)
 
-    def test_case_status_known_values_map_through(self):
-        self.assertEqual(self._map(case_status="managed")["case_status"], "managed")
-        self.assertEqual(self._map(case_status="off_platform")["case_status"], "off_platform")
-        self.assertEqual(self._map(case_status="closed")["case_status"], "closed")
-
-    def test_case_status_unknown_falls_back_to_open(self):
+    def test_case_status_is_open_or_closed_only(self):
+        # Case status is Open/Closed ONLY, driven by the closed date. Without a
+        # closed date EVERY raw state (managed/off_platform/cancelled/unknown)
+        # maps to Open; the authorization status is a separate dimension.
+        self.assertEqual(self._map(case_status="managed")["case_status"], "open")
+        self.assertEqual(self._map(case_status="off_platform")["case_status"], "open")
         self.assertEqual(self._map(case_status="somethingelse")["case_status"], "open")
+        # A closed date is the only thing that yields Closed.
+        self.assertEqual(
+            self._map(case_status="managed", case_closed_at="2026-01-02T00:00:00Z")[
+                "case_status"
+            ],
+            "closed",
+        )
 
     def test_closed_date_forces_closed_despite_managed_state(self):
         # Unite Us leaves the exported state "managed" even after closure; a
@@ -1647,12 +2070,14 @@ class CsvCaseMappingTest(SimpleTestCase):
         )
         self.assertEqual(out["case_status"], "closed")
 
-    def test_closed_date_does_not_override_explicit_cancelled(self):
+    def test_closed_date_yields_closed_regardless_of_raw_state(self):
+        # Even a raw "cancelled" state with a closed date is stored as Closed --
+        # case status is Open/Closed ONLY.
         out = self._map(case_status="cancelled", case_closed_at="2026-01-02T00:00:00Z")
-        self.assertEqual(out["case_status"], "cancelled")
+        self.assertEqual(out["case_status"], "closed")
 
-    def test_managed_without_closed_date_stays_managed(self):
-        self.assertEqual(self._map(case_status="managed")["case_status"], "managed")
+    def test_no_closed_date_stays_open(self):
+        self.assertEqual(self._map(case_status="managed")["case_status"], "open")
 
     def test_auth_aliases_map(self):
         self.assertEqual(
@@ -1693,8 +2118,10 @@ class UniteUsPersonMapperTest(SimpleTestCase):
             "created_at": "2026-01-01T00:00:00Z",
             "updated_at": "2026-02-02T00:00:00Z",
         })
-        self.assertEqual(out["created_at"].date().isoformat(), "2026-01-01")
-        self.assertEqual(out["updated_at"].date().isoformat(), "2026-02-02")
+        # The mapper passes ISO strings through (DRF's DateTimeField parses them
+        # on save), so assert the string form.
+        self.assertTrue(out["created_at"].startswith("2026-01-01"))
+        self.assertTrue(out["updated_at"].startswith("2026-02-02"))
 
     def test_missing_timestamps_omitted(self):
         out = self._map({"first_name": "Ada", "last_name": "Lovelace"})
@@ -1722,13 +2149,14 @@ class UniteUsCaseMapperTest(SimpleTestCase):
             state="open",
             attrs={"opened_date": "2026-01-05T00:00:00Z", "created_at": "2026-01-01T00:00:00Z"},
         )
-        self.assertEqual(out["date_opened"].date().isoformat(), "2026-01-05")
+        # map_case passes the ISO string through (DRF parses it on save).
+        self.assertTrue(out["date_opened"].startswith("2026-01-05"))
 
     def test_date_opened_falls_back_to_created_at(self):
         # No opened_date -> use the Unite Us case created timestamp so date_opened
         # is never blank (mirrors the CSV import fallback).
         out = self._map(state="open", attrs={"created_at": "2026-01-01T00:00:00Z"})
-        self.assertEqual(out["date_opened"].date().isoformat(), "2026-01-01")
+        self.assertTrue(out["date_opened"].startswith("2026-01-01"))
 
     def test_closed_date_marks_case_closed_despite_managed_state(self):
         out = self._map(state="managed", closed_date="2026-01-02T00:00:00Z")
@@ -1751,19 +2179,71 @@ class UniteUsCaseMapperTest(SimpleTestCase):
         out = self._map(state="managed", auth={"state": "rejected"})
         self.assertEqual(out["service_authorization_status"], "denied")
 
-    def test_managed_without_closed_date_stays_managed(self):
+    def test_managed_without_closed_date_is_open(self):
+        # Case status is Open/Closed ONLY: no closed date -> Open (regardless of
+        # the raw Unite Us state).
         out = self._map(state="managed")
-        self.assertEqual(out["case_status"], "managed")
+        self.assertEqual(out["case_status"], "open")
 
     def test_unknown_state_without_closed_date_falls_back_open(self):
         out = self._map(state="requested")
         self.assertEqual(out["case_status"], "open")
 
 
+class CaseStatusChangeTimelineReasonTest(TestCase):
+    """A Closed/Cancelled case-status transition must surface the closure reason
+    (the case's ``closed_note``) on the timeline subtitle, so the history
+    explains WHY the case was cancelled -- mirroring the client note. Open
+    transitions stay a clean 'Prev -> New'."""
+
+    def _client(self):
+        return Client.objects.create(
+            client_id=uuid.uuid4(), first_name="Case", last_name="Closer"
+        )
+
+    def _case(self, client, **fields):
+        from .models import Case
+
+        return Case.objects.create(
+            case_id=uuid.uuid4(), client=client,
+            date_opened=timezone.now(), **fields,
+        )
+
+    def test_closed_case_shows_reason_on_timeline(self):
+        from .models import CaseStatus
+        from .services.timeline import event_for_case_status_change
+
+        c = self._client()
+        case = self._case(
+            c, case_status=CaseStatus.CLOSED, case_closed_at=timezone.now(),
+            closed_note="Client moved out of service area",
+        )
+        ev = event_for_case_status_change(case, previous_status="open")
+        self.assertIsNotNone(ev)
+        self.assertIn("Client moved out of service area", ev.subtitle)
+        self.assertIn("Closed", ev.subtitle)
+        self.assertEqual(
+            ev.metadata.get("closed_reason"), "Client moved out of service area"
+        )
+
+    def test_open_transition_has_no_reason_suffix(self):
+        from .models import CaseStatus
+        from .services.timeline import event_for_case_status_change
+
+        c = self._client()
+        case = self._case(
+            c, case_status=CaseStatus.OPEN, closed_note="ignored while open",
+        )
+        ev = event_for_case_status_change(case, previous_status="pending_authorization")
+        self.assertIsNotNone(ev)
+        self.assertNotIn("ignored while open", ev.subtitle)
+
+
 class AuthDrivesCaseStatusTest(TestCase):
-    """The service authorization drives the case status: a Denied (Rejected)
-    authorization closes the case regardless of its current status; other auth
-    states (Pending/Approved) never force a status change. Enforced in
+    """Authorization is INDEPENDENT of case status: no auth state (denied,
+    approved, pending, ...) ever changes the stored case_status. Case status is
+    Open/Closed only, driven by the closed date. A denial instead pauses the
+    household via the internal-service reconcile (covered elsewhere). Enforced in
     CaseSerializer._upsert, so it holds on EVERY write path (extension, CSV
     import, daily Unite Us pull, admin/direct API) since they all funnel there."""
 
@@ -1784,7 +2264,9 @@ class AuthDrivesCaseStatusTest(TestCase):
         ser.is_valid(raise_exception=True)
         return ser.save()
 
-    def test_managed_plus_denied_closes(self):
+    def test_denied_does_not_change_case_status(self):
+        # Authorization no longer drives case status: a denial leaves the case in
+        # whatever status it was written with (here Managed), NOT Closed.
         from .models import CaseStatus
 
         c = self._client()
@@ -1793,7 +2275,7 @@ class AuthDrivesCaseStatusTest(TestCase):
             service_type="Home Delivered Meals",
             case_status="managed", service_authorization_status="denied",
         )
-        self.assertEqual(case.case_status, CaseStatus.CLOSED)
+        self.assertEqual(case.case_status, CaseStatus.MANAGED)
 
     def test_managed_plus_approved_stays_managed(self):
         from .models import CaseStatus
@@ -1806,9 +2288,9 @@ class AuthDrivesCaseStatusTest(TestCase):
         )
         self.assertEqual(case.case_status, CaseStatus.MANAGED)
 
-    def test_open_plus_denied_closes(self):
-        # The authorization drives the status: denial closes the case from ANY
-        # current status, including Open.
+    def test_open_plus_denied_stays_open(self):
+        # A denial does NOT close an open case -- authorization is independent of
+        # case status.
         from .models import CaseStatus
 
         c = self._client()
@@ -1817,7 +2299,7 @@ class AuthDrivesCaseStatusTest(TestCase):
             service_type="Home Delivered Meals",
             case_status="open", service_authorization_status="denied",
         )
-        self.assertEqual(case.case_status, CaseStatus.CLOSED)
+        self.assertEqual(case.case_status, CaseStatus.OPEN)
 
     def test_open_plus_pending_stays_open(self):
         from .models import CaseStatus
@@ -1841,10 +2323,9 @@ class AuthDrivesCaseStatusTest(TestCase):
         )
         self.assertEqual(case.case_status, CaseStatus.OPEN)
 
-    def test_denial_on_existing_managed_case_closes_via_partial_write(self):
+    def test_denial_on_existing_managed_case_leaves_status_unchanged(self):
         # A later write that flips ONLY the authorization to Denied (status
-        # omitted) must still close the stored Managed case -- the rule falls back
-        # to the stored status.
+        # omitted) must NOT change the stored case status -- it stays Managed.
         from .models import CaseStatus
 
         c = self._client()
@@ -1855,7 +2336,77 @@ class AuthDrivesCaseStatusTest(TestCase):
             case_status="managed", service_authorization_status="approved",
         )
         case = self._save(c, case_id=cid, service_authorization_status="denied")
-        self.assertEqual(case.case_status, CaseStatus.CLOSED)
+        self.assertEqual(case.case_status, CaseStatus.MANAGED)
+
+
+class CaseSerializerAuthNormalizationTest(TestCase):
+    """CaseSerializer must normalize a RAW Unite Us authorization state on the
+    EXTENSION write path (which posts straight through the serializer with no
+    pre-mapping), exactly like the CSV / daily-import mappers. Regression for:
+    saving a rejected authorization from the extension left the stored status
+    reading 'requested'/pending because the raw state was never mapped."""
+
+    def _client(self):
+        return Client.objects.create(
+            client_id=uuid.uuid4(), first_name="Auth", last_name="Norm"
+        )
+
+    def _save(self, client, case_id=None, **fields):
+        from .serializers import CaseSerializer
+
+        data = {
+            "case_id": case_id or str(uuid.uuid4()),
+            "client_id": str(client.client_id),
+            "program_name": "Medically Tailored Meals",
+            "service_type": "Home Delivered Meals",
+            **fields,
+        }
+        ser = CaseSerializer(data=data)
+        ser.is_valid(raise_exception=True)
+        return ser.save()
+
+    def test_raw_rejected_maps_to_denied(self):
+        from .models import ServiceAuthorizationStatus
+
+        case = self._save(self._client(), service_authorization_status="rejected")
+        self.assertEqual(
+            case.service_authorization_status, ServiceAuthorizationStatus.DENIED
+        )
+        # Raw label preserved for UI fidelity.
+        self.assertEqual(case.service_authorization_status_label, "Rejected")
+
+    def test_raw_requested_maps_to_pending(self):
+        from .models import ServiceAuthorizationStatus
+
+        case = self._save(self._client(), service_authorization_status="requested")
+        self.assertEqual(
+            case.service_authorization_status, ServiceAuthorizationStatus.PENDING
+        )
+
+    def test_resaving_pending_case_as_rejected_updates_enum(self):
+        # The exact reported bug: an existing case at 'requested' (pending) that
+        # is later saved from the ext as 'rejected' must flip to Denied, not stay
+        # pending.
+        from .models import ServiceAuthorizationStatus
+
+        c = self._client()
+        cid = str(uuid.uuid4())
+        first = self._save(c, case_id=cid, service_authorization_status="requested")
+        self.assertEqual(
+            first.service_authorization_status, ServiceAuthorizationStatus.PENDING
+        )
+        second = self._save(c, case_id=cid, service_authorization_status="rejected")
+        self.assertEqual(
+            second.service_authorization_status, ServiceAuthorizationStatus.DENIED
+        )
+
+    def test_clean_enum_value_still_accepted(self):
+        from .models import ServiceAuthorizationStatus
+
+        case = self._save(self._client(), service_authorization_status="denied")
+        self.assertEqual(
+            case.service_authorization_status, ServiceAuthorizationStatus.DENIED
+        )
 
 
 class DailyPullClientSelectionTest(TestCase):
@@ -4065,16 +4616,26 @@ class CsvImportRulesTest(TestCase):
             service_subtype="Social Service Case Management",
             program_name="Navigation Services - Eligibility Assessment Level 1 - Brooklyn",
         )
-        importer.import_cases([mine, managed, external, blank, referred_out])
+        # Internal-service MEAL case Met Council ORIGINATED but a DIFFERENT named
+        # org MANAGES (referred out to God's Love): dropped -- the managing org
+        # owns it, so originating must NOT rescue it.
+        referred_meal = self._case_row(
+            client.client_id, self.MET,
+            provider_name="God's Love We Deliver - SCN - PHS",
+        )
+        importer.import_cases([mine, managed, external, blank, referred_out, referred_meal])
 
-        # Met Council-originated AND Met Council-managed are imported; the rest not.
+        # Met Council-originated (blank manager) AND Met Council-managed are
+        # imported; the rest -- including the meal case referred out to another
+        # named org -- are not.
         self.assertTrue(Case.objects.filter(pk=mine["case_id"]).exists())
         self.assertTrue(Case.objects.filter(pk=managed["case_id"]).exists())
         self.assertFalse(Case.objects.filter(pk=external["case_id"]).exists())
         self.assertFalse(Case.objects.filter(pk=blank["case_id"]).exists())
         self.assertFalse(Case.objects.filter(pk=referred_out["case_id"]).exists())
+        self.assertFalse(Case.objects.filter(pk=referred_meal["case_id"]).exists())
         self.assertEqual(importer.stats["created"], 2)
-        self.assertEqual(importer.stats["skipped"], 3)
+        self.assertEqual(importer.stats["skipped"], 4)
 
         # And it's classified correctly: internal-service + household (token).
         case = Case.objects.get(pk=mine["case_id"])
@@ -4137,6 +4698,82 @@ class CsvImportRulesTest(TestCase):
         self.assertTrue(Case.objects.filter(pk=keep_blank_internal.pk).exists())
         self.assertFalse(Case.objects.filter(pk=drop.pk).exists())
         self.assertFalse(Case.objects.filter(pk=drop_referred_out.pk).exists())
+
+
+class ReconcileInternalCasesAgainstExportTest(TestCase):
+    """The export-anchored cleanup removes blank-provider internal-service cases
+    that are ACTIVE but absent from Met Council's export -- while keeping ones in
+    the export, closed history, and any actively-served member's case."""
+
+    def _blank_internal(self, status, **over):
+        from .models import Case, CaseStatus, CaseType
+
+        return Case.objects.create(
+            case_id=uuid.uuid4(), client=over.pop("client", self.client_obj),
+            case_type=CaseType.INTERNAL_SERVICE, case_status=status,
+            provider_name="", program_name="MTM Boxes - Queens", **over,
+        )
+
+    def _export(self, case_ids):
+        import csv
+        import tempfile
+
+        fh = tempfile.NamedTemporaryFile(
+            "w", suffix=".csv", delete=False, newline=""
+        )
+        w = csv.DictWriter(fh, fieldnames=["case_id", "case_status"])
+        w.writeheader()
+        for cid in case_ids:
+            w.writerow({"case_id": str(cid), "case_status": "managed"})
+        fh.close()
+        return fh.name
+
+    def setUp(self):
+        self.client_obj = Client.objects.create(
+            client_id=uuid.uuid4(), first_name="Aiden", last_name="Buguia"
+        )
+        self.served_client = Client.objects.create(
+            client_id=uuid.uuid4(), first_name="Served", last_name="Member"
+        )
+
+    def test_reconcile_partitions_correctly(self):
+        from django.core.management import call_command
+        from .models import (
+            Case, CaseStatus, EnrollmentStage, EnrollmentVerification,
+            Household, HouseholdMember,
+        )
+
+        in_export = self._blank_internal(CaseStatus.MANAGED)
+        active_absent = self._blank_internal(CaseStatus.MANAGED)
+        closed_absent = self._blank_internal(CaseStatus.CLOSED)
+
+        # A served member's active+absent case must be PROTECTED.
+        hh = Household.objects.create()
+        HouseholdMember.objects.create(
+            household=hh, client=self.served_client, is_primary=True
+        )
+        EnrollmentVerification.objects.create(
+            client=self.served_client, household=hh,
+            stage=EnrollmentStage.SERVICE_ACTIVE,
+        )
+        served_absent = self._blank_internal(
+            CaseStatus.MANAGED, client=self.served_client
+        )
+
+        export_path = self._export([in_export.case_id])  # only this one is "ours"
+
+        # Dry run changes nothing.
+        call_command("reconcile_internal_cases_against_export", "--export", export_path)
+        self.assertEqual(Case.objects.count(), 4)
+
+        # Apply: only the active, absent, UN-served case is removed.
+        call_command(
+            "reconcile_internal_cases_against_export", "--export", export_path, "--apply"
+        )
+        self.assertTrue(Case.objects.filter(pk=in_export.pk).exists())
+        self.assertTrue(Case.objects.filter(pk=closed_absent.pk).exists())
+        self.assertTrue(Case.objects.filter(pk=served_absent.pk).exists())
+        self.assertFalse(Case.objects.filter(pk=active_absent.pk).exists())
 
 
 class MemberCaseRemoveTest(TestCase):

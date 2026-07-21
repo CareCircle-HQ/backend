@@ -14,6 +14,7 @@ from rest_framework.decorators import action
 from rest_framework import status
 
 from .models import (
+    Agent,
     AllowedZipCode,
     Assessment,
     Case,
@@ -198,6 +199,30 @@ class ZipCodeCheckView(APIView):
         })
 
 
+class StateCheckView(APIView):
+    """Check whether a US state is one we accept clients/cases from.
+
+    GET /api/states/check/?state=NY -> {"state": "NY", "allowed": true}
+
+    ``allowed`` is True for a served state, an unknown/blank state (can't judge),
+    or when no states are configured at all (feature inert until an admin opts
+    in). This is a soft signal the extension surfaces as a warning; it never
+    blocks.
+    """
+
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        from .services.state_area import is_state_allowed, normalize_state
+
+        raw = (request.query_params.get("state") or "").strip()
+        code = normalize_state(raw)
+        return Response({
+            "state": code or raw.upper(),
+            "allowed": is_state_allowed(raw),
+        })
+
+
 class BulkUpsertMixin:
     """Adds a /bulk/ action accepting a list of records for batch upsert.
 
@@ -262,7 +287,23 @@ class ClientViewSet(BulkUpsertMixin, viewsets.ModelViewSet):
         name = getattr(user, "name", None)
         if name:
             kwargs["agent_name"] = name
+        # Williamsburg agents (Settings > Williamsburg Setup): force every client
+        # they save to lead_source="Williamsburg". Passing lead_source through
+        # serializer.save() lands it in validated_data, so ClientSerializer's
+        # existing derivation flips is_williamsburg=True automatically.
+        if self._is_williamsburg_agent(user):
+            kwargs["lead_source"] = "Williamsburg"
         return kwargs
+
+    @staticmethod
+    def _is_williamsburg_agent(user):
+        """True when the authenticated agent is flagged as a Williamsburg agent."""
+        agent_id = getattr(user, "agent_id", None)
+        if not agent_id:
+            return False
+        return Agent.objects.filter(
+            pk=agent_id, is_williamsburg_agent=True
+        ).exists()
 
     def perform_create(self, serializer):
         serializer.save(**self._agent_save_kwargs())
@@ -284,6 +325,16 @@ class ClientViewSet(BulkUpsertMixin, viewsets.ModelViewSet):
         if name and obj.agent_name != name:
             obj.agent_name = name
             updates.append("agent_name")
+        # Williamsburg agents: force lead_source="Williamsburg" (+ derived flag).
+        # The bulk path saves via the serializer without _agent_save_kwargs, so
+        # apply the same rule here to keep both write paths consistent.
+        if self._is_williamsburg_agent(user):
+            if obj.lead_source != "Williamsburg":
+                obj.lead_source = "Williamsburg"
+                updates.append("lead_source")
+            if not obj.is_williamsburg:
+                obj.is_williamsburg = True
+                updates.append("is_williamsburg")
         if updates:
             obj.save(update_fields=updates)
         _safe_timeline(timeline.event_for_consent, obj, self.request)
@@ -420,8 +471,11 @@ class CaseViewSet(BulkUpsertMixin, viewsets.ModelViewSet):
     _SKIP_TICKET_ACTIONS = frozenset()
 
     def _record_case_change(self, case):
-        """Emit case-change timeline events + open follow-up tickets for a case
-        written by the extension, attributed to the acting agent."""
+        """Emit case-change TIMELINE events for a case written by the extension,
+        attributed to the acting agent. Opens NO follow-up tickets: case
+        status/authorization changes (closed, denied, approved, ...) are surfaced
+        via the member timeline + the lifecycle reconcile (pause/cancel/resume),
+        not tickets."""
         from .services import case_events
 
         try:
@@ -431,7 +485,7 @@ class CaseViewSet(BulkUpsertMixin, viewsets.ModelViewSet):
                 previous_auth=getattr(case, "_prev_auth", None),
                 source=ChangeSource.EXTENSION,
                 actor=_agent_actor(self.request),
-                create_tickets=True,
+                create_tickets=False,
                 skip_actions=self._SKIP_TICKET_ACTIONS,
             )
         except Exception:  # noqa: BLE001 - tracking must never break the write

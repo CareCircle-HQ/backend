@@ -19,6 +19,7 @@ from .views import (
     ProviderViewSet,
     RegisterView,
     ScreeningViewSet,
+    StateCheckView,
     ZipCodeCheckView,
 )
 from .views_agent import (
@@ -123,6 +124,7 @@ urlpatterns = [
     # Misc
     path("health/", HealthView.as_view(), name="health"),
     path("zipcodes/check/", ZipCodeCheckView.as_view(), name="zipcode-check"),
+    path("states/check/", StateCheckView.as_view(), name="state-check"),
     # Program eligibilities available for a household member
     # (?member=<id>, optional ?program=&is_eligible=&model_version=)
     path(

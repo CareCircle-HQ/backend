@@ -13,7 +13,8 @@ import re
 from rest_framework import status as http
 from rest_framework.response import Response
 
-from ..models import ExcludedZipCode
+from ..models import AllowedState, ExcludedZipCode
+from ..services.state_area import US_STATES, normalize_state
 from .base import PortalAPIView
 
 _ZIP_RE = re.compile(r"^\d{5}$")
@@ -59,4 +60,48 @@ class ExcludedZipCodeDetailView(PortalAPIView):
         if z is None:
             return Response(status=http.HTTP_404_NOT_FOUND)
         z.delete()
+        return Response(status=http.HTTP_204_NO_CONTENT)
+
+
+class AllowedStatesView(PortalAPIView):
+    """Settings > Allowed States: the states we accept clients/cases from.
+
+    GET  — every US state (+DC) with an ``enabled`` flag, so the settings page
+           can render the full toggle list from one call.
+    POST — enable a state ({"code": "NY"}). Idempotent.
+    """
+
+    def get(self, request):
+        enabled = {s.code.upper() for s in AllowedState.objects.all()}
+        results = [
+            {"code": code, "name": name, "enabled": code in enabled}
+            for code, name in sorted(US_STATES.items(), key=lambda kv: kv[1])
+        ]
+        return Response({"count": len(enabled), "results": results})
+
+    def post(self, request):
+        code = normalize_state(request.data.get("code"))
+        if not code:
+            return Response(
+                {"code": "Enter a valid US state code."},
+                status=http.HTTP_400_BAD_REQUEST,
+            )
+        obj, _ = AllowedState.objects.get_or_create(
+            code=code, defaults={"name": US_STATES.get(code, code)}
+        )
+        return Response(
+            {"code": obj.code, "name": obj.name, "enabled": True},
+            status=http.HTTP_201_CREATED,
+        )
+
+
+class AllowedStateDetailView(PortalAPIView):
+    """DELETE /settings/allowed-states/<code>/ — disable (remove) a state."""
+
+    def delete(self, request, code):
+        norm = normalize_state(code)
+        obj = AllowedState.objects.filter(code=norm).first() if norm else None
+        if obj is None:
+            return Response(status=http.HTTP_404_NOT_FOUND)
+        obj.delete()
         return Response(status=http.HTTP_204_NO_CONTENT)
