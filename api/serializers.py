@@ -566,13 +566,25 @@ def ensure_primary_of_own_household(client):
     if membership is None or membership.is_primary:
         return ensure_household_with_primary(client)
     old_household = membership.household
+    membership.delete()
+    new_household = ensure_household_with_primary(client)
+    # Move the client's OWN enrollments (client=client) to their new household,
+    # carrying their dietary profile with them. Without this the enrollment stays
+    # anchored to the old (shared) household, so the Program/Household tab -- which
+    # renders active_enrollment.member_profiles for enrollment.household's roster --
+    # keeps showing the OLD household's members (and, via sync_household_members,
+    # grows stray profiles for them on this client's enrollment).
+    EnrollmentVerification.objects.filter(
+        client=client, household=old_household
+    ).update(household=new_household)
+    # Drop the client's dietary profile from any enrollments that STAYED in the
+    # old household (the old primary's shared enrollment): the client has left it.
     MemberDietaryProfile.objects.filter(
         client=client, enrollment__household=old_household
     ).delete()
-    membership.delete()
     if not old_household.members.exists():
         old_household.delete()
-    return ensure_household_with_primary(client)
+    return new_household
 
 
 @transaction.atomic

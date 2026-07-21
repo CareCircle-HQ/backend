@@ -23,8 +23,10 @@ from api.models import (
     Case,
     CaseType,
     Client,
+    EnrollmentVerification,
     HouseholdMember,
     MemberDietaryProfile,
+    MemberStatus,
 )
 
 
@@ -121,6 +123,100 @@ def diagnose(client_id):
         return
     print("=== DIAGNOSE ===")
     _describe(client)
+
+
+def _heal_client_enrollments(client, *, apply=False):
+    """Re-anchor a client's OWN enrollments to their roster household, strip
+    stray foreign member profiles, and ensure the client has their own profile.
+
+    Repairs the case where a client was made primary of their own (solo)
+    household but their enrollments stayed pointing at the OLD shared household
+    -- so the Program tab renders the old household's member(s) (e.g. another
+    person who is primary of THEIR own household) instead of the client.
+
+    A stray profile (owner NOT in this household's roster) is only DELETED when
+    that owner has their dietary data elsewhere (another profile); otherwise it's
+    left in place and flagged for manual review, so we never destroy a member's
+    only dietary record. Idempotent.
+    """
+    membership = (
+        HouseholdMember.objects.filter(client=client)
+        .select_related("household")
+        .first()
+    )
+    if membership is None:
+        print("  client has no roster household -- cannot heal enrollments.")
+        return
+    household = membership.household
+    roster_ids = set(household.members.values_list("client_id", flat=True))
+    own = list(EnrollmentVerification.objects.filter(client=client))
+    print(f"  healing {len(own)} own enrollment(s) into household "
+          f"{household.household_id} (roster={sorted(str(i) for i in roster_ids)})")
+    for enr in own:
+        # 1) Re-anchor the enrollment to the client's roster household.
+        if enr.household_id != household.household_id:
+            print(f"    enr {enr.pk}: household {enr.household_id} -> "
+                  f"{household.household_id}")
+            if apply:
+                enr.household = household
+                enr.save(update_fields=["household"])
+        # 2) Strip stray profiles whose owner isn't in this household's roster,
+        #    but only when that owner has their dietary data elsewhere.
+        for p in list(enr.member_profiles.select_related("client").all()):
+            if not p.client_id or p.client_id in roster_ids:
+                continue
+            has_data_elsewhere = (
+                MemberDietaryProfile.objects.filter(client_id=p.client_id)
+                .exclude(pk=p.pk)
+                .exists()
+            )
+            if has_data_elsewhere:
+                print(f"    enr {enr.pk}: strip stray profile {p.pk} "
+                      f"(client={p.client_id}; has data elsewhere)")
+                if apply:
+                    p.delete()
+            else:
+                print(f"    enr {enr.pk}: SKIP stray profile {p.pk} "
+                      f"(client={p.client_id}) -- it's their ONLY profile; "
+                      f"needs manual review")
+        # 3) Ensure the client has their OWN profile on this enrollment (theirs
+        #    was deleted when they were split out). Starts Out of Orbit until a
+        #    menu type + dietary needs are set (mirrors sync_household_members).
+        if not enr.member_profiles.filter(client=client).exists():
+            print(f"    enr {enr.pk}: create own profile for {client.client_id}")
+            if apply:
+                MemberDietaryProfile.objects.create(
+                    enrollment=enr, client=client,
+                    member_name=f"{client.first_name} {client.last_name}".strip(),
+                    menu_type="", status=MemberStatus.OUT_OF_ORBIT,
+                )
+
+
+def heal(client_id, *, apply=False):
+    """Fix a client whose enrollments are stranded on the OLD shared household.
+
+        # DRY RUN (default) -- prints what WOULD change, no writes:
+        .venv/bin/python manage.py shell -c "import scripts.fix_primary_household as f; f.heal('<client_id>')"
+
+        # APPLY -- performs the repair inside a transaction:
+        .venv/bin/python manage.py shell -c "import scripts.fix_primary_household as f; f.heal('<client_id>', apply=True)"
+    """
+    client = Client.objects.filter(client_id=client_id).first()
+    if client is None:
+        print(f"NO CLIENT with id {client_id}")
+        return
+    print("=== BEFORE ===")
+    _describe(client)
+    print("\n=== HEAL ===")
+    if apply:
+        with transaction.atomic():
+            _heal_client_enrollments(client, apply=True)
+        print("\nAPPLIED.")
+        print("\n=== AFTER ===")
+        _describe(client)
+    else:
+        _heal_client_enrollments(client, apply=False)
+        print("\nDRY RUN -- no changes written. Re-run with apply=True to apply.")
 
 
 def run(client_id, *, apply=False):

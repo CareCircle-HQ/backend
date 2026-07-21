@@ -1003,6 +1003,31 @@ class EnsurePrimaryOfOwnHouseholdTest(TestCase):
             ).exists()
         )
 
+    def test_split_client_own_enrollment_moves_to_new_household(self):
+        from .models import (
+            EnrollmentStage, EnrollmentVerification, Household, HouseholdMember,
+        )
+        from .serializers import ensure_primary_of_own_household
+
+        # The split client holds their OWN enrollment while still a non-primary
+        # dependent of a shared household (they got their own Internal Service
+        # case). The enrollment must move to their new solo household -- else the
+        # Program tab keeps rendering the old household's roster.
+        primary = self._client("Pat", "Primary")
+        dep = self._client("Dee", "Dependent")
+        hh = Household.objects.create(name="Shared HH")
+        HouseholdMember.objects.create(household=hh, client=primary, is_primary=True)
+        HouseholdMember.objects.create(household=hh, client=dep, is_primary=False)
+        dep_enr = EnrollmentVerification.objects.create(
+            client=dep, household=hh, stage=EnrollmentStage.KITCHEN_ASSIGNMENT,
+        )
+
+        new_hh = ensure_primary_of_own_household(dep)
+
+        dep_enr.refresh_from_db()
+        self.assertEqual(dep_enr.household_id, new_hh.household_id)
+        self.assertNotEqual(dep_enr.household_id, hh.household_id)
+
     def test_already_primary_is_noop(self):
         from .models import Household, HouseholdMember
         from .serializers import ensure_primary_of_own_household
