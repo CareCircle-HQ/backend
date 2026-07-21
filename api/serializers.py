@@ -1098,6 +1098,17 @@ class CaseSerializer(serializers.ModelSerializer):
     originating_provider_id = serializers.UUIDField(required=False, allow_null=True)
     provider_id = serializers.UUIDField(required=False, allow_null=True)
     program_id = serializers.UUIDField(required=False, allow_null=True)
+    # Accept a RAW Unite Us authorization state (e.g. "requested", "deferred",
+    # "accepted", "rejected") in addition to our own enum values. Declared as a
+    # plain CharField to bypass the auto ChoiceField's strict validation so
+    # ``to_internal_value`` can normalize it -- mirroring the CSV / daily-import
+    # mappers, which pre-map via ``_AUTH_STATE_MAP`` before hitting this
+    # serializer. Without this, an extension save that sent a raw/denied state
+    # never updated the stored enum (the bug: a rejected auth still read
+    # "requested"/pending).
+    service_authorization_status = serializers.CharField(
+        required=False, allow_blank=True
+    )
 
     class Meta:
         model = Case
@@ -1108,6 +1119,31 @@ class CaseSerializer(serializers.ModelSerializer):
             "provider",
             "program",
         )
+
+    def to_internal_value(self, data):
+        ret = super().to_internal_value(data)
+        # Normalize the authorization status so EVERY write path (extension,
+        # import, admin) persists the same enum. The extension writes straight
+        # through this serializer with no mapping, so a raw Unite Us state
+        # ("rejected"/"requested"/"accepted"/"deferred") must be translated here
+        # or the stored enum never updates. Mirrors mappers._AUTH_STATE_MAP.
+        raw = data.get("service_authorization_status") if hasattr(data, "get") else None
+        if raw not in (None, ""):
+            from api.integrations.uniteus.mappers import (
+                _AUTH_STATE_MAP,
+                _enum_or_blank,
+            )
+
+            ret["service_authorization_status"] = _enum_or_blank(
+                raw, ServiceAuthorizationStatus.values, _AUTH_STATE_MAP
+            )
+            # Preserve the human-readable raw label when the caller didn't send
+            # one, so the UI keeps fidelity (e.g. "Rejected").
+            if not (data.get("service_authorization_status_label") or "").strip():
+                ret["service_authorization_status_label"] = (
+                    str(raw).replace("_", " ").title()
+                )
+        return ret
 
     @transaction.atomic
     def create(self, validated_data):

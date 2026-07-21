@@ -16,6 +16,7 @@ from django.db.models import (
     OuterRef,
     Prefetch,
     Q,
+    Subquery,
 )
 from django.db.models.functions import Lower
 from django.shortcuts import get_object_or_404
@@ -802,6 +803,11 @@ class TeamsListView(PortalAPIView):
     ``UniteUsAgent.originating_team`` string the filter matches
     (``team__iexact=value``)."""
 
+    # "Met Council Team" is the default originating_team assigned to everyone
+    # not on the CareCircle roster (i.e. non-US staff), so it isn't a real
+    # filterable CareCircle team -- hide it from the Team filter dropdown.
+    _EXCLUDED_TEAMS = {"met council team"}
+
     def get(self, request):
         teams = (
             UniteUsAgent.objects.exclude(originating_team="")
@@ -809,7 +815,12 @@ class TeamsListView(PortalAPIView):
             .values_list("originating_team", flat=True)
             .distinct()
         )
-        options = sorted({(t or "").strip() for t in teams if (t or "").strip()})
+        options = sorted({
+            (t or "").strip()
+            for t in teams
+            if (t or "").strip()
+            and (t or "").strip().lower() not in self._EXCLUDED_TEAMS
+        })
         return Response([{"value": t, "label": t} for t in options])
 
 
@@ -970,6 +981,23 @@ class MembersListView(PortalGenericAPIView):
             "1", "true", "yes",
         ):
             qs = qs.filter(cases__case_type=CaseType.INTERNAL_SERVICE)
+            # Open/closed sub-filter: ONLY active when Internal Service is on
+            # (it narrows that set). Mirrors the "current case" the Created column
+            # shows: a member is OPEN if they have any non-terminal internal-
+            # service case (actively serviced), else CLOSED. So "closed" means the
+            # member has NO open internal-service case (all done) -- NOT merely
+            # "has a closed case", since members with an open case also usually
+            # have older closed ones and would otherwise wrongly show as closed.
+            internal_status = (params.get("internal_status") or "").strip().lower()
+            if internal_status in ("open", "closed"):
+                terminal = (CaseStatus.CLOSED, CaseStatus.CANCELLED)
+                open_case = Case.objects.filter(
+                    client=OuterRef("pk"), case_type=CaseType.INTERNAL_SERVICE,
+                ).exclude(case_status__in=terminal)
+                if internal_status == "open":
+                    qs = qs.filter(Exists(open_case))
+                else:
+                    qs = qs.exclude(Exists(open_case))
 
         # Product-kind filter (Meals vs Boxes), keyed off the household's program
         # name. A household is always one kind, so meals/boxes never mix.
@@ -1129,6 +1157,24 @@ class MembersListView(PortalGenericAPIView):
             if created_to:
                 case_date_q &= Q(cases__date_opened__date__lte=created_to)
             qs = qs.filter(case_date_q)
+
+        # Closed-date range filter (Members page): filters on the date the
+        # member's INTERNAL-SERVICE case was CLOSED (its ``case_closed_at``, the
+        # C: date shown in the "Created" column). Mirrors the created-date filter
+        # above but on the close date, so an ops user can pull members whose
+        # service case was closed within a window (e.g. "closed today") and then
+        # cross-check paused/active status via the status filter. Both bounds
+        # apply to the SAME internal-service case row; .distinct() dedupes the
+        # join. Inclusive [from, to]; either bound may be omitted.
+        closed_from = _parse_date(params.get("closed_from"))
+        closed_to = _parse_date(params.get("closed_to"))
+        if closed_from or closed_to:
+            case_closed_q = Q(cases__case_type=CaseType.INTERNAL_SERVICE)
+            if closed_from:
+                case_closed_q &= Q(cases__case_closed_at__date__gte=closed_from)
+            if closed_to:
+                case_closed_q &= Q(cases__case_closed_at__date__lte=closed_to)
+            qs = qs.filter(case_closed_q)
 
         # Date-period filter (Verification page dropdown): narrow to households
         # whose enrollment record was OPENED within the selected window.
@@ -1295,20 +1341,35 @@ class MembersListView(PortalGenericAPIView):
         is built.
 
         ``sort_field`` selects the timestamp the groups are ordered by:
-          * ``created``   -> Client.created_at (default; most-recently-added)
-          * ``requested`` -> the enrollment's requested_at/opened_at (Verification
-            page "Requested" column)
-          * ``completed`` -> the enrollment's verified_at ("Completed" column)
+          * ``created``      -> Client.created_at (default; most-recently-added)
+          * ``requested``    -> the enrollment's requested_at/opened_at
+            (Verification page "Requested" column)
+          * ``completed``    -> the enrollment's verified_at ("Completed" column)
+          * ``case_created`` -> the member's latest internal-service case
+            date_opened (Urgent Care "Case Created" column)
         Timestamps are aggregated as the MAX across a client's enrollments and
         then across a household's matching members. Groups with no timestamp sort
         last regardless of direction; name (case-insensitive) breaks ties."""
+        # Latest internal-service case date_opened per client, as a scalar
+        # subquery so the multi-valued cases relation can't multiply rows (it
+        # matches the "Case Created" column the Urgent Care list renders).
+        latest_case_opened = (
+            Case.objects.filter(
+                client=OuterRef("pk"),
+                case_type=CaseType.INTERNAL_SERVICE,
+            )
+            .order_by("-date_opened")
+            .values("date_opened")[:1]
+        )
         # The enrollment join is multi-valued (a client can have several), so a
         # client appears on several rows -- aggregate per client below.
-        rows = self.get_queryset().values_list(
+        rows = self.get_queryset().annotate(
+            _case_opened=Subquery(latest_case_opened)
+        ).values_list(
             "client_id", "household_membership__household_id",
             "first_name", "last_name", "created_at",
             "enrollments__requested_at", "enrollments__opened_at",
-            "enrollments__verified_at",
+            "enrollments__verified_at", "_case_opened",
         )
 
         def _max_dt(a, b):
@@ -1318,8 +1379,8 @@ class MembersListView(PortalGenericAPIView):
                 return a
             return a if a >= b else b
 
-        clients = {}  # cid -> {hid, name, created, requested, completed}
-        for cid, hid, fn, ln, created, req, opened, verified in rows:
+        clients = {}  # cid -> {hid, name, created, requested, completed, case_created}
+        for cid, hid, fn, ln, created, req, opened, verified, case_opened in rows:
             requested = req or opened
             c = clients.get(cid)
             if c is None:
@@ -1329,13 +1390,16 @@ class MembersListView(PortalGenericAPIView):
                     "created": created,
                     "requested": requested,
                     "completed": verified,
+                    # Scalar per client (subquery), identical on every row.
+                    "case_created": case_opened,
                 }
             else:
                 c["requested"] = _max_dt(c["requested"], requested)
                 c["completed"] = _max_dt(c["completed"], verified)
 
         hh_ids, seen_hh, individuals = [], set(), []
-        hh_ts = {}  # hid -> {created, requested, completed} aggregated across members
+        # hid -> {created, requested, completed, case_created} aggregated across members
+        hh_ts = {}
         for cid, c in clients.items():
             hid = c["hid"]
             if hid:
@@ -1343,9 +1407,11 @@ class MembersListView(PortalGenericAPIView):
                     seen_hh.add(hid)
                     hh_ids.append(hid)
                 agg = hh_ts.setdefault(
-                    hid, {"created": None, "requested": None, "completed": None}
+                    hid,
+                    {"created": None, "requested": None, "completed": None,
+                     "case_created": None},
                 )
-                for k in ("created", "requested", "completed"):
+                for k in ("created", "requested", "completed", "case_created"):
                     agg[k] = _max_dt(agg[k], c[k])
             else:
                 individuals.append((cid, c["name"], c))
@@ -1363,7 +1429,7 @@ class MembersListView(PortalGenericAPIView):
                     hname or f"{(fn or '').strip()} {(ln or '').strip()}".strip()
                 )
 
-        field = sort_field if sort_field in ("created", "requested", "completed") else "created"
+        field = sort_field if sort_field in ("created", "requested", "completed", "case_created") else "created"
         entries = [
             {"type": "household", "id": hid, "name": hh_names.get(hid, ""),
              "sort_ts": hh_ts[hid][field]}
@@ -1689,17 +1755,30 @@ class MembersListView(PortalGenericAPIView):
             # most-recently-created first. Rows with a null date sort last; name
             # (case-insensitive "First Last") breaks ties.
             #
-            # The Created column shows the member's own Client ``created_at``, so
-            # sort on that. (The created-date FILTER is a separate control that
-            # searches the internal-service case date; the column + its sort stay
-            # on the member created date.)
-            sort_field = {
-                "created": "created_at", "updated": "updated_at",
-            }.get((request.query_params.get("sort") or "created").strip().lower(), "created_at")
+            # The Created column now sorts by the member's most-recently-opened
+            # INTERNAL-SERVICE case date (matching the O: rows it renders), NOT
+            # the Client record's own ``created_at``. A correlated subquery pulls
+            # that one date per client so ordering over the multi-valued cases
+            # relation can't multiply rows. ``updated`` still sorts on the member
+            # ``updated_at``. Rows with a null sort key sort last; name breaks ties.
+            sort_key = (request.query_params.get("sort") or "created").strip().lower()
             descending = (request.query_params.get("dir") or "desc").strip().lower() != "asc"
-            col = F(sort_field)
+            qs = self.get_queryset()
+            if sort_key == "updated":
+                col = F("updated_at")
+            else:
+                latest_case_opened = (
+                    Case.objects.filter(
+                        client=OuterRef("pk"),
+                        case_type=CaseType.INTERNAL_SERVICE,
+                    )
+                    .order_by("-date_opened")
+                    .values("date_opened")[:1]
+                )
+                qs = qs.annotate(_case_opened=Subquery(latest_case_opened))
+                col = F("_case_opened")
             primary = col.desc(nulls_last=True) if descending else col.asc(nulls_last=True)
-            qs = self.get_queryset().order_by(
+            qs = qs.order_by(
                 primary,
                 Lower("first_name"),
                 Lower("last_name"),
@@ -1728,10 +1807,12 @@ class MembersListView(PortalGenericAPIView):
         # Grouped mode (Verification / Logistics): build the ordered group keys
         # cheaply, paginate THEM, and serialize only the current page's groups
         # (previously the whole scoped set was serialized on every request).
-        # Sortable by the Verification page Requested / Completed columns
-        # (``sort`` + ``dir``); default is most-recently-created first.
+        # Sortable by the Verification page Requested / Completed columns and the
+        # Urgent Care "Case Created" column (``sort`` + ``dir``); default is
+        # most-recently-created first.
         group_sort = {
             "requested": "requested", "completed": "completed",
+            "case_created": "case_created",
         }.get((request.query_params.get("sort") or "").strip().lower(), "created")
         group_desc = (request.query_params.get("dir") or "desc").strip().lower() != "asc"
         entries = self._group_entries(group_sort, group_desc)

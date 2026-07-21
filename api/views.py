@@ -14,6 +14,7 @@ from rest_framework.decorators import action
 from rest_framework import status
 
 from .models import (
+    Agent,
     AllowedZipCode,
     Assessment,
     Case,
@@ -262,7 +263,23 @@ class ClientViewSet(BulkUpsertMixin, viewsets.ModelViewSet):
         name = getattr(user, "name", None)
         if name:
             kwargs["agent_name"] = name
+        # Williamsburg agents (Settings > Williamsburg Setup): force every client
+        # they save to lead_source="Williamsburg". Passing lead_source through
+        # serializer.save() lands it in validated_data, so ClientSerializer's
+        # existing derivation flips is_williamsburg=True automatically.
+        if self._is_williamsburg_agent(user):
+            kwargs["lead_source"] = "Williamsburg"
         return kwargs
+
+    @staticmethod
+    def _is_williamsburg_agent(user):
+        """True when the authenticated agent is flagged as a Williamsburg agent."""
+        agent_id = getattr(user, "agent_id", None)
+        if not agent_id:
+            return False
+        return Agent.objects.filter(
+            pk=agent_id, is_williamsburg_agent=True
+        ).exists()
 
     def perform_create(self, serializer):
         serializer.save(**self._agent_save_kwargs())
@@ -284,6 +301,16 @@ class ClientViewSet(BulkUpsertMixin, viewsets.ModelViewSet):
         if name and obj.agent_name != name:
             obj.agent_name = name
             updates.append("agent_name")
+        # Williamsburg agents: force lead_source="Williamsburg" (+ derived flag).
+        # The bulk path saves via the serializer without _agent_save_kwargs, so
+        # apply the same rule here to keep both write paths consistent.
+        if self._is_williamsburg_agent(user):
+            if obj.lead_source != "Williamsburg":
+                obj.lead_source = "Williamsburg"
+                updates.append("lead_source")
+            if not obj.is_williamsburg:
+                obj.is_williamsburg = True
+                updates.append("is_williamsburg")
         if updates:
             obj.save(update_fields=updates)
         _safe_timeline(timeline.event_for_consent, obj, self.request)

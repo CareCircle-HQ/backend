@@ -444,6 +444,59 @@ class ExtensionTimelineTest(TestCase):
         self.assertEqual(occurred, sorted(occurred, reverse=True))
 
 
+class WilliamsburgAgentLeadSourceTest(TestCase):
+    """Settings > Williamsburg Setup: a client saved by an agent flagged
+    ``is_williamsburg_agent`` is forced to lead_source="Williamsburg" (which
+    derives Client.is_williamsburg), overriding whatever lead source the
+    extension sent. A normal agent's save is left untouched."""
+
+    def _api_for(self, agent):
+        access = AccessToken()
+        access["agent_id"] = str(agent.id)
+        access["agent_code"] = agent.agent_code
+        access["agent_name"] = agent.name
+        access["agent_group"] = agent.group
+        api = APIClient()
+        api.credentials(HTTP_AUTHORIZATION=f"Bearer {access}")
+        return api
+
+    def _post_client(self, api, lead_source=None):
+        cid = str(uuid.uuid4())
+        body = {"client_id": cid, "first_name": "Willie", "last_name": "Burg"}
+        if lead_source is not None:
+            body["lead_source"] = lead_source
+        resp = api.post(reverse("client-list"), body, format="json")
+        self.assertEqual(resp.status_code, 201, resp.content)
+        return Client.objects.get(pk=cid)
+
+    def test_williamsburg_agent_forces_lead_source(self):
+        agent = Agent.objects.create(
+            name="Will Agent", agent_code="700", group="Screeners",
+            is_williamsburg_agent=True,
+        )
+        # Even with a different lead source picked in the ext, it's overridden.
+        client = self._post_client(self._api_for(agent), lead_source="Some Queue")
+        self.assertEqual(client.lead_source, "Williamsburg")
+        self.assertTrue(client.is_williamsburg)
+
+    def test_williamsburg_agent_forces_lead_source_when_blank(self):
+        agent = Agent.objects.create(
+            name="Will Agent", agent_code="701", group="Screeners",
+            is_williamsburg_agent=True,
+        )
+        client = self._post_client(self._api_for(agent))
+        self.assertEqual(client.lead_source, "Williamsburg")
+        self.assertTrue(client.is_williamsburg)
+
+    def test_normal_agent_lead_source_untouched(self):
+        agent = Agent.objects.create(
+            name="Reg Agent", agent_code="702", group="Screeners",
+        )
+        client = self._post_client(self._api_for(agent), lead_source="Some Queue")
+        self.assertEqual(client.lead_source, "Some Queue")
+        self.assertFalse(client.is_williamsburg)
+
+
 class HouseholdEnrollmentActivationTest(TestCase):
     """When a household enrollment advances, every participant — not just the
     primary — should follow the enrollment's lifecycle stage. The household is
@@ -1863,6 +1916,55 @@ class UniteUsCaseMapperTest(SimpleTestCase):
         self.assertEqual(out["case_status"], "open")
 
 
+class CaseStatusChangeTimelineReasonTest(TestCase):
+    """A Closed/Cancelled case-status transition must surface the closure reason
+    (the case's ``closed_note``) on the timeline subtitle, so the history
+    explains WHY the case was cancelled -- mirroring the client note. Open
+    transitions stay a clean 'Prev -> New'."""
+
+    def _client(self):
+        return Client.objects.create(
+            client_id=uuid.uuid4(), first_name="Case", last_name="Closer"
+        )
+
+    def _case(self, client, **fields):
+        from .models import Case
+
+        return Case.objects.create(
+            case_id=uuid.uuid4(), client=client,
+            date_opened=timezone.now(), **fields,
+        )
+
+    def test_closed_case_shows_reason_on_timeline(self):
+        from .models import CaseStatus
+        from .services.timeline import event_for_case_status_change
+
+        c = self._client()
+        case = self._case(
+            c, case_status=CaseStatus.CLOSED, case_closed_at=timezone.now(),
+            closed_note="Client moved out of service area",
+        )
+        ev = event_for_case_status_change(case, previous_status="open")
+        self.assertIsNotNone(ev)
+        self.assertIn("Client moved out of service area", ev.subtitle)
+        self.assertIn("Closed", ev.subtitle)
+        self.assertEqual(
+            ev.metadata.get("closed_reason"), "Client moved out of service area"
+        )
+
+    def test_open_transition_has_no_reason_suffix(self):
+        from .models import CaseStatus
+        from .services.timeline import event_for_case_status_change
+
+        c = self._client()
+        case = self._case(
+            c, case_status=CaseStatus.OPEN, closed_note="ignored while open",
+        )
+        ev = event_for_case_status_change(case, previous_status="pending_authorization")
+        self.assertIsNotNone(ev)
+        self.assertNotIn("ignored while open", ev.subtitle)
+
+
 class AuthDrivesCaseStatusTest(TestCase):
     """Authorization is INDEPENDENT of case status: no auth state (denied,
     approved, pending, ...) ever changes the stored case_status. Case status is
@@ -1961,6 +2063,76 @@ class AuthDrivesCaseStatusTest(TestCase):
         )
         case = self._save(c, case_id=cid, service_authorization_status="denied")
         self.assertEqual(case.case_status, CaseStatus.MANAGED)
+
+
+class CaseSerializerAuthNormalizationTest(TestCase):
+    """CaseSerializer must normalize a RAW Unite Us authorization state on the
+    EXTENSION write path (which posts straight through the serializer with no
+    pre-mapping), exactly like the CSV / daily-import mappers. Regression for:
+    saving a rejected authorization from the extension left the stored status
+    reading 'requested'/pending because the raw state was never mapped."""
+
+    def _client(self):
+        return Client.objects.create(
+            client_id=uuid.uuid4(), first_name="Auth", last_name="Norm"
+        )
+
+    def _save(self, client, case_id=None, **fields):
+        from .serializers import CaseSerializer
+
+        data = {
+            "case_id": case_id or str(uuid.uuid4()),
+            "client_id": str(client.client_id),
+            "program_name": "Medically Tailored Meals",
+            "service_type": "Home Delivered Meals",
+            **fields,
+        }
+        ser = CaseSerializer(data=data)
+        ser.is_valid(raise_exception=True)
+        return ser.save()
+
+    def test_raw_rejected_maps_to_denied(self):
+        from .models import ServiceAuthorizationStatus
+
+        case = self._save(self._client(), service_authorization_status="rejected")
+        self.assertEqual(
+            case.service_authorization_status, ServiceAuthorizationStatus.DENIED
+        )
+        # Raw label preserved for UI fidelity.
+        self.assertEqual(case.service_authorization_status_label, "Rejected")
+
+    def test_raw_requested_maps_to_pending(self):
+        from .models import ServiceAuthorizationStatus
+
+        case = self._save(self._client(), service_authorization_status="requested")
+        self.assertEqual(
+            case.service_authorization_status, ServiceAuthorizationStatus.PENDING
+        )
+
+    def test_resaving_pending_case_as_rejected_updates_enum(self):
+        # The exact reported bug: an existing case at 'requested' (pending) that
+        # is later saved from the ext as 'rejected' must flip to Denied, not stay
+        # pending.
+        from .models import ServiceAuthorizationStatus
+
+        c = self._client()
+        cid = str(uuid.uuid4())
+        first = self._save(c, case_id=cid, service_authorization_status="requested")
+        self.assertEqual(
+            first.service_authorization_status, ServiceAuthorizationStatus.PENDING
+        )
+        second = self._save(c, case_id=cid, service_authorization_status="rejected")
+        self.assertEqual(
+            second.service_authorization_status, ServiceAuthorizationStatus.DENIED
+        )
+
+    def test_clean_enum_value_still_accepted(self):
+        from .models import ServiceAuthorizationStatus
+
+        case = self._save(self._client(), service_authorization_status="denied")
+        self.assertEqual(
+            case.service_authorization_status, ServiceAuthorizationStatus.DENIED
+        )
 
 
 class DailyPullClientSelectionTest(TestCase):

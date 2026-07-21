@@ -25,6 +25,7 @@ from ..models import (
     Agent,
     Cadence,
     Case,
+    CaseStatus,
     CaseType,
     Client,
     CommunicationChannel,
@@ -486,6 +487,11 @@ class MemberListSerializer(serializers.Serializer):
     # case and when. Null when the client has no internal-service case.
     case_created_at = serializers.SerializerMethodField()
     case_created_by = serializers.SerializerMethodField()
+    # Open/close dates of the member's INTERNAL-SERVICE (meal/box) cases, shown
+    # in the Members page "Created" column as O:/C: rows (most-recently-opened
+    # first). ``closed`` is null while a case is still open, so the column omits
+    # the C: line for open cases.
+    case_dates = serializers.SerializerMethodField()
     household_primary_id = serializers.SerializerMethodField()
     last_updated = serializers.DateTimeField(source="updated_at")
     created_at = serializers.DateTimeField()
@@ -541,6 +547,42 @@ class MemberListSerializer(serializers.Serializer):
             or getattr(obj, "agent_name", "")
             or ""
         )
+
+    def get_case_dates(self, obj):
+        # Open/close dates for the member's CURRENT internal-service case only --
+        # the one we're actively servicing. That's the OPEN case (not
+        # Closed/Cancelled); if none is open, the most-recently-opened case (the
+        # last one we serviced). Other/older cases are intentionally omitted so
+        # the Members "Created" column shows a single O:/C: block. ``closed`` is
+        # null for an open case, so its C: row is dropped. Returned as a one-item
+        # list to keep the column's rendering (it maps over case_dates).
+        cases = internal_service_cases(obj)
+        if not cases:
+            return []
+        terminal = (CaseStatus.CLOSED, CaseStatus.CANCELLED)
+        open_cases = [c for c in cases if c.case_status not in terminal]
+        if open_cases:
+            # Actively servicing: show the most-recently-opened open case.
+            chosen = max(
+                open_cases,
+                key=lambda c: (c.date_opened is not None, c.date_opened),
+            )
+        else:
+            # No open case -> show the LAST case we serviced: the one closed most
+            # recently (latest close date), so its close date is what's shown.
+            # date_opened breaks ties / covers any missing close date.
+            chosen = max(
+                cases,
+                key=lambda c: (
+                    c.case_closed_at is not None, c.case_closed_at,
+                    c.date_opened is not None, c.date_opened,
+                ),
+            )
+        opened = chosen.date_opened.isoformat() if chosen.date_opened else None
+        closed = chosen.case_closed_at.isoformat() if chosen.case_closed_at else None
+        if not (opened or closed):
+            return []
+        return [{"opened": opened, "closed": closed}]
 
     def get_household_primary_id(self, obj):
         # client_id of the household's PRIMARY member, used by the Members list
@@ -1260,6 +1302,9 @@ class PortalCrmAgentSerializer(serializers.ModelSerializer):
             "title",
             "department",
             "is_manager",
+            # Williamsburg Setup: force this agent's saved clients to
+            # lead_source="Williamsburg" (see api.views.ClientViewSet).
+            "is_williamsburg_agent",
             # Read-only CallTools identity / sync metadata.
             "username",
             "calltools_synced_at",

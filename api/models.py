@@ -2331,6 +2331,11 @@ class Agent(models.Model):
     is_agent = models.BooleanField(default=True)
     is_manager = models.BooleanField(default=False)
     is_account_owner = models.BooleanField(default=False)
+    # Williamsburg agent: every client this agent saves is forced to
+    # lead_source="Williamsburg" (which derives Client.is_williamsburg and
+    # fast-tracks verification). Set from Settings > Williamsburg Setup and
+    # enforced in api.views.ClientViewSet on save.
+    is_williamsburg_agent = models.BooleanField(default=False, db_index=True)
     calltools_synced_at = models.DateTimeField(null=True, blank=True)
 
     created_at = models.DateTimeField(auto_now_add=True)
@@ -2866,6 +2871,7 @@ class TicketTypeCode(models.TextChoices):
     CANCELLATION = "cancellation", "Cancellation"
     MISSING_WRONG_ORDER = "missing_wrong_order", "Missing / Wrong Order"
     NUTRITIONAL_COUNSELING = "nutritional_counseling", "Nutritional Counseling"
+    KITCHEN_SWITCH = "kitchen_switch", "Kitchen Switch"
     # Raised by the daily import when an internal-service case has no contracted
     # services (the member has no active internal-services contract).
     CASE_NO_SERVICES = "case_no_services", "No Internal services Case"

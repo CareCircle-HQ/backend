@@ -271,6 +271,14 @@ def event_for_case_status_change(
     new_label = case.get_case_status_display()
     prev_label = (previous_status or "").replace("_", " ").title()
     subtitle = f"{prev_label} \u2192 {new_label}" if prev_label else new_label
+    # Explain WHY the case was closed/cancelled on the timeline, mirroring the
+    # reason recorded in the client note. The closure reason lives on the case's
+    # ``closed_note`` (populated by the CSV/API import + the extension); fall back
+    # to the case description. Only appended for a terminal transition so open
+    # cases stay a clean "Prev -> New".
+    reason = (case.closed_note or "").strip() or (case.case_description or "").strip()
+    if reason and case.case_status in (CaseStatus.CLOSED, CaseStatus.CANCELLED):
+        subtitle = f"{subtitle} \u00b7 {reason}" if subtitle else reason
     day = occurred.date().isoformat() if occurred else ""
     return emit_timeline_event(
         client=client,
@@ -287,6 +295,7 @@ def event_for_case_status_change(
         metadata={
             "previous_status": previous_status or "",
             "new_status": case.case_status,
+            "closed_reason": (case.closed_note or "").strip(),
             "import_run": import_run.pk if import_run is not None else None,
         },
         dedupe_key=f"case_status:{case.pk}:{case.case_status}:{day}",
@@ -477,11 +486,18 @@ def event_for_verification(enrollment, *, stage_event=None, source=ChangeSource.
     event_type, title = fields if fields else (TimelineEventType.VERIFICATION, label or "Verification")
     tone = _VERIFICATION_STAGE_TONE.get(enrollment.stage, TimelineBadgeTone.NEUTRAL)
     dedupe = f"verification_stage:{stage_event.pk}" if stage_event is not None else ""
-    # For a disregarded request, surface the agent's reason (recorded on the
-    # StageEvent note) directly on the timeline row instead of the program name.
+    # For an off-ramp (Disregarded / Cancelled / Closed), surface the agent's
+    # reason (recorded on the StageEvent note) directly on the timeline row
+    # instead of the program name, so the history explains WHY -- mirroring the
+    # reason captured in the client note.
     subtitle = enrollment.program_name or ""
+    _REASON_STAGES = (
+        EnrollmentStage.DISREGARDED,
+        EnrollmentStage.CANCELLED,
+        EnrollmentStage.CLOSED,
+    )
     if (
-        enrollment.stage == EnrollmentStage.DISREGARDED
+        enrollment.stage in _REASON_STAGES
         and stage_event is not None
         and stage_event.note
     ):
