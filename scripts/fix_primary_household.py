@@ -19,7 +19,21 @@ Safe to re-run: a client who is already primary (or has no household) is a no-op
 """
 from django.db import transaction
 
-from api.models import Case, CaseType, Client, HouseholdMember
+from api.models import (
+    Case,
+    CaseType,
+    Client,
+    HouseholdMember,
+    MemberDietaryProfile,
+)
+
+
+def _member_is_primary(client):
+    """Whether ``client`` is the PRIMARY of their own roster household."""
+    membership = getattr(client, "household_membership", None)
+    if membership is None:
+        membership = HouseholdMember.objects.filter(client=client).first()
+    return bool(getattr(membership, "is_primary", False)), membership
 
 
 def _describe(client):
@@ -41,7 +55,72 @@ def _describe(client):
     print(f"  internal-service cases: {internal.count()}")
     for c in internal:
         print(f"     case: {c.case_id} status={c.case_status} program={c.program_name!r}")
+    _describe_enrollments(client, membership)
     return membership
+
+
+def _describe_enrollments(client, membership):
+    """Dump the enrollments that govern this client + their per-member dietary
+    profiles, flagging WHICH profile the Household/Program tab would render as
+    'primary' (the one whose owner is is_primary of their OWN roster household).
+
+    This is where a mismatch hides: the roster can say the client is primary of
+    their solo household, yet their governing enrollment is still the OLD shared
+    household's -- so its member_profiles list a DIFFERENT member (the old
+    primary), which is what the Program tab shows.
+    """
+    own = [e for e in client.enrollments.all() if e.stage != "disregarded"]
+    print(f"  own enrollments (non-disregarded): {len(own)}")
+    for e in own:
+        print(f"     enr {e.pk} code={e.code!r} stage={e.stage} "
+              f"closed={e.closed_at is not None} household={e.household_id} "
+              f"client={e.client_id}")
+
+    # Which enrollment the Program/Household tab actually renders (mirrors
+    # portal.serializers.active_enrollment: own first, else household's).
+    governing = own
+    if not governing and membership is not None:
+        governing = [
+            e for e in membership.household.enrollment_verifications.all()
+            if e.stage != "disregarded"
+        ]
+        print(f"  NO own enrollment -> falls back to household "
+              f"{membership.household_id}'s enrollments: {len(governing)}")
+    if not governing:
+        print("  governing enrollment: NONE (Household/Program tab would be empty)")
+        return
+    open_ones = [e for e in governing if e.closed_at is None]
+    pool = open_ones or governing
+    active = sorted(pool, key=lambda e: e.opened_at or e.pk, reverse=True)[0]
+    print(f"  >>> ACTIVE enrollment (drives Program tab): {active.pk} "
+          f"stage={active.stage} household={active.household_id}")
+    profiles = (
+        MemberDietaryProfile.objects.filter(enrollment=active)
+        .select_related("client__household_membership")
+    )
+    print(f"      member profiles: {profiles.count()}")
+    for p in profiles:
+        is_primary, _m = (
+            _member_is_primary(p.client) if p.client_id else (False, None)
+        )
+        flag = "  <== shown as PRIMARY" if is_primary else ""
+        pname = p.member_name or (
+            f"{p.client.first_name} {p.client.last_name}".strip()
+            if p.client else ""
+        )
+        print(f"        profile {p.pk} client={p.client_id} "
+              f"roster_primary={is_primary} status={p.status} ({pname}){flag}")
+
+
+def diagnose(client_id):
+    """READ-ONLY: print the full roster + enrollment/profile picture for a
+    client, to pinpoint why the Program tab shows the wrong primary. No writes."""
+    client = Client.objects.filter(client_id=client_id).first()
+    if client is None:
+        print(f"NO CLIENT with id {client_id}")
+        return
+    print("=== DIAGNOSE ===")
+    _describe(client)
 
 
 def run(client_id, *, apply=False):
