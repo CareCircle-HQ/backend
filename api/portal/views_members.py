@@ -3,12 +3,20 @@
 the verification wizard write."""
 
 import logging
+import re
 import uuid
 from datetime import datetime, timedelta
 
 from django.db import transaction
 from django.utils import timezone
-from django.db.models import Count, Exists, F, OuterRef, Prefetch, Q
+from django.db.models import (
+    Count,
+    Exists,
+    F,
+    OuterRef,
+    Prefetch,
+    Q,
+)
 from django.db.models.functions import Lower
 from django.shortcuts import get_object_or_404
 from rest_framework import status as http
@@ -29,6 +37,8 @@ from ..models import (
     EnrollmentVerification,
     FoodAllergy,
     HouseholdMember,
+    Insurance,
+    InsurancePlanType,
     Kitchen,
     MemberDietaryProfile,
     KitchenProductType,
@@ -638,14 +648,40 @@ def apply_authorization_date_filter(qs, start, end):
     return qs.filter(Exists(cases))
 
 
+def apply_case_created_date_filter(qs, start, end):
+    """Restrict ``qs`` to clients whose GOVERNING internal-service case was
+    CREATED/opened (``Case.date_opened``) within the inclusive [start, end]
+    window. Either bound may be None (open-ended); no-op when both are None.
+
+    Uses ``Exists`` on the internal-service case (mirroring
+    ``apply_authorization_date_filter``), so it introduces no join duplicates
+    and needs no ``.distinct()`` of its own."""
+    if not start and not end:
+        return qs
+    cases = Case.objects.filter(
+        client=OuterRef("pk"),
+        case_type=CaseType.INTERNAL_SERVICE,
+    )
+    if start:
+        cases = cases.filter(date_opened__date__gte=start)
+    if end:
+        cases = cases.filter(date_opened__date__lte=end)
+    return qs.filter(Exists(cases))
+
+
 def apply_verification_date_filters(qs, params):
-    """Apply the Verification-page requested/completed/authorized date-range
-    filters from query params (``requested_from``/``requested_to`` -> enrollment
-    ``opened_at``; ``completed_from``/``completed_to`` -> enrollment
-    ``verified_at``; ``authorized_from``/``authorized_to`` -> internal-service
-    case ``service_authorization_approval_starts_at``). Returns (qs, changed)
-    where ``changed`` signals the caller to ``.distinct()``."""
+    """Apply the Verification-page case-created/requested/completed/authorized
+    date-range filters from query params (``case_from``/``case_to`` ->
+    internal-service case ``date_opened``; ``requested_from``/``requested_to``
+    -> enrollment ``opened_at``; ``completed_from``/``completed_to`` ->
+    enrollment ``verified_at``; ``authorized_from``/``authorized_to`` ->
+    internal-service case ``service_authorization_approval_starts_at``). Returns
+    (qs, changed) where ``changed`` signals the caller to ``.distinct()``."""
     changed = False
+    case_from, case_to = _parse_date(params.get("case_from")), _parse_date(params.get("case_to"))
+    if case_from or case_to:
+        qs = apply_case_created_date_filter(qs, case_from, case_to)
+        # Exists-based, so no distinct is required for this bound alone.
     req_from, req_to = _parse_date(params.get("requested_from")), _parse_date(params.get("requested_to"))
     if req_from or req_to:
         qs = apply_enrollment_date_filter(qs, "opened_at", req_from, req_to)
@@ -1085,22 +1121,16 @@ class MembersListView(PortalGenericAPIView):
         "system": "System",
     }
 
-    def _stamp_added_via(self, groups):
-        """Annotate each member dict in ``groups`` with how the client was first
-        created: ``added_via`` (raw ChangeSource code) + ``added_via_label``.
-
-        Derived from the EARLIEST historical row (history_type='+') of the
+    def _added_via_map(self, ids):
+        """{client_id(str): (source_code, label)} for how each client was first
+        created, from the EARLIEST historical row (history_type='+') of the
         Client, whose ``change_source`` records whether the extension, the CSV /
         Unite Us import, admin, etc. created the record. Batched into ONE query
-        over the page's client ids to avoid an N+1. Blank source (e.g. records
+        over the given client ids to avoid an N+1. Blank source (e.g. records
         that predate change-source stamping) surfaces as 'Unknown'."""
-        ids = {
-            m["id"]
-            for g in groups
-            for m in g.get("members", [])
-        }
+        result = {}
         if not ids:
-            return
+            return result
         hist_model = Client.history.model
         src_by_id = {}
         for cid, src in (
@@ -1112,13 +1142,29 @@ class MembersListView(PortalGenericAPIView):
             # First create row wins (ordered oldest-first).
             if key not in src_by_id:
                 src_by_id[key] = src or ""
+        for key, src in src_by_id.items():
+            result[key] = (
+                src,
+                self._ADDED_VIA_LABELS.get(
+                    src, src.replace("_", " ").title() if src else "Unknown"
+                ),
+            )
+        return result
+
+    def _stamp_added_via(self, groups):
+        """Annotate each member dict in ``groups`` with how the client was first
+        created: ``added_via`` (raw ChangeSource code) + ``added_via_label``."""
+        ids = {
+            m["id"]
+            for g in groups
+            for m in g.get("members", [])
+        }
+        via = self._added_via_map(ids)
         for g in groups:
             for m in g.get("members", []):
-                src = src_by_id.get(m["id"], "")
+                src, label = via.get(m["id"], ("", "Unknown"))
                 m["added_via"] = src
-                m["added_via_label"] = self._ADDED_VIA_LABELS.get(
-                    src, src.replace("_", " ").title() if src else "Unknown"
-                )
+                m["added_via_label"] = label
 
     @staticmethod
     def _hidden_in_logistics(client):
@@ -1583,6 +1629,14 @@ class MembersListView(PortalGenericAPIView):
                 # Meals/Boxes kind (household-wide) for the row's service label.
                 row["service_type"] = self._service_type_for_client(c)
                 data.append(row)
+            # Stamp how each member was first created (Extension / Import / …),
+            # shown under the lead source in the Source column. Batched over the
+            # page's client ids to avoid an N+1.
+            via = self._added_via_map([r["id"] for r in data])
+            for row in data:
+                src, label = via.get(row["id"], ("", "Unknown"))
+                row["added_via"] = src
+                row["added_via_label"] = label
             return self.get_paginated_response(data)
         # Grouped mode (Verification / Logistics): build the ordered group keys
         # cheaply, paginate THEM, and serialize only the current page's groups
@@ -1627,6 +1681,379 @@ class MembersListView(PortalGenericAPIView):
         if scope == "need_attention":
             self._stamp_added_via(groups)
         return self.get_paginated_response(groups)
+
+
+class UnlinkedMembersListView(PortalGenericAPIView):
+    """Urgent Care -> Un-Linked Members tab.
+
+    Members who hold an eligibility/navigation case but NO internal-service case
+    and are NOT attached to any household -- the "unaffiliated" population the
+    dashboard's Total Members card surfaces. Optionally scoped by the
+    eligibility/navigation case's opened date (``case_from`` / ``case_to``).
+
+    For each member we also probe whether their Medicaid ID or member id (client
+    UUID) is referenced in ANY OTHER member's case description, so an agent can
+    jump to the case that actually "owns" them (and open it in Unite Us / CRM).
+    """
+
+    @staticmethod
+    def base_queryset(case_from=None, case_to=None):
+        """The un-linked/"unaffiliated" population: members with an
+        eligibility/navigation case (optionally opened within [case_from,
+        case_to]) but NO internal-service case, who are NOT attached to any
+        household. Shared with the executive dashboard's Total Members card so
+        the "Unaffiliated" number matches this tab exactly."""
+        en_case = Case.objects.filter(
+            client=OuterRef("pk"),
+            case_type__in=(CaseType.ELIGIBILITY, CaseType.NAVIGATION),
+        )
+        if case_from:
+            en_case = en_case.filter(date_opened__date__gte=case_from)
+        if case_to:
+            en_case = en_case.filter(date_opened__date__lte=case_to)
+        internal_case = Case.objects.filter(
+            client=OuterRef("pk"), case_type=CaseType.INTERNAL_SERVICE,
+        )
+        return (
+            Client.objects.filter(household_membership__isnull=True)
+            .annotate(_has_en=Exists(en_case), _has_ic=Exists(internal_case))
+            .filter(_has_en=True, _has_ic=False)
+        )
+
+    def get_queryset(self):
+        params = self.request.query_params
+        case_from = _parse_date(params.get("case_from"))
+        case_to = _parse_date(params.get("case_to"))
+
+        qs = self.base_queryset(case_from, case_to).prefetch_related(
+            "insurances", "cases", "assessments"
+        )
+
+        search = (params.get("search") or "").strip()
+        if search:
+            cond = (
+                Q(first_name__icontains=search)
+                | Q(last_name__icontains=search)
+                | Q(insurances__external_member_id__icontains=search)
+            )
+            parts = search.split()
+            if len(parts) >= 2:
+                cond |= Q(first_name__icontains=parts[0]) & Q(
+                    last_name__icontains=parts[-1]
+                )
+            try:
+                cond |= Q(client_id=uuid.UUID(search))
+            except (ValueError, TypeError, AttributeError):
+                pass
+            qs = qs.filter(cond)
+
+        # Optionally keep only members that ARE referenced in some other member's
+        # case description (the "Referenced In" column). Resolved in a single
+        # pass over all descriptions (see _referenced_client_ids) rather than a
+        # per-candidate icontains EXISTS, which scanned every case per member and
+        # timed out on the full population.
+        if (params.get("referenced") or "").strip().lower() in ("1", "true", "yes"):
+            qs = qs.filter(pk__in=self._referenced_client_ids(qs))
+
+        return qs.order_by(Lower("first_name"), Lower("last_name")).distinct()
+
+    # Client UUID + generic alphanumeric-id tokens (>=6 chars, e.g. Medicaid
+    # member ids) as they'd appear inside a free-text case description.
+    _UUID_RE = re.compile(
+        r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+    )
+    _TOKEN_RE = re.compile(r"[a-z0-9]{6,}")
+
+    @classmethod
+    def _referenced_client_ids(cls, base_qs):
+        """PKs of the candidate members whose client UUID or Medicaid member id
+        appears in ANY case description. Builds the set of id-like tokens found
+        across every non-empty description once, then keeps only candidates whose
+        UUID / Medicaid id is among them -- O(descriptions + candidates) instead
+        of a correlated icontains scan per candidate."""
+        tokens = set()
+        for desc in (
+            Case.objects.exclude(case_description="")
+            .values_list("case_description", flat=True)
+            .iterator(chunk_size=2000)
+        ):
+            low = desc.lower()
+            tokens.update(cls._UUID_RE.findall(low))
+            tokens.update(cls._TOKEN_RE.findall(low))
+
+        # candidate client_id -> Medicaid member id (lowercased)
+        medicaid = {
+            r["client_id"]: (r["insurances__external_member_id"] or "").lower()
+            for r in base_qs.filter(
+                insurances__plan_type=InsurancePlanType.MEDICAID
+            )
+            .exclude(insurances__external_member_id="")
+            .values("client_id", "insurances__external_member_id")
+        }
+
+        keep = []
+        for cid in base_qs.values_list("client_id", flat=True):
+            m = medicaid.get(cid)
+            if str(cid).lower() in tokens or (m and m in tokens):
+                keep.append(cid)
+        return keep
+
+    @staticmethod
+    def _case_of_type(client, case_type):
+        """The client's most-recent case of ``case_type`` (for the per-type
+        created date + creator columns). None when the client has none."""
+        dated = [
+            c
+            for c in client.cases.all()
+            if c.case_type == case_type and c.date_opened
+        ]
+        return max(dated, key=lambda c: c.date_opened) if dated else None
+
+    @staticmethod
+    def _case_cell(case):
+        """Serialize a case's created date + creator for a table column."""
+        if case is None:
+            return {"created_at": None, "created_by": ""}
+        return {
+            "created_at": case.date_opened.isoformat() if case.date_opened else None,
+            "created_by": case.created_by_name or case.primary_worker_name or "",
+        }
+
+    @staticmethod
+    def _eligible_services(client):
+        """Unique eligible-service names across ALL of the client's eligibility
+        assessments (``Assessment.eligible_services``), order preserved. Items
+        are usually plain strings, but tolerate ``{"name"/"code": ...}`` dicts."""
+        seen = []
+        for a in client.assessments.all():
+            for raw in a.eligible_services or []:
+                name = (
+                    (raw.get("name") or raw.get("code"))
+                    if isinstance(raw, dict)
+                    else raw
+                )
+                if isinstance(name, str) and name.strip() and name not in seen:
+                    seen.append(name.strip())
+        return seen
+
+    @staticmethod
+    def _description_match(client):
+        """If this member's member id (client UUID) or ANY of their Medicaid IDs
+        appears in ANOTHER member's case description, return that owning case's
+        info so the agent can open it. None when there's no reference.
+
+        A member can carry more than one Medicaid insurance row, so we probe
+        EVERY Medicaid id -- not just the single canonical one -- to stay in
+        step with the referenced-in filter (``_referenced_client_ids``), which
+        also scans all of them. Probing only the canonical id left members that
+        were referenced by a secondary Medicaid id showing an empty column."""
+        cid = str(client.client_id)
+        medicaid_ids = [
+            mid
+            for i in client.insurances.all()
+            if i.plan_type == InsurancePlanType.MEDICAID
+            and (mid := (i.external_member_id or "").strip())
+        ]
+        cond = Q(case_description__icontains=cid)
+        for mid in medicaid_ids:
+            cond |= Q(case_description__icontains=mid)
+        match = (
+            Case.objects.filter(cond)
+            .exclude(client_id=client.client_id)
+            .exclude(case_description="")
+            .select_related("client")
+            .order_by("-date_opened")
+            .first()
+        )
+        if match is None:
+            return None
+        desc = (match.case_description or "").lower()
+        matched_on = (
+            "medicaid"
+            if any(mid.lower() in desc for mid in medicaid_ids)
+            else "member_id"
+        )
+        return {
+            "owner_id": str(match.client_id),
+            "owner_name": s._full_name(match.client) if match.client else "",
+            "case_id": str(match.case_id),
+            "program_name": match.program_name or match.service_type or "",
+            "matched_on": matched_on,
+        }
+
+    def get(self, request):
+        page = self.paginate_queryset(self.get_queryset())
+        rows = []
+        for c in page or []:
+            rows.append(
+                {
+                    "id": str(c.client_id),
+                    "name": s._full_name(c),
+                    "date_of_birth": c.date_of_birth.isoformat()
+                    if c.date_of_birth
+                    else None,
+                    "medicaid_id": s.medicaid_member_id(c) or "",
+                    "eligible_services": self._eligible_services(c),
+                    # Eligibility is checked first, then navigation -- surfaced as
+                    # two separate columns so a member with only one is obvious.
+                    "eligibility_case": self._case_cell(
+                        self._case_of_type(c, CaseType.ELIGIBILITY)
+                    ),
+                    "navigation_case": self._case_cell(
+                        self._case_of_type(c, CaseType.NAVIGATION)
+                    ),
+                    "description_match": self._description_match(c),
+                }
+            )
+        return self.get_paginated_response(rows)
+
+
+class NoNavigationMembersListView(UnlinkedMembersListView):
+    """Urgent Care -> No Navigation tab.
+
+    Members who HOLD an internal-service case but have NO navigation case at all
+    (regardless of the navigation case's status). Reuses the row
+    serialization + eligibility/navigation column helpers from
+    :class:`UnlinkedMembersListView`; only the population differs. Optionally
+    scoped by the internal-service case's opened date (``case_from`` /
+    ``case_to``).
+    """
+
+    def get_queryset(self):
+        params = self.request.query_params
+        case_from = _parse_date(params.get("case_from"))
+        case_to = _parse_date(params.get("case_to"))
+
+        # Internal-service case, optionally opened within [from, to].
+        internal_case = Case.objects.filter(
+            client=OuterRef("pk"), case_type=CaseType.INTERNAL_SERVICE,
+        )
+        if case_from:
+            internal_case = internal_case.filter(date_opened__date__gte=case_from)
+        if case_to:
+            internal_case = internal_case.filter(date_opened__date__lte=case_to)
+        # ANY navigation case (regardless of status) disqualifies the member --
+        # this tab is for members who have NO navigation case at all.
+        nav_case = Case.objects.filter(
+            client=OuterRef("pk"), case_type=CaseType.NAVIGATION,
+        )
+
+        qs = (
+            Client.objects.annotate(
+                _has_ic=Exists(internal_case),
+                _has_nav=Exists(nav_case),
+            )
+            .filter(_has_ic=True, _has_nav=False)
+            .prefetch_related("insurances", "cases", "assessments")
+        )
+
+        search = (params.get("search") or "").strip()
+        if search:
+            cond = (
+                Q(first_name__icontains=search)
+                | Q(last_name__icontains=search)
+                | Q(insurances__external_member_id__icontains=search)
+            )
+            parts = search.split()
+            if len(parts) >= 2:
+                cond |= Q(first_name__icontains=parts[0]) & Q(
+                    last_name__icontains=parts[-1]
+                )
+            try:
+                cond |= Q(client_id=uuid.UUID(search))
+            except (ValueError, TypeError, AttributeError):
+                pass
+            qs = qs.filter(cond)
+
+        return qs.order_by(Lower("first_name"), Lower("last_name")).distinct()
+
+
+class NeedAttestationMembersListView(UnlinkedMembersListView):
+    """Urgent Care -> Need Attestation tab.
+
+    Members the ext flagged as needing a provider (doctor) attestation:
+    ``Client.attestation_needed=True``. On the ext this is set when an
+    eligibility Assessment's ``"<Population> - Verification Method"`` answer is
+    ``"Provider Attestation"`` (replayed onto our data by the
+    ``backfill_attestation_needed`` command). Reuses the row serialization +
+    eligibility/navigation column helpers from :class:`UnlinkedMembersListView`;
+    only the population differs.
+    """
+
+    # The eligibility-assessment answer that means "provider/doctor attestation
+    # required" (mirrors backfill_attestation_needed).
+    _PROVIDER_ATTESTATION = "provider attestation"
+    _VERIFICATION_METHOD_SUFFIX = "verification method"
+
+    def get_queryset(self):
+        params = self.request.query_params
+
+        qs = Client.objects.filter(attestation_needed=True).prefetch_related(
+            "insurances", "cases", "assessments"
+        )
+
+        search = (params.get("search") or "").strip()
+        if search:
+            cond = (
+                Q(first_name__icontains=search)
+                | Q(last_name__icontains=search)
+                | Q(insurances__external_member_id__icontains=search)
+            )
+            parts = search.split()
+            if len(parts) >= 2:
+                cond |= Q(first_name__icontains=parts[0]) & Q(
+                    last_name__icontains=parts[-1]
+                )
+            try:
+                cond |= Q(client_id=uuid.UUID(search))
+            except (ValueError, TypeError, AttributeError):
+                pass
+            qs = qs.filter(cond)
+
+        return qs.order_by(Lower("first_name"), Lower("last_name")).distinct()
+
+    @classmethod
+    def _attestation_qa(cls, client):
+        """The eligibility-assessment question + answer that flags this member as
+        needing provider attestation (a ``"… - Verification Method"`` answered
+        ``"Provider Attestation"``). None when not found on any assessment."""
+        for a in client.assessments.all():
+            for qa in a.questions_answers or []:
+                question = (qa.get("question") or "").strip()
+                answer = (qa.get("answer") or "").strip()
+                if question.lower().endswith(cls._VERIFICATION_METHOD_SUFFIX) and (
+                    answer.lower() == cls._PROVIDER_ATTESTATION
+                ):
+                    return {
+                        "question": question,
+                        "answer": answer,
+                        "form_name": a.form_name or "",
+                    }
+        return None
+
+    def get(self, request):
+        page = self.paginate_queryset(self.get_queryset())
+        rows = []
+        for c in page or []:
+            rows.append(
+                {
+                    "id": str(c.client_id),
+                    "name": s._full_name(c),
+                    "date_of_birth": c.date_of_birth.isoformat()
+                    if c.date_of_birth
+                    else None,
+                    "medicaid_id": s.medicaid_member_id(c) or "",
+                    "eligibility_case": self._case_cell(
+                        self._case_of_type(c, CaseType.ELIGIBILITY)
+                    ),
+                    "navigation_case": self._case_cell(
+                        self._case_of_type(c, CaseType.NAVIGATION)
+                    ),
+                    # The screening question + answer we keyed the flag on.
+                    "attestation": self._attestation_qa(c),
+                }
+            )
+        return self.get_paginated_response(rows)
 
 
 class MembersStatsView(PortalAPIView):
@@ -1711,6 +2138,27 @@ class MemberSocialCoverageView(PortalAPIView):
         client = get_object_or_404(Client, pk=client_id)
         plans = client.social_care_coverages.all()
         return Response(s.PortalSocialCoverageSerializer(plans, many=True).data)
+
+
+class MemberDoctorView(PortalAPIView):
+    """GET/PATCH /members/<client_id>/doctor/ — the member's Doctor/PCP
+    (attestation) information shown and edited on the profile's Attestation tab.
+
+    The doctor fields are collected by the ext when a member needs a provider
+    attestation (``attestation_needed=True``); this lets an agent view, enter or
+    correct them directly. PATCH accepts any subset of the doctor fields.
+    """
+
+    def get(self, request, client_id):
+        client = get_object_or_404(Client, pk=client_id)
+        return Response(s.PortalDoctorSerializer(client).data)
+
+    def patch(self, request, client_id):
+        client = get_object_or_404(Client, pk=client_id)
+        ser = s.PortalDoctorSerializer(client, data=request.data, partial=True)
+        ser.is_valid(raise_exception=True)
+        ser.save()
+        return Response(ser.data)
 
 
 class MemberPhonesView(PortalAPIView):

@@ -114,9 +114,17 @@ def _attribution_from_request():
     user = getattr(request, "user", None) if request is not None else None
     if user is None:
         return "", ""
+    # An AgentUser (the agent JWT principal) is ALWAYS the extension, even when
+    # it has no dialer ``agent_code`` -- agents without an extension have
+    # agent_code=None (see Agent.agent_code). Keying only on agent_code
+    # mis-stamped those code-less agents' writes as ADMIN, so detect the agent
+    # principal via ``agent_id`` and prefer the code, falling back to the id, for
+    # the actor label.
+    agent_id = getattr(user, "agent_id", None)
     agent_code = getattr(user, "agent_code", None)
-    if agent_code:
-        return ChangeSource.EXTENSION, f"agent:{agent_code}"
+    if agent_id or agent_code:
+        return ChangeSource.EXTENSION, f"agent:{agent_code or agent_id}"
+    # A genuine Django auth user (e.g. Django admin / superuser) -- not an agent.
     if getattr(user, "is_authenticated", False):
         label = getattr(user, "username", "") or getattr(user, "pk", "")
         return ChangeSource.ADMIN, f"user:{label}"

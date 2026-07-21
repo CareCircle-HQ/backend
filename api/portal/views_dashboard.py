@@ -1,18 +1,21 @@
 """Management dashboard analytics.
 
 A single aggregate endpoint (management-only) reporting on the internal-service
-(meal/box) program. Only three metrics are scoped by the selected date range (to
-internal-service cases OPENED within that window): Total Open Cases, Total
-Members, and Cancel Rate. Every other metric -- Total Enrolled, Active Delivery
-Members, Meals vs Boxes, and the whole Section-2 serving breakdown -- is an
-all-time live snapshot regardless of the selected range. ``All Time`` applies no
-date filter to any metric. See :class:`DashboardView` for the exact definitions.
+(meal/box) program. The six headline cards are scoped by the selected date range
+(to internal-service cases OPENED within that window): Total Open Cases, Total
+Members, Cancel Rate, Total Enrolled, Total Receiving Meals, and Total Pending
+Meals. The date window is either a named ``period`` preset or an explicit custom
+``start``/``end`` range (see :func:`resolve_window`). Meals vs Boxes is also
+scoped to cases opened in the range; the Section-2 serving breakdown remains an
+all-time live snapshot. ``All Time`` applies no date filter to any metric. See
+:class:`DashboardView` for exact definitions.
 """
 
-from datetime import timedelta
+from datetime import date, timedelta
 
 from django.db.models import Count, Q
 from django.utils import timezone
+from django.utils.dateparse import parse_date
 from rest_framework.response import Response
 
 from ..models import (
@@ -76,6 +79,30 @@ def period_window(period):
     if period == "year":  # This Year
         return today.replace(month=1, day=1), today
     return None, None  # all time (default)
+
+
+def resolve_window(request):
+    """Resolve the dashboard's ``(start, end)`` date window from the request.
+
+    An explicit custom range (``start`` / ``end`` query params, ISO YYYY-MM-DD)
+    wins over the named ``period`` preset. A one-sided custom range is closed
+    with a sensible default (missing start -> 2000-01-01, missing end -> today)
+    so a custom window is ALWAYS fully bounded -- this preserves the
+    "``start is None`` => all time" invariant the metric helpers rely on.
+    """
+    start_raw = (request.query_params.get("start") or "").strip()
+    end_raw = (request.query_params.get("end") or "").strip()
+    if start_raw or end_raw:
+        start = parse_date(start_raw) if start_raw else None
+        end = parse_date(end_raw) if end_raw else None
+        if start is None:
+            start = date(2000, 1, 1)
+        if end is None:
+            end = timezone.localdate()
+        if end < start:
+            start, end = end, start
+        return start, end
+    return period_window((request.query_params.get("period") or "all").lower())
 
 
 def _scope_by_opened(qs, start, end):
@@ -166,10 +193,9 @@ def serving_client_ids(reason, *, start, end):
             mdp.filter(status=MemberStatus.OUT_OF_ORBIT)
         ).values_list("client_id", flat=True))
     if reason == "services_paused":
-        # Mirror the Receiving Meals card's pipeline split EXACTLY so the two
-        # cards reconcile (services_paused == receiving.paused + receiving.on_hold):
-        # a member individually Paused within the active-service pipeline, OR an
-        # otherwise-Active member whose household is On Hold. Out-of-Orbit /
+        # A member individually Paused within the active-service pipeline, OR an
+        # otherwise-Active member whose household is On Hold -- the "not currently
+        # served" states the Receiving Meals card excludes. Out-of-Orbit /
         # Out-of-Range members of on-hold households are deliberately excluded --
         # they surface under their own reasons, so counting them here too would
         # double-count them.
@@ -374,13 +400,20 @@ class DashboardView(PortalAPIView):
       enrolled in accepted-authorization (open + APPROVED) internal-service
       cases (the base). Can exceed 100% since the lost buckets are not a strict
       subset of the accepted-case base.
-    * total_enrolled -- [ALL TIME] distinct members in the households of ALL
-      internal-service cases, regardless of status.
+    * total_enrolled -- [ALL TIME scalar] distinct members in the households of
+      ALL internal-service cases (legacy field; the range-scoped Total Enrolled
+      card reads the ``enrolled`` breakdown below).
+    * enrolled / receiving / pending -- [TIME-FRAME] the three second-row cards
+      (Total Enrolled, Total Receiving Meals, Total Pending Meals), scoped to
+      members tied to an internal-service case opened in the selected range.
     * active_delivery_members -- [ALL TIME] distinct members currently ACTIVE in
       a Service-Active enrollment (Accepted + Verified + being served).
-    * meals_boxes -- [ALL TIME] currently-open cases split by product kind
-      (Meals/Boxes) and, within each, Individual vs Household.
-    * serving -- [ALL TIME] Section-2 member serving-status breakdown.
+    * meals_boxes -- [TIME-FRAME] currently-open cases opened in the selected
+      range, split by product kind (Meals/Boxes) and, within each, Individual
+      vs Household.
+    * serving -- Section-2 member serving-status breakdown. The Not Being Served
+      + Needs Follow-up (watchlist) counts are [TIME-FRAME] (scoped to the range
+      via serving_client_ids); receiving_meals + pending_meals are [ALL TIME].
     """
 
     def get(self, request):
@@ -390,7 +423,11 @@ class DashboardView(PortalAPIView):
             return Response({"detail": "Management access required."}, status=403)
 
         period = (request.query_params.get("period") or "all").lower()
-        start, end = period_window(period)
+        custom = bool(
+            (request.query_params.get("start") or "").strip()
+            or (request.query_params.get("end") or "").strip()
+        )
+        start, end = resolve_window(request)
 
         ic = Case.objects.filter(case_type=CaseType.INTERNAL_SERVICE)
         ic_in_range = _scope_by_opened(ic, start, end)
@@ -418,14 +455,14 @@ class DashboardView(PortalAPIView):
             "other": auth_counts["other"],
         }
 
-        # --- 1.5 Meals vs Boxes (ALL TIME) --------------------------------
-        # Product mix across EVERY currently-open internal-service case,
-        # regardless of the selected date range.
+        # --- 1.5 Meals vs Boxes (TIME-FRAME SENSITIVE) --------------------
+        # Product mix across currently-open internal-service cases OPENED in the
+        # selected date range (All Time => every open case).
         mb = {
             k: {"individual": 0, "household": 0}
             for k in ("meals", "boxes", "unknown")
         }
-        all_open_rows = ic.exclude(case_status__in=_TERMINAL_CASE_STATUSES).values(
+        all_open_rows = open_cases.values(
             "household_type",
             "program__product_type__type",
             "program_name",
@@ -462,6 +499,24 @@ class DashboardView(PortalAPIView):
         enrolled_client_ids = set(ic.values_list("client_id", flat=True))
         total_enrolled = self._household_member_count(enrolled_client_ids)
 
+        # --- 1.2b Unaffiliated members (TIME-FRAME SENSITIVE) -------------
+        # Clients with an eligibility/navigation case OPENED in the selected
+        # range who hold NO internal-service case and are not a member of any
+        # household. Scoped by the eligibility/navigation case opened date (they
+        # have no internal-service case to date-scope on). NOT part of the
+        # members total above -- it's a separate, non-overlapping population.
+        #
+        # This must match the Urgent Care "Un-Linked Members" tab exactly, so we
+        # additionally keep only those whose member id / Medicaid id is
+        # referenced in ANOTHER member's case description -- using the same
+        # helper that tab does (UnlinkedMembersListView._referenced_client_ids).
+        from .views_members import UnlinkedMembersListView
+
+        unaffiliated_qs = UnlinkedMembersListView.base_queryset(start, end)
+        members_payload["unaffiliated"] = len(
+            UnlinkedMembersListView._referenced_client_ids(unaffiliated_qs)
+        )
+
         # --- 1.4 Active delivery members (ALL TIME) -----------------------
         # Members currently ACTIVE in a Service-Active enrollment, regardless
         # of when their case was opened.
@@ -497,14 +552,9 @@ class DashboardView(PortalAPIView):
             cr_paused + cr_on_hold + cr_out_of_orbit + cr_out_of_range + cr_cancelled
         )
 
-        # Base: distinct members across the households of accepted-authorization
-        # (open + APPROVED) internal-service cases in range.
-        accepted_case_clients = set(
-            open_cases.filter(
-                service_authorization_status=ServiceAuthorizationStatus.APPROVED
-            ).values_list("client_id", flat=True)
-        )
-        accepted_members = self._household_member_count(accepted_case_clients)
+        # Base: Total Members across open cases (the "Total Members" card's
+        # value) -- the same in-range open-case member population.
+        base_members = members_payload["total"]
 
         cancel_rate = {
             "paused": cr_paused,
@@ -513,10 +563,10 @@ class DashboardView(PortalAPIView):
             "out_of_range": cr_out_of_range,
             "cancelled": cr_cancelled,
             "lost_total": lost_total,
-            "base": accepted_members,
+            "base": base_members,
             "rate": (
-                round(lost_total / accepted_members * 100, 1)
-                if accepted_members else 0.0
+                round(lost_total / base_members * 100, 1)
+                if base_members else 0.0
             ),
         }
 
@@ -525,7 +575,9 @@ class DashboardView(PortalAPIView):
         # count is derived from serving_client_ids(), the same source of truth the
         # drill-down list endpoint uses, so a count can never disagree with its
         # list. pending_meals stays inline (it has no drill-down list of its own).
-        # ALL TIME: Section-2 counts are live snapshots, ignoring the range.
+        # TIME-FRAME: the Not Being Served + Needs Follow-up counts are scoped to
+        # the selected range (members tied to an internal-service case opened in
+        # the window); All Time applies no date filter.
         mdp = MemberDietaryProfile.objects
         pending_meals = mdp.filter(
             enrollment__verified_at__isnull=False,
@@ -536,7 +588,7 @@ class DashboardView(PortalAPIView):
         pending_meals = pending_meals.values("client_id").distinct().count()
 
         def _count(reason):
-            return len(serving_client_ids(reason, start=None, end=None))
+            return len(serving_client_ids(reason, start=start, end=end))
 
         serving = {
             # 2.1 Accepted case + Verified + being served.
@@ -567,59 +619,118 @@ class DashboardView(PortalAPIView):
             },
         }
 
-        # --- Second-row service cards (ALL TIME) --------------------------
-        # Member-level (distinct client) breakdowns. Leaf counts are queried and
-        # the card TOTALS derived by summing them, so the displayed math is
-        # always exactly additive and can never disagree with its parts.
+        # --- Second-row service cards (TIME-FRAME SENSITIVE) --------------
+        # Member-level (distinct client) breakdowns, scoped to members tied to an
+        # internal-service case OPENED in the selected range (``_scope_members``
+        # is a no-op for All Time, so these stay a live snapshot then). Leaf
+        # counts are queried and the card TOTALS derived by summing them, so the
+        # displayed math is always exactly additive and can never disagree with
+        # its parts.
         def _members(**flt):
-            return mdp.filter(**flt).values("client_id").distinct().count()
+            return (
+                _scope_members(mdp.filter(**flt), start, end)
+                .values("client_id").distinct().count()
+            )
 
-        _ACTIVE_ENR = [EnrollmentStage.SERVICE_ACTIVE, EnrollmentStage.ON_HOLD]
-
-        # Receiving Meals: status ACTIVE in a live (Service Active) enrollment.
-        receiving = active_delivery_members
-        # Still in the active-service pipeline but not currently receiving:
-        # individually Paused, or the whole household is On Hold (members keep
-        # ACTIVE status while the enrollment sits at On Hold).
-        paused = _members(status=MemberStatus.PAUSED, enrollment__stage__in=_ACTIVE_ENR)
-        on_hold = _members(
-            status=MemberStatus.ACTIVE, enrollment__stage=EnrollmentStage.ON_HOLD
+        # Verification/authorization funnel counts (scoped to range) reused by
+        # the Pending Meals card (MemberDietaryProfile-based serving snapshot).
+        kitchen_assignment = _members(
+            enrollment__stage=EnrollmentStage.KITCHEN_ASSIGNMENT
         )
-        active_pipeline = receiving + paused + on_hold
+        pending_verified_auth = _members(
+            enrollment__verified_at__isnull=False,
+            enrollment__case__service_authorization_status=(
+                ServiceAuthorizationStatus.PENDING
+            ),
+        )
+        active_members = _members(enrollment__stage=EnrollmentStage.SERVICE_ACTIVE)
 
-        # Total Enrolled: the active-delivery pipeline plus the two delivery-
-        # blocked buckets (dietary Out of Orbit, geographic Out of Range).
+        # Total Enrolled = Total Members across open cases MINUS the inactive
+        # buckets (Paused + On Hold + Out of Orbit + Out of Range + Cancelled),
+        # i.e. base_members - lost_total. The sub-rows break the enrolled members
+        # down by verification funnel stage. They mirror the Verification page
+        # EXACTLY -- same helpers, keyed on the verification FACT (verified_at),
+        # scoped by the internal-service case CREATED date -- so an agent sees the
+        # identical Pending / Verified split there (not additive to the headline;
+        # these are funnel snapshots of the enrolled population).
+        from .views_members import (
+            apply_authorization_filter,
+            apply_case_created_date_filter,
+            require_internal_service_primary,
+            verification_completed_q,
+            verification_scope_q,
+        )
+
+        ver_base = apply_case_created_date_filter(
+            require_internal_service_primary(
+                Client.objects.filter(verification_scope_q())
+            ),
+            start,
+            end,
+        ).distinct()
+        ver_verified = ver_base.filter(verification_completed_q())
         enrolled = {
-            "active": active_pipeline,
-            "out_of_orbit": _count("out_of_orbit"),
-            "out_of_range": _count("out_of_range"),
+            "pending_verification": (
+                ver_base.exclude(verification_completed_q()).distinct().count()
+            ),
+            "verified_pending_auth": (
+                apply_authorization_filter(ver_verified, "pending")
+                .distinct().count()
+            ),
+            "kitchen_assignment": (
+                ver_verified.filter(
+                    Q(enrollments__stage=EnrollmentStage.KITCHEN_ASSIGNMENT)
+                    | Q(
+                        household_membership__household__enrollment_verifications__stage=(
+                            EnrollmentStage.KITCHEN_ASSIGNMENT
+                        )
+                    )
+                ).distinct().count()
+            ),
+            "active": active_members,
+            "total": max(base_members - lost_total, 0),
         }
-        enrolled["total"] = (
-            enrolled["active"] + enrolled["out_of_orbit"] + enrolled["out_of_range"]
-        )
 
+        # Total Receiving Meals: LIVE members we are actively serving in a PO --
+        # status ACTIVE in a Service-Active enrollment. Deliberately EXCLUDES On
+        # Hold / Paused / Cancelled / Out of Orbit / Out of Range (not currently
+        # being served). Split DISJOINTLY (by distinct client) into members who
+        # became active WITHIN the selected range ("new members added", tied to an
+        # internal-service case opened in range) vs the all-history remainder, so
+        # new + history == total exactly. All Time => new is 0 (no window).
+        serving_flt = dict(
+            status=MemberStatus.ACTIVE,
+            enrollment__stage=EnrollmentStage.SERVICE_ACTIVE,
+        )
+        serving_ids = set(
+            mdp.filter(**serving_flt).values_list("client_id", flat=True)
+        )
+        new_serving_ids = (
+            set()
+            if start is None
+            else set(
+                _scope_members(mdp.filter(**serving_flt), start, end)
+                .values_list("client_id", flat=True)
+            )
+        ) & serving_ids
         receiving_meals = {
-            "active": active_pipeline,
-            "paused": paused,
-            "on_hold": on_hold,
-            "total": receiving,  # active_pipeline - paused - on_hold
+            "new_members": len(new_serving_ids),
+            "history": len(serving_ids - new_serving_ids),
+            "total": len(serving_ids),
         }
 
         # Pending Meals: verified households not yet being served -- awaiting a
         # manual kitchen assignment (case auth approved), or still awaiting the
-        # case authorization decision (verified, auth Pending).
-        kitchen_assignment = _members(
-            enrollment__stage=EnrollmentStage.KITCHEN_ASSIGNMENT
-        )
+        # case authorization decision (verified, auth Pending). Scoped to range.
         pending = {
             "kitchen_assignment": kitchen_assignment,
-            "verified_pending_auth": pending_meals,
-            "total": kitchen_assignment + pending_meals,
+            "verified_pending_auth": pending_verified_auth,
+            "total": kitchen_assignment + pending_verified_auth,
         }
 
         return Response(
             {
-                "period": period,
+                "period": "custom" if custom else period,
                 "range": (
                     {"start": start.isoformat(), "end": end.isoformat()}
                     if start is not None
@@ -703,9 +814,10 @@ class DashboardServingListView(PortalAPIView):
         if reason not in _SERVING_REASONS:
             return Response({"detail": "Unknown reason."}, status=404)
 
-        # Section-2 serving metrics are all-time (they mirror the dashboard
-        # cards, which ignore the selected range), so the drill-down is too.
-        start, end = None, None
+        # Scope the drill-down to the SAME date range as the dashboard cards
+        # (Not Being Served / Needs Follow-up are range-scoped), so a count and
+        # its member list can never disagree. All Time => no date filter.
+        start, end = resolve_window(request)
         client_ids = serving_client_ids(reason, start=start, end=end) or set()
         details = _serving_details(reason, client_ids, start=start, end=end)
         # multiple_cases links to the member's own profile (it is about that

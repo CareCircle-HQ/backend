@@ -20,6 +20,7 @@ from api.models import (
     DeliveryOrder,
     DeliveryOrderStatus,
     EnrollmentStage,
+    MemberDeliverySchedule,
     MemberStatus,
     SERVICE_EXCLUDED_MEMBER_STATUSES,
     OrderSchedule,
@@ -259,10 +260,23 @@ def resync_scheduled_orders(*, enrollment=None, delivery_date=None, from_date=No
         qs = qs.filter(
             anticipated_delivery_date__gte=from_date or timezone.localdate()
         )
-    qs = qs.select_related("member", "enrollment")
+    rows = list(qs.select_related("member", "enrollment"))
+
+    # Live per-member delivery plans for the enrollments in scope, so we can
+    # also refresh the per-delivery QUANTITY. Keyed by (enrollment, member
+    # profile) to match each occurrence back to its plan.
+    enr_ids = {o.enrollment_id for o in rows if o.enrollment_id}
+    plan_map = {}
+    for p in (
+        MemberDeliverySchedule.objects.filter(
+            enrollment_id__in=enr_ids, status=ScheduleStatus.SCHEDULED
+        )
+    ):
+        plan_map[(p.enrollment_id, p.member_profile_id)] = p
+    wd_ints = {}  # enrollment_id -> delivery weekday ints (cached)
 
     updated = 0
-    for o in qs:
+    for o in rows:
         m = o.member
         if m is None:
             continue
@@ -275,13 +289,33 @@ def resync_scheduled_orders(*, enrollment=None, delivery_date=None, from_date=No
             "allergies": list(m.food_allergies or []),
             "restrictions": list(m.dietary_restrictions or []),
         }
+        # Per-delivery quantity from the member's LIVE plan (meals: daily rate x
+        # coverage for the delivery weekday; boxes: flat prod_per_delivery). This
+        # heals occurrences left at a stale 0 when the plan quantity was set
+        # AFTER the occurrence was created -- the root cause of PO lines showing
+        # quantity 0. Only applied when a plan exists, so it never zeroes out a
+        # valid snapshot for a member whose plan was removed.
+        plan = plan_map.get((o.enrollment_id, o.member_id))
+        if plan is not None:
+            if plan.meals_per_day:
+                if o.enrollment_id not in wd_ints:
+                    wd_ints[o.enrollment_id] = _weekday_ints(
+                        (o.enrollment.delivery_weekdays if o.enrollment else []) or []
+                    )
+                fields["how_many_meals_or_boxes"] = meals_for_delivery(
+                    o.anticipated_delivery_date.weekday(),
+                    wd_ints[o.enrollment_id],
+                    plan.meals_per_day,
+                )
+            else:
+                fields["how_many_meals_or_boxes"] = plan.prod_per_delivery or 0
         if all(getattr(o, f) == v for f, v in fields.items()):
             continue  # already in sync
         for f, v in fields.items():
             setattr(o, f, v)
         o.save(update_fields=[
             "kitchen", "menu_type", "kitchen_meal_type", "kitchen_food_notes",
-            "allergies", "restrictions", "updated_at",
+            "allergies", "restrictions", "how_many_meals_or_boxes", "updated_at",
         ])
         updated += 1
     return updated
