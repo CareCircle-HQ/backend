@@ -4025,6 +4025,20 @@ class CsvImportRulesTest(TestCase):
         ))
         self.assertFalse(is_met_council_case())
 
+        # allow_originating=False (non-internal-service cases): originating alone
+        # NO LONGER counts -- Met Council must MANAGE the case. A case Met
+        # Council merely referred out to another org is dropped.
+        self.assertFalse(is_met_council_case(
+            originating_provider_id=self.MET, allow_originating=False,
+        ))
+        # ...but managing provider still keeps it, regardless of the flag.
+        self.assertTrue(is_met_council_case(
+            provider_id=self.MET, allow_originating=False,
+        ))
+        self.assertTrue(is_met_council_case(
+            provider_name="Met Council - SCN - PHS", allow_originating=False,
+        ))
+
     def test_import_cases_met_council_only(self):
         from .models import Case, CaseHouseholdType, CaseType, Client, ImportRun, ImportRunStatus
         from .services.csv_import import CsvImporter
@@ -4043,15 +4057,24 @@ class CsvImportRulesTest(TestCase):
         )
         external = self._case_row(client.client_id, str(uuid.uuid4()))
         blank = self._case_row(client.client_id, "")
-        importer.import_cases([mine, managed, external, blank])
+        # Originated by Met Council but a NON-internal case it does NOT manage
+        # (ECM-style eligibility assessment referred out): dropped, because
+        # originating only counts for internal-service (meal/box) cases.
+        referred_out = self._case_row(
+            client.client_id, self.MET,
+            service_subtype="Social Service Case Management",
+            program_name="Navigation Services - Eligibility Assessment Level 1 - Brooklyn",
+        )
+        importer.import_cases([mine, managed, external, blank, referred_out])
 
         # Met Council-originated AND Met Council-managed are imported; the rest not.
         self.assertTrue(Case.objects.filter(pk=mine["case_id"]).exists())
         self.assertTrue(Case.objects.filter(pk=managed["case_id"]).exists())
         self.assertFalse(Case.objects.filter(pk=external["case_id"]).exists())
         self.assertFalse(Case.objects.filter(pk=blank["case_id"]).exists())
+        self.assertFalse(Case.objects.filter(pk=referred_out["case_id"]).exists())
         self.assertEqual(importer.stats["created"], 2)
-        self.assertEqual(importer.stats["skipped"], 2)
+        self.assertEqual(importer.stats["skipped"], 3)
 
         # And it's classified correctly: internal-service + household (token).
         case = Case.objects.get(pk=mine["case_id"])
@@ -4068,34 +4091,52 @@ class CsvImportRulesTest(TestCase):
 
     def test_delete_non_metcouncil_cases_command(self):
         from django.core.management import call_command
-        from .models import Case, CaseStatus, Client, Provider
+        from .models import Case, CaseStatus, CaseType, Client, Provider
 
         client = Client.objects.create(
             client_id=uuid.uuid4(), first_name="A", last_name="B"
         )
         met = Provider.objects.create(provider_id=self.MET, name="Met Council - SCN - PHS")
+        # Internal-service case Met Council ORIGINATED -> kept (union rule).
         keep_orig = Case.objects.create(
             case_id=uuid.uuid4(), client=client, case_status=CaseStatus.OPEN,
-            originating_provider=met,
+            originating_provider=met, case_type=CaseType.INTERNAL_SERVICE,
         )
         keep_managed = Case.objects.create(
             case_id=uuid.uuid4(), client=client, case_status=CaseStatus.OPEN,
             provider_name="Met Council - SCN - PHS",
         )
+        # Internal-service meal case with NO named managing org (blank provider
+        # columns, as many were imported) -> KEPT: meal/box programs are Met
+        # Council's own, so a blank manager is treated as Met Council's.
+        keep_blank_internal = Case.objects.create(
+            case_id=uuid.uuid4(), client=client, case_status=CaseStatus.OPEN,
+            case_type=CaseType.INTERNAL_SERVICE, provider_name="",
+        )
+        # Internal-service case attributed to a DIFFERENT named org -> dropped.
         drop = Case.objects.create(
             case_id=uuid.uuid4(), client=client, case_status=CaseStatus.OPEN,
             provider_name="Selfhelp Community Services",
         )
+        # Eligibility case Met Council only ORIGINATED (didn't manage) -> dropped,
+        # because originating no longer counts for non-internal-service cases.
+        drop_referred_out = Case.objects.create(
+            case_id=uuid.uuid4(), client=client, case_status=CaseStatus.OPEN,
+            originating_provider=met, case_type=CaseType.ELIGIBILITY,
+        )
 
         # Dry run: nothing deleted.
         call_command("delete_non_metcouncil_cases")
-        self.assertEqual(Case.objects.count(), 3)
+        self.assertEqual(Case.objects.count(), 5)
 
-        # Apply: only the external-org case is removed.
+        # Apply: the named external-org case AND the originated-only eligibility
+        # case go; the blank-provider meal case is preserved.
         call_command("delete_non_metcouncil_cases", "--apply")
         self.assertTrue(Case.objects.filter(pk=keep_orig.pk).exists())
         self.assertTrue(Case.objects.filter(pk=keep_managed.pk).exists())
+        self.assertTrue(Case.objects.filter(pk=keep_blank_internal.pk).exists())
         self.assertFalse(Case.objects.filter(pk=drop.pk).exists())
+        self.assertFalse(Case.objects.filter(pk=drop_referred_out.pk).exists())
 
 
 class MemberCaseRemoveTest(TestCase):
@@ -4170,6 +4211,17 @@ class MemberCaseRemoveTest(TestCase):
         resp = self.api.delete(self._url(originated))
         self.assertEqual(resp.status_code, 400, resp.content)
         self.assertTrue(Case.objects.filter(pk=originated.pk).exists())
+
+    def test_remove_blank_provider_meal_case_refused(self):
+        # Internal-service meal case with blank provider columns is Met Council's
+        # own program -> refused (protects the many meal cases imported without a
+        # provider), and the list flags it as Met Council.
+        from .models import Case, CaseType
+
+        meal = self._case(case_type=CaseType.INTERNAL_SERVICE, provider_name="")
+        resp = self.api.delete(self._url(meal))
+        self.assertEqual(resp.status_code, 400, resp.content)
+        self.assertTrue(Case.objects.filter(pk=meal.pk).exists())
 
 
 class ProgramStatusComputationTest(TestCase):

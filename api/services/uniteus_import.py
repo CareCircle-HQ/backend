@@ -272,11 +272,22 @@ class DailyPull:
             "provider_id": provider_id,
             "provider": self._name("/providers", provider_id),
         }
-        # STRICT Met Council org gate (same union rule as the CSV import). The
-        # live API only exposes the managing provider, so a person coordinated
-        # across a shared network can carry other orgs' cases -- drop them.
+        # STRICT Met Council org gate (same rule as the CSV import). Internal-
+        # service (meal/box) cases keep the UNION rule (originated OR managed);
+        # every other case type must be MANAGED by Met Council. The live API
+        # only exposes the managing provider (no originating column), so
+        # originating never applies here -- but pass allow_originating
+        # explicitly to mirror the CSV gate. A person coordinated across a
+        # shared network can carry other orgs' cases -- drop them.
+        from api.serializers import INTERNAL_SERVICE_SUBTYPES
+
+        is_internal = (
+            (names.get("service") or "").strip().casefold()
+            in INTERNAL_SERVICE_SUBTYPES
+        )
         if not is_met_council_case(
             provider_id=provider_id, provider_name=names["provider"],
+            allow_originating=is_internal,
         ):
             self._count("cases", "skipped")
             return

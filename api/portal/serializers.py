@@ -1171,17 +1171,15 @@ class PortalMemberCaseSerializer(serializers.ModelSerializer):
         return f"CSE-{str(obj.case_id)[:8]}"
 
     def get_is_met_council(self, obj):
-        # UNION rule (created OR managed by Met Council); see
-        # api.services.lifecycle.is_met_council_case. Non-Met-Council cases are
-        # external orgs' work that shouldn't live in the member base -- the
-        # Cases tab surfaces a Remove action for them.
-        from api.services.lifecycle import is_met_council_case
+        # Per-case-type rule (see api.services.lifecycle.case_is_met_council):
+        # internal-service (meal/box) cases are Met Council's own programs (kept
+        # unless attributed to a different named org); every other type must be
+        # MANAGED by Met Council. Non-Met-Council cases are external orgs' work
+        # that shouldn't live in the member base -- the Cases tab surfaces a
+        # Remove action for them.
+        from api.services.lifecycle import case_is_met_council
 
-        return is_met_council_case(
-            originating_provider_id=obj.originating_provider_id,
-            provider_id=obj.provider_id,
-            provider_name=obj.provider_name,
-        )
+        return case_is_met_council(obj)
 
     def get_auth_status_label(self, obj):
         return obj.service_authorization_status_label or (

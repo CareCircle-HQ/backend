@@ -1,12 +1,17 @@
 """Delete cases that do NOT belong to Met Council.
 
-A case belongs to Met Council under the UNION rule (the same gate every import
-path now enforces, see ``api.services.lifecycle.is_met_council_case``): Met
-Council either CREATED it (``originating_provider_id`` == the Met Council id) OR
-MANAGES/services it (``provider_id`` == the id, or ``provider_name`` ==
-"Met Council - SCN - PHS"). Every other case is an external-org case that
-shouldn't be in our member base -- this command removes the ones already
-imported before the filter existed.
+A case belongs to Met Council under the same per-case-type gate every import
+path now enforces (see ``api.services.lifecycle.is_met_council_case``):
+
+* INTERNAL-SERVICE (meal/box) cases use the UNION rule -- Met Council either
+  CREATED it (``originating_provider_id`` == the Met Council id) OR
+  MANAGES/services it (``provider_id`` / ``provider_name``).
+* Every other case type (Eligibility / Navigation / External) must be MANAGED
+  by Met Council -- a case Met Council merely referred out to another org (e.g.
+  an ECM eligibility assessment) does NOT count and is deleted.
+
+Every other case is an external-org case that shouldn't be in our member base --
+this command removes the ones already imported before the filter existed.
 
 Dry-run by default (prints a breakdown of what WOULD be deleted); pass --apply
 to actually delete. Deleting a case cascades to its child rows (contracted
@@ -19,7 +24,7 @@ from django.core.management.base import BaseCommand
 from django.db import transaction
 from django.db.models import Q
 
-from api.models import Case, Client
+from api.models import Case, CaseType, Client
 from api.services.lifecycle import (
     MET_COUNCIL_PROVIDER_ID,
     MET_COUNCIL_PROVIDER_NAME,
@@ -43,11 +48,24 @@ class Command(BaseCommand):
         )
 
     def _doomed_queryset(self):
-        """Cases with NO Met Council signal (the complement of the keep rule)."""
-        keep = (
-            Q(originating_provider_id=MET_COUNCIL_PROVIDER_ID)
-            | Q(provider_id=MET_COUNCIL_PROVIDER_ID)
+        """Cases we DON'T keep (complement of the per-case-type keep rule --
+        mirrors api.services.lifecycle.case_is_met_council in the ORM).
+
+        Kept when Met Council MANAGES the case (provider id/name), OR -- for
+        INTERNAL-SERVICE (meal/box) cases -- when Met Council ORIGINATED it OR it
+        carries NO named managing org at all (many legit meal cases were
+        imported with blank provider columns; only a meal case attributed to a
+        DIFFERENT named org is dropped).
+        """
+        managed = (
+            Q(provider_id=MET_COUNCIL_PROVIDER_ID)
             | Q(provider_name__iexact=MET_COUNCIL_PROVIDER_NAME)
+        )
+        internal = Q(case_type=CaseType.INTERNAL_SERVICE)
+        no_named_manager = Q(provider_id__isnull=True) & Q(provider_name="")
+        keep = managed | (
+            internal
+            & (no_named_manager | Q(originating_provider_id=MET_COUNCIL_PROVIDER_ID))
         )
         return Case.objects.exclude(keep)
 

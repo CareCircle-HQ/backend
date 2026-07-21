@@ -45,9 +45,6 @@ from .base import PortalAPIView, current_agent
 # Case statuses that mean the case is no longer open/serviceable.
 _TERMINAL_CASE_STATUSES = [CaseStatus.CLOSED, CaseStatus.CANCELLED]
 
-# Medicaid insurance within this many days of its end date is "expiring soon".
-_EXPIRING_WINDOW_DAYS = 30
-
 # The drill-down reasons the serving-status list endpoint understands. The first
 # group mirrors the "Not Being Served" cards; the second is the follow-up
 # watchlist (which can overlap with actively-served members).
@@ -179,11 +176,19 @@ def serving_client_ids(reason, *, start, end):
         member_ids = set(clients.values_list("client_id", flat=True))
         return set(_primary_map(member_ids).values())
     if reason == "rejected_case":
-        return set(scope(mdp.filter(
-            enrollment__case__service_authorization_status=(
-                ServiceAuthorizationStatus.DENIED
-            )
-        )).values_list("client_id", flat=True))
+        # Mirror the Total Open Cases "Rejected" definition EXACTLY (same Case
+        # query: internal-service, opened in range, non-terminal, auth DENIED)
+        # so the two cards can't disagree. Sourced from the Case table -- NOT
+        # MemberDietaryProfile -- because a denied case need not have an
+        # enrollment/dietary profile yet; the mdp path missed those.
+        denied = _scope_by_opened(
+            Case.objects.filter(
+                case_type=CaseType.INTERNAL_SERVICE,
+                service_authorization_status=ServiceAuthorizationStatus.DENIED,
+            ),
+            start, end,
+        ).exclude(case_status__in=_TERMINAL_CASE_STATUSES)
+        return set(denied.values_list("client_id", flat=True))
     if reason == "out_of_range":
         return set(scope(
             mdp.filter(status=MemberStatus.OUT_OF_RANGE)
@@ -237,14 +242,17 @@ def serving_client_ids(reason, *, start, end):
     if not enrolled and start is not None:
         return set()
     if reason == "insurance_expiring":
-        window = timezone.now() + timedelta(days=_EXPIRING_WINDOW_DAYS)
-        return set(Insurance.objects.filter(
+        # "No active Medicaid" watchlist. Imports don't reliably populate a
+        # coverage end date, so an expiry-date window can't be trusted; we
+        # trust the imported STATUS instead and flag enrolled members with NO
+        # ACTIVE Medicaid (or Dual Medicare/Medicaid) plan on file. Mirrors
+        # lifecycle.has_valid_medicaid (same status-based rule used elsewhere).
+        have = set(Insurance.objects.filter(
             client_id__in=enrolled,
-            plan_type=InsurancePlanType.MEDICAID,
+            plan_type__in=[InsurancePlanType.MEDICAID, InsurancePlanType.DUAL],
             status=RecordStatus.ACTIVE,
-            expired_at__isnull=False,
-            expired_at__lte=window,
         ).values_list("client_id", flat=True))
+        return enrolled - have
     if reason == "no_social_coverage":
         have = set(SocialCareCoverage.objects.filter(
             client_id__in=enrolled,
@@ -293,7 +301,7 @@ def _serving_details(reason, client_ids, *, start, end):
     ids = set(client_ids)
     mdp = MemberDietaryProfile.objects
 
-    if reason in ("needs_verification", "rejected_case"):
+    if reason == "needs_verification":
         out = {}
         for p in (
             mdp.filter(client_id__in=ids)
@@ -305,6 +313,25 @@ def _serving_details(reason, client_ids, *, start, end):
             case = getattr(p.enrollment, "case", None)
             label = (getattr(case, "program_name", "") or "").strip()
             out[p.client_id] = label or "Internal service case"
+        return out
+    if reason == "rejected_case":
+        # Source from the same Case query as the count (Case table, not mdp) so
+        # denied cases without an enrollment/dietary profile still get a label.
+        denied = _scope_by_opened(
+            Case.objects.filter(
+                case_type=CaseType.INTERNAL_SERVICE,
+                service_authorization_status=ServiceAuthorizationStatus.DENIED,
+            ),
+            start, end,
+        ).exclude(case_status__in=_TERMINAL_CASE_STATUSES).filter(client_id__in=ids)
+        out = {}
+        for row in denied.values("client_id", "program_name", "service_type"):
+            if row["client_id"] in out:
+                continue
+            name = (row["program_name"] or row["service_type"] or "").strip()
+            out[row["client_id"]] = (
+                f"Denied · {name}" if name else "Case authorization denied"
+            )
         return out
     if reason in ("out_of_range", "out_of_orbit"):
         target = (
@@ -358,21 +385,7 @@ def _serving_details(reason, client_ids, *, start, end):
             out[t.client_id] = (t.reason or "Case closure in progress")[:140]
         return out
     if reason == "insurance_expiring":
-        window = timezone.now() + timedelta(days=_EXPIRING_WINDOW_DAYS)
-        plans = Insurance.objects.filter(
-            client_id__in=ids,
-            plan_type=InsurancePlanType.MEDICAID,
-            status=RecordStatus.ACTIVE,
-            expired_at__isnull=False,
-            expired_at__lte=window,
-        ).order_by("client_id", "expired_at")
-        out = {}
-        for pl in plans:
-            if pl.client_id in out:
-                continue
-            plan = (pl.plan_name or "Medicaid").strip()
-            out[pl.client_id] = f"{plan} · expires {_fmt_date(pl.expired_at)}"
-        return out
+        return {cid: "No active Medicaid on file" for cid in ids}
     if reason == "no_social_coverage":
         return {cid: "No enrolled social care coverage" for cid in ids}
     if reason == "no_insurance":

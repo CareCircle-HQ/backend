@@ -3310,13 +3310,9 @@ class MemberCaseDetailView(PortalAPIView):
     def delete(self, request, client_id, case_id):
         get_object_or_404(Client, pk=client_id)
         case = get_object_or_404(Case, pk=case_id, client_id=client_id)
-        from api.services.lifecycle import is_met_council_case
+        from api.services.lifecycle import case_is_met_council
 
-        if is_met_council_case(
-            originating_provider_id=case.originating_provider_id,
-            provider_id=case.provider_id,
-            provider_name=case.provider_name,
-        ):
+        if case_is_met_council(case):
             return Response(
                 {"detail": "Met Council cases cannot be removed."}, status=400
             )
