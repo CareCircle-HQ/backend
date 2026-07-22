@@ -3075,6 +3075,9 @@ class TimelineEventType(models.TextChoices):
     HOUSEHOLD_MEMBER_ADDED = "household_member_added", "Household Member Added"
     HOUSEHOLD_MEMBER_REMOVED = "household_member_removed", "Household Member Removed"
     PRODUCT_TYPE_CHANGED = "product_type_changed", "Product Type Changed"
+    # A member's dietary data (restrictions / allergies / menu / meal category)
+    # was edited. The specific before -> after fields are in metadata["changes"].
+    DIETARY_CHANGED = "dietary_changed", "Dietary Info Updated"
     # --- Legacy coarse types: retained so existing rows stay valid; no longer
     # emitted by the timeline service (a data migration remaps old rows). ---
     VERIFICATION = "verification", "Verification"

@@ -444,6 +444,80 @@ class ExtensionTimelineTest(TestCase):
         self.assertEqual(occurred, sorted(occurred, reverse=True))
 
 
+class KitchenAndDietaryTimelineBuilderTest(TestCase):
+    """Unit-level coverage for the kitchen/cadence-change and dietary-change
+    timeline builders: they write a precise before -> after diff when something
+    changed and are a no-op otherwise."""
+
+    def setUp(self):
+        from .models import EnrollmentVerification
+
+        self.client_obj = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Ada", last_name="Lovelace"
+        )
+        self.enr = EnrollmentVerification.objects.create(client=self.client_obj)
+
+    def _events(self, event_type):
+        return TimelineEvent.objects.filter(
+            client=self.client_obj, event_type=event_type
+        )
+
+    def test_kitchen_changed_logs_diff(self):
+        from .services import timeline
+
+        ev = timeline.event_for_kitchen_changed(
+            self.enr, previous_kitchen="Old Kitchen", new_kitchen="New Kitchen",
+            previous_cadence="Weekly", new_cadence="Biweekly", actor="agent:1",
+        )
+        self.assertIsNotNone(ev)
+        self.assertEqual(ev.title, "Kitchen Changed")
+        self.assertEqual(ev.badge_text, "New Kitchen")
+        fields = {c["field"]: (c["from"], c["to"]) for c in ev.metadata["changes"]}
+        self.assertEqual(fields["Kitchen"], ("Old Kitchen", "New Kitchen"))
+        self.assertEqual(fields["Cadence"], ("Weekly", "Biweekly"))
+
+    def test_kitchen_changed_noop_when_unchanged(self):
+        from .services import timeline
+
+        ev = timeline.event_for_kitchen_changed(
+            self.enr, previous_kitchen="Same", new_kitchen="Same",
+            previous_cadence="Weekly", new_cadence="Weekly",
+        )
+        self.assertIsNone(ev)
+        self.assertFalse(self._events("kitchen_assigned").exists())
+
+    def test_dietary_changed_logs_diff_on_member(self):
+        from .models import MemberDietaryProfile
+        from .services import timeline
+
+        profile = MemberDietaryProfile.objects.create(
+            enrollment=self.enr, client=self.client_obj, member_name="Ada",
+        )
+        changes = timeline.build_change_list([
+            ("Food allergies", ["peanuts"], ["peanuts", "shellfish"]),
+            ("Menu type", "Standard", "Standard"),  # unchanged -> dropped
+        ])
+        ev = timeline.event_for_dietary_changed(
+            profile, changes=changes, enrollment=self.enr, actor="agent:1",
+        )
+        self.assertIsNotNone(ev)
+        self.assertEqual(ev.title, "Dietary Info Updated")
+        self.assertEqual([c["field"] for c in ev.metadata["changes"]], ["Food allergies"])
+
+    def test_dietary_changed_noop_when_empty(self):
+        from .models import MemberDietaryProfile
+        from .services import timeline
+
+        profile = MemberDietaryProfile.objects.create(
+            enrollment=self.enr, client=self.client_obj, member_name="Ada",
+        )
+        ev = timeline.event_for_dietary_changed(
+            profile, changes=[], enrollment=self.enr,
+        )
+        self.assertIsNone(ev)
+        self.assertFalse(self._events("dietary_changed").exists())
+
+
 class WilliamsburgAgentLeadSourceTest(TestCase):
     """Settings > Williamsburg Setup: a client saved by an agent flagged
     ``is_williamsburg_agent`` is forced to lead_source="Williamsburg" (which

@@ -112,6 +112,42 @@ def _client_full_name(client):
     return f"{client.first_name} {client.last_name}".strip()
 
 
+def _norm_value(value):
+    """Normalize a value for change-detection. Lists/tuples/sets compare
+    order-insensitively; scalars compare as trimmed strings."""
+    if isinstance(value, (list, tuple, set)):
+        return sorted(str(v) for v in value)
+    return "" if value is None else str(value).strip()
+
+
+def _display_value(value):
+    """Human-readable rendering of a value for a change row. Lists join with
+    ', '; empty values render as an em dash."""
+    if isinstance(value, (list, tuple, set)):
+        return ", ".join(str(v) for v in value) or "\u2014"
+    text = "" if value is None else str(value).strip()
+    return text or "\u2014"
+
+
+def build_change_list(pairs):
+    """Build the standardized ``changes`` metadata list from ``pairs``.
+
+    ``pairs`` is an iterable of ``(label, before, after)``. Only genuinely
+    changed entries are kept (order-insensitive for lists), each rendered as
+    ``{"field": label, "from": <display>, "to": <display>}`` so the History tab
+    can show a clean ``from -> to`` diff. Returns ``[]`` when nothing changed.
+    """
+    changes = []
+    for label, before, after in pairs:
+        if _norm_value(before) != _norm_value(after):
+            changes.append({
+                "field": label,
+                "from": _display_value(before),
+                "to": _display_value(after),
+            })
+    return changes
+
+
 def event_for_consent(client, *, source=ChangeSource.EXTENSION, actor=""):
     """Emit a 'Consent Granted' event once the client's consent is granted.
 
@@ -641,7 +677,136 @@ def event_for_delivery_address_change(
         actor=actor,
         entity=address,
         enrollment=enrollment,
-        metadata={"previous": previous, "new": new_addr},
+        metadata={
+            "previous": previous,
+            "new": new_addr,
+            "changes": build_change_list([("Delivery address", previous, new_addr)]),
+        },
+    )
+
+
+def event_for_kitchen_changed(
+    enrollment, *, previous_kitchen="", new_kitchen="",
+    previous_cadence="", new_cadence="", source=ChangeSource.CRM, actor="",
+):
+    """Emit a 'Kitchen Changed' event when a household's assigned kitchen and/or
+    delivery cadence is changed (Logistics kitchen/cadence editors + the Kitchen
+    Assignment pop-up re-assignment). Reuses the KITCHEN_ASSIGNED type. No-op
+    when nothing actually changed, so callers can fire it unconditionally.
+
+    Logged on the primary client; not de-duped so every change is preserved.
+    """
+    client = getattr(enrollment, "client", None)
+    if client is None:
+        return None
+    changes = build_change_list([
+        ("Kitchen", previous_kitchen, new_kitchen),
+        ("Cadence", previous_cadence, new_cadence),
+    ])
+    if not changes:
+        return None  # nothing actually changed -- don't write a no-op row
+    # Lead the subtitle with whichever dimension changed (kitchen first).
+    parts = [f"{c['field']}: {c['from']} \u2192 {c['to']}" for c in changes]
+    return emit_timeline_event(
+        client=client,
+        event_type=TimelineEventType.KITCHEN_ASSIGNED,
+        occurred_at=timezone.now(),
+        title="Kitchen Changed",
+        subtitle=" \u00b7 ".join(parts),
+        badge_text=(new_kitchen or "").strip() or "Changed",
+        badge_tone=TimelineBadgeTone.INFO,
+        source=source,
+        actor=actor,
+        entity=enrollment,
+        enrollment=enrollment,
+        case=getattr(enrollment, "case", None),
+        metadata={
+            "changes": changes,
+            "previous_kitchen": (previous_kitchen or "").strip(),
+            "new_kitchen": (new_kitchen or "").strip(),
+            "previous_cadence": (previous_cadence or "").strip(),
+            "new_cadence": (new_cadence or "").strip(),
+        },
+    )
+
+
+def event_for_dietary_changed(profile, *, changes, enrollment=None, source=ChangeSource.CRM, actor=""):
+    """Emit a 'Dietary Info Updated' event when an agent edits a member's dietary
+    data (restrictions / allergies / menu type / meal category / notes).
+
+    ``changes`` is the standardized :func:`build_change_list` output. No-op when
+    empty. Logged on the MEMBER's own client so it shows on their history; not
+    de-duped, so each edit is its own point.
+    """
+    client = getattr(profile, "client", None)
+    if client is None or not changes:
+        return None
+    enrollment = enrollment or getattr(profile, "enrollment", None)
+    fields = ", ".join(c["field"] for c in changes)
+    name = profile.member_name or _client_full_name(client)
+    subtitle = f"{name} \u00b7 {fields}" if name else fields
+    return emit_timeline_event(
+        client=client,
+        event_type=TimelineEventType.DIETARY_CHANGED,
+        occurred_at=timezone.now(),
+        title="Dietary Info Updated",
+        subtitle=subtitle,
+        badge_text="Updated",
+        badge_tone=TimelineBadgeTone.INFO,
+        source=source,
+        actor=actor,
+        entity=profile,
+        enrollment=enrollment,
+        metadata={"changes": changes},
+    )
+
+
+def event_for_verification_submitted(
+    enrollment, *, members=None, delivery_address="", delivery_weekdays=None,
+    verified_flags=None, source=ChangeSource.CRM, actor="",
+):
+    """Emit a 'Verification Submitted' summary event capturing what an agent
+    entered on the verification pop-up: the household roster + each member's
+    menu type, the delivery address + days, and which verification checkboxes
+    were confirmed. Reuses the VERIFICATION_COMPLETED type. De-duped per
+    enrollment so a re-save doesn't duplicate the summary.
+
+    Logged on the subject client's history.
+    """
+    client = getattr(enrollment, "client", None)
+    if client is None:
+        return None
+    members = members or []
+    verified_flags = verified_flags or {}
+    member_lines = []
+    for m in members:
+        nm = (m.get("member_name") or "").strip() or "Member"
+        menu = (m.get("menu_type") or "").strip()
+        member_lines.append(f"{nm} ({menu})" if menu else nm)
+    n = len(members)
+    subtitle = f"{n} member" + ("s" if n != 1 else "")
+    if delivery_address:
+        subtitle = f"{subtitle} \u00b7 {delivery_address}"
+    return emit_timeline_event(
+        client=client,
+        event_type=TimelineEventType.VERIFICATION_COMPLETED,
+        occurred_at=timezone.now(),
+        title="Verification Submitted",
+        subtitle=subtitle,
+        badge_text="Submitted",
+        badge_tone=TimelineBadgeTone.SUCCESS,
+        source=source,
+        actor=actor,
+        entity=enrollment,
+        enrollment=enrollment,
+        case=getattr(enrollment, "case", None),
+        metadata={
+            "members": member_lines,
+            "delivery_address": delivery_address,
+            "delivery_weekdays": list(delivery_weekdays or []),
+            "verified": verified_flags,
+        },
+        dedupe_key=f"verification_submitted:{enrollment.pk}",
     )
 
 
