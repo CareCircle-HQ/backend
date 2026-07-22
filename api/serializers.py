@@ -1027,7 +1027,11 @@ class EnrollmentVerificationSerializer(serializers.ModelSerializer):
 # Map a ProgramPipeline.case_category value to a Case.case_type. Keys are
 # casefolded; both singular/plural spellings from the source data are accepted.
 _PIPELINE_CATEGORY_TO_CASE_TYPE = {
+    # "Navigation" was renamed to "Care Management" (display only -- both map to
+    # the same CaseType, whose stored value is still "navigation"). Accept both
+    # so legacy + renamed ProgramPipeline rows classify identically.
     "navigation": CaseType.NAVIGATION,
+    "care management": CaseType.NAVIGATION,
     "eligibility": CaseType.ELIGIBILITY,
     "internal service": CaseType.INTERNAL_SERVICE,
     "internal services": CaseType.INTERNAL_SERVICE,
@@ -1210,13 +1214,15 @@ class CaseSerializer(serializers.ModelSerializer):
         # -- OR one with NO managing organization at all (blank provider) --
         # since those are out of scope and must never enter the member base from
         # an agent write. Only enforced for extension/CRM HTTP writes (the
-        # request principal carries an ``agent_code``); the CSV import + nightly
-        # Unite Us pull build their payloads with no request in context and apply
-        # their own gate first (and legitimately keep blank-org internal-service
-        # meal cases), so they're unaffected.
+        # request principal is an authenticated Agent, i.e. carries ``agent_id``
+        # -- NOT ``agent_code``, which is null for agents without a dialer
+        # extension and would let their writes slip past this gate); the CSV
+        # import + nightly Unite Us pull build their payloads with no request in
+        # context and apply their own gate first (and legitimately keep blank-org
+        # internal-service meal cases), so they're unaffected.
         request = self.context.get("request")
         request_user = getattr(request, "user", None) if request is not None else None
-        if getattr(request_user, "agent_code", None):
+        if getattr(request_user, "agent_id", None):
             from api.services.lifecycle import is_met_council_case
 
             if not is_met_council_case(
@@ -1416,12 +1422,20 @@ class CaseSerializer(serializers.ModelSerializer):
         try:
             if case.case_type == CaseType.INTERNAL_SERVICE:
                 from .services.lifecycle import (
+                    internal_service_reconcile_deferred,
                     reconcile_internal_service_authorization,
                 )
 
-                request = self.context.get("request")
-                agent = getattr(request, "user", None) if request is not None else None
-                reconcile_internal_service_authorization(client, actor=agent)
+                # Imports defer this: they save one case per row, so reconciling
+                # here would evaluate the client-wide rules against a partial
+                # picture (e.g. cancel a household before the row for its still-
+                # open case is written). The import runs the reconcile ONCE per
+                # client on the full picture after all rows land. Single-case
+                # writes (extension/portal) are NOT deferred -> reconcile now.
+                if not internal_service_reconcile_deferred():
+                    request = self.context.get("request")
+                    agent = getattr(request, "user", None) if request is not None else None
+                    reconcile_internal_service_authorization(client, actor=agent)
         except Exception:
             logger.exception(
                 "internal-service authorization reconcile failed for case %s", case_id

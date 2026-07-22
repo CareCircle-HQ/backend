@@ -1168,6 +1168,24 @@ class VerificationCaseOptionsTest(TestCase):
         )
         self.assertNotIn(str(denied.case_id), self._case_ids(client))
 
+    def test_non_met_council_case_excluded(self):
+        # A meal case explicitly MANAGED by a different named org (referred out)
+        # is not a Met Council verification target, so it must not be offered --
+        # even while open with no denial. A Met Council-managed open case is.
+        from .models import Case, CaseStatus, CaseType
+
+        client = self._client()
+        other_org = Case.objects.create(
+            case_id=uuid.uuid4(), client=client,
+            case_type=CaseType.INTERNAL_SERVICE, case_status=CaseStatus.OPEN,
+            program_name="Meals (God's Love)",
+            provider_name="God's Love We Deliver - SCN - PHS",
+        )
+        met = self._internal_case(client, program="Met Council Meals")
+        ids = self._case_ids(client)
+        self.assertNotIn(str(other_org.case_id), ids)
+        self.assertIn(str(met.case_id), ids)
+
 
 class EnsurePrimaryOfOwnHouseholdTest(TestCase):
     """A client who holds their own Internal Service case must be the PRIMARY of
@@ -1408,7 +1426,7 @@ class RemovalAndVerificationGuardsTest(TestCase):
 
 class ExtensionCaseMetCouncilGateTest(TestCase):
     """A case written through the browser extension (an authenticated agent, so
-    the request principal carries an ``agent_code``) must be MANAGED by Met
+    the request principal carries an ``agent_id``) must be MANAGED by Met
     Council. A case attributed to another org -- or one with a blank managing
     org -- is rejected. Import/daily-sync writes (no request in context) are
     unaffected, so their own gate + blank-org meal-case tolerance still stands.
@@ -1419,10 +1437,16 @@ class ExtensionCaseMetCouncilGateTest(TestCase):
             client_id=str(uuid.uuid4()), first_name="Case", last_name="Owner",
         )
 
-    def _ext_ctx(self):
+    def _ext_ctx(self, agent_code="900"):
         from types import SimpleNamespace
 
-        return {"request": SimpleNamespace(user=SimpleNamespace(agent_code="900"))}
+        # Mirror the real AgentUser principal: an authenticated agent always
+        # carries ``agent_id``; ``agent_code`` may be null (no dialer extension).
+        return {"request": SimpleNamespace(
+            user=SimpleNamespace(
+                agent_id=str(uuid.uuid4()), agent_code=agent_code, name="Casey CS",
+            )
+        )}
 
     def _payload(self, client, **over):
         data = {
@@ -1454,6 +1478,19 @@ class ExtensionCaseMetCouncilGateTest(TestCase):
         client = self._client()
         with self.assertRaises(ValidationError):
             self._save(client, self._ext_ctx())  # no provider id/name
+
+    def test_ext_gate_applies_to_code_less_agent(self):
+        # An authenticated agent with a NULL agent_code (no dialer extension)
+        # still has an agent_id, so the gate must fire -- a non-Met-Council case
+        # from such an agent must be rejected, not slip through.
+        from rest_framework.exceptions import ValidationError
+
+        client = self._client()
+        with self.assertRaises(ValidationError):
+            self._save(
+                client, self._ext_ctx(agent_code=None),
+                provider_name="God's Love We Deliver",
+            )
 
     def test_ext_accepts_met_council_by_name(self):
         from api.models import Case
@@ -3599,6 +3636,177 @@ class ExternalServiceCaseBlockedTest(TestCase):
         self.assertEqual(case.case_type, CaseType.NAVIGATION)
 
 
+class MemberEligibilityTest(TestCase):
+    """api.services.eligibility: import-time gates + disposition (INELIGIBLE +
+    note + timeline + stop future deliveries), idempotency and recovery."""
+
+    def _client(self):
+        from .models import Client
+
+        return Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="El", last_name="Ig"
+        )
+
+    def _reconcile(self, client):
+        from .services.eligibility import reconcile_client_eligibility
+
+        return reconcile_client_eligibility(client)
+
+    def test_missing_insurance_is_ineligible_with_note_and_timeline(self):
+        from .models import (
+            ClientStage, Note, NoteSource, TimelineEvent, TimelineEventType,
+        )
+
+        c = self._client()
+        self._reconcile(c)
+        c.refresh_from_db()
+        self.assertEqual(c.lifecycle_stage, ClientStage.INELIGIBLE)
+        self.assertTrue(
+            Note.objects.filter(client=c, source=NoteSource.SYSTEM).exists()
+        )
+        self.assertTrue(
+            TimelineEvent.objects.filter(
+                client=c, event_type=TimelineEventType.MEMBER_INELIGIBLE
+            ).exists()
+        )
+
+    def test_active_insurance_is_eligible(self):
+        from .models import ClientStage, Insurance
+
+        c = self._client()
+        Insurance.objects.create(  # blank expired_at => active
+            client=c, plan_name="P", external_member_id="1"
+        )
+        self._reconcile(c)
+        c.refresh_from_db()
+        self.assertNotEqual(c.lifecycle_stage, ClientStage.INELIGIBLE)
+
+    def test_expired_insurance_ineligible_ignores_active_status(self):
+        # record_status ACTIVE but a past expired_at => expired (date-based gate).
+        from .models import ClientStage, Insurance, RecordStatus
+
+        c = self._client()
+        Insurance.objects.create(
+            client=c, plan_name="P", external_member_id="1",
+            status=RecordStatus.ACTIVE,
+            expired_at=timezone.now() - timedelta(days=10),
+        )
+        self._reconcile(c)
+        c.refresh_from_db()
+        self.assertEqual(c.lifecycle_stage, ClientStage.INELIGIBLE)
+
+    def test_lifetime_sentinel_9999_is_active(self):
+        from datetime import datetime, timezone as dtz
+
+        from .models import ClientStage, Insurance
+
+        c = self._client()
+        Insurance.objects.create(
+            client=c, plan_name="P", external_member_id="1",
+            expired_at=datetime(9999, 12, 31, tzinfo=dtz.utc),
+        )
+        self._reconcile(c)
+        c.refresh_from_db()
+        self.assertNotEqual(c.lifecycle_stage, ClientStage.INELIGIBLE)
+
+    def test_wrong_medicaid_type_is_ineligible(self):
+        from .models import ClientStage, Insurance, InsurancePlanType
+
+        c = self._client()
+        Insurance.objects.create(  # active (blank expiry) but bad Medicaid type
+            client=c, plan_type=InsurancePlanType.MEDICAID,
+            plan_name="New York State Medicaid FFS", external_member_id="1",
+        )
+        self._reconcile(c)
+        c.refresh_from_db()
+        self.assertEqual(c.lifecycle_stage, ClientStage.INELIGIBLE)
+
+    def test_zip_out_of_range_is_ineligible(self):
+        from .models import (
+            Address, AddressType, ClientStage, ExcludedZipCode, Insurance,
+        )
+
+        c = self._client()
+        Insurance.objects.create(client=c, plan_name="P", external_member_id="1")
+        ExcludedZipCode.objects.create(zip="11209")
+        Address.objects.create(
+            client=c, type=AddressType.CURRENT, zip="11209", state="NY"
+        )
+        self._reconcile(c)
+        c.refresh_from_db()
+        self.assertEqual(c.lifecycle_stage, ClientStage.INELIGIBLE)
+
+    def test_state_not_served_is_ineligible(self):
+        from .models import (
+            Address, AddressType, AllowedState, ClientStage, Insurance,
+        )
+
+        c = self._client()
+        Insurance.objects.create(client=c, plan_name="P", external_member_id="1")
+        AllowedState.objects.create(code="NY", name="New York")
+        Address.objects.create(
+            client=c, type=AddressType.CURRENT, state="NJ", zip="07030"
+        )
+        self._reconcile(c)
+        c.refresh_from_db()
+        self.assertEqual(c.lifecycle_stage, ClientStage.INELIGIBLE)
+
+    def test_recovery_restores_stage(self):
+        from .models import (
+            ClientStage, Insurance, TimelineEvent, TimelineEventType,
+        )
+
+        c = self._client()
+        self._reconcile(c)  # no insurance => ineligible
+        c.refresh_from_db()
+        self.assertEqual(c.lifecycle_stage, ClientStage.INELIGIBLE)
+
+        Insurance.objects.create(client=c, plan_name="P", external_member_id="1")
+        self._reconcile(c)
+        c.refresh_from_db()
+        self.assertNotEqual(c.lifecycle_stage, ClientStage.INELIGIBLE)
+        self.assertTrue(
+            TimelineEvent.objects.filter(
+                client=c, event_type=TimelineEventType.MEMBER_ELIGIBILITY_RESTORED
+            ).exists()
+        )
+
+    def test_idempotent_no_duplicate_note_or_event(self):
+        from .models import (
+            Note, NoteSource, TimelineEvent, TimelineEventType,
+        )
+
+        c = self._client()
+        self._reconcile(c)
+        self._reconcile(c)
+        self.assertEqual(
+            TimelineEvent.objects.filter(
+                client=c, event_type=TimelineEventType.MEMBER_INELIGIBLE
+            ).count(),
+            1,
+        )
+        self.assertEqual(
+            Note.objects.filter(client=c, source=NoteSource.SYSTEM).count(), 1
+        )
+
+    def test_ineligible_stops_future_deliveries(self):
+        from .models import (
+            EnrollmentStage, EnrollmentVerification, Household, HouseholdMember,
+            MemberDietaryProfile,
+        )
+
+        c = self._client()  # no insurance => ineligible
+        hh = Household.objects.create(name="HH")
+        HouseholdMember.objects.create(household=hh, client=c, is_primary=True)
+        enr = EnrollmentVerification.objects.create(
+            client=c, household=hh, stage=EnrollmentStage.SERVICE_ACTIVE,
+        )
+        MemberDietaryProfile.objects.create(enrollment=enr, client=c)
+        self._reconcile(c)
+        enr.refresh_from_db()
+        self.assertEqual(enr.stage, EnrollmentStage.ON_HOLD)
+
+
 class MemberWarningsTest(TestCase):
     """The member/household warning evaluator (api.services.warnings). Each check
     is exercised in isolation on a purpose-built household, plus a clean
@@ -3877,6 +4085,70 @@ class MemberWarningsTest(TestCase):
         )
         ws = [w for w in evaluate_enrollment_warnings(enr) if w.code == INSURANCE_EXPIRING]
         self.assertEqual([w.title for w in ws], ["Insurance expired"])
+
+    def test_wrong_medicaid_type(self):
+        # A member whose ONLY Medicaid plan is an unserviceable type
+        # (MLTC/MAP/FFS in the name) is flagged; a clean Medicaid plan alongside
+        # it clears the flag (all-bad rule); a non-medicaid plan carrying the
+        # token is ignored; and "MAPD" does not false-match "MAP".
+        from .models import Insurance, InsurancePlanType
+        from .services.warnings import WRONG_MEDICAID_TYPE
+
+        bad = self._client()
+        enr = self._enrollment(bad)
+        Insurance.objects.create(
+            client=bad, plan_type=InsurancePlanType.MEDICAID,
+            plan_name="New York State Medicaid FFS", external_member_id="1",
+        )
+        self.assertIn(WRONG_MEDICAID_TYPE, self._codes(enr))
+
+        # A clean Medicaid plan alongside the bad one clears it.
+        Insurance.objects.create(
+            client=bad, plan_type=InsurancePlanType.MEDICAID,
+            plan_name="MetroPlus Medicaid (NY)", external_member_id="2",
+        )
+        self.assertNotIn(WRONG_MEDICAID_TYPE, self._codes(enr))
+
+        # Token in a NON-medicaid plan type is ignored.
+        other = self._client()
+        enr2 = self._enrollment(other)
+        Insurance.objects.create(
+            client=other, plan_type=InsurancePlanType.COMMERCIAL,
+            plan_name="Some MAP Commercial", external_member_id="3",
+        )
+        self.assertNotIn(WRONG_MEDICAID_TYPE, self._codes(enr2))
+
+        # "MAPD" must not match the word "MAP".
+        mapd = self._client()
+        enr3 = self._enrollment(mapd)
+        Insurance.objects.create(
+            client=mapd, plan_type=InsurancePlanType.MEDICAID,
+            plan_name="MAPD Advantage", external_member_id="4",
+        )
+        self.assertNotIn(WRONG_MEDICAID_TYPE, self._codes(enr3))
+
+        # Each ineligible type is detected by its abbreviation OR its long-form
+        # name (case-insensitive, whitespace-tolerant).
+        for i, name in enumerate((
+            "PMLTC",
+            "MLTCP",
+            "Partial Managed Long Term Care",
+            "Managed Long Term Care Partial",
+            "NYS Medicaid Managed Long Term Care",
+            "Fee For Service",
+            "Medicaid Advantage Plan",
+            "medicaid  fee   for service",  # case + extra whitespace
+        )):
+            c = self._client()
+            enr = self._enrollment(c)
+            Insurance.objects.create(
+                client=c, plan_type=InsurancePlanType.MEDICAID,
+                plan_name=name, external_member_id=f"long-{i}",
+            )
+            self.assertIn(
+                WRONG_MEDICAID_TYPE, self._codes(enr),
+                msg=f"expected {name!r} to flag as an ineligible Medicaid type",
+            )
 
     def test_internal_case_expired(self):
         from .services.warnings import INTERNAL_CASE_EXPIRED
@@ -5010,55 +5282,166 @@ class CsvImportRulesTest(TestCase):
         run = ImportRun.objects.create(source="csv_uniteus", status=ImportRunStatus.RUNNING)
         importer = CsvImporter(run, emit_side_effects=False)
 
-        mine = self._case_row(client.client_id, self.MET)
-        # Originated elsewhere but MANAGED by Met Council -> kept (union rule).
+        # Met Council ORIGINATED but a blank managing provider: DROPPED now --
+        # originating columns are ignored by the extraction.
+        originated_only = self._case_row(client.client_id, self.MET)
+        # MANAGED by Met Council (provider_name) -> the only thing kept.
         managed = self._case_row(
             client.client_id, str(uuid.uuid4()),
             provider_name="Met Council - SCN - PHS",
         )
         external = self._case_row(client.client_id, str(uuid.uuid4()))
         blank = self._case_row(client.client_id, "")
-        # Originated by Met Council but a NON-internal case it does NOT manage
-        # (ECM-style eligibility assessment referred out): dropped, because
-        # originating only counts for internal-service (meal/box) cases.
+        # Originated by Met Council but a NON-internal case it does NOT manage:
+        # dropped.
         referred_out = self._case_row(
             client.client_id, self.MET,
             service_subtype="Social Service Case Management",
             program_name="Navigation Services - Eligibility Assessment Level 1 - Brooklyn",
         )
         # Internal-service MEAL case Met Council ORIGINATED but a DIFFERENT named
-        # org MANAGES (referred out to God's Love): dropped -- the managing org
-        # owns it, so originating must NOT rescue it.
+        # org MANAGES (referred out to God's Love): dropped.
         referred_meal = self._case_row(
             client.client_id, self.MET,
             provider_name="God's Love We Deliver - SCN - PHS",
         )
-        importer.import_cases([mine, managed, external, blank, referred_out, referred_meal])
+        importer.import_cases(
+            [originated_only, managed, external, blank, referred_out, referred_meal]
+        )
 
-        # Met Council-originated (blank manager) AND Met Council-managed are
-        # imported; the rest -- including the meal case referred out to another
-        # named org -- are not.
-        self.assertTrue(Case.objects.filter(pk=mine["case_id"]).exists())
+        # ONLY the Met Council-MANAGED case is imported. Originating (even for a
+        # meal case, even with a blank manager) no longer counts.
+        self.assertFalse(Case.objects.filter(pk=originated_only["case_id"]).exists())
         self.assertTrue(Case.objects.filter(pk=managed["case_id"]).exists())
         self.assertFalse(Case.objects.filter(pk=external["case_id"]).exists())
         self.assertFalse(Case.objects.filter(pk=blank["case_id"]).exists())
         self.assertFalse(Case.objects.filter(pk=referred_out["case_id"]).exists())
         self.assertFalse(Case.objects.filter(pk=referred_meal["case_id"]).exists())
-        self.assertEqual(importer.stats["created"], 2)
-        self.assertEqual(importer.stats["skipped"], 4)
+        self.assertEqual(importer.stats["created"], 1)
+        self.assertEqual(importer.stats["skipped"], 5)
 
         # And it's classified correctly: internal-service + household (token).
-        case = Case.objects.get(pk=mine["case_id"])
+        case = Case.objects.get(pk=managed["case_id"])
         self.assertEqual(case.case_type, CaseType.INTERNAL_SERVICE)
         self.assertEqual(case.household_type, CaseHouseholdType.HOUSEHOLD)
 
-        # Both imported cases are Internal Service; the count is surfaced in the
+        # The imported case is Internal Service; the count is surfaced in the
         # cases dataset stats (for the Settings import UI) without inflating the
         # processed/created totals.
-        self.assertEqual(importer.internal_service_count, 2)
+        self.assertEqual(importer.internal_service_count, 1)
         importer.finalize()
-        self.assertEqual(run.stats["cases"]["internal_service"], 2)
-        self.assertEqual(run.created_count, 2)
+        self.assertEqual(run.stats["cases"]["internal_service"], 1)
+        self.assertEqual(run.created_count, 1)
+
+    def test_open_case_blank_auth_becomes_never_requested(self):
+        from .models import ServiceAuthorizationStatus
+        from .services.csv_import import map_case_row
+
+        # OPEN case + blank authorization request -> Never Requested.
+        open_blank = map_case_row(self._case_row(uuid.uuid4(), self.MET))
+        self.assertEqual(
+            open_blank["service_authorization_status"],
+            ServiceAuthorizationStatus.NEVER_REQUESTED,
+        )
+        self.assertEqual(
+            open_blank["service_authorization_status_label"], "Never Requested"
+        )
+
+        # An explicit auth value is untouched (not overwritten).
+        approved = map_case_row(
+            self._case_row(
+                uuid.uuid4(), self.MET, service_authorization_status="approved",
+            )
+        )
+        self.assertEqual(
+            approved["service_authorization_status"],
+            ServiceAuthorizationStatus.APPROVED,
+        )
+
+        # A CLOSED case with blank auth stays blank (rule is OPEN-only).
+        closed_blank = map_case_row(
+            self._case_row(
+                uuid.uuid4(), self.MET, case_closed_at="2024-01-01T00:00:00Z",
+            )
+        )
+        self.assertNotIn("service_authorization_status", closed_blank)
+
+    def test_deferred_reconcile_flag_toggles(self):
+        from .services.lifecycle import (
+            deferred_internal_service_reconcile,
+            internal_service_reconcile_deferred,
+        )
+
+        self.assertFalse(internal_service_reconcile_deferred())
+        with deferred_internal_service_reconcile():
+            self.assertTrue(internal_service_reconcile_deferred())
+        self.assertFalse(internal_service_reconcile_deferred())
+
+    def test_cases_import_defers_reconcile_until_full_picture(self):
+        """A cases sheet is processed one row per case. Reconciling per row would
+        evaluate the client-wide rules against a PARTIAL picture -- closing a
+        client's currently-only-open case would full-stop CANCEL the household
+        before the row that opens their next case is seen. The import defers the
+        reconcile to a single post-pass, so the household survives regardless of
+        row order."""
+        from .models import (
+            Case, CaseStatus, CaseType, Client, EnrollmentStage,
+            EnrollmentVerification, Household, HouseholdMember, ImportRun,
+            ImportRunStatus,
+        )
+        from .services.csv_import import CsvImporter
+        from .services.lifecycle import deferred_internal_service_reconcile
+
+        client = Client.objects.create(
+            client_id=uuid.uuid4(), first_name="Ord", last_name="Ering"
+        )
+        hh = Household.objects.create(name="HH")
+        HouseholdMember.objects.create(household=hh, client=client, is_primary=True)
+        enr = EnrollmentVerification.objects.create(
+            client=client, household=hh, stage=EnrollmentStage.KITCHEN_ASSIGNMENT,
+            verified_at=timezone.now(),
+        )
+        # Pre-existing OPEN internal-service case A -- the governing case today
+        # (created directly, so no reconcile fires yet).
+        case_a = Case.objects.create(
+            case_id=uuid.uuid4(), client=client, case_type=CaseType.INTERNAL_SERVICE,
+            case_status=CaseStatus.OPEN, service_authorization_status="approved",
+            provider_name="",
+        )
+
+        # Dangerous order: CLOSE A first, then OPEN a new case B. (The import
+        # derives Closed from a populated close date, not the status string.)
+        row_close_a = self._case_row(
+            client.client_id, self.MET, case_id=str(case_a.case_id),
+            provider_name="Met Council - SCN - PHS",
+            case_status="closed", case_closed_at=timezone.now().isoformat(),
+        )
+        case_b_id = str(uuid.uuid4())
+        row_open_b = self._case_row(
+            client.client_id, self.MET, case_id=case_b_id, case_status="open",
+            provider_name="Met Council - SCN - PHS",
+        )
+
+        run = ImportRun.objects.create(
+            source="csv_uniteus", status=ImportRunStatus.RUNNING
+        )
+        importer = CsvImporter(run, emit_side_effects=False)
+        # Mirror run_import's cases branch: defer during the row loop, then
+        # reconcile once per touched client on the full picture.
+        with deferred_internal_service_reconcile():
+            importer.import_cases([row_close_a, row_open_b])
+        importer.reconcile_touched_cases()
+
+        # A closed, B open -> the household still has an open internal-service
+        # case, so it must NOT have been cancelled by a partial-picture close-out.
+        enr.refresh_from_db()
+        self.assertEqual(enr.stage, EnrollmentStage.KITCHEN_ASSIGNMENT)
+        self.assertEqual(
+            Case.objects.get(pk=case_a.case_id).case_status, CaseStatus.CLOSED
+        )
+        self.assertEqual(
+            Case.objects.get(pk=case_b_id).case_status, CaseStatus.OPEN
+        )
 
     def test_delete_non_metcouncil_cases_command(self):
         from django.core.management import call_command
@@ -5391,3 +5774,88 @@ class ProgramStatusComputationTest(TestCase):
 
         enr = self._enrollment(EnrollmentStage.CANCELLED)
         self.assertEqual(program_status(enr), ProgramStatus.CLOSED)
+
+
+class ReconcileOrphanEnrollmentsTest(TestCase):
+    """The reconcile_orphan_enrollments backfill heals enrollments stuck at an
+    advanced stage with no OPEN internal-service case:
+
+    * no internal case at all -> DISREGARDED (both pending & kitchen).
+    * has internal case(s) but none open -> CANCELLED (closure full stop).
+    """
+
+    def _client(self):
+        return Client.objects.create(
+            client_id=uuid.uuid4(), first_name="P", last_name="Q"
+        )
+
+    def _internal_case(self, client, status):
+        from .models import Case, CaseType
+
+        return Case.objects.create(
+            case_id=uuid.uuid4(), client=client,
+            case_type=CaseType.INTERNAL_SERVICE, case_status=status,
+        )
+
+    def _enrollment(self, client, stage, *, case=None):
+        from .models import EnrollmentVerification
+
+        return EnrollmentVerification.objects.create(
+            client=client, case=case, stage=stage,
+        )
+
+    def test_no_case_kitchen_is_disregarded(self):
+        from .models import CaseType, EnrollmentStage, EnrollmentVerification
+        from django.core.management import call_command
+
+        client = self._client()
+        # Only non-internal cases -> "no internal case at all".
+        from .models import Case
+        Case.objects.create(
+            case_id=uuid.uuid4(), client=client, case_type=CaseType.NAVIGATION,
+            case_status="managed",
+        )
+        enr = self._enrollment(client, EnrollmentStage.KITCHEN_ASSIGNMENT)
+
+        call_command("reconcile_orphan_enrollments", "--apply")
+
+        enr.refresh_from_db()
+        self.assertEqual(enr.stage, EnrollmentStage.DISREGARDED)
+
+    def test_no_case_pending_is_disregarded(self):
+        from .models import EnrollmentStage
+        from django.core.management import call_command
+
+        client = self._client()
+        enr = self._enrollment(client, EnrollmentStage.PENDING_VERIFICATION)
+
+        call_command("reconcile_orphan_enrollments", "--apply")
+
+        enr.refresh_from_db()
+        self.assertEqual(enr.stage, EnrollmentStage.DISREGARDED)
+
+    def test_closed_internal_case_is_cancelled(self):
+        from .models import CaseStatus, EnrollmentStage
+        from django.core.management import call_command
+
+        client = self._client()
+        self._internal_case(client, CaseStatus.CLOSED)
+        enr = self._enrollment(client, EnrollmentStage.PENDING_VERIFICATION)
+
+        call_command("reconcile_orphan_enrollments", "--apply")
+
+        enr.refresh_from_db()
+        self.assertEqual(enr.stage, EnrollmentStage.CANCELLED)
+
+    def test_open_internal_case_is_left_untouched(self):
+        from .models import CaseStatus, EnrollmentStage
+        from django.core.management import call_command
+
+        client = self._client()
+        self._internal_case(client, CaseStatus.MANAGED)
+        enr = self._enrollment(client, EnrollmentStage.KITCHEN_ASSIGNMENT)
+
+        call_command("reconcile_orphan_enrollments", "--apply")
+
+        enr.refresh_from_db()
+        self.assertEqual(enr.stage, EnrollmentStage.KITCHEN_ASSIGNMENT)

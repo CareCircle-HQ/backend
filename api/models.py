@@ -66,7 +66,7 @@ class ClientStage(models.TextChoices):
     CONSENT = "consent", "Consent"  # consent accepted
     SCREENED = "screened", "Screening"  # >=1 completed Met Council screening
     ASSESSMENT = "assessment", "Assessment"  # completed assessment, eligible
-    NAVIGATION = "navigation", "Navigation"  # >=1 Met Council case
+    NAVIGATION = "navigation", "Care Management"  # >=1 Met Council case (stored value stays "navigation")
     # Screening identified a social need under an ACTIVE program we serve (see
     # api.services.lifecycle._is_eligible). Ranks above Navigation.
     ELIGIBLE = "eligible", "Eligible"
@@ -86,6 +86,16 @@ class ClientStage(models.TextChoices):
     CANCELLED = "cancelled", "Cancelled"
     # --- Terminal off-ramp ---
     NOT_ELIGIBLE = "not_eligible", "Not Eligible"  # ineligible / closed without service
+    # --- Import-time eligibility off-ramps (api.services.eligibility) ---
+    # Hard off-ramp: a CareCircle-UNFIXABLE eligibility failure (expired/missing
+    # medical insurance, wrong Medicaid type, or an out-of-range primary/delivery
+    # address). The member's Unite Us case must be closed by an agent. Set only by
+    # reconcile_client_eligibility and kept sticky in derive_client_stage until the
+    # underlying data recovers on a later import.
+    INELIGIBLE = "ineligible", "Ineligible"
+    # Was enrolled but now has ZERO OPEN internal-service cases (set by the cases
+    # import). Distinct from INACTIVE ("never pursued / funnel start").
+    SERVICE_INACTIVE = "service_inactive", "Inactive"
 
 
 class ProgramStatus(models.TextChoices):
@@ -802,6 +812,11 @@ class ServiceAuthorizationStatus(models.TextChoices):
     APPROVED = "approved", "Approved"
     DENIED = "denied", "Denied"
     EXPIRED = "expired", "Expired"
+    # An OPEN case whose authorization has never been requested (blank auth on
+    # the export). Neutral in lifecycle logic (treated like no authorization:
+    # not favorable, not denied) -- it only gives the UI an explicit state
+    # instead of a blank.
+    NEVER_REQUESTED = "never_requested", "Never Requested"
 
 
 class CaseType(models.TextChoices):
@@ -811,7 +826,11 @@ class CaseType(models.TextChoices):
     (Social Service Case Management => Internal Service, else => Navigation) when
     the program is not found in ProgramPipeline."""
 
-    NAVIGATION = "navigation", "Navigation"
+    # Stored value stays "navigation" (kept for backward-compatibility with
+    # existing rows + the frontend filter id); the DISPLAY label is "Care
+    # Management". Cases are classified here from the ProgramPipeline
+    # "Care Management" (formerly "Navigation") case_category.
+    NAVIGATION = "navigation", "Care Management"
     EXTERNAL_SERVICE = "external_service", "External Service"
     INTERNAL_SERVICE = "internal_service", "Internal Service"
     ELIGIBILITY = "eligibility", "Eligibility"
@@ -3072,6 +3091,10 @@ class TimelineEventType(models.TextChoices):
     MEMBER_REACTIVATED = "member_reactivated", "Member Reactivated"
     MEMBER_PAUSED = "member_paused", "Member Paused"
     MEMBER_UNPAUSED = "member_unpaused", "Member Unpaused"
+    # --- Import-time eligibility off-ramps (api.services.eligibility) ---
+    MEMBER_INELIGIBLE = "member_ineligible", "Member Ineligible"
+    MEMBER_ELIGIBILITY_RESTORED = "member_eligibility_restored", "Eligibility Restored"
+    MEMBER_SERVICE_INACTIVE = "member_service_inactive", "Service Inactive"
     HOUSEHOLD_MEMBER_ADDED = "household_member_added", "Household Member Added"
     HOUSEHOLD_MEMBER_REMOVED = "household_member_removed", "Household Member Removed"
     PRODUCT_TYPE_CHANGED = "product_type_changed", "Product Type Changed"

@@ -328,22 +328,13 @@ class DailyPull:
             emit_timeline=self.emit_side_effects, import_run=self.run,
         )
         self._record_case_changes(case, prev_status, prev_auth, change)
-        self._reconcile_enrollments(case)
+        # The client-wide authorization reconcile is NOT run per case: with a
+        # person carrying several cases it would fire against a partial picture.
+        # _process_person defers it and reconciles ONCE after all the person's
+        # cases are synced (reconcile_internal_service_authorization subsumes the
+        # per-enrollment projection this used to do inline).
         if self.emit_side_effects:
             self._emit_timeline(timeline.event_for_case, case)
-
-    def _reconcile_enrollments(self, case):
-        """Project the (possibly updated) case authorization onto any verified
-        enrollments. When the status flips to Accepted, this is what triggers
-        delivery-order generation during the nightly run. Best-effort: a single
-        enrollment hiccup must not abort the import."""
-        from api.services.lifecycle import reconcile_enrollment_authorization
-
-        for enrollment in case.enrollments.all():
-            try:
-                reconcile_enrollment_authorization(enrollment)
-            except Exception as exc:  # pragma: no cover - defensive
-                self.errors.append(f"reconcile enrollment {enrollment.pk}: {exc}")
 
     # -- person / client ---------------------------------------------------
     def _process_person(self, client_id):
@@ -407,8 +398,25 @@ class DailyPull:
 
         self._process_notes(subject_id=client_id, client=client, case=None)
 
-        for case_rec in self.api.list_cases(client_id):
-            self._process_case(case_rec, client)
+        # Sync all of this person's cases with the client-wide reconcile DEFERRED
+        # (one case per API record would otherwise reconcile against a partial
+        # picture -- e.g. pausing/cancelling before a still-open case is synced),
+        # then reconcile ONCE on the complete picture.
+        from api.services.lifecycle import (
+            deferred_internal_service_reconcile,
+            reconcile_internal_service_authorization,
+        )
+
+        with deferred_internal_service_reconcile():
+            for case_rec in self.api.list_cases(client_id):
+                self._process_case(case_rec, client)
+        try:
+            reconcile_internal_service_authorization(client)
+        except Exception:  # noqa: BLE001 - never abort the import on a reconcile hiccup
+            logger.warning(
+                "reconcile_internal_service_authorization failed for %s",
+                client_id, exc_info=True,
+            )
 
         # Recompute the acquisition funnel now that consent + cases are synced.
         try:

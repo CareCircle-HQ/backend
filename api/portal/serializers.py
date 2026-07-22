@@ -12,6 +12,7 @@ from django.utils import timezone
 from rest_framework import serializers
 
 from api.services.lifecycle import (
+    case_is_met_council,
     governing_case_key,
     governing_pending_enrollment,
     has_open_internal_service_case,
@@ -802,13 +803,16 @@ class MemberDetailSerializer(serializers.Serializer):
                 "service_type": svc_case.service_type if svc_case else "",
                 "case_id": str(svc_case.case_id) if svc_case else None,
                 # Every Internal Service case the verification can attach to, so
-                # the pop-up can let the agent switch the governing case when the
-                # client holds more than one. `governing` marks the default pick.
-                # DENIED-authorization cases are excluded: a denied meal/box case
-                # can't be verified against, so it must not be an option in the
-                # pop-up's case dropdown (any other status is still selectable).
-                # CLOSED/CANCELLED cases are likewise excluded -- a finished case
-                # is no longer a live target for a verification.
+                # the pop-up can let the agent pick the governing case when the
+                # client holds more than one (shown as radio buttons with each
+                # case's authorization status). `governing` marks the default
+                # pick. Only live, selectable targets are listed:
+                #   * Met Council-managed cases only (external orgs' work is
+                #     never a verification target -- see case_is_met_council).
+                #   * DENIED-authorization cases are excluded: a denied meal/box
+                #     case can't be verified against.
+                #   * CLOSED/CANCELLED cases are excluded -- a finished case is
+                #     no longer a live target for a verification.
                 "cases": [
                     {
                         "case_id": str(c.case_id),
@@ -818,7 +822,8 @@ class MemberDetailSerializer(serializers.Serializer):
                         "governing": bool(svc_case and c.case_id == svc_case.case_id),
                     }
                     for c in internal_service_cases(client)
-                    if c.service_authorization_status != ServiceAuthorizationStatus.DENIED
+                    if case_is_met_council(c)
+                    and c.service_authorization_status != ServiceAuthorizationStatus.DENIED
                     and c.case_status not in (CaseStatus.CLOSED, CaseStatus.CANCELLED)
                 ],
             },

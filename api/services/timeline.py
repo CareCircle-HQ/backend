@@ -878,6 +878,52 @@ def event_for_out_of_range(
     )
 
 
+def event_for_member_ineligible(
+    client, *, reasons=None, source=ChangeSource.IMPORT, actor="",
+):
+    """Emit a 'Member marked Ineligible' event when the import-time eligibility
+    check fails a CareCircle-unfixable gate (expired/missing insurance, wrong
+    Medicaid type, out-of-range address). Logged on the member's own client. Not
+    de-duped: it fires only on the transition INTO ineligible (the caller gates
+    it), so a later recovery + re-flag records a fresh point."""
+    if client is None:
+        return None
+    reasons = [r for r in (reasons or []) if r]
+    return emit_timeline_event(
+        client=client,
+        event_type=TimelineEventType.MEMBER_INELIGIBLE,
+        occurred_at=timezone.now(),
+        title="Member marked Ineligible",
+        subtitle="; ".join(reasons),
+        badge_text="Ineligible",
+        badge_tone=TimelineBadgeTone.DANGER,
+        source=source,
+        actor=actor,
+        entity=client,
+        metadata={"reasons": reasons},
+    )
+
+
+def event_for_member_eligibility_restored(
+    client, *, source=ChangeSource.IMPORT, actor="",
+):
+    """Emit an 'Eligibility restored' event when a previously-ineligible member
+    passes the eligibility checks again on a later import."""
+    if client is None:
+        return None
+    return emit_timeline_event(
+        client=client,
+        event_type=TimelineEventType.MEMBER_ELIGIBILITY_RESTORED,
+        occurred_at=timezone.now(),
+        title="Member eligibility restored",
+        badge_text="Eligible",
+        badge_tone=TimelineBadgeTone.SUCCESS,
+        source=source,
+        actor=actor,
+        entity=client,
+    )
+
+
 def event_for_household_member_added(
     primary_client, member_client, *, enrollment=None, source=ChangeSource.CRM,
     actor="", added_from="",

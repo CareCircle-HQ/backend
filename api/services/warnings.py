@@ -25,6 +25,7 @@ Scope:
 """
 
 import logging
+import re
 from dataclasses import dataclass, field
 from datetime import date, timedelta
 
@@ -32,6 +33,7 @@ from django.utils import timezone
 
 from api.models import (
     EnrollmentStage,
+    InsurancePlanType,
     KitchenProductType,
     MemberStatus,
     ProductType,
@@ -72,7 +74,43 @@ CADENCE_NOT_SUPPORTED_BY_KITCHEN = "cadence_not_supported_by_kitchen"
 KITCHEN_MISSING_PRODUCT = "kitchen_missing_product"
 CADENCE_KIND_MISMATCH = "cadence_kind_mismatch"
 INSURANCE_EXPIRING = "insurance_expiring"
+# Member holds a Medicaid plan whose TYPE Met Council can't serve (MLTC / MAP /
+# FFS in the plan name) and has NO clean Medicaid plan alongside it. CareCircle
+# CANNOT fix this in the CRM -- the case must be closed in Unite Us.
+WRONG_MEDICAID_TYPE = "wrong_medicaid_type"
 INTERNAL_CASE_EXPIRED = "internal_case_expired"
+
+# Medicaid plan-name tokens that mark an unserviceable Medicaid type. Each entry
+# is detected either by its abbreviation OR its long-form name, so a plan named
+# "...Medicaid FFS" and "...Fee For Service" both match. Word-aware +
+# case-insensitive so "MAPD" does not false-match "MAP".
+#   PMLTC  -> Partial Managed Long Term Care
+#   MLTCP  -> Managed Long Term Care Partial
+#   MLTC   -> Managed Long Term Care
+#   FFS    -> Fee For Service
+#   MAP    -> Medicaid Advantage Plan
+_MEDICAID_INELIGIBLE_TERMS = ("PMLTC", "MLTCP", "MLTC", "MAP", "FFS")
+_MEDICAID_INELIGIBLE_PHRASES = (
+    "Partial Managed Long Term Care",
+    "Managed Long Term Care Partial",
+    "Managed Long Term Care",
+    "Fee For Service",
+    "Medicaid Advantage Plan",
+)
+
+
+def _medicaid_bad_pattern():
+    """Word-aware alternation over the abbreviations + long-form phrases. Phrase
+    spaces are matched as ``\\s+`` so extra/variant whitespace still matches."""
+    parts = [re.escape(t) for t in _MEDICAID_INELIGIBLE_TERMS]
+    parts += [
+        r"\s+".join(re.escape(w) for w in phrase.split())
+        for phrase in _MEDICAID_INELIGIBLE_PHRASES
+    ]
+    return re.compile(r"\b(?:" + "|".join(parts) + r")\b", re.IGNORECASE)
+
+
+_MEDICAID_BAD_RE = _medicaid_bad_pattern()
 # Household service state (household-scope).
 HOUSEHOLD_ON_HOLD = "household_on_hold"
 HOUSEHOLD_CANCELLED = "household_cancelled"
@@ -110,6 +148,10 @@ WARNING_CATEGORY = {
     CADENCE_KIND_MISMATCH: SERVICE_CONFIG,
     INTERNAL_CASE_EXPIRED: SERVICE_CONFIG,
     INSURANCE_EXPIRING: SERVICE_CONFIG,
+    # CareCircle cannot fix a wrong Medicaid type in the CRM (the case must be
+    # closed in Unite Us), so it is informational -- NOT a Care Management queue
+    # item -- but still shown on the member profile header.
+    WRONG_MEDICAID_TYPE: MEMBER_STATE,
     MULTIPLE_OPEN_CASES: SERVICE_CONFIG,
     CONFLICTING_PRODUCT_TYPES: SERVICE_CONFIG,
     HOUSEHOLD_MEMBERS_OUT_OF_ORBIT: MEMBER_STATE,
@@ -467,6 +509,61 @@ def check_insurance_expiring(ctx):
     return out
 
 
+def _medicaid_plans(client):
+    """The client's Medicaid insurance records (plan_type == medicaid)."""
+    return [
+        i for i in client.insurances.all()
+        if (i.plan_type or "").lower() == InsurancePlanType.MEDICAID
+    ]
+
+
+def member_wrong_medicaid_types(client):
+    """Offending Medicaid plan names (MLTC/MAP/FFS) for ``client`` when they have
+    NO clean Medicaid plan on file, else ``[]``.
+
+    All-bad rule: a member is only flagged when EVERY named Medicaid plan is an
+    ineligible type -- a single clean Medicaid plan clears it.
+    """
+    bad = []
+    has_clean = False
+    for p in _medicaid_plans(client):
+        name = (p.plan_name or "").strip()
+        if not name:
+            continue
+        if _MEDICAID_BAD_RE.search(name):
+            bad.append(name)
+        else:
+            has_clean = True
+    return [] if has_clean else bad
+
+
+def check_wrong_medicaid_type(ctx):
+    """Member-scope: flag members whose only Medicaid plan(s) are an
+    unserviceable type (MLTC/MAP/FFS). Not fixable in the CRM -- surfaces so an
+    agent can close the case in Unite Us."""
+    out = []
+    for member in ctx.members:
+        bad = member_wrong_medicaid_types(member)
+        if not bad:
+            continue
+        names = sorted(set(bad))
+        out.append(Warning(
+            code=WRONG_MEDICAID_TYPE,
+            severity=RED,
+            scope="member",
+            title="Wrong Medicaid type",
+            detail=(
+                "The member's Medicaid plan type isn't served "
+                f"({', '.join(_MEDICAID_INELIGIBLE_TERMS)}): {', '.join(names)}. "
+                "This can't be fixed in the CRM \u2014 the case must be closed in "
+                "Unite Us."
+            ),
+            client_id=member.pk,
+            refs={"plan_names": names},
+        ))
+    return out
+
+
 def check_internal_case_expired(ctx):
     gov = ctx.governing_case
     end_dt = getattr(gov, "service_authorization_approval_ends_at", None) if gov else None
@@ -617,6 +714,7 @@ WARNING_CHECKS = [
     check_cadence_kind_mismatch,
     check_internal_case_expired,
     check_insurance_expiring,
+    check_wrong_medicaid_type,
     check_multiple_open_cases,
     check_conflicting_product_types,
 ]

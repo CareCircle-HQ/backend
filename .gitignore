@@ -6,6 +6,11 @@
 # Virtualenv
 venv/
 .venv/
+.venv-py39-backup/
+
+# Local prod DB copies / scratch dumps
+carecircle_prod_copy
+carecircle_prod_copy/
 
 # Python
 __pycache__/

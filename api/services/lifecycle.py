@@ -11,6 +11,8 @@ Every transition appends a :class:`~api.models.StageEvent` row, which is the
 source of truth for funnel-conversion and time-in-stage reporting.
 """
 
+import contextvars
+from contextlib import contextmanager
 from datetime import datetime, timezone as dt_timezone
 
 from django.conf import settings
@@ -391,12 +393,23 @@ def governing_pending_enrollment(client):
     return max(candidates, key=lambda e: e.stage_at or e.opened_at)
 
 
-def derive_client_stage(client):
+def derive_client_stage(client, *, ignore_sticky=False):
     """Compute the client's lifecycle stage (no writes).
 
     The early funnel governs until an EnrollmentVerification exists; from
     Pending Verification onward the enrollment's stage takes precedence.
+
+    Import-time eligibility off-ramps (INELIGIBLE / SERVICE_INACTIVE) are set
+    explicitly by ``api.services.eligibility.reconcile_client_eligibility`` and
+    are STICKY here: an unrelated recompute (e.g. an enrollment stage change on a
+    household member) must not clobber them. Only reconcile_client_eligibility
+    clears them, by re-deriving with ``ignore_sticky=True`` once the data
+    recovers.
     """
+    if not ignore_sticky and client.lifecycle_stage in (
+        ClientStage.INELIGIBLE, ClientStage.SERVICE_INACTIVE,
+    ):
+        return client.lifecycle_stage
     early = _derive_early_funnel(client)
     enr = _primary_enrollment(client)
     if enr is None:
@@ -545,6 +558,12 @@ ENROLLMENT_TRANSITIONS = {
         EnrollmentStage.SERVICE_ACTIVE,
         EnrollmentStage.ON_HOLD,
         EnrollmentStage.CANCELLED,
+        # An enrollment that reached kitchen assignment but has NO internal-service
+        # (meal/box) case backing it is an orphan (its case was deleted/never
+        # existed) -- it can be disregarded (dismissed, reversible) rather than
+        # cancelled. Not reachable from the portal disregard action, which only
+        # targets pending requests (governing_pending_enrollment).
+        EnrollmentStage.DISREGARDED,
     },
     EnrollmentStage.SERVICE_ACTIVE: {
         EnrollmentStage.SERVICE_COMPLETE,
@@ -1372,6 +1391,36 @@ def _resume_auto_paused_enrollment(enrollment, *, actor=None):
         )
     except InvalidTransition:
         return enrollment
+
+
+# When set, ``CaseSerializer`` SKIPS its inline per-save call to
+# ``reconcile_internal_service_authorization`` (below). Imports process one case
+# per row, so a client with several cases would otherwise have the client-wide
+# reconcile fire against a partial picture -- e.g. cancelling a household when
+# the row for its still-open case hasn't been written yet. Imports set this for
+# the duration of the case load, then run the reconcile ONCE per client on the
+# complete picture. Single-case writes (extension/portal) leave it False so they
+# reconcile immediately.
+_DEFER_INTERNAL_SERVICE_RECONCILE = contextvars.ContextVar(
+    "defer_internal_service_reconcile", default=False
+)
+
+
+def internal_service_reconcile_deferred():
+    """True when a caller (an import) has deferred the per-save reconcile."""
+    return _DEFER_INTERNAL_SERVICE_RECONCILE.get()
+
+
+@contextmanager
+def deferred_internal_service_reconcile():
+    """Within this context, ``CaseSerializer`` skips its inline reconcile; the
+    caller is responsible for running ``reconcile_internal_service_authorization``
+    once per touched client afterwards, on the full case picture."""
+    token = _DEFER_INTERNAL_SERVICE_RECONCILE.set(True)
+    try:
+        yield
+    finally:
+        _DEFER_INTERNAL_SERVICE_RECONCILE.reset(token)
 
 
 def reconcile_internal_service_authorization(client, *, actor=None, actor_label=""):
