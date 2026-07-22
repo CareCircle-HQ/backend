@@ -293,8 +293,13 @@ def map_provided_service(ps, *, case_id, sole_auth=None, invoice=None, program_n
     out = {
         "contracted_service_id": ps.get("id"),
         "case_id": case_id,
-        "name": _provided_description(a),
-        "service_type": program_name or "",
+        # ContractedService.name is CharField(max_length=255); Unite Us
+        # free-text descriptions can be longer, so cap it to avoid the serializer
+        # rejecting the row (and silently dropping the contracted service).
+        "name": _provided_description(a)[:255],
+        # ContractedService.service_type is CharField(max_length=120); program
+        # names can be longer, so cap here too.
+        "service_type": (program_name or "")[:120],
         "status": str(a.get("state") or ""),
         "authorized_units": str(a["unit_amount"]) if a.get("unit_amount") is not None else "",
         "service_starts_at": _date(a.get("starts_at")),
