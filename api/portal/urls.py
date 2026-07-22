@@ -105,6 +105,7 @@ from .views_kitchen_output import KitchenOutputView
 from .views_po_blockers import POBlockersFixView, POBlockersStatsView, POBlockersView
 from .views_reports import (
     AllMembersReportView,
+    CasesReportView,
     MembersByLeadSourceReportView,
     MembersPendingVerificationReportView,
 )
@@ -386,6 +387,11 @@ urlpatterns = [
         "reports/all-members/",
         AllMembersReportView.as_view(),
         name="portal-report-all-members",
+    ),
+    path(
+        "reports/cases/",
+        CasesReportView.as_view(),
+        name="portal-report-cases",
     ),
 
     # Care Management (Customer Service)

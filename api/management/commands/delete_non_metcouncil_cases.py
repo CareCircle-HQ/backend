@@ -162,9 +162,27 @@ class Command(BaseCommand):
             ))
             return
 
-        client_ids = list(qs.values_list("client_id", flat=True).distinct())
+        # Materialize the doomed PKs first, then delete via a plain ``pk__in``
+        # queryset (no reverse-relation joins) in chunks. The doomed queryset
+        # carries an ``exclude(enrollments__isnull=False)`` join; deleting it
+        # directly makes Django build the CASCADE child-delete for
+        # ContractedService as a subquery over that joined case query and
+        # re-evaluates the whole join several times. Deleting by materialized PKs
+        # keeps each cascade delete deterministic and cheap, and avoids the
+        # deferred FK check failing at COMMIT ("... still referenced from table
+        # api_contractedservice").
+        case_ids = list(qs.values_list("pk", flat=True))
+        client_ids = list(
+            Case.objects.filter(pk__in=case_ids)
+            .values_list("client_id", flat=True)
+            .distinct()
+        )
+        deleted = 0
         with transaction.atomic():
-            deleted, _ = qs.delete()
+            for i in range(0, len(case_ids), 1000):
+                chunk = case_ids[i:i + 1000]
+                d, _ = Case.objects.filter(pk__in=chunk).delete()
+                deleted += d
         self.stdout.write(self.style.SUCCESS(
             f"Deleted {n} non-Met Council case(s) ({deleted} row(s) incl. children)."
         ))
