@@ -21,7 +21,7 @@ recomputed afterwards so the member view stays consistent.
 from collections import Counter
 
 from django.core.management.base import BaseCommand
-from django.db import transaction
+from django.db import IntegrityError, transaction
 from django.db.models import Q
 
 from api.models import Case, CaseType, Client
@@ -162,27 +162,39 @@ class Command(BaseCommand):
             ))
             return
 
-        # Materialize the doomed PKs first, then delete via a plain ``pk__in``
-        # queryset (no reverse-relation joins) in chunks. The doomed queryset
-        # carries an ``exclude(enrollments__isnull=False)`` join; deleting it
-        # directly makes Django build the CASCADE child-delete for
-        # ContractedService as a subquery over that joined case query and
-        # re-evaluates the whole join several times. Deleting by materialized PKs
-        # keeps each cascade delete deterministic and cheap, and avoids the
-        # deferred FK check failing at COMMIT ("... still referenced from table
-        # api_contractedservice").
+        # Materialize the doomed PKs, then delete each chunk in its OWN
+        # transaction, explicitly removing the ContractedService children FIRST.
+        # ``ContractedService.case`` is the only hard (CASCADE) child of Case, so
+        # deleting those rows ourselves -- instead of relying on Django's in-Python
+        # cascade -- guarantees no orphan trips the deferred FK check at COMMIT
+        # ("... still referenced from table api_contractedservice"). Per-chunk
+        # transactions keep each commit window short; if a concurrent daily pull
+        # inserts a new ContractedService for a doomed case mid-flight we retry the
+        # chunk once (deleting the freshly-inserted child too).
+        from api.models import ContractedService
+
         case_ids = list(qs.values_list("pk", flat=True))
         client_ids = list(
             Case.objects.filter(pk__in=case_ids)
             .values_list("client_id", flat=True)
             .distinct()
         )
-        deleted = 0
-        with transaction.atomic():
-            for i in range(0, len(case_ids), 1000):
-                chunk = case_ids[i:i + 1000]
+
+        def _delete_chunk(chunk):
+            with transaction.atomic():
+                ContractedService.objects.filter(case_id__in=chunk).delete()
                 d, _ = Case.objects.filter(pk__in=chunk).delete()
-                deleted += d
+                return d
+
+        deleted = 0
+        for i in range(0, len(case_ids), 500):
+            chunk = case_ids[i:i + 500]
+            try:
+                deleted += _delete_chunk(chunk)
+            except IntegrityError:
+                # A concurrent insert raced this chunk; retry once now that the
+                # new child row is visible to our second sweep.
+                deleted += _delete_chunk(chunk)
         self.stdout.write(self.style.SUCCESS(
             f"Deleted {n} non-Met Council case(s) ({deleted} row(s) incl. children)."
         ))
