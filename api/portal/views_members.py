@@ -2898,6 +2898,18 @@ class HouseholdMemberEditView(PortalAPIView):
         unpause = data.pop("unpause", False)
         restore_range = data.pop("restore_range", False)
         pause_reason = (data.pop("pause_reason", "") or "").strip()
+        # Snapshot the dietary fields being edited BEFORE applying them, so we
+        # can log a precise before -> after diff on the timeline once saved.
+        _DIETARY_LABELS = {
+            "dietary_restrictions": "Dietary restrictions",
+            "food_allergies": "Food allergies",
+            "other_dietary_restrictions": "Other restrictions",
+            "meal_category": "Meal category",
+            "menu_type": "Menu type",
+            "meals_per_delivery": "Meals per delivery",
+            "general_verification_notes": "Notes",
+        }
+        dietary_before = {f: getattr(mv, f) for f in _DIETARY_LABELS if f in data}
         for field, value in data.items():
             setattr(mv, field, value)
 
@@ -3080,6 +3092,21 @@ class HouseholdMemberEditView(PortalAPIView):
                         )
                     except Exception:  # never let note-writing break the edit
                         pass
+
+        # Log the dietary before -> after diff on the member's own history (only
+        # when something actually changed). Best-effort: never break the edit.
+        dietary_changes = timeline.build_change_list([
+            (_DIETARY_LABELS[f], dietary_before[f], getattr(mv, f))
+            for f in dietary_before
+        ])
+        if dietary_changes:
+            try:
+                timeline.event_for_dietary_changed(
+                    mv, changes=dietary_changes, enrollment=mv.enrollment,
+                    actor=_agent_actor(current_agent(request)),
+                )
+            except Exception:  # never let history-logging break the edit
+                pass
 
         # Propagate the edited menu type / allergies onto this member's future
         # SCHEDULED delivery occurrences so PO generation reflects the change
@@ -4078,6 +4105,13 @@ def assign_kitchen_to_household(
     exclude_notes = exclude_notes or {}
     actor = _agent_actor(agent)
 
+    # Capture the pre-assignment kitchen + cadence so a RE-assignment (the
+    # household already had a kitchen) logs a precise 'Kitchen Changed' diff.
+    # First-time assignment (no previous kitchen) is already recorded by the
+    # KITCHEN_ASSIGNED stage event, so we skip the change row there.
+    previous_kitchen = enr.kitchen.name if enr.kitchen_id else ""
+    previous_cadence = current_household_cadence(enr) or ""
+
     enr.kitchen = kitchen
     enr.save(update_fields=["kitchen"])
 
@@ -4220,6 +4254,23 @@ def assign_kitchen_to_household(
         logger.exception(
             "warning sync failed after kitchen assignment for enrollment %s", enr.pk
         )
+
+    # Log the kitchen/cadence change on a RE-assignment (skipped on first-time
+    # assignment, where previous_kitchen is blank). event_for_kitchen_changed is
+    # itself a no-op when nothing actually changed. Best-effort.
+    if previous_kitchen:
+        try:
+            _cad_label = {c.code: c.label for c in Cadence.objects.all()}
+            timeline.event_for_kitchen_changed(
+                enr,
+                previous_kitchen=previous_kitchen,
+                new_kitchen=kitchen.name if kitchen else "",
+                previous_cadence=_cad_label.get(previous_cadence, previous_cadence),
+                new_cadence=_cad_label.get(cadence, cadence),
+                actor=actor,
+            )
+        except Exception:  # never let history-logging break assignment
+            pass
 
     return {
         "out_of_orbit": out_of_orbit,
@@ -4752,9 +4803,19 @@ class MemberKitchenView(PortalAPIView):
                     {"error": f"{kitchen.name} doesn't run this household's current cadence. Reassign the kitchen from the Kitchen Assignment popup to pick a compatible cadence."},
                     status=http.HTTP_400_BAD_REQUEST,
                 )
+        previous_kitchen = enr.kitchen.name if enr.kitchen_id else ""
         enr.kitchen = kitchen
         enr.save(update_fields=["kitchen"])
         enr.delivery_schedules.update(kitchen=kitchen)
+        # Record the kitchen change (prev -> new) on the primary's history.
+        try:
+            timeline.event_for_kitchen_changed(
+                enr, previous_kitchen=previous_kitchen,
+                new_kitchen=kitchen.name if kitchen else "",
+                actor=_agent_actor(current_agent(request)),
+            )
+        except Exception:  # never let history-logging break the change
+            pass
         # Also refresh the already-generated future delivery occurrences so PO
         # generation groups this household under the NEW kitchen (the calendar
         # snapshots the kitchen at build time and is otherwise never rebuilt).
@@ -4806,9 +4867,22 @@ class MemberCadenceView(PortalAPIView):
                 status=http.HTTP_400_BAD_REQUEST,
             )
         case = enr.case or s.primary_case(client)
+        previous_cadence = current_household_cadence(enr) or ""
         update_household_cadence(
             enr, cadence=cadence, once_a_week_weekday=once_weekday, case=case
         )
+        # Record the cadence change (prev -> new) on the primary's history,
+        # rendered with the human labels. Best-effort.
+        try:
+            _cad_label = {c.code: c.label for c in Cadence.objects.all()}
+            timeline.event_for_kitchen_changed(
+                enr,
+                previous_cadence=_cad_label.get(previous_cadence, previous_cadence),
+                new_cadence=_cad_label.get(cadence, cadence),
+                actor=_agent_actor(current_agent(request)),
+            )
+        except Exception:  # never let history-logging break the change
+            pass
         # A cadence change moves the delivery DATES, so the existing dated
         # calendar must be rebuilt (not just field-resynced): drop future
         # occurrences no longer in the plan and add the new ones, leaving any
