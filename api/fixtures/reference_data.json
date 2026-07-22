@@ -3803,7 +3803,7 @@
   "fields": {
     "program_name": "Care Management Services",
     "main_category": "Food",
-    "case_category": "NAVIGATION",
+    "case_category": "Care Management",
     "services_category": "",
     "pipeline_name": "D: Navigation",
     "pipeline_id": "2GToxmnm3MrMsotZ1kgn",
@@ -4153,7 +4153,7 @@
   "fields": {
     "program_name": "Enhanced Care Management - Care Management Level 2 Only - Brooklyn",
     "main_category": "Food",
-    "case_category": "NAVIGATION",
+    "case_category": "Care Management",
     "services_category": "",
     "pipeline_name": "D: Navigation",
     "pipeline_id": "2GToxmnm3MrMsotZ1kgn",
@@ -4167,7 +4167,7 @@
   "fields": {
     "program_name": "Enhanced Care Management - Care Management Level 2 Only - Manhattan",
     "main_category": "Food",
-    "case_category": "NAVIGATION",
+    "case_category": "Care Management",
     "services_category": "",
     "pipeline_name": "D: Navigation",
     "pipeline_id": "2GToxmnm3MrMsotZ1kgn",
@@ -4181,7 +4181,7 @@
   "fields": {
     "program_name": "Enhanced Care Management - Care Management Level 2 Only - Queens",
     "main_category": "Food",
-    "case_category": "NAVIGATION",
+    "case_category": "Care Management",
     "services_category": "",
     "pipeline_name": "D: Navigation",
     "pipeline_id": "2GToxmnm3MrMsotZ1kgn",
@@ -5707,7 +5707,7 @@
   "fields": {
     "program_name": "NY1115 Member Navigation",
     "main_category": "Food",
-    "case_category": "NAVIGATION",
+    "case_category": "Care Management",
     "services_category": "",
     "pipeline_name": "D: Navigation",
     "pipeline_id": "2GToxmnm3MrMsotZ1kgn",

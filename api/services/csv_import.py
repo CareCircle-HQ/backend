@@ -54,7 +54,6 @@ from api.models import (
     VerifiedSocialNeed,
 )
 from api.serializers import (
-    INTERNAL_SERVICE_SUBTYPES,
     AssessmentSerializer,
     CaseSerializer,
     ClientSerializer,
@@ -617,6 +616,13 @@ def map_case_row(row):
         if norm in ServiceAuthorizationStatus.values:
             out["service_authorization_status"] = norm
         out["service_authorization_status_label"] = raw_auth.replace("_", " ").title()
+    elif out["case_status"] == CaseStatus.OPEN:
+        # An OPEN case with a BLANK authorization request has never had an
+        # authorization requested -- record that explicitly as "Never Requested"
+        # instead of leaving a blank, so the authorization UI reads a real state.
+        # Neutral in lifecycle logic (like blank): not favorable, not denied.
+        out["service_authorization_status"] = ServiceAuthorizationStatus.NEVER_REQUESTED
+        out["service_authorization_status_label"] = "Never Requested"
     set_("service_authorization_request_starts_at", _dt(row, "service_authorization_request_starts_at"))
     set_("service_authorization_request_ends_at", _dt(row, "service_authorization_request_ends_at"))
     set_("service_authorization_approval_starts_at", _dt(row, "service_authorization_approval_starts_at"))
@@ -652,6 +658,12 @@ class CsvImporter:
         # self-heals lifecycle_stage even on bulk loads (emit_side_effects=False)
         # and regardless of the order the client/case/screening files arrive in.
         self.touched_client_ids = set()
+        # Clients whose INTERNAL-SERVICE cases this run touched. The client-wide
+        # authorization reconcile (pause/cancel/resume/advance) is deferred during
+        # the row loop and run ONCE per client here, on the full case picture, so
+        # a client with several cases isn't reconciled against a partial state
+        # mid-stream (see reconcile_touched_cases + deferred_internal_service_reconcile).
+        self.reconcile_client_ids = set()
         # --- live progress (for the async S3 + Celery flow) --------------------
         # Every _count() call == one processed work item (a row for cases/notes,
         # a grouped entity for clients/screenings/assessments). ``processed`` is
@@ -775,6 +787,23 @@ class CsvImporter:
                 self._count("updated" if existed else "created")
                 if self.emit_side_effects:
                     self._post_save(client)
+                    # Client-based eligibility disposition: now that ALL of this
+                    # client's rows (insurances, coverages, addresses) are
+                    # persisted, evaluate the CareCircle gates ONCE and dispose
+                    # (INELIGIBLE + note + timeline + stop future deliveries).
+                    try:
+                        from api.services.eligibility import (
+                            reconcile_client_eligibility,
+                        )
+
+                        reconcile_client_eligibility(
+                            client, actor_label=TIMELINE_ACTOR,
+                            source=ChangeSource.IMPORT,
+                        )
+                    except Exception as exc:  # isolate from the client upsert
+                        logger.warning(
+                            "csv_import eligibility %s failed: %s", client.pk, exc
+                        )
             except Exception as exc:  # isolate one bad client from the run
                 self._count("errors")
                 self.errors.append(f"client {cid}: {exc}")
@@ -1064,12 +1093,13 @@ class CsvImporter:
                 originating_team__in=CARECIRCLE_ALLOWLIST_TEAMS
             ).values_list("user_id", flat=True)
         }
-        # STRICT Met Council org gate (union rule, see lifecycle.is_met_council_case):
-        # keep a case only if Met Council either CREATED it (originating_provider_id)
-        # or MANAGES/services it (provider_id / provider_name). Any case with no Met
-        # Council signal is out of scope and dropped -- the authoritative filter that
-        # keeps external-org cases out of the member base, applied on every import
-        # path.
+        # STRICT Met Council org gate: keep a case ONLY if Met Council
+        # MANAGES/services it -- i.e. provider_id == the Met Council id OR
+        # provider_name == "Met Council - SCN - PHS". The originating columns
+        # (originating_provider_id / originating_provider_name) are deliberately
+        # IGNORED here: a case Met Council merely CREATED/referred (even a meal
+        # case) is out of scope for the extraction unless Met Council also
+        # manages it. Any case with no managing Met Council signal is dropped.
         from api.services.lifecycle import is_met_council_case
 
         # One row per case — stream directly, no grouping needed.
@@ -1078,32 +1108,13 @@ class CsvImporter:
             if not cid:
                 self._count("skipped")
                 continue
-            # STRICT Met Council org gate. A case is kept when Met Council
-            # MANAGES it (provider id/name). For INTERNAL-SERVICE (meal/box)
-            # cases only, Met Council merely ORIGINATING it also keeps it -- but
-            # ONLY when no OTHER named org manages it. A meal case Met Council
-            # referred OUT to another provider (e.g. God's Love We Deliver, Boro
-            # Park) is that org's case, not ours, even though Met Council
-            # originated it. Every non-internal type must be MANAGED by Met
-            # Council (originating alone -- an ECM referral out -- never counts).
-            # The internal test keys on the meal/box service subtype (same rule
-            # as derive_case_type), so no ProgramPipeline lookup is needed.
-            is_internal = (
-                (row.get("service_subtype") or "").strip().casefold()
-                in INTERNAL_SERVICE_SUBTYPES
-            )
+            # Managing-provider gate (provider_id OR provider_name). Originating
+            # is NOT considered (allow_originating=False, and we pass no
+            # originating id).
             prov_id = (row.get("provider_id") or "").strip()
             prov_name = (row.get("provider_name") or "").strip()
-            has_named_manager = bool(prov_id or prov_name)
-            managed_by_met = is_met_council_case(
+            keep = is_met_council_case(
                 provider_id=prov_id, provider_name=prov_name, allow_originating=False,
-            )
-            originated_by_met = is_met_council_case(
-                originating_provider_id=row.get("originating_provider_id"),
-                allow_originating=True,
-            )
-            keep = managed_by_met or (
-                is_internal and originated_by_met and not has_named_manager
             )
             if not keep:
                 self._count("skipped")
@@ -1156,6 +1167,10 @@ class CsvImporter:
                 self._count("updated" if existed else "created")
                 if case.case_type == CaseType.INTERNAL_SERVICE:
                     self.internal_service_count += 1
+                    # Defer the client-wide reconcile to a single post-pass
+                    # (reconcile_touched_cases) once every row is written.
+                    if case.client_id:
+                        self.reconcile_client_ids.add(str(case.client_id))
                 if self.emit_side_effects:
                     self._post_save_case(case, prev_status, prev_auth)
             except Exception as exc:  # isolate one bad case from the run
@@ -1164,11 +1179,15 @@ class CsvImporter:
                 logger.warning("csv_import case %s failed: %s", cid, exc)
 
     def _post_save_case(self, case, previous_status=None, previous_auth_status=None):
-        """Emit the case timeline, record (and optionally open) the follow-up
-        tickets a change triggers, re-project the (possibly updated)
-        authorization onto the member's enrollments, and recompute the funnel
-        stage. Tickets are only WRITTEN when create_tickets is True; otherwise
-        they're previewed for review.
+        """Emit the case timeline and record (and optionally open) the follow-up
+        tickets a change triggers. Tickets are only WRITTEN when create_tickets
+        is True; otherwise they're previewed for review.
+
+        The client-wide authorization reconcile (pause/cancel/resume/advance) and
+        the funnel-stage recompute are NOT run here: they'd fire per row against a
+        partial case picture. They run ONCE per client after every row is written
+        -- reconcile via ``reconcile_touched_cases``, stage via
+        ``recompute_touched``.
 
         Runs ONLY when ``emit_side_effects`` is True (the manual Settings
         upload). Bulk historical CLI loads (``emit_side_effects=False``) skip
@@ -1184,25 +1203,37 @@ class CsvImporter:
             except Exception:  # noqa: BLE001
                 logger.warning("csv_import case timeline failed", exc_info=True)
         self._record_case_actions(case, previous_status, previous_auth_status)
-        self._reconcile_enrollments(case)
-        self._recompute_stage(case.client_id, case.client)
 
-    def _reconcile_enrollments(self, case):
-        """Project the case's (possibly updated) authorization onto the client's
-        enrollments so a re-import shows on the member -- e.g. a case that
-        flipped to Accepted advances the enrollment (verified -> kitchen
-        assignment). Mirrors the daily Unite Us pull's reconcile. Best-effort:
-        one enrollment hiccup never fails the import row."""
-        from api.services.lifecycle import reconcile_enrollment_authorization
+    def reconcile_touched_cases(self):
+        """Run the client-wide internal-service reconcile ONCE per client whose
+        cases this run touched, now that every row is written -- so the household
+        rules (pause / cancel / resume / advance, delivery-calendar truncation)
+        evaluate the COMPLETE picture instead of firing per row against partial
+        state. Applies to every case-import path (manual upload AND bulk CLI).
 
-        for enrollment in case.enrollments.all():
-            try:
-                reconcile_enrollment_authorization(enrollment)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(
-                    "csv_import reconcile enrollment %s failed: %s",
-                    enrollment.pk, exc,
-                )
+        Runs OUTSIDE the ``deferred_internal_service_reconcile`` context, so this
+        is the reconcile the deferred per-save calls were skipped in favor of.
+        Each client is isolated -- one reconcile hiccup never fails the run."""
+        from api.services.lifecycle import reconcile_internal_service_authorization
+
+        ids = list(self.reconcile_client_ids)
+        chunk = 500
+        for start in range(0, len(ids), chunk):
+            batch = ids[start:start + chunk]
+            clients = Client.objects.filter(pk__in=batch).prefetch_related(
+                "cases",
+                "enrollments",
+                "household_membership__household__members",
+                "household_membership__household__enrollment_verifications",
+                "member_profiles__enrollment",
+            )
+            for client in clients:
+                try:
+                    reconcile_internal_service_authorization(client)
+                except Exception:  # noqa: BLE001 - never fail the run on a reconcile hiccup
+                    logger.warning(
+                        "csv_import reconcile failed for %s", client.pk, exc_info=True
+                    )
 
     def _record_case_actions(self, case, previous_status, previous_auth_status):
         """Record the case change (timeline events + follow-up tickets) via the
@@ -1504,9 +1535,18 @@ def run_csv_import(*, export_type, file_obj, triggered_by="manual", emit_side_ef
                     reader, provider_id=provider_id, provider_name=provider_name,
                 )
             elif export_type == "cases":
-                importer.import_cases(
-                    reader, provider_id=provider_id, provider_name=provider_name,
-                )
+                # Defer the per-save client-wide reconcile: with one case per row,
+                # reconciling inside each save would evaluate the household rules
+                # (pause/cancel/resume/advance) against a partial picture -- e.g.
+                # cancelling a household before the row for its still-open case is
+                # written. Reconcile ONCE per client afterwards on the full picture.
+                from api.services.lifecycle import deferred_internal_service_reconcile
+
+                with deferred_internal_service_reconcile():
+                    importer.import_cases(
+                        reader, provider_id=provider_id, provider_name=provider_name,
+                    )
+                importer.reconcile_touched_cases()
             elif export_type == "notes":
                 importer.import_notes(reader)
             # Always reconcile the funnel stage for every touched client, so the
