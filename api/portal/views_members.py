@@ -4192,6 +4192,18 @@ def assign_kitchen_to_household(
     enr.delivery_schedules.update(kitchen=kitchen)
     resync_scheduled_orders(enrollment=enr)
 
+    # A household reaching this helper straight from VERIFIED (the Williamsburg
+    # fast-track in the verification pop-up, which skips the manual Logistics
+    # kitchen-assignment step) must pass through KITCHEN_ASSIGNMENT first: the
+    # transition map has no VERIFIED -> SERVICE_ACTIVE edge, so jumping directly
+    # raises InvalidTransition even with force=True. From the Logistics page the
+    # enrollment is already at KITCHEN_ASSIGNMENT, so this is a no-op there.
+    if EnrollmentStage(enr.stage) == EnrollmentStage.VERIFIED:
+        advance_enrollment(
+            enr, EnrollmentStage.KITCHEN_ASSIGNMENT, force=True,
+            note=f"Kitchen assigned ({kitchen.name}).",
+        )
+
     advance_enrollment(
         enr, EnrollmentStage.SERVICE_ACTIVE, force=True,
         note=f"Kitchen assigned ({kitchen.name}); service activated.",
