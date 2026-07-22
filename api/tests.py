@@ -294,6 +294,11 @@ class ExtensionTimelineTest(TestCase):
         self.client_api.credentials(HTTP_AUTHORIZATION=f"Bearer {access}")
         self.cid = str(uuid.uuid4())
         self.now = timezone.now().isoformat()
+        from api.services.lifecycle import MET_COUNCIL_PROVIDER_NAME
+
+        # Managing org for extension case writes (the CaseSerializer gate
+        # rejects non-Met-Council / blank-org cases logged by an agent).
+        self.mc = MET_COUNCIL_PROVIDER_NAME
 
     def _create_client(self, consent=True):
         return self.client_api.post(
@@ -398,7 +403,7 @@ class ExtensionTimelineTest(TestCase):
                 "client_id": self.cid,
                 "program_name": "Meals on Wheels",
                 "service_type": "Food",
-                "provider_name": "Met Council",
+                "provider_name": self.mc,
                 "date_opened": self.now,
             }],
             format="json",
@@ -430,6 +435,7 @@ class ExtensionTimelineTest(TestCase):
                 "case_id": str(uuid.uuid4()),
                 "client_id": self.cid,
                 "program_name": "PCA",
+                "provider_name": self.mc,
                 "date_opened": self.now,
             }],
             format="json",
@@ -1398,6 +1404,86 @@ class RemovalAndVerificationGuardsTest(TestCase):
 
         self.assertEqual(resp.status_code, 400)
         self.assertFalse(EnrollmentVerification.objects.filter(client=client).exists())
+
+
+class ExtensionCaseMetCouncilGateTest(TestCase):
+    """A case written through the browser extension (an authenticated agent, so
+    the request principal carries an ``agent_code``) must be MANAGED by Met
+    Council. A case attributed to another org -- or one with a blank managing
+    org -- is rejected. Import/daily-sync writes (no request in context) are
+    unaffected, so their own gate + blank-org meal-case tolerance still stands.
+    """
+
+    def _client(self):
+        return Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Case", last_name="Owner",
+        )
+
+    def _ext_ctx(self):
+        from types import SimpleNamespace
+
+        return {"request": SimpleNamespace(user=SimpleNamespace(agent_code="900"))}
+
+    def _payload(self, client, **over):
+        data = {
+            "case_id": str(uuid.uuid4()),
+            "client_id": str(client.pk),
+            "service_type": "Housing Navigation",
+            "program_name": "Housing Navigation",
+        }
+        data.update(over)
+        return data
+
+    def _save(self, client, ctx, **over):
+        from api.serializers import CaseSerializer
+
+        ser = CaseSerializer(data=self._payload(client, **over), context=ctx)
+        ser.is_valid(raise_exception=True)
+        return ser.save()
+
+    def test_ext_rejects_non_met_council_org(self):
+        from rest_framework.exceptions import ValidationError
+
+        client = self._client()
+        with self.assertRaises(ValidationError):
+            self._save(client, self._ext_ctx(), provider_name="God's Love We Deliver")
+
+    def test_ext_rejects_blank_org(self):
+        from rest_framework.exceptions import ValidationError
+
+        client = self._client()
+        with self.assertRaises(ValidationError):
+            self._save(client, self._ext_ctx())  # no provider id/name
+
+    def test_ext_accepts_met_council_by_name(self):
+        from api.models import Case
+        from api.services.lifecycle import MET_COUNCIL_PROVIDER_NAME
+
+        client = self._client()
+        case = self._save(
+            client, self._ext_ctx(), provider_name=MET_COUNCIL_PROVIDER_NAME
+        )
+        self.assertTrue(Case.objects.filter(pk=case.pk).exists())
+
+    def test_ext_accepts_met_council_by_id(self):
+        from api.models import Case
+        from api.services.lifecycle import MET_COUNCIL_PROVIDER_ID
+
+        client = self._client()
+        case = self._save(
+            client, self._ext_ctx(), provider_id=str(MET_COUNCIL_PROVIDER_ID)
+        )
+        self.assertTrue(Case.objects.filter(pk=case.pk).exists())
+
+    def test_import_context_not_gated(self):
+        # No request in context == import/daily-sync write: the serializer gate
+        # must NOT fire, so a blank-org case still saves (imports pre-filter and
+        # legitimately keep blank-org internal-service meal cases).
+        from api.models import Case
+
+        client = self._client()
+        case = self._save(client, {})  # no request context, blank org
+        self.assertTrue(Case.objects.filter(pk=case.pk).exists())
 
 
 class VerificationSubmittedTimelineTest(TestCase):
@@ -4478,12 +4564,16 @@ class IsNewFlagTest(TestCase):
     def _save_internal_case(self, client, *, context):
         from .models import CaseType
         from .serializers import CaseSerializer
+        from .services.lifecycle import MET_COUNCIL_PROVIDER_NAME
 
         data = {
             "case_id": str(uuid.uuid4()),
             "client_id": str(client.client_id),
             "case_type": CaseType.INTERNAL_SERVICE,
             "program_name": "Medically Tailored Meals",
+            # Managed by Met Council -- required for extension-context writes
+            # (the CaseSerializer gate rejects non-MC / blank-org ext cases).
+            "provider_name": MET_COUNCIL_PROVIDER_NAME,
         }
         ser = CaseSerializer(data=data, context=context)
         ser.is_valid(raise_exception=True)
@@ -4583,12 +4673,15 @@ class IsNewFlagTest(TestCase):
         request = SimpleNamespace(
             user=SimpleNamespace(agent_code="123", name="Ada Agent")
         )
+        from .services.lifecycle import MET_COUNCIL_PROVIDER_NAME
+
         ser = CaseSerializer(
             data={
                 "case_id": str(uuid.uuid4()),
                 "client_id": str(client.client_id),
                 "case_type": CaseType.INTERNAL_SERVICE,
                 "program_name": "Medically Tailored Meals",
+                "provider_name": MET_COUNCIL_PROVIDER_NAME,
                 "created_by_name": "Source Creator",
             },
             context={"request": request},
@@ -5015,6 +5108,61 @@ class CsvImportRulesTest(TestCase):
         self.assertTrue(Case.objects.filter(pk=keep_blank_internal.pk).exists())
         self.assertFalse(Case.objects.filter(pk=drop.pk).exists())
         self.assertFalse(Case.objects.filter(pk=drop_referred_out.pk).exists())
+
+    def test_delete_include_blank_internal_with_enrollment_guard(self):
+        # --include-blank-internal purges blank-org meal cases too, BUT the
+        # safety guard preserves any case backing a verification enrollment.
+        from django.core.management import call_command
+        from .models import (
+            Case, CaseStatus, CaseType, Client, EnrollmentVerification, Household,
+        )
+
+        client = Client.objects.create(
+            client_id=uuid.uuid4(), first_name="A", last_name="B"
+        )
+        keep_managed = Case.objects.create(
+            case_id=uuid.uuid4(), client=client, case_status=CaseStatus.OPEN,
+            provider_name="Met Council - SCN - PHS",
+        )
+        # Blank-org meal case with NO enrollment -> deleted under the flag.
+        blank_no_enroll = Case.objects.create(
+            case_id=uuid.uuid4(), client=client, case_status=CaseStatus.MANAGED,
+            case_type=CaseType.INTERNAL_SERVICE, provider_name="",
+        )
+        # Blank-org meal case that BACKS an enrollment -> preserved by the guard.
+        blank_with_enroll = Case.objects.create(
+            case_id=uuid.uuid4(), client=client, case_status=CaseStatus.MANAGED,
+            case_type=CaseType.INTERNAL_SERVICE, provider_name="",
+        )
+        hh = Household.objects.create(name="HH")
+        EnrollmentVerification.objects.create(
+            client=client, household=hh, case=blank_with_enroll,
+            verified_at=timezone.now(),
+        )
+
+        # Default (no flag): both blank-org meal cases are kept.
+        call_command("delete_non_metcouncil_cases", "--apply")
+        self.assertTrue(Case.objects.filter(pk=blank_no_enroll.pk).exists())
+        self.assertTrue(Case.objects.filter(pk=blank_with_enroll.pk).exists())
+
+        # With the flag: the un-enrolled blank meal case goes; the enrolled one
+        # is preserved by the safety guard; the managed case stays.
+        call_command(
+            "delete_non_metcouncil_cases", "--apply", "--include-blank-internal"
+        )
+        self.assertFalse(Case.objects.filter(pk=blank_no_enroll.pk).exists())
+        self.assertTrue(Case.objects.filter(pk=blank_with_enroll.pk).exists())
+        self.assertTrue(Case.objects.filter(pk=keep_managed.pk).exists())
+
+        # Override the guard: the enrolled blank meal case is now deleted too,
+        # and its enrollment's case link is nulled (SET_NULL), not cascaded.
+        call_command(
+            "delete_non_metcouncil_cases", "--apply", "--include-blank-internal",
+            "--force-enrollment-linked",
+        )
+        self.assertFalse(Case.objects.filter(pk=blank_with_enroll.pk).exists())
+        ev = EnrollmentVerification.objects.get(client=client)
+        self.assertIsNone(ev.case_id)
 
 
 class ReconcileInternalCasesAgainstExportTest(TestCase):

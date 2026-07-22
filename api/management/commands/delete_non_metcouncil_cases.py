@@ -46,8 +46,27 @@ class Command(BaseCommand):
             "--limit", type=int, default=20,
             help="How many sample rows to print in the preview (default 20).",
         )
+        parser.add_argument(
+            "--include-blank-internal", action="store_true",
+            help=(
+                "Also delete INTERNAL-SERVICE (meal/box) cases that carry NO "
+                "managing org (blank provider). By default these are kept as "
+                "Met Council's own; pass this to purge stale blank-org meal "
+                "cases too."
+            ),
+        )
+        parser.add_argument(
+            "--force-enrollment-linked", action="store_true",
+            help=(
+                "Override the safety guard and ALSO delete cases that back a "
+                "verification enrollment (EnrollmentVerification.case). By "
+                "default such cases are NEVER deleted, so an active delivery "
+                "never loses its governing case."
+            ),
+        )
 
-    def _doomed_queryset(self):
+    def _doomed_queryset(self, *, include_blank_internal=False,
+                         protect_enrollments=True):
         """Cases we DON'T keep (complement of the per-case-type keep rule --
         mirrors api.services.lifecycle.case_is_met_council in the ORM).
 
@@ -62,15 +81,49 @@ class Command(BaseCommand):
             Q(provider_id=MET_COUNCIL_PROVIDER_ID)
             | Q(provider_name__iexact=MET_COUNCIL_PROVIDER_NAME)
         )
-        internal = Q(case_type=CaseType.INTERNAL_SERVICE)
-        no_named_manager = Q(provider_id__isnull=True) & Q(provider_name="")
-        keep = managed | (internal & no_named_manager)
-        return Case.objects.exclude(keep)
+        if include_blank_internal:
+            # Blank-org meal cases are no longer treated as Met Council's: keep
+            # ONLY cases Met Council explicitly manages.
+            keep = managed
+        else:
+            internal = Q(case_type=CaseType.INTERNAL_SERVICE)
+            no_named_manager = Q(provider_id__isnull=True) & Q(provider_name="")
+            keep = managed | (internal & no_named_manager)
+        qs = Case.objects.exclude(keep)
+        if protect_enrollments:
+            # SAFETY: never delete a case that backs a verification enrollment
+            # (FK is on_delete=SET_NULL, so deleting would orphan the delivery).
+            qs = qs.exclude(enrollments__isnull=False)
+        return qs
 
     def handle(self, *args, **opts):
-        qs = self._doomed_queryset()
+        include_blank_internal = opts["include_blank_internal"]
+        protect_enrollments = not opts["force_enrollment_linked"]
+        qs = self._doomed_queryset(
+            include_blank_internal=include_blank_internal,
+            protect_enrollments=protect_enrollments,
+        )
         total_cases = Case.objects.count()
         n = qs.count()
+
+        if include_blank_internal:
+            self.stdout.write(
+                "Mode: --include-blank-internal (blank-org meal cases WILL be deleted)."
+            )
+        if protect_enrollments:
+            protected = (
+                self._doomed_queryset(
+                    include_blank_internal=include_blank_internal,
+                    protect_enrollments=False,
+                )
+                .filter(enrollments__isnull=False)
+                .distinct()
+                .count()
+            )
+            self.stdout.write(self.style.SUCCESS(
+                f"Safety guard: {protected} enrollment-backed case(s) will be "
+                f"PRESERVED (use --force-enrollment-linked to override)."
+            ))
 
         if n == 0:
             self.stdout.write(self.style.SUCCESS(
@@ -91,6 +144,14 @@ class Command(BaseCommand):
         extra = len(by_org) - opts["limit"]
         if extra > 0:
             self.stdout.write(f"    ... and {extra} more organization(s)")
+
+        # Breakdown by case_type too (blank-org cases span all types).
+        by_type = Counter()
+        for ct in qs.values_list("case_type", flat=True):
+            by_type[ct or "(blank)"] += 1
+        self.stdout.write("  By case_type:")
+        for ct, c in by_type.most_common():
+            self.stdout.write(f"    {c:6}  {ct}")
 
         affected_clients = qs.values_list("client_id", flat=True).distinct().count()
         self.stdout.write(f"  Spanning {affected_clients} client(s).")
