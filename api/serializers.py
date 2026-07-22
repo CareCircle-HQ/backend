@@ -1205,6 +1205,32 @@ class CaseSerializer(serializers.ModelSerializer):
         provider_id = validated_data.pop("provider_id", None)
         program_id = validated_data.pop("program_id", None)
 
+        # Extension guard: a case logged through the browser extension must be
+        # MANAGED by Met Council. Reject one attributed to another organization
+        # -- OR one with NO managing organization at all (blank provider) --
+        # since those are out of scope and must never enter the member base from
+        # an agent write. Only enforced for extension/CRM HTTP writes (the
+        # request principal carries an ``agent_code``); the CSV import + nightly
+        # Unite Us pull build their payloads with no request in context and apply
+        # their own gate first (and legitimately keep blank-org internal-service
+        # meal cases), so they're unaffected.
+        request = self.context.get("request")
+        request_user = getattr(request, "user", None) if request is not None else None
+        if getattr(request_user, "agent_code", None):
+            from api.services.lifecycle import is_met_council_case
+
+            if not is_met_council_case(
+                provider_id=provider_id,
+                provider_name=validated_data.get("provider_name"),
+                allow_originating=False,
+            ):
+                raise serializers.ValidationError(
+                    {"provider_name": (
+                        "This case isn't managed by Met Council (or has no "
+                        "managing organization), so it can't be added."
+                    )}
+                )
+
         # Use subject_id if provided, otherwise fall back to client_id
         lookup_id = subject_id or client_id
         client = Client.objects.filter(pk=lookup_id).first()
