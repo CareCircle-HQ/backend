@@ -659,14 +659,25 @@ def _format_address(address):
 
 
 def event_for_delivery_address_change(
-    client, address, *, previous="", enrollment=None,
+    client, address, *, previous="", changes=None, enrollment=None,
     source=ChangeSource.CRM, actor="",
 ):
     """Emit a 'Delivery Address Changed' event. Not de-duped (each change is its
-    own timeline point); ``previous`` is the pre-edit address string."""
+    own timeline point); ``previous`` is the pre-edit one-line address string.
+
+    ``changes`` is the standardized :func:`build_change_list` output (a precise
+    per-field diff, e.g. Street / Unit / ZIP / Delivery notes). When supplied it
+    is used as-is -- so a notes-only edit still logs -- and the event is a no-op
+    when it's empty. When omitted, a one-line address diff is derived (falls back
+    to the legacy behaviour for callers that only pass ``previous``).
+    """
     if client is None or address is None:
         return None
     new_addr = _format_address(address)
+    if changes is None:
+        changes = build_change_list([("Delivery address", previous, new_addr)])
+    if not changes:
+        return None  # nothing actually changed -- don't write a no-op row
     return emit_timeline_event(
         client=client,
         event_type=TimelineEventType.DELIVERY_ADDRESS_CHANGED,
@@ -680,7 +691,7 @@ def event_for_delivery_address_change(
         metadata={
             "previous": previous,
             "new": new_addr,
-            "changes": build_change_list([("Delivery address", previous, new_addr)]),
+            "changes": changes,
         },
     )
 

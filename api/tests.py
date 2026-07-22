@@ -517,6 +517,111 @@ class KitchenAndDietaryTimelineBuilderTest(TestCase):
         self.assertIsNone(ev)
         self.assertFalse(self._events("dietary_changed").exists())
 
+    def test_delivery_address_change_logs_notes_only_edit(self):
+        # Regression: a notes-only edit (the one-line formatted address is
+        # unchanged) must still log, via the explicit per-field diff.
+        from .models import Address
+        from .services import timeline
+
+        addr = Address.objects.create(
+            client=self.client_obj, type="temporary",
+            street="1 Main St", city="Minneapolis", state="MN", zip="55401",
+        )
+        changes = timeline.build_change_list([
+            ("Street", "1 Main St", "1 Main St"),  # unchanged -> dropped
+            ("Delivery notes", "", "Leave at front desk"),
+        ])
+        ev = timeline.event_for_delivery_address_change(
+            self.client_obj, addr, previous="1 Main St, Minneapolis, MN 55401",
+            changes=changes, enrollment=self.enr, actor="agent:1",
+        )
+        self.assertIsNotNone(ev)
+        self.assertEqual([c["field"] for c in ev.metadata["changes"]], ["Delivery notes"])
+
+    def test_delivery_address_change_noop_when_unchanged(self):
+        from .models import Address
+        from .services import timeline
+
+        addr = Address.objects.create(
+            client=self.client_obj, type="temporary", street="1 Main St",
+        )
+        ev = timeline.event_for_delivery_address_change(
+            self.client_obj, addr, previous="1 Main St", changes=[],
+            enrollment=self.enr,
+        )
+        self.assertIsNone(ev)
+        self.assertFalse(self._events("delivery_address_changed").exists())
+
+
+class MemberHouseholdAddressTimelineTest(TestCase):
+    """PATCH /members/<id>/household/ must log a Delivery Address Changed event
+    on the timeline of the member whose profile the agent is viewing -- including
+    when that member is a NON-primary household member (who has no enrollment of
+    their own and falls back to the household/primary enrollment)."""
+
+    def _api(self, group="CS"):
+        agent = Agent.objects.create(name="Casey CS", agent_code="900", group=group)
+        access = AccessToken()
+        access["agent_id"] = str(agent.id)
+        access["agent_code"] = agent.agent_code
+        access["agent_name"] = agent.name
+        access["agent_group"] = agent.group
+        api = APIClient()
+        api.credentials(HTTP_AUTHORIZATION=f"Bearer {access}")
+        return api
+
+    def _setup_household(self):
+        from .models import (
+            Address, EnrollmentStage, EnrollmentVerification, Household,
+            HouseholdMember, MemberDietaryProfile,
+        )
+        primary = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Pat", last_name="Primary",
+        )
+        dep = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Dee", last_name="Dependent",
+        )
+        hh = Household.objects.create(name="HH")
+        HouseholdMember.objects.create(household=hh, client=primary, is_primary=True)
+        HouseholdMember.objects.create(household=hh, client=dep, is_primary=False)
+        addr = Address.objects.create(
+            client=primary, type="temporary", street="1 Main St",
+            city="Minneapolis", state="MN", zip="55401",
+        )
+        enr = EnrollmentVerification.objects.create(
+            client=primary, household=hh, stage=EnrollmentStage.SERVICE_ACTIVE,
+            delivery_address=addr,
+        )
+        MemberDietaryProfile.objects.create(enrollment=enr, client=primary)
+        MemberDietaryProfile.objects.create(enrollment=enr, client=dep)
+        return primary, dep, enr
+
+    def _events(self, client):
+        return TimelineEvent.objects.filter(
+            client=client, event_type="delivery_address_changed"
+        )
+
+    def test_address_edit_from_primary_logs_event(self):
+        primary, dep, enr = self._setup_household()
+        resp = self._api().patch(
+            f"/api/portal/members/{primary.pk}/household/",
+            {"unit": "Apt 5"}, format="json",
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        self.assertTrue(self._events(primary).exists())
+
+    def test_address_edit_from_dependent_logs_on_household_owner(self):
+        # Editing the (household-wide) address while viewing a non-primary member
+        # still records the event -- on the household's enrollment owner (primary),
+        # since that's who the shared delivery address belongs to.
+        primary, dep, enr = self._setup_household()
+        resp = self._api().patch(
+            f"/api/portal/members/{dep.pk}/household/",
+            {"unit": "Apt 9"}, format="json",
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        self.assertTrue(self._events(primary).exists())
+
 
 class WilliamsburgAgentLeadSourceTest(TestCase):
     """Settings > Williamsburg Setup: a client saved by an agent flagged
@@ -1293,6 +1398,73 @@ class RemovalAndVerificationGuardsTest(TestCase):
 
         self.assertEqual(resp.status_code, 400)
         self.assertFalse(EnrollmentVerification.objects.filter(client=client).exists())
+
+
+class VerificationSubmittedTimelineTest(TestCase):
+    """Completing the verification wizard writes a 'Verification Submitted'
+    timeline event whose metadata captures WHAT was verified (roster + menus,
+    delivery address/days, confirmed checkboxes), so the History detail shows the
+    verification data -- not just the bare stage change."""
+
+    def _client(self, first, last):
+        return Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name=first, last_name=last,
+        )
+
+    def _internal_case(self, client):
+        from .models import Case, CaseStatus, CaseType
+
+        return Case.objects.create(
+            case_id=str(uuid.uuid4()), client=client,
+            case_type=CaseType.INTERNAL_SERVICE, case_status=CaseStatus.OPEN,
+        )
+
+    def _api(self):
+        agent = Agent.objects.create(name="Casey CS", agent_code="900", group="CS")
+        access = AccessToken()
+        access["agent_id"] = str(agent.id)
+        access["agent_code"] = agent.agent_code
+        access["agent_name"] = agent.name
+        access["agent_group"] = agent.group
+        api = APIClient()
+        api.credentials(HTTP_AUTHORIZATION=f"Bearer {access}")
+        return api
+
+    def test_verification_logs_submitted_event_with_metadata(self):
+        from .models import TimelineEvent, TimelineEventType
+
+        client = self._client("Vera", "Verified")
+        self._internal_case(client)
+
+        payload = {
+            "program_name": "MTM Meals",
+            "members": [{
+                "client_id": str(client.pk), "member_name": "Vera Verified",
+                "food_allergies": ["peanuts"], "menu_type": "Standard",
+            }],
+            "street": "1 Main St", "apt": "2B", "city": "Brooklyn",
+            "state": "NY", "zip": "11201",
+            "delivery_weekdays": ["mon", "thu"],
+            "is_family_verified": True,
+            "medicaid_type_verified": True,
+            "delivery_address_verified": True,
+        }
+        resp = self._api().post(
+            f"/api/portal/members/{client.pk}/verification/", payload, format="json",
+        )
+        self.assertEqual(resp.status_code, 201, resp.content)
+
+        ev = TimelineEvent.objects.filter(
+            client=client, event_type=TimelineEventType.VERIFICATION_COMPLETED,
+        ).first()
+        self.assertIsNotNone(ev)
+        self.assertTrue(ev.metadata)
+        self.assertEqual(
+            ev.metadata.get("delivery_address"), "1 Main St, 2B, Brooklyn, NY 11201"
+        )
+        self.assertEqual(ev.metadata.get("delivery_weekdays"), ["mon", "thu"])
+        self.assertIn("Vera Verified (Standard)", ev.metadata.get("members", []))
+        self.assertEqual(ev.metadata.get("verified", {}).get("family"), True)
 
 
 class DeliveryCoverageEligibilityTest(TestCase):

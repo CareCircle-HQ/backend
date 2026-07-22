@@ -2541,21 +2541,32 @@ class MemberHouseholdView(PortalAPIView):
         addr = enr.delivery_address
         previous = timeline._format_address(addr) if addr is not None else ""
         prev_zip = addr.zip if addr is not None else ""
+        # Snapshot every editable address field (incl. notes) BEFORE applying, so
+        # the timeline logs a precise per-field diff -- and fires even when the
+        # one-line address is unchanged but the delivery notes were edited (the
+        # old check compared only _format_address, which omits notes).
+        ADDR_FIELDS = (
+            ("street", "Street"), ("unit", "Unit"), ("city", "City"),
+            ("state", "State"), ("zip", "ZIP"), ("notes", "Delivery notes"),
+        )
+        before = {f: (getattr(addr, f, "") if addr is not None else "") for f, _ in ADDR_FIELDS}
         if addr is None:
             addr = Address.objects.create(client_id=client_id, type="temporary")
             enr.delivery_address = addr
             enr.save(update_fields=["delivery_address"])
-        for field in ("street", "unit", "city", "state", "zip", "notes"):
+        for field, _ in ADDR_FIELDS:
             if field in data:
                 setattr(addr, field, data[field])
         addr.save()
         agent = current_agent(request)
-        new_addr = timeline._format_address(addr)
-        if new_addr != previous:
+        changes = timeline.build_change_list(
+            [(label, before[f], getattr(addr, f, "")) for f, label in ADDR_FIELDS]
+        )
+        if changes:
             try:
                 timeline.event_for_delivery_address_change(
-                    enr.client, addr, previous=previous, enrollment=enr,
-                    actor=(f"agent:{agent.code}" if agent and agent.code else ""),
+                    enr.client, addr, previous=previous, changes=changes,
+                    enrollment=enr, actor=_agent_actor(agent),
                 )
             except Exception:  # never let history-logging break the edit
                 pass
@@ -3806,6 +3817,36 @@ class MemberVerificationCreateView(PortalAPIView):
             actor_label=actor_label,
             note="Verification completed via support portal.",
         )
+
+        # Summary event capturing WHAT was verified -- the household roster + each
+        # member's resolved menu, the delivery address/days, and which checkboxes
+        # the agent confirmed -- so the History detail shows the verification data,
+        # not just the bare stage change. De-duped per enrollment.
+        try:
+            addr_str = ", ".join(
+                p for p in [
+                    address.street, address.unit, address.city,
+                    " ".join(x for x in [address.state, address.zip] if x),
+                ] if p
+            )
+            submitted_members = [
+                {"member_name": mp.member_name, "menu_type": mp.menu_type}
+                for mp in enrollment.member_profiles.all()
+            ]
+            timeline.event_for_verification_submitted(
+                enrollment,
+                members=submitted_members,
+                delivery_address=addr_str,
+                delivery_weekdays=data.get("delivery_weekdays", []),
+                verified_flags={
+                    "family": data.get("is_family_verified"),
+                    "medicaid_type": data.get("medicaid_type_verified"),
+                    "delivery_address": data.get("delivery_address_verified"),
+                },
+                actor=actor_label,
+            )
+        except Exception:  # never let history-logging break the verification
+            pass
 
         # Tie the enrollment to the agent-selected Internal Service case from the
         # pop-up (when provided + free) BEFORE the authorization projection, so
