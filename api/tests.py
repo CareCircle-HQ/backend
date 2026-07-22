@@ -497,6 +497,52 @@ class WilliamsburgAgentLeadSourceTest(TestCase):
         self.assertFalse(client.is_williamsburg)
 
 
+class AssignKitchenFromVerifiedTest(TestCase):
+    """assign_kitchen_to_household activates a household straight from VERIFIED
+    (the Williamsburg fast-track in the verification pop-up, which skips the
+    manual Logistics kitchen-assignment step).
+
+    Regression: the helper advanced VERIFIED -> SERVICE_ACTIVE directly, but the
+    transition map has no such edge, so it raised InvalidTransition (500 on the
+    verification save). It must route through KITCHEN_ASSIGNMENT first.
+    """
+
+    def test_activates_from_verified_via_kitchen_assignment(self):
+        from unittest.mock import patch
+
+        from .models import (
+            Client, DeliveryCadence, EnrollmentStage, EnrollmentVerification,
+            Kitchen, KitchenStatus,
+        )
+        from .portal import views_members as vm
+
+        client = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Will", last_name="Burg",
+        )
+        kitchen = Kitchen.objects.create(
+            name="Williamsburg", status=KitchenStatus.ACTIVE,
+        )
+        # No member profiles -> the per-member meal-rule loop is skipped, so the
+        # test isolates the stage-transition behavior (the actual bug).
+        enr = EnrollmentVerification.objects.create(
+            client=client, stage=EnrollmentStage.VERIFIED,
+        )
+
+        # Stub the delivery-plan side effects: this test only asserts the stage
+        # routing, not schedule/calendar building.
+        with patch.object(vm, "create_member_delivery_schedules", return_value=[1]), \
+                patch.object(vm, "generate_delivery_calendar"), \
+                patch.object(vm, "resync_scheduled_orders"), \
+                patch.object(vm, "sync_household_warnings"):
+            vm.assign_kitchen_to_household(
+                enr, client, kitchen, cadence=DeliveryCadence.MON_THU,
+            )
+
+        enr.refresh_from_db()
+        self.assertEqual(enr.stage, EnrollmentStage.SERVICE_ACTIVE)
+        self.assertEqual(enr.kitchen_id, kitchen.pk)
+
+
 class HouseholdEnrollmentActivationTest(TestCase):
     """When a household enrollment advances, every participant — not just the
     primary — should follow the enrollment's lifecycle stage. The household is
