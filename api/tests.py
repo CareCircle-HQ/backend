@@ -3948,6 +3948,43 @@ class MemberWarningsTest(TestCase):
         self._internal_case(c)
         self.assertIn(MULTIPLE_OPEN_CASES, self._codes(enr))
 
+    def test_multiple_open_cases_ignores_non_met_council(self):
+        # A second OPEN internal-service case managed by a DIFFERENT org is not
+        # part of the member base (excluded from the Cases tab / verification),
+        # so it must not make "multiple open cases" fire on a member who really
+        # has just one Met Council case.
+        from .models import Case, CaseStatus, CaseType
+        from .services.warnings import MULTIPLE_OPEN_CASES
+
+        c = self._client()
+        enr = self._enrollment(c)
+        self._internal_case(c)  # Met Council (blank managing org)
+        Case.objects.create(
+            case_id=uuid.uuid4(), client=c,
+            case_type=CaseType.INTERNAL_SERVICE,
+            case_status=CaseStatus.OPEN,
+            program_name="Medically Tailored Meals",
+            provider_name="God's Love We Deliver",
+        )
+        self.assertNotIn(MULTIPLE_OPEN_CASES, self._codes(enr))
+
+    def test_multiple_open_cases_suppressed_once_verified(self):
+        # Two genuine Met Council open cases flag before verification, but once
+        # the household is verified (has an active enrollment tied to its case)
+        # the extra open case is no longer an actionable problem.
+        from django.utils import timezone
+        from .services.warnings import MULTIPLE_OPEN_CASES
+
+        c = self._client()
+        enr = self._enrollment(c)
+        self._internal_case(c)
+        self._internal_case(c)
+        self.assertIn(MULTIPLE_OPEN_CASES, self._codes(enr))
+
+        enr.verified_at = timezone.now()
+        enr.save(update_fields=["verified_at"])
+        self.assertNotIn(MULTIPLE_OPEN_CASES, self._codes(enr))
+
     def test_conflicting_product_types(self):
         from .services.warnings import CONFLICTING_PRODUCT_TYPES
 
@@ -5223,10 +5260,11 @@ class CsvImportRulesTest(TestCase):
             ),
             CaseHouseholdType.HOUSEHOLD,
         )
-        # Client household data still counts even without the token.
+        # Client household data no longer counts: only the program-name word
+        # "Household" makes a case a household case.
         fam = Client(client_id=uuid.uuid4(), first_name="A", last_name="B", is_a_family=True)
         self.assertEqual(
-            derive_household_type(fam, "MTM - Brooklyn"), CaseHouseholdType.HOUSEHOLD
+            derive_household_type(fam, "MTM - Brooklyn"), CaseHouseholdType.INDIVIDUAL
         )
 
     def _case_row(self, client_id, originating_provider_id, **over):
@@ -5859,3 +5897,188 @@ class ReconcileOrphanEnrollmentsTest(TestCase):
 
         enr.refresh_from_db()
         self.assertEqual(enr.stage, EnrollmentStage.KITCHEN_ASSIGNMENT)
+
+
+class ReportExportsTest(TestCase):
+    """Admin > Reports CSV exports: the reworked All-members export (one row per
+    member, coverage + service columns) and the new Cases export (one row per
+    case, creator/provider/program/authorization columns, date-range filtered)."""
+
+    def setUp(self):
+        self.agent = Agent.objects.create(
+            name="Rep Manager", agent_code="950", group="Management"
+        )
+        access = AccessToken()
+        access["agent_id"] = str(self.agent.id)
+        access["agent_code"] = self.agent.agent_code
+        access["agent_name"] = self.agent.name
+        access["agent_group"] = self.agent.group
+        self.api = APIClient()
+        self.api.credentials(HTTP_AUTHORIZATION=f"Bearer {access}")
+
+    def _client(self, first="Ada", last="Member"):
+        return Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name=first, last_name=last
+        )
+
+    def _rows(self, url):
+        import csv
+        import io
+
+        resp = self.api.get(url)
+        self.assertEqual(resp.status_code, 200, resp.content)
+        text = resp.content.decode()
+        return list(csv.DictReader(io.StringIO(text)))
+
+    def test_all_members_export_columns_and_values(self):
+        from datetime import datetime, timezone as dt_tz
+
+        from .models import Insurance, SocialCareCoverage, SocialCareCoverageStatus
+
+        client = self._client("Grace", "Hopper")
+        Insurance.objects.create(
+            client=client, plan_type="medicaid", plan_name="Fidelis Medicaid",
+            status="active", is_primary=True,
+            enrolled_at=datetime(2025, 1, 1, tzinfo=dt_tz.utc),
+            expired_at=datetime(2030, 12, 31, tzinfo=dt_tz.utc),
+        )
+        SocialCareCoverage.objects.create(
+            client=client, status=SocialCareCoverageStatus.ENROLLED,
+            expired_at=datetime(2030, 6, 30, tzinfo=dt_tz.utc),
+        )
+
+        rows = self._rows(reverse("portal-report-all-members"))
+        row = next(r for r in rows if r["Client ID"] == str(client.client_id))
+
+        self.assertEqual(row["Client Name"], "Grace Hopper")
+        self.assertEqual(row["Medicaid Plan"], "Fidelis Medicaid")
+        self.assertEqual(row["Medicaid Type"], "OK")
+        self.assertEqual(row["Insurance Effective Date"], "2025-01-01")
+        self.assertEqual(row["Insurance Expiration Date"], "2030-12-31")
+        self.assertEqual(row["Social Care Coverage Status"], "Enrolled")
+        self.assertEqual(row["SCC Expiration Date"], "2030-06-30")
+        self.assertEqual(row["Enrollment Platform"], "UniteUs")
+        self.assertEqual(row["Out of Orbit?"], "No")
+        self.assertEqual(row["Out of Range"], "No")
+        self.assertEqual(row["Client Eligibility"], "Eligible")
+        self.assertEqual(row["Currently Servicing"], "")
+
+    def test_all_members_flags_wrong_medicaid_type_ineligible(self):
+        from datetime import datetime, timezone as dt_tz
+
+        from .models import Insurance
+
+        client = self._client("Mel", "Ltc")
+        Insurance.objects.create(
+            client=client, plan_type="medicaid", plan_name="Elderplan MLTC",
+            status="active", is_primary=True,
+            expired_at=datetime(2030, 12, 31, tzinfo=dt_tz.utc),
+        )
+
+        rows = self._rows(reverse("portal-report-all-members"))
+        row = next(r for r in rows if r["Client ID"] == str(client.client_id))
+        self.assertEqual(row["Medicaid Type"], "MLTC")
+        self.assertEqual(row["Client Eligibility"], "Ineligible")
+
+    def test_cases_export_columns_and_values(self):
+        from datetime import datetime, timezone as dt_tz
+
+        from .models import (
+            Case, CaseHouseholdType, CaseStatus, CaseType,
+            ServiceAuthorizationStatus, UniteUsAgent,
+        )
+
+        client = self._client("Case", "Owner")
+        creator_id = uuid.uuid4()
+        UniteUsAgent.objects.create(
+            user_id=creator_id, name="Cara Creator",
+            originating_team="CareCircle Call Center",
+        )
+        Agent.objects.create(name="Coord Person", agent_code="777", group="CS")
+
+        case = Case.objects.create(
+            case_id=uuid.uuid4(), client=client,
+            created_by_id=creator_id, created_by_name="Cara Creator",
+            agent_code="777",
+            case_status=CaseStatus.OPEN,
+            case_type=CaseType.NAVIGATION,
+            household_type=CaseHouseholdType.INDIVIDUAL,
+            originating_provider_name="Origin Health",
+            provider_name="Met Council",
+            program_name="MTM - (Household) Medically Tailored Meals - Queens",
+            primary_worker_name="Wanda Worker",
+            service_authorization_status=ServiceAuthorizationStatus.APPROVED,
+            service_authorization_status_label="Accepted",
+            service_authorization_approval_ends_at=datetime(2027, 3, 1, tzinfo=dt_tz.utc),
+            date_opened=datetime(2026, 5, 10, tzinfo=dt_tz.utc),
+        )
+
+        rows = self._rows(reverse("portal-report-cases"))
+        row = next(r for r in rows if r["Case ID"] == str(case.case_id))
+
+        self.assertEqual(row["Client ID"], str(client.client_id))
+        self.assertEqual(row["Member Name"], "Case Owner")
+        self.assertEqual(row["Team of Case Creator"], "CareCircle Call Center")
+        self.assertEqual(row["Case Created By Name"], "Cara Creator")
+        self.assertEqual(row["Case Created Date"], "2026-05-10")
+        self.assertEqual(row["Case Status"], "Open")
+        self.assertEqual(row["Originating Provider Name"], "Origin Health")
+        self.assertEqual(row["Provider Name"], "Met Council")
+        self.assertEqual(
+            row["Program Name"], "MTM - (Household) Medically Tailored Meals - Queens"
+        )
+        # Household is derived from the program name ("Household"), NOT the
+        # stored household_type (which is INDIVIDUAL here).
+        self.assertEqual(row["Is Program Household?"], "Yes")
+        self.assertEqual(row["Case Type"], "Care Management")
+        self.assertEqual(row["Meals/Boxes"], "Meals")
+        self.assertEqual(row["Primary Worker Name"], "Wanda Worker")
+        self.assertEqual(row["Care Coordinator"], "Coord Person")
+        self.assertEqual(row["Service Authorization Status"], "Accepted")
+        self.assertEqual(row["Service Authorization End Date"], "2027-03-01")
+
+    def test_cases_export_creator_not_on_roster_is_met_council(self):
+        from .models import Case, CaseStatus
+
+        client = self._client("No", "Roster")
+        case = Case.objects.create(
+            case_id=uuid.uuid4(), client=client,
+            created_by_id=uuid.uuid4(), case_status=CaseStatus.CLOSED,
+        )
+        rows = self._rows(reverse("portal-report-cases"))
+        row = next(r for r in rows if r["Case ID"] == str(case.case_id))
+        self.assertEqual(row["Team of Case Creator"], "Met Council Team")
+        self.assertEqual(row["Case Status"], "Closed")
+
+    def test_cases_export_date_range_filters(self):
+        from datetime import datetime, timezone as dt_tz
+
+        from .models import Case, CaseStatus
+
+        client = self._client("Range", "Test")
+        in_range = Case.objects.create(
+            case_id=uuid.uuid4(), client=client, case_status=CaseStatus.OPEN,
+            date_opened=datetime(2026, 6, 15, tzinfo=dt_tz.utc),
+        )
+        out_range = Case.objects.create(
+            case_id=uuid.uuid4(), client=client, case_status=CaseStatus.OPEN,
+            date_opened=datetime(2026, 1, 1, tzinfo=dt_tz.utc),
+        )
+        url = reverse("portal-report-cases") + "?created_from=2026-06-01&created_to=2026-06-30"
+        ids = {r["Case ID"] for r in self._rows(url)}
+        self.assertIn(str(in_range.case_id), ids)
+        self.assertNotIn(str(out_range.case_id), ids)
+
+    def test_reports_require_management(self):
+        agent = Agent.objects.create(
+            name="Screener Sam", agent_code="951", group="Screeners"
+        )
+        access = AccessToken()
+        access["agent_id"] = str(agent.id)
+        access["agent_code"] = agent.agent_code
+        access["agent_name"] = agent.name
+        access["agent_group"] = agent.group
+        api = APIClient()
+        api.credentials(HTTP_AUTHORIZATION=f"Bearer {access}")
+        self.assertEqual(api.get(reverse("portal-report-all-members")).status_code, 403)
+        self.assertEqual(api.get(reverse("portal-report-cases")).status_code, 403)

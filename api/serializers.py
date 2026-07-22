@@ -1094,17 +1094,19 @@ def derive_case_type(service_type, program_name=None):
 
 
 def derive_household_type(client, program_name=None):
-    """Individual vs Household for a case.
+    """Individual vs Household for a case, from the PROGRAM NAME only.
 
-    A household case when EITHER the program is a Met Council "(Household)"
-    eligibility pathway (the token appears in the program name, e.g. "MTM -
-    (Household) High-Risk Children Under 18 - Brooklyn") OR the client's own
-    household data says so (flagged a family, or more than one member)."""
-    is_household = (
-        "(household)" in (program_name or "").casefold()
-        or bool(getattr(client, "is_a_family", False))
-        or (getattr(client, "household_size", None) or 0) > 1
-    )
+    A household case when the word "Household" appears anywhere in the program
+    name (a Met Council "(Household)" eligibility pathway, e.g. "MTM -
+    (Household) High-Risk Children Under 18 - Brooklyn"); otherwise a single
+    member case.
+
+    The client's own household data (``is_a_family`` / ``household_size``) is
+    deliberately NOT considered: it was a frequent source of misclassification
+    (a single-member case flipped to Household purely because the client's
+    profile reported >1 member). ``client`` is kept in the signature for
+    backward-compatibility with existing callers but is unused."""
+    is_household = "household" in (program_name or "").casefold()
     return (
         CaseHouseholdType.HOUSEHOLD if is_household else CaseHouseholdType.INDIVIDUAL
     )

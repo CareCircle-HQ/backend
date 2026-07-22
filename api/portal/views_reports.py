@@ -8,6 +8,7 @@ CallTools queue) within an optional Client.created_at date range.
 import csv
 import functools
 import operator
+import re
 
 from django.db.models import Q
 from django.http import HttpResponse
@@ -15,16 +16,30 @@ from django.utils import timezone
 from rest_framework.response import Response
 
 from ..models import (
-    AddressType,
+    Agent,
     Case,
     CaseStatus,
     CaseType,
     Client,
+    DeliveryCadence,
+    DietaryRestriction,
     EnrollmentStage,
     EnrollmentVerification,
+    FoodAllergy,
+    ProductTypeKind,
+    ServiceAuthorizationStatus,
+    SocialCareCoverageStatus,
+    UniteUsAgent,
 )
+from ..services.catalog import product_type_kind_for_name
 from .base import PortalAPIView, current_agent
-from .serializers import internal_service_case, medicaid_member_id
+from .serializers import (
+    active_enrollment,
+    active_member_profile,
+    medicaid_member_id,
+    member_out_of_orbit,
+    member_out_of_range,
+)
 from .views_members import _parse_date
 
 
@@ -273,58 +288,166 @@ def _primary_phone(client):
     return ""
 
 
-def _active_medicaid_id(client):
-    """Member id from an ACTIVE Medicaid plan (primary preferred). Falls back to
-    :func:`medicaid_member_id` (any Medicaid / primary insurance) when no active
-    Medicaid plan carries an id."""
-    plans = list(client.insurances.all())
-    active = [
-        p for p in plans
-        if p.plan_type == "medicaid" and p.status == "active" and p.external_member_id
-    ]
-    if active:
-        primary = next((p for p in active if p.is_primary), active[0])
-        return primary.external_member_id
-    return medicaid_member_id(client)
+def _yn(value):
+    return "Yes" if value else "No"
 
 
-def _pick_address(client):
-    """The member's best own address: Current, then Home, then any. None when
-    the member has no address on file."""
-    addresses = list(client.addresses.all())
-    if not addresses:
+def _date_str(value):
+    """ISO date string for a date/datetime, or "" when None."""
+    if value is None:
+        return ""
+    d = value.date() if hasattr(value, "date") else value
+    return d.isoformat()
+
+
+# Medicaid plan-name -> served-type classification, evaluated top-down (the more
+# specific abbreviations/phrases win). Mirrors the ineligible-type detector in
+# api.services.warnings so the export and the eligibility gate never drift.
+_MEDICAID_TYPE_SPECS = (
+    ("PMLTC", ("PMLTC", "Partial Managed Long Term Care")),
+    ("MLTCP", ("MLTCP", "Managed Long Term Care Partial")),
+    ("MLTC", ("MLTC", "Managed Long Term Care")),
+    ("MAP", ("MAP", "Medicaid Advantage Plan")),
+    ("FFS", ("FFS", "Fee For Service")),
+)
+
+
+def _medicaid_type_matchers():
+    out = []
+    for label, tokens in _MEDICAID_TYPE_SPECS:
+        parts = [r"\s+".join(re.escape(w) for w in t.split()) for t in tokens]
+        out.append((label, re.compile(r"\b(?:" + "|".join(parts) + r")\b", re.IGNORECASE)))
+    return out
+
+
+_MEDICAID_TYPE_MATCHERS = _medicaid_type_matchers()
+
+
+def _medicaid_insurance(client):
+    """The member's representative Medicaid plan: an ACTIVE one (primary
+    preferred), else the primary/first Medicaid plan on file, else None."""
+    meds = [i for i in client.insurances.all() if (i.plan_type or "").lower() == "medicaid"]
+    if not meds:
         return None
-    for wanted in (AddressType.CURRENT, AddressType.HOME):
-        for a in addresses:
-            if a.type == wanted:
-                return a
-    return addresses[0]
+    active = [i for i in meds if (i.status or "").lower() == "active"]
+    pool = active or meds
+    return next((i for i in pool if i.is_primary), pool[0])
 
 
-def _household_primary(household):
-    """The primary member client of a household (or None)."""
-    if household is None:
+def _medicaid_type_label(plan_name):
+    """Classify a Medicaid plan name as PMLTC/MLTCP/MLTC/MAP/FFS, else 'OK'.
+    Blank plan name -> ''."""
+    name = (plan_name or "").strip()
+    if not name:
+        return ""
+    for label, matcher in _MEDICAID_TYPE_MATCHERS:
+        if matcher.search(name):
+            return label
+    return "OK"
+
+
+def _social_care_coverage(client):
+    """The member's representative social-care coverage: an ENROLLED one, else
+    the latest on file (rows are ordered -enrolled_at), else None."""
+    covs = list(client.social_care_coverages.all())
+    if not covs:
         return None
-    for hm in household.members.all():
-        if hm.is_primary and hm.client_id:
-            return hm.client
-    return None
+    enrolled = [c for c in covs if c.status == SocialCareCoverageStatus.ENROLLED]
+    return (enrolled or covs)[0]
+
+
+_SCC_STATUS_LABELS = dict(SocialCareCoverageStatus.choices)
+_DIETARY_LABELS = dict(DietaryRestriction.choices)
+_ALLERGY_LABELS = dict(FoodAllergy.choices)
+_CADENCE_LABELS = dict(DeliveryCadence.choices)
+_ENROLLMENT_STAGE_LABELS = dict(EnrollmentStage.choices)
+_PRODUCT_KIND_LABELS = dict(ProductTypeKind.choices)
+
+
+def _meals_or_boxes(program_name):
+    """Classify a case as a Meals or Boxes case from its program name keywords
+    (Meals wins; the box family also covers voucher / produce-prescription /
+    pantry names). '' when the name carries no product keyword."""
+    kind = product_type_kind_for_name(program_name)
+    return _PRODUCT_KIND_LABELS.get(kind, "") if kind else ""
+
+
+def _dietary_restrictions(profile):
+    """'; '-joined dietary restrictions + food allergies + free-text notes for a
+    member's dietary profile (excludes the 'none' sentinel). '' when none."""
+    if profile is None:
+        return ""
+    parts = []
+    for code in (profile.dietary_restrictions or []):
+        if code and code != "none":
+            parts.append(_DIETARY_LABELS.get(code, code))
+    for code in (profile.food_allergies or []):
+        if code and code != "none":
+            parts.append(_ALLERGY_LABELS.get(code, code))
+    other = (profile.other_dietary_restrictions or "").strip()
+    if other:
+        parts.append(other)
+    seen, uniq = set(), []
+    for p in parts:
+        if p not in seen:
+            seen.add(p)
+            uniq.append(p)
+    return "; ".join(uniq)
+
+
+def _cadence_label(profile, enrollment):
+    """The member's delivery cadence label (household-level). Prefers the
+    member's own delivery schedule, else the household's first. '' when none."""
+    if enrollment is None:
+        return ""
+    schedules = list(enrollment.delivery_schedules.all())
+    if not schedules:
+        return ""
+    own = None
+    if profile is not None:
+        own = next((s for s in schedules if s.member_profile_id == profile.pk), None)
+    sched = own or schedules[0]
+    code = (sched.delivery_days_cadence or "").strip()
+    return _CADENCE_LABELS.get(code, code)
+
+
+def _currently_servicing(enrollment):
+    """The member's live enrollment stage label (Active, Kitchen Assignment,
+    Pending Verification, ...); '' when there is no active enrollment."""
+    if enrollment is None:
+        return ""
+    return _ENROLLMENT_STAGE_LABELS.get(enrollment.stage, enrollment.stage or "")
+
+
+def _out_of_orbit_reason(enrollment, profile):
+    """Recompute the member's out-of-orbit reason from the meal rule + assigned
+    kitchen, WITHOUT writing to the DB. '' when the member is serviceable."""
+    if profile is None:
+        return ""
+    from ..services.meal_rules import reconcile_member_kitchen_output
+
+    try:
+        kitchen = enrollment.kitchen if enrollment is not None else None
+        _out, _became, reason = reconcile_member_kitchen_output(
+            profile, kitchen, save=False
+        )
+        return reason or ""
+    except Exception:  # pragma: no cover - defensive; a report must never 500
+        return ""
 
 
 class AllMembersReportView(PortalAPIView):
     """Management-only CSV export of every member (Client), one row per member.
 
-    Household-scoped columns (primary member id, total members) repeat the
-    household's value across each of its members; a member with no household is
-    treated as their own single-member household. Address falls back to the
-    household primary's address when the member has none of their own (household
-    members share a delivery address).
+    Columns: Client ID, Client Name, Medicaid Plan, Medicaid Type, Insurance
+    Effective Date, Insurance Expiration Date, Social Care Coverage Status, SCC
+    Expiration Date, Enrollment Platform, Out of Orbit?, Out of Orbit Reason, Out
+    of Range, Client Eligibility, Cadence, Facility, Menu Type, Dietary
+    Restrictions, Currently Servicing.
 
-    Columns: Household Primary Member ID, Member ID, Medicaid ID (active), Name,
-    Phone Number, Street Address, Apt, City, State, Zip, DOB, Internal Service
-    Program Name, Is there Screening, Is there Eligibility, Is there Navigation,
-    Is there Internal Service Case, Total members in household, Lead Source in
-    CRM, Authorized amount for the open internal service case.
+    Query params (both optional; omit both to export every member):
+        created_from -- inclusive lower bound on the member's created date.
+        created_to   -- inclusive upper bound on the member's created date.
     """
 
     def get(self, request):
@@ -332,26 +455,35 @@ class AllMembersReportView(PortalAPIView):
         if not (agent and (agent.group == "Management" or getattr(agent, "is_manager", False))):
             return Response({"detail": "Management access required."}, status=403)
 
+        created_from = _parse_date(request.query_params.get("created_from"))
+        created_to = _parse_date(request.query_params.get("created_to"))
+
         qs = (
             Client.objects.all()
             .prefetch_related(
                 "insurances",
-                "screenings",
-                "cases",
+                "social_care_coverages",
                 "addresses",
-                "phones",
-                "household_membership__household__members__client__addresses",
+                "member_profiles",
+                "enrollments__kitchen",
+                "enrollments__delivery_schedules",
+                "household_membership__household__enrollment_verifications__kitchen",
+                "household_membership__household__enrollment_verifications__delivery_schedules",
             )
-            .order_by(
-                "household_membership__household__household_id",
-                "-household_membership__is_primary",
-                "last_name",
-                "first_name",
-                "created_at",
-            )
+            .order_by("last_name", "first_name", "created_at")
         )
+        if created_from:
+            qs = qs.filter(created_at__date__gte=created_from)
+        if created_to:
+            qs = qs.filter(created_at__date__lte=created_to)
 
-        label_map = _lead_source_label_map()
+        # Live eligibility inputs, resolved once for the whole run.
+        from ..services.eligibility import evaluate_client
+        from ..services.service_area import excluded_zips
+        from ..services.state_area import allowed_state_codes
+
+        zips = excluded_zips()
+        states = allowed_state_codes()
 
         response = HttpResponse(content_type="text/csv")
         filename = f"all_members_{timezone.localdate().isoformat()}.csv"
@@ -359,98 +491,184 @@ class AllMembersReportView(PortalAPIView):
 
         writer = csv.writer(response)
         writer.writerow([
-            "Household Primary Member ID",
-            "Member ID",
-            "Medicaid ID (active)",
-            "Name",
-            "Phone Number",
-            "Street Address",
-            "Apt",
-            "City",
-            "State",
-            "Zip",
-            "DOB",
-            "Internal Service Program Name",
-            "Is there Screening",
-            "Is there Eligibility",
-            "Is there Navigation",
-            "Is there Internal Service Case",
-            "Total members in household",
-            "Lead Source in CRM",
-            "Authorized amount for the open internal service case",
+            "Client ID",
+            "Client Name",
+            "Medicaid Plan",
+            "Medicaid Type",
+            "Insurance Effective Date",
+            "Insurance Expiration Date",
+            "Social Care Coverage Status",
+            "SCC Expiration Date",
+            "Enrollment Platform",
+            "Out of Orbit?",
+            "Out of Orbit Reason",
+            "Out of Range",
+            "Client Eligibility",
+            "Cadence",
+            "Facility",
+            "Menu Type",
+            "Dietary Restrictions",
+            "Currently Servicing",
         ])
 
         for client in qs:
-            cases = list(client.cases.all())
-            has_screening = len(list(client.screenings.all())) > 0
-            has_eligibility = any(c.case_type == CaseType.ELIGIBILITY for c in cases)
-            has_navigation = any(c.case_type == CaseType.NAVIGATION for c in cases)
-            has_internal_service = any(
-                c.case_type == CaseType.INTERNAL_SERVICE for c in cases
-            )
+            med = _medicaid_insurance(client)
+            scc = _social_care_coverage(client)
+            enr = active_enrollment(client)
+            profile = active_member_profile(client)
 
-            # Household context: primary id repeats across a household's members;
-            # a member with no household is their own single-member household.
-            membership = getattr(client, "household_membership", None)
-            household = membership.household if membership is not None else None
-            primary_client = _household_primary(household) or client
-            member_total = (
-                len(list(household.members.all())) if household is not None else 1
-            )
+            out_of_orbit = member_out_of_orbit(client)
+            reason = _out_of_orbit_reason(enr, profile) if out_of_orbit else ""
 
-            # Internal-service program name (governing case, any status) + the
-            # authorized amount from the OPEN internal-service case.
-            gov_internal = internal_service_case(client)
-            program_name = ""
-            if gov_internal is not None:
-                program_name = gov_internal.program_name or (
-                    gov_internal.program.name if gov_internal.program_id else ""
-                )
-            open_internal = None
-            if gov_internal is not None and gov_internal.case_status not in _CLOSED_CASE_STATUSES:
-                open_internal = gov_internal
-            else:
-                opens = [
-                    c for c in cases
-                    if c.case_type == CaseType.INTERNAL_SERVICE
-                    and c.case_status not in _CLOSED_CASE_STATUSES
-                ]
-                if opens:
-                    open_internal = max(
-                        opens,
-                        key=lambda c: c.date_opened.timestamp() if c.date_opened else 0,
-                    )
-            authorized_amount = open_internal.authorized_amount if open_internal else ""
+            verdict = evaluate_client(client, zips=zips, states=states)
+            eligibility = "Ineligible" if verdict.ineligible else "Eligible"
 
-            # Address: the member's own (Current/Home/any), else the household
-            # primary's (household members share a delivery address).
-            addr = _pick_address(client)
-            if addr is None and primary_client is not client:
-                addr = _pick_address(primary_client)
-
-            raw_source = (client.lead_source or "").strip()
-            source_label = label_map.get(raw_source, raw_source)
+            facility = ""
+            if enr is not None and enr.kitchen_id:
+                facility = enr.kitchen.name or ""
 
             writer.writerow([
-                str(primary_client.client_id),
                 str(client.client_id),
-                _active_medicaid_id(client),
                 f"{client.first_name or ''} {client.last_name or ''}".strip(),
-                _primary_phone(client),
-                (addr.street if addr else ""),
-                (addr.unit if addr else ""),
-                (addr.city if addr else ""),
-                (addr.state if addr else ""),
-                (addr.zip if addr else ""),
-                client.date_of_birth.isoformat() if client.date_of_birth else "",
-                program_name,
-                "Yes" if has_screening else "No",
-                "Yes" if has_eligibility else "No",
-                "Yes" if has_navigation else "No",
-                "Yes" if has_internal_service else "No",
-                member_total,
-                source_label,
-                authorized_amount,
+                (med.plan_name if med else ""),
+                _medicaid_type_label(med.plan_name if med else ""),
+                _date_str(med.enrolled_at if med else None),
+                _date_str(med.expired_at if med else None),
+                (_SCC_STATUS_LABELS.get(scc.status, scc.status) if scc else ""),
+                _date_str(scc.expired_at if scc else None),
+                "UniteUs",
+                _yn(out_of_orbit),
+                reason,
+                _yn(member_out_of_range(client)),
+                eligibility,
+                _cadence_label(profile, enr),
+                facility,
+                (profile.menu_type if profile else ""),
+                _dietary_restrictions(profile),
+                _currently_servicing(enr),
+            ])
+
+        return response
+
+
+class CasesReportView(PortalAPIView):
+    """Management-only CSV export of cases, one row per case, optionally limited
+    to a case-created (``date_opened``) date range.
+
+    Columns: Client ID, Case ID, Member Name, Member Phone Number, Team of Case
+    Creator, Case Created By Name, Case Created Date, Case Closed Date, Case
+    Status, Originating Provider Name, Provider Name, Program Name, Is Program
+    Household?, Case Type, Meals/Boxes, Primary Worker Name, Care Coordinator,
+    Service Authorization Status, Service Authorization End Date.
+
+    ``Is Program Household?`` is computed LIVE from the word "Household" in the
+    program name (mirrors ``derive_household_type``) rather than reading the
+    stored ``household_type``, so the export is correct even for rows written
+    before the classification rule was unified. ``Meals/Boxes`` is derived from
+    the program name's product keyword.
+
+    Query params:
+        created_from -- optional inclusive lower bound on the case's created
+                        (``date_opened``) date.
+        created_to   -- optional inclusive upper bound on the case's created
+                        (``date_opened``) date.
+    """
+
+    def get(self, request):
+        agent = current_agent(request)
+        if not (agent and (agent.group == "Management" or getattr(agent, "is_manager", False))):
+            return Response({"detail": "Management access required."}, status=403)
+
+        created_from = _parse_date(request.query_params.get("created_from"))
+        created_to = _parse_date(request.query_params.get("created_to"))
+
+        qs = (
+            Case.objects.select_related("client")
+            .prefetch_related("client__phones")
+            .order_by("date_opened")
+        )
+        if created_from:
+            qs = qs.filter(date_opened__date__gte=created_from)
+        if created_to:
+            qs = qs.filter(date_opened__date__lte=created_to)
+
+        # Case-creator team (Unite Us user_id -> Originating Team) and care
+        # coordinator (agent_code -> agent name) lookups, built once.
+        team_map = {
+            str(u.user_id): (u.originating_team or "")
+            for u in UniteUsAgent.objects.all()
+        }
+        coord_map = {
+            a.agent_code: a.name
+            for a in Agent.objects.exclude(agent_code__isnull=True).exclude(agent_code="")
+        }
+        auth_status_labels = dict(ServiceAuthorizationStatus.choices)
+
+        response = HttpResponse(content_type="text/csv")
+        filename = f"cases_{timezone.localdate().isoformat()}.csv"
+        response["Content-Disposition"] = f'attachment; filename="{filename}"'
+
+        writer = csv.writer(response)
+        writer.writerow([
+            "Client ID",
+            "Case ID",
+            "Member Name",
+            "Member Phone Number",
+            "Team of Case Creator",
+            "Case Created By Name",
+            "Case Created Date",
+            "Case Closed Date",
+            "Case Status",
+            "Originating Provider Name",
+            "Provider Name",
+            "Program Name",
+            "Is Program Household?",
+            "Case Type",
+            "Meals/Boxes",
+            "Primary Worker Name",
+            "Care Coordinator",
+            "Service Authorization Status",
+            "Service Authorization End Date",
+        ])
+
+        for case in qs:
+            client = case.client
+            # Team: on-roster Unite Us creators carry an Originating Team; a
+            # creator not on the roster is Met Council staff. Blank when the case
+            # has no recorded creator.
+            if case.created_by_id:
+                team = team_map.get(str(case.created_by_id), "Met Council Team")
+            else:
+                team = ""
+
+            care_coordinator = coord_map.get(case.agent_code, case.agent_code or "")
+            case_status = (
+                "Closed" if case.case_status in _CLOSED_CASE_STATUSES else "Open"
+            )
+            auth_status = case.service_authorization_status_label or auth_status_labels.get(
+                case.service_authorization_status, case.service_authorization_status or ""
+            )
+
+            writer.writerow([
+                str(case.client_id),
+                str(case.case_id),
+                f"{client.first_name or ''} {client.last_name or ''}".strip() if client else "",
+                _primary_phone(client) if client else "",
+                team,
+                case.created_by_name or "",
+                _date_str(case.date_opened),
+                _date_str(case.case_closed_at),
+                case_status,
+                case.originating_provider_name or "",
+                case.provider_name or "",
+                case.program_name or "",
+                _yn("household" in (case.program_name or "").casefold()),
+                case.get_case_type_display(),
+                _meals_or_boxes(case.program_name),
+                case.primary_worker_name or "",
+                care_coordinator,
+                auth_status,
+                _date_str(case.service_authorization_approval_ends_at),
             ])
 
         return response

@@ -50,8 +50,10 @@ from api.services.catalog import (
 )
 from api.services.delivery import current_household_cadence
 from api.services.lifecycle import (
+    case_is_met_council,
     governing_internal_case,
     open_internal_service_cases,
+    verification_completed,
 )
 
 logger = logging.getLogger(__name__)
@@ -210,9 +212,10 @@ class _Context:
     cadence: str                  # household cadence code ("" when none)
     kitchen: object               # Kitchen | None
     governing_case: object        # Case | None
-    open_cases: list              # open internal-service cases
+    open_cases: list              # open Met Council internal-service cases
     members: list                 # household member clients (incl. primary)
     has_servable_member: bool     # >=1 member is ACTIVE (being served)
+    verified: bool                # household verification pop-up completed
 
 
 def _coerce_kind(value):
@@ -282,9 +285,18 @@ def _build_context(enrollment):
         cadence=current_household_cadence(enrollment) or "",
         kitchen=enrollment.kitchen if enrollment.kitchen_id else None,
         governing_case=governing_internal_case(enrollment),
-        open_cases=open_internal_service_cases(client),
+        # Only Met Council-managed cases live in the member base (external orgs'
+        # work is excluded from the Cases tab / verification picker), so the
+        # case-config warnings must count the same set -- otherwise a stray
+        # non-Met case makes "multiple open cases" fire on a member who really
+        # has just one. See api.services.lifecycle.case_is_met_council.
+        open_cases=[
+            c for c in open_internal_service_cases(client)
+            if case_is_met_council(c)
+        ],
         members=_household_members(enrollment),
         has_servable_member=_has_servable_member(enrollment),
+        verified=verification_completed(client),
     )
 
 
@@ -292,6 +304,12 @@ def _build_context(enrollment):
 # Checks. Each returns 0..N Warning objects. Keep them small and independent.
 # ---------------------------------------------------------------------------
 def check_multiple_open_cases(ctx):
+    # Only actionable BEFORE verification: the pop-up is where the agent picks
+    # the single governing case. Once the household is verified (has an active
+    # enrollment tied to its case), a second open case no longer blocks anything,
+    # so we don't nag Care Management about it.
+    if ctx.verified:
+        return []
     if len(ctx.open_cases) < 2:
         return []
     return [Warning(
