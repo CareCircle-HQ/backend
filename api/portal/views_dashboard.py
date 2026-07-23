@@ -20,7 +20,6 @@ from rest_framework.response import Response
 
 from ..models import (
     Case,
-    CaseHouseholdType,
     CaseStatus,
     CaseType,
     Client,
@@ -449,7 +448,9 @@ class DashboardView(PortalAPIView):
         # --- 1.1 Open cases + authorization breakdown (TIME-FRAME SENSITIVE)
         # Scoped to cases opened in the selected date range.
         scoped_rows = list(
-            open_cases.values("client_id", "service_authorization_status")
+            open_cases.values(
+                "client_id", "service_authorization_status", "program_name"
+            )
         )
         auth_counts = {"accepted": 0, "requested": 0, "rejected": 0, "other": 0}
         _AUTH_BUCKET = {
@@ -457,11 +458,20 @@ class DashboardView(PortalAPIView):
             ServiceAuthorizationStatus.PENDING: "requested",
             ServiceAuthorizationStatus.DENIED: "rejected",
         }
+        # Household vs Individual, from the PROGRAM NAME keyword only -- the same
+        # live rule as ``derive_household_type`` / the Cases export, so the card
+        # reconciles with the export's "Is Program Household?" column even when a
+        # stored ``household_type`` predates the unified classification.
+        household_cases = 0
         for row in scoped_rows:
             auth_counts[_AUTH_BUCKET.get(row["service_authorization_status"], "other")] += 1
+            if "household" in (row["program_name"] or "").casefold():
+                household_cases += 1
 
         open_cases_payload = {
             "total": len(scoped_rows),
+            "household": household_cases,
+            "individual": len(scoped_rows) - household_cases,
             "accepted": auth_counts["accepted"],
             "requested": auth_counts["requested"],
             "rejected": auth_counts["rejected"],
@@ -488,9 +498,11 @@ class DashboardView(PortalAPIView):
                 row["service_type"],
             )
             kind_key = kind.value if kind is not None else "unknown"
+            # Same program-name rule as the open-cases Household/Individual split
+            # above (and the Cases export), not the stored household_type.
             hh_key = (
                 "household"
-                if row["household_type"] == CaseHouseholdType.HOUSEHOLD
+                if "household" in (row["program_name"] or "").casefold()
                 else "individual"
             )
             mb[kind_key][hh_key] += 1
