@@ -17,11 +17,30 @@ Requires FIELD_ENCRYPTION_KEY to be set (the seeded credential's tokens are
 encrypted at rest).
 """
 
+import fcntl
+import os
+import signal
+import tempfile
+
 from django.core.management.base import BaseCommand
 
 from api.integrations.uniteus import config as uniteus_config
 from api.services import uniteus_import
 from api.services.uniteus_import import run_daily_pull
+
+# Single-instance lock. The nightly cron fires daily, but a full live-API pull
+# over the whole client base can take longer than 24h; without a lock the runs
+# STACK (we found 8 concurrent pulls, several executing pre-deploy code in
+# memory, which kept re-importing filtered-out cases and caused FK violations
+# during cleanup). A non-blocking flock guarantees at most one pull at a time --
+# a second invocation exits immediately instead of piling on. The lock lives in
+# the system temp dir and auto-releases if the holder dies.
+_LOCK_PATH = os.path.join(tempfile.gettempdir(), "carecircle_daily_pull.lock")
+
+
+class _RunTimeout(Exception):
+    """Raised when --max-runtime-seconds elapses so the run ends and releases the
+    lock instead of wedging forever."""
 
 
 class Command(BaseCommand):
@@ -43,6 +62,16 @@ class Command(BaseCommand):
                             help="Delete seeded simulation data after the run.")
         parser.add_argument("--force", action="store_true",
                             help="Run even when UNITEUS_ENABLED is false.")
+        parser.add_argument(
+            "--max-runtime-seconds", type=int, default=None,
+            help=("Abort the pull after this many seconds so a wedged run can't "
+                  "hold the singleton lock forever (default: env "
+                  "DAILY_PULL_MAX_SECONDS, or unlimited)."),
+        )
+        parser.add_argument(
+            "--ignore-lock", action="store_true",
+            help="Run even if another daily_pull holds the singleton lock.",
+        )
 
     def handle(self, *args, **options):
         if options["simulate"]:
@@ -53,13 +82,68 @@ class Command(BaseCommand):
                 "Set UNITEUS_ENABLED=True (or pass --force) to run."
             ))
             return
-        run = run_daily_pull(
-            triggered_by=options["triggered_by"],
-            client_limit=options["client_limit"],
-            provider_id=options["provider_id"],
-            client_ids=options["client_id"],
-        )
-        self._report(run)
+
+        # Acquire the singleton lock (unless explicitly overridden). Hold the fd
+        # open for the whole run -- closing it releases the lock.
+        lock_fd = None
+        if not options["ignore_lock"]:
+            lock_fd = self._acquire_lock()
+            if lock_fd is None:
+                self.stdout.write(self.style.WARNING(
+                    "Another daily_pull is already running (lock held at "
+                    f"{_LOCK_PATH}); skipping this run."
+                ))
+                return
+
+        max_seconds = options["max_runtime_seconds"]
+        if max_seconds is None:
+            max_seconds = int(os.getenv("DAILY_PULL_MAX_SECONDS", "0") or 0)
+        self._arm_timeout(max_seconds)
+        try:
+            run = run_daily_pull(
+                triggered_by=options["triggered_by"],
+                client_limit=options["client_limit"],
+                provider_id=options["provider_id"],
+                client_ids=options["client_id"],
+            )
+            self._report(run)
+        except _RunTimeout:
+            self.stdout.write(self.style.ERROR(
+                f"daily_pull aborted after {max_seconds}s (--max-runtime-seconds)."
+            ))
+        finally:
+            if max_seconds > 0:
+                signal.alarm(0)
+            self._release_lock(lock_fd)
+
+    # -- singleton lock + runtime guard -----------------------------------
+    def _acquire_lock(self):
+        """Return an open, exclusively-locked file descriptor, or None if another
+        process already holds it."""
+        fd = open(_LOCK_PATH, "w")
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            fd.close()
+            return None
+        fd.write(f"{os.getpid()}\n")
+        fd.flush()
+        return fd
+
+    def _release_lock(self, fd):
+        if fd is None:
+            return
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            fd.close()
+
+    def _arm_timeout(self, max_seconds):
+        if max_seconds and max_seconds > 0:
+            def _on_alarm(signum, frame):
+                raise _RunTimeout()
+            signal.signal(signal.SIGALRM, _on_alarm)
+            signal.alarm(max_seconds)
 
     def _handle_simulate(self, options):
         from api.integrations.uniteus import simulation
