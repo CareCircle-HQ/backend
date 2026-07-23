@@ -105,6 +105,21 @@ def sync_delivery_calendars(self, from_date=None):
 
 
 @shared_task(bind=True, ignore_result=True)
+def sweep_closed_case_service(self):
+    """Safety-net sweep: cancel service for any client whose LAST internal-service
+    (meal/box) case has closed but whose enrollment was never terminalized (the
+    close-out never ran -- e.g. a historical closure on a client not since
+    re-synced). Re-runs the idempotent internal-service reconcile so their future
+    deliveries are truncated and the enrollment(s) cancelled -- dropping them off
+    Purchase Orders and the delivery calendar. A no-op once everything is clean.
+    Scheduled daily on Celery beat; also safe to call ad-hoc. Delegates to the
+    management command so the sweep logic lives in one place."""
+    from django.core.management import call_command
+
+    call_command("stop_closed_case_service", "--all", "--apply")
+
+
+@shared_task(bind=True, ignore_result=True)
 def request_uniteus_exports(self, export_types=None, days=7, triggered_by="cron:uniteus-export"):
     """Request a rolling-window export for each of ``export_types`` (default: all
     supported), then kick a poll. Used by the nightly schedule; the UI requests

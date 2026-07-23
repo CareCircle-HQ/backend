@@ -22,11 +22,15 @@ import re
 from datetime import timedelta
 
 from django.db import transaction
+from django.db.models import Exists, OuterRef
 from django.utils import timezone
 
 from api.models import (
     Address,
     AddressType,
+    Case,
+    CaseStatus,
+    CaseType,
     DeliveryOrder,
     DeliveryOrderStatus,
     DietaryRestriction,
@@ -292,13 +296,38 @@ def _dedupe_by_client(schedules):
     return out
 
 
+# Case statuses that no longer confer authorization for a future delivery.
+_CLOSED_CASE_STATUSES = (CaseStatus.CLOSED, CaseStatus.CANCELLED)
+
+
+def open_internal_service_case_exists(member_client_field="member__client_id"):
+    """An ``Exists`` subquery, true when the OrderSchedule's member still has an
+    OPEN (not closed/cancelled) internal-service case.
+
+    This is the authoritative PO guardrail: a member whose meal/box case has
+    closed must NEVER be selected for a Purchase Order, even if the
+    enrollment-cancel close-out (``_full_stop_close_out``) failed to run and left
+    the enrollment at an active stage with stale SCHEDULED occurrences. Keying PO
+    eligibility off "has an open internal-service case" makes closure the single
+    source of truth and stops closed-case members from being ordered/delivered.
+    """
+    return Exists(
+        Case.objects.filter(
+            client_id=OuterRef(member_client_field),
+            case_type=CaseType.INTERNAL_SERVICE,
+        ).exclude(case_status__in=_CLOSED_CASE_STATUSES)
+    )
+
+
 def _due_schedules(kind, delivery_date):
     """SCHEDULED OrderSchedule rows for the given kind that land on the date.
 
     Schedules whose enrollment is On Hold or in a terminal stage
     (Service Complete / Closed / Cancelled) are excluded, as are Out of Orbit /
-    Paused / Inactive members: none may appear in any new Purchase Order. Also
-    de-duped per client so a duplicate-enrollment anomaly never doubles a line.
+    Paused / Inactive members, AND any member with no OPEN internal-service case
+    (their meal/box case has closed): none may appear in any new Purchase Order.
+    Also de-duped per client so a duplicate-enrollment anomaly never doubles a
+    line.
     """
     qs = (
         OrderSchedule.objects.filter(
@@ -307,6 +336,8 @@ def _due_schedules(kind, delivery_date):
         )
         .exclude(enrollment__stage__in=SERVICE_EXCLUDED_ENROLLMENT_STAGES)
         .exclude(member__status__in=SERVICE_EXCLUDED_MEMBER_STATUSES)
+        .annotate(_has_open_isc=open_internal_service_case_exists())
+        .filter(_has_open_isc=True)
         .select_related(
             "member", "member__client", "household", "kitchen",
             "enrollment", "enrollment__case", "enrollment__case__program",
@@ -558,6 +589,8 @@ def generate_purchase_order(kind, delivery_date, kitchen, schedule_ids, split_se
         )
         .exclude(enrollment__stage__in=SERVICE_EXCLUDED_ENROLLMENT_STAGES)
         .exclude(member__status__in=SERVICE_EXCLUDED_MEMBER_STATUSES)
+        .annotate(_has_open_isc=open_internal_service_case_exists())
+        .filter(_has_open_isc=True)
         .select_related("member", "member__client", "household", "kitchen")
     )
     already = _batched_client_ids(delivery_date)

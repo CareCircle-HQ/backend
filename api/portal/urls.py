@@ -107,6 +107,8 @@ from .views_reports import (
     AllMembersReportView,
     CasesReportView,
     MembersByLeadSourceReportView,
+    MembersForPurchaseOrderReportView,
+    MembersNotServedReportView,
     MembersPendingVerificationReportView,
 )
 from .views_activity import ActivityFiltersView, ActivityLogView
@@ -392,6 +394,16 @@ urlpatterns = [
         "reports/cases/",
         CasesReportView.as_view(),
         name="portal-report-cases",
+    ),
+    path(
+        "reports/members-for-po/",
+        MembersForPurchaseOrderReportView.as_view(),
+        name="portal-report-members-for-po",
+    ),
+    path(
+        "reports/members-not-served/",
+        MembersNotServedReportView.as_view(),
+        name="portal-report-members-not-served",
     ),
 
     # Care Management (Customer Service)

@@ -6082,3 +6082,77 @@ class ReportExportsTest(TestCase):
         api.credentials(HTTP_AUTHORIZATION=f"Bearer {access}")
         self.assertEqual(api.get(reverse("portal-report-all-members")).status_code, 403)
         self.assertEqual(api.get(reverse("portal-report-cases")).status_code, 403)
+
+
+class POClosedCaseGuardrailTest(TestCase):
+    """A member whose internal-service (meal/box) case is CLOSED/CANCELLED must
+    never be selected for a Purchase Order -- even if the enrollment-cancel
+    close-out failed to run and left an active enrollment + stale SCHEDULED
+    occurrence. Enforced by ``open_internal_service_case_exists`` in the PO
+    candidate query."""
+
+    def _setup(self, case_status):
+        from datetime import timedelta
+
+        from .models import (
+            Case, CaseStatus, CaseType, Client, EnrollmentStage,
+            EnrollmentVerification, Household, HouseholdMember,
+            MemberDietaryProfile, MemberStatus, OrderSchedule, OrderStatus,
+        )
+
+        today = timezone.localdate()
+        client = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Guard", last_name="Rail",
+        )
+        hh = Household.objects.create(name="HH")
+        HouseholdMember.objects.create(household=hh, client=client, is_primary=True)
+        case = Case.objects.create(
+            case_id=str(uuid.uuid4()), client=client,
+            case_type=CaseType.INTERNAL_SERVICE, case_status=case_status,
+            program_name="Medically Tailored Meals", date_opened=timezone.now(),
+        )
+        # Enrollment left ACTIVE on purpose (close-out never ran).
+        enr = EnrollmentVerification.objects.create(
+            client=client, household=hh, case=case,
+            stage=EnrollmentStage.SERVICE_ACTIVE,
+        )
+        member = MemberDietaryProfile.objects.create(
+            enrollment=enr, client=client, menu_type="Standard",
+            status=MemberStatus.ACTIVE,
+        )
+        OrderSchedule.objects.create(
+            enrollment=enr, member=member, member_name="Guard Rail",
+            anticipated_delivery_date=today + timedelta(days=1),
+            status=OrderStatus.SCHEDULED, household_group_code="G", household=hh,
+        )
+        return client
+
+    def _po_eligible_client_ids(self):
+        from .models import OrderSchedule, OrderStatus
+        from .services.purchase_orders import open_internal_service_case_exists
+
+        return {
+            str(cid)
+            for cid in OrderSchedule.objects.filter(status=OrderStatus.SCHEDULED)
+            .annotate(_h=open_internal_service_case_exists())
+            .filter(_h=True)
+            .values_list("member__client_id", flat=True)
+        }
+
+    def test_open_case_member_is_po_eligible(self):
+        from .models import CaseStatus
+
+        client = self._setup(CaseStatus.OPEN)
+        self.assertIn(str(client.client_id), self._po_eligible_client_ids())
+
+    def test_closed_case_member_excluded_even_when_enrollment_active(self):
+        from .models import CaseStatus
+
+        client = self._setup(CaseStatus.CLOSED)
+        self.assertNotIn(str(client.client_id), self._po_eligible_client_ids())
+
+    def test_cancelled_case_member_excluded(self):
+        from .models import CaseStatus
+
+        client = self._setup(CaseStatus.CANCELLED)
+        self.assertNotIn(str(client.client_id), self._po_eligible_client_ids())

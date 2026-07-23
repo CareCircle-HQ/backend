@@ -26,6 +26,7 @@ from ..models import (
     EnrollmentStage,
     EnrollmentVerification,
     FoodAllergy,
+    MemberStatus,
     ProductTypeKind,
     ServiceAuthorizationStatus,
     SocialCareCoverageStatus,
@@ -36,6 +37,7 @@ from .base import PortalAPIView, current_agent
 from .serializers import (
     active_enrollment,
     active_member_profile,
+    internal_service_case,
     medicaid_member_id,
     member_out_of_orbit,
     member_out_of_range,
@@ -669,6 +671,272 @@ class CasesReportView(PortalAPIView):
                 care_coordinator,
                 auth_status,
                 _date_str(case.service_authorization_approval_ends_at),
+            ])
+
+        return response
+
+
+class MembersForPurchaseOrderReportView(PortalAPIView):
+    """Management-only CSV of active members scheduled to land on a Purchase
+    Order for a given delivery date (or the current week).
+
+    Source of truth is the dated delivery calendar (:class:`OrderSchedule`) --
+    the exact set PO generation aggregates -- filtered to still-scheduled
+    deliveries for servable members. One row per member per delivery.
+
+    Columns: Delivery Date, HouseholdGroup, PrimaryMemberID, Client ID,
+    PrimaryHousehold (is-head flag), Quantity, Delivery Address, Menu Type,
+    Meal Type (Meal/Box), Kitchen, Cadence.
+
+    Query params:
+        scope    -- "date" (default) or "week".
+        date     -- required when scope=date; must be a FUTURE date (YYYY-MM-DD).
+        cadence  -- optional (scope=date only): mon_thu | tue_fri | once_a_week;
+                    keeps only deliveries whose weekday belongs to that cadence.
+        scope=week exports the entire current Mon-Sun week for every cadence.
+    """
+
+    def get(self, request):
+        agent = current_agent(request)
+        if not (agent and (agent.group == "Management" or getattr(agent, "is_manager", False))):
+            return Response({"detail": "Management access required."}, status=403)
+
+        from datetime import timedelta
+
+        from ..models import (
+            HouseholdMember,
+            OrderSchedule,
+            OrderStatus,
+            SERVICE_EXCLUDED_ENROLLMENT_STAGES,
+            SERVICE_EXCLUDED_MEMBER_STATUSES,
+        )
+        from ..services.purchase_orders import (
+            _WEEKDAY_CADENCE,
+            _household_group_code,
+            _household_is_primary,
+            open_internal_service_case_exists,
+        )
+
+        today = timezone.localdate()
+        scope = (request.query_params.get("scope") or "date").lower()
+
+        cadence = ""
+        if scope == "week":
+            monday = today - timedelta(days=today.weekday())
+            sunday = monday + timedelta(days=6)
+            base = OrderSchedule.objects.filter(
+                anticipated_delivery_date__gte=monday,
+                anticipated_delivery_date__lte=sunday,
+            )
+        else:
+            d = _parse_date(request.query_params.get("date"))
+            if d is None:
+                return Response({"detail": "A valid date is required."}, status=400)
+            if d <= today:
+                return Response({"detail": "Date must be in the future."}, status=400)
+            base = OrderSchedule.objects.filter(anticipated_delivery_date=d)
+            cadence = (request.query_params.get("cadence") or "").strip()
+
+        qs = (
+            base.filter(status=OrderStatus.SCHEDULED, member__isnull=False)
+            .exclude(enrollment__stage__in=SERVICE_EXCLUDED_ENROLLMENT_STAGES)
+            .exclude(member__status__in=SERVICE_EXCLUDED_MEMBER_STATUSES)
+            .annotate(_has_open_isc=open_internal_service_case_exists())
+            .filter(_has_open_isc=True)
+            .select_related("member__client", "household", "kitchen")
+            .prefetch_related("member__client__cases")
+            .order_by(
+                "anticipated_delivery_date", "household__name",
+                "household_group_code", "member_name",
+            )
+        )
+
+        rows = list(qs)
+        if cadence:
+            rows = [
+                o for o in rows
+                if o.anticipated_delivery_date
+                and _WEEKDAY_CADENCE.get(o.anticipated_delivery_date.weekday()) == cadence
+            ]
+
+        # Primary (head-of-household) client id per household, shared by every
+        # member row so a group can be tied to its head.
+        hh_ids = {o.household_id for o in rows if o.household_id}
+        primary_by_hh = {}
+        if hh_ids:
+            primary_by_hh = dict(
+                HouseholdMember.objects.filter(
+                    household_id__in=hh_ids, is_primary=True
+                ).values_list("household_id", "client_id")
+            )
+
+        response = HttpResponse(content_type="text/csv")
+        filename = f"members_for_po_{today.isoformat()}.csv"
+        response["Content-Disposition"] = f'attachment; filename="{filename}"'
+
+        writer = csv.writer(response)
+        writer.writerow([
+            "Delivery Date",
+            "HouseholdGroup",
+            "PrimaryMemberID",
+            "Client ID",
+            "PrimaryHousehold",
+            "Quantity",
+            "Delivery Address",
+            "Menu Type",
+            "Meal Type",
+            "Kitchen",
+            "Cadence",
+            "Case ID",
+            "Case Status",
+            "Member Status",
+        ])
+
+        for o in rows:
+            client = o.member.client if (o.member and o.member.client_id) else None
+            client_id = str(client.client_id) if client else ""
+            # Household head id (shared across the group); a lone member is their
+            # own head.
+            primary_id = client_id
+            if o.household_id and primary_by_hh.get(o.household_id):
+                primary_id = str(primary_by_hh[o.household_id])
+
+            weekday = (
+                o.anticipated_delivery_date.weekday()
+                if o.anticipated_delivery_date else None
+            )
+            meal_type = _meals_or_boxes(o.program_name)
+            if not meal_type:
+                meal_type = "Boxes" if weekday == 2 else "Meals"
+            cad_code = _WEEKDAY_CADENCE.get(weekday, "") if weekday is not None else ""
+
+            # Internal-service case backing this member's delivery + its status,
+            # and the member's current sub-status (Active / Out of Orbit / ...).
+            case = internal_service_case(client) if client else None
+            case_id = str(case.case_id) if case else ""
+            case_status = case.get_case_status_display() if case else ""
+            member_status = o.member.get_status_display() if o.member else ""
+
+            writer.writerow([
+                _date_str(o.anticipated_delivery_date),
+                _household_group_code(o.household),
+                primary_id,
+                client_id,
+                _yn(_household_is_primary(client)),
+                o.how_many_meals_or_boxes if o.how_many_meals_or_boxes is not None else 0,
+                (o.delivery_address or "").replace("\n", ", ").strip(),
+                o.menu_type or "",
+                meal_type,
+                (o.kitchen.name if o.kitchen_id else ""),
+                _CADENCE_LABELS.get(cad_code, cad_code),
+                case_id,
+                case_status,
+                member_status,
+            ])
+
+        return response
+
+
+class MembersNotServedReportView(PortalAPIView):
+    """Management-only CSV of members who HAVE an internal-service case (Household
+    or Individual program) but are NOT currently being served on any Purchase
+    Order -- i.e. they have no scheduled delivery in the calendar -- regardless
+    of the case's status.
+
+    Columns: Client ID, Case ID, Case Status, Full Name, Out of Orbit, Out of
+    Range, On Hold, Cancelled. The status flags explain WHY a member isn't being
+    served (out-of-orbit/out-of-range/paused/ended); all can be No when the
+    member simply never reached a Purchase Order (e.g. pending verification).
+    """
+
+    def get(self, request):
+        agent = current_agent(request)
+        if not (agent and (agent.group == "Management" or getattr(agent, "is_manager", False))):
+            return Response({"detail": "Management access required."}, status=403)
+
+        from ..models import (
+            OrderSchedule,
+            OrderStatus,
+            SERVICE_EXCLUDED_ENROLLMENT_STAGES,
+            SERVICE_EXCLUDED_MEMBER_STATUSES,
+        )
+        from ..services.purchase_orders import open_internal_service_case_exists
+
+        # Clients currently scheduled for a delivery (i.e. on/heading to a PO).
+        # Mirror PO candidate selection (services.purchase_orders._due_schedules)
+        # so a stale SCHEDULED occurrence on a cancelled/closed enrollment, an
+        # out-of-service member, or a member with no OPEN internal-service case
+        # is NOT counted as "served" -- otherwise those members would be wrongly
+        # excluded from this not-served report.
+        served_ids = set(
+            OrderSchedule.objects.filter(
+                status=OrderStatus.SCHEDULED, member__client__isnull=False
+            )
+            .exclude(enrollment__stage__in=SERVICE_EXCLUDED_ENROLLMENT_STAGES)
+            .exclude(member__status__in=SERVICE_EXCLUDED_MEMBER_STATUSES)
+            .annotate(_has_open_isc=open_internal_service_case_exists())
+            .filter(_has_open_isc=True)
+            .values_list("member__client_id", flat=True)
+        )
+
+        qs = (
+            Client.objects.filter(cases__case_type=CaseType.INTERNAL_SERVICE)
+            .exclude(client_id__in=served_ids)
+            .distinct()
+            .prefetch_related(
+                "cases",
+                "enrollments__member_profiles",
+                "member_profiles",
+            )
+            .order_by("last_name", "first_name")
+        )
+
+        response = HttpResponse(content_type="text/csv")
+        filename = f"members_not_on_po_{timezone.localdate().isoformat()}.csv"
+        response["Content-Disposition"] = f'attachment; filename="{filename}"'
+
+        writer = csv.writer(response)
+        writer.writerow([
+            "Client ID",
+            "Case ID",
+            "Case Status",
+            "Full Name",
+            "Out of Orbit",
+            "Out of Range",
+            "On Hold",
+            "Cancelled",
+        ])
+
+        for client in qs:
+            case = internal_service_case(client)
+            profile = active_member_profile(client)
+            status = profile.status if profile else ""
+
+            # On Hold / Cancelled are household-level (enrollment) states; read
+            # the latest enrollment (any status) so a terminal one still shows.
+            enrollments = list(client.enrollments.all())
+            latest = (
+                max(enrollments, key=lambda e: e.opened_at or timezone.now())
+                if enrollments else None
+            )
+            on_hold = (
+                status == MemberStatus.PAUSED
+                or (latest is not None and latest.stage == EnrollmentStage.ON_HOLD)
+            )
+            cancelled = (
+                status == MemberStatus.INACTIVE
+                or (latest is not None and latest.stage == EnrollmentStage.CANCELLED)
+            )
+
+            writer.writerow([
+                str(client.client_id),
+                str(case.case_id) if case else "",
+                case.get_case_status_display() if case else "",
+                f"{client.first_name or ''} {client.last_name or ''}".strip(),
+                _yn(member_out_of_orbit(client)),
+                _yn(member_out_of_range(client)),
+                _yn(on_hold),
+                _yn(cancelled),
             ])
 
         return response
