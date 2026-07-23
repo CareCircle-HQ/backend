@@ -301,20 +301,28 @@ def _dedupe_by_client(schedules):
 _CLOSED_CASE_STATUSES = (CaseStatus.CLOSED, CaseStatus.CANCELLED)
 
 
-def open_internal_service_case_exists(member_client_field="member__client_id"):
-    """An ``Exists`` subquery, true when the OrderSchedule's member still has an
-    OPEN (not closed/cancelled) internal-service case.
+def open_internal_service_case_exists(applicant_field="enrollment__client_id"):
+    """An ``Exists`` subquery, true when the schedule's household case-holder
+    (the enrollment applicant) still has an OPEN (not closed/cancelled)
+    internal-service case.
 
-    This is the authoritative PO guardrail: a member whose meal/box case has
-    closed must NEVER be selected for a Purchase Order, even if the
+    This is the authoritative PO guardrail: once the household's meal/box case
+    closes, NO member may be selected for a Purchase Order, even if the
     enrollment-cancel close-out (``_full_stop_close_out``) failed to run and left
     the enrollment at an active stage with stale SCHEDULED occurrences. Keying PO
-    eligibility off "has an open internal-service case" makes closure the single
-    source of truth and stops closed-case members from being ordered/delivered.
+    eligibility off "the case-holder has an open internal-service case" makes
+    closure the single source of truth and stops closed-case households from
+    being ordered/delivered.
+
+    Keyed on the enrollment applicant -- NOT the individual member -- so the
+    WHOLE household follows the one governing case (matching
+    :func:`authorized_internal_service_case_exists`). Household dependents don't
+    hold an internal-service case of their own; keying on the member would drop
+    every non-case-holder off the PO even when the household is fully authorized.
     """
     return Exists(
         Case.objects.filter(
-            client_id=OuterRef(member_client_field),
+            client_id=OuterRef(applicant_field),
             case_type=CaseType.INTERNAL_SERVICE,
         ).exclude(case_status__in=_CLOSED_CASE_STATUSES)
     )
