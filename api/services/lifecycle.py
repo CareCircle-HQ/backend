@@ -558,6 +558,11 @@ ENROLLMENT_TRANSITIONS = {
         EnrollmentStage.SERVICE_ACTIVE,
         EnrollmentStage.ON_HOLD,
         EnrollmentStage.CANCELLED,
+        # De-authorization pull-back: when the governing internal-service
+        # authorization is no longer approved (reverted to pending), the
+        # reconcile moves the enrollment BACK to Verified so it correctly reads
+        # "Waiting Authorization" (see _downgrade_unauthorized_enrollment).
+        EnrollmentStage.VERIFIED,
         # An enrollment that reached kitchen assignment but has NO internal-service
         # (meal/box) case backing it is an orphan (its case was deleted/never
         # existed) -- it can be disregarded (dismissed, reversible) rather than
@@ -570,6 +575,10 @@ ENROLLMENT_TRANSITIONS = {
         EnrollmentStage.ON_HOLD,
         EnrollmentStage.CLOSED,
         EnrollmentStage.CANCELLED,
+        # De-authorization pull-back (see above): an active member whose
+        # governing authorization is no longer approved returns to Verified /
+        # Waiting Authorization and stops receiving deliveries.
+        EnrollmentStage.VERIFIED,
     },
     EnrollmentStage.SERVICE_COMPLETE: {EnrollmentStage.CLOSED},
     EnrollmentStage.ON_HOLD: {
@@ -1125,6 +1134,64 @@ _DENIAL_PAUSE_STAGES = {
 # never a manual Place-on-Hold.
 _DENIAL_HOLD_NOTE = "Auto-paused: sole internal-service meal/box case denied."
 
+# Authorization statuses that mean "not yet approved -- awaiting a decision".
+# A governing case in one of these states must NOT keep a household in service:
+# only an approval (or Not Required) authorizes delivery. Because
+# ``governing_case_key`` ranks an approval ABOVE a pending/never-requested case,
+# a governing status in this set already means the client has NO approved
+# internal-service authorization anywhere. EXPIRED is deliberately excluded --
+# that is a post-approval terminal state handled by the delivery-window logic.
+_WAITING_AUTH_STATUSES = {
+    ServiceAuthorizationStatus.PENDING,
+    ServiceAuthorizationStatus.NEVER_REQUESTED,
+    "",
+}
+
+# Post-verification stages that a not-yet-approved authorization pulls BACK to
+# Verified (which then displays "Waiting Authorization"). ON_HOLD is left to the
+# denial/close rules; terminal stages are never touched.
+_UNAUTH_PULLBACK_STAGES = {
+    EnrollmentStage.KITCHEN_ASSIGNMENT,
+    EnrollmentStage.SERVICE_ACTIVE,
+}
+
+_WAITING_AUTH_NOTE = (
+    "Auto-downgraded: internal-service authorization is not approved yet "
+    "(pending) -- returned to Waiting Authorization and future deliveries stopped."
+)
+
+
+def _downgrade_unauthorized_enrollment(enrollment, *, actor=None, actor_label=""):
+    """Pull an enrollment that was advanced past Verified BACK to Verified when
+    its governing internal-service authorization isn't approved yet, and stop
+    future deliveries.
+
+    This is the reverse of an activation: an approval advances Verified ->
+    Kitchen Assignment -> Active; if the governing authorization later reads
+    pending (e.g. a re-import, or a household activated before its authorization
+    landed), the household must not keep being served. The enrollment returns to
+    Verified (shown as "Waiting Authorization") and its future delivery
+    occurrences are truncated so it drops off Purchase Orders. Auto-resumes via
+    ``reconcile_enrollment_authorization`` once the case is approved. Idempotent:
+    a no-op for an enrollment already at/behind Verified.
+    """
+    from api.services.orders import truncate_future_deliveries
+
+    if EnrollmentStage(enrollment.stage) not in _UNAUTH_PULLBACK_STAGES:
+        return enrollment
+    try:
+        advance_enrollment(
+            enrollment, EnrollmentStage.VERIFIED, actor=actor,
+            actor_label=actor_label, note=_WAITING_AUTH_NOTE, force=True,
+        )
+    except InvalidTransition:
+        return enrollment
+    try:
+        truncate_future_deliveries(enrollment)
+    except Exception:  # pragma: no cover - defensive
+        pass
+    return enrollment
+
 # Stamped on the pause / cancel StageEvents raised by the case-CLOSURE full stop
 # (distinct from the denial note above so the two rules stay independently
 # auditable).
@@ -1446,7 +1513,7 @@ def reconcile_internal_service_authorization(client, *, actor=None, actor_label=
     """
     result = {
         "sole_denied": False, "paused": False,
-        "closed_out": False, "cancelled": False,
+        "closed_out": False, "cancelled": False, "downgraded": False,
     }
     cases = _internal_service_cases(client)
     if not cases:
@@ -1501,6 +1568,20 @@ def reconcile_internal_service_authorization(client, *, actor=None, actor_label=
                     )
                 except Exception:  # pragma: no cover - defensive
                     pass
+    elif gov_status in _WAITING_AUTH_STATUSES:
+        # Not approved yet (pending / never-requested / blank) but an open case
+        # exists: only an approval authorizes service, so pull any enrollment
+        # that was advanced past Verified BACK to Verified ("Waiting
+        # Authorization") and stop its future deliveries. Fixes households that
+        # were activated before their authorization was approved (the CSV-import
+        # gap). Fires on every case-save path via this single chokepoint, and
+        # auto-resumes when the case is later approved.
+        for enr in _governing_enrollments(client):
+            if EnrollmentStage(enr.stage) in _UNAUTH_PULLBACK_STAGES:
+                _downgrade_unauthorized_enrollment(
+                    enr, actor=actor, actor_label=actor_label,
+                )
+                result["downgraded"] = True
 
     # Keep the delivery calendar in step with the (possibly changed) governing
     # authorization: auto-heal a same-kind window extension, or truncate future
