@@ -6069,6 +6069,50 @@ class ReportExportsTest(TestCase):
         self.assertIn(str(in_range.case_id), ids)
         self.assertNotIn(str(out_range.case_id), ids)
 
+    def test_members_not_served_export_new_columns(self):
+        from .models import (
+            Case, CaseStatus, CaseType, Household, HouseholdMember,
+            ServiceAuthorizationStatus,
+        )
+
+        # A member with an internal-service case, in a multi-member household,
+        # and NOT served (no scheduled delivery) -> appears in the report.
+        client = self._client("Hh", "Member")
+        other = self._client("Room", "Mate")
+        hh = Household.objects.create(name="Shared HH")
+        HouseholdMember.objects.create(household=hh, client=client, is_primary=True)
+        HouseholdMember.objects.create(household=hh, client=other, is_primary=False)
+        case = Case.objects.create(
+            case_id=uuid.uuid4(), client=client,
+            case_type=CaseType.INTERNAL_SERVICE,
+            case_status=CaseStatus.OPEN,
+            program_name="MTM - (Household) Medically Tailored Meals - Queens",
+            service_authorization_status=ServiceAuthorizationStatus.APPROVED,
+            service_authorization_status_label="Accepted",
+        )
+
+        # A solo member (no multi-member household) -> household flag is No.
+        solo = self._client("Solo", "Member")
+        Case.objects.create(
+            case_id=uuid.uuid4(), client=solo,
+            case_type=CaseType.INTERNAL_SERVICE, case_status=CaseStatus.OPEN,
+            program_name="MTM - (Individual) Medically Tailored Meals - Queens",
+        )
+
+        rows = self._rows(reverse("portal-report-members-not-served"))
+        row = next(r for r in rows if r["Client ID"] == str(client.client_id))
+        self.assertEqual(row["Case ID"], str(case.case_id))
+        self.assertEqual(row["Case Status"], "Open")
+        self.assertEqual(row["Case Authorization"], "Accepted")
+        self.assertEqual(
+            row["Program Name"],
+            "MTM - (Household) Medically Tailored Meals - Queens",
+        )
+        self.assertEqual(row["Is Part of a Household"], "Yes")
+
+        solo_row = next(r for r in rows if r["Client ID"] == str(solo.client_id))
+        self.assertEqual(solo_row["Is Part of a Household"], "No")
+
     def test_reports_require_management(self):
         agent = Agent.objects.create(
             name="Screener Sam", agent_code="951", group="Screeners"
@@ -6082,6 +6126,9 @@ class ReportExportsTest(TestCase):
         api.credentials(HTTP_AUTHORIZATION=f"Bearer {access}")
         self.assertEqual(api.get(reverse("portal-report-all-members")).status_code, 403)
         self.assertEqual(api.get(reverse("portal-report-cases")).status_code, 403)
+        self.assertEqual(
+            api.get(reverse("portal-report-members-not-served")).status_code, 403
+        )
 
 
 class POClosedCaseGuardrailTest(TestCase):

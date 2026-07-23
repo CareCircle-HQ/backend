@@ -843,10 +843,11 @@ class MembersNotServedReportView(PortalAPIView):
     Order -- i.e. they have no scheduled delivery in the calendar -- regardless
     of the case's status.
 
-    Columns: Client ID, Case ID, Case Status, Full Name, Out of Orbit, Out of
-    Range, On Hold, Cancelled. The status flags explain WHY a member isn't being
-    served (out-of-orbit/out-of-range/paused/ended); all can be No when the
-    member simply never reached a Purchase Order (e.g. pending verification).
+    Columns: Client ID, Case ID, Case Status, Case Authorization, Program Name,
+    Is Part of a Household, Full Name, Out of Orbit, Out of Range, On Hold,
+    Cancelled. The status flags explain WHY a member isn't being served
+    (out-of-orbit/out-of-range/paused/ended); all can be No when the member
+    simply never reached a Purchase Order (e.g. pending verification).
     """
 
     def get(self, request):
@@ -887,6 +888,7 @@ class MembersNotServedReportView(PortalAPIView):
                 "cases",
                 "enrollments__member_profiles",
                 "member_profiles",
+                "household_membership__household__members",
             )
             .order_by("last_name", "first_name")
         )
@@ -900,6 +902,9 @@ class MembersNotServedReportView(PortalAPIView):
             "Client ID",
             "Case ID",
             "Case Status",
+            "Case Authorization",
+            "Program Name",
+            "Is Part of a Household",
             "Full Name",
             "Out of Orbit",
             "Out of Range",
@@ -911,6 +916,26 @@ class MembersNotServedReportView(PortalAPIView):
             case = internal_service_case(client)
             profile = active_member_profile(client)
             status = profile.status if profile else ""
+
+            # Authorization is a separate dimension from case status; prefer the
+            # human-readable label (e.g. "Accepted") and fall back to the enum's
+            # display when only the normalized value is stored.
+            case_authorization = ""
+            program_name = ""
+            if case:
+                case_authorization = case.service_authorization_status_label or (
+                    case.get_service_authorization_status_display()
+                    if case.service_authorization_status else ""
+                )
+                program_name = case.program_name or ""
+
+            # "Part of a household" = the client's household has more than one
+            # member (mirrors the Members-for-PO report's household rule).
+            membership = getattr(client, "household_membership", None)
+            in_household = (
+                membership is not None
+                and len(list(membership.household.members.all())) > 1
+            )
 
             # On Hold / Cancelled are household-level (enrollment) states; read
             # the latest enrollment (any status) so a terminal one still shows.
@@ -932,6 +957,9 @@ class MembersNotServedReportView(PortalAPIView):
                 str(client.client_id),
                 str(case.case_id) if case else "",
                 case.get_case_status_display() if case else "",
+                case_authorization,
+                program_name,
+                _yn(in_household),
                 f"{client.first_name or ''} {client.last_name or ''}".strip(),
                 _yn(member_out_of_orbit(client)),
                 _yn(member_out_of_range(client)),
