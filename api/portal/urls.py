@@ -110,6 +110,7 @@ from .views_reports import (
     MembersForPurchaseOrderReportView,
     MembersNotServedReportView,
     MembersPendingVerificationReportView,
+    UniteUsAgentsReportView,
 )
 from .views_activity import ActivityFiltersView, ActivityLogView
 from .views_service_area import (
@@ -404,6 +405,11 @@ urlpatterns = [
         "reports/members-not-served/",
         MembersNotServedReportView.as_view(),
         name="portal-report-members-not-served",
+    ),
+    path(
+        "reports/unite-us-agents/",
+        UniteUsAgentsReportView.as_view(),
+        name="portal-report-unite-us-agents",
     ),
 
     # Care Management (Customer Service)

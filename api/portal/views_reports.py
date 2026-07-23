@@ -990,3 +990,43 @@ class MembersNotServedReportView(PortalAPIView):
             ])
 
         return response
+
+
+class UniteUsAgentsReportView(PortalAPIView):
+    """Management-only CSV of every Unite Us agent (the Unite NYC / SCN platform
+    users on the allowlist, sourced from the Unite Us users export).
+
+    Columns: Unite Us user_id, Full Name, Email, Team, Status.
+    """
+
+    def get(self, request):
+        agent = current_agent(request)
+        if not (agent and (agent.group == "Management" or getattr(agent, "is_manager", False))):
+            return Response({"detail": "Management access required."}, status=403)
+
+        response = HttpResponse(content_type="text/csv")
+        filename = f"unite_us_agents_{timezone.localdate().isoformat()}.csv"
+        response["Content-Disposition"] = f'attachment; filename="{filename}"'
+
+        writer = csv.writer(response)
+        writer.writerow([
+            "Unite Us user_id",
+            "Full Name",
+            "Email",
+            "Team",
+            "Status",
+        ])
+
+        for a in UniteUsAgent.objects.all():
+            full_name = a.name or " ".join(
+                p for p in [a.first_name, a.last_name] if p
+            )
+            writer.writerow([
+                str(a.user_id),
+                full_name,
+                a.email or "",
+                a.originating_team or "",
+                (a.status or "").title(),
+            ])
+
+        return response

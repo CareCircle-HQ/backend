@@ -6137,6 +6137,43 @@ class ReportExportsTest(TestCase):
         self.assertEqual(solo_row["Cadence"], "")
         self.assertEqual(solo_row["Menu Type"], "")
 
+    def test_unite_us_agents_export_columns_and_values(self):
+        from .models import UniteUsAgent
+
+        a1 = UniteUsAgent.objects.create(
+            user_id=uuid.uuid4(),
+            name="Rosa Reviewer",
+            email="rosa@example.org",
+            originating_team="CareCircle Call Center",
+            status="active",
+            is_us=True,
+        )
+        # No explicit ``name`` -> falls back to first + last; status title-cased.
+        a2 = UniteUsAgent.objects.create(
+            user_id=uuid.uuid4(),
+            first_name="Manny",
+            last_name="Council",
+            email="manny@metcouncil.org",
+            status="inactive",
+        )
+
+        rows = self._rows(reverse("portal-report-unite-us-agents"))
+        self.assertEqual(
+            list(rows[0].keys()),
+            ["Unite Us user_id", "Full Name", "Email", "Team", "Status"],
+        )
+
+        r1 = next(r for r in rows if r["Unite Us user_id"] == str(a1.user_id))
+        self.assertEqual(r1["Full Name"], "Rosa Reviewer")
+        self.assertEqual(r1["Email"], "rosa@example.org")
+        self.assertEqual(r1["Team"], "CareCircle Call Center")
+        self.assertEqual(r1["Status"], "Active")
+
+        r2 = next(r for r in rows if r["Unite Us user_id"] == str(a2.user_id))
+        self.assertEqual(r2["Full Name"], "Manny Council")
+        self.assertEqual(r2["Team"], "Met Council Team")
+        self.assertEqual(r2["Status"], "Inactive")
+
     def test_reports_require_management(self):
         agent = Agent.objects.create(
             name="Screener Sam", agent_code="951", group="Screeners"
