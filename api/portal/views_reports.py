@@ -843,10 +843,12 @@ class MembersNotServedReportView(PortalAPIView):
     Order -- i.e. they have no scheduled delivery in the calendar -- regardless
     of the case's status.
 
-    Columns: Client ID, Case ID, Case Status, Full Name, Out of Orbit, Out of
-    Range, On Hold, Cancelled. The status flags explain WHY a member isn't being
-    served (out-of-orbit/out-of-range/paused/ended); all can be No when the
-    member simply never reached a Purchase Order (e.g. pending verification).
+    Columns: Client ID, Case ID, Case Status, Case Authorization, Program Name,
+    Is Part of a Household, Full Name, Member Stage, Kitchen, Cadence, Menu Type,
+    Out of Orbit, Out of Range, On Hold, Cancelled. The status flags explain WHY
+    a member isn't being served (out-of-orbit/out-of-range/paused/ended); all can
+    be No when the member simply never reached a Purchase Order (e.g. pending
+    verification). Kitchen / Cadence / Menu Type are blank until assigned.
     """
 
     def get(self, request):
@@ -886,7 +888,10 @@ class MembersNotServedReportView(PortalAPIView):
             .prefetch_related(
                 "cases",
                 "enrollments__member_profiles",
+                "enrollments__kitchen",
+                "enrollments__delivery_schedules",
                 "member_profiles",
+                "household_membership__household__members",
             )
             .order_by("last_name", "first_name")
         )
@@ -900,7 +905,14 @@ class MembersNotServedReportView(PortalAPIView):
             "Client ID",
             "Case ID",
             "Case Status",
+            "Case Authorization",
+            "Program Name",
+            "Is Part of a Household",
             "Full Name",
+            "Member Stage",
+            "Kitchen",
+            "Cadence",
+            "Menu Type",
             "Out of Orbit",
             "Out of Range",
             "On Hold",
@@ -911,6 +923,26 @@ class MembersNotServedReportView(PortalAPIView):
             case = internal_service_case(client)
             profile = active_member_profile(client)
             status = profile.status if profile else ""
+
+            # Authorization is a separate dimension from case status; prefer the
+            # human-readable label (e.g. "Accepted") and fall back to the enum's
+            # display when only the normalized value is stored.
+            case_authorization = ""
+            program_name = ""
+            if case:
+                case_authorization = case.service_authorization_status_label or (
+                    case.get_service_authorization_status_display()
+                    if case.service_authorization_status else ""
+                )
+                program_name = case.program_name or ""
+
+            # "Part of a household" = the client's household has more than one
+            # member (mirrors the Members-for-PO report's household rule).
+            membership = getattr(client, "household_membership", None)
+            in_household = (
+                membership is not None
+                and len(list(membership.household.members.all())) > 1
+            )
 
             # On Hold / Cancelled are household-level (enrollment) states; read
             # the latest enrollment (any status) so a terminal one still shows.
@@ -928,15 +960,73 @@ class MembersNotServedReportView(PortalAPIView):
                 or (latest is not None and latest.stage == EnrollmentStage.CANCELLED)
             )
 
+            # Member service assignments (blank until set): the enrollment stage
+            # label, the assigned kitchen, the delivery cadence, and the menu
+            # type from the member's dietary profile.
+            member_stage = (
+                _ENROLLMENT_STAGE_LABELS.get(latest.stage, latest.stage or "")
+                if latest is not None else ""
+            )
+            kitchen = latest.kitchen.name if (latest and latest.kitchen_id) else ""
+            cadence = _cadence_label(profile, latest)
+            menu_type = profile.menu_type if profile else ""
+
             writer.writerow([
                 str(client.client_id),
                 str(case.case_id) if case else "",
                 case.get_case_status_display() if case else "",
+                case_authorization,
+                program_name,
+                _yn(in_household),
                 f"{client.first_name or ''} {client.last_name or ''}".strip(),
+                member_stage,
+                kitchen,
+                cadence,
+                menu_type,
                 _yn(member_out_of_orbit(client)),
                 _yn(member_out_of_range(client)),
                 _yn(on_hold),
                 _yn(cancelled),
+            ])
+
+        return response
+
+
+class UniteUsAgentsReportView(PortalAPIView):
+    """Management-only CSV of every Unite Us agent (the Unite NYC / SCN platform
+    users on the allowlist, sourced from the Unite Us users export).
+
+    Columns: Unite Us user_id, Full Name, Email, Team, Status.
+    """
+
+    def get(self, request):
+        agent = current_agent(request)
+        if not (agent and (agent.group == "Management" or getattr(agent, "is_manager", False))):
+            return Response({"detail": "Management access required."}, status=403)
+
+        response = HttpResponse(content_type="text/csv")
+        filename = f"unite_us_agents_{timezone.localdate().isoformat()}.csv"
+        response["Content-Disposition"] = f'attachment; filename="{filename}"'
+
+        writer = csv.writer(response)
+        writer.writerow([
+            "Unite Us user_id",
+            "Full Name",
+            "Email",
+            "Team",
+            "Status",
+        ])
+
+        for a in UniteUsAgent.objects.all():
+            full_name = a.name or " ".join(
+                p for p in [a.first_name, a.last_name] if p
+            )
+            writer.writerow([
+                str(a.user_id),
+                full_name,
+                a.email or "",
+                a.originating_team or "",
+                (a.status or "").title(),
             ])
 
         return response

@@ -6069,6 +6069,111 @@ class ReportExportsTest(TestCase):
         self.assertIn(str(in_range.case_id), ids)
         self.assertNotIn(str(out_range.case_id), ids)
 
+    def test_members_not_served_export_new_columns(self):
+        from .models import (
+            Case, CaseStatus, CaseType, EnrollmentStage, EnrollmentVerification,
+            Household, HouseholdMember, Kitchen, MemberDeliverySchedule,
+            MemberDietaryProfile, ServiceAuthorizationStatus,
+        )
+
+        # A member with an internal-service case, in a multi-member household,
+        # and NOT served (no scheduled delivery) -> appears in the report. Give
+        # them an enrollment with a kitchen, a delivery schedule (cadence) and a
+        # dietary profile (menu type) so the assignment columns are populated.
+        client = self._client("Hh", "Member")
+        other = self._client("Room", "Mate")
+        hh = Household.objects.create(name="Shared HH")
+        HouseholdMember.objects.create(household=hh, client=client, is_primary=True)
+        HouseholdMember.objects.create(household=hh, client=other, is_primary=False)
+        case = Case.objects.create(
+            case_id=uuid.uuid4(), client=client,
+            case_type=CaseType.INTERNAL_SERVICE,
+            case_status=CaseStatus.OPEN,
+            program_name="MTM - (Household) Medically Tailored Meals - Queens",
+            service_authorization_status=ServiceAuthorizationStatus.APPROVED,
+            service_authorization_status_label="Accepted",
+        )
+        kitchen = Kitchen.objects.create(name="Brooklyn Kitchen")
+        enr = EnrollmentVerification.objects.create(
+            client=client, household=hh, case=case, kitchen=kitchen,
+            stage=EnrollmentStage.KITCHEN_ASSIGNMENT,
+        )
+        profile = MemberDietaryProfile.objects.create(
+            enrollment=enr, client=client, menu_type="Kosher",
+        )
+        MemberDeliverySchedule.objects.create(
+            enrollment=enr, member_profile=profile,
+            delivery_days_cadence="mon_thu",
+        )
+
+        # A solo member (no multi-member household) -> household flag is No.
+        solo = self._client("Solo", "Member")
+        Case.objects.create(
+            case_id=uuid.uuid4(), client=solo,
+            case_type=CaseType.INTERNAL_SERVICE, case_status=CaseStatus.OPEN,
+            program_name="MTM - (Individual) Medically Tailored Meals - Queens",
+        )
+
+        rows = self._rows(reverse("portal-report-members-not-served"))
+        row = next(r for r in rows if r["Client ID"] == str(client.client_id))
+        self.assertEqual(row["Case ID"], str(case.case_id))
+        self.assertEqual(row["Case Status"], "Open")
+        self.assertEqual(row["Case Authorization"], "Accepted")
+        self.assertEqual(
+            row["Program Name"],
+            "MTM - (Household) Medically Tailored Meals - Queens",
+        )
+        self.assertEqual(row["Is Part of a Household"], "Yes")
+        self.assertEqual(row["Member Stage"], "Kitchen Assignment")
+        self.assertEqual(row["Kitchen"], "Brooklyn Kitchen")
+        self.assertEqual(row["Cadence"], "Mon/Thu")
+        self.assertEqual(row["Menu Type"], "Kosher")
+
+        solo_row = next(r for r in rows if r["Client ID"] == str(solo.client_id))
+        self.assertEqual(solo_row["Is Part of a Household"], "No")
+        # No enrollment/assignments -> the new columns are blank.
+        self.assertEqual(solo_row["Member Stage"], "")
+        self.assertEqual(solo_row["Kitchen"], "")
+        self.assertEqual(solo_row["Cadence"], "")
+        self.assertEqual(solo_row["Menu Type"], "")
+
+    def test_unite_us_agents_export_columns_and_values(self):
+        from .models import UniteUsAgent
+
+        a1 = UniteUsAgent.objects.create(
+            user_id=uuid.uuid4(),
+            name="Rosa Reviewer",
+            email="rosa@example.org",
+            originating_team="CareCircle Call Center",
+            status="active",
+            is_us=True,
+        )
+        # No explicit ``name`` -> falls back to first + last; status title-cased.
+        a2 = UniteUsAgent.objects.create(
+            user_id=uuid.uuid4(),
+            first_name="Manny",
+            last_name="Council",
+            email="manny@metcouncil.org",
+            status="inactive",
+        )
+
+        rows = self._rows(reverse("portal-report-unite-us-agents"))
+        self.assertEqual(
+            list(rows[0].keys()),
+            ["Unite Us user_id", "Full Name", "Email", "Team", "Status"],
+        )
+
+        r1 = next(r for r in rows if r["Unite Us user_id"] == str(a1.user_id))
+        self.assertEqual(r1["Full Name"], "Rosa Reviewer")
+        self.assertEqual(r1["Email"], "rosa@example.org")
+        self.assertEqual(r1["Team"], "CareCircle Call Center")
+        self.assertEqual(r1["Status"], "Active")
+
+        r2 = next(r for r in rows if r["Unite Us user_id"] == str(a2.user_id))
+        self.assertEqual(r2["Full Name"], "Manny Council")
+        self.assertEqual(r2["Team"], "Met Council Team")
+        self.assertEqual(r2["Status"], "Inactive")
+
     def test_reports_require_management(self):
         agent = Agent.objects.create(
             name="Screener Sam", agent_code="951", group="Screeners"
@@ -6082,6 +6187,9 @@ class ReportExportsTest(TestCase):
         api.credentials(HTTP_AUTHORIZATION=f"Bearer {access}")
         self.assertEqual(api.get(reverse("portal-report-all-members")).status_code, 403)
         self.assertEqual(api.get(reverse("portal-report-cases")).status_code, 403)
+        self.assertEqual(
+            api.get(reverse("portal-report-members-not-served")).status_code, 403
+        )
 
 
 class POClosedCaseGuardrailTest(TestCase):
