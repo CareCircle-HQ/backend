@@ -1,4 +1,4 @@
-"""Import / refresh Program Name -> GHL pipeline mappings from a CSV.
+"""Import / refresh Program Name -> Case Category mappings (ActiveProgram) from a CSV.
 
 Usage:
     python manage.py import_program_pipelines
@@ -13,7 +13,7 @@ import os
 from django.conf import settings
 from django.core.management.base import BaseCommand
 
-from api.models import ProgramPipeline
+from api.models import ActiveProgram
 
 
 def _norm(key):
@@ -21,7 +21,7 @@ def _norm(key):
 
 
 class Command(BaseCommand):
-    help = "Import/refresh Program Name -> GHL pipeline mappings from a CSV."
+    help = "Import/refresh Program Name -> Case Category mappings from a CSV."
 
     def add_arguments(self, parser):
         parser.add_argument(
@@ -43,28 +43,32 @@ class Command(BaseCommand):
             for row in csv.DictReader(f):
                 r = {_norm(k): (v or "").strip() for k, v in row.items()}
                 program_name = r.get("program_name", "")
-                pipeline_id = r.get("pipeline_id", "")
+                case_category = r.get("case_category", "")
 
-                if not program_name or not pipeline_id:
+                if not program_name or not case_category:
                     skipped += 1
                     continue
 
-                _, was_created = ProgramPipeline.objects.update_or_create(
+                defaults = {
+                    "main_category": r.get("main_category", ""),
+                    "case_category": case_category,
+                    "services_category": r.get("services_category", ""),
+                }
+                # Optional Food/Transportation column; defaults to Food.
+                case_type = r.get("case_type", "").casefold()
+                if case_type in ActiveProgram.CaseType.values:
+                    defaults["case_type"] = case_type
+
+                _, was_created = ActiveProgram.objects.update_or_create(
                     program_name=program_name,
-                    defaults={
-                        "main_category": r.get("main_category", ""),
-                        "case_category": r.get("case_category", ""),
-                        "services_category": r.get("services_category", ""),
-                        "pipeline_name": r.get("pipeline_name", ""),
-                        "pipeline_id": pipeline_id,
-                    },
+                    defaults=defaults,
                 )
                 created += int(was_created)
                 updated += int(not was_created)
 
         self.stdout.write(
             self.style.SUCCESS(
-                f"ProgramPipeline import done: {created} created, "
+                f"ActiveProgram import done: {created} created, "
                 f"{updated} updated, {skipped} skipped."
             )
         )

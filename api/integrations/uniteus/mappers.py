@@ -246,11 +246,10 @@ def map_case(case_body_data, *, names=None, auth=None):
     closed_at = _dt(a.get("closed_date"))
     out["case_status"] = CaseStatus.CLOSED if closed_at else CaseStatus.OPEN
     set_("case_description", a.get("description"))
-    # Prefer the agent-entered opened date; fall back to the Unite Us case
-    # created timestamp so date_opened is never blank when the API omits
-    # opened_date (mirrors the CSV import's user_entered_opened_date ->
-    # case_created_at fallback).
-    set_("date_opened", _dt(a.get("opened_date")) or _dt(a.get("created_at")))
+    # Prefer the Unite Us case-created timestamp; fall back to the agent-entered
+    # opened date only when the API omits created_at (mirrors the CSV import's
+    # case_created_at -> user_entered_opened_date fallback).
+    set_("date_opened", _dt(a.get("created_at")) or _dt(a.get("opened_date")))
     set_("case_closed_at", closed_at)
     set_("updated_at", _dt(a.get("updated_at")))
 

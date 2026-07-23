@@ -9,6 +9,7 @@ import csv
 import functools
 import operator
 import re
+from datetime import datetime
 
 from django.db.models import Q
 from django.http import HttpResponse
@@ -295,9 +296,19 @@ def _yn(value):
 
 
 def _date_str(value):
-    """ISO date string for a date/datetime, or "" when None."""
+    """ISO date string for a date/datetime, or "" when None.
+
+    Aware datetimes are stored in UTC; convert to the project's local timezone
+    before taking the calendar date so an evening EDT timestamp (e.g. 9:34 PM,
+    01:34 UTC next day) doesn't roll forward a day in the export -- matching the
+    CRM UI, which renders in local time.
+    """
     if value is None:
         return ""
+    if isinstance(value, datetime):
+        if timezone.is_aware(value):
+            value = timezone.localtime(value)
+        return value.date().isoformat()
     d = value.date() if hasattr(value, "date") else value
     return d.isoformat()
 
@@ -553,6 +564,42 @@ class AllMembersReportView(PortalAPIView):
         return response
 
 
+_WEEKDAY_ABBR = {
+    "mon": "Mon", "tue": "Tue", "wed": "Wed", "thu": "Thu",
+    "fri": "Fri", "sat": "Sat", "sun": "Sun",
+}
+
+
+def _case_enrollment(case):
+    """The enrollment governing a case's delivery, preferring a live one over a
+    disregarded/cancelled row. ``None`` when the case has no enrollment."""
+    enrs = list(case.enrollments.all())
+    if not enrs:
+        return None
+    live = [e for e in enrs if e.stage not in ("disregarded", "cancelled")]
+    return (live or enrs)[0]
+
+
+def _enrollment_kitchen(enrollment):
+    """The kitchen assigned to the enrollment's household; '' when unassigned."""
+    if enrollment is not None and enrollment.kitchen_id:
+        return enrollment.kitchen.name or ""
+    return ""
+
+
+def _enrollment_cadence(enrollment):
+    """The enrollment's delivery cadence label. Prefers the delivery schedule's
+    cadence code (e.g. 'Mon/Thu'), falling back to the raw delivery weekdays."""
+    label = _cadence_label(None, enrollment)
+    if label:
+        return label
+    if enrollment is not None and enrollment.delivery_weekdays:
+        return "/".join(
+            _WEEKDAY_ABBR.get(w, w) for w in enrollment.delivery_weekdays
+        )
+    return ""
+
+
 class CasesReportView(PortalAPIView):
     """Management-only CSV export of cases, one row per case, optionally limited
     to a case-created (``date_opened``) date range.
@@ -560,8 +607,9 @@ class CasesReportView(PortalAPIView):
     Columns: Client ID, Case ID, Member Name, Member Phone Number, Team of Case
     Creator, Case Created By Name, Case Created Date, Case Closed Date, Case
     Status, Originating Provider Name, Provider Name, Program Name, Is Program
-    Household?, Case Type, Meals/Boxes, Primary Worker Name, Care Coordinator,
-    Service Authorization Status, Service Authorization End Date.
+    Household?, Case Type, Meals/Boxes, Kitchen, Cadence, Primary Worker Name,
+    Care Coordinator, Service Authorization Status, Service Authorization End
+    Date.
 
     ``Is Program Household?`` is computed LIVE from the word "Household" in the
     program name (mirrors ``derive_household_type``) rather than reading the
@@ -586,7 +634,11 @@ class CasesReportView(PortalAPIView):
 
         qs = (
             Case.objects.select_related("client")
-            .prefetch_related("client__phones")
+            .prefetch_related(
+                "client__phones",
+                "enrollments__kitchen",
+                "enrollments__delivery_schedules",
+            )
             .order_by("date_opened")
         )
         if created_from:
@@ -627,6 +679,8 @@ class CasesReportView(PortalAPIView):
             "Is Program Household?",
             "Case Type",
             "Meals/Boxes",
+            "Kitchen",
+            "Cadence",
             "Primary Worker Name",
             "Care Coordinator",
             "Service Authorization Status",
@@ -635,6 +689,7 @@ class CasesReportView(PortalAPIView):
 
         for case in qs:
             client = case.client
+            enr = _case_enrollment(case)
             # Team: on-roster Unite Us creators carry an Originating Team; a
             # creator not on the roster is Met Council staff. Blank when the case
             # has no recorded creator.
@@ -667,6 +722,8 @@ class CasesReportView(PortalAPIView):
                 _yn("household" in (case.program_name or "").casefold()),
                 case.get_case_type_display(),
                 _meals_or_boxes(case.program_name),
+                _enrollment_kitchen(enr),
+                _enrollment_cadence(enr),
                 case.primary_worker_name or "",
                 care_coordinator,
                 auth_status,

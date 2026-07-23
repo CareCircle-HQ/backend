@@ -6,7 +6,7 @@ Housing Case Management, etc.) are services provided by OTHER programs, not our
 internal meal/box service. The importers now skip them and ``CaseSerializer``
 rejects them (see ``api.serializers.derive_case_type`` +
 the ``EXTERNAL_SERVICE`` guard), but legacy rows imported before those programs
-were classified as "External Services" in ``ProgramPipeline`` remain in the DB
+were classified as "External Services" in ``ActiveProgram`` remain in the DB
 and surface on member Case tabs.
 
 Deleting a Case cascades ONLY to its ``ContractedService`` rows (the external
@@ -17,7 +17,7 @@ lose the (now-deleted) case reference.
 
 Because the classification is authoritative, this re-derives each case's type at
 purge time and only deletes rows that STILL resolve to External Service, so a
-mis-seeded ProgramPipeline row can't cause an internal/eligibility/navigation
+mis-seeded ActiveProgram row can't cause an internal/eligibility/navigation
 case to be dropped.
 
 Dry-run unless ``--apply`` so you can review the counts first.
