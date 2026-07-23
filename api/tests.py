@@ -6344,3 +6344,155 @@ class POClosedCaseGuardrailTest(TestCase):
 
         client = self._setup(CaseStatus.CANCELLED)
         self.assertNotIn(str(client.client_id), self._po_eligible_client_ids())
+
+
+class POAuthorizationGuardrailTest(TestCase):
+    """A household whose governing OPEN internal-service (meal/box) case is NOT
+    approved -- still "Waiting Authorization" (pending / never_requested / blank),
+    denied, or expired -- must never be selected for a Purchase Order, even if a
+    stale SCHEDULED occurrence survived (e.g. the reconcile pull-back's
+    truncation didn't run). Only APPROVED / Not Required authorizes a future
+    delivery. Enforced by ``authorized_internal_service_case_exists`` in the PO
+    candidate query."""
+
+    def _setup(self, auth_status):
+        from datetime import timedelta
+
+        from .models import (
+            Case, CaseStatus, CaseType, Client, EnrollmentStage,
+            EnrollmentVerification, Household, HouseholdMember,
+            MemberDietaryProfile, MemberStatus, OrderSchedule, OrderStatus,
+        )
+
+        today = timezone.localdate()
+        client = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Auth", last_name="Gate",
+        )
+        hh = Household.objects.create(name="HH")
+        HouseholdMember.objects.create(household=hh, client=client, is_primary=True)
+        Case.objects.create(
+            case_id=str(uuid.uuid4()), client=client,
+            case_type=CaseType.INTERNAL_SERVICE, case_status=CaseStatus.OPEN,
+            service_authorization_status=auth_status,
+            program_name="Medically Tailored Meals", date_opened=timezone.now(),
+        )
+        # Enrollment left ACTIVE + a stale SCHEDULED occurrence on purpose (the
+        # pull-back truncation never ran).
+        enr = EnrollmentVerification.objects.create(
+            client=client, household=hh,
+            stage=EnrollmentStage.SERVICE_ACTIVE,
+        )
+        member = MemberDietaryProfile.objects.create(
+            enrollment=enr, client=client, menu_type="Standard",
+            status=MemberStatus.ACTIVE,
+        )
+        OrderSchedule.objects.create(
+            enrollment=enr, member=member, member_name="Auth Gate",
+            anticipated_delivery_date=today + timedelta(days=1),
+            status=OrderStatus.SCHEDULED, household_group_code="G", household=hh,
+        )
+        return client
+
+    def _po_eligible_client_ids(self):
+        from .models import OrderSchedule, OrderStatus
+        from .services.purchase_orders import (
+            authorized_internal_service_case_exists,
+        )
+
+        return {
+            str(cid)
+            for cid in OrderSchedule.objects.filter(status=OrderStatus.SCHEDULED)
+            .annotate(_a=authorized_internal_service_case_exists())
+            .filter(_a=True)
+            .values_list("member__client_id", flat=True)
+        }
+
+    def test_approved_is_po_eligible(self):
+        from .models import ServiceAuthorizationStatus
+
+        client = self._setup(ServiceAuthorizationStatus.APPROVED)
+        self.assertIn(str(client.client_id), self._po_eligible_client_ids())
+
+    def test_not_required_is_po_eligible(self):
+        from .models import ServiceAuthorizationStatus
+
+        client = self._setup(ServiceAuthorizationStatus.NOT_REQUIRED)
+        self.assertIn(str(client.client_id), self._po_eligible_client_ids())
+
+    def test_pending_excluded(self):
+        from .models import ServiceAuthorizationStatus
+
+        client = self._setup(ServiceAuthorizationStatus.PENDING)
+        self.assertNotIn(str(client.client_id), self._po_eligible_client_ids())
+
+    def test_never_requested_excluded(self):
+        from .models import ServiceAuthorizationStatus
+
+        client = self._setup(ServiceAuthorizationStatus.NEVER_REQUESTED)
+        self.assertNotIn(str(client.client_id), self._po_eligible_client_ids())
+
+    def test_denied_excluded(self):
+        from .models import ServiceAuthorizationStatus
+
+        client = self._setup(ServiceAuthorizationStatus.DENIED)
+        self.assertNotIn(str(client.client_id), self._po_eligible_client_ids())
+
+    def test_expired_excluded(self):
+        from .models import ServiceAuthorizationStatus
+
+        client = self._setup(ServiceAuthorizationStatus.EXPIRED)
+        self.assertNotIn(str(client.client_id), self._po_eligible_client_ids())
+
+
+class PrepareMembersForPOTaskTest(TestCase):
+    """The async "Prepare Members for PO" job: the Celery task runs the
+    full-calendar reconcile, streams progress to its tracking ``ImportRun``, and
+    records the aggregate totals -- so the Orders page can poll a live percentage
+    and completion (mirrors the CSV-import flow)."""
+
+    def test_task_reports_progress_and_completes(self):
+        from unittest.mock import patch
+
+        from .models import ImportRun, ImportRunStatus
+        from .tasks import MEMBER_PREP_SOURCE, prepare_members_for_po
+
+        run = ImportRun.objects.create(
+            source=MEMBER_PREP_SOURCE, status=ImportRunStatus.PENDING,
+        )
+        totals = {"enrollments": 3, "added": 5, "removed": 2, "updated": 1,
+                  "plans_created": 4}
+
+        def fake_sync(from_date=None, progress_cb=None):
+            # Drive the callback exactly as the real reconcile would.
+            progress_cb(0, 3)
+            for i in (1, 2, 3):
+                progress_cb(i, 3)
+            return totals
+
+        with patch("api.services.orders.sync_active_calendars", side_effect=fake_sync):
+            prepare_members_for_po.run(run.pk)
+
+        run.refresh_from_db()
+        self.assertEqual(run.status, ImportRunStatus.COMPLETED)
+        self.assertEqual(run.progress_total, 3)
+        self.assertEqual(run.processed_count, 3)
+        self.assertEqual(run.stats, {"member_prep": totals})
+        self.assertIsNotNone(run.finished_at)
+
+    def test_task_marks_failed_on_error(self):
+        from unittest.mock import patch
+
+        from .models import ImportRun, ImportRunStatus
+        from .tasks import MEMBER_PREP_SOURCE, prepare_members_for_po
+
+        run = ImportRun.objects.create(
+            source=MEMBER_PREP_SOURCE, status=ImportRunStatus.PENDING,
+        )
+        with patch("api.services.orders.sync_active_calendars",
+                   side_effect=RuntimeError("boom")):
+            prepare_members_for_po.run(run.pk)
+
+        run.refresh_from_db()
+        self.assertEqual(run.status, ImportRunStatus.FAILED)
+        self.assertIn("boom", run.error_log)
+        self.assertIsNotNone(run.finished_at)

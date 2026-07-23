@@ -376,6 +376,61 @@ class PurchaseOrderPreviewLateView(PortalAPIView):
         return Response(data)
 
 
+class PrepareMembersForPOView(PortalAPIView):
+    """Start / poll the async "Prepare Members for PO" job.
+
+    A full-calendar reconcile across every active household is far too slow for a
+    web request (it 504s inline), so POST enqueues a Celery worker that refreshes
+    the whole delivery calendar -- adding newly-eligible members, dropping those
+    no longer part of a servable household, and freeing dates whose PO was
+    cancelled -- and writes live progress to a tracking ``ImportRun``. GET polls
+    that row for the progress bar + completion (mirrors the CSV import flow)."""
+
+    def _latest(self):
+        from ..models import ImportRun
+        from ..tasks import MEMBER_PREP_SOURCE
+
+        return (
+            ImportRun.objects.filter(source=MEMBER_PREP_SOURCE)
+            .order_by("-started_at")
+            .first()
+        )
+
+    def get(self, request):
+        from .views_imports import _run_summary
+
+        run = self._latest()
+        if run is None:
+            return Response({"status": "idle", "run": None})
+        return Response(_run_summary(run))
+
+    def post(self, request):
+        from ..models import ImportRun, ImportRunStatus
+        from ..tasks import MEMBER_PREP_SOURCE, prepare_members_for_po
+        from .base import current_agent
+        from .views_imports import _run_summary
+
+        # Idempotent: if a prep job is already in flight, return it instead of
+        # spawning a second heavy full-calendar pass.
+        existing = self._latest()
+        if existing is not None and existing.status in (
+            ImportRunStatus.PENDING, ImportRunStatus.RUNNING,
+        ):
+            return Response(_run_summary(existing), status=http.HTTP_202_ACCEPTED)
+
+        agent = current_agent(request)
+        triggered_by = (
+            f"agent:{agent.agent_code}" if agent and agent.agent_code else "manual"
+        )
+        run = ImportRun.objects.create(
+            source=MEMBER_PREP_SOURCE,
+            status=ImportRunStatus.PENDING,
+            triggered_by=triggered_by,
+        )
+        prepare_members_for_po.delay(run.pk)
+        return Response(_run_summary(run), status=http.HTTP_202_ACCEPTED)
+
+
 class PurchaseOrderGenerateView(PortalAPIView):
     """Create one PO for a kitchen on a delivery date from selected member
     schedules (the agent's % / subset selection)."""

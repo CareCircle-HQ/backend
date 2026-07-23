@@ -470,10 +470,16 @@ def sync_delivery_calendar(enrollment, from_date=None):
     return {"added": len(to_create), "removed": removed, "updated": updated}
 
 
-def sync_active_calendars(from_date=None):
+def sync_active_calendars(from_date=None, progress_cb=None):
     """Reconcile the delivery calendar for every enrollment that either has
     future occurrences OR still has a live plan covering future dates (see
     :func:`sync_delivery_calendar`).
+
+    ``progress_cb(processed, total)`` -- when given -- is invoked after each
+    enrollment is reconciled so a long-running background job (the "Prepare
+    Members for PO" Celery task) can report a live percentage to the UI. The
+    total is known up front (the enrollment set is materialized before the
+    loop).
 
     Backs the PO popup "Refresh" and the ``sync_delivery_calendars`` command so
     no eligible member is ever missing from a Purchase Order: any member added
@@ -512,6 +518,9 @@ def sync_active_calendars(from_date=None):
     )
     totals = {"enrollments": 0, "added": 0, "removed": 0, "updated": 0,
               "plans_created": 0}
+    total = len(enr_ids)
+    if progress_cb is not None:
+        progress_cb(0, total)
     for enr in EnrollmentVerification.objects.filter(pk__in=enr_ids).iterator():
         # rebuild (not just sync) so a member ADDED to an already-active
         # household -- who never got a delivery plan and is therefore missing
@@ -523,6 +532,8 @@ def sync_active_calendars(from_date=None):
         totals["removed"] += res["removed"]
         totals["updated"] += res["updated"]
         totals["plans_created"] += res.get("plans_created", 0)
+        if progress_cb is not None:
+            progress_cb(totals["enrollments"], total)
     return totals
 
 
