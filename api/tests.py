@@ -851,10 +851,12 @@ class SoleInternalServiceDenialTest(TestCase):
         client = self._client()
         enr = self._enrollment(client, EnrollmentStage.KITCHEN_ASSIGNMENT)
         case_id = str(uuid.uuid4())
-        # First save as pending -> no pause.
+        # First save as pending -> NOT approved, so the pull-back rule returns
+        # the enrollment to Verified ("Waiting Authorization"): only an approval
+        # keeps a household past Verified.
         self._save_case(client, case_id, "pending")
         enr.refresh_from_db()
-        self.assertEqual(enr.stage, EnrollmentStage.KITCHEN_ASSIGNMENT)
+        self.assertEqual(enr.stage, EnrollmentStage.VERIFIED)
 
         # Deny the sole internal-service case -> full stop (On Hold). The case
         # stays OPEN (authorization no longer drives case status) and NO ticket
@@ -888,6 +890,84 @@ class SoleInternalServiceDenialTest(TestCase):
         self.assertEqual(enr.stage, EnrollmentStage.ON_HOLD)
 
         # Re-approve the same sole case -> auto-resume to the held-from stage.
+        self._save_case(client, case_id, "approved")
+        enr.refresh_from_db()
+        self.assertEqual(enr.stage, EnrollmentStage.KITCHEN_ASSIGNMENT)
+
+
+class UnapprovedActivePullBackTest(TestCase):
+    """A household advanced past Verified (Kitchen Assignment / Service Active)
+    whose governing internal-service authorization is NOT approved (pending /
+    never-requested / blank) is pulled BACK to Verified ("Waiting
+    Authorization"): only an approval keeps a household in service. A later
+    approval re-advances it. This fixes households activated before their
+    authorization landed (the CSV-import gap)."""
+
+    def _client(self):
+        return Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Ann", last_name="Auth"
+        )
+
+    def _enrollment(self, client, stage):
+        from .models import EnrollmentVerification, Household, HouseholdMember
+
+        household = Household.objects.create(name="HH")
+        HouseholdMember.objects.create(
+            household=household, client=client, is_primary=True
+        )
+        return EnrollmentVerification.objects.create(
+            client=client, household=household, stage=stage,
+            verified_at=timezone.now(),
+        )
+
+    def _save_case(self, client, case_id, auth_status):
+        from .serializers import CaseSerializer
+
+        data = {
+            "case_id": case_id,
+            "client_id": str(client.client_id),
+            "case_type": "internal_service",
+            "program_name": "Medically Tailored Meals",
+            "service_authorization_status": auth_status,
+            "date_opened": timezone.now().isoformat(),
+        }
+        ser = CaseSerializer(data=data)
+        ser.is_valid(raise_exception=True)
+        return ser.save()
+
+    def test_pending_pulls_service_active_back_to_verified(self):
+        from .models import EnrollmentStage, ProgramStatus
+        from .services.lifecycle import program_status
+
+        client = self._client()
+        enr = self._enrollment(client, EnrollmentStage.SERVICE_ACTIVE)
+        self._save_case(client, str(uuid.uuid4()), "pending")
+        enr.refresh_from_db()
+        self.assertEqual(enr.stage, EnrollmentStage.VERIFIED)
+        self.assertEqual(program_status(enr), ProgramStatus.WAITING_AUTHORIZATION)
+
+    def test_never_requested_pulls_kitchen_assignment_back(self):
+        from .models import EnrollmentStage
+
+        client = self._client()
+        enr = self._enrollment(client, EnrollmentStage.KITCHEN_ASSIGNMENT)
+        self._save_case(client, str(uuid.uuid4()), "never_requested")
+        enr.refresh_from_db()
+        self.assertEqual(enr.stage, EnrollmentStage.VERIFIED)
+
+    def test_approval_readvances_after_pullback(self):
+        from .models import EnrollmentStage
+
+        client = self._client()
+        enr = self._enrollment(client, EnrollmentStage.SERVICE_ACTIVE)
+        case_id = str(uuid.uuid4())
+        self._save_case(client, case_id, "pending")
+        enr.refresh_from_db()
+        self.assertEqual(enr.stage, EnrollmentStage.VERIFIED)
+
+        # Approve the same case -> the enrollment re-advances to Kitchen
+        # Assignment (reconcile_enrollment_authorization), so the pull-back is
+        # fully reversible.
         self._save_case(client, case_id, "approved")
         enr.refresh_from_db()
         self.assertEqual(enr.stage, EnrollmentStage.KITCHEN_ASSIGNMENT)
