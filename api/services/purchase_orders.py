@@ -49,6 +49,7 @@ from api.models import (
     PurchaseOrder,
     PurchaseOrderStatus,
     ScheduleStatus,
+    ServiceAuthorizationStatus,
     generate_household_group_code,
 )
 from api.services.catalog import product_kind_for_enrollment, product_type_kind_for_name
@@ -319,6 +320,45 @@ def open_internal_service_case_exists(member_client_field="member__client_id"):
     )
 
 
+# Authorization statuses that clear a household for a FUTURE delivery. Only an
+# APPROVED (or Not Required) authorization authorizes service; PENDING /
+# NEVER_REQUESTED / DENIED / EXPIRED / blank do NOT -- a case that is only
+# "Waiting Authorization" (or has lapsed/been refused) must never put a member
+# on a Purchase Order.
+_AUTHORIZED_AUTH_STATUSES = (
+    ServiceAuthorizationStatus.APPROVED,
+    ServiceAuthorizationStatus.NOT_REQUIRED,
+)
+
+
+def authorized_internal_service_case_exists(applicant_field="enrollment__client_id"):
+    """An ``Exists`` subquery, true when the schedule's household case-holder
+    (the enrollment applicant) has an OPEN internal-service case whose
+    authorization is APPROVED / Not Required.
+
+    Companion guardrail to :func:`open_internal_service_case_exists`. Where that
+    stops CLOSED-case leaks, this stops UNAUTHORIZED leaks: a household whose
+    governing meal/box authorization is still pending ("Waiting Authorization"),
+    denied, expired, or never requested must never be selected for a Purchase
+    Order -- only an approval authorizes a future delivery. Keyed on the
+    enrollment applicant (the case-holder) so the WHOLE household follows the one
+    governing authorization.
+
+    Belt-and-suspenders alongside the reconcile pull-back
+    (:func:`~api.services.lifecycle._downgrade_unauthorized_enrollment`), which
+    truncates the future occurrences of an unapproved household: if that failed
+    to run and left a stale SCHEDULED occurrence, this query-level gate still
+    keeps the member off the PO.
+    """
+    return Exists(
+        Case.objects.filter(
+            client_id=OuterRef(applicant_field),
+            case_type=CaseType.INTERNAL_SERVICE,
+            service_authorization_status__in=_AUTHORIZED_AUTH_STATUSES,
+        ).exclude(case_status__in=_CLOSED_CASE_STATUSES)
+    )
+
+
 def _due_schedules(kind, delivery_date):
     """SCHEDULED OrderSchedule rows for the given kind that land on the date.
 
@@ -338,6 +378,8 @@ def _due_schedules(kind, delivery_date):
         .exclude(member__status__in=SERVICE_EXCLUDED_MEMBER_STATUSES)
         .annotate(_has_open_isc=open_internal_service_case_exists())
         .filter(_has_open_isc=True)
+        .annotate(_has_auth_isc=authorized_internal_service_case_exists())
+        .filter(_has_auth_isc=True)
         .select_related(
             "member", "member__client", "household", "kitchen",
             "enrollment", "enrollment__case", "enrollment__case__program",
@@ -591,6 +633,8 @@ def generate_purchase_order(kind, delivery_date, kitchen, schedule_ids, split_se
         .exclude(member__status__in=SERVICE_EXCLUDED_MEMBER_STATUSES)
         .annotate(_has_open_isc=open_internal_service_case_exists())
         .filter(_has_open_isc=True)
+        .annotate(_has_auth_isc=authorized_internal_service_case_exists())
+        .filter(_has_auth_isc=True)
         .select_related("member", "member__client", "household", "kitchen")
     )
     already = _batched_client_ids(delivery_date)

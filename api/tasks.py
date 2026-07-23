@@ -104,6 +104,72 @@ def sync_delivery_calendars(self, from_date=None):
     )
 
 
+# ImportRun.source for the manual "Prepare Members for PO" job so it is tracked
+# with the same progress fields the UI already polls, without polluting the CSV
+# import history (which filters on CSV_SOURCE).
+MEMBER_PREP_SOURCE = "member_prep"
+
+
+@shared_task(bind=True, ignore_result=True)
+def prepare_members_for_po(self, run_id):
+    """Reconcile the delivery calendar for EVERY active household in one
+    background pass, writing live progress to the tracking ``ImportRun`` so the
+    Orders page can show a progress bar (mirrors the S3 CSV import flow).
+
+    This is the manual, agent-triggered "Prepare Members for PO" action: it adds
+    newly-eligible members to the calendar, drops occurrences for members who are
+    no longer part of a servable household (closed/unauthorized/paused), and
+    frees dates whose PO was cancelled -- so the next Purchase Order preview is
+    accurate. Runs in the worker because a full-calendar reconcile is far too
+    slow for a web request (it 504s inline).
+    """
+    run = ImportRun.objects.filter(pk=run_id).first()
+    if run is None:
+        logger.warning("prepare_members_for_po: ImportRun %s not found", run_id)
+        return
+
+    from .services.orders import sync_active_calendars
+
+    run.status = ImportRunStatus.RUNNING
+    run.save(update_fields=["status"])
+
+    # Throttle progress writes: the callback fires per enrollment (thousands of
+    # them), so only flush the tracking row every N to keep it cheap while still
+    # giving the UI a live percentage.
+    state = {"last": 0}
+
+    def _progress(processed, total):
+        # Keep the in-memory instance in sync too, so the final save() in the
+        # finally block doesn't clobber the flushed counts with stale values.
+        if run.progress_total != total:
+            ImportRun.objects.filter(pk=run.pk).update(
+                progress_total=total, processed_count=processed,
+            )
+            run.progress_total = total
+            run.processed_count = processed
+            state["last"] = processed
+            return
+        if processed - state["last"] >= 50 or processed == total:
+            ImportRun.objects.filter(pk=run.pk).update(processed_count=processed)
+            run.processed_count = processed
+            state["last"] = processed
+
+    try:
+        totals = sync_active_calendars(progress_cb=_progress)
+        run.stats = {"member_prep": totals}
+        run.status = ImportRunStatus.COMPLETED
+    except Exception as exc:  # noqa: BLE001 - surface the failure to the UI
+        logger.exception("prepare_members_for_po %s failed", run_id)
+        run.status = ImportRunStatus.FAILED
+        run.error_log = f"FATAL: {exc}"[:10000]
+    finally:
+        run.finished_at = timezone.now()
+        run.save(update_fields=[
+            "status", "stats", "error_log", "finished_at", "processed_count",
+            "progress_total",
+        ])
+
+
 @shared_task(bind=True, ignore_result=True)
 def sweep_closed_case_service(self):
     """Safety-net sweep: cancel service for any client whose LAST internal-service

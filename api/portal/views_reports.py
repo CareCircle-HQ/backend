@@ -714,6 +714,7 @@ class MembersForPurchaseOrderReportView(PortalAPIView):
             _WEEKDAY_CADENCE,
             _household_group_code,
             _household_is_primary,
+            authorized_internal_service_case_exists,
             open_internal_service_case_exists,
         )
 
@@ -743,6 +744,8 @@ class MembersForPurchaseOrderReportView(PortalAPIView):
             .exclude(member__status__in=SERVICE_EXCLUDED_MEMBER_STATUSES)
             .annotate(_has_open_isc=open_internal_service_case_exists())
             .filter(_has_open_isc=True)
+            .annotate(_has_auth_isc=authorized_internal_service_case_exists())
+            .filter(_has_auth_isc=True)
             .select_related("member__client", "household", "kitchen")
             .prefetch_related("member__client__cases")
             .order_by(
@@ -862,7 +865,10 @@ class MembersNotServedReportView(PortalAPIView):
             SERVICE_EXCLUDED_ENROLLMENT_STAGES,
             SERVICE_EXCLUDED_MEMBER_STATUSES,
         )
-        from ..services.purchase_orders import open_internal_service_case_exists
+        from ..services.purchase_orders import (
+            authorized_internal_service_case_exists,
+            open_internal_service_case_exists,
+        )
 
         # Clients currently scheduled for a delivery (i.e. on/heading to a PO).
         # Mirror PO candidate selection (services.purchase_orders._due_schedules)
@@ -878,6 +884,8 @@ class MembersNotServedReportView(PortalAPIView):
             .exclude(member__status__in=SERVICE_EXCLUDED_MEMBER_STATUSES)
             .annotate(_has_open_isc=open_internal_service_case_exists())
             .filter(_has_open_isc=True)
+            .annotate(_has_auth_isc=authorized_internal_service_case_exists())
+            .filter(_has_auth_isc=True)
             .values_list("member__client_id", flat=True)
         )
 
