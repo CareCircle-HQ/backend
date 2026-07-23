@@ -844,10 +844,11 @@ class MembersNotServedReportView(PortalAPIView):
     of the case's status.
 
     Columns: Client ID, Case ID, Case Status, Case Authorization, Program Name,
-    Is Part of a Household, Full Name, Out of Orbit, Out of Range, On Hold,
-    Cancelled. The status flags explain WHY a member isn't being served
-    (out-of-orbit/out-of-range/paused/ended); all can be No when the member
-    simply never reached a Purchase Order (e.g. pending verification).
+    Is Part of a Household, Full Name, Member Stage, Kitchen, Cadence, Menu Type,
+    Out of Orbit, Out of Range, On Hold, Cancelled. The status flags explain WHY
+    a member isn't being served (out-of-orbit/out-of-range/paused/ended); all can
+    be No when the member simply never reached a Purchase Order (e.g. pending
+    verification). Kitchen / Cadence / Menu Type are blank until assigned.
     """
 
     def get(self, request):
@@ -887,6 +888,8 @@ class MembersNotServedReportView(PortalAPIView):
             .prefetch_related(
                 "cases",
                 "enrollments__member_profiles",
+                "enrollments__kitchen",
+                "enrollments__delivery_schedules",
                 "member_profiles",
                 "household_membership__household__members",
             )
@@ -906,6 +909,10 @@ class MembersNotServedReportView(PortalAPIView):
             "Program Name",
             "Is Part of a Household",
             "Full Name",
+            "Member Stage",
+            "Kitchen",
+            "Cadence",
+            "Menu Type",
             "Out of Orbit",
             "Out of Range",
             "On Hold",
@@ -953,6 +960,17 @@ class MembersNotServedReportView(PortalAPIView):
                 or (latest is not None and latest.stage == EnrollmentStage.CANCELLED)
             )
 
+            # Member service assignments (blank until set): the enrollment stage
+            # label, the assigned kitchen, the delivery cadence, and the menu
+            # type from the member's dietary profile.
+            member_stage = (
+                _ENROLLMENT_STAGE_LABELS.get(latest.stage, latest.stage or "")
+                if latest is not None else ""
+            )
+            kitchen = latest.kitchen.name if (latest and latest.kitchen_id) else ""
+            cadence = _cadence_label(profile, latest)
+            menu_type = profile.menu_type if profile else ""
+
             writer.writerow([
                 str(client.client_id),
                 str(case.case_id) if case else "",
@@ -961,6 +979,10 @@ class MembersNotServedReportView(PortalAPIView):
                 program_name,
                 _yn(in_household),
                 f"{client.first_name or ''} {client.last_name or ''}".strip(),
+                member_stage,
+                kitchen,
+                cadence,
+                menu_type,
                 _yn(member_out_of_orbit(client)),
                 _yn(member_out_of_range(client)),
                 _yn(on_hold),

@@ -6071,12 +6071,15 @@ class ReportExportsTest(TestCase):
 
     def test_members_not_served_export_new_columns(self):
         from .models import (
-            Case, CaseStatus, CaseType, Household, HouseholdMember,
-            ServiceAuthorizationStatus,
+            Case, CaseStatus, CaseType, EnrollmentStage, EnrollmentVerification,
+            Household, HouseholdMember, Kitchen, MemberDeliverySchedule,
+            MemberDietaryProfile, ServiceAuthorizationStatus,
         )
 
         # A member with an internal-service case, in a multi-member household,
-        # and NOT served (no scheduled delivery) -> appears in the report.
+        # and NOT served (no scheduled delivery) -> appears in the report. Give
+        # them an enrollment with a kitchen, a delivery schedule (cadence) and a
+        # dietary profile (menu type) so the assignment columns are populated.
         client = self._client("Hh", "Member")
         other = self._client("Room", "Mate")
         hh = Household.objects.create(name="Shared HH")
@@ -6089,6 +6092,18 @@ class ReportExportsTest(TestCase):
             program_name="MTM - (Household) Medically Tailored Meals - Queens",
             service_authorization_status=ServiceAuthorizationStatus.APPROVED,
             service_authorization_status_label="Accepted",
+        )
+        kitchen = Kitchen.objects.create(name="Brooklyn Kitchen")
+        enr = EnrollmentVerification.objects.create(
+            client=client, household=hh, case=case, kitchen=kitchen,
+            stage=EnrollmentStage.KITCHEN_ASSIGNMENT,
+        )
+        profile = MemberDietaryProfile.objects.create(
+            enrollment=enr, client=client, menu_type="Kosher",
+        )
+        MemberDeliverySchedule.objects.create(
+            enrollment=enr, member_profile=profile,
+            delivery_days_cadence="mon_thu",
         )
 
         # A solo member (no multi-member household) -> household flag is No.
@@ -6109,9 +6124,18 @@ class ReportExportsTest(TestCase):
             "MTM - (Household) Medically Tailored Meals - Queens",
         )
         self.assertEqual(row["Is Part of a Household"], "Yes")
+        self.assertEqual(row["Member Stage"], "Kitchen Assignment")
+        self.assertEqual(row["Kitchen"], "Brooklyn Kitchen")
+        self.assertEqual(row["Cadence"], "Mon/Thu")
+        self.assertEqual(row["Menu Type"], "Kosher")
 
         solo_row = next(r for r in rows if r["Client ID"] == str(solo.client_id))
         self.assertEqual(solo_row["Is Part of a Household"], "No")
+        # No enrollment/assignments -> the new columns are blank.
+        self.assertEqual(solo_row["Member Stage"], "")
+        self.assertEqual(solo_row["Kitchen"], "")
+        self.assertEqual(solo_row["Cadence"], "")
+        self.assertEqual(solo_row["Menu Type"], "")
 
     def test_reports_require_management(self):
         agent = Agent.objects.create(
