@@ -821,14 +821,14 @@ class ServiceAuthorizationStatus(models.TextChoices):
 
 class CaseType(models.TextChoices):
     """Classification of a case. Auto-derived on save by matching the case's
-    program_name against the ProgramPipeline table (program_name -> case_category)
+    program_name against the ActiveProgram table (program_name -> case_category)
     and mapping that category here; falls back to the service_type heuristic
     (Social Service Case Management => Internal Service, else => Navigation) when
-    the program is not found in ProgramPipeline."""
+    the program is not found in ActiveProgram."""
 
     # Stored value stays "navigation" (kept for backward-compatibility with
     # existing rows + the frontend filter id); the DISPLAY label is "Care
-    # Management". Cases are classified here from the ProgramPipeline
+    # Management". Cases are classified here from the ActiveProgram
     # "Care Management" (formerly "Navigation") case_category.
     NAVIGATION = "navigation", "Care Management"
     EXTERNAL_SERVICE = "external_service", "External Service"
@@ -2597,23 +2597,33 @@ class HouseholdMemberLoginCode(models.Model):
         return check_password(str(code or "").strip(), self.code_hash)
 
 
-class ProgramPipeline(models.Model):
-    """Maps a source Program Name to the GHL pipeline a case should sync to.
+class ActiveProgram(models.Model):
+    """Maps a source Program Name to the Case Category it classifies as.
 
-    Cases are routed to a GHL opportunity pipeline by looking up the case's
-    ``program_name`` here. The authoritative routing value is ``pipeline_id``
-    (the ``pipeline_name`` column in the source data has typos and is for human
-    reference only). The category columns support a fallback when a case's
-    program name is not found in this table.
+    Every imported case is classified by looking up its ``program_name`` here
+    and reading the matched row's ``case_category`` (Eligibility / Care
+    Management / Internal Service / External Service). Agents manage this table
+    from Settings > Active Programs, where a program can be added or moved to a
+    different case category. See ``api.serializers.derive_case_type``.
     """
+
+    class CaseType(models.TextChoices):
+        FOOD = "food", "Food"
+        TRANSPORTATION = "transportation", "Transportation"
 
     program_name = models.CharField(max_length=255, unique=True, db_index=True)
     main_category = models.CharField(max_length=120, blank=True)
     # ELIGIBILITY / NAVIGATION / Internal Services / External Services, etc.
     case_category = models.CharField(max_length=120, blank=True, db_index=True)
     services_category = models.CharField(max_length=120, blank=True)
-    pipeline_name = models.CharField(max_length=120, blank=True)  # human label
-    pipeline_id = models.CharField(max_length=64)  # authoritative GHL pipeline id
+    # True when the program name contains the word "Household" (a household
+    # pathway). Auto-derived from ``program_name`` on save.
+    is_for_household = models.BooleanField(default=False)
+    # Food vs Transportation domain. Defaults to Food (every internal-service
+    # program today is food); set to Transportation for transport programs.
+    case_type = models.CharField(
+        max_length=20, choices=CaseType.choices, default=CaseType.FOOD
+    )
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -2623,8 +2633,12 @@ class ProgramPipeline(models.Model):
             models.Index(fields=["case_category"]),
         ]
 
+    def save(self, *args, **kwargs):
+        self.is_for_household = "household" in (self.program_name or "").casefold()
+        super().save(*args, **kwargs)
+
     def __str__(self):
-        return f"{self.program_name} -> {self.pipeline_name} ({self.pipeline_id})"
+        return f"{self.program_name} -> {self.case_category}"
 
 
 class AllowedZipCode(models.Model):

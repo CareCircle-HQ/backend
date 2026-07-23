@@ -7,6 +7,7 @@ from rest_framework.decorators import action
 from rest_framework.response import Response
 
 from ..models import (
+    ActiveProgram,
     Agent,
     Cadence,
     DeliveryCompany,
@@ -319,6 +320,62 @@ class ProgramMainCategoryViewSet(viewsets.ModelViewSet):
             {
                 "count": len(data),
                 "active_count": sum(1 for c in data if c["is_active"]),
+                "results": data,
+            }
+        )
+
+
+class ActiveProgramViewSet(viewsets.ModelViewSet):
+    """Settings > Programs: manage the ActiveProgram classification table -- the
+    Program Name -> Case Category map that decides, on import, whether a case is
+    Internal / External Service, Eligibility or Care Management (see
+    ``api.serializers.derive_case_type_from_active_program``).
+
+    Agents can add / edit / delete rows and set each program's ``case_category``
+    and ``case_type`` (Food/Transportation). ``is_for_household`` is auto-derived
+    from the name on save. Full list (no pagination for client-side search) with
+    optional ``?search=`` (program name), ``?category=`` (case_category) and
+    ``?case_type=food|transportation``.
+    """
+
+    permission_classes = [IsPortalAgent]
+    serializer_class = s.PortalActiveProgramSerializer
+    pagination_class = None
+    http_method_names = ["get", "post", "patch", "put", "delete", "head", "options"]
+
+    def get_queryset(self):
+        qs = ActiveProgram.objects.all()
+        params = self.request.query_params
+        search = (params.get("search") or "").strip()
+        if search:
+            qs = qs.filter(program_name__icontains=search)
+        category = (params.get("category") or "").strip()
+        if category:
+            qs = qs.filter(case_category__iexact=category)
+        case_type = (params.get("case_type") or "").strip().lower()
+        if case_type in ActiveProgram.CaseType.values:
+            qs = qs.filter(case_type=case_type)
+        return qs
+
+    def list(self, request, *args, **kwargs):
+        qs = self.filter_queryset(self.get_queryset())
+        data = self.get_serializer(qs, many=True).data
+        # Distinct case categories currently in use, so the UI dropdown stays in
+        # sync with the data without hard-coding the (free-text) labels.
+        categories = list(
+            ActiveProgram.objects.exclude(case_category="")
+            .order_by("case_category")
+            .values_list("case_category", flat=True)
+            .distinct()
+        )
+        return Response(
+            {
+                "count": len(data),
+                "categories": categories,
+                "case_types": [
+                    {"value": v, "label": label}
+                    for v, label in ActiveProgram.CaseType.choices
+                ],
                 "results": data,
             }
         )

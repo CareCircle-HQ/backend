@@ -2664,19 +2664,20 @@ class UniteUsCaseMapperTest(SimpleTestCase):
         }
         return map_case(rec, auth=auth)
 
-    def test_date_opened_prefers_opened_date(self):
+    def test_date_opened_prefers_created_at(self):
         out = self._map(
             state="open",
             attrs={"opened_date": "2026-01-05T00:00:00Z", "created_at": "2026-01-01T00:00:00Z"},
         )
-        # map_case passes the ISO string through (DRF parses it on save).
-        self.assertTrue(out["date_opened"].startswith("2026-01-05"))
-
-    def test_date_opened_falls_back_to_created_at(self):
-        # No opened_date -> use the Unite Us case created timestamp so date_opened
-        # is never blank (mirrors the CSV import fallback).
-        out = self._map(state="open", attrs={"created_at": "2026-01-01T00:00:00Z"})
+        # map_case passes the ISO string through (DRF parses it on save). The
+        # Unite Us case-created timestamp wins over the agent-entered opened date.
         self.assertTrue(out["date_opened"].startswith("2026-01-01"))
+
+    def test_date_opened_falls_back_to_opened_date(self):
+        # No created_at -> fall back to the agent-entered opened date so
+        # date_opened is never blank (mirrors the CSV import fallback).
+        out = self._map(state="open", attrs={"opened_date": "2026-01-05T00:00:00Z"})
+        self.assertTrue(out["date_opened"].startswith("2026-01-05"))
 
     def test_closed_date_marks_case_closed_despite_managed_state(self):
         out = self._map(state="managed", closed_date="2026-01-02T00:00:00Z")
@@ -3655,7 +3656,7 @@ class ProgramCreationRestrictionTest(TestCase):
 
 class ExternalServiceCaseBlockedTest(TestCase):
     """External Service cases are never persisted -- neither an explicit type nor
-    one derived from the program's ProgramPipeline category can be saved. The
+    one derived from the program's ActiveProgram category can be saved. The
     other three types (Navigation, Internal Service, Eligibility) still save."""
 
     def _client(self):
@@ -3683,13 +3684,12 @@ class ExternalServiceCaseBlockedTest(TestCase):
     def test_derived_external_service_rejected(self):
         from rest_framework.exceptions import ValidationError
 
-        from .models import Case, ProgramPipeline
+        from .models import ActiveProgram, Case
         from .serializers import CaseSerializer
 
         c = self._client()
-        ProgramPipeline.objects.create(
+        ActiveProgram.objects.create(
             program_name="Legal Aid", case_category="External Service",
-            pipeline_id="p1",
         )
         cid = str(uuid.uuid4())
         ser = CaseSerializer(data={
@@ -3714,6 +3714,41 @@ class ExternalServiceCaseBlockedTest(TestCase):
         ser.is_valid(raise_exception=True)
         case = ser.save()
         self.assertEqual(case.case_type, CaseType.NAVIGATION)
+
+
+class ActiveProgramFieldsTest(TestCase):
+    """ActiveProgram.is_for_household auto-derives from the program name on save
+    (True only when "household" appears), and case_type defaults to Food."""
+
+    def test_is_for_household_and_case_type_default(self):
+        from .models import ActiveProgram
+
+        hh = ActiveProgram.objects.create(
+            program_name="MTM - (Household) High-Risk Children - Brooklyn",
+            case_category="Internal Service",
+        )
+        indiv = ActiveProgram.objects.create(
+            program_name="MTM - Individual - Queens",
+            case_category="Internal Service",
+        )
+        self.assertTrue(hh.is_for_household)
+        self.assertFalse(indiv.is_for_household)
+        self.assertEqual(hh.case_type, ActiveProgram.CaseType.FOOD)
+
+    def test_is_for_household_recomputes_on_rename(self):
+        from .models import ActiveProgram
+
+        ap = ActiveProgram.objects.create(
+            program_name="Transit Assistance - Individual",
+            case_category="Internal Service",
+            case_type=ActiveProgram.CaseType.TRANSPORTATION,
+        )
+        self.assertFalse(ap.is_for_household)
+        ap.program_name = "Transit Assistance - Household"
+        ap.save()
+        ap.refresh_from_db()
+        self.assertTrue(ap.is_for_household)
+        self.assertEqual(ap.case_type, ActiveProgram.CaseType.TRANSPORTATION)
 
 
 class MemberEligibilityTest(TestCase):
@@ -6019,12 +6054,12 @@ class ReportExportsTest(TestCase):
         Insurance.objects.create(
             client=client, plan_type="medicaid", plan_name="Fidelis Medicaid",
             status="active", is_primary=True,
-            enrolled_at=datetime(2025, 1, 1, tzinfo=dt_tz.utc),
-            expired_at=datetime(2030, 12, 31, tzinfo=dt_tz.utc),
+            enrolled_at=datetime(2025, 1, 1, 12, tzinfo=dt_tz.utc),
+            expired_at=datetime(2030, 12, 31, 12, tzinfo=dt_tz.utc),
         )
         SocialCareCoverage.objects.create(
             client=client, status=SocialCareCoverageStatus.ENROLLED,
-            expired_at=datetime(2030, 6, 30, tzinfo=dt_tz.utc),
+            expired_at=datetime(2030, 6, 30, 12, tzinfo=dt_tz.utc),
         )
 
         rows = self._rows(reverse("portal-report-all-members"))
@@ -6064,8 +6099,9 @@ class ReportExportsTest(TestCase):
         from datetime import datetime, timezone as dt_tz
 
         from .models import (
-            Case, CaseHouseholdType, CaseStatus, CaseType,
-            ServiceAuthorizationStatus, UniteUsAgent,
+            Case, CaseHouseholdType, CaseStatus, CaseType, DeliveryCadence,
+            EnrollmentVerification, Kitchen, MemberDeliverySchedule,
+            ScheduleStatus, ServiceAuthorizationStatus, UniteUsAgent,
         )
 
         client = self._client("Case", "Owner")
@@ -6089,8 +6125,18 @@ class ReportExportsTest(TestCase):
             primary_worker_name="Wanda Worker",
             service_authorization_status=ServiceAuthorizationStatus.APPROVED,
             service_authorization_status_label="Accepted",
-            service_authorization_approval_ends_at=datetime(2027, 3, 1, tzinfo=dt_tz.utc),
-            date_opened=datetime(2026, 5, 10, tzinfo=dt_tz.utc),
+            service_authorization_approval_ends_at=datetime(2027, 3, 1, 12, tzinfo=dt_tz.utc),
+            date_opened=datetime(2026, 5, 10, 12, tzinfo=dt_tz.utc),
+        )
+        kitchen = Kitchen.objects.create(name="Williamsburg")
+        enrollment = EnrollmentVerification.objects.create(
+            client=client, case=case, kitchen=kitchen,
+            delivery_weekdays=["mon", "thu"],
+        )
+        MemberDeliverySchedule.objects.create(
+            enrollment=enrollment,
+            delivery_days_cadence=DeliveryCadence.MON_THU,
+            status=ScheduleStatus.SCHEDULED,
         )
 
         rows = self._rows(reverse("portal-report-cases"))
@@ -6112,6 +6158,8 @@ class ReportExportsTest(TestCase):
         self.assertEqual(row["Is Program Household?"], "Yes")
         self.assertEqual(row["Case Type"], "Care Management")
         self.assertEqual(row["Meals/Boxes"], "Meals")
+        self.assertEqual(row["Kitchen"], "Williamsburg")
+        self.assertEqual(row["Cadence"], "Mon/Thu")
         self.assertEqual(row["Primary Worker Name"], "Wanda Worker")
         self.assertEqual(row["Care Coordinator"], "Coord Person")
         self.assertEqual(row["Service Authorization Status"], "Accepted")
@@ -6148,6 +6196,23 @@ class ReportExportsTest(TestCase):
         ids = {r["Case ID"] for r in self._rows(url)}
         self.assertIn(str(in_range.case_id), ids)
         self.assertNotIn(str(out_range.case_id), ids)
+
+    def test_cases_export_created_date_uses_local_timezone(self):
+        # An evening EDT case-created timestamp is stored in UTC as the NEXT
+        # calendar day (9:34 PM EDT == 01:34 UTC). The export must render the
+        # LOCAL date (matching the CRM UI), not the raw UTC date.
+        from datetime import datetime, timezone as dt_tz
+
+        from .models import Case, CaseStatus
+
+        client = self._client("Evening", "Case")
+        case = Case.objects.create(
+            case_id=uuid.uuid4(), client=client, case_status=CaseStatus.OPEN,
+            date_opened=datetime(2026, 7, 23, 1, 34, 17, tzinfo=dt_tz.utc),
+        )
+        rows = self._rows(reverse("portal-report-cases"))
+        row = next(r for r in rows if r["Case ID"] == str(case.case_id))
+        self.assertEqual(row["Case Created Date"], "2026-07-22")
 
     def test_members_not_served_export_new_columns(self):
         from .models import (

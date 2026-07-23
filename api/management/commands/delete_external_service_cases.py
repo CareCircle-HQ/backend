@@ -1,6 +1,6 @@
 """Delete every Case classified as External Service.
 
-Case type is auto-derived on save (program_name -> ProgramPipeline category,
+Case type is auto-derived on save (program_name -> ActiveProgram category,
 falling back to the service_type heuristic), so this targets
 ``Case.case_type == CaseType.EXTERNAL_SERVICE``.
 

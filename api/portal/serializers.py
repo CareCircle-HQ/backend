@@ -22,6 +22,7 @@ from api.services.lifecycle import (
 )
 
 from ..models import (
+    ActiveProgram,
     Address,
     Agent,
     Cadence,
@@ -1349,6 +1350,36 @@ class PortalProgramMainCategorySerializer(serializers.ModelSerializer):
         model = ProgramMainCategory
         fields = ["id", "name", "is_active", "program_count"]
         read_only_fields = ["id", "program_count"]
+
+
+class PortalActiveProgramSerializer(serializers.ModelSerializer):
+    """Settings > Programs: the Program Name -> Case Category classification
+    table (ActiveProgram) that drives internal/external service classification
+    on import (see api.serializers.derive_case_type_from_active_program).
+
+    ``case_category`` is the authoritative routing label; ``case_type`` is the
+    Food/Transportation domain. ``is_for_household`` is auto-derived from the
+    program name on save and is read-only here."""
+
+    is_for_household = serializers.BooleanField(read_only=True)
+    case_type_label = serializers.CharField(
+        source="get_case_type_display", read_only=True
+    )
+
+    class Meta:
+        model = ActiveProgram
+        fields = [
+            "id",
+            "program_name",
+            "main_category",
+            "case_category",
+            "services_category",
+            "case_type",
+            "case_type_label",
+            "is_for_household",
+            "updated_at",
+        ]
+        read_only_fields = ["id", "case_type_label", "is_for_household", "updated_at"]
 
 
 # ---------------------------------------------------------------------------

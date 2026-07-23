@@ -134,6 +134,7 @@ from .views_imports import (
     UniteUsExportsView,
 )
 from .views_settings import (
+    ActiveProgramViewSet,
     CadenceViewSet,
     CrmAgentViewSet,
     DeliveryCompanyIntegrationDetailView,
@@ -167,6 +168,11 @@ router.register(
     "settings/program-main-categories",
     ProgramMainCategoryViewSet,
     basename="portal-program-main-category",
+)
+router.register(
+    "settings/programs",
+    ActiveProgramViewSet,
+    basename="portal-active-program",
 )
 
 urlpatterns = [

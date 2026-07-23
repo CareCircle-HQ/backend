@@ -46,10 +46,10 @@ from .models import (
     MilitaryProfile,
     Note,
     NoteSource,
+    ActiveProgram,
     Program,
     ProgramEligibility,
     ProgramMainCategory,
-    ProgramPipeline,
     Provider,
     RecordStatus,
     Screening,
@@ -1024,12 +1024,12 @@ class EnrollmentVerificationSerializer(serializers.ModelSerializer):
 
 # ===========================================================================
 # Case domain
-# Map a ProgramPipeline.case_category value to a Case.case_type. Keys are
+# Map an ActiveProgram.case_category value to a Case.case_type. Keys are
 # casefolded; both singular/plural spellings from the source data are accepted.
-_PIPELINE_CATEGORY_TO_CASE_TYPE = {
+_CATEGORY_TO_CASE_TYPE = {
     # "Navigation" was renamed to "Care Management" (display only -- both map to
     # the same CaseType, whose stored value is still "navigation"). Accept both
-    # so legacy + renamed ProgramPipeline rows classify identically.
+    # so legacy + renamed ActiveProgram rows classify identically.
     "navigation": CaseType.NAVIGATION,
     "care management": CaseType.NAVIGATION,
     "eligibility": CaseType.ELIGIBILITY,
@@ -1040,8 +1040,8 @@ _PIPELINE_CATEGORY_TO_CASE_TYPE = {
 }
 
 
-def derive_case_type_from_pipeline(program_name):
-    """Classify a case by matching its program_name against the ProgramPipeline
+def derive_case_type_from_active_program(program_name):
+    """Classify a case by matching its program_name against the ActiveProgram
     table and mapping the matched row's case_category to a CaseType.
 
     The match is case-insensitive and whitespace-trimmed so minor differences
@@ -1053,10 +1053,10 @@ def derive_case_type_from_pipeline(program_name):
     pn = (program_name or "").strip()
     if not pn:
         return None
-    row = ProgramPipeline.objects.filter(program_name__iexact=pn).first()
+    row = ActiveProgram.objects.filter(program_name__iexact=pn).first()
     if row is None:
         return None
-    return _PIPELINE_CATEGORY_TO_CASE_TYPE.get((row.case_category or "").strip().casefold())
+    return _CATEGORY_TO_CASE_TYPE.get((row.case_category or "").strip().casefold())
 
 
 # Service subtypes (stored in ``Case.service_type``) that ARE our internal
@@ -1074,7 +1074,7 @@ def derive_case_type(service_type, program_name=None):
 
     Internal Service is identified by the meal/box service subtype (stored in
     ``service_type``): Medically Tailored Meals or Produce Prescription/Voucher.
-    Otherwise the type comes from the ``program_name``'s ProgramPipeline
+    Otherwise the type comes from the ``program_name``'s ActiveProgram
     category (Eligibility / Navigation / External Service); a blank or unmatched
     program is Navigation.
 
@@ -1085,9 +1085,9 @@ def derive_case_type(service_type, program_name=None):
     st = (service_type or "").strip()
     if st.casefold() in INTERNAL_SERVICE_SUBTYPES:
         return CaseType.INTERNAL_SERVICE
-    from_pipeline = derive_case_type_from_pipeline(program_name)
-    if from_pipeline is not None:
-        return from_pipeline
+    from_program = derive_case_type_from_active_program(program_name)
+    if from_program is not None:
+        return from_program
     if not st:
         return None
     return CaseType.NAVIGATION

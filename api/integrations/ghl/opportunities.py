@@ -45,9 +45,8 @@ PIPELINE_CASE_EXTERNAL = "vVnLwzTO1nkVxUt0zmdF"
 # Default case pipeline (use food delivery as default for now)
 PIPELINE_CASE = PIPELINE_CASE_FOOD
 
-# Canonical case pipelines by Case Category. Used as a fallback when a case's
-# program_name is not found in the ProgramPipeline table (keys are normalized
-# lowercase). IDs come from tmp/pipelines_id.csv.
+# Canonical case pipelines by Case Category, keyed on the case's inferred
+# category (keys are normalized lowercase). IDs come from tmp/pipelines_id.csv.
 CASE_CATEGORY_PIPELINES = {
     "eligibility": PIPELINE_ELIGIBILITY,         # C: Eligibility Assessment
     "navigation": PIPELINE_CASE_NAVIGATION,      # D: Navigation
@@ -429,9 +428,8 @@ def build_screening_payload(screening):
 
 
 def _infer_case_category(case):
-    """Best-effort Case Category from the case text, used only when the
-    program_name isn't in the ProgramPipeline table. Mirrors the source data's
-    category buckets."""
+    """Best-effort Case Category from the case text, used to route the case to
+    a GHL pipeline. Mirrors the source data's category buckets."""
     text = (
         f"{getattr(case, 'service_type', '') or ''} "
         f"{getattr(case, 'program_name', '') or ''}"
@@ -451,27 +449,10 @@ def _infer_case_category(case):
 def _resolve_case_pipeline(case):
     """Return the GHL pipeline id for a case.
 
-    1. Exact match on the case's ``program_name`` in the ProgramPipeline table.
-    2. Fallback: infer the Case Category from the case text and route by
-       category (CASE_CATEGORY_PIPELINES), defaulting to External Services.
+    Infer the Case Category from the case text and route by category
+    (CASE_CATEGORY_PIPELINES), defaulting to External Services.
     """
-    from api.models import ProgramPipeline  # local import avoids import cycles
-
     program = (getattr(case, "program_name", "") or "").strip()
-    if program:
-        mapping = (
-            ProgramPipeline.objects.filter(program_name=program).first()
-            or ProgramPipeline.objects.filter(program_name__iexact=program).first()
-        )
-        if mapping and mapping.pipeline_id:
-            # CSV/table ids are GHL originIds -> translate to the real per-
-            # location pipeline id before sending.
-            resolved = _resolve_pipeline_id(mapping.pipeline_id)
-            print(f"[GHL]   pipeline: program '{program}' -> "
-                  f"{mapping.pipeline_name} ({mapping.pipeline_id} => {resolved})",
-                  flush=True)
-            return resolved
-
     category = _infer_case_category(case)
     origin_id = CASE_CATEGORY_PIPELINES.get(category, PIPELINE_CASE_EXTERNAL)
     resolved = _resolve_pipeline_id(origin_id)

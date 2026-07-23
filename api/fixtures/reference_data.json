@@ -3784,3123 +3784,3123 @@
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 1,
   "fields": {
     "program_name": "Boro Park Jewish Community Council",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Other",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.787Z",
     "updated_at": "2026-06-12T17:18:54.660Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 2,
   "fields": {
     "program_name": "Care Management Services",
     "main_category": "Food",
     "case_category": "Care Management",
     "services_category": "",
-    "pipeline_name": "D: Navigation",
-    "pipeline_id": "2GToxmnm3MrMsotZ1kgn",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.787Z",
     "updated_at": "2026-06-12T17:18:54.662Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 3,
   "fields": {
     "program_name": "Clinically Appropriate Meals - (Household) High-Risk Children Under the Age of 18 - Brooklyn",
     "main_category": "Food",
     "case_category": "Internal Services",
     "services_category": "Clinically Appropriate Meals",
-    "pipeline_name": "G1: Internal Services",
-    "pipeline_id": "05nsZFCbcujvqSJIdlbN",
+    "is_for_household": true,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.788Z",
     "updated_at": "2026-06-12T17:18:54.662Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 4,
   "fields": {
     "program_name": "Clinically Appropriate Meals - (Household) High-Risk Children Under the Age of 18 - Manhattan",
     "main_category": "Food",
     "case_category": "Internal Services",
     "services_category": "Clinically Appropriate Meals",
-    "pipeline_name": "G1: Internal Services",
-    "pipeline_id": "05nsZFCbcujvqSJIdlbN",
+    "is_for_household": true,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.789Z",
     "updated_at": "2026-06-12T17:18:54.663Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 5,
   "fields": {
     "program_name": "Clinically Appropriate Meals - (Household) High-Risk Children Under the Age of 18 - Queens",
     "main_category": "Food",
     "case_category": "Internal Services",
     "services_category": "Clinically Appropriate Meals",
-    "pipeline_name": "G1: Internal Services",
-    "pipeline_id": "05nsZFCbcujvqSJIdlbN",
+    "is_for_household": true,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.790Z",
     "updated_at": "2026-06-12T17:18:54.663Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 6,
   "fields": {
     "program_name": "Clinically Appropriate Meals - (Household) Pregnant / Postpartum - Brooklyn",
     "main_category": "Food",
     "case_category": "Internal Services",
     "services_category": "Clinically Appropriate Meals",
-    "pipeline_name": "G1: Internal Services",
-    "pipeline_id": "05nsZFCbcujvqSJIdlbN",
+    "is_for_household": true,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.790Z",
     "updated_at": "2026-06-12T17:18:54.664Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 7,
   "fields": {
     "program_name": "Clinically Appropriate Meals - (Household) Pregnant / Postpartum - Manhattan",
     "main_category": "Food",
     "case_category": "Internal Services",
     "services_category": "Clinically Appropriate Meals",
-    "pipeline_name": "G1: Internal Services",
-    "pipeline_id": "05nsZFCbcujvqSJIdlbN",
+    "is_for_household": true,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.791Z",
     "updated_at": "2026-06-12T17:18:54.665Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 8,
   "fields": {
     "program_name": "Clinically Appropriate Meals - (Household) Pregnant / Postpartum - Queens",
     "main_category": "Food",
     "case_category": "Internal Services",
     "services_category": "Clinically Appropriate Meals",
-    "pipeline_name": "G1: Internal Services",
-    "pipeline_id": "05nsZFCbcujvqSJIdlbN",
+    "is_for_household": true,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.792Z",
     "updated_at": "2026-06-12T17:18:54.665Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 9,
   "fields": {
     "program_name": "Clinically Appropriate Meals - Other Eligible Populations - Brooklyn",
     "main_category": "Food",
     "case_category": "Internal Services",
     "services_category": "Clinically Appropriate Meals",
-    "pipeline_name": "G1: Internal Services",
-    "pipeline_id": "05nsZFCbcujvqSJIdlbN",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.792Z",
     "updated_at": "2026-06-12T17:18:54.666Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 10,
   "fields": {
     "program_name": "Clinically Appropriate Meals - Other Eligible Populations - Manhattan",
     "main_category": "Food",
     "case_category": "Internal Services",
     "services_category": "Clinically Appropriate Meals",
-    "pipeline_name": "G1: Internal Services",
-    "pipeline_id": "05nsZFCbcujvqSJIdlbN",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.793Z",
     "updated_at": "2026-06-12T17:18:54.666Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 11,
   "fields": {
     "program_name": "Clinically Appropriate Meals - Other Eligible Populations - Queens",
     "main_category": "Food",
     "case_category": "Internal Services",
     "services_category": "Clinically Appropriate Meals",
-    "pipeline_name": "G1: Internal Services",
-    "pipeline_id": "05nsZFCbcujvqSJIdlbN",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.794Z",
     "updated_at": "2026-06-12T17:18:54.667Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 12,
   "fields": {
     "program_name": "Clinically Appropriate Meals - Pregnant / Postpartum - Brooklyn",
     "main_category": "Food",
     "case_category": "Internal Services",
     "services_category": "Clinically Appropriate Meals",
-    "pipeline_name": "G1: Internal Services",
-    "pipeline_id": "05nsZFCbcujvqSJIdlbN",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.794Z",
     "updated_at": "2026-06-12T17:18:54.667Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 13,
   "fields": {
     "program_name": "Clinically Appropriate Meals - Pregnant / Postpartum - Manhattan",
     "main_category": "Food",
     "case_category": "Internal Services",
     "services_category": "Clinically Appropriate Meals",
-    "pipeline_name": "G1: Internal Services",
-    "pipeline_id": "05nsZFCbcujvqSJIdlbN",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.795Z",
     "updated_at": "2026-06-12T17:18:54.668Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 14,
   "fields": {
     "program_name": "Clinically Appropriate Meals - Pregnant / Postpartum - Queens",
     "main_category": "Food",
     "case_category": "Internal Services",
     "services_category": "Clinically Appropriate Meals",
-    "pipeline_name": "G1: Internal Services",
-    "pipeline_id": "05nsZFCbcujvqSJIdlbN",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.796Z",
     "updated_at": "2026-06-12T17:18:54.669Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 15,
   "fields": {
     "program_name": "Cooking Supplies- Kitchenware - Brooklyn",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Cooking Supplies",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.796Z",
     "updated_at": "2026-06-12T17:18:54.669Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 16,
   "fields": {
     "program_name": "Cooking Supplies- Kitchenware - Manhattan",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Cooking Supplies",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.797Z",
     "updated_at": "2026-06-12T17:18:54.670Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 17,
   "fields": {
     "program_name": "Cooking Supplies- Kitchenware - Queens",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Cooking Supplies",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.798Z",
     "updated_at": "2026-06-12T17:18:54.670Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 18,
   "fields": {
     "program_name": "Cooking Supplies- Microwave - Brooklyn",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Cooking Supplies",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.798Z",
     "updated_at": "2026-06-12T17:18:54.671Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 19,
   "fields": {
     "program_name": "Cooking Supplies- Microwave - Manhattan",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Cooking Supplies",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.799Z",
     "updated_at": "2026-06-12T17:18:54.671Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 20,
   "fields": {
     "program_name": "Cooking Supplies- Microwave - Queens",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Cooking Supplies",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.799Z",
     "updated_at": "2026-06-12T17:18:54.672Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 21,
   "fields": {
     "program_name": "Cooking Supplies- Refrigerator - Brooklyn",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Cooking Supplies",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.800Z",
     "updated_at": "2026-06-12T17:18:54.672Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 22,
   "fields": {
     "program_name": "Cooking Supplies- Refrigerator - Manhattan",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Cooking Supplies",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.801Z",
     "updated_at": "2026-06-12T17:18:54.673Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 23,
   "fields": {
     "program_name": "Cooking Supplies- Refrigerator - Queens",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Cooking Supplies",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.801Z",
     "updated_at": "2026-06-12T17:18:54.673Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 24,
   "fields": {
     "program_name": "Dwelling Assessment & Statement of Work (SOW) Development - Modifications and Remediation Service - Brooklyn",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "SOW",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.802Z",
     "updated_at": "2026-06-12T17:18:54.674Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 25,
   "fields": {
     "program_name": "Dwelling Assessment & Statement of Work (SOW) Development - Modifications and Remediation Service - Manhattan",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "SOW",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.802Z",
     "updated_at": "2026-06-12T17:18:54.674Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 26,
   "fields": {
     "program_name": "Dwelling Assessment & Statement of Work (SOW) Development - Modifications and Remediation Service - Queens",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "SOW",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.803Z",
     "updated_at": "2026-06-12T17:18:54.675Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 27,
   "fields": {
     "program_name": "Enhanced Care Management - Care Management Level 2 Only - Brooklyn",
     "main_category": "Food",
     "case_category": "Care Management",
     "services_category": "",
-    "pipeline_name": "D: Navigation",
-    "pipeline_id": "2GToxmnm3MrMsotZ1kgn",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.803Z",
     "updated_at": "2026-06-12T17:18:54.676Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 28,
   "fields": {
     "program_name": "Enhanced Care Management - Care Management Level 2 Only - Manhattan",
     "main_category": "Food",
     "case_category": "Care Management",
     "services_category": "",
-    "pipeline_name": "D: Navigation",
-    "pipeline_id": "2GToxmnm3MrMsotZ1kgn",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.804Z",
     "updated_at": "2026-06-12T17:18:54.676Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 29,
   "fields": {
     "program_name": "Enhanced Care Management - Care Management Level 2 Only - Queens",
     "main_category": "Food",
     "case_category": "Care Management",
     "services_category": "",
-    "pipeline_name": "D: Navigation",
-    "pipeline_id": "2GToxmnm3MrMsotZ1kgn",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.805Z",
     "updated_at": "2026-06-12T17:18:54.677Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 30,
   "fields": {
     "program_name": "Enhanced Care Management - Eligibility Assessment Level 2 Only - Brooklyn",
     "main_category": "Food",
     "case_category": "ELIGIBILITY",
     "services_category": "",
-    "pipeline_name": "C: Eligibility Assessment",
-    "pipeline_id": "F6cAYzGyB9H1Tsb88QZO",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.805Z",
     "updated_at": "2026-06-12T17:18:54.677Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 31,
   "fields": {
     "program_name": "Enhanced Care Management - Eligibility Assessment Level 2 Only - Manhattan",
     "main_category": "Food",
     "case_category": "ELIGIBILITY",
     "services_category": "",
-    "pipeline_name": "C: Eligibility Assessment",
-    "pipeline_id": "F6cAYzGyB9H1Tsb88QZO",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.806Z",
     "updated_at": "2026-06-12T17:18:54.678Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 32,
   "fields": {
     "program_name": "Enhanced Care Management - Eligibility Assessment Level 2 Only - Queens",
     "main_category": "Food",
     "case_category": "ELIGIBILITY",
     "services_category": "",
-    "pipeline_name": "C: Eligibility Assessment",
-    "pipeline_id": "F6cAYzGyB9H1Tsb88QZO",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.806Z",
     "updated_at": "2026-06-12T17:18:54.678Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 33,
   "fields": {
     "program_name": "Family Connect (WYNYC)",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Other",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.807Z",
     "updated_at": "2026-06-12T17:18:54.679Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 34,
   "fields": {
     "program_name": "Food pantry",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Food Pantry",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.808Z",
     "updated_at": "2026-06-12T17:18:54.679Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 35,
   "fields": {
     "program_name": "Fresh Produce and Nonperishable Groceries: Pantry Stocking - (Household) High-Risk Children Under the Age of 18 - Brooklyn",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Fresh Produce",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": true,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.808Z",
     "updated_at": "2026-06-12T17:18:54.680Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 36,
   "fields": {
     "program_name": "Fresh Produce and Nonperishable Groceries: Pantry Stocking - (Household) High-Risk Children Under the Age of 18 - Manhattan",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Fresh Produce",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": true,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.809Z",
     "updated_at": "2026-06-12T17:18:54.680Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 37,
   "fields": {
     "program_name": "Fresh Produce and Nonperishable Groceries: Pantry Stocking - (Household) High-Risk Children Under the Age of 18 - Queens",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Fresh Produce",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": true,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.810Z",
     "updated_at": "2026-06-12T17:18:54.681Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 38,
   "fields": {
     "program_name": "Fresh Produce and Nonperishable Groceries: Pantry Stocking - (Household) Pregnant / Postpartum - Brooklyn",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Fresh Produce",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": true,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.810Z",
     "updated_at": "2026-06-12T17:18:54.681Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 39,
   "fields": {
     "program_name": "Fresh Produce and Nonperishable Groceries: Pantry Stocking - (Household) Pregnant / Postpartum - Manhattan",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Fresh Produce",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": true,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.811Z",
     "updated_at": "2026-06-12T17:18:54.682Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 40,
   "fields": {
     "program_name": "Fresh Produce and Nonperishable Groceries: Pantry Stocking - (Household) Pregnant / Postpartum - Queens",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Fresh Produce",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": true,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.812Z",
     "updated_at": "2026-06-12T17:18:54.682Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 41,
   "fields": {
     "program_name": "Fresh Produce and Nonperishable Groceries: Pantry Stocking - Other Eligible Populations - Brooklyn",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Fresh Produce",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.812Z",
     "updated_at": "2026-06-12T17:18:54.683Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 42,
   "fields": {
     "program_name": "Fresh Produce and Nonperishable Groceries: Pantry Stocking - Other Eligible Populations - Manhattan",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Fresh Produce",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.813Z",
     "updated_at": "2026-06-12T17:18:54.684Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 43,
   "fields": {
     "program_name": "Fresh Produce and Nonperishable Groceries: Pantry Stocking - Other Eligible Populations - Queens",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Fresh Produce",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.814Z",
     "updated_at": "2026-06-12T17:18:54.684Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 44,
   "fields": {
     "program_name": "Fresh Produce and Nonperishable Groceries: Pantry Stocking - Pregnant / Postpartum - Brooklyn",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Fresh Produce",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.814Z",
     "updated_at": "2026-06-12T17:18:54.685Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 45,
   "fields": {
     "program_name": "Fresh Produce and Nonperishable Groceries: Pantry Stocking - Pregnant / Postpartum - Manhattan",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Fresh Produce",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.815Z",
     "updated_at": "2026-06-12T17:18:54.685Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 46,
   "fields": {
     "program_name": "Fresh Produce and Nonperishable Groceries: Pantry Stocking - Pregnant / Postpartum - Queens",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Fresh Produce",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.815Z",
     "updated_at": "2026-06-12T17:18:54.686Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 47,
   "fields": {
     "program_name": "Health Home Serving Adults Care Management Program",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Health Home Adult Care",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.816Z",
     "updated_at": "2026-06-12T17:18:54.686Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 48,
   "fields": {
     "program_name": "Help 365",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Other",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.816Z",
     "updated_at": "2026-06-12T17:18:54.687Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 49,
   "fields": {
     "program_name": "Home Accessibility and Safety Modification - Bathroom Facilities - Brooklyn",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Home Accessibility",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.817Z",
     "updated_at": "2026-06-12T17:18:54.687Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 50,
   "fields": {
     "program_name": "Home Accessibility and Safety Modification - Bathroom Facilities - Manhattan",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Home Accessibility",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.817Z",
     "updated_at": "2026-06-12T17:18:54.688Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 51,
   "fields": {
     "program_name": "Home Accessibility and Safety Modification - Bathroom Facilities - Queens",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Home Accessibility",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.818Z",
     "updated_at": "2026-06-12T17:18:54.688Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 52,
   "fields": {
     "program_name": "Home Accessibility and Safety Modification - Doors and Cabinet Handles - Brooklyn",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Home Accessibility",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.818Z",
     "updated_at": "2026-06-12T17:18:54.689Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 53,
   "fields": {
     "program_name": "Home Accessibility and Safety Modification - Doors and Cabinet Handles - Manhattan",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Home Accessibility",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.819Z",
     "updated_at": "2026-06-12T17:18:54.689Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 54,
   "fields": {
     "program_name": "Home Accessibility and Safety Modification - Doors and Cabinet Handles - Queens",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Home Accessibility",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.819Z",
     "updated_at": "2026-06-12T17:18:54.690Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 55,
   "fields": {
     "program_name": "Home Accessibility and Safety Modification - Grab Bars - Brooklyn",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Home Accessibility",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.820Z",
     "updated_at": "2026-06-12T17:18:54.690Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 56,
   "fields": {
     "program_name": "Home Accessibility and Safety Modification - Grab Bars - Manhattan",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Home Accessibility",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.820Z",
     "updated_at": "2026-06-12T17:18:54.690Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 57,
   "fields": {
     "program_name": "Home Accessibility and Safety Modification - Grab Bars - Queens",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Home Accessibility",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.820Z",
     "updated_at": "2026-06-12T17:18:54.691Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 58,
   "fields": {
     "program_name": "Home Accessibility and Safety Modification - Hand Rails - Brooklyn",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Home Accessibility",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.821Z",
     "updated_at": "2026-06-12T17:18:54.691Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 59,
   "fields": {
     "program_name": "Home Accessibility and Safety Modification - Hand Rails - Manhattan",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Home Accessibility",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.821Z",
     "updated_at": "2026-06-12T17:18:54.692Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 60,
   "fields": {
     "program_name": "Home Accessibility and Safety Modification - Hand Rails - Queens",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Home Accessibility",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.822Z",
     "updated_at": "2026-06-12T17:18:54.692Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 61,
   "fields": {
     "program_name": "Home Accessibility and Safety Modification - Kitchen Cabinet or Sinks - Brooklyn",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Home Accessibility",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.822Z",
     "updated_at": "2026-06-12T17:18:54.692Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 62,
   "fields": {
     "program_name": "Home Accessibility and Safety Modification - Kitchen Cabinet or Sinks - Manhattan",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Home Accessibility",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.823Z",
     "updated_at": "2026-06-12T17:18:54.693Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 63,
   "fields": {
     "program_name": "Home Accessibility and Safety Modification - Kitchen Cabinet or Sinks - Queens",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Home Accessibility",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.823Z",
     "updated_at": "2026-06-12T17:18:54.693Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 64,
   "fields": {
     "program_name": "Home Accessibility and Safety Modification - Non-skid Surfaces - Brooklyn",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Home Accessibility",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.824Z",
     "updated_at": "2026-06-12T17:18:54.694Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 65,
   "fields": {
     "program_name": "Home Accessibility and Safety Modification - Non-skid Surfaces - Manhattan",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Home Accessibility",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.824Z",
     "updated_at": "2026-06-12T17:18:54.694Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 66,
   "fields": {
     "program_name": "Home Accessibility and Safety Modification - Non-skid Surfaces - Queens",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Home Accessibility",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.824Z",
     "updated_at": "2026-06-12T17:18:54.694Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 67,
   "fields": {
     "program_name": "Home Remediation - Air Conditioner - Brooklyn",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Home Remediation",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.825Z",
     "updated_at": "2026-06-12T17:18:54.695Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 68,
   "fields": {
     "program_name": "Home Remediation - Air Conditioner - Manhattan",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Home Remediation",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.825Z",
     "updated_at": "2026-06-12T17:18:54.695Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 69,
   "fields": {
     "program_name": "Home Remediation - Air Conditioner - Queens",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Home Remediation",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.826Z",
     "updated_at": "2026-06-12T17:18:54.695Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 70,
   "fields": {
     "program_name": "Home Remediation - Air Filtration Device - Brooklyn",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Home Remediation",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.826Z",
     "updated_at": "2026-06-12T17:18:54.696Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 71,
   "fields": {
     "program_name": "Home Remediation - Air Filtration Device - Manhattan",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Home Remediation",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.827Z",
     "updated_at": "2026-06-12T17:18:54.696Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 72,
   "fields": {
     "program_name": "Home Remediation - Air Filtration Device - Queens",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Home Remediation",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.827Z",
     "updated_at": "2026-06-12T17:18:54.697Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 73,
   "fields": {
     "program_name": "Home Remediation - De-humidifier - Brooklyn",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Home Remediation",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.827Z",
     "updated_at": "2026-06-12T17:18:54.697Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 74,
   "fields": {
     "program_name": "Home Remediation - De-humidifier - Manhattan",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Home Remediation",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.828Z",
     "updated_at": "2026-06-12T17:18:54.697Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 75,
   "fields": {
     "program_name": "Home Remediation - De-humidifier - Queens",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Home Remediation",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.828Z",
     "updated_at": "2026-06-12T17:18:54.698Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 76,
   "fields": {
     "program_name": "Home Remediation - Heater - Brooklyn",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Home Remediation",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.829Z",
     "updated_at": "2026-06-12T17:18:54.698Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 77,
   "fields": {
     "program_name": "Home Remediation - Heater - Manhattan",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Home Remediation",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.829Z",
     "updated_at": "2026-06-12T17:18:54.698Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 78,
   "fields": {
     "program_name": "Home Remediation - Heater - Queens",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Home Remediation",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.830Z",
     "updated_at": "2026-06-12T17:18:54.699Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 79,
   "fields": {
     "program_name": "Home Remediation - Humidifier - Brooklyn",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Home Remediation",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.830Z",
     "updated_at": "2026-06-12T17:18:54.699Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 80,
   "fields": {
     "program_name": "Home Remediation - Humidifier - Manhattan",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Home Remediation",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.830Z",
     "updated_at": "2026-06-12T17:18:54.699Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 81,
   "fields": {
     "program_name": "Home Remediation - Humidifier - Queens",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Home Remediation",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.831Z",
     "updated_at": "2026-06-12T17:18:54.700Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 82,
   "fields": {
     "program_name": "Hope and Healing Family Center Brooklyn Diaper Bank",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Other",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.831Z",
     "updated_at": "2026-06-12T17:18:54.700Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 83,
   "fields": {
     "program_name": "Housing Transition and Navigation Services - Brooklyn",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Housing Transition",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.832Z",
     "updated_at": "2026-06-12T17:18:54.700Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 84,
   "fields": {
     "program_name": "Housing Transition and Navigation Services - Queens",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Housing Transition",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.832Z",
     "updated_at": "2026-06-12T17:18:54.701Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 85,
   "fields": {
     "program_name": "Interborough Developmental & Consultation Center -Health Home Programs",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Other",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.833Z",
     "updated_at": "2026-06-12T17:18:54.701Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 86,
   "fields": {
     "program_name": "JCCA - East Flatbush Community Partnership",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Other",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.833Z",
     "updated_at": "2026-06-12T17:18:54.701Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 87,
   "fields": {
     "program_name": "Medically Tailored Meals (MTM) - (Household) High-Risk Children Under the Age of 18 - Brooklyn",
     "main_category": "Food",
     "case_category": "Internal Services",
     "services_category": "Medically Tailored Meals (MTM)",
-    "pipeline_name": "G1: Internal Services",
-    "pipeline_id": "05nsZFCbcujvqSJIdlbN",
+    "is_for_household": true,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.833Z",
     "updated_at": "2026-06-12T17:18:54.702Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 88,
   "fields": {
     "program_name": "Medically Tailored Meals (MTM) - (Household) High-Risk Children Under the Age of 18 - Manhattan",
     "main_category": "Food",
     "case_category": "Internal Services",
     "services_category": "Medically Tailored Meals (MTM)",
-    "pipeline_name": "G1: Internal Services",
-    "pipeline_id": "05nsZFCbcujvqSJIdlbN",
+    "is_for_household": true,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.834Z",
     "updated_at": "2026-06-12T17:18:54.702Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 89,
   "fields": {
     "program_name": "Medically Tailored Meals (MTM) - (Household) High-Risk Children Under the Age of 18 - Queens",
     "main_category": "Food",
     "case_category": "Internal Services",
     "services_category": "Medically Tailored Meals (MTM)",
-    "pipeline_name": "G1: Internal Services",
-    "pipeline_id": "05nsZFCbcujvqSJIdlbN",
+    "is_for_household": true,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.834Z",
     "updated_at": "2026-06-12T17:18:54.702Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 90,
   "fields": {
     "program_name": "Medically Tailored Meals (MTM) - (Household) Pregnant / Postpartum - Brooklyn",
     "main_category": "Food",
     "case_category": "Internal Services",
     "services_category": "Medically Tailored Meals (MTM)",
-    "pipeline_name": "G1: Internal Services",
-    "pipeline_id": "05nsZFCbcujvqSJIdlbN",
+    "is_for_household": true,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.835Z",
     "updated_at": "2026-06-12T17:18:54.703Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 91,
   "fields": {
     "program_name": "Medically Tailored Meals (MTM) - (Household) Pregnant / Postpartum - Manhattan",
     "main_category": "Food",
     "case_category": "Internal Services",
     "services_category": "Medically Tailored Meals (MTM)",
-    "pipeline_name": "G1: Internal Services",
-    "pipeline_id": "05nsZFCbcujvqSJIdlbN",
+    "is_for_household": true,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.835Z",
     "updated_at": "2026-06-12T17:18:54.703Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 92,
   "fields": {
     "program_name": "Medically Tailored Meals (MTM) - (Household) Pregnant / Postpartum - Queens",
     "main_category": "Food",
     "case_category": "Internal Services",
     "services_category": "Medically Tailored Meals (MTM)",
-    "pipeline_name": "G1: Internal Services",
-    "pipeline_id": "05nsZFCbcujvqSJIdlbN",
+    "is_for_household": true,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.836Z",
     "updated_at": "2026-06-12T17:18:54.704Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 93,
   "fields": {
     "program_name": "Medically Tailored Meals (MTM) - Other Eligible Populations - Brooklyn",
     "main_category": "Food",
     "case_category": "Internal Services",
     "services_category": "Medically Tailored Meals (MTM)",
-    "pipeline_name": "G1: Internal Services",
-    "pipeline_id": "05nsZFCbcujvqSJIdlbN",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.836Z",
     "updated_at": "2026-06-12T17:18:54.704Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 94,
   "fields": {
     "program_name": "Medically Tailored Meals (MTM) - Other Eligible Populations - Manhattan",
     "main_category": "Food",
     "case_category": "Internal Services",
     "services_category": "Medically Tailored Meals (MTM)",
-    "pipeline_name": "G1: Internal Services",
-    "pipeline_id": "05nsZFCbcujvqSJIdlbN",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.836Z",
     "updated_at": "2026-06-12T17:18:54.704Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 95,
   "fields": {
     "program_name": "Medically Tailored Meals (MTM) - Other Eligible Populations - Queens",
     "main_category": "Food",
     "case_category": "Internal Services",
     "services_category": "Medically Tailored Meals (MTM)",
-    "pipeline_name": "G1: Internal Services",
-    "pipeline_id": "05nsZFCbcujvqSJIdlbN",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.837Z",
     "updated_at": "2026-06-12T17:18:54.705Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 96,
   "fields": {
     "program_name": "Medically Tailored Meals (MTM) - Pregnant / Postpartum - Brooklyn",
     "main_category": "Food",
     "case_category": "Internal Services",
     "services_category": "Medically Tailored Meals (MTM)",
-    "pipeline_name": "G1: Internal Services",
-    "pipeline_id": "05nsZFCbcujvqSJIdlbN",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.837Z",
     "updated_at": "2026-06-12T17:18:54.705Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 97,
   "fields": {
     "program_name": "Medically Tailored Meals (MTM) - Pregnant / Postpartum - Manhattan",
     "main_category": "Food",
     "case_category": "Internal Services",
     "services_category": "Medically Tailored Meals (MTM)",
-    "pipeline_name": "G1: Internal Services",
-    "pipeline_id": "05nsZFCbcujvqSJIdlbN",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.838Z",
     "updated_at": "2026-06-12T17:18:54.705Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 98,
   "fields": {
     "program_name": "Medically Tailored Meals (MTM) - Pregnant / Postpartum - Queens",
     "main_category": "Food",
     "case_category": "Internal Services",
     "services_category": "Medically Tailored Meals (MTM)",
-    "pipeline_name": "G1: Internal Services",
-    "pipeline_id": "05nsZFCbcujvqSJIdlbN",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.838Z",
     "updated_at": "2026-06-12T17:18:54.706Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 99,
   "fields": {
     "program_name": "Medically Tailored or Nutritionally Appropriate Food Prescriptions: Boxes - (Household) High-Risk Children Under the Age of 18 - Brooklyn",
     "main_category": "Food",
     "case_category": "Internal Services",
     "services_category": "Medically Tailored Meals (MTM)",
-    "pipeline_name": "G1: Internal Services",
-    "pipeline_id": "TDm8maO5pJX11F0CpFXD",
+    "is_for_household": true,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.839Z",
     "updated_at": "2026-06-12T17:18:54.706Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 100,
   "fields": {
     "program_name": "Medically Tailored or Nutritionally Appropriate Food Prescriptions: Boxes - (Household) High-Risk Children Under the Age of 18 - Manhattan",
     "main_category": "Food",
     "case_category": "Internal Services",
     "services_category": "Medically Tailored Meals (MTM)",
-    "pipeline_name": "G1: Internal Services",
-    "pipeline_id": "TDm8maO5pJX11F0CpFXD",
+    "is_for_household": true,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.839Z",
     "updated_at": "2026-06-12T17:18:54.706Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 101,
   "fields": {
     "program_name": "Medically Tailored or Nutritionally Appropriate Food Prescriptions: Boxes - (Household) High-Risk Children Under the Age of 18 - Queens",
     "main_category": "Food",
     "case_category": "Internal Services",
     "services_category": "Medically Tailored Meals (MTM)",
-    "pipeline_name": "G1: Internal Services",
-    "pipeline_id": "TDm8maO5pJX11F0CpFXD",
+    "is_for_household": true,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.839Z",
     "updated_at": "2026-06-12T17:18:54.707Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 102,
   "fields": {
     "program_name": "Medically Tailored or Nutritionally Appropriate Food Prescriptions: Boxes - (Household) Pregnant / Postpartum - Brooklyn",
     "main_category": "Food",
     "case_category": "Internal Services",
     "services_category": "Medically Tailored Meals (MTM)",
-    "pipeline_name": "G1: Internal Services",
-    "pipeline_id": "TDm8maO5pJX11F0CpFXD",
+    "is_for_household": true,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.840Z",
     "updated_at": "2026-06-12T17:18:54.707Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 103,
   "fields": {
     "program_name": "Medically Tailored or Nutritionally Appropriate Food Prescriptions: Boxes - (Household) Pregnant / Postpartum - Manhattan",
     "main_category": "Food",
     "case_category": "Internal Services",
     "services_category": "Medically Tailored Meals (MTM)",
-    "pipeline_name": "G1: Internal Services",
-    "pipeline_id": "TDm8maO5pJX11F0CpFXD",
+    "is_for_household": true,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.840Z",
     "updated_at": "2026-06-12T17:18:54.707Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 104,
   "fields": {
     "program_name": "Medically Tailored or Nutritionally Appropriate Food Prescriptions: Boxes - (Household) Pregnant / Postpartum - Queens",
     "main_category": "Food",
     "case_category": "Internal Services",
     "services_category": "Medically Tailored Meals (MTM)",
-    "pipeline_name": "G1: Internal Services",
-    "pipeline_id": "TDm8maO5pJX11F0CpFXD",
+    "is_for_household": true,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.841Z",
     "updated_at": "2026-06-12T17:18:54.708Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 105,
   "fields": {
     "program_name": "Medically Tailored or Nutritionally Appropriate Food Prescriptions: Boxes - Other Eligible Populations - Brooklyn",
     "main_category": "Food",
     "case_category": "Internal Services",
     "services_category": "Medically Tailored Meals (MTM)",
-    "pipeline_name": "G1: Internal Services",
-    "pipeline_id": "TDm8maO5pJX11F0CpFXD",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.841Z",
     "updated_at": "2026-06-12T17:18:54.708Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 106,
   "fields": {
     "program_name": "Medically Tailored or Nutritionally Appropriate Food Prescriptions: Boxes - Other Eligible Populations - Manhattan",
     "main_category": "Food",
     "case_category": "Internal Services",
     "services_category": "Medically Tailored Meals (MTM)",
-    "pipeline_name": "G1: Internal Services",
-    "pipeline_id": "TDm8maO5pJX11F0CpFXD",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.842Z",
     "updated_at": "2026-06-12T17:18:54.708Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 107,
   "fields": {
     "program_name": "Medically Tailored or Nutritionally Appropriate Food Prescriptions: Boxes - Other Eligible Populations - Queens",
     "main_category": "Food",
     "case_category": "Internal Services",
     "services_category": "Medically Tailored Meals (MTM)",
-    "pipeline_name": "G1: Internal Services",
-    "pipeline_id": "TDm8maO5pJX11F0CpFXD",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.842Z",
     "updated_at": "2026-06-12T17:18:54.709Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 108,
   "fields": {
     "program_name": "Medically Tailored or Nutritionally Appropriate Food Prescriptions: Boxes - Pregnant / Postpartum - Brooklyn",
     "main_category": "Food",
     "case_category": "Internal Services",
     "services_category": "Medically Tailored Meals (MTM)",
-    "pipeline_name": "G1: Internal Services",
-    "pipeline_id": "TDm8maO5pJX11F0CpFXD",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.843Z",
     "updated_at": "2026-06-12T17:18:54.709Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 109,
   "fields": {
     "program_name": "Medically Tailored or Nutritionally Appropriate Food Prescriptions: Boxes - Pregnant / Postpartum - Manhattan",
     "main_category": "Food",
     "case_category": "Internal Services",
     "services_category": "Medically Tailored Meals (MTM)",
-    "pipeline_name": "G1: Internal Services",
-    "pipeline_id": "TDm8maO5pJX11F0CpFXD",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.843Z",
     "updated_at": "2026-06-12T17:18:54.709Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 110,
   "fields": {
     "program_name": "Medically Tailored or Nutritionally Appropriate Food Prescriptions: Boxes - Pregnant / Postpartum - Queens",
     "main_category": "Food",
     "case_category": "Internal Services",
     "services_category": "Medically Tailored Meals (MTM)",
-    "pipeline_name": "G1: Internal Services",
-    "pipeline_id": "TDm8maO5pJX11F0CpFXD",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.843Z",
     "updated_at": "2026-06-12T17:18:54.710Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 111,
   "fields": {
     "program_name": "Medically Tailored or Nutritionally Appropriate Food Prescriptions: Voucher - (Household) High-Risk Children Under the Age of 18 - Brooklyn",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Medically Tailored Meals (MTM)",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": true,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.844Z",
     "updated_at": "2026-06-12T17:18:54.710Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 112,
   "fields": {
     "program_name": "Medically Tailored or Nutritionally Appropriate Food Prescriptions: Voucher - (Household) High-Risk Children Under the Age of 18 - Manhattan",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Medically Tailored Meals (MTM)",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": true,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.844Z",
     "updated_at": "2026-06-12T17:18:54.711Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 113,
   "fields": {
     "program_name": "Medically Tailored or Nutritionally Appropriate Food Prescriptions: Voucher - (Household) High-Risk Children Under the Age of 18 - Queens",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Medically Tailored Meals (MTM)",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": true,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.845Z",
     "updated_at": "2026-06-12T17:18:54.711Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 114,
   "fields": {
     "program_name": "Medically Tailored or Nutritionally Appropriate Food Prescriptions: Voucher - (Household) Pregnant / Postpartum - Brooklyn",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Medically Tailored Meals (MTM)",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": true,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.845Z",
     "updated_at": "2026-06-12T17:18:54.711Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 115,
   "fields": {
     "program_name": "Medically Tailored or Nutritionally Appropriate Food Prescriptions: Voucher - (Household) Pregnant / Postpartum - Manhattan",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Medically Tailored Meals (MTM)",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": true,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.846Z",
     "updated_at": "2026-06-12T17:18:54.712Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 116,
   "fields": {
     "program_name": "Medically Tailored or Nutritionally Appropriate Food Prescriptions: Voucher - (Household) Pregnant / Postpartum - Queens",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Medically Tailored Meals (MTM)",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": true,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.846Z",
     "updated_at": "2026-06-12T17:18:54.712Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 117,
   "fields": {
     "program_name": "Medically Tailored or Nutritionally Appropriate Food Prescriptions: Voucher - Other Eligible Populations - Brooklyn",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Medically Tailored Meals (MTM)",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.846Z",
     "updated_at": "2026-06-12T17:18:54.712Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 118,
   "fields": {
     "program_name": "Medically Tailored or Nutritionally Appropriate Food Prescriptions: Voucher - Other Eligible Populations - Manhattan",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Medically Tailored Meals (MTM)",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.847Z",
     "updated_at": "2026-06-12T17:18:54.713Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 119,
   "fields": {
     "program_name": "Medically Tailored or Nutritionally Appropriate Food Prescriptions: Voucher - Other Eligible Populations - Queens",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Medically Tailored Meals (MTM)",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.847Z",
     "updated_at": "2026-06-12T17:18:54.713Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 120,
   "fields": {
     "program_name": "Medically Tailored or Nutritionally Appropriate Food Prescriptions: Voucher - Pregnant / Postpartum - Brooklyn",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Medically Tailored Meals (MTM)",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.848Z",
     "updated_at": "2026-06-12T17:18:54.713Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 121,
   "fields": {
     "program_name": "Medically Tailored or Nutritionally Appropriate Food Prescriptions: Voucher - Pregnant / Postpartum - Manhattan",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Medically Tailored Meals (MTM)",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.848Z",
     "updated_at": "2026-06-12T17:18:54.714Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 122,
   "fields": {
     "program_name": "Medically Tailored or Nutritionally Appropriate Food Prescriptions: Voucher - Pregnant / Postpartum - Queens",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Medically Tailored Meals (MTM)",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.849Z",
     "updated_at": "2026-06-12T17:18:54.714Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 123,
   "fields": {
     "program_name": "Navigation Services - Eligibility Assessment and Navigation to existing resources (Level 1) - FFS Members - Brooklyn",
     "main_category": "Food",
     "case_category": "ELIGIBILITY",
     "services_category": "",
-    "pipeline_name": "C: Eligibility Assessment",
-    "pipeline_id": "F6cAYzGyB9H1Tsb88QZO",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.849Z",
     "updated_at": "2026-06-12T17:18:54.714Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 124,
   "fields": {
     "program_name": "Navigation Services - Eligibility Assessment and Navigation to existing resources (Level 1) - FFS Members - Manhattan",
     "main_category": "Food",
     "case_category": "ELIGIBILITY",
     "services_category": "",
-    "pipeline_name": "C: Eligibility Assessment",
-    "pipeline_id": "F6cAYzGyB9H1Tsb88QZO",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.850Z",
     "updated_at": "2026-06-12T17:18:54.715Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 125,
   "fields": {
     "program_name": "Navigation Services - Eligibility Assessment and Navigation to existing resources (Level 1) - FFS Members - Queens",
     "main_category": "Food",
     "case_category": "ELIGIBILITY",
     "services_category": "",
-    "pipeline_name": "C: Eligibility Assessment",
-    "pipeline_id": "F6cAYzGyB9H1Tsb88QZO",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.850Z",
     "updated_at": "2026-06-12T17:18:54.715Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 126,
   "fields": {
     "program_name": "Navigation Services - Eligibility Assessment and Navigation to existing resources (Level 1) - MCO Members - Brooklyn",
     "main_category": "Food",
     "case_category": "ELIGIBILITY",
     "services_category": "",
-    "pipeline_name": "C: Eligibility Assessment",
-    "pipeline_id": "F6cAYzGyB9H1Tsb88QZO",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.850Z",
     "updated_at": "2026-06-12T17:18:54.715Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 127,
   "fields": {
     "program_name": "Navigation Services - Eligibility Assessment and Navigation to existing resources (Level 1) - MCO Members - Manhattan",
     "main_category": "Food",
     "case_category": "ELIGIBILITY",
     "services_category": "",
-    "pipeline_name": "C: Eligibility Assessment",
-    "pipeline_id": "F6cAYzGyB9H1Tsb88QZO",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.851Z",
     "updated_at": "2026-06-12T17:18:54.716Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 128,
   "fields": {
     "program_name": "Navigation Services - Eligibility Assessment and Navigation to existing resources (Level 1) - MCO Members - Queens",
     "main_category": "Food",
     "case_category": "ELIGIBILITY",
     "services_category": "",
-    "pipeline_name": "C: Eligibility Assessment",
-    "pipeline_id": "F6cAYzGyB9H1Tsb88QZO",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.851Z",
     "updated_at": "2026-06-12T17:18:54.716Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 129,
   "fields": {
     "program_name": "Nutritional Counseling and Education - Counseling and Education: Individual (Initial assessment) - Brooklyn",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Nutritional Counseling",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.852Z",
     "updated_at": "2026-06-12T17:18:54.716Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 130,
   "fields": {
     "program_name": "Nutritional Counseling and Education - Counseling and Education: Individual (Initial assessment) - Manhattan",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Nutritional Counseling",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.852Z",
     "updated_at": "2026-06-12T17:18:54.717Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 131,
   "fields": {
     "program_name": "Nutritional Counseling and Education - Counseling and Education: Individual (Initial assessment) - Queens",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Nutritional Counseling",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.852Z",
     "updated_at": "2026-06-12T17:18:54.717Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 132,
   "fields": {
     "program_name": "Nutritional Counseling and Education: Individual (Reassessment) - Brooklyn",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Nutritional Counseling",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.853Z",
     "updated_at": "2026-06-12T17:18:54.717Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 133,
   "fields": {
     "program_name": "Nutritional Counseling and Education: Individual (Reassessment) - Manhattan",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Nutritional Counseling",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.853Z",
     "updated_at": "2026-06-12T17:18:54.718Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 134,
   "fields": {
     "program_name": "Nutritional Counseling and Education: Individual (Reassessment) - Queens",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Nutritional Counseling",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.854Z",
     "updated_at": "2026-06-12T17:18:54.718Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 135,
   "fields": {
     "program_name": "Nutritional Counseling and Education; Group (2 or more individuals) - Brooklyn",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Nutritional Counseling",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.854Z",
     "updated_at": "2026-06-12T17:18:54.719Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 136,
   "fields": {
     "program_name": "Nutritional Counseling and Education; Group (2 or more individuals) - Manhattan",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Nutritional Counseling",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.855Z",
     "updated_at": "2026-06-12T17:18:54.719Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 137,
   "fields": {
     "program_name": "Nutritional Counseling and Education; Group (2 or more individuals) - Queens",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Nutritional Counseling",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.855Z",
     "updated_at": "2026-06-12T17:18:54.719Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 138,
   "fields": {
     "program_name": "NY1115 Member Navigation",
     "main_category": "Food",
     "case_category": "Care Management",
     "services_category": "",
-    "pipeline_name": "D: Navigation",
-    "pipeline_id": "2GToxmnm3MrMsotZ1kgn",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.855Z",
     "updated_at": "2026-06-12T17:18:54.720Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 139,
   "fields": {
     "program_name": "NYC Groceries to Go",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Groceries to Go",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.856Z",
     "updated_at": "2026-06-12T17:18:54.720Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 140,
   "fields": {
     "program_name": "PHS SNAP (General)",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "SNAP",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.856Z",
     "updated_at": "2026-06-12T17:18:54.720Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 141,
   "fields": {
     "program_name": "Private Transportation - Care Management - Brooklyn",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Transportation",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.857Z",
     "updated_at": "2026-06-12T17:18:54.721Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 142,
   "fields": {
     "program_name": "Private Transportation - HRSN Services Only",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Transportation",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.857Z",
     "updated_at": "2026-06-12T17:18:54.721Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 143,
   "fields": {
     "program_name": "Public Transportation - Care Management - Brooklyn",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Transportation",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.857Z",
     "updated_at": "2026-06-12T17:18:54.721Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 144,
   "fields": {
     "program_name": "Public Transportation - HRSN Services Only - Brooklyn",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Transportation",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.858Z",
     "updated_at": "2026-06-12T17:18:54.722Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 145,
   "fields": {
     "program_name": "Public Transportation - HRSN Services Only - Queens",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Transportation",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.858Z",
     "updated_at": "2026-06-12T17:18:54.722Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 146,
   "fields": {
     "program_name": "Selfhelpâ€™s Case Management Programs",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Other",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.859Z",
     "updated_at": "2026-06-12T17:18:54.722Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 147,
   "fields": {
     "program_name": "Selfhelpâ€™s Naturally Occurring Retirement Communities",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Other",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.859Z",
     "updated_at": "2026-06-12T17:18:54.723Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 148,
   "fields": {
     "program_name": "SNAP (Supplemental Nutrition Assistance Program)",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Other",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.862Z",
     "updated_at": "2026-06-12T17:18:54.723Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 149,
   "fields": {
     "program_name": "Tenancy Sustaining Services - Housing Recertification and Renewals - Brooklyn",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Tenancy",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.863Z",
     "updated_at": "2026-06-12T17:18:54.723Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 150,
   "fields": {
     "program_name": "Tenancy Sustaining Services - Rights, Education, Eviction Prevention, Dispute Resolution, Risk Intervention, and Legal Services - Brooklyn",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Tenancy",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.863Z",
     "updated_at": "2026-06-12T17:18:54.724Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 151,
   "fields": {
     "program_name": "The Menu",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Other",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.864Z",
     "updated_at": "2026-06-12T17:18:54.724Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 152,
   "fields": {
     "program_name": "Utility Assistance - Brooklyn",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Other",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.864Z",
     "updated_at": "2026-06-12T17:18:54.724Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 153,
   "fields": {
     "program_name": "NYC Benefits",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Other",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.864Z",
     "updated_at": "2026-06-12T17:18:54.725Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 154,
   "fields": {
     "program_name": "CORE",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Other",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.865Z",
     "updated_at": "2026-06-12T17:18:54.725Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 155,
   "fields": {
     "program_name": "Health Home Program",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Other",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.865Z",
     "updated_at": "2026-06-12T17:18:54.725Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 156,
   "fields": {
     "program_name": "Selfhelpâ€™s Older Adult Centers",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Other",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.866Z",
     "updated_at": "2026-06-12T17:18:54.726Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 157,
   "fields": {
     "program_name": "New Horizon Counseling Center - Health Home Care Management",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Other",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.866Z",
     "updated_at": "2026-06-12T17:18:54.726Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 158,
   "fields": {
     "program_name": "Housing & Shelter",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Other",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.867Z",
     "updated_at": "2026-06-12T17:18:54.727Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 159,
   "fields": {
     "program_name": "Private Transportation - HRSN Services Only - Brooklyn",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Other",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.867Z",
     "updated_at": "2026-06-12T17:18:54.727Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 160,
   "fields": {
     "program_name": "Selfhelp's Holocaust Survivor Programs",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Other",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.868Z",
     "updated_at": "2026-06-12T17:18:54.728Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 161,
   "fields": {
     "program_name": "Job readiness - The Alex House Project, Inc",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Other",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.869Z",
     "updated_at": "2026-06-12T17:18:54.728Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 162,
   "fields": {
     "program_name": "Selfhelp's Home Care Training Program",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Other",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.869Z",
     "updated_at": "2026-06-12T17:18:54.728Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 163,
   "fields": {
     "program_name": "Housing Transition and Navigation Services - Manhattan",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Other",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.870Z",
     "updated_at": "2026-06-12T17:18:54.729Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 164,
   "fields": {
     "program_name": "Selfhelp's Alzheimerâ€™s Resource Program (SHARP)",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Other",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.870Z",
     "updated_at": "2026-06-12T17:18:54.729Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 165,
   "fields": {
     "program_name": "WIC Made Easy",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Other",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.870Z",
     "updated_at": "2026-06-12T17:18:54.729Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 166,
   "fields": {
     "program_name": "Original Pentecostal Apostolic Church, Inc",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Other",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.871Z",
     "updated_at": "2026-06-12T17:18:54.730Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 167,
   "fields": {
     "program_name": "Community Food Pantry",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Other",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.871Z",
     "updated_at": "2026-06-12T17:18:54.730Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 168,
   "fields": {
     "program_name": "IMMIGRATION, SNAP.",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Other",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.872Z",
     "updated_at": "2026-06-12T17:18:54.730Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 169,
   "fields": {
     "program_name": "Food and Nutrition Program",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Other",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.872Z",
     "updated_at": "2026-06-12T17:18:54.731Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 170,
   "fields": {
     "program_name": "Public Transportation - HRSN Services Only",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Other",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.872Z",
     "updated_at": "2026-06-12T17:18:54.731Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 171,
   "fields": {
     "program_name": "Home-Delivered Meals",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Other",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.873Z",
     "updated_at": "2026-06-12T17:18:54.731Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 172,
   "fields": {
     "program_name": "Diabetes Nutrition Education",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Other",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.873Z",
     "updated_at": "2026-06-12T17:18:54.732Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 173,
   "fields": {
     "program_name": "Housing Program",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Other",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.874Z",
     "updated_at": "2026-06-12T17:18:54.732Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 174,
   "fields": {
     "program_name": "Reauthorization: Public Transportation - Care Management - Manhattan",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Other",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.874Z",
     "updated_at": "2026-06-12T17:18:54.732Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 175,
   "fields": {
     "program_name": "Holistic Parenting Classes",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Other",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.875Z",
     "updated_at": "2026-06-12T17:18:54.733Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 176,
   "fields": {
     "program_name": "Island Harvest Food Bank",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Other",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.875Z",
     "updated_at": "2026-06-12T17:18:54.733Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 177,
   "fields": {
     "program_name": "Continuous Access Center",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Other",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.876Z",
     "updated_at": "2026-06-12T17:18:54.733Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 178,
   "fields": {
     "program_name": "Nutrition- Food Pantry",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Other",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.876Z",
     "updated_at": "2026-06-12T17:18:54.734Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 179,
   "fields": {
     "program_name": "Addiction Services",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Other",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.876Z",
     "updated_at": "2026-06-12T17:18:54.734Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 180,
   "fields": {
     "program_name": "Job Readiness",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Other",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.877Z",
     "updated_at": "2026-06-12T17:18:54.734Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 181,
   "fields": {
     "program_name": "Public Health Solutions Services",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Other",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.877Z",
     "updated_at": "2026-06-12T17:18:54.735Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 182,
   "fields": {
     "program_name": "NYP/PHS Queens Program",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Other",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.878Z",
     "updated_at": "2026-06-12T17:18:54.735Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 183,
   "fields": {
     "program_name": "CAMBA's Health Link Program, A Health Home Program",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Other",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.878Z",
     "updated_at": "2026-06-12T17:18:54.735Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 184,
   "fields": {
     "program_name": "Maranatha S.D.A. Church Food Pantry",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Other",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.878Z",
     "updated_at": "2026-06-12T17:18:54.736Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 185,
   "fields": {
     "program_name": "Project Dignity",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Other",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.879Z",
     "updated_at": "2026-06-12T17:18:54.736Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 186,
   "fields": {
     "program_name": "High School Equivalency/GED Program (Women's Only Program)",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Other",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.879Z",
     "updated_at": "2026-06-12T17:18:54.736Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 187,
   "fields": {
     "program_name": "Resource Referral Program",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Other",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.880Z",
     "updated_at": "2026-06-12T17:18:54.737Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 188,
   "fields": {
     "program_name": "IHOPE",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Other",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.880Z",
     "updated_at": "2026-06-12T17:18:54.737Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 189,
   "fields": {
     "program_name": "Public Transportation - HRSN Services Only - Manhattan",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Other",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.880Z",
     "updated_at": "2026-06-12T17:18:54.737Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 190,
   "fields": {
     "program_name": "Brooklyn Care Coordination",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Other",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.881Z",
     "updated_at": "2026-06-12T17:18:54.738Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 191,
   "fields": {
     "program_name": "Tenancy Sustaining Services - Rights, Education, Eviction Prevention, Dispute Resolution, Risk Intervention, and Legal Services - Queens",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Other",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.881Z",
     "updated_at": "2026-06-12T17:18:54.738Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 192,
   "fields": {
     "program_name": "Senior Services",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Other",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.882Z",
     "updated_at": "2026-06-12T17:18:54.738Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 193,
   "fields": {
     "program_name": "Utility Assistance - Manhattan",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Other",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.882Z",
     "updated_at": "2026-06-12T17:18:54.739Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 194,
   "fields": {
     "program_name": "Pre-Tenancy Services - Negotiating Lease Agreements - Brooklyn",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Other",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.883Z",
     "updated_at": "2026-06-12T17:18:54.739Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 195,
   "fields": {
     "program_name": "Home Care Services- Brooklyn, Manhattan, Queens, Bronx",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Other",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.883Z",
     "updated_at": "2026-06-12T17:18:54.739Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 196,
   "fields": {
     "program_name": "Queens Vocational Services",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Other",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.883Z",
     "updated_at": "2026-06-12T17:18:54.740Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 197,
   "fields": {
     "program_name": "Pre-Tenancy Services - Navigating and Completing Housing Application - Brooklyn",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Other",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.884Z",
     "updated_at": "2026-06-12T17:18:54.740Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 198,
   "fields": {
     "program_name": "Pre-Tenancy Services - Tenant Screening Assistance and Tenant Interviews - Queens",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Other",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.884Z",
     "updated_at": "2026-06-12T17:18:54.740Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 199,
   "fields": {
     "program_name": "Tenancy Sustaining Services - Financial Education, Literacy and Resources - Brooklyn",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Other",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.885Z",
     "updated_at": "2026-06-12T17:18:54.741Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 200,
   "fields": {
     "program_name": "New Horizon Counseling Center- Outpatient Mental Health",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Other",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.885Z",
     "updated_at": "2026-06-12T17:18:54.741Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 201,
   "fields": {
     "program_name": "NFP The Rockaways",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Other",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.886Z",
     "updated_at": "2026-06-12T17:18:54.741Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 202,
   "fields": {
     "program_name": "Interborough Developmental & Consultation Center CCBHC - Mental Health",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Other",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.886Z",
     "updated_at": "2026-06-12T17:18:54.742Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 203,
   "fields": {
     "program_name": "VAP - General Civil Legal Services (NY)",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Other",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.886Z",
     "updated_at": "2026-06-12T17:18:54.742Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 204,
   "fields": {
     "program_name": "Mercy Haven Inc Food Pantry",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Other",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.887Z",
     "updated_at": "2026-06-12T17:18:54.742Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 205,
   "fields": {
     "program_name": "Reentry Services",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Other",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.887Z",
     "updated_at": "2026-06-12T17:18:54.743Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 206,
   "fields": {
     "program_name": "Utility Assistance - Queens",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Other",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.888Z",
     "updated_at": "2026-06-12T17:18:54.743Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 207,
   "fields": {
     "program_name": "Utility Setup - Back Payments - Brooklyn",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Other",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.888Z",
     "updated_at": "2026-06-12T17:18:54.743Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 208,
   "fields": {
     "program_name": "Tenancy Sustaining Services - Housing Recertification and Renewals - Queens",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Other",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.889Z",
     "updated_at": "2026-06-12T17:18:54.744Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 209,
   "fields": {
     "program_name": "Disability Benefits (SSI/SSDI) Evaluation, Application Support, Appeal Representation",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Other",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.889Z",
     "updated_at": "2026-06-12T17:18:54.744Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 210,
   "fields": {
     "program_name": "Interborough Developmental & Consultation Center - Multihealth Services, Dba. SLA Associates",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Other",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.889Z",
     "updated_at": "2026-06-12T17:18:54.745Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 211,
   "fields": {
     "program_name": "Pre-Tenancy Services - Negotiating Lease Agreements - Queens",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Other",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.890Z",
     "updated_at": "2026-06-12T17:18:54.745Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 212,
   "fields": {
     "program_name": "Healthcare Access",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Other",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.890Z",
     "updated_at": "2026-06-12T17:18:54.745Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 213,
   "fields": {
     "program_name": "Workforce Development & Re-Entry at BronxConnect (ONLY For Formerly Incarcerated or Detained)",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Other",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.891Z",
     "updated_at": "2026-06-12T17:18:54.746Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 214,
   "fields": {
     "program_name": "Public Transportation - Care Management",
     "main_category": "Transportation",
     "case_category": "External Services",
     "services_category": "Transportation",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.891Z",
     "updated_at": "2026-06-12T17:18:54.746Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 215,
   "fields": {
     "program_name": "Help 365 Bronx",
     "main_category": "Social Support",
     "case_category": "External Services",
     "services_category": "Other",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.891Z",
     "updated_at": "2026-06-12T17:18:54.746Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 216,
   "fields": {
     "program_name": "Early Head Start - Family Child Care Network",
     "main_category": "Childcare",
     "case_category": "External Services",
     "services_category": "Other",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.892Z",
     "updated_at": "2026-06-12T17:18:54.747Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 217,
   "fields": {
     "program_name": "Bridge Street Development Corporation",
     "main_category": "Social Support",
     "case_category": "External Services",
     "services_category": "Other",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.892Z",
     "updated_at": "2026-06-12T17:18:54.747Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 218,
   "fields": {
     "program_name": "Mercy Haven",
     "main_category": "Housing",
     "case_category": "External Services",
     "services_category": "Other",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.893Z",
     "updated_at": "2026-06-12T17:18:54.747Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 219,
   "fields": {
     "program_name": "The River Fund New York",
     "main_category": "Food",
     "case_category": "External Services",
     "services_category": "Other",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.893Z",
     "updated_at": "2026-06-12T17:18:54.748Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 220,
   "fields": {
     "program_name": "Homeless Veteran's Reintegration Program",
     "main_category": "Unemployment",
     "case_category": "External Services",
     "services_category": "Other",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.893Z",
     "updated_at": "2026-06-12T17:18:54.748Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 221,
   "fields": {
     "program_name": "In-home personal care",
     "main_category": "Home Care",
     "case_category": "External Services",
     "services_category": "Other",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.894Z",
     "updated_at": "2026-06-12T17:18:54.748Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 222,
   "fields": {
     "program_name": "National Diabetes Prevention Program (NDPP)",
     "main_category": "Health",
     "case_category": "External Services",
     "services_category": "Other",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.894Z",
     "updated_at": "2026-06-12T17:18:54.749Z"
   }
 },
 {
-  "model": "api.programpipeline",
+  "model": "api.activeprogram",
   "pk": 223,
   "fields": {
     "program_name": "Health and Wellness",
     "main_category": "Health",
     "case_category": "External Services",
     "services_category": "Other",
-    "pipeline_name": "E: External Servicess",
-    "pipeline_id": "vVnLwzTO1nkVxUt0zmdF",
+    "is_for_household": false,
+    "case_type": "food",
     "created_at": "2026-06-12T17:13:59.895Z",
     "updated_at": "2026-06-12T17:18:54.749Z"
   }

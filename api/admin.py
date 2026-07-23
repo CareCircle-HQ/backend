@@ -27,10 +27,10 @@ from .models import (
     MenuType,
     MilitaryProfile,
     Note,
+    ActiveProgram,
     ProductType,
     Program,
     ProgramMainCategory,
-    ProgramPipeline,
     Provider,
     Screening,
     Service,
@@ -471,17 +471,18 @@ class ExcludedZipCodeAdmin(admin.ModelAdmin):
     ordering = ("zip",)
 
 
-@admin.register(ProgramPipeline)
-class ProgramPipelineAdmin(admin.ModelAdmin):
+@admin.register(ActiveProgram)
+class ActiveProgramAdmin(admin.ModelAdmin):
     list_display = (
         "program_name",
         "case_category",
-        "pipeline_name",
-        "pipeline_id",
+        "case_type",
+        "is_for_household",
+        "main_category",
         "updated_at",
     )
-    list_filter = ("case_category", "main_category", "pipeline_name")
-    search_fields = ("program_name", "pipeline_id")
+    list_filter = ("case_category", "case_type", "is_for_household", "main_category")
+    search_fields = ("program_name", "case_category")
     ordering = ("program_name",)
 
 

@@ -569,7 +569,9 @@ def map_case_row(row):
     set_("previous_case_id", _s(row, "previous_case_id"))
     set_("created_by_id", _s(row, "case_created_by_id"))
     set_("created_by_name", _s(row, "case_created_by_name"))
-    set_("date_opened", _dt(row, "user_entered_opened_date") or _dt(row, "case_created_at"))
+    # Prefer the Unite Us case-created timestamp; fall back to the user-entered
+    # opened date only when the source carries no creation timestamp.
+    set_("date_opened", _dt(row, "case_created_at") or _dt(row, "user_entered_opened_date"))
     set_("updated_at", _dt(row, "case_updated_at"))
     set_("ar_submitted_on", _dt(row, "ar_submitted_on"))
     set_("case_processed_at", _dt(row, "case_processed_at"))
@@ -1146,7 +1148,7 @@ class CsvImporter:
                 self._count("skipped")
                 continue
             # External-service cases are out of scope -- we don't track them.
-            # (Classified from the program's ProgramPipeline category.)
+            # (Classified from the program's ActiveProgram category.)
             if derive_case_type(
                 row.get("service_subtype"), row.get("program_name")
             ) == CaseType.EXTERNAL_SERVICE:
