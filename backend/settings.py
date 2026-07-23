@@ -362,6 +362,16 @@ CELERY_BEAT_SCHEDULE = {
         "task": "api.tasks.sync_member_warnings",
         "schedule": crontab(minute=0, hour=11),
     },
+    # Daily safety-net sweep: cancel service for clients whose LAST internal-
+    # service case has closed but whose enrollment was never terminalized (a
+    # historical closure the close-out never re-evaluated). Idempotent -- a no-op
+    # once clean. Runs at 04:00 America/New_York, after the 02:00 daily_pull and
+    # BEFORE the 05:00 delivery-calendar sync, so cancelled households drop off
+    # the calendar before the day's PO work.
+    "sweep-closed-case-service": {
+        "task": "api.tasks.sweep_closed_case_service",
+        "schedule": crontab(minute=0, hour=4),
+    },
     # Daily delivery-calendar reconcile so no eligible member is missing from
     # upcoming Purchase Orders (members added get scheduled; paused/removed get
     # dropped). Runs at 05:00 America/New_York, after the 02:00 daily_pull import
