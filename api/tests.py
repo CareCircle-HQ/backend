@@ -6444,6 +6444,88 @@ class POAuthorizationGuardrailTest(TestCase):
         self.assertNotIn(str(client.client_id), self._po_eligible_client_ids())
 
 
+class POHouseholdDependentEligibilityTest(TestCase):
+    """A household dependent (non-case-holder) holds NO internal-service case of
+    their own -- the whole household is governed by the case-holder's case. The
+    open-case PO guardrail must therefore key on the enrollment applicant, not
+    each member, or every dependent is wrongly dropped off the PO even when the
+    household is open + approved."""
+
+    def _setup(self, case_status):
+        from .models import (
+            Case, CaseStatus, CaseType, Client, EnrollmentStage,
+            EnrollmentVerification, Household, HouseholdMember,
+            MemberDietaryProfile, MemberStatus, OrderSchedule, OrderStatus,
+            ServiceAuthorizationStatus,
+        )
+        from datetime import timedelta
+
+        today = timezone.localdate()
+        holder = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Case", last_name="Holder",
+        )
+        dep = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Depen", last_name="Dent",
+        )
+        hh = Household.objects.create(name="HH")
+        HouseholdMember.objects.create(household=hh, client=holder, is_primary=True)
+        HouseholdMember.objects.create(household=hh, client=dep, is_primary=False)
+        # Only the case-holder has the internal-service case.
+        Case.objects.create(
+            case_id=str(uuid.uuid4()), client=holder,
+            case_type=CaseType.INTERNAL_SERVICE, case_status=case_status,
+            service_authorization_status=ServiceAuthorizationStatus.APPROVED,
+            program_name="Medically Tailored Meals", date_opened=timezone.now(),
+        )
+        enr = EnrollmentVerification.objects.create(
+            client=holder, household=hh, stage=EnrollmentStage.SERVICE_ACTIVE,
+        )
+        for c in (holder, dep):
+            m = MemberDietaryProfile.objects.create(
+                enrollment=enr, client=c, menu_type="Standard",
+                status=MemberStatus.ACTIVE,
+            )
+            OrderSchedule.objects.create(
+                enrollment=enr, member=m, member_name=f"{c.first_name} {c.last_name}",
+                anticipated_delivery_date=today + timedelta(days=1),
+                status=OrderStatus.SCHEDULED, household_group_code="G", household=hh,
+            )
+        return holder, dep
+
+    def _po_eligible_client_ids(self):
+        from .models import OrderSchedule, OrderStatus
+        from .services.purchase_orders import (
+            authorized_internal_service_case_exists,
+            open_internal_service_case_exists,
+        )
+
+        return {
+            str(cid)
+            for cid in OrderSchedule.objects.filter(status=OrderStatus.SCHEDULED)
+            .annotate(_o=open_internal_service_case_exists())
+            .filter(_o=True)
+            .annotate(_a=authorized_internal_service_case_exists())
+            .filter(_a=True)
+            .values_list("member__client_id", flat=True)
+        }
+
+    def test_dependent_included_when_household_open_approved(self):
+        from .models import CaseStatus
+
+        holder, dep = self._setup(CaseStatus.OPEN)
+        eligible = self._po_eligible_client_ids()
+        self.assertIn(str(holder.client_id), eligible)
+        self.assertIn(str(dep.client_id), eligible)
+
+    def test_whole_household_excluded_when_case_holder_case_closed(self):
+        from .models import CaseStatus
+
+        holder, dep = self._setup(CaseStatus.CLOSED)
+        eligible = self._po_eligible_client_ids()
+        self.assertNotIn(str(holder.client_id), eligible)
+        self.assertNotIn(str(dep.client_id), eligible)
+
+
 class PrepareMembersForPOTaskTest(TestCase):
     """The async "Prepare Members for PO" job: the Celery task runs the
     full-calendar reconcile, streams progress to its tracking ``ImportRun``, and
@@ -6496,3 +6578,123 @@ class PrepareMembersForPOTaskTest(TestCase):
         self.assertEqual(run.status, ImportRunStatus.FAILED)
         self.assertIn("boom", run.error_log)
         self.assertIsNotNone(run.finished_at)
+
+
+class ReconcileDeliveryStateAuthorizationTest(TestCase):
+    """``reconcile_delivery_state`` must only keep serving through a pending
+    case when the household holds an OPEN approved authorization (a genuine
+    in-flight renewal/switch). When the sole/governing authorization is pending
+    -- an initial request not yet granted, or an approval that sits only on a
+    CLOSED case -- service must NOT run, so future non-batched occurrences are
+    truncated. This aligns delivery with the PO guardrail (authorized == OPEN +
+    APPROVED) and fixes households that landed on POs while only "Requested"."""
+
+    def _setup(self, *, auth_status, case_status):
+        from datetime import timedelta
+
+        from .models import (
+            Case, CaseStatus, CaseType, Client, DeliveryCadence, EnrollmentStage,
+            EnrollmentVerification, Household, HouseholdMember,
+            MemberDeliverySchedule, MemberDietaryProfile, MemberStatus,
+            OrderSchedule, OrderStatus, ScheduleStatus,
+        )
+
+        today = timezone.localdate()
+        client = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Del", last_name="State",
+        )
+        hh = Household.objects.create(name="HH")
+        HouseholdMember.objects.create(household=hh, client=client, is_primary=True)
+        case = Case.objects.create(
+            case_id=str(uuid.uuid4()), client=client,
+            case_type=CaseType.INTERNAL_SERVICE, case_status=case_status,
+            service_authorization_status=auth_status,
+            program_name="Medically Tailored Meals", date_opened=timezone.now(),
+        )
+        enr = EnrollmentVerification.objects.create(
+            client=client, household=hh, case=case,
+            stage=EnrollmentStage.SERVICE_ACTIVE,
+            delivery_weekdays=["mon", "thu"],
+        )
+        member = MemberDietaryProfile.objects.create(
+            enrollment=enr, client=client, menu_type="Standard",
+            status=MemberStatus.ACTIVE,
+        )
+        # A live plan + a future occurrence that is NOT batched into any PO.
+        MemberDeliverySchedule.objects.create(
+            enrollment=enr, member_profile=member, member_name="Del State",
+            status=ScheduleStatus.SCHEDULED,
+            delivery_days_cadence=DeliveryCadence.MON_THU,
+            starts_on=today - timedelta(days=7), ends_on=today + timedelta(days=60),
+            meals_per_day=3,
+        )
+        # Land the occurrence on a Monday within the window so a recompute would
+        # otherwise re-plan it.
+        future = today + timedelta(days=(7 - today.weekday()) % 7 or 7)
+        while future.weekday() != 0:  # Monday
+            future += timedelta(days=1)
+        OrderSchedule.objects.create(
+            enrollment=enr, member=member, member_name="Del State",
+            anticipated_delivery_date=future,
+            status=OrderStatus.SCHEDULED, household_group_code="G", household=hh,
+        )
+        return client, case, enr
+
+    def _future_occurrences(self, client):
+        from .models import OrderSchedule, OrderStatus
+
+        return OrderSchedule.objects.filter(
+            member__client_id=client.client_id, status=OrderStatus.SCHEDULED,
+            anticipated_delivery_date__gte=timezone.localdate(),
+        ).count()
+
+    def test_open_pending_only_truncates_future_deliveries(self):
+        from .models import CaseStatus, ServiceAuthorizationStatus
+        from .services.lifecycle import reconcile_internal_service_authorization
+
+        client, _, _ = self._setup(
+            auth_status=ServiceAuthorizationStatus.PENDING,
+            case_status=CaseStatus.OPEN,
+        )
+        self.assertEqual(self._future_occurrences(client), 1)
+        reconcile_internal_service_authorization(client)
+        self.assertEqual(self._future_occurrences(client), 0)
+
+    def test_closed_approved_plus_open_pending_truncates(self):
+        from .models import (
+            Case, CaseStatus, CaseType, ServiceAuthorizationStatus,
+        )
+        from .services.lifecycle import reconcile_internal_service_authorization
+
+        # Governing approval sits on a CLOSED case; the only OPEN case is pending.
+        client, closed_case, _ = self._setup(
+            auth_status=ServiceAuthorizationStatus.APPROVED,
+            case_status=CaseStatus.CLOSED,
+        )
+        Case.objects.create(
+            case_id=str(uuid.uuid4()), client=client,
+            case_type=CaseType.INTERNAL_SERVICE, case_status=CaseStatus.OPEN,
+            service_authorization_status=ServiceAuthorizationStatus.PENDING,
+            program_name="Medically Tailored Meals", date_opened=timezone.now(),
+        )
+        self.assertEqual(self._future_occurrences(client), 1)
+        reconcile_internal_service_authorization(client)
+        self.assertEqual(self._future_occurrences(client), 0)
+
+    def test_open_approved_keeps_serving(self):
+        from datetime import timedelta
+
+        from .models import CaseStatus, ServiceAuthorizationStatus
+        from .services.lifecycle import reconcile_internal_service_authorization
+
+        # OPEN + approved with a future window -> service continues (no truncate).
+        client, case, _ = self._setup(
+            auth_status=ServiceAuthorizationStatus.APPROVED,
+            case_status=CaseStatus.OPEN,
+        )
+        case.service_authorization_approval_ends_at = timezone.now() + timedelta(days=90)
+        case.save(update_fields=["service_authorization_approval_ends_at"])
+        self.assertEqual(self._future_occurrences(client), 1)
+        reconcile_internal_service_authorization(client)
+        # Service continues -- the window heals/regenerates rather than truncating.
+        self.assertGreaterEqual(self._future_occurrences(client), 1)

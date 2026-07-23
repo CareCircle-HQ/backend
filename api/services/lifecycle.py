@@ -1425,9 +1425,23 @@ def reconcile_delivery_state(enrollment, *, actor=None):
         heal_delivery_window(enrollment)
         return
 
-    # No open+approved authorization covering the future. Keep serving during an
-    # in-flight switch/renewal; otherwise stop over-delivering.
-    if pending_switch_case(enrollment) is not None:
+    # No open+approved authorization covering the future. Keep serving through an
+    # in-flight switch/renewal ONLY when the household is currently authorized by
+    # an OPEN approved case (its window merely drifted/expired) -- that is the
+    # legitimate gap-serving case. When NO open approved authorization exists
+    # anywhere (the household's only open case is pending -- an initial request
+    # not yet granted -- or its sole approval sits on a CLOSED case), a pending
+    # case is NOT a renewal of live service: service must not run, so truncate.
+    # This aligns delivery with the PO guardrail (authorized == OPEN + APPROVED).
+    has_open_approved = any(
+        c.service_authorization_status in (
+            ServiceAuthorizationStatus.APPROVED,
+            ServiceAuthorizationStatus.NOT_REQUIRED,
+        )
+        and c.case_status not in _CLOSED_CASE_STATUSES
+        for c in _internal_service_cases(enrollment.client)
+    )
+    if has_open_approved and pending_switch_case(enrollment) is not None:
         return
     truncate_future_deliveries(enrollment)
 
