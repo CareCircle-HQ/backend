@@ -3221,10 +3221,19 @@ class CalendarKeepsOccurrencesOnExclusionTest(TestCase):
         self.assertEqual(self._future_count(enr), n0)
 
     def test_sync_active_calendars_heals_fully_lapsed_calendar(self):
+        from datetime import timedelta
+
         from .models import OrderSchedule
         from .services.orders import sync_active_calendars, sync_delivery_calendar
 
         enr, _member = self._make_active_enrollment()
+        # Align the plan window with the authorization end so this test isolates
+        # REGENERATION of a lapsed calendar; window-drift healing (extending
+        # ends_on to the authorization end) is covered separately in
+        # RebuildDeliveryCalendarTest.
+        plan = enr.delivery_schedules.get()
+        plan.ends_on = timezone.localdate() + timedelta(days=60)
+        plan.save(update_fields=["ends_on"])
         sync_delivery_calendar(enr)
         n0 = self._future_count(enr)
         self.assertGreater(n0, 0)
@@ -3500,6 +3509,45 @@ class RebuildDeliveryCalendarTest(TestCase):
         self.assertTrue(
             MemberDeliverySchedule.objects.filter(member_profile=new_member).exists()
         )
+
+    def test_sync_active_calendars_heals_lapsed_but_authorized_window(self):
+        # A member whose plan window has LAPSED (ends_on in the past) while the
+        # governing authorization still reaches into the future used to be
+        # skipped forever by the self-heal (selection required ends_on >= today,
+        # and rebuild only regenerated within the stale window). It must now
+        # extend the window to the authorization end and regenerate future
+        # occurrences so the member returns to the Purchase Order.
+        from datetime import timedelta
+
+        from .models import OrderSchedule, OrderStatus
+        from .services.orders import sync_active_calendars
+
+        enr, hh = self._make_active_enrollment()
+        today = timezone.localdate()
+        plan = enr.delivery_schedules.get()
+        # Lapse the plan window (ended yesterday) and clear any occurrences, so
+        # the enrollment has no future calendar left -- exactly the stalled state.
+        plan.starts_on = today - timedelta(days=30)
+        plan.ends_on = today - timedelta(days=1)
+        plan.save(update_fields=["starts_on", "ends_on"])
+        OrderSchedule.objects.filter(enrollment=enr).delete()
+
+        def _future_occurrences():
+            return OrderSchedule.objects.filter(
+                enrollment=enr, status=OrderStatus.SCHEDULED,
+                anticipated_delivery_date__gte=today,
+            ).count()
+
+        # Before: nothing scheduled in the future.
+        self.assertEqual(_future_occurrences(), 0)
+
+        sync_active_calendars()
+
+        plan.refresh_from_db()
+        # Window was EXTENDED to the (future) authorization end ...
+        self.assertGreater(plan.ends_on, today)
+        # ... and future occurrences were regenerated.
+        self.assertGreater(_future_occurrences(), 0)
 
     def test_primary_calendar_is_household_wide_dependent_is_self(self):
         # The PRIMARY's delivery calendar aggregates the WHOLE household; an
