@@ -743,7 +743,8 @@ class MembersForPurchaseOrderReportView(PortalAPIView):
 
     Columns: Delivery Date, HouseholdGroup, PrimaryMemberID, Client ID,
     PrimaryHousehold (is-head flag), Quantity, Delivery Address, Menu Type,
-    Meal Type (Meal/Box), Kitchen, Cadence.
+    Meal Type (Meal/Box), Kitchen, Cadence, Case ID, Case Status, Case
+    Authorization, Member Status.
 
     Query params:
         scope    -- "date" (default) or "week".
@@ -849,6 +850,7 @@ class MembersForPurchaseOrderReportView(PortalAPIView):
             "Cadence",
             "Case ID",
             "Case Status",
+            "Case Authorization",
             "Member Status",
         ])
 
@@ -875,6 +877,15 @@ class MembersForPurchaseOrderReportView(PortalAPIView):
             case = internal_service_case(client) if client else None
             case_id = str(case.case_id) if case else ""
             case_status = case.get_case_status_display() if case else ""
+            # Authorization is a separate dimension from case status; prefer the
+            # human-readable label (e.g. "Accepted"), falling back to the enum's
+            # display when only the normalized value is stored.
+            case_authorization = ""
+            if case:
+                case_authorization = case.service_authorization_status_label or (
+                    case.get_service_authorization_status_display()
+                    if case.service_authorization_status else ""
+                )
             member_status = o.member.get_status_display() if o.member else ""
 
             writer.writerow([
@@ -891,6 +902,7 @@ class MembersForPurchaseOrderReportView(PortalAPIView):
                 _CADENCE_LABELS.get(cad_code, cad_code),
                 case_id,
                 case_status,
+                case_authorization,
                 member_status,
             ])
 
