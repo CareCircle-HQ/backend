@@ -116,6 +116,7 @@ from ..services.warnings import sync_household_warnings
 from ..serializers import (
     add_client_to_household,
     ensure_household_with_primary,
+    ensure_primary_of_own_household,
     search_clients,
     sync_household_members,
 )
@@ -3468,6 +3469,55 @@ class MemberServiceReactivateView(PortalAPIView):
         Note.objects.create(
             client=client, source=NoteSource.AGENT, author_name=author,
             body=f"Household reactivated.{suffix}",
+        )
+        return Response(s.MemberDetailSerializer(client).data)
+
+
+# Restricted maintenance action: only this operator may re-anchor a member as
+# the primary of their own household. This is a targeted data-fix for members
+# wrongly anchored as a dependent in another household's enrollment (so their
+# own case can't be worked); it is not a general agent action.
+MAKE_PRIMARY_ALLOWED_EMAIL = "alexis@carecirclecs.com"
+
+
+class MemberMakePrimaryView(PortalAPIView):
+    """POST /members/<client_id>/make-primary/ — make THIS member the primary of
+    their own household.
+
+    Splits the member out of any shared household they are currently a
+    (non-primary) member of into a fresh household as its primary, moving their
+    own enrollments to that household (see
+    :func:`ensure_primary_of_own_household`). This is the fix for a member whose
+    enrollment is mis-anchored to a relative's household -- the reason they don't
+    appear in that household's roster -- so their internal-service case can then
+    be worked. Idempotent: a member already primary (or with no household) is a
+    no-op re-home.
+
+    Restricted to a single operator (``MAKE_PRIMARY_ALLOWED_EMAIL``); every other
+    agent gets 403 and never sees the button.
+    """
+
+    def post(self, request, client_id):
+        agent = current_agent(request)
+        email = (getattr(agent, "email", "") or "").strip().lower()
+        if email != MAKE_PRIMARY_ALLOWED_EMAIL:
+            return Response(
+                {"error": "You are not permitted to perform this action."},
+                status=http.HTTP_403_FORBIDDEN,
+            )
+        client = get_object_or_404(Client, pk=client_id)
+        ensure_primary_of_own_household(client)
+        # Re-drive the lifecycle stage for the client + their (new) household so
+        # the profile header / roster reflect the re-anchoring immediately.
+        enr = s.active_enrollment(client)
+        if enr is not None:
+            recompute_enrollment_household(enr)
+        else:
+            recompute_client_stage(client)
+        author = agent.name if agent else ""
+        Note.objects.create(
+            client=client, source=NoteSource.AGENT, author_name=author,
+            body="Set as primary of their own household (case-fix re-anchor).",
         )
         return Response(s.MemberDetailSerializer(client).data)
 
