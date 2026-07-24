@@ -6263,12 +6263,21 @@ class ReportExportsTest(TestCase):
         row = next(r for r in rows if r["Client ID"] == str(client.client_id))
         self.assertEqual(row["Case ID"], str(case.case_id))
         self.assertEqual(row["Case Status"], "Open")
+        self.assertEqual(row["Case Type"], "Internal Service")
         self.assertEqual(row["Case Authorization"], "Accepted")
         self.assertEqual(
             row["Program Name"],
             "MTM - (Household) Medically Tailored Meals - Queens",
         )
+        self.assertEqual(row["Meals/Boxes"], "Meals")
         self.assertEqual(row["Is Part of a Household"], "Yes")
+        # Household grouping columns: stable per-household code, the head's id
+        # (this member IS the primary), and the is-primary flag.
+        self.assertEqual(
+            row["Household Group"], f"HH-{hh.household_id.hex[:12].upper()}"
+        )
+        self.assertEqual(row["Primary Member ID"], str(client.client_id))
+        self.assertEqual(row["Is Primary"], "Yes")
         self.assertEqual(row["Member Stage"], "Kitchen Assignment")
         self.assertEqual(row["Kitchen"], "Brooklyn Kitchen")
         self.assertEqual(row["Cadence"], "Mon/Thu")
@@ -6276,6 +6285,12 @@ class ReportExportsTest(TestCase):
 
         solo_row = next(r for r in rows if r["Client ID"] == str(solo.client_id))
         self.assertEqual(solo_row["Is Part of a Household"], "No")
+        # A lone member (no household record) has no group code but is their own
+        # primary/head.
+        self.assertEqual(solo_row["Household Group"], "")
+        self.assertEqual(solo_row["Primary Member ID"], str(solo.client_id))
+        self.assertEqual(solo_row["Is Primary"], "Yes")
+        self.assertEqual(solo_row["Meals/Boxes"], "Meals")
         # No enrollment/assignments -> the new columns are blank.
         self.assertEqual(solo_row["Member Stage"], "")
         self.assertEqual(solo_row["Kitchen"], "")
