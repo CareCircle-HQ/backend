@@ -492,8 +492,6 @@ def sync_active_calendars(from_date=None, progress_cb=None):
     future -- otherwise such a member would be skipped forever and silently stop
     receiving deliveries. Returns aggregate counts.
     """
-    from django.db.models import Q
-
     from api.models import (
         EnrollmentVerification,
         MemberDeliverySchedule,
@@ -508,11 +506,15 @@ def sync_active_calendars(from_date=None, progress_cb=None):
             status=OrderStatus.SCHEDULED, anticipated_delivery_date__gte=from_date,
         ).values_list("enrollment_id", flat=True)
     )
-    # ... PLUS active enrollments whose plan window still covers today/future but
-    # whose calendar has lapsed (no future occurrences), so it can self-heal.
+    # ... PLUS every serviceable enrollment that still has a SCHEDULED delivery
+    # plan -- INCLUDING one whose plan window has already LAPSED (ends_on <
+    # today). A lapsed window is precisely the "authorized but silently stopped"
+    # case: the governing approval still reaches into the future, so
+    # heal_delivery_window (below) must get the chance to EXTEND the window.
+    # Restricting this to ends_on >= today (as it did before) skipped those
+    # members forever -- they never came back onto a Purchase Order.
     enr_ids |= set(
         MemberDeliverySchedule.objects.filter(status=ScheduleStatus.SCHEDULED)
-        .filter(Q(ends_on__isnull=True) | Q(ends_on__gte=from_date))
         .exclude(enrollment__stage__in=SERVICE_EXCLUDED_ENROLLMENT_STAGES)
         .values_list("enrollment_id", flat=True)
     )
@@ -522,7 +524,14 @@ def sync_active_calendars(from_date=None, progress_cb=None):
     if progress_cb is not None:
         progress_cb(0, total)
     for enr in EnrollmentVerification.objects.filter(pk__in=enr_ids).iterator():
-        # rebuild (not just sync) so a member ADDED to an already-active
+        # First heal a drifted/lapsed plan window from the governing APPROVED
+        # authorization: heal_delivery_window pulls ends_on up to the auth end
+        # (no-op when already in sync, when nothing authorizes the future, or on
+        # a meals<->boxes switch). Without this, rebuild below only regenerates
+        # WITHIN the stale window, so a lapsed-but-authorized member would never
+        # return to a Purchase Order.
+        heal_delivery_window(enr, from_date=from_date)
+        # Then rebuild (not just sync) so a member ADDED to an already-active
         # household -- who never got a delivery plan and is therefore missing
         # from the calendar + every future PO -- is created and scheduled. This
         # is the batch self-heal counterpart to the per-edit activation heal.
