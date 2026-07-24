@@ -903,8 +903,9 @@ class MembersNotServedReportView(PortalAPIView):
     Order -- i.e. they have no scheduled delivery in the calendar -- regardless
     of the case's status.
 
-    Columns: Client ID, Case ID, Case Status, Case Authorization, Program Name,
-    Is Part of a Household, Full Name, Member Stage, Kitchen, Cadence, Menu Type,
+    Columns: Client ID, Case ID, Case Status, Case Type, Case Authorization,
+    Program Name, Meals/Boxes, Is Part of a Household, Household Group, Primary
+    Member ID, Is Primary, Full Name, Member Stage, Kitchen, Cadence, Menu Type,
     Out of Orbit, Out of Range, On Hold, Cancelled. The status flags explain WHY
     a member isn't being served (out-of-orbit/out-of-range/paused/ended); all can
     be No when the member simply never reached a Purchase Order (e.g. pending
@@ -923,6 +924,8 @@ class MembersNotServedReportView(PortalAPIView):
             SERVICE_EXCLUDED_MEMBER_STATUSES,
         )
         from ..services.purchase_orders import (
+            _household_group_code,
+            _household_is_primary,
             authorized_internal_service_case_exists,
             open_internal_service_case_exists,
         )
@@ -970,9 +973,14 @@ class MembersNotServedReportView(PortalAPIView):
             "Client ID",
             "Case ID",
             "Case Status",
+            "Case Type",
             "Case Authorization",
             "Program Name",
+            "Meals/Boxes",
             "Is Part of a Household",
+            "Household Group",
+            "Primary Member ID",
+            "Is Primary",
             "Full Name",
             "Member Stage",
             "Kitchen",
@@ -1004,10 +1012,20 @@ class MembersNotServedReportView(PortalAPIView):
             # "Part of a household" = the client's household has more than one
             # member (mirrors the Members-for-PO report's household rule).
             membership = getattr(client, "household_membership", None)
-            in_household = (
-                membership is not None
-                and len(list(membership.household.members.all())) > 1
-            )
+            household = membership.household if membership is not None else None
+            members = list(household.members.all()) if household is not None else []
+            in_household = len(members) > 1
+
+            # Household grouping columns (mirror the Members-for-PO report): the
+            # stable per-household group code, the head-of-household's client id
+            # (a lone member is their own head), and whether THIS member is that
+            # head.
+            group_code = _household_group_code(household)
+            primary_id = str(client.client_id)
+            prim = next((m for m in members if m.is_primary), None)
+            if prim is not None:
+                primary_id = str(prim.client_id)
+            is_primary = _household_is_primary(client)
 
             # On Hold / Cancelled are household-level (enrollment) states; read
             # the latest enrollment (any status) so a terminal one still shows.
@@ -1040,9 +1058,14 @@ class MembersNotServedReportView(PortalAPIView):
                 str(client.client_id),
                 str(case.case_id) if case else "",
                 case.get_case_status_display() if case else "",
+                case.get_case_type_display() if case else "",
                 case_authorization,
                 program_name,
+                _meals_or_boxes(program_name),
                 _yn(in_household),
+                group_code,
+                primary_id,
+                _yn(is_primary),
                 f"{client.first_name or ''} {client.last_name or ''}".strip(),
                 member_stage,
                 kitchen,
