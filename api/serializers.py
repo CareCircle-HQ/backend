@@ -550,41 +550,55 @@ def ensure_primary_of_own_household(client):
 
     A client who holds their own Internal Service (meal/box) case goes through
     verification + delivery as a household head, so they must be the primary of
-    their household. If they're currently a NON-primary member of a (shared)
-    household -- e.g. an agent added them as a relative's dependent before their
-    own case existed -- split them out into a fresh household as primary,
-    detaching their dietary profile(s) from the old household's enrollments
-    (mirroring :func:`add_client_to_household`'s move semantics). Idempotent: a
-    client who is already primary (or has no household yet) is handled by
-    :func:`ensure_household_with_primary`.
+    their household AND every enrollment they own must be anchored to that
+    household. Two mis-anchorings are healed:
+
+    1. The client is a NON-primary member of a (shared) household -- e.g. an
+       agent added them as a relative's dependent -- so split them out.
+    2. The client owns an enrollment whose ``household`` points at a RELATIVE's
+       household (e.g. from a duplicate import), even while the client is already
+       primary of their own household. Left there, ``active_enrollment`` resolves
+       that relative's roster, so the Household tab shows the relative's members
+       and never the client as primary.
+
+    Every enrollment the client owns is re-homed to their primary household, and
+    any relatives dragged onto those enrollments by household sync are detached
+    (their profiles belong to their own household). Idempotent.
     """
     membership = (
         HouseholdMember.objects.filter(client=client)
         .select_related("household")
         .first()
     )
-    if membership is None or membership.is_primary:
-        return ensure_household_with_primary(client)
-    old_household = membership.household
-    membership.delete()
-    new_household = ensure_household_with_primary(client)
-    # Move the client's OWN enrollments (client=client) to their new household,
-    # carrying their dietary profile with them. Without this the enrollment stays
-    # anchored to the old (shared) household, so the Program/Household tab -- which
-    # renders active_enrollment.member_profiles for enrollment.household's roster --
-    # keeps showing the OLD household's members (and, via sync_household_members,
-    # grows stray profiles for them on this client's enrollment).
-    EnrollmentVerification.objects.filter(
-        client=client, household=old_household
-    ).update(household=new_household)
+    # (1) If the client is a NON-primary member of a shared household, split them
+    # out of it first (they leave that roster entirely).
+    left_household = None
+    if membership is not None and not membership.is_primary:
+        left_household = membership.household
+        membership.delete()
+    # The client's OWN primary household (their existing one, or a fresh one).
+    household = ensure_household_with_primary(client)
+    # (2) Re-home every enrollment the client owns into their primary household.
+    for enr in list(
+        EnrollmentVerification.objects.filter(client=client).exclude(household=household)
+    ):
+        # Detach relatives dragged onto this enrollment by household sync: their
+        # dietary profiles belong to their own household's enrollment, not the
+        # client's. The client's own profile (if any) is kept.
+        MemberDietaryProfile.objects.filter(enrollment=enr).exclude(
+            client=client
+        ).delete()
+        enr.household = household
+        enr.save(update_fields=["household"])
     # Drop the client's dietary profile from any enrollments that STAYED in the
-    # old household (the old primary's shared enrollment): the client has left it.
-    MemberDietaryProfile.objects.filter(
-        client=client, enrollment__household=old_household
-    ).delete()
-    if not old_household.members.exists():
-        old_household.delete()
-    return new_household
+    # household they just left (they're no longer a member there).
+    if left_household is not None:
+        MemberDietaryProfile.objects.filter(
+            client=client, enrollment__household=left_household
+        ).delete()
+        if not left_household.members.exists():
+            left_household.delete()
+    return household
 
 
 @transaction.atomic

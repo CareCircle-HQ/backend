@@ -49,6 +49,7 @@ from .views_members import (
     MemberHouseholdAddView,
     MemberHouseholdSearchView,
     MemberHouseholdView,
+    MemberMakePrimaryView,
     MemberProductTypeView,
     MemberWarningsView,
     MemberInternalCaseDescriptionsView,
@@ -225,6 +226,10 @@ urlpatterns = [
     path(
         "members/<uuid:client_id>/household/members/<int:member_id>/",
         HouseholdMemberEditView.as_view(),
+    ),
+    path(
+        "members/<uuid:client_id>/make-primary/",
+        MemberMakePrimaryView.as_view(),
     ),
     # Logistics / kitchen assignment
     path("members/bulk-assign-boxes/", BulkAssignBoxesView.as_view()),
