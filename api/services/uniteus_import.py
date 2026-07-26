@@ -167,6 +167,26 @@ class DailyPull:
         self.name_cache[rid] = name
         return name
 
+    def _service_category(self, service_id):
+        """Broad category = the service node's PARENT name in the Unite Us
+        taxonomy (e.g. "Food Assistance"). The service's OWN name is the specific
+        service (stored as ``service_type``); the CSV export calls this parent
+        the ``service_type`` column. Cached per run."""
+        if not service_id:
+            return ""
+        key = f"svc_parent:{service_id}"
+        if key in self.name_cache:
+            return self.name_cache[key]
+        name = ""
+        try:
+            body = self.api.get_resource("/services", service_id)
+            parent_id = mappers._rel_id(body.get("data") or {}, "parent")
+            name = self._name("/services", parent_id) if parent_id else ""
+        except UniteUsApiError:
+            pass
+        self.name_cache[key] = name
+        return name
+
     # -- coverage ----------------------------------------------------------
     def _pull_coverage(self, client_id):
         med = self.api.list_insurances(client_id, MEDICAL_PLAN_TYPES)
@@ -257,8 +277,10 @@ class DailyPull:
         from api.services.lifecycle import is_met_council_case
 
         provider_id = mappers._rel_id(case_rec, "provider")
+        service_id = mappers._rel_id(case_rec, "service")
         names = {
-            "service": self._name("/services", mappers._rel_id(case_rec, "service")),
+            "service": self._name("/services", service_id),
+            "service_category": self._service_category(service_id),
             "program": self._name("/programs", mappers._rel_id(case_rec, "program")),
             "program_id": mappers._rel_id(case_rec, "program"),
             "network": self._name("/networks", mappers._rel_id(case_rec, "network")),

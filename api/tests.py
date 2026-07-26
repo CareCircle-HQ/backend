@@ -2621,6 +2621,17 @@ class CsvCaseMappingTest(SimpleTestCase):
                 raw,
             )
 
+    def test_service_columns_split_subtype_and_category(self):
+        # CSV service_subtype -> model service_type (the specific service used for
+        # classification); CSV service_type -> model service_category (the broad
+        # Unite Us grouping).
+        out = self._map(
+            service_subtype="Medically Tailored Meals",
+            service_type="Food Assistance",
+        )
+        self.assertEqual(out["service_type"], "Medically Tailored Meals")
+        self.assertEqual(out["service_category"], "Food Assistance")
+
 
 class UniteUsPersonMapperTest(SimpleTestCase):
     """map_person_to_client carries the Unite Us person's own created/updated
@@ -6826,3 +6837,147 @@ class ReconcileDeliveryStateAuthorizationTest(TestCase):
         reconcile_internal_service_authorization(client)
         # Service continues -- the window heals/regenerates rather than truncating.
         self.assertGreaterEqual(self._future_occurrences(client), 1)
+
+
+class CadenceProductQuantitiesSchemaTest(SimpleTestCase):
+    """PortalCadenceSerializer.validate_product_quantities enforces the new
+    shape: meals carry a weekly target (``per_week``) plus an agent-set
+    distribution across delivery days (``per_delivery``) that must sum to the
+    target; boxes carry a per-DAY rate (``per_day``)."""
+
+    def _validate(self, value, weekdays=None):
+        from .portal.serializers import PortalCadenceSerializer
+
+        payload = dict(value)
+        if weekdays is not None:
+            payload["_weekdays"] = weekdays
+        return PortalCadenceSerializer().validate_product_quantities(payload)
+
+    def test_default_shape_is_valid(self):
+        from .models import default_cadence_product_quantities
+
+        clean = self._validate(default_cadence_product_quantities())
+        self.assertEqual(clean["meals"], {"per_week": 21, "per_delivery": {}})
+        self.assertEqual(clean["boxes"], {"per_day": 1})
+
+    def test_per_delivery_must_sum_to_per_week(self):
+        from rest_framework import serializers
+
+        # Balanced distribution passes.
+        clean = self._validate({
+            "meals": {"per_week": 21, "per_delivery": {"mon": 9, "thu": 12}},
+            "boxes": {"per_day": 1},
+        }, weekdays=["mon", "thu"])
+        self.assertEqual(clean["meals"]["per_delivery"], {"mon": 9, "thu": 12})
+
+        # Unbalanced distribution is rejected.
+        with self.assertRaises(serializers.ValidationError):
+            self._validate({
+                "meals": {"per_week": 21, "per_delivery": {"mon": 9, "thu": 9}},
+            }, weekdays=["mon", "thu"])
+
+    def test_per_delivery_rejects_non_delivery_weekday(self):
+        from rest_framework import serializers
+
+        with self.assertRaises(serializers.ValidationError):
+            self._validate({
+                "meals": {"per_week": 21, "per_delivery": {"tue": 21}},
+            }, weekdays=["mon", "thu"])
+
+    def test_negative_amounts_rejected(self):
+        from rest_framework import serializers
+
+        with self.assertRaises(serializers.ValidationError):
+            self._validate({"boxes": {"per_day": -1}})
+
+
+class DeliveryQuantityCadenceTest(TestCase):
+    """PO line quantities are driven by the member's assigned-kitchen cadence:
+    meals use the cadence's per-delivery distribution for the weekday; boxes use
+    its per-DAY rate times the days the delivery covers. When no cadence resolves
+    it falls back to the legacy fixed meal map / the stored per-line count."""
+
+    # 2026-01-01 is a Thursday, so: Mon = Jan 5, Wed = Jan 7, Thu = Jan 8.
+    from datetime import date as _date
+    MON = _date(2026, 1, 5)
+    WED = _date(2026, 1, 7)
+    THU = _date(2026, 1, 8)
+
+    def _schedule(self, kitchen, stored=0):
+        return SimpleNamespace(kitchen=kitchen, how_many_meals_or_boxes=stored)
+
+    def test_meals_use_cadence_per_delivery(self):
+        from .models import (
+            Cadence, Kitchen, KitchenProductType, KitchenStatus, ProductTypeKind,
+        )
+        from .services.purchase_orders import delivery_quantity
+
+        cadence = Cadence.objects.create(
+            code="mon_thu", label="Mon/Thu", is_active=True,
+            weekdays=["mon", "thu"],
+            product_quantities={
+                ProductTypeKind.MEALS: {
+                    "per_week": 21, "per_delivery": {"mon": 5, "thu": 16},
+                },
+                ProductTypeKind.BOXES: {"per_day": 1},
+            },
+        )
+        kitchen = Kitchen.objects.create(
+            name="MealCo", status=KitchenStatus.ACTIVE,
+            supported_products=[KitchenProductType.MEAL],
+        )
+        kitchen.cadences.set([cadence])
+        sched = self._schedule(kitchen)
+
+        # The agent-set distribution (5 / 16) is used, NOT the legacy 9 / 12 map.
+        self.assertEqual(
+            delivery_quantity(ProductTypeKind.MEALS, self.MON, sched), 5
+        )
+        self.assertEqual(
+            delivery_quantity(ProductTypeKind.MEALS, self.THU, sched), 16
+        )
+
+    def test_meals_fall_back_to_legacy_map_without_kitchen(self):
+        from .models import ProductTypeKind
+        from .services.purchase_orders import delivery_quantity
+
+        sched = self._schedule(None)
+        # Legacy fixed map: Mon = 9, Thu = 12.
+        self.assertEqual(
+            delivery_quantity(ProductTypeKind.MEALS, self.MON, sched), 9
+        )
+        self.assertEqual(
+            delivery_quantity(ProductTypeKind.MEALS, self.THU, sched), 12
+        )
+
+    def test_boxes_use_cadence_per_day_times_coverage(self):
+        from .models import (
+            Cadence, Kitchen, KitchenProductType, KitchenStatus, ProductTypeKind,
+        )
+        from .services.purchase_orders import delivery_quantity
+
+        cadence = Cadence.objects.create(
+            code="box_weekly", label="Weekly Box", is_active=True,
+            weekdays=[],  # once-a-week: a single delivery covers the full week
+            product_quantities={ProductTypeKind.BOXES: {"per_day": 1}},
+        )
+        kitchen = Kitchen.objects.create(
+            name="BoxCo", status=KitchenStatus.ACTIVE,
+            supported_products=[KitchenProductType.BOX],
+        )
+        kitchen.cadences.set([cadence])
+        sched = self._schedule(kitchen, stored=1)
+
+        # per_day (1) x days covered (7) = a weekly box delivery of 7.
+        self.assertEqual(
+            delivery_quantity(ProductTypeKind.BOXES, self.WED, sched), 7
+        )
+
+    def test_boxes_fall_back_to_stored_count_without_kitchen(self):
+        from .models import ProductTypeKind
+        from .services.purchase_orders import delivery_quantity
+
+        sched = self._schedule(None, stored=3)
+        self.assertEqual(
+            delivery_quantity(ProductTypeKind.BOXES, self.WED, sched), 3
+        )

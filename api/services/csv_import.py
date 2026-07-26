@@ -552,7 +552,7 @@ def map_case_row(row):
     - CSV ``service_subtype`` -> model ``service_type`` (the daily import stores
       the service name there, e.g. "Social Service Case Management", which is
       what ``derive_case_type`` keys on). CSV ``service_type`` (the broad
-      category, e.g. "Individual & Family Support") has no model field.
+      category, e.g. "Food Assistance") -> model ``service_category``.
     - Unknown ``case_status`` values fall back to Open; auth status is
       normalized but the raw label is preserved.
     """
@@ -604,6 +604,9 @@ def map_case_row(row):
     set_("primary_worker_name", _s(row, "primary_worker_name"))
     # CSV service_subtype carries the service name used for classification.
     set_("service_type", _s(row, "service_subtype"))
+    # CSV service_type is the BROAD category (e.g. "Food Assistance") -- stored
+    # as service_category (on the live API this is the service node's parent).
+    set_("service_category", _s(row, "service_type"))
 
     set_("outcome_id", _s(row, "outcome_id"))
     set_("outcome_description", _s(row, "outcome_description"))

@@ -903,6 +903,29 @@ class DeliveryCadence(models.TextChoices):
 CADENCE_WEEKDAY_CODES = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
 
 
+# Weekly meal target per member (3 meals/day x 7 days). The per-delivery
+# amounts an agent distributes across a cadence's delivery days must sum to this.
+CADENCE_MEALS_PER_WEEK = 21
+
+
+def default_cadence_product_quantities():
+    """Default per-product delivery quantities for a new cadence.
+
+    Meals: a fixed weekly target (``per_week``, default 21 = 3/day x 7) that the
+    agent distributes across the cadence's delivery days (``per_delivery``, keyed
+    by weekday code). The per-day amounts must sum to ``per_week`` but can be set
+    unevenly to match real routes (e.g. Mon 9 / Thu 12). ``per_delivery`` starts
+    empty and is filled once delivery days are chosen.
+
+    Boxes: always 1 box per day (``per_day``); a delivery covering N days carries
+    N boxes, so a week always totals 7.
+    """
+    return {
+        ProductTypeKind.MEALS: {"per_week": CADENCE_MEALS_PER_WEEK, "per_delivery": {}},
+        ProductTypeKind.BOXES: {"per_day": 1},
+    }
+
+
 class Cadence(models.Model):
     """A configurable delivery cadence (how often + on which weekdays a product
     is delivered each week), managed from Settings > Delivery Cadences.
@@ -931,6 +954,16 @@ class Cadence(models.Model):
     # date is the most recent occurrence of that weekday strictly before the
     # delivery. Empty falls back to the legacy hardcoded map in purchase_orders.
     po_weekdays = models.JSONField(default=dict, blank=True)
+    # Per-product delivery quantities for this cadence, keyed by ProductTypeKind
+    # ("meals"/"boxes"). Meals store a weekly target (``per_week``, default 21)
+    # and the agent-set distribution across delivery days (``per_delivery``,
+    # keyed by weekday code, summing to ``per_week``); boxes store a per-DAY rate
+    # (``per_day``, always 1 -> a delivery covering N days carries N boxes).
+    # Supersedes the per-(type, cadence) quantities previously read from
+    # ProductType, so each cadence can define its own quantities per product.
+    product_quantities = models.JSONField(
+        default=default_cadence_product_quantities, blank=True
+    )
     is_active = models.BooleanField(default=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -940,6 +973,38 @@ class Cadence(models.Model):
 
     def __str__(self):
         return self.label or self.code
+
+    def meals_per_week_for(self):
+        """The weekly meal target configured for this cadence (0 when unset)."""
+        q = (self.product_quantities or {}).get(ProductTypeKind.MEALS) or {}
+        try:
+            return int(q.get("per_week") or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    def meals_per_delivery_for(self):
+        """The agent-set per-delivery meal amounts, keyed by delivery weekday
+        code (e.g. ``{"mon": 9, "thu": 12}``). Values that can't be coerced to
+        ints are skipped."""
+        q = (self.product_quantities or {}).get(ProductTypeKind.MEALS) or {}
+        pd = q.get("per_delivery") or {}
+        out = {}
+        if isinstance(pd, dict):
+            for wd, qty in pd.items():
+                try:
+                    out[wd] = int(qty or 0)
+                except (TypeError, ValueError):
+                    continue
+        return out
+
+    def boxes_per_day_for(self):
+        """The per-DAY box rate configured for this cadence (defaults to 1). A
+        delivery covering N days carries N boxes."""
+        q = (self.product_quantities or {}).get(ProductTypeKind.BOXES) or {}
+        try:
+            return int(q.get("per_day") or 0)
+        except (TypeError, ValueError):
+            return 0
 
 
 class ProductType(models.Model):
@@ -1248,6 +1313,13 @@ class Case(models.Model):
     service_type = models.CharField(max_length=255, blank=True, db_index=True)
     # Program Name from detail view (what we called service_subtype before)
     program_name = models.CharField(max_length=255, blank=True)
+    # Broad Unite Us service category -- the service node's PARENT in the Unite Us
+    # taxonomy (e.g. "Food Assistance", code UU-FOOD). Source: the CSV export's
+    # `service_type` column, and on the live API the case's `service` relationship
+    # resolved to its parent service `name`. NOTE: `service_type` above actually
+    # holds the SPECIFIC service (CSV `service_subtype`, e.g. "Medically Tailored
+    # Meals"); this field is the broader grouping above it.
+    service_category = models.CharField(max_length=255, blank=True)
 
     # --- Case Classification (auto-derived on upsert) ---
     # Internal Service when service_type is a meal/box subtype (Medically
