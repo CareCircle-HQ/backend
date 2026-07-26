@@ -75,16 +75,36 @@ class UniteUsCredentialCaptureView(views.APIView):
         if agent_id:
             defaults["agent"] = Agent.objects.filter(pk=agent_id).first()
 
-        cred, created = UniteUsCredential.objects.update_or_create(
-            provider_id=provider_id, employee_id=employee_id, defaults=defaults
+        # NB: do NOT use update_or_create here -- a matching row may already
+        # exist whose token was encrypted with a DIFFERENT FIELD_ENCRYPTION_KEY
+        # (e.g. a prod-copy DB used in local dev). update_or_create's internal
+        # get() would materialize that row and try to DECRYPT its token columns,
+        # raising ImproperlyConfigured (500) before we ever write. Find the pk
+        # WITHOUT selecting the encrypted columns, then .update() (which only
+        # ENCRYPTS on write, never decrypts) or create fresh. Mirrors the
+        # set_uniteus_credential management command.
+        existing_pk = (
+            UniteUsCredential.objects.filter(
+                provider_id=provider_id, employee_id=employee_id
+            )
+            .values_list("pk", flat=True)
+            .first()
         )
+        if existing_pk:
+            UniteUsCredential.objects.filter(pk=existing_pk).update(**defaults)
+            pk, created = existing_pk, False
+        else:
+            obj = UniteUsCredential.objects.create(
+                provider_id=provider_id, employee_id=employee_id, **defaults
+            )
+            pk, created = obj.pk, True
 
         return Response(
             {
-                "id": cred.pk,
-                "provider_id": cred.provider_id,
-                "employee_id": cred.employee_id,
-                "status": cred.status,
+                "id": pk,
+                "provider_id": provider_id,
+                "employee_id": employee_id,
+                "status": UniteUsCredentialStatus.ACTIVE,
                 "created": created,
             },
             status=status.HTTP_201_CREATED if created else status.HTTP_200_OK,

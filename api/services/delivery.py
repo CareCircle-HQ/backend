@@ -107,9 +107,11 @@ def cadence_options_for_kind(kind):
         chosen = active
     else:
         codes = set()
-        for k in Kitchen.objects.filter(
-            supported_products__contains=[product]
-        ).prefetch_related("cadences"):
+        # Filter supported_products in Python: the JSONField ``contains`` lookup
+        # is unsupported on SQLite, so a DB-side filter breaks portability.
+        for k in Kitchen.objects.prefetch_related("cadences"):
+            if product not in (k.supported_products or []):
+                continue
             codes.update(c.code for c in k.cadences.all() if c.is_active)
         chosen = [by_code[c] for c in codes if c in by_code]
 
@@ -159,11 +161,44 @@ def cadence_codes_for_kind(kind):
     if product is None:
         return set()
     codes = set()
-    for k in Kitchen.objects.filter(
-        supported_products__contains=[product]
-    ).prefetch_related("cadences"):
+    # Filter the (small) supported_products JSON list in Python so this works on
+    # every backend -- the JSONField ``contains`` lookup is unsupported on SQLite.
+    for k in Kitchen.objects.prefetch_related("cadences"):
+        if product not in (k.supported_products or []):
+            continue
         codes.update(c.code for c in k.cadences.all() if c.is_active)
     return codes
+
+
+def kitchen_cadence_for_delivery(kitchen, kind, delivery_weekday_code):
+    """The cadence that governs a member's PO quantities for a delivery of
+    ``kind`` on ``delivery_weekday_code``, resolved from the member's assigned
+    ``kitchen`` (kitchen -> kind -> cadence -> quantities).
+
+    Among the kitchen's active cadences it picks the one scoped to this product
+    kind that delivers on the weekday. A cadence with fixed weekdays must include
+    the delivery weekday; a once-a-week cadence (no fixed weekdays) matches any
+    single delivery day. When several match, a fixed-weekday cadence is preferred
+    over a once-a-week one (so a meals Mon/Thu cadence wins over a boxes
+    once-a-week on a shared kitchen), then the lowest label for a deterministic
+    result. Returns ``None`` when the kitchen is unset or nothing matches, so the
+    caller falls back to legacy quantities.
+    """
+    if kitchen is None or delivery_weekday_code not in _WEEKDAY_CODES:
+        return None
+    kind_codes = cadence_codes_for_kind(kind)
+    matches = []
+    for c in kitchen.cadences.all():
+        if not c.is_active:
+            continue
+        if kind_codes and c.code not in kind_codes:
+            continue
+        weekdays = [w for w in (c.weekdays or []) if w in _WEEKDAY_CODES]
+        if weekdays and delivery_weekday_code not in weekdays:
+            continue
+        matches.append((0 if weekdays else 1, (c.label or c.code).lower(), c))
+    matches.sort(key=lambda m: (m[0], m[1]))
+    return matches[0][2] if matches else None
 
 
 def cadence_po_weekday(kind, delivery_weekday_code):

@@ -1641,11 +1641,78 @@ class PortalCadenceSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = Cadence
-        fields = ["id", "code", "label", "weekdays", "po_weekdays", "is_active", "kitchen_count"]
+        fields = [
+            "id", "code", "label", "weekdays", "po_weekdays",
+            "product_quantities", "is_active", "kitchen_count",
+        ]
         extra_kwargs = {"code": {"required": False}}
 
     def get_kitchen_count(self, obj):
         return obj.kitchens.count()
+
+    def validate_product_quantities(self, value):
+        """Per-product delivery quantities keyed by ProductTypeKind.
+
+        Meals carry a weekly target (``per_week``) plus an agent-set
+        distribution across delivery days (``per_delivery``, keyed by weekday
+        code). When ``per_delivery`` is non-empty its amounts must sum to
+        ``per_week`` and only use the cadence's delivery weekdays. Boxes carry a
+        per-DAY rate (``per_day``); a delivery covering N days carries N boxes.
+        All amounts must be non-negative integers."""
+        from ..models import CADENCE_WEEKDAY_CODES, ProductTypeKind
+
+        if not isinstance(value, dict):
+            raise serializers.ValidationError(
+                "product_quantities must be a map keyed by product kind."
+            )
+
+        def _int(raw, label):
+            try:
+                num = int(raw or 0)
+            except (TypeError, ValueError):
+                raise serializers.ValidationError(f"{label} must be an integer.")
+            if num < 0:
+                raise serializers.ValidationError(f"{label} must be zero or greater.")
+            return num
+
+        clean = {}
+        weekdays = value.get("_weekdays")  # optional context for stricter checks
+        for kind, qty in value.items():
+            if kind == "_weekdays":
+                continue
+            if kind not in (ProductTypeKind.MEALS, ProductTypeKind.BOXES):
+                raise serializers.ValidationError(f"Unknown product kind: {kind}.")
+            if not isinstance(qty, dict):
+                raise serializers.ValidationError(
+                    f"Quantities for {kind} must be an object."
+                )
+            if kind == ProductTypeKind.MEALS:
+                per_week = _int(qty.get("per_week"), "per_week for meals")
+                per_delivery_raw = qty.get("per_delivery") or {}
+                if not isinstance(per_delivery_raw, dict):
+                    raise serializers.ValidationError(
+                        "per_delivery for meals must be an object keyed by weekday."
+                    )
+                per_delivery = {}
+                for wd, amt in per_delivery_raw.items():
+                    if wd not in CADENCE_WEEKDAY_CODES:
+                        raise serializers.ValidationError(
+                            f"Invalid weekday code in per_delivery: {wd}."
+                        )
+                    if weekdays and wd not in weekdays:
+                        raise serializers.ValidationError(
+                            f"per_delivery weekday {wd} is not a delivery day."
+                        )
+                    per_delivery[wd] = _int(amt, f"per_delivery[{wd}] for meals")
+                if per_delivery and sum(per_delivery.values()) != per_week:
+                    raise serializers.ValidationError(
+                        "per_delivery amounts for meals must sum to per_week "
+                        f"({per_week})."
+                    )
+                clean[kind] = {"per_week": per_week, "per_delivery": per_delivery}
+            else:
+                clean[kind] = {"per_day": _int(qty.get("per_day"), "per_day for boxes")}
+        return clean
 
     def validate_weekdays(self, value):
         from ..models import CADENCE_WEEKDAY_CODES

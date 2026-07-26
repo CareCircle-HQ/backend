@@ -58,6 +58,7 @@ from api.services.orders import (
     _WEEKDAY_CODES,
     _format_address,
     _weekday_ints,
+    coverage_days,
     meals_for_delivery,
 )
 
@@ -86,11 +87,46 @@ def meals_per_member_for_delivery(delivery_date):
     return _MEAL_QTY_BY_WEEKDAY.get(delivery_date.weekday(), 0)
 
 
-def delivery_quantity(kind, delivery_date, schedule):
-    """Quantity for one member's delivery line. Meals are fixed by the delivery
-    weekday; boxes use the member's scheduled quantity."""
+def delivery_quantity(kind, delivery_date, schedule, cadence_cache=None):
+    """Quantity for one member's delivery line, driven by the member's assigned
+    kitchen cadence (kitchen -> kind -> cadence -> quantities).
+
+    Meals use the cadence's agent-set per-delivery distribution for the delivery
+    weekday (e.g. Mon 9 / Thu 12); boxes use the cadence's per-DAY rate times the
+    number of days the delivery covers (so a weekly box delivery totals 7). When
+    no cadence resolves (kitchen unset, or an un-seeded environment) it falls
+    back to the legacy fixed meal map / the member's stored per-line count.
+
+    ``cadence_cache`` is an optional dict reused across a PO run to avoid
+    re-resolving the same ``(kitchen, kind, weekday)`` cadence for every line.
+    """
+    from api.services.delivery import kitchen_cadence_for_delivery
+
+    wd = delivery_date.weekday()
+    code = _WEEKDAY_NAMES.get(wd)
+    kitchen = getattr(schedule, "kitchen", None)
+
+    cadence = None
+    if kitchen is not None and code:
+        key = (getattr(kitchen, "pk", None), kind, code)
+        if cadence_cache is not None and key in cadence_cache:
+            cadence = cadence_cache[key]
+        else:
+            cadence = kitchen_cadence_for_delivery(kitchen, kind, code)
+            if cadence_cache is not None:
+                cadence_cache[key] = cadence
+
     if kind == ProductTypeKind.MEALS:
+        if cadence is not None:
+            per_delivery = cadence.meals_per_delivery_for()
+            if code in per_delivery:
+                return per_delivery[code]
         return meals_per_member_for_delivery(delivery_date)
+
+    if cadence is not None:
+        per_day = cadence.boxes_per_day_for()
+        if per_day:
+            return per_day * coverage_days(wd, _weekday_ints(cadence.weekdays or []))
     return schedule.how_many_meals_or_boxes or 0
 
 # Delivery weekday (int) -> the DeliveryCadence the delivery belongs to.
@@ -564,6 +600,7 @@ def preview_purchase_orders(kind, delivery_date):
         used[str(kid)] = used.get(str(kid), 0) + 1
 
     offered_idx = _kitchen_offered_index()
+    cadence_cache = {}
 
     groups = {}  # kitchen_id (str) or "" -> group dict
     for s in schedules:
@@ -586,7 +623,7 @@ def preview_purchase_orders(kind, delivery_date):
                 "_offered": offered_idx.get(kid, set()),
             }
         is_batched = s.member and s.member.client_id in batched
-        qty = delivery_quantity(kind, delivery_date, s)
+        qty = delivery_quantity(kind, delivery_date, s, cadence_cache)
         code = s.menu_type or ""
         # A menu type only appears in the breakdown when this kitchen offers it
         # (meals only; boxes don't map to KitchenMenuType rows).
@@ -670,6 +707,7 @@ def generate_purchase_order(kind, delivery_date, kitchen, schedule_ids, split_se
     )
 
     menu_index = _menu_type_index()
+    cadence_cache = {}
     orders = []
     for s in schedules:
         default_kitchen = s.kitchen
@@ -679,7 +717,7 @@ def generate_purchase_order(kind, delivery_date, kitchen, schedule_ids, split_se
             member=s.member.client if s.member else None,
             group=s.household,
             status=DeliveryOrderStatus.PENDING,
-            quantity=delivery_quantity(kind, delivery_date, s),
+            quantity=delivery_quantity(kind, delivery_date, s, cadence_cache),
             expected_delivery_date=delivery_date,
             kitchen=kitchen,
             default_kitchen=default_kitchen,

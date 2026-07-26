@@ -254,6 +254,9 @@ def map_case(case_body_data, *, names=None, auth=None):
     set_("updated_at", _dt(a.get("updated_at")))
 
     set_("service_type", names.get("service"))
+    # Broad category = the service node's PARENT name (resolved in the pull);
+    # the CSV export calls this its `service_type` column.
+    set_("service_category", names.get("service_category"))
     set_("program_name", names.get("program"))
     set_("program_id", names.get("program_id"))
     set_("network_name", names.get("network"))
