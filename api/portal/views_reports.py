@@ -17,6 +17,7 @@ from django.utils import timezone
 from rest_framework.response import Response
 
 from ..models import (
+    AddressType,
     Agent,
     Case,
     CaseStatus,
@@ -449,14 +450,59 @@ def _out_of_orbit_reason(enrollment, profile):
         return ""
 
 
+def _member_household(client):
+    """The client's household (via their membership), or None."""
+    hm = getattr(client, "household_membership", None)
+    return hm.household if hm is not None else None
+
+
+def _household_primary_member_id(client):
+    """Client ID of the primary member of the client's household. A lone member
+    (no household row) is their own primary, so fall back to their own id."""
+    household = _member_household(client)
+    if household is not None:
+        primary = next((m for m in household.members.all() if m.is_primary), None)
+        if primary and primary.client_id:
+            return str(primary.client_id)
+    return str(client.client_id)
+
+
+def _household_member_count(client):
+    """Number of members in the client's household (incl. the primary); 1 when
+    the client isn't attached to a household (just themselves)."""
+    household = _member_household(client)
+    if household is None:
+        return 1
+    return len(household.members.all()) or 1
+
+
+def _current_address(client):
+    """The client's representative address: a 'current' type preferred, then
+    'home', else the first on file. None when there is none."""
+    addrs = list(client.addresses.all())
+    if not addrs:
+        return None
+    for want in (AddressType.CURRENT, AddressType.HOME):
+        match = next((a for a in addrs if a.type == want), None)
+        if match is not None:
+            return match
+    return addrs[0]
+
+
 class AllMembersReportView(PortalAPIView):
     """Management-only CSV export of every member (Client), one row per member.
 
-    Columns: Client ID, Client Name, Medicaid Plan, Medicaid Type, Insurance
-    Effective Date, Insurance Expiration Date, Social Care Coverage Status, SCC
-    Expiration Date, Enrollment Platform, Out of Orbit?, Out of Orbit Reason, Out
-    of Range, Client Eligibility, Cadence, Facility, Menu Type, Dietary
-    Restrictions, Currently Servicing.
+    Columns follow the Reports "All Members" spec, grouped: Identification
+    (Household Primary Member ID, Member ID, Medicaid ID (active), Member Name,
+    DOB), Contact & Address (Phone Number, Street Address, Apt, City, State,
+    Zip), Household (Total members in household), Program & Case Status (Internal
+    Service Program Name, Is there Screening/Eligibility/Navigation/Internal
+    Service Case, Client Eligibility, Currently servicing, Cadence, Facility, Out
+    of Orbit? + reason, Out of Range, Authorized amount for the open internal
+    service case), Lead & Enrollment (Lead Source in CRM, Enrollment Platform),
+    Insurance/Medicaid (Medicaid Plan, Medicaid Type, Insurance Effective/
+    Expiration Date), Social Care Coverage (Status, Expiration Date), plus Menu
+    Type + Dietary Restrictions appended.
 
     Query params (both optional; omit both to export every member):
         created_from -- inclusive lower bound on the member's created date.
@@ -477,9 +523,13 @@ class AllMembersReportView(PortalAPIView):
                 "insurances",
                 "social_care_coverages",
                 "addresses",
+                "phones",
+                "cases",
+                "screenings",
                 "member_profiles",
                 "enrollments__kitchen",
                 "enrollments__delivery_schedules",
+                "household_membership__household__members",
                 "household_membership__household__enrollment_verifications__kitchen",
                 "household_membership__household__enrollment_verifications__delivery_schedules",
             )
@@ -497,6 +547,7 @@ class AllMembersReportView(PortalAPIView):
 
         zips = excluded_zips()
         states = allowed_state_codes()
+        lead_labels = _lead_source_label_map()
 
         response = HttpResponse(content_type="text/csv")
         filename = f"all_members_{timezone.localdate().isoformat()}.csv"
@@ -504,24 +555,49 @@ class AllMembersReportView(PortalAPIView):
 
         writer = csv.writer(response)
         writer.writerow([
-            "Client ID",
-            "Client Name",
+            # Identification
+            "Household Primary Member ID",
+            "Member ID",
+            "Medicaid ID (active)",
+            "Member Name",
+            "DOB",
+            # Contact & Address
+            "Phone Number",
+            "Street Address",
+            "Apt",
+            "City",
+            "State",
+            "Zip",
+            # Household
+            "Total members in household",
+            # Program & Case Status
+            "Internal Service Program Name",
+            "Is there Screening",
+            "Is there Eligibility",
+            "Is there Navigation",
+            "Is there Internal Service Case",
+            "Client Eligibility",
+            "Currently servicing",
+            "Cadence",
+            "Facility",
+            "Out of Orbit?",
+            "Out of Orbit reason",
+            "Out of Range",
+            "Authorized amount for the open internal service case",
+            # Lead & Enrollment
+            "Lead Source in CRM",
+            "Enrollment Platform",
+            # Insurance / Medicaid
             "Medicaid Plan",
             "Medicaid Type",
             "Insurance Effective Date",
             "Insurance Expiration Date",
+            # Social Care Coverage
             "Social Care Coverage Status",
-            "SCC Expiration Date",
-            "Enrollment Platform",
-            "Out of Orbit?",
-            "Out of Orbit Reason",
-            "Out of Range",
-            "Client Eligibility",
-            "Cadence",
-            "Facility",
+            "Social Care Coverage Expiration Date",
+            # Extras
             "Menu Type",
             "Dietary Restrictions",
-            "Currently Servicing",
         ])
 
         for client in qs:
@@ -529,6 +605,10 @@ class AllMembersReportView(PortalAPIView):
             scc = _social_care_coverage(client)
             enr = active_enrollment(client)
             profile = active_member_profile(client)
+            addr = _current_address(client)
+            cases = list(client.cases.all())
+            # Governing Internal Service case: the one delivery/auth attach to.
+            isc = internal_service_case(client)
 
             out_of_orbit = member_out_of_orbit(client)
             reason = _out_of_orbit_reason(enr, profile) if out_of_orbit else ""
@@ -540,25 +620,52 @@ class AllMembersReportView(PortalAPIView):
             if enr is not None and enr.kitchen_id:
                 facility = enr.kitchen.name or ""
 
+            raw_source = (client.lead_source or "").strip()
+
             writer.writerow([
+                # Identification
+                _household_primary_member_id(client),
                 str(client.client_id),
+                medicaid_member_id(client),
                 f"{client.first_name or ''} {client.last_name or ''}".strip(),
+                _date_str(client.date_of_birth),
+                # Contact & Address
+                _client_phone_numbers(client),
+                (addr.street if addr else ""),
+                (addr.unit if addr else ""),
+                (addr.city if addr else ""),
+                (addr.state if addr else ""),
+                (addr.zip if addr else ""),
+                # Household
+                _household_member_count(client),
+                # Program & Case Status
+                (isc.program_name if isc else ""),
+                _yn(len(client.screenings.all()) > 0),
+                _yn(any(c.case_type == CaseType.ELIGIBILITY for c in cases)),
+                _yn(any(c.case_type == CaseType.NAVIGATION for c in cases)),
+                _yn(isc is not None),
+                eligibility,
+                _currently_servicing(enr),
+                _cadence_label(profile, enr),
+                facility,
+                _yn(out_of_orbit),
+                reason,
+                _yn(member_out_of_range(client)),
+                (isc.authorized_amount if isc else ""),
+                # Lead & Enrollment
+                lead_labels.get(raw_source, raw_source),
+                "UniteUs",
+                # Insurance / Medicaid
                 (med.plan_name if med else ""),
                 _medicaid_type_label(med.plan_name if med else ""),
                 _date_str(med.enrolled_at if med else None),
                 _date_str(med.expired_at if med else None),
+                # Social Care Coverage
                 (_SCC_STATUS_LABELS.get(scc.status, scc.status) if scc else ""),
                 _date_str(scc.expired_at if scc else None),
-                "UniteUs",
-                _yn(out_of_orbit),
-                reason,
-                _yn(member_out_of_range(client)),
-                eligibility,
-                _cadence_label(profile, enr),
-                facility,
+                # Extras
                 (profile.menu_type if profile else ""),
                 _dietary_restrictions(profile),
-                _currently_servicing(enr),
             ])
 
         return response
