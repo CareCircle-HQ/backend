@@ -3339,10 +3339,28 @@ class MemberServiceResumeView(PortalAPIView):
                 {"error": "Service is not on hold."},
                 status=http.HTTP_400_BAD_REQUEST,
             )
-        # Resume to the stage the enrollment held from (most recent hold event).
-        last_hold = StageEvent.objects.filter(
-            enrollment=enr, to_stage=EnrollmentStage.ON_HOLD
-        ).first()
+        # Resume to the SERVICE stage the enrollment was held from -- but NEVER
+        # back into a terminal stage. A household that was REACTIVATED from
+        # Cancelled lands in On Hold via a ``cancelled -> on_hold`` StageEvent, so
+        # the most-recent hold's ``from_stage`` is ``cancelled``; resuming to that
+        # re-cancelled the member on every click (the endless reactivate/resume
+        # loop this fixes). Only a genuine service stage (Verified / Kitchen
+        # Assignment / Service Active) is a valid resume target -- restrict the
+        # lookup to those, and default to Service Active when none is found.
+        _RESUMABLE_FROM_STAGES = (
+            EnrollmentStage.VERIFIED,
+            EnrollmentStage.KITCHEN_ASSIGNMENT,
+            EnrollmentStage.SERVICE_ACTIVE,
+        )
+        last_hold = (
+            StageEvent.objects.filter(
+                enrollment=enr,
+                to_stage=EnrollmentStage.ON_HOLD,
+                from_stage__in=[st.value for st in _RESUMABLE_FROM_STAGES],
+            )
+            .order_by("-entered_at")
+            .first()
+        )
         target = EnrollmentStage.SERVICE_ACTIVE
         if last_hold and last_hold.from_stage:
             try:

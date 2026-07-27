@@ -2052,6 +2052,65 @@ class RestoreOutOfRangeMemberTest(TestCase):
         self.assertEqual(mv.status, MemberStatus.OUT_OF_RANGE)
 
 
+class ResumeAfterReactivationTest(TestCase):
+    """Regression: Resume must never send a household back into a terminal stage.
+
+    A member CANCELLED then REACTIVATED lands in On Hold via a
+    ``cancelled -> on_hold`` StageEvent. Resume used to return to the most-recent
+    hold's ``from_stage`` -- which was ``cancelled`` -- so every Resume click
+    re-cancelled the household (prod: a member stuck in an endless
+    reactivate/resume loop despite an open, approved case). Resume must land on
+    the real service stage the member was held from (Kitchen Assignment here)."""
+
+    def setUp(self):
+        self.agent = Agent.objects.create(
+            name="Res Agent", agent_code="912", group="CS"
+        )
+        access = AccessToken()
+        access["agent_id"] = str(self.agent.id)
+        access["agent_code"] = self.agent.agent_code
+        access["agent_name"] = self.agent.name
+        access["agent_group"] = self.agent.group
+        self.api = APIClient()
+        self.api.credentials(HTTP_AUTHORIZATION=f"Bearer {access}")
+
+    def test_resume_after_reactivation_does_not_recancel(self):
+        from .models import (
+            Client, EnrollmentStage, EnrollmentVerification, Household,
+            HouseholdMember,
+        )
+        from .services.lifecycle import advance_enrollment
+
+        client = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Loop", last_name="Member"
+        )
+        hh = Household.objects.create(name="HH")
+        HouseholdMember.objects.create(household=hh, client=client, is_primary=True)
+        enr = EnrollmentVerification.objects.create(
+            client=client, household=hh, stage=EnrollmentStage.KITCHEN_ASSIGNMENT,
+        )
+        # Reproduce the history: held from Kitchen Assignment, cancelled, then
+        # reactivated back to On Hold (a `cancelled -> on_hold` event, which is
+        # now the most-recent transition INTO on_hold).
+        advance_enrollment(enr, EnrollmentStage.ON_HOLD, force=True)
+        advance_enrollment(enr, EnrollmentStage.CANCELLED, force=True)
+        advance_enrollment(enr, EnrollmentStage.ON_HOLD, force=True)
+        enr.refresh_from_db()
+        self.assertEqual(EnrollmentStage(enr.stage), EnrollmentStage.ON_HOLD)
+
+        resp = self.api.post(
+            f"/api/portal/members/{client.client_id}/resume/",
+            {"reason": "Member requested to resume meals"}, format="json",
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        enr.refresh_from_db()
+        # The bug resumed to CANCELLED; the fix resumes to the real held-from
+        # service stage (Kitchen Assignment).
+        self.assertEqual(
+            EnrollmentStage(enr.stage), EnrollmentStage.KITCHEN_ASSIGNMENT
+        )
+
+
 class ProductKindResolverTest(SimpleTestCase):
     """product_kind_for_enrollment resolves Meals/Boxes across name sources so a
     keyword-less Program row name no longer yields an unresolved '—' kind and a
