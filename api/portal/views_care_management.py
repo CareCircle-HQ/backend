@@ -8,10 +8,17 @@ Detection lives in ``api.services.warnings``; this endpoint only queries the
 snapshot, so it is cheap and never recomputes across the whole DB.
 """
 
+from django.db import transaction
 from django.db.models import Q
+from django.shortcuts import get_object_or_404
+from django.utils import timezone
 from rest_framework.response import Response
 
 from api.models import (
+    CaseMismatchFlag,
+    CaseMismatchStatus,
+    CaseMismatchType,
+    MemberDietaryProfile,
     MemberWarning,
     SERVICE_EXCLUDED_ENROLLMENT_STAGES,
     WarningSeverity,
@@ -22,6 +29,9 @@ from .base import PortalAPIView, current_agent
 
 # Care Management is a CS queue: CS + Management (and manager override).
 _ALLOWED_GROUPS = ("CS", "Management")
+# Dismissing a Case Mismatch flag is a Customer-Service-only action (CS +
+# Management/override); a plain Care Management viewer cannot clear the pin.
+_DISMISS_GROUPS = ("CS", "Management")
 
 _SEVERITY_RANK = {WarningSeverity.RED: 2, WarningSeverity.ORANGE: 1}
 
@@ -197,3 +207,145 @@ class CareManagementListView(PortalAPIView):
             "has_more": start + len(page_rows) < total,
             "results": results,
         })
+
+
+# ── Case Mismatch (governing-case Household<->Individual scope switch) ─────────
+def _can_dismiss(agent):
+    if not agent:
+        return False
+    return agent.group in _DISMISS_GROUPS or getattr(agent, "is_manager", False)
+
+
+def _flag_payload(flag):
+    """Serialize a CaseMismatchFlag row (+ its currently-pinned members)."""
+    pinned = []
+    if flag.enrollment_id is not None:
+        for mv in MemberDietaryProfile.objects.filter(
+            enrollment_id=flag.enrollment_id, pause_locked=True
+        ).select_related("client"):
+            pinned.append({
+                "member_id": mv.pk,
+                "client_id": str(mv.client_id) if mv.client_id else None,
+                "member_name": mv.member_name or _client_name(mv.client),
+                "status": mv.status,
+            })
+    mtype = flag.mismatch_type
+    return {
+        "id": flag.id,
+        "client_id": str(flag.client_id),
+        "household_name": _client_name(flag.client),
+        "enrollment_id": flag.enrollment_id,
+        "mismatch_type": mtype,
+        "mismatch_type_label": CaseMismatchType(mtype).label if mtype else "",
+        "previous_case_id": flag.previous_case_id,
+        "new_case_id": flag.new_case_id,
+        "previous_household_type": flag.previous_household_type,
+        "new_household_type": flag.new_household_type,
+        "detail": flag.detail,
+        "context": flag.context or {},
+        "status": flag.status,
+        "created_at": flag.created_at.isoformat(),
+        "dismissed_at": flag.dismissed_at.isoformat() if flag.dismissed_at else None,
+        "dismissed_by": flag.dismissed_by,
+        "dismiss_reason": flag.dismiss_reason,
+        "pinned_members": pinned,
+    }
+
+
+class CaseMismatchListView(PortalAPIView):
+    """GET /portal/care-management/case-mismatch/ — governing-case scope-switch
+    flags awaiting Customer Service review.
+
+    Query params: ``status`` (open [default] | dismissed | all), ``search``
+    (household name or client id), ``page``. Returns summary counts + a page.
+    """
+
+    def get(self, request):
+        agent = current_agent(request)
+        if not _can_access(agent):
+            return Response(
+                {"detail": "Care Management access required."}, status=403
+            )
+
+        params = request.query_params
+        status_filter = (params.get("status") or "open").lower()
+        search = (params.get("search") or "").strip()
+        try:
+            page = max(1, int(params.get("page") or 1))
+        except (TypeError, ValueError):
+            page = 1
+
+        qs = CaseMismatchFlag.objects.select_related("client", "enrollment")
+        if status_filter == "open":
+            qs = qs.filter(status=CaseMismatchStatus.OPEN)
+        elif status_filter == "dismissed":
+            qs = qs.filter(status=CaseMismatchStatus.DISMISSED)
+        if search:
+            qs = qs.filter(
+                Q(client__first_name__icontains=search)
+                | Q(client__last_name__icontains=search)
+                | Q(client__client_id__icontains=search)
+            )
+
+        # Summary counts over the full (unpaged, unfiltered-by-status) set.
+        all_flags = CaseMismatchFlag.objects.all()
+        open_count = all_flags.filter(status=CaseMismatchStatus.OPEN).count()
+        dismissed_count = all_flags.filter(
+            status=CaseMismatchStatus.DISMISSED
+        ).count()
+
+        qs = qs.order_by("-created_at")
+        total = qs.count()
+        start = (page - 1) * PAGE_SIZE
+        rows = list(qs[start:start + PAGE_SIZE])
+        results = [_flag_payload(f) for f in rows]
+
+        return Response({
+            "summary": {
+                "open": open_count,
+                "dismissed": dismissed_count,
+            },
+            "count": total,
+            "page": page,
+            "page_size": PAGE_SIZE,
+            "results": results,
+        })
+
+
+class CaseMismatchDismissView(PortalAPIView):
+    """POST /portal/care-management/case-mismatch/<flag_id>/dismiss/ —
+    Customer-Service-only dismissal.
+
+    Marks the flag DISMISSED and clears the ``pause_locked`` pin on the
+    household's additional members (so agents regain control; the members stay
+    Paused until an agent un-pauses them). Idempotent: dismissing an already-
+    dismissed flag is a no-op that still returns the flag.
+    """
+
+    def post(self, request, flag_id):
+        agent = current_agent(request)
+        if not _can_dismiss(agent):
+            return Response(
+                {"detail": "Customer Service access required to dismiss."},
+                status=403,
+            )
+        flag = get_object_or_404(CaseMismatchFlag, pk=flag_id)
+        reason = (request.data.get("reason") or "").strip()
+
+        if flag.status != CaseMismatchStatus.DISMISSED:
+            with transaction.atomic():
+                flag.status = CaseMismatchStatus.DISMISSED
+                flag.dismissed_at = timezone.now()
+                flag.dismissed_by = agent.name if agent else ""
+                flag.dismiss_reason = reason
+                flag.save(update_fields=[
+                    "status", "dismissed_at", "dismissed_by", "dismiss_reason",
+                ])
+                # Clear the pin on the household's additional members so agents
+                # can un-pause them again (never auto-unpaused here).
+                if flag.enrollment_id is not None:
+                    MemberDietaryProfile.objects.filter(
+                        enrollment_id=flag.enrollment_id, pause_locked=True
+                    ).update(pause_locked=False)
+
+        return Response(_flag_payload(flag))

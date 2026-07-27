@@ -250,6 +250,10 @@ def map_case(case_body_data, *, names=None, auth=None):
     # opened date only when the API omits created_at (mirrors the CSV import's
     # case_created_at -> user_entered_opened_date fallback).
     set_("date_opened", _dt(a.get("created_at")) or _dt(a.get("opened_date")))
+    # Authoritative created timestamp (with time) for governing-case selection --
+    # straight from the API ``created_at`` with NO fallback to the editable
+    # opened date. Left null when the API omits it.
+    set_("case_created_at", _dt(a.get("created_at")))
     set_("case_closed_at", closed_at)
     set_("updated_at", _dt(a.get("updated_at")))
 

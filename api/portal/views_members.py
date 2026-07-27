@@ -2925,6 +2925,20 @@ class HouseholdMemberEditView(PortalAPIView):
         for field, value in data.items():
             setattr(mv, field, value)
 
+        # A pinned (pause_locked) member was auto-paused by a governing-case
+        # Household->Individual switch. Only a Customer Service dismissal of the
+        # matching Case Mismatch flag can lift the pin -- an agent cannot un-pause
+        # (or otherwise reactivate) them from the Program/Household tab.
+        if (unpause or reactivate or restore_range) and mv.pause_locked:
+            return Response(
+                {"error": (
+                    "This member is pinned pending Customer Service review of a "
+                    "case mismatch and cannot be un-paused here. Customer Service "
+                    "must dismiss the Case Mismatch flag first."
+                )},
+                status=http.HTTP_400_BAD_REQUEST,
+            )
+
         if pause and mv.status == MemberStatus.ACTIVE:
             # Manual agent pause (requires a reason). Excludes the member from
             # every delivery schedule / Purchase Order until unpaused.

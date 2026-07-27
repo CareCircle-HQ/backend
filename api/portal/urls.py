@@ -4,7 +4,11 @@ from django.urls import include, path
 from rest_framework.routers import SimpleRouter
 
 from .auth import PortalRequestCodeView, PortalVerifyCodeView
-from .views_care_management import CareManagementListView
+from .views_care_management import (
+    CareManagementListView,
+    CaseMismatchDismissView,
+    CaseMismatchListView,
+)
 from .views_cs_dashboard import (
     CSDashboardSummaryView,
     CSDashboardTrendsView,
@@ -430,6 +434,16 @@ urlpatterns = [
         "care-management/",
         CareManagementListView.as_view(),
         name="portal-care-management",
+    ),
+    path(
+        "care-management/case-mismatch/",
+        CaseMismatchListView.as_view(),
+        name="portal-care-management-case-mismatch",
+    ),
+    path(
+        "care-management/case-mismatch/<int:flag_id>/dismiss/",
+        CaseMismatchDismissView.as_view(),
+        name="portal-care-management-case-mismatch-dismiss",
     ),
 
     # Delivery Address (Customer Service)

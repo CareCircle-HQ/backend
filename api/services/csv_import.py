@@ -572,6 +572,10 @@ def map_case_row(row):
     # Prefer the Unite Us case-created timestamp; fall back to the user-entered
     # opened date only when the source carries no creation timestamp.
     set_("date_opened", _dt(row, "case_created_at") or _dt(row, "user_entered_opened_date"))
+    # Authoritative created timestamp (with time) for governing-case selection --
+    # NO fallback to the agent-entered opened date (that column can be date-only
+    # and is editable). Left null when the export omits it.
+    set_("case_created_at", _dt(row, "case_created_at"))
     set_("updated_at", _dt(row, "case_updated_at"))
     set_("ar_submitted_on", _dt(row, "ar_submitted_on"))
     set_("case_processed_at", _dt(row, "case_processed_at"))

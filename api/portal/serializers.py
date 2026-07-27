@@ -1519,7 +1519,7 @@ class PortalHouseholdMemberSerializer(serializers.ModelSerializer):
             "dietary_restrictions", "food_allergies", "other_dietary_restrictions",
             "meal_category", "menu_type", "general_verification_notes",
             "status", "status_label", "kitchen_meal_type", "kitchen_food_notes",
-            "is_primary",
+            "is_primary", "pause_locked",
         ]
 
     def get_client_id(self, obj):

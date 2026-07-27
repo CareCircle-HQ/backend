@@ -924,6 +924,231 @@ def event_for_member_eligibility_restored(
     )
 
 
+def event_for_member_coverage_hold(
+    client, *, reasons=None, source=ChangeSource.IMPORT, actor="",
+):
+    """Emit a 'Coverage Hold' event when the import-time eligibility check finds a
+    RECOVERABLE social-care-coverage gap (expired/missing coverage): service is
+    paused rather than the hard INELIGIBLE off-ramp. Fires only on the transition
+    INTO the hold (the caller gates it)."""
+    if client is None:
+        return None
+    reasons = [r for r in (reasons or []) if r]
+    return emit_timeline_event(
+        client=client,
+        event_type=TimelineEventType.MEMBER_COVERAGE_HOLD,
+        occurred_at=timezone.now(),
+        title="Service paused \u2014 coverage hold",
+        subtitle="; ".join(reasons),
+        badge_text="On Hold",
+        badge_tone=TimelineBadgeTone.WARNING,
+        source=source,
+        actor=actor,
+        entity=client,
+        metadata={"reasons": reasons},
+    )
+
+
+def event_for_member_coverage_restored(
+    client, *, source=ChangeSource.IMPORT, actor="",
+):
+    """Emit a 'Coverage Restored' event when a member's social-care coverage is
+    renewed on a later import, lifting the recoverable coverage hold."""
+    if client is None:
+        return None
+    return emit_timeline_event(
+        client=client,
+        event_type=TimelineEventType.MEMBER_COVERAGE_RESTORED,
+        occurred_at=timezone.now(),
+        title="Service resumed \u2014 coverage restored",
+        badge_text="Resumed",
+        badge_tone=TimelineBadgeTone.SUCCESS,
+        source=source,
+        actor=actor,
+        entity=client,
+    )
+
+
+def event_for_member_service_inactive(
+    client, *, case_id=None, program="", closed_on="", source=ChangeSource.IMPORT,
+    actor="",
+):
+    """Emit a 'Service Inactive' event when a member's LAST open internal-service
+    (meal/box) case closes: no open case remains, so service is paused. Reversible
+    -- a new open case emits the matching reactivation event. Fires only on the
+    transition INTO inactive (the caller gates it)."""
+    if client is None:
+        return None
+    parts = [p for p in (f"case {case_id}" if case_id else "", program) if p]
+    subtitle = " \u00b7 ".join(parts)
+    if closed_on:
+        subtitle = f"{subtitle} closed {closed_on}" if subtitle else f"Closed {closed_on}"
+    return emit_timeline_event(
+        client=client,
+        event_type=TimelineEventType.MEMBER_SERVICE_INACTIVE,
+        occurred_at=timezone.now(),
+        title="Service Inactive",
+        subtitle=subtitle or "No open internal-service case remains",
+        badge_text="Inactive",
+        badge_tone=TimelineBadgeTone.WARNING,
+        source=source,
+        actor=actor,
+        entity=client,
+        metadata={
+            "case_id": str(case_id) if case_id else "",
+            "program": program or "",
+            "closed_on": closed_on or "",
+        },
+    )
+
+
+def event_for_member_service_reactivated(
+    client, *, source=ChangeSource.IMPORT, actor="",
+):
+    """Emit a 'Service Reactivated' event when a previously SERVICE_INACTIVE
+    member gets a new OPEN internal-service case, reopening service."""
+    if client is None:
+        return None
+    return emit_timeline_event(
+        client=client,
+        event_type=TimelineEventType.MEMBER_SERVICE_REACTIVATED,
+        occurred_at=timezone.now(),
+        title="Service Reactivated",
+        badge_text="Reactivated",
+        badge_tone=TimelineBadgeTone.SUCCESS,
+        source=source,
+        actor=actor,
+        entity=client,
+    )
+
+
+def event_for_member_governing_case_changed(
+    client, *, previous_case_id="", new_case_id="", auth_status="", program="",
+    reason="", source=ChangeSource.IMPORT, actor="",
+):
+    """Emit a 'Governing Case Changed' event when the internal-service case whose
+    authorization GOVERNS a member's program changes (a newer case was approved
+    and superseded the prior one, or the prior governing case closed). Recorded
+    once per actual old->new transition: the ``dedupe_key`` keys the event on the
+    exact ``previous -> new`` pair, so re-running the case reconcile against an
+    unchanged governing case never duplicates it. The caller (``lifecycle``) also
+    guards on ``Client.governing_internal_case_id`` so the FIRST governing case
+    to land is recorded silently (there is no prior case to switch from)."""
+    if client is None or not new_case_id or not previous_case_id:
+        return None
+    prog = (program or "").strip() or "meal/box"
+    auth = (auth_status or "").strip() or "blank"
+    subtitle = f"{previous_case_id} \u2192 {new_case_id} \u00b7 {prog}"
+    if reason:
+        subtitle = f"{subtitle} \u00b7 {reason}"
+    return emit_timeline_event(
+        client=client,
+        event_type=TimelineEventType.MEMBER_GOVERNING_CASE_CHANGED,
+        occurred_at=timezone.now(),
+        title="Governing Case Changed",
+        subtitle=subtitle,
+        badge_text=prog,
+        badge_tone=TimelineBadgeTone.INFO,
+        source=source,
+        actor=actor,
+        entity=client,
+        metadata={
+            "previous_case_id": str(previous_case_id),
+            "new_case_id": str(new_case_id),
+            "authorization_status": auth_status or "",
+            "program": program or "",
+            "reason": reason or "",
+        },
+        dedupe_key=(
+            f"governing_case_changed:{client.pk}:{previous_case_id}:{new_case_id}"
+        ),
+    )
+
+
+def event_for_member_program_switched(
+    client, *, previous_kind="", new_kind="", previous_case_id="",
+    new_case_id="", auth_status="", reason="", source=ChangeSource.IMPORT,
+    actor="",
+):
+    """Emit a 'Program Switched' event when the household's GOVERNING internal-
+    service case switches product KIND (meals<->boxes) to an authorized case: the
+    household's future deliveries were stopped and it was requeued for a NEW
+    kitchen assignment (a new kitchen + cadence + delivery calendar) under the new
+    product. De-duped on the exact ``previous -> new`` case pair, so re-running the
+    case reconcile against an unchanged governing case never duplicates it."""
+    if client is None or not new_kind:
+        return None
+    prev = (previous_kind or "").strip() or "\u2014"
+    new = (new_kind or "").strip()
+    subtitle = f"{prev} \u2192 {new}"
+    if reason:
+        subtitle = f"{subtitle} \u00b7 {reason}"
+    return emit_timeline_event(
+        client=client,
+        event_type=TimelineEventType.MEMBER_PROGRAM_SWITCHED,
+        occurred_at=timezone.now(),
+        title="Program Switched",
+        subtitle=subtitle,
+        badge_text=new,
+        badge_tone=TimelineBadgeTone.WARNING,
+        source=source,
+        actor=actor,
+        entity=client,
+        metadata={
+            "previous_kind": previous_kind or "",
+            "new_kind": new_kind or "",
+            "previous_case_id": str(previous_case_id) if previous_case_id else "",
+            "new_case_id": str(new_case_id) if new_case_id else "",
+            "authorization_status": auth_status or "",
+            "reason": reason or "",
+        },
+        dedupe_key=(
+            f"program_switched:{client.pk}:{previous_case_id}:{new_case_id}"
+        ),
+    )
+
+
+def event_for_member_case_mismatch(
+    client, *, mismatch_type="", previous_case_id="", new_case_id="",
+    previous_household_type="", new_household_type="", reason="",
+    source=ChangeSource.IMPORT, actor="",
+):
+    """Emit a 'Case Mismatch' event when the household's GOVERNING internal-
+    service case switches household SCOPE (household<->individual). This needs
+    Customer Service review (a CaseMismatchFlag is opened alongside). De-duped on
+    the exact ``previous -> new`` case pair so a re-import never duplicates it."""
+    if client is None or not new_case_id or not previous_case_id:
+        return None
+    prev = (previous_household_type or "").strip() or "\u2014"
+    new = (new_household_type or "").strip() or "\u2014"
+    subtitle = f"{prev.title()} \u2192 {new.title()}"
+    if reason:
+        subtitle = f"{subtitle} \u00b7 {reason}"
+    return emit_timeline_event(
+        client=client,
+        event_type=TimelineEventType.MEMBER_CASE_MISMATCH,
+        occurred_at=timezone.now(),
+        title="Case Mismatch",
+        subtitle=subtitle,
+        badge_text="Needs CS Review",
+        badge_tone=TimelineBadgeTone.WARNING,
+        source=source,
+        actor=actor,
+        entity=client,
+        metadata={
+            "mismatch_type": mismatch_type or "",
+            "previous_case_id": str(previous_case_id),
+            "new_case_id": str(new_case_id),
+            "previous_household_type": previous_household_type or "",
+            "new_household_type": new_household_type or "",
+            "reason": reason or "",
+        },
+        dedupe_key=(
+            f"case_mismatch:{client.pk}:{previous_case_id}:{new_case_id}"
+        ),
+    )
+
+
 def event_for_household_member_added(
     primary_client, member_client, *, enrollment=None, source=ChangeSource.CRM,
     actor="", added_from="",

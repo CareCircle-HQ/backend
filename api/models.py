@@ -358,6 +358,12 @@ class Client(models.Model):
     # governing pending enrollment), so a dismissed request can't be re-run
     # straight from the CRM. Never blocks a live request.
     verification_disregarded_at = models.DateTimeField(null=True, blank=True)
+    # The ``case_id`` (UUID string) of the client's CURRENT governing
+    # internal-service case, as chosen by ``lifecycle.governing_case_key``. Kept
+    # so the case reconcile can detect when the governing case CHANGES (old ->
+    # new) and record it exactly once; also lets the frontend read the program's
+    # governing case directly. Empty until the first internal-service case lands.
+    governing_internal_case_id = models.CharField(max_length=64, blank=True)
 
     # --- CRM Sync (External - GoHighLevel) ---
     crm_contact_id = models.CharField(max_length=64, blank=True, db_index=True)
@@ -1251,6 +1257,14 @@ class Case(models.Model):
     created_by_id = models.UUIDField(null=True, blank=True)  # source agent id
     created_by_name = models.CharField(max_length=255, blank=True)
     date_opened = models.DateTimeField(null=True, blank=True)  # Date Opened from Unite Us
+    # The Unite Us case CREATED timestamp (with time), taken straight from the
+    # source ``created_at`` -- NO fallback to the agent-entered opened date. This
+    # is the authoritative tie-breaker for governing-case selection: when a
+    # member holds several open internal-service cases created the same day, the
+    # most recent ``case_created_at`` (date + time) is the governing candidate.
+    # ``date_opened`` is kept for display / the "Date Opened" filter (and can be
+    # agent-edited), so it is NOT reliable for this ordering.
+    case_created_at = models.DateTimeField(null=True, blank=True, db_index=True)
     updated_at = models.DateTimeField(null=True, blank=True)  # source last update
 
     # Product (model to be defined later) - placeholder reference for now.
@@ -2012,6 +2026,12 @@ class MemberDietaryProfile(models.Model):
     # Distinct from ``updated_at`` (any edit); stamped in ``save()`` only when the
     # status value actually flips, so the UI can show "Paused/Out of Orbit since".
     status_changed_at = models.DateTimeField(null=True, blank=True)
+    # Set True when a governing-case Household->Individual switch auto-pauses this
+    # (additional) member: the member is PINNED so an agent cannot un-pause them
+    # from the Program tab. Cleared ONLY when Customer Service dismisses the
+    # matching CaseMismatchFlag (never auto-cleared on a switch back to
+    # household). See api.services.lifecycle governing-case switch handling.
+    pause_locked = models.BooleanField(default=False)
 
     class Meta:
         ordering = ["created_at"]
@@ -3181,6 +3201,25 @@ class TimelineEventType(models.TextChoices):
     MEMBER_INELIGIBLE = "member_ineligible", "Member Ineligible"
     MEMBER_ELIGIBILITY_RESTORED = "member_eligibility_restored", "Eligibility Restored"
     MEMBER_SERVICE_INACTIVE = "member_service_inactive", "Service Inactive"
+    MEMBER_SERVICE_REACTIVATED = "member_service_reactivated", "Service Reactivated"
+    # Recoverable social-care-coverage hold (api.services.eligibility): a fixable
+    # coverage gap pauses service (reversible) rather than the hard INELIGIBLE
+    # off-ramp; the matching restore fires when coverage recovers.
+    MEMBER_COVERAGE_HOLD = "member_coverage_hold", "Coverage Hold"
+    MEMBER_COVERAGE_RESTORED = "member_coverage_restored", "Coverage Restored"
+    # The GOVERNING internal-service case for a program changed (a new case was
+    # created, a case was approved and superseded the prior one, or the prior
+    # governing case closed). Recorded once per actual change by the case
+    # reconcile (api.services.lifecycle).
+    MEMBER_GOVERNING_CASE_CHANGED = "member_governing_case_changed", "Governing Case Changed"
+    # Governing case switched product KIND (meals<->boxes) to an authorized case:
+    # the household was paused + requeued for a new kitchen assignment
+    # (api.services.lifecycle). Recorded once per switch by the case reconcile.
+    MEMBER_PROGRAM_SWITCHED = "member_program_switched", "Program Switched"
+    # Governing case switched household SCOPE (household<->individual). Needs
+    # Customer Service review via a CaseMismatchFlag; recorded once per switch by
+    # the case reconcile (api.services.lifecycle).
+    MEMBER_CASE_MISMATCH = "member_case_mismatch", "Case Mismatch"
     HOUSEHOLD_MEMBER_ADDED = "household_member_added", "Household Member Added"
     HOUSEHOLD_MEMBER_REMOVED = "household_member_removed", "Household Member Removed"
     PRODUCT_TYPE_CHANGED = "product_type_changed", "Product Type Changed"
@@ -3363,6 +3402,79 @@ class MemberWarning(models.Model):
 
     def __str__(self):
         return f"{self.code} ({self.status}) for {self.client_id}"
+
+
+# ---------------------------------------------------------------------------
+# Case mismatch flags (governing-case Household<->Individual scope switch)
+# ---------------------------------------------------------------------------
+class CaseMismatchType(models.TextChoices):
+    """Direction of a governing-case household-scope switch."""
+
+    HOUSEHOLD_TO_INDIVIDUAL = "household_to_individual", "Household \u2192 Individual"
+    INDIVIDUAL_TO_HOUSEHOLD = "individual_to_household", "Individual \u2192 Household"
+
+
+class CaseMismatchStatus(models.TextChoices):
+    OPEN = "open", "Open"
+    DISMISSED = "dismissed", "Dismissed"
+
+
+class CaseMismatchFlag(models.Model):
+    """A governing-case Household<->Individual scope switch that needs Customer
+    Service review.
+
+    Created by the case reconcile (``api.services.lifecycle``) when the client's
+    governing internal-service case changes its ``household_type``. Unlike a
+    :class:`MemberWarning` (which auto-resolves when the condition clears), a
+    Case Mismatch flag is a manual work item: it stays OPEN until Customer
+    Service dismisses it, and never re-locks on a switch back. Dismissing a
+    Household->Individual flag also clears the ``pause_locked`` pin on the
+    household's additional members (they were auto-paused + pinned on the
+    switch). Surfaced on the Care Management -> Case Mismatch tab.
+
+    ``client`` is the household PRIMARY. De-duped on ``(client, new_case_id)`` so
+    a re-import never stacks duplicate flags (and a dismissed flag is not
+    re-created).
+    """
+
+    client = models.ForeignKey(
+        Client, on_delete=models.CASCADE, related_name="case_mismatch_flags"
+    )
+    enrollment = models.ForeignKey(
+        "EnrollmentVerification", on_delete=models.SET_NULL,
+        null=True, blank=True, related_name="case_mismatch_flags",
+    )
+    mismatch_type = models.CharField(max_length=32, choices=CaseMismatchType.choices)
+    previous_case_id = models.CharField(max_length=64, blank=True)
+    new_case_id = models.CharField(max_length=64, blank=True)
+    previous_household_type = models.CharField(max_length=12, blank=True)
+    new_household_type = models.CharField(max_length=12, blank=True)
+    detail = models.TextField(blank=True)
+    context = models.JSONField(default=dict, blank=True)
+    status = models.CharField(
+        max_length=16, choices=CaseMismatchStatus.choices,
+        default=CaseMismatchStatus.OPEN, db_index=True,
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    dismissed_at = models.DateTimeField(null=True, blank=True)
+    dismissed_by = models.CharField(max_length=255, blank=True)
+    dismiss_reason = models.TextField(blank=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["client", "new_case_id"],
+                name="uniq_case_mismatch_client_new_case",
+            )
+        ]
+        indexes = [
+            models.Index(fields=["status"]),
+            models.Index(fields=["enrollment", "status"]),
+        ]
+
+    def __str__(self):
+        return f"{self.mismatch_type} ({self.status}) for {self.client_id}"
 
 
 # ---------------------------------------------------------------------------
