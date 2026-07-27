@@ -501,9 +501,49 @@ class CaseViewSet(BulkUpsertMixin, viewsets.ModelViewSet):
         _safe_timeline(timeline.event_for_case, serializer.instance, self.request)
         self._record_case_change(serializer.instance)
 
+    @action(detail=False, methods=["post"])
+    def bulk(self, request):
+        """Batch case upsert for the extension.
+
+        A client can carry several cases in one payload, so the client-wide
+        internal-service reconcile (governing-case detection + Objective 1-3
+        actions) must run ONCE on the COMPLETE case picture -- never per row
+        against a partial one (which could, e.g., hard off-ramp a client to
+        Ineligible off a closed case written before its open successor). Defer the
+        per-save reconcile for the loop, collect the touched clients, then
+        reconcile each exactly once. Mirrors the CSV import + Unite Us pull.
+        """
+        from .services.lifecycle import (
+            deferred_internal_service_reconcile,
+            reconcile_internal_service_authorization,
+        )
+
+        self._bulk_reconcile_client_ids = set()
+        try:
+            with deferred_internal_service_reconcile():
+                response = super().bulk(request)
+        finally:
+            client_ids = getattr(self, "_bulk_reconcile_client_ids", set())
+            self._bulk_reconcile_client_ids = set()
+
+        actor = getattr(request, "user", None)
+        for cid in client_ids:
+            client = Client.objects.filter(pk=cid).first()
+            if client is None:
+                continue
+            try:
+                reconcile_internal_service_authorization(client, actor=actor)
+            except Exception:  # noqa: BLE001 - never fail the write on a reconcile
+                logger.exception("bulk case reconcile failed for client %s", cid)
+        return response
+
     def post_upsert(self, obj):
         _safe_timeline(timeline.event_for_case, obj, self.request)
         self._record_case_change(obj)
+        # Collect the client for the once-per-client deferred reconcile run by
+        # ``bulk`` after the full case picture is written.
+        if getattr(obj, "client_id", None) and hasattr(self, "_bulk_reconcile_client_ids"):
+            self._bulk_reconcile_client_ids.add(obj.client_id)
 
 
 class ContractedServiceViewSet(BulkUpsertMixin, viewsets.ModelViewSet):

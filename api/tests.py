@@ -991,6 +991,150 @@ class GoverningCaseChangeTest(TestCase):
         )
 
 
+class GoverningCaseKeyTest(TestCase):
+    """Task 6.1: governing_case_key ordering -- an APPROVED authorization beats
+    anything regardless of dates; among equally-favorable cases the most recent
+    case_created_at wins; and OPEN outranks closed at the same favor + date."""
+
+    def _client(self):
+        return Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Key", last_name="Order"
+        )
+
+    def _case(self, client, *, auth, status="open", created):
+        from .models import Case, CaseType
+
+        return Case.objects.create(
+            case_id=uuid.uuid4(), client=client,
+            case_type=CaseType.INTERNAL_SERVICE,
+            program_name="Medically Tailored Meals",
+            service_authorization_status=auth, case_status=status,
+            case_created_at=created, date_opened=created,
+        )
+
+    def test_approved_beats_pending_regardless_of_date(self):
+        from datetime import timedelta
+
+        from .services.lifecycle import governing_case_key
+
+        client = self._client()
+        older_approved = self._case(
+            client, auth="approved", created=timezone.now() - timedelta(days=10)
+        )
+        newer_pending = self._case(client, auth="pending", created=timezone.now())
+        gov = max([newer_pending, older_approved], key=governing_case_key)
+        self.assertEqual(gov.pk, older_approved.pk)
+
+    def test_newer_created_wins_among_approved(self):
+        from datetime import timedelta
+
+        from .services.lifecycle import governing_case_key
+
+        client = self._client()
+        older = self._case(
+            client, auth="approved", created=timezone.now() - timedelta(days=5)
+        )
+        newer = self._case(client, auth="approved", created=timezone.now())
+        gov = max([older, newer], key=governing_case_key)
+        self.assertEqual(gov.pk, newer.pk)
+
+    def test_open_beats_closed_at_same_favor_and_date(self):
+        from .services.lifecycle import governing_case_key
+
+        client = self._client()
+        created = timezone.now()
+        closed = self._case(
+            client, auth="approved", status="closed", created=created
+        )
+        open_case = self._case(
+            client, auth="approved", status="open", created=created
+        )
+        gov = max([closed, open_case], key=governing_case_key)
+        self.assertEqual(gov.pk, open_case.pk)
+
+
+class BulkCaseReconcileDeferralTest(TestCase):
+    """Phase 5: the extension /cases/bulk/ endpoint must reconcile the client-wide
+    internal-service state ONCE on the COMPLETE case picture, not per row. A
+    payload writing a CLOSED case before its OPEN+approved successor must NOT
+    hard off-ramp the (Kitchen Assignment) client to INELIGIBLE off the partial
+    picture -- the final governing case is the open+approved one."""
+
+    def _api(self):
+        agent = Agent.objects.create(
+            name="Ext Agent", agent_code=str(uuid.uuid4())[:8], group="Screeners"
+        )
+        access = AccessToken()
+        access["agent_id"] = str(agent.id)
+        access["agent_code"] = agent.agent_code
+        access["agent_name"] = agent.name
+        access["agent_group"] = agent.group
+        api = APIClient()
+        api.credentials(HTTP_AUTHORIZATION=f"Bearer {access}")
+        return api
+
+    def test_bulk_reconciles_once_on_full_picture(self):
+        from django.urls import reverse
+
+        from api.services.lifecycle import MET_COUNCIL_PROVIDER_NAME
+        from .models import (
+            ClientStage, EnrollmentStage, EnrollmentVerification, Household,
+            HouseholdMember,
+        )
+
+        mc = MET_COUNCIL_PROVIDER_NAME
+        client = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Bulk", last_name="Case"
+        )
+        household = Household.objects.create(name="HH")
+        HouseholdMember.objects.create(
+            household=household, client=client, is_primary=True
+        )
+        enr = EnrollmentVerification.objects.create(
+            client=client, household=household,
+            stage=EnrollmentStage.KITCHEN_ASSIGNMENT, verified_at=timezone.now(),
+        )
+
+        # One payload: a CLOSED case FIRST, then a newer OPEN + approved case.
+        # Deferred reconcile => only the full-picture governing (open+approved)
+        # is acted on, so the client is NOT stranded at INELIGIBLE.
+        api = self._api()
+        resp = api.post(
+            reverse("case-bulk"),
+            [
+                {
+                    "case_id": str(uuid.uuid4()),
+                    "client_id": str(client.client_id),
+                    "case_type": "internal_service",
+                    "program_name": "Medically Tailored Meals",
+                    "service_authorization_status": "approved",
+                    "case_status": "closed",
+                    "provider_name": mc,
+                    "date_opened": timezone.now().isoformat(),
+                    "case_closed_at": timezone.now().isoformat(),
+                },
+                {
+                    "case_id": str(uuid.uuid4()),
+                    "client_id": str(client.client_id),
+                    "case_type": "internal_service",
+                    "program_name": "Medically Tailored Meals",
+                    "service_authorization_status": "approved",
+                    "case_status": "open",
+                    "provider_name": mc,
+                    "date_opened": timezone.now().isoformat(),
+                },
+            ],
+            format="json",
+        )
+        self.assertIn(resp.status_code, (200, 207), resp.content)
+        client.refresh_from_db()
+        enr.refresh_from_db()
+        # Governing = the open + approved case -> served, NOT ineligible/inactive.
+        self.assertNotEqual(client.lifecycle_stage, ClientStage.INELIGIBLE)
+        self.assertNotEqual(client.lifecycle_stage, ClientStage.SERVICE_INACTIVE)
+        self.assertEqual(enr.stage, EnrollmentStage.KITCHEN_ASSIGNMENT)
+
+
 class ProgramSwitchRequeueTest(TestCase):
     """Task 3.1: when the GOVERNING internal-service case switches product KIND
     (meals<->boxes) to an authorized, still-open successor, the household is
