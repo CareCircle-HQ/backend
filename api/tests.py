@@ -2633,6 +2633,50 @@ class CsvCaseMappingTest(SimpleTestCase):
         self.assertEqual(out["service_category"], "Food Assistance")
 
 
+class ReimportCaseWithNullServiceCategoryTest(TestCase):
+    """Regression: cases created before the ``service_category`` column existed
+    (migration 0150) carry a NULL there. A NOT-NULL column rejected the
+    django-simple-history copy on re-save, rolling back the whole import row so a
+    re-import silently failed to update the authorization status (prod: ~22,810
+    rows errored with 'null value in column service_category ... violates
+    not-null constraint'). The column must be nullable so such rows re-save."""
+
+    def test_reimport_updates_auth_on_legacy_null_category_row(self):
+        from .models import Case, Client
+        from .serializers import CaseSerializer
+        from .services.csv_import import map_case_row
+
+        client_id = "11111111-1111-1111-1111-111111111111"
+        case_id = "22222222-2222-2222-2222-222222222222"
+        Client.objects.create(client_id=client_id, first_name="A", last_name="B")
+
+        # Simulate a legacy row: written before service_category existed, so it's
+        # NULL in the DB (bypass the model default via a raw UPDATE).
+        Case.objects.create(
+            case_id=case_id, client_id=client_id, program_name="Meals",
+            service_type="Home Delivered Meals",
+            service_authorization_status="pending",
+        )
+        Case.objects.filter(pk=case_id).update(service_category=None)
+        self.assertIsNone(Case.objects.get(pk=case_id).service_category)
+
+        # Re-import the same case with an APPROVED authorization (blank broad
+        # category, mirroring the failing prod rows). Must NOT raise and must
+        # persist the new auth.
+        payload = map_case_row({
+            "case_id": case_id, "client_id": client_id, "program_name": "Meals",
+            "service_subtype": "Home Delivered Meals",
+            "service_authorization_status": "approved",
+        })
+        ser = CaseSerializer(data=payload)
+        ser.is_valid(raise_exception=True)
+        ser.save()  # previously raised IntegrityError on the historical copy
+
+        self.assertEqual(
+            Case.objects.get(pk=case_id).service_authorization_status, "approved"
+        )
+
+
 class UniteUsPersonMapperTest(SimpleTestCase):
     """map_person_to_client carries the Unite Us person's own created/updated
     timestamps onto the Client so the member's "Created" date matches Unite Us
@@ -6122,20 +6166,28 @@ class ReportExportsTest(TestCase):
         )
 
         rows = self._rows(reverse("portal-report-all-members"))
-        row = next(r for r in rows if r["Client ID"] == str(client.client_id))
+        row = next(r for r in rows if r["Member ID"] == str(client.client_id))
 
-        self.assertEqual(row["Client Name"], "Grace Hopper")
+        self.assertEqual(row["Member Name"], "Grace Hopper")
+        # A lone member is their own household primary; household size 1.
+        self.assertEqual(row["Household Primary Member ID"], str(client.client_id))
+        self.assertEqual(row["Total members in household"], "1")
         self.assertEqual(row["Medicaid Plan"], "Fidelis Medicaid")
         self.assertEqual(row["Medicaid Type"], "OK")
         self.assertEqual(row["Insurance Effective Date"], "2025-01-01")
         self.assertEqual(row["Insurance Expiration Date"], "2030-12-31")
         self.assertEqual(row["Social Care Coverage Status"], "Enrolled")
-        self.assertEqual(row["SCC Expiration Date"], "2030-06-30")
+        self.assertEqual(row["Social Care Coverage Expiration Date"], "2030-06-30")
         self.assertEqual(row["Enrollment Platform"], "UniteUs")
         self.assertEqual(row["Out of Orbit?"], "No")
         self.assertEqual(row["Out of Range"], "No")
         self.assertEqual(row["Client Eligibility"], "Eligible")
-        self.assertEqual(row["Currently Servicing"], "")
+        self.assertEqual(row["Currently servicing"], "")
+        # No cases/screenings on file -> the presence flags read No.
+        self.assertEqual(row["Is there Screening"], "No")
+        self.assertEqual(row["Is there Internal Service Case"], "No")
+        self.assertEqual(row["Is there Eligibility"], "No")
+        self.assertEqual(row["Is there Navigation"], "No")
 
     def test_all_members_flags_wrong_medicaid_type_ineligible(self):
         from datetime import datetime, timezone as dt_tz
@@ -6150,7 +6202,7 @@ class ReportExportsTest(TestCase):
         )
 
         rows = self._rows(reverse("portal-report-all-members"))
-        row = next(r for r in rows if r["Client ID"] == str(client.client_id))
+        row = next(r for r in rows if r["Member ID"] == str(client.client_id))
         self.assertEqual(row["Medicaid Type"], "MLTC")
         self.assertEqual(row["Client Eligibility"], "Ineligible")
 
