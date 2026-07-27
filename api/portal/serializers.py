@@ -298,6 +298,15 @@ def _main_stage_value(client):
     return main_stage(client)
 
 
+def _program_tracks(client):
+    """Per-program display tracks for the redesigned stage bar (see
+    lifecycle.program_tracks): one entry per program the client qualifies for,
+    each with Authorization / Verification / Service phase + status."""
+    from ..services.lifecycle import program_tracks
+
+    return program_tracks(client)
+
+
 def _main_stage_label(client):
     """Human label for the client's main stage."""
     from api.models import ClientStage
@@ -790,6 +799,12 @@ class MemberDetailSerializer(serializers.Serializer):
                 "main_stage_label": _main_stage_label(client),
                 "service_hold": service_hold_state(client),
                 "service_cancelled": service_cancelled_state(client),
+                # Phase 7: per-program display tracks for the redesigned stage
+                # bar -- one entry per program the client qualifies for, each
+                # decomposed into Authorization -> Verification -> Service phase
+                # + status. Governing program first. Empty when no internal-
+                # service case exists (the client hasn't entered a program yet).
+                "programs": _program_tracks(client),
             },
             # Read-only authorization status sourced from the client's GOVERNING
             # internal-service case (the meal/box case that gates kitchen

@@ -2809,6 +2809,259 @@ class RestoreOutOfRangeMemberTest(TestCase):
         self.assertEqual(mv.status, MemberStatus.OUT_OF_RANGE)
 
 
+class ProgramTracksTest(TestCase):
+    """lifecycle.program_tracks: the Phase 7 per-program display tracks that feed
+    the redesigned member stage bar. Each program decomposes into Authorization
+    -> Verification -> Service phase + status."""
+
+    def _setup(self, *, stage, auth, case_status=None, client_stage="active",
+               household_type=None):
+        from .models import (
+            Case, CaseHouseholdType, CaseStatus, CaseType, Client,
+            EnrollmentVerification, Household, HouseholdMember,
+        )
+
+        client = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Pro", last_name="Gram",
+            lifecycle_stage=client_stage,
+        )
+        hh = Household.objects.create(name="HH")
+        HouseholdMember.objects.create(household=hh, client=client, is_primary=True)
+        Case.objects.create(
+            case_id=str(uuid.uuid4()), client=client,
+            case_type=CaseType.INTERNAL_SERVICE,
+            case_status=case_status or CaseStatus.OPEN,
+            service_type="Medically Tailored Meals", program_name="MTM",
+            service_authorization_status=auth,
+            household_type=household_type or CaseHouseholdType.INDIVIDUAL,
+        )
+        EnrollmentVerification.objects.create(
+            client=client, household=hh, stage=stage,
+        )
+        return client
+
+    def test_no_internal_service_case_is_empty(self):
+        from .models import Client
+        from .services.lifecycle import program_tracks
+
+        c = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="No", last_name="Case"
+        )
+        self.assertEqual(program_tracks(c), [])
+
+    def test_single_meals_program_approved_awaiting_kitchen(self):
+        from .models import EnrollmentStage, ServiceAuthorizationStatus
+        from .services.lifecycle import program_tracks
+
+        c = self._setup(
+            stage=EnrollmentStage.KITCHEN_ASSIGNMENT,
+            auth=ServiceAuthorizationStatus.APPROVED,
+        )
+        tracks = program_tracks(c)
+        self.assertEqual(len(tracks), 1)
+        t = tracks[0]
+        self.assertEqual(t["service_type"], "Meals")
+        self.assertTrue(t["governing"])
+        self.assertEqual(t["scope"]["label"], "Individual")
+        self.assertEqual(t["authorization"]["label"], "Approved")
+        self.assertEqual(t["verification"]["label"], "Verified")
+        self.assertEqual(t["service"]["label"], "Waiting for Kitchen Assignment")
+
+    def test_household_scope_label(self):
+        from .models import (
+            CaseHouseholdType, EnrollmentStage, ServiceAuthorizationStatus,
+        )
+        from .services.lifecycle import program_tracks
+
+        t = program_tracks(self._setup(
+            stage=EnrollmentStage.SERVICE_ACTIVE,
+            auth=ServiceAuthorizationStatus.APPROVED,
+            household_type=CaseHouseholdType.HOUSEHOLD,
+        ))[0]
+        self.assertEqual(t["scope"]["value"], "household")
+        self.assertEqual(t["scope"]["label"], "Household")
+
+    def test_non_food_program_named_from_service_type(self):
+        """A non-food internal-service program (e.g. Housing) is its own branch,
+        named from its service_type, with Authorization from its own case but
+        Verification/Service blank (NOT borrowed from the food enrollment)."""
+        from .models import (
+            Case, CaseStatus, CaseType, EnrollmentStage, ServiceAuthorizationStatus,
+        )
+        from .services.lifecycle import program_tracks
+
+        # Meals is Approved (governs); Housing is a second internal-service case.
+        client = self._setup(
+            stage=EnrollmentStage.SERVICE_ACTIVE,
+            auth=ServiceAuthorizationStatus.APPROVED,
+        )
+        Case.objects.create(
+            case_id=str(uuid.uuid4()), client=client,
+            case_type=CaseType.INTERNAL_SERVICE, case_status=CaseStatus.OPEN,
+            service_type="Housing", service_category="Housing",
+            program_name="Housing Program",
+            service_authorization_status=ServiceAuthorizationStatus.PENDING,
+        )
+        tracks = program_tracks(client)
+        self.assertEqual(len(tracks), 2)
+        housing = next(t for t in tracks if t["category"] == "Housing")
+        self.assertEqual(housing["service_type"], "Housing")
+        self.assertEqual(housing["service_type_value"], "housing")
+        self.assertFalse(housing["governing"])
+        self.assertEqual(housing["authorization"]["label"], "Requested")
+        self.assertEqual(housing["verification"]["label"], "")
+        self.assertEqual(housing["service"]["label"], "")
+        # The food program still resolves its phases from the enrollment.
+        meals = next(t for t in tracks if t["service_type"] == "Meals")
+        self.assertTrue(meals["governing"])
+        self.assertEqual(meals["service"]["label"], "Active")
+
+    def test_two_cases_same_kind_show_as_separate_tracks(self):
+        """Two Meals internal-service cases produce TWO tracks (not grouped): the
+        governing (Approved) one carries the Verification/Service phases; the
+        other (Pending) shows Authorization only."""
+        from .models import (
+            Case, CaseStatus, CaseType, EnrollmentStage, ServiceAuthorizationStatus,
+        )
+        from .services.lifecycle import program_tracks
+
+        client = self._setup(
+            stage=EnrollmentStage.SERVICE_ACTIVE,
+            auth=ServiceAuthorizationStatus.APPROVED,
+        )
+        second = Case.objects.create(
+            case_id=str(uuid.uuid4()), client=client,
+            case_type=CaseType.INTERNAL_SERVICE, case_status=CaseStatus.OPEN,
+            service_type="Medically Tailored Meals", program_name="MTM 2",
+            service_authorization_status=ServiceAuthorizationStatus.PENDING,
+        )
+        tracks = program_tracks(client)
+        self.assertEqual(len(tracks), 2)
+        self.assertTrue(all(t["service_type"] == "Meals" for t in tracks))
+        gov = next(t for t in tracks if t["governing"])
+        other = next(t for t in tracks if not t["governing"])
+        self.assertEqual(str(other["case_id"]), str(second.case_id))
+        # Governing carries the household service phases.
+        self.assertEqual(gov["authorization"]["label"], "Approved")
+        self.assertEqual(gov["service"]["label"], "Active")
+        # The competing (duplicate) case shares the household verification but
+        # is not separately serviced -> "Duplicated".
+        self.assertEqual(other["authorization"]["label"], "Requested")
+        self.assertEqual(other["verification"]["label"], "Verified")
+        self.assertEqual(other["service"]["label"], "Duplicated")
+        self.assertEqual(other["service"]["value"], "duplicated")
+
+    def test_closed_case_is_not_shown(self):
+        """A closed/cancelled internal-service case drops off the bar."""
+        from .models import (
+            Case, CaseStatus, CaseType, EnrollmentStage, ServiceAuthorizationStatus,
+        )
+        from .services.lifecycle import program_tracks
+
+        client = self._setup(
+            stage=EnrollmentStage.SERVICE_ACTIVE,
+            auth=ServiceAuthorizationStatus.APPROVED,
+        )
+        Case.objects.create(
+            case_id=str(uuid.uuid4()), client=client,
+            case_type=CaseType.INTERNAL_SERVICE, case_status=CaseStatus.CLOSED,
+            service_type="Medically Tailored Meals", program_name="MTM closed",
+            service_authorization_status=ServiceAuthorizationStatus.DENIED,
+        )
+        tracks = program_tracks(client)
+        self.assertEqual(len(tracks), 1)
+        self.assertTrue(tracks[0]["governing"])
+
+    def test_pending_verification_requested_authorization(self):
+        # A PENDING (Unite Us requested/open/deferred) authorization reads the
+        # real "Requested" state on the bar -- not a generic "Waiting".
+        from .models import EnrollmentStage, ServiceAuthorizationStatus
+        from .services.lifecycle import program_tracks
+
+        t = program_tracks(self._setup(
+            stage=EnrollmentStage.PENDING_VERIFICATION,
+            auth=ServiceAuthorizationStatus.PENDING,
+        ))[0]
+        self.assertEqual(t["authorization"]["value"], "requested")
+        self.assertEqual(t["authorization"]["label"], "Requested")
+        self.assertEqual(t["verification"]["label"], "Pending Verification")
+        self.assertEqual(t["service"]["label"], "")
+
+    def test_never_requested_authorization_reads_real_state(self):
+        # A case whose authorization was NEVER requested reads "Never Requested"
+        # (distinct from a live pending request), not "Waiting Authorization".
+        from .models import EnrollmentStage, ServiceAuthorizationStatus
+        from .services.lifecycle import program_tracks
+
+        t = program_tracks(self._setup(
+            stage=EnrollmentStage.VERIFIED,
+            auth=ServiceAuthorizationStatus.NEVER_REQUESTED,
+        ))[0]
+        self.assertEqual(t["authorization"]["value"], "never_requested")
+        self.assertEqual(t["authorization"]["label"], "Never Requested")
+
+    def test_second_food_kind_conflicts_and_shares_verification(self):
+        # A non-governing, DIFFERENT-kind food case (e.g. a Boxes case alongside
+        # a governing Meals case) reads the household-wide "Verified" and is
+        # flagged "Conflicting" (a household runs one food program; Meals/Boxes
+        # are subtypes). Mirrors client c5d0c921 (Meals approved + Boxes
+        # never-requested).
+        from .models import (
+            Case, CaseStatus, CaseType, EnrollmentStage, ServiceAuthorizationStatus,
+        )
+        from .services.lifecycle import program_tracks
+
+        client = self._setup(
+            stage=EnrollmentStage.SERVICE_ACTIVE,
+            auth=ServiceAuthorizationStatus.APPROVED,
+        )
+        Case.objects.create(
+            case_id=str(uuid.uuid4()), client=client,
+            case_type=CaseType.INTERNAL_SERVICE, case_status=CaseStatus.OPEN,
+            service_type="Produce Prescription/Voucher", program_name="Boxes",
+            service_authorization_status=ServiceAuthorizationStatus.NEVER_REQUESTED,
+        )
+        tracks = program_tracks(client)
+        boxes = next(t for t in tracks if t["service_type"] == "Boxes")
+        self.assertFalse(boxes["governing"])
+        self.assertEqual(boxes["authorization"]["label"], "Never Requested")
+        self.assertEqual(boxes["verification"]["label"], "Verified")
+        self.assertEqual(boxes["service"]["value"], "conflicting")
+        self.assertEqual(boxes["service"]["label"], "Conflicting")
+
+    def test_denied_authorization(self):
+        from .models import EnrollmentStage, ServiceAuthorizationStatus
+        from .services.lifecycle import program_tracks
+
+        t = program_tracks(self._setup(
+            stage=EnrollmentStage.VERIFIED,
+            auth=ServiceAuthorizationStatus.DENIED,
+        ))[0]
+        self.assertEqual(t["authorization"]["label"], "Denied")
+        self.assertEqual(t["verification"]["label"], "Verified")
+
+    def test_active_service(self):
+        from .models import EnrollmentStage, ServiceAuthorizationStatus
+        from .services.lifecycle import program_tracks
+
+        t = program_tracks(self._setup(
+            stage=EnrollmentStage.SERVICE_ACTIVE,
+            auth=ServiceAuthorizationStatus.APPROVED,
+        ))[0]
+        self.assertEqual(t["service"]["label"], "Active")
+
+    def test_does_not_qualify_when_ineligible(self):
+        from .models import ClientStage, EnrollmentStage, ServiceAuthorizationStatus
+        from .services.lifecycle import program_tracks
+
+        t = program_tracks(self._setup(
+            stage=EnrollmentStage.SERVICE_ACTIVE,
+            auth=ServiceAuthorizationStatus.APPROVED,
+            client_stage=ClientStage.INELIGIBLE,
+        ))[0]
+        self.assertEqual(t["service"]["label"], "Does Not Qualify")
+
+
 class ProductKindResolverTest(SimpleTestCase):
     """product_kind_for_enrollment resolves Meals/Boxes across name sources so a
     keyword-less Program row name no longer yields an unresolved '—' kind and a

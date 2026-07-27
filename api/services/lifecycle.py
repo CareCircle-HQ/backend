@@ -1042,6 +1042,234 @@ def program_status(enrollment):
     return ProgramStatus.PENDING_VERIFICATION
 
 
+# ---------------------------------------------------------------------------
+# Phase 7: per-program display tracks for the new member stage bar
+# ---------------------------------------------------------------------------
+# The redesigned stage bar decomposes each PROGRAM into three display phases --
+# Authorization -> Verification -> Service -- rather than the single linear
+# ``program_status`` timeline. ``program_tracks`` returns one entry per distinct
+# program the client qualifies for. It is generic across categories (today only
+# Food -> Meals/Boxes exists, but additional categories slot in as more entries)
+# and is derived on read, never stored.
+
+
+def _authorization_phase(auth):
+    """Fold a Case ``service_authorization_status`` into the display states of
+    the Authorization phase.
+
+    The bar shows the REAL authorization state rather than collapsing every
+    not-yet-decided value into a generic "Waiting Authorization" (which was
+    confusing -- a case where an authorization was never even requested read the
+    same as one with a live pending request). States:
+
+        Approved / Denied / Never Requested / Requested
+    """
+    from api.models import ServiceAuthorizationStatus as A
+
+    # EXPIRED was authorized once; the expiry surfaces in the Service phase, so
+    # the Authorization phase still reads Approved.
+    if auth in (A.APPROVED, A.NOT_REQUIRED, A.EXPIRED):
+        return ("approved", "Approved")
+    if auth == A.DENIED:
+        return ("denied", "Denied")
+    # No authorization was ever requested on the case (an OPEN case with a blank
+    # authorization -- see csv_import). Distinct from a live pending request.
+    if auth == A.NEVER_REQUESTED:
+        return ("never_requested", "Never Requested")
+    # PENDING (Unite Us requested / open / deferred) -- a request exists and is
+    # awaiting a decision. A truly blank status also lands here.
+    return ("requested", "Requested")
+
+
+def _verification_phase(enrollment):
+    """Verification phase: Pending Verification until the enrollment is Verified."""
+    if enrollment is None:
+        return ("pending", "Pending Verification")
+    if EnrollmentStage(enrollment.stage) in _PRE_VERIFICATION_STAGES:
+        return ("pending", "Pending Verification")
+    return ("verified", "Verified")
+
+
+def _member_status_on(client, enrollment):
+    """The client's own per-member status on the given enrollment (or None)."""
+    if enrollment is None or client is None:
+        return None
+    for mv in enrollment.member_profiles.all():
+        if mv.client_id and str(mv.client_id) == str(client.client_id):
+            return mv.status
+    return None
+
+
+def _service_phase(client, enrollment, gov_case):
+    """Service phase display status. Empty until the program reaches a servicing
+    stage. Mirrors the plan's Service statuses (Waiting for Kitchen Assignment /
+    Active / On Hold / Out of Range / Out of Orbit / Service Expired / Canceled /
+    Does Not Qualify / Closed)."""
+    from api.models import ClientStage, MemberStatus
+    from api.models import ServiceAuthorizationStatus as A
+
+    if enrollment is not None:
+        stage = EnrollmentStage(enrollment.stage)
+        if stage == EnrollmentStage.CANCELLED:
+            return ("canceled", "Canceled")
+        if stage in (EnrollmentStage.CLOSED, EnrollmentStage.SERVICE_COMPLETE):
+            return ("closed", "Closed")
+    # Coverage / eligibility off-ramp (Decision 2): unsupported insurance or
+    # social-care coverage -> Does Not Qualify. Distinct from the main-bar Not
+    # Eligible off-ramp; only applies to a still-live (non-terminal) program.
+    if client is not None and client.lifecycle_stage == ClientStage.INELIGIBLE:
+        return ("does_not_qualify", "Does Not Qualify")
+    if enrollment is None:
+        return ("", "")
+    stage = EnrollmentStage(enrollment.stage)
+    if stage == EnrollmentStage.ON_HOLD:
+        return ("on_hold", "On Hold")
+    end = getattr(gov_case, "service_authorization_approval_ends_at", None) if gov_case else None
+    auth = getattr(gov_case, "service_authorization_status", "") if gov_case else ""
+    window_expired = bool(end and end.date() < timezone.localdate())
+    if (auth == A.EXPIRED or window_expired) and stage in _AUTH_WINDOW_STAGES:
+        return ("service_expired", "Service Expired")
+    if stage in (EnrollmentStage.SERVICE_ACTIVE, EnrollmentStage.KITCHEN_ASSIGNMENT):
+        mv = _member_status_on(client, enrollment)
+        if mv == MemberStatus.OUT_OF_RANGE:
+            return ("out_of_range", "Out of Range")
+        if mv == MemberStatus.OUT_OF_ORBIT:
+            return ("out_of_orbit", "Out of Orbit")
+        if stage == EnrollmentStage.SERVICE_ACTIVE:
+            return ("active", "Active")
+        return ("waiting_kitchen", "Waiting for Kitchen Assignment")
+    # Verified but not yet advanced to a servicing stage.
+    return ("", "")
+
+
+def program_tracks(client):
+    """Per-program display tracks for the redesigned member stage bar (Phase 7).
+
+    One entry per distinct PROGRAM the client qualifies for -- grouped by product
+    kind (Meals/Boxes) today, generic for future categories. Each program's
+    governing internal-service case drives the Authorization phase; the client's
+    governing (household) enrollment drives the Verification + Service phases. The
+    governing program is returned first (``governing: true``), additional programs
+    after. Derived on read; never stored. Empty list when the client holds no
+    internal-service case.
+    """
+    from api.models import CaseHouseholdType, ProductTypeKind
+    from api.services.catalog import product_type_kind_for_name
+
+    if client is None:
+        return []
+    # Only OPEN cases are shown on the bar -- a closed/cancelled case no longer
+    # confers service, so it drops off (its history lives on the Programs tab).
+    cases = [
+        c for c in _internal_service_cases(client)
+        if c.case_status not in _CLOSED_CASE_STATUSES
+    ]
+    if not cases:
+        return []
+
+    # Representative enrollment (a verification is household-wide): the most
+    # recent non-terminal governing enrollment, else the most recent overall.
+    enr = None
+    enrollments = _governing_enrollments(client)
+    if enrollments:
+        live = [
+            e for e in enrollments
+            if EnrollmentStage(e.stage) not in _TERMINAL_STAGES
+        ]
+        enr = sorted(
+            live or enrollments,
+            key=lambda e: e.opened_at or _DT_FLOOR,
+            reverse=True,
+        )[0]
+
+    # One track PER internal-service case -- cases are NOT grouped by program, so
+    # every case shows on the bar (even two of the same Meals/Boxes kind), and
+    # the single governing case is flagged (``governing``) so the UI can
+    # distinguish it. Authorization is read per-case. Verification + Service
+    # attach to the household EnrollmentVerification, which reconciles onto the
+    # governing case -- so only the governing FOOD case shows those phases; every
+    # other case (competing / superseded authorizations, and all non-food cases)
+    # shows Authorization only, with Verification/Service blank ("--").
+    governing = max(cases, key=governing_case_key)
+    gov_kind = product_type_kind_for_name(
+        governing.service_type or governing.program_name
+    )
+    gov_label = (
+        governing.service_type or governing.service_category
+        or governing.program_name or ""
+    ).strip().casefold()
+    tracks = []
+    for c in cases:
+        kind = product_type_kind_for_name(c.service_type or c.program_name)
+        is_food = kind is not None
+        is_governing = c.case_id == governing.case_id
+        # A "duplicate" is a non-governing case for the SAME program as the
+        # governing case (same food kind, or same service_type for non-food).
+        if is_food:
+            is_duplicate = (not is_governing) and kind == gov_kind
+        else:
+            label = (
+                c.service_type or c.service_category or c.program_name or ""
+            ).strip().casefold()
+            is_duplicate = (
+                (not is_governing) and gov_kind is None and label == gov_label
+            )
+        # A non-governing food case of a DIFFERENT kind than the governing food
+        # case (e.g. a Boxes case alongside a governing Meals case) CONFLICTS: a
+        # household runs one food program (Meals/Boxes are subtypes of it), so
+        # the extra case competes with -- rather than duplicates -- the governing
+        # one. Distinct from a same-kind "Duplicated" case.
+        is_conflicting = (
+            is_food and (not is_governing)
+            and gov_kind is not None and kind != gov_kind
+        )
+        auth = getattr(c, "service_authorization_status", "") or ""
+        a_val, a_lbl = _authorization_phase(auth)
+        # Verification is a HOUSEHOLD-WIDE fact (one EnrollmentVerification), so
+        # every FOOD case reflects it -- not just the governing/duplicate case.
+        # A member whose household is already Verified must read Verified on all
+        # their food programs, even a second (different-kind) case. Non-food
+        # programs model Authorization only, so verification stays blank there.
+        v_val, v_lbl = _verification_phase(enr) if is_food else ("", "")
+        if is_governing and is_food:
+            s_val, s_lbl = _service_phase(client, enr, c)
+        elif is_duplicate:
+            # A second open case for the same program shares the household
+            # verification but is not separately serviced -> "Duplicated".
+            s_val, s_lbl = ("duplicated", "Duplicated")
+        elif is_conflicting:
+            # A competing food case of a different kind than the governing one.
+            s_val, s_lbl = ("conflicting", "Conflicting")
+        else:
+            s_val, s_lbl = ("", "")
+        if is_food:
+            service_type = ProductTypeKind(kind).label
+            service_type_value = kind.value
+            category = getattr(c, "service_category", "") or "Food"
+        else:
+            service_type = (
+                c.service_type or c.service_category or c.program_name or ""
+            ).strip()
+            service_type_value = service_type.casefold().replace(" ", "_")
+            category = getattr(c, "service_category", "") or service_type
+        # Service scope (Household vs Individual) from the case's household_type.
+        ht = getattr(c, "household_type", "") or CaseHouseholdType.INDIVIDUAL
+        tracks.append({
+            "category": category,
+            "service_type": service_type,
+            "service_type_value": service_type_value,
+            "case_id": str(c.case_id),
+            "governing": is_governing,
+            "scope": {"value": ht, "label": CaseHouseholdType(ht).label},
+            "authorization": {"value": a_val, "label": a_lbl},
+            "verification": {"value": v_val, "label": v_lbl},
+            "service": {"value": s_val, "label": s_lbl},
+        })
+    # Governing case first, then by service-type label + case id (stable order).
+    tracks.sort(key=lambda t: (not t["governing"], t["service_type"], t["case_id"]))
+    return tracks
+
+
 # Enrollment stages that roll a member up to the "Enrolled" main stage.
 _ENROLLED_LEVEL_STAGES = frozenset({
     EnrollmentStage.PENDING_VERIFICATION,
