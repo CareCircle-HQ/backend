@@ -1319,7 +1319,15 @@ class Case(models.Model):
     # resolved to its parent service `name`. NOTE: `service_type` above actually
     # holds the SPECIFIC service (CSV `service_subtype`, e.g. "Medically Tailored
     # Meals"); this field is the broader grouping above it.
-    service_category = models.CharField(max_length=255, blank=True)
+    #
+    # NULLABLE: cases created before this column existed (migration 0150) carry a
+    # NULL here, and the CSV/API export leaves it blank for cases with no broad
+    # category. A NOT-NULL column rejected the historical-row copy on every
+    # re-save of such a case (django-simple-history), rolling back the whole
+    # import row -- so a re-import silently failed to update auth status. Allowing
+    # NULL lets those rows save; the value is populated whenever the source
+    # carries a category.
+    service_category = models.CharField(max_length=255, blank=True, null=True)
 
     # --- Case Classification (auto-derived on upsert) ---
     # Internal Service when service_type is a meal/box subtype (Medically
