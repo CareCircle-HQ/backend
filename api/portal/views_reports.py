@@ -549,6 +549,14 @@ class AllMembersReportView(PortalAPIView):
         states = allowed_state_codes()
         lead_labels = _lead_source_label_map()
 
+        # Case-creator team lookup (Unite Us user_id -> Originating Team), built
+        # once and reused per row for the governing internal-service case's
+        # creator. Mirrors the Cases export "Team of Case Creator" column.
+        team_map = {
+            str(u.user_id): (u.originating_team or "")
+            for u in UniteUsAgent.objects.all()
+        }
+
         response = HttpResponse(content_type="text/csv")
         filename = f"all_members_{timezone.localdate().isoformat()}.csv"
         response["Content-Disposition"] = f'attachment; filename="{filename}"'
@@ -572,6 +580,7 @@ class AllMembersReportView(PortalAPIView):
             "Total members in household",
             # Program & Case Status
             "Internal Service Program Name",
+            "Team of Case Creator",
             "Is there Screening",
             "Is there Eligibility",
             "Is there Navigation",
@@ -609,6 +618,13 @@ class AllMembersReportView(PortalAPIView):
             cases = list(client.cases.all())
             # Governing Internal Service case: the one delivery/auth attach to.
             isc = internal_service_case(client)
+            # Team of that case's creator: on-roster Unite Us creators carry an
+            # Originating Team; a creator not on the roster is Met Council staff.
+            # Blank when there's no governing case or no recorded creator.
+            if isc is not None and isc.created_by_id:
+                isc_team = team_map.get(str(isc.created_by_id), "Met Council Team")
+            else:
+                isc_team = ""
 
             out_of_orbit = member_out_of_orbit(client)
             reason = _out_of_orbit_reason(enr, profile) if out_of_orbit else ""
@@ -640,6 +656,7 @@ class AllMembersReportView(PortalAPIView):
                 _household_member_count(client),
                 # Program & Case Status
                 (isc.program_name if isc else ""),
+                isc_team,
                 _yn(len(client.screenings.all()) > 0),
                 _yn(any(c.case_type == CaseType.ELIGIBILITY for c in cases)),
                 _yn(any(c.case_type == CaseType.NAVIGATION for c in cases)),
