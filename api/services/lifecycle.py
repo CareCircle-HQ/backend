@@ -1012,8 +1012,14 @@ def program_status(enrollment):
 
     stage = EnrollmentStage(enrollment.stage)
 
-    # A paused program shows On Hold above everything else.
+    # A paused program shows On Hold above everything else -- UNLESS the hold is
+    # a delivery-coverage (Out of Range) hold, which surfaces as Out of Range so
+    # the program stage matches the members' Out of Range labels. (The main
+    # lifecycle stage separately carries the Ineligible / Does Not Qualify
+    # off-ramp; this per-program status reflects the coverage block distinctly.)
     if stage == EnrollmentStage.ON_HOLD:
+        if _enrollment_has_out_of_range_member(enrollment):
+            return ProgramStatus.OUT_OF_RANGE
         return ProgramStatus.ON_HOLD
 
     gov = governing_internal_case(enrollment)
@@ -1126,6 +1132,20 @@ def _member_status_on(client, enrollment):
     return None
 
 
+def _enrollment_has_out_of_range_member(enrollment):
+    """True when any member of ``enrollment`` is Out of Range -- i.e. the
+    household is held for a delivery-coverage (ZIP) block, which the program
+    stage should surface as Out of Range rather than a generic On Hold."""
+    from api.models import MemberStatus
+
+    if enrollment is None:
+        return False
+    return any(
+        mv.status == MemberStatus.OUT_OF_RANGE
+        for mv in enrollment.member_profiles.all()
+    )
+
+
 def _service_phase(client, enrollment, gov_case):
     """Service phase display status. Empty until the program reaches a servicing
     stage. Mirrors the plan's Service statuses (Waiting for Kitchen Assignment /
@@ -1140,6 +1160,14 @@ def _service_phase(client, enrollment, gov_case):
             return ("canceled", "Canceled")
         if stage in (EnrollmentStage.CLOSED, EnrollmentStage.SERVICE_COMPLETE):
             return ("closed", "Closed")
+        # An Out-of-Range member surfaces on the SERVICE phase as Out of Range on
+        # every non-terminal stage -- including an Out-of-Range HOLD (ON_HOLD) --
+        # and takes precedence over both On Hold and the Does Not Qualify
+        # eligibility off-ramp below: the per-program Service stage reflects the
+        # coverage block, while the MAIN lifecycle stage separately carries the
+        # Ineligible / Does Not Qualify off-ramp.
+        if _member_status_on(client, enrollment) == MemberStatus.OUT_OF_RANGE:
+            return ("out_of_range", "Out of Range")
     # Coverage / eligibility off-ramp (Decision 2): unsupported insurance or
     # social-care coverage -> Does Not Qualify. Distinct from the main-bar Not
     # Eligible off-ramp; only applies to a still-live (non-terminal) program.
@@ -1334,6 +1362,16 @@ def main_stage(client):
     every enrollment is cancelled. Falls back to the stored early-funnel stage.
     Never stored.
     """
+    # A hard eligibility off-ramp is the headline outcome: an INELIGIBLE member
+    # reads Ineligible on the stage bar's Eligibility node even when a (cancelled
+    # or still-live) enrollment exists -- the enrollment roll-up below would
+    # otherwise hide it behind Enrolled/Cancelled. INELIGIBLE is sticky (set only
+    # by reconcile_client_eligibility), so this reflects the current gate verdict;
+    # the per-program Service stage separately carries the service state (Out of
+    # Range / Canceled / On Hold).
+    if client.lifecycle_stage == ClientStage.INELIGIBLE:
+        return ClientStage.INELIGIBLE
+
     enrollments = _governing_enrollments(client)
     if enrollments:
         if any(
@@ -1735,27 +1773,117 @@ _PROGRAM_SWITCH_STAGES = {
 }
 
 
+def requeue_enrollment_for_product_switch(
+    enrollment, *, actor=None, actor_label="", note=_PROGRAM_SWITCH_NOTE,
+):
+    """Requeue ONE enrollment after a meals<->boxes product switch.
+
+    Its current kitchen + delivery calendar are for the WRONG product, so:
+      1. stop all future deliveries (shorten every plan window to yesterday so the
+         nightly sync won't regenerate them);
+      2. clear the kitchen + delivery cadence so a NEW kitchen assignment (kitchen
+         + cadence + fresh calendar) is required for the new kind; and
+      3. move the enrollment back to Kitchen Assignment (force, since
+         Service Active has no direct edge back).
+
+    Only acts on post-verification enrollments that actually hold a kitchen /
+    calendar (``_PROGRAM_SWITCH_STAGES``); pre-verification / terminal stages are
+    left to the normal approval flow. Best-effort; returns True when the
+    enrollment was requeued. Shared by the governing-case-driven switch
+    (:func:`_handle_program_switch`) and the manual Household-tab product-type
+    correction (``MemberProductTypeView``).
+    """
+    from api.services.orders import truncate_future_deliveries
+
+    if EnrollmentStage(enrollment.stage) not in _PROGRAM_SWITCH_STAGES:
+        return False
+    # 1) Stop the OLD product's future deliveries.
+    try:
+        truncate_future_deliveries(enrollment)
+    except Exception:  # pragma: no cover - defensive
+        pass
+    # 2) Clear the kitchen + delivery cadence so a NEW kitchen assignment is
+    #    required for the new kind.
+    update_fields = []
+    if enrollment.kitchen_id is not None:
+        enrollment.kitchen = None
+        update_fields.append("kitchen")
+    if enrollment.delivery_weekdays:
+        enrollment.delivery_weekdays = []
+        update_fields.append("delivery_weekdays")
+    if update_fields:
+        enrollment.save(update_fields=update_fields)
+    # 3) Requeue to Kitchen Assignment (force: Service Active has no direct edge
+    #    back to Kitchen Assignment; On Hold does).
+    if EnrollmentStage(enrollment.stage) != EnrollmentStage.KITCHEN_ASSIGNMENT:
+        try:
+            advance_enrollment(
+                enrollment, EnrollmentStage.KITCHEN_ASSIGNMENT, actor=actor,
+                actor_label=actor_label, note=note, force=True,
+            )
+        except InvalidTransition:
+            pass
+    return True
+
+
+def _served_product_kind(enrollment, old_case=None):
+    """The Meals/Boxes kind the household is CURRENTLY SET UP FOR (its served
+    kind), used as the baseline to detect a governing-case product switch.
+
+    Robust to an empty governing pointer -- tries, in order: the explicit
+    ``product_type_override`` (the verified kind), the product of an existing
+    delivery schedule (what deliveries are actually built as), then the previous
+    governing case's name-derived kind. Deliberately does NOT fall back to the
+    new governing case (that would hide the switch). Returns a ProductTypeKind
+    or None."""
+    from api.models import ProductTypeKind
+    from api.services.catalog import product_type_kind_for_name
+
+    if enrollment is None:
+        return None
+    override = getattr(enrollment, "product_type_override", None)
+    if override is not None:
+        try:
+            return ProductTypeKind(override.type)
+        except ValueError:
+            pass
+    sched = enrollment.delivery_schedules.filter(
+        product_type__isnull=False
+    ).first()
+    if sched is not None and sched.product_type:
+        try:
+            return ProductTypeKind(sched.product_type.type)
+        except ValueError:
+            pass
+    if old_case is not None:
+        return product_type_kind_for_name(old_case.program_name)
+    return None
+
+
 def _handle_program_switch(
     client, previous_governing_id, governing, *, actor=None, actor_label="",
 ):
-    """Objective 2 / task 3.1 -- react to a governing-case Meals<->Boxes switch.
+    """AUTO-RECONCILE a governing-case Meals<->Boxes product switch at import
+    time -- fully automatic.
 
-    When the governing internal-service case switches product KIND (meals<->boxes)
-    to an authorized (approved / not-required) OPEN case, the household's current
-    kitchen + delivery calendar are for the WRONG product. Requeue the whole
-    program: stop all future deliveries, clear the kitchen + delivery cadence so a
-    NEW kitchen assignment is required, move every actionable enrollment to Kitchen
-    Assignment, and record a 'Program Switched' timeline event + primary system
-    note describing the switch.
+    Detection is DATA-DRIVEN so it fires even when the stored governing pointer
+    was never initialised: each governing enrollment's SERVED kind
+    (:func:`_served_product_kind` -- override, then delivery schedule, then the
+    previous governing case) is compared with the NEW governing case's DETECTED
+    kind (name-derived). When they differ the switch is APPLIED automatically:
 
-    Idempotent: gated on ``previous_governing_id`` (the governing pointer BEFORE
-    this reconcile settled it) resolving to a case whose product kind DIFFERS from
-    the new governing case, and the timeline event is create-once on the exact
-    old->new case pair. Once the pointer has advanced to the new case, a re-run
-    compares same-kind cases and no-ops. Returns True when a switch was handled.
-    Best-effort.
+    * the enrollment ``product_type_override`` is pointed at the new kind so the
+      served kind follows the governing case (and a re-import no-ops);
+    * the household is requeued for a NEW kitchen assignment -- future deliveries
+      stopped, kitchen + cadence cleared, moved to Kitchen Assignment
+      (``requeue_enrollment_for_product_switch``); and
+    * a 'Program Switched' timeline event + primary system note are written.
+
+    Only a switch to an authorized, still-OPEN governing case requeues service (a
+    closed / not-yet-approved successor is handled by the close/pull-back rules).
+    Returns True when a switch was applied. Best-effort.
     """
-    if governing is None or not previous_governing_id:
+    if governing is None:
         return False
     # Only a switch to an authorized, still-OPEN case requeues service (a closed
     # or not-yet-approved successor is handled by the close/pull-back rules).
@@ -1767,61 +1895,63 @@ def _handle_program_switch(
     if governing.case_status in _CLOSED_CASE_STATUSES:
         return False
 
-    old_case = next(
-        (
-            c for c in _internal_service_cases(client)
-            if str(c.case_id) == str(previous_governing_id)
-        ),
-        None,
-    )
-    if old_case is None:
-        return False
+    old_case = None
+    if previous_governing_id:
+        old_case = next(
+            (c for c in _internal_service_cases(client)
+             if str(c.case_id) == str(previous_governing_id)),
+            None,
+        )
 
-    from api.services.catalog import product_type_kind_for_name
-
-    old_kind = product_type_kind_for_name(old_case.program_name)
-    new_kind = product_type_kind_for_name(governing.program_name)
-    # Not a resolvable meals<->boxes switch (kind unknown or unchanged).
-    if old_kind is None or new_kind is None or old_kind == new_kind:
-        return False
-
-    from api.models import ProductTypeKind
+    from api.models import ProductType, ProductTypeKind
     from api.services import timeline
-    from api.services.orders import truncate_future_deliveries
+    from api.services.catalog import (
+        detected_product_kind_for_enrollment, product_type_kind_for_name,
+    )
+
+    # The governing case's DETECTED (name-derived) kind -- the new served kind.
+    new_kind = product_type_kind_for_name(
+        getattr(governing, "program_name", "")
+    ) or product_type_kind_for_name(getattr(governing, "service_type", ""))
+    if new_kind is None:
+        return False
+    new_product_type = ProductType.objects.filter(type=new_kind).first()
 
     switched = False
+    old_kind = None
     for enr in _governing_enrollments(client):
-        if EnrollmentStage(enr.stage) not in _PROGRAM_SWITCH_STAGES:
+        # The governing case's DETECTED kind (name-derived, ignores overrides).
+        gov_kind = detected_product_kind_for_enrollment(enr) or new_kind
+        served_kind = _served_product_kind(enr, old_case)
+        # Not a resolvable meals<->boxes switch on this enrollment.
+        if served_kind is None or served_kind == gov_kind:
             continue
-        # 1) Stop the OLD product's future deliveries.
-        try:
-            truncate_future_deliveries(enr)
-        except Exception:  # pragma: no cover - defensive
-            pass
-        # 2) Clear the kitchen + delivery cadence so a NEW kitchen assignment
-        #    (kitchen + cadence + delivery calendar) is required for the new kind.
-        update_fields = []
-        if enr.kitchen_id is not None:
-            enr.kitchen = None
-            update_fields.append("kitchen")
-        if enr.delivery_weekdays:
-            enr.delivery_weekdays = []
-            update_fields.append("delivery_weekdays")
-        if update_fields:
-            enr.save(update_fields=update_fields)
-        # 3) Requeue to Kitchen Assignment (force: SERVICE_ACTIVE has no direct
-        #    edge back to Kitchen Assignment; ON_HOLD does).
-        if EnrollmentStage(enr.stage) != EnrollmentStage.KITCHEN_ASSIGNMENT:
+        old_kind = served_kind
+        # 1) Point the served kind at the governing case's kind so the Programs
+        #    tab + resolvers follow it (and a re-import is idempotent). When no
+        #    ProductType row exists for the new kind, clear the override so the
+        #    served kind falls back to the (governing) derived kind instead.
+        if new_product_type is not None:
+            if enr.product_type_override_id != new_product_type.pk:
+                enr.product_type_override = new_product_type
+                try:
+                    enr.save(update_fields=["product_type_override"])
+                except Exception:  # pragma: no cover - defensive
+                    pass
+        elif enr.product_type_override_id is not None:
+            enr.product_type_override = None
             try:
-                advance_enrollment(
-                    enr, EnrollmentStage.KITCHEN_ASSIGNMENT, actor=actor,
-                    actor_label=actor_label, note=_PROGRAM_SWITCH_NOTE, force=True,
-                )
-            except InvalidTransition:
+                enr.save(update_fields=["product_type_override"])
+            except Exception:  # pragma: no cover - defensive
                 pass
-        switched = True
+        # 2) Stop future deliveries, clear the kitchen + cadence, and requeue to
+        #    Kitchen Assignment (the shared meals<->boxes requeue).
+        if requeue_enrollment_for_product_switch(
+            enr, actor=actor, actor_label=actor_label,
+        ):
+            switched = True
 
-    if not switched:
+    if not switched or old_kind is None:
         return False
 
     old_label = ProductTypeKind(old_kind).label
@@ -2049,8 +2179,12 @@ def _resume_additional_members_manual(client, primary, *, actor=None, actor_labe
             try:
                 mv.pause_locked = False
                 # Re-run the meal rule against the household kitchen: sets status
-                # (Active / Out of Orbit) + kitchen meal result.
-                reconcile_member_kitchen_output(mv, enr.kitchen, save=False)
+                # (Active / Out of Orbit) + kitchen meal result. This IS the
+                # explicit Individual->Household resume, so allow_resume=True lets
+                # the meal rule move these members OFF the manual PAUSED status.
+                reconcile_member_kitchen_output(
+                    mv, enr.kitchen, save=False, allow_resume=True,
+                )
                 mv.save()
             except Exception:  # pragma: no cover - defensive
                 continue
@@ -2110,133 +2244,244 @@ def apply_manual_scope_switch_effects(client, new_scope, *, actor=None, actor_la
     return 0
 
 
+def dismiss_case_mismatch_flags_for_household(
+    enrollment, *, dismissed_by="", reason="",
+):
+    """Dismiss any OPEN :class:`~api.models.CaseMismatchFlag` for this
+    enrollment's household and clear the ``pause_locked`` CS pins on its members.
+
+    Called when an agent RECONCILES the household scope from the Programs tab --
+    that reconciliation IS the Customer Service review the flag was waiting on,
+    so the flag clears from the Case Mismatch tab and the members are un-pinned.
+    Mirrors :class:`CaseMismatchDismissView`. MUST run BEFORE the scope roster
+    effects so an Individual->Household resume can un-pause the (now un-pinned)
+    members. Returns the number of flags dismissed. Best-effort.
+    """
+    from django.db.models import Q
+
+    from api.models import (
+        CaseMismatchFlag, CaseMismatchStatus, MemberDietaryProfile,
+    )
+
+    if enrollment is None:
+        return 0
+    primary = _household_primary(enrollment.client)
+    q = Q(enrollment=enrollment)
+    if primary is not None:
+        q |= Q(client=primary)
+    flags = list(CaseMismatchFlag.objects.filter(q, status=CaseMismatchStatus.OPEN))
+    now = timezone.now()
+    for flag in flags:
+        flag.status = CaseMismatchStatus.DISMISSED
+        flag.dismissed_at = now
+        flag.dismissed_by = dismissed_by or ""
+        flag.dismiss_reason = reason or ""
+        try:
+            flag.save(update_fields=[
+                "status", "dismissed_at", "dismissed_by", "dismiss_reason",
+            ])
+        except Exception:  # pragma: no cover - defensive
+            continue
+        # Clear the CS pins on the flag's household members so agents regain
+        # control (mirrors the manual Case Mismatch dismissal).
+        MemberDietaryProfile.objects.filter(
+            enrollment_id=(flag.enrollment_id or enrollment.pk), pause_locked=True
+        ).update(pause_locked=False)
+    return len(flags)
+
+
+def _ht_value(scope):
+    """Coerce a household-type (CaseHouseholdType enum OR raw string) to its
+    plain string value, or "" when empty. Lets scope logic compare an
+    enrollment ``household_type_override`` (a CharField string) with a derived
+    ``CaseHouseholdType`` uniformly."""
+    return getattr(scope, "value", scope) or ""
+
+
 def _handle_household_scope_switch(
     client, previous_governing_id, governing, *, actor=None, actor_label="",
 ):
-    """Objective 2 / tasks 3.2-3.3 -- react to a governing-case Household<->
-    Individual scope switch.
+    """AUTO-RECONCILE a governing-case Household<->Individual SCOPE switch at
+    import time -- fully automatic, no Customer Service step.
 
-    Compares the household_type of the PREVIOUS governing case (captured before
-    ``_record_governing_case_change`` settled the pointer) with the NEW governing
-    case. When they differ:
+    Detection is DATA-DRIVEN so it fires even when the stored governing pointer
+    was never initialised: the NEW governing case's scope (derived LIVE from its
+    program name) is compared with the household's CURRENTLY-SERVED scope -- the
+    enrollment ``household_type_override`` (the verified scope shown on the
+    Programs tab), falling back to the PREVIOUS governing case's derived scope.
 
-    * **Household -> Individual**: pause + PIN every additional (non-primary)
-      household member (``pause_locked``); they can only be un-paused by a
-      Customer Service dismissal of the flag.
-    * **Individual -> Household**: no auto-pause, but still flagged for CS.
+    When they differ the switch is APPLIED automatically:
 
-    In both directions a :class:`~api.models.CaseMismatchFlag` is opened (for the
-    Care Management -> Case Mismatch tab), plus a primary system note and a
-    'Case Mismatch' timeline event. Idempotent: the flag is de-duped on
-    ``(primary, new_case_id)`` and the timeline event on the old->new case pair,
-    so a re-import never re-fires or re-pins. Returns True when a switch was
-    handled. Best-effort.
+    * the new scope is written onto every governing enrollment's
+      ``household_type_override`` so the Programs tab reflects it immediately;
+    * any lingering OPEN Case Mismatch flag is auto-dismissed (+ CS pins cleared);
+    * roster/delivery effects run (``apply_manual_scope_switch_effects``):
+        - **Household -> Individual**: additional members auto-paused + pinned
+          (the pin clears automatically when scope returns to Household);
+        - **Individual -> Household**: additional members resumed + un-pinned and
+          the delivery calendar rebuilt;
+    * an audit 'Case Scope Reconciled' timeline event + primary system note are
+      written.
+
+    NO CaseMismatchFlag is created -- the fix is automatic. Idempotent: once the
+    override matches the governing scope a re-import no-ops. Returns True when a
+    switch was applied. Best-effort.
     """
-    if governing is None or not previous_governing_id:
-        return False
-
-    old_case = next(
-        (
-            c for c in _internal_service_cases(client)
-            if str(c.case_id) == str(previous_governing_id)
-        ),
-        None,
-    )
-    if old_case is None:
+    if governing is None:
         return False
 
     from api.models import CaseHouseholdType
-
-    old_ht = old_case.household_type or ""
-    new_ht = governing.household_type or ""
-    # Not a resolvable scope switch (unknown or unchanged).
-    if not old_ht or not new_ht or old_ht == new_ht:
-        return False
-
-    from api.models import (
-        CaseMismatchFlag,
-        CaseMismatchStatus,
-        CaseMismatchType,
-    )
-    from api.services import timeline
+    from api.serializers import derive_household_type
 
     primary = _household_primary(client)
     if primary is None:
         return False
+    enrollments = _governing_enrollments(client)
+    if not enrollments:
+        return False
+
+    new_ht = _ht_value(
+        derive_household_type(None, getattr(governing, "program_name", ""))
+    )
+    if not new_ht:
+        return False
+
+    # CURRENTLY-SERVED (previous) scope baseline. Enrollments can carry DIFFERENT
+    # overrides (e.g. a service-active one already on the new scope while a
+    # pending-verification sibling still holds the old), so the baseline must be
+    # an override that actually DIVERGES from the governing scope -- taking the
+    # first override blindly would let a matching sibling mask a divergent one and
+    # skip the fix. Fall back to the previous governing case's derived scope only
+    # when NO enrollment carries an override at all.
+    divergent = next(
+        (
+            e for e in enrollments
+            if e.household_type_override
+            and _ht_value(e.household_type_override) != new_ht
+        ),
+        None,
+    )
+    served = _ht_value(divergent.household_type_override) if divergent else ""
+    # Pre-settle pointer, ONLY when it genuinely names a different case than the
+    # (already-settled) new governing case -- otherwise it's useless as a "prev".
+    old_case = None
+    if previous_governing_id and str(previous_governing_id) != str(governing.case_id):
+        old_case = next(
+            (c for c in _internal_service_cases(client)
+             if str(c.case_id) == str(previous_governing_id)),
+            None,
+        )
+    if (
+        not served
+        and not any(e.household_type_override for e in enrollments)
+        and old_case is not None
+    ):
+        served = _ht_value(derive_household_type(None, old_case.program_name))
+
+    # No baseline to diff -> every enrollment already matches the governing scope
+    # (or a brand-new member simply follows it); nothing to auto-fix. Idempotent
+    # no-op on re-import.
+    if not served or served == new_ht:
+        return False
+
+    # Resolve the previous case for the audit record. Prefer a runner-up
+    # internal-service case whose derived scope matches the SERVED (previous)
+    # scope -- that's the case the household was actually being served under --
+    # else the pre-settle pointer, else any runner-up, else the linked case.
+    if old_case is None or str(old_case.case_id) == str(governing.case_id):
+        scoped = [
+            c for c in _internal_service_cases(client)
+            if str(c.case_id) != str(governing.case_id)
+            and _ht_value(derive_household_type(None, c.program_name)) == served
+        ]
+        others = [
+            c for c in _internal_service_cases(client)
+            if str(c.case_id) != str(governing.case_id)
+        ]
+        pool = scoped or others
+        old_case = max(pool, key=governing_case_key) if pool else None
+    prev_case_id = (
+        str(old_case.case_id) if old_case is not None
+        else (str(enrollments[0].case_id) if enrollments[0].case_id else "")
+    )
+
+    author = actor_label or _actor_name(actor)
+
+    # 1) Persist the new served scope on every governing enrollment so the
+    #    Programs tab reflects the switch immediately.
+    for e in enrollments:
+        if _ht_value(e.household_type_override) != new_ht:
+            e.household_type_override = new_ht
+            try:
+                e.save(update_fields=["household_type_override"])
+            except Exception:  # pragma: no cover - defensive
+                pass
+
+    # 2) Auto-resolve any lingering OPEN Case Mismatch flag + clear CS pins BEFORE
+    #    the roster effects (so an Individual->Household resume can un-pause the
+    #    now-unpinned members). No NEW flag is ever created.
+    for e in enrollments:
+        try:
+            dismiss_case_mismatch_flags_for_household(
+                e, dismissed_by=author,
+                reason="Auto-reconciled by import: governing case scope switch.",
+            )
+        except Exception:  # pragma: no cover - defensive
+            pass
+
+    # 3) Roster + delivery side effects: -> Individual pauses + PINS additional
+    #    members (auto, cleared on return to Household); -> Household resumes +
+    #    un-pins them and rebuilds the calendar.
+    try:
+        apply_manual_scope_switch_effects(
+            client, new_ht, actor=actor, actor_label=actor_label,
+        )
+    except Exception:  # pragma: no cover - never break the reconcile
+        pass
+
+    # 4) Audit: primary system note + 'Case Scope Reconciled' timeline event.
+    #    NO flag.
+    from api.models import CaseMismatchType
+    from api.services import timeline
 
     if (
-        old_ht == CaseHouseholdType.HOUSEHOLD
+        served == CaseHouseholdType.HOUSEHOLD
         and new_ht == CaseHouseholdType.INDIVIDUAL
     ):
         mismatch_type = CaseMismatchType.HOUSEHOLD_TO_INDIVIDUAL
-        _pause_lock_additional_members(
-            client, primary, actor=actor, actor_label=actor_label,
-        )
         detail = (
-            "The governing internal-service case is now an Individual case, but "
-            "this household still has additional members. The additional members "
-            "were paused and pinned; Customer Service must review and dismiss."
+            "governing internal-service case switched to Individual scope; the "
+            "additional household members were automatically paused and pinned"
         )
     else:
         mismatch_type = CaseMismatchType.INDIVIDUAL_TO_HOUSEHOLD
         detail = (
-            "The governing internal-service case is now a Household case, but was "
-            "previously tracked as Individual. Customer Service should review the "
-            "household roster."
+            "governing internal-service case switched to Household scope; the "
+            "additional household members were automatically resumed"
         )
-
-    # Prefer a live enrollment on the governing case for the household context;
-    # else any governing enrollment; else None (flag still groups by client).
-    flag_enrollment = (
-        governing.enrollments.exclude(
-            stage__in=(EnrollmentStage.DISREGARDED, EnrollmentStage.CANCELLED)
-        ).first()
-    )
-    if flag_enrollment is None:
-        gov_enrs = _governing_enrollments(client)
-        flag_enrollment = gov_enrs[0] if gov_enrs else None
-
-    # De-dupe on (primary, new_case_id): a re-import returns the existing flag
-    # (open OR dismissed) and never re-creates / re-pins.
-    _flag, created = CaseMismatchFlag.objects.get_or_create(
-        client=primary,
-        new_case_id=str(governing.case_id),
-        defaults={
-            "enrollment": flag_enrollment,
-            "mismatch_type": mismatch_type,
-            "previous_case_id": str(old_case.case_id),
-            "previous_household_type": old_ht,
-            "new_household_type": new_ht,
-            "detail": detail,
-            "status": CaseMismatchStatus.OPEN,
-            "context": {"program": governing.program_name or ""},
-        },
-    )
-    if not created:
-        return False
-
-    author = actor_label or _actor_name(actor)
     reason = (
         f"governing case scope changed from "
-        f"{CaseHouseholdType(old_ht).label} to {CaseHouseholdType(new_ht).label}"
+        f"{CaseHouseholdType(served).label} to {CaseHouseholdType(new_ht).label}"
     )
     _write_primary_system_note(
         client,
         (
-            f"Case mismatch flagged on {timezone.localdate().isoformat()}: "
-            f"{detail} ({old_case.case_id} \u2192 {governing.case_id})."
+            f"Household scope auto-reconciled on "
+            f"{timezone.localdate().isoformat()}: {detail} "
+            f"({prev_case_id or '\u2014'} \u2192 {governing.case_id})."
         ),
         author_name=author,
     )
     timeline.event_for_member_case_mismatch(
         client,
         mismatch_type=mismatch_type,
-        previous_case_id=old_case.case_id,
+        previous_case_id=prev_case_id,
         new_case_id=governing.case_id,
-        previous_household_type=old_ht,
+        previous_household_type=served,
         new_household_type=new_ht,
         reason=reason,
         actor=author,
+        auto_resolved=True,
     )
     return True
 
@@ -2310,7 +2555,7 @@ def reconcile_delivery_state(enrollment, *, actor=None):
         return
 
     gov = governing_internal_case(enrollment)
-    end = getattr(gov, "service_authorization_approval_ends_at", None) if gov else None
+    _, end = gov.effective_authorization_window() if gov else (None, None)
     gov_end = end.date() if end else None
     favorable = gov is not None and gov.service_authorization_status in (
         ServiceAuthorizationStatus.APPROVED,
@@ -2508,10 +2753,12 @@ def reconcile_internal_service_authorization(client, *, actor=None, actor_label=
     _record_governing_case_change(
         client, governing, actor=actor, actor_label=actor_label,
     )
-    # Household<->Individual scope switch (Objective 2 / tasks 3.2-3.3) is
-    # orthogonal to the authorization outcome, so detect it here -- before the
-    # auth branch -- off the SAME pre-settle pointer. It pauses + pins additional
-    # members (Household->Individual) and always opens a Case Mismatch flag for CS.
+    # Household<->Individual scope switch is orthogonal to the authorization
+    # outcome, so detect it here -- before the auth branch -- off the SAME
+    # pre-settle pointer. It AUTO-APPLIES the new scope: pauses + pins additional
+    # members (Household->Individual) or resumes + un-pins them
+    # (Individual->Household), writing an audit timeline event. NO Case Mismatch
+    # flag is opened -- the fix is fully automatic.
     if _handle_household_scope_switch(
         client, previous_governing_id, governing,
         actor=actor, actor_label=actor_label,

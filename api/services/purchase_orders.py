@@ -31,6 +31,7 @@ from api.models import (
     Case,
     CaseStatus,
     CaseType,
+    ClientStage,
     DeliveryOrder,
     DeliveryOrderStatus,
     DietaryRestriction,
@@ -403,15 +404,31 @@ def authorized_internal_service_case_exists(applicant_field="enrollment__client_
     )
 
 
+def _exclude_ineligible_members(qs):
+    """Drop schedules whose OWN member is on the hard INELIGIBLE eligibility
+    off-ramp (out-of-range address, wrong Medicaid type, or expired/missing
+    medical insurance -- see api.services.eligibility).
+
+    The authoritative PO guardrail for ineligibility: keyed on the individual
+    member's client (NOT the household case-holder), so an ineligible person is
+    dropped from every Purchase Order while their still-eligible household
+    members stay selectable. Belt-and-suspenders alongside
+    ``reconcile_client_eligibility``'s truncate + On Hold: if that hold could not
+    apply (or the calendar was later rebuilt while the member is still
+    INELIGIBLE), this query-level gate still keeps them off the PO.
+    """
+    return qs.exclude(member__client__lifecycle_stage=ClientStage.INELIGIBLE)
+
+
 def _due_schedules(kind, delivery_date):
     """SCHEDULED OrderSchedule rows for the given kind that land on the date.
 
     Schedules whose enrollment is On Hold or in a terminal stage
     (Service Complete / Closed / Cancelled) are excluded, as are Out of Orbit /
-    Paused / Inactive members, AND any member with no OPEN internal-service case
-    (their meal/box case has closed): none may appear in any new Purchase Order.
-    Also de-duped per client so a duplicate-enrollment anomaly never doubles a
-    line.
+    Paused / Inactive members, members on the INELIGIBLE off-ramp, AND any member
+    with no OPEN internal-service case (their meal/box case has closed): none may
+    appear in any new Purchase Order. Also de-duped per client so a
+    duplicate-enrollment anomaly never doubles a line.
     """
     qs = (
         OrderSchedule.objects.filter(
@@ -420,7 +437,10 @@ def _due_schedules(kind, delivery_date):
         )
         .exclude(enrollment__stage__in=SERVICE_EXCLUDED_ENROLLMENT_STAGES)
         .exclude(member__status__in=SERVICE_EXCLUDED_MEMBER_STATUSES)
-        .annotate(_has_open_isc=open_internal_service_case_exists())
+    )
+    qs = _exclude_ineligible_members(qs)
+    qs = (
+        qs.annotate(_has_open_isc=open_internal_service_case_exists())
         .filter(_has_open_isc=True)
         .annotate(_has_auth_isc=authorized_internal_service_case_exists())
         .filter(_has_auth_isc=True)
@@ -671,11 +691,13 @@ def generate_purchase_order(kind, delivery_date, kitchen, schedule_ids, split_se
     kitchen differs from ``kitchen`` are flagged ``rerouted``. Skips schedules
     already batched for that date (idempotent on re-submit)."""
     schedules = list(
-        OrderSchedule.objects.filter(
-            order_id__in=schedule_ids, status=ScheduleStatus.SCHEDULED
+        _exclude_ineligible_members(
+            OrderSchedule.objects.filter(
+                order_id__in=schedule_ids, status=ScheduleStatus.SCHEDULED
+            )
+            .exclude(enrollment__stage__in=SERVICE_EXCLUDED_ENROLLMENT_STAGES)
+            .exclude(member__status__in=SERVICE_EXCLUDED_MEMBER_STATUSES)
         )
-        .exclude(enrollment__stage__in=SERVICE_EXCLUDED_ENROLLMENT_STAGES)
-        .exclude(member__status__in=SERVICE_EXCLUDED_MEMBER_STATUSES)
         .annotate(_has_open_isc=open_internal_service_case_exists())
         .filter(_has_open_isc=True)
         .annotate(_has_auth_isc=authorized_internal_service_case_exists())

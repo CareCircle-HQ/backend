@@ -58,8 +58,7 @@ def _delivery_window(enrollment):
     case = enrollment.case
     if case is None:
         return None, None
-    start = case.service_authorization_approval_starts_at
-    end = case.service_authorization_approval_ends_at
+    start, end = case.effective_authorization_window()
     if not start or not end:
         return None, None
     return start.date(), end.date()
@@ -652,7 +651,7 @@ def heal_delivery_window(enrollment, from_date=None):
     if plan is None:
         return None
     gov = governing_internal_case(enrollment)
-    end = getattr(gov, "service_authorization_approval_ends_at", None) if gov else None
+    _, end = gov.effective_authorization_window() if gov else (None, None)
     gov_end = end.date() if end else None
     if gov_end is None:
         return None

@@ -20,6 +20,7 @@ Verification / authorization stage changes are emitted by
 on every guarded stage transition.
 """
 
+import hashlib
 import logging
 
 from django.contrib.contenttypes.models import ContentType
@@ -37,6 +38,28 @@ from api.models import (
 )
 
 logger = logging.getLogger(__name__)
+
+# The ``TimelineEvent.dedupe_key`` column is ``varchar(128)``. Some keys are
+# built from several UUIDs (e.g. the governing-case-changed key concatenates the
+# client id + previous + new case ids -> 133 chars), which would overflow the
+# column and raise ``DataError`` on INSERT -- aborting whatever reconcile emitted
+# the event. Clamp any over-long key to a stable, collision-resistant form so the
+# create-once dedupe still holds and no caller can ever be broken by a long key.
+_DEDUPE_KEY_MAX = 128
+
+
+def _clamp_dedupe_key(dedupe_key):
+    """Return ``dedupe_key`` unchanged when it fits the column, else a
+    deterministic <=128-char form: a readable prefix + a SHA-1 of the full key.
+
+    Deterministic (same input -> same output) so the unique/create-once semantics
+    are preserved for a given logical key."""
+    if len(dedupe_key) <= _DEDUPE_KEY_MAX:
+        return dedupe_key
+    digest = hashlib.sha1(dedupe_key.encode("utf-8")).hexdigest()  # 40 chars
+    # prefix + ":" + digest == _DEDUPE_KEY_MAX exactly.
+    prefix = dedupe_key[: _DEDUPE_KEY_MAX - len(digest) - 1]
+    return f"{prefix}:{digest}"
 
 
 def emit_timeline_event(
@@ -98,6 +121,7 @@ def emit_timeline_event(
     }
 
     if dedupe_key:
+        dedupe_key = _clamp_dedupe_key(dedupe_key)
         existing = TimelineEvent.objects.filter(dedupe_key=dedupe_key).first()
         if existing is not None:
             return existing  # create-once: leave the original event untouched
@@ -1111,12 +1135,16 @@ def event_for_member_program_switched(
 def event_for_member_case_mismatch(
     client, *, mismatch_type="", previous_case_id="", new_case_id="",
     previous_household_type="", new_household_type="", reason="",
-    source=ChangeSource.IMPORT, actor="",
+    source=ChangeSource.IMPORT, actor="", auto_resolved=False,
 ):
-    """Emit a 'Case Mismatch' event when the household's GOVERNING internal-
-    service case switches household SCOPE (household<->individual). This needs
-    Customer Service review (a CaseMismatchFlag is opened alongside). De-duped on
-    the exact ``previous -> new`` case pair so a re-import never duplicates it."""
+    """Emit a household SCOPE-switch (household<->individual) event on the
+    GOVERNING internal-service case.
+
+    When ``auto_resolved`` is True (the import-driven auto-reconcile) the switch
+    was APPLIED automatically -- no Customer Service action is required -- so it
+    renders as an informational 'Case Scope Reconciled' audit row. Otherwise it
+    is the legacy 'Case Mismatch' that needs CS review. De-duped on the exact
+    ``previous -> new`` case pair so a re-import never duplicates it."""
     if client is None or not new_case_id or not previous_case_id:
         return None
     prev = (previous_household_type or "").strip() or "\u2014"
@@ -1128,10 +1156,12 @@ def event_for_member_case_mismatch(
         client=client,
         event_type=TimelineEventType.MEMBER_CASE_MISMATCH,
         occurred_at=timezone.now(),
-        title="Case Mismatch",
+        title="Case Scope Reconciled" if auto_resolved else "Case Mismatch",
         subtitle=subtitle,
-        badge_text="Needs CS Review",
-        badge_tone=TimelineBadgeTone.WARNING,
+        badge_text="Auto-Reconciled" if auto_resolved else "Needs CS Review",
+        badge_tone=(
+            TimelineBadgeTone.INFO if auto_resolved else TimelineBadgeTone.WARNING
+        ),
         source=source,
         actor=actor,
         entity=client,
@@ -1142,6 +1172,7 @@ def event_for_member_case_mismatch(
             "previous_household_type": previous_household_type or "",
             "new_household_type": new_household_type or "",
             "reason": reason or "",
+            "auto_resolved": bool(auto_resolved),
         },
         dedupe_key=(
             f"case_mismatch:{client.pk}:{previous_case_id}:{new_case_id}"

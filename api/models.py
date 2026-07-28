@@ -115,6 +115,11 @@ class ProgramStatus(models.TextChoices):
     KITCHEN_ASSIGNMENT = "kitchen_assignment", "Kitchen Assignment"
     ACTIVE = "active", "Active"
     ON_HOLD = "on_hold", "On Hold"
+    # A delivery-coverage hold: the household's delivery/primary ZIP is outside
+    # the service area, so every member is Out of Range and the program is held.
+    # Distinct from a generic On Hold so the program stage matches the members'
+    # Out of Range labels (the main lifecycle stage separately reads Ineligible).
+    OUT_OF_RANGE = "out_of_range", "Out of Range"
     # Final: the approval window's end date passed. A re-authorization arrives on
     # a NEW case (a new program row), never on this expired one.
     AUTHORIZATION_EXPIRED = "authorization_expired", "Authorization Expired"
@@ -1414,6 +1419,27 @@ class Case(models.Model):
     def __str__(self):
         return f"Case {self.case_id} ({self.get_case_status_display()})"
 
+    def effective_authorization_window(self):
+        """``(start, end)`` datetimes of the case's authorization window.
+
+        Prefers the APPROVAL window (``service_authorization_approval_starts_at`` /
+        ``_ends_at``). When the case is APPROVED (or NOT_REQUIRED) but the approval
+        window was not exported -- some Unite Us exports carry only the REQUEST
+        window on an already-approved authorization -- fall back to the request
+        window so an approved case still yields a usable service window instead of
+        stranding the household out of service. Each endpoint falls back
+        independently. Returns ``(None, None)`` when neither is set.
+        """
+        start = self.service_authorization_approval_starts_at
+        end = self.service_authorization_approval_ends_at
+        if (start is None or end is None) and self.service_authorization_status in (
+            ServiceAuthorizationStatus.APPROVED,
+            ServiceAuthorizationStatus.NOT_REQUIRED,
+        ):
+            start = start or self.service_authorization_request_starts_at
+            end = end or self.service_authorization_request_ends_at
+        return start, end
+
 
 class ContractedService(models.Model):
     """A contracted service (Unite Us ``provided_service``) on a case.
@@ -1778,12 +1804,23 @@ SERVICE_EXCLUDED_MEMBER_STATUSES = (
 
 # Enrollment stages that exclude a whole household from Purchase Order / delivery
 # generation: ON_HOLD (a problem was detected and the case is under review, and
-# may be heading to closure -- distinct from a benign, temporary MemberStatus.PAUSED)
-# plus the terminal stages
+# may be heading to closure -- distinct from a benign, temporary MemberStatus.PAUSED),
+# KITCHEN_ASSIGNMENT (awaiting a manual kitchen + cadence assignment -- with no
+# kitchen the household is not deliverable, so it must never feed a PO; e.g. a
+# meals<->boxes product switch requeues the household here and its OLD calendar
+# must not keep shipping until a NEW kitchen/cadence is assigned, which advances
+# it to SERVICE_ACTIVE and rebuilds the calendar), plus the terminal stages
 # SERVICE_COMPLETE / CLOSED / CANCELLED (service has ended -- e.g. a cancelled /
 # off-boarded household must never appear on a new PO or delivery).
+#
+# NOTE: excluding KITCHEN_ASSIGNMENT is a no-op for a normally-onboarding
+# household (it holds no delivery calendar until a kitchen is assigned, and the
+# assignment flow builds the calendar THEN advances to SERVICE_ACTIVE in one
+# request -- MemberAssignKitchenView). It only closes the leak where a stale /
+# requeued household still carries occurrences at this stage.
 SERVICE_EXCLUDED_ENROLLMENT_STAGES = (
     EnrollmentStage.ON_HOLD,
+    EnrollmentStage.KITCHEN_ASSIGNMENT,
     EnrollmentStage.SERVICE_COMPLETE,
     EnrollmentStage.CLOSED,
     EnrollmentStage.CANCELLED,

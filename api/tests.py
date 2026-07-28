@@ -245,6 +245,74 @@ class InsuranceReconcileTest(TestCase):
         )
 
 
+class ExtSaveEligibilityReconcileTest(TestCase):
+    """The extension client upsert (ClientViewSet) must run the SAME eligibility
+    gates as the CSV import: an ext save that persists bad insurance data SETS
+    the INELIGIBLE off-ramp, and a later ext save that fixes it (a never-expiring
+    9999 plan) RECOVERS the client. This is the ext half of the recovery-on-fix
+    path (perform_create / perform_update / bulk post_upsert)."""
+
+    def setUp(self):
+        self.agent = Agent.objects.create(
+            name="Ext Agent", agent_code="920", group="CS"
+        )
+        access = AccessToken()
+        access["agent_id"] = str(self.agent.id)
+        access["agent_code"] = self.agent.agent_code
+        access["agent_name"] = self.agent.name
+        access["agent_group"] = self.agent.group
+        self.api = APIClient()
+        self.api.credentials(HTTP_AUTHORIZATION=f"Bearer {access}")
+
+    def _client_with_expired(self):
+        from datetime import datetime, timezone as dtz
+
+        cid = str(uuid.uuid4())
+        client = Client.objects.create(
+            client_id=cid, first_name="Ext", last_name="Save",
+        )
+        Insurance.objects.create(
+            client=client, plan_name="Healthfirst PHSP (NY)",
+            external_member_id="1",
+            expired_at=datetime(1999, 12, 31, tzinfo=dtz.utc),
+        )
+        return client, cid
+
+    def test_ext_update_sets_ineligible(self):
+        from .models import ClientStage
+
+        client, cid = self._client_with_expired()
+        resp = self.api.patch(
+            f"/api/clients/{cid}/", {"first_name": "Ext2"}, format="json",
+        )
+        self.assertIn(resp.status_code, (200, 202), resp.content)
+        client.refresh_from_db()
+        self.assertEqual(client.lifecycle_stage, ClientStage.INELIGIBLE)
+
+    def test_ext_update_recovers_when_fixed(self):
+        from .models import ClientStage
+
+        client, cid = self._client_with_expired()
+        self.api.patch(f"/api/clients/{cid}/", {"first_name": "Ext2"}, format="json")
+        client.refresh_from_db()
+        self.assertEqual(client.lifecycle_stage, ClientStage.INELIGIBLE)
+        # A second ext save adds a never-expiring (9999) plan -> recover.
+        resp = self.api.patch(
+            f"/api/clients/{cid}/",
+            {
+                "insurances": [{
+                    "plan_name": "Healthfirst PHSP (NY)", "external_member_id": "1",
+                    "expired_at": "9999-12-31T00:00:00Z",
+                }],
+                "reconcile_insurances": True,
+            },
+            format="json",
+        )
+        self.assertIn(resp.status_code, (200, 202), resp.content)
+        client.refresh_from_db()
+        self.assertNotEqual(client.lifecycle_stage, ClientStage.INELIGIBLE)
+
+
 class InsuranceExpiringFlagTest(TestCase):
     """`is_insurance_expiring` flags only an ACTIVE plan whose end date is in the
     near future -- never a null end date, and never a stale PAST date (which is
@@ -445,7 +513,13 @@ class ExtensionTimelineTest(TestCase):
         body = resp.json()
         self.assertEqual(body["client_id"], self.cid)
         types = {e["event_type"] for e in body["results"]}
-        self.assertSetEqual(types, {"consent_granted", "case_opened"})
+        # The ext client-save now runs the eligibility gate (parity with the CSV
+        # import): this client has no medical insurance on file, so it is marked
+        # Ineligible and a member_ineligible event is emitted alongside the
+        # consent + case events.
+        self.assertSetEqual(
+            types, {"consent_granted", "case_opened", "member_ineligible"}
+        )
         occurred = [e["occurred_at"] for e in body["results"]]
         self.assertEqual(occurred, sorted(occurred, reverse=True))
 
@@ -1254,14 +1328,303 @@ class ProgramSwitchRequeueTest(TestCase):
             1,
         )
 
+    def test_import_switch_auto_sets_product_override_to_governing_kind(self):
+        # A household VERIFIED as MEALS (explicit product_type_override) whose
+        # governing case switches to BOXES: the import auto-points the override at
+        # BOXES (so the served kind follows the governing case) and requeues for a
+        # new kitchen assignment -- no manual Programs-tab step.
+        from datetime import timedelta
+
+        from .models import (
+            EnrollmentStage, Kitchen, ProductType, ProductTypeKind,
+        )
+
+        meals_pt = ProductType.objects.create(type=ProductTypeKind.MEALS)
+        boxes_pt = ProductType.objects.create(type=ProductTypeKind.BOXES)
+        client = self._client()
+        kitchen = Kitchen.objects.create(name="Meals Kitchen")
+        enr = self._enrollment(
+            client, EnrollmentStage.SERVICE_ACTIVE,
+            kitchen=kitchen, weekdays=["mon", "thu"],
+        )
+        enr.product_type_override = meals_pt
+        enr.save(update_fields=["product_type_override"])
+        now = timezone.now()
+        # Meals governs first -> matches the override, so NO switch.
+        self._save_case(
+            client, str(uuid.uuid4()), "Medically Tailored Meals",
+            now - timedelta(days=2),
+        )
+        enr.refresh_from_db()
+        self.assertEqual(enr.product_type_override_id, meals_pt.pk)
+        # A newer BOXES governing case -> auto-switch: override -> boxes, requeued.
+        self._save_case(client, str(uuid.uuid4()), "Food Box", now)
+        enr.refresh_from_db()
+        self.assertEqual(enr.product_type_override_id, boxes_pt.pk)
+        self.assertEqual(enr.stage, EnrollmentStage.KITCHEN_ASSIGNMENT)
+        self.assertIsNone(enr.kitchen_id)
+        self.assertEqual(enr.delivery_weekdays, [])
+
+
+class ProductTypeSwitchEndpointTest(TestCase):
+    """MemberProductTypeView: a manual meals<->boxes reconcile on the Programs
+    tab (only offered on a case mismatch) must requeue the household exactly
+    like the governing-case-driven switch -- stop future deliveries, clear the
+    kitchen + cadence, move to Kitchen Assignment -- and leave a client note.
+    Reconcilable ONLY when the verified kind diverges from the governing case."""
+
+    def _auth(self):
+        from rest_framework.test import APIClient
+        from rest_framework_simplejwt.tokens import AccessToken
+
+        agent = Agent.objects.create(
+            name="Prod Agent", agent_code="950", group="CS",
+        )
+        access = AccessToken()
+        access["agent_id"] = str(agent.id)
+        access["agent_code"] = agent.agent_code
+        access["agent_name"] = agent.name
+        access["agent_group"] = agent.group
+        api = APIClient()
+        api.credentials(HTTP_AUTHORIZATION=f"Bearer {access}")
+        return api
+
+    def _save_case(self, client, program_name):
+        from .serializers import CaseSerializer
+        from .services.lifecycle import deferred_internal_service_reconcile
+
+        ser = CaseSerializer(data={
+            "case_id": str(uuid.uuid4()),
+            "client_id": str(client.client_id),
+            "case_type": "internal_service",
+            "program_name": program_name,
+            "service_authorization_status": "approved",
+            "case_status": "open",
+            "date_opened": timezone.now().isoformat(),
+            "case_created_at": timezone.now().isoformat(),
+        })
+        ser.is_valid(raise_exception=True)
+        # Defer the per-save reconcile so the import-driven auto-fix does NOT
+        # pre-empt the manual endpoint under test: this leaves the verified-kind
+        # vs governing-case MISMATCH standing for the endpoint to reconcile.
+        with deferred_internal_service_reconcile():
+            return ser.save()
+
+    def _enrollment(self, client, *, override, kitchen=None, weekdays=None):
+        from .models import EnrollmentStage, EnrollmentVerification, Household, HouseholdMember
+
+        hh = Household.objects.create(name="HH")
+        HouseholdMember.objects.create(household=hh, client=client, is_primary=True)
+        return EnrollmentVerification.objects.create(
+            client=client, household=hh, stage=EnrollmentStage.SERVICE_ACTIVE,
+            verified_at=timezone.now(), kitchen=kitchen,
+            delivery_weekdays=weekdays or [], product_type_override=override,
+        )
+
+    def test_boxes_to_meals_switch_requeues_and_notes(self):
+        from .models import (
+            Client, EnrollmentStage, Kitchen, Note, NoteSource, ProductType,
+            ProductTypeKind,
+        )
+
+        meals_pt = ProductType.objects.create(type=ProductTypeKind.MEALS)
+        boxes_pt = ProductType.objects.create(type=ProductTypeKind.BOXES)
+        client = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Switch", last_name="Me",
+        )
+        kitchen = Kitchen.objects.create(name="Meals Kitchen")
+        # VERIFIED as boxes, but the governing case is a MEALS case -> mismatch.
+        enr = self._enrollment(
+            client, override=boxes_pt, kitchen=kitchen, weekdays=["mon", "thu"],
+        )
+        self._save_case(client, "Medically Tailored Meals")
+
+        resp = self._auth().post(
+            f"/api/portal/members/{client.client_id}/product-type/",
+            {"product_type": "meals"}, format="json",
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        self.assertTrue(resp.json()["requeued"])
+
+        enr.refresh_from_db()
+        # Reconciled kind stored on the ENROLLMENT (governing case untouched).
+        self.assertEqual(enr.product_type_override_id, meals_pt.pk)
+        # Requeued: kitchen + cadence cleared, stage back to Kitchen Assignment.
+        self.assertEqual(enr.stage, EnrollmentStage.KITCHEN_ASSIGNMENT)
+        self.assertIsNone(enr.kitchen_id)
+        self.assertEqual(enr.delivery_weekdays, [])
+        self.assertTrue(
+            Note.objects.filter(
+                client=client, source=NoteSource.SYSTEM,
+                body__icontains="Product type corrected from Boxes to Meals",
+            ).exists()
+        )
+
+    def test_no_switch_when_kind_matches_governing_case(self):
+        from .models import Client, EnrollmentStage, ProductType, ProductTypeKind
+
+        ProductType.objects.create(type=ProductTypeKind.MEALS)
+        boxes_pt = ProductType.objects.create(type=ProductTypeKind.BOXES)
+        client = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="No", last_name="Switch",
+        )
+        enr = self._enrollment(client, override=boxes_pt, weekdays=["wed"])
+        # Governing case is ALSO boxes -> verified matches governing, no mismatch.
+        self._save_case(client, "Food Box")
+
+        resp = self._auth().post(
+            f"/api/portal/members/{client.client_id}/product-type/",
+            {"product_type": "meals"}, format="json",
+        )
+        self.assertEqual(resp.status_code, 400, resp.content)
+        enr.refresh_from_db()
+        # Untouched: still boxes, still Service Active.
+        self.assertEqual(enr.product_type_override_id, boxes_pt.pk)
+        self.assertEqual(enr.stage, EnrollmentStage.SERVICE_ACTIVE)
+
+
+class EffectiveAuthorizationWindowTest(TestCase):
+    """Regression: an APPROVED governing case whose export carried only the
+    REQUEST window (approval window blank) must still yield a usable service
+    window, so a scope/governing switch to such a case doesn't wipe the delivery
+    calendar and strand the household out of service. ``Case.effective_
+    authorization_window()`` prefers the approval window and falls back to the
+    request window (per-endpoint) only for approved / not-required cases."""
+
+    def _case(self, **kw):
+        from .models import Case, CaseStatus, CaseType, ServiceAuthorizationStatus
+
+        client = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Win", last_name="Dow"
+        )
+        defaults = dict(
+            case_id=str(uuid.uuid4()), client=client,
+            case_type=CaseType.INTERNAL_SERVICE, case_status=CaseStatus.OPEN,
+            service_authorization_status=ServiceAuthorizationStatus.APPROVED,
+        )
+        defaults.update(kw)
+        return Case.objects.create(**defaults)
+
+    def test_prefers_approval_window(self):
+        now = timezone.now()
+        case = self._case(
+            service_authorization_approval_starts_at=now,
+            service_authorization_approval_ends_at=now + timedelta(days=60),
+            service_authorization_request_starts_at=now - timedelta(days=5),
+            service_authorization_request_ends_at=now + timedelta(days=5),
+        )
+        start, end = case.effective_authorization_window()
+        self.assertEqual(start, case.service_authorization_approval_starts_at)
+        self.assertEqual(end, case.service_authorization_approval_ends_at)
+
+    def test_approved_falls_back_to_request_window(self):
+        now = timezone.now()
+        case = self._case(
+            service_authorization_approval_starts_at=None,
+            service_authorization_approval_ends_at=None,
+            service_authorization_request_starts_at=now,
+            service_authorization_request_ends_at=now + timedelta(days=90),
+        )
+        start, end = case.effective_authorization_window()
+        self.assertEqual(start, case.service_authorization_request_starts_at)
+        self.assertEqual(end, case.service_authorization_request_ends_at)
+
+    def test_pending_case_does_not_fall_back(self):
+        from .models import ServiceAuthorizationStatus
+
+        now = timezone.now()
+        case = self._case(
+            service_authorization_status=ServiceAuthorizationStatus.PENDING,
+            service_authorization_approval_starts_at=None,
+            service_authorization_approval_ends_at=None,
+            service_authorization_request_starts_at=now,
+            service_authorization_request_ends_at=now + timedelta(days=90),
+        )
+        # A pending case is not served -> no fallback, so the delivery pipeline
+        # (gated on approved/not-required) still sees no window.
+        self.assertEqual(case.effective_authorization_window(), (None, None))
+
+
+class TimelineDedupeKeyClampTest(TestCase):
+    """Regression: the ``TimelineEvent.dedupe_key`` column is varchar(128). The
+    governing-case-changed key concatenates the client id + previous + new case
+    ids (three UUIDs + prefix -> 133 chars), which overflowed the column and
+    raised ``DataError`` on Postgres -- aborting ``_record_governing_case_change``
+    (and therefore the whole import reconcile) BEFORE the household scope switch /
+    member pause ran, so only the governing pointer moved. (The test DB is SQLite,
+    which does NOT enforce varchar length, so the crash never surfaced in tests.)
+    ``emit_timeline_event`` now clamps any over-long key to a stable <=128 form."""
+
+    def test_clamp_leaves_short_key_unchanged(self):
+        from .services.timeline import _clamp_dedupe_key
+
+        key = "governing_case_changed:short"
+        self.assertEqual(_clamp_dedupe_key(key), key)
+
+    def test_clamp_shortens_overlong_key_deterministically(self):
+        from .services.timeline import _clamp_dedupe_key
+
+        # The exact shape that overflowed: prefix + 3 UUIDs == 133 chars.
+        key = "governing_case_changed:{}:{}:{}".format(
+            uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+        )
+        self.assertGreater(len(key), 128)
+        clamped = _clamp_dedupe_key(key)
+        self.assertLessEqual(len(clamped), 128)
+        # Deterministic + keeps a readable prefix so it stays diagnosable.
+        self.assertEqual(clamped, _clamp_dedupe_key(key))
+        self.assertTrue(clamped.startswith("governing_case_changed:"))
+
+    def test_emit_stores_clamped_key_and_dedupes(self):
+        from .models import TimelineEventType
+        from .services.timeline import (
+            _clamp_dedupe_key, emit_timeline_event,
+        )
+
+        client = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Long", last_name="Key"
+        )
+        key = "governing_case_changed:{}:{}:{}".format(
+            client.pk, uuid.uuid4(), uuid.uuid4()
+        )
+        self.assertGreater(len(key), 128)
+        ev1 = emit_timeline_event(
+            client=client,
+            event_type=TimelineEventType.MEMBER_GOVERNING_CASE_CHANGED,
+            occurred_at=timezone.now(), title="Governing Case Changed",
+            dedupe_key=key,
+        )
+        self.assertIsNotNone(ev1)
+        self.assertLessEqual(len(ev1.dedupe_key), 128)
+        self.assertEqual(ev1.dedupe_key, _clamp_dedupe_key(key))
+        # Re-emitting the same logical key is create-once (no duplicate).
+        ev2 = emit_timeline_event(
+            client=client,
+            event_type=TimelineEventType.MEMBER_GOVERNING_CASE_CHANGED,
+            occurred_at=timezone.now(), title="Governing Case Changed",
+            dedupe_key=key,
+        )
+        self.assertEqual(ev1.pk, ev2.pk)
+        self.assertEqual(
+            TimelineEvent.objects.filter(dedupe_key=ev1.dedupe_key).count(), 1
+        )
+
 
 class HouseholdScopeSwitchTest(TestCase):
-    """Tasks 3.2-3.4: when the GOVERNING internal-service case switches household
-    SCOPE (Household -> Individual), the additional (non-primary) members are
-    paused + PINNED (``pause_locked``) and a ``CaseMismatchFlag`` is opened for
-    Customer Service, alongside a 'Case Mismatch' timeline event + primary note.
-    A CS dismissal clears the pins (leaving the members Paused); non-CS cannot
-    dismiss. Idempotent on re-save."""
+    """When the GOVERNING internal-service case switches household SCOPE the
+    import AUTO-RECONCILES it (no Customer Service step):
+
+    * **Household -> Individual**: the additional (non-primary) members are
+      auto-paused + PINNED (``pause_locked``), the enrollment scope override is
+      set to Individual, and an audit 'Case Scope Reconciled' timeline event +
+      primary note are written.
+    * **Individual -> Household**: the additional members are auto-resumed +
+      un-pinned and the scope override follows to Household.
+
+    NO ``CaseMismatchFlag`` is opened -- the fix is automatic. Detection is
+    data-driven so it fires even when the stored governing pointer was never
+    initialised. Idempotent on re-save. (The legacy Case Mismatch dismiss
+    endpoint is still exercised below against a manually-created flag.)"""
 
     def _setup(self):
         from .models import (
@@ -1341,9 +1704,27 @@ class HouseholdScopeSwitchTest(TestCase):
         self._save_case(primary, case_b, "Medically Tailored Meals", now)
         return primary, member2, mp_primary, mp_member2, case_a, case_b
 
-    def test_household_to_individual_pauses_pins_and_flags(self):
+    def _manual_flag(self, primary, enr):
+        """Create an OPEN Case Mismatch flag + a paused/pinned member by hand,
+        to exercise the legacy Case Mismatch dismiss endpoint (the reconcile no
+        longer opens flags -- it auto-fixes instead)."""
         from .models import (
-            CaseMismatchStatus, CaseMismatchFlag, CaseMismatchType, MemberStatus,
+            CaseMismatchFlag, CaseMismatchStatus, CaseMismatchType, MemberStatus,
+            MemberDietaryProfile,
+        )
+
+        MemberDietaryProfile.objects.filter(enrollment=enr).exclude(
+            client=primary
+        ).update(status=MemberStatus.PAUSED, pause_locked=True)
+        return CaseMismatchFlag.objects.create(
+            client=primary, enrollment=enr,
+            mismatch_type=CaseMismatchType.HOUSEHOLD_TO_INDIVIDUAL,
+            new_case_id=str(uuid.uuid4()), status=CaseMismatchStatus.OPEN,
+        )
+
+    def test_household_to_individual_auto_pauses_pins_no_flag(self):
+        from .models import (
+            CaseHouseholdType, CaseMismatchFlag, MemberStatus,
             TimelineEvent, TimelineEventType,
         )
 
@@ -1353,44 +1734,49 @@ class HouseholdScopeSwitchTest(TestCase):
         mp_primary.refresh_from_db()
         mp_member2.refresh_from_db()
 
-        # Additional member paused + pinned; primary untouched.
+        # Additional member auto-paused + pinned; primary untouched.
         self.assertEqual(mp_member2.status, MemberStatus.PAUSED)
         self.assertTrue(mp_member2.pause_locked)
         self.assertEqual(mp_primary.status, MemberStatus.ACTIVE)
         self.assertFalse(mp_primary.pause_locked)
 
-        # Flag opened for CS, keyed to the new governing case.
-        flags = CaseMismatchFlag.objects.filter(
-            client=primary, status=CaseMismatchStatus.OPEN
-        )
-        self.assertEqual(flags.count(), 1)
-        flag = flags.first()
-        self.assertEqual(flag.new_case_id, case_b)
-        self.assertEqual(flag.previous_case_id, case_a)
+        # Scope override AUTO-APPLIED to Individual on the enrollment (Programs
+        # tab now reflects the switch immediately).
+        enr = mp_member2.enrollment
+        enr.refresh_from_db()
         self.assertEqual(
-            flag.mismatch_type, CaseMismatchType.HOUSEHOLD_TO_INDIVIDUAL
-        )
-        # Timeline event.
-        self.assertEqual(
-            TimelineEvent.objects.filter(
-                client=primary,
-                event_type=TimelineEventType.MEMBER_CASE_MISMATCH,
-            ).count(),
-            1,
+            enr.household_type_override, CaseHouseholdType.INDIVIDUAL
         )
 
+        # NO Case Mismatch flag is created -- the fix is automatic.
+        self.assertEqual(
+            CaseMismatchFlag.objects.filter(client=primary).count(), 0
+        )
+
+        # An auto-resolved audit event, keyed old -> new case.
+        evs = TimelineEvent.objects.filter(
+            client=primary, event_type=TimelineEventType.MEMBER_CASE_MISMATCH,
+        )
+        self.assertEqual(evs.count(), 1)
+        ev = evs.first()
+        self.assertTrue(ev.metadata.get("auto_resolved"))
+        self.assertEqual(ev.metadata.get("new_case_id"), case_b)
+        self.assertEqual(ev.metadata.get("previous_case_id"), case_a)
+
     def test_switch_is_idempotent_on_resave(self):
-        from .models import CaseMismatchFlag, TimelineEvent, TimelineEventType
+        from .models import (
+            CaseMismatchFlag, MemberStatus, TimelineEvent, TimelineEventType,
+        )
 
         primary, member2, mp_primary, mp_member2, case_a, case_b = (
             self._trigger_switch()
         )
-        # Re-save the (now governing) individual case: no new flag / event / pin.
+        # Re-save the (now governing) individual case: no new event / re-pin.
         self._save_case(
             primary, case_b, "Medically Tailored Meals", timezone.now()
         )
         self.assertEqual(
-            CaseMismatchFlag.objects.filter(client=primary).count(), 1
+            CaseMismatchFlag.objects.filter(client=primary).count(), 0
         )
         self.assertEqual(
             TimelineEvent.objects.filter(
@@ -1399,16 +1785,137 @@ class HouseholdScopeSwitchTest(TestCase):
             ).count(),
             1,
         )
+        mp_member2.refresh_from_db()
+        self.assertEqual(mp_member2.status, MemberStatus.PAUSED)
+        self.assertTrue(mp_member2.pause_locked)
 
-    def test_cs_dismiss_clears_pins_but_keeps_paused(self):
-        from django.urls import reverse
+    def test_individual_to_household_auto_resumes_and_unpins(self):
+        # Reverse direction: a newer HOUSEHOLD case supersedes the Individual one
+        # -> the paused + pinned additional members are auto-resumed + un-pinned
+        # and the scope override follows to Household. No flag either way.
+        from datetime import timedelta
 
-        from .models import CaseMismatchFlag, CaseMismatchStatus, MemberStatus
+        from .models import CaseHouseholdType, CaseMismatchFlag, MemberStatus
 
         primary, member2, mp_primary, mp_member2, case_a, case_b = (
             self._trigger_switch()
         )
-        flag = CaseMismatchFlag.objects.get(client=primary)
+        mp_member2.refresh_from_db()
+        self.assertTrue(mp_member2.pause_locked)  # pinned by the -> Individual
+
+        # A newer HOUSEHOLD case now governs -> Individual -> Household.
+        case_c = str(uuid.uuid4())
+        self._save_case(
+            primary, case_c, "Medically Tailored Meals Household",
+            timezone.now() + timedelta(days=1),
+        )
+        mp_member2.refresh_from_db()
+        enr = mp_member2.enrollment
+        enr.refresh_from_db()
+        # Scope override auto-followed to Household; member auto-un-pinned +
+        # resumed (no longer Paused).
+        self.assertEqual(
+            enr.household_type_override, CaseHouseholdType.HOUSEHOLD
+        )
+        self.assertFalse(mp_member2.pause_locked)
+        self.assertNotEqual(mp_member2.status, MemberStatus.PAUSED)
+        self.assertEqual(
+            CaseMismatchFlag.objects.filter(client=primary).count(), 0
+        )
+
+    def test_empty_governing_pointer_still_detects_scope_switch(self):
+        # Regression (the JEREMIAHH scenario): an active member VERIFIED as
+        # Individual (household_type_override set) whose stored governing pointer
+        # was NEVER initialised. A reconcile that first sees a HOUSEHOLD governing
+        # case must STILL auto-reconcile Individual -> Household -- data-driven
+        # detection off the served override, not the (empty) pointer -- instead of
+        # silently adopting the new case and swallowing the switch.
+        from datetime import timedelta
+
+        from .models import (
+            CaseHouseholdType, CaseMismatchFlag, TimelineEvent, TimelineEventType,
+        )
+        from .services.lifecycle import (
+            deferred_internal_service_reconcile,
+            reconcile_internal_service_authorization,
+        )
+
+        primary, member2, enr, mp_primary, mp_member2 = self._setup()
+        enr.household_type_override = CaseHouseholdType.INDIVIDUAL
+        enr.save(update_fields=["household_type_override"])
+        now = timezone.now()
+        individual_id, household_id = str(uuid.uuid4()), str(uuid.uuid4())
+        # Load an older Individual + a newer Household case with the reconcile
+        # DEFERRED, so nothing auto-fixes and the governing pointer stays empty.
+        with deferred_internal_service_reconcile():
+            self._save_case(
+                primary, individual_id, "Medically Tailored Meals",
+                now - timedelta(days=2),
+            )
+            self._save_case(
+                primary, household_id, "Medically Tailored Meals Household", now,
+            )
+        primary.refresh_from_db()
+        self.assertEqual(primary.governing_internal_case_id, "")  # empty baseline
+
+        # The import's once-per-client reconcile on the FULL picture.
+        reconcile_internal_service_authorization(primary)
+
+        enr.refresh_from_db()
+        # Auto-reconciled to Household off the served override, despite the empty
+        # pointer; no flag; a single auto-resolved audit event keyed old -> new.
+        self.assertEqual(
+            enr.household_type_override, CaseHouseholdType.HOUSEHOLD
+        )
+        self.assertEqual(
+            CaseMismatchFlag.objects.filter(client=primary).count(), 0
+        )
+        evs = TimelineEvent.objects.filter(
+            client=primary, event_type=TimelineEventType.MEMBER_CASE_MISMATCH,
+        )
+        self.assertEqual(evs.count(), 1)
+        self.assertEqual(evs.first().metadata.get("new_case_id"), household_id)
+        self.assertEqual(evs.first().metadata.get("previous_case_id"), individual_id)
+
+    def test_divergent_sibling_override_still_reconciled(self):
+        # Regression: two governing enrollments carrying DIFFERENT overrides -- one
+        # already on the governing scope (Individual), a sibling still on the old
+        # (Household). Detecting the served scope off the FIRST override would let
+        # the matching sibling mask the divergent one and skip the fix; the
+        # divergent enrollment must STILL be reconciled to the governing scope.
+        from .models import (
+            CaseHouseholdType, EnrollmentStage, EnrollmentVerification,
+        )
+        from .services.lifecycle import reconcile_internal_service_authorization
+
+        primary, member2, enr, mp_primary, mp_member2 = self._setup()
+        # enr (service_active) already matches the Individual governing case; a
+        # second pending-verification enrollment still holds the old Household.
+        enr.household_type_override = CaseHouseholdType.INDIVIDUAL
+        enr.save(update_fields=["household_type_override"])
+        enr2 = EnrollmentVerification.objects.create(
+            client=primary, household=enr.household,
+            stage=EnrollmentStage.PENDING_VERIFICATION,
+            household_type_override=CaseHouseholdType.HOUSEHOLD,
+        )
+        self._save_case(
+            primary, str(uuid.uuid4()), "Medically Tailored Meals", timezone.now()
+        )
+        reconcile_internal_service_authorization(primary)
+        enr.refresh_from_db()
+        enr2.refresh_from_db()
+        # BOTH enrollments now match the Individual governing scope.
+        self.assertEqual(enr.household_type_override, CaseHouseholdType.INDIVIDUAL)
+        self.assertEqual(enr2.household_type_override, CaseHouseholdType.INDIVIDUAL)
+
+    def test_cs_dismiss_clears_pins_but_keeps_paused(self):
+        from django.urls import reverse
+
+        from .models import CaseMismatchStatus, MemberStatus
+
+        primary, member2, enr, mp_primary, mp_member2 = self._setup()
+        flag = self._manual_flag(primary, enr)
+        mp_member2.refresh_from_db()
         api = self._api("CS")
         resp = api.post(
             reverse(
@@ -1430,12 +1937,10 @@ class HouseholdScopeSwitchTest(TestCase):
     def test_non_cs_cannot_dismiss(self):
         from django.urls import reverse
 
-        from .models import CaseMismatchFlag, CaseMismatchStatus
+        from .models import CaseMismatchStatus
 
-        primary, member2, mp_primary, mp_member2, case_a, case_b = (
-            self._trigger_switch()
-        )
-        flag = CaseMismatchFlag.objects.get(client=primary)
+        primary, member2, enr, mp_primary, mp_member2 = self._setup()
+        flag = self._manual_flag(primary, enr)
         api = self._api("Verifiers")
         resp = api.post(
             reverse(
@@ -1446,6 +1951,42 @@ class HouseholdScopeSwitchTest(TestCase):
         self.assertEqual(resp.status_code, 403)
         flag.refresh_from_db()
         self.assertEqual(flag.status, CaseMismatchStatus.OPEN)
+
+    def test_programs_tab_scope_reconcile_auto_dismisses_flag_and_unpins(self):
+        # Reconciling the scope on the Programs tab IS the CS review the flag was
+        # waiting on: the OPEN Case Mismatch flag auto-dismisses and the pinned
+        # member is un-pinned, without a separate Case Mismatch tab step.
+        from .models import (
+            CaseHouseholdType, CaseMismatchFlag, CaseMismatchStatus,
+            CaseMismatchType, MemberStatus,
+        )
+
+        primary, member2, enr, mp_primary, mp_member2 = self._setup()
+        # Governing INDIVIDUAL case, but the household was VERIFIED as Household
+        # -> a standing mismatch with an OPEN flag + a CS-pinned member.
+        self._save_case(
+            primary, str(uuid.uuid4()), "Medically Tailored Meals", timezone.now()
+        )
+        enr.household_type_override = CaseHouseholdType.HOUSEHOLD
+        enr.save(update_fields=["household_type_override"])
+        mp_member2.status = MemberStatus.PAUSED
+        mp_member2.pause_locked = True
+        mp_member2.save(update_fields=["status", "pause_locked"])
+        flag = CaseMismatchFlag.objects.create(
+            client=primary, enrollment=enr,
+            mismatch_type=CaseMismatchType.HOUSEHOLD_TO_INDIVIDUAL,
+            new_case_id=str(uuid.uuid4()), status=CaseMismatchStatus.OPEN,
+        )
+
+        resp = self._api("CS").post(
+            f"/api/portal/members/{primary.client_id}/household-type/",
+            {"household_type": "individual"}, format="json",
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        flag.refresh_from_db()
+        mp_member2.refresh_from_db()
+        self.assertEqual(flag.status, CaseMismatchStatus.DISMISSED)
+        self.assertFalse(mp_member2.pause_locked)
 
 
 class UnapprovedActivePullBackTest(TestCase):
@@ -2353,6 +2894,181 @@ class RemovalAndVerificationGuardsTest(TestCase):
         self.assertEqual(resp.status_code, 400)
         self.assertFalse(EnrollmentVerification.objects.filter(client=client).exists())
 
+    def test_verification_sets_out_of_range_member_ineligible(self):
+        # Wiring: completing a verification runs the eligibility gates per
+        # household member, so a member whose PRIMARY (Current) address ZIP is
+        # outside the coverage area lands on the INELIGIBLE node -- not just held.
+        from rest_framework.parsers import JSONParser
+        from rest_framework.request import Request
+        from rest_framework.test import APIRequestFactory
+
+        from .models import (
+            Address, AddressType, ClientStage, ExcludedZipCode, Insurance,
+        )
+        from .portal.views_members import MemberVerificationCreateView
+
+        client = self._client("Ora", "Range")
+        self._internal_case(client)
+        # Valid medical insurance (blank expiry => active) so the ONLY hard gate
+        # that can fire is the out-of-range address.
+        Insurance.objects.create(client=client, plan_name="P", external_member_id="1")
+        ExcludedZipCode.objects.create(zip="11209")
+        Address.objects.create(
+            client=client, type=AddressType.CURRENT, zip="11209", street="1 St",
+        )
+
+        raw = APIRequestFactory().post(
+            "/",
+            {"members": [{"client_id": str(client.pk)}], "zip": "10001"},
+            format="json",
+        )
+        req = Request(raw, parsers=[JSONParser()])
+        resp = MemberVerificationCreateView().post(req, client.pk)
+
+        self.assertEqual(resp.status_code, 201)
+        client.refresh_from_db()
+        self.assertEqual(client.lifecycle_stage, ClientStage.INELIGIBLE)
+
+    def test_verification_leaves_in_range_member_eligible(self):
+        # Control: a serviceable primary ZIP + valid insurance is NOT marked
+        # ineligible by the verify-time eligibility pass.
+        from rest_framework.parsers import JSONParser
+        from rest_framework.request import Request
+        from rest_framework.test import APIRequestFactory
+
+        from .models import (
+            Address, AddressType, ClientStage, Insurance,
+        )
+        from .portal.views_members import MemberVerificationCreateView
+
+        client = self._client("In", "Range")
+        self._internal_case(client)
+        Insurance.objects.create(client=client, plan_name="P", external_member_id="1")
+        Address.objects.create(
+            client=client, type=AddressType.CURRENT, zip="10001", street="1 St",
+        )
+
+        raw = APIRequestFactory().post(
+            "/",
+            {"members": [{"client_id": str(client.pk)}], "zip": "10001"},
+            format="json",
+        )
+        req = Request(raw, parsers=[JSONParser()])
+        resp = MemberVerificationCreateView().post(req, client.pk)
+
+        self.assertEqual(resp.status_code, 201)
+        client.refresh_from_db()
+        self.assertNotEqual(client.lifecycle_stage, ClientStage.INELIGIBLE)
+
+
+class MainStageIneligibleTest(TestCase):
+    """The headline stage bar's Eligibility node must read Ineligible whenever
+    the client is on the hard INELIGIBLE off-ramp -- even when the enrollment
+    roll-up would otherwise report Enrolled (live enrollment) or Cancelled (all
+    enrollments cancelled), which previously hid the off-ramp."""
+
+    def _client(self, stage):
+        from .models import Client, ClientStage
+
+        return Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="El", last_name="Igible",
+            lifecycle_stage=stage,
+        )
+
+    def _enrollment(self, client, stage):
+        from .models import EnrollmentVerification, Household, HouseholdMember
+
+        hh = Household.objects.create(name="HH")
+        HouseholdMember.objects.create(household=hh, client=client, is_primary=True)
+        return EnrollmentVerification.objects.create(
+            client=client, household=hh, stage=stage,
+        )
+
+    def test_ineligible_wins_over_cancelled_enrollments(self):
+        from .models import ClientStage, EnrollmentStage
+        from .services.lifecycle import main_stage
+
+        client = self._client(ClientStage.INELIGIBLE)
+        self._enrollment(client, EnrollmentStage.CANCELLED)
+        self.assertEqual(main_stage(client), ClientStage.INELIGIBLE)
+
+    def test_ineligible_wins_over_live_enrollment(self):
+        from .models import ClientStage, EnrollmentStage
+        from .services.lifecycle import main_stage
+
+        client = self._client(ClientStage.INELIGIBLE)
+        self._enrollment(client, EnrollmentStage.SERVICE_ACTIVE)
+        self.assertEqual(main_stage(client), ClientStage.INELIGIBLE)
+
+    def test_non_ineligible_still_rolls_up_to_enrolled(self):
+        from .models import ClientStage, EnrollmentStage
+        from .services.lifecycle import main_stage
+
+        client = self._client(ClientStage.ELIGIBLE)
+        self._enrollment(client, EnrollmentStage.SERVICE_ACTIVE)
+        self.assertEqual(main_stage(client), ClientStage.ENROLLED)
+
+
+class ProgramStageOutOfRangeTest(TestCase):
+    """An Out-of-Range (delivery-coverage) HOLD surfaces on the program stage as
+    Out of Range, not a generic On Hold -- on both the accordion status
+    (program_status) and the stage-bar Service phase (_service_phase). The main
+    lifecycle stage separately keeps the Ineligible / Does Not Qualify off-ramp,
+    so Out of Range even wins over Does Not Qualify on the Service phase."""
+
+    def _held(self, member_status):
+        from .models import (
+            Client, EnrollmentStage, EnrollmentVerification, Household,
+            HouseholdMember, MemberDietaryProfile,
+        )
+
+        client = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Ora", last_name="Nge",
+        )
+        hh = Household.objects.create(name="HH")
+        HouseholdMember.objects.create(household=hh, client=client, is_primary=True)
+        enr = EnrollmentVerification.objects.create(
+            client=client, household=hh, stage=EnrollmentStage.ON_HOLD,
+        )
+        MemberDietaryProfile.objects.create(
+            enrollment=enr, client=client, status=member_status,
+        )
+        return client, enr
+
+    def test_out_of_range_hold_program_status(self):
+        from .models import MemberStatus, ProgramStatus
+        from .services.lifecycle import program_status
+
+        _client, enr = self._held(MemberStatus.OUT_OF_RANGE)
+        self.assertEqual(program_status(enr), ProgramStatus.OUT_OF_RANGE)
+
+    def test_out_of_range_hold_service_phase(self):
+        from .models import MemberStatus
+        from .services.lifecycle import _service_phase
+
+        client, enr = self._held(MemberStatus.OUT_OF_RANGE)
+        self.assertEqual(_service_phase(client, enr, None), ("out_of_range", "Out of Range"))
+
+    def test_plain_hold_still_on_hold(self):
+        from .models import MemberStatus, ProgramStatus
+        from .services.lifecycle import _service_phase, program_status
+
+        client, enr = self._held(MemberStatus.PAUSED)  # held, but not out of range
+        self.assertEqual(program_status(enr), ProgramStatus.ON_HOLD)
+        self.assertEqual(_service_phase(client, enr, None), ("on_hold", "On Hold"))
+
+    def test_out_of_range_wins_over_does_not_qualify_on_service_phase(self):
+        # Both surfaces coexist: the MAIN lifecycle stage reads Ineligible, but
+        # the per-program Service phase still shows Out of Range for the coverage
+        # block (Out of Range takes precedence over Does Not Qualify here).
+        from .models import ClientStage, MemberStatus
+        from .services.lifecycle import _service_phase
+
+        client, enr = self._held(MemberStatus.OUT_OF_RANGE)
+        client.lifecycle_stage = ClientStage.INELIGIBLE
+        client.save(update_fields=["lifecycle_stage"])
+        self.assertEqual(_service_phase(client, enr, None), ("out_of_range", "Out of Range"))
+
 
 class ExtensionCaseMetCouncilGateTest(TestCase):
     """A case written through the browser extension (an authenticated agent, so
@@ -2794,6 +3510,89 @@ class KitchenAwareMealRuleTest(TestCase):
         mv.refresh_from_db()
         self.assertEqual(mv.status, MemberStatus.OUT_OF_ORBIT)
 
+    def test_paused_member_not_auto_resumed_by_kitchen_assignment(self):
+        # A manually PAUSED member (e.g. the non-primary members of an
+        # individual-scope case) must stay PAUSED when the kitchen-aware meal rule
+        # runs for the whole household at kitchen assignment -- even though the
+        # assigned kitchen COULD serve them. Regression: kitchen assignment was
+        # silently un-pausing paused members, activating an individual case's
+        # dependents for service.
+        from .models import MemberStatus
+        from .services.meal_rules import reconcile_member_kitchen_output
+
+        kitchen = self._kosher_kitchen()
+        mv = self._profile(["shellfish", "pork"], status=MemberStatus.PAUSED)
+        out, became, reason = reconcile_member_kitchen_output(mv, kitchen, save=True)
+        self.assertFalse(out)
+        self.assertFalse(became)
+        self.assertEqual(reason, "")
+        mv.refresh_from_db()
+        self.assertEqual(mv.status, MemberStatus.PAUSED)
+        # The pause also leaves the kitchen meal result untouched (not recomputed).
+        self.assertEqual(mv.kitchen_meal_type, "")
+
+    def test_inactive_member_not_auto_resumed(self):
+        # A terminal INACTIVE member (service ended) is likewise never revived by
+        # the automatic meal rule.
+        from .models import MemberStatus
+        from .services.meal_rules import reconcile_member_kitchen_output
+
+        kitchen = self._kosher_kitchen()
+        mv = self._profile(["shellfish", "pork"], status=MemberStatus.INACTIVE)
+        reconcile_member_kitchen_output(mv, kitchen, save=True)
+        mv.refresh_from_db()
+        self.assertEqual(mv.status, MemberStatus.INACTIVE)
+
+    def test_out_of_range_member_not_reactivated_by_kitchen_assignment(self):
+        # Out of Range is a ZIP-coverage block a kitchen change can't fix, so the
+        # automatic meal rule (kitchen assignment) must respect it -- even when
+        # the member's ZIP is otherwise serviceable and the kitchen could serve
+        # them. Only the explicit restore-range flow (allow_resume=True) may bring
+        # them back.
+        from .models import MemberStatus
+        from .services.meal_rules import reconcile_member_kitchen_output
+
+        kitchen = self._kosher_kitchen()
+        mv = self._profile(["shellfish", "pork"], status=MemberStatus.OUT_OF_RANGE)
+        out, became, reason = reconcile_member_kitchen_output(mv, kitchen, save=True)
+        self.assertFalse(out)
+        self.assertFalse(became)
+        self.assertEqual(reason, "")
+        mv.refresh_from_db()
+        self.assertEqual(mv.status, MemberStatus.OUT_OF_RANGE)
+
+    def test_out_of_range_member_restored_only_with_allow_resume(self):
+        # The explicit restore-range flow passes allow_resume=True; with a
+        # serviceable ZIP (no address set here) the member returns to Active.
+        from .models import MemberStatus
+        from .services.meal_rules import reconcile_member_kitchen_output
+
+        kitchen = self._kosher_kitchen()
+        mv = self._profile(["shellfish", "pork"], status=MemberStatus.OUT_OF_RANGE)
+        out, _became, _reason = reconcile_member_kitchen_output(
+            mv, kitchen, save=True, allow_resume=True,
+        )
+        self.assertFalse(out)
+        mv.refresh_from_db()
+        self.assertEqual(mv.status, MemberStatus.ACTIVE)
+
+    def test_paused_member_resumed_only_with_allow_resume(self):
+        # The explicit unpause/resume flow passes allow_resume=True, which DOES
+        # let the meal rule move the member off PAUSED (to Active here, since the
+        # kitchen can serve the Kosher + Pork/Shellfish combo).
+        from .models import MemberStatus
+        from .services.meal_rules import reconcile_member_kitchen_output
+
+        kitchen = self._kosher_kitchen()
+        mv = self._profile(["shellfish", "pork"], status=MemberStatus.PAUSED)
+        out, _became, _reason = reconcile_member_kitchen_output(
+            mv, kitchen, save=True, allow_resume=True,
+        )
+        self.assertFalse(out)
+        mv.refresh_from_db()
+        self.assertEqual(mv.status, MemberStatus.ACTIVE)
+        self.assertEqual(mv.kitchen_meal_type, "Kosher")
+
 
 class ExcludedZipSettingsTest(TestCase):
     """Settings CRUD for the excluded-ZIP list."""
@@ -2920,13 +3719,21 @@ class ProgramTracksTest(TestCase):
         )
         hh = Household.objects.create(name="HH")
         HouseholdMember.objects.create(household=hh, client=client, is_primary=True)
+        ht = household_type or CaseHouseholdType.INDIVIDUAL
+        # program_tracks derives the Household/Individual scope LIVE from the
+        # PROGRAM NAME (the source of truth), so a Household case must carry the
+        # "(Household)" keyword for the scope to read Household.
+        program_name = (
+            "MTM - (Household) Program"
+            if ht == CaseHouseholdType.HOUSEHOLD else "MTM"
+        )
         Case.objects.create(
             case_id=str(uuid.uuid4()), client=client,
             case_type=CaseType.INTERNAL_SERVICE,
             case_status=case_status or CaseStatus.OPEN,
-            service_type="Medically Tailored Meals", program_name="MTM",
+            service_type="Medically Tailored Meals", program_name=program_name,
             service_authorization_status=auth,
-            household_type=household_type or CaseHouseholdType.INDIVIDUAL,
+            household_type=ht,
         )
         EnrollmentVerification.objects.create(
             client=client, household=hh, stage=stage,
@@ -3208,6 +4015,105 @@ class ProgramTracksTest(TestCase):
             client_stage=ClientStage.INELIGIBLE,
         ))[0]
         self.assertEqual(t["service"]["label"], "Does Not Qualify")
+
+
+class ResumeBlockedWhenIneligibleTest(TestCase):
+    """A program held because a member is on the hard INELIGIBLE off-ramp must
+    NOT be manually resumable: the resume endpoint rejects it (only recovering
+    the eligibility data lifts the hold), and the household payload reports
+    ``can_resume=False`` so the frontend hides the Resume button."""
+
+    def setUp(self):
+        self.agent = Agent.objects.create(
+            name="Elig Agent", agent_code="913", group="CS"
+        )
+        access = AccessToken()
+        access["agent_id"] = str(self.agent.id)
+        access["agent_code"] = self.agent.agent_code
+        access["agent_name"] = self.agent.name
+        access["agent_group"] = self.agent.group
+        self.api = APIClient()
+        self.api.credentials(HTTP_AUTHORIZATION=f"Bearer {access}")
+
+    def _held_client(self, lifecycle_stage):
+        from .models import (
+            Client, ClientStage, EnrollmentStage, EnrollmentVerification,
+            Household, HouseholdMember,
+        )
+        from .services.lifecycle import advance_enrollment
+
+        client = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Held", last_name="Member",
+            lifecycle_stage=lifecycle_stage,
+        )
+        hh = Household.objects.create(name="HH")
+        HouseholdMember.objects.create(household=hh, client=client, is_primary=True)
+        enr = EnrollmentVerification.objects.create(
+            client=client, household=hh, stage=EnrollmentStage.SERVICE_ACTIVE,
+        )
+        advance_enrollment(enr, EnrollmentStage.ON_HOLD, force=True)
+        enr.refresh_from_db()
+        return client, enr
+
+    def test_resume_rejected_for_ineligible(self):
+        from .models import ClientStage, EnrollmentStage
+
+        client, enr = self._held_client(ClientStage.INELIGIBLE)
+        resp = self.api.post(
+            f"/api/portal/members/{client.client_id}/resume/",
+            {"reason": "try to resume"}, format="json",
+        )
+        self.assertEqual(resp.status_code, 400, resp.content)
+        self.assertIn("Ineligible", resp.json().get("error", ""))
+        enr.refresh_from_db()
+        self.assertEqual(EnrollmentStage(enr.stage), EnrollmentStage.ON_HOLD)
+
+    def test_resume_allowed_for_eligible(self):
+        from .models import ClientStage, EnrollmentStage
+
+        client, enr = self._held_client(ClientStage.ACTIVE)
+        resp = self.api.post(
+            f"/api/portal/members/{client.client_id}/resume/",
+            {"reason": "resume"}, format="json",
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        enr.refresh_from_db()
+        self.assertEqual(EnrollmentStage(enr.stage), EnrollmentStage.SERVICE_ACTIVE)
+
+    def test_household_payload_reports_can_resume_false_when_ineligible(self):
+        from .models import ClientStage
+
+        client, _enr = self._held_client(ClientStage.INELIGIBLE)
+        resp = self.api.get(f"/api/portal/members/{client.client_id}/household/")
+        self.assertEqual(resp.status_code, 200, resp.content)
+        enrollment = resp.json()["enrollment"]
+        self.assertTrue(enrollment["on_hold"])
+        self.assertFalse(enrollment["can_resume"])
+
+    def test_resume_blocked_by_ineligible_dependent(self):
+        # The case-holder is eligible, but an ineligible DEPENDENT still blocks
+        # the whole program's manual resume.
+        from .models import (
+            Client, ClientStage, EnrollmentStage, HouseholdMember,
+            MemberDietaryProfile,
+        )
+
+        holder, enr = self._held_client(ClientStage.ACTIVE)
+        dep = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Dep", last_name="X",
+            lifecycle_stage=ClientStage.INELIGIBLE,
+        )
+        HouseholdMember.objects.create(
+            household=enr.household, client=dep, is_primary=False,
+        )
+        MemberDietaryProfile.objects.create(enrollment=enr, client=dep)
+        resp = self.api.post(
+            f"/api/portal/members/{holder.client_id}/resume/",
+            {"reason": "resume"}, format="json",
+        )
+        self.assertEqual(resp.status_code, 400, resp.content)
+        enr.refresh_from_db()
+        self.assertEqual(EnrollmentStage(enr.stage), EnrollmentStage.ON_HOLD)
 
 
 class ResumeAfterReactivationTest(TestCase):
@@ -3568,37 +4474,40 @@ class DashboardServingClientIdsTests(TestCase):
             serving_client_ids("no_social_coverage", start=None, end=None),
         )
 
-    def test_insurance_expiring_only_flags_active_medicaid_within_30_days(self):
-        from datetime import timedelta
-
-        from django.utils import timezone
-
+    def test_insurance_expiring_flags_enrolled_members_without_active_medicaid(self):
+        # The "insurance_expiring" watchlist is a STATUS-based "no active
+        # Medicaid" rule (imports don't reliably carry a coverage end date, so an
+        # expiry-date window can't be trusted). Enrolled members with an ACTIVE
+        # Medicaid / Dual plan are cleared; everyone else is flagged.
         from .models import Insurance, InsurancePlanType, RecordStatus
         from .portal.views_dashboard import serving_client_ids
 
-        soon = self._member()
+        # Active Medicaid on file -> NOT on the watchlist.
+        has_medicaid = self._member()
         Insurance.objects.create(
-            client=soon, plan_type=InsurancePlanType.MEDICAID,
+            client=has_medicaid, plan_type=InsurancePlanType.MEDICAID,
             status=RecordStatus.ACTIVE,
-            expired_at=timezone.now() + timedelta(days=10),
         )
-        far = self._member()
+        # Active Dual (Medicare/Medicaid) also counts as Medicaid -> NOT flagged.
+        has_dual = self._member()
         Insurance.objects.create(
-            client=far, plan_type=InsurancePlanType.MEDICAID,
+            client=has_dual, plan_type=InsurancePlanType.DUAL,
             status=RecordStatus.ACTIVE,
-            expired_at=timezone.now() + timedelta(days=200),
         )
-        commercial = self._member()
+        # Only a commercial plan (no active Medicaid) -> flagged.
+        commercial_only = self._member()
         Insurance.objects.create(
-            client=commercial, plan_type=InsurancePlanType.COMMERCIAL,
+            client=commercial_only, plan_type=InsurancePlanType.COMMERCIAL,
             status=RecordStatus.ACTIVE,
-            expired_at=timezone.now() + timedelta(days=10),
         )
+        # No insurance at all -> flagged.
+        no_plan = self._member()
 
         ids = serving_client_ids("insurance_expiring", start=None, end=None)
-        self.assertIn(soon.client_id, ids)
-        self.assertNotIn(far.client_id, ids)         # expires too far out
-        self.assertNotIn(commercial.client_id, ids)  # not Medicaid
+        self.assertNotIn(has_medicaid.client_id, ids)
+        self.assertNotIn(has_dual.client_id, ids)
+        self.assertIn(commercial_only.client_id, ids)
+        self.assertIn(no_plan.client_id, ids)
 
 
 class ProgramSwitchClassificationTest(SimpleTestCase):
@@ -3848,6 +4757,82 @@ class CsvCaseMappingTest(SimpleTestCase):
         )
         self.assertEqual(out["service_type"], "Medically Tailored Meals")
         self.assertEqual(out["service_category"], "Food Assistance")
+
+
+class CsvFlexibleDatetimeTest(SimpleTestCase):
+    """Regression: a Unite Us export opened + re-saved in Excel/Sheets emits
+    US-format datetimes (e.g. ``7/28/26 0:00``) instead of ISO. The importer
+    passed the raw cell to DRF, whose DateTimeField accepts ISO only, so EVERY
+    row failed validation on ``updated_at`` / the service-authorization windows.
+    ``map_case_row`` now normalizes US formats to ISO (and still passes ISO
+    through), while junk cells are dropped rather than failing the row."""
+
+    def _dt(self, value):
+        from .services.csv_import import _dt
+
+        return _dt({"k": value}, "k")
+
+    def test_us_datetime_normalized_to_iso(self):
+        self.assertEqual(self._dt("7/27/26 17:06"), "2026-07-27T17:06:00")
+        self.assertEqual(self._dt("7/28/26 0:00"), "2026-07-28T00:00:00")
+        self.assertEqual(self._dt("1/28/27 0:00"), "2027-01-28T00:00:00")
+
+    def test_us_date_only_and_4_digit_year(self):
+        self.assertEqual(self._dt("3/29/2011"), "2011-03-29T00:00:00")
+        self.assertEqual(self._dt("12/1/26"), "2026-12-01T00:00:00")
+
+    def test_iso_passes_through(self):
+        self.assertEqual(self._dt("2026-07-29T20:16:00"), "2026-07-29T20:16:00")
+
+    def test_blank_and_junk_return_none(self):
+        self.assertIsNone(self._dt(""))
+        self.assertIsNone(self._dt("06:02.6"))  # Excel-mangled cell -> dropped
+
+    def test_date_helper_handles_iso_date_only_and_us(self):
+        from .services.csv_import import _date
+
+        self.assertEqual(_date({"k": "2020-01-15"}, "k"), "2020-01-15")
+        self.assertEqual(_date({"k": "1/15/20"}, "k"), "2020-01-15")
+        self.assertIsNone(_date({"k": ""}, "k"))
+
+    def test_expiry_never_expires_sentinel_99_and_9999(self):
+        # Unite Us marks a lifetime policy 12/31/9999; Excel truncates that to a
+        # two-digit 12/31/99 (which strptime would read as 1999). BOTH spellings
+        # -- and an ISO 9999 -- must normalize to the canonical year-9999 date so
+        # the policy reads as never-expiring, not as expired in 1999.
+        from .services.csv_import import _expiry_dt
+
+        self.assertEqual(_expiry_dt({"k": "12/31/99 0:00"}, "k"), "9999-12-31T00:00:00")
+        self.assertEqual(_expiry_dt({"k": "12/31/9999 12:00:00 AM"}, "k"), "9999-12-31T00:00:00")
+        self.assertEqual(_expiry_dt({"k": "1/1/9999"}, "k"), "9999-12-31T00:00:00")
+        self.assertEqual(_expiry_dt({"k": "2099-12-31T00:00:00"}, "k"), "2099-12-31T00:00:00")
+
+    def test_expiry_genuine_dates_unaffected(self):
+        # A real expiry (incl. a genuine 4-digit 1999) parses normally; only the
+        # 2-digit /99 and 4-digit /9999 sentinels are promoted to never-expires.
+        from .services.csv_import import _expiry_dt
+
+        self.assertEqual(_expiry_dt({"k": "3/31/26 0:00"}, "k"), "2026-03-31T00:00:00")
+        self.assertEqual(_expiry_dt({"k": "12/31/1999"}, "k"), "1999-12-31T00:00:00")
+        self.assertIsNone(_expiry_dt({"k": ""}, "k"))
+
+    def test_full_row_validates_with_us_dates(self):
+        from .serializers import CaseSerializer
+        from .services.csv_import import map_case_row
+
+        payload = map_case_row({
+            "case_id": "6603dd31-48e0-4fd0-b0c0-c2ff7c4400e6",
+            "client_id": "397a5a2d-7af6-4282-a9da-e1430af63a6d",
+            "program_name": "Medically Tailored Meals (MTM)",
+            "service_subtype": "Medically Tailored Meals",
+            "case_status": "open",
+            "service_authorization_status": "requested",
+            "case_updated_at": "7/27/26 17:06",
+            "service_authorization_request_starts_at": "7/28/26 0:00",
+            "service_authorization_request_ends_at": "1/28/27 0:00",
+        })
+        ser = CaseSerializer(data=payload)
+        self.assertTrue(ser.is_valid(), ser.errors)
 
 
 class ReimportCaseWithNullServiceCategoryTest(TestCase):
@@ -5508,6 +6493,24 @@ class MemberWarningsTest(TestCase):
         self._internal_case(c, program="Medically Tailored Meals")
         self._internal_case(c, program="Grocery Boxes Program")
         self.assertIn(CONFLICTING_PRODUCT_TYPES, self._codes(enr))
+
+    def test_conflicting_product_types_suppressed_once_verified(self):
+        # Mirrors multiple_open_cases: before verification, cases spanning
+        # different kinds nag "which case governs?". Once verified, the governing
+        # case owns the kind and any divergence is handled by the Programs-tab
+        # meals<->boxes reconciliation, so the warning clears.
+        from django.utils import timezone
+        from .services.warnings import CONFLICTING_PRODUCT_TYPES
+
+        c = self._client()
+        enr = self._enrollment(c)
+        self._internal_case(c, program="Medically Tailored Meals")
+        self._internal_case(c, program="Grocery Boxes Program")
+        self.assertIn(CONFLICTING_PRODUCT_TYPES, self._codes(enr))
+
+        enr.verified_at = timezone.now()
+        enr.save(update_fields=["verified_at"])
+        self.assertNotIn(CONFLICTING_PRODUCT_TYPES, self._codes(enr))
 
     def test_kitchen_missing_product(self):
         from .models import Kitchen, KitchenProductType, KitchenStatus
@@ -7979,6 +8982,185 @@ class POAuthorizationGuardrailTest(TestCase):
 
         client = self._setup(ServiceAuthorizationStatus.EXPIRED)
         self.assertNotIn(str(client.client_id), self._po_eligible_client_ids())
+
+
+class POKitchenAssignmentExclusionTest(TestCase):
+    """A household requeued to KITCHEN_ASSIGNMENT (e.g. a completed meals<->boxes
+    product switch) has NO assigned kitchen, so it is not deliverable and must
+    never feed a Purchase Order -- even while its OLD calendar still carries
+    SCHEDULED occurrences (the switch requeue clears the kitchen/cadence but a
+    committed occurrence can linger). Regression for the leak where the primary
+    kept landing on a meals PO on the OLD kitchen after switching to boxes.
+    KITCHEN_ASSIGNMENT is in ``SERVICE_EXCLUDED_ENROLLMENT_STAGES``; assigning a
+    kitchen advances the household to SERVICE_ACTIVE, which restores eligibility.
+    """
+
+    def _setup(self, stage):
+        from datetime import timedelta
+
+        from .models import (
+            Case, CaseStatus, CaseType, Client, EnrollmentStage,
+            EnrollmentVerification, Household, HouseholdMember,
+            MemberDietaryProfile, MemberStatus, OrderSchedule, OrderStatus,
+            ServiceAuthorizationStatus,
+        )
+
+        today = timezone.localdate()
+        client = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Kitchen", last_name="Queue",
+        )
+        hh = Household.objects.create(name="HH")
+        HouseholdMember.objects.create(household=hh, client=client, is_primary=True)
+        case = Case.objects.create(
+            case_id=str(uuid.uuid4()), client=client,
+            case_type=CaseType.INTERNAL_SERVICE, case_status=CaseStatus.OPEN,
+            service_authorization_status=ServiceAuthorizationStatus.APPROVED,
+            program_name="Medically Tailored Meals", date_opened=timezone.now(),
+        )
+        enr = EnrollmentVerification.objects.create(
+            client=client, household=hh, case=case, stage=stage,
+        )
+        member = MemberDietaryProfile.objects.create(
+            enrollment=enr, client=client, menu_type="Standard",
+            status=MemberStatus.ACTIVE,
+        )
+        # Tomorrow's stale SCHEDULED occurrence (the OLD calendar the switch left
+        # behind). Use tomorrow so it is unambiguously "due" on that date.
+        self.due_date = today + timedelta(days=1)
+        OrderSchedule.objects.create(
+            enrollment=enr, member=member, member_name="Kitchen Queue",
+            program_name="Medically Tailored Meals",
+            anticipated_delivery_date=self.due_date,
+            status=OrderStatus.SCHEDULED, household_group_code="G", household=hh,
+        )
+        return client
+
+    def _due_client_ids(self):
+        from .models import ProductTypeKind
+        from .services.purchase_orders import _due_schedules
+
+        rows = _due_schedules(ProductTypeKind.MEALS, self.due_date)
+        return {str(r.member.client_id) for r in rows if r.member_id}
+
+    def test_kitchen_assignment_excluded(self):
+        from .models import EnrollmentStage
+
+        client = self._setup(EnrollmentStage.KITCHEN_ASSIGNMENT)
+        self.assertNotIn(str(client.client_id), self._due_client_ids())
+
+    def test_service_active_included(self):
+        from .models import EnrollmentStage
+
+        client = self._setup(EnrollmentStage.SERVICE_ACTIVE)
+        self.assertIn(str(client.client_id), self._due_client_ids())
+
+
+class POIneligibleMemberExclusionTest(TestCase):
+    """A member on the hard INELIGIBLE eligibility off-ramp (out-of-range
+    address, wrong Medicaid type, expired/missing insurance) must never be
+    selected for a Purchase Order -- even when their enrollment is at an active,
+    approved, open-case stage with a stale SCHEDULED occurrence (i.e. the
+    truncate + On Hold from reconcile_client_eligibility could not apply, or the
+    calendar was rebuilt while still INELIGIBLE). Keyed per member, so an
+    ineligible person is dropped while eligible household members remain."""
+
+    def _member(self, hh, case, enr, *, name, lifecycle_stage, member_status):
+        from .models import (
+            Client, ClientStage, HouseholdMember, MemberDietaryProfile,
+            MemberStatus, OrderSchedule, OrderStatus,
+        )
+
+        client = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name=name, last_name="X",
+            lifecycle_stage=lifecycle_stage,
+        )
+        HouseholdMember.objects.create(household=hh, client=client, is_primary=False)
+        mp = MemberDietaryProfile.objects.create(
+            enrollment=enr, client=client, menu_type="Standard",
+            status=member_status,
+        )
+        OrderSchedule.objects.create(
+            enrollment=enr, member=mp, member_name=name,
+            program_name="Medically Tailored Meals",
+            anticipated_delivery_date=self.due_date,
+            status=OrderStatus.SCHEDULED, household_group_code="G", household=hh,
+        )
+        return client, mp
+
+    def setUp(self):
+        from datetime import timedelta
+
+        from .models import (
+            Case, CaseStatus, CaseType, Client, ClientStage, EnrollmentStage,
+            EnrollmentVerification, Household, HouseholdMember, MemberStatus,
+            ServiceAuthorizationStatus,
+        )
+
+        self.due_date = timezone.localdate() + timedelta(days=1)
+        holder = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Holder", last_name="X",
+            lifecycle_stage=ClientStage.ACTIVE,
+        )
+        hh = Household.objects.create(name="HH")
+        HouseholdMember.objects.create(household=hh, client=holder, is_primary=True)
+        case = Case.objects.create(
+            case_id=str(uuid.uuid4()), client=holder,
+            case_type=CaseType.INTERNAL_SERVICE, case_status=CaseStatus.OPEN,
+            service_authorization_status=ServiceAuthorizationStatus.APPROVED,
+            program_name="Medically Tailored Meals", date_opened=timezone.now(),
+        )
+        enr = EnrollmentVerification.objects.create(
+            client=holder, household=hh, case=case,
+            stage=EnrollmentStage.SERVICE_ACTIVE,
+        )
+        # Case-holder is a normal, active member with an occurrence.
+        from .models import MemberDietaryProfile, OrderSchedule, OrderStatus
+        holder_mp = MemberDietaryProfile.objects.create(
+            enrollment=enr, client=holder, menu_type="Standard",
+            status=MemberStatus.ACTIVE,
+        )
+        OrderSchedule.objects.create(
+            enrollment=enr, member=holder_mp, member_name="Holder",
+            program_name="Medically Tailored Meals",
+            anticipated_delivery_date=self.due_date,
+            status=OrderStatus.SCHEDULED, household_group_code="G", household=hh,
+        )
+        self.holder = holder
+        self.hh, self.enr = hh, enr
+        # An ineligible dependent whose enrollment/member status are otherwise
+        # perfectly serviceable (ACTIVE) -- only lifecycle_stage flags them.
+        self.ineligible, _ = self._member(
+            hh, case, enr, name="Nope",
+            lifecycle_stage=ClientStage.INELIGIBLE,
+            member_status=MemberStatus.ACTIVE,
+        )
+
+    def _due_client_ids(self):
+        from .models import ProductTypeKind
+        from .services.purchase_orders import _due_schedules
+
+        rows = _due_schedules(ProductTypeKind.MEALS, self.due_date)
+        return {str(r.member.client_id) for r in rows if r.member_id}
+
+    def test_ineligible_member_excluded_from_due(self):
+        ids = self._due_client_ids()
+        self.assertNotIn(str(self.ineligible.client_id), ids)
+        # Eligible household members are unaffected.
+        self.assertIn(str(self.holder.client_id), ids)
+
+    def test_ineligible_member_excluded_from_generation(self):
+        from .models import OrderSchedule, ProductTypeKind
+        from .services.purchase_orders import generate_purchase_order
+
+        ids = list(
+            OrderSchedule.objects.filter(anticipated_delivery_date=self.due_date)
+            .values_list("order_id", flat=True)
+        )
+        po = generate_purchase_order(ProductTypeKind.MEALS, self.due_date, None, ids)
+        self.assertIsNotNone(po)
+        ordered = {str(o.member_id) for o in po.delivery_orders.all()}
+        self.assertNotIn(str(self.ineligible.client_id), ordered)
+        self.assertIn(str(self.holder.client_id), ordered)
 
 
 class POHouseholdDependentEligibilityTest(TestCase):

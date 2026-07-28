@@ -327,6 +327,12 @@ def check_multiple_open_cases(ctx):
 
 
 def check_conflicting_product_types(ctx):
+    # Like multiple_open_cases, this is a PRE-verification "which case governs?"
+    # nag. Once the household is verified the governing case owns the product
+    # kind and any divergent open case is handled by the mismatch-reconciliation
+    # flow (the Programs-tab meals<->boxes switch), so we don't keep nagging.
+    if ctx.verified:
+        return []
     kinds = {k for k in (_case_kind(c) for c in ctx.open_cases) if k is not None}
     if len(kinds) < 2:
         return []

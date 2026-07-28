@@ -22,11 +22,12 @@ import io
 import logging
 import re
 from collections import OrderedDict
+from datetime import datetime
 
 from django.core.exceptions import ValidationError
 from django.core.validators import validate_email
 from django.utils import timezone
-from django.utils.dateparse import parse_datetime
+from django.utils.dateparse import parse_date, parse_datetime
 
 import json
 
@@ -171,24 +172,89 @@ def _int(row, key):
         return None
 
 
+# US-style datetime formats spreadsheet exports (Excel / Google Sheets) emit
+# when a Unite Us export is opened + re-saved -- ISO is NOT guaranteed. Tried in
+# order after a strict ISO parse fails. Covers 2- and 4-digit years, 12/24-hour
+# clocks, optional seconds, and date-only cells. Python's strptime tolerates
+# non-zero-padded month/day/hour ("7/28/26 0:00"), so a single pattern each
+# handles both padded and unpadded inputs.
+_US_DATETIME_FORMATS = (
+    "%m/%d/%Y %H:%M:%S", "%m/%d/%Y %H:%M", "%m/%d/%Y %I:%M %p", "%m/%d/%Y",
+    "%m/%d/%y %H:%M:%S", "%m/%d/%y %H:%M", "%m/%d/%y %I:%M %p", "%m/%d/%y",
+)
+
+
+def _parse_flexible_datetime(raw):
+    """Parse a datetime cell to a naive ``datetime``, tolerating both ISO 8601
+    and the common US spreadsheet formats above. Returns None when blank or
+    unparseable (junk cells like Excel's "06:02.6" are dropped, not raised)."""
+    if not raw:
+        return None
+    dt = parse_datetime(raw)  # strict ISO 8601 datetime (with or without offset)
+    if dt is not None:
+        return dt
+    iso_date = parse_date(raw)  # strict ISO 8601 date-only ('YYYY-MM-DD')
+    if iso_date is not None:
+        return datetime(iso_date.year, iso_date.month, iso_date.day)
+    for fmt in _US_DATETIME_FORMATS:
+        try:
+            return datetime.strptime(raw, fmt)
+        except ValueError:
+            continue
+    return None
+
+
 def _date(row, key):
-    """ISO date/datetime string -> 'YYYY-MM-DD' for DRF DateField."""
-    v = _s(row, key)
-    return v[:10] if v else None
+    """Date cell -> 'YYYY-MM-DD' for DRF DateField (ISO or US format)."""
+    dt = _parse_flexible_datetime(_s(row, key))
+    return dt.date().isoformat() if dt else None
 
 
 def _dt(row, key):
-    """Pass an ISO datetime string through (DRF DateTimeField parses it)."""
-    return _s(row, key) or None
+    """Datetime cell -> ISO 8601 string DRF's DateTimeField accepts.
+
+    Passes ISO through and normalizes common US spreadsheet formats
+    (e.g. ``7/28/26 0:00``) to ISO. Unparseable/blank cells return None (the
+    field is then simply not set) rather than failing the whole row."""
+    dt = _parse_flexible_datetime(_s(row, key))
+    return dt.isoformat() if dt else None
 
 
-def _aware_dt(row, key):
-    """Parse an ISO datetime to a timezone-aware value for direct ORM writes
-    (those that bypass DRF, which would otherwise warn on naive datetimes)."""
+# Unite Us marks a lifetime (never-expiring) policy with the year-9999 sentinel
+# (``12/31/9999``). Excel/Sheets silently truncate that to a TWO-digit year on a
+# round-trip (``12/31/99``), which ``strptime('%y')`` then reads as 1999 --
+# turning a lifetime policy into one that "expired" 27 years ago and wrongly
+# marking the member Ineligible. Treat a ``/99`` OR ``/9999`` year in an EXPIRY
+# cell identically: the never-expires sentinel. Scoped to expiry only (via
+# ``_expiry_dt``) so created/enrolled/verified dates are never affected.
+NEVER_EXPIRES_YEAR = 9999
+_NEVER_EXPIRES_US_YEAR_RE = re.compile(r"\b\d{1,2}/\d{1,2}/(?:99|9999)\b")
+
+
+def _expiry_dt(row, key):
+    """Datetime cell for an EXPIRY field -> ISO 8601, mapping the never-expires
+    sentinel to the canonical year-9999 date.
+
+    A US-format cell whose year is ``99`` (Excel-truncated) or ``9999``, and an
+    ISO cell already at year 9999, are normalized to ``9999-12-31`` so
+    downstream expiry checks (``coverage_expired`` / the serializer's status
+    derivation) read the policy as active. All other dates parse normally."""
     raw = _s(row, key)
     if not raw:
         return None
-    dt = parse_datetime(raw)
+    if _NEVER_EXPIRES_US_YEAR_RE.search(raw):
+        return datetime(NEVER_EXPIRES_YEAR, 12, 31).isoformat()
+    dt = _parse_flexible_datetime(raw)
+    if dt is not None and dt.year == NEVER_EXPIRES_YEAR:
+        return datetime(NEVER_EXPIRES_YEAR, 12, 31).isoformat()
+    return dt.isoformat() if dt else None
+
+
+def _aware_dt(row, key):
+    """Parse a datetime cell (ISO or US format) to a timezone-aware value for
+    direct ORM writes (those that bypass DRF, which would otherwise warn on
+    naive datetimes)."""
+    dt = _parse_flexible_datetime(_s(row, key))
     if dt is None:
         return None
     if timezone.is_naive(dt):
@@ -280,7 +346,7 @@ def _insurance_from_row(row):
         "status": _enum(_s(row, "insurance_record_status"), {"active", "pending", "inactive", "expired"}),
         "record_status": _enum(_s(row, "insurance_record_status"), {"active", "pending", "inactive", "expired"}),
         "enrolled_at": _dt(row, "insurance_enrolled_at"),
-        "expired_at": _dt(row, "insurance_expired_at"),
+        "expired_at": _expiry_dt(row, "insurance_expired_at"),
         "verified": _bool(row, "insurance_verified"),
         "verified_at": _dt(row, "insurance_verified_at"),
         "ingested": _bool(row, "insurance_ingested"),
@@ -304,7 +370,7 @@ def _coverage_from_row(row):
         "external_member_id": _s(row, "external_member_id"),
         "status": _enum(_s(row, "insurance_status"), set(SocialCareCoverageStatus.values)),
         "enrolled_at": _dt(row, "insurance_enrolled_at"),
-        "expired_at": _dt(row, "insurance_expired_at"),
+        "expired_at": _expiry_dt(row, "insurance_expired_at"),
         "verified": _bool(row, "insurance_verified"),
         "verified_at": _dt(row, "insurance_verified_at"),
         "ingested": _bool(row, "insurance_ingested"),

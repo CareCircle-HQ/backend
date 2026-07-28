@@ -305,12 +305,41 @@ class ClientViewSet(BulkUpsertMixin, viewsets.ModelViewSet):
             pk=agent_id, is_williamsburg_agent=True
         ).exists()
 
+    def _reconcile_eligibility(self, obj):
+        """Run the import-time eligibility gates (medical-insurance expiry/type,
+        social-care hold, out-of-range address) after an extension client
+        upsert, so the INELIGIBLE off-ramp is SET when the ext saves bad data and
+        RECOVERED when the ext saves a fix -- exactly as on the CSV import. This
+        is the ext half of the "recovery-on-fix" path.
+
+        Runs AFTER ``serializer.save`` has persisted the client's insurances /
+        addresses (the gates read those relations). Fetches a fresh client so
+        newly-written child rows aren't read from a stale prefetch cache.
+        Best-effort: eligibility must never break the client save.
+        """
+        if obj is None:
+            return
+        try:
+            from api.history import ChangeSource
+            from api.services.eligibility import reconcile_client_eligibility
+
+            actor_label = getattr(self.request.user, "name", "") or ""
+            reconcile_client_eligibility(
+                Client.objects.get(pk=obj.pk),
+                actor_label=actor_label,
+                source=ChangeSource.EXTENSION,
+            )
+        except Exception:  # never let eligibility break the client upsert
+            pass
+
     def perform_create(self, serializer):
         serializer.save(**self._agent_save_kwargs())
+        self._reconcile_eligibility(serializer.instance)
         _safe_timeline(timeline.event_for_consent, serializer.instance, self.request)
 
     def perform_update(self, serializer):
         serializer.save(**self._agent_save_kwargs())
+        self._reconcile_eligibility(serializer.instance)
         _safe_timeline(timeline.event_for_consent, serializer.instance, self.request)
 
     def post_upsert(self, obj):
@@ -337,6 +366,7 @@ class ClientViewSet(BulkUpsertMixin, viewsets.ModelViewSet):
                 updates.append("is_williamsburg")
         if updates:
             obj.save(update_fields=updates)
+        self._reconcile_eligibility(obj)
         _safe_timeline(timeline.event_for_consent, obj, self.request)
 
     @action(detail=True, methods=["get"])
