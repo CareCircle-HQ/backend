@@ -53,6 +53,7 @@ from .views_members import (
     MemberHouseholdAddView,
     MemberHouseholdSearchView,
     MemberHouseholdView,
+    MemberHouseholdTypeView,
     MemberMakePrimaryView,
     MemberProductTypeView,
     MemberWarningsView,
@@ -64,9 +65,7 @@ from .views_members import (
     MemberOrdersView,
     MemberPhoneDetailView,
     MemberPhonesView,
-    MemberServiceCancelView,
     MemberServiceHoldView,
-    MemberServiceReactivateView,
     MemberServiceResumeView,
     MemberDismissAttentionView,
     MemberDoctorView,
@@ -219,6 +218,10 @@ urlpatterns = [
         MemberProductTypeView.as_view(),
     ),
     path(
+        "members/<uuid:client_id>/household-type/",
+        MemberHouseholdTypeView.as_view(),
+    ),
+    path(
         "members/<uuid:client_id>/warnings/",
         MemberWarningsView.as_view(),
     ),
@@ -244,8 +247,6 @@ urlpatterns = [
     path("members/<uuid:client_id>/cadence/", MemberCadenceView.as_view()),
     path("members/<uuid:client_id>/hold/", MemberServiceHoldView.as_view()),
     path("members/<uuid:client_id>/resume/", MemberServiceResumeView.as_view()),
-    path("members/<uuid:client_id>/cancel/", MemberServiceCancelView.as_view()),
-    path("members/<uuid:client_id>/reactivate/", MemberServiceReactivateView.as_view()),
     path("members/<uuid:client_id>/notes/", MemberNotesView.as_view()),
     path("members/<uuid:client_id>/cases/", MemberCasesView.as_view()),
     path(

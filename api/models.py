@@ -819,9 +819,10 @@ class ServiceAuthorizationStatus(models.TextChoices):
     DENIED = "denied", "Denied"
     EXPIRED = "expired", "Expired"
     # An OPEN case whose authorization has never been requested (blank auth on
-    # the export). Neutral in lifecycle logic (treated like no authorization:
-    # not favorable, not denied) -- it only gives the UI an explicit state
-    # instead of a blank.
+    # the export). In lifecycle logic it is treated exactly like a DENIAL (an
+    # open case that confers no service: never governs over a real approved/
+    # pending case, and drives the same full-stop when it is the top case) -- see
+    # lifecycle._DENIED_EQUIVALENT_STATUSES. Only the DISPLAY label differs.
     NEVER_REQUESTED = "never_requested", "Never Requested"
 
 
@@ -1886,6 +1887,13 @@ class EnrollmentVerification(models.Model):
     product_type_override = models.ForeignKey(
         "ProductType", on_delete=models.SET_NULL, null=True, blank=True,
         related_name="override_enrollments",
+    )
+    # Manual Household/Individual scope correction for THIS household. The scope
+    # is normally derived from the governing case's program name (see
+    # ``derive_household_type``); when that is wrong an agent sets this on the
+    # Household tab and readers honor it FIRST. Blank = use the derived scope.
+    household_type_override = models.CharField(
+        max_length=12, choices=CaseHouseholdType.choices, blank=True, default="",
     )
     stage = models.CharField(
         max_length=25, choices=EnrollmentStage.choices,

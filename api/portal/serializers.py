@@ -307,6 +307,40 @@ def _program_tracks(client):
     return program_tracks(client)
 
 
+def _screening_needs(client):
+    """Distinct identified social-need names across the client's screenings.
+    Feeds the 'Screening Results' sub-label under the stage bar's Screening
+    node. Entries in ``Screening.identified_social_needs`` may be plain strings
+    or dicts with a ``name`` key (mirrors lifecycle._is_eligible)."""
+    seen = {}
+    for s in client.screenings.all():
+        for need in (s.identified_social_needs or []):
+            name = need if isinstance(need, str) else (
+                (need or {}).get("name") if isinstance(need, dict) else ""
+            )
+            name = (name or "").strip()
+            if name and name.casefold() not in seen:
+                seen[name.casefold()] = name
+    return list(seen.values())
+
+
+def _assessment_eligible(client):
+    """Distinct 'Client May Be Eligible' program names across the client's
+    assessments (``Assessment.eligible_services``). Feeds the sub-label under the
+    stage bar's Assessment node. Entries may be plain strings or dicts with a
+    ``name`` key."""
+    seen = {}
+    for a in client.assessments.all():
+        for svc in (a.eligible_services or []):
+            name = svc if isinstance(svc, str) else (
+                (svc or {}).get("name") if isinstance(svc, dict) else ""
+            )
+            name = (name or "").strip()
+            if name and name.casefold() not in seen:
+                seen[name.casefold()] = name
+    return list(seen.values())
+
+
 def _main_stage_label(client):
     """Human label for the client's main stage."""
     from api.models import ClientStage
@@ -805,6 +839,13 @@ class MemberDetailSerializer(serializers.Serializer):
                 # + status. Governing program first. Empty when no internal-
                 # service case exists (the client hasn't entered a program yet).
                 "programs": _program_tracks(client),
+                # Distinct social needs the screening identified -- shown as
+                # chips under the stage bar's Screening node. Empty when no
+                # screening (or no needs) on file.
+                "screening_needs": _screening_needs(client),
+                # "Client May Be Eligible" program names from the assessments --
+                # shown as a sub-label under the stage bar's Assessment node.
+                "assessment_eligible": _assessment_eligible(client),
             },
             # Read-only authorization status sourced from the client's GOVERNING
             # internal-service case (the meal/box case that gates kitchen
@@ -1215,6 +1256,15 @@ class PortalMemberCaseSerializer(serializers.ModelSerializer):
         source="get_outcome_resolution_type_display", read_only=True
     )
     is_met_council = serializers.SerializerMethodField()
+    # True for the client's GOVERNING internal-service case -- the same case the
+    # stage progress bar stars. Passed in via context by MemberCasesView.
+    governing = serializers.SerializerMethodField()
+    # Product kind (Meals / Boxes) resolved from the program/service name, and the
+    # Household vs Individual scope -- mirrors the stage progress bar's chips.
+    product_kind = serializers.SerializerMethodField()
+    product_kind_label = serializers.SerializerMethodField()
+    household_type = serializers.SerializerMethodField()
+    household_type_label = serializers.SerializerMethodField()
 
     class Meta:
         model = Case
@@ -1230,11 +1280,50 @@ class PortalMemberCaseSerializer(serializers.ModelSerializer):
             "service_authorization_request_starts_at",
             "service_authorization_request_ends_at",
             "outcome_description", "resolution_type", "resolution_label",
-            "case_description", "is_met_council",
+            "case_description", "is_met_council", "governing",
+            "product_kind", "product_kind_label",
+            "household_type", "household_type_label",
         ]
 
     def get_code(self, obj):
         return f"CSE-{str(obj.case_id)[:8]}"
+
+    def get_governing(self, obj):
+        gid = self.context.get("governing_case_id")
+        return bool(gid) and str(obj.case_id) == str(gid)
+
+    def _product_kind(self, obj):
+        from api.services.catalog import product_type_kind_for_name
+
+        return product_type_kind_for_name(obj.service_type or obj.program_name)
+
+    def get_product_kind(self, obj):
+        kind = self._product_kind(obj)
+        return kind.value if kind else ""
+
+    def get_product_kind_label(self, obj):
+        from api.models import ProductTypeKind
+
+        kind = self._product_kind(obj)
+        return ProductTypeKind(kind).label if kind else ""
+
+    def _household_type(self, obj):
+        # Scope is DRIVEN BY THE CASE -- derived LIVE from the program name (the
+        # source of truth), never the stored household_type cache. A manual
+        # per-household scope correction lives on the enrollment and must never
+        # change what the case itself reports.
+        from api.models import CaseHouseholdType
+        from api.serializers import derive_household_type
+
+        return derive_household_type(None, obj.program_name) or CaseHouseholdType.INDIVIDUAL
+
+    def get_household_type(self, obj):
+        return self._household_type(obj)
+
+    def get_household_type_label(self, obj):
+        from api.models import CaseHouseholdType
+
+        return CaseHouseholdType(self._household_type(obj)).label
 
     def get_is_met_council(self, obj):
         # Per-case-type rule (see api.services.lifecycle.case_is_met_council):

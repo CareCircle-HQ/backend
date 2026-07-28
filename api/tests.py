@@ -1450,11 +1450,12 @@ class HouseholdScopeSwitchTest(TestCase):
 
 class UnapprovedActivePullBackTest(TestCase):
     """A household advanced past Verified (Kitchen Assignment / Service Active)
-    whose governing internal-service authorization is NOT approved (pending /
-    never-requested / blank) is pulled BACK to Verified ("Waiting
-    Authorization"): only an approval keeps a household in service. A later
-    approval re-advances it. This fixes households activated before their
-    authorization landed (the CSV-import gap)."""
+    whose governing internal-service authorization is still PENDING (or blank) is
+    pulled BACK to Verified ("Waiting Authorization"): only an approval keeps a
+    household in service. A later approval re-advances it. This fixes households
+    activated before their authorization landed (the CSV-import gap).
+    (NEVER_REQUESTED is NOT a soft pull-back -- it is treated as a denial; see
+    ``test_never_requested_full_stops_like_denial``.)"""
 
     def _client(self):
         return Client.objects.create(
@@ -1499,14 +1500,20 @@ class UnapprovedActivePullBackTest(TestCase):
         self.assertEqual(enr.stage, EnrollmentStage.VERIFIED)
         self.assertEqual(program_status(enr), ProgramStatus.WAITING_AUTHORIZATION)
 
-    def test_never_requested_pulls_kitchen_assignment_back(self):
-        from .models import EnrollmentStage
+    def test_never_requested_full_stops_like_denial(self):
+        # A NEVER_REQUESTED authorization is treated exactly like a DENIAL: an
+        # open case that confers no service. A Kitchen-Assignment household is
+        # paused (On Hold) and hard off-ramped to INELIGIBLE -- NOT softly pulled
+        # back to Verified.
+        from .models import ClientStage, EnrollmentStage
 
         client = self._client()
         enr = self._enrollment(client, EnrollmentStage.KITCHEN_ASSIGNMENT)
         self._save_case(client, str(uuid.uuid4()), "never_requested")
         enr.refresh_from_db()
-        self.assertEqual(enr.stage, EnrollmentStage.VERIFIED)
+        client.refresh_from_db()
+        self.assertEqual(EnrollmentStage(enr.stage), EnrollmentStage.ON_HOLD)
+        self.assertEqual(client.lifecycle_stage, ClientStage.INELIGIBLE)
 
     def test_approval_readvances_after_pullback(self):
         from .models import EnrollmentStage
@@ -2231,6 +2238,92 @@ class RemovalAndVerificationGuardsTest(TestCase):
         self.assertIn(resp.status_code, (200, 204))
         self.assertFalse(HouseholdMember.objects.filter(client=dep).exists())
 
+    def _patch_member(self, client_pk, mv_pk, body):
+        """PATCH the HouseholdMemberEditView directly with a DRF-wrapped request
+        (so ``request.data`` parses when calling the view method in-process)."""
+        from rest_framework.parsers import JSONParser
+        from rest_framework.request import Request
+        from rest_framework.test import APIRequestFactory
+
+        from .portal.views_members import HouseholdMemberEditView
+
+        raw = APIRequestFactory().patch("/", body, format="json")
+        req = Request(raw, parsers=[JSONParser()])
+        return HouseholdMemberEditView().patch(req, client_pk, mv_pk)
+
+    def _serviced_household(self, *, deps=1):
+        """A SERVICE_ACTIVE household: primary + ``deps`` dependents, each with an
+        ACTIVE MemberDietaryProfile. Returns (enr, primary_mv, [dep_mv, ...])."""
+        from .models import (
+            EnrollmentStage, EnrollmentVerification, Household, HouseholdMember,
+            MemberDietaryProfile, MemberStatus,
+        )
+
+        primary = self._client("Pat", "Primary")
+        hh = Household.objects.create(name="HH")
+        HouseholdMember.objects.create(household=hh, client=primary, is_primary=True)
+        enr = EnrollmentVerification.objects.create(
+            client=primary, household=hh, stage=EnrollmentStage.SERVICE_ACTIVE,
+        )
+        primary_mv = MemberDietaryProfile.objects.create(
+            enrollment=enr, client=primary, status=MemberStatus.ACTIVE,
+        )
+        dep_mvs = []
+        for i in range(deps):
+            dep = self._client(f"Dep{i}", "Endent")
+            HouseholdMember.objects.create(household=hh, client=dep, is_primary=False)
+            dep_mvs.append(MemberDietaryProfile.objects.create(
+                enrollment=enr, client=dep, status=MemberStatus.ACTIVE,
+            ))
+        return enr, primary_mv, dep_mvs
+
+    def test_can_pause_primary_member(self):
+        """The primary is pausable like any member. Pausing them while another
+        member is still active does NOT hold the program."""
+        from .models import EnrollmentStage, MemberStatus
+
+        enr, primary_mv, (dep_mv,) = self._serviced_household(deps=1)
+
+        resp = self._patch_member(
+            enr.client_id, primary_mv.pk, {"pause": True, "pause_reason": "x"},
+        )
+
+        self.assertEqual(resp.status_code, 200)
+        primary_mv.refresh_from_db()
+        self.assertEqual(primary_mv.status, MemberStatus.PAUSED)
+        enr.refresh_from_db()
+        self.assertEqual(enr.stage, EnrollmentStage.SERVICE_ACTIVE)  # dep still active
+
+    def test_all_members_paused_holds_program(self):
+        """Once EVERY household member is paused the program goes On Hold."""
+        from .models import EnrollmentStage
+
+        enr, primary_mv, (dep_mv,) = self._serviced_household(deps=1)
+
+        self._patch_member(enr.client_id, dep_mv.pk, {"pause": True, "pause_reason": "a"})
+        enr.refresh_from_db()
+        self.assertEqual(enr.stage, EnrollmentStage.SERVICE_ACTIVE)  # primary still active
+
+        self._patch_member(enr.client_id, primary_mv.pk, {"pause": True, "pause_reason": "b"})
+        enr.refresh_from_db()
+        self.assertEqual(enr.stage, EnrollmentStage.ON_HOLD)  # all paused -> held
+
+    def test_unpausing_resumes_held_program(self):
+        """Unpausing any member lifts the all-paused auto-hold."""
+        from .models import EnrollmentStage
+
+        enr, primary_mv, (dep_mv,) = self._serviced_household(deps=1)
+        self._patch_member(enr.client_id, dep_mv.pk, {"pause": True, "pause_reason": "a"})
+        self._patch_member(enr.client_id, primary_mv.pk, {"pause": True, "pause_reason": "b"})
+        enr.refresh_from_db()
+        self.assertEqual(enr.stage, EnrollmentStage.ON_HOLD)
+
+        self._patch_member(
+            enr.client_id, dep_mv.pk, {"unpause": True, "pause_reason": "back"},
+        )
+        enr.refresh_from_db()
+        self.assertEqual(enr.stage, EnrollmentStage.SERVICE_ACTIVE)
+
     def test_cannot_verify_member_without_internal_service_case(self):
         from rest_framework.test import APIRequestFactory
 
@@ -2865,7 +2958,38 @@ class ProgramTracksTest(TestCase):
         self.assertEqual(t["scope"]["label"], "Individual")
         self.assertEqual(t["authorization"]["label"], "Approved")
         self.assertEqual(t["verification"]["label"], "Verified")
-        self.assertEqual(t["service"]["label"], "Waiting for Kitchen Assignment")
+        self.assertEqual(t["service"]["label"], "Kitchen Assignment")
+
+    def test_verified_approved_shows_waiting_for_kitchen(self):
+        """A VERIFIED enrollment on an APPROVED case (verification complete but
+        not yet advanced to the KITCHEN_ASSIGNMENT stage) reads
+        "Waiting for Kitchen Assignment" on the Service phase -- not blank."""
+        from .models import EnrollmentStage, ServiceAuthorizationStatus
+        from .services.lifecycle import program_tracks
+
+        c = self._setup(
+            stage=EnrollmentStage.VERIFIED,
+            auth=ServiceAuthorizationStatus.APPROVED,
+        )
+        t = program_tracks(c)[0]
+        self.assertEqual(t["verification"]["label"], "Verified")
+        self.assertEqual(t["service"]["value"], "waiting_kitchen")
+        self.assertEqual(t["service"]["label"], "Kitchen Assignment")
+
+    def test_verified_pending_auth_keeps_service_blank(self):
+        """A VERIFIED enrollment whose authorization is still pending/requested
+        (not yet approved) keeps the Service phase blank -- the Authorization
+        phase carries the pending state until approval lands."""
+        from .models import EnrollmentStage, ServiceAuthorizationStatus
+        from .services.lifecycle import program_tracks
+
+        c = self._setup(
+            stage=EnrollmentStage.VERIFIED,
+            auth=ServiceAuthorizationStatus.PENDING,
+        )
+        t = program_tracks(c)[0]
+        self.assertEqual(t["authorization"]["label"], "Requested")
+        self.assertEqual(t["service"]["label"], "")
 
     def test_household_scope_label(self):
         from .models import (
@@ -2972,6 +3096,30 @@ class ProgramTracksTest(TestCase):
         self.assertEqual(len(tracks), 1)
         self.assertTrue(tracks[0]["governing"])
 
+    def test_verification_not_requested_without_enrollment(self):
+        # A food case with NO enrollment (no verification request raised yet)
+        # must read "Not Requested" -- NOT "Pending Verification", which would
+        # imply a request the (correctly hidden) verification button won't offer.
+        from .models import (
+            Case, CaseStatus, CaseType, Client, Household, HouseholdMember,
+        )
+        from .services.lifecycle import program_tracks
+
+        client = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="No", last_name="Enr",
+            lifecycle_stage="assessment",
+        )
+        hh = Household.objects.create(name="HH")
+        HouseholdMember.objects.create(household=hh, client=client, is_primary=True)
+        Case.objects.create(
+            case_id=str(uuid.uuid4()), client=client,
+            case_type=CaseType.INTERNAL_SERVICE, case_status=CaseStatus.OPEN,
+            service_type="Medically Tailored Meals", program_name="MTM",
+        )
+        t = program_tracks(client)[0]
+        self.assertEqual(t["verification"]["value"], "not_requested")
+        self.assertEqual(t["verification"]["label"], "Not Requested")
+
     def test_pending_verification_requested_authorization(self):
         # A PENDING (Unite Us requested/open/deferred) authorization reads the
         # real "Requested" state on the bar -- not a generic "Waiting".
@@ -2987,25 +3135,25 @@ class ProgramTracksTest(TestCase):
         self.assertEqual(t["verification"]["label"], "Pending Verification")
         self.assertEqual(t["service"]["label"], "")
 
-    def test_never_requested_authorization_reads_real_state(self):
-        # A case whose authorization was NEVER requested reads "Never Requested"
-        # (distinct from a live pending request), not "Waiting Authorization".
+    def test_never_requested_hidden_from_bar(self):
+        # A NEVER_REQUESTED authorization is treated like a denial AND is hidden
+        # from the stage bar entirely -- an open case that never had an
+        # authorization requested is not surfaced as a program track.
         from .models import EnrollmentStage, ServiceAuthorizationStatus
         from .services.lifecycle import program_tracks
 
-        t = program_tracks(self._setup(
+        c = self._setup(
             stage=EnrollmentStage.VERIFIED,
             auth=ServiceAuthorizationStatus.NEVER_REQUESTED,
-        ))[0]
-        self.assertEqual(t["authorization"]["value"], "never_requested")
-        self.assertEqual(t["authorization"]["label"], "Never Requested")
+        )
+        self.assertEqual(program_tracks(c), [])
 
     def test_second_food_kind_conflicts_and_shares_verification(self):
         # A non-governing, DIFFERENT-kind food case (e.g. a Boxes case alongside
         # a governing Meals case) reads the household-wide "Verified" and is
         # flagged "Conflicting" (a household runs one food program; Meals/Boxes
-        # are subtypes). Mirrors client c5d0c921 (Meals approved + Boxes
-        # never-requested).
+        # are subtypes). (A NEVER_REQUESTED second case would be hidden entirely,
+        # so a still-shown DENIED case is used here.)
         from .models import (
             Case, CaseStatus, CaseType, EnrollmentStage, ServiceAuthorizationStatus,
         )
@@ -3019,12 +3167,12 @@ class ProgramTracksTest(TestCase):
             case_id=str(uuid.uuid4()), client=client,
             case_type=CaseType.INTERNAL_SERVICE, case_status=CaseStatus.OPEN,
             service_type="Produce Prescription/Voucher", program_name="Boxes",
-            service_authorization_status=ServiceAuthorizationStatus.NEVER_REQUESTED,
+            service_authorization_status=ServiceAuthorizationStatus.DENIED,
         )
         tracks = program_tracks(client)
         boxes = next(t for t in tracks if t["service_type"] == "Boxes")
         self.assertFalse(boxes["governing"])
-        self.assertEqual(boxes["authorization"]["label"], "Never Requested")
+        self.assertEqual(boxes["authorization"]["label"], "Denied")
         self.assertEqual(boxes["verification"]["label"], "Verified")
         self.assertEqual(boxes["service"]["value"], "conflicting")
         self.assertEqual(boxes["service"]["label"], "Conflicting")

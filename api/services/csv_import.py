@@ -629,7 +629,8 @@ def map_case_row(row):
         # An OPEN case with a BLANK authorization request has never had an
         # authorization requested -- record that explicitly as "Never Requested"
         # instead of leaving a blank, so the authorization UI reads a real state.
-        # Neutral in lifecycle logic (like blank): not favorable, not denied.
+        # In lifecycle logic it is treated exactly like a DENIAL (confers no
+        # service) -- see lifecycle._DENIED_EQUIVALENT_STATUSES.
         out["service_authorization_status"] = ServiceAuthorizationStatus.NEVER_REQUESTED
         out["service_authorization_status_label"] = "Never Requested"
     set_("service_authorization_request_starts_at", _dt(row, "service_authorization_request_starts_at"))
