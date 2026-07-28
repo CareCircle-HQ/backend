@@ -6248,6 +6248,48 @@ class ReportExportsTest(TestCase):
         self.assertEqual(row["Is there Eligibility"], "No")
         self.assertEqual(row["Is there Navigation"], "No")
 
+    def test_all_members_team_of_case_creator(self):
+        from .models import Case, CaseStatus, CaseType, UniteUsAgent
+
+        creator_id = uuid.uuid4()
+        UniteUsAgent.objects.create(
+            user_id=creator_id, name="Cara Creator",
+            originating_team="CareCircle Call Center",
+        )
+        # Member whose governing internal-service case was created by a rostered
+        # Unite Us user -> that user's Originating Team.
+        rostered = self._client("Team", "Rostered")
+        Case.objects.create(
+            case_id=uuid.uuid4(), client=rostered,
+            created_by_id=creator_id,
+            case_status=CaseStatus.OPEN, case_type=CaseType.INTERNAL_SERVICE,
+            program_name="MTM - Medically Tailored Meals",
+        )
+        # Governing case created by someone NOT on the roster -> Met Council Team.
+        offroster = self._client("Team", "Metcouncil")
+        Case.objects.create(
+            case_id=uuid.uuid4(), client=offroster,
+            created_by_id=uuid.uuid4(),
+            case_status=CaseStatus.OPEN, case_type=CaseType.INTERNAL_SERVICE,
+            program_name="MTM - Medically Tailored Meals",
+        )
+        # No case at all -> blank.
+        none_case = self._client("Team", "Nocase")
+
+        rows = self._rows(reverse("portal-report-all-members"))
+        by_id = {r["Member ID"]: r for r in rows}
+        self.assertEqual(
+            by_id[str(rostered.client_id)]["Team of Case Creator"],
+            "CareCircle Call Center",
+        )
+        self.assertEqual(
+            by_id[str(offroster.client_id)]["Team of Case Creator"],
+            "Met Council Team",
+        )
+        self.assertEqual(
+            by_id[str(none_case.client_id)]["Team of Case Creator"], ""
+        )
+
     def test_all_members_flags_wrong_medicaid_type_ineligible(self):
         from datetime import datetime, timezone as dt_tz
 
