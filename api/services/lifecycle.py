@@ -446,12 +446,37 @@ def derive_client_stage(client, *, ignore_sticky=False):
     return _ENROLLMENT_DRIVES.get(stage, early)
 
 
+def _set_client_stage(client, target, *, actor=None):
+    """Set the client's lifecycle stage + log a StageEvent, unconditionally
+    (used for the SERVICE_INACTIVE off-ramp, which ``derive_client_stage`` never
+    PRODUCES -- it only keeps it sticky once set). No-op when already on
+    ``target``."""
+    current = client.lifecycle_stage
+    if current == target:
+        return
+    client.lifecycle_stage = target
+    client.lifecycle_stage_at = timezone.now()
+    client.save(update_fields=["lifecycle_stage", "lifecycle_stage_at"])
+    StageEvent.objects.create(
+        entity_type=StageEntityType.CLIENT,
+        client=client,
+        from_stage=current or "",
+        to_stage=target,
+        source=StageEventSource.AUTO,
+        actor=actor,
+    )
+
+
 @transaction.atomic
-def recompute_client_stage(client, *, actor=None, save=True):
+def recompute_client_stage(client, *, actor=None, save=True, ignore_sticky=False):
     """Derive and apply the client's funnel stage. Logs a StageEvent only when
     the stage changes. Returns the (possibly unchanged) stage.
+
+    ``ignore_sticky=True`` bypasses the INELIGIBLE / SERVICE_INACTIVE off-ramp
+    stickiness so a recovered member is re-derived from live data -- used by the
+    reactivation path when a new open internal-service case reopens service.
     """
-    target = derive_client_stage(client)
+    target = derive_client_stage(client, ignore_sticky=ignore_sticky)
     current = client.lifecycle_stage
     if target == current:
         return target
@@ -579,6 +604,11 @@ ENROLLMENT_TRANSITIONS = {
         # governing authorization is no longer approved returns to Verified /
         # Waiting Authorization and stops receiving deliveries.
         EnrollmentStage.VERIFIED,
+        # Meals<->boxes program switch requeue (task 3.1, _handle_program_switch):
+        # when the governing internal-service case switches product KIND, the
+        # active household's kitchen + calendar are for the WRONG product, so it
+        # is requeued for a NEW kitchen assignment (kitchen + cadence + calendar).
+        EnrollmentStage.KITCHEN_ASSIGNMENT,
     },
     EnrollmentStage.SERVICE_COMPLETE: {EnrollmentStage.CLOSED},
     EnrollmentStage.ON_HOLD: {
@@ -861,12 +891,27 @@ _AUTH_ELIGIBLE_STAGES = {
 # among several. An approval supersedes a denial regardless of dates: a
 # household holding at least one approved meal/box authorization IS authorized,
 # even if a parallel program was denied (or denied the same day). Higher wins.
+# NEVER_REQUESTED is treated exactly like a DENIAL (same rank): an OPEN case that
+# never had an authorization requested confers no service, so it must never be
+# chosen as governing over a real approved/pending case, and when it IS the top
+# case it drives the same full-stop as a denial (see _DENIED_EQUIVALENT_STATUSES).
 _AUTH_FAVOR_RANK = {
     ServiceAuthorizationStatus.APPROVED: 4,
     ServiceAuthorizationStatus.NOT_REQUIRED: 4,
     ServiceAuthorizationStatus.PENDING: 3,
     ServiceAuthorizationStatus.DENIED: 2,
+    ServiceAuthorizationStatus.NEVER_REQUESTED: 2,
     ServiceAuthorizationStatus.EXPIRED: 1,
+}
+
+# Authorization statuses that drive the DENIAL full-stop. A NEVER_REQUESTED
+# authorization on an OPEN case is treated identically to an explicit DENIAL:
+# the case stays open but confers no service, so the household is paused / the
+# verification request disregarded / a Kitchen-Assignment household off-ramped,
+# exactly as a denial would. (Only the DISPLAY label stays "Never Requested".)
+_DENIED_EQUIVALENT_STATUSES = {
+    ServiceAuthorizationStatus.DENIED,
+    ServiceAuthorizationStatus.NEVER_REQUESTED,
 }
 
 # Timezone-aware floor so cases with a missing date sort last (never beat a
@@ -887,13 +932,15 @@ def governing_case_key(case):
     """Descending sort key for picking the governing case among several.
 
     Priority: most favorable authorization first (an approval beats a denial no
-    matter the dates), then OPEN over closed/cancelled (so a lingering
-    superseded case can't keep governing a switch), then most recently opened,
-    then most recently updated, then case_id -- a stable,
-    environment-independent final tiebreak so the same case is chosen
-    everywhere. The previous date-only sort left exact ``date_opened`` ties to
-    arbitrary DB row order, which could pick a denied case over an approved one
-    for the same household.
+    matter the dates -- "Approved is a must over any other rule"), then OPEN over
+    closed/cancelled (so a lingering superseded case can't keep governing a
+    switch), then **most recently created** (``case_created_at`` -- the
+    authoritative source created timestamp WITH TIME, since most cases are
+    created the same day; falls back to ``date_opened`` only for rows not yet
+    refreshed by an import), then most recently updated, then case_id -- a
+    stable, environment-independent final tiebreak so the same case is chosen
+    everywhere. ``date_opened`` is NOT used as the primary key: it can be
+    date-only and agent-edited, which left exact ties to arbitrary DB row order.
 
     The open-ness rank sits BELOW authorization favor, so an approved case
     (open or closed) still beats a pending one -- during a meals->boxes switch
@@ -903,7 +950,7 @@ def governing_case_key(case):
     return (
         _AUTH_FAVOR_RANK.get(case.service_authorization_status, 0),
         _case_open_rank(case),
-        case.date_opened or _DT_FLOOR,
+        case.case_created_at or case.date_opened or _DT_FLOOR,
         case.updated_at or _DT_FLOOR,
         str(case.case_id),
     )
@@ -965,8 +1012,14 @@ def program_status(enrollment):
 
     stage = EnrollmentStage(enrollment.stage)
 
-    # A paused program shows On Hold above everything else.
+    # A paused program shows On Hold above everything else -- UNLESS the hold is
+    # a delivery-coverage (Out of Range) hold, which surfaces as Out of Range so
+    # the program stage matches the members' Out of Range labels. (The main
+    # lifecycle stage separately carries the Ineligible / Does Not Qualify
+    # off-ramp; this per-program status reflects the coverage block distinctly.)
     if stage == EnrollmentStage.ON_HOLD:
+        if _enrollment_has_out_of_range_member(enrollment):
+            return ProgramStatus.OUT_OF_RANGE
         return ProgramStatus.ON_HOLD
 
     gov = governing_internal_case(enrollment)
@@ -1010,6 +1063,301 @@ def program_status(enrollment):
     return ProgramStatus.PENDING_VERIFICATION
 
 
+# ---------------------------------------------------------------------------
+# Phase 7: per-program display tracks for the new member stage bar
+# ---------------------------------------------------------------------------
+# The redesigned stage bar decomposes each PROGRAM into three display phases --
+# Authorization -> Verification -> Service -- rather than the single linear
+# ``program_status`` timeline. ``program_tracks`` returns one entry per distinct
+# program the client qualifies for. It is generic across categories (today only
+# Food -> Meals/Boxes exists, but additional categories slot in as more entries)
+# and is derived on read, never stored.
+
+
+def _authorization_phase(auth):
+    """Fold a Case ``service_authorization_status`` into the display states of
+    the Authorization phase.
+
+    The bar shows the REAL authorization state rather than collapsing every
+    not-yet-decided value into a generic "Waiting Authorization" (which was
+    confusing -- a case where an authorization was never even requested read the
+    same as one with a live pending request). States:
+
+        Approved / Denied / Never Requested / Requested
+    """
+    from api.models import ServiceAuthorizationStatus as A
+
+    # EXPIRED was authorized once; the expiry surfaces in the Service phase, so
+    # the Authorization phase still reads Approved.
+    if auth in (A.APPROVED, A.NOT_REQUIRED, A.EXPIRED):
+        return ("approved", "Approved")
+    if auth == A.DENIED:
+        return ("denied", "Denied")
+    # No authorization was ever requested on the case (an OPEN case with a blank
+    # authorization -- see csv_import). Distinct from a live pending request.
+    if auth == A.NEVER_REQUESTED:
+        return ("never_requested", "Never Requested")
+    # PENDING (Unite Us requested / open / deferred) -- a request exists and is
+    # awaiting a decision. A truly blank status also lands here.
+    return ("requested", "Requested")
+
+
+def _verification_phase(enrollment):
+    """Verification phase for the program bar:
+
+        Not Requested -> no verification request has been raised yet
+        Pending Verification -> a request exists but isn't Verified yet
+        Verified -> the enrollment has been verified
+
+    "Pending Verification" is reserved for a LIVE request (an enrollment exists
+    and sits in a pre-verification stage). A food case with NO enrollment has no
+    request yet, so it reads "Not Requested" -- mirroring the Authorization
+    phase's "Never Requested" -- instead of implying a pending request that the
+    verification button (which needs a real request) won't offer.
+    """
+    if enrollment is None:
+        return ("not_requested", "Not Requested")
+    if EnrollmentStage(enrollment.stage) in _PRE_VERIFICATION_STAGES:
+        return ("pending", "Pending Verification")
+    return ("verified", "Verified")
+
+
+def _member_status_on(client, enrollment):
+    """The client's own per-member status on the given enrollment (or None)."""
+    if enrollment is None or client is None:
+        return None
+    for mv in enrollment.member_profiles.all():
+        if mv.client_id and str(mv.client_id) == str(client.client_id):
+            return mv.status
+    return None
+
+
+def _enrollment_has_out_of_range_member(enrollment):
+    """True when any member of ``enrollment`` is Out of Range -- i.e. the
+    household is held for a delivery-coverage (ZIP) block, which the program
+    stage should surface as Out of Range rather than a generic On Hold."""
+    from api.models import MemberStatus
+
+    if enrollment is None:
+        return False
+    return any(
+        mv.status == MemberStatus.OUT_OF_RANGE
+        for mv in enrollment.member_profiles.all()
+    )
+
+
+def _service_phase(client, enrollment, gov_case):
+    """Service phase display status. Empty until the program reaches a servicing
+    stage. Mirrors the plan's Service statuses (Waiting for Kitchen Assignment /
+    Active / On Hold / Out of Range / Out of Orbit / Service Expired / Canceled /
+    Does Not Qualify / Closed)."""
+    from api.models import CaseStatus, ClientStage, MemberStatus
+    from api.models import ServiceAuthorizationStatus as A
+
+    # A terminal GOVERNING case (now surfaced on the bar even when closed) ends
+    # the program, so the Service phase reflects the CASE outcome directly --
+    # Closed vs Canceled -- taking precedence over the enrollment stage (a
+    # closed case can sit atop a cancelled or completed enrollment).
+    case_status = getattr(gov_case, "case_status", None) if gov_case else None
+    if case_status == CaseStatus.CANCELLED:
+        return ("canceled", "Canceled")
+    if case_status == CaseStatus.CLOSED:
+        return ("closed", "Closed")
+
+    if enrollment is not None:
+        stage = EnrollmentStage(enrollment.stage)
+        if stage == EnrollmentStage.CANCELLED:
+            return ("canceled", "Canceled")
+        if stage in (EnrollmentStage.CLOSED, EnrollmentStage.SERVICE_COMPLETE):
+            return ("closed", "Closed")
+        # An Out-of-Range member surfaces on the SERVICE phase as Out of Range on
+        # every non-terminal stage -- including an Out-of-Range HOLD (ON_HOLD) --
+        # and takes precedence over both On Hold and the Does Not Qualify
+        # eligibility off-ramp below: the per-program Service stage reflects the
+        # coverage block, while the MAIN lifecycle stage separately carries the
+        # Ineligible / Does Not Qualify off-ramp.
+        if _member_status_on(client, enrollment) == MemberStatus.OUT_OF_RANGE:
+            return ("out_of_range", "Out of Range")
+    # Coverage / eligibility off-ramp (Decision 2): unsupported insurance or
+    # social-care coverage -> Does Not Qualify. Distinct from the main-bar Not
+    # Eligible off-ramp; only applies to a still-live (non-terminal) program.
+    if client is not None and client.lifecycle_stage == ClientStage.INELIGIBLE:
+        return ("does_not_qualify", "Does Not Qualify")
+    if enrollment is None:
+        return ("", "")
+    stage = EnrollmentStage(enrollment.stage)
+    if stage == EnrollmentStage.ON_HOLD:
+        return ("on_hold", "On Hold")
+    end = getattr(gov_case, "service_authorization_approval_ends_at", None) if gov_case else None
+    auth = getattr(gov_case, "service_authorization_status", "") if gov_case else ""
+    window_expired = bool(end and end.date() < timezone.localdate())
+    if (auth == A.EXPIRED or window_expired) and stage in _AUTH_WINDOW_STAGES:
+        return ("service_expired", "Service Expired")
+    # A VERIFIED household whose authorization is APPROVED is cleared for service
+    # but not yet assigned to a kitchen -> "Waiting for Kitchen Assignment" (the
+    # KITCHEN_ASSIGNMENT stage is the explicit next step, but the moment
+    # verification completes on an approved case the program is already waiting on
+    # a kitchen). If the authorization hasn't been approved yet (still
+    # pending/requested) the Authorization phase carries that state and Service
+    # stays blank until approval lands.
+    verified_awaiting_kitchen = (
+        stage == EnrollmentStage.VERIFIED and auth in (A.APPROVED, A.NOT_REQUIRED)
+    )
+    if stage in (EnrollmentStage.SERVICE_ACTIVE, EnrollmentStage.KITCHEN_ASSIGNMENT) or verified_awaiting_kitchen:
+        mv = _member_status_on(client, enrollment)
+        if mv == MemberStatus.OUT_OF_RANGE:
+            return ("out_of_range", "Out of Range")
+        if mv == MemberStatus.OUT_OF_ORBIT:
+            return ("out_of_orbit", "Out of Orbit")
+        if stage == EnrollmentStage.SERVICE_ACTIVE:
+            return ("active", "Active")
+        return ("waiting_kitchen", "Kitchen Assignment")
+    # Verified but authorization not yet approved -> Service stays blank.
+    return ("", "")
+
+
+def program_tracks(client):
+    """Per-program display tracks for the redesigned member stage bar (Phase 7).
+
+    One entry per distinct PROGRAM the client qualifies for -- grouped by product
+    kind (Meals/Boxes) today, generic for future categories. Each program's
+    governing internal-service case drives the Authorization phase; the client's
+    governing (household) enrollment drives the Verification + Service phases. The
+    governing program is returned first (``governing: true``), additional programs
+    after. Derived on read; never stored. Empty list when the client holds no
+    internal-service case.
+    """
+    from api.models import CaseHouseholdType, ProductTypeKind
+    from api.models import ServiceAuthorizationStatus as A
+    from api.services.catalog import product_type_kind_for_name
+
+    if client is None:
+        return []
+    # The GOVERNING internal-service case is ALWAYS surfaced regardless of its
+    # case STATUS -- even when closed / cancelled -- so the bar always reflects
+    # the case that governs the member (its live Service phase carries Closed /
+    # Canceled). Non-governing cases render only while OPEN; a closed/cancelled
+    # non-governing case drops off (its history lives on the Programs tab). A
+    # NEVER_REQUESTED authorization is treated like a denial and stays hidden for
+    # every case (governing included) -- it is not a real program to surface.
+    all_cases = _internal_service_cases(client)
+    if not all_cases:
+        return []
+    governing = max(all_cases, key=governing_case_key)
+    cases = [
+        c for c in all_cases
+        if c.service_authorization_status != A.NEVER_REQUESTED
+        and (
+            c.case_status not in _CLOSED_CASE_STATUSES
+            or c.case_id == governing.case_id
+        )
+    ]
+
+    # Representative enrollment (a verification is household-wide): the most
+    # recent non-terminal governing enrollment, else the most recent overall.
+    enr = None
+    enrollments = _governing_enrollments(client)
+    if enrollments:
+        live = [
+            e for e in enrollments
+            if EnrollmentStage(e.stage) not in _TERMINAL_STAGES
+        ]
+        enr = sorted(
+            live or enrollments,
+            key=lambda e: e.opened_at or _DT_FLOOR,
+            reverse=True,
+        )[0]
+
+    # One track PER internal-service case -- cases are NOT grouped by program, so
+    # every case shows on the bar (even two of the same Meals/Boxes kind), and
+    # the single governing case is flagged (``governing``) so the UI can
+    # distinguish it. Authorization is read per-case. Verification + Service
+    # attach to the household EnrollmentVerification, which reconciles onto the
+    # governing case -- so only the governing FOOD case shows those phases; every
+    # other case shows Authorization only, with Verification/Service blank ("--").
+    gov_kind = product_type_kind_for_name(
+        governing.service_type or governing.program_name
+    ) if governing else None
+    gov_label = (
+        (governing.service_type or governing.service_category
+         or governing.program_name or "").strip().casefold()
+        if governing else ""
+    )
+    tracks = []
+    for c in cases:
+        kind = product_type_kind_for_name(c.service_type or c.program_name)
+        is_food = kind is not None
+        is_governing = governing is not None and c.case_id == governing.case_id
+        if is_food:
+            # A "duplicate" is a non-governing case for the SAME food kind; a
+            # DIFFERENT-kind non-governing food case CONFLICTS (a household runs
+            # one food program, Meals/Boxes being subtypes of it).
+            is_duplicate = (not is_governing) and kind == gov_kind
+            is_conflicting = (
+                (not is_governing) and gov_kind is not None and kind != gov_kind
+            )
+        else:
+            label = (
+                c.service_type or c.service_category or c.program_name or ""
+            ).strip().casefold()
+            is_duplicate = (
+                (not is_governing) and gov_kind is None and label == gov_label
+            )
+            is_conflicting = False
+        auth = getattr(c, "service_authorization_status", "") or ""
+        a_val, a_lbl = _authorization_phase(auth)
+        # Verification is a HOUSEHOLD-WIDE fact (one EnrollmentVerification), so
+        # every FOOD case reflects it. Non-food programs model Authorization
+        # only, so verification stays blank there.
+        v_val, v_lbl = _verification_phase(enr) if is_food else ("", "")
+        if is_governing and is_food:
+            s_val, s_lbl = _service_phase(client, enr, c)
+        elif is_duplicate:
+            s_val, s_lbl = ("duplicated", "Duplicated")
+        elif is_conflicting:
+            s_val, s_lbl = ("conflicting", "Conflicting")
+        else:
+            s_val, s_lbl = ("", "")
+        if is_food:
+            service_type = ProductTypeKind(kind).label
+            service_type_value = kind.value
+            category = getattr(c, "service_category", "") or "Food"
+        else:
+            service_type = (
+                c.service_type or c.service_category or c.program_name or ""
+            ).strip()
+            service_type_value = service_type.casefold().replace(" ", "_")
+            category = getattr(c, "service_category", "") or service_type
+        # Service scope (Household vs Individual) is DRIVEN BY THE CASE -- derived
+        # LIVE from the program name (the source of truth), never the stored
+        # household_type cache. A manual per-household scope correction lives on
+        # the enrollment (household_type_override) and must NEVER change what the
+        # governing case reports here.
+        from api.serializers import derive_household_type
+
+        ht = derive_household_type(None, getattr(c, "program_name", "")) or CaseHouseholdType.INDIVIDUAL
+        tracks.append({
+            "category": category,
+            "service_type": service_type,
+            "service_type_value": service_type_value,
+            "case_id": str(c.case_id),
+            # Raw case status so the UI can hide close/actions on a case that is
+            # already closed/cancelled (a closed governing case still renders).
+            "case_status": getattr(c, "case_status", "") or "",
+            "governing": is_governing,
+            "scope": {"value": ht, "label": CaseHouseholdType(ht).label},
+            "authorization": {"value": a_val, "label": a_lbl},
+            "verification": {"value": v_val, "label": v_lbl},
+            "service": {"value": s_val, "label": s_lbl},
+        })
+    # Governing first, then by service-type label + case id (a stable,
+    # environment-independent order).
+    tracks.sort(key=lambda t: (
+        not t["governing"], t["service_type"], t["case_id"]
+    ))
+    return tracks
+
+
 # Enrollment stages that roll a member up to the "Enrolled" main stage.
 _ENROLLED_LEVEL_STAGES = frozenset({
     EnrollmentStage.PENDING_VERIFICATION,
@@ -1033,6 +1381,16 @@ def main_stage(client):
     every enrollment is cancelled. Falls back to the stored early-funnel stage.
     Never stored.
     """
+    # A hard eligibility off-ramp is the headline outcome: an INELIGIBLE member
+    # reads Ineligible on the stage bar's Eligibility node even when a (cancelled
+    # or still-live) enrollment exists -- the enrollment roll-up below would
+    # otherwise hide it behind Enrolled/Cancelled. INELIGIBLE is sticky (set only
+    # by reconcile_client_eligibility), so this reflects the current gate verdict;
+    # the per-program Service stage separately carries the service state (Out of
+    # Range / Canceled / On Hold).
+    if client.lifecycle_stage == ClientStage.INELIGIBLE:
+        return ClientStage.INELIGIBLE
+
     enrollments = _governing_enrollments(client)
     if enrollments:
         if any(
@@ -1134,6 +1492,16 @@ _DENIAL_PAUSE_STAGES = {
 # never a manual Place-on-Hold.
 _DENIAL_HOLD_NOTE = "Auto-paused: sole internal-service meal/box case denied."
 
+# Objective 3 / task 4.1: a governing meal/box authorization DENIED while the
+# household is still only at Pending Verification (no service yet) removes the
+# verification request -- the enrollment is DISREGARDED (dismissed), so the
+# member leaves the Verification queue. Not auto-resumed: a later re-approval
+# needs a fresh verification request (matches the manual disregard semantics).
+_DENIAL_DISREGARD_NOTE = (
+    "Auto-disregarded: internal-service meal/box authorization denied while the "
+    "member was still awaiting verification. Verification request removed."
+)
+
 # Authorization statuses that mean "not yet approved -- awaiting a decision".
 # A governing case in one of these states must NOT keep a household in service:
 # only an approval (or Not Required) authorizes delivery. Because
@@ -1141,9 +1509,11 @@ _DENIAL_HOLD_NOTE = "Auto-paused: sole internal-service meal/box case denied."
 # a governing status in this set already means the client has NO approved
 # internal-service authorization anywhere. EXPIRED is deliberately excluded --
 # that is a post-approval terminal state handled by the delivery-window logic.
+# NEVER_REQUESTED is deliberately excluded too: it is handled by the DENIAL
+# full-stop (see _DENIED_EQUIVALENT_STATUSES), not this soft "waiting" downgrade.
+# A truly blank status ("") stays here (data not yet imported -> benign wait).
 _WAITING_AUTH_STATUSES = {
     ServiceAuthorizationStatus.PENDING,
-    ServiceAuthorizationStatus.NEVER_REQUESTED,
     "",
 }
 
@@ -1192,11 +1562,10 @@ def _downgrade_unauthorized_enrollment(enrollment, *, actor=None, actor_label=""
         pass
     return enrollment
 
-# Stamped on the pause / cancel StageEvents raised by the case-CLOSURE full stop
-# (distinct from the denial note above so the two rules stay independently
-# auditable).
+# Stamped on the pause StageEvents raised by the case-CLOSURE full stop (distinct
+# from the denial note above so the two rules stay independently auditable, and
+# so the reactivation path can tell a closure hold from a denial hold).
 _CLOSURE_HOLD_NOTE = "Auto-paused: last open internal-service meal/box case closed."
-_CLOSURE_CANCEL_NOTE = "Auto-cancelled: no open internal-service meal/box case remains."
 
 
 def _actor_name(actor):
@@ -1250,28 +1619,32 @@ def _write_primary_system_note(client, body, *, author_name="System"):
 
 
 def _full_stop_close_out(client, governing, *, actor=None, actor_label=""):
-    """Pause-then-cancel every actionable governing enrollment when the client's
-    LAST open internal-service case has closed.
+    """Reversibly stop service when the client's LAST open internal-service case
+    closes, and park the member at the SERVICE_INACTIVE off-ramp.
 
-    Steps (mirrors the product spec): truncate future deliveries + pause the
-    household (On Hold) + note the primary, THEN cancel the enrollment(s) + a
-    second note. Idempotent: once every governing enrollment is terminal there is
-    nothing ``actionable`` left, so a re-import is a no-op (no duplicate
-    notes/events). Opens NO tickets -- visibility comes from StageEvents, the
-    timeline, and the primary notes.
+    Steps: truncate future deliveries + pause (On Hold) every actionable
+    governing enrollment + note the primary, THEN set the client's lifecycle
+    stage to SERVICE_INACTIVE and emit a 'Service Inactive' timeline event on the
+    transition IN.
+
+    This is NOT a cancel -- the enrollments stay On Hold so a later open
+    internal-service case can RESUME them (see the reactivation path in
+    ``reconcile_internal_service_authorization``). Idempotent: once the household
+    is On Hold and already SERVICE_INACTIVE, a re-import is a no-op (deduped note,
+    single stage transition, create-once event). INELIGIBLE outranks
+    SERVICE_INACTIVE and is never downgraded. Opens NO tickets -- visibility comes
+    from StageEvents, the timeline, and the primary note.
     """
+    from api.services import timeline
     from api.services.orders import truncate_future_deliveries
 
-    result = {"paused": False, "cancelled": False}
-    govs = _governing_enrollments(client)
+    result = {"paused": False, "cancelled": False, "service_inactive": False}
     actionable = [
         e
-        for e in govs
+        for e in _governing_enrollments(client)
         if EnrollmentStage(e.stage) not in _TERMINAL_STAGES
         and EnrollmentStage(e.stage) != EnrollmentStage.SERVICE_COMPLETE
     ]
-    if not actionable:
-        return result
 
     author = actor_label or _actor_name(actor)
     today = timezone.localdate().isoformat()
@@ -1300,43 +1673,836 @@ def _full_stop_close_out(client, governing, *, actor=None, actor_label=""):
             except InvalidTransition:
                 pass
 
-    _write_primary_system_note(
-        client,
-        (
-            f"Service paused on {today}: the member's last open internal-service "
-            f"case ({governing.case_id} - {label}) closed on {closed_on}. Future "
-            f"deliveries were stopped and the household was placed On Hold."
-        ),
-        author_name=author,
-    )
-
-    # 2) Cancel the household (hard off-ramp). SERVICE_COMPLETE / terminal rows
-    #    are left as-is (force=False -> illegal cancels are skipped).
-    for enr in _governing_enrollments(client):
-        if EnrollmentStage(enr.stage) in _TERMINAL_STAGES:
-            continue
-        try:
-            advance_enrollment(
-                enr,
-                EnrollmentStage.CANCELLED,
-                actor=actor,
-                actor_label=actor_label,
-                note=_CLOSURE_CANCEL_NOTE,
-            )
-            result["cancelled"] = True
-        except InvalidTransition:
-            pass
-
-    if result["cancelled"]:
+    if result["paused"]:
         _write_primary_system_note(
             client,
             (
-                f"Member cancelled on {today}: no open internal-service case "
-                f"remains after case {governing.case_id} closed."
+                f"Service paused on {today}: the member's last open internal-service "
+                f"case ({governing.case_id} - {label}) closed on {closed_on}. Future "
+                f"deliveries were stopped and the household was placed On Hold. "
+                f"Reversible -- a new open internal-service case resumes service."
             ),
             author_name=author,
         )
+
+    # 2) Park at the reversible SERVICE_INACTIVE off-ramp. Set explicitly because
+    #    derive_client_stage never PRODUCES this stage (it only keeps it sticky).
+    #    Emit the timeline event only on the transition IN. INELIGIBLE outranks it.
+    if client.lifecycle_stage not in (
+        ClientStage.INELIGIBLE, ClientStage.SERVICE_INACTIVE,
+    ):
+        _set_client_stage(client, ClientStage.SERVICE_INACTIVE, actor=actor)
+        timeline.event_for_member_service_inactive(
+            client,
+            case_id=governing.case_id,
+            program=label,
+            closed_on=closed_on,
+            actor=author,
+        )
+        result["service_inactive"] = True
     return result
+
+
+def _record_governing_case_change(client, governing, *, actor=None, actor_label=""):
+    """Detect and record when the client's GOVERNING internal-service case
+    changes (old -> new), writing a timeline event + a primary system note that
+    describe the switch, its reason, the new authorization status and program.
+
+    Idempotent two ways: the stored ``Client.governing_internal_case_id`` gates
+    re-firing (updated to the settled governing case here), and the timeline
+    event is create-once on the exact ``previous -> new`` pair. The FIRST
+    governing case to land is recorded SILENTLY -- there is no prior case to
+    switch from -- so this only speaks up on an actual change. Returns True when a
+    change event was emitted. Best-effort."""
+    new_id = str(governing.case_id) if governing is not None else ""
+    old_id = client.governing_internal_case_id or ""
+    if new_id == old_id:
+        return False
+
+    # Persist the settled pointer regardless (so the frontend can read the
+    # program's governing case and the next reconcile compares against it).
+    client.governing_internal_case_id = new_id
+    client.save(update_fields=["governing_internal_case_id"])
+
+    # First governing case (or all cases removed): not a SWITCH -- record silently.
+    if not old_id or not new_id:
+        return False
+
+    from api.services import timeline
+
+    old_case = next(
+        (c for c in _internal_service_cases(client) if str(c.case_id) == old_id),
+        None,
+    )
+    auth = getattr(governing, "service_authorization_status", "") or ""
+    program = getattr(governing, "program_name", "") or "meal/box"
+    old_auth = getattr(old_case, "service_authorization_status", "") if old_case else ""
+    favorable = {
+        ServiceAuthorizationStatus.APPROVED,
+        ServiceAuthorizationStatus.NOT_REQUIRED,
+    }
+    if (
+        old_case is not None
+        and old_case.case_status in _CLOSED_CASE_STATUSES
+        and governing.case_status not in _CLOSED_CASE_STATUSES
+    ):
+        reason = "the previous governing case closed"
+    elif auth in favorable and old_auth not in favorable:
+        reason = "a newer case was approved and now governs"
+    else:
+        reason = "a newer internal-service case now governs"
+
+    author = actor_label or _actor_name(actor)
+    _write_primary_system_note(
+        client,
+        (
+            f"Governing internal-service case changed on "
+            f"{timezone.localdate().isoformat()}: {old_id} \u2192 {new_id} "
+            f"({program}, authorization: {auth or 'blank'}). Reason: {reason}."
+        ),
+        author_name=author,
+    )
+    timeline.event_for_member_governing_case_changed(
+        client,
+        previous_case_id=old_id,
+        new_case_id=new_id,
+        auth_status=auth,
+        program=program,
+        reason=reason,
+        actor=author,
+    )
+    return True
+
+
+# Stamped on the requeue StageEvent so it is clear WHY the household was moved
+# back to Kitchen Assignment (a governing-case meals<->boxes product switch).
+_PROGRAM_SWITCH_NOTE = (
+    "Requeued for kitchen assignment: governing internal-service case switched "
+    "product kind (meals<->boxes)."
+)
+
+# Post-verification stages a meals<->boxes switch requeues to a fresh Kitchen
+# Assignment: these hold (or were queued for) a kitchen + calendar for the OLD
+# product. VERIFIED (no kitchen/calendar yet) and pre-verification / terminal
+# stages are left to the normal approval flow.
+_PROGRAM_SWITCH_STAGES = {
+    EnrollmentStage.KITCHEN_ASSIGNMENT,
+    EnrollmentStage.SERVICE_ACTIVE,
+    EnrollmentStage.ON_HOLD,
+}
+
+
+def requeue_enrollment_for_product_switch(
+    enrollment, *, actor=None, actor_label="", note=_PROGRAM_SWITCH_NOTE,
+):
+    """Requeue ONE enrollment after a meals<->boxes product switch.
+
+    Its current kitchen + delivery calendar are for the WRONG product, so:
+      1. stop all future deliveries (shorten every plan window to yesterday so the
+         nightly sync won't regenerate them);
+      2. clear the kitchen + delivery cadence so a NEW kitchen assignment (kitchen
+         + cadence + fresh calendar) is required for the new kind; and
+      3. move the enrollment back to Kitchen Assignment (force, since
+         Service Active has no direct edge back).
+
+    Only acts on post-verification enrollments that actually hold a kitchen /
+    calendar (``_PROGRAM_SWITCH_STAGES``); pre-verification / terminal stages are
+    left to the normal approval flow. Best-effort; returns True when the
+    enrollment was requeued. Shared by the governing-case-driven switch
+    (:func:`_handle_program_switch`) and the manual Household-tab product-type
+    correction (``MemberProductTypeView``).
+    """
+    from api.services.orders import truncate_future_deliveries
+
+    if EnrollmentStage(enrollment.stage) not in _PROGRAM_SWITCH_STAGES:
+        return False
+    # 1) Stop the OLD product's future deliveries.
+    try:
+        truncate_future_deliveries(enrollment)
+    except Exception:  # pragma: no cover - defensive
+        pass
+    # 2) Clear the kitchen + delivery cadence so a NEW kitchen assignment is
+    #    required for the new kind.
+    update_fields = []
+    if enrollment.kitchen_id is not None:
+        enrollment.kitchen = None
+        update_fields.append("kitchen")
+    if enrollment.delivery_weekdays:
+        enrollment.delivery_weekdays = []
+        update_fields.append("delivery_weekdays")
+    if update_fields:
+        enrollment.save(update_fields=update_fields)
+    # 3) Requeue to Kitchen Assignment (force: Service Active has no direct edge
+    #    back to Kitchen Assignment; On Hold does).
+    if EnrollmentStage(enrollment.stage) != EnrollmentStage.KITCHEN_ASSIGNMENT:
+        try:
+            advance_enrollment(
+                enrollment, EnrollmentStage.KITCHEN_ASSIGNMENT, actor=actor,
+                actor_label=actor_label, note=note, force=True,
+            )
+        except InvalidTransition:
+            pass
+    return True
+
+
+def _served_product_kind(enrollment, old_case=None):
+    """The Meals/Boxes kind the household is CURRENTLY SET UP FOR (its served
+    kind), used as the baseline to detect a governing-case product switch.
+
+    Robust to an empty governing pointer -- tries, in order: the explicit
+    ``product_type_override`` (the verified kind), the product of an existing
+    delivery schedule (what deliveries are actually built as), then the previous
+    governing case's name-derived kind. Deliberately does NOT fall back to the
+    new governing case (that would hide the switch). Returns a ProductTypeKind
+    or None."""
+    from api.models import ProductTypeKind
+    from api.services.catalog import product_type_kind_for_name
+
+    if enrollment is None:
+        return None
+    override = getattr(enrollment, "product_type_override", None)
+    if override is not None:
+        try:
+            return ProductTypeKind(override.type)
+        except ValueError:
+            pass
+    sched = enrollment.delivery_schedules.filter(
+        product_type__isnull=False
+    ).first()
+    if sched is not None and sched.product_type:
+        try:
+            return ProductTypeKind(sched.product_type.type)
+        except ValueError:
+            pass
+    if old_case is not None:
+        return product_type_kind_for_name(old_case.program_name)
+    return None
+
+
+def _handle_program_switch(
+    client, previous_governing_id, governing, *, actor=None, actor_label="",
+):
+    """AUTO-RECONCILE a governing-case Meals<->Boxes product switch at import
+    time -- fully automatic.
+
+    Detection is DATA-DRIVEN so it fires even when the stored governing pointer
+    was never initialised: each governing enrollment's SERVED kind
+    (:func:`_served_product_kind` -- override, then delivery schedule, then the
+    previous governing case) is compared with the NEW governing case's DETECTED
+    kind (name-derived). When they differ the switch is APPLIED automatically:
+
+    * the enrollment ``product_type_override`` is pointed at the new kind so the
+      served kind follows the governing case (and a re-import no-ops);
+    * the household is requeued for a NEW kitchen assignment -- future deliveries
+      stopped, kitchen + cadence cleared, moved to Kitchen Assignment
+      (``requeue_enrollment_for_product_switch``); and
+    * a 'Program Switched' timeline event + primary system note are written.
+
+    Only a switch to an authorized, still-OPEN governing case requeues service (a
+    closed / not-yet-approved successor is handled by the close/pull-back rules).
+    Returns True when a switch was applied. Best-effort.
+    """
+    if governing is None:
+        return False
+    # Only a switch to an authorized, still-OPEN case requeues service (a closed
+    # or not-yet-approved successor is handled by the close/pull-back rules).
+    if governing.service_authorization_status not in (
+        ServiceAuthorizationStatus.APPROVED,
+        ServiceAuthorizationStatus.NOT_REQUIRED,
+    ):
+        return False
+    if governing.case_status in _CLOSED_CASE_STATUSES:
+        return False
+
+    old_case = None
+    if previous_governing_id:
+        old_case = next(
+            (c for c in _internal_service_cases(client)
+             if str(c.case_id) == str(previous_governing_id)),
+            None,
+        )
+
+    from api.models import ProductType, ProductTypeKind
+    from api.services import timeline
+    from api.services.catalog import (
+        detected_product_kind_for_enrollment, product_type_kind_for_name,
+    )
+
+    # The governing case's DETECTED (name-derived) kind -- the new served kind.
+    new_kind = product_type_kind_for_name(
+        getattr(governing, "program_name", "")
+    ) or product_type_kind_for_name(getattr(governing, "service_type", ""))
+    if new_kind is None:
+        return False
+    new_product_type = ProductType.objects.filter(type=new_kind).first()
+
+    switched = False
+    old_kind = None
+    for enr in _governing_enrollments(client):
+        # The governing case's DETECTED kind (name-derived, ignores overrides).
+        gov_kind = detected_product_kind_for_enrollment(enr) or new_kind
+        served_kind = _served_product_kind(enr, old_case)
+        # Not a resolvable meals<->boxes switch on this enrollment.
+        if served_kind is None or served_kind == gov_kind:
+            continue
+        old_kind = served_kind
+        # 1) Point the served kind at the governing case's kind so the Programs
+        #    tab + resolvers follow it (and a re-import is idempotent). When no
+        #    ProductType row exists for the new kind, clear the override so the
+        #    served kind falls back to the (governing) derived kind instead.
+        if new_product_type is not None:
+            if enr.product_type_override_id != new_product_type.pk:
+                enr.product_type_override = new_product_type
+                try:
+                    enr.save(update_fields=["product_type_override"])
+                except Exception:  # pragma: no cover - defensive
+                    pass
+        elif enr.product_type_override_id is not None:
+            enr.product_type_override = None
+            try:
+                enr.save(update_fields=["product_type_override"])
+            except Exception:  # pragma: no cover - defensive
+                pass
+        # 2) Stop future deliveries, clear the kitchen + cadence, and requeue to
+        #    Kitchen Assignment (the shared meals<->boxes requeue).
+        if requeue_enrollment_for_product_switch(
+            enr, actor=actor, actor_label=actor_label,
+        ):
+            switched = True
+
+    if not switched or old_kind is None:
+        return False
+
+    old_label = ProductTypeKind(old_kind).label
+    new_label = ProductTypeKind(new_kind).label
+    reason = f"governing case switched from {old_label} to {new_label}"
+    author = actor_label or _actor_name(actor)
+    _write_primary_system_note(
+        client,
+        (
+            f"Program switched on {timezone.localdate().isoformat()}: governing "
+            f"internal-service case changed product from {old_label} to "
+            f"{new_label} ({old_case.case_id} \u2192 {governing.case_id}). Future "
+            f"deliveries were stopped and the household was requeued for a new "
+            f"kitchen assignment (new kitchen, cadence and delivery calendar "
+            f"required)."
+        ),
+        author_name=author,
+    )
+    timeline.event_for_member_program_switched(
+        client,
+        previous_kind=old_label,
+        new_kind=new_label,
+        previous_case_id=old_case.case_id,
+        new_case_id=governing.case_id,
+        auth_status=governing.service_authorization_status or "",
+        reason=reason,
+        actor=author,
+    )
+    return True
+
+
+# Stamped on the auto-pause of an additional (non-primary) member when the
+# governing case switches Household -> Individual. Distinct from the manual /
+# denial / closure holds so it stays independently auditable, and so the pause
+# is recognisable as the pinned (pause_locked) one that only CS can lift.
+_SCOPE_SWITCH_PAUSE_REASON = (
+    "Auto-paused: governing internal-service case switched to Individual scope. "
+    "This additional household member is pinned pending Customer Service review."
+)
+
+
+def _pause_lock_additional_members(client, primary, *, actor=None, actor_label=""):
+    """Pause + PIN every ACTIVE additional (non-primary) member of the client's
+    household when the governing case switches Household -> Individual.
+
+    Sets each additional member's ``MemberDietaryProfile`` to PAUSED with
+    ``pause_locked=True`` (so an agent cannot un-pause them from the Program tab),
+    clears their kitchen meal result (excludes them from Purchase Orders), emits a
+    'Member Paused' timeline event and writes a system note. Idempotent: a member
+    already paused+locked is skipped. Returns the number of members newly pinned.
+    Best-effort per member.
+    """
+    from api.models import MemberStatus, Note, NoteSource
+    from api.services import timeline
+    from api.services.orders import resync_scheduled_orders
+
+    primary_id = getattr(primary, "pk", None)
+    pinned = 0
+    touched_enrollments = set()
+    author = actor_label or _actor_name(actor)
+    for enr in _governing_enrollments(client):
+        for mv in enr.member_profiles.all():
+            # Never pin the primary (they own the individual case).
+            if mv.client_id and primary_id and str(mv.client_id) == str(primary_id):
+                continue
+            if mv.pause_locked and mv.status == MemberStatus.PAUSED:
+                continue  # already pinned -- idempotent
+            mv.status = MemberStatus.PAUSED
+            mv.pause_locked = True
+            mv.kitchen_meal_type = ""
+            mv.kitchen_food_notes = ""
+            try:
+                mv.save()
+            except Exception:  # pragma: no cover - defensive
+                continue
+            pinned += 1
+            touched_enrollments.add(enr.pk)
+            try:
+                timeline.event_for_member_paused(
+                    mv, enrollment=enr,
+                    reason=_SCOPE_SWITCH_PAUSE_REASON, actor=author,
+                )
+            except Exception:  # pragma: no cover - never break the reconcile
+                pass
+            if mv.client_id:
+                try:
+                    Note.objects.create(
+                        client=mv.client, source=NoteSource.SYSTEM,
+                        author_name=author, body=_SCOPE_SWITCH_PAUSE_REASON,
+                    )
+                except Exception:  # pragma: no cover - defensive
+                    pass
+    # Reflect the pauses on the future delivery calendar / Purchase Orders.
+    for enr in _governing_enrollments(client):
+        if enr.pk in touched_enrollments:
+            try:
+                resync_scheduled_orders(enrollment=enr)
+            except Exception:  # pragma: no cover - defensive
+                pass
+    return pinned
+
+
+# Reasons stamped on the members affected by a MANUAL (agent-initiated, from the
+# Household tab) Household<->Individual scope switch. Like the AUTO import-
+# reconcile pause (_SCOPE_SWITCH_PAUSE_REASON) this LOCKS (pause_locked) the
+# members so an agent cannot un-pause them from the tab -- but unlike the CS-
+# pinned auto pause (which only a Case Mismatch dismissal lifts), this lock is
+# cleared automatically when the scope is corrected back to Household.
+_MANUAL_SCOPE_TO_INDIVIDUAL_PAUSE_REASON = (
+    "Auto-paused: program scope changed to Individual. Additional household "
+    "members are paused and excluded from future deliveries, and are locked "
+    "from being un-paused until the program scope is corrected back to Household."
+)
+_MANUAL_SCOPE_TO_HOUSEHOLD_RESUME_REASON = (
+    "Auto-resumed: program scope changed to Household. Additional household "
+    "members were un-paused and re-added to the delivery calendar."
+)
+
+
+def _pause_additional_members_manual(client, primary, *, actor=None, actor_label=""):
+    """Manual Household -> Individual switch: PAUSE + LOCK every ACTIVE additional
+    (non-primary) member and drop them from future deliveries.
+
+    Sets ``pause_locked=True`` so an agent cannot un-pause the members from the
+    Household tab while the program is Individual -- unlike the CS-pinned auto
+    reconcile (:func:`_pause_lock_additional_members`, which only a Case Mismatch
+    dismissal lifts), THIS lock is cleared automatically by
+    :func:`_resume_additional_members_manual` when the scope is corrected back to
+    Household. Clears each member's kitchen meal result (so they fall off Purchase
+    Orders) and refreshes the future calendar. Returns the number newly paused.
+    Best-effort per member.
+    """
+    from api.models import MemberStatus, Note, NoteSource
+    from api.services import timeline
+    from api.services.orders import resync_scheduled_orders
+
+    primary_id = getattr(primary, "pk", None)
+    paused = 0
+    touched = set()
+    author = actor_label or _actor_name(actor)
+    for enr in _governing_enrollments(client):
+        for mv in enr.member_profiles.all():
+            if mv.client_id and primary_id and str(mv.client_id) == str(primary_id):
+                continue  # never pause the primary
+            if mv.status != MemberStatus.ACTIVE:
+                continue  # already excluded (paused / out of orbit / inactive)
+            mv.status = MemberStatus.PAUSED
+            mv.pause_locked = True
+            mv.kitchen_meal_type = ""
+            mv.kitchen_food_notes = ""
+            try:
+                mv.save()
+            except Exception:  # pragma: no cover - defensive
+                continue
+            paused += 1
+            touched.add(enr.pk)
+            try:
+                timeline.event_for_member_paused(
+                    mv, enrollment=enr,
+                    reason=_MANUAL_SCOPE_TO_INDIVIDUAL_PAUSE_REASON, actor=author,
+                )
+            except Exception:  # pragma: no cover
+                pass
+            if mv.client_id:
+                try:
+                    Note.objects.create(
+                        client=mv.client, source=NoteSource.SYSTEM,
+                        author_name=author,
+                        body=_MANUAL_SCOPE_TO_INDIVIDUAL_PAUSE_REASON,
+                    )
+                except Exception:  # pragma: no cover
+                    pass
+    for enr in _governing_enrollments(client):
+        if enr.pk in touched:
+            try:
+                resync_scheduled_orders(enrollment=enr)
+            except Exception:  # pragma: no cover
+                pass
+    return paused
+
+
+def _resume_additional_members_manual(client, primary, *, actor=None, actor_label=""):
+    """Manual Individual -> Household switch: UN-PAUSE the additional (non-primary)
+    members that were paused, then rebuild the delivery calendar so they receive
+    service on the next Purchase Order on the household (primary) cadence.
+
+    Clears the manual scope lock (``pause_locked``) that
+    :func:`_pause_additional_members_manual` set, then re-runs the kitchen-aware
+    meal rule per member (so they land Active or Out of Orbit as appropriate) and
+    rebuilds each governing enrollment's calendar (missing plans + future
+    occurrences). GENUINE CS pins are preserved: a locked member whose enrollment
+    has an OPEN Case Mismatch flag is left paused+locked (only a CS dismissal may
+    lift those). Returns the number un-paused. Best-effort per member.
+    """
+    from api.models import (
+        CaseMismatchFlag, CaseMismatchStatus, MemberStatus, Note, NoteSource,
+    )
+    from api.services import timeline
+    from api.services.meal_rules import reconcile_member_kitchen_output
+    from api.services.orders import rebuild_delivery_calendar
+
+    primary_id = getattr(primary, "pk", None)
+    enrollments = list(_governing_enrollments(client))
+    # Enrollments with an OPEN Case Mismatch flag: their locked members are
+    # CS-pinned, NOT manual-scope-locked, so leave them untouched here.
+    cs_pinned_enr_ids = set(
+        CaseMismatchFlag.objects.filter(
+            enrollment_id__in=[e.pk for e in enrollments],
+            status=CaseMismatchStatus.OPEN,
+        ).values_list("enrollment_id", flat=True)
+    )
+    resumed = 0
+    touched = set()
+    author = actor_label or _actor_name(actor)
+    for enr in enrollments:
+        for mv in enr.member_profiles.all():
+            if mv.client_id and primary_id and str(mv.client_id) == str(primary_id):
+                continue
+            if mv.status != MemberStatus.PAUSED:
+                continue
+            # Leave genuine CS pins (open mismatch flag on this enrollment) for
+            # Customer Service to lift; clear the manual scope lock otherwise.
+            if mv.pause_locked and enr.pk in cs_pinned_enr_ids:
+                continue
+            try:
+                mv.pause_locked = False
+                # Re-run the meal rule against the household kitchen: sets status
+                # (Active / Out of Orbit) + kitchen meal result. This IS the
+                # explicit Individual->Household resume, so allow_resume=True lets
+                # the meal rule move these members OFF the manual PAUSED status.
+                reconcile_member_kitchen_output(
+                    mv, enr.kitchen, save=False, allow_resume=True,
+                )
+                mv.save()
+            except Exception:  # pragma: no cover - defensive
+                continue
+            resumed += 1
+            touched.add(enr.pk)
+            try:
+                timeline.event_for_member_unpaused(
+                    mv, enrollment=enr,
+                    reason=_MANUAL_SCOPE_TO_HOUSEHOLD_RESUME_REASON, actor=author,
+                )
+            except Exception:  # pragma: no cover
+                pass
+            if mv.client_id:
+                try:
+                    Note.objects.create(
+                        client=mv.client, source=NoteSource.SYSTEM,
+                        author_name=author,
+                        body=_MANUAL_SCOPE_TO_HOUSEHOLD_RESUME_REASON,
+                    )
+                except Exception:  # pragma: no cover
+                    pass
+    # Rebuild the calendar so resumed members get a plan + future occurrences on
+    # the household (primary) cadence, ready for the next Purchase Order.
+    for enr in _governing_enrollments(client):
+        if enr.pk in touched:
+            try:
+                rebuild_delivery_calendar(enr)
+            except Exception:  # pragma: no cover
+                pass
+    return resumed
+
+
+def apply_manual_scope_switch_effects(client, new_scope, *, actor=None, actor_label=""):
+    """Delivery/roster side effects of a MANUAL Household<->Individual scope
+    switch made from the Household tab (see ``MemberHouseholdTypeView``):
+
+    * **-> Individual**: pause every non-primary member and drop them from future
+      deliveries.
+    * **-> Household**: un-pause the (non-CS-pinned) additional members and
+      rebuild the calendar so they get service on the next PO.
+
+    Returns the count of members affected. Best-effort; never raises.
+    """
+    from api.models import CaseHouseholdType
+
+    primary = _household_primary(client)
+    if primary is None:
+        return 0
+    if new_scope == CaseHouseholdType.INDIVIDUAL:
+        return _pause_additional_members_manual(
+            client, primary, actor=actor, actor_label=actor_label,
+        )
+    if new_scope == CaseHouseholdType.HOUSEHOLD:
+        return _resume_additional_members_manual(
+            client, primary, actor=actor, actor_label=actor_label,
+        )
+    return 0
+
+
+def dismiss_case_mismatch_flags_for_household(
+    enrollment, *, dismissed_by="", reason="",
+):
+    """Dismiss any OPEN :class:`~api.models.CaseMismatchFlag` for this
+    enrollment's household and clear the ``pause_locked`` CS pins on its members.
+
+    Called when an agent RECONCILES the household scope from the Programs tab --
+    that reconciliation IS the Customer Service review the flag was waiting on,
+    so the flag clears from the Case Mismatch tab and the members are un-pinned.
+    Mirrors :class:`CaseMismatchDismissView`. MUST run BEFORE the scope roster
+    effects so an Individual->Household resume can un-pause the (now un-pinned)
+    members. Returns the number of flags dismissed. Best-effort.
+    """
+    from django.db.models import Q
+
+    from api.models import (
+        CaseMismatchFlag, CaseMismatchStatus, MemberDietaryProfile,
+    )
+
+    if enrollment is None:
+        return 0
+    primary = _household_primary(enrollment.client)
+    q = Q(enrollment=enrollment)
+    if primary is not None:
+        q |= Q(client=primary)
+    flags = list(CaseMismatchFlag.objects.filter(q, status=CaseMismatchStatus.OPEN))
+    now = timezone.now()
+    for flag in flags:
+        flag.status = CaseMismatchStatus.DISMISSED
+        flag.dismissed_at = now
+        flag.dismissed_by = dismissed_by or ""
+        flag.dismiss_reason = reason or ""
+        try:
+            flag.save(update_fields=[
+                "status", "dismissed_at", "dismissed_by", "dismiss_reason",
+            ])
+        except Exception:  # pragma: no cover - defensive
+            continue
+        # Clear the CS pins on the flag's household members so agents regain
+        # control (mirrors the manual Case Mismatch dismissal).
+        MemberDietaryProfile.objects.filter(
+            enrollment_id=(flag.enrollment_id or enrollment.pk), pause_locked=True
+        ).update(pause_locked=False)
+    return len(flags)
+
+
+def _ht_value(scope):
+    """Coerce a household-type (CaseHouseholdType enum OR raw string) to its
+    plain string value, or "" when empty. Lets scope logic compare an
+    enrollment ``household_type_override`` (a CharField string) with a derived
+    ``CaseHouseholdType`` uniformly."""
+    return getattr(scope, "value", scope) or ""
+
+
+def _handle_household_scope_switch(
+    client, previous_governing_id, governing, *, actor=None, actor_label="",
+):
+    """AUTO-RECONCILE a governing-case Household<->Individual SCOPE switch at
+    import time -- fully automatic, no Customer Service step.
+
+    Detection is DATA-DRIVEN so it fires even when the stored governing pointer
+    was never initialised: the NEW governing case's scope (derived LIVE from its
+    program name) is compared with the household's CURRENTLY-SERVED scope -- the
+    enrollment ``household_type_override`` (the verified scope shown on the
+    Programs tab), falling back to the PREVIOUS governing case's derived scope.
+
+    When they differ the switch is APPLIED automatically:
+
+    * the new scope is written onto every governing enrollment's
+      ``household_type_override`` so the Programs tab reflects it immediately;
+    * any lingering OPEN Case Mismatch flag is auto-dismissed (+ CS pins cleared);
+    * roster/delivery effects run (``apply_manual_scope_switch_effects``):
+        - **Household -> Individual**: additional members auto-paused + pinned
+          (the pin clears automatically when scope returns to Household);
+        - **Individual -> Household**: additional members resumed + un-pinned and
+          the delivery calendar rebuilt;
+    * an audit 'Case Scope Reconciled' timeline event + primary system note are
+      written.
+
+    NO CaseMismatchFlag is created -- the fix is automatic. Idempotent: once the
+    override matches the governing scope a re-import no-ops. Returns True when a
+    switch was applied. Best-effort.
+    """
+    if governing is None:
+        return False
+
+    from api.models import CaseHouseholdType
+    from api.serializers import derive_household_type
+
+    primary = _household_primary(client)
+    if primary is None:
+        return False
+    enrollments = _governing_enrollments(client)
+    if not enrollments:
+        return False
+
+    new_ht = _ht_value(
+        derive_household_type(None, getattr(governing, "program_name", ""))
+    )
+    if not new_ht:
+        return False
+
+    # CURRENTLY-SERVED (previous) scope baseline. Enrollments can carry DIFFERENT
+    # overrides (e.g. a service-active one already on the new scope while a
+    # pending-verification sibling still holds the old), so the baseline must be
+    # an override that actually DIVERGES from the governing scope -- taking the
+    # first override blindly would let a matching sibling mask a divergent one and
+    # skip the fix. Fall back to the previous governing case's derived scope only
+    # when NO enrollment carries an override at all.
+    divergent = next(
+        (
+            e for e in enrollments
+            if e.household_type_override
+            and _ht_value(e.household_type_override) != new_ht
+        ),
+        None,
+    )
+    served = _ht_value(divergent.household_type_override) if divergent else ""
+    # Pre-settle pointer, ONLY when it genuinely names a different case than the
+    # (already-settled) new governing case -- otherwise it's useless as a "prev".
+    old_case = None
+    if previous_governing_id and str(previous_governing_id) != str(governing.case_id):
+        old_case = next(
+            (c for c in _internal_service_cases(client)
+             if str(c.case_id) == str(previous_governing_id)),
+            None,
+        )
+    if (
+        not served
+        and not any(e.household_type_override for e in enrollments)
+        and old_case is not None
+    ):
+        served = _ht_value(derive_household_type(None, old_case.program_name))
+
+    # No baseline to diff -> every enrollment already matches the governing scope
+    # (or a brand-new member simply follows it); nothing to auto-fix. Idempotent
+    # no-op on re-import.
+    if not served or served == new_ht:
+        return False
+
+    # Resolve the previous case for the audit record. Prefer a runner-up
+    # internal-service case whose derived scope matches the SERVED (previous)
+    # scope -- that's the case the household was actually being served under --
+    # else the pre-settle pointer, else any runner-up, else the linked case.
+    if old_case is None or str(old_case.case_id) == str(governing.case_id):
+        scoped = [
+            c for c in _internal_service_cases(client)
+            if str(c.case_id) != str(governing.case_id)
+            and _ht_value(derive_household_type(None, c.program_name)) == served
+        ]
+        others = [
+            c for c in _internal_service_cases(client)
+            if str(c.case_id) != str(governing.case_id)
+        ]
+        pool = scoped or others
+        old_case = max(pool, key=governing_case_key) if pool else None
+    prev_case_id = (
+        str(old_case.case_id) if old_case is not None
+        else (str(enrollments[0].case_id) if enrollments[0].case_id else "")
+    )
+
+    author = actor_label or _actor_name(actor)
+
+    # 1) Persist the new served scope on every governing enrollment so the
+    #    Programs tab reflects the switch immediately.
+    for e in enrollments:
+        if _ht_value(e.household_type_override) != new_ht:
+            e.household_type_override = new_ht
+            try:
+                e.save(update_fields=["household_type_override"])
+            except Exception:  # pragma: no cover - defensive
+                pass
+
+    # 2) Auto-resolve any lingering OPEN Case Mismatch flag + clear CS pins BEFORE
+    #    the roster effects (so an Individual->Household resume can un-pause the
+    #    now-unpinned members). No NEW flag is ever created.
+    for e in enrollments:
+        try:
+            dismiss_case_mismatch_flags_for_household(
+                e, dismissed_by=author,
+                reason="Auto-reconciled by import: governing case scope switch.",
+            )
+        except Exception:  # pragma: no cover - defensive
+            pass
+
+    # 3) Roster + delivery side effects: -> Individual pauses + PINS additional
+    #    members (auto, cleared on return to Household); -> Household resumes +
+    #    un-pins them and rebuilds the calendar.
+    try:
+        apply_manual_scope_switch_effects(
+            client, new_ht, actor=actor, actor_label=actor_label,
+        )
+    except Exception:  # pragma: no cover - never break the reconcile
+        pass
+
+    # 4) Audit: primary system note + 'Case Scope Reconciled' timeline event.
+    #    NO flag.
+    from api.models import CaseMismatchType
+    from api.services import timeline
+
+    if (
+        served == CaseHouseholdType.HOUSEHOLD
+        and new_ht == CaseHouseholdType.INDIVIDUAL
+    ):
+        mismatch_type = CaseMismatchType.HOUSEHOLD_TO_INDIVIDUAL
+        detail = (
+            "governing internal-service case switched to Individual scope; the "
+            "additional household members were automatically paused and pinned"
+        )
+    else:
+        mismatch_type = CaseMismatchType.INDIVIDUAL_TO_HOUSEHOLD
+        detail = (
+            "governing internal-service case switched to Household scope; the "
+            "additional household members were automatically resumed"
+        )
+    reason = (
+        f"governing case scope changed from "
+        f"{CaseHouseholdType(served).label} to {CaseHouseholdType(new_ht).label}"
+    )
+    _write_primary_system_note(
+        client,
+        (
+            f"Household scope auto-reconciled on "
+            f"{timezone.localdate().isoformat()}: {detail} "
+            f"({prev_case_id or '\u2014'} \u2192 {governing.case_id})."
+        ),
+        author_name=author,
+    )
+    timeline.event_for_member_case_mismatch(
+        client,
+        mismatch_type=mismatch_type,
+        previous_case_id=prev_case_id,
+        new_case_id=governing.case_id,
+        previous_household_type=served,
+        new_household_type=new_ht,
+        reason=reason,
+        actor=author,
+        auto_resolved=True,
+    )
+    return True
 
 
 def _internal_service_cases(client):
@@ -1408,7 +2574,7 @@ def reconcile_delivery_state(enrollment, *, actor=None):
         return
 
     gov = governing_internal_case(enrollment)
-    end = getattr(gov, "service_authorization_approval_ends_at", None) if gov else None
+    _, end = gov.effective_authorization_window() if gov else (None, None)
     gov_end = end.date() if end else None
     favorable = gov is not None and gov.service_authorization_status in (
         ServiceAuthorizationStatus.APPROVED,
@@ -1446,10 +2612,20 @@ def reconcile_delivery_state(enrollment, *, actor=None):
     truncate_future_deliveries(enrollment)
 
 
-def _resume_auto_paused_enrollment(enrollment, *, actor=None):
+def _resume_auto_paused_enrollment(
+    enrollment,
+    *,
+    actor=None,
+    hold_note=_DENIAL_HOLD_NOTE,
+    resume_note="Auto-resumed: internal-service case re-approved.",
+):
     """Resume an enrollment that THIS rule auto-paused (ON_HOLD) back to the
-    stage it was held from. No-op when the most recent hold was NOT an auto-pause
-    (so a manual Place-on-Hold is never silently overridden)."""
+    stage it was held from. No-op when the most recent hold was NOT the matching
+    auto-pause (so a manual Place-on-Hold -- or a hold from a DIFFERENT rule -- is
+    never silently overridden).
+
+    ``hold_note`` selects which auto-pause to reverse: the denial hold by default,
+    or the closure hold (``_CLOSURE_HOLD_NOTE``) on the reactivation path."""
     last_hold = (
         StageEvent.objects.filter(
             enrollment=enrollment, to_stage=EnrollmentStage.ON_HOLD
@@ -1457,7 +2633,7 @@ def _resume_auto_paused_enrollment(enrollment, *, actor=None):
         .order_by("-entered_at")
         .first()
     )
-    if not last_hold or not (last_hold.note or "").startswith(_DENIAL_HOLD_NOTE):
+    if not last_hold or not (last_hold.note or "").startswith(hold_note):
         return enrollment
     target = EnrollmentStage.KITCHEN_ASSIGNMENT
     if last_hold.from_stage:
@@ -1468,7 +2644,7 @@ def _resume_auto_paused_enrollment(enrollment, *, actor=None):
     try:
         return advance_enrollment(
             enrollment, target, actor=actor, force=True,
-            note="Auto-resumed: internal-service case re-approved.",
+            note=resume_note,
         )
     except InvalidTransition:
         return enrollment
@@ -1504,6 +2680,60 @@ def deferred_internal_service_reconcile():
         _DEFER_INTERNAL_SERVICE_RECONCILE.reset(token)
 
 
+# Objective 3 / task 4.3: a household still only at Kitchen Assignment
+# (authorized, awaiting a kitchen -- never became an active member) whose
+# governing internal-service case CLOSES or is DENIED is a hard off-ramp to
+# INELIGIBLE. Distinct reasons so the timeline/note explain which trigger fired.
+_KA_CLOSED_INELIGIBLE_REASON = (
+    "the internal-service case closed while the household was still awaiting "
+    "kitchen assignment"
+)
+_KA_DENIED_INELIGIBLE_REASON = (
+    "the internal-service authorization was denied while the household was still "
+    "awaiting kitchen assignment"
+)
+
+
+def _has_kitchen_assignment_enrollment(client):
+    """True when any of the client's governing enrollments is at Kitchen
+    Assignment (authorized, awaiting a manual kitchen assignment)."""
+    return any(
+        EnrollmentStage(e.stage) == EnrollmentStage.KITCHEN_ASSIGNMENT
+        for e in _governing_enrollments(client)
+    )
+
+
+def _mark_kitchen_assignment_ineligible(client, *, reason, actor=None, actor_label=""):
+    """Objective 3 / task 4.3: hard off-ramp a Kitchen-Assignment household to
+    INELIGIBLE when its governing internal-service case closes or is denied.
+
+    Sets the client's lifecycle stage to INELIGIBLE (sticky in
+    ``derive_client_stage`` -- an agent must resolve it), emits a
+    'Member marked Ineligible' timeline event + primary system note on the
+    transition IN. Idempotent: a no-op when already INELIGIBLE. Returns True when
+    newly set. The enrollment itself is paused (On Hold) by the caller's existing
+    denial / closure handling; the CLIENT stage is the hard off-ramp here.
+    """
+    from api.services import timeline
+
+    if client.lifecycle_stage == ClientStage.INELIGIBLE:
+        return False
+    author = actor_label or _actor_name(actor)
+    _set_client_stage(client, ClientStage.INELIGIBLE, actor=actor)
+    # Persist the reason so the Members list can display why (matches the
+    # reconcile_client_eligibility path).
+    if list(client.ineligible_reasons or []) != [reason]:
+        client.ineligible_reasons = [reason]
+        client.save(update_fields=["ineligible_reasons"])
+    _write_primary_system_note(
+        client,
+        f"Marked Ineligible on {timezone.localdate().isoformat()}: {reason}.",
+        author_name=author,
+    )
+    timeline.event_for_member_ineligible(client, reasons=[reason], actor=author)
+    return True
+
+
 def reconcile_internal_service_authorization(client, *, actor=None, actor_label=""):
     """React to a change in the client's internal-service case authorization.
 
@@ -1523,11 +2753,14 @@ def reconcile_internal_service_authorization(client, *, actor=None, actor_label=
     (it becomes the governing case, so gov_status is not DENIED).
 
     Best-effort and idempotent. Returns ``{"sole_denied", "paused",
-    "closed_out", "cancelled"}``.
+    "closed_out", "cancelled", "downgraded", "service_inactive",
+    "reactivated"}``.
     """
     result = {
         "sole_denied": False, "paused": False,
         "closed_out": False, "cancelled": False, "downgraded": False,
+        "service_inactive": False, "reactivated": False, "switched": False,
+        "scope_switched": False, "disregarded": False, "ineligible": False,
     }
     cases = _internal_service_cases(client)
     if not cases:
@@ -1536,26 +2769,67 @@ def reconcile_internal_service_authorization(client, *, actor=None, actor_label=
 
     open_cases = open_internal_service_cases(client)
     governing = max(cases, key=governing_case_key)
+    # Capture the governing pointer BEFORE _record_governing_case_change settles
+    # it -- _handle_program_switch needs the OLD case to compare product kinds.
+    previous_governing_id = client.governing_internal_case_id or ""
+    # Record an old -> new governing-case switch (timeline event + primary note)
+    # before acting on it, so the history captures WHY service state changed.
+    _record_governing_case_change(
+        client, governing, actor=actor, actor_label=actor_label,
+    )
+    # Household<->Individual scope switch is orthogonal to the authorization
+    # outcome, so detect it here -- before the auth branch -- off the SAME
+    # pre-settle pointer. It AUTO-APPLIES the new scope: pauses + pins additional
+    # members (Household->Individual) or resumes + un-pins them
+    # (Individual->Household), writing an audit timeline event. NO Case Mismatch
+    # flag is opened -- the fix is fully automatic.
+    if _handle_household_scope_switch(
+        client, previous_governing_id, governing,
+        actor=actor, actor_label=actor_label,
+    ):
+        result["scope_switched"] = True
     gov_status = governing.service_authorization_status
+    # SERVICE_INACTIVE is sticky: remember it here so the tail can RE-DERIVE past
+    # it (ignore_sticky) + emit the reactivation event once an open case reopens
+    # service below.
+    was_service_inactive = client.lifecycle_stage == ClientStage.SERVICE_INACTIVE
 
     if not open_cases:
         # CLOSURE full stop: the client's LAST open internal-service case has
-        # closed. Pause + truncate future deliveries + note the primary, THEN
-        # cancel + a second note. Opens NO tickets -- the timeline, StageEvents
-        # and primary notes carry the visibility.
+        # closed. Reversibly stop service -- truncate future deliveries + pause
+        # (On Hold) + note the primary, THEN park at the SERVICE_INACTIVE
+        # off-ramp. NOT a cancel, so a later open case resumes it. Opens NO
+        # tickets -- the timeline, StageEvents and primary note carry visibility.
+        # Task 4.3: a household still only at Kitchen Assignment when its last
+        # open case closes never became an active member -> hard off-ramp to
+        # INELIGIBLE. Set BEFORE the close-out so it isn't also parked at the
+        # reversible SERVICE_INACTIVE off-ramp (INELIGIBLE outranks it).
+        if _has_kitchen_assignment_enrollment(client) and _mark_kitchen_assignment_ineligible(
+            client, reason=_KA_CLOSED_INELIGIBLE_REASON,
+            actor=actor, actor_label=actor_label,
+        ):
+            result["ineligible"] = True
         outcome = _full_stop_close_out(
             client, governing, actor=actor, actor_label=actor_label,
         )
         result["closed_out"] = True
         result["paused"] = outcome["paused"]
-        result["cancelled"] = outcome["cancelled"]
-    elif gov_status == ServiceAuthorizationStatus.DENIED:
-        # Governing meal/box authorization is denied (no favorable/pending open
-        # case exists, whether one case or several) -> full stop: pause every
-        # servable enrollment (incl. Active -- Rule 3).
+        result["service_inactive"] = outcome["service_inactive"]
+    elif gov_status in _DENIED_EQUIVALENT_STATUSES:
+        # Governing meal/box authorization is denied -- or NEVER_REQUESTED, which
+        # is treated identically to a denial (an open case that confers no
+        # service). No favorable/pending open case exists, whether one case or
+        # several -> full stop: pause every servable enrollment (incl. Active --
+        # Rule 3), disregard a still-pending-verification request, and off-ramp a
+        # Kitchen-Assignment household to INELIGIBLE.
         result["sole_denied"] = True
+        # Task 4.3: capture Kitchen-Assignment membership BEFORE the loop pauses
+        # those enrollments (KA -> On Hold), so a denied authorization at Kitchen
+        # Assignment can hard off-ramp the client to INELIGIBLE afterwards.
+        had_kitchen_assignment = _has_kitchen_assignment_enrollment(client)
         for enr in _governing_enrollments(client):
-            if EnrollmentStage(enr.stage) in _DENIAL_PAUSE_STAGES:
+            stage = EnrollmentStage(enr.stage)
+            if stage in _DENIAL_PAUSE_STAGES:
                 try:
                     advance_enrollment(
                         enr, EnrollmentStage.ON_HOLD, actor=actor,
@@ -1564,6 +2838,23 @@ def reconcile_internal_service_authorization(client, *, actor=None, actor_label=
                     result["paused"] = True
                 except InvalidTransition:
                     pass
+            elif stage == EnrollmentStage.PENDING_VERIFICATION:
+                # Objective 3 / task 4.1: a denial while still awaiting
+                # verification removes the request (DISREGARDED) -- the member
+                # leaves the Verification queue. Not auto-resumed on re-approval.
+                try:
+                    advance_enrollment(
+                        enr, EnrollmentStage.DISREGARDED, actor=actor,
+                        actor_label=actor_label, note=_DENIAL_DISREGARD_NOTE,
+                    )
+                    result["disregarded"] = True
+                except InvalidTransition:
+                    pass
+        if had_kitchen_assignment and _mark_kitchen_assignment_ineligible(
+            client, reason=_KA_DENIED_INELIGIBLE_REASON,
+            actor=actor, actor_label=actor_label,
+        ):
+            result["ineligible"] = True
     elif gov_status in (
         ServiceAuthorizationStatus.APPROVED,
         ServiceAuthorizationStatus.NOT_REQUIRED,
@@ -1572,16 +2863,37 @@ def reconcile_internal_service_authorization(client, *, actor=None, actor_label=
         # advance a verified household to Kitchen Assignment (Rule 2). Routing
         # the advance through here means it fires on EVERY case-save path
         # (extension, manual import, bulk CLI), not just the manual import.
-        for enr in _governing_enrollments(client):
-            if EnrollmentStage(enr.stage) == EnrollmentStage.ON_HOLD:
-                _resume_auto_paused_enrollment(enr, actor=actor)
-            else:
-                try:
-                    reconcile_enrollment_authorization(
-                        enr, actor=actor, actor_label=actor_label,
+        #
+        # A meals<->boxes product switch on the governing case takes precedence:
+        # it requeues the whole household for a NEW kitchen assignment, so skip
+        # the normal resume/advance below to avoid re-advancing past it.
+        if _handle_program_switch(
+            client, previous_governing_id, governing,
+            actor=actor, actor_label=actor_label,
+        ):
+            result["switched"] = True
+        else:
+            for enr in _governing_enrollments(client):
+                if EnrollmentStage(enr.stage) == EnrollmentStage.ON_HOLD:
+                    # Resume whichever auto-pause holds this enrollment: a denial
+                    # hold, or -- on reactivation -- the closure hold. Each is a
+                    # no-op unless the last hold's note matches, so calling both
+                    # is safe and order-independent.
+                    _resume_auto_paused_enrollment(enr, actor=actor)
+                    _resume_auto_paused_enrollment(
+                        enr, actor=actor, hold_note=_CLOSURE_HOLD_NOTE,
+                        resume_note=(
+                            "Auto-resumed: new open internal-service case "
+                            "reopened service."
+                        ),
                     )
-                except Exception:  # pragma: no cover - defensive
-                    pass
+                else:
+                    try:
+                        reconcile_enrollment_authorization(
+                            enr, actor=actor, actor_label=actor_label,
+                        )
+                    except Exception:  # pragma: no cover - defensive
+                        pass
     elif gov_status in _WAITING_AUTH_STATUSES:
         # Not approved yet (pending / never-requested / blank) but an open case
         # exists: only an approval authorizes service, so pull any enrollment
@@ -1602,7 +2914,7 @@ def reconcile_internal_service_authorization(client, *, actor=None, actor_label=
     # deliveries when a case closed with no authorization / pending successor.
     # Never auto-flips product kind -- a meals<->boxes switch stays a
     # human-confirmed PO Blockers fix. Skipped on a close-out (deliveries were
-    # already truncated and the enrollments cancelled). Best-effort.
+    # already truncated and the enrollments placed On Hold). Best-effort.
     if not result["closed_out"]:
         for enr in _governing_enrollments(client):
             try:
@@ -1610,7 +2922,24 @@ def reconcile_internal_service_authorization(client, *, actor=None, actor_label=
             except Exception:  # pragma: no cover - defensive
                 pass
 
-    recompute_client_stage(client, actor=actor)
+    # Reactivation: a member parked at SERVICE_INACTIVE now has an open case
+    # again -> re-derive past the sticky off-ramp and announce it once.
+    reactivated = was_service_inactive and bool(open_cases)
+    recompute_client_stage(client, actor=actor, ignore_sticky=reactivated)
+    if reactivated and client.lifecycle_stage != ClientStage.SERVICE_INACTIVE:
+        from api.services import timeline
+
+        author = actor_label or _actor_name(actor)
+        _write_primary_system_note(
+            client,
+            (
+                f"Service reactivated on {timezone.localdate().isoformat()}: a new "
+                f"open internal-service case reopened service."
+            ),
+            author_name=author,
+        )
+        timeline.event_for_member_service_reactivated(client, actor=author)
+        result["reactivated"] = True
 
     # Refresh the member/household warning snapshot after a case-driven change
     # (fires on both extension case saves and CSV imports, which route through

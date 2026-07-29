@@ -208,10 +208,19 @@ def _set_client_stage(client, target, *, actor=None):
     )
 
 
-def _stop_future_deliveries(client, *, to_hold=True):
+_INELIGIBLE_HOLD_NOTE = "Auto-hold: member marked Ineligible by import."
+# Distinct hold note so the RECOVERABLE coverage hold can be reversed on its own
+# (``_resume_auto_paused_enrollment`` matches on this prefix) without touching an
+# ineligibility hold, a denial/closure hold, or a manual Place-on-Hold.
+_COVERAGE_HOLD_NOTE = "Auto-hold: social care coverage expired/missing by import."
+_COVERAGE_RESUME_NOTE = "Auto-resumed: social care coverage restored."
+
+
+def _stop_future_deliveries(client, *, to_hold=True, note=_INELIGIBLE_HOLD_NOTE, actor=None):
     """Truncate every governing enrollment's future deliveries so the member
     can't land in a new PO, and (optionally) place the household On Hold -- the
-    proven closure step, minus the cancel. Returns the paused enrollments."""
+    proven closure step, minus the cancel. ``note`` labels the hold StageEvent so
+    the matching auto-resume can find it. Returns the paused enrollments."""
     from api.models import EnrollmentStage
     from api.services.lifecycle import (
         ENROLLMENT_TRANSITIONS,
@@ -233,13 +242,88 @@ def _stop_future_deliveries(client, *, to_hold=True):
         ):
             try:
                 advance_enrollment(
-                    enr, EnrollmentStage.ON_HOLD, actor=None,
-                    note="Auto-hold: member marked Ineligible by import.",
+                    enr, EnrollmentStage.ON_HOLD, actor=actor, note=note,
                 )
                 paused.append(enr)
             except Exception:  # pragma: no cover - defensive
                 pass
     return paused
+
+
+def _coverage_held_enrollments(client):
+    """Governing enrollments currently ON_HOLD *because of* the recoverable
+    coverage hold (their most recent hold StageEvent carries the coverage note).
+    Used to detect an active coverage hold for idempotency + recovery."""
+    from api.models import EnrollmentStage, StageEvent
+    from api.services.lifecycle import _governing_enrollments
+
+    held = []
+    for enr in _governing_enrollments(client):
+        try:
+            if EnrollmentStage(enr.stage) != EnrollmentStage.ON_HOLD:
+                continue
+        except ValueError:  # pragma: no cover - defensive
+            continue
+        last_hold = (
+            StageEvent.objects.filter(
+                enrollment=enr, to_stage=EnrollmentStage.ON_HOLD
+            )
+            .order_by("-entered_at")
+            .first()
+        )
+        if last_hold and (last_hold.note or "").startswith(_COVERAGE_HOLD_NOTE):
+            held.append(enr)
+    return held
+
+
+def _apply_coverage_hold(client, verdict, *, actor, author, today_str, source):
+    """Place the member on the RECOVERABLE coverage hold: truncate future
+    deliveries (always, so no PO leak) and, on the transition IN, pause the
+    household + write a member note and timeline event. Idempotent: re-imports of
+    an already-held member only re-truncate."""
+    from api.services import timeline
+
+    already = bool(_coverage_held_enrollments(client))
+    paused = _stop_future_deliveries(
+        client, to_hold=not already, note=_COVERAGE_HOLD_NOTE, actor=actor,
+    )
+    if already or not paused:
+        return
+    reasons = "; ".join(verdict.hold_reasons) or "social care coverage expired/missing"
+    _write_client_system_note(
+        client,
+        (
+            f"Service paused on {today_str}: {reasons}. Reversible \u2014 renewed "
+            "social care coverage resumes service."
+        ),
+        author_name=author,
+    )
+    timeline.event_for_member_coverage_hold(
+        client, reasons=verdict.hold_reasons, source=source, actor=author,
+    )
+
+
+def _clear_coverage_hold(client, *, actor, author, today_str, source):
+    """Reverse a coverage hold once coverage recovers: resume each coverage-held
+    enrollment to the stage it was held from, then write a recovery note +
+    timeline event. No-op when no coverage hold is active."""
+    from api.services import timeline
+    from api.services.lifecycle import _resume_auto_paused_enrollment
+
+    held = _coverage_held_enrollments(client)
+    if not held:
+        return
+    for enr in held:
+        _resume_auto_paused_enrollment(
+            enr, actor=actor, hold_note=_COVERAGE_HOLD_NOTE,
+            resume_note=_COVERAGE_RESUME_NOTE,
+        )
+    _write_client_system_note(
+        client,
+        f"Service resumed on {today_str}: social care coverage restored.",
+        author_name=author,
+    )
+    timeline.event_for_member_coverage_restored(client, source=source, actor=author)
 
 
 def reconcile_client_eligibility(client, *, actor=None, actor_label="", source=None, today=None):
@@ -279,6 +363,12 @@ def reconcile_client_eligibility(client, *, actor=None, actor_label="", source=N
             timeline.event_for_member_ineligible(
                 client, reasons=verdict.reasons, source=src, actor=author,
             )
+        # Persist the reasons on EVERY reconcile (idempotent) so the stored value
+        # stays current and back-fills members flagged before this field existed
+        # -- re-running the ext/CSV import populates it.
+        if list(client.ineligible_reasons or []) != verdict.reasons:
+            client.ineligible_reasons = verdict.reasons
+            client.save(update_fields=["ineligible_reasons"])
         # Always stop future deliveries (idempotent) so an ineligible member is
         # excluded from every new PO, even across re-imports.
         _stop_future_deliveries(client)
@@ -288,11 +378,28 @@ def reconcile_client_eligibility(client, *, actor=None, actor_label="", source=N
     if client.lifecycle_stage == ClientStage.INELIGIBLE:
         target = derive_client_stage(client, ignore_sticky=True)
         _set_client_stage(client, target, actor=actor)
+        # Clear the stored reasons now that the member passes the gates again.
+        if client.ineligible_reasons:
+            client.ineligible_reasons = []
+            client.save(update_fields=["ineligible_reasons"])
         _write_client_system_note(
             client,
             f"Eligibility restored on {today_str}: the eligibility checks now pass.",
             author_name=author,
         )
         timeline.event_for_member_eligibility_restored(client, source=src, actor=author)
+
+    # Recoverable social-care-coverage hold: pause (reversible) when coverage is
+    # expired/missing, resume when it is restored. Runs only once the hard gates
+    # pass, so an ineligible member is never double-handled.
+    if verdict.needs_hold:
+        _apply_coverage_hold(
+            client, verdict, actor=actor, author=author,
+            today_str=today_str, source=src,
+        )
+    else:
+        _clear_coverage_hold(
+            client, actor=actor, author=author, today_str=today_str, source=src,
+        )
 
     return client.lifecycle_stage

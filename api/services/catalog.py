@@ -261,9 +261,13 @@ def detected_product_kind_for_enrollment(enrollment):
     if gov is not None:
         case = gov
     program = case.program if (case is not None and getattr(case, "program_id", None)) else None
+    # Only names belonging to the GOVERNING CASE -- deliberately NOT
+    # ``enrollment.program_name``. The enrollment snapshot reflects the kind the
+    # household was VERIFIED under, so including it here would make the governing
+    # baseline echo the verified kind and hide a genuine case mismatch (e.g. a
+    # meals governing case with a boxes-verified enrollment).
     for candidate in (
         program.name if program is not None else "",
-        enrollment.program_name,
         getattr(case, "program_name", "") if case is not None else "",
         getattr(case, "service_type", "") if case is not None else "",
     ):

@@ -13,7 +13,7 @@ all-time live snapshot. ``All Time`` applies no date filter to any metric. See
 
 from datetime import date, timedelta
 
-from django.db.models import Count, Q
+from django.db.models import Q
 from django.utils import timezone
 from django.utils.dateparse import parse_date
 from rest_framework.response import Response
@@ -48,7 +48,7 @@ _TERMINAL_CASE_STATUSES = [CaseStatus.CLOSED, CaseStatus.CANCELLED]
 # group mirrors the "Not Being Served" cards; the second is the follow-up
 # watchlist (which can overlap with actively-served members).
 _SERVING_REASONS = frozenset({
-    "needs_verification", "rejected_case", "multiple_cases", "out_of_range",
+    "needs_verification", "rejected_case", "out_of_range",
     "services_paused", "pending_closure", "out_of_orbit",
     "insurance_expiring", "no_social_coverage", "no_insurance",
 })
@@ -110,6 +110,32 @@ def _scope_by_opened(qs, start, end):
     return qs.filter(date_opened__date__gte=start, date_opened__date__lte=end)
 
 
+def governing_internal_case_ids():
+    """The ``case_id`` of each client's GOVERNING internal-service case, using
+    the system-wide governing rule (:func:`governing_case_key` over ALL of the
+    client's internal-service cases -- an approved authorization beats a denial
+    regardless of dates, then OPEN over closed, then most recent).
+
+    Every dashboard case metric is restricted to these ids, so a superseded or
+    parallel NON-governing case is never counted or considered anywhere: a
+    client contributes exactly ONE (their governing) internal-service case.
+    """
+    from ..services.lifecycle import governing_case_key
+
+    best = {}
+    for c in (
+        Case.objects.filter(case_type=CaseType.INTERNAL_SERVICE)
+        .only(
+            "case_id", "client_id", "service_authorization_status",
+            "case_status", "case_created_at", "date_opened", "updated_at",
+        )
+    ):
+        cur = best.get(c.client_id)
+        if cur is None or governing_case_key(c) > governing_case_key(cur):
+            best[c.client_id] = c
+    return {c.case_id for c in best.values()}
+
+
 def _case_product_kind(program_product_type, program_name, service_type):
     """Resolve a case's Meals/Boxes kind: the linked Program's ProductType wins;
     otherwise a keyword heuristic across the program/service names. Returns a
@@ -139,10 +165,15 @@ def _scope_members(qs, start, end):
     )
 
 
-def serving_client_ids(reason, *, start, end):
+def serving_client_ids(reason, *, start, end, governing_ids=None):
     """Distinct client_ids for a serving-status / watchlist ``reason``, scoped to
     the selected date range. Single source of truth for both the dashboard counts
     and the drill-down list, so the two never disagree on WHO is included.
+
+    ``governing_ids`` is the precomputed set of GOVERNING internal-service
+    case_ids (:func:`governing_internal_case_ids`); the case-driven reasons are
+    restricted to it so a NON-governing case is never considered. Computed lazily
+    when not supplied.
 
     Returns a set of client_ids, or ``None`` for an unknown reason.
     """
@@ -150,6 +181,9 @@ def serving_client_ids(reason, *, start, end):
 
     def scope(qs):
         return _scope_members(qs, start, end)
+
+    def gov():
+        return governing_ids if governing_ids is not None else governing_internal_case_ids()
 
     if reason == "needs_verification":
         # Mirror the Verification page's "Pending + Requested-date" filter EXACTLY
@@ -180,9 +214,13 @@ def serving_client_ids(reason, *, start, end):
         # so the two cards can't disagree. Sourced from the Case table -- NOT
         # MemberDietaryProfile -- because a denied case need not have an
         # enrollment/dietary profile yet; the mdp path missed those.
+        # Restricted to the GOVERNING case: a client is only "rejected" when the
+        # case that governs them is denied -- a superseded/parallel denied case
+        # while their governing case is approved must NOT flag them.
         denied = _scope_by_opened(
             Case.objects.filter(
                 case_type=CaseType.INTERNAL_SERVICE,
+                case_id__in=gov(),
                 service_authorization_status=ServiceAuthorizationStatus.DENIED,
             ),
             start, end,
@@ -212,19 +250,12 @@ def serving_client_ids(reason, *, start, end):
             )
             | Q(status=MemberStatus.ACTIVE, enrollment__stage=EnrollmentStage.ON_HOLD)
         )).values_list("client_id", flat=True))
-    if reason == "multiple_cases":
-        open_cases = _scope_by_opened(
-            Case.objects.filter(case_type=CaseType.INTERNAL_SERVICE), start, end
-        ).exclude(case_status__in=_TERMINAL_CASE_STATUSES)
-        return {
-            row["client_id"]
-            for row in open_cases.values("client_id")
-            .annotate(n=Count("case_id"))
-            .filter(n__gt=1)
-        }
     if reason == "pending_closure":
+        # Only a closure ticket on the GOVERNING case flags the member -- a ticket
+        # on a non-governing case is not their service closing.
         tickets = Ticket.objects.filter(
             type__code=TicketTypeCode.CASE_CLOSURE,
+            case_id__in=gov(),
         ).exclude(status=TicketStatus.RESOLVED)
         if start is not None:
             tickets = tickets.filter(
@@ -292,13 +323,17 @@ def _fmt_date(dt):
     return dt.date().isoformat() if dt else None
 
 
-def _serving_details(reason, client_ids, *, start, end):
+def _serving_details(reason, client_ids, *, start, end, governing_ids=None):
     """Per-client presentation detail for a reason's list rows. Presentation only
-    -- membership is decided by :func:`serving_client_ids`."""
+    -- membership is decided by :func:`serving_client_ids`. ``governing_ids``
+    mirrors that function's governing-case restriction."""
     if not client_ids:
         return {}
     ids = set(client_ids)
     mdp = MemberDietaryProfile.objects
+
+    def gov():
+        return governing_ids if governing_ids is not None else governing_internal_case_ids()
 
     if reason == "needs_verification":
         out = {}
@@ -319,6 +354,7 @@ def _serving_details(reason, client_ids, *, start, end):
         denied = _scope_by_opened(
             Case.objects.filter(
                 case_type=CaseType.INTERNAL_SERVICE,
+                case_id__in=gov(),
                 service_authorization_status=ServiceAuthorizationStatus.DENIED,
             ),
             start, end,
@@ -359,20 +395,6 @@ def _serving_details(reason, client_ids, *, start, end):
             elif getattr(p.enrollment, "stage", None) == EnrollmentStage.ON_HOLD:
                 out[p.client_id] = "Household on hold (under review)"
         return out
-    if reason == "multiple_cases":
-        open_cases = _scope_by_opened(
-            Case.objects.filter(case_type=CaseType.INTERNAL_SERVICE), start, end
-        ).exclude(case_status__in=_TERMINAL_CASE_STATUSES)
-        by_client = {}
-        for row in open_cases.filter(client_id__in=ids).values(
-            "client_id", "program_name", "service_type"
-        ):
-            name = (row["program_name"] or row["service_type"] or "Case").strip()
-            by_client.setdefault(row["client_id"], []).append(name)
-        return {
-            cid: f"{len(names)} open cases: " + ", ".join(names[:4])
-            for cid, names in by_client.items()
-        }
     if reason == "pending_closure":
         tickets = Ticket.objects.filter(
             client_id__in=ids, type__code=TicketTypeCode.CASE_CLOSURE,
@@ -400,9 +422,14 @@ class DashboardView(PortalAPIView):
     filter): open_cases, members, and cancel_rate. Every other metric is an
     ALL-TIME live snapshot. Metric definitions:
 
-    * open_cases  -- [TIME-FRAME] non-terminal (not Closed/Cancelled)
-      internal-service cases, broken down by service-authorization outcome:
-      Accepted (approved), Requested (pending), Rejected (denied).
+    Every case metric counts ONLY each client's GOVERNING internal-service case
+    (:func:`governing_internal_case_ids`); a superseded / parallel non-governing
+    case is never counted or considered anywhere.
+
+    * open_cases  -- [TIME-FRAME] non-terminal (not Closed/Cancelled) GOVERNING
+      internal-service cases (one per client), broken down by service-
+      authorization outcome: Accepted (approved), Requested (pending), Rejected
+      (denied).
     * members     -- [TIME-FRAME] distinct clients across those open cases'
       households, split into Primary members (household heads / case holders)
       vs Members of Household. A client with several open cases counts once.
@@ -441,7 +468,13 @@ class DashboardView(PortalAPIView):
         )
         start, end = resolve_window(request)
 
-        ic = Case.objects.filter(case_type=CaseType.INTERNAL_SERVICE)
+        # Every case metric below is restricted to each client's GOVERNING
+        # internal-service case, so a superseded / parallel NON-governing case is
+        # never counted or considered anywhere on the dashboard.
+        gov_ids = governing_internal_case_ids()
+        ic = Case.objects.filter(
+            case_type=CaseType.INTERNAL_SERVICE, case_id__in=gov_ids
+        )
         ic_in_range = _scope_by_opened(ic, start, end)
         open_cases = ic_in_range.exclude(case_status__in=_TERMINAL_CASE_STATUSES)
 
@@ -613,7 +646,11 @@ class DashboardView(PortalAPIView):
         pending_meals = pending_meals.values("client_id").distinct().count()
 
         def _count(reason):
-            return len(serving_client_ids(reason, start=start, end=end))
+            return len(
+                serving_client_ids(
+                    reason, start=start, end=end, governing_ids=gov_ids
+                )
+            )
 
         serving = {
             # 2.1 Accepted case + Verified + being served.
@@ -625,8 +662,6 @@ class DashboardView(PortalAPIView):
                 "needs_verification": _count("needs_verification"),
                 # 2.3b Case authorization Denied.
                 "rejected_case": _count("rejected_case"),
-                # 2.3c >1 open internal-service case (surfaced for manual review).
-                "multiple_cases": _count("multiple_cases"),
                 # 2.3d Delivery/primary ZIP outside coverage (geographic block).
                 "out_of_range": _count("out_of_range"),
                 # 2.3e Member Paused (benign) OR household On Hold (under review).
@@ -843,15 +878,16 @@ class DashboardServingListView(PortalAPIView):
         # (Not Being Served / Needs Follow-up are range-scoped), so a count and
         # its member list can never disagree. All Time => no date filter.
         start, end = resolve_window(request)
-        client_ids = serving_client_ids(reason, start=start, end=end) or set()
-        details = _serving_details(reason, client_ids, start=start, end=end)
-        # multiple_cases links to the member's own profile (it is about that
-        # member's duplicate cases); every other reason links to the primary.
-        primary_map = (
-            {cid: cid for cid in client_ids}
-            if reason == "multiple_cases"
-            else _primary_map(client_ids)
+        # Same governing-case restriction as the summary counts, so the list and
+        # its count can never disagree (and no non-governing case is considered).
+        gov_ids = governing_internal_case_ids()
+        client_ids = serving_client_ids(
+            reason, start=start, end=end, governing_ids=gov_ids
+        ) or set()
+        details = _serving_details(
+            reason, client_ids, start=start, end=end, governing_ids=gov_ids
         )
+        primary_map = _primary_map(client_ids)
 
         needed = set(client_ids) | set(primary_map.values())
         names = {
