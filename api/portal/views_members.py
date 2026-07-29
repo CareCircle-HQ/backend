@@ -122,6 +122,7 @@ from ..serializers import (
     sync_household_members,
 )
 from .base import PortalAPIView, PortalGenericAPIView, current_agent
+from .permissions import IsManagementAgent, is_management_group
 from . import serializers as s
 
 logger = logging.getLogger(__name__)
@@ -247,6 +248,50 @@ def _enrollment_resume_blocked_by_ineligibility(enrollment):
     return enrollment.member_profiles.filter(
         client__lifecycle_stage=ClientStage.INELIGIBLE
     ).exists()
+
+
+# Message shown when a program-tab write action is rejected because the
+# program's governing internal-service case is closed (no open case remains).
+_PROGRAM_LOCKED_MESSAGE = (
+    "This program is closed — its internal-service case is no longer open, so "
+    "no further changes can be made. Service resumes automatically only when a "
+    "new open internal-service case is created for the member."
+)
+
+
+def _program_locked(enrollment):
+    """True when the enrollment's program is CLOSED — the household HAS an
+    internal-service (meal/box) case but NONE is still open, so its verification
+    enrollment is frozen (read-only history). Every program-tab write action is
+    refused in this state.
+
+    Requires at least one internal-service case: a household with no such case
+    yet (e.g. a pre-case enrollment) is NOT "closed" — it simply has nothing to
+    govern it — so it stays editable. Once a case existed and all of them closed,
+    the program is off service and only a NEW open case reopens it (via the
+    reversible reconcile path). Keyed on the enrollment owner's cases (the primary
+    owns the household's case), matching ``governing_internal_case`` / the PO
+    guardrail. Read-only.
+    """
+    if enrollment is None:
+        return False
+    holder = getattr(enrollment, "client", None)
+    if holder is None:
+        return False
+    has_internal_case = any(
+        c.case_type == CaseType.INTERNAL_SERVICE for c in holder.cases.all()
+    )
+    return has_internal_case and not has_open_internal_service_case(holder)
+
+
+def _program_locked_response():
+    """The standard 400 returned when a program-tab action is blocked because the
+    governing case is closed. Centralized so every guarded endpoint speaks with
+    one voice."""
+    return Response(
+        {"error": _PROGRAM_LOCKED_MESSAGE},
+        status=http.HTTP_400_BAD_REQUEST,
+    )
 
 
 def _resume_household_after_range(enrollment):
@@ -523,6 +568,9 @@ SCOPE_TO_STAGES = {
 # so the Verification list's agent columns don't trigger an extra query per row.
 MEMBER_LIST_PREFETCH = (
     "insurances",
+    # Addresses, so the eligibility-reason recompute (address_range_reason, shown
+    # under a Not Eligible badge) resolves without an extra query per row.
+    "addresses",
     # Social care coverage, so the Urgent Care coverage gate
     # (has_valid_social_care / can_request_verification) resolves without an
     # extra query per row.
@@ -590,6 +638,31 @@ def verification_scope_q():
     they advance to kitchen assignment / active / completed. The ``verified_at``
     join is multi-valued, so the caller must ``.distinct()``."""
     return Q(lifecycle_stage="pending_verification") | verification_completed_q()
+
+
+def enrollment_stage_q(*stages):
+    """Match a client whose OWN enrollment OR their household's governing
+    enrollment sits at any of the given stage(s). Mirrors the On Hold pattern so
+    a dependent inherits the household enrollment's stage. Caller handles
+    ``.distinct()`` (this adds multi-valued joins)."""
+    return Q(enrollments__stage__in=stages) | Q(
+        household_membership__household__enrollment_verifications__stage__in=stages
+    )
+
+
+def governing_auth_expired_q():
+    """Match a client whose GOVERNING internal-service case authorization has
+    EXPIRED (``service_authorization_status`` = expired). Anchored on the
+    internal-service (meal/box) case via ``Exists`` so it stays scoped to the
+    case that actually governs. Caller handles ``.distinct()``."""
+    internal_cases = Case.objects.filter(
+        client=OuterRef("pk"), case_type=CaseType.INTERNAL_SERVICE,
+    )
+    return Exists(
+        internal_cases.filter(
+            service_authorization_status=ServiceAuthorizationStatus.EXPIRED
+        )
+    )
 
 
 _ALLERGY_LABELS = dict(FoodAllergy.choices)
@@ -1006,39 +1079,92 @@ class MembersListView(PortalGenericAPIView):
                 )
             )
 
+        # Status filter (Members page grouped dropdown). One selection spanning
+        # several axes; each value maps to exactly one query. Legacy Verification
+        # page values (Pending / Verified / Denied / Kitchen Assignment / ...) are
+        # kept for backward-compat alongside the new grouped values.
         status_val = (params.get("status") or "").strip()
-        if status_val and status_val.lower() != "all":
-            if status_val in ("Denied", "not_eligible"):
-                # Eligibility denial only (lifecycle_stage not_eligible). A denied
-                # case AUTHORIZATION is no longer an eligibility/verification
-                # state -- it is surfaced via the separate `authorization` filter.
+        sv = status_val.lower()
+        if status_val and sv != "all":
+            # ── Eligibility axis (client eligibility gate) ──
+            if sv == "eligible":
+                # Passed the gate: valid Medicaid + in-range ZIP/state. Anyone NOT
+                # parked at the hard Ineligible off-ramp, at any later stage.
+                qs = qs.exclude(lifecycle_stage=ClientStage.INELIGIBLE)
+            elif sv == "ineligible":
+                # Failed the gate: missing/expired Medicaid, wrong Medicaid type,
+                # or out-of-range ZIP/state (set by reconcile_client_eligibility).
+                qs = qs.filter(lifecycle_stage=ClientStage.INELIGIBLE)
+            # ── legacy eligibility-denial value (Verification page "Denied") ──
+            elif status_val in ("Denied", "not_eligible"):
                 qs = qs.filter(lifecycle_stage="not_eligible")
-            elif status_val in ("verified_awaiting", "Verified"):
-                # Verification page "Verified" chip: the pop-up was completed
-                # (verified_at set). Independent of the case authorization status.
+            # ── Verification axis (yes/no fact) ──
+            elif status_val in ("verified_awaiting", "Verified", "verified"):
+                # Pop-up completed (verified_at set). Independent of case auth.
                 qs = qs.filter(verification_completed_q())
             elif status_val in ("pending_verification", "Pending"):
-                # Verification page "Pending Verification" chip: pop-up NOT yet
-                # completed (verified_at null), regardless of any case auth status.
-                qs = qs.exclude(verification_completed_q())
+                # Pop-up NOT yet completed (verified_at null) AND the member is
+                # actually IN the verification window -- mirrors the Verification
+                # column (serializers.get_verification_state), which only labels a
+                # member "Pending Verification" at these stages and shows blank
+                # otherwise. Without the stage gate, the Members page (no scope)
+                # would also match Inactive/Screened members who never entered
+                # verification, surfacing rows with a blank Verification column.
+                qs = qs.filter(
+                    lifecycle_stage__in=[
+                        "pending_verification", "verified", "kitchen_assignment",
+                    ]
+                ).exclude(verification_completed_q())
+            # ── Authorization axis (governing internal-service case) ──
+            elif sv in ("auth_pending", "waiting_authorization"):
+                qs = apply_authorization_filter(qs, "pending")
+            elif sv == "authorized":
+                qs = apply_authorization_filter(qs, "approved")
+            elif sv == "auth_denied":
+                qs = apply_authorization_filter(qs, "denied")
+            # ── Service axis ──
             elif status_val in ("On Hold", "on_hold"):
                 # On Hold is a service-state overlay (not a lifecycle_stage), so it
-                # is filtered on the member's/household's enrollment stage --
-                # independent of verification status or authorization.
-                qs = qs.filter(
-                    Q(enrollments__stage=EnrollmentStage.ON_HOLD)
-                    | Q(
-                        household_membership__household__enrollment_verifications__stage=(
-                            EnrollmentStage.ON_HOLD
-                        )
-                    )
-                )
+                # is filtered on the member's/household's enrollment stage.
+                qs = qs.filter(enrollment_stage_q(EnrollmentStage.ON_HOLD))
+            elif sv == "out_of_range":
+                qs = qs.filter(member_profiles__status=MemberStatus.OUT_OF_RANGE)
+            # ── Terminal axis (program / enrollment stage) ──
+            elif sv == "term_open":
+                # Open program: an active service enrollment.
+                qs = qs.filter(enrollment_stage_q(EnrollmentStage.SERVICE_ACTIVE))
+            elif sv == "term_expired":
+                # Authorization window/status expired on the governing case.
+                qs = qs.filter(governing_auth_expired_q())
+            elif sv == "term_closed":
+                # Closed/off-boarded program (enrollment closed, cancelled or
+                # service-complete).
+                qs = qs.filter(enrollment_stage_q(
+                    EnrollmentStage.CLOSED,
+                    EnrollmentStage.CANCELLED,
+                    EnrollmentStage.SERVICE_COMPLETE,
+                ))
+            # ── Logistics / plain lifecycle-stage buckets ──
+            elif sv == "kitchen_assignment":
+                qs = qs.filter(lifecycle_stage="kitchen_assignment")
+            elif sv == "active":
+                qs = qs.filter(lifecycle_stage="active")
             else:
                 stages = STATUS_TO_STAGES.get(status_val)
                 if stages:
                     qs = qs.filter(lifecycle_stage__in=stages)
                 else:
                     qs = qs.filter(lifecycle_stage=status_val)
+
+        # Eligibility filter (its own dimension, composes with the status chips):
+        # whether the member cleared the hard eligibility gate. "eligible" = NOT
+        # parked on the INELIGIBLE off-ramp; "ineligible" = on it. Mirrors the
+        # serializer's `eligibility` field and the Eligible column.
+        elig_val = (params.get("eligibility") or "").strip().lower()
+        if elig_val == "eligible":
+            qs = qs.exclude(lifecycle_stage=ClientStage.INELIGIBLE)
+        elif elig_val == "ineligible":
+            qs = qs.filter(lifecycle_stage=ClientStage.INELIGIBLE)
 
         # Authorization filter (separate dimension from verification): match the
         # client's GOVERNING internal-service case authorization. Composes with
@@ -1169,6 +1295,34 @@ class MembersListView(PortalGenericAPIView):
                 qs = qs.filter(_hh_member_count__gt=1)
             else:  # single
                 qs = qs.filter(_hh_member_count__lte=1)
+
+        # Program-type (scope) filter — its own dimension, meant to be combined
+        # with the household-composition filter above to surface data mismatches
+        # (e.g. an INDIVIDUAL-scope program that nonetheless has 2+ members, or a
+        # HOUSEHOLD-scope program with a single member). Scope is derived LIVE
+        # from the governing program name -- the source of truth, mirroring
+        # derive_household_type / the Case serializer: a program is HOUSEHOLD when
+        # "household" appears in its name, else INDIVIDUAL. Matched on the member's
+        # own enrollment OR their household's enrollment so dependents inherit the
+        # household's program.
+        program_type = (params.get("program_type") or "").strip().lower()
+        if program_type in ("household", "individual"):
+            household_prog = (
+                Q(enrollments__program_name__icontains="household")
+                | Q(
+                    household_membership__household__enrollment_verifications__program_name__icontains="household"
+                )
+            )
+            has_prog = (
+                Q(enrollments__isnull=False)
+                | Q(
+                    household_membership__household__enrollment_verifications__isnull=False
+                )
+            )
+            if program_type == "household":
+                qs = qs.filter(household_prog)
+            else:  # individual: has a program, but none of household scope
+                qs = qs.filter(has_prog).exclude(household_prog)
 
         # Menu-type filter (Members page): the member's assigned catalog menu
         # type. MemberDietaryProfile.menu_type stores the catalog NAME, so match
@@ -1918,12 +2072,16 @@ class MembersListView(PortalGenericAPIView):
                 entries = [e for e in entries if (e["type"], e["id"]) in renderable]
         page = self.paginate_queryset(entries)
         groups = self._build_groups_for_page(page or [], checks=checks)
-        # Urgent Care ("Need Attention"): show how each member was first added
-        # (extension vs import) so agents can triage the list at a glance.
-        if scope == "need_attention":
+        # Stamp the Source (extension vs import) + case-creator Team badges onto
+        # each member. Needed by the Urgent Care ("Need Attention") triage list
+        # AND by the household-grouped Members page (no scope), whose rows render
+        # those same columns. The Verification page also shows a Team column, so
+        # it gets the team badge (but not the Source/added-via stamp). Logistics
+        # needs neither.
+        if scope in ("need_attention", ""):
             self._stamp_added_via(groups)
-            # Also stamp the case creator's CareCircle team so the Urgent Care
-            # list can flag Street Team-created cases under the Created By column.
+            self._stamp_case_teams(groups)
+        elif scope == "verification":
             self._stamp_case_teams(groups)
         return self.get_paginated_response(groups)
 
@@ -2581,6 +2739,12 @@ class MemberHouseholdView(PortalAPIView):
         household_type_mismatch = bool(detected_ht) and effective_ht != detected_ht
         from ..services.lifecycle import program_status
         ps = program_status(enr)
+        # A CLOSED program (no open internal-service case) is frozen: the whole
+        # tab is read-only history. The frontend uses ``program_locked`` to
+        # disable every write control, and both can_* flags are forced False so a
+        # closure hold can't be resumed and an active-but-orphaned enrollment
+        # can't be held.
+        program_locked = _program_locked(enr)
         return Response(
             {
                 "enrollment": {
@@ -2589,10 +2753,13 @@ class MemberHouseholdView(PortalAPIView):
                     # governing case authorization) shown on the accordion row.
                     "program_status": ps.value,
                     "program_status_label": ps.label,
+                    # True when the program's governing internal-service case is
+                    # closed -- the tab is frozen (read-only history).
+                    "program_locked": program_locked,
                     # Per-program On Hold controls (the household-wide hold was
                     # replaced by a per-program hold on the accordion row).
                     "on_hold": enr.stage == EnrollmentStage.ON_HOLD,
-                    "can_hold": enr.stage not in (
+                    "can_hold": not program_locked and enr.stage not in (
                         EnrollmentStage.ON_HOLD, EnrollmentStage.CANCELLED,
                         EnrollmentStage.CLOSED, EnrollmentStage.SERVICE_COMPLETE,
                     ),
@@ -2600,10 +2767,12 @@ class MemberHouseholdView(PortalAPIView):
                     # program is held AND no member is on the INELIGIBLE off-ramp:
                     # an ineligibility hold is CareCircle-unfixable, so it can be
                     # lifted only by the data recovering (reconcile_client_
-                    # eligibility), never by a manual Resume. The frontend hides
-                    # the Resume button when this is False.
+                    # eligibility), never by a manual Resume. Also forced off for a
+                    # closed program (a closure hold reopens only via a new case).
+                    # The frontend hides the Resume button when this is False.
                     "can_resume": (
-                        enr.stage == EnrollmentStage.ON_HOLD
+                        not program_locked
+                        and enr.stage == EnrollmentStage.ON_HOLD
                         and not _enrollment_resume_blocked_by_ineligibility(enr)
                     ),
                     "kitchen_id": str(enr.kitchen_id) if enr.kitchen_id else None,
@@ -2658,6 +2827,10 @@ class MemberHouseholdView(PortalAPIView):
                 {"error": "No active enrollment for this member."},
                 status=http.HTTP_404_NOT_FOUND,
             )
+        # Program-tab guard: a closed program (no open internal-service case) is
+        # frozen -- refuse every write action.
+        if _program_locked(enr):
+            return _program_locked_response()
         ser = s.PortalAddressEditSerializer(data=request.data)
         ser.is_valid(raise_exception=True)
         data = ser.validated_data
@@ -2793,6 +2966,9 @@ class MemberProductTypeView(PortalAPIView):
                 {"error": "No active enrollment for this member."},
                 status=http.HTTP_404_NOT_FOUND,
             )
+        # Program-tab guard: a closed program is frozen -- no type changes.
+        if _program_locked(enr):
+            return _program_locked_response()
         raw = (request.data.get("product_type") or "").strip().lower()
         try:
             kind = ProductTypeKind(raw)
@@ -2934,6 +3110,9 @@ class MemberHouseholdTypeView(PortalAPIView):
                 {"error": "No active enrollment for this member."},
                 status=http.HTTP_404_NOT_FOUND,
             )
+        # Program-tab guard: a closed program is frozen -- no scope changes.
+        if _program_locked(enr):
+            return _program_locked_response()
         raw = (request.data.get("household_type") or "").strip().lower()
         try:
             scope = CaseHouseholdType(raw)
@@ -3081,6 +3260,9 @@ class MemberHouseholdAddView(PortalAPIView):
                 {"error": "A client can't be added to their own household."},
                 status=http.HTTP_400_BAD_REQUEST,
             )
+        # Program-tab guard: a closed program is frozen -- no roster changes.
+        if _program_locked(s.active_enrollment(primary)):
+            return _program_locked_response()
         agent = current_agent(request)
         add_client_to_household(primary, member_client, agent=agent)
         actor = _agent_actor(agent)
@@ -3205,6 +3387,10 @@ class HouseholdMemberEditView(PortalAPIView):
         mv = get_object_or_404(
             MemberDietaryProfile, pk=member_id, enrollment=enr,
         )
+        # Program-tab guard: a closed program (no open internal-service case) is
+        # frozen -- no dietary edits, pause/unpause, or reactivation.
+        if _program_locked(enr):
+            return _program_locked_response()
         ser = s.PortalMemberDietaryEditSerializer(data=request.data)
         ser.is_valid(raise_exception=True)
         data = dict(ser.validated_data)
@@ -3565,6 +3751,14 @@ class HouseholdMemberEditView(PortalAPIView):
                 .first()
             )
 
+        # Program-tab guard: a closed program (no open internal-service case) is
+        # frozen. Plain removal is refused -- EXCEPT when the member being removed
+        # still holds their OWN open internal-service case: they must be extracted
+        # to their own household + verification (promotion below), so that path
+        # stays open even on a closed household program.
+        if _program_locked(enr) and active_case is None:
+            return _program_locked_response()
+
         # The household's primary owns the timeline; the removed-member event is
         # logged on their history (the primary can't themselves be removed -- that
         # is guarded above, against the roster, before any of this runs).
@@ -3636,6 +3830,9 @@ class MemberServiceHoldView(PortalAPIView):
                 {"error": "This member has no active enrollment to place on hold."},
                 status=http.HTTP_404_NOT_FOUND,
             )
+        # Program-tab guard: a closed program is frozen -- can't be held/resumed.
+        if _program_locked(enr):
+            return _program_locked_response()
         if EnrollmentStage(enr.stage) == EnrollmentStage.ON_HOLD:
             return Response(
                 {"error": "Service is already on hold."},
@@ -3679,6 +3876,12 @@ class MemberServiceResumeView(PortalAPIView):
                 {"error": "Service is not on hold."},
                 status=http.HTTP_400_BAD_REQUEST,
             )
+        # Program-tab guard: a CLOSURE hold (the governing case closed, so no open
+        # internal-service case remains) must NOT be manually resumable -- it is
+        # the reversible off-ramp that only a NEW open case reopens. Belt-and-
+        # suspenders alongside the ``can_resume`` flag that hides the button.
+        if _program_locked(enr):
+            return _program_locked_response()
         # An ineligibility hold is CareCircle-unfixable: only recovering the
         # underlying data (a later import/save re-running the eligibility gate)
         # may lift it -- a manual Resume must not. Belt-and-suspenders alongside
@@ -4753,6 +4956,23 @@ class MemberAssignKitchenView(PortalAPIView):
         client, enr, err = _logistics_enrollment(client_id)
         if err is not None:
             return err
+        # Program-tab guard: a closed program is frozen -- no kitchen/cadence
+        # (re)assignment, which would otherwise re-activate a closed member.
+        if _program_locked(enr):
+            return _program_locked_response()
+
+        # CHANGING an already-assigned kitchen (the program tab's "Kitchen &
+        # Delivery" Change control) is Management-only: verification / CS /
+        # logistics agents can't alter a household's kitchen once set. The
+        # INITIAL assignment (no kitchen yet -- the Logistics Kitchen Assignment
+        # step) stays open to non-management logistics staff.
+        if enr.kitchen_id and not is_management_group(
+            getattr(getattr(request, "user", None), "group", None)
+        ):
+            return Response(
+                {"error": "Only Management users can change the household's kitchen."},
+                status=http.HTTP_403_FORBIDDEN,
+            )
 
         kitchen_id = request.data.get("kitchen_id")
         cadence = (request.data.get("cadence") or "").strip()
@@ -5212,7 +5432,13 @@ class MemberKitchenView(PortalAPIView):
     """Change the household's assigned kitchen from the member profile editor.
 
     The assignment is household-wide: it updates the enrollment and any existing
-    delivery-plan snapshots. PATCH body: ``{kitchen_id}`` (null clears it)."""
+    delivery-plan snapshots. PATCH body: ``{kitchen_id}`` (null clears it).
+
+    Locked to Management: changing the shared-household kitchen from the program
+    tab's "Kitchen & Delivery" section is a high-impact action, so verification /
+    CS / logistics agents are read-only here."""
+
+    permission_classes = [IsManagementAgent]
 
     def patch(self, request, client_id):
         client, enr, err = _logistics_enrollment(client_id)

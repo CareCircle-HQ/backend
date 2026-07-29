@@ -363,6 +363,12 @@ def reconcile_client_eligibility(client, *, actor=None, actor_label="", source=N
             timeline.event_for_member_ineligible(
                 client, reasons=verdict.reasons, source=src, actor=author,
             )
+        # Persist the reasons on EVERY reconcile (idempotent) so the stored value
+        # stays current and back-fills members flagged before this field existed
+        # -- re-running the ext/CSV import populates it.
+        if list(client.ineligible_reasons or []) != verdict.reasons:
+            client.ineligible_reasons = verdict.reasons
+            client.save(update_fields=["ineligible_reasons"])
         # Always stop future deliveries (idempotent) so an ineligible member is
         # excluded from every new PO, even across re-imports.
         _stop_future_deliveries(client)
@@ -372,6 +378,10 @@ def reconcile_client_eligibility(client, *, actor=None, actor_label="", source=N
     if client.lifecycle_stage == ClientStage.INELIGIBLE:
         target = derive_client_stage(client, ignore_sticky=True)
         _set_client_stage(client, target, actor=actor)
+        # Clear the stored reasons now that the member passes the gates again.
+        if client.ineligible_reasons:
+            client.ineligible_reasons = []
+            client.save(update_fields=["ineligible_reasons"])
         _write_client_system_note(
             client,
             f"Eligibility restored on {today_str}: the eligibility checks now pass.",

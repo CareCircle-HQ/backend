@@ -13,9 +13,18 @@ from rest_framework.permissions import BasePermission
 # Logistics page, so they must be able to sign in too.
 PORTAL_ALLOWED_GROUPS = frozenset({"Verifiers", "Management", "CS", "Logistics"})
 
+# The management group. High-impact, shared-household actions (e.g. changing the
+# household's assigned kitchen from the program tab) are locked to this group so
+# verification / CS / logistics agents can't alter them.
+MANAGEMENT_GROUP = "Management"
+
 
 def is_portal_group(group):
     return (group or "") in PORTAL_ALLOWED_GROUPS
+
+
+def is_management_group(group):
+    return (group or "") == MANAGEMENT_GROUP
 
 
 class IsPortalAgent(BasePermission):
@@ -30,3 +39,16 @@ class IsPortalAgent(BasePermission):
             and getattr(user, "is_authenticated", False)
             and is_portal_group(getattr(user, "group", None))
         )
+
+
+class IsManagementAgent(IsPortalAgent):
+    """Authenticated portal agent in the Management group. Locks high-impact
+    shared-household actions (e.g. changing the assigned kitchen) to management
+    staff only -- verification and other agents are read-only for these."""
+
+    message = "Only Management users can perform this action."
+
+    def has_permission(self, request, view):
+        if not super().has_permission(request, view):
+            return False
+        return is_management_group(getattr(getattr(request, "user", None), "group", None))

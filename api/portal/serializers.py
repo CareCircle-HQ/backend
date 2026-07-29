@@ -216,8 +216,12 @@ def authorization_status(client):
     ``{status, status_label, is_accepted}`` snapshot. Sourced ONLY from the
     client's Internal Service case -- members without one have no authorization
     to show (empty values). This is a separate dimension from
-    verification_status, surfaced as its own column."""
-    return case_authorization(internal_service_case(client))
+    verification_status, surfaced as its own column.
+
+    Uses :func:`governing_service_case_for_display`, so a household dependent --
+    who owns no case of their own -- inherits the HOUSEHOLD's governing case
+    authorization instead of showing a blank."""
+    return case_authorization(governing_service_case_for_display(client))
 
 
 def active_enrollment(client):
@@ -436,6 +440,31 @@ def internal_service_case(client):
     return max(cases, key=governing_case_key)
 
 
+def governing_service_case_for_display(client):
+    """The internal-service case whose authorization governs this member FOR
+    DISPLAY on the members list. Prefer the client's OWN governing internal-
+    service case (:func:`internal_service_case`); when the member owns none --
+    e.g. a household DEPENDENT, whose meal/box case sits on the household primary
+    -- fall back to the HOUSEHOLD's governing case via the active enrollment, so
+    every household member shows the same authorization instead of a blank.
+    Authorization is a household-level fact, mirroring how the list's stage /
+    dates already fall back to the household enrollment (see active_enrollment)."""
+    own = internal_service_case(client)
+    if own is not None:
+        return own
+    enr = active_enrollment(client)
+    if enr is None:
+        return None
+    from ..services.lifecycle import governing_internal_case
+    gov = governing_internal_case(enr)
+    # governing_internal_case can fall back to enrollment.case, which may be a
+    # non-internal-service case (or None); only surface a real internal-service
+    # case so the authorization column stays meaningful.
+    if gov is not None and gov.case_type == CaseType.INTERNAL_SERVICE:
+        return gov
+    return None
+
+
 def internal_service_cases(client):
     """All of the client's Internal Service cases, most-governing first (by
     :func:`governing_case_key`). The verification can attach to any of them; the
@@ -505,6 +534,10 @@ class MemberListSerializer(serializers.Serializer):
     authorization_status = serializers.SerializerMethodField()
     authorization_status_label = serializers.SerializerMethodField()
     authorization_date = serializers.SerializerMethodField()
+    # Governing case authorization WINDOW (start/end) shown in the Authorization
+    # column, with the status rendered beneath it.
+    authorization_window_start = serializers.SerializerMethodField()
+    authorization_window_end = serializers.SerializerMethodField()
     medicaid_id = serializers.SerializerMethodField()
     case_manager = serializers.CharField(source="agent_name")
     lead_source = serializers.SerializerMethodField()
@@ -520,6 +553,18 @@ class MemberListSerializer(serializers.Serializer):
     verification_completed_by = serializers.SerializerMethodField()
     stage_label = serializers.SerializerMethodField()
     verification_state = serializers.SerializerMethodField()
+    # Eligibility node: the client cleared the eligibility gate (valid Medicaid +
+    # in-range ZIP/state) unless parked on the hard INELIGIBLE off-ramp.
+    eligibility = serializers.SerializerMethodField()
+    eligibility_label = serializers.SerializerMethodField()
+    # Why a member is ineligible (the hard-gate reasons: expired/missing Medicaid,
+    # wrong Medicaid type, out-of-range ZIP/state). Recomputed on read via the
+    # same gates that set the stage; empty for eligible members.
+    eligibility_reasons = serializers.SerializerMethodField()
+    # Per-program display status (lifecycle.program_status) shown in the Service
+    # column -- the enrollment stage folded with the governing case authorization.
+    program_status = serializers.SerializerMethodField()
+    program_status_label = serializers.SerializerMethodField()
     # Urgent Care ("Need Attention") coverage gate: whether the client has a
     # valid Medicaid insurance + valid social care coverage, and whether a
     # verification can be requested (open internal-service case + both coverages).
@@ -689,16 +734,87 @@ class MemberListSerializer(serializers.Serializer):
         # The date the internal-service case's authorization takes effect (its
         # approval-window start) -- i.e. when the case was authorized. Shown
         # under the authorization status on the Verification page. Null when the
-        # case has no approved authorization date (pending / denied).
-        case = internal_service_case(obj)
+        # case has no approved authorization date (pending / denied). Uses the
+        # household-aware governing case so dependents inherit it (see
+        # governing_service_case_for_display).
+        case = governing_service_case_for_display(obj)
         dt = getattr(case, "service_authorization_approval_starts_at", None) if case else None
         return dt.date().isoformat() if dt else None
+
+    def get_authorization_window_start(self, obj):
+        # Start of the governing case's effective authorization window (approval
+        # window, falling back to the request window on an approved case). Null
+        # when the case has no usable window (e.g. still pending). Household-aware
+        # so dependents inherit the primary's governing case.
+        case = governing_service_case_for_display(obj)
+        if case is None:
+            return None
+        start, _end = case.effective_authorization_window()
+        return start.date().isoformat() if start else None
+
+    def get_authorization_window_end(self, obj):
+        case = governing_service_case_for_display(obj)
+        if case is None:
+            return None
+        _start, end = case.effective_authorization_window()
+        return end.date().isoformat() if end else None
+
+    def get_eligibility(self, obj):
+        from api.models import ClientStage
+
+        return (
+            "ineligible"
+            if obj.lifecycle_stage == ClientStage.INELIGIBLE
+            else "eligible"
+        )
+
+    def get_eligibility_label(self, obj):
+        from api.models import ClientStage
+
+        return (
+            "Not Eligible"
+            if obj.lifecycle_stage == ClientStage.INELIGIBLE
+            else "Eligible"
+        )
+
+    def get_eligibility_reasons(self, obj):
+        # The hard-gate reasons a member is Ineligible (expired/missing Medicaid,
+        # wrong Medicaid type, out-of-range ZIP/state). Only meaningful while
+        # INELIGIBLE; empty otherwise. Prefer the STORED reasons
+        # (Client.ineligible_reasons, written on the ext/CSV import); fall back to
+        # recomputing via the same gates for members flagged before the field was
+        # populated (relations are prefetched by the list view, so no extra query
+        # for eligible members).
+        from api.models import ClientStage
+
+        if obj.lifecycle_stage != ClientStage.INELIGIBLE:
+            return []
+        stored = list(obj.ineligible_reasons or [])
+        if stored:
+            return stored
+        from api.services.eligibility import evaluate_client
+
+        return evaluate_client(obj).reasons
+
+    def get_program_status(self, obj):
+        from api.services.lifecycle import program_status
+
+        enr = active_enrollment(obj)
+        return program_status(enr).value if enr is not None else ""
+
+    def get_program_status_label(self, obj):
+        from api.models import ProgramStatus
+        from api.services.lifecycle import program_status
+
+        enr = active_enrollment(obj)
+        return ProgramStatus(program_status(enr)).label if enr is not None else ""
 
     def get_authorization_status_at(self, obj):
         # No dedicated "status decided at" field exists on the Case; the source's
         # last-update time (Case.updated_at) is the closest proxy for when we got
-        # the current authorization status. Sourced from the internal-service case.
-        case = internal_service_case(obj)
+        # the current authorization status. Sourced from the household-aware
+        # governing case so it matches the authorization status shown.
+        case = governing_service_case_for_display(obj)
         return case.updated_at.isoformat() if case and case.updated_at else None
 
     def get_on_hold_at(self, obj):
@@ -1490,11 +1606,29 @@ class PortalActiveProgramSerializer(serializers.ModelSerializer):
 # Orders (purchase orders + delivery orders)
 # ---------------------------------------------------------------------------
 def _delivery_address_str(member):
-    """Delivery address for a member = their active enrollment's address."""
+    """Delivery address for a member = the SHARED enrollment delivery address.
+
+    A member's ``MemberDietaryProfile`` (and their delivery orders) always lives
+    on the household's governing enrollment, so a non-primary member is served
+    at the primary's shared address, NOT their own standalone address. Resolve it
+    from that profile enrollment first; fall back to ``active_enrollment`` (for a
+    member with no profile yet). Mirrors purchase_orders._export_address."""
     if member is None:
         return ""
-    enr = active_enrollment(member)
-    addr = enr.delivery_address if enr else None
+    prof = (
+        MemberDietaryProfile.objects.filter(client=member)
+        .select_related("enrollment__delivery_address")
+        .order_by("-updated_at")
+        .first()
+    )
+    addr = (
+        prof.enrollment.delivery_address
+        if prof and prof.enrollment_id
+        else None
+    )
+    if addr is None:
+        enr = active_enrollment(member)
+        addr = enr.delivery_address if enr else None
     if not addr:
         return ""
     parts = [addr.street, addr.city, addr.state, addr.zip]

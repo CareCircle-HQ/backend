@@ -358,6 +358,12 @@ class Client(models.Model):
         default=ClientStage.INACTIVE, db_index=True,
     )
     lifecycle_stage_at = models.DateTimeField(null=True, blank=True)
+    # Why the member is on the hard INELIGIBLE off-ramp: the human-readable gate
+    # reasons (expired/missing Medicaid, wrong Medicaid type, out-of-range
+    # ZIP/state, or a Kitchen-Assignment closure/denial). Written wherever the
+    # INELIGIBLE stage is set (ext save + CSV import via reconcile_client_eligibility,
+    # and the Kitchen-Assignment off-ramp) and cleared on eligibility recovery.
+    ineligible_reasons = models.JSONField(default=list, blank=True)
     # Set when an agent DISREGARDS this member's pending verification. Suppresses
     # the "run verification" button until a NEW request arrives from the ext (a
     # governing pending enrollment), so a dismissed request can't be re-run

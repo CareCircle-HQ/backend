@@ -32,6 +32,7 @@ from datetime import date, timedelta
 from django.utils import timezone
 
 from api.models import (
+    CaseStatus,
     EnrollmentStage,
     InsurancePlanType,
     KitchenProductType,
@@ -115,7 +116,6 @@ def _medicaid_bad_pattern():
 _MEDICAID_BAD_RE = _medicaid_bad_pattern()
 # Household service state (household-scope).
 HOUSEHOLD_ON_HOLD = "household_on_hold"
-HOUSEHOLD_CANCELLED = "household_cancelled"
 # Household roll-up counts of members not being served (household-scope). Shown
 # on EVERY member of the household so an agent sees the household-wide impact,
 # not just the member they're currently viewing.
@@ -160,7 +160,6 @@ WARNING_CATEGORY = {
     HOUSEHOLD_MEMBERS_OUT_OF_RANGE: MEMBER_STATE,
     HOUSEHOLD_MEMBERS_PAUSED: MEMBER_STATE,
     HOUSEHOLD_ON_HOLD: HOUSEHOLD_STATE,
-    HOUSEHOLD_CANCELLED: HOUSEHOLD_STATE,
     HOUSEHOLD_OPEN_TICKETS: HOUSEHOLD_STATE,
 }
 
@@ -627,18 +626,6 @@ def check_household_on_hold(ctx):
     )]
 
 
-def check_household_cancelled(ctx):
-    """Household-scope: the household's service has been cancelled."""
-    if ctx.stage != EnrollmentStage.CANCELLED:
-        return []
-    return [Warning(
-        code=HOUSEHOLD_CANCELLED, severity=RED, scope="household",
-        title="Household cancelled",
-        detail="This household's service has been cancelled.",
-        client_id=ctx.client.pk,
-    )]
-
-
 def _plural(n, noun):
     return f"{n} {noun}" if n == 1 else f"{n} {noun}s"
 
@@ -649,8 +636,9 @@ def check_household_out_of_service_counts(ctx):
     single count shown on EVERY member, so pausing / out-of-orbit / out-of-range
     for ANY household member surfaces on every member's profile (and clears for
     all of them the moment the member is unpaused / back in orbit / in range).
-    Skipped for a cancelled household (terminal)."""
-    if ctx.stage == EnrollmentStage.CANCELLED:
+    Skipped for a terminal (cancelled/closed) household -- no per-member noise
+    once the household is off service."""
+    if ctx.stage in (EnrollmentStage.CANCELLED, EnrollmentStage.CLOSED):
         return []
     n_orbit = n_range = n_paused = 0
     for mp in ctx.enrollment.member_profiles.all():
@@ -727,7 +715,6 @@ def check_household_open_tickets(ctx):
 # Registry — add a new check here and it flows everywhere. Order is display
 # order within a severity band; the UI re-sorts by severity (red first).
 WARNING_CHECKS = [
-    check_household_cancelled,
     check_household_on_hold,
     check_household_out_of_service_counts,
     check_household_open_tickets,
@@ -754,7 +741,18 @@ def evaluate_enrollment_warnings(enrollment):
     return _run_checks(ctx)
 
 
+# Governing-case statuses that end the program -- once the governing case is
+# closed/cancelled the member is done, so no warnings apply.
+_TERMINAL_CASE_STATUSES = (CaseStatus.CLOSED, CaseStatus.CANCELLED)
+
+
 def _run_checks(ctx):
+    # Warnings only make sense while an OPEN governing internal-service case
+    # backs the member. Once that case is closed/cancelled the program is over,
+    # so suppress every warning; sync then resolves any stale persisted rows.
+    gov = ctx.governing_case
+    if gov is not None and getattr(gov, "case_status", None) in _TERMINAL_CASE_STATUSES:
+        return []
     out = []
     for check in WARNING_CHECKS:
         try:

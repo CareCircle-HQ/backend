@@ -37,6 +37,7 @@ from ..models import (
 from ..services.catalog import product_type_kind_for_name
 from .base import PortalAPIView, current_agent
 from .serializers import (
+    _assessment_eligible,
     active_enrollment,
     active_member_profile,
     internal_service_case,
@@ -526,6 +527,7 @@ class AllMembersReportView(PortalAPIView):
                 "phones",
                 "cases",
                 "screenings",
+                "assessments",
                 "member_profiles",
                 "enrollments__kitchen",
                 "enrollments__delivery_schedules",
@@ -586,6 +588,7 @@ class AllMembersReportView(PortalAPIView):
             "Is there Navigation",
             "Is there Internal Service Case",
             "Client Eligibility",
+            "Eligible for:",
             "Currently servicing",
             "Cadence",
             "Facility",
@@ -662,6 +665,7 @@ class AllMembersReportView(PortalAPIView):
                 _yn(any(c.case_type == CaseType.NAVIGATION for c in cases)),
                 _yn(isc is not None),
                 eligibility,
+                "; ".join(_assessment_eligible(client)),
                 _currently_servicing(enr),
                 _cadence_label(profile, enr),
                 facility,

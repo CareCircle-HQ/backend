@@ -2491,6 +2491,420 @@ class LogisticsRosterFilterTest(TestCase):
         ids = {m["id"] for m in hh_group["members"]}
         self.assertIn(str(dep.client_id), ids)
 
+    def test_search_by_dependent_medicaid_id_returns_whole_household(self):
+        # Searching a DEPENDENT's Medicaid (insurance member) id must surface the
+        # entire household -- the primary as the header, full roster nested --
+        # not just the matched dependent. Grouped mode loads the full roster.
+        from .models import ClientStage, Insurance, MemberStatus
+
+        primary = self._client("Pat", "Primary")
+        dep = self._client("Dee", "Dependent", stage=ClientStage.ACTIVE)
+        hh = self._household(primary, dep)
+        self._internal_case(primary)
+        self._enrollment(primary, hh, {
+            primary: MemberStatus.ACTIVE,
+            dep: MemberStatus.ACTIVE,
+        })
+        Insurance.objects.create(
+            client=dep, plan_name="Medicaid", external_member_id="MCD-9988",
+        )
+
+        groups = self._groups(search="MCD-9988")
+        self.assertEqual(len(groups), 1, groups)
+        g = groups[0]
+        self.assertEqual(g["type"], "household")
+        # The header is the primary (case-holder), not the matched dependent.
+        self.assertEqual(g["primary"]["id"], str(primary.client_id))
+        ids = {m["id"] for m in g["members"]}
+        self.assertEqual(ids, {str(primary.client_id), str(dep.client_id)})
+
+    def test_search_by_dependent_client_id_returns_whole_household(self):
+        from .models import ClientStage, MemberStatus
+
+        primary = self._client("Pat", "Primary")
+        dep = self._client("Dee", "Dependent", stage=ClientStage.ACTIVE)
+        hh = self._household(primary, dep)
+        self._internal_case(primary)
+        self._enrollment(primary, hh, {
+            primary: MemberStatus.ACTIVE,
+            dep: MemberStatus.ACTIVE,
+        })
+
+        groups = self._groups(search=str(dep.client_id))
+        self.assertEqual(len(groups), 1, groups)
+        self.assertEqual(groups[0]["primary"]["id"], str(primary.client_id))
+        ids = {m["id"] for m in groups[0]["members"]}
+        self.assertIn(str(dep.client_id), ids)
+
+
+class MemberListGroupedStatusFilterTest(TestCase):
+    """The Members page grouped status dropdown maps each value to exactly one
+    backend query across several axes (Eligibility / Verification /
+    Authorization / Logistics / Service / Terminal). Each solo-household member
+    is built so a matching status surfaces its group and a non-match hides it."""
+
+    def _member(self, first, *, lifecycle=None, enr_stage=None, verified=False,
+                auth=None, case_status=None, member_status=None,
+                program_name="Medically Tailored Meals"):
+        from django.utils import timezone
+
+        from .models import (
+            Case, CaseStatus, CaseType, Client, ClientStage, EnrollmentStage,
+            EnrollmentVerification, Household, HouseholdMember,
+            MemberDietaryProfile, MemberStatus,
+        )
+
+        client = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name=first, last_name="Member",
+            lifecycle_stage=lifecycle or ClientStage.ACTIVE,
+        )
+        hh = Household.objects.create(name=f"{first} Household")
+        HouseholdMember.objects.create(household=hh, client=client, is_primary=True)
+        Case.objects.create(
+            case_id=uuid.uuid4(), client=client,
+            case_type=CaseType.INTERNAL_SERVICE,
+            case_status=case_status or CaseStatus.OPEN,
+            service_authorization_status=auth or "",
+            program_name=program_name,
+        )
+        enr = EnrollmentVerification.objects.create(
+            client=client, household=hh,
+            stage=enr_stage or EnrollmentStage.SERVICE_ACTIVE,
+            verified_at=timezone.now() if verified else None,
+            program_name=program_name,
+        )
+        MemberDietaryProfile.objects.create(
+            enrollment=enr, client=client,
+            status=member_status or MemberStatus.ACTIVE,
+        )
+        return client
+
+    def _ids(self, **params):
+        from rest_framework.request import Request
+        from rest_framework.test import APIRequestFactory
+
+        from .portal.views_members import MembersListView
+
+        view = MembersListView()
+        view.request = Request(APIRequestFactory().get("/portal/members/", params))
+        view.kwargs = {}
+        groups = view._build_groups_for_page(view._group_entries())
+        return {g["primary"]["id"] for g in groups}
+
+    def test_eligibility_axis(self):
+        from .models import ClientStage
+
+        eligible = self._member("Ellie", lifecycle=ClientStage.ACTIVE)
+        ineligible = self._member("Iggy", lifecycle=ClientStage.INELIGIBLE)
+
+        elig_ids = self._ids(status="eligible")
+        self.assertIn(str(eligible.client_id), elig_ids)
+        self.assertNotIn(str(ineligible.client_id), elig_ids)
+
+        inelig_ids = self._ids(status="ineligible")
+        self.assertIn(str(ineligible.client_id), inelig_ids)
+        self.assertNotIn(str(eligible.client_id), inelig_ids)
+
+    def test_standalone_eligibility_filter(self):
+        # The dedicated `eligibility` param (its own dimension, composes with the
+        # status chips) filters by the eligibility gate independently of `status`.
+        from .models import ClientStage
+
+        eligible = self._member("Ellie", lifecycle=ClientStage.ACTIVE)
+        ineligible = self._member("Iggy", lifecycle=ClientStage.INELIGIBLE)
+
+        elig_ids = self._ids(eligibility="eligible")
+        self.assertIn(str(eligible.client_id), elig_ids)
+        self.assertNotIn(str(ineligible.client_id), elig_ids)
+
+        inelig_ids = self._ids(eligibility="ineligible")
+        self.assertIn(str(ineligible.client_id), inelig_ids)
+        self.assertNotIn(str(eligible.client_id), inelig_ids)
+
+        # No eligibility param => both returned.
+        all_ids = self._ids()
+        self.assertIn(str(eligible.client_id), all_ids)
+        self.assertIn(str(ineligible.client_id), all_ids)
+
+    def test_program_type_filter(self):
+        # The `program_type` param (its own dimension, meant to combine with the
+        # household-composition filter) filters by the governing program's scope,
+        # derived LIVE from the program name: "household" in the name => Household,
+        # else Individual.
+        household = self._member(
+            "Holly", program_name="MTM - (Household) High-Risk Children - Brooklyn",
+        )
+        individual = self._member(
+            "Ivan", program_name="MTM - Individual - Queens",
+        )
+
+        hh_ids = self._ids(program_type="household")
+        self.assertIn(str(household.client_id), hh_ids)
+        self.assertNotIn(str(individual.client_id), hh_ids)
+
+        indiv_ids = self._ids(program_type="individual")
+        self.assertIn(str(individual.client_id), indiv_ids)
+        self.assertNotIn(str(household.client_id), indiv_ids)
+
+        # No param => both returned.
+        all_ids = self._ids()
+        self.assertIn(str(household.client_id), all_ids)
+        self.assertIn(str(individual.client_id), all_ids)
+
+    def test_verification_axis(self):
+        from .models import ClientStage, EnrollmentStage
+
+        verified = self._member(
+            "Vera", enr_stage=EnrollmentStage.VERIFIED, verified=True,
+        )
+        pending = self._member(
+            "Peny", lifecycle=ClientStage.PENDING_VERIFICATION,
+            enr_stage=EnrollmentStage.PENDING_VERIFICATION, verified=False,
+        )
+
+        v_ids = self._ids(status="verified")
+        self.assertIn(str(verified.client_id), v_ids)
+        self.assertNotIn(str(pending.client_id), v_ids)
+
+        p_ids = self._ids(status="pending_verification")
+        self.assertIn(str(pending.client_id), p_ids)
+        self.assertNotIn(str(verified.client_id), p_ids)
+
+    def test_pending_verification_excludes_members_outside_window(self):
+        # A member who never entered verification (Inactive lifecycle, no
+        # verified_at) must NOT match the Pending Verification filter -- otherwise
+        # they surface with a blank Verification column. Only members actually in
+        # the verification window match.
+        from .models import ClientStage, EnrollmentStage
+
+        pending = self._member(
+            "Peny", lifecycle=ClientStage.PENDING_VERIFICATION,
+            enr_stage=EnrollmentStage.PENDING_VERIFICATION, verified=False,
+        )
+        outside = self._member(
+            "Ivy", lifecycle=ClientStage.INACTIVE,
+            enr_stage=EnrollmentStage.PENDING_VALIDATION, verified=False,
+        )
+        p_ids = self._ids(status="pending_verification")
+        self.assertIn(str(pending.client_id), p_ids)
+        self.assertNotIn(str(outside.client_id), p_ids)
+
+    def test_authorization_axis(self):
+        from .models import ServiceAuthorizationStatus
+
+        approved = self._member("Amy", auth=ServiceAuthorizationStatus.APPROVED)
+        waiting = self._member("Will", auth=ServiceAuthorizationStatus.PENDING)
+        denied = self._member("Dan", auth=ServiceAuthorizationStatus.DENIED)
+
+        self.assertEqual(self._ids(status="authorized") & {
+            str(approved.client_id), str(waiting.client_id), str(denied.client_id),
+        }, {str(approved.client_id)})
+        self.assertEqual(self._ids(status="auth_pending") & {
+            str(approved.client_id), str(waiting.client_id), str(denied.client_id),
+        }, {str(waiting.client_id)})
+        self.assertEqual(self._ids(status="auth_denied") & {
+            str(approved.client_id), str(waiting.client_id), str(denied.client_id),
+        }, {str(denied.client_id)})
+
+    def test_service_axis(self):
+        from .models import ClientStage, EnrollmentStage, MemberStatus
+
+        active = self._member("Ace", lifecycle=ClientStage.ACTIVE)
+        on_hold = self._member("Hal", enr_stage=EnrollmentStage.ON_HOLD)
+        out_of_range = self._member(
+            "Rory", member_status=MemberStatus.OUT_OF_RANGE,
+        )
+
+        self.assertIn(str(active.client_id), self._ids(status="active"))
+        self.assertIn(str(on_hold.client_id), self._ids(status="on_hold"))
+        oor = self._ids(status="out_of_range")
+        self.assertIn(str(out_of_range.client_id), oor)
+        self.assertNotIn(str(active.client_id), oor)
+
+    def test_logistics_axis(self):
+        from .models import ClientStage
+
+        ka = self._member("Kay", lifecycle=ClientStage.KITCHEN_ASSIGNMENT)
+        active = self._member("Ace", lifecycle=ClientStage.ACTIVE)
+        ids = self._ids(status="kitchen_assignment")
+        self.assertIn(str(ka.client_id), ids)
+        self.assertNotIn(str(active.client_id), ids)
+
+    def test_terminal_axis(self):
+        from .models import EnrollmentStage, ServiceAuthorizationStatus
+
+        open_prog = self._member("Ollie", enr_stage=EnrollmentStage.SERVICE_ACTIVE)
+        expired = self._member(
+            "Xander", auth=ServiceAuthorizationStatus.EXPIRED,
+        )
+        closed = self._member("Cleo", enr_stage=EnrollmentStage.CLOSED)
+
+        self.assertIn(str(open_prog.client_id), self._ids(status="term_open"))
+        exp_ids = self._ids(status="term_expired")
+        self.assertIn(str(expired.client_id), exp_ids)
+        self.assertNotIn(str(open_prog.client_id), exp_ids)
+        cl_ids = self._ids(status="term_closed")
+        self.assertIn(str(closed.client_id), cl_ids)
+        self.assertNotIn(str(open_prog.client_id), cl_ids)
+
+
+class MemberListColumnFieldsTest(TestCase):
+    """MemberListSerializer surfaces the Members-page column data: the eligibility
+    node verdict, the governing case authorization WINDOW (start/end), and the
+    per-program Service status (lifecycle.program_status)."""
+
+    def _data(self, client):
+        from .portal.serializers import MemberListSerializer
+
+        return MemberListSerializer(client).data
+
+    def test_eligibility_verdict(self):
+        from .models import Client, ClientStage
+
+        eligible = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="El", last_name="Igible",
+            lifecycle_stage=ClientStage.ACTIVE,
+        )
+        ineligible = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="In", last_name="Eligible",
+            lifecycle_stage=ClientStage.INELIGIBLE,
+        )
+        self.assertEqual(self._data(eligible)["eligibility"], "eligible")
+        self.assertEqual(self._data(eligible)["eligibility_label"], "Eligible")
+        self.assertEqual(self._data(eligible)["eligibility_reasons"], [])
+        self.assertEqual(self._data(ineligible)["eligibility"], "ineligible")
+        self.assertEqual(self._data(ineligible)["eligibility_label"], "Not Eligible")
+
+    def test_ineligible_reasons_recomputed(self):
+        # An INELIGIBLE member with NO insurance on file surfaces the hard-gate
+        # reason (recomputed on read via evaluate_client), so the Members page can
+        # display why the member is Not Eligible.
+        from .models import Client, ClientStage
+
+        client = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="No", last_name="Insurance",
+            lifecycle_stage=ClientStage.INELIGIBLE,
+        )
+        reasons = self._data(client)["eligibility_reasons"]
+        self.assertTrue(reasons)
+        self.assertIn("no medical insurance on file", reasons)
+
+    def test_authorization_window_and_program_status(self):
+        from datetime import timedelta
+
+        from django.utils import timezone
+
+        from .models import (
+            Case, CaseStatus, CaseType, Client, ClientStage, EnrollmentStage,
+            EnrollmentVerification, Household, HouseholdMember,
+            ServiceAuthorizationStatus,
+        )
+
+        now = timezone.now()
+        client = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Ann", last_name="Active",
+            lifecycle_stage=ClientStage.ACTIVE,
+        )
+        hh = Household.objects.create(name="HH")
+        HouseholdMember.objects.create(household=hh, client=client, is_primary=True)
+        Case.objects.create(
+            case_id=uuid.uuid4(), client=client,
+            case_type=CaseType.INTERNAL_SERVICE, case_status=CaseStatus.OPEN,
+            service_authorization_status=ServiceAuthorizationStatus.APPROVED,
+            service_authorization_approval_starts_at=now,
+            service_authorization_approval_ends_at=now + timedelta(days=60),
+            program_name="Medically Tailored Meals",
+        )
+        EnrollmentVerification.objects.create(
+            client=client, household=hh, stage=EnrollmentStage.SERVICE_ACTIVE,
+        )
+        data = self._data(client)
+        self.assertEqual(data["authorization_window_start"], now.date().isoformat())
+        self.assertEqual(
+            data["authorization_window_end"],
+            (now + timedelta(days=60)).date().isoformat(),
+        )
+        self.assertEqual(data["program_status"], "active")
+        self.assertEqual(data["program_status_label"], "Active")
+
+
+class MemberListDependentAuthorizationTest(TestCase):
+    """Members-list rows must show the authorization of the GOVERNING case. A
+    household DEPENDENT owns no case of their own (the meal/box case sits on the
+    primary), so their authorization column must inherit the HOUSEHOLD's
+    governing case via governing_service_case_for_display -- not read blank."""
+
+    def _client(self, first, last):
+        from .models import ClientStage
+
+        return Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name=first, last_name=last,
+            lifecycle_stage=ClientStage.KITCHEN_ASSIGNMENT,
+        )
+
+    def _household(self, primary, *deps):
+        from .models import Household, HouseholdMember
+
+        hh = Household.objects.create(name=f"{primary.last_name} Household")
+        HouseholdMember.objects.create(household=hh, client=primary, is_primary=True)
+        for d in deps:
+            HouseholdMember.objects.create(household=hh, client=d, is_primary=False)
+        return hh
+
+    def _approved_case(self, client):
+        from .models import Case, CaseStatus, CaseType, ServiceAuthorizationStatus
+
+        return Case.objects.create(
+            case_id=uuid.uuid4(), client=client,
+            case_type=CaseType.INTERNAL_SERVICE, case_status=CaseStatus.OPEN,
+            service_authorization_status=ServiceAuthorizationStatus.APPROVED,
+            program_name="Medically Tailored Meals",
+        )
+
+    def _enrollment(self, primary, household):
+        from .models import EnrollmentStage, EnrollmentVerification
+
+        return EnrollmentVerification.objects.create(
+            client=primary, household=household,
+            stage=EnrollmentStage.KITCHEN_ASSIGNMENT,
+        )
+
+    def _auth(self, client):
+        from .portal.serializers import MemberListSerializer
+
+        return MemberListSerializer(client).data["authorization_status"]
+
+    def test_dependent_inherits_household_governing_authorization(self):
+        primary = self._client("Pat", "Primary")
+        dep = self._client("Dee", "Dependent")
+        hh = self._household(primary, dep)
+        self._approved_case(primary)  # case lives on the primary only
+        self._enrollment(primary, hh)
+
+        # Primary owns the governing case; the dependent inherits it via the
+        # household enrollment instead of showing a blank.
+        self.assertEqual(self._auth(primary), "approved")
+        self.assertEqual(self._auth(dep), "approved")
+
+    def test_dependent_with_own_case_uses_own(self):
+        from .models import Case, CaseStatus, CaseType, ServiceAuthorizationStatus
+
+        primary = self._client("Pat", "Primary")
+        dep = self._client("Dee", "Dependent")
+        hh = self._household(primary, dep)
+        self._approved_case(primary)
+        # The dependent has their OWN internal-service case -> it wins over the
+        # household fallback (own governing case first).
+        Case.objects.create(
+            case_id=uuid.uuid4(), client=dep,
+            case_type=CaseType.INTERNAL_SERVICE, case_status=CaseStatus.OPEN,
+            service_authorization_status=ServiceAuthorizationStatus.PENDING,
+            program_name="Medically Tailored Meals",
+        )
+        self._enrollment(primary, hh)
+
+        self.assertEqual(self._auth(dep), "pending")
+
 
 class VerificationCaseOptionsTest(TestCase):
     """The verification pop-up's Internal Service case dropdown
@@ -3285,6 +3699,45 @@ class DeliveryCoverageEligibilityTest(TestCase):
         mv.refresh_from_db()
         self.assertEqual(mv.status, MemberStatus.OUT_OF_RANGE)
 
+    def test_new_household_member_inherits_out_of_range(self):
+        # Adding a member to a household whose delivery ZIP is outside coverage
+        # (so the existing members are already Out of Range) must set the new
+        # member Out of Range too — a menu type can't fix a geographic block.
+        from .models import (
+            Address, EnrollmentStage, EnrollmentVerification, Household,
+            HouseholdMember, MemberDietaryProfile, MemberStatus, Note, NoteSource,
+        )
+        from .serializers import sync_household_members
+
+        primary = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Pat", last_name="Primary",
+        )
+        hh = Household.objects.create(name="HH")
+        HouseholdMember.objects.create(household=hh, client=primary, is_primary=True)
+        addr = Address.objects.create(client=primary, type="temporary", zip="11209")
+        enr = EnrollmentVerification.objects.create(
+            client=primary, household=hh, delivery_address=addr,
+            stage=EnrollmentStage.KITCHEN_ASSIGNMENT,
+        )
+        MemberDietaryProfile.objects.create(
+            enrollment=enr, client=primary, menu_type="Standard",
+            status=MemberStatus.OUT_OF_RANGE,
+        )
+
+        # New dependent added via the roster only (no profile yet).
+        dep = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Dee", last_name="Pendent",
+        )
+        HouseholdMember.objects.create(household=hh, client=dep, is_primary=False)
+
+        sync_household_members(primary, enrollment=enr)
+
+        prof = MemberDietaryProfile.objects.get(enrollment=enr, client=dep)
+        self.assertEqual(prof.status, MemberStatus.OUT_OF_RANGE)
+        note = Note.objects.filter(client=dep, source=NoteSource.SYSTEM).first()
+        self.assertIsNotNone(note)
+        self.assertIn("11209", note.body)
+
     def test_reconcile_active_for_serviceable_zip(self):
         from .models import MemberStatus
         from .services.meal_rules import reconcile_member_kitchen_output
@@ -3417,6 +3870,138 @@ class DeliveryCoverageEligibilityTest(TestCase):
         _enforce_delivery_coverage(mv.enrollment, None, allow_reactivate=True)
         mv.refresh_from_db()
         self.assertEqual(mv.status, MemberStatus.ACTIVE)
+
+
+class KitchenExportSharedAddressTest(TestCase):
+    """The PO / kitchen export must serve every household member at the SHARED
+    verification delivery address (EnrollmentVerification.delivery_address), the
+    same for the primary and every other member -- never each member's own
+    standalone address."""
+
+    def test_non_primary_member_exports_shared_enrollment_address(self):
+        from .models import (
+            Address, AddressType, Client, DeliveryOrder, EnrollmentStage,
+            EnrollmentVerification, Household, HouseholdMember,
+            MemberDietaryProfile, PurchaseOrder, PurchaseOrderStatus,
+        )
+        from .services.purchase_orders import build_kitchen_export_rows
+
+        primary = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Pat", last_name="Primary",
+        )
+        dep = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Dee", last_name="Pendent",
+        )
+        hh = Household.objects.create(name="Primary Household")
+        HouseholdMember.objects.create(household=hh, client=primary, is_primary=True)
+        HouseholdMember.objects.create(household=hh, client=dep, is_primary=False)
+
+        # The dependent has their OWN standalone address -- it must NOT be used.
+        Address.objects.create(
+            client=dep, type=AddressType.CURRENT, street="999 Own St",
+            city="Selfville", state="NY", zip="10002",
+        )
+        # The shared verification delivery address on the household enrollment.
+        shared = Address.objects.create(
+            client=primary, type=AddressType.DELIVERY, street="1 Shared Ave",
+            unit="4B", city="Brooklyn", state="NY", zip="11201",
+        )
+        enr = EnrollmentVerification.objects.create(
+            client=primary, household=hh, delivery_address=shared,
+            stage=EnrollmentStage.SERVICE_ACTIVE,
+        )
+        MemberDietaryProfile.objects.create(enrollment=enr, client=primary)
+        MemberDietaryProfile.objects.create(enrollment=enr, client=dep)
+
+        po = PurchaseOrder.objects.create(status=PurchaseOrderStatus.DRAFT)
+        DeliveryOrder.objects.create(purchase_order=po, member=primary, group=hh)
+        DeliveryOrder.objects.create(purchase_order=po, member=dep, group=hh)
+
+        _headers, rows = build_kitchen_export_rows(po)
+        self.assertEqual(len(rows), 2)
+        # Address columns: street=8, unit=9, city=10, state=11, zip=12.
+        for row in rows:
+            self.assertEqual(row[8], "1 Shared Ave")
+            self.assertEqual(row[9], "4B")
+            self.assertEqual(row[10], "Brooklyn")
+            self.assertEqual(row[12], "11201")
+
+
+class KitchenChangeManagementOnlyTest(TestCase):
+    """Changing an ALREADY-assigned household kitchen (the program tab's "Kitchen
+    & Delivery" Change control) is Management-only: verification / CS / logistics
+    agents are blocked. The INITIAL assignment (no kitchen yet -- the Logistics
+    Kitchen Assignment step) stays open to non-management staff."""
+
+    def _api(self, group):
+        agent = Agent.objects.create(
+            name=f"{group} Agent", agent_code=str(uuid.uuid4())[:8], group=group,
+        )
+        access = AccessToken()
+        access["agent_id"] = str(agent.id)
+        access["agent_code"] = agent.agent_code
+        access["agent_name"] = agent.name
+        access["agent_group"] = agent.group
+        api = APIClient()
+        api.credentials(HTTP_AUTHORIZATION=f"Bearer {access}")
+        return api
+
+    def _enrollment(self, *, with_kitchen):
+        from .models import (
+            EnrollmentStage, EnrollmentVerification, Household, HouseholdMember,
+            Kitchen, KitchenStatus, MemberDietaryProfile,
+        )
+
+        client = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Pat", last_name="Primary",
+        )
+        hh = Household.objects.create(name="HH")
+        HouseholdMember.objects.create(household=hh, client=client, is_primary=True)
+        kitchen = (
+            Kitchen.objects.create(name="K1", status=KitchenStatus.ACTIVE)
+            if with_kitchen else None
+        )
+        enr = EnrollmentVerification.objects.create(
+            client=client, household=hh, stage=EnrollmentStage.SERVICE_ACTIVE,
+            kitchen=kitchen,
+        )
+        MemberDietaryProfile.objects.create(enrollment=enr, client=client)
+        return client
+
+    def _assign_url(self, client):
+        return f"/api/portal/members/{client.pk}/assign-kitchen/"
+
+    def test_non_management_cannot_change_assigned_kitchen(self):
+        # Kitchen already assigned + non-management agent -> 403 (the management
+        # guard fires before any body validation).
+        client = self._enrollment(with_kitchen=True)
+        resp = self._api("CS").post(self._assign_url(client), {}, format="json")
+        self.assertEqual(resp.status_code, 403)
+
+    def test_management_not_blocked_by_kitchen_change_guard(self):
+        # Management passes the guard; an empty body then fails normal validation
+        # (400) -- proving the management guard did NOT block them.
+        client = self._enrollment(with_kitchen=True)
+        resp = self._api("Management").post(self._assign_url(client), {}, format="json")
+        self.assertNotEqual(resp.status_code, 403)
+        self.assertEqual(resp.status_code, 400)
+
+    def test_initial_assignment_open_to_non_management(self):
+        # No kitchen yet -> the management guard doesn't apply; an empty body
+        # fails normal validation (400), NOT the management 403.
+        client = self._enrollment(with_kitchen=False)
+        resp = self._api("Logistics").post(self._assign_url(client), {}, format="json")
+        self.assertNotEqual(resp.status_code, 403)
+        self.assertEqual(resp.status_code, 400)
+
+    def test_member_kitchen_patch_is_management_only(self):
+        # The dedicated /kitchen/ PATCH endpoint is locked to Management outright.
+        client = self._enrollment(with_kitchen=True)
+        cs = self._api("CS").patch(
+            f"/api/portal/members/{client.pk}/kitchen/", {"kitchen_id": None},
+            format="json",
+        )
+        self.assertEqual(cs.status_code, 403)
 
 
 class KitchenAwareMealRuleTest(TestCase):
@@ -3882,8 +4467,9 @@ class ProgramTracksTest(TestCase):
         self.assertEqual(other["service"]["label"], "Duplicated")
         self.assertEqual(other["service"]["value"], "duplicated")
 
-    def test_closed_case_is_not_shown(self):
-        """A closed/cancelled internal-service case drops off the bar."""
+    def test_non_governing_closed_case_is_not_shown(self):
+        # A closed/cancelled NON-governing internal-service case drops off the
+        # bar (only the open governing case remains).
         from .models import (
             Case, CaseStatus, CaseType, EnrollmentStage, ServiceAuthorizationStatus,
         )
@@ -3902,6 +4488,70 @@ class ProgramTracksTest(TestCase):
         tracks = program_tracks(client)
         self.assertEqual(len(tracks), 1)
         self.assertTrue(tracks[0]["governing"])
+
+    def test_governing_case_shown_even_when_closed(self):
+        # The governing case is surfaced regardless of case STATUS: a member
+        # whose only (governing) case is closed still shows it on the bar, with
+        # the Service phase reading the closed state.
+        from .models import (
+            CaseStatus, EnrollmentStage, ServiceAuthorizationStatus,
+        )
+        from .services.lifecycle import program_tracks
+
+        client = self._setup(
+            stage=EnrollmentStage.SERVICE_COMPLETE,
+            auth=ServiceAuthorizationStatus.APPROVED,
+            case_status=CaseStatus.CLOSED,
+        )
+        tracks = program_tracks(client)
+        self.assertEqual(len(tracks), 1)
+        self.assertTrue(tracks[0]["governing"])
+        self.assertEqual(tracks[0]["service"]["value"], "closed")
+        self.assertEqual(tracks[0]["case_status"], "closed")
+
+    def test_closed_case_over_cancelled_enrollment_reads_closed(self):
+        # Regression (member CHAYA ABOUD e85b695c): a CLOSED governing case that
+        # sits atop a CANCELLED enrollment must read "Closed" on the Service
+        # phase -- the CASE outcome wins over the enrollment stage, which
+        # previously leaked "Canceled".
+        from .models import (
+            CaseStatus, EnrollmentStage, ServiceAuthorizationStatus,
+        )
+        from .services.lifecycle import program_tracks
+
+        client = self._setup(
+            stage=EnrollmentStage.CANCELLED,
+            auth=ServiceAuthorizationStatus.APPROVED,
+            case_status=CaseStatus.CLOSED,
+        )
+        t = program_tracks(client)[0]
+        self.assertEqual(t["service"]["value"], "closed")
+        self.assertEqual(t["service"]["label"], "Closed")
+        self.assertEqual(t["case_status"], "closed")
+
+    def test_open_governing_wins_and_hides_closed_non_governing(self):
+        # An OPEN approved case governs over a CLOSED one; the closed
+        # (non-governing) case still drops off, so only the open governing
+        # program renders.
+        from .models import (
+            Case, CaseStatus, CaseType, EnrollmentStage, ServiceAuthorizationStatus,
+        )
+        from .services.lifecycle import program_tracks
+
+        client = self._setup(
+            stage=EnrollmentStage.SERVICE_ACTIVE,
+            auth=ServiceAuthorizationStatus.APPROVED,
+        )
+        Case.objects.create(
+            case_id=str(uuid.uuid4()), client=client,
+            case_type=CaseType.INTERNAL_SERVICE, case_status=CaseStatus.CLOSED,
+            service_type="Medically Tailored Meals", program_name="MTM old",
+            service_authorization_status=ServiceAuthorizationStatus.APPROVED,
+        )
+        tracks = program_tracks(client)
+        self.assertEqual(len(tracks), 1)
+        self.assertTrue(tracks[0]["governing"])
+        self.assertEqual(tracks[0]["service"]["value"], "active")
 
     def test_verification_not_requested_without_enrollment(self):
         # A food case with NO enrollment (no verification request raised yet)
@@ -4114,6 +4764,117 @@ class ResumeBlockedWhenIneligibleTest(TestCase):
         self.assertEqual(resp.status_code, 400, resp.content)
         enr.refresh_from_db()
         self.assertEqual(EnrollmentStage(enr.stage), EnrollmentStage.ON_HOLD)
+
+
+class ProgramLockedGuardTest(TestCase):
+    """When the governing internal-service case is CLOSED (no open case remains),
+    the member's program tab is frozen: every write endpoint rejects with 400 and
+    the Household GET reports ``program_locked=True`` with ``can_hold`` /
+    ``can_resume`` forced False. An OPEN governing case leaves them all working.
+    Belt-and-suspenders behind the frontend controls (guard actions, layered)."""
+
+    def setUp(self):
+        self.agent = Agent.objects.create(
+            name="Lock Agent", agent_code="944", group="CS"
+        )
+        access = AccessToken()
+        access["agent_id"] = str(self.agent.id)
+        access["agent_code"] = self.agent.agent_code
+        access["agent_name"] = self.agent.name
+        access["agent_group"] = self.agent.group
+        self.api = APIClient()
+        self.api.credentials(HTTP_AUTHORIZATION=f"Bearer {access}")
+
+    def _client(self, *, case_status):
+        """A primary + household + SERVICE_ACTIVE enrollment, plus a single
+        internal-service case in the given status (its governing status decides
+        whether the program is locked)."""
+        from .models import (
+            Case, CaseStatus, CaseType, Client, EnrollmentStage,
+            EnrollmentVerification, Household, HouseholdMember,
+            MemberDietaryProfile,
+        )
+
+        client = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Lock", last_name="Member",
+        )
+        Case.objects.create(
+            case_id=uuid.uuid4(), client=client,
+            case_type=CaseType.INTERNAL_SERVICE,
+            case_status=case_status or CaseStatus.OPEN,
+            program_name="Medically Tailored Meals",
+        )
+        hh = Household.objects.create(name="HH")
+        HouseholdMember.objects.create(household=hh, client=client, is_primary=True)
+        enr = EnrollmentVerification.objects.create(
+            client=client, household=hh, stage=EnrollmentStage.SERVICE_ACTIVE,
+        )
+        mp = MemberDietaryProfile.objects.create(enrollment=enr, client=client)
+        return client, enr, mp
+
+    def test_household_get_reports_locked_for_closed_case(self):
+        from .models import CaseStatus
+
+        client, _enr, _mp = self._client(case_status=CaseStatus.CLOSED)
+        resp = self.api.get(f"/api/portal/members/{client.client_id}/household/")
+        self.assertEqual(resp.status_code, 200, resp.content)
+        enrollment = resp.json()["enrollment"]
+        self.assertTrue(enrollment["program_locked"])
+        self.assertFalse(enrollment["can_hold"])
+        self.assertFalse(enrollment["can_resume"])
+
+    def test_household_get_not_locked_for_open_case(self):
+        from .models import CaseStatus
+
+        client, _enr, _mp = self._client(case_status=CaseStatus.OPEN)
+        resp = self.api.get(f"/api/portal/members/{client.client_id}/household/")
+        self.assertEqual(resp.status_code, 200, resp.content)
+        enrollment = resp.json()["enrollment"]
+        self.assertFalse(enrollment["program_locked"])
+        self.assertTrue(enrollment["can_hold"])
+
+    def test_hold_rejected_on_closed_program(self):
+        from .models import CaseStatus, EnrollmentStage
+
+        client, enr, _mp = self._client(case_status=CaseStatus.CLOSED)
+        resp = self.api.post(
+            f"/api/portal/members/{client.client_id}/hold/",
+            {"reason": "try to hold"}, format="json",
+        )
+        self.assertEqual(resp.status_code, 400, resp.content)
+        self.assertIn("closed", resp.json().get("error", "").lower())
+        enr.refresh_from_db()
+        self.assertEqual(EnrollmentStage(enr.stage), EnrollmentStage.SERVICE_ACTIVE)
+
+    def test_address_edit_rejected_on_closed_program(self):
+        from .models import CaseStatus
+
+        client, _enr, _mp = self._client(case_status=CaseStatus.CLOSED)
+        resp = self.api.patch(
+            f"/api/portal/members/{client.client_id}/household/",
+            {"unit": "Apt 9"}, format="json",
+        )
+        self.assertEqual(resp.status_code, 400, resp.content)
+
+    def test_dietary_edit_rejected_on_closed_program(self):
+        from .models import CaseStatus
+
+        client, _enr, mp = self._client(case_status=CaseStatus.CLOSED)
+        resp = self.api.patch(
+            f"/api/portal/members/{client.client_id}/household/members/{mp.pk}/",
+            {"menu_type": "Standard"}, format="json",
+        )
+        self.assertEqual(resp.status_code, 400, resp.content)
+
+    def test_address_edit_allowed_on_open_program(self):
+        from .models import CaseStatus
+
+        client, _enr, _mp = self._client(case_status=CaseStatus.OPEN)
+        resp = self.api.patch(
+            f"/api/portal/members/{client.client_id}/household/",
+            {"unit": "Apt 9"}, format="json",
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
 
 
 class ResumeAfterReactivationTest(TestCase):
@@ -4510,6 +5271,91 @@ class DashboardServingClientIdsTests(TestCase):
         self.assertIn(no_plan.client_id, ids)
 
 
+class DashboardGoverningCaseTests(TestCase):
+    """The executive dashboard must count ONLY each client's GOVERNING
+    internal-service case. A client with a superseded/parallel NON-governing
+    case is counted once (via the governing case), never per-case, and a stray
+    denied case while the governing case is approved must not surface anywhere.
+    The 'Multiple open cases' bucket is removed entirely."""
+
+    def _auth(self):
+        agent = Agent.objects.create(
+            name="Mgr", agent_code="970", group="Management", is_manager=True,
+        )
+        access = AccessToken()
+        access["agent_id"] = str(agent.id)
+        access["agent_code"] = agent.agent_code
+        access["agent_name"] = agent.name
+        access["agent_group"] = agent.group
+        access["agent_is_manager"] = agent.is_manager
+        api = APIClient()
+        api.credentials(HTTP_AUTHORIZATION=f"Bearer {access}")
+        return api
+
+    def _client(self, first, last):
+        return Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name=first, last_name=last
+        )
+
+    def _case(self, client, auth, *, opened):
+        from datetime import datetime, timezone as dt_tz
+
+        from .models import Case, CaseStatus, CaseType
+
+        return Case.objects.create(
+            case_id=uuid.uuid4(), client=client,
+            case_type=CaseType.INTERNAL_SERVICE, case_status=CaseStatus.OPEN,
+            service_authorization_status=auth,
+            program_name="Medically Tailored Meals",
+            date_opened=datetime(2026, 1, opened, 12, tzinfo=dt_tz.utc),
+        )
+
+    def test_governing_case_ids_picks_one_per_client(self):
+        from .models import ServiceAuthorizationStatus
+        from .portal.views_dashboard import governing_internal_case_ids
+
+        c = self._client("Gov", "Erning")
+        approved = self._case(c, ServiceAuthorizationStatus.APPROVED, opened=1)
+        # A later-dated denied case is NON-governing (approval outranks a denial
+        # regardless of dates), so it must be excluded from the dashboard set.
+        denied = self._case(c, ServiceAuthorizationStatus.DENIED, opened=20)
+
+        gov = governing_internal_case_ids()
+        self.assertIn(approved.case_id, gov)
+        self.assertNotIn(denied.case_id, gov)
+
+    def test_open_cases_and_rejected_count_governing_only(self):
+        from .models import ServiceAuthorizationStatus
+        from .portal.views_dashboard import serving_client_ids
+
+        # Client A: governing APPROVED + a superseded (non-governing) DENIED case.
+        a = self._client("Appr", "Oved")
+        self._case(a, ServiceAuthorizationStatus.APPROVED, opened=1)
+        self._case(a, ServiceAuthorizationStatus.DENIED, opened=20)
+        # Client B: sole case DENIED -> that IS their governing case.
+        b = self._client("Den", "Ied")
+        self._case(b, ServiceAuthorizationStatus.DENIED, opened=5)
+
+        resp = self._auth().get(reverse("portal-dashboard"))
+        self.assertEqual(resp.status_code, 200, resp.content)
+        data = resp.json()
+
+        # One case per client (governing), NOT per case: A(approved)+B(denied).
+        self.assertEqual(data["open_cases"]["total"], 2)
+        self.assertEqual(data["open_cases"]["accepted"], 1)
+        self.assertEqual(data["open_cases"]["rejected"], 1)
+
+        # The removed bucket is gone from the serving payload.
+        self.assertNotIn("multiple_cases", data["serving"]["not_being_served"])
+
+        # Rejected-case bucket keys off the GOVERNING case: only B, never A
+        # (whose governing case is approved despite the stray denied case).
+        self.assertEqual(data["serving"]["not_being_served"]["rejected_case"], 1)
+        rejected = {str(x) for x in serving_client_ids("rejected_case", start=None, end=None)}
+        self.assertIn(str(b.client_id), rejected)
+        self.assertNotIn(str(a.client_id), rejected)
+
+
 class ProgramSwitchClassificationTest(SimpleTestCase):
     """The program_switched blocker must fire only on a REAL meals<->boxes
     switch (the old kind is retired), not when a parallel different-kind case is
@@ -4673,6 +5519,56 @@ class UniteUsRefreshTest(TestCase):
         self.assertTrue(res["ok"])
         self.assertEqual(res["changes"], [])
         self.assertIn("No changes", res["message"])
+
+
+class CaseSerializerStatusNormalizationTest(TestCase):
+    """CaseSerializer is the central chokepoint for EVERY case write (extension,
+    CSV/API import, direct). A populated ``case_closed_at`` must force the stored
+    status to CLOSED regardless of the raw incoming ``case_status`` -- the
+    extension used to pass the raw Unite Us state ("managed") straight through,
+    leaving closed cases reading Managed. A write with NO close date keeps its
+    written status untouched (see AuthDrivesCaseStatusTest)."""
+
+    def _client(self):
+        return Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Case", last_name="Status"
+        )
+
+    def _save(self, client, **over):
+        from api.serializers import CaseSerializer
+        from api.services.lifecycle import MET_COUNCIL_PROVIDER_NAME
+
+        data = {
+            "case_id": str(uuid.uuid4()),
+            "client_id": str(client.client_id),
+            "program_name": "Meals on Wheels",
+            "service_type": "Food",
+            "provider_name": MET_COUNCIL_PROVIDER_NAME,
+            "date_opened": timezone.now().isoformat(),
+        }
+        data.update(over)
+        ser = CaseSerializer(data=data)
+        ser.is_valid(raise_exception=True)
+        return ser.save()
+
+    def test_managed_with_close_date_persists_as_closed(self):
+        from .models import CaseStatus
+
+        client = self._client()
+        case = self._save(
+            client, case_status="managed",
+            case_closed_at="2026-06-26T15:42:50Z",
+        )
+        self.assertEqual(case.case_status, CaseStatus.CLOSED)
+
+    def test_managed_without_close_date_is_preserved(self):
+        # No close date -> the serializer does NOT force a status; the written
+        # 'managed' is kept (authorization/status independence contract).
+        from .models import CaseStatus
+
+        client = self._client()
+        case = self._save(client, case_status="managed")
+        self.assertEqual(case.case_status, CaseStatus.MANAGED)
 
 
 class CsvCaseMappingTest(SimpleTestCase):
@@ -6081,6 +6977,8 @@ class MemberEligibilityTest(TestCase):
         self._reconcile(c)
         c.refresh_from_db()
         self.assertEqual(c.lifecycle_stage, ClientStage.INELIGIBLE)
+        # The reason is persisted on the client for display on the Members list.
+        self.assertIn("no medical insurance on file", c.ineligible_reasons)
         self.assertTrue(
             Note.objects.filter(client=c, source=NoteSource.SYSTEM).exists()
         )
@@ -6089,6 +6987,21 @@ class MemberEligibilityTest(TestCase):
                 client=c, event_type=TimelineEventType.MEMBER_INELIGIBLE
             ).exists()
         )
+
+    def test_recovery_clears_stored_reasons(self):
+        from .models import ClientStage, Insurance
+
+        c = self._client()
+        self._reconcile(c)
+        c.refresh_from_db()
+        self.assertTrue(c.ineligible_reasons)
+        # Add a valid (never-expiring) insurance and re-reconcile: the member
+        # recovers and the stored reasons are cleared.
+        Insurance.objects.create(client=c, plan_name="P", external_member_id="1")
+        self._reconcile(c)
+        c.refresh_from_db()
+        self.assertNotEqual(c.lifecycle_stage, ClientStage.INELIGIBLE)
+        self.assertEqual(c.ineligible_reasons, [])
 
     def test_active_insurance_is_eligible(self):
         from .models import ClientStage, Insurance
@@ -6359,6 +7272,26 @@ class MemberWarningsTest(TestCase):
         from .services.warnings import evaluate_enrollment_warnings
 
         return {w.code for w in evaluate_enrollment_warnings(enr)}
+
+    def test_warnings_suppressed_when_governing_case_closed(self):
+        # Warnings only make sense while an OPEN governing case backs the member.
+        # A SERVICE_ACTIVE household with no cadence normally flags NO_CADENCE;
+        # once the governing internal-service case is CLOSED, every warning is
+        # suppressed (the program is done).
+        from .models import CaseStatus, EnrollmentStage
+        from .services.warnings import NO_CADENCE
+
+        # Baseline: an OPEN governing case surfaces the warning.
+        c_open = self._client()
+        enr_open = self._enrollment(c_open, stage=EnrollmentStage.SERVICE_ACTIVE)
+        self._internal_case(c_open, status=CaseStatus.OPEN)
+        self.assertIn(NO_CADENCE, self._codes(enr_open))
+
+        # A CLOSED governing case suppresses ALL warnings for the member.
+        c_closed = self._client()
+        enr_closed = self._enrollment(c_closed, stage=EnrollmentStage.SERVICE_ACTIVE)
+        self._internal_case(c_closed, status=CaseStatus.CLOSED)
+        self.assertEqual(self._codes(enr_closed), set())
 
     def test_no_cadence_flagged_across_assignment_stages(self):
         from .models import EnrollmentStage
@@ -6749,19 +7682,19 @@ class MemberWarningsTest(TestCase):
         enr = self._enrollment(self._client(), stage=EnrollmentStage.ON_HOLD)
         self.assertIn(HOUSEHOLD_ON_HOLD, self._codes(enr))
 
-    def test_household_cancelled_suppresses_member_status(self):
+    def test_cancelled_household_suppresses_member_status(self):
         from .models import EnrollmentStage, MemberStatus
-        from .services.warnings import HOUSEHOLD_CANCELLED, HOUSEHOLD_MEMBERS_PAUSED
+        from .services.warnings import HOUSEHOLD_MEMBERS_PAUSED
 
         enr = self._enrollment(self._client(), stage=EnrollmentStage.CANCELLED)
         mp = enr.member_profiles.first()
         mp.status = MemberStatus.PAUSED
         mp.save(update_fields=["status"])
         codes = self._codes(enr)
-        self.assertIn(HOUSEHOLD_CANCELLED, codes)
-        # Member-status roll-up counts are suppressed for a terminal (cancelled)
-        # household.
+        # Member-status roll-up counts are suppressed for a terminal household,
+        # and the retired "Household cancelled" warning is no longer emitted.
         self.assertNotIn(HOUSEHOLD_MEMBERS_PAUSED, codes)
+        self.assertNotIn("household_cancelled", codes)
 
     def test_household_out_of_service_counts(self):
         from .models import MemberDietaryProfile, MemberStatus
@@ -8458,7 +9391,9 @@ class ReportExportsTest(TestCase):
     def test_all_members_export_columns_and_values(self):
         from datetime import datetime, timezone as dt_tz
 
-        from .models import Insurance, SocialCareCoverage, SocialCareCoverageStatus
+        from .models import (
+            Assessment, Insurance, SocialCareCoverage, SocialCareCoverageStatus,
+        )
 
         client = self._client("Grace", "Hopper")
         Insurance.objects.create(
@@ -8471,10 +9406,23 @@ class ReportExportsTest(TestCase):
             client=client, status=SocialCareCoverageStatus.ENROLLED,
             expired_at=datetime(2030, 6, 30, 12, tzinfo=dt_tz.utc),
         )
+        # Assessment "Client May Be Eligible For" programs -> the "Eligible for:"
+        # column (distinct names joined with "; "). Mixed string/dict entries.
+        Assessment.objects.create(
+            assessment_id=uuid.uuid4(), subject_id=client.client_id, client=client,
+            eligible_services=[
+                "Medically Tailored Meals (MTM)",
+                {"name": "Clinically Appropriate Meals"},
+            ],
+        )
 
         rows = self._rows(reverse("portal-report-all-members"))
         row = next(r for r in rows if r["Member ID"] == str(client.client_id))
 
+        self.assertEqual(
+            row["Eligible for:"],
+            "Medically Tailored Meals (MTM); Clinically Appropriate Meals",
+        )
         self.assertEqual(row["Member Name"], "Grace Hopper")
         # A lone member is their own household primary; household size 1.
         self.assertEqual(row["Household Primary Member ID"], str(client.client_id))

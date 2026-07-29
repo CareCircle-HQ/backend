@@ -1151,8 +1151,18 @@ def _service_phase(client, enrollment, gov_case):
     stage. Mirrors the plan's Service statuses (Waiting for Kitchen Assignment /
     Active / On Hold / Out of Range / Out of Orbit / Service Expired / Canceled /
     Does Not Qualify / Closed)."""
-    from api.models import ClientStage, MemberStatus
+    from api.models import CaseStatus, ClientStage, MemberStatus
     from api.models import ServiceAuthorizationStatus as A
+
+    # A terminal GOVERNING case (now surfaced on the bar even when closed) ends
+    # the program, so the Service phase reflects the CASE outcome directly --
+    # Closed vs Canceled -- taking precedence over the enrollment stage (a
+    # closed case can sit atop a cancelled or completed enrollment).
+    case_status = getattr(gov_case, "case_status", None) if gov_case else None
+    if case_status == CaseStatus.CANCELLED:
+        return ("canceled", "Canceled")
+    if case_status == CaseStatus.CLOSED:
+        return ("closed", "Closed")
 
     if enrollment is not None:
         stage = EnrollmentStage(enrollment.stage)
@@ -1223,18 +1233,25 @@ def program_tracks(client):
 
     if client is None:
         return []
-    # OPEN cases confer service and render normally. Closed/cancelled cases drop
-    # off the bar (their history lives on the Programs tab). A NEVER_REQUESTED
-    # authorization is treated like a denial in lifecycle logic AND is hidden
-    # from the bar entirely -- an open case that never had an authorization
-    # requested is not a real program to surface here.
-    cases = [
-        c for c in _internal_service_cases(client)
-        if c.case_status not in _CLOSED_CASE_STATUSES
-        and c.service_authorization_status != A.NEVER_REQUESTED
-    ]
-    if not cases:
+    # The GOVERNING internal-service case is ALWAYS surfaced regardless of its
+    # case STATUS -- even when closed / cancelled -- so the bar always reflects
+    # the case that governs the member (its live Service phase carries Closed /
+    # Canceled). Non-governing cases render only while OPEN; a closed/cancelled
+    # non-governing case drops off (its history lives on the Programs tab). A
+    # NEVER_REQUESTED authorization is treated like a denial and stays hidden for
+    # every case (governing included) -- it is not a real program to surface.
+    all_cases = _internal_service_cases(client)
+    if not all_cases:
         return []
+    governing = max(all_cases, key=governing_case_key)
+    cases = [
+        c for c in all_cases
+        if c.service_authorization_status != A.NEVER_REQUESTED
+        and (
+            c.case_status not in _CLOSED_CASE_STATUSES
+            or c.case_id == governing.case_id
+        )
+    ]
 
     # Representative enrollment (a verification is household-wide): the most
     # recent non-terminal governing enrollment, else the most recent overall.
@@ -1258,7 +1275,6 @@ def program_tracks(client):
     # attach to the household EnrollmentVerification, which reconciles onto the
     # governing case -- so only the governing FOOD case shows those phases; every
     # other case shows Authorization only, with Verification/Service blank ("--").
-    governing = max(cases, key=governing_case_key) if cases else None
     gov_kind = product_type_kind_for_name(
         governing.service_type or governing.program_name
     ) if governing else None
@@ -1325,6 +1341,9 @@ def program_tracks(client):
             "service_type": service_type,
             "service_type_value": service_type_value,
             "case_id": str(c.case_id),
+            # Raw case status so the UI can hide close/actions on a case that is
+            # already closed/cancelled (a closed governing case still renders).
+            "case_status": getattr(c, "case_status", "") or "",
             "governing": is_governing,
             "scope": {"value": ht, "label": CaseHouseholdType(ht).label},
             "authorization": {"value": a_val, "label": a_lbl},
@@ -2701,6 +2720,11 @@ def _mark_kitchen_assignment_ineligible(client, *, reason, actor=None, actor_lab
         return False
     author = actor_label or _actor_name(actor)
     _set_client_stage(client, ClientStage.INELIGIBLE, actor=actor)
+    # Persist the reason so the Members list can display why (matches the
+    # reconcile_client_eligibility path).
+    if list(client.ineligible_reasons or []) != [reason]:
+        client.ineligible_reasons = [reason]
+        client.save(update_fields=["ineligible_reasons"])
     _write_primary_system_note(
         client,
         f"Marked Ineligible on {timezone.localdate().isoformat()}: {reason}.",

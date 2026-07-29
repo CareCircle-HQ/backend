@@ -824,14 +824,32 @@ def _member_address(client):
 def _export_address(client):
     """The address to put on the kitchen export for a member.
 
-    Source of truth is the member's active ``EnrollmentVerification.delivery_address``
-    -- the exact record captured on the verification pop-up, shown/edited on the
-    member profile Household tab, and used by the delivery-order serializer. Only
-    when the enrollment has no delivery address do we fall back to the member's
-    best standalone Address (legacy behavior), so we never regress to blank.
+    Source of truth is the SHARED ``EnrollmentVerification.delivery_address``
+    captured on the verification pop-up (Step 2) -- the ONE address the whole
+    household is served at, the same for every member and regardless of whether
+    the program is household- or individual-scoped. It is read from the member's
+    dietary profile enrollment, because a member's ``MemberDietaryProfile`` (and
+    thus their delivery orders) always lives on the household's governing
+    enrollment -- so a non-primary member exports the primary's shared address,
+    NOT their own standalone address.
+
+    Fallbacks, in order, so we never regress to blank: the client's active
+    enrollment delivery address, then the member's best standalone Address.
     """
     if client is None:
         return None
+    # The member's dietary profile lives on the enrollment that generated their
+    # delivery orders -- the household's shared enrollment -- so its delivery
+    # address is the one every member of the household is served at. Mirrors how
+    # _delivery_notes() resolves the delivery-address notes.
+    prof = (
+        MemberDietaryProfile.objects.filter(client=client)
+        .select_related("enrollment__delivery_address")
+        .order_by("-updated_at")
+        .first()
+    )
+    if prof and prof.enrollment_id and prof.enrollment.delivery_address is not None:
+        return prof.enrollment.delivery_address
     # Lazy import to avoid a service <-> portal.serializers import cycle.
     from api.portal.serializers import active_enrollment
 
