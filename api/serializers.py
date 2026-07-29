@@ -664,16 +664,13 @@ def sync_household_members(client, enrollment=None, agent=None):
             status=MemberStatus.OUT_OF_ORBIT,
         )
         created += 1
-        # This member was added outside the verification wizard, so leave a
-        # system note explaining why they start Out of Orbit + what's needed to
-        # activate them, AND log the Out-of-Orbit event to the timeline (same as
-        # the other paths that set a member Out of Orbit). Best-effort: never let
-        # history/note-logging break the add.
-        reason = (
-            "New member added outside of the verification process. "
-            "This member needs a menu type and dietary preferences to be "
-            "active (added Out of Orbit by default)."
-        )
+        # Delivery Coverage takes priority over the default Out of Orbit: if this
+        # household's delivery ZIP (or the new member's own primary ZIP) is
+        # outside the coverage area — the same block that already put the
+        # existing members Out of Range — the new member inherits Out of Range
+        # too, since a menu type can't fix a geographic block.
+        from .services.service_area import member_excluded_info, service_area_note_body
+        oor_zip, oor_source = member_excluded_info(profile)
         # Attribute the acting agent (who added the member) so the note author
         # and the timeline actor show WHO performed the action instead of blank.
         agent_author = (agent.name if agent else "") or ""
@@ -685,6 +682,36 @@ def sync_household_members(client, enrollment=None, agent=None):
             agent_actor = f"user:{agent_author}"
         else:
             agent_actor = ""
+        if oor_zip:
+            profile.status = MemberStatus.OUT_OF_RANGE
+            profile.save(update_fields=["status"])
+            reason = service_area_note_body(oor_zip, oor_source)
+            try:
+                Note.objects.create(
+                    client=member, source=NoteSource.SYSTEM,
+                    author_name=agent_author, body=reason,
+                )
+            except Exception:
+                logger.warning("household member note failed", exc_info=True)
+            try:
+                from .services import timeline
+                timeline.event_for_out_of_range(
+                    profile, enrollment=enrollment, reason=reason,
+                    zip_code=oor_zip, actor=agent_actor,
+                )
+            except Exception:
+                logger.warning("household member out-of-range event failed", exc_info=True)
+            continue
+        # This member was added outside the verification wizard, so leave a
+        # system note explaining why they start Out of Orbit + what's needed to
+        # activate them, AND log the Out-of-Orbit event to the timeline (same as
+        # the other paths that set a member Out of Orbit). Best-effort: never let
+        # history/note-logging break the add.
+        reason = (
+            "New member added outside of the verification process. "
+            "This member needs a menu type and dietary preferences to be "
+            "active (added Out of Orbit by default)."
+        )
         try:
             Note.objects.create(
                 client=member, source=NoteSource.SYSTEM,
@@ -1333,6 +1360,18 @@ class CaseSerializer(serializers.ModelSerializer):
         # leaves the case Open and instead pauses the household via the
         # internal-service reconcile below. (The old "denied -> Closed" coupling
         # was removed so authorization never drives case status.)
+        #
+        # A populated close date is the authoritative "closed" signal, enforced
+        # HERE -- the central chokepoint for every write path -- not just in the
+        # CSV/API mappers. Unite Us keeps a closed case as "managed" in its data,
+        # so any save carrying a ``case_closed_at`` must land as CLOSED regardless
+        # of the raw incoming ``case_status``. Without this the extension (which
+        # passes the Unite Us state straight through) persisted closed cases as
+        # "Managed". We only FORCE the closed direction: a write with no close
+        # date keeps whatever status it carried (authorization stays independent
+        # of case status -- see AuthDrivesCaseStatusTest).
+        if validated_data.get("case_closed_at"):
+            validated_data["case_status"] = CaseStatus.CLOSED
 
         case, _ = Case.objects.update_or_create(case_id=case_id, defaults=validated_data)
         # Stash the pre-save values on the instance so the write path (e.g.

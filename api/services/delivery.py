@@ -223,17 +223,17 @@ def cadence_po_weekday(kind, delivery_weekday_code):
 
 
 def _accept_date(case):
-    """The date the case became active: its authorization approval start date,
+    """The date the case became active: its authorization window start date,
     falling back to today when the case/date is missing."""
-    starts_at = getattr(case, "service_authorization_approval_starts_at", None)
+    starts_at = case.effective_authorization_window()[0] if case else None
     if starts_at:
         return starts_at.date()
     return timezone.localdate()
 
 
 def _window_end(case):
-    """The authorization approval end date from the case, or None."""
-    ends_at = getattr(case, "service_authorization_approval_ends_at", None)
+    """The authorization window end date from the case, or None."""
+    ends_at = case.effective_authorization_window()[1] if case else None
     return ends_at.date() if ends_at else None
 
 

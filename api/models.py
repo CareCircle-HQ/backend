@@ -115,6 +115,11 @@ class ProgramStatus(models.TextChoices):
     KITCHEN_ASSIGNMENT = "kitchen_assignment", "Kitchen Assignment"
     ACTIVE = "active", "Active"
     ON_HOLD = "on_hold", "On Hold"
+    # A delivery-coverage hold: the household's delivery/primary ZIP is outside
+    # the service area, so every member is Out of Range and the program is held.
+    # Distinct from a generic On Hold so the program stage matches the members'
+    # Out of Range labels (the main lifecycle stage separately reads Ineligible).
+    OUT_OF_RANGE = "out_of_range", "Out of Range"
     # Final: the approval window's end date passed. A re-authorization arrives on
     # a NEW case (a new program row), never on this expired one.
     AUTHORIZATION_EXPIRED = "authorization_expired", "Authorization Expired"
@@ -353,11 +358,23 @@ class Client(models.Model):
         default=ClientStage.INACTIVE, db_index=True,
     )
     lifecycle_stage_at = models.DateTimeField(null=True, blank=True)
+    # Why the member is on the hard INELIGIBLE off-ramp: the human-readable gate
+    # reasons (expired/missing Medicaid, wrong Medicaid type, out-of-range
+    # ZIP/state, or a Kitchen-Assignment closure/denial). Written wherever the
+    # INELIGIBLE stage is set (ext save + CSV import via reconcile_client_eligibility,
+    # and the Kitchen-Assignment off-ramp) and cleared on eligibility recovery.
+    ineligible_reasons = models.JSONField(default=list, blank=True)
     # Set when an agent DISREGARDS this member's pending verification. Suppresses
     # the "run verification" button until a NEW request arrives from the ext (a
     # governing pending enrollment), so a dismissed request can't be re-run
     # straight from the CRM. Never blocks a live request.
     verification_disregarded_at = models.DateTimeField(null=True, blank=True)
+    # The ``case_id`` (UUID string) of the client's CURRENT governing
+    # internal-service case, as chosen by ``lifecycle.governing_case_key``. Kept
+    # so the case reconcile can detect when the governing case CHANGES (old ->
+    # new) and record it exactly once; also lets the frontend read the program's
+    # governing case directly. Empty until the first internal-service case lands.
+    governing_internal_case_id = models.CharField(max_length=64, blank=True)
 
     # --- CRM Sync (External - GoHighLevel) ---
     crm_contact_id = models.CharField(max_length=64, blank=True, db_index=True)
@@ -813,9 +830,10 @@ class ServiceAuthorizationStatus(models.TextChoices):
     DENIED = "denied", "Denied"
     EXPIRED = "expired", "Expired"
     # An OPEN case whose authorization has never been requested (blank auth on
-    # the export). Neutral in lifecycle logic (treated like no authorization:
-    # not favorable, not denied) -- it only gives the UI an explicit state
-    # instead of a blank.
+    # the export). In lifecycle logic it is treated exactly like a DENIAL (an
+    # open case that confers no service: never governs over a real approved/
+    # pending case, and drives the same full-stop when it is the top case) -- see
+    # lifecycle._DENIED_EQUIVALENT_STATUSES. Only the DISPLAY label differs.
     NEVER_REQUESTED = "never_requested", "Never Requested"
 
 
@@ -1251,6 +1269,14 @@ class Case(models.Model):
     created_by_id = models.UUIDField(null=True, blank=True)  # source agent id
     created_by_name = models.CharField(max_length=255, blank=True)
     date_opened = models.DateTimeField(null=True, blank=True)  # Date Opened from Unite Us
+    # The Unite Us case CREATED timestamp (with time), taken straight from the
+    # source ``created_at`` -- NO fallback to the agent-entered opened date. This
+    # is the authoritative tie-breaker for governing-case selection: when a
+    # member holds several open internal-service cases created the same day, the
+    # most recent ``case_created_at`` (date + time) is the governing candidate.
+    # ``date_opened`` is kept for display / the "Date Opened" filter (and can be
+    # agent-edited), so it is NOT reliable for this ordering.
+    case_created_at = models.DateTimeField(null=True, blank=True, db_index=True)
     updated_at = models.DateTimeField(null=True, blank=True)  # source last update
 
     # Product (model to be defined later) - placeholder reference for now.
@@ -1398,6 +1424,27 @@ class Case(models.Model):
 
     def __str__(self):
         return f"Case {self.case_id} ({self.get_case_status_display()})"
+
+    def effective_authorization_window(self):
+        """``(start, end)`` datetimes of the case's authorization window.
+
+        Prefers the APPROVAL window (``service_authorization_approval_starts_at`` /
+        ``_ends_at``). When the case is APPROVED (or NOT_REQUIRED) but the approval
+        window was not exported -- some Unite Us exports carry only the REQUEST
+        window on an already-approved authorization -- fall back to the request
+        window so an approved case still yields a usable service window instead of
+        stranding the household out of service. Each endpoint falls back
+        independently. Returns ``(None, None)`` when neither is set.
+        """
+        start = self.service_authorization_approval_starts_at
+        end = self.service_authorization_approval_ends_at
+        if (start is None or end is None) and self.service_authorization_status in (
+            ServiceAuthorizationStatus.APPROVED,
+            ServiceAuthorizationStatus.NOT_REQUIRED,
+        ):
+            start = start or self.service_authorization_request_starts_at
+            end = end or self.service_authorization_request_ends_at
+        return start, end
 
 
 class ContractedService(models.Model):
@@ -1763,12 +1810,23 @@ SERVICE_EXCLUDED_MEMBER_STATUSES = (
 
 # Enrollment stages that exclude a whole household from Purchase Order / delivery
 # generation: ON_HOLD (a problem was detected and the case is under review, and
-# may be heading to closure -- distinct from a benign, temporary MemberStatus.PAUSED)
-# plus the terminal stages
+# may be heading to closure -- distinct from a benign, temporary MemberStatus.PAUSED),
+# KITCHEN_ASSIGNMENT (awaiting a manual kitchen + cadence assignment -- with no
+# kitchen the household is not deliverable, so it must never feed a PO; e.g. a
+# meals<->boxes product switch requeues the household here and its OLD calendar
+# must not keep shipping until a NEW kitchen/cadence is assigned, which advances
+# it to SERVICE_ACTIVE and rebuilds the calendar), plus the terminal stages
 # SERVICE_COMPLETE / CLOSED / CANCELLED (service has ended -- e.g. a cancelled /
 # off-boarded household must never appear on a new PO or delivery).
+#
+# NOTE: excluding KITCHEN_ASSIGNMENT is a no-op for a normally-onboarding
+# household (it holds no delivery calendar until a kitchen is assigned, and the
+# assignment flow builds the calendar THEN advances to SERVICE_ACTIVE in one
+# request -- MemberAssignKitchenView). It only closes the leak where a stale /
+# requeued household still carries occurrences at this stage.
 SERVICE_EXCLUDED_ENROLLMENT_STAGES = (
     EnrollmentStage.ON_HOLD,
+    EnrollmentStage.KITCHEN_ASSIGNMENT,
     EnrollmentStage.SERVICE_COMPLETE,
     EnrollmentStage.CLOSED,
     EnrollmentStage.CANCELLED,
@@ -1872,6 +1930,13 @@ class EnrollmentVerification(models.Model):
     product_type_override = models.ForeignKey(
         "ProductType", on_delete=models.SET_NULL, null=True, blank=True,
         related_name="override_enrollments",
+    )
+    # Manual Household/Individual scope correction for THIS household. The scope
+    # is normally derived from the governing case's program name (see
+    # ``derive_household_type``); when that is wrong an agent sets this on the
+    # Household tab and readers honor it FIRST. Blank = use the derived scope.
+    household_type_override = models.CharField(
+        max_length=12, choices=CaseHouseholdType.choices, blank=True, default="",
     )
     stage = models.CharField(
         max_length=25, choices=EnrollmentStage.choices,
@@ -2020,6 +2085,12 @@ class MemberDietaryProfile(models.Model):
     # Distinct from ``updated_at`` (any edit); stamped in ``save()`` only when the
     # status value actually flips, so the UI can show "Paused/Out of Orbit since".
     status_changed_at = models.DateTimeField(null=True, blank=True)
+    # Set True when a governing-case Household->Individual switch auto-pauses this
+    # (additional) member: the member is PINNED so an agent cannot un-pause them
+    # from the Program tab. Cleared ONLY when Customer Service dismisses the
+    # matching CaseMismatchFlag (never auto-cleared on a switch back to
+    # household). See api.services.lifecycle governing-case switch handling.
+    pause_locked = models.BooleanField(default=False)
 
     class Meta:
         ordering = ["created_at"]
@@ -3189,6 +3260,25 @@ class TimelineEventType(models.TextChoices):
     MEMBER_INELIGIBLE = "member_ineligible", "Member Ineligible"
     MEMBER_ELIGIBILITY_RESTORED = "member_eligibility_restored", "Eligibility Restored"
     MEMBER_SERVICE_INACTIVE = "member_service_inactive", "Service Inactive"
+    MEMBER_SERVICE_REACTIVATED = "member_service_reactivated", "Service Reactivated"
+    # Recoverable social-care-coverage hold (api.services.eligibility): a fixable
+    # coverage gap pauses service (reversible) rather than the hard INELIGIBLE
+    # off-ramp; the matching restore fires when coverage recovers.
+    MEMBER_COVERAGE_HOLD = "member_coverage_hold", "Coverage Hold"
+    MEMBER_COVERAGE_RESTORED = "member_coverage_restored", "Coverage Restored"
+    # The GOVERNING internal-service case for a program changed (a new case was
+    # created, a case was approved and superseded the prior one, or the prior
+    # governing case closed). Recorded once per actual change by the case
+    # reconcile (api.services.lifecycle).
+    MEMBER_GOVERNING_CASE_CHANGED = "member_governing_case_changed", "Governing Case Changed"
+    # Governing case switched product KIND (meals<->boxes) to an authorized case:
+    # the household was paused + requeued for a new kitchen assignment
+    # (api.services.lifecycle). Recorded once per switch by the case reconcile.
+    MEMBER_PROGRAM_SWITCHED = "member_program_switched", "Program Switched"
+    # Governing case switched household SCOPE (household<->individual). Needs
+    # Customer Service review via a CaseMismatchFlag; recorded once per switch by
+    # the case reconcile (api.services.lifecycle).
+    MEMBER_CASE_MISMATCH = "member_case_mismatch", "Case Mismatch"
     HOUSEHOLD_MEMBER_ADDED = "household_member_added", "Household Member Added"
     HOUSEHOLD_MEMBER_REMOVED = "household_member_removed", "Household Member Removed"
     PRODUCT_TYPE_CHANGED = "product_type_changed", "Product Type Changed"
@@ -3371,6 +3461,79 @@ class MemberWarning(models.Model):
 
     def __str__(self):
         return f"{self.code} ({self.status}) for {self.client_id}"
+
+
+# ---------------------------------------------------------------------------
+# Case mismatch flags (governing-case Household<->Individual scope switch)
+# ---------------------------------------------------------------------------
+class CaseMismatchType(models.TextChoices):
+    """Direction of a governing-case household-scope switch."""
+
+    HOUSEHOLD_TO_INDIVIDUAL = "household_to_individual", "Household \u2192 Individual"
+    INDIVIDUAL_TO_HOUSEHOLD = "individual_to_household", "Individual \u2192 Household"
+
+
+class CaseMismatchStatus(models.TextChoices):
+    OPEN = "open", "Open"
+    DISMISSED = "dismissed", "Dismissed"
+
+
+class CaseMismatchFlag(models.Model):
+    """A governing-case Household<->Individual scope switch that needs Customer
+    Service review.
+
+    Created by the case reconcile (``api.services.lifecycle``) when the client's
+    governing internal-service case changes its ``household_type``. Unlike a
+    :class:`MemberWarning` (which auto-resolves when the condition clears), a
+    Case Mismatch flag is a manual work item: it stays OPEN until Customer
+    Service dismisses it, and never re-locks on a switch back. Dismissing a
+    Household->Individual flag also clears the ``pause_locked`` pin on the
+    household's additional members (they were auto-paused + pinned on the
+    switch). Surfaced on the Care Management -> Case Mismatch tab.
+
+    ``client`` is the household PRIMARY. De-duped on ``(client, new_case_id)`` so
+    a re-import never stacks duplicate flags (and a dismissed flag is not
+    re-created).
+    """
+
+    client = models.ForeignKey(
+        Client, on_delete=models.CASCADE, related_name="case_mismatch_flags"
+    )
+    enrollment = models.ForeignKey(
+        "EnrollmentVerification", on_delete=models.SET_NULL,
+        null=True, blank=True, related_name="case_mismatch_flags",
+    )
+    mismatch_type = models.CharField(max_length=32, choices=CaseMismatchType.choices)
+    previous_case_id = models.CharField(max_length=64, blank=True)
+    new_case_id = models.CharField(max_length=64, blank=True)
+    previous_household_type = models.CharField(max_length=12, blank=True)
+    new_household_type = models.CharField(max_length=12, blank=True)
+    detail = models.TextField(blank=True)
+    context = models.JSONField(default=dict, blank=True)
+    status = models.CharField(
+        max_length=16, choices=CaseMismatchStatus.choices,
+        default=CaseMismatchStatus.OPEN, db_index=True,
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    dismissed_at = models.DateTimeField(null=True, blank=True)
+    dismissed_by = models.CharField(max_length=255, blank=True)
+    dismiss_reason = models.TextField(blank=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["client", "new_case_id"],
+                name="uniq_case_mismatch_client_new_case",
+            )
+        ]
+        indexes = [
+            models.Index(fields=["status"]),
+            models.Index(fields=["enrollment", "status"]),
+        ]
+
+    def __str__(self):
+        return f"{self.mismatch_type} ({self.status}) for {self.client_id}"
 
 
 # ---------------------------------------------------------------------------

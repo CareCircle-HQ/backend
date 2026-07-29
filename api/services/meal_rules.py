@@ -168,7 +168,9 @@ def apply_to_member(profile, *, save=True):
     return result, (out and not was_out)
 
 
-def reconcile_member_kitchen_output(profile, kitchen=None, *, offered=None, save=True):
+def reconcile_member_kitchen_output(
+    profile, kitchen=None, *, offered=None, save=True, allow_resume=False,
+):
     """Reconcile a member's kitchen output against BOTH the global meal rules
     and the ASSIGNED kitchen's capabilities, writing ``status`` /
     ``kitchen_meal_type`` / ``kitchen_food_notes``.
@@ -183,10 +185,37 @@ def reconcile_member_kitchen_output(profile, kitchen=None, *, offered=None, save
     When no kitchen is assigned the kitchen-capability check is skipped (the
     household hasn't reached kitchen assignment yet).
 
+    The ONLY status this may change on its own is OUT_OF_ORBIT: an out-of-orbit
+    member is returned to ACTIVE when the (new) kitchen can meet their dietary
+    needs, and an ACTIVE member is sent OUT_OF_ORBIT when it can't. Every OTHER
+    status is respected and left untouched unless ``allow_resume=True``:
+      * PAUSED    -- a deliberate manual pause (e.g. the non-primary members of
+                     an individual-scope case) must never be silently resumed;
+      * INACTIVE  -- a terminal off-ramp (service ended) is never revived;
+      * OUT_OF_RANGE -- a delivery/primary ZIP outside coverage is a geographic
+                     block a kitchen change can't fix, so kitchen assignment must
+                     not reactivate it.
+    So kitchen assignment, imports and dietary re-checks (which call this for
+    EVERY household member) can only ever toggle ACTIVE <-> OUT_OF_ORBIT. Only an
+    explicit unpause / restore-range flow passes ``allow_resume=True`` to move a
+    member off PAUSED / INACTIVE / OUT_OF_RANGE (the ZIP re-check still applies).
+
     Returns ``(out_of_orbit, became_out, reason)`` where ``became_out`` is True
     only on an ACTIVE -> OUT_OF_ORBIT transition (so the caller emits a single
-    timeline event) and ``reason`` explains an out-of-orbit outcome.
+    timeline event) and ``reason`` explains an out-of-orbit outcome. A preserved
+    PAUSED / INACTIVE / OUT_OF_RANGE member returns ``(False, False, "")`` (no
+    mutation).
     """
+    # Respect every non-automatic status: only an explicit resume/restore flow
+    # (allow_resume=True) may bring a PAUSED, terminal INACTIVE or OUT_OF_RANGE
+    # member back. Guarded here (the shared entry point) so every caller is
+    # protected, not just kitchen assignment -- the automatic meal rule may only
+    # move members between ACTIVE and OUT_OF_ORBIT.
+    if not allow_resume and profile.status in (
+        MemberStatus.PAUSED, MemberStatus.INACTIVE, MemberStatus.OUT_OF_RANGE,
+    ):
+        return False, False, ""
+
     # Local imports avoid any import cycle between services modules.
     from api.services.kitchens import (
         member_coverage_for_kitchen,

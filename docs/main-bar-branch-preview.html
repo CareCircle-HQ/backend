@@ -1,0 +1,275 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Member Stage Design — Main Bar &amp; Program Branch</title>
+<style>
+  :root {
+    --bg: #0f172a;
+    --panel: #ffffff;
+    --ink: #0f172a;
+    --muted: #64748b;
+    --line: #e2e8f0;
+    --brand: #4f46e5;
+    --brand-soft: #eef2ff;
+    --ok: #16a34a;
+    --ok-soft: #dcfce7;
+    --warn: #d97706;
+    --warn-soft: #fef3c7;
+    --bad: #dc2626;
+    --bad-soft: #fee2e2;
+    --info: #0284c7;
+    --info-soft: #e0f2fe;
+    --slate-soft: #f1f5f9;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    background: linear-gradient(180deg, #f8fafc 0%, #eef2f7 100%);
+    color: var(--ink);
+    line-height: 1.5;
+    padding: 40px 24px 80px;
+  }
+  .wrap { max-width: 1120px; margin: 0 auto; }
+  header.page { margin-bottom: 32px; }
+  header.page h1 { font-size: 26px; margin: 0 0 6px; letter-spacing: -0.02em; }
+  header.page p { margin: 0; color: var(--muted); font-size: 15px; }
+  .tag { display:inline-block; font-size:11px; font-weight:700; letter-spacing:.06em;
+    text-transform:uppercase; color:var(--brand); background:var(--brand-soft);
+    padding:4px 10px; border-radius:999px; margin-bottom:14px; }
+
+  section.card {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 16px;
+    padding: 26px;
+    margin-bottom: 26px;
+    box-shadow: 0 1px 2px rgba(15,23,42,.04), 0 8px 24px rgba(15,23,42,.05);
+  }
+  section.card > h2 { font-size: 18px; margin: 0 0 4px; }
+  section.card > .sub { color: var(--muted); font-size: 13px; margin: 0 0 22px; }
+
+  /* ---- Main stage bar (chevrons) ---- */
+  .flow { display:flex; flex-wrap:wrap; align-items:stretch; gap:8px; }
+  .step {
+    position: relative;
+    flex: 1 1 0;
+    min-width: 120px;
+    background: var(--slate-soft);
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    padding: 14px 16px;
+    text-align: center;
+  }
+  .step .n { font-size: 11px; color: var(--muted); font-weight:700; letter-spacing:.05em; }
+  .step .t { font-size: 15px; font-weight: 700; margin-top: 2px; }
+  .step .d { font-size: 12px; color: var(--muted); margin-top: 4px; }
+  .step.brand { background: var(--brand-soft); border-color: #c7d2fe; }
+  .step.brand .t { color: var(--brand); }
+  .arrow { align-self:center; color: var(--muted); font-size: 20px; font-weight:700; padding: 0 2px; }
+
+  .branch-pill {
+    display:flex; gap:10px; align-items:center; justify-content:center;
+    flex-wrap:wrap; margin-top: 16px;
+  }
+  .decision {
+    background: #fff; border:1px dashed #cbd5e1; border-radius:10px;
+    padding:8px 14px; font-size:13px; font-weight:600; color:var(--muted);
+  }
+  .decision b { color: var(--ok); }
+  .decision .no { color: var(--bad); }
+
+  /* ---- Program branch split ---- */
+  .tracks { display:grid; grid-template-columns:1fr 1fr; gap:20px; margin-top: 6px; }
+  @media (max-width: 760px){ .tracks { grid-template-columns:1fr; } }
+  .track { border:1px solid var(--line); border-radius:14px; overflow:hidden; }
+  .track > .head {
+    padding:14px 18px; font-weight:700; font-size:15px; display:flex;
+    align-items:center; gap:10px;
+  }
+  .track.meals > .head { background:#ecfeff; color:#0e7490; border-bottom:1px solid #cffafe; }
+  .track.boxes > .head { background:#fdf4ff; color:#a21caf; border-bottom:1px solid #f5d0fe; }
+  .track .subtype { font-size:11px; font-weight:700; text-transform:uppercase;
+    letter-spacing:.05em; background:rgba(255,255,255,.7); padding:3px 8px; border-radius:999px; }
+  .phase { padding:16px 18px; border-bottom:1px dashed var(--line); }
+  .phase:last-child { border-bottom:0; }
+  .phase h4 { margin:0 0 10px; font-size:12px; text-transform:uppercase;
+    letter-spacing:.06em; color:var(--muted); }
+  .chips { display:flex; flex-wrap:wrap; gap:8px; }
+
+  .chip {
+    display:inline-flex; align-items:center; gap:6px; font-size:12.5px;
+    font-weight:600; padding:6px 11px; border-radius:999px; border:1px solid transparent;
+  }
+  .chip .dot { width:8px; height:8px; border-radius:50%; }
+  .chip.ok   { background:var(--ok-soft);   color:#166534; border-color:#bbf7d0; }
+  .chip.ok   .dot{ background:var(--ok); }
+  .chip.warn { background:var(--warn-soft); color:#92400e; border-color:#fde68a; }
+  .chip.warn .dot{ background:var(--warn); }
+  .chip.bad  { background:var(--bad-soft);  color:#991b1b; border-color:#fecaca; }
+  .chip.bad  .dot{ background:var(--bad); }
+  .chip.info { background:var(--info-soft); color:#075985; border-color:#bae6fd; }
+  .chip.info .dot{ background:var(--info); }
+  .chip.mute { background:var(--slate-soft);color:#475569; border-color:#e2e8f0; }
+  .chip.mute .dot{ background:#94a3b8; }
+
+  .statusgrid { display:grid; grid-template-columns:repeat(auto-fill,minmax(240px,1fr));
+    gap:12px; }
+  .statusrow { border:1px solid var(--line); border-radius:10px; padding:12px 14px; }
+  .statusrow .name { font-weight:700; font-size:13.5px; display:flex; align-items:center; gap:7px; }
+  .statusrow .desc { color:var(--muted); font-size:12.5px; margin-top:4px; }
+
+  .legend { display:flex; flex-wrap:wrap; gap:16px; margin-top:4px; }
+  .legend .chip { cursor:default; }
+  .note { font-size:12.5px; color:var(--muted); margin-top:16px;
+    background:var(--brand-soft); border:1px solid #c7d2fe; border-radius:10px; padding:12px 14px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header class="page">
+    <span class="tag">Design preview · for approval</span>
+    <h1>Member Stage Model — Main Bar &amp; Program Branch</h1>
+    <p>Proposed redesign of the client lifecycle bar and the per-program (Meals / Boxes) status tracks. Review and approve before implementation.</p>
+  </header>
+
+  <!-- MAIN BAR -->
+  <section class="card">
+    <h2>1 · Main client stages</h2>
+    <p class="sub">Linear client-level lifecycle. Branches at Eligibility, then enters a Program once an internal-service case is created.</p>
+    <div class="flow">
+      <div class="step"><div class="n">01</div><div class="t">Consent</div><div class="d">Consent accepted</div></div>
+      <div class="arrow">&rsaquo;</div>
+      <div class="step"><div class="n">02</div><div class="t">Screening</div><div class="d">Screening completed</div></div>
+      <div class="arrow">&rsaquo;</div>
+      <div class="step"><div class="n">03</div><div class="t">Assessment</div><div class="d">Assessment completed</div></div>
+      <div class="arrow">&rsaquo;</div>
+      <div class="step"><div class="n">04</div><div class="t">Eligibility</div><div class="d">Eligible / Not eligible</div></div>
+      <div class="arrow">&rsaquo;</div>
+      <div class="step brand"><div class="n">05</div><div class="t">Program: Meals</div><div class="d">headline shows the <code>service_type</code></div></div>
+    </div>
+    <div class="branch-pill">
+      <span class="decision">At Eligibility &rarr; <b>Eligible</b> (&ge;1 open internal-service case)</span>
+      <span class="decision">or <span class="no">Not Eligible</span> (0 open cases &rarr; off-ramp)</span>
+    </div>
+  </section>
+
+  <!-- PROGRAM BRANCH -->
+  <section class="card">
+    <h2>2 · Program branches by <code>service_subtype</code></h2>
+    <p class="sub">Each program (governed by one internal-service case) runs three phases: Authorization &rarr; Verification &rarr; Service. Service is only Meals or Boxes.</p>
+    <div class="tracks">
+      <!-- MEALS -->
+      <div class="track meals">
+        <div class="head">🍽️ Meals <span class="subtype">service_subtype: meals</span></div>
+        <div class="phase">
+          <h4>Authorization</h4>
+          <div class="chips">
+            <span class="chip warn"><span class="dot"></span>Waiting Authorization</span>
+            <span class="chip ok"><span class="dot"></span>Approved</span>
+            <span class="chip bad"><span class="dot"></span>Denied</span>
+          </div>
+        </div>
+        <div class="phase">
+          <h4>Verification</h4>
+          <div class="chips">
+            <span class="chip info"><span class="dot"></span>Pending Verification</span>
+            <span class="chip ok"><span class="dot"></span>Verified</span>
+          </div>
+        </div>
+        <div class="phase">
+          <h4>Service</h4>
+          <div class="chips">
+            <span class="chip mute"><span class="dot"></span>Waiting for Kitchen Assignment</span>
+            <span class="chip ok"><span class="dot"></span>Active</span>
+            <span class="chip warn"><span class="dot"></span>On Hold</span>
+            <span class="chip bad"><span class="dot"></span>Out of Range</span>
+            <span class="chip bad"><span class="dot"></span>Out of Orbit</span>
+            <span class="chip warn"><span class="dot"></span>Service Expired</span>
+            <span class="chip bad"><span class="dot"></span>Canceled</span>
+            <span class="chip bad"><span class="dot"></span>Does Not Qualify</span>
+            <span class="chip mute"><span class="dot"></span>Closed</span>
+          </div>
+        </div>
+      </div>
+      <!-- BOXES -->
+      <div class="track boxes">
+        <div class="head">📦 Boxes <span class="subtype">service_subtype: boxes</span></div>
+        <div class="phase">
+          <h4>Authorization</h4>
+          <div class="chips">
+            <span class="chip warn"><span class="dot"></span>Waiting Authorization</span>
+            <span class="chip ok"><span class="dot"></span>Approved</span>
+            <span class="chip bad"><span class="dot"></span>Denied</span>
+          </div>
+        </div>
+        <div class="phase">
+          <h4>Verification</h4>
+          <div class="chips">
+            <span class="chip info"><span class="dot"></span>Pending Verification</span>
+            <span class="chip ok"><span class="dot"></span>Verified</span>
+          </div>
+        </div>
+        <div class="phase">
+          <h4>Service</h4>
+          <div class="chips">
+            <span class="chip mute"><span class="dot"></span>Waiting for Kitchen Assignment</span>
+            <span class="chip ok"><span class="dot"></span>Active</span>
+            <span class="chip warn"><span class="dot"></span>On Hold</span>
+            <span class="chip bad"><span class="dot"></span>Out of Range</span>
+            <span class="chip bad"><span class="dot"></span>Out of Orbit</span>
+            <span class="chip warn"><span class="dot"></span>Service Expired</span>
+            <span class="chip bad"><span class="dot"></span>Canceled</span>
+            <span class="chip bad"><span class="dot"></span>Does Not Qualify</span>
+            <span class="chip mute"><span class="dot"></span>Closed</span>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="note"><b>Governing case:</b> when a member holds several open cases, the program shown here is driven by the <b>governing</b> internal-service case — Approved beats all, otherwise the most recent <code>case_created_at</code> (date + time) wins.</div>
+  </section>
+
+  <!-- STATUS DICTIONARY -->
+  <section class="card">
+    <h2>3 · Status descriptions</h2>
+    <p class="sub">Full definition of every program status, grouped by phase.</p>
+
+    <h4 style="margin:0 0 10px;color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.06em;">Authorization</h4>
+    <div class="statusgrid" style="margin-bottom:20px;">
+      <div class="statusrow"><div class="name"><span class="chip warn" style="padding:2px 8px"><span class="dot"></span></span>Waiting Authorization</div><div class="desc">Requested, Blank, Open, Draft, or Deferred — not yet decided.</div></div>
+      <div class="statusrow"><div class="name"><span class="chip ok" style="padding:2px 8px"><span class="dot"></span></span>Approved</div><div class="desc">Authorization granted; service can proceed.</div></div>
+      <div class="statusrow"><div class="name"><span class="chip bad" style="padding:2px 8px"><span class="dot"></span></span>Denied</div><div class="desc">Authorization refused; service is stopped/held.</div></div>
+    </div>
+
+    <h4 style="margin:0 0 10px;color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.06em;">Verification</h4>
+    <div class="statusgrid" style="margin-bottom:20px;">
+      <div class="statusrow"><div class="name"><span class="chip info" style="padding:2px 8px"><span class="dot"></span></span>Pending Verification</div><div class="desc">A verification request was made.</div></div>
+      <div class="statusrow"><div class="name"><span class="chip ok" style="padding:2px 8px"><span class="dot"></span></span>Verified</div><div class="desc">Verification completed.</div></div>
+    </div>
+
+    <h4 style="margin:0 0 10px;color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.06em;">Service</h4>
+    <div class="statusgrid">
+      <div class="statusrow"><div class="name"><span class="chip mute" style="padding:2px 8px"><span class="dot"></span></span>Waiting for Kitchen Assignment</div><div class="desc">Approved but not yet assigned a kitchen/cadence.</div></div>
+      <div class="statusrow"><div class="name"><span class="chip ok" style="padding:2px 8px"><span class="dot"></span></span>Active</div><div class="desc">We are providing service.</div></div>
+      <div class="statusrow"><div class="name"><span class="chip warn" style="padding:2px 8px"><span class="dot"></span></span>On Hold</div><div class="desc">Service paused for all individual members of one household.</div></div>
+      <div class="statusrow"><div class="name"><span class="chip bad" style="padding:2px 8px"><span class="dot"></span></span>Out of Range</div><div class="desc">Delivery address is outside our delivery range.</div></div>
+      <div class="statusrow"><div class="name"><span class="chip bad" style="padding:2px 8px"><span class="dot"></span></span>Out of Orbit</div><div class="desc">Member dietary restrictions exceed kitchen capabilities.</div></div>
+      <div class="statusrow"><div class="name"><span class="chip warn" style="padding:2px 8px"><span class="dot"></span></span>Service Expired</div><div class="desc">The authorization approval window for service expired.</div></div>
+      <div class="statusrow"><div class="name"><span class="chip bad" style="padding:2px 8px"><span class="dot"></span></span>Canceled</div><div class="desc">Service stopped manually, or the governing case was closed.</div></div>
+      <div class="statusrow"><div class="name"><span class="chip bad" style="padding:2px 8px"><span class="dot"></span></span>Does Not Qualify</div><div class="desc">Member insurance / social-care coverage is not supported.</div></div>
+      <div class="statusrow"><div class="name"><span class="chip mute" style="padding:2px 8px"><span class="dot"></span></span>Closed</div><div class="desc">Program closed.</div></div>
+    </div>
+
+    <div class="legend" style="margin-top:24px;">
+      <span class="chip ok"><span class="dot"></span>Healthy / active</span>
+      <span class="chip info"><span class="dot"></span>In progress</span>
+      <span class="chip warn"><span class="dot"></span>Attention / paused</span>
+      <span class="chip bad"><span class="dot"></span>Blocked / stopped</span>
+      <span class="chip mute"><span class="dot"></span>Neutral / terminal</span>
+    </div>
+  </section>
+</div>
+</body>
+</html>
