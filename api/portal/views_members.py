@@ -4088,6 +4088,78 @@ class MemberCaseHistoryView(PortalGenericAPIView):
         return self.get_paginated_response(data)
 
 
+def _enrollment_history_window(enrollment):
+    """Resolve the (start, end, open?) bounds of a verification enrollment's
+    history timeline.
+
+    Start = the verification completion (``verified_at``), falling back to the
+    request / open time so a not-yet-verified enrollment still has a stable
+    anchor. End = when the governing internal-service case CLOSED (or was
+    cancelled), else the case's authorization approval window end once it is in
+    the past, else the enrollment's own close time. ``None`` while the program
+    is still live -- in which case ``open`` is True.
+    """
+    start = enrollment.verified_at or enrollment.requested_at or enrollment.opened_at
+    end = None
+    case = enrollment.case
+    now = timezone.now()
+    if case is not None:
+        if case.case_status in (CaseStatus.CLOSED, CaseStatus.CANCELLED):
+            end = case.case_closed_at or case.updated_at
+        elif (
+            case.service_authorization_approval_ends_at is not None
+            and case.service_authorization_approval_ends_at <= now
+        ):
+            end = case.service_authorization_approval_ends_at
+    if end is None and enrollment.closed_at is not None:
+        end = enrollment.closed_at
+    return start, end, end is None
+
+
+class MemberEnrollmentHistoryView(PortalGenericAPIView):
+    """The client timeline scoped to a single verification ENROLLMENT -- the
+    'History' sub-tab on the profile's Program tab. Mirrors the case history but
+    keyed on the enrollment, so it captures the whole household's program
+    activity regardless of which member each event is logged on.
+
+    Tracks the program from verification completion through every change made to
+    the enrollment (members added / removed, delivery-address edits, out-of-orbit
+    / out-of-range flips, dietary & menu edits, stage / authorization changes),
+    ending when the authorization window expires or the governing case closes.
+    Events are filtered to this enrollment and clamped to that window,
+    newest-first."""
+
+    serializer_class = s.HistoryEventSummarySerializer
+
+    def get(self, request, client_id, enrollment_id):
+        get_object_or_404(Client, pk=client_id)
+        enrollment = get_object_or_404(
+            EnrollmentVerification, pk=enrollment_id, client_id=client_id
+        )
+        start, end, window_open = _enrollment_history_window(enrollment)
+        qs = TimelineEvent.objects.filter(enrollment_id=enrollment.pk)
+        # Bound to the enrollment's window: from verification completion onward.
+        # No hard upper cap -- the program is locked once its case closes, so the
+        # terminal (close / expiry) event is the natural last row.
+        if start is not None:
+            qs = qs.filter(occurred_at__gte=start)
+        events = list(
+            qs.select_related("content_type", "enrollment")
+            .order_by("-occurred_at", "-created_at")
+        )
+        ctx = self.get_serializer_context()
+        ctx["actor_names"] = s.build_actor_name_map(events)
+        data = self.get_serializer(events, many=True, context=ctx).data
+        return Response({
+            "enrollment_id": enrollment.pk,
+            "program_name": enrollment.program_name or enrollment.service_type or "",
+            "window_start": start.isoformat() if start else None,
+            "window_end": end.isoformat() if end else None,
+            "window_open": window_open,
+            "results": data,
+        })
+
+
 # Noisy / internal fields to hide from the raw field-diff drill-down.
 _AUDIT_EXCLUDE = frozenset({
     "updated_at", "created_at", "crm_sync_hash", "crm_synced_at",

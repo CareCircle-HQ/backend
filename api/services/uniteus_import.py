@@ -308,11 +308,24 @@ class DailyPull:
             self._count("cases", "skipped")
             return
         auth_attrs = None
+        denial_reason_id = None
+        denial_reason_name = ""
         auth_id = mappers._rel_id(case_rec, "service_authorization")
         if auth_id:
             try:
-                auth_attrs = mappers._attrs(
-                    self.api.get_service_authorization(auth_id).get("data") or {}
+                auth_data = self.api.get_service_authorization(auth_id).get("data") or {}
+                auth_attrs = mappers._attrs(auth_data)
+                # Coded denial reason lives on the auth's RELATIONSHIP (not its
+                # attributes), so resolve its id + display name here and hand
+                # both to map_case. Populated only on denied auths; best-effort
+                # name resolution degrades to "" (the id is still stored).
+                denial_reason_id = mappers._rel_id(
+                    auth_data, "service_authorization_denial_reason"
+                )
+                denial_reason_name = self._name(
+                    "/service_authorization_denial_reasons",
+                    denial_reason_id,
+                    ("name", "display_name", "description", "reason"),
                 )
             except UniteUsApiError:
                 pass
@@ -321,7 +334,11 @@ class DailyPull:
         prev_status = prev.case_status if prev else None
         prev_auth = prev.service_authorization_status if prev else None
 
-        data = mappers.map_case(case_rec, names=names, auth=auth_attrs)
+        data = mappers.map_case(
+            case_rec, names=names, auth=auth_attrs,
+            denial_reason_id=denial_reason_id,
+            denial_reason_name=denial_reason_name,
+        )
         # External-service cases are out of scope -- skip cleanly (mirrors the
         # CSV import gate + the CaseSerializer backstop).
         from api.models import CaseType
