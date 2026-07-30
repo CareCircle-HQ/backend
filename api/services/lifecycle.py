@@ -1845,6 +1845,119 @@ def requeue_enrollment_for_product_switch(
     return True
 
 
+# Note stamped on the requeue when a mis-switched household (its kitchen can't
+# make the governing kind, or its plan was built as the wrong product) is
+# self-healed by the "Prepare Members for PO" sweep / remediation command.
+_SWITCH_REMEDIATION_REQUEUE_NOTE = (
+    "Requeued for kitchen assignment: delivery plan/kitchen didn't match the "
+    "governing meal/box case after a product switch (auto-remediation)."
+)
+
+
+def classify_switched_household(enrollment):
+    """Compare a household's delivery plan to its GOVERNING internal-service case
+    kind and report how (if at all) it is mis-set after a meals<->boxes switch.
+
+    Returns ``(gov_kind, action, reason)``:
+      - ``action == "requeue"`` -- the assigned kitchen can't make the governing
+        kind, OR the plan was BUILT as the wrong product; it needs a new kitchen
+        + fresh calendar.
+      - ``action == "rename"`` -- the plan / cadence / kitchen are already correct
+        for the governing kind; only the ``program_name`` (which PO
+        kind-resolution trusts first) is stale.
+      - ``action is None`` -- consistent, nothing to do.
+
+    Read-only. ``gov_kind`` is None when the governing kind can't be determined.
+    """
+    from api.models import KitchenProductType, ProductTypeKind
+    from api.services.catalog import (
+        detected_product_kind_for_enrollment,
+        product_type_kind_for_name,
+    )
+    from api.services.orders import plan_built_kind
+
+    gov = detected_product_kind_for_enrollment(enrollment)
+    if gov is None:
+        return None, None, None
+    plan = enrollment.delivery_schedules.first()
+    built = plan_built_kind(plan)
+    name_kind = product_type_kind_for_name(enrollment.program_name)
+    code = {
+        ProductTypeKind.MEALS: KitchenProductType.MEAL,
+        ProductTypeKind.BOXES: KitchenProductType.BOX,
+    }
+    k = enrollment.kitchen
+    kitchen_ok = bool(k) and code.get(gov) in (getattr(k, "supported_products", None) or [])
+    built_wrong = built is not None and built != gov
+    if built_wrong or not kitchen_ok:
+        return gov, "requeue", (
+            "plan built as wrong kind" if built_wrong
+            else "kitchen can't make governing kind"
+        )
+    if name_kind is not None and name_kind != gov:
+        return gov, "rename", "stale program_name"
+    return gov, None, None
+
+
+def remediate_switched_household(
+    enrollment, *, actor=None, actor_label="system:po-switch-remediation",
+):
+    """Fix a household mis-set after a meals<->boxes governing-case switch.
+
+    Dispatches on :func:`classify_switched_household`:
+      - ``requeue`` -> point ``product_type_override`` at the governing kind and
+        requeue to Kitchen Assignment (compatible kitchen + fresh calendar).
+      - ``rename``  -> set ``program_name`` to the governing program, reconcile
+        the calendar (drop wrong-day leftovers, add the correct ones), and
+        re-stamp the name on the scheduled rows.
+
+    Returns the action taken (``"requeue"`` / ``"rename"``) or ``None``.
+    Best-effort and idempotent -- safe to call on EVERY enrollment during the
+    "Prepare Members for PO" sweep so any member's mismatch self-heals.
+    """
+    from django.utils import timezone
+
+    from api.models import OrderSchedule, ProductType, ScheduleStatus
+    from api.services.orders import sync_delivery_calendar
+
+    gov, action, _reason = classify_switched_household(enrollment)
+    if action == "requeue":
+        pt = ProductType.objects.filter(type=gov).first()
+        if pt is not None and enrollment.product_type_override_id != pt.pk:
+            enrollment.product_type_override = pt
+            try:
+                enrollment.save(update_fields=["product_type_override"])
+            except Exception:  # pragma: no cover - defensive
+                pass
+        did = requeue_enrollment_for_product_switch(
+            enrollment, actor=actor, actor_label=actor_label,
+            note=_SWITCH_REMEDIATION_REQUEUE_NOTE,
+        )
+        return "requeue" if did else None
+    if action == "rename":
+        gov_case = governing_internal_case(enrollment)
+        name = getattr(gov_case, "program_name", "") or ""
+        if not name:
+            return None
+        if enrollment.program_name != name:
+            enrollment.program_name = name
+            try:
+                enrollment.save(update_fields=["program_name"])
+            except Exception:  # pragma: no cover - defensive
+                pass
+        today = timezone.localdate()
+        try:
+            sync_delivery_calendar(enrollment, from_date=today)
+        except Exception:  # pragma: no cover - defensive
+            pass
+        OrderSchedule.objects.filter(
+            enrollment=enrollment, status=ScheduleStatus.SCHEDULED,
+            anticipated_delivery_date__gte=today,
+        ).update(program_name=name)
+        return "rename"
+    return None
+
+
 def _served_product_kind(enrollment, old_case=None):
     """The Meals/Boxes kind the household is CURRENTLY SET UP FOR (its served
     kind), used as the baseline to detect a governing-case product switch.

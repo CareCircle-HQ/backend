@@ -207,6 +207,23 @@ Read within `map_case` (case's auth) and standalone.
 | `approved_ends_at` | datetime | `service_authorization_approval_ends_at` |
 | `requested_starts_at` | datetime | `service_authorization_request_starts_at` |
 | `requested_ends_at` | datetime | `service_authorization_request_ends_at` |
+| `adjudicator_note` | string | `service_authorization_decision_note` (UI "Decision Note"; falls back to `in_review_note`/`update_request_note`) |
+| `in_review_note` | string | `service_authorization_in_review_note` |
+| `update_request_note` | string | `service_authorization_update_request_note` |
+| `payer_authorization_number` | string | `payer_authorization_number` |
+| `submitted_at` | datetime | `service_authorization_submitted_at` |
+| `auto_approved` | bool | `service_authorization_auto_approved` (null when absent) |
+| `urgent` | bool | `service_authorization_urgent` (null when absent) |
+
+**relationships**
+
+| Field | Type | Used as |
+| --- | --- | --- |
+| `service_authorization_denial_reason` | id | `service_authorization_denial_reason_id` + resolved `service_authorization_denial_reason` name (via `/service_authorization_denial_reasons/{id}`); populated only on denied auths |
+
+> The full `/v1/service_authorizations/{id}` payload (every attribute +
+> relationship, including ones we do **not** yet ingest) is captured in
+> [uniteus-service-authorization-sample.md](./uniteus-service-authorization-sample.md).
 
 ---
 
