@@ -54,9 +54,8 @@ from .views_members import (
     MemberHouseholdAddView,
     MemberHouseholdSearchView,
     MemberHouseholdView,
-    MemberHouseholdTypeView,
     MemberMakePrimaryView,
-    MemberProductTypeView,
+    MemberMobileNumberView,
     MemberWarningsView,
     MemberInternalCaseDescriptionsView,
     MemberInsuranceView,
@@ -220,14 +219,6 @@ urlpatterns = [
     path("members/<uuid:client_id>/household/search/", MemberHouseholdSearchView.as_view()),
     path("members/<uuid:client_id>/household/add/", MemberHouseholdAddView.as_view()),
     path(
-        "members/<uuid:client_id>/product-type/",
-        MemberProductTypeView.as_view(),
-    ),
-    path(
-        "members/<uuid:client_id>/household-type/",
-        MemberHouseholdTypeView.as_view(),
-    ),
-    path(
         "members/<uuid:client_id>/warnings/",
         MemberWarningsView.as_view(),
     ),
@@ -239,6 +230,10 @@ urlpatterns = [
     path(
         "members/<uuid:client_id>/household/members/<int:member_id>/",
         HouseholdMemberEditView.as_view(),
+    ),
+    path(
+        "members/<uuid:client_id>/member-mobile/<int:member_id>/",
+        MemberMobileNumberView.as_view(),
     ),
     path(
         "members/<uuid:client_id>/make-primary/",

@@ -2037,6 +2037,19 @@ class EnrollmentVerification(models.Model):
     closed_at = models.DateTimeField(null=True, blank=True)
     note = models.TextField(blank=True)
 
+    # Supersession link for the close-old / open-new enrollment replacement
+    # (enrollment-case-replacement-plan.md). New enrollment points at the one it
+    # replaced; old enrollment's related_name "superseded_by" yields the new one.
+    supersedes = models.ForeignKey(
+        "self", on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="superseded_by",
+    )
+    # Why this enrollment was closed (e.g. "case_replaced"). Extra details such
+    # as old/new product kind, old/new scope, and old/new case ids are kept in
+    # close_context for audit and UI history.
+    close_reason = models.CharField(max_length=32, blank=True, default="")
+    close_context = models.JSONField(default=dict, blank=True)
+
     class Meta:
         ordering = ["-opened_at"]
         indexes = [
@@ -2045,13 +2058,15 @@ class EnrollmentVerification(models.Model):
         ]
         constraints = [
             # At most one LIVE verification per (navigation) case. Renewals reuse
-            # the same row, so this never blocks a renewal. Disregarded and
-            # cancelled rows are kept for history and excluded here, so a fresh
-            # request can reuse the same case. NULL case is unconstrained.
+            # the same row, so this never blocks a renewal. Terminal rows --
+            # disregarded, cancelled, and CLOSED (a superseded/replaced
+            # enrollment kept as read-only history) -- are excluded here, so when
+            # a case governs again a fresh enrollment can reuse it without
+            # colliding with its own history. NULL case is unconstrained.
             models.UniqueConstraint(
                 fields=["case"],
                 condition=models.Q(case__isnull=False)
-                & ~models.Q(stage__in=["disregarded", "cancelled"]),
+                & ~models.Q(stage__in=["disregarded", "cancelled", "closed"]),
                 name="uniq_enrollment_verification_per_case",
             ),
         ]
@@ -2123,6 +2138,18 @@ class MemberDietaryProfile(models.Model):
     # matching CaseMismatchFlag (never auto-cleared on a switch back to
     # household). See api.services.lifecycle governing-case switch handling.
     pause_locked = models.BooleanField(default=False)
+    # The member's mobile number, collected during verification. Stored on the
+    # enrollment (not just the client) so it is part of the verification record
+    # and CARRIES ACROSS a governing-case replacement -- like the delivery
+    # address. Required for the PRIMARY member; optional for dependents. Also
+    # mirrored to HouseholdMember.mobile_app_username (Benefully app login).
+    mobile_number = models.CharField(max_length=32, blank=True)
+    # Set True when the import-time eligibility gate paused THIS member (expired/
+    # missing insurance, wrong Medicaid type, out-of-range address, or missing
+    # social-care coverage) -- as opposed to a manual agent pause or a scope-
+    # switch pause. Lets the recovery pass un-pause ONLY eligibility-driven pauses
+    # when the member's data later passes the gates. See api.services.eligibility.
+    eligibility_paused = models.BooleanField(default=False)
 
     class Meta:
         ordering = ["created_at"]

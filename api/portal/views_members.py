@@ -13,6 +13,8 @@ from django.db.models import (
     Count,
     Exists,
     F,
+    Max,
+    Min,
     OuterRef,
     Prefetch,
     Q,
@@ -42,6 +44,7 @@ from ..models import (
     Insurance,
     InsurancePlanType,
     Kitchen,
+    MemberDeliverySchedule,
     MemberDietaryProfile,
     KitchenProductType,
     MemberStatus,
@@ -110,7 +113,6 @@ from ..services.lifecycle import (
     recompute_client_stage,
     recompute_enrollment_household,
     reconcile_enrollment_authorization,
-    requeue_enrollment_for_product_switch,
 )
 from ..services import timeline
 from ..services.warnings import sync_household_warnings
@@ -230,24 +232,29 @@ def _hold_household_for_range(enrollment, author):
 
 
 def _enrollment_resume_blocked_by_ineligibility(enrollment):
-    """True when a held program must NOT be manually resumable because a member
-    is on the hard INELIGIBLE eligibility off-ramp (out-of-range address, wrong
-    Medicaid type, expired/missing insurance).
+    """True when a held program must NOT be manually resumable because there is
+    NO servable member left -- everyone is on the hard INELIGIBLE off-ramp
+    (out-of-range address, wrong Medicaid type, expired/missing insurance).
 
-    An INELIGIBLE hold is CareCircle-unfixable: only recovering the underlying
-    data (a later import/save re-running ``reconcile_client_eligibility``) may
-    lift it, never an agent's manual Resume. Keyed on the enrollment's own
-    case-holder AND any household member, so an ineligible member anywhere in the
-    household blocks the whole program's manual resume. Idempotent read-only.
+    An INELIGIBLE member is now paused INDIVIDUALLY (see
+    ``api.services.eligibility``) and excluded from the schedule, so a single
+    ineligible member no longer blocks resuming the rest of the household. Resume
+    is blocked only when there is no eligible member to serve: no member profile
+    is eligible AND the case-holder themselves is ineligible. An INELIGIBLE hold
+    is CareCircle-unfixable -- only recovering the underlying data (a later import
+    re-running ``reconcile_client_eligibility``) lifts it. Idempotent read-only.
     """
     if enrollment is None:
         return False
-    holder = getattr(enrollment, "client", None)
-    if holder is not None and holder.lifecycle_stage == ClientStage.INELIGIBLE:
-        return True
-    return enrollment.member_profiles.filter(
+    # At least one member whose client is NOT ineligible -> there is someone to
+    # serve, so the program may be resumed (ineligible members stay paused).
+    eligible_member_exists = enrollment.member_profiles.exclude(
         client__lifecycle_stage=ClientStage.INELIGIBLE
     ).exists()
+    if eligible_member_exists:
+        return False
+    holder = getattr(enrollment, "client", None)
+    return holder is not None and holder.lifecycle_stage == ClientStage.INELIGIBLE
 
 
 # Message shown when a program-tab write action is rejected because the
@@ -292,6 +299,32 @@ def _program_locked_response():
         {"error": _PROGRAM_LOCKED_MESSAGE},
         status=http.HTTP_400_BAD_REQUEST,
     )
+
+
+def _prior_enrollment_chain(enrollment, limit=25):
+    """Walk the supersession chain of ``enrollment`` (enr.supersedes, then its
+    supersedes, ...) and return a newest-first list of the older, replaced
+    enrollments. Each entry carries the display fields the Program tab needs to
+    render a read-only accordion (with its own history sub-tab)."""
+    chain = []
+    seen = set()
+    cur = enrollment.supersedes if enrollment else None
+    while cur is not None and cur.pk not in seen and len(chain) < limit:
+        seen.add(cur.pk)
+        case = cur.case
+        chain.append({
+            "id": cur.pk,
+            "code": cur.code,
+            "stage": cur.stage,
+            "case_id": str(case.case_id) if case else None,
+            "program_name": cur.program_name or "",
+            "service_type": cur.service_type or "",
+            "kitchen_name": cur.kitchen.name if cur.kitchen_id else "",
+            "close_reason": cur.close_reason or "",
+            "verified_at": cur.verified_at.isoformat() if cur.verified_at else None,
+        })
+        cur = cur.supersedes
+    return chain
 
 
 def _resume_household_after_range(enrollment):
@@ -2673,6 +2706,22 @@ class MemberOrdersView(PortalGenericAPIView):
             .distinct()
             .prefetch_related("delivery_orders", "kitchen", "delivery_company")
         )
+        # Optional ?enrollment=<id> scopes orders to a SPECIFIC (superseded)
+        # enrollment. DeliveryOrders aren't enrollment-linked, so scope by that
+        # enrollment's delivery window (its plan's start/end dates) -- the orders
+        # delivered while that enrollment was the active program.
+        override = (request.query_params.get("enrollment") or "").strip()
+        if override:
+            window = MemberDeliverySchedule.objects.filter(
+                enrollment_id=override
+            ).aggregate(start=Min("starts_on"), end=Max("ends_on"))
+            start, end = window.get("start"), window.get("end")
+            if start:
+                qs = qs.filter(delivery_orders__expected_delivery_date__gte=start)
+            if end:
+                qs = qs.filter(delivery_orders__expected_delivery_date__lte=end)
+            if not start and not end:
+                qs = qs.none()
         status_val = (request.query_params.get("status") or "").strip()
         if status_val and status_val.lower() != "all":
             qs = qs.filter(status=status_val)
@@ -2684,21 +2733,45 @@ class MemberOrdersView(PortalGenericAPIView):
 
 
 class MemberHouseholdView(PortalAPIView):
-    """Household tab: address + per-member dietary, from the active enrollment."""
+    """Household tab: address + per-member dietary, from the active enrollment.
+
+    An optional ``?enrollment=<id>`` query param scopes the response to a
+    SPECIFIC (e.g. superseded/closed) enrollment of the client instead of the
+    active one -- used to show a prior enrollment's tab read-only. The enrollment
+    must belong to the client. The response carries ``read_only=True`` in that
+    case so the frontend disables every write control.
+    """
 
     def _enrollment(self, client_id):
         client = get_object_or_404(Client, pk=client_id)
+        override = None
+        req = getattr(self, "request", None)
+        if req is not None:
+            override = (req.query_params.get("enrollment") or "").strip()
+        if override:
+            return get_object_or_404(
+                EnrollmentVerification, pk=override, client_id=client_id
+            )
         return s.active_enrollment(client)
+
+    def _is_scoped_override(self, client_id, enr):
+        """True when the response is scoped to a non-active enrollment (read-only)."""
+        client = get_object_or_404(Client, pk=client_id)
+        active = s.active_enrollment(client)
+        return enr is not None and active is not None and enr.pk != active.pk
 
     def get(self, request, client_id):
         enr = self._enrollment(client_id)
         if enr is None:
             return Response({"enrollment": None, "address": None, "members": []})
+        read_only = self._is_scoped_override(client_id, enr)
         # Heal any drift between the household roster and this enrollment's
         # per-member profiles, so members tied via the extension picker (which
         # only writes a HouseholdMember row) appear here with dietary/menu/status
-        # and share the enrollment's address/service. Idempotent.
-        sync_household_members(enr.client, enrollment=enr)
+        # and share the enrollment's address/service. Idempotent. Skipped for a
+        # read-only scoped (superseded) enrollment -- never mutate history.
+        if not read_only:
+            sync_household_members(enr.client, enrollment=enr)
         members = enr.member_profiles.select_related(
             "client__household_membership"
         ).all()
@@ -2807,7 +2880,26 @@ class MemberHouseholdView(PortalAPIView):
                     "cadence": cadence,
                     "cadence_label": (cadence_row.label if cadence_row else "") or cadence,
                     "cadence_options": cadence_options_for_kind(kind),
+                    "supersedes": {
+                        "id": enr.supersedes_id,
+                        "case_id": str(enr.supersedes.case.case_id) if enr.supersedes and enr.supersedes.case else None,
+                        "program_name": enr.supersedes.program_name or "",
+                        "stage": enr.supersedes.stage if enr.supersedes else None,
+                    } if enr.supersedes else None,
+                    # Full supersession chain (this enrollment's older, replaced
+                    # enrollments from prior cases), newest first. Each is shown as
+                    # a read-only accordion on the Program tab with its own history.
+                    # Only the ACTIVE (non-scoped) response carries the chain -- a
+                    # scoped prior enrollment shows just its own tab.
+                    "prior_enrollments": [] if read_only else _prior_enrollment_chain(enr),
+                    # This enrollment's OWN case description (the new case on the
+                    # active program; the old case on a superseded one).
+                    "case_description": (enr.case.case_description or "") if enr.case else "",
+                    "case_id": str(enr.case.case_id) if enr.case else None,
                 },
+                # True when scoped to a superseded enrollment: the frontend hides
+                # every edit/action control and renders the tab read-only.
+                "read_only": read_only,
                 "address": {
                     "street": addr.street, "unit": addr.unit, "city": addr.city,
                     "state": addr.state, "zip": addr.zip,
@@ -2826,6 +2918,12 @@ class MemberHouseholdView(PortalAPIView):
             return Response(
                 {"error": "No active enrollment for this member."},
                 status=http.HTTP_404_NOT_FOUND,
+            )
+        # A superseded (read-only) enrollment is history -- refuse edits.
+        if self._is_scoped_override(client_id, enr):
+            return Response(
+                {"error": "This is a previous enrollment (read-only history)."},
+                status=http.HTTP_400_BAD_REQUEST,
             )
         # Program-tab guard: a closed program (no open internal-service case) is
         # frozen -- refuse every write action.
@@ -2938,295 +3036,6 @@ class MemberWarningsView(PortalAPIView):
         ]})
 
 
-class MemberProductTypeView(PortalAPIView):
-    """POST /members/<client_id>/product-type/ — reconcile a household's
-    meals/boxes kind from the Programs tab when the VERIFIED kind diverges from
-    the governing case (a case mismatch).
-
-    A meals<->boxes switch invalidates the current kitchen + delivery calendar
-    (they're for the OLD product), so this:
-      1. stores a per-household override on the enrollment (resolver honors it
-         first), so THIS household's kind is corrected immediately -- the
-         governing case is NEVER changed;
-      2. stops all future deliveries, clears the kitchen + cadence, and requeues
-         the enrollment to Kitchen Assignment so a NEW kitchen + cadence + fresh
-         delivery calendar are chosen for the new kind (the SAME requeue the
-         governing-case-driven switch performs); and
-      3. logs a 'Product Type Changed' timeline event + a client note.
-
-    Only reconcilable on a mismatch; the governing case's kind stays the
-    source-driven baseline.
-    """
-
-    def post(self, request, client_id):
-        client = get_object_or_404(Client, pk=client_id)
-        enr = s.active_enrollment(client)
-        if enr is None:
-            return Response(
-                {"error": "No active enrollment for this member."},
-                status=http.HTTP_404_NOT_FOUND,
-            )
-        # Program-tab guard: a closed program is frozen -- no type changes.
-        if _program_locked(enr):
-            return _program_locked_response()
-        raw = (request.data.get("product_type") or "").strip().lower()
-        try:
-            kind = ProductTypeKind(raw)
-        except ValueError:
-            return Response(
-                {"error": "product_type must be 'meals' or 'boxes'."},
-                status=http.HTTP_400_BAD_REQUEST,
-            )
-        product_type = ProductType.objects.filter(type=kind).first()
-        if product_type is None:
-            return Response(
-                {"error": f"No {kind.label} product type is configured."},
-                status=http.HTTP_400_BAD_REQUEST,
-            )
-
-        # Governing case product kind is the immutable baseline (derived from the
-        # case/program name). The enrollment carries the VERIFIED product kind
-        # (product_type_override). Only reconcilable on a MISMATCH between them --
-        # the governing case is never changed here.
-        gov_kind = detected_product_kind_for_enrollment(enr)
-        verified_kind = product_kind_for_enrollment(enr)
-        is_mismatch = (
-            gov_kind is not None
-            and verified_kind is not None
-            and gov_kind != verified_kind
-        )
-        if not is_mismatch:
-            gov_label = gov_kind.label if gov_kind else "Unknown"
-            return Response(
-                {"error": (
-                    f"This enrollment's product type already matches the governing "
-                    f"case ({gov_label}); there's nothing to switch."
-                )},
-                status=http.HTTP_400_BAD_REQUEST,
-            )
-        previous_kind = verified_kind
-        previous_label = verified_kind.label if verified_kind else "Unknown"
-        # The requested value must actually change the enrollment's kind.
-        if verified_kind == kind:
-            return Response(
-                {"error": f"Product type is already {kind.label}."},
-                status=http.HTTP_400_BAD_REQUEST,
-            )
-
-        agent = current_agent(request)
-        actor = _agent_actor(agent)
-        actor_label = agent.name if agent else ""
-        # StageEvent note stamped on the requeue so the Kitchen Assignment move is
-        # attributable to THIS manual meals<->boxes correction.
-        switch_note = (
-            f"Requeued for kitchen assignment: product switched from "
-            f"{previous_label} to {kind.label} on the Programs tab."
-        )
-        with transaction.atomic():
-            # Per-household override (resolver honors this first). Stores the
-            # reconciled product kind on the ENROLLMENT; the governing case is
-            # NEVER changed -- it stays the source-driven baseline.
-            enr.product_type_override = product_type
-            enr.save(update_fields=["product_type_override"])
-            # A meals<->boxes switch invalidates the current kitchen + delivery
-            # calendar (they're for the OLD product). Stop all future deliveries,
-            # clear the kitchen + cadence, and requeue to Kitchen Assignment so a
-            # NEW kitchen + cadence + calendar are chosen for the new kind -- the
-            # SAME requeue the governing-case-driven switch performs.
-            requeued = False
-            try:
-                # advance_enrollment stamps StageEvent.actor (a User FK); an agent
-                # is NOT a User, so pass actor=None and carry the agent name in
-                # actor_label (stored in the StageEvent metadata), matching the
-                # governing-case-driven switch path.
-                requeued = requeue_enrollment_for_product_switch(
-                    enr, actor=None, actor_label=actor_label, note=switch_note,
-                )
-            except Exception:  # never let the requeue break the correction
-                logger.exception(
-                    "requeue_enrollment_for_product_switch failed after "
-                    "product-type change for enrollment %s", enr.pk,
-                )
-            # Timeline event + client note.
-            try:
-                timeline.event_for_product_type_changed(
-                    enr, previous_label=previous_label, new_label=kind.label,
-                    actor=actor,
-                )
-            except Exception:  # never let history-logging break the correction
-                pass
-            try:
-                requeue_sentence = (
-                    " Future deliveries were stopped and the household was "
-                    "requeued for a new kitchen assignment (new kitchen + cadence "
-                    "required)."
-                    if requeued else ""
-                )
-                Note.objects.create(
-                    client=client, source=NoteSource.SYSTEM,
-                    author_name=actor_label,
-                    body=(
-                        f"Product type corrected from {previous_label} to "
-                        f"{kind.label} on the Programs tab.{requeue_sentence}"
-                    ),
-                )
-            except Exception:  # never let note-writing break the correction
-                pass
-
-        # Re-evaluate the household's warning snapshot so a stale
-        # "Conflicting product types" flag (now moot -- the household is verified
-        # and its kind is reconciled) is RESOLVED immediately instead of
-        # lingering until the next sweep.
-        try:
-            sync_household_warnings(enr)
-        except Exception:  # never let warning-sync break the correction
-            pass
-
-        return Response({
-            "product_type": kind.value,
-            "product_type_label": kind.label,
-            "previous": previous_label,
-            "requeued": requeued,
-            "stage": enr.stage,
-        })
-
-
-class MemberHouseholdTypeView(PortalAPIView):
-    """POST /members/<client_id>/household-type/ — correct a household's
-    Household/Individual scope from the Household tab.
-
-    Scope is normally derived onto the governing internal-service case from its
-    program name; when that detection is wrong an agent picks the right scope
-    here. This stores a per-household override on the enrollment (readers honor
-    it first) and re-points the governing case's ``household_type`` so other case
-    reads agree, then logs a client note.
-    """
-
-    def post(self, request, client_id):
-        client = get_object_or_404(Client, pk=client_id)
-        enr = s.active_enrollment(client)
-        if enr is None:
-            return Response(
-                {"error": "No active enrollment for this member."},
-                status=http.HTTP_404_NOT_FOUND,
-            )
-        # Program-tab guard: a closed program is frozen -- no scope changes.
-        if _program_locked(enr):
-            return _program_locked_response()
-        raw = (request.data.get("household_type") or "").strip().lower()
-        try:
-            scope = CaseHouseholdType(raw)
-        except ValueError:
-            return Response(
-                {"error": "household_type must be 'individual' or 'household'."},
-                status=http.HTTP_400_BAD_REQUEST,
-            )
-
-        from ..serializers import derive_household_type
-
-        gov = governing_internal_case(enr) or enr.case
-        # The governing case's scope is the immutable baseline -- derived LIVE
-        # from its program name (driven by the source case), never the stored
-        # household_type cache. The enrollment carries the VERIFIED scope.
-        gov_scope = (
-            derive_household_type(None, getattr(gov, "program_name", ""))
-            if gov is not None else CaseHouseholdType.INDIVIDUAL
-        )
-        current = (enr.household_type_override or "") or gov_scope
-        current_label = CaseHouseholdType(current).label
-        gov_label = CaseHouseholdType(gov_scope).label
-
-        # Only reconcilable on a CASE MISMATCH: the enrollment's verified scope
-        # must differ from the governing case's scope. When they already agree
-        # there is nothing to switch (the governing case is never changed here).
-        if gov_scope == current:
-            return Response(
-                {"error": (
-                    f"This enrollment's scope already matches the governing case "
-                    f"({gov_label}); there's nothing to switch."
-                )},
-                status=http.HTTP_400_BAD_REQUEST,
-            )
-        # The requested value must actually change the enrollment's scope.
-        if scope.value == current:
-            return Response(
-                {"error": f"Household scope is already {current_label}."},
-                status=http.HTTP_400_BAD_REQUEST,
-            )
-        new_effective = scope.value
-        new_label = CaseHouseholdType(new_effective).label
-        previous_label = current_label
-
-        agent = current_agent(request)
-        actor = _agent_actor(agent)
-        with transaction.atomic():
-            # Store the reconciled scope on the ENROLLMENT (its verified scope).
-            # The governing case's household_type is deliberately LEFT ALONE so it
-            # stays the authoritative, source-driven baseline.
-            enr.household_type_override = new_effective
-            enr.save(update_fields=["household_type_override"])
-            # Reconciling the scope on the Programs tab IS the Customer Service
-            # review a Case Mismatch flag was waiting on, so auto-dismiss any OPEN
-            # flag for this household + un-pin its members. MUST run BEFORE the
-            # roster effects below so an Individual->Household resume can un-pause
-            # the now-unpinned members (the resume skips still-CS-pinned ones).
-            try:
-                from ..services.lifecycle import dismiss_case_mismatch_flags_for_household
-
-                dismiss_case_mismatch_flags_for_household(
-                    enr, dismissed_by=(agent.name if agent else ""),
-                    reason="Reconciled from the Programs tab (household scope switch).",
-                )
-            except Exception:  # never let flag-dismissal break the correction
-                logger.exception(
-                    "case-mismatch auto-dismiss failed for client %s", client.pk
-                )
-            # Roster + delivery side effects:
-            #    - Household -> Individual: pause every non-primary member and
-            #      drop them from future deliveries.
-            #    - Individual -> Household: un-pause the (non-CS-pinned)
-            #      additional members and rebuild the calendar so they get
-            #      service on the next PO on the primary's cadence.
-            try:
-                from ..services.lifecycle import apply_manual_scope_switch_effects
-
-                affected = apply_manual_scope_switch_effects(
-                    client, new_effective,
-                    actor=actor, actor_label=(agent.name if agent else ""),
-                )
-            except Exception:  # never let the roster heal break the correction
-                logger.exception(
-                    "scope-switch side effects failed for client %s", client.pk,
-                )
-                affected = 0
-            # 4. Client note.
-            try:
-                Note.objects.create(
-                    client=client, source=NoteSource.SYSTEM,
-                    author_name=agent.name if agent else "",
-                    body=(
-                        f"Household scope corrected from {previous_label} to "
-                        f"{new_label}."
-                    ),
-                )
-            except Exception:  # never let note-writing break the correction
-                pass
-
-        # Re-evaluate the household's warning snapshot after the scope switch so
-        # any household-scope warning that is now resolved clears immediately.
-        try:
-            sync_household_warnings(enr)
-        except Exception:  # never let warning-sync break the correction
-            pass
-
-        return Response({
-            "household_type": new_effective,
-            "household_type_label": new_label,
-            "previous": previous_label,
-            "members_affected": affected,
-        })
-
-
 class MemberHouseholdSearchView(PortalAPIView):
     """Search existing clients (by client ID or Medicaid/insurance member ID) to
     add to this member's household. Mirrors the extension's client picker."""
@@ -3299,6 +3108,44 @@ class MemberInternalCaseDescriptionsView(PortalAPIView):
             }
             for c in cases
         ])
+
+
+class MemberMobileNumberView(PortalAPIView):
+    """Add / edit one household member's mobile number on the ACTIVE enrollment
+    (the Contacts tab on the program accordion).
+
+    The number is stored on the member's ``MemberDietaryProfile`` (so it is part
+    of the verification record and carries across a governing-case replacement)
+    and mirrored to ``HouseholdMember.mobile_app_username`` (Benefully app login).
+    A blank number is allowed for a DEPENDENT but rejected for the PRIMARY member.
+    """
+
+    def patch(self, request, client_id, member_id):
+        client = get_object_or_404(Client, pk=client_id)
+        enr = s.active_enrollment(client)
+        if enr is None:
+            return Response(
+                {"error": "No active enrollment for this member."},
+                status=http.HTTP_404_NOT_FOUND,
+            )
+        if _program_locked(enr):
+            return _program_locked_response()
+        mv = get_object_or_404(MemberDietaryProfile, pk=member_id, enrollment=enr)
+        number = (request.data.get("mobile_number") or "").strip()
+        # The primary member (the enrollment's own client) must keep a number.
+        if not number and mv.client_id and str(mv.client_id) == str(client.pk):
+            return Response(
+                {"mobile_number": "A mobile number is required for the primary member."},
+                status=http.HTTP_400_BAD_REQUEST,
+            )
+        mv.mobile_number = number
+        mv.save(update_fields=["mobile_number", "updated_at"])
+        # Keep the app-login mirror in step for members mapped to a real client.
+        if mv.client_id:
+            HouseholdMember.objects.filter(client_id=mv.client_id).update(
+                mobile_app_username=number,
+            )
+        return Response(s.MemberDetailSerializer(client).data)
 
 
 def _promote_removed_member_to_own_household(
@@ -3937,6 +3784,43 @@ class MemberServiceResumeView(PortalAPIView):
             )
         except InvalidTransition as exc:
             return Response({"error": str(exc)}, status=http.HTTP_400_BAD_REQUEST)
+        # Make the resumed household deliverable again -- flipping the enrollment
+        # stage back is NOT enough. A cancel/hold can (a) exclude member profiles
+        # (INACTIVE), (b) cancel their delivery PLANS, and (c) truncate the plan
+        # WINDOW. So, in order:
+        #   1. Return each excluded member to service (skipping a manual pause and
+        #      an eligibility pause -- those are lifted explicitly).
+        #   2. Reactivate any cancelled delivery plans so the calendar can expand.
+        #   3. Recompute the plan from the GOVERNING case -- which re-derives the
+        #      delivery window from that case's status + authorization window (no
+        #      future window => no future deliveries, correctly) -- and rebuild the
+        #      dated calendar.
+        # Depends entirely on the governing case + auth window, so a member is
+        # only made deliverable when their case actually authorizes future service.
+        # Best-effort: never fail the resume on it.
+        if enr.stage == EnrollmentStage.SERVICE_ACTIVE:
+            try:
+                from ..models import ScheduleStatus
+                from ..services.meal_rules import reconcile_member_kitchen_output
+                from ..services.orders import recompute_delivery_plan
+
+                for mv in enr.member_profiles.all():
+                    if mv.eligibility_paused or mv.status != MemberStatus.INACTIVE:
+                        continue
+                    reconcile_member_kitchen_output(
+                        mv, kitchen=enr.kitchen, allow_resume=True, save=True,
+                    )
+                enr.delivery_schedules.filter(
+                    status=ScheduleStatus.CANCELLED
+                ).update(status=ScheduleStatus.SCHEDULED)
+                # Re-derive the plan window from the governing authorization + sync
+                # the calendar (falls back to a plain sync when there is no plan).
+                recompute_delivery_plan(enr)
+                rebuild_delivery_calendar(enr)
+            except Exception:  # pragma: no cover - defensive
+                logger.exception(
+                    "resume calendar rebuild failed for enrollment %s", enr.pk
+                )
         Note.objects.create(
             client=client, source=NoteSource.AGENT, author_name=author,
             body=f"Service resumed.{suffix}",
@@ -4300,6 +4184,23 @@ class MemberVerificationCreateView(PortalAPIView):
             deduped_members.append(m)
         data["members"] = deduped_members
 
+        # A mobile number is REQUIRED for the primary member (the household's
+        # point of contact); dependents are optional. The primary is the member
+        # whose client_id is this client (or the first row when unmapped).
+        def _is_primary_row(m, idx):
+            cid = m.get("client_id")
+            return (str(cid) == str(client.pk)) if cid else (idx == 0)
+
+        primary_row = next(
+            (m for i, m in enumerate(data["members"]) if _is_primary_row(m, i)),
+            (data["members"][0] if data["members"] else None),
+        )
+        if primary_row is not None and not (primary_row.get("mobile_number") or "").strip():
+            return Response(
+                {"mobile_number": "A mobile number is required for the primary member."},
+                status=http.HTTP_400_BAD_REQUEST,
+            )
+
         # Delivery address (shared by the household). Unit/apt is stored in its
         # own field so the kitchen + delivery label can show it distinctly.
         address = Address.objects.create(
@@ -4367,6 +4268,7 @@ class MemberVerificationCreateView(PortalAPIView):
                     )
                 ),
                 general_verification_notes=m.get("notes", ""),
+                mobile_number=(m.get("mobile_number") or "").strip(),
             )
 
             # Wire the member's mobile-app login number onto their HouseholdMember

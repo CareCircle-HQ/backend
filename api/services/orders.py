@@ -627,9 +627,41 @@ def rebuild_delivery_calendar(enrollment, from_date=None):
     auto-heal when a member is activated. Returns the sync result dict
     ``{added, removed, updated}`` plus ``plans_created``.
     """
-    from api.services.delivery import ensure_member_delivery_schedules
+    from api.services.delivery import (
+        create_member_delivery_schedules,
+        current_household_cadence,
+        ensure_member_delivery_schedules,
+    )
 
-    created = ensure_member_delivery_schedules(enrollment)
+    # A carried-over enrollment (superseded a prior one and kept its kitchen) has
+    # a kitchen but NO delivery plan yet -- it skipped kitchen assignment, which
+    # is what normally creates the first plan. ensure_member_delivery_schedules
+    # only snapshots from an EXISTING plan, so it is a no-op here. Bootstrap the
+    # first plan from the superseded enrollment's cadence so the manual "Rebuild
+    # calendar" action (and any auto-rebuild) works for the new case.
+    created = []
+    if enrollment.kitchen_id and not enrollment.delivery_schedules.exists():
+        prior = enrollment.supersedes
+        cadence = current_household_cadence(prior) if prior else ""
+        if cadence:
+            from api.models import DeliveryCadence
+            from api.services.catalog import product_kind_for_enrollment
+
+            once_weekday = None
+            if cadence == DeliveryCadence.ONCE_A_WEEK.value:
+                wds = enrollment.delivery_weekdays or []
+                once_weekday = wds[0] if wds else None
+            created = create_member_delivery_schedules(
+                enrollment,
+                case=enrollment.case,
+                cadence=cadence,
+                once_a_week_weekday=once_weekday,
+                kitchen=enrollment.kitchen,
+                product_kind=product_kind_for_enrollment(enrollment),
+            )
+
+    if not created:
+        created = ensure_member_delivery_schedules(enrollment)
     result = sync_delivery_calendar(enrollment, from_date=from_date)
     result["plans_created"] = len(created)
     return result

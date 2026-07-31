@@ -1071,6 +1071,7 @@ def event_for_member_governing_case_changed(
     subtitle = f"{previous_case_id} \u2192 {new_case_id} \u00b7 {prog}"
     if reason:
         subtitle = f"{subtitle} \u00b7 {reason}"
+    # Defensively fit the display columns (subtitle max_length=255).
     subtitle = subtitle[:255]
     return emit_timeline_event(
         client=client,
