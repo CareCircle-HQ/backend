@@ -26,6 +26,7 @@ from collections import Counter
 from datetime import timedelta
 
 from django.core.management.base import BaseCommand
+from django.db import transaction
 from django.utils import timezone
 
 from api.models import (
@@ -34,7 +35,6 @@ from api.models import (
     ServiceAuthorizationStatus,
 )
 from api.services.lifecycle import (
-    InvalidTransition,
     _CLOSED_CASE_STATUSES,
     _DENIED_EQUIVALENT_STATUSES,
     advance_enrollment,
@@ -48,6 +48,34 @@ _APPROVED = {
 _ACTOR_LABEL = "system:cancelled-reconcile"
 
 
+# Stages that OCCUPY a case for the uniq_enrollment_verification_per_case
+# constraint (i.e. NOT excluded). Reviving a cancelled enrollment INTO one of
+# these on a case that already has such an enrollment would collide.
+_LIVE_STAGES = [
+    EnrollmentStage.PENDING_VALIDATION,
+    EnrollmentStage.VALIDATED,
+    EnrollmentStage.PENDING_VERIFICATION,
+    EnrollmentStage.VERIFIED,
+    EnrollmentStage.KITCHEN_ASSIGNMENT,
+    EnrollmentStage.SERVICE_ACTIVE,
+    EnrollmentStage.ON_HOLD,
+    EnrollmentStage.SERVICE_COMPLETE,
+]
+
+
+def _case_has_other_live_enrollment(enr):
+    """True when this enrollment's case already has ANOTHER non-excluded (live)
+    enrollment -- reviving this cancelled row to On Hold would violate the
+    per-case unique constraint, so it is really a duplicate to close instead."""
+    if not enr.case_id:
+        return False  # NULL case is unconstrained
+    return (
+        EnrollmentVerification.objects.filter(case_id=enr.case_id, stage__in=_LIVE_STAGES)
+        .exclude(pk=enr.pk)
+        .exists()
+    )
+
+
 def _decide(enr):
     """Return ``(target_stage, reason)`` for a cancelled enrollment based on its
     governing internal-service case + authorization."""
@@ -57,12 +85,18 @@ def _decide(enr):
     if gov.case_status in _CLOSED_CASE_STATUSES:
         return EnrollmentStage.CLOSED, "governing case closed/cancelled"
     auth = gov.service_authorization_status
-    if auth in _APPROVED:
-        return EnrollmentStage.ON_HOLD, "governing case open + authorization approved"
     if auth in _DENIED_EQUIVALENT_STATUSES:
         return EnrollmentStage.CLOSED, "governing case open + authorization denied"
-    # Open but not yet approved (pending / blank): reversible wait.
-    return EnrollmentStage.ON_HOLD, "governing case open + awaiting authorization"
+    if auth in _APPROVED:
+        target, reason = EnrollmentStage.ON_HOLD, "governing case open + authorization approved"
+    else:
+        # Open but not yet approved (pending / blank): reversible wait.
+        target, reason = EnrollmentStage.ON_HOLD, "governing case open + awaiting authorization"
+    # A revive-to-On-Hold collides if the case already has a live enrollment
+    # (the real active one). This cancelled row is a duplicate -> close it.
+    if target == EnrollmentStage.ON_HOLD and _case_has_other_live_enrollment(enr):
+        return EnrollmentStage.CLOSED, "duplicate: case already has a live enrollment"
+    return target, reason
 
 
 class Command(BaseCommand):
@@ -112,13 +146,18 @@ class Command(BaseCommand):
             if not apply:
                 continue
             note = f"Cancelled reconcile -> {target}: {reason}."
+            # Own transaction per row so one failure rolls back only that row and
+            # the run keeps going (a DB IntegrityError otherwise aborts the loop).
             try:
-                advance_enrollment(
-                    enr, target, force=True,
-                    actor_label=_ACTOR_LABEL, note=note,
-                )
-            except InvalidTransition as exc:
+                with transaction.atomic():
+                    advance_enrollment(
+                        enr, target, force=True,
+                        actor_label=_ACTOR_LABEL, note=note,
+                    )
+            except Exception as exc:  # noqa: BLE001 - isolate + report, never abort the run
                 errors += 1
+                buckets[f"{target} :: {reason}"] -= 1
+                buckets[f"ERROR :: {type(exc).__name__}"] += 1
                 self.stderr.write(f"  SKIP enr {enr.pk} (client {enr.client_id}): {exc}")
 
         self.stdout.write("")
