@@ -1747,13 +1747,14 @@ class PortalHouseholdMemberSerializer(serializers.ModelSerializer):
     client_id = serializers.SerializerMethodField()
     name = serializers.SerializerMethodField()
     mobile_number = serializers.SerializerMethodField()
+    mobile_number_suggested = serializers.SerializerMethodField()
     status_label = serializers.CharField(source="get_status_display", read_only=True)
     is_primary = serializers.SerializerMethodField()
 
     class Meta:
         model = MemberDietaryProfile
         fields = [
-            "id", "client_id", "name", "mobile_number",
+            "id", "client_id", "name", "mobile_number", "mobile_number_suggested",
             "dietary_restrictions", "food_allergies", "other_dietary_restrictions",
             "meal_category", "menu_type", "general_verification_notes",
             "status", "status_label", "kitchen_meal_type", "kitchen_food_notes",
@@ -1772,9 +1773,28 @@ class PortalHouseholdMemberSerializer(serializers.ModelSerializer):
         return obj.member_name or (_full_name(obj.client) if obj.client else "")
 
     def get_mobile_number(self, obj):
-        # The member-app login number lives on the member's HouseholdMember row.
-        membership = getattr(obj.client, "household_membership", None) if obj.client_id else None
-        return (getattr(membership, "mobile_app_username", "") or "")
+        # The number CAPTURED during verification (stored on this enrollment's
+        # profile) -- the source of truth shown on the Contacts tab. NO fallback
+        # to the member/client profile here: the enrollment record is what we
+        # verified and what carries across cases.
+        return obj.mobile_number or ""
+
+    def get_mobile_number_suggested(self, obj):
+        # A best-guess existing number used ONLY to AUTO-FILL the verification
+        # pop-up (never shown on the Contacts tab): the member-app login number
+        # (HouseholdMember), else the client's primary phone (e.g. a Unite Us
+        # imported number).
+        client = obj.client if obj.client_id else None
+        membership = getattr(client, "household_membership", None) if client else None
+        app_number = getattr(membership, "mobile_app_username", "") or ""
+        if app_number:
+            return app_number
+        if client is not None and hasattr(client, "phones"):
+            phones = list(client.phones.all())
+            if phones:
+                primary = next((p for p in phones if p.is_primary), phones[0])
+                return primary.raw or primary.normalized or ""
+        return ""
 
 
 class PortalAddressEditSerializer(serializers.Serializer):

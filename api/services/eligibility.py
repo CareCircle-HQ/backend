@@ -277,53 +277,220 @@ def _coverage_held_enrollments(client):
 
 
 def _apply_coverage_hold(client, verdict, *, actor, author, today_str, source):
-    """Place the member on the RECOVERABLE coverage hold: truncate future
-    deliveries (always, so no PO leak) and, on the transition IN, pause the
-    household + write a member note and timeline event. Idempotent: re-imports of
-    an already-held member only re-truncate."""
+    """Place the member on the RECOVERABLE coverage hold. Pauses the affected
+    member(s) INDIVIDUALLY and drops them from the schedule (the whole household
+    is held only when it's the member's sole member); on the transition IN it also
+    records the household-level coverage timeline event. Idempotent."""
     from api.services import timeline
 
-    already = bool(_coverage_held_enrollments(client))
-    paused = _stop_future_deliveries(
-        client, to_hold=not already, note=_COVERAGE_HOLD_NOTE, actor=actor,
+    already = any(p.eligibility_paused for p in _live_member_profiles(client))
+    handled = _pause_members_for_eligibility(
+        client, verdict.hold_reasons, kind="coverage",
+        actor=actor, author=author, today_str=today_str,
     )
-    if already or not paused:
+    if not handled:
+        # No member profile to pause -> legacy whole-enrollment hold.
+        paused = _stop_future_deliveries(
+            client, to_hold=not already, note=_COVERAGE_HOLD_NOTE, actor=actor,
+        )
+        if not paused:
+            return
+    if already:
         return
-    reasons = "; ".join(verdict.hold_reasons) or "social care coverage expired/missing"
-    _write_client_system_note(
-        client,
-        (
-            f"Service paused on {today_str}: {reasons}. Reversible \u2014 renewed "
-            "social care coverage resumes service."
-        ),
-        author_name=author,
-    )
     timeline.event_for_member_coverage_hold(
         client, reasons=verdict.hold_reasons, source=source, actor=author,
     )
 
 
 def _clear_coverage_hold(client, *, actor, author, today_str, source):
-    """Reverse a coverage hold once coverage recovers: resume each coverage-held
-    enrollment to the stage it was held from, then write a recovery note +
-    timeline event. No-op when no coverage hold is active."""
+    """Reverse a coverage hold once coverage recovers: un-pause the member(s) that
+    were eligibility-paused, rebuild their schedule, and resume the program if the
+    all-paused hold had fired. Also reverses any legacy whole-enrollment coverage
+    hold. No-op when nothing is held."""
     from api.services import timeline
     from api.services.lifecycle import _resume_auto_paused_enrollment
 
-    held = _coverage_held_enrollments(client)
-    if not held:
-        return
-    for enr in held:
+    had_member_pause = any(p.eligibility_paused for p in _live_member_profiles(client))
+    _unpause_members_for_eligibility(
+        client, actor=actor, author=author, today_str=today_str,
+    )
+    # Legacy whole-enrollment coverage hold (no member profile path).
+    for enr in _coverage_held_enrollments(client):
         _resume_auto_paused_enrollment(
             enr, actor=actor, hold_note=_COVERAGE_HOLD_NOTE,
             resume_note=_COVERAGE_RESUME_NOTE,
         )
-    _write_client_system_note(
-        client,
-        f"Service resumed on {today_str}: social care coverage restored.",
-        author_name=author,
+        had_member_pause = True
+    if had_member_pause:
+        timeline.event_for_member_coverage_restored(client, source=source, actor=author)
+
+
+def _live_member_profiles(client):
+    """This client's dietary profiles on LIVE (non-terminal) enrollments."""
+    from api.models import EnrollmentStage, MemberDietaryProfile
+
+    terminal = [
+        EnrollmentStage.CLOSED, EnrollmentStage.CANCELLED, EnrollmentStage.DISREGARDED,
+    ]
+    return list(
+        MemberDietaryProfile.objects.filter(client=client)
+        .select_related("enrollment", "client")
+        .exclude(enrollment__stage__in=terminal)
     )
-    timeline.event_for_member_coverage_restored(client, source=source, actor=author)
+
+
+def _member_display_name(profile):
+    c = getattr(profile, "client", None)
+    name = f"{getattr(c, 'first_name', '')} {getattr(c, 'last_name', '')}".strip()
+    return name or (profile.member_name or "this member")
+
+
+def _pause_members_for_eligibility(client, reasons, *, kind, actor, author, today_str):
+    """Pause THIS client's household-member profile(s) for an eligibility problem
+    -- instead of holding the WHOLE household. For each live profile: mark the
+    member Paused (eligibility-driven), clear its kitchen result, drop them from
+    the delivery calendar (so no future PO includes them), and write a
+    self-descriptive SYSTEM note (WHY + WHAT changed/was discovered). The program
+    is placed On Hold ONLY when EVERY member ends up paused -- i.e. the member IS
+    the household -- via ``_reconcile_all_paused_hold``.
+
+    Idempotent: the note/timeline fire only on the transition into the pause.
+    Returns True when at least one profile was handled (False -> caller falls back
+    to the legacy whole-enrollment hold when the client has no member profile).
+    """
+    from api.models import MemberStatus, Note, NoteSource
+    from api.portal.views_members import _reconcile_all_paused_hold
+    from api.services import timeline
+    from api.services.orders import sync_delivery_calendar
+
+    profiles = _live_member_profiles(client)
+    if not profiles:
+        return False
+    reason_text = "; ".join(reasons) or (
+        "ineligible" if kind == "ineligible" else "social care coverage expired/missing"
+    )
+    for mv in profiles:
+        enr = mv.enrollment
+        newly = not (mv.status == MemberStatus.PAUSED and mv.eligibility_paused)
+        if newly:
+            mv.status = MemberStatus.PAUSED
+            mv.eligibility_paused = True
+            mv.kitchen_meal_type = ""
+            mv.kitchen_food_notes = ""
+            mv.save(update_fields=[
+                "status", "eligibility_paused", "kitchen_meal_type",
+                "kitchen_food_notes", "status_changed_at", "updated_at",
+            ])
+        # Paused members are excluded from the schedule; resync drops their future
+        # (non-batched) occurrences so they leave the next Purchase Order.
+        try:
+            sync_delivery_calendar(enr)
+        except Exception:  # pragma: no cover - defensive
+            pass
+        if newly:
+            name = _member_display_name(mv)
+            if kind == "ineligible":
+                body = (
+                    f"Paused {name} on {today_str} and removed them from the delivery "
+                    f"schedule. Why: marked Ineligible by the import -- {reason_text}. "
+                    "They are excluded from future Purchase Orders. This can't be fixed "
+                    "in the CRM -- the Unite Us case must be closed by an agent; service "
+                    "resumes automatically if the data later passes."
+                )
+            else:
+                body = (
+                    f"Paused {name} on {today_str} and removed them from the delivery "
+                    f"schedule. Why: {reason_text}. They are excluded from future "
+                    "Purchase Orders. Reversible -- renewed coverage resumes this member."
+                )
+            if mv.client_id:
+                Note.objects.create(
+                    client=mv.client, source=NoteSource.SYSTEM,
+                    author_name=author, body=body,
+                )
+            try:
+                timeline.event_for_member_paused(
+                    mv, enrollment=enr, reason=reason_text, actor=author,
+                )
+            except Exception:  # pragma: no cover - defensive
+                pass
+        # Roll up to a PROGRAM hold only when every member is now paused.
+        try:
+            _reconcile_all_paused_hold(enr)
+        except Exception:  # pragma: no cover - defensive
+            pass
+        # If some members remain servable, resume any STALE legacy whole-household
+        # eligibility/coverage hold (from the old behavior, or a prior all-paused
+        # state) so the rest of the household keeps serving. Note-scoped no-op
+        # otherwise.
+        profiles_all = list(enr.member_profiles.all())
+        all_paused = bool(profiles_all) and all(
+            p.status == MemberStatus.PAUSED for p in profiles_all
+        )
+        if not all_paused:
+            from api.services.lifecycle import _resume_auto_paused_enrollment
+
+            _resume_auto_paused_enrollment(
+                enr, actor=actor, hold_note=_INELIGIBLE_HOLD_NOTE,
+                resume_note=(
+                    "Auto-resumed: only the ineligible member is paused; the rest "
+                    "of the household continues service."
+                ),
+            )
+            _resume_auto_paused_enrollment(
+                enr, actor=actor, hold_note=_COVERAGE_HOLD_NOTE,
+                resume_note=_COVERAGE_RESUME_NOTE,
+            )
+    return True
+
+
+def _unpause_members_for_eligibility(client, *, actor, author, today_str):
+    """Reverse an eligibility-driven member pause once the member passes the gates
+    again: return the member(s) to Active, rebuild their delivery plan, write a
+    recovery SYSTEM note (why + what changed), and resume the program if the
+    all-paused hold had fired. No-op when the client has no eligibility-paused
+    profiles."""
+    from api.models import MemberStatus, Note, NoteSource
+    from api.portal.views_members import _reconcile_all_paused_hold
+    from api.services import timeline
+    from api.services.orders import rebuild_delivery_calendar
+
+    profiles = [p for p in _live_member_profiles(client) if p.eligibility_paused]
+    if not profiles:
+        return
+    for mv in profiles:
+        enr = mv.enrollment
+        mv.status = MemberStatus.ACTIVE
+        mv.eligibility_paused = False
+        mv.save(update_fields=[
+            "status", "eligibility_paused", "status_changed_at", "updated_at",
+        ])
+        # Resume the program first (if it was held because everyone was paused),
+        # then rebuild this member's plan + calendar so they rejoin the next PO.
+        try:
+            _reconcile_all_paused_hold(enr)
+        except Exception:  # pragma: no cover - defensive
+            pass
+        try:
+            rebuild_delivery_calendar(enr)
+        except Exception:  # pragma: no cover - defensive
+            pass
+        name = _member_display_name(mv)
+        body = (
+            f"Reactivated {name} on {today_str} and rebuilt their delivery schedule. "
+            "Why: the eligibility checks now pass, so they rejoin future Purchase Orders."
+        )
+        if mv.client_id:
+            Note.objects.create(
+                client=mv.client, source=NoteSource.SYSTEM,
+                author_name=author, body=body,
+            )
+        try:
+            timeline.event_for_member_unpaused(
+                mv, enrollment=enr, reason="eligibility restored", actor=author,
+            )
+        except Exception:  # pragma: no cover - defensive
+            pass
 
 
 def reconcile_client_eligibility(client, *, actor=None, actor_label="", source=None, today=None):
@@ -369,9 +536,15 @@ def reconcile_client_eligibility(client, *, actor=None, actor_label="", source=N
         if list(client.ineligible_reasons or []) != verdict.reasons:
             client.ineligible_reasons = verdict.reasons
             client.save(update_fields=["ineligible_reasons"])
-        # Always stop future deliveries (idempotent) so an ineligible member is
-        # excluded from every new PO, even across re-imports.
-        _stop_future_deliveries(client)
+        # Exclude the ineligible member from every future PO by pausing THEM
+        # individually (idempotent) and dropping them from the schedule -- the
+        # whole household is only held when this is its ONLY member. Falls back to
+        # the legacy whole-enrollment stop when the client has no member profile.
+        if not _pause_members_for_eligibility(
+            client, verdict.reasons, kind="ineligible",
+            actor=actor, author=author, today_str=today_str,
+        ):
+            _stop_future_deliveries(client)
         return ClientStage.INELIGIBLE
 
     # Not ineligible: recover a previously-ineligible member.
@@ -400,6 +573,12 @@ def reconcile_client_eligibility(client, *, actor=None, actor_label="", source=N
     else:
         _clear_coverage_hold(
             client, actor=actor, author=author, today_str=today_str, source=src,
+        )
+        # Also reverse any hard-ineligibility member pause once the member fully
+        # passes the gates (the client stage recovery above handles the CLIENT;
+        # this returns the paused member(s) to service).
+        _unpause_members_for_eligibility(
+            client, actor=actor, author=author, today_str=today_str,
         )
 
     return client.lifecycle_stage

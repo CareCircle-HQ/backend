@@ -1282,21 +1282,20 @@ class ProgramSwitchRequeueTest(TestCase):
 
         enr.refresh_from_db()
         client.refresh_from_db()
-        # Requeued to Kitchen Assignment with kitchen + cadence cleared, so a
-        # NEW kitchen assignment (kitchen + cadence + calendar) is required.
-        self.assertEqual(enr.stage, EnrollmentStage.KITCHEN_ASSIGNMENT)
-        self.assertIsNone(enr.kitchen_id)
-        self.assertEqual(enr.delivery_weekdays, [])
+        # The old meals enrollment is closed as read-only history; a new boxes
+        # enrollment is opened and requeued to Kitchen Assignment.
+        self.assertEqual(enr.stage, EnrollmentStage.CLOSED)
+        new = client.enrollments.exclude(
+            stage__in=[EnrollmentStage.CLOSED.value, EnrollmentStage.CANCELLED.value]
+        ).first()
+        self.assertIsNotNone(new)
+        self.assertEqual(new.supersedes_id, enr.pk)
+        self.assertEqual(new.stage, EnrollmentStage.KITCHEN_ASSIGNMENT)
+        self.assertIsNone(new.kitchen_id)
+        self.assertEqual(new.delivery_weekdays, [])
         # Governing pointer advanced to the boxes case.
         self.assertEqual(client.governing_internal_case_id, boxes)
-        # 'Program Switched' timeline event + primary system note.
-        ev = TimelineEvent.objects.filter(
-            client=client,
-            event_type=TimelineEventType.MEMBER_PROGRAM_SWITCHED,
-        )
-        self.assertEqual(ev.count(), 1)
-        self.assertEqual(ev.first().metadata["previous_case_id"], meals)
-        self.assertEqual(ev.first().metadata["new_case_id"], boxes)
+        # Primary system note records the replacement.
         self.assertTrue(
             Note.objects.filter(client=client, source=NoteSource.SYSTEM).exists()
         )
@@ -1304,7 +1303,9 @@ class ProgramSwitchRequeueTest(TestCase):
     def test_switch_is_idempotent_on_resave(self):
         from datetime import timedelta
 
-        from .models import EnrollmentStage, TimelineEvent, TimelineEventType
+        from .models import (
+            EnrollmentStage, EnrollmentVerification, TimelineEvent, TimelineEventType,
+        )
 
         client = self._client()
         self._enrollment(
@@ -1317,170 +1318,50 @@ class ProgramSwitchRequeueTest(TestCase):
             client, meals, "Medically Tailored Meals", now - timedelta(days=2)
         )
         self._save_case(client, boxes, "Food Box", now)
-        # Re-saving the (now governing) boxes case compares same-kind cases and
-        # must NOT re-fire the switch.
+        # Re-saving the (now governing) boxes case must NOT open another new
+        # enrollment.
         self._save_case(client, boxes, "Food Box", now)
         self.assertEqual(
-            TimelineEvent.objects.filter(
-                client=client,
-                event_type=TimelineEventType.MEMBER_PROGRAM_SWITCHED,
-            ).count(),
-            1,
+            EnrollmentVerification.objects.filter(client=client).count(),
+            2,  # original (closed) + replacement
         )
 
-    def test_import_switch_auto_sets_product_override_to_governing_kind(self):
-        # A household VERIFIED as MEALS (explicit product_type_override) whose
-        # governing case switches to BOXES: the import auto-points the override at
-        # BOXES (so the served kind follows the governing case) and requeues for a
-        # new kitchen assignment -- no manual Programs-tab step.
+    def test_import_switch_opens_new_boxes_enrollment(self):
+        # A household served as MEALS whose governing case switches to BOXES:
+        # the import closes the old enrollment and opens a new one bound to the
+        # boxes case -- no manual Programs-tab step.
         from datetime import timedelta
 
         from .models import (
-            EnrollmentStage, Kitchen, ProductType, ProductTypeKind,
+            EnrollmentStage, EnrollmentVerification, Kitchen,
         )
 
-        meals_pt = ProductType.objects.create(type=ProductTypeKind.MEALS)
-        boxes_pt = ProductType.objects.create(type=ProductTypeKind.BOXES)
         client = self._client()
         kitchen = Kitchen.objects.create(name="Meals Kitchen")
         enr = self._enrollment(
             client, EnrollmentStage.SERVICE_ACTIVE,
             kitchen=kitchen, weekdays=["mon", "thu"],
         )
-        enr.product_type_override = meals_pt
-        enr.save(update_fields=["product_type_override"])
         now = timezone.now()
-        # Meals governs first -> matches the override, so NO switch.
+        # Meals governs first; no change.
         self._save_case(
             client, str(uuid.uuid4()), "Medically Tailored Meals",
             now - timedelta(days=2),
         )
         enr.refresh_from_db()
-        self.assertEqual(enr.product_type_override_id, meals_pt.pk)
-        # A newer BOXES governing case -> auto-switch: override -> boxes, requeued.
+        self.assertEqual(enr.stage, EnrollmentStage.SERVICE_ACTIVE)
+        # A newer BOXES governing case closes the old enrollment and opens a new one.
         self._save_case(client, str(uuid.uuid4()), "Food Box", now)
         enr.refresh_from_db()
-        self.assertEqual(enr.product_type_override_id, boxes_pt.pk)
-        self.assertEqual(enr.stage, EnrollmentStage.KITCHEN_ASSIGNMENT)
-        self.assertIsNone(enr.kitchen_id)
-        self.assertEqual(enr.delivery_weekdays, [])
-
-
-class ProductTypeSwitchEndpointTest(TestCase):
-    """MemberProductTypeView: a manual meals<->boxes reconcile on the Programs
-    tab (only offered on a case mismatch) must requeue the household exactly
-    like the governing-case-driven switch -- stop future deliveries, clear the
-    kitchen + cadence, move to Kitchen Assignment -- and leave a client note.
-    Reconcilable ONLY when the verified kind diverges from the governing case."""
-
-    def _auth(self):
-        from rest_framework.test import APIClient
-        from rest_framework_simplejwt.tokens import AccessToken
-
-        agent = Agent.objects.create(
-            name="Prod Agent", agent_code="950", group="CS",
-        )
-        access = AccessToken()
-        access["agent_id"] = str(agent.id)
-        access["agent_code"] = agent.agent_code
-        access["agent_name"] = agent.name
-        access["agent_group"] = agent.group
-        api = APIClient()
-        api.credentials(HTTP_AUTHORIZATION=f"Bearer {access}")
-        return api
-
-    def _save_case(self, client, program_name):
-        from .serializers import CaseSerializer
-        from .services.lifecycle import deferred_internal_service_reconcile
-
-        ser = CaseSerializer(data={
-            "case_id": str(uuid.uuid4()),
-            "client_id": str(client.client_id),
-            "case_type": "internal_service",
-            "program_name": program_name,
-            "service_authorization_status": "approved",
-            "case_status": "open",
-            "date_opened": timezone.now().isoformat(),
-            "case_created_at": timezone.now().isoformat(),
-        })
-        ser.is_valid(raise_exception=True)
-        # Defer the per-save reconcile so the import-driven auto-fix does NOT
-        # pre-empt the manual endpoint under test: this leaves the verified-kind
-        # vs governing-case MISMATCH standing for the endpoint to reconcile.
-        with deferred_internal_service_reconcile():
-            return ser.save()
-
-    def _enrollment(self, client, *, override, kitchen=None, weekdays=None):
-        from .models import EnrollmentStage, EnrollmentVerification, Household, HouseholdMember
-
-        hh = Household.objects.create(name="HH")
-        HouseholdMember.objects.create(household=hh, client=client, is_primary=True)
-        return EnrollmentVerification.objects.create(
-            client=client, household=hh, stage=EnrollmentStage.SERVICE_ACTIVE,
-            verified_at=timezone.now(), kitchen=kitchen,
-            delivery_weekdays=weekdays or [], product_type_override=override,
-        )
-
-    def test_boxes_to_meals_switch_requeues_and_notes(self):
-        from .models import (
-            Client, EnrollmentStage, Kitchen, Note, NoteSource, ProductType,
-            ProductTypeKind,
-        )
-
-        meals_pt = ProductType.objects.create(type=ProductTypeKind.MEALS)
-        boxes_pt = ProductType.objects.create(type=ProductTypeKind.BOXES)
-        client = Client.objects.create(
-            client_id=str(uuid.uuid4()), first_name="Switch", last_name="Me",
-        )
-        kitchen = Kitchen.objects.create(name="Meals Kitchen")
-        # VERIFIED as boxes, but the governing case is a MEALS case -> mismatch.
-        enr = self._enrollment(
-            client, override=boxes_pt, kitchen=kitchen, weekdays=["mon", "thu"],
-        )
-        self._save_case(client, "Medically Tailored Meals")
-
-        resp = self._auth().post(
-            f"/api/portal/members/{client.client_id}/product-type/",
-            {"product_type": "meals"}, format="json",
-        )
-        self.assertEqual(resp.status_code, 200, resp.content)
-        self.assertTrue(resp.json()["requeued"])
-
-        enr.refresh_from_db()
-        # Reconciled kind stored on the ENROLLMENT (governing case untouched).
-        self.assertEqual(enr.product_type_override_id, meals_pt.pk)
-        # Requeued: kitchen + cadence cleared, stage back to Kitchen Assignment.
-        self.assertEqual(enr.stage, EnrollmentStage.KITCHEN_ASSIGNMENT)
-        self.assertIsNone(enr.kitchen_id)
-        self.assertEqual(enr.delivery_weekdays, [])
-        self.assertTrue(
-            Note.objects.filter(
-                client=client, source=NoteSource.SYSTEM,
-                body__icontains="Product type corrected from Boxes to Meals",
-            ).exists()
-        )
-
-    def test_no_switch_when_kind_matches_governing_case(self):
-        from .models import Client, EnrollmentStage, ProductType, ProductTypeKind
-
-        ProductType.objects.create(type=ProductTypeKind.MEALS)
-        boxes_pt = ProductType.objects.create(type=ProductTypeKind.BOXES)
-        client = Client.objects.create(
-            client_id=str(uuid.uuid4()), first_name="No", last_name="Switch",
-        )
-        enr = self._enrollment(client, override=boxes_pt, weekdays=["wed"])
-        # Governing case is ALSO boxes -> verified matches governing, no mismatch.
-        self._save_case(client, "Food Box")
-
-        resp = self._auth().post(
-            f"/api/portal/members/{client.client_id}/product-type/",
-            {"product_type": "meals"}, format="json",
-        )
-        self.assertEqual(resp.status_code, 400, resp.content)
-        enr.refresh_from_db()
-        # Untouched: still boxes, still Service Active.
-        self.assertEqual(enr.product_type_override_id, boxes_pt.pk)
-        self.assertEqual(enr.stage, EnrollmentStage.SERVICE_ACTIVE)
+        self.assertEqual(enr.stage, EnrollmentStage.CLOSED)
+        new = EnrollmentVerification.objects.filter(
+            client=client,
+        ).exclude(stage__in=[EnrollmentStage.CLOSED.value, EnrollmentStage.CANCELLED.value]).first()
+        self.assertIsNotNone(new)
+        self.assertEqual(new.supersedes_id, enr.pk)
+        self.assertEqual(new.stage, EnrollmentStage.KITCHEN_ASSIGNMENT)
+        self.assertIsNone(new.kitchen_id)
+        self.assertEqual(new.delivery_weekdays, [])
 
 
 class EffectiveAuthorizationWindowTest(TestCase):
@@ -1608,385 +1489,6 @@ class TimelineDedupeKeyClampTest(TestCase):
         self.assertEqual(
             TimelineEvent.objects.filter(dedupe_key=ev1.dedupe_key).count(), 1
         )
-
-
-class HouseholdScopeSwitchTest(TestCase):
-    """When the GOVERNING internal-service case switches household SCOPE the
-    import AUTO-RECONCILES it (no Customer Service step):
-
-    * **Household -> Individual**: the additional (non-primary) members are
-      auto-paused + PINNED (``pause_locked``), the enrollment scope override is
-      set to Individual, and an audit 'Case Scope Reconciled' timeline event +
-      primary note are written.
-    * **Individual -> Household**: the additional members are auto-resumed +
-      un-pinned and the scope override follows to Household.
-
-    NO ``CaseMismatchFlag`` is opened -- the fix is automatic. Detection is
-    data-driven so it fires even when the stored governing pointer was never
-    initialised. Idempotent on re-save. (The legacy Case Mismatch dismiss
-    endpoint is still exercised below against a manually-created flag.)"""
-
-    def _setup(self):
-        from .models import (
-            EnrollmentStage, EnrollmentVerification, Household, HouseholdMember,
-            MemberDietaryProfile, MemberStatus,
-        )
-
-        primary = Client.objects.create(
-            client_id=str(uuid.uuid4()), first_name="Prim", last_name="Ary"
-        )
-        member2 = Client.objects.create(
-            client_id=str(uuid.uuid4()), first_name="Mem", last_name="Two"
-        )
-        household = Household.objects.create(name="HH")
-        HouseholdMember.objects.create(
-            household=household, client=primary, is_primary=True
-        )
-        HouseholdMember.objects.create(
-            household=household, client=member2, is_primary=False
-        )
-        enr = EnrollmentVerification.objects.create(
-            client=primary, household=household,
-            stage=EnrollmentStage.SERVICE_ACTIVE, verified_at=timezone.now(),
-        )
-        mp_primary = MemberDietaryProfile.objects.create(
-            enrollment=enr, client=primary, member_name="Prim Ary",
-            status=MemberStatus.ACTIVE,
-        )
-        mp_member2 = MemberDietaryProfile.objects.create(
-            enrollment=enr, client=member2, member_name="Mem Two",
-            status=MemberStatus.ACTIVE,
-        )
-        return primary, member2, enr, mp_primary, mp_member2
-
-    def _save_case(self, client, case_id, program_name, created_at):
-        from .serializers import CaseSerializer
-
-        data = {
-            "case_id": case_id,
-            "client_id": str(client.client_id),
-            "case_type": "internal_service",
-            "program_name": program_name,
-            "service_authorization_status": "approved",
-            "case_status": "open",
-            "date_opened": created_at.isoformat(),
-            "case_created_at": created_at.isoformat(),
-        }
-        ser = CaseSerializer(data=data)
-        ser.is_valid(raise_exception=True)
-        return ser.save()
-
-    def _api(self, group="CS"):
-        agent = Agent.objects.create(
-            name=f"{group} Agent", agent_code=str(uuid.uuid4())[:8], group=group
-        )
-        access = AccessToken()
-        access["agent_id"] = str(agent.id)
-        access["agent_code"] = agent.agent_code
-        access["agent_name"] = agent.name
-        access["agent_group"] = agent.group
-        api = APIClient()
-        api.credentials(HTTP_AUTHORIZATION=f"Bearer {access}")
-        return api
-
-    def _trigger_switch(self):
-        from datetime import timedelta
-
-        primary, member2, enr, mp_primary, mp_member2 = self._setup()
-        now = timezone.now()
-        case_a, case_b = str(uuid.uuid4()), str(uuid.uuid4())
-        # Case A is a HOUSEHOLD meals case (program name contains "Household");
-        # Case B is a newer INDIVIDUAL meals case -> governing scope switches.
-        self._save_case(
-            primary, case_a, "Medically Tailored Meals Household",
-            now - timedelta(days=2),
-        )
-        self._save_case(primary, case_b, "Medically Tailored Meals", now)
-        return primary, member2, mp_primary, mp_member2, case_a, case_b
-
-    def _manual_flag(self, primary, enr):
-        """Create an OPEN Case Mismatch flag + a paused/pinned member by hand,
-        to exercise the legacy Case Mismatch dismiss endpoint (the reconcile no
-        longer opens flags -- it auto-fixes instead)."""
-        from .models import (
-            CaseMismatchFlag, CaseMismatchStatus, CaseMismatchType, MemberStatus,
-            MemberDietaryProfile,
-        )
-
-        MemberDietaryProfile.objects.filter(enrollment=enr).exclude(
-            client=primary
-        ).update(status=MemberStatus.PAUSED, pause_locked=True)
-        return CaseMismatchFlag.objects.create(
-            client=primary, enrollment=enr,
-            mismatch_type=CaseMismatchType.HOUSEHOLD_TO_INDIVIDUAL,
-            new_case_id=str(uuid.uuid4()), status=CaseMismatchStatus.OPEN,
-        )
-
-    def test_household_to_individual_auto_pauses_pins_no_flag(self):
-        from .models import (
-            CaseHouseholdType, CaseMismatchFlag, MemberStatus,
-            TimelineEvent, TimelineEventType,
-        )
-
-        primary, member2, mp_primary, mp_member2, case_a, case_b = (
-            self._trigger_switch()
-        )
-        mp_primary.refresh_from_db()
-        mp_member2.refresh_from_db()
-
-        # Additional member auto-paused + pinned; primary untouched.
-        self.assertEqual(mp_member2.status, MemberStatus.PAUSED)
-        self.assertTrue(mp_member2.pause_locked)
-        self.assertEqual(mp_primary.status, MemberStatus.ACTIVE)
-        self.assertFalse(mp_primary.pause_locked)
-
-        # Scope override AUTO-APPLIED to Individual on the enrollment (Programs
-        # tab now reflects the switch immediately).
-        enr = mp_member2.enrollment
-        enr.refresh_from_db()
-        self.assertEqual(
-            enr.household_type_override, CaseHouseholdType.INDIVIDUAL
-        )
-
-        # NO Case Mismatch flag is created -- the fix is automatic.
-        self.assertEqual(
-            CaseMismatchFlag.objects.filter(client=primary).count(), 0
-        )
-
-        # An auto-resolved audit event, keyed old -> new case.
-        evs = TimelineEvent.objects.filter(
-            client=primary, event_type=TimelineEventType.MEMBER_CASE_MISMATCH,
-        )
-        self.assertEqual(evs.count(), 1)
-        ev = evs.first()
-        self.assertTrue(ev.metadata.get("auto_resolved"))
-        self.assertEqual(ev.metadata.get("new_case_id"), case_b)
-        self.assertEqual(ev.metadata.get("previous_case_id"), case_a)
-
-    def test_switch_is_idempotent_on_resave(self):
-        from .models import (
-            CaseMismatchFlag, MemberStatus, TimelineEvent, TimelineEventType,
-        )
-
-        primary, member2, mp_primary, mp_member2, case_a, case_b = (
-            self._trigger_switch()
-        )
-        # Re-save the (now governing) individual case: no new event / re-pin.
-        self._save_case(
-            primary, case_b, "Medically Tailored Meals", timezone.now()
-        )
-        self.assertEqual(
-            CaseMismatchFlag.objects.filter(client=primary).count(), 0
-        )
-        self.assertEqual(
-            TimelineEvent.objects.filter(
-                client=primary,
-                event_type=TimelineEventType.MEMBER_CASE_MISMATCH,
-            ).count(),
-            1,
-        )
-        mp_member2.refresh_from_db()
-        self.assertEqual(mp_member2.status, MemberStatus.PAUSED)
-        self.assertTrue(mp_member2.pause_locked)
-
-    def test_individual_to_household_auto_resumes_and_unpins(self):
-        # Reverse direction: a newer HOUSEHOLD case supersedes the Individual one
-        # -> the paused + pinned additional members are auto-resumed + un-pinned
-        # and the scope override follows to Household. No flag either way.
-        from datetime import timedelta
-
-        from .models import CaseHouseholdType, CaseMismatchFlag, MemberStatus
-
-        primary, member2, mp_primary, mp_member2, case_a, case_b = (
-            self._trigger_switch()
-        )
-        mp_member2.refresh_from_db()
-        self.assertTrue(mp_member2.pause_locked)  # pinned by the -> Individual
-
-        # A newer HOUSEHOLD case now governs -> Individual -> Household.
-        case_c = str(uuid.uuid4())
-        self._save_case(
-            primary, case_c, "Medically Tailored Meals Household",
-            timezone.now() + timedelta(days=1),
-        )
-        mp_member2.refresh_from_db()
-        enr = mp_member2.enrollment
-        enr.refresh_from_db()
-        # Scope override auto-followed to Household; member auto-un-pinned +
-        # resumed (no longer Paused).
-        self.assertEqual(
-            enr.household_type_override, CaseHouseholdType.HOUSEHOLD
-        )
-        self.assertFalse(mp_member2.pause_locked)
-        self.assertNotEqual(mp_member2.status, MemberStatus.PAUSED)
-        self.assertEqual(
-            CaseMismatchFlag.objects.filter(client=primary).count(), 0
-        )
-
-    def test_empty_governing_pointer_still_detects_scope_switch(self):
-        # Regression (the JEREMIAHH scenario): an active member VERIFIED as
-        # Individual (household_type_override set) whose stored governing pointer
-        # was NEVER initialised. A reconcile that first sees a HOUSEHOLD governing
-        # case must STILL auto-reconcile Individual -> Household -- data-driven
-        # detection off the served override, not the (empty) pointer -- instead of
-        # silently adopting the new case and swallowing the switch.
-        from datetime import timedelta
-
-        from .models import (
-            CaseHouseholdType, CaseMismatchFlag, TimelineEvent, TimelineEventType,
-        )
-        from .services.lifecycle import (
-            deferred_internal_service_reconcile,
-            reconcile_internal_service_authorization,
-        )
-
-        primary, member2, enr, mp_primary, mp_member2 = self._setup()
-        enr.household_type_override = CaseHouseholdType.INDIVIDUAL
-        enr.save(update_fields=["household_type_override"])
-        now = timezone.now()
-        individual_id, household_id = str(uuid.uuid4()), str(uuid.uuid4())
-        # Load an older Individual + a newer Household case with the reconcile
-        # DEFERRED, so nothing auto-fixes and the governing pointer stays empty.
-        with deferred_internal_service_reconcile():
-            self._save_case(
-                primary, individual_id, "Medically Tailored Meals",
-                now - timedelta(days=2),
-            )
-            self._save_case(
-                primary, household_id, "Medically Tailored Meals Household", now,
-            )
-        primary.refresh_from_db()
-        self.assertEqual(primary.governing_internal_case_id, "")  # empty baseline
-
-        # The import's once-per-client reconcile on the FULL picture.
-        reconcile_internal_service_authorization(primary)
-
-        enr.refresh_from_db()
-        # Auto-reconciled to Household off the served override, despite the empty
-        # pointer; no flag; a single auto-resolved audit event keyed old -> new.
-        self.assertEqual(
-            enr.household_type_override, CaseHouseholdType.HOUSEHOLD
-        )
-        self.assertEqual(
-            CaseMismatchFlag.objects.filter(client=primary).count(), 0
-        )
-        evs = TimelineEvent.objects.filter(
-            client=primary, event_type=TimelineEventType.MEMBER_CASE_MISMATCH,
-        )
-        self.assertEqual(evs.count(), 1)
-        self.assertEqual(evs.first().metadata.get("new_case_id"), household_id)
-        self.assertEqual(evs.first().metadata.get("previous_case_id"), individual_id)
-
-    def test_divergent_sibling_override_still_reconciled(self):
-        # Regression: two governing enrollments carrying DIFFERENT overrides -- one
-        # already on the governing scope (Individual), a sibling still on the old
-        # (Household). Detecting the served scope off the FIRST override would let
-        # the matching sibling mask the divergent one and skip the fix; the
-        # divergent enrollment must STILL be reconciled to the governing scope.
-        from .models import (
-            CaseHouseholdType, EnrollmentStage, EnrollmentVerification,
-        )
-        from .services.lifecycle import reconcile_internal_service_authorization
-
-        primary, member2, enr, mp_primary, mp_member2 = self._setup()
-        # enr (service_active) already matches the Individual governing case; a
-        # second pending-verification enrollment still holds the old Household.
-        enr.household_type_override = CaseHouseholdType.INDIVIDUAL
-        enr.save(update_fields=["household_type_override"])
-        enr2 = EnrollmentVerification.objects.create(
-            client=primary, household=enr.household,
-            stage=EnrollmentStage.PENDING_VERIFICATION,
-            household_type_override=CaseHouseholdType.HOUSEHOLD,
-        )
-        self._save_case(
-            primary, str(uuid.uuid4()), "Medically Tailored Meals", timezone.now()
-        )
-        reconcile_internal_service_authorization(primary)
-        enr.refresh_from_db()
-        enr2.refresh_from_db()
-        # BOTH enrollments now match the Individual governing scope.
-        self.assertEqual(enr.household_type_override, CaseHouseholdType.INDIVIDUAL)
-        self.assertEqual(enr2.household_type_override, CaseHouseholdType.INDIVIDUAL)
-
-    def test_cs_dismiss_clears_pins_but_keeps_paused(self):
-        from django.urls import reverse
-
-        from .models import CaseMismatchStatus, MemberStatus
-
-        primary, member2, enr, mp_primary, mp_member2 = self._setup()
-        flag = self._manual_flag(primary, enr)
-        mp_member2.refresh_from_db()
-        api = self._api("CS")
-        resp = api.post(
-            reverse(
-                "portal-care-management-case-mismatch-dismiss",
-                kwargs={"flag_id": flag.id},
-            ),
-            {"reason": "Reviewed - correct scope"},
-            format="json",
-        )
-        self.assertEqual(resp.status_code, 200, resp.content)
-        flag.refresh_from_db()
-        mp_member2.refresh_from_db()
-        self.assertEqual(flag.status, CaseMismatchStatus.DISMISSED)
-        self.assertEqual(flag.dismiss_reason, "Reviewed - correct scope")
-        # Pin cleared, but the member stays Paused (never auto-unpaused).
-        self.assertFalse(mp_member2.pause_locked)
-        self.assertEqual(mp_member2.status, MemberStatus.PAUSED)
-
-    def test_non_cs_cannot_dismiss(self):
-        from django.urls import reverse
-
-        from .models import CaseMismatchStatus
-
-        primary, member2, enr, mp_primary, mp_member2 = self._setup()
-        flag = self._manual_flag(primary, enr)
-        api = self._api("Verifiers")
-        resp = api.post(
-            reverse(
-                "portal-care-management-case-mismatch-dismiss",
-                kwargs={"flag_id": flag.id},
-            )
-        )
-        self.assertEqual(resp.status_code, 403)
-        flag.refresh_from_db()
-        self.assertEqual(flag.status, CaseMismatchStatus.OPEN)
-
-    def test_programs_tab_scope_reconcile_auto_dismisses_flag_and_unpins(self):
-        # Reconciling the scope on the Programs tab IS the CS review the flag was
-        # waiting on: the OPEN Case Mismatch flag auto-dismisses and the pinned
-        # member is un-pinned, without a separate Case Mismatch tab step.
-        from .models import (
-            CaseHouseholdType, CaseMismatchFlag, CaseMismatchStatus,
-            CaseMismatchType, MemberStatus,
-        )
-
-        primary, member2, enr, mp_primary, mp_member2 = self._setup()
-        # Governing INDIVIDUAL case, but the household was VERIFIED as Household
-        # -> a standing mismatch with an OPEN flag + a CS-pinned member.
-        self._save_case(
-            primary, str(uuid.uuid4()), "Medically Tailored Meals", timezone.now()
-        )
-        enr.household_type_override = CaseHouseholdType.HOUSEHOLD
-        enr.save(update_fields=["household_type_override"])
-        mp_member2.status = MemberStatus.PAUSED
-        mp_member2.pause_locked = True
-        mp_member2.save(update_fields=["status", "pause_locked"])
-        flag = CaseMismatchFlag.objects.create(
-            client=primary, enrollment=enr,
-            mismatch_type=CaseMismatchType.HOUSEHOLD_TO_INDIVIDUAL,
-            new_case_id=str(uuid.uuid4()), status=CaseMismatchStatus.OPEN,
-        )
-
-        resp = self._api("CS").post(
-            f"/api/portal/members/{primary.client_id}/household-type/",
-            {"household_type": "individual"}, format="json",
-        )
-        self.assertEqual(resp.status_code, 200, resp.content)
-        flag.refresh_from_db()
-        mp_member2.refresh_from_db()
-        self.assertEqual(flag.status, CaseMismatchStatus.DISMISSED)
-        self.assertFalse(mp_member2.pause_locked)
 
 
 class UnapprovedActivePullBackTest(TestCase):
@@ -2166,13 +1668,19 @@ class InternalServiceClosureFullStopTest(TestCase):
         self.assertEqual(enr.stage, EnrollmentStage.ON_HOLD)
         self.assertEqual(client.lifecycle_stage, ClientStage.SERVICE_INACTIVE)
 
-        # A new open, approved case reopens service -> resumed + off the off-ramp.
+        # A new open, approved case opens a new enrollment; the old one stays
+        # closed and the client is no longer parked at SERVICE_INACTIVE.
         self._save_case(
             client, str(uuid.uuid4()), auth="approved", case_status="open",
         )
         enr.refresh_from_db()
         client.refresh_from_db()
-        self.assertEqual(enr.stage, EnrollmentStage.SERVICE_ACTIVE)
+        self.assertEqual(enr.stage, EnrollmentStage.CLOSED)
+        new = client.enrollments.exclude(
+            stage__in=[EnrollmentStage.CLOSED.value, EnrollmentStage.CANCELLED.value]
+        ).first()
+        self.assertIsNotNone(new)
+        self.assertEqual(new.supersedes_id, enr.pk)
         self.assertNotEqual(client.lifecycle_stage, ClientStage.SERVICE_INACTIVE)
 
     def test_close_out_is_idempotent(self):
@@ -3333,7 +2841,7 @@ class RemovalAndVerificationGuardsTest(TestCase):
 
         raw = APIRequestFactory().post(
             "/",
-            {"members": [{"client_id": str(client.pk)}], "zip": "10001"},
+            {"members": [{"client_id": str(client.pk), "mobile_number": "3475550142"}], "zip": "10001"},
             format="json",
         )
         req = Request(raw, parsers=[JSONParser()])
@@ -3364,7 +2872,7 @@ class RemovalAndVerificationGuardsTest(TestCase):
 
         raw = APIRequestFactory().post(
             "/",
-            {"members": [{"client_id": str(client.pk)}], "zip": "10001"},
+            {"members": [{"client_id": str(client.pk), "mobile_number": "3475550142"}], "zip": "10001"},
             format="json",
         )
         req = Request(raw, parsers=[JSONParser()])
@@ -3623,6 +3131,7 @@ class VerificationSubmittedTimelineTest(TestCase):
             "program_name": "MTM Meals",
             "members": [{
                 "client_id": str(client.pk), "member_name": "Vera Verified",
+                "mobile_number": "3475550142",
                 "food_allergies": ["peanuts"], "menu_type": "Standard",
             }],
             "street": "1 Main St", "apt": "2B", "city": "Brooklyn",
@@ -3648,6 +3157,42 @@ class VerificationSubmittedTimelineTest(TestCase):
         self.assertEqual(ev.metadata.get("delivery_weekdays"), ["mon", "thu"])
         self.assertIn("Vera Verified (Standard)", ev.metadata.get("members", []))
         self.assertEqual(ev.metadata.get("verified", {}).get("family"), True)
+
+    def test_primary_mobile_required_and_persisted(self):
+        from .models import MemberDietaryProfile
+
+        client = self._client("Mo", "Bile")
+        self._internal_case(client)
+        api = self._api()
+        base = {
+            "program_name": "MTM Meals",
+            "street": "1 Main St", "city": "Brooklyn", "state": "NY", "zip": "11201",
+            "delivery_weekdays": ["mon", "thu"],
+        }
+        # Missing primary mobile -> rejected.
+        resp = api.post(
+            f"/api/portal/members/{client.pk}/verification/",
+            {**base, "members": [{
+                "client_id": str(client.pk), "member_name": "Mo Bile",
+                "menu_type": "Standard",
+            }]},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 400, resp.content)
+        self.assertIn("mobile_number", resp.json())
+
+        # With a primary mobile -> accepted + persisted on the enrollment profile.
+        resp = api.post(
+            f"/api/portal/members/{client.pk}/verification/",
+            {**base, "members": [{
+                "client_id": str(client.pk), "member_name": "Mo Bile",
+                "menu_type": "Standard", "mobile_number": "(347) 555-0142",
+            }]},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 201, resp.content)
+        mv = MemberDietaryProfile.objects.get(client=client)
+        self.assertEqual(mv.mobile_number, "(347) 555-0142")
 
 
 class DeliveryCoverageEligibilityTest(TestCase):
@@ -4847,15 +4392,19 @@ class ResumeBlockedWhenIneligibleTest(TestCase):
         self.assertTrue(enrollment["on_hold"])
         self.assertFalse(enrollment["can_resume"])
 
-    def test_resume_blocked_by_ineligible_dependent(self):
-        # The case-holder is eligible, but an ineligible DEPENDENT still blocks
-        # the whole program's manual resume.
+    def test_resume_allowed_with_ineligible_dependent(self):
+        # An ineligible DEPENDENT is paused individually and must NOT block the
+        # whole program's resume when the case-holder (and thus the household) can
+        # still be served: the resume succeeds and the dependent stays excluded.
         from .models import (
             Client, ClientStage, EnrollmentStage, HouseholdMember,
-            MemberDietaryProfile,
+            MemberDietaryProfile, MemberStatus,
         )
 
         holder, enr = self._held_client(ClientStage.ACTIVE)
+        MemberDietaryProfile.objects.create(
+            enrollment=enr, client=holder, status=MemberStatus.ACTIVE,
+        )
         dep = Client.objects.create(
             client_id=str(uuid.uuid4()), first_name="Dep", last_name="X",
             lifecycle_stage=ClientStage.INELIGIBLE,
@@ -4863,14 +4412,17 @@ class ResumeBlockedWhenIneligibleTest(TestCase):
         HouseholdMember.objects.create(
             household=enr.household, client=dep, is_primary=False,
         )
-        MemberDietaryProfile.objects.create(enrollment=enr, client=dep)
+        MemberDietaryProfile.objects.create(
+            enrollment=enr, client=dep, status=MemberStatus.PAUSED,
+            eligibility_paused=True,
+        )
         resp = self.api.post(
             f"/api/portal/members/{holder.client_id}/resume/",
             {"reason": "resume"}, format="json",
         )
-        self.assertEqual(resp.status_code, 400, resp.content)
+        self.assertEqual(resp.status_code, 200, resp.content)
         enr.refresh_from_db()
-        self.assertEqual(EnrollmentStage(enr.stage), EnrollmentStage.ON_HOLD)
+        self.assertEqual(EnrollmentStage(enr.stage), EnrollmentStage.SERVICE_ACTIVE)
 
 
 class ProgramLockedGuardTest(TestCase):
@@ -7245,6 +6797,76 @@ class MemberEligibilityTest(TestCase):
         self._reconcile(c)
         enr.refresh_from_db()
         self.assertEqual(enr.stage, EnrollmentStage.ON_HOLD)
+
+    def test_ineligible_dependent_pauses_member_not_whole_household(self):
+        # A household with an eligible primary + one ineligible dependent: the
+        # dependent is PAUSED individually (removed from the schedule) while the
+        # program keeps serving -- the whole household is NOT held.
+        from .models import (
+            EnrollmentStage, EnrollmentVerification, Household, HouseholdMember,
+            Insurance, MemberDietaryProfile, MemberStatus, Note, NoteSource,
+        )
+
+        primary = self._client()
+        Insurance.objects.create(client=primary, plan_name="P", external_member_id="1")
+        dep = self._client()  # no insurance => ineligible
+        hh = Household.objects.create(name="HH")
+        HouseholdMember.objects.create(household=hh, client=primary, is_primary=True)
+        HouseholdMember.objects.create(household=hh, client=dep, is_primary=False)
+        enr = EnrollmentVerification.objects.create(
+            client=primary, household=hh, stage=EnrollmentStage.SERVICE_ACTIVE,
+        )
+        pmv = MemberDietaryProfile.objects.create(enrollment=enr, client=primary)
+        dmv = MemberDietaryProfile.objects.create(enrollment=enr, client=dep)
+
+        self._reconcile(dep)
+
+        enr.refresh_from_db(); pmv.refresh_from_db(); dmv.refresh_from_db()
+        # Program keeps serving; only the dependent is paused + flagged.
+        self.assertEqual(enr.stage, EnrollmentStage.SERVICE_ACTIVE)
+        self.assertEqual(pmv.status, MemberStatus.ACTIVE)
+        self.assertEqual(dmv.status, MemberStatus.PAUSED)
+        self.assertTrue(dmv.eligibility_paused)
+        # A self-descriptive system note (why + what) is written on the member.
+        self.assertTrue(
+            Note.objects.filter(
+                client=dep, source=NoteSource.SYSTEM,
+                body__icontains="removed them from the delivery schedule",
+            ).exists()
+        )
+
+    def test_ineligible_dependent_recovers_and_rejoins(self):
+        from .models import (
+            EnrollmentStage, EnrollmentVerification, Household, HouseholdMember,
+            Insurance, MemberDietaryProfile, MemberStatus,
+        )
+
+        primary = self._client()
+        Insurance.objects.create(client=primary, plan_name="P", external_member_id="1")
+        dep = self._client()
+        hh = Household.objects.create(name="HH")
+        HouseholdMember.objects.create(household=hh, client=primary, is_primary=True)
+        HouseholdMember.objects.create(household=hh, client=dep, is_primary=False)
+        enr = EnrollmentVerification.objects.create(
+            client=primary, household=hh, stage=EnrollmentStage.SERVICE_ACTIVE,
+        )
+        MemberDietaryProfile.objects.create(enrollment=enr, client=primary)
+        dmv = MemberDietaryProfile.objects.create(enrollment=enr, client=dep)
+
+        self._reconcile(dep)  # paused
+        dmv.refresh_from_db()
+        self.assertEqual(dmv.status, MemberStatus.PAUSED)
+
+        # Dependent's insurance + social-care coverage are fixed -> re-reconcile
+        # returns them to service (both the hard gate and the coverage hold pass).
+        from .models import SocialCareCoverage
+
+        Insurance.objects.create(client=dep, plan_name="P", external_member_id="2")
+        SocialCareCoverage.objects.create(client=dep, plan_name="SC")
+        self._reconcile(dep)
+        dmv.refresh_from_db()
+        self.assertEqual(dmv.status, MemberStatus.ACTIVE)
+        self.assertFalse(dmv.eligibility_paused)
 
     # --- Recoverable social-care-coverage hold ---------------------------------
     def _eligible_client_with_enrollment(self):

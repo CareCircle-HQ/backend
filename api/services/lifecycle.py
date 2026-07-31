@@ -618,6 +618,7 @@ ENROLLMENT_TRANSITIONS = {
         EnrollmentStage.VERIFIED,
         EnrollmentStage.KITCHEN_ASSIGNMENT,
         EnrollmentStage.SERVICE_ACTIVE,
+        EnrollmentStage.CLOSED,
         EnrollmentStage.CANCELLED,
     },
     EnrollmentStage.CLOSED: set(),
@@ -1022,7 +1023,9 @@ def program_status(enrollment):
             return ProgramStatus.OUT_OF_RANGE
         return ProgramStatus.ON_HOLD
 
-    gov = governing_internal_case(enrollment)
+    # Each enrollment is bound to one case; terminal enrollments in particular
+    # must report their OWN case's status, not the household's current governing.
+    gov = enrollment.case or governing_internal_case(enrollment)
     auth = getattr(gov, "service_authorization_status", "") if gov else ""
     case_closed = bool(gov and gov.case_status in _CLOSED_CASE_STATUSES)
     end = getattr(gov, "service_authorization_approval_ends_at", None) if gov else None
@@ -1433,9 +1436,6 @@ def reconcile_enrollment_authorization(enrollment, *, actor=None, actor_label=""
 
     No-ops unless the enrollment is verified and the case is approved. Idempotent.
     """
-    if EnrollmentStage(enrollment.stage) not in _AUTH_ELIGIBLE_STAGES:
-        return enrollment
-
     case = governing_internal_case(enrollment)
     if case is None:
         return enrollment
@@ -1458,6 +1458,9 @@ def reconcile_enrollment_authorization(enrollment, *, actor=None, actor_label=""
         if not taken:
             enrollment.case = case
             enrollment.save(update_fields=["case"])
+
+    if EnrollmentStage(enrollment.stage) not in _AUTH_ELIGIBLE_STAGES:
+        return enrollment
 
     target = _AUTH_STATUS_TO_STAGE.get(case.service_authorization_status)
     if target is None:
@@ -2618,6 +2621,337 @@ def _handle_household_scope_switch(
     return True
 
 
+def _close_old_and_link_to_existing(
+    live, existing, new_governing_case, actor=None, actor_label="", note="",
+):
+    """Close the current live enrollment and point an existing replacement
+    enrollment at it. Used when the new governing case already has a live
+    enrollment (e.g. a pending verification created earlier)."""
+    from api.models import EnrollmentStage
+
+    old_case_id = str(live.case.case_id) if live.case else (live.case_id or "")
+    new_case_id = str(new_governing_case.case_id)
+
+    with transaction.atomic():
+        try:
+            truncate_future_deliveries(live)
+        except Exception:  # pragma: no cover - defensive
+            pass
+
+        try:
+            advance_enrollment(
+                live,
+                EnrollmentStage.CLOSED,
+                actor=actor,
+                actor_label=actor_label,
+                note=note or "Governing case replaced; enrollment closed as read-only history.",
+            )
+        except InvalidTransition:
+            pass
+
+        live.close_reason = "case_replaced"
+        live.close_context = {
+            "previous_case_id": old_case_id,
+            "new_case_id": new_case_id,
+            "new_enrollment_id": str(existing.pk),
+        }
+        try:
+            live.save(update_fields=["close_reason", "close_context"])
+        except Exception:  # pragma: no cover - defensive
+            pass
+
+        if existing.supersedes_id is None:
+            existing.supersedes = live
+            try:
+                existing.save(update_fields=["supersedes"])
+            except Exception:  # pragma: no cover - defensive
+                pass
+
+
+def replace_enrollment_for_case_change(
+    client, new_governing_case, *, actor=None, actor_label="",
+):
+    """Close the client's live enrollment and open a new one bound to
+    ``new_governing_case`` whenever the governing internal-service case id
+    changes. Carries over delivery address, kitchen/cadence (when compatible),
+    and member profiles; applies scope-driven pause/enable; links old and new
+    via supersession. Idempotent, transactional, best-effort.
+
+    Returns the new EnrollmentVerification or None when no replacement happens.
+    """
+    from api.models import (
+        CaseHouseholdType,
+        EnrollmentStage,
+        EnrollmentVerification,
+        KitchenProductType,
+        MemberDietaryProfile,
+        ProductTypeKind,
+        ServiceAuthorizationStatus,
+    )
+    from api.serializers import derive_household_type
+    from api.services.catalog import product_type_kind_for_name
+    from api.services.orders import (
+        rebuild_delivery_calendar,
+        truncate_future_deliveries,
+    )
+
+    if new_governing_case is None:
+        return None
+
+    if new_governing_case.service_authorization_status not in (
+        ServiceAuthorizationStatus.APPROVED,
+        ServiceAuthorizationStatus.NOT_REQUIRED,
+    ):
+        return None
+
+    if new_governing_case.case_status in _CLOSED_CASE_STATUSES:
+        return None
+
+    terminal = {EnrollmentStage.CLOSED, EnrollmentStage.CANCELLED}
+    live = _primary_enrollment(client)
+    if live is None:
+        return None
+    if EnrollmentStage(live.stage) in terminal:
+        return None
+
+    if str(live.case_id) == str(new_governing_case.case_id):
+        return None
+
+    # If the new governing case already has a live enrollment (e.g. a
+    # pending-verification row created earlier), close the current live one
+    # and use that existing row as the replacement rather than creating yet
+    # another duplicate.
+    existing = EnrollmentVerification.objects.filter(
+        client=client, case=new_governing_case,
+    ).exclude(pk=live.pk).exclude(stage__in=[s.value for s in terminal]).first()
+    if existing is not None:
+        _close_old_and_link_to_existing(live, existing, new_governing_case, actor, actor_label)
+        return existing
+
+    # An unbound enrollment (no case FK) is normally a first-time enrollment
+    # waiting for its FIRST case to bind -- no replacement, the normal reconcile
+    # attaches the governing case to it. BUT an enrollment that already served
+    # and later lost its case FK (its governing case CLOSED and unbound it) must
+    # be replaced when a genuinely NEW case arrives, so the old one is preserved
+    # as read-only history and the new one supersedes it. We detect that by the
+    # presence of a PRIOR internal-service case (distinct from the new governing
+    # case) on the client -- the closed case the enrollment used to serve. This
+    # also keeps a same-case denial->reapproval (no prior distinct case) from
+    # spuriously forking a duplicate enrollment.
+    if live.case is None:
+        _served_stages = {
+            EnrollmentStage.SERVICE_ACTIVE,
+            EnrollmentStage.ON_HOLD,
+            EnrollmentStage.SERVICE_COMPLETE,
+        }
+        has_prior_case = (
+            client.cases.filter(case_type=CaseType.INTERNAL_SERVICE)
+            .exclude(case_id=new_governing_case.case_id)
+            .exists()
+        )
+        if EnrollmentStage(live.stage) not in _served_stages or not has_prior_case:
+            return None
+
+    old_case = live.case
+    old_case_id = str(old_case.case_id) if old_case else ""
+    new_case_id = str(new_governing_case.case_id)
+
+    old_kind = product_type_kind_for_name(live.program_name or "")
+    if old_kind is None:
+        old_kind = product_type_kind_for_name(live.service_type or "")
+
+    new_kind = product_type_kind_for_name(new_governing_case.program_name or "")
+    if new_kind is None:
+        new_kind = product_type_kind_for_name(new_governing_case.service_type or "")
+
+    old_scope = derive_household_type(
+        None, old_case.program_name if old_case else live.program_name or ""
+    )
+    new_scope = derive_household_type(None, new_governing_case.program_name or "")
+
+    author = actor_label or _actor_name(actor)
+
+    with transaction.atomic():
+        # Close the old enrollment: stop delivery, move to CLOSED, save metadata.
+        try:
+            truncate_future_deliveries(live)
+        except Exception:  # pragma: no cover - defensive
+            pass
+
+        try:
+            advance_enrollment(
+                live,
+                EnrollmentStage.CLOSED,
+                actor=actor,
+                actor_label=actor_label,
+                note="Governing case replaced; enrollment closed as read-only history.",
+            )
+        except InvalidTransition:
+            pass
+
+        # Build the new enrollment with copied verification data.
+        new_fields = {
+            "client": live.client,
+            "household": live.household,
+            "case": new_governing_case,
+            "program_name": new_governing_case.program_name or "",
+            "service_type": new_governing_case.service_type or "",
+            "delivery_address": live.delivery_address,
+            "household_size": live.household_size,
+            "is_family_verified": live.is_family_verified,
+            "medicaid_type_verified": live.medicaid_type_verified,
+            "delivery_address_verified": live.delivery_address_verified,
+            "verified_at": live.verified_at,
+            "verified_by": live.verified_by,
+            "requested_by": live.requested_by,
+            "requested_at": live.requested_at,
+            "supersedes": live,
+            "stage": EnrollmentStage.PENDING_VERIFICATION.value,
+        }
+
+        # Kitchen/cadence carry rule (D4).
+        #
+        # The current kitchen + cadence carry over -- so the household stays IN
+        # SERVICE with no kitchen-assignment step and a ready delivery calendar --
+        # ONLY when the product kind is UNCHANGED (meals->meals or boxes->boxes).
+        # The existing kitchen already serves that kind on that cadence, so it
+        # still fits. A meals<->boxes SWITCH ALWAYS goes to Kitchen Assignment:
+        # even if the current kitchen happens to also serve the new kind, its
+        # cadence/plan is for the wrong product, so a fresh kitchen + cadence must
+        # be chosen. (No per-kitchen product validation here -- a switch is never
+        # carried.)
+        from api.services.delivery import current_household_cadence
+
+        kitchen = live.kitchen
+        carries_kitchen = False
+        carried_cadence = ""
+        same_kind = (
+            old_kind is not None and new_kind is not None and old_kind == new_kind
+        )
+        if kitchen is not None and same_kind:
+            candidate_cadence = current_household_cadence(live)
+            if candidate_cadence:
+                new_fields["kitchen"] = kitchen
+                new_fields["delivery_weekdays"] = live.delivery_weekdays or []
+                carried_cadence = candidate_cadence
+                carries_kitchen = True
+
+        new_enrollment = EnrollmentVerification.objects.create(**new_fields)
+
+        # Record why the old one closed and the new one it was replaced by.
+        live.close_reason = "case_replaced"
+        live.close_context = {
+            "previous_case_id": old_case_id,
+            "new_case_id": new_case_id,
+            "new_enrollment_id": str(new_enrollment.pk),
+            "previous_product_kind": old_kind.value if old_kind else None,
+            "new_product_kind": new_kind.value if new_kind else None,
+            "previous_household_type": old_scope.value,
+            "new_household_type": new_scope.value,
+        }
+        try:
+            live.save(update_fields=["close_reason", "close_context"])
+        except Exception:  # pragma: no cover - defensive
+            pass
+
+        # Copy member dietary profiles (D3).
+        for mv in live.member_profiles.all():
+            MemberDietaryProfile.objects.create(
+                enrollment=new_enrollment,
+                client=mv.client,
+                member_name=mv.member_name,
+                dietary_restrictions=mv.dietary_restrictions,
+                food_allergies=mv.food_allergies,
+                other_dietary_restrictions=mv.other_dietary_restrictions,
+                meal_category=mv.meal_category,
+                menu_type=mv.menu_type,
+                status=mv.status,
+                kitchen_meal_type="",
+                kitchen_food_notes="",
+                meals_per_delivery=mv.meals_per_delivery,
+                general_verification_notes=mv.general_verification_notes,
+                pause_locked=mv.pause_locked,
+                mobile_number=mv.mobile_number,
+            )
+
+        # Advance the new enrollment through verified -> kitchen assignment -> active.
+        try:
+            advance_enrollment(
+                new_enrollment,
+                EnrollmentStage.VERIFIED,
+                actor=actor,
+                actor_label=actor_label,
+                note="Verification data carried from the previous enrollment.",
+                force=True,
+            )
+            advance_enrollment(
+                new_enrollment,
+                EnrollmentStage.KITCHEN_ASSIGNMENT,
+                actor=actor,
+                actor_label=actor_label,
+                note="Ready for kitchen assignment for the new governing case.",
+            )
+            if carries_kitchen:
+                advance_enrollment(
+                    new_enrollment,
+                    EnrollmentStage.SERVICE_ACTIVE,
+                    actor=actor,
+                    actor_label=actor_label,
+                    note="Kitchen and cadence carried from the previous enrollment.",
+                )
+        except InvalidTransition:
+            pass
+
+        # Apply scope effects to the new enrollment's copied member profiles (D3).
+        try:
+            apply_manual_scope_switch_effects(
+                client, new_scope, actor=actor, actor_label=actor_label,
+            )
+        except Exception:  # pragma: no cover - defensive
+            pass
+
+        # Build delivery calendar if the kitchen carried over. The new enrollment
+        # skipped kitchen assignment (which normally creates the first delivery
+        # plan), so create the initial plan from the carried cadence/kitchen and
+        # then reconcile the dated calendar.
+        if carries_kitchen:
+            try:
+                from api.models import DeliveryCadence
+                from api.services.delivery import create_member_delivery_schedules
+
+                once_weekday = None
+                if carried_cadence == DeliveryCadence.ONCE_A_WEEK.value:
+                    wds = live.delivery_weekdays or []
+                    once_weekday = wds[0] if wds else None
+                create_member_delivery_schedules(
+                    new_enrollment,
+                    case=new_governing_case,
+                    cadence=carried_cadence,
+                    once_a_week_weekday=once_weekday,
+                    kitchen=kitchen,
+                    product_kind=new_kind,
+                )
+                rebuild_delivery_calendar(new_enrollment)
+            except Exception:  # pragma: no cover - defensive
+                pass
+
+        # Primary system note describing the replacement.
+        em_dash = "\u2014"
+        _write_primary_system_note(
+            client,
+            (
+                f"Enrollment replaced on {timezone.localdate().isoformat()}: "
+                f"closed {live.code or live.pk} "
+                f"({old_case_id or em_dash}) and opened "
+                f"{new_enrollment.code or new_enrollment.pk} ({new_case_id}) for "
+                f"{(new_kind.label if new_kind else em_dash)} / {new_scope.label}."
+            ),
+            author_name=author,
+        )
+
+        return new_enrollment
+
+
 def _internal_service_cases(client):
     return [c for c in client.cases.all() if c.case_type == CaseType.INTERNAL_SERVICE]
 
@@ -2874,6 +3208,7 @@ def reconcile_internal_service_authorization(client, *, actor=None, actor_label=
         "closed_out": False, "cancelled": False, "downgraded": False,
         "service_inactive": False, "reactivated": False, "switched": False,
         "scope_switched": False, "disregarded": False, "ineligible": False,
+        "replaced": False,
     }
     cases = _internal_service_cases(client)
     if not cases:
@@ -2882,30 +3217,26 @@ def reconcile_internal_service_authorization(client, *, actor=None, actor_label=
 
     open_cases = open_internal_service_cases(client)
     governing = max(cases, key=governing_case_key)
-    # Capture the governing pointer BEFORE _record_governing_case_change settles
-    # it -- _handle_program_switch needs the OLD case to compare product kinds.
-    previous_governing_id = client.governing_internal_case_id or ""
     # Record an old -> new governing-case switch (timeline event + primary note)
     # before acting on it, so the history captures WHY service state changed.
     _record_governing_case_change(
         client, governing, actor=actor, actor_label=actor_label,
     )
-    # Household<->Individual scope switch is orthogonal to the authorization
-    # outcome, so detect it here -- before the auth branch -- off the SAME
-    # pre-settle pointer. It AUTO-APPLIES the new scope: pauses + pins additional
-    # members (Household->Individual) or resumes + un-pins them
-    # (Individual->Household), writing an audit timeline event. NO Case Mismatch
-    # flag is opened -- the fix is fully automatic.
-    if _handle_household_scope_switch(
-        client, previous_governing_id, governing,
-        actor=actor, actor_label=actor_label,
-    ):
-        result["scope_switched"] = True
     gov_status = governing.service_authorization_status
     # SERVICE_INACTIVE is sticky: remember it here so the tail can RE-DERIVE past
     # it (ignore_sticky) + emit the reactivation event once an open case reopens
     # service below.
     was_service_inactive = client.lifecycle_stage == ClientStage.SERVICE_INACTIVE
+    # A CASE-DRIVEN INELIGIBLE off-ramp (Kitchen Assignment whose case closed or
+    # was denied) is ALSO reversible: it must be lifted when a new open, favorable
+    # case reopens service. Distinguished from a genuine (assessment) ineligibility
+    # by its ineligible_reasons, so we never clear a real ineligibility here.
+    _KA_OFFRAMP_REASONS = {_KA_CLOSED_INELIGIBLE_REASON, _KA_DENIED_INELIGIBLE_REASON}
+    was_case_ineligible = (
+        client.lifecycle_stage == ClientStage.INELIGIBLE
+        and bool(client.ineligible_reasons)
+        and set(client.ineligible_reasons or []) <= _KA_OFFRAMP_REASONS
+    )
 
     if not open_cases:
         # CLOSURE full stop: the client's LAST open internal-service case has
@@ -2977,14 +3308,15 @@ def reconcile_internal_service_authorization(client, *, actor=None, actor_label=
         # the advance through here means it fires on EVERY case-save path
         # (extension, manual import, bulk CLI), not just the manual import.
         #
-        # A meals<->boxes product switch on the governing case takes precedence:
-        # it requeues the whole household for a NEW kitchen assignment, so skip
-        # the normal resume/advance below to avoid re-advancing past it.
-        if _handle_program_switch(
-            client, previous_governing_id, governing,
+        # A governing-case replacement (new case id, possibly different product
+        # kind or scope) takes precedence: it closes the old enrollment and opens
+        # a new one, so skip the normal resume/advance below.
+        if replace_enrollment_for_case_change(
+            client, governing,
             actor=actor, actor_label=actor_label,
         ):
             result["switched"] = True
+            result["replaced"] = True
         else:
             for enr in _governing_enrollments(client):
                 if EnrollmentStage(enr.stage) == EnrollmentStage.ON_HOLD:
@@ -3035,9 +3367,22 @@ def reconcile_internal_service_authorization(client, *, actor=None, actor_label=
             except Exception:  # pragma: no cover - defensive
                 pass
 
-    # Reactivation: a member parked at SERVICE_INACTIVE now has an open case
+    # Reactivation: a member parked at a REVERSIBLE off-ramp now has an open case
     # again -> re-derive past the sticky off-ramp and announce it once.
-    reactivated = was_service_inactive and bool(open_cases)
+    #   - SERVICE_INACTIVE: any open case reopens service.
+    #   - case-driven INELIGIBLE (KA case closed/denied): only a FAVORABLE open
+    #     case (approved / not-required) reopens it -- a pending/denied reopen
+    #     leaves the household off-ramped. Its stale ineligible_reasons are
+    #     cleared so the flag doesn't linger after the stage lifts.
+    gov_favorable = gov_status in (
+        ServiceAuthorizationStatus.APPROVED,
+        ServiceAuthorizationStatus.NOT_REQUIRED,
+    )
+    lift_case_ineligible = was_case_ineligible and gov_favorable and bool(open_cases)
+    if lift_case_ineligible and client.ineligible_reasons:
+        client.ineligible_reasons = []
+        client.save(update_fields=["ineligible_reasons"])
+    reactivated = (was_service_inactive and bool(open_cases)) or lift_case_ineligible
     recompute_client_stage(client, actor=actor, ignore_sticky=reactivated)
     if reactivated and client.lifecycle_stage != ClientStage.SERVICE_INACTIVE:
         from api.services import timeline
