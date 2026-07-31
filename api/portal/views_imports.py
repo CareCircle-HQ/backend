@@ -1,6 +1,8 @@
 """Settings > Import: manual Unite Us CSV upload (initial setup + backup) and
 the Unite Us agents allowlist that gates which cases the import accepts."""
 
+import csv
+import io
 import uuid
 
 from django.db import transaction
@@ -428,6 +430,11 @@ class UniteUsAgentsView(PortalAPIView):
         name = (request.data.get("name") or "").strip() or " ".join(
             p for p in [first, last] if p
         )
+        originating_team = (
+            "Met Council Team"
+            if "originating_team" not in request.data
+            else (request.data.get("originating_team") or "").strip()
+        )
         agent = UniteUsAgent.objects.create(
             user_id=user_id,
             first_name=first,
@@ -437,10 +444,7 @@ class UniteUsAgentsView(PortalAPIView):
             work_title=(request.data.get("work_title") or "").strip(),
             status=(request.data.get("status") or "active").strip().lower(),
             is_us=bool(request.data.get("is_us", False)),
-            originating_team=(
-                (request.data.get("originating_team") or "").strip()
-                or "Met Council Team"
-            ),
+            originating_team=originating_team,
         )
         counts = _case_counts_by_creator()
         return Response(
@@ -496,9 +500,7 @@ class UniteUsAgentDetailView(PortalAPIView):
         if "is_us" in data:
             agent.is_us = bool(data.get("is_us"))
         if "originating_team" in data:
-            agent.originating_team = (
-                (data.get("originating_team") or "").strip() or "Met Council Team"
-            )
+            agent.originating_team = (data.get("originating_team") or "").strip()
 
         # Keep the display name in sync when only the name parts changed and no
         # explicit name is set.
@@ -523,6 +525,118 @@ class UniteUsAgentDetailView(PortalAPIView):
             return Response(status=http.HTTP_404_NOT_FOUND)
         agent.delete()
         return Response(status=http.HTTP_204_NO_CONTENT)
+
+
+class UniteUsAgentsImportView(PortalAPIView):
+    """Bulk import / refresh Unite Us agents from the Unite Us users export CSV.
+
+    multipart/form-data: ``file`` (the CSV). New agents are created with an
+    empty ``originating_team`` so they can be filtered and assigned manually.
+    Existing agents are updated with name / email / title / status from the
+    CSV, but their team assignment is left untouched.
+    """
+
+    parser_classes = [MultiPartParser, FormParser]
+
+    def post(self, request):
+        upload = request.FILES.get("file")
+        if upload is None:
+            return Response(
+                {"file": "A CSV file is required."}, status=http.HTTP_400_BAD_REQUEST
+            )
+        name = (upload.name or "").lower()
+        if not name.endswith(".csv"):
+            return Response(
+                {"file": "Please upload a .csv file."}, status=http.HTTP_400_BAD_REQUEST
+            )
+
+        try:
+            text = upload.read().decode("utf-8-sig")
+        except UnicodeDecodeError:
+            return Response(
+                {"file": "Could not read the CSV (expected UTF-8)."},
+                status=http.HTTP_400_BAD_REQUEST,
+            )
+
+        def _norm(value):
+            return (value or "").strip()
+
+        def _uuid_or_none(value):
+            value = _norm(value)
+            if not value:
+                return None
+            try:
+                return uuid.UUID(value)
+            except (ValueError, AttributeError, TypeError):
+                return None
+
+        created = updated = unchanged = skipped = failed = 0
+        seen = set()
+
+        try:
+            with transaction.atomic():
+                for raw_row in csv.DictReader(io.StringIO(text)):
+                    r = {(_norm(k).lower()): v for k, v in raw_row.items()}
+                    user_id = _uuid_or_none(r.get("user_id"))
+                    if not user_id:
+                        skipped += 1
+                        continue
+                    if user_id in seen:
+                        skipped += 1
+                        continue
+                    seen.add(user_id)
+
+                    first = _norm(r.get("first_name"))
+                    last = _norm(r.get("last_name"))
+                    name = " ".join(p for p in [first, last] if p) or _norm(
+                        r.get("email_address")
+                    )
+                    fields = {
+                        "employee_id": _uuid_or_none(r.get("employee_id")),
+                        "first_name": first,
+                        "last_name": last,
+                        "name": name,
+                        "email": _norm(r.get("email_address")).lower(),
+                        "work_title": _norm(r.get("work_title")),
+                        "status": _norm(r.get("employee_status")).lower() or "active",
+                    }
+
+                    agent = UniteUsAgent.objects.filter(user_id=user_id).first()
+                    if agent is None:
+                        created += 1
+                        UniteUsAgent.objects.create(
+                            user_id=user_id,
+                            is_us=False,
+                            originating_team="",
+                            **fields,
+                        )
+                    else:
+                        changed = {
+                            k: v for k, v in fields.items()
+                            if getattr(agent, k) != v
+                        }
+                        if changed:
+                            updated += 1
+                            for k, v in changed.items():
+                                setattr(agent, k, v)
+                            agent.save(update_fields=list(changed.keys()) + ["updated_at"])
+                        else:
+                            unchanged += 1
+        except Exception as exc:
+            return Response(
+                {"error": f"Import failed: {exc}"},
+                status=http.HTTP_400_BAD_REQUEST,
+            )
+
+        return Response(
+            {
+                "created": created,
+                "updated": updated,
+                "unchanged": unchanged,
+                "skipped": skipped,
+                "failed": failed,
+            }
+        )
 
 
 # ---------------------------------------------------------------------------

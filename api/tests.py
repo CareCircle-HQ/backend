@@ -4004,6 +4004,113 @@ class KitchenChangeManagementOnlyTest(TestCase):
         self.assertEqual(cs.status_code, 403)
 
 
+class EnrollmentHistoryViewTest(TestCase):
+    """The Program tab's History sub-tab: the enrollment-scoped timeline. Events
+    are filtered to THIS enrollment (regardless of which household member each
+    is logged on) and bounded at the verification-completion start; the window
+    end reflects the governing case close / authorization expiry."""
+
+    def _api(self):
+        agent = Agent.objects.create(
+            name="CS Agent", agent_code=str(uuid.uuid4())[:8], group="CS",
+        )
+        access = AccessToken()
+        access["agent_id"] = str(agent.id)
+        access["agent_code"] = agent.agent_code
+        access["agent_name"] = agent.name
+        access["agent_group"] = agent.group
+        api = APIClient()
+        api.credentials(HTTP_AUTHORIZATION=f"Bearer {access}")
+        return api
+
+    def _enrollment(self, *, case=None, verified_at=None):
+        from .models import (
+            EnrollmentStage, EnrollmentVerification, Household, HouseholdMember,
+            MemberDietaryProfile,
+        )
+
+        client = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Pat", last_name="Primary",
+        )
+        hh = Household.objects.create(name="HH")
+        HouseholdMember.objects.create(household=hh, client=client, is_primary=True)
+        enr = EnrollmentVerification.objects.create(
+            client=client, household=hh, stage=EnrollmentStage.SERVICE_ACTIVE,
+            case=case, verified_at=verified_at,
+            program_name="Medically Tailored Meals",
+        )
+        MemberDietaryProfile.objects.create(enrollment=enr, client=client)
+        return client, enr
+
+    def _url(self, client, enr):
+        return f"/api/portal/members/{client.pk}/enrollments/{enr.pk}/history/"
+
+    def test_filters_to_enrollment_and_window_start(self):
+        from datetime import timedelta
+
+        from .models import TimelineEvent, TimelineEventType
+
+        verified = timezone.now() - timedelta(days=2)
+        client, enr = self._enrollment(verified_at=verified)
+        # Pre-verification event -> excluded by the window start.
+        TimelineEvent.objects.create(
+            client=client, enrollment=enr, title="Old edit",
+            event_type=TimelineEventType.DIETARY_CHANGED,
+            occurred_at=verified - timedelta(days=1),
+        )
+        # Post-verification event -> included.
+        inside = TimelineEvent.objects.create(
+            client=client, enrollment=enr, title="Out of Orbit",
+            event_type=TimelineEventType.OUT_OF_ORBIT,
+            occurred_at=verified + timedelta(hours=3),
+        )
+        # A different enrollment's event -> excluded.
+        _, other_enr = self._enrollment(verified_at=verified)
+        TimelineEvent.objects.create(
+            client=client, enrollment=other_enr, title="Other program",
+            event_type=TimelineEventType.DIETARY_CHANGED,
+            occurred_at=verified + timedelta(hours=4),
+        )
+
+        resp = self._api().get(self._url(client, enr))
+        self.assertEqual(resp.status_code, 200)
+        ids = [r["id"] for r in resp.data["results"]]
+        self.assertEqual(ids, [inside.pk])
+        self.assertTrue(resp.data["window_open"])
+        self.assertIsNone(resp.data["window_end"])
+
+    def test_window_end_reflects_closed_case(self):
+        from datetime import timedelta
+
+        from .models import Case, CaseStatus, CaseType
+
+        client = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Cee", last_name="Closed",
+        )
+        closed_at = timezone.now()
+        case = Case.objects.create(
+            case_id=uuid.uuid4(), client=client,
+            case_type=CaseType.INTERNAL_SERVICE, case_status=CaseStatus.CLOSED,
+            case_closed_at=closed_at,
+        )
+        # Reuse the enrollment factory but point it at the same client + case.
+        from .models import (
+            EnrollmentStage, EnrollmentVerification, Household, HouseholdMember,
+        )
+
+        hh = Household.objects.create(name="HH2")
+        HouseholdMember.objects.create(household=hh, client=client, is_primary=True)
+        enr = EnrollmentVerification.objects.create(
+            client=client, household=hh, stage=EnrollmentStage.SERVICE_ACTIVE,
+            case=case, verified_at=closed_at - timedelta(days=10),
+        )
+
+        resp = self._api().get(self._url(client, enr))
+        self.assertEqual(resp.status_code, 200)
+        self.assertFalse(resp.data["window_open"])
+        self.assertIsNotNone(resp.data["window_end"])
+
+
 class KitchenAwareMealRuleTest(TestCase):
     """A capable kitchen makes an otherwise-"strict" menu (Kosher/Halal/
     Vegetarian) serviceable: the kitchen-agnostic fallback would send the member

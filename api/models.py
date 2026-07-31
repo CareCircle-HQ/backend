@@ -1399,6 +1399,38 @@ class Case(models.Model):
     authorized_rate = models.CharField(max_length=80, blank=True)  # Rate from authorization
     program_cap = models.TextField(blank=True)
     authorization_note = models.TextField(blank=True)
+    # --- Service Authorization decision detail (Unite Us
+    # /v1/service_authorizations attributes) ---
+    # The adjudicator's decision note (e.g. "This authorization was
+    # automatically accepted." or a denial rationale) -- this is the UI's
+    # "Decision Note". Maps from the auth's ``adjudicator_note``.
+    service_authorization_decision_note = models.TextField(blank=True)
+    # Comment left while the authorization sat in review (``in_review_note``).
+    service_authorization_in_review_note = models.TextField(blank=True)
+    # Comment attached to an "update requested" action (``update_request_note``).
+    service_authorization_update_request_note = models.TextField(blank=True)
+    # Payer-side authorization number, when the payer supplies one
+    # (``payer_authorization_number``); usually null for auto-approved auths.
+    payer_authorization_number = models.CharField(max_length=120, blank=True)
+    # When the authorization was submitted for decision (``submitted_at``).
+    service_authorization_submitted_at = models.DateTimeField(null=True, blank=True)
+    # True when Unite Us auto-approved the authorization (``auto_approved``);
+    # null when the source didn't report it.
+    service_authorization_auto_approved = models.BooleanField(null=True, blank=True)
+    # True when the authorization was flagged urgent (``urgent``); null when the
+    # source didn't report it.
+    service_authorization_urgent = models.BooleanField(null=True, blank=True)
+    # Coded denial reason on a DENIED authorization (the auth's
+    # ``service_authorization_denial_reason`` relationship). We store the id plus
+    # the resolved human-readable name; both blank on non-denied auths. This is
+    # the structured "why" that complements the free-text decision note.
+    service_authorization_denial_reason_id = models.UUIDField(null=True, blank=True)
+    service_authorization_denial_reason = models.CharField(max_length=255, blank=True)
+    # Authorized unit COUNT from the authorization (``approved_unit_amount``,
+    # falling back to ``requested_unit_amount``). Distinct from ``authorized_unit``
+    # (the unit TYPE, e.g. "meals") and ``authorized_amount`` (dollars). Free text
+    # to mirror the per-service ContractedService.authorized_units.
+    authorized_units = models.CharField(max_length=80, blank=True)
 
     # --- Social Care Coverage (as shown on the case) ---
     social_care_coverage_plan = models.CharField(max_length=255, blank=True)

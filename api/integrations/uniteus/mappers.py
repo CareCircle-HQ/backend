@@ -218,12 +218,18 @@ _AUTH_STATE_MAP = {
 }
 
 
-def map_case(case_body_data, *, names=None, auth=None):
+def map_case(
+    case_body_data, *, names=None, auth=None,
+    denial_reason_id=None, denial_reason_name=None,
+):
     """A single case JSON:API record (``body['data'][i]``) -> CaseSerializer dict.
 
     ``names`` is a resolved {service, program, network, primary_worker,
     program_id, network_id, primary_worker_id} dict; ``auth`` is the case's
-    service_authorization attributes dict (or None).
+    service_authorization attributes dict (or None). ``denial_reason_id`` /
+    ``denial_reason_name`` come from the auth's
+    ``service_authorization_denial_reason`` relationship, resolved by the caller
+    (the relationship is not present in ``auth`` attributes).
     """
     names = names or {}
     a = _attrs(case_body_data)
@@ -288,6 +294,42 @@ def map_case(case_body_data, *, names=None, auth=None):
         set_("service_authorization_approval_ends_at", _dt(auth.get("approved_ends_at")))
         set_("service_authorization_request_starts_at", _dt(auth.get("requested_starts_at")))
         set_("service_authorization_request_ends_at", _dt(auth.get("requested_ends_at")))
+        # Decision detail. The UI's "Decision Note" is the adjudicator_note;
+        # fall back to the in-review / update-request comments when the
+        # authorization hasn't been adjudicated yet so the note field is never
+        # left blank while Unite Us has one.
+        set_(
+            "service_authorization_decision_note",
+            auth.get("adjudicator_note")
+            or auth.get("in_review_note")
+            or auth.get("update_request_note"),
+        )
+        set_("service_authorization_in_review_note", auth.get("in_review_note"))
+        set_(
+            "service_authorization_update_request_note",
+            auth.get("update_request_note"),
+        )
+        set_("payer_authorization_number", auth.get("payer_authorization_number"))
+        set_("service_authorization_submitted_at", _dt(auth.get("submitted_at")))
+        # Authorized unit count: approved is authoritative, fall back to the
+        # requested amount (e.g. a pending auth). Distinct from the dollar
+        # ``authorized_amount``; null on dollar-only auths.
+        units = auth.get("approved_unit_amount")
+        if units is None:
+            units = auth.get("requested_unit_amount")
+        if units is not None:
+            out["authorized_units"] = str(units)
+        # Coded denial reason (resolved by the caller from the auth's
+        # ``service_authorization_denial_reason`` relationship). Populated only
+        # on denied auths.
+        set_("service_authorization_denial_reason_id", denial_reason_id)
+        set_("service_authorization_denial_reason", denial_reason_name)
+        # Booleans: pass through only when the source actually reported them so
+        # a missing value stays null rather than being coerced to False.
+        if auth.get("auto_approved") is not None:
+            out["service_authorization_auto_approved"] = bool(auth["auto_approved"])
+        if auth.get("urgent") is not None:
+            out["service_authorization_urgent"] = bool(auth["urgent"])
     return out
 
 

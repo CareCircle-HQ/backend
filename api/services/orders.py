@@ -518,11 +518,31 @@ def sync_active_calendars(from_date=None, progress_cb=None):
         .values_list("enrollment_id", flat=True)
     )
     totals = {"enrollments": 0, "added": 0, "removed": 0, "updated": 0,
-              "plans_created": 0}
+              "plans_created": 0, "renamed": 0, "requeued": 0}
     total = len(enr_ids)
     if progress_cb is not None:
         progress_cb(0, total)
     for enr in EnrollmentVerification.objects.filter(pk__in=enr_ids).iterator():
+        # Self-heal a meals<->boxes governing-case switch BEFORE rebuilding, so no
+        # member is served the wrong product or dropped from the correct PO by a
+        # stale plan: a stale-name/correct-plan household is renamed + reconciled;
+        # a wrong-kind / kitchen-incompatible one is requeued to Kitchen
+        # Assignment (and then skipped here -- it's excluded from POs until ops
+        # reassign a compatible kitchen). Best-effort; never breaks the sweep.
+        try:
+            from api.services.lifecycle import remediate_switched_household
+
+            switch_action = remediate_switched_household(enr)
+        except Exception:  # pragma: no cover - defensive
+            switch_action = None
+        if switch_action == "requeue":
+            totals["requeued"] += 1
+            totals["enrollments"] += 1
+            if progress_cb is not None:
+                progress_cb(totals["enrollments"], total)
+            continue
+        if switch_action == "rename":
+            totals["renamed"] += 1
         # First heal a drifted/lapsed plan window from the governing APPROVED
         # authorization: heal_delivery_window pulls ends_on up to the auth end
         # (no-op when already in sync, when nothing authorizes the future, or on

@@ -48,6 +48,7 @@ from .views_members import (
     MemberCasesView,
     MemberDetailView,
     MemberDiagnosticView,
+    MemberEnrollmentHistoryView,
     MemberHistoryDetailView,
     MemberHistoryView,
     MemberHouseholdAddView,
@@ -132,6 +133,7 @@ from .views_imports import (
     ImportStartView,
     ImportUploadView,
     UniteUsAgentDetailView,
+    UniteUsAgentsImportView,
     UniteUsAgentsView,
     UniteUsExportDetailView,
     UniteUsExportPollView,
@@ -205,6 +207,10 @@ urlpatterns = [
     ),
     path("members/<uuid:client_id>/history/", MemberHistoryView.as_view()),
     path("members/<uuid:client_id>/history/<int:event_id>/", MemberHistoryDetailView.as_view()),
+    path(
+        "members/<uuid:client_id>/enrollments/<int:enrollment_id>/history/",
+        MemberEnrollmentHistoryView.as_view(),
+    ),
     path("members/<uuid:client_id>/orders/", MemberOrdersView.as_view()),
     path(
         "members/<uuid:client_id>/delivery-calendar/",
@@ -346,6 +352,7 @@ urlpatterns = [
     path("activity/filters/", ActivityFiltersView.as_view(), name="portal-activity-filters"),
     # Settings > Import: Unite Us agents allowlist (gates which cases import)
     path("settings/unite-us-agents/", UniteUsAgentsView.as_view(), name="portal-unite-us-agents"),
+    path("settings/unite-us-agents/import/", UniteUsAgentsImportView.as_view(), name="portal-unite-us-agents-import"),
     path(
         "settings/unite-us-agents/<uuid:agent_id>/",
         UniteUsAgentDetailView.as_view(),
