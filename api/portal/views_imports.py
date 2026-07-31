@@ -3,6 +3,7 @@ the Unite Us agents allowlist that gates which cases the import accepts."""
 
 import csv
 import io
+import os
 import uuid
 
 from django.db import transaction
@@ -73,8 +74,13 @@ def _triggered_by(request):
 
 
 # Max upload size. The clients export is a few MB, but the denormalized
-# screening export (one row per answer) runs to several hundred MB.
-_MAX_UPLOAD_BYTES = 512 * 1024 * 1024
+# screening export (one row per answer) runs to SEVERAL GB. The async S3 flow
+# (presign -> direct browser PUT -> Celery) uploads straight to S3 and streams
+# during processing, so it isn't bounded by gunicorn/nginx -- default the cap to
+# 5 GB and make it env-tunable. (The synchronous fallback still POSTs through the
+# gateway, so keep it modest via the gateway's own body limit.)
+_MAX_UPLOAD_BYTES = int(os.getenv("IMPORT_MAX_UPLOAD_BYTES", str(5 * 1024 * 1024 * 1024)))
+_MAX_UPLOAD_MB = _MAX_UPLOAD_BYTES // (1024 * 1024)
 
 
 class ImportUploadView(PortalAPIView):
@@ -107,7 +113,7 @@ class ImportUploadView(PortalAPIView):
             )
         if upload.size and upload.size > _MAX_UPLOAD_BYTES:
             return Response(
-                {"file": "File is too large (max 512 MB)."},
+                {"file": f"File is too large (max {_MAX_UPLOAD_MB} MB)."},
                 status=http.HTTP_400_BAD_REQUEST,
             )
         name = (upload.name or "").lower()
@@ -205,7 +211,7 @@ class ImportPresignView(PortalAPIView):
             size = None
         if size is not None and size > _MAX_UPLOAD_BYTES:
             return Response(
-                {"file": "File is too large (max 512 MB)."},
+                {"file": f"File is too large (max {_MAX_UPLOAD_MB} MB)."},
                 status=http.HTTP_400_BAD_REQUEST,
             )
 
