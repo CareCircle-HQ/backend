@@ -144,6 +144,14 @@ def apply_to_member(profile, *, save=True):
     from api.services.service_area import profile_excluded_zip
 
     result = resolve_kitchen_meal(profile.menu_type, profile.food_allergies)
+    # Preserve a member the automatic rule must never reactivate: a manual PAUSE,
+    # a terminal INACTIVE, or an eligibility-driven pause (import off-ramp). Only
+    # the explicit eligibility-recovery / unpause flow may bring these back, so
+    # the automatic meal rule leaves their status untouched.
+    if profile.eligibility_paused or profile.status in (
+        MemberStatus.PAUSED, MemberStatus.INACTIVE,
+    ):
+        return result, False
     was_out = profile.status in (MemberStatus.OUT_OF_ORBIT, MemberStatus.OUT_OF_RANGE)
     # Delivery Coverage takes priority: an out-of-area delivery/primary ZIP forces
     # the member out of service even when the meal rule alone could fulfill them.
@@ -214,6 +222,11 @@ def reconcile_member_kitchen_output(
     if not allow_resume and profile.status in (
         MemberStatus.PAUSED, MemberStatus.INACTIVE, MemberStatus.OUT_OF_RANGE,
     ):
+        return False, False, ""
+    # An eligibility-driven pause (import off-ramp) is CareCircle-unfixable: NOT
+    # even an explicit resume (allow_resume=True) may reactivate it here. Only the
+    # eligibility-recovery flow (which clears eligibility_paused) returns them.
+    if profile.eligibility_paused:
         return False, False, ""
 
     # Local imports avoid any import cycle between services modules.

@@ -108,10 +108,21 @@ class MemberDeliveryCalendarView(PortalAPIView):
             client_ids = [client_id]
         is_household = is_primary and len(client_ids) > 1
 
-        profile_ids = list(
-            MemberDietaryProfile.objects.filter(client_id__in=client_ids)
-            .values_list("pk", flat=True)
-        )
+        # Optional ?enrollment=<id> scopes the calendar to a SPECIFIC (e.g.
+        # superseded/closed) enrollment's own delivery plans instead of the whole
+        # household's active profiles -- used to show a prior enrollment's
+        # Delivery Schedule tab read-only.
+        override = (request.query_params.get("enrollment") or "").strip()
+        if override:
+            profile_ids = list(
+                MemberDietaryProfile.objects.filter(enrollment_id=override)
+                .values_list("pk", flat=True)
+            )
+        else:
+            profile_ids = list(
+                MemberDietaryProfile.objects.filter(client_id__in=client_ids)
+                .values_list("pk", flat=True)
+            )
 
         occurrences = list(
             OrderSchedule.objects.filter(member_id__in=profile_ids)
@@ -228,6 +239,12 @@ class MemberDeliveryCalendarView(PortalAPIView):
         the dated calendar, never touching a date already batched into a PO.
         """
         get_object_or_404(Client, pk=client_id)
+        # A scoped (superseded) enrollment is read-only history -- never rebuild it.
+        if (request.query_params.get("enrollment") or "").strip():
+            return Response(
+                {"detail": "This is a previous enrollment (read-only history)."},
+                status=400,
+            )
         enr = self._enrollment_for(client_id)
         if enr is None:
             return Response(

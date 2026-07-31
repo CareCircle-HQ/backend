@@ -1062,16 +1062,22 @@ def event_for_member_governing_case_changed(
         return None
     prog = (program or "").strip() or "meal/box"
     auth = (auth_status or "").strip() or "blank"
+    # Badge is a SHORT product-kind label (Boxes/Meals): the raw program name can
+    # exceed the badge_text column (max_length=120), so never store it there.
+    prog_low = prog.lower()
+    badge = "Boxes" if "box" in prog_low else "Meals" if "meal" in prog_low else "Program"
     subtitle = f"{previous_case_id} \u2192 {new_case_id} \u00b7 {prog}"
     if reason:
         subtitle = f"{subtitle} \u00b7 {reason}"
+    # Defensively fit the display columns (subtitle max_length=255).
+    subtitle = subtitle[:255]
     return emit_timeline_event(
         client=client,
         event_type=TimelineEventType.MEMBER_GOVERNING_CASE_CHANGED,
         occurred_at=timezone.now(),
         title="Governing Case Changed",
         subtitle=subtitle,
-        badge_text=prog,
+        badge_text=badge[:120],
         badge_tone=TimelineBadgeTone.INFO,
         source=source,
         actor=actor,
