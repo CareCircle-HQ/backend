@@ -163,8 +163,8 @@ WSGI_APPLICATION = 'backend.wsgi.application'
 
 DATABASES = {
     'default': {
-        'ENGINE': os.getenv('DB_ENGINE', 'django.db.backends.sqlite3'),
-        'NAME': os.getenv('DB_NAME', BASE_DIR / 'db.sqlite3'),
+        'ENGINE': os.getenv('DB_ENGINE', 'django.db.backends.postgresql'),
+        'NAME': os.getenv('DB_NAME', 'carecircle'),
         'USER': os.getenv('DB_USER', ''),
         'PASSWORD': os.getenv('DB_PASSWORD', ''),
         'HOST': os.getenv('DB_HOST', ''),
@@ -184,8 +184,8 @@ DATABASES = {
     }
 }
 
-# PostgreSQL/RDS connection options (only when SSL is configured, i.e. not the
-# local sqlite default). ``connect_timeout`` makes a stalled connection attempt
+# PostgreSQL/RDS connection options (only when SSL is configured, i.e. not a
+# local unencrypted Postgres). ``connect_timeout`` makes a stalled connection attempt
 # fail in seconds instead of tying up a gunicorn worker until its 300s timeout
 # when RDS is slow to accept a new connection.
 if os.getenv('DB_SSLMODE'):
@@ -197,22 +197,16 @@ if os.getenv('DB_SSLMODE'):
 # ---------------------------------------------------------------------------
 # Test database
 # ---------------------------------------------------------------------------
-# Production runs on PostgreSQL. Building the test schema from scratch on SQLite
-# trips a historical migration (0036_rename_eligibility_to_assessment): it
-# relies on Postgres' in-place column rename, whereas SQLite's table-remake path
-# rebuilds a stale index reference and raises FieldDoesNotExist. That migration
-# is already applied everywhere and is correct on Postgres, so we don't rewrite
-# it. Instead, when running the test suite we use a fast in-memory SQLite DB and
-# build the schema DIRECTLY from the current models (migrations disabled), which
-# sidesteps the SQLite-only remake issue and also speeds tests up. Opt in
-# automatically for `manage.py test`, or explicitly via DISABLE_MIGRATIONS=1.
+# The test suite runs on PostgreSQL (Django creates/drops a ``test_<DB_NAME>``
+# database), so tests exercise REAL Postgres behavior -- column length limits,
+# transaction semantics -- catching bugs a SQLite test DB would silently mask.
+# The schema is built DIRECTLY from the current models (migrations disabled) both
+# for speed and to sidestep a historical migration
+# (0036_rename_eligibility_to_assessment) that only needs Postgres' in-place
+# column rename. Opt in automatically for `manage.py test`, or explicitly via
+# DISABLE_MIGRATIONS=1.
 RUNNING_TESTS = "test" in sys.argv or os.getenv("DISABLE_MIGRATIONS") == "1"
 if RUNNING_TESTS:
-    DATABASES["default"] = {
-        "ENGINE": "django.db.backends.sqlite3",
-        "NAME": ":memory:",
-    }
-
     class _DisableMigrations:
         def __contains__(self, item):
             return True
