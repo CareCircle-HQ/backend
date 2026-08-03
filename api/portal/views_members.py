@@ -5003,6 +5003,19 @@ class MemberKitchenOptionsView(PortalAPIView):
         return Response(data)
 
 
+# Enrollment stages from which a kitchen can be assigned + service activated:
+# VERIFIED (Williamsburg fast-track), KITCHEN_ASSIGNMENT (the normal Logistics
+# step), SERVICE_ACTIVE (a re-assignment / kitchen change -- a no-op advance),
+# and ON_HOLD (which has a valid edge to SERVICE_ACTIVE). Any earlier stage has
+# no valid transition to SERVICE_ACTIVE, so assignment must be rejected.
+_KITCHEN_ASSIGNABLE_STAGES = {
+    EnrollmentStage.VERIFIED,
+    EnrollmentStage.KITCHEN_ASSIGNMENT,
+    EnrollmentStage.SERVICE_ACTIVE,
+    EnrollmentStage.ON_HOLD,
+}
+
+
 class MemberAssignKitchenView(PortalAPIView):
     """Logistics: assign a kitchen + cadence to the whole household, build the
     per-member delivery plans, and activate the household (Service Active).
@@ -5020,6 +5033,18 @@ class MemberAssignKitchenView(PortalAPIView):
         # (re)assignment, which would otherwise re-activate a closed member.
         if _program_locked(enr):
             return _program_locked_response()
+
+        # A kitchen can only be assigned once the member is VERIFIED and awaiting
+        # kitchen assignment (or already served -- a re-assignment). An earlier
+        # stage (e.g. Pending Verification) has NO valid path to Service Active,
+        # so assign_kitchen_to_household's force-advance would raise
+        # InvalidTransition (a 500). Reject it cleanly instead.
+        if EnrollmentStage(enr.stage) not in _KITCHEN_ASSIGNABLE_STAGES:
+            return Response(
+                {"error": "This member must complete verification before a "
+                          "kitchen can be assigned."},
+                status=http.HTTP_400_BAD_REQUEST,
+            )
 
         # CHANGING an already-assigned kitchen (the program tab's "Kitchen &
         # Delivery" Change control) is Management-only: verification / CS /

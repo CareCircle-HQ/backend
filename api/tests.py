@@ -822,6 +822,44 @@ class AssignKitchenFromVerifiedTest(TestCase):
         self.assertEqual(enr.stage, EnrollmentStage.SERVICE_ACTIVE)
         self.assertEqual(enr.kitchen_id, kitchen.pk)
 
+    def test_assign_kitchen_rejected_before_verification(self):
+        # Regression: assigning a kitchen to a member still at PENDING_VERIFICATION
+        # force-advanced to SERVICE_ACTIVE with no valid transition -> a 500. It
+        # must return a clean 400 telling the agent to verify first.
+        from rest_framework.test import APIClient
+        from rest_framework_simplejwt.tokens import AccessToken
+
+        from .models import (
+            Agent, Client, EnrollmentStage, EnrollmentVerification, Household,
+            HouseholdMember, Kitchen, KitchenStatus,
+        )
+
+        client = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Pend", last_name="Ver",
+            lifecycle_stage="pending_verification",
+        )
+        hh = Household.objects.create(name="HH")
+        HouseholdMember.objects.create(household=hh, client=client, is_primary=True)
+        EnrollmentVerification.objects.create(
+            client=client, household=hh, stage=EnrollmentStage.PENDING_VERIFICATION,
+        )
+        kitchen = Kitchen.objects.create(name="K", status=KitchenStatus.ACTIVE)
+        agent = Agent.objects.create(name="Mgr", agent_code="961", group="Management")
+        access = AccessToken()
+        access["agent_id"] = str(agent.id)
+        access["agent_code"] = agent.agent_code
+        access["agent_name"] = agent.name
+        access["agent_group"] = agent.group
+        api = APIClient()
+        api.credentials(HTTP_AUTHORIZATION=f"Bearer {access}")
+        r = api.post(
+            f"/api/portal/members/{client.client_id}/assign-kitchen/",
+            {"kitchen_id": str(kitchen.pk), "cadence": "tue_only", "member_overrides": []},
+            format="json",
+        )
+        self.assertEqual(r.status_code, 400, r.content)
+        self.assertIn("verification", r.json()["error"].lower())
+
 
 class HouseholdEnrollmentActivationTest(TestCase):
     """When a household enrollment advances, every participant — not just the
