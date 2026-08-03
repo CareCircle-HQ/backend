@@ -1076,6 +1076,11 @@ _CATEGORY_TO_CASE_TYPE = {
     "eligibility": CaseType.ELIGIBILITY,
     "internal service": CaseType.INTERNAL_SERVICE,
     "internal services": CaseType.INTERNAL_SERVICE,
+    # Reauthorization renews an existing meal/box authorization, so it IS an
+    # internal-service case: it must drive service the same way (governing-case
+    # selection, enrollment, delivery, the program tab) rather than being a
+    # separate Navigation case.
+    "reauthorization": CaseType.INTERNAL_SERVICE,
     "external service": CaseType.EXTERNAL_SERVICE,
     "external services": CaseType.EXTERNAL_SERVICE,
 }
