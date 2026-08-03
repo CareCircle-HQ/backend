@@ -10501,3 +10501,82 @@ class CalendarHidesSupersededFutureRowsTest(TestCase):
         rows = [row for row in r.json()["occurrences"] if row["date"] == day.isoformat()]
         self.assertEqual(len(rows), 1, rows)
         self.assertEqual(rows[0]["state"], "scheduled")
+
+    def test_past_cancelled_and_active_delivery_deduped(self):
+        from datetime import timedelta
+
+        from rest_framework.test import APIClient
+        from rest_framework_simplejwt.tokens import AccessToken
+
+        from .models import (
+            Agent, Case, CaseStatus, CaseType, Client, DeliveryOrder,
+            DeliveryOrderStatus, EnrollmentStage, EnrollmentVerification,
+            Household, HouseholdMember, MemberDietaryProfile, MemberStatus,
+            OrderSchedule, OrderStatus, PurchaseOrder, PurchaseOrderStatus,
+        )
+
+        today = timezone.localdate()
+        past = today - timedelta(days=5)
+        client = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Past", last_name="Dup",
+        )
+        hh = Household.objects.create(name="HH")
+        HouseholdMember.objects.create(household=hh, client=client, is_primary=True)
+        case = Case.objects.create(
+            case_id=str(uuid.uuid4()), client=client,
+            case_type=CaseType.INTERNAL_SERVICE, case_status=CaseStatus.OPEN,
+            service_authorization_status="approved", date_opened=timezone.now(),
+        )
+        old = EnrollmentVerification.objects.create(
+            client=client, household=hh, stage=EnrollmentStage.CLOSED,
+            close_reason="case_replaced",
+        )
+        old_mp = MemberDietaryProfile.objects.create(
+            enrollment=old, client=client, member_name="Past Dup",
+            menu_type="Standard", status=MemberStatus.ACTIVE,
+        )
+        OrderSchedule.objects.create(
+            enrollment=old, member=old_mp, member_name="Past Dup",
+            anticipated_delivery_date=past, status=OrderStatus.SCHEDULED,
+            household_group_code="G", household=hh,
+        )
+        new = EnrollmentVerification.objects.create(
+            client=client, household=hh, case=case,
+            stage=EnrollmentStage.SERVICE_ACTIVE, supersedes=old,
+        )
+        new_mp = MemberDietaryProfile.objects.create(
+            enrollment=new, client=client, member_name="Past Dup",
+            menu_type="Standard", status=MemberStatus.ACTIVE,
+        )
+        OrderSchedule.objects.create(
+            enrollment=new, member=new_mp, member_name="Past Dup",
+            anticipated_delivery_date=past, status=OrderStatus.SCHEDULED,
+            household_group_code="G", household=hh,
+        )
+        # Two committed DeliveryOrders on the same past date: an old CANCELLED
+        # (from the replaced PO) and a live ready_for_delivery.
+        po_old = PurchaseOrder.objects.create(status=PurchaseOrderStatus.DRAFT)
+        DeliveryOrder.objects.create(
+            purchase_order=po_old, member=client, group=hh,
+            expected_delivery_date=past, status=DeliveryOrderStatus.CANCELLED,
+        )
+        po_new = PurchaseOrder.objects.create(status=PurchaseOrderStatus.DRAFT)
+        DeliveryOrder.objects.create(
+            purchase_order=po_new, member=client, group=hh,
+            expected_delivery_date=past, status=DeliveryOrderStatus.READY_FOR_DELIVERY,
+        )
+
+        agent = Agent.objects.create(name="C2", agent_code="953", group="CS")
+        access = AccessToken()
+        access["agent_id"] = str(agent.id)
+        access["agent_code"] = agent.agent_code
+        access["agent_name"] = agent.name
+        access["agent_group"] = agent.group
+        api = APIClient()
+        api.credentials(HTTP_AUTHORIZATION=f"Bearer {access}")
+        r = api.get(f"/api/portal/members/{client.client_id}/delivery-calendar/")
+        self.assertEqual(r.status_code, 200, r.content)
+        rows = [row for row in r.json()["occurrences"] if row["date"] == past.isoformat()]
+        # A single row for the date, keyed off the live (non-cancelled) delivery.
+        self.assertEqual(len(rows), 1, rows)
+        self.assertNotEqual(rows[0]["status"], "cancelled")

@@ -148,6 +148,33 @@ class MemberDeliveryCalendarView(PortalAPIView):
 
         today = timezone.localdate()
 
+        # De-duplicate occurrences per (member, date) in the household aggregate.
+        # After a governing-case replacement/restore a member can have BOTH a
+        # superseded (closed) enrollment and the active one carrying an occurrence
+        # for the SAME date -- which rendered as two rows (e.g. a live "Scheduled"
+        # next to the dead plan's "Service Ended", or a real delivery next to a
+        # cancelled one). Keep a single row per date, preferring the ACTIVE
+        # (non-terminal) enrollment, then a committed delivery over a bare plan.
+        # The ?enrollment= read-only view is exempt (it shows one enrollment only).
+        if not override:
+            def _rank(o):
+                mcid = o.member.client_id if o.member_id else None
+                terminal = getattr(o.enrollment, "stage", None) in _TERMINAL_STAGES
+                has_do = (mcid, o.anticipated_delivery_date) in do_by_key
+                # Lower sorts first / wins: active before terminal, committed first.
+                return (0 if not terminal else 1, 0 if has_do else 1)
+
+            best = {}
+            for o in occurrences:
+                mcid = o.member.client_id if o.member_id else None
+                key = (mcid, o.anticipated_delivery_date)
+                cur = best.get(key)
+                if cur is None or _rank(o) < _rank(cur):
+                    best[key] = o
+            occurrences = sorted(
+                best.values(), key=lambda o: (o.anticipated_delivery_date or today)
+            )
+
         rows = []
         counts = {"total": 0, "scheduled": 0, "committed": 0, "delivered": 0,
                   "cancelled": 0, "upcoming": 0}
@@ -156,21 +183,6 @@ class MemberDeliveryCalendarView(PortalAPIView):
             d = o.anticipated_delivery_date
             member_client_id = o.member.client_id if o.member_id else None
             do = do_by_key.get((member_client_id, d))
-
-            # Skip a SUPERSEDED/terminal enrollment's leftover FUTURE scheduled
-            # occurrences in the household aggregate: the current active
-            # enrollment already covers those dates, so showing the dead plan's
-            # "Service Ended" rows next to the live "Scheduled" ones is a
-            # confusing duplicate. Past/committed deliveries still render (via the
-            # DeliveryOrder match). The ?enrollment= read-only view is exempt --
-            # it deliberately shows that specific enrollment's own plan.
-            if (
-                not override
-                and do is None
-                and d and today and d >= today
-                and getattr(o.enrollment, "stage", None) in _TERMINAL_STAGES
-            ):
-                continue
 
             if do is not None:
                 state = _do_state(do.status)
