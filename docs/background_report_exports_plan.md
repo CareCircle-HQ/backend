@@ -13,8 +13,28 @@ Run large report exports **in the background** (Celery worker), store the CSV in
 infrastructure already proven by the async CSV **import** flow
 (`api/tasks.py` + `api/services/import_storage.py` + `ImportRun` polling).
 
-Design it **generically** (keyed by `report_key`) so every large report can opt
-into it, starting with All Members.
+Design it **generically** (keyed by `report_key`) and migrate **every export on
+the Reports page** to the same background flow — All Members is the urgent one,
+but doing them all uniformly means one code path, one UX, and no other report can
+hit the same timeout later.
+
+### Reports to migrate (all of them)
+Each becomes a `report_key` with a request-independent row generator in
+`REPORT_BUILDERS`:
+
+| report_key | current view | params |
+|---|---|---|
+| `members-by-lead-source` | `MembersByLeadSourceReportView` | `lead_sources[]`, `created_from/to` |
+| `members-pending-verification` | `MembersPendingVerificationReportView` | `created_from/to` |
+| `all-verifications` | `AllVerificationsReportView` | `requested_from/to` |
+| `all-members` | `AllMembersReportView` | `created_from/to` |
+| `cases` | `CasesReportView` | (its existing filters) |
+| `members-for-po` | `MembersForPurchaseOrderReportView` | delivery date / kitchen params |
+| `members-not-served` | `MembersNotServedReportView` | — |
+| `unite-us-agents` | `UniteUsAgentsReportView` | — |
+
+Each existing `*.get()` is refactored to delegate to its generator (single source
+of truth); the sync endpoints stay as the **no-S3 fallback** and for tiny pulls.
 
 ## Existing infrastructure to reuse
 - **Celery**: `backend/celery.py`, `@shared_task` in `api/tasks.py` (e.g.
@@ -45,16 +65,26 @@ into it, starting with All Members.
 Migration: `0169_reportexport`.
 
 ### 2. Reusable CSV row generators — `api/portal/report_exports.py` (new)
-Extract the per-report row building into request-independent generators that
-`yield` lists:
+Extract EVERY report's row building into request-independent generators that
+`yield` lists (header first, then one list per row), registered in one table:
 ```python
-REPORT_BUILDERS = {"all-members": all_members_rows}   # extend later
+REPORT_BUILDERS = {
+    "members-by-lead-source": members_by_lead_source_rows,
+    "members-pending-verification": members_pending_verification_rows,
+    "all-verifications": all_verifications_rows,
+    "all-members": all_members_rows,
+    "cases": cases_rows,
+    "members-for-po": members_for_po_rows,
+    "members-not-served": members_not_served_rows,
+    "unite-us-agents": unite_us_agents_rows,
+}
 def all_members_rows(params): ...  # yields header + one list per member
 ```
-Refactor `AllMembersReportView.get()` to delegate to `all_members_rows` (single
-source of truth; the sync endpoint stays for small/filtered pulls and as a
-non-S3 fallback). Use `Client.objects...iterator(chunk_size=2000)` inside the
-generator to bound memory.
+Each generator takes a plain `params` dict (no request) and uses
+`queryset.iterator(chunk_size=...)` to bound memory. Every existing report view's
+`.get()` is refactored to build its response from its generator, so the sync path
+and the background path share ONE implementation per report — no divergence.
+A `default_filename(report_key)` helper centralizes the download filenames.
 
 ### 3. Storage helpers — `api/services/import_storage.py`
 - `EXPORTS_PREFIX = "exports"` + `build_export_key(filename)`.
@@ -84,13 +114,21 @@ def generate_report_export(self, export_id): ...
 - `PortalReportExportSerializer`.
 
 ## Frontend (`ReportsPage.tsx`)
-- `AllMembersReport` "Export all members" → `POST /reports/exports/`
-  `{report_key:"all-members", params}`, store the returned `id`.
-- Poll `GET /reports/exports/<id>/` every ~2s; show **Preparing… (n rows)** →
-  when `completed`, show a **Download CSV** button (opens `download_url`); on
-  `failed`, show `error`.
-- The date-range ("Export range") path can keep the direct sync download when the
-  filtered set is small; the full export always goes background.
+Introduce ONE shared hook/component used by **every** report panel so they behave
+identically:
+```ts
+useReportExport(report_key)  ->  { start(params), status, rowCount, downloadUrl, error, reset }
+```
+- `start(params)` → `POST /reports/exports/` `{report_key, params}`, stores `id`.
+- Polls `GET /reports/exports/<id>/` ~every 2s; button shows **Preparing… (n rows)**
+  → **Download CSV** (opens `download_url`) when `completed`; shows `error` on
+  `failed`.
+- Migrate all eight report panels (Members by Lead Source, Members Pending
+  Verification, All Verifications, All Members, Cases, Active Members for PO,
+  Members Not on a PO, Unite Us Agents) to call `useReportExport` instead of the
+  direct `apiDownload`. Same look/behavior everywhere.
+- When the backend responds that it streamed directly (no S3), the hook just
+  triggers the download immediately (no polling) — transparent to the user.
 
 ## Fallback / environments
 - Background flow requires **S3 + a running Celery worker** (same as imports).
@@ -114,8 +152,14 @@ def generate_report_export(self, export_id): ...
 2. Deploy frontend.
 3. Retest All Members on prod: job starts, completes, downloads.
 
-## Reusability / follow-ups
-- Add `report_key`s for the other heavy reports (All Members done first;
-  Cases / Members-for-PO / Members-not-served can plug into `REPORT_BUILDERS`).
-- Optional: a small "Recent exports" list (last N `ReportExport` rows with
-  re-download) and TTL cleanup of old S3 objects via `delete_object`.
+## Suggested implementation order (all reports)
+1. Infra first: `ReportExport` model + migration, `import_storage.presign_get` /
+   `build_export_key`, the Celery task, and the two endpoints + serializer.
+2. `report_exports.py` with `all_members_rows` + refactor `AllMembersReportView`;
+   wire the frontend `useReportExport` hook on the All Members panel end-to-end.
+3. Port the remaining seven generators one at a time (each: extract generator,
+   refactor its view to use it, switch its panel to `useReportExport`, add a test).
+
+## Follow-ups
+- Optional "Recent exports" list (last N `ReportExport` rows with re-download).
+- TTL cleanup of old S3 export objects via `delete_object` (management command).
