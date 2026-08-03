@@ -2208,6 +2208,26 @@ class MemberListGroupedStatusFilterTest(TestCase):
         self.assertNotIn(str(stale.client_id), ids)   # stale closed profile ignored
         self.assertIn(str(current.client_id), ids)     # current profile matches
 
+    def test_paused_flag_splits_agent_vs_eligibility(self):
+        # Paused splits into agent (manual) vs eligibility (auto) so the two are
+        # distinguishable on the list; both are status=PAUSED, told apart by the
+        # eligibility_paused flag.
+        from .models import MemberDietaryProfile, MemberStatus
+
+        agent = self._member("AgentPause", member_status=MemberStatus.PAUSED)
+        elig = self._member("EligPause", member_status=MemberStatus.PAUSED)
+        p = MemberDietaryProfile.objects.get(client=elig)
+        p.eligibility_paused = True
+        p.save(update_fields=["eligibility_paused"])
+
+        agent_ids = self._ids(flag="paused")
+        self.assertIn(str(agent.client_id), agent_ids)
+        self.assertNotIn(str(elig.client_id), agent_ids)
+
+        elig_ids = self._ids(flag="eligibility_paused")
+        self.assertIn(str(elig.client_id), elig_ids)
+        self.assertNotIn(str(agent.client_id), elig_ids)
+
     def test_verification_axis(self):
         from .models import ClientStage, EnrollmentStage
 

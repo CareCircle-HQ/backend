@@ -598,7 +598,7 @@ _NON_CURRENT_ENROLLMENT_STAGES = [
 ]
 
 
-def current_member_status_exists(member_status):
+def current_member_status_exists(member_status, *, eligibility_paused=None):
     """``Exists`` over the client's member dietary profiles in ``member_status``
     on a CURRENT (non-terminal) enrollment.
 
@@ -608,12 +608,17 @@ def current_member_status_exists(member_status):
     superseded enrollment (e.g. an out-of-orbit profile left behind by a
     governing-case replacement), surfacing members whose live profile is Active.
     Scoping to a non-terminal enrollment fixes that, and ``Exists`` avoids the
-    join duplicates a multi-valued ``.filter`` would add."""
+    join duplicates a multi-valued ``.filter`` would add.
+
+    ``eligibility_paused`` (True/False) further splits Paused into the auto
+    (eligibility-driven) vs manual (agent) pause; None leaves it unfiltered."""
     profiles = (
         MemberDietaryProfile.objects
         .filter(client=OuterRef("pk"), status=member_status)
         .exclude(enrollment__stage__in=[s.value for s in _NON_CURRENT_ENROLLMENT_STAGES])
     )
+    if eligibility_paused is not None:
+        profiles = profiles.filter(eligibility_paused=eligibility_paused)
     return Exists(profiles)
 
 
@@ -1307,7 +1312,17 @@ class MembersListView(PortalGenericAPIView):
         elif flag == "out_of_range":
             qs = qs.filter(current_member_status_exists(MemberStatus.OUT_OF_RANGE))
         elif flag == "paused":
-            qs = qs.filter(current_member_status_exists(MemberStatus.PAUSED))
+            # AGENT (manual) pause only -- exclude the eligibility-driven pause so
+            # the two are distinguishable on the list.
+            qs = qs.filter(current_member_status_exists(
+                MemberStatus.PAUSED, eligibility_paused=False,
+            ))
+        elif flag == "eligibility_paused":
+            # AUTO pause: the member failed their own eligibility (expired
+            # insurance / missing coverage).
+            qs = qs.filter(current_member_status_exists(
+                MemberStatus.PAUSED, eligibility_paused=True,
+            ))
         # TEMP diagnostic flags (to be removed): members missing dietary/logistics
         # data. "no_menu_type" -> no dietary profile carries a menu type at all;
         # "no_kitchen" -> neither the member's nor their household's enrollment has

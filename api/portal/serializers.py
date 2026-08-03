@@ -288,11 +288,26 @@ def member_out_of_range(client):
 
 
 def member_paused(client):
-    """True when the client's active-enrollment dietary profile is Paused (an
-    agent manually paused them). Paused members are excluded from delivery
-    schedules/POs."""
+    """True when the client's active-enrollment dietary profile is Paused (agent
+    OR eligibility). Paused members are excluded from delivery schedules/POs."""
     mp = active_member_profile(client)
     return mp is not None and mp.status == MemberStatus.PAUSED
+
+
+def member_pause_type(client):
+    """WHICH kind of pause the member's active-enrollment profile is in, so the
+    list can tell them apart at a glance:
+
+      * "eligibility" -> auto/system pause because the member failed their OWN
+        eligibility (expired insurance / missing coverage); reversible only via
+        the eligibility-recovery flow.
+      * "agent"       -> a manual agent pause (with a pause_reason note).
+      * ""            -> not paused.
+    """
+    mp = active_member_profile(client)
+    if mp is None or mp.status != MemberStatus.PAUSED:
+        return ""
+    return "eligibility" if getattr(mp, "eligibility_paused", False) else "agent"
 
 
 def _main_stage_value(client):
@@ -545,6 +560,10 @@ class MemberListSerializer(serializers.Serializer):
     out_of_orbit = serializers.SerializerMethodField()
     out_of_range = serializers.SerializerMethodField()
     paused = serializers.SerializerMethodField()
+    # WHICH pause the member is in: "eligibility" (auto -- failed own eligibility)
+    # vs "agent" (manual), so the list badge/tooltip can tell them apart. "" when
+    # not paused.
+    pause_type = serializers.SerializerMethodField()
     start_date = serializers.SerializerMethodField()
     end_date = serializers.SerializerMethodField()
     verification_requested_at = serializers.SerializerMethodField()
@@ -720,6 +739,9 @@ class MemberListSerializer(serializers.Serializer):
 
     def get_paused(self, obj):
         return member_paused(obj)
+
+    def get_pause_type(self, obj):
+        return member_pause_type(obj)
 
     def get_verification_status(self, obj):
         return verification_status(obj)
