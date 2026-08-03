@@ -11151,3 +11151,68 @@ class KitchenAbbreviationPoNumberTest(TestCase):
         k.refresh_from_db()
         self.assertEqual(k.name, "West Side Kitchen")
         self.assertEqual(k.abbreviation, "WSK")
+
+
+class AllVerificationsReportTest(TestCase):
+    """The Admin > Reports 'All Verifications' export: one row per verification
+    with Member ID + the milestone dates, management-gated."""
+
+    def _api(self, group="Management", code="965"):
+        from rest_framework.test import APIClient
+        from rest_framework_simplejwt.tokens import AccessToken
+
+        from .models import Agent
+
+        agent = Agent.objects.create(name="M", agent_code=code, group=group)
+        access = AccessToken()
+        access["agent_id"] = str(agent.id)
+        access["agent_code"] = agent.agent_code
+        access["agent_name"] = agent.name
+        access["agent_group"] = agent.group
+        api = APIClient()
+        api.credentials(HTTP_AUTHORIZATION=f"Bearer {access}")
+        return api
+
+    def test_export_rows_and_management_gate(self):
+        from datetime import timedelta
+
+        from .models import (
+            Case, CaseStatus, CaseType, Client, EnrollmentStage,
+            EnrollmentVerification, Household, HouseholdMember,
+            ServiceAuthorizationStatus,
+        )
+
+        now = timezone.now()
+        client = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Vera", last_name="Fied",
+        )
+        hh = Household.objects.create(name="HH")
+        HouseholdMember.objects.create(household=hh, client=client, is_primary=True)
+        case = Case.objects.create(
+            case_id=str(uuid.uuid4()), client=client,
+            case_type=CaseType.INTERNAL_SERVICE, case_status=CaseStatus.OPEN,
+            service_authorization_status=ServiceAuthorizationStatus.APPROVED,
+            service_authorization_approval_starts_at=now - timedelta(days=1),
+            program_name="Medically Tailored Meals",
+        )
+        EnrollmentVerification.objects.create(
+            client=client, household=hh, case=case,
+            stage=EnrollmentStage.VERIFIED,
+            requested_at=now - timedelta(days=3),
+            verified_at=now - timedelta(days=2),
+        )
+
+        # Non-management is refused.
+        self.assertEqual(self._api(group="CS", code="966").get("/api/portal/reports/all-verifications/").status_code, 403)
+
+        r = self._api().get("/api/portal/reports/all-verifications/")
+        self.assertEqual(r.status_code, 200, r.content)
+        body = r.content.decode()
+        lines = [ln for ln in body.splitlines() if ln.strip()]
+        self.assertEqual(
+            lines[0],
+            "Member ID,Verification Requested,Verification Completed,Authorization Approved",
+        )
+        self.assertIn(str(client.client_id), lines[1])
+        # All three dates present (requested/completed/authorized).
+        self.assertEqual(lines[1].count(str((now - timedelta(days=2)).date())), 1)

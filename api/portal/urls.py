@@ -110,6 +110,7 @@ from .views_kitchen_output import KitchenOutputView
 from .views_po_blockers import POBlockersFixView, POBlockersStatsView, POBlockersView
 from .views_reports import (
     AllMembersReportView,
+    AllVerificationsReportView,
     CasesReportView,
     MembersByLeadSourceReportView,
     MembersForPurchaseOrderReportView,
@@ -407,6 +408,11 @@ urlpatterns = [
         "reports/members-pending-verification/",
         MembersPendingVerificationReportView.as_view(),
         name="portal-report-members-pending-verification",
+    ),
+    path(
+        "reports/all-verifications/",
+        AllVerificationsReportView.as_view(),
+        name="portal-report-all-verifications",
     ),
     path(
         "reports/all-members/",
