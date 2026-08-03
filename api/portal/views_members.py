@@ -1147,7 +1147,16 @@ class MembersListView(PortalGenericAPIView):
             # verification was already requested/handled, so a stale is_new flag
             # must never keep them on the list. Leaves only members with no
             # enrollment yet.
-            qs = qs.filter(is_new=True).exclude(
+            # Enforce rule 1 LIVE: the member must currently hold an OPEN
+            # internal-service (meal/box) case. is_new is a set-only flag that is
+            # never cleared when the internal-service case later closes or is
+            # replaced by an eligibility-only case, so trusting it alone leaves
+            # stale members on the tab (e.g. a member with only an eligibility
+            # case). The Exists check drops them regardless of the stale flag.
+            open_internal_case = Case.objects.filter(
+                client=OuterRef("pk"), case_type=CaseType.INTERNAL_SERVICE,
+            ).exclude(case_status__in=[CaseStatus.CLOSED, CaseStatus.CANCELLED])
+            qs = qs.filter(is_new=True).filter(Exists(open_internal_case)).exclude(
                 Q(enrollments__isnull=False)
                 | Q(household_membership__household__enrollment_verifications__isnull=False)
             ).distinct()

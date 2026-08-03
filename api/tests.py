@@ -11037,3 +11037,62 @@ class TicketCreatedByAndActivityTest(TestCase):
         r = api.post("/api/portal/tickets/", {"type": tt.code, "reason": "x"}, format="json")
         self.assertEqual(r.json()["created_by"], agent.name)
         self.assertEqual(r.json()["created_by_id"], str(agent.id))
+
+
+class NeedAttentionScopeCaseRuleTest(TestCase):
+    """The Urgent Care 'No Verification requested' tab (scope=need_attention)
+    must enforce rule 1 LIVE: only members who currently hold an OPEN
+    internal-service case appear. A stale is_new flag on a member with no
+    internal-service case (e.g. only an eligibility case) must NOT surface."""
+
+    def setUp(self):
+        from .models import Agent
+
+        self.agent = Agent.objects.create(name="UC", agent_code="963", group="Management")
+
+    def _member(self, *, case_type, is_new=True):
+        from .models import (
+            Case, CaseStatus, CaseType, Client, Household, HouseholdMember,
+            InsurancePlanType, RecordStatus, SocialCareCoverage,
+            SocialCareCoverageStatus,
+        )
+
+        c = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="N", last_name="A", is_new=is_new,
+        )
+        hh = Household.objects.create(name="HH")
+        HouseholdMember.objects.create(household=hh, client=c, is_primary=True)
+        Insurance.objects.create(
+            client=c, plan_type=InsurancePlanType.MEDICAID,
+            status=RecordStatus.ACTIVE, plan_name="Medicaid",
+        )
+        SocialCareCoverage.objects.create(
+            client=c, status=SocialCareCoverageStatus.ENROLLED, plan_name="SC",
+        )
+        Case.objects.create(
+            case_id=str(uuid.uuid4()), client=c, case_type=case_type,
+            case_status=CaseStatus.OPEN, program_name="P",
+        )
+        return c
+
+    def _ids(self):
+        from rest_framework.request import Request
+        from rest_framework.test import APIRequestFactory
+
+        from .portal.views_members import MembersListView
+
+        v = MembersListView()
+        v.request = Request(APIRequestFactory().get("/x", {"scope": "need_attention"}))
+        v.kwargs = {}
+        groups = v._build_groups_for_page(v._group_entries())
+        return {m["id"] for g in groups for m in ([g["primary"]] + g.get("members", []))}
+
+    def test_internal_service_case_shows_eligibility_only_hidden(self):
+        from .models import CaseType
+
+        internal = self._member(case_type=CaseType.INTERNAL_SERVICE)
+        elig_only = self._member(case_type=CaseType.ELIGIBILITY)  # stale is_new, no IS case
+
+        ids = self._ids()
+        self.assertIn(str(internal.client_id), ids)
+        self.assertNotIn(str(elig_only.client_id), ids)
