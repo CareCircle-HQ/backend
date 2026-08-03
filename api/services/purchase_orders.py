@@ -225,9 +225,17 @@ def _product_type_for(kind, delivery_date):
 
 
 def _kitchen_code(kitchen, _cache={}):
-    """A short, stable code for a kitchen, e.g. "K01" (1-based by creation)."""
+    """A short, stable code for a kitchen used in the PO number.
+
+    Prefers the kitchen's configured ``abbreviation`` (Settings > Kitchens);
+    falls back to an auto "K01"-style code (1-based by creation order) when no
+    abbreviation is set, so PO naming keeps working before it's configured."""
     if kitchen is None:
         return "K00"
+    abbr = (getattr(kitchen, "abbreviation", "") or "").strip().upper()
+    if abbr:
+        # Sanitize to keep the PO number token clean (no spaces/hyphens).
+        return re.sub(r"[^A-Z0-9]", "", abbr) or "K00"
     if not _cache:
         for i, kid in enumerate(
             Kitchen.objects.order_by("created_at").values_list("pk", flat=True)

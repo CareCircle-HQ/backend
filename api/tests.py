@@ -11096,3 +11096,58 @@ class NeedAttentionScopeCaseRuleTest(TestCase):
         ids = self._ids()
         self.assertIn(str(internal.client_id), ids)
         self.assertNotIn(str(elig_only.client_id), ids)
+
+
+class KitchenAbbreviationPoNumberTest(TestCase):
+    """The PO number uses the kitchen's configured abbreviation when set, and
+    the abbreviation is editable via the kitchen settings endpoint."""
+
+    def test_po_number_uses_kitchen_abbreviation(self):
+        from datetime import date
+
+        from .models import Kitchen, KitchenStatus, ProductTypeKind
+        from .services.purchase_orders import build_po_number
+
+        k = Kitchen.objects.create(
+            name="Hicksville", abbreviation="HICK", status=KitchenStatus.ACTIVE,
+        )
+        # 2026-08-06 is a Thursday in ISO week 32.
+        meals = build_po_number(ProductTypeKind.MEALS, date(2026, 8, 6), k)
+        self.assertEqual(meals, "PO-MEALS-2026-W32-THU-HICK")
+        # Boxes omit the weekday.
+        boxes = build_po_number(ProductTypeKind.BOXES, date(2026, 8, 6), k)
+        self.assertEqual(boxes, "PO-BOX-2026-W32-HICK")
+
+    def test_abbreviation_is_sanitized_and_uppercased(self):
+        from datetime import date
+
+        from .models import Kitchen, KitchenStatus, ProductTypeKind
+        from .services.purchase_orders import build_po_number
+
+        k = Kitchen.objects.create(name="X", abbreviation="k-1 a")
+        self.assertEqual(
+            build_po_number(ProductTypeKind.MEALS, date(2026, 8, 6), k),
+            "PO-MEALS-2026-W32-THU-K1A",
+        )
+
+    def test_kitchen_abbreviation_editable_via_settings_api(self):
+        from rest_framework.test import APIClient
+        from rest_framework_simplejwt.tokens import AccessToken
+
+        from .models import Agent, Kitchen, KitchenStatus
+
+        k = Kitchen.objects.create(name="West Side", status=KitchenStatus.ACTIVE)
+        agent = Agent.objects.create(name="S", agent_code="964", group="Management")
+        access = AccessToken()
+        access["agent_id"] = str(agent.id)
+        access["agent_code"] = agent.agent_code
+        access["agent_name"] = agent.name
+        access["agent_group"] = agent.group
+        api = APIClient()
+        api.credentials(HTTP_AUTHORIZATION=f"Bearer {access}")
+        r = api.patch(f"/api/portal/settings/kitchens/{k.pk}/",
+                      {"name": "West Side Kitchen", "abbreviation": "WSK"}, format="json")
+        self.assertEqual(r.status_code, 200, r.content)
+        k.refresh_from_db()
+        self.assertEqual(k.name, "West Side Kitchen")
+        self.assertEqual(k.abbreviation, "WSK")

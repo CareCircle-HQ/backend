@@ -3714,6 +3714,10 @@ class Kitchen(models.Model):
         primary_key=True, default=uuid.uuid4, editable=False
     )
     name = models.CharField(max_length=255)
+    # Short code used in the human-readable PO number (e.g. "HICK" ->
+    # PO-MEALS-2026-W32-THU-HICK). Falls back to an auto "K01"-style code when
+    # blank, so PO naming keeps working before abbreviations are configured.
+    abbreviation = models.CharField(max_length=12, blank=True)
     address = models.CharField(max_length=255, blank=True)
     phone = models.CharField(max_length=40, blank=True)
     email = models.EmailField(blank=True)

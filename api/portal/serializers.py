@@ -2133,10 +2133,10 @@ class PortalKitchenSerializer(serializers.ModelSerializer):
     class Meta:
         model = Kitchen
         fields = [
-            "id", "name", "address", "phone", "email", "status", "status_label",
-            "max_orders_per_day", "supported_products", "product_options",
-            "menu_type_ids", "menu_types", "cadence_ids", "cadences",
-            "integrations",
+            "id", "name", "abbreviation", "address", "phone", "email", "status",
+            "status_label", "max_orders_per_day", "supported_products",
+            "product_options", "menu_type_ids", "menu_types", "cadence_ids",
+            "cadences", "integrations",
         ]
 
     def get_menu_type_ids(self, obj):
