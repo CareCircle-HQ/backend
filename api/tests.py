@@ -10388,3 +10388,42 @@ class ReplacementKeepsServiceActiveTest(TestCase):
         self.assertEqual(existing.kitchen_id, kitchen.pk)
         self.assertEqual(EnrollmentStage(live.stage), EnrollmentStage.CLOSED)
         self.assertEqual(existing.supersedes_id, live.pk)
+
+
+class StageChangeTimelineMetadataTest(TestCase):
+    """A stage change records the FULL context on the timeline event's metadata:
+    previous + new stage (value + label), the trigger, and the reason note -- so
+    an auto-hold (or any transition) is traceable to what caused it."""
+
+    def test_hold_records_previous_new_and_trigger(self):
+        from .models import (
+            Client, EnrollmentStage, EnrollmentVerification, Household,
+            HouseholdMember, TimelineEvent,
+        )
+        from .services.lifecycle import advance_enrollment
+
+        client = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Meta", last_name="Data",
+        )
+        hh = Household.objects.create(name="HH")
+        HouseholdMember.objects.create(household=hh, client=client, is_primary=True)
+        enr = EnrollmentVerification.objects.create(
+            client=client, household=hh, stage=EnrollmentStage.SERVICE_ACTIVE,
+            program_name="Medically Tailored Meals",
+        )
+        advance_enrollment(
+            enr, EnrollmentStage.ON_HOLD, note="coverage expired",
+            trigger="eligibility.coverage_expired",
+        )
+        ev = (
+            TimelineEvent.objects.filter(client=client, enrollment=enr)
+            .order_by("-occurred_at").first()
+        )
+        self.assertIsNotNone(ev)
+        md = ev.metadata or {}
+        self.assertEqual(md.get("previous_stage"), EnrollmentStage.SERVICE_ACTIVE.value)
+        self.assertEqual(md.get("new_stage"), EnrollmentStage.ON_HOLD.value)
+        self.assertEqual(md.get("trigger"), "eligibility.coverage_expired")
+        self.assertEqual(md.get("reason"), "coverage expired")
+        self.assertTrue(md.get("previous_stage_label"))
+        self.assertTrue(md.get("new_stage_label"))

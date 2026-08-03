@@ -524,7 +524,8 @@ def stage_timeline_fields(stage, *, from_stage=None):
     return _STAGE_TIMELINE.get(stage, (TimelineEventType.VERIFICATION, stage.label))
 
 
-def event_for_verification(enrollment, *, stage_event=None, source=ChangeSource.SYSTEM, actor=""):
+def event_for_verification(enrollment, *, stage_event=None, source=ChangeSource.SYSTEM,
+                           actor="", trigger=""):
     """Emit a timeline event for an enrollment stage change.
 
     Called from :func:`api.services.lifecycle.advance_enrollment` after a
@@ -532,6 +533,11 @@ def event_for_verification(enrollment, *, stage_event=None, source=ChangeSource.
     StageEvent (one timeline row per transition); otherwise it logs unconditionally.
     The event type + title reflect the specific stage (Verification vs Service),
     so hold/resume and other service changes read as their own events.
+
+    The event ``metadata`` records the FULL context of the change -- previous +
+    new stage (value + label), the ``trigger`` (what caused it), the reason note
+    and the acting label -- so the history can be traced to its cause (e.g. why
+    the system placed a member On Hold).
     """
     client = enrollment.client
     if client is None:
@@ -556,12 +562,32 @@ def event_for_verification(enrollment, *, stage_event=None, source=ChangeSource.
         EnrollmentStage.CANCELLED,
         EnrollmentStage.CLOSED,
     )
-    if (
-        enrollment.stage in _REASON_STAGES
-        and stage_event is not None
-        and stage_event.note
-    ):
-        subtitle = stage_event.note
+    note = stage_event.note if stage_event is not None else ""
+    if enrollment.stage in _REASON_STAGES and note:
+        subtitle = note
+
+    def _stage_label(value):
+        if not value:
+            return ""
+        try:
+            return EnrollmentStage(value).label
+        except ValueError:
+            return str(value).replace("_", " ").title()
+
+    stage_meta = stage_event.metadata if stage_event is not None else {}
+    metadata = {
+        "previous_stage": from_stage or "",
+        "previous_stage_label": _stage_label(from_stage),
+        "new_stage": enrollment.stage or "",
+        "new_stage_label": label,
+        # What caused the change (explicit trigger, else the StageEvent's).
+        "trigger": trigger or (stage_meta or {}).get("trigger", ""),
+        "reason": note,
+        "actor_label": (stage_meta or {}).get("actor_label", ""),
+        "case_id": str(enrollment.case_id) if enrollment.case_id else "",
+        "program": enrollment.program_name or "",
+        "kitchen": enrollment.kitchen.name if enrollment.kitchen_id else "",
+    }
     return emit_timeline_event(
         client=client,
         event_type=event_type,
@@ -575,6 +601,7 @@ def event_for_verification(enrollment, *, stage_event=None, source=ChangeSource.
         entity=enrollment,
         enrollment=enrollment,
         case=enrollment.case,
+        metadata=metadata,
         dedupe_key=dedupe,
     )
 

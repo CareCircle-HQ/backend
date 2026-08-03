@@ -768,7 +768,8 @@ def evaluate_is_new_flag(client):
 
 
 @transaction.atomic
-def advance_enrollment(enrollment, to_stage, *, actor=None, actor_label="", note="", force=False):
+def advance_enrollment(enrollment, to_stage, *, actor=None, actor_label="", note="",
+                       force=False, trigger=""):
     """Move an enrollment to ``to_stage`` with guard checks. Logs a StageEvent.
 
     Raises :class:`InvalidTransition` for illegal transitions or unmet process
@@ -780,6 +781,10 @@ def advance_enrollment(enrollment, to_stage, *, actor=None, actor_label="", note
     a User (e.g. the support portal, where the actor is an ``Agent``): it drives
     the timeline event's ``actor`` and is stored on ``StageEvent.metadata`` for
     audit, so the history shows WHO advanced the enrollment.
+    ``trigger`` is a short machine code for WHAT caused the change (e.g.
+    ``"import.governing_denied"``, ``"eligibility.coverage_expired"``,
+    ``"case_replaced"``, ``"manual.hold"``). Stored on the StageEvent + mirrored
+    into the timeline event metadata so the history is traceable to its cause.
     """
     to_stage = EnrollmentStage(to_stage)
     from_stage = EnrollmentStage(enrollment.stage)
@@ -828,16 +833,24 @@ def advance_enrollment(enrollment, to_stage, *, actor=None, actor_label="", note
             client.is_new = False
             client.save(update_fields=["is_new"])
 
+    stage_meta = {}
+    if actor_label:
+        stage_meta["actor_label"] = actor_label
+    if trigger:
+        stage_meta["trigger"] = trigger
+    # A change with no human actor/label is system-driven (import, reconcile,
+    # eligibility off-ramp); otherwise it was a person via the portal/admin.
+    is_system = actor is None and not actor_label
     stage_event = StageEvent.objects.create(
         entity_type=StageEntityType.ENROLLMENT,
         enrollment=enrollment,
         client=enrollment.client,
         from_stage=from_stage,
         to_stage=to_stage,
-        source=StageEventSource.MANUAL,
+        source=StageEventSource.AUTO if is_system else StageEventSource.MANUAL,
         actor=actor,
         note=note,
-        metadata={"actor_label": actor_label} if actor_label else {},
+        metadata=stage_meta,
     )
 
     # Delivery orders are NOT generated here. They are built at the manual
@@ -856,7 +869,8 @@ def advance_enrollment(enrollment, to_stage, *, actor=None, actor_label="", note
             or getattr(actor, "username", "")
         )
         timeline.event_for_verification(
-            enrollment, stage_event=stage_event, actor=actor_name or ""
+            enrollment, stage_event=stage_event, actor=actor_name or "",
+            trigger=trigger,
         )
     except Exception:  # pragma: no cover - defensive
         import logging
@@ -1556,6 +1570,7 @@ def _downgrade_unauthorized_enrollment(enrollment, *, actor=None, actor_label=""
         advance_enrollment(
             enrollment, EnrollmentStage.VERIFIED, actor=actor,
             actor_label=actor_label, note=_WAITING_AUTH_NOTE, force=True,
+            trigger="reconcile.awaiting_authorization",
         )
     except InvalidTransition:
         return enrollment
@@ -1671,6 +1686,7 @@ def _full_stop_close_out(client, governing, *, actor=None, actor_label=""):
                     actor=actor,
                     actor_label=actor_label,
                     note=_CLOSURE_HOLD_NOTE,
+                    trigger="reconcile.governing_case_closed",
                 )
                 result["paused"] = True
             except InvalidTransition:
@@ -2648,6 +2664,7 @@ def _close_old_and_link_to_existing(
                 actor=actor,
                 actor_label=actor_label,
                 note=note or "Governing case replaced; enrollment closed as read-only history.",
+                trigger="case_replaced",
             )
         except InvalidTransition:
             pass
@@ -2708,7 +2725,7 @@ _PRIOR_SERVING_STAGES = frozenset({
 })
 
 
-def _step_stage_forward(enrollment, target, *, actor, actor_label, note):
+def _step_stage_forward(enrollment, target, *, actor, actor_label, note, trigger=""):
     """Advance ``enrollment`` FORWARD to ``target`` one legal hop at a time
     (forcing past process gates). on_hold resumes straight to the target.
     No-op if already at/after the target. Best-effort: stops at the first hop
@@ -2729,7 +2746,7 @@ def _step_stage_forward(enrollment, target, *, actor, actor_label, note):
         try:
             advance_enrollment(
                 enrollment, nxt, actor=actor, actor_label=actor_label,
-                note=note, force=True,
+                note=note, force=True, trigger=trigger,
             )
         except InvalidTransition:
             break
@@ -2774,6 +2791,7 @@ def _carry_service_and_activate(
             actor_label=actor_label,
             note="Verification carried from the previous enrollment; awaiting "
                  "kitchen assignment for the new governing case.",
+            trigger="case_replaced",
         )
         return False
 
@@ -2801,6 +2819,7 @@ def _carry_service_and_activate(
         new_enr, EnrollmentStage.SERVICE_ACTIVE, actor=actor,
         actor_label=actor_label,
         note="Kitchen and cadence carried from the previous enrollment.",
+        trigger="case_replaced",
     )
 
     # (Re)create the delivery plan + rebuild the calendar so the household stays
@@ -2942,6 +2961,7 @@ def replace_enrollment_for_case_change(
                 actor=actor,
                 actor_label=actor_label,
                 note="Governing case replaced; enrollment closed as read-only history.",
+                trigger="case_replaced",
             )
         except InvalidTransition:
             pass
@@ -3371,6 +3391,7 @@ def reconcile_internal_service_authorization(client, *, actor=None, actor_label=
                     advance_enrollment(
                         enr, EnrollmentStage.ON_HOLD, actor=actor,
                         actor_label=actor_label, note=_DENIAL_HOLD_NOTE,
+                        trigger="reconcile.authorization_denied",
                     )
                     result["paused"] = True
                 except InvalidTransition:
@@ -3383,6 +3404,7 @@ def reconcile_internal_service_authorization(client, *, actor=None, actor_label=
                     advance_enrollment(
                         enr, EnrollmentStage.DISREGARDED, actor=actor,
                         actor_label=actor_label, note=_DENIAL_DISREGARD_NOTE,
+                        trigger="reconcile.authorization_denied",
                     )
                     result["disregarded"] = True
                 except InvalidTransition:
