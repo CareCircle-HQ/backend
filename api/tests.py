@@ -10427,3 +10427,77 @@ class StageChangeTimelineMetadataTest(TestCase):
         self.assertEqual(md.get("reason"), "coverage expired")
         self.assertTrue(md.get("previous_stage_label"))
         self.assertTrue(md.get("new_stage_label"))
+
+
+class CalendarHidesSupersededFutureRowsTest(TestCase):
+    """Regression: the household delivery calendar must not show a superseded
+    (closed) enrollment's leftover FUTURE scheduled occurrence as 'Service Ended'
+    next to the active enrollment's 'Scheduled' row for the same date."""
+
+    def test_no_service_ended_duplicate_for_superseded_enrollment(self):
+        from datetime import timedelta
+
+        from rest_framework.test import APIClient
+        from rest_framework_simplejwt.tokens import AccessToken
+
+        from .models import (
+            Agent, Case, CaseStatus, CaseType, Client, EnrollmentStage,
+            EnrollmentVerification, Household, HouseholdMember,
+            MemberDietaryProfile, MemberStatus, OrderSchedule, OrderStatus,
+        )
+
+        today = timezone.localdate()
+        day = today + timedelta(days=3)
+        client = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Dup", last_name="Cal",
+        )
+        hh = Household.objects.create(name="HH")
+        HouseholdMember.objects.create(household=hh, client=client, is_primary=True)
+        now = timezone.now()
+        case = Case.objects.create(
+            case_id=str(uuid.uuid4()), client=client,
+            case_type=CaseType.INTERNAL_SERVICE, case_status=CaseStatus.OPEN,
+            service_authorization_status="approved", date_opened=now,
+        )
+        # Closed (superseded) enrollment with a leftover future scheduled row.
+        old = EnrollmentVerification.objects.create(
+            client=client, household=hh, stage=EnrollmentStage.CLOSED,
+            close_reason="case_replaced",
+        )
+        old_mp = MemberDietaryProfile.objects.create(
+            enrollment=old, client=client, member_name="Dup Cal",
+            menu_type="Standard", status=MemberStatus.ACTIVE,
+        )
+        OrderSchedule.objects.create(
+            enrollment=old, member=old_mp, member_name="Dup Cal",
+            anticipated_delivery_date=day, status=OrderStatus.SCHEDULED,
+            household_group_code="G", household=hh,
+        )
+        # Active enrollment (supersedes old) with a scheduled row same date.
+        new = EnrollmentVerification.objects.create(
+            client=client, household=hh, case=case,
+            stage=EnrollmentStage.SERVICE_ACTIVE, supersedes=old,
+        )
+        new_mp = MemberDietaryProfile.objects.create(
+            enrollment=new, client=client, member_name="Dup Cal",
+            menu_type="Standard", status=MemberStatus.ACTIVE,
+        )
+        OrderSchedule.objects.create(
+            enrollment=new, member=new_mp, member_name="Dup Cal",
+            anticipated_delivery_date=day, status=OrderStatus.SCHEDULED,
+            household_group_code="G", household=hh,
+        )
+
+        agent = Agent.objects.create(name="C", agent_code="952", group="CS")
+        access = AccessToken()
+        access["agent_id"] = str(agent.id)
+        access["agent_code"] = agent.agent_code
+        access["agent_name"] = agent.name
+        access["agent_group"] = agent.group
+        api = APIClient()
+        api.credentials(HTTP_AUTHORIZATION=f"Bearer {access}")
+        r = api.get(f"/api/portal/members/{client.client_id}/delivery-calendar/")
+        self.assertEqual(r.status_code, 200, r.content)
+        rows = [row for row in r.json()["occurrences"] if row["date"] == day.isoformat()]
+        self.assertEqual(len(rows), 1, rows)
+        self.assertEqual(rows[0]["state"], "scheduled")
