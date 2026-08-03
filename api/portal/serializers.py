@@ -1361,16 +1361,24 @@ class PortalCaseOptionSerializer(serializers.ModelSerializer):
     status_label = serializers.CharField(source="get_case_status_display", read_only=True)
     type_label = serializers.CharField(source="get_case_type_display", read_only=True)
     date_opened = serializers.DateTimeField(read_only=True)
+    # True for the member's GOVERNING internal-service case, so the New-Ticket
+    # modal can auto-select it (matches the stage bar / Cases-tab star). Passed
+    # in via context by MemberCasesView.
+    governing = serializers.SerializerMethodField()
 
     class Meta:
         model = Case
         fields = [
             "id", "code", "status", "status_label", "type_label",
-            "service_type", "program_name", "date_opened",
+            "service_type", "program_name", "date_opened", "governing",
         ]
 
     def get_code(self, obj):
         return f"CSE-{str(obj.case_id)[:8]}"
+
+    def get_governing(self, obj):
+        gid = self.context.get("governing_case_id")
+        return bool(gid) and str(obj.case_id) == str(gid)
 
 
 class PortalMemberCaseSerializer(serializers.ModelSerializer):

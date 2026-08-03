@@ -4003,23 +4003,23 @@ class MemberCasesView(PortalAPIView):
     def get(self, request, client_id):
         client = get_object_or_404(Client, pk=client_id)
         cases = Case.objects.filter(client_id=client_id).order_by("-date_opened")
-        if request.query_params.get("detail"):
-            # Flag the governing internal-service case the SAME way the stage
-            # progress bar stars it (lifecycle.program_tracks), so the Cases tab
-            # star always matches the bar.
-            from api.services.lifecycle import program_tracks
+        # Flag the governing internal-service case the SAME way the stage progress
+        # bar stars it (lifecycle.program_tracks), so both the Cases-tab star AND
+        # the New-Ticket "related case" dropdown auto-select the same case.
+        from api.services.lifecycle import program_tracks
 
-            tracks = program_tracks(client)
-            governing_case_id = next(
-                (t["case_id"] for t in tracks if t["governing"]), None
-            )
+        tracks = program_tracks(client)
+        governing_case_id = next(
+            (t["case_id"] for t in tracks if t["governing"]), None
+        )
+        context = {"governing_case_id": governing_case_id}
+        if request.query_params.get("detail"):
             return Response(
-                s.PortalMemberCaseSerializer(
-                    cases, many=True,
-                    context={"governing_case_id": governing_case_id},
-                ).data
+                s.PortalMemberCaseSerializer(cases, many=True, context=context).data
             )
-        return Response(s.PortalCaseOptionSerializer(cases, many=True).data)
+        return Response(
+            s.PortalCaseOptionSerializer(cases, many=True, context=context).data
+        )
 
 
 class MemberCaseDetailView(PortalAPIView):
