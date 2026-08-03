@@ -26,7 +26,6 @@ from django.utils import timezone
 from api.models import (
     EnrollmentStage,
     EnrollmentVerification,
-    MemberStatus,
     ServiceAuthorizationStatus,
 )
 from api.services.catalog import product_kind_for_enrollment
@@ -55,6 +54,14 @@ _RESTORABLE_STAGES = {
     EnrollmentStage.ON_HOLD,
 }
 _ONCE_A_WEEK = "once_a_week"
+# Forward stage ladder to reach Service Active (the transition map has no direct
+# pending_verification -> service_active edge, so we step through it).
+_FORWARD_LADDER = [
+    EnrollmentStage.PENDING_VERIFICATION,
+    EnrollmentStage.VERIFIED,
+    EnrollmentStage.KITCHEN_ASSIGNMENT,
+    EnrollmentStage.SERVICE_ACTIVE,
+]
 
 
 class Command(BaseCommand):
@@ -87,25 +94,31 @@ class Command(BaseCommand):
             qs = qs[: opts["limit"]]
         return qs
 
-    def _carry_source(self, enr):
+    def _carry_source(self, enr, want_kind):
         """Walk the supersedes chain (nearest first, incl. ``enr``) and return
-        ``(kitchen, cadence, weekdays)`` from the last real serving state.
+        ``(kitchen, cadence, weekdays)`` from the last real serving state whose
+        product kind MATCHES ``want_kind``.
 
         A member may have been replaced MORE THAN ONCE (e.g. the first bad import
         demoted them, then a re-import replaced the demoted -- kitchen-less --
-        enrollment again). The immediate parent then carries nothing, so we take
-        the NEAREST kitchen and the NEAREST cadence found anywhere in the chain.
+        enrollment again), so we take the NEAREST kitchen and NEAREST cadence
+        found anywhere in the chain. But we ONLY carry from a node of the SAME
+        product kind: for a genuine meals<->boxes switch the old kitchen/cadence
+        is for the wrong product and must not be reused (that member falls to
+        "needs manual" instead of being wrongly activated on the old kitchen).
         """
         kitchen = cadence = weekdays = None
         seen, node = set(), enr
         while node is not None and node.pk not in seen:
             seen.add(node.pk)
-            if kitchen is None and node.kitchen_id:
-                kitchen = node.kitchen
-            if not cadence:
-                c = current_household_cadence(node)
-                if c:
-                    cadence, weekdays = c, node.delivery_weekdays
+            # Skip nodes whose product kind differs from the current enrollment.
+            if want_kind is None or product_kind_for_enrollment(node) == want_kind:
+                if kitchen is None and node.kitchen_id:
+                    kitchen = node.kitchen
+                if not cadence:
+                    c = current_household_cadence(node)
+                    if c:
+                        cadence, weekdays = c, node.delivery_weekdays
             if kitchen is not None and cadence:
                 break
             node = node.supersedes
@@ -124,12 +137,36 @@ class Command(BaseCommand):
         if gov.service_authorization_status not in _FAVORABLE:
             return False, None, None, None, None, "governing case not approved"
         kind = product_kind_for_enrollment(enr)
-        kitchen, cadence, weekdays = self._carry_source(enr)
+        kitchen, cadence, weekdays = self._carry_source(enr, kind)
         if kitchen is None:
-            return False, None, None, None, kind, "no kitchen to carry (needs manual assignment)"
+            return False, None, None, None, kind, "no same-kind kitchen to carry (needs manual assignment)"
         if not cadence:
-            return False, kitchen, None, None, kind, "no cadence to carry (needs manual assignment)"
+            return False, kitchen, None, None, kind, "no same-kind cadence to carry (needs manual assignment)"
         return True, kitchen, cadence, weekdays, kind, "restore -> service_active + rebuild calendar"
+
+    def _advance_to_active(self, enr):
+        """Move ``enr`` to Service Active respecting the transition map.
+
+        The map has no direct pending_verification -> service_active edge, so we
+        walk pending_verification -> verified -> kitchen_assignment ->
+        service_active (each forced past its process gate). on_hold resumes
+        straight to service_active. Already-active is a no-op.
+        """
+        cur = EnrollmentStage(enr.stage)
+        note = ("Restored service after governing-case replacement: carried the "
+                "previous kitchen + cadence.")
+        if cur == EnrollmentStage.SERVICE_ACTIVE:
+            return
+        if cur == EnrollmentStage.ON_HOLD:
+            steps = [EnrollmentStage.SERVICE_ACTIVE]
+        elif cur in _FORWARD_LADDER:
+            steps = _FORWARD_LADDER[_FORWARD_LADDER.index(cur) + 1:]
+        else:
+            steps = [EnrollmentStage.SERVICE_ACTIVE]
+        for nxt in steps:
+            advance_enrollment(
+                enr, nxt, force=True, actor_label=_ACTOR_LABEL, note=note,
+            )
 
     @transaction.atomic
     def _apply_one(self, enr, kitchen, cadence, weekdays, kind):
@@ -143,23 +180,24 @@ class Command(BaseCommand):
             fields.append("delivery_weekdays")
         if fields:
             enr.save(update_fields=fields)
-        # Return cancel/hold-excluded members to service (respect eligibility pause).
+        # Reconcile EVERY member against the carried kitchen (respect eligibility
+        # pause). This returns an out-of-orbit / inactive member to ACTIVE when the
+        # kitchen can meet their menu + allergies -- so servable members get a
+        # delivery plan -- while genuinely unservable members (e.g. no menu type)
+        # correctly stay out of orbit and off the PO.
         for mv in enr.member_profiles.all():
             if getattr(mv, "eligibility_paused", False):
                 continue
-            if mv.status == MemberStatus.INACTIVE:
-                reconcile_member_kitchen_output(
-                    mv, kitchen=kitchen, allow_resume=True, save=True,
-                )
-        # Advance to Service Active (force: verification already happened before
-        # the replacement; restoring the prior service state must not be re-gated).
-        if EnrollmentStage(enr.stage) != EnrollmentStage.SERVICE_ACTIVE:
-            advance_enrollment(
-                enr, EnrollmentStage.SERVICE_ACTIVE, force=True,
-                actor_label=_ACTOR_LABEL,
-                note="Restored service after governing-case replacement: carried "
-                     "the previous kitchen + cadence.",
+            reconcile_member_kitchen_output(
+                mv, kitchen=kitchen, allow_resume=True, save=True,
             )
+        # Advance to Service Active. force=True bypasses the process GATES but the
+        # transition MAP is still enforced, so there is no direct
+        # pending_verification -> service_active edge: we must step through
+        # verified -> kitchen_assignment -> service_active. on_hold has a direct
+        # edge to service_active (resume). Verification already happened before
+        # the replacement, so forcing each step is safe.
+        self._advance_to_active(enr)
         # (Re)create the delivery plan from the carried cadence, then rebuild the
         # dated calendar from today so they rejoin future Purchase Orders.
         once_weekday = None
