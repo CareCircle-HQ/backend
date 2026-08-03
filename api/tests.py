@@ -2180,6 +2180,34 @@ class MemberListGroupedStatusFilterTest(TestCase):
         self.assertIn(str(household.client_id), all_ids)
         self.assertIn(str(individual.client_id), all_ids)
 
+    def test_member_status_flag_ignores_stale_closed_enrollment_profile(self):
+        # The individual member-status flags (Out of Orbit / Out of Range /
+        # Paused) reflect the CURRENT enrollment. A stale status on a CLOSED /
+        # superseded enrollment (left behind by a governing-case replacement) must
+        # NOT surface a member whose live profile is Active.
+        from .models import (
+            EnrollmentStage, EnrollmentVerification, HouseholdMember,
+            MemberDietaryProfile, MemberStatus,
+        )
+
+        # Currently ACTIVE, but with a leftover OUT_OF_ORBIT profile on a closed
+        # (superseded) enrollment.
+        stale = self._member("Stale", member_status=MemberStatus.ACTIVE)
+        hh = HouseholdMember.objects.get(client=stale).household
+        closed = EnrollmentVerification.objects.create(
+            client=stale, household=hh, stage=EnrollmentStage.CLOSED,
+            program_name="Medically Tailored Meals",
+        )
+        MemberDietaryProfile.objects.create(
+            enrollment=closed, client=stale, status=MemberStatus.OUT_OF_ORBIT,
+        )
+        # A genuinely current out-of-orbit member (live enrollment).
+        current = self._member("Orbit", member_status=MemberStatus.OUT_OF_ORBIT)
+
+        ids = self._ids(flag="out_of_orbit")
+        self.assertNotIn(str(stale.client_id), ids)   # stale closed profile ignored
+        self.assertIn(str(current.client_id), ids)     # current profile matches
+
     def test_verification_axis(self):
         from .models import ClientStage, EnrollmentStage
 

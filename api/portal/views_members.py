@@ -587,6 +587,36 @@ def apply_authorization_filter(qs, value):
     return qs
 
 
+# Enrollment stages that are NOT the member's current/live service: a dietary
+# profile attached to one of these is HISTORY (a superseded/closed/off-boarded
+# enrollment) and must not drive a "current member status" filter.
+_NON_CURRENT_ENROLLMENT_STAGES = [
+    EnrollmentStage.CLOSED,
+    EnrollmentStage.CANCELLED,
+    EnrollmentStage.DISREGARDED,
+    EnrollmentStage.SERVICE_COMPLETE,
+]
+
+
+def current_member_status_exists(member_status):
+    """``Exists`` over the client's member dietary profiles in ``member_status``
+    on a CURRENT (non-terminal) enrollment.
+
+    The individual member-status flags (Out of Orbit / Out of Range / Paused) are
+    a CURRENT state, but a client accumulates a profile per enrollment -- so a
+    plain ``member_profiles__status=X`` also matches a STALE status on a closed or
+    superseded enrollment (e.g. an out-of-orbit profile left behind by a
+    governing-case replacement), surfacing members whose live profile is Active.
+    Scoping to a non-terminal enrollment fixes that, and ``Exists`` avoids the
+    join duplicates a multi-valued ``.filter`` would add."""
+    profiles = (
+        MemberDietaryProfile.objects
+        .filter(client=OuterRef("pk"), status=member_status)
+        .exclude(enrollment__stage__in=[s.value for s in _NON_CURRENT_ENROLLMENT_STAGES])
+    )
+    return Exists(profiles)
+
+
 # Page-level base scope: restricts the list to the lifecycle stages a given
 # work area cares about (independent of the per-status filter chips).
 SCOPE_TO_STAGES = {
@@ -1161,7 +1191,7 @@ class MembersListView(PortalGenericAPIView):
                 # is filtered on the member's/household's enrollment stage.
                 qs = qs.filter(enrollment_stage_q(EnrollmentStage.ON_HOLD))
             elif sv == "out_of_range":
-                qs = qs.filter(member_profiles__status=MemberStatus.OUT_OF_RANGE)
+                qs = qs.filter(current_member_status_exists(MemberStatus.OUT_OF_RANGE))
             # ── Terminal axis (program / enrollment stage) ──
             elif sv == "term_open":
                 # Open program: an active service enrollment.
@@ -1269,36 +1299,15 @@ class MembersListView(PortalGenericAPIView):
         #     (On Hold). NB: lifecycle_stage keeps the held-from stage, so this
         #     must be filtered on the enrollment stage, not lifecycle_stage.
         flag = (params.get("flag") or "").strip().lower()
+        # The `flag` filter is for INDIVIDUAL member-level statuses only. Program-
+        # level states (On Hold / Cancelled) live on the grouped status filter, not
+        # here, and are intentionally NOT member flags.
         if flag == "out_of_orbit":
-            qs = qs.filter(member_profiles__status=MemberStatus.OUT_OF_ORBIT)
+            qs = qs.filter(current_member_status_exists(MemberStatus.OUT_OF_ORBIT))
         elif flag == "out_of_range":
-            qs = qs.filter(member_profiles__status=MemberStatus.OUT_OF_RANGE)
+            qs = qs.filter(current_member_status_exists(MemberStatus.OUT_OF_RANGE))
         elif flag == "paused":
-            qs = qs.filter(member_profiles__status=MemberStatus.PAUSED)
-        elif flag == "inactive":
-            # Members whose service ended (terminal member status). Set when a
-            # household is cancelled, so this surfaces off-boarded members.
-            qs = qs.filter(member_profiles__status=MemberStatus.INACTIVE)
-        elif flag == "cancelled":
-            # Cancelled households: the member's own OR their household's
-            # enrollment is at the terminal CANCELLED stage. Keyed off the
-            # enrollment stage (not lifecycle_stage, which collapses to
-            # not_eligible and can't be told apart from an eligibility denial).
-            qs = qs.filter(
-                Q(enrollments__stage=EnrollmentStage.CANCELLED)
-                | Q(
-                    household_membership__household__enrollment_verifications__stage=(
-                        EnrollmentStage.CANCELLED
-                    )
-                )
-            )
-        elif flag == "on_hold":
-            qs = qs.filter(
-                Q(enrollments__stage=EnrollmentStage.ON_HOLD)
-                | Q(
-                    household_membership__household__enrollment_verifications__stage=EnrollmentStage.ON_HOLD
-                )
-            )
+            qs = qs.filter(current_member_status_exists(MemberStatus.PAUSED))
         # TEMP diagnostic flags (to be removed): members missing dietary/logistics
         # data. "no_menu_type" -> no dietary profile carries a menu type at all;
         # "no_kitchen" -> neither the member's nor their household's enrollment has
