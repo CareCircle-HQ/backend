@@ -838,9 +838,12 @@ def advance_enrollment(enrollment, to_stage, *, actor=None, actor_label="", note
         stage_meta["actor_label"] = actor_label
     if trigger:
         stage_meta["trigger"] = trigger
-    # A change with no human actor/label is system-driven (import, reconcile,
-    # eligibility off-ramp); otherwise it was a person via the portal/admin.
-    is_system = actor is None and not actor_label
+    # A change with no human actor/label -- or one whose label is a "system:..."
+    # marker (import, reconcile, eligibility off-ramp) -- is system-driven;
+    # otherwise it was a person via the portal/admin.
+    is_system = actor is None and (
+        not actor_label or actor_label.strip().lower().startswith("system:")
+    )
     stage_event = StageEvent.objects.create(
         entity_type=StageEntityType.ENROLLMENT,
         enrollment=enrollment,

@@ -153,6 +153,7 @@ class Command(BaseCommand):
                     advance_enrollment(
                         enr, target, force=True,
                         actor_label=_ACTOR_LABEL, note=note,
+                        trigger="reconcile.cancelled_enrollment",
                     )
             except Exception as exc:  # noqa: BLE001 - isolate + report, never abort the run
                 errors += 1
