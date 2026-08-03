@@ -10580,3 +10580,74 @@ class CalendarHidesSupersededFutureRowsTest(TestCase):
         # A single row for the date, keyed off the live (non-cancelled) delivery.
         self.assertEqual(len(rows), 1, rows)
         self.assertNotEqual(rows[0]["status"], "cancelled")
+
+
+class CloseDuplicateHoldsTest(TestCase):
+    """close_duplicate_holds closes an ON_HOLD enrollment that duplicates a
+    member's live SERVICE_ACTIVE enrollment (revived case-less duplicate), but
+    leaves a legit different-product hold alone."""
+
+    def _client(self):
+        from .models import Client, Household, HouseholdMember
+        c = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Dup", last_name="Hold",
+        )
+        hh = Household.objects.create(name="HH")
+        HouseholdMember.objects.create(household=hh, client=c, is_primary=True)
+        return c, hh
+
+    def test_closes_unbound_hold_next_to_active(self):
+        from django.core.management import call_command
+
+        from .models import EnrollmentStage, EnrollmentVerification
+
+        c, hh = self._client()
+        active = EnrollmentVerification.objects.create(
+            client=c, household=hh, stage=EnrollmentStage.SERVICE_ACTIVE,
+            program_name="Medically Tailored Meals",
+        )
+        held = EnrollmentVerification.objects.create(
+            client=c, household=hh, stage=EnrollmentStage.ON_HOLD,
+            program_name="Medically Tailored Meals",
+        )
+        call_command("close_duplicate_holds", "--apply", "--client", str(c.client_id))
+        active.refresh_from_db(); held.refresh_from_db()
+        self.assertEqual(EnrollmentStage(active.stage), EnrollmentStage.SERVICE_ACTIVE)
+        self.assertEqual(EnrollmentStage(held.stage), EnrollmentStage.CLOSED)
+        self.assertEqual(held.close_reason, "duplicate_of_active")
+
+    def test_keeps_different_kind_hold(self):
+        from datetime import timedelta
+
+        from django.core.management import call_command
+
+        from .models import (
+            Case, CaseStatus, CaseType, EnrollmentStage, EnrollmentVerification,
+        )
+
+        c, hh = self._client()
+        meals_case = Case.objects.create(
+            case_id=str(uuid.uuid4()), client=c, case_type=CaseType.INTERNAL_SERVICE,
+            case_status=CaseStatus.OPEN, program_name="Medically Tailored Meals",
+            date_opened=timezone.now(),
+        )
+        boxes_case = Case.objects.create(
+            case_id=str(uuid.uuid4()), client=c, case_type=CaseType.INTERNAL_SERVICE,
+            case_status=CaseStatus.OPEN,
+            program_name="Fresh Produce and Nonperishable Groceries: Pantry Stocking",
+            date_opened=timezone.now(),
+        )
+        EnrollmentVerification.objects.create(
+            client=c, household=hh, case=meals_case,
+            stage=EnrollmentStage.SERVICE_ACTIVE, program_name=meals_case.program_name,
+        )
+        boxes_hold = EnrollmentVerification.objects.create(
+            client=c, household=hh, case=boxes_case,
+            stage=EnrollmentStage.ON_HOLD, program_name=boxes_case.program_name,
+        )
+        call_command("close_duplicate_holds", "--apply", "--client", str(c.client_id))
+        boxes_hold.refresh_from_db()
+        self.assertEqual(
+            EnrollmentStage(boxes_hold.stage), EnrollmentStage.ON_HOLD,
+            "a different-product hold must NOT be closed",
+        )
