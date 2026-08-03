@@ -48,21 +48,39 @@ of truth); the sync endpoints stay as the **no-S3 fallback** and for tiny pulls.
 
 ## Backend
 
-### 1. Model `ReportExport` (+ `ReportExportStatus`) — `api/models.py`
+### 1. Storage table `ReportExport` (+ `ReportExportStatus`) — `api/models.py`
+A single dedicated table stores **every** export job for **all** report types
+(keyed by `report_key`). It is both the polling anchor (status the UI watches)
+and a durable audit/history of who exported what, when — mirroring how
+`ImportRun` anchors the async import flow.
+
 | field | type | notes |
 |---|---|---|
 | `export_id` | UUID pk | |
-| `report_key` | Char | e.g. `"all-members"` |
-| `params` | JSON | filters (e.g. `created_from`/`created_to`) |
-| `status` | Char(choices) | pending / running / completed / failed |
-| `file_key` | Char | S3 key (blank until done) |
-| `filename` | Char | e.g. `all_members_2026-08-03.csv` |
+| `report_key` | Char (db_index) | which report, e.g. `"all-members"` (from `REPORT_BUILDERS`) |
+| `params` | JSON (default dict) | the filters used (e.g. `created_from`/`created_to`, lead sources) |
+| `status` | Char(choices, db_index) | `ReportExportStatus`: pending / running / completed / failed |
+| `file_key` | Char (blank) | S3 key under `exports/` (blank until done) |
+| `filename` | Char | download name, e.g. `all_members_2026-08-03.csv` |
 | `row_count` | PositiveInt null | data rows written |
-| `error_log` | Text | on failure |
-| `requested_by` | FK Agent null | who ran it (management) |
-| `created_at` / `finished_at` | DateTime | |
+| `error_log` | Text (blank) | populated on failure |
+| `requested_by` | FK Agent (null, SET_NULL) | who ran it (management); `related_name="report_exports"` |
+| `created_at` / `finished_at` | DateTime | queued + done timestamps |
 
-Migration: `0169_reportexport`.
+```python
+class ReportExportStatus(models.TextChoices):
+    PENDING = "pending", "Pending"
+    RUNNING = "running", "Running"
+    COMPLETED = "completed", "Completed"
+    FAILED = "failed", "Failed"
+```
+
+- **Meta**: `ordering = ["-created_at"]`; indexes on `report_key`, `status`, and
+  `(requested_by, created_at)` so a "my recent exports" list is cheap.
+- **Retention**: rows are kept as history; the S3 objects they point at can be
+  TTL-cleaned later via `import_storage.delete_object` (see Follow-ups) without
+  deleting the audit row.
+- Migration: `0169_reportexport`.
 
 ### 2. Reusable CSV row generators — `api/portal/report_exports.py` (new)
 Extract EVERY report's row building into request-independent generators that
