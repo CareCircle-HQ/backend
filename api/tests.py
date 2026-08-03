@@ -10866,3 +10866,96 @@ class CloseDuplicateHoldsTest(TestCase):
             EnrollmentStage(boxes_hold.stage), EnrollmentStage.ON_HOLD,
             "a different-product hold must NOT be closed",
         )
+
+
+class TicketGoverningCaseAutoLinkTest(TestCase):
+    """Every ticket we open for a known member auto-links their GOVERNING
+    internal-service case, so the case travels with the ticket -- not just the
+    member. An explicitly passed case still wins."""
+
+    def _client_with_case(self, *, stamp=True, status=None):
+        from .models import Case, CaseStatus, CaseType, Client
+
+        c = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Tick", last_name="Case",
+        )
+        case = Case.objects.create(
+            case_id=str(uuid.uuid4()), client=c,
+            case_type=CaseType.INTERNAL_SERVICE,
+            case_status=status or CaseStatus.OPEN,
+            program_name="Medically Tailored Meals", date_opened=timezone.now(),
+        )
+        if stamp:
+            c.governing_internal_case_id = str(case.case_id)
+            c.save(update_fields=["governing_internal_case_id"])
+        return c, case
+
+    def test_open_ticket_auto_links_stamped_governing_case(self):
+        from .models import TicketTypeCode
+        from .services.tickets import open_ticket
+
+        c, case = self._client_with_case(stamp=True)
+        t, created = open_ticket(
+            TicketTypeCode.SYSTEM_CHANGE_DETECTED, reason="x", client=c,
+        )
+        self.assertTrue(created)
+        self.assertEqual(str(t.case_id), str(case.case_id))
+
+    def test_governing_case_falls_back_to_open_internal_case(self):
+        from .services.tickets import governing_case_for_client
+
+        c, case = self._client_with_case(stamp=False)  # not stamped
+        self.assertEqual(
+            str(governing_case_for_client(c).case_id), str(case.case_id)
+        )
+
+    def test_open_ticket_explicit_case_is_kept(self):
+        from .models import Case, CaseStatus, CaseType, TicketTypeCode
+        from .services.tickets import open_ticket
+
+        c, gov = self._client_with_case(stamp=True)
+        other = Case.objects.create(
+            case_id=str(uuid.uuid4()), client=c,
+            case_type=CaseType.INTERNAL_SERVICE, case_status=CaseStatus.OPEN,
+            date_opened=timezone.now(),
+        )
+        t, _ = open_ticket(
+            TicketTypeCode.SYSTEM_CHANGE_DETECTED, reason="x", client=c, case=other,
+        )
+        self.assertEqual(str(t.case_id), str(other.case_id))
+
+    def test_no_internal_case_leaves_ticket_member_only(self):
+        from .models import Client, TicketTypeCode
+        from .services.tickets import open_ticket
+
+        c = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="No", last_name="Case",
+        )
+        t, _ = open_ticket(TicketTypeCode.SYSTEM_CHANGE_DETECTED, reason="x", client=c)
+        self.assertIsNone(t.case_id)
+
+    def test_manual_create_endpoint_auto_links_governing_case(self):
+        from rest_framework.test import APIClient
+        from rest_framework_simplejwt.tokens import AccessToken
+
+        from .models import Agent, TicketType, TicketTypeCode
+
+        c, case = self._client_with_case(stamp=True)
+        tt, _ = TicketType.objects.get_or_create(
+            code=TicketTypeCode.VERIFICATION, defaults={"label": "Verification"},
+        )
+        agent = Agent.objects.create(name="Mgr", agent_code="962", group="Management")
+        access = AccessToken()
+        access["agent_id"] = str(agent.id)
+        access["agent_code"] = agent.agent_code
+        access["agent_name"] = agent.name
+        access["agent_group"] = agent.group
+        api = APIClient()
+        api.credentials(HTTP_AUTHORIZATION=f"Bearer {access}")
+        r = api.post("/api/portal/tickets/", {
+            "type": tt.code, "reason": "Follow up", "client_id": str(c.client_id),
+        }, format="json")
+        self.assertEqual(r.status_code, 201, r.content)
+        from .models import Ticket
+        t = Ticket.objects.get(pk=r.json()["id"])
+        self.assertEqual(str(t.case_id), str(case.case_id))

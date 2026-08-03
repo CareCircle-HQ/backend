@@ -195,7 +195,9 @@ def _open_out_of_range_ticket(enrollment, reason):
         source=TicketSource.OTHER,
         reason=reason,
         client=client,
-        case=getattr(enrollment, "case", None),
+        # Auto-link the member's GOVERNING internal-service case (fall back to
+        # the enrollment's tied case) so the ticket points at the case too.
+        case=governing_internal_case(enrollment) or getattr(enrollment, "case", None),
     )
     return True
 

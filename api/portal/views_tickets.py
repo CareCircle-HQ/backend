@@ -106,6 +106,20 @@ class WorkQueueView(PortalGenericAPIView):
         ser = s.PortalTicketCreateSerializer(data=request.data)
         ser.is_valid(raise_exception=True)
         data = ser.validated_data
+        # Auto-link the member's governing case when a member is known but the
+        # agent didn't pick a specific case, so the ticket also points at the
+        # case it concerns.
+        case_id = data.get("case_id")
+        client_id = data.get("client_id")
+        if not case_id and client_id:
+            from ..models import Client
+            from ..services.tickets import governing_case_for_client
+
+            gov = governing_case_for_client(
+                Client.objects.filter(pk=client_id).first()
+            )
+            if gov is not None:
+                case_id = gov.pk
         ticket = Ticket.objects.create(
             type=data["type"],
             severity=data.get("severity", "medium"),
@@ -113,8 +127,8 @@ class WorkQueueView(PortalGenericAPIView):
             origin=TicketOrigin.AGENT,
             vip=data.get("vip", False),
             reason=data["reason"],
-            client_id=data.get("client_id"),
-            case_id=data.get("case_id"),
+            client_id=client_id,
+            case_id=case_id,
             assigned_to_id=data.get("assignee_id"),
         )
         ticket = (
