@@ -2631,6 +2631,9 @@ def _close_old_and_link_to_existing(
 
     old_case_id = str(live.case.case_id) if live.case else (live.case_id or "")
     new_case_id = str(new_governing_case.case_id)
+    # Capture serving state BEFORE the close (the carry reads this, not the
+    # post-close CLOSED stage).
+    live_was_serving = EnrollmentStage(live.stage) in _PRIOR_SERVING_STAGES
 
     with transaction.atomic():
         try:
@@ -2666,6 +2669,156 @@ def _close_old_and_link_to_existing(
                 existing.save(update_fields=["supersedes"])
             except Exception:  # pragma: no cover - defensive
                 pass
+
+        # Carry the closed enrollment's service forward: if ``live`` was serving a
+        # SAME-KIND program, drive ``existing`` back to Service Active with the
+        # carried kitchen/cadence instead of leaving the household stranded at the
+        # pre-existing (e.g. Pending Verification) stage and off the Purchase Order.
+        from api.services.catalog import product_type_kind_for_name
+        new_kind = (
+            product_type_kind_for_name(new_governing_case.program_name or "")
+            or product_type_kind_for_name(new_governing_case.service_type or "")
+        )
+        _carry_service_and_activate(
+            existing, live, new_governing_case, new_kind,
+            prior_was_serving=live_was_serving,
+            actor=actor, actor_label=actor_label,
+        )
+
+
+# Forward stage ladder used to walk a replacement enrollment up to Service
+# Active. The transition map has NO direct pending_verification -> service_active
+# edge, so a replacement of an already-serving member must step through each
+# stage (each hop forced past its process gate).
+_SERVICE_LADDER = [
+    EnrollmentStage.PENDING_VALIDATION,
+    EnrollmentStage.VALIDATED,
+    EnrollmentStage.PENDING_VERIFICATION,
+    EnrollmentStage.VERIFIED,
+    EnrollmentStage.KITCHEN_ASSIGNMENT,
+    EnrollmentStage.SERVICE_ACTIVE,
+]
+# Stages that mean the PRIOR enrollment was actually serving (or paused from
+# serving) -- a replacement of one of these must land the new enrollment back in
+# Service Active, not stranded at Pending Verification / Kitchen Assignment.
+_PRIOR_SERVING_STAGES = frozenset({
+    EnrollmentStage.SERVICE_ACTIVE,
+    EnrollmentStage.ON_HOLD,
+    EnrollmentStage.SERVICE_COMPLETE,
+})
+
+
+def _step_stage_forward(enrollment, target, *, actor, actor_label, note):
+    """Advance ``enrollment`` FORWARD to ``target`` one legal hop at a time
+    (forcing past process gates). on_hold resumes straight to the target.
+    No-op if already at/after the target. Best-effort: stops at the first hop
+    the map rejects rather than raising."""
+    cur = EnrollmentStage(enrollment.stage)
+    if cur == target:
+        return
+    if cur == EnrollmentStage.ON_HOLD:
+        steps = [target]
+    elif cur in _SERVICE_LADDER and target in _SERVICE_LADDER:
+        ci, ti = _SERVICE_LADDER.index(cur), _SERVICE_LADDER.index(target)
+        if ti <= ci:
+            return
+        steps = _SERVICE_LADDER[ci + 1:ti + 1]
+    else:
+        steps = [target]
+    for nxt in steps:
+        try:
+            advance_enrollment(
+                enrollment, nxt, actor=actor, actor_label=actor_label,
+                note=note, force=True,
+            )
+        except InvalidTransition:
+            break
+
+
+def _carry_service_and_activate(
+    new_enr, prior_enr, new_case, new_kind, *, prior_was_serving, actor, actor_label,
+):
+    """Carry the prior enrollment's kitchen/cadence onto ``new_enr`` and drive it
+    to the right stage after a governing-case replacement.
+
+    When the PRIOR enrollment was serving (Service Active / On Hold / Complete)
+    and the product kind is UNCHANGED and its kitchen + cadence are known, the
+    household must stay IN SERVICE: carry the kitchen/cadence, step ``new_enr`` up
+    to Service Active, (re)create the delivery plan and rebuild the calendar.
+    Otherwise the new enrollment advances only to Kitchen Assignment (a genuine
+    meals<->boxes switch, or no prior kitchen/cadence -> a fresh kitchen
+    assignment is required). Returns True when service was carried.
+    """
+    from api.services.catalog import product_type_kind_for_name
+    from api.services.delivery import (
+        create_member_delivery_schedules,
+        current_household_cadence,
+    )
+    from api.services.meal_rules import reconcile_member_kitchen_output
+    from api.services.orders import rebuild_delivery_calendar
+
+    prior_kind = product_type_kind_for_name(prior_enr.program_name or "") or \
+        product_type_kind_for_name(prior_enr.service_type or "")
+    same_kind = (
+        prior_kind is not None and new_kind is not None and prior_kind == new_kind
+    )
+    kitchen = prior_enr.kitchen
+    cadence = current_household_cadence(prior_enr)
+
+    carries = bool(prior_was_serving and same_kind and kitchen is not None and cadence)
+    if not carries:
+        # No service to carry: leave the new enrollment ready for a fresh kitchen
+        # assignment (Verified -> Kitchen Assignment) rather than stranded earlier.
+        _step_stage_forward(
+            new_enr, EnrollmentStage.KITCHEN_ASSIGNMENT, actor=actor,
+            actor_label=actor_label,
+            note="Verification carried from the previous enrollment; awaiting "
+                 "kitchen assignment for the new governing case.",
+        )
+        return False
+
+    # Carry kitchen + weekdays.
+    fields = []
+    if new_enr.kitchen_id != kitchen.pk:
+        new_enr.kitchen = kitchen
+        fields.append("kitchen")
+    if not new_enr.delivery_weekdays and prior_enr.delivery_weekdays:
+        new_enr.delivery_weekdays = prior_enr.delivery_weekdays
+        fields.append("delivery_weekdays")
+    if fields:
+        new_enr.save(update_fields=fields)
+
+    # Return servable members to Active against the carried kitchen.
+    for mv in new_enr.member_profiles.all():
+        if getattr(mv, "eligibility_paused", False):
+            continue
+        try:
+            reconcile_member_kitchen_output(mv, kitchen=kitchen, allow_resume=True, save=True)
+        except Exception:  # pragma: no cover - defensive
+            pass
+
+    _step_stage_forward(
+        new_enr, EnrollmentStage.SERVICE_ACTIVE, actor=actor,
+        actor_label=actor_label,
+        note="Kitchen and cadence carried from the previous enrollment.",
+    )
+
+    # (Re)create the delivery plan + rebuild the calendar so the household stays
+    # on the Purchase Order.
+    try:
+        from api.models import DeliveryCadence
+        once_weekday = None
+        if cadence == DeliveryCadence.ONCE_A_WEEK.value:
+            wds = new_enr.delivery_weekdays or []
+            once_weekday = wds[0] if wds else None
+        create_member_delivery_schedules(
+            new_enr, case=new_case, cadence=cadence, once_a_week_weekday=once_weekday,
+            kitchen=kitchen, product_kind=new_kind,
+        )
+        rebuild_delivery_calendar(new_enr)
+    except Exception:  # pragma: no cover - defensive
+        pass
+    return True
 
 
 def replace_enrollment_for_case_change(
@@ -2756,6 +2909,10 @@ def replace_enrollment_for_case_change(
     old_case_id = str(old_case.case_id) if old_case else ""
     new_case_id = str(new_governing_case.case_id)
 
+    # Capture whether the OLD enrollment was actually serving BEFORE we close it
+    # (the carry decision must not read the post-close CLOSED stage).
+    live_was_serving = EnrollmentStage(live.stage) in _PRIOR_SERVING_STAGES
+
     old_kind = product_type_kind_for_name(live.program_name or "")
     if old_kind is None:
         old_kind = product_type_kind_for_name(live.service_type or "")
@@ -2809,33 +2966,12 @@ def replace_enrollment_for_case_change(
             "stage": EnrollmentStage.PENDING_VERIFICATION.value,
         }
 
-        # Kitchen/cadence carry rule (D4).
-        #
-        # The current kitchen + cadence carry over -- so the household stays IN
-        # SERVICE with no kitchen-assignment step and a ready delivery calendar --
-        # ONLY when the product kind is UNCHANGED (meals->meals or boxes->boxes).
-        # The existing kitchen already serves that kind on that cadence, so it
-        # still fits. A meals<->boxes SWITCH ALWAYS goes to Kitchen Assignment:
-        # even if the current kitchen happens to also serve the new kind, its
-        # cadence/plan is for the wrong product, so a fresh kitchen + cadence must
-        # be chosen. (No per-kitchen product validation here -- a switch is never
-        # carried.)
-        from api.services.delivery import current_household_cadence
-
-        kitchen = live.kitchen
-        carries_kitchen = False
-        carried_cadence = ""
-        same_kind = (
-            old_kind is not None and new_kind is not None and old_kind == new_kind
-        )
-        if kitchen is not None and same_kind:
-            candidate_cadence = current_household_cadence(live)
-            if candidate_cadence:
-                new_fields["kitchen"] = kitchen
-                new_fields["delivery_weekdays"] = live.delivery_weekdays or []
-                carried_cadence = candidate_cadence
-                carries_kitchen = True
-
+        # Kitchen/cadence carry rule (D4) is applied AFTER creation by
+        # _carry_service_and_activate: the current kitchen + cadence carry over --
+        # so the household stays IN SERVICE with a ready delivery calendar -- ONLY
+        # when the PRIOR enrollment was serving AND the product kind is UNCHANGED
+        # (meals->meals or boxes->boxes). A meals<->boxes switch always goes to
+        # Kitchen Assignment (its plan is for the wrong product).
         new_enrollment = EnrollmentVerification.objects.create(**new_fields)
 
         # Record why the old one closed and the new one it was replaced by.
@@ -2874,33 +3010,15 @@ def replace_enrollment_for_case_change(
                 mobile_number=mv.mobile_number,
             )
 
-        # Advance the new enrollment through verified -> kitchen assignment -> active.
-        try:
-            advance_enrollment(
-                new_enrollment,
-                EnrollmentStage.VERIFIED,
-                actor=actor,
-                actor_label=actor_label,
-                note="Verification data carried from the previous enrollment.",
-                force=True,
-            )
-            advance_enrollment(
-                new_enrollment,
-                EnrollmentStage.KITCHEN_ASSIGNMENT,
-                actor=actor,
-                actor_label=actor_label,
-                note="Ready for kitchen assignment for the new governing case.",
-            )
-            if carries_kitchen:
-                advance_enrollment(
-                    new_enrollment,
-                    EnrollmentStage.SERVICE_ACTIVE,
-                    actor=actor,
-                    actor_label=actor_label,
-                    note="Kitchen and cadence carried from the previous enrollment.",
-                )
-        except InvalidTransition:
-            pass
+        # Carry the prior kitchen/cadence and drive the new enrollment to the
+        # right stage: an already-serving SAME-KIND member stays in Service Active
+        # (kitchen + calendar carried); otherwise it lands in Kitchen Assignment.
+        # This never strands a previously-serving member at Pending Verification.
+        _carry_service_and_activate(
+            new_enrollment, live, new_governing_case, new_kind,
+            prior_was_serving=live_was_serving,
+            actor=actor, actor_label=actor_label,
+        )
 
         # Apply scope effects to the new enrollment's copied member profiles (D3).
         try:
@@ -2909,31 +3027,6 @@ def replace_enrollment_for_case_change(
             )
         except Exception:  # pragma: no cover - defensive
             pass
-
-        # Build delivery calendar if the kitchen carried over. The new enrollment
-        # skipped kitchen assignment (which normally creates the first delivery
-        # plan), so create the initial plan from the carried cadence/kitchen and
-        # then reconcile the dated calendar.
-        if carries_kitchen:
-            try:
-                from api.models import DeliveryCadence
-                from api.services.delivery import create_member_delivery_schedules
-
-                once_weekday = None
-                if carried_cadence == DeliveryCadence.ONCE_A_WEEK.value:
-                    wds = live.delivery_weekdays or []
-                    once_weekday = wds[0] if wds else None
-                create_member_delivery_schedules(
-                    new_enrollment,
-                    case=new_governing_case,
-                    cadence=carried_cadence,
-                    once_a_week_weekday=once_weekday,
-                    kitchen=kitchen,
-                    product_kind=new_kind,
-                )
-                rebuild_delivery_calendar(new_enrollment)
-            except Exception:  # pragma: no cover - defensive
-                pass
 
         # Primary system note describing the replacement.
         em_dash = "\u2014"

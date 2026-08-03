@@ -10288,3 +10288,103 @@ class DeliveryQuantityCadenceTest(TestCase):
         self.assertEqual(
             delivery_quantity(ProductTypeKind.BOXES, self.WED, sched), 3
         )
+
+
+class ReplacementKeepsServiceActiveTest(TestCase):
+    """Fix (A): a governing-case REPLACEMENT of an already-serving, same-kind
+    member must keep the household in Service Active (carrying kitchen + cadence +
+    calendar), never strand it at Pending Verification / Kitchen Assignment.
+
+    Covers BOTH replacement paths:
+      * create branch  -- no pre-existing enrollment on the new case; and
+      * existing-link branch -- a Pending Verification enrollment already exists
+        on the new case (the mass-stranding bug: closing the serving enrollment
+        and linking the pending one without carrying service)."""
+
+    def _meals_case(self, client, *, opened_day):
+        from datetime import timedelta
+
+        from .models import Case, CaseStatus, CaseType, ServiceAuthorizationStatus
+
+        now = timezone.now()
+        return Case.objects.create(
+            case_id=str(uuid.uuid4()), client=client,
+            case_type=CaseType.INTERNAL_SERVICE, case_status=CaseStatus.OPEN,
+            service_authorization_status=ServiceAuthorizationStatus.APPROVED,
+            service_authorization_approval_starts_at=now,
+            service_authorization_approval_ends_at=now + timedelta(days=90),
+            program_name="Medically Tailored Meals",
+            case_created_at=now + timedelta(days=opened_day),
+            date_opened=now + timedelta(days=opened_day),
+        )
+
+    def _serving_setup(self):
+        from .models import (
+            Client, DeliveryCadence, EnrollmentStage, EnrollmentVerification,
+            Household, HouseholdMember, Kitchen, KitchenStatus,
+            MemberDeliverySchedule, MemberDietaryProfile, MemberStatus,
+            ScheduleStatus,
+        )
+
+        client = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Serve", last_name="Ing",
+        )
+        hh = Household.objects.create(name="HH")
+        HouseholdMember.objects.create(household=hh, client=client, is_primary=True)
+        kitchen = Kitchen.objects.create(name="ENG", status=KitchenStatus.ACTIVE)
+        old_case = self._meals_case(client, opened_day=1)
+        live = EnrollmentVerification.objects.create(
+            client=client, household=hh, case=old_case, kitchen=kitchen,
+            stage=EnrollmentStage.SERVICE_ACTIVE, program_name="Medically Tailored Meals",
+            delivery_weekdays=["mon", "thu"], verified_at=timezone.now(),
+        )
+        member = MemberDietaryProfile.objects.create(
+            enrollment=live, client=client, member_name="Serve Ing",
+            menu_type="Standard", status=MemberStatus.ACTIVE,
+        )
+        MemberDeliverySchedule.objects.create(
+            enrollment=live, member_profile=member, member_name="Serve Ing",
+            delivery_days_cadence=DeliveryCadence.MON_THU, meals_per_day=3,
+            prod_per_delivery=0, meals_boxes_total=12, status=ScheduleStatus.SCHEDULED,
+        )
+        new_case = self._meals_case(client, opened_day=30)
+        return client, live, new_case, kitchen
+
+    def test_create_branch_keeps_service_active(self):
+        from .models import EnrollmentStage, EnrollmentVerification
+        from .services.lifecycle import replace_enrollment_for_case_change
+
+        client, live, new_case, kitchen = self._serving_setup()
+        new_enr = replace_enrollment_for_case_change(client, new_case)
+        self.assertIsNotNone(new_enr)
+        new_enr.refresh_from_db()
+        live.refresh_from_db()
+        self.assertEqual(EnrollmentStage(new_enr.stage), EnrollmentStage.SERVICE_ACTIVE)
+        self.assertEqual(new_enr.kitchen_id, kitchen.pk)
+        self.assertEqual(str(new_enr.case_id), str(new_case.case_id))
+        self.assertEqual(EnrollmentStage(live.stage), EnrollmentStage.CLOSED)
+        self.assertEqual(live.close_reason, "case_replaced")
+
+    def test_existing_link_branch_keeps_service_active(self):
+        from .models import EnrollmentStage, EnrollmentVerification
+        from .services.lifecycle import replace_enrollment_for_case_change
+
+        client, live, new_case, kitchen = self._serving_setup()
+        # A Pending Verification enrollment already exists on the NEW case (the
+        # stranding trigger): the replacement must drive IT to Service Active.
+        existing = EnrollmentVerification.objects.create(
+            client=client, household=live.household, case=new_case,
+            stage=EnrollmentStage.PENDING_VERIFICATION,
+            program_name="Medically Tailored Meals",
+        )
+        result = replace_enrollment_for_case_change(client, new_case)
+        self.assertEqual(result.pk, existing.pk)
+        existing.refresh_from_db()
+        live.refresh_from_db()
+        self.assertEqual(
+            EnrollmentStage(existing.stage), EnrollmentStage.SERVICE_ACTIVE,
+            "existing pending-verification enrollment must be driven to Service Active",
+        )
+        self.assertEqual(existing.kitchen_id, kitchen.pk)
+        self.assertEqual(EnrollmentStage(live.stage), EnrollmentStage.CLOSED)
+        self.assertEqual(existing.supersedes_id, live.pk)
