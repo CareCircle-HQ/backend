@@ -10,17 +10,21 @@ from datetime import datetime, timedelta
 from django.db import transaction
 from django.utils import timezone
 from django.db.models import (
+    Case as SQLCase,
     Count,
     Exists,
     F,
+    IntegerField,
     Max,
     Min,
     OuterRef,
     Prefetch,
     Q,
     Subquery,
+    Value,
+    When,
 )
-from django.db.models.functions import Lower
+from django.db.models.functions import Coalesce, Lower
 from django.shortcuts import get_object_or_404
 from rest_framework import status as http
 from rest_framework.response import Response
@@ -597,11 +601,6 @@ _NON_CURRENT_ENROLLMENT_STAGES = [
     EnrollmentStage.SERVICE_COMPLETE,
 ]
 
-# LIVE (non-terminal) enrollment stages -- a member with an enrollment at any of
-# these is still in the program (not closed/off-boarded).
-_LIVE_ENROLLMENT_STAGES = [
-    s for s in EnrollmentStage if s not in _NON_CURRENT_ENROLLMENT_STAGES
-]
 
 
 def current_member_status_exists(member_status, *, eligibility_paused=None):
@@ -721,6 +720,37 @@ def enrollment_stage_q(*stages):
     ``.distinct()`` (this adds multi-valued joins)."""
     return Q(enrollments__stage__in=stages) | Q(
         household_membership__household__enrollment_verifications__stage__in=stages
+    )
+
+
+def governing_enrollment_stage():
+    """A ``Subquery`` yielding the stage of the client's GOVERNING enrollment --
+    the SQL mirror of ``serializers.active_enrollment`` (most-recent non-
+    disregarded enrollment, preferring an OPEN one, with a household fallback).
+
+    Stage-based status filters (On Hold / Open / Closed) must key off this ONE
+    governing enrollment, the same way the rest of the app does -- NOT off "any
+    enrollment at this stage" (``enrollment_stage_q``), which over-matches a
+    member who has a stray extra live enrollment (e.g. an On Hold enrollment
+    alongside a newer Service Active one). Validated to match ``active_enrollment``
+    exactly on the production snapshot."""
+    def _latest(rel):
+        return Subquery(
+            EnrollmentVerification.objects
+            .filter(**rel)
+            .exclude(stage=EnrollmentStage.DISREGARDED)
+            .annotate(_open=SQLCase(
+                When(closed_at__isnull=True, then=Value(1)),
+                default=Value(0), output_field=IntegerField(),
+            ))
+            .order_by("-_open", "-opened_at")
+            .values("stage")[:1]
+        )
+    # Own enrollments take precedence; a dependent with none inherits the
+    # household's governing enrollment.
+    return Coalesce(
+        _latest({"client": OuterRef("pk")}),
+        _latest({"household__members__client": OuterRef("pk")}),
     )
 
 
@@ -1198,29 +1228,36 @@ class MembersListView(PortalGenericAPIView):
                 qs = apply_authorization_filter(qs, "denied")
             # ── Service axis ──
             elif status_val in ("On Hold", "on_hold"):
-                # On Hold is a service-state overlay (not a lifecycle_stage), so it
-                # is filtered on the member's/household's enrollment stage.
-                qs = qs.filter(enrollment_stage_q(EnrollmentStage.ON_HOLD))
+                # On Hold is a PROGRAM (enrollment) state -- scope to the member's
+                # GOVERNING enrollment (not "any enrollment"), so a stray On Hold
+                # enrollment alongside a newer live one doesn't misfile them.
+                qs = qs.annotate(_gov_stage=governing_enrollment_stage()).filter(
+                    _gov_stage=EnrollmentStage.ON_HOLD
+                )
             elif sv == "out_of_range":
                 qs = qs.filter(current_member_status_exists(MemberStatus.OUT_OF_RANGE))
-            # ── Terminal axis (program / enrollment stage) ──
+            # ── Terminal axis (program / enrollment stage) ── all keyed off the
+            # GOVERNING enrollment (mirrors active_enrollment), never "any".
             elif sv == "term_open":
-                # Open program: an active service enrollment.
-                qs = qs.filter(enrollment_stage_q(EnrollmentStage.SERVICE_ACTIVE))
+                # Open program: the governing enrollment is actively serving.
+                qs = qs.annotate(_gov_stage=governing_enrollment_stage()).filter(
+                    _gov_stage=EnrollmentStage.SERVICE_ACTIVE
+                )
             elif sv == "term_expired":
                 # Authorization window/status expired on the governing case.
                 qs = qs.filter(governing_auth_expired_q())
             elif sv == "term_closed":
-                # Closed/off-boarded program: the member (or their household) HAS
-                # enrollment history but NO current LIVE enrollment. Keyed off the
-                # absence of a live enrollment rather than the presence of a closed
-                # one -- otherwise every member who was ever re-enrolled (a closed,
-                # superseded enrollment sits in their history) wrongly reads as
-                # Closed while they're actively being served on a live enrollment.
-                qs = qs.filter(
-                    Q(enrollments__isnull=False)
-                    | Q(household_membership__household__enrollment_verifications__isnull=False)
-                ).exclude(enrollment_stage_q(*_LIVE_ENROLLMENT_STAGES))
+                # Closed/off-boarded program: the GOVERNING enrollment is terminal
+                # (closed / cancelled / service-complete). Keyed off the governing
+                # enrollment so a member actively served on a live enrollment isn't
+                # shown as Closed just because an old superseded enrollment is.
+                qs = qs.annotate(_gov_stage=governing_enrollment_stage()).filter(
+                    _gov_stage__in=[
+                        EnrollmentStage.CLOSED,
+                        EnrollmentStage.CANCELLED,
+                        EnrollmentStage.SERVICE_COMPLETE,
+                    ]
+                )
             # ── Logistics / plain lifecycle-stage buckets ──
             elif sv == "kitchen_assignment":
                 qs = qs.filter(lifecycle_stage="kitchen_assignment")

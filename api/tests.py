@@ -2221,12 +2221,31 @@ class MemberListGroupedStatusFilterTest(TestCase):
         EnrollmentVerification.objects.create(
             client=served, household=hh, stage=EnrollmentStage.CLOSED,
             program_name="Medically Tailored Meals",
+            closed_at=timezone.now(),  # a real closed enrollment is closed
         )
         done = self._member("Done", enr_stage=EnrollmentStage.CLOSED)
 
         ids = self._ids(status="term_closed")
         self.assertNotIn(str(served.client_id), ids)  # has a live enrollment
         self.assertIn(str(done.client_id), ids)         # only a closed enrollment
+
+    def test_stage_filter_uses_governing_enrollment_not_any(self):
+        # A member with a stray ON_HOLD enrollment PLUS a newer live SERVICE_ACTIVE
+        # one: the governing (newer, open) enrollment is Active, so they read as
+        # Open -- NOT On Hold. The filter must key off the governing enrollment,
+        # not "any enrollment at this stage".
+        from .models import (
+            EnrollmentStage, EnrollmentVerification, HouseholdMember,
+        )
+
+        m = self._member("Dual", enr_stage=EnrollmentStage.ON_HOLD)
+        hh = HouseholdMember.objects.get(client=m).household
+        EnrollmentVerification.objects.create(
+            client=m, household=hh, stage=EnrollmentStage.SERVICE_ACTIVE,
+            program_name="Medically Tailored Meals",
+        )
+        self.assertNotIn(str(m.client_id), self._ids(status="on_hold"))
+        self.assertIn(str(m.client_id), self._ids(status="term_open"))
 
     def test_paused_flag_splits_agent_vs_eligibility(self):
         # Paused splits into agent (manual) vs eligibility (auto) so the two are
