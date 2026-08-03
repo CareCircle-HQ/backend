@@ -1076,6 +1076,11 @@ _CATEGORY_TO_CASE_TYPE = {
     "eligibility": CaseType.ELIGIBILITY,
     "internal service": CaseType.INTERNAL_SERVICE,
     "internal services": CaseType.INTERNAL_SERVICE,
+    # Reauthorization renews an existing meal/box authorization, so it IS an
+    # internal-service case: it must drive service the same way (governing-case
+    # selection, enrollment, delivery, the program tab) rather than being a
+    # separate Navigation case.
+    "reauthorization": CaseType.INTERNAL_SERVICE,
     "external service": CaseType.EXTERNAL_SERVICE,
     "external services": CaseType.EXTERNAL_SERVICE,
 }
@@ -1132,6 +1137,45 @@ def derive_case_type(service_type, program_name=None):
     if not st:
         return None
     return CaseType.NAVIGATION
+
+
+# ActiveProgram.case_category values (casefolded) that ARE in scope to import.
+# A case is imported only when it is one of our meal/box services OR its program
+# belongs to one of these categories. External Services, "Other", a blank/unknown
+# program, or a program not present in ActiveProgram are OUT of scope and dropped.
+_IN_SCOPE_CASE_CATEGORIES = frozenset({
+    "internal service", "internal services",
+    "eligibility",
+    "reauthorization",
+    "care management", "navigation",
+    "screening",
+})
+
+
+def active_program_category(program_name):
+    """The ActiveProgram ``case_category`` (casefolded) for ``program_name``, or
+    None when the program is blank or not in the ActiveProgram table."""
+    pn = (program_name or "").strip()
+    if not pn:
+        return None
+    row = ActiveProgram.objects.filter(program_name__iexact=pn).first()
+    if row is None:
+        return None
+    return (row.case_category or "").strip().casefold()
+
+
+def case_in_import_scope(service_type, program_name=None):
+    """True when a case should be imported at all.
+
+    Scope = our meal/box service (by subtype) OR a program that exists in the
+    ActiveProgram table AND whose category is one we track (Internal Service,
+    Eligibility, Reauthorization, Care Management, Screening). Everything else --
+    External Services, "Other", a blank program, or a program NOT in the table --
+    is out of scope and must be skipped by the importer.
+    """
+    if (service_type or "").strip().casefold() in INTERNAL_SERVICE_SUBTYPES:
+        return True
+    return active_program_category(program_name) in _IN_SCOPE_CASE_CATEGORIES
 
 
 def derive_household_type(client, program_name=None):
