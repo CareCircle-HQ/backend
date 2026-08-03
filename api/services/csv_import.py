@@ -59,7 +59,7 @@ from api.serializers import (
     CaseSerializer,
     ClientSerializer,
     ScreeningSerializer,
-    derive_case_type,
+    case_in_import_scope,
 )
 from api.services import timeline, tickets
 
@@ -1215,17 +1215,14 @@ class CsvImporter:
             if (row.get("case_status") or "").strip().lower() == "referred":
                 self._count("skipped")
                 continue
-            # A blank program_name means the case never advanced into a Met
-            # Council program (overwhelmingly declined / denied / recalled): out
-            # of scope, don't import.
-            if not (row.get("program_name") or "").strip():
-                self._count("skipped")
-                continue
-            # External-service cases are out of scope -- we don't track them.
-            # (Classified from the program's ActiveProgram category.)
-            if derive_case_type(
+            # Program scope gate: import ONLY our programs -- a meal/box service,
+            # or a program in the ActiveProgram table whose category is Internal
+            # Service / Eligibility / Reauthorization / Care Management / Screening.
+            # Drops blank/unknown programs, External Services and "Other", and any
+            # program not in our table (previously kept as Navigation).
+            if not case_in_import_scope(
                 row.get("service_subtype"), row.get("program_name")
-            ) == CaseType.EXTERNAL_SERVICE:
+            ):
                 self._count("skipped")
                 continue
             # Capture the pre-save status/auth so we can detect what changed
