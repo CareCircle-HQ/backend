@@ -26,7 +26,6 @@ from django.utils import timezone
 from api.models import (
     EnrollmentStage,
     EnrollmentVerification,
-    MemberStatus,
     ServiceAuthorizationStatus,
 )
 from api.services.catalog import product_kind_for_enrollment
@@ -55,6 +54,14 @@ _RESTORABLE_STAGES = {
     EnrollmentStage.ON_HOLD,
 }
 _ONCE_A_WEEK = "once_a_week"
+# Forward stage ladder to reach Service Active (the transition map has no direct
+# pending_verification -> service_active edge, so we step through it).
+_FORWARD_LADDER = [
+    EnrollmentStage.PENDING_VERIFICATION,
+    EnrollmentStage.VERIFIED,
+    EnrollmentStage.KITCHEN_ASSIGNMENT,
+    EnrollmentStage.SERVICE_ACTIVE,
+]
 
 
 class Command(BaseCommand):
@@ -137,6 +144,30 @@ class Command(BaseCommand):
             return False, kitchen, None, None, kind, "no same-kind cadence to carry (needs manual assignment)"
         return True, kitchen, cadence, weekdays, kind, "restore -> service_active + rebuild calendar"
 
+    def _advance_to_active(self, enr):
+        """Move ``enr`` to Service Active respecting the transition map.
+
+        The map has no direct pending_verification -> service_active edge, so we
+        walk pending_verification -> verified -> kitchen_assignment ->
+        service_active (each forced past its process gate). on_hold resumes
+        straight to service_active. Already-active is a no-op.
+        """
+        cur = EnrollmentStage(enr.stage)
+        note = ("Restored service after governing-case replacement: carried the "
+                "previous kitchen + cadence.")
+        if cur == EnrollmentStage.SERVICE_ACTIVE:
+            return
+        if cur == EnrollmentStage.ON_HOLD:
+            steps = [EnrollmentStage.SERVICE_ACTIVE]
+        elif cur in _FORWARD_LADDER:
+            steps = _FORWARD_LADDER[_FORWARD_LADDER.index(cur) + 1:]
+        else:
+            steps = [EnrollmentStage.SERVICE_ACTIVE]
+        for nxt in steps:
+            advance_enrollment(
+                enr, nxt, force=True, actor_label=_ACTOR_LABEL, note=note,
+            )
+
     @transaction.atomic
     def _apply_one(self, enr, kitchen, cadence, weekdays, kind):
         # Carry kitchen + weekdays onto the live enrollment.
@@ -149,23 +180,24 @@ class Command(BaseCommand):
             fields.append("delivery_weekdays")
         if fields:
             enr.save(update_fields=fields)
-        # Return cancel/hold-excluded members to service (respect eligibility pause).
+        # Reconcile EVERY member against the carried kitchen (respect eligibility
+        # pause). This returns an out-of-orbit / inactive member to ACTIVE when the
+        # kitchen can meet their menu + allergies -- so servable members get a
+        # delivery plan -- while genuinely unservable members (e.g. no menu type)
+        # correctly stay out of orbit and off the PO.
         for mv in enr.member_profiles.all():
             if getattr(mv, "eligibility_paused", False):
                 continue
-            if mv.status == MemberStatus.INACTIVE:
-                reconcile_member_kitchen_output(
-                    mv, kitchen=kitchen, allow_resume=True, save=True,
-                )
-        # Advance to Service Active (force: verification already happened before
-        # the replacement; restoring the prior service state must not be re-gated).
-        if EnrollmentStage(enr.stage) != EnrollmentStage.SERVICE_ACTIVE:
-            advance_enrollment(
-                enr, EnrollmentStage.SERVICE_ACTIVE, force=True,
-                actor_label=_ACTOR_LABEL,
-                note="Restored service after governing-case replacement: carried "
-                     "the previous kitchen + cadence.",
+            reconcile_member_kitchen_output(
+                mv, kitchen=kitchen, allow_resume=True, save=True,
             )
+        # Advance to Service Active. force=True bypasses the process GATES but the
+        # transition MAP is still enforced, so there is no direct
+        # pending_verification -> service_active edge: we must step through
+        # verified -> kitchen_assignment -> service_active. on_hold has a direct
+        # edge to service_active (resume). Verification already happened before
+        # the replacement, so forcing each step is safe.
+        self._advance_to_active(enr)
         # (Re)create the delivery plan from the carried cadence, then rebuild the
         # dated calendar from today so they rejoin future Purchase Orders.
         once_weekday = None
