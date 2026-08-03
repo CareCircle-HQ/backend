@@ -597,6 +597,12 @@ _NON_CURRENT_ENROLLMENT_STAGES = [
     EnrollmentStage.SERVICE_COMPLETE,
 ]
 
+# LIVE (non-terminal) enrollment stages -- a member with an enrollment at any of
+# these is still in the program (not closed/off-boarded).
+_LIVE_ENROLLMENT_STAGES = [
+    s for s in EnrollmentStage if s not in _NON_CURRENT_ENROLLMENT_STAGES
+]
+
 
 def current_member_status_exists(member_status, *, eligibility_paused=None):
     """``Exists`` over the client's member dietary profiles in ``member_status``
@@ -1205,13 +1211,16 @@ class MembersListView(PortalGenericAPIView):
                 # Authorization window/status expired on the governing case.
                 qs = qs.filter(governing_auth_expired_q())
             elif sv == "term_closed":
-                # Closed/off-boarded program (enrollment closed, cancelled or
-                # service-complete).
-                qs = qs.filter(enrollment_stage_q(
-                    EnrollmentStage.CLOSED,
-                    EnrollmentStage.CANCELLED,
-                    EnrollmentStage.SERVICE_COMPLETE,
-                ))
+                # Closed/off-boarded program: the member (or their household) HAS
+                # enrollment history but NO current LIVE enrollment. Keyed off the
+                # absence of a live enrollment rather than the presence of a closed
+                # one -- otherwise every member who was ever re-enrolled (a closed,
+                # superseded enrollment sits in their history) wrongly reads as
+                # Closed while they're actively being served on a live enrollment.
+                qs = qs.filter(
+                    Q(enrollments__isnull=False)
+                    | Q(household_membership__household__enrollment_verifications__isnull=False)
+                ).exclude(enrollment_stage_q(*_LIVE_ENROLLMENT_STAGES))
             # ── Logistics / plain lifecycle-stage buckets ──
             elif sv == "kitchen_assignment":
                 qs = qs.filter(lifecycle_stage="kitchen_assignment")

@@ -2208,6 +2208,26 @@ class MemberListGroupedStatusFilterTest(TestCase):
         self.assertNotIn(str(stale.client_id), ids)   # stale closed profile ignored
         self.assertIn(str(current.client_id), ids)     # current profile matches
 
+    def test_term_closed_excludes_members_with_a_live_enrollment(self):
+        # "Closed" means NO current live enrollment -- a member actively served on
+        # a live enrollment must NOT read as Closed just because an old superseded
+        # enrollment in their history is closed.
+        from .models import (
+            EnrollmentStage, EnrollmentVerification, HouseholdMember,
+        )
+
+        served = self._member("Served", enr_stage=EnrollmentStage.SERVICE_ACTIVE)
+        hh = HouseholdMember.objects.get(client=served).household
+        EnrollmentVerification.objects.create(
+            client=served, household=hh, stage=EnrollmentStage.CLOSED,
+            program_name="Medically Tailored Meals",
+        )
+        done = self._member("Done", enr_stage=EnrollmentStage.CLOSED)
+
+        ids = self._ids(status="term_closed")
+        self.assertNotIn(str(served.client_id), ids)  # has a live enrollment
+        self.assertIn(str(done.client_id), ids)         # only a closed enrollment
+
     def test_paused_flag_splits_agent_vs_eligibility(self):
         # Paused splits into agent (manual) vs eligibility (auto) so the two are
         # distinguishable on the list; both are status=PAUSED, told apart by the
