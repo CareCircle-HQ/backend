@@ -87,25 +87,31 @@ class Command(BaseCommand):
             qs = qs[: opts["limit"]]
         return qs
 
-    def _carry_source(self, enr):
+    def _carry_source(self, enr, want_kind):
         """Walk the supersedes chain (nearest first, incl. ``enr``) and return
-        ``(kitchen, cadence, weekdays)`` from the last real serving state.
+        ``(kitchen, cadence, weekdays)`` from the last real serving state whose
+        product kind MATCHES ``want_kind``.
 
         A member may have been replaced MORE THAN ONCE (e.g. the first bad import
         demoted them, then a re-import replaced the demoted -- kitchen-less --
-        enrollment again). The immediate parent then carries nothing, so we take
-        the NEAREST kitchen and the NEAREST cadence found anywhere in the chain.
+        enrollment again), so we take the NEAREST kitchen and NEAREST cadence
+        found anywhere in the chain. But we ONLY carry from a node of the SAME
+        product kind: for a genuine meals<->boxes switch the old kitchen/cadence
+        is for the wrong product and must not be reused (that member falls to
+        "needs manual" instead of being wrongly activated on the old kitchen).
         """
         kitchen = cadence = weekdays = None
         seen, node = set(), enr
         while node is not None and node.pk not in seen:
             seen.add(node.pk)
-            if kitchen is None and node.kitchen_id:
-                kitchen = node.kitchen
-            if not cadence:
-                c = current_household_cadence(node)
-                if c:
-                    cadence, weekdays = c, node.delivery_weekdays
+            # Skip nodes whose product kind differs from the current enrollment.
+            if want_kind is None or product_kind_for_enrollment(node) == want_kind:
+                if kitchen is None and node.kitchen_id:
+                    kitchen = node.kitchen
+                if not cadence:
+                    c = current_household_cadence(node)
+                    if c:
+                        cadence, weekdays = c, node.delivery_weekdays
             if kitchen is not None and cadence:
                 break
             node = node.supersedes
@@ -124,11 +130,11 @@ class Command(BaseCommand):
         if gov.service_authorization_status not in _FAVORABLE:
             return False, None, None, None, None, "governing case not approved"
         kind = product_kind_for_enrollment(enr)
-        kitchen, cadence, weekdays = self._carry_source(enr)
+        kitchen, cadence, weekdays = self._carry_source(enr, kind)
         if kitchen is None:
-            return False, None, None, None, kind, "no kitchen to carry (needs manual assignment)"
+            return False, None, None, None, kind, "no same-kind kitchen to carry (needs manual assignment)"
         if not cadence:
-            return False, kitchen, None, None, kind, "no cadence to carry (needs manual assignment)"
+            return False, kitchen, None, None, kind, "no same-kind cadence to carry (needs manual assignment)"
         return True, kitchen, cadence, weekdays, kind, "restore -> service_active + rebuild calendar"
 
     @transaction.atomic
