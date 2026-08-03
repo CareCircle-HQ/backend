@@ -87,37 +87,59 @@ class Command(BaseCommand):
             qs = qs[: opts["limit"]]
         return qs
 
+    def _carry_source(self, enr):
+        """Walk the supersedes chain (nearest first, incl. ``enr``) and return
+        ``(kitchen, cadence, weekdays)`` from the last real serving state.
+
+        A member may have been replaced MORE THAN ONCE (e.g. the first bad import
+        demoted them, then a re-import replaced the demoted -- kitchen-less --
+        enrollment again). The immediate parent then carries nothing, so we take
+        the NEAREST kitchen and the NEAREST cadence found anywhere in the chain.
+        """
+        kitchen = cadence = weekdays = None
+        seen, node = set(), enr
+        while node is not None and node.pk not in seen:
+            seen.add(node.pk)
+            if kitchen is None and node.kitchen_id:
+                kitchen = node.kitchen
+            if not cadence:
+                c = current_household_cadence(node)
+                if c:
+                    cadence, weekdays = c, node.delivery_weekdays
+            if kitchen is not None and cadence:
+                break
+            node = node.supersedes
+        return kitchen, cadence, weekdays
+
     def _plan(self, enr):
-        """Return (ok, kitchen, cadence, kind, reason)."""
+        """Return (ok, kitchen, cadence, weekdays, kind, reason)."""
         old = enr.supersedes
         if old is None or (old.close_reason or "") != "case_replaced":
-            return False, None, None, None, "supersedes is not a case_replaced enrollment"
+            return False, None, None, None, None, "supersedes is not a case_replaced enrollment"
         gov = governing_internal_case(enr)
         if gov is None:
-            return False, None, None, None, "no governing internal-service case"
+            return False, None, None, None, None, "no governing internal-service case"
         if gov.case_status in _CLOSED_CASE_STATUSES:
-            return False, None, None, None, "governing case closed/cancelled"
+            return False, None, None, None, None, "governing case closed/cancelled"
         if gov.service_authorization_status not in _FAVORABLE:
-            return False, None, None, None, "governing case not approved"
-        kitchen = enr.kitchen or old.kitchen
-        cadence = current_household_cadence(enr) or current_household_cadence(old)
+            return False, None, None, None, None, "governing case not approved"
         kind = product_kind_for_enrollment(enr)
+        kitchen, cadence, weekdays = self._carry_source(enr)
         if kitchen is None:
-            return False, None, None, kind, "no kitchen to carry (needs manual assignment)"
+            return False, None, None, None, kind, "no kitchen to carry (needs manual assignment)"
         if not cadence:
-            return False, kitchen, None, kind, "no cadence to carry (needs manual assignment)"
-        return True, kitchen, cadence, kind, "restore -> service_active + rebuild calendar"
+            return False, kitchen, None, None, kind, "no cadence to carry (needs manual assignment)"
+        return True, kitchen, cadence, weekdays, kind, "restore -> service_active + rebuild calendar"
 
     @transaction.atomic
-    def _apply_one(self, enr, kitchen, cadence, kind):
-        old = enr.supersedes
+    def _apply_one(self, enr, kitchen, cadence, weekdays, kind):
         # Carry kitchen + weekdays onto the live enrollment.
         fields = []
         if enr.kitchen_id != kitchen.pk:
             enr.kitchen = kitchen
             fields.append("kitchen")
-        if not enr.delivery_weekdays and old.delivery_weekdays:
-            enr.delivery_weekdays = old.delivery_weekdays
+        if not enr.delivery_weekdays and weekdays:
+            enr.delivery_weekdays = weekdays
             fields.append("delivery_weekdays")
         if fields:
             enr.save(update_fields=fields)
@@ -157,7 +179,7 @@ class Command(BaseCommand):
         rows = list(self._candidates(opts))
         self.stdout.write(f"Superseded live enrollments in scope: {len(rows)}")
         for enr in rows:
-            ok, kitchen, cadence, kind, reason = self._plan(enr)
+            ok, kitchen, cadence, weekdays, kind, reason = self._plan(enr)
             tag = ("RESTORE" if ok else "SKIP") + " :: " + reason
             buckets[tag] += 1
             kn = kitchen.name if kitchen else None
@@ -167,7 +189,7 @@ class Command(BaseCommand):
             )
             if ok and apply:
                 try:
-                    self._apply_one(enr, kitchen, cadence, kind)
+                    self._apply_one(enr, kitchen, cadence, weekdays, kind)
                     restored += 1
                 except Exception as exc:  # noqa: BLE001 - isolate, report, continue
                     errors += 1
