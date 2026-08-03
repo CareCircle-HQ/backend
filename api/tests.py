@@ -1956,6 +1956,52 @@ class LogisticsRosterFilterTest(TestCase):
         view.kwargs = {}
         return view._build_groups_for_page(view._group_entries())
 
+    def _checks(self, primary, member_clients, *, kitchens=None):
+        # Refetch from the DB so client_id is a UUID (matching the profile FK),
+        # as the real endpoint's querysets provide -- passing in-memory instances
+        # created with a str client_id would mismatch the profile lookup.
+        from .portal.views_members import MembersListView
+        primary = Client.objects.get(pk=primary.pk)
+        member_clients = list(
+            Client.objects.filter(pk__in=[c.pk for c in member_clients])
+        )
+        return MembersListView()._logistics_checks(
+            primary, member_clients, kitchens or [], is_boxes=False,
+        )
+
+    def test_no_menu_member_not_double_counted_as_out_of_orbit(self):
+        # A member with no menu type is a 'missing menu type' blocker only -- it
+        # must NOT ALSO be counted as 'may get out of orbit' (the old double
+        # count that inflated Has Blockers).
+        from .models import MemberStatus
+
+        primary = self._client("Nomenu", "Primary")
+        hh = self._household(primary)
+        self._internal_case(primary)
+        self._enrollment(primary, hh, {primary: MemberStatus.ACTIVE})  # no menu_type
+        per, agg = self._checks(primary, [primary])
+        self.assertFalse(per[str(primary.client_id)]["predicted_out_of_orbit"])
+        self.assertEqual(agg["predicted_out_of_orbit"], 0)
+        self.assertTrue(any("missing menu" in b for b in agg["blockers"]))
+        self.assertFalse(any("out of orbit" in b for b in agg["blockers"]))
+
+    def test_out_of_orbit_prediction_is_kitchen_aware(self):
+        # A member WITH a menu but for whom NO available kitchen can serve is
+        # predicted out of orbit (kitchen-aware) -- not from the old global rule.
+        from .models import EnrollmentStage, MemberDietaryProfile, MemberStatus
+
+        primary = self._client("Menu", "Primary")
+        hh = self._household(primary)
+        self._internal_case(primary)
+        enr = self._enrollment(primary, hh, {})
+        MemberDietaryProfile.objects.create(
+            enrollment=enr, client=primary, status=MemberStatus.ACTIVE,
+            menu_type="Standard",
+        )
+        per, agg = self._checks(primary, [primary], kitchens=[])  # no kitchens
+        self.assertTrue(per[str(primary.client_id)]["predicted_out_of_orbit"])
+        self.assertIn("kitchen", per[str(primary.client_id)]["predicted_reason"].lower())
+
     def test_out_of_orbit_member_hidden_from_household(self):
         from .models import ClientStage, MemberStatus
 

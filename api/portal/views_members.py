@@ -1812,28 +1812,44 @@ class MembersListView(PortalGenericAPIView):
         missing_menu = predicted_out = 0
         for c in member_clients:
             mp = profiles.get(c.client_id)
-            out, reason = predict_member_out_of_orbit(mp)
             menu_type = (mp.menu_type if mp else "") or ""
+            allergies = _allergy_labels(mp.food_allergies if mp else [])
             if not menu_type:
+                # No menu type is its OWN blocker (missing menu) -- it must NOT
+                # ALSO be counted as "may get out of orbit" (that double-reported
+                # the same gap).
                 missing_menu += 1
-            if out:
-                predicted_out += 1
-            else:
-                # Kitchens that can serve this member's menu + allergies for the
-                # household's product (meals/boxes). A household is servable only
-                # if ONE kitchen serves every eligible member (set intersection).
-                serving_sets.append({
-                    sk["kitchen"].pk
-                    for sk in serving_kitchens_for_member(
-                        mp, kitchens=kitchens, required_product=required,
-                    )
-                })
-            per_member[str(c.client_id)] = {
-                "menu_type": menu_type,
-                "allergies": _allergy_labels(mp.food_allergies if mp else []),
-                "predicted_out_of_orbit": out,
-                "predicted_reason": reason,
+                per_member[str(c.client_id)] = {
+                    "menu_type": "", "allergies": allergies,
+                    "predicted_out_of_orbit": False, "predicted_reason": "",
+                }
+                continue
+            # KITCHEN-AWARE out-of-orbit prediction: the member is only a blocker
+            # when NO available kitchen can actually serve their menu + allergies.
+            # The old kitchen-AGNOSTIC rule (predict_member_out_of_orbit) flagged
+            # members a real kitchen could serve, so it hugely over-inflated
+            # "Has blockers" and hid them from the kitchen serviceability check.
+            serving = {
+                sk["kitchen"].pk
+                for sk in serving_kitchens_for_member(
+                    mp, kitchens=kitchens, required_product=required,
+                )
             }
+            if not serving:
+                predicted_out += 1
+                per_member[str(c.client_id)] = {
+                    "menu_type": menu_type, "allergies": allergies,
+                    "predicted_out_of_orbit": True,
+                    "predicted_reason": "No available kitchen can serve this menu + allergies",
+                }
+            else:
+                # A household is servable only if ONE kitchen serves EVERY member
+                # (set intersection below).
+                serving_sets.append(serving)
+                per_member[str(c.client_id)] = {
+                    "menu_type": menu_type, "allergies": allergies,
+                    "predicted_out_of_orbit": False, "predicted_reason": "",
+                }
 
         kitchen_available = bool(set.intersection(*serving_sets)) if serving_sets else False
         address = _format_address(enr.delivery_address) if enr else ""
@@ -5143,15 +5159,21 @@ def enrollment_ready_for_assignment(enr, kitchens):
     required = required_product_for_program(enr.program_name)
     serving_sets = []
     for mp in members:
-        out, _ = predict_member_out_of_orbit(mp)
-        if out:
+        # Kitchen-AWARE (matches the Logistics list): missing menu, or NO
+        # available kitchen able to serve the member's menu + allergies, means
+        # not ready. The old kitchen-agnostic predict_member_out_of_orbit flagged
+        # members a real kitchen could serve, wrongly excluding ready households.
+        if not (mp.menu_type or "").strip():
             return False
-        serving_sets.append({
+        serving = {
             sk["kitchen"].pk
             for sk in serving_kitchens_for_member(
                 mp, kitchens=kitchens, required_product=required,
             )
-        })
+        }
+        if not serving:
+            return False
+        serving_sets.append(serving)
     return bool(set.intersection(*serving_sets))
 
 
