@@ -229,6 +229,14 @@ def _stop_future_deliveries(client, *, to_hold=True, note=_INELIGIBLE_HOLD_NOTE,
     )
     from api.services.orders import truncate_future_deliveries
 
+    # Machine trigger for the timeline history, derived from the hold note.
+    if note.startswith(_COVERAGE_HOLD_NOTE):
+        trigger = "eligibility.coverage_expired"
+    elif note.startswith(_INELIGIBLE_HOLD_NOTE):
+        trigger = "eligibility.ineligible"
+    else:
+        trigger = "eligibility.hold"
+
     paused = []
     for enr in _governing_enrollments(client):
         try:
@@ -243,6 +251,7 @@ def _stop_future_deliveries(client, *, to_hold=True, note=_INELIGIBLE_HOLD_NOTE,
             try:
                 advance_enrollment(
                     enr, EnrollmentStage.ON_HOLD, actor=actor, note=note,
+                    trigger=trigger,
                 )
                 paused.append(enr)
             except Exception:  # pragma: no cover - defensive

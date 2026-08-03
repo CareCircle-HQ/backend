@@ -10288,3 +10288,366 @@ class DeliveryQuantityCadenceTest(TestCase):
         self.assertEqual(
             delivery_quantity(ProductTypeKind.BOXES, self.WED, sched), 3
         )
+
+
+class ReplacementKeepsServiceActiveTest(TestCase):
+    """Fix (A): a governing-case REPLACEMENT of an already-serving, same-kind
+    member must keep the household in Service Active (carrying kitchen + cadence +
+    calendar), never strand it at Pending Verification / Kitchen Assignment.
+
+    Covers BOTH replacement paths:
+      * create branch  -- no pre-existing enrollment on the new case; and
+      * existing-link branch -- a Pending Verification enrollment already exists
+        on the new case (the mass-stranding bug: closing the serving enrollment
+        and linking the pending one without carrying service)."""
+
+    def _meals_case(self, client, *, opened_day):
+        from datetime import timedelta
+
+        from .models import Case, CaseStatus, CaseType, ServiceAuthorizationStatus
+
+        now = timezone.now()
+        return Case.objects.create(
+            case_id=str(uuid.uuid4()), client=client,
+            case_type=CaseType.INTERNAL_SERVICE, case_status=CaseStatus.OPEN,
+            service_authorization_status=ServiceAuthorizationStatus.APPROVED,
+            service_authorization_approval_starts_at=now,
+            service_authorization_approval_ends_at=now + timedelta(days=90),
+            program_name="Medically Tailored Meals",
+            case_created_at=now + timedelta(days=opened_day),
+            date_opened=now + timedelta(days=opened_day),
+        )
+
+    def _serving_setup(self):
+        from .models import (
+            Client, DeliveryCadence, EnrollmentStage, EnrollmentVerification,
+            Household, HouseholdMember, Kitchen, KitchenStatus,
+            MemberDeliverySchedule, MemberDietaryProfile, MemberStatus,
+            ScheduleStatus,
+        )
+
+        client = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Serve", last_name="Ing",
+        )
+        hh = Household.objects.create(name="HH")
+        HouseholdMember.objects.create(household=hh, client=client, is_primary=True)
+        kitchen = Kitchen.objects.create(name="ENG", status=KitchenStatus.ACTIVE)
+        old_case = self._meals_case(client, opened_day=1)
+        live = EnrollmentVerification.objects.create(
+            client=client, household=hh, case=old_case, kitchen=kitchen,
+            stage=EnrollmentStage.SERVICE_ACTIVE, program_name="Medically Tailored Meals",
+            delivery_weekdays=["mon", "thu"], verified_at=timezone.now(),
+        )
+        member = MemberDietaryProfile.objects.create(
+            enrollment=live, client=client, member_name="Serve Ing",
+            menu_type="Standard", status=MemberStatus.ACTIVE,
+        )
+        MemberDeliverySchedule.objects.create(
+            enrollment=live, member_profile=member, member_name="Serve Ing",
+            delivery_days_cadence=DeliveryCadence.MON_THU, meals_per_day=3,
+            prod_per_delivery=0, meals_boxes_total=12, status=ScheduleStatus.SCHEDULED,
+        )
+        new_case = self._meals_case(client, opened_day=30)
+        return client, live, new_case, kitchen
+
+    def test_create_branch_keeps_service_active(self):
+        from .models import EnrollmentStage, EnrollmentVerification
+        from .services.lifecycle import replace_enrollment_for_case_change
+
+        client, live, new_case, kitchen = self._serving_setup()
+        new_enr = replace_enrollment_for_case_change(client, new_case)
+        self.assertIsNotNone(new_enr)
+        new_enr.refresh_from_db()
+        live.refresh_from_db()
+        self.assertEqual(EnrollmentStage(new_enr.stage), EnrollmentStage.SERVICE_ACTIVE)
+        self.assertEqual(new_enr.kitchen_id, kitchen.pk)
+        self.assertEqual(str(new_enr.case_id), str(new_case.case_id))
+        self.assertEqual(EnrollmentStage(live.stage), EnrollmentStage.CLOSED)
+        self.assertEqual(live.close_reason, "case_replaced")
+
+    def test_existing_link_branch_keeps_service_active(self):
+        from .models import EnrollmentStage, EnrollmentVerification
+        from .services.lifecycle import replace_enrollment_for_case_change
+
+        client, live, new_case, kitchen = self._serving_setup()
+        # A Pending Verification enrollment already exists on the NEW case (the
+        # stranding trigger): the replacement must drive IT to Service Active.
+        existing = EnrollmentVerification.objects.create(
+            client=client, household=live.household, case=new_case,
+            stage=EnrollmentStage.PENDING_VERIFICATION,
+            program_name="Medically Tailored Meals",
+        )
+        result = replace_enrollment_for_case_change(client, new_case)
+        self.assertEqual(result.pk, existing.pk)
+        existing.refresh_from_db()
+        live.refresh_from_db()
+        self.assertEqual(
+            EnrollmentStage(existing.stage), EnrollmentStage.SERVICE_ACTIVE,
+            "existing pending-verification enrollment must be driven to Service Active",
+        )
+        self.assertEqual(existing.kitchen_id, kitchen.pk)
+        self.assertEqual(EnrollmentStage(live.stage), EnrollmentStage.CLOSED)
+        self.assertEqual(existing.supersedes_id, live.pk)
+
+
+class StageChangeTimelineMetadataTest(TestCase):
+    """A stage change records the FULL context on the timeline event's metadata:
+    previous + new stage (value + label), the trigger, and the reason note -- so
+    an auto-hold (or any transition) is traceable to what caused it."""
+
+    def test_hold_records_previous_new_and_trigger(self):
+        from .models import (
+            Client, EnrollmentStage, EnrollmentVerification, Household,
+            HouseholdMember, TimelineEvent,
+        )
+        from .services.lifecycle import advance_enrollment
+
+        client = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Meta", last_name="Data",
+        )
+        hh = Household.objects.create(name="HH")
+        HouseholdMember.objects.create(household=hh, client=client, is_primary=True)
+        enr = EnrollmentVerification.objects.create(
+            client=client, household=hh, stage=EnrollmentStage.SERVICE_ACTIVE,
+            program_name="Medically Tailored Meals",
+        )
+        advance_enrollment(
+            enr, EnrollmentStage.ON_HOLD, note="coverage expired",
+            trigger="eligibility.coverage_expired",
+        )
+        ev = (
+            TimelineEvent.objects.filter(client=client, enrollment=enr)
+            .order_by("-occurred_at").first()
+        )
+        self.assertIsNotNone(ev)
+        md = ev.metadata or {}
+        self.assertEqual(md.get("previous_stage"), EnrollmentStage.SERVICE_ACTIVE.value)
+        self.assertEqual(md.get("new_stage"), EnrollmentStage.ON_HOLD.value)
+        self.assertEqual(md.get("trigger"), "eligibility.coverage_expired")
+        self.assertEqual(md.get("reason"), "coverage expired")
+        self.assertTrue(md.get("previous_stage_label"))
+        self.assertTrue(md.get("new_stage_label"))
+
+
+class CalendarHidesSupersededFutureRowsTest(TestCase):
+    """Regression: the household delivery calendar must not show a superseded
+    (closed) enrollment's leftover FUTURE scheduled occurrence as 'Service Ended'
+    next to the active enrollment's 'Scheduled' row for the same date."""
+
+    def test_no_service_ended_duplicate_for_superseded_enrollment(self):
+        from datetime import timedelta
+
+        from rest_framework.test import APIClient
+        from rest_framework_simplejwt.tokens import AccessToken
+
+        from .models import (
+            Agent, Case, CaseStatus, CaseType, Client, EnrollmentStage,
+            EnrollmentVerification, Household, HouseholdMember,
+            MemberDietaryProfile, MemberStatus, OrderSchedule, OrderStatus,
+        )
+
+        today = timezone.localdate()
+        day = today + timedelta(days=3)
+        client = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Dup", last_name="Cal",
+        )
+        hh = Household.objects.create(name="HH")
+        HouseholdMember.objects.create(household=hh, client=client, is_primary=True)
+        now = timezone.now()
+        case = Case.objects.create(
+            case_id=str(uuid.uuid4()), client=client,
+            case_type=CaseType.INTERNAL_SERVICE, case_status=CaseStatus.OPEN,
+            service_authorization_status="approved", date_opened=now,
+        )
+        # Closed (superseded) enrollment with a leftover future scheduled row.
+        old = EnrollmentVerification.objects.create(
+            client=client, household=hh, stage=EnrollmentStage.CLOSED,
+            close_reason="case_replaced",
+        )
+        old_mp = MemberDietaryProfile.objects.create(
+            enrollment=old, client=client, member_name="Dup Cal",
+            menu_type="Standard", status=MemberStatus.ACTIVE,
+        )
+        OrderSchedule.objects.create(
+            enrollment=old, member=old_mp, member_name="Dup Cal",
+            anticipated_delivery_date=day, status=OrderStatus.SCHEDULED,
+            household_group_code="G", household=hh,
+        )
+        # Active enrollment (supersedes old) with a scheduled row same date.
+        new = EnrollmentVerification.objects.create(
+            client=client, household=hh, case=case,
+            stage=EnrollmentStage.SERVICE_ACTIVE, supersedes=old,
+        )
+        new_mp = MemberDietaryProfile.objects.create(
+            enrollment=new, client=client, member_name="Dup Cal",
+            menu_type="Standard", status=MemberStatus.ACTIVE,
+        )
+        OrderSchedule.objects.create(
+            enrollment=new, member=new_mp, member_name="Dup Cal",
+            anticipated_delivery_date=day, status=OrderStatus.SCHEDULED,
+            household_group_code="G", household=hh,
+        )
+
+        agent = Agent.objects.create(name="C", agent_code="952", group="CS")
+        access = AccessToken()
+        access["agent_id"] = str(agent.id)
+        access["agent_code"] = agent.agent_code
+        access["agent_name"] = agent.name
+        access["agent_group"] = agent.group
+        api = APIClient()
+        api.credentials(HTTP_AUTHORIZATION=f"Bearer {access}")
+        r = api.get(f"/api/portal/members/{client.client_id}/delivery-calendar/")
+        self.assertEqual(r.status_code, 200, r.content)
+        rows = [row for row in r.json()["occurrences"] if row["date"] == day.isoformat()]
+        self.assertEqual(len(rows), 1, rows)
+        self.assertEqual(rows[0]["state"], "scheduled")
+
+    def test_past_cancelled_and_active_delivery_deduped(self):
+        from datetime import timedelta
+
+        from rest_framework.test import APIClient
+        from rest_framework_simplejwt.tokens import AccessToken
+
+        from .models import (
+            Agent, Case, CaseStatus, CaseType, Client, DeliveryOrder,
+            DeliveryOrderStatus, EnrollmentStage, EnrollmentVerification,
+            Household, HouseholdMember, MemberDietaryProfile, MemberStatus,
+            OrderSchedule, OrderStatus, PurchaseOrder, PurchaseOrderStatus,
+        )
+
+        today = timezone.localdate()
+        past = today - timedelta(days=5)
+        client = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Past", last_name="Dup",
+        )
+        hh = Household.objects.create(name="HH")
+        HouseholdMember.objects.create(household=hh, client=client, is_primary=True)
+        case = Case.objects.create(
+            case_id=str(uuid.uuid4()), client=client,
+            case_type=CaseType.INTERNAL_SERVICE, case_status=CaseStatus.OPEN,
+            service_authorization_status="approved", date_opened=timezone.now(),
+        )
+        old = EnrollmentVerification.objects.create(
+            client=client, household=hh, stage=EnrollmentStage.CLOSED,
+            close_reason="case_replaced",
+        )
+        old_mp = MemberDietaryProfile.objects.create(
+            enrollment=old, client=client, member_name="Past Dup",
+            menu_type="Standard", status=MemberStatus.ACTIVE,
+        )
+        OrderSchedule.objects.create(
+            enrollment=old, member=old_mp, member_name="Past Dup",
+            anticipated_delivery_date=past, status=OrderStatus.SCHEDULED,
+            household_group_code="G", household=hh,
+        )
+        new = EnrollmentVerification.objects.create(
+            client=client, household=hh, case=case,
+            stage=EnrollmentStage.SERVICE_ACTIVE, supersedes=old,
+        )
+        new_mp = MemberDietaryProfile.objects.create(
+            enrollment=new, client=client, member_name="Past Dup",
+            menu_type="Standard", status=MemberStatus.ACTIVE,
+        )
+        OrderSchedule.objects.create(
+            enrollment=new, member=new_mp, member_name="Past Dup",
+            anticipated_delivery_date=past, status=OrderStatus.SCHEDULED,
+            household_group_code="G", household=hh,
+        )
+        # Two committed DeliveryOrders on the same past date: an old CANCELLED
+        # (from the replaced PO) and a live ready_for_delivery.
+        po_old = PurchaseOrder.objects.create(status=PurchaseOrderStatus.DRAFT)
+        DeliveryOrder.objects.create(
+            purchase_order=po_old, member=client, group=hh,
+            expected_delivery_date=past, status=DeliveryOrderStatus.CANCELLED,
+        )
+        po_new = PurchaseOrder.objects.create(status=PurchaseOrderStatus.DRAFT)
+        DeliveryOrder.objects.create(
+            purchase_order=po_new, member=client, group=hh,
+            expected_delivery_date=past, status=DeliveryOrderStatus.READY_FOR_DELIVERY,
+        )
+
+        agent = Agent.objects.create(name="C2", agent_code="953", group="CS")
+        access = AccessToken()
+        access["agent_id"] = str(agent.id)
+        access["agent_code"] = agent.agent_code
+        access["agent_name"] = agent.name
+        access["agent_group"] = agent.group
+        api = APIClient()
+        api.credentials(HTTP_AUTHORIZATION=f"Bearer {access}")
+        r = api.get(f"/api/portal/members/{client.client_id}/delivery-calendar/")
+        self.assertEqual(r.status_code, 200, r.content)
+        rows = [row for row in r.json()["occurrences"] if row["date"] == past.isoformat()]
+        # A single row for the date, keyed off the live (non-cancelled) delivery.
+        self.assertEqual(len(rows), 1, rows)
+        self.assertNotEqual(rows[0]["status"], "cancelled")
+
+
+class CloseDuplicateHoldsTest(TestCase):
+    """close_duplicate_holds closes an ON_HOLD enrollment that duplicates a
+    member's live SERVICE_ACTIVE enrollment (revived case-less duplicate), but
+    leaves a legit different-product hold alone."""
+
+    def _client(self):
+        from .models import Client, Household, HouseholdMember
+        c = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Dup", last_name="Hold",
+        )
+        hh = Household.objects.create(name="HH")
+        HouseholdMember.objects.create(household=hh, client=c, is_primary=True)
+        return c, hh
+
+    def test_closes_unbound_hold_next_to_active(self):
+        from django.core.management import call_command
+
+        from .models import EnrollmentStage, EnrollmentVerification
+
+        c, hh = self._client()
+        active = EnrollmentVerification.objects.create(
+            client=c, household=hh, stage=EnrollmentStage.SERVICE_ACTIVE,
+            program_name="Medically Tailored Meals",
+        )
+        held = EnrollmentVerification.objects.create(
+            client=c, household=hh, stage=EnrollmentStage.ON_HOLD,
+            program_name="Medically Tailored Meals",
+        )
+        call_command("close_duplicate_holds", "--apply", "--client", str(c.client_id))
+        active.refresh_from_db(); held.refresh_from_db()
+        self.assertEqual(EnrollmentStage(active.stage), EnrollmentStage.SERVICE_ACTIVE)
+        self.assertEqual(EnrollmentStage(held.stage), EnrollmentStage.CLOSED)
+        self.assertEqual(held.close_reason, "duplicate_of_active")
+
+    def test_keeps_different_kind_hold(self):
+        from datetime import timedelta
+
+        from django.core.management import call_command
+
+        from .models import (
+            Case, CaseStatus, CaseType, EnrollmentStage, EnrollmentVerification,
+        )
+
+        c, hh = self._client()
+        meals_case = Case.objects.create(
+            case_id=str(uuid.uuid4()), client=c, case_type=CaseType.INTERNAL_SERVICE,
+            case_status=CaseStatus.OPEN, program_name="Medically Tailored Meals",
+            date_opened=timezone.now(),
+        )
+        boxes_case = Case.objects.create(
+            case_id=str(uuid.uuid4()), client=c, case_type=CaseType.INTERNAL_SERVICE,
+            case_status=CaseStatus.OPEN,
+            program_name="Fresh Produce and Nonperishable Groceries: Pantry Stocking",
+            date_opened=timezone.now(),
+        )
+        EnrollmentVerification.objects.create(
+            client=c, household=hh, case=meals_case,
+            stage=EnrollmentStage.SERVICE_ACTIVE, program_name=meals_case.program_name,
+        )
+        boxes_hold = EnrollmentVerification.objects.create(
+            client=c, household=hh, case=boxes_case,
+            stage=EnrollmentStage.ON_HOLD, program_name=boxes_case.program_name,
+        )
+        call_command("close_duplicate_holds", "--apply", "--client", str(c.client_id))
+        boxes_hold.refresh_from_db()
+        self.assertEqual(
+            EnrollmentStage(boxes_hold.stage), EnrollmentStage.ON_HOLD,
+            "a different-product hold must NOT be closed",
+        )

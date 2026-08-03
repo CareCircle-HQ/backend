@@ -63,14 +63,18 @@ _LIVE_STAGES = [
 ]
 
 
-def _case_has_other_live_enrollment(enr):
-    """True when this enrollment's case already has ANOTHER non-excluded (live)
-    enrollment -- reviving this cancelled row to On Hold would violate the
-    per-case unique constraint, so it is really a duplicate to close instead."""
-    if not enr.case_id:
-        return False  # NULL case is unconstrained
+def _client_has_other_live_enrollment(enr):
+    """True when the CLIENT already has ANOTHER non-excluded (live) enrollment.
+
+    Reviving this cancelled row would create a second live enrollment for a
+    member who is already being served (or held) -- a duplicate. This is broader
+    than the per-case check: a cancelled row is frequently UNBOUND (case=None),
+    so a case-only guard misses it and revives a duplicate next to the member's
+    real active enrollment (the "on hold for no reason" bug)."""
     return (
-        EnrollmentVerification.objects.filter(case_id=enr.case_id, stage__in=_LIVE_STAGES)
+        EnrollmentVerification.objects.filter(
+            client_id=enr.client_id, stage__in=_LIVE_STAGES
+        )
         .exclude(pk=enr.pk)
         .exists()
     )
@@ -79,6 +83,10 @@ def _case_has_other_live_enrollment(enr):
 def _decide(enr):
     """Return ``(target_stage, reason)`` for a cancelled enrollment based on its
     governing internal-service case + authorization."""
+    # A revive would duplicate an enrollment the client already has live (bound
+    # or unbound) -- close this cancelled row instead of reviving a duplicate.
+    if _client_has_other_live_enrollment(enr):
+        return EnrollmentStage.CLOSED, "duplicate: client already has a live enrollment"
     gov = governing_internal_case(enr)
     if gov is None:
         return EnrollmentStage.CLOSED, "no governing internal-service case"
@@ -88,15 +96,9 @@ def _decide(enr):
     if auth in _DENIED_EQUIVALENT_STATUSES:
         return EnrollmentStage.CLOSED, "governing case open + authorization denied"
     if auth in _APPROVED:
-        target, reason = EnrollmentStage.ON_HOLD, "governing case open + authorization approved"
-    else:
-        # Open but not yet approved (pending / blank): reversible wait.
-        target, reason = EnrollmentStage.ON_HOLD, "governing case open + awaiting authorization"
-    # A revive-to-On-Hold collides if the case already has a live enrollment
-    # (the real active one). This cancelled row is a duplicate -> close it.
-    if target == EnrollmentStage.ON_HOLD and _case_has_other_live_enrollment(enr):
-        return EnrollmentStage.CLOSED, "duplicate: case already has a live enrollment"
-    return target, reason
+        return EnrollmentStage.ON_HOLD, "governing case open + authorization approved"
+    # Open but not yet approved (pending / blank): reversible wait.
+    return EnrollmentStage.ON_HOLD, "governing case open + awaiting authorization"
 
 
 class Command(BaseCommand):
@@ -153,6 +155,7 @@ class Command(BaseCommand):
                     advance_enrollment(
                         enr, target, force=True,
                         actor_label=_ACTOR_LABEL, note=note,
+                        trigger="reconcile.cancelled_enrollment",
                     )
             except Exception as exc:  # noqa: BLE001 - isolate + report, never abort the run
                 errors += 1
