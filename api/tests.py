@@ -6673,8 +6673,10 @@ class MemberEligibilityTest(TestCase):
         c.refresh_from_db()
         self.assertNotEqual(c.lifecycle_stage, ClientStage.INELIGIBLE)
 
-    def test_expired_insurance_ineligible_ignores_active_status(self):
-        # record_status ACTIVE but a past expired_at => expired (date-based gate).
+    def test_active_status_covers_despite_stale_past_end_date(self):
+        # Status wins (aligned with the warnings layer): a policy the source marks
+        # ACTIVE covers the member even with a stale past end date -- a "good"
+        # (Active, no/old end date) insurance must NOT off-ramp them to Ineligible.
         from .models import ClientStage, Insurance, RecordStatus
 
         c = self._client()
@@ -6685,7 +6687,7 @@ class MemberEligibilityTest(TestCase):
         )
         self._reconcile(c)
         c.refresh_from_db()
-        self.assertEqual(c.lifecycle_stage, ClientStage.INELIGIBLE)
+        self.assertNotEqual(c.lifecycle_stage, ClientStage.INELIGIBLE)
 
     def test_lifetime_sentinel_9999_is_active(self):
         from datetime import datetime, timezone as dtz

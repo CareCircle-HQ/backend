@@ -33,7 +33,7 @@ from dataclasses import dataclass, field
 
 from django.utils import timezone
 
-from api.models import AddressType, ClientStage, InsurancePlanType
+from api.models import AddressType, ClientStage, InsurancePlanType, RecordStatus
 
 # Coverage end-date sentinel: year 9999 means "never expires".
 LIFETIME_SENTINEL_YEAR = 9999
@@ -62,17 +62,33 @@ def coverage_expired(end_dt, *, today=None):
     return end is not None and end < (today or timezone.localdate())
 
 
+def _policy_provides_coverage(policy, *, today=None):
+    """Whether a single insurance policy counts as active medical coverage.
+
+    The SOURCE status is authoritative: a policy Unite Us marks ACTIVE covers the
+    member even if its stored end date is blank or stale/past -- the same "status
+    wins" rule the ingest reconcile and the Care-Management warnings layer use
+    (see ``services.warnings`` / ``portal.serializers.is_insurance_expiring``: an
+    Active policy is "covered now" and is never treated as expired). Absent an
+    Active status, fall back to the date: a non-past end date still covers.
+    """
+    if (policy.status or "") == RecordStatus.ACTIVE:
+        return True
+    return not coverage_expired(policy.expired_at, today=today)
+
+
 def medical_insurance_reason(client, *, today=None):
     """Ineligibility reason for medical insurance, or "" when covered.
 
-    Ineligible when the client has NO medical insurance on file, or when EVERY
-    insurance policy is expired (date-based). A single non-expired policy clears
-    the gate.
+    Ineligible when the client has NO medical insurance on file, or when NO
+    policy provides coverage. A single covering policy clears the gate -- one the
+    source marks ACTIVE (status wins, even with a blank/past end date), or one
+    whose end date isn't in the past.
     """
     plans = list(client.insurances.all())
     if not plans:
         return "no medical insurance on file"
-    if all(coverage_expired(p.expired_at, today=today) for p in plans):
+    if not any(_policy_provides_coverage(p, today=today) for p in plans):
         return "all medical insurance plans are expired"
     return ""
 
