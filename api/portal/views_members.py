@@ -188,7 +188,7 @@ def _open_out_of_range_ticket(enrollment, reason):
     )
     if exists:
         return False
-    Ticket.objects.create(
+    ticket = Ticket.objects.create(
         type=type_obj,
         status=TicketStatus.OPEN,
         severity=TicketSeverity.HIGH,
@@ -198,6 +198,14 @@ def _open_out_of_range_ticket(enrollment, reason):
         # Auto-link the member's GOVERNING internal-service case (fall back to
         # the enrollment's tied case) so the ticket points at the case too.
         case=governing_internal_case(enrollment) or getattr(enrollment, "case", None),
+        created_by_label="System",
+    )
+    from ..models import TicketActivityAction
+    from ..services.tickets import log_ticket_activity
+
+    log_ticket_activity(
+        ticket, TicketActivityAction.CREATED, actor_label="System",
+        detail="Out-of-range ticket opened by the system.",
     )
     return True
 
@@ -212,11 +220,21 @@ def _resolve_out_of_range_tickets(enrollment, actor=""):
         client=client, type__code=TicketTypeCode.CASE_CLOSURE,
         reason__startswith=_OUT_OF_RANGE_TICKET_MARKER,
     ).exclude(status=TicketStatus.RESOLVED)
-    return qs.update(
+    from ..models import TicketActivityAction
+    from ..services.tickets import log_ticket_activity
+
+    resolved_tickets = list(qs)
+    count = qs.update(
         status=TicketStatus.RESOLVED,
         resolved_at=timezone.now(),
         resolved_by=actor,
     )
+    for t in resolved_tickets:
+        log_ticket_activity(
+            t, TicketActivityAction.RESOLVED, actor_label=actor or "System",
+            detail="Resolved: delivery ZIP is serviceable again.",
+        )
+    return count
 
 
 def _hold_household_for_range(enrollment, author):

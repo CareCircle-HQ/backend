@@ -52,6 +52,7 @@ from ..models import (
     SocialCareCoverage,
     StageEvent,
     Ticket,
+    TicketActivity,
     TicketNote,
     TicketSource,
     TicketType,
@@ -1310,6 +1311,8 @@ class PortalTicketSerializer(serializers.ModelSerializer):
     case_code = serializers.SerializerMethodField()
     assignee = serializers.SerializerMethodField()
     assignee_id = serializers.SerializerMethodField()
+    created_by = serializers.SerializerMethodField()
+    created_by_id = serializers.SerializerMethodField()
     origin = serializers.CharField(read_only=True)
     notes = PortalTicketNoteSerializer(many=True, read_only=True)
 
@@ -1318,12 +1321,23 @@ class PortalTicketSerializer(serializers.ModelSerializer):
         fields = [
             "id", "code", "type", "type_label", "status", "status_label",
             "severity", "source", "source_label", "reason", "client_id",
-            "client_name", "case_code", "assignee", "assignee_id", "origin",
+            "client_name", "case_code", "assignee", "assignee_id",
+            "created_by", "created_by_id", "origin",
             "vip", "created_at", "updated_at", "resolved_at", "notes",
         ]
 
     def get_code(self, obj):
         return ticket_code(obj)
+
+    def get_created_by(self, obj):
+        # Prefer the linked agent's current name; fall back to the snapshot label
+        # (system-raised tickets have no agent -> show the label, e.g. "System").
+        if obj.created_by_id and obj.created_by:
+            return obj.created_by.name
+        return obj.created_by_label or ("System" if obj.origin == "system" else "")
+
+    def get_created_by_id(self, obj):
+        return str(obj.created_by_id) if obj.created_by_id else None
 
     def get_client_id(self, obj):
         return str(obj.client_id) if obj.client_id else None
@@ -1342,6 +1356,26 @@ class PortalTicketSerializer(serializers.ModelSerializer):
 
     def get_assignee_id(self, obj):
         return str(obj.assigned_to_id) if obj.assigned_to_id else None
+
+
+class PortalTicketActivitySerializer(serializers.ModelSerializer):
+    """One entry in a ticket's activity/history feed."""
+
+    id = serializers.IntegerField(source="pk", read_only=True)
+    action_label = serializers.CharField(source="get_action_display", read_only=True)
+    actor = serializers.SerializerMethodField()
+
+    class Meta:
+        model = TicketActivity
+        fields = [
+            "id", "action", "action_label", "actor", "detail", "metadata",
+            "created_at",
+        ]
+
+    def get_actor(self, obj):
+        if obj.actor_agent_id and obj.actor_agent:
+            return obj.actor_agent.name
+        return obj.actor_label or "System"
 
 
 class PortalTicketTypeSerializer(serializers.ModelSerializer):

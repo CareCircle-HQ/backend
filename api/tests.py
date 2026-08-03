@@ -10959,3 +10959,81 @@ class TicketGoverningCaseAutoLinkTest(TestCase):
         from .models import Ticket
         t = Ticket.objects.get(pk=r.json()["id"])
         self.assertEqual(str(t.case_id), str(case.case_id))
+
+
+class TicketCreatedByAndActivityTest(TestCase):
+    """Manual ticket creation records created_by + assignment, and every ticket
+    action (create / assign / status / note / resolve) appends to the ticket's
+    activity feed exposed at /tickets/<id>/activity/."""
+
+    def _api(self, group="Management", code="970"):
+        from rest_framework.test import APIClient
+        from rest_framework_simplejwt.tokens import AccessToken
+
+        from .models import Agent
+
+        agent = Agent.objects.create(name="Quinn", agent_code=code, group=group, status="Active")
+        access = AccessToken()
+        access["agent_id"] = str(agent.id)
+        access["agent_code"] = agent.agent_code
+        access["agent_name"] = agent.name
+        access["agent_group"] = agent.group
+        api = APIClient()
+        api.credentials(HTTP_AUTHORIZATION=f"Bearer {access}")
+        return api, agent
+
+    def _ticket_type(self):
+        from .models import TicketType, TicketTypeCode
+
+        tt, _ = TicketType.objects.get_or_create(
+            code=TicketTypeCode.VERIFICATION, defaults={"label": "Verification"},
+        )
+        return tt
+
+    def test_manual_create_records_created_by_and_activity(self):
+        from .models import Agent, Ticket, TicketActivityAction
+
+        api, agent = self._api()
+        tt = self._ticket_type()
+        assignee = Agent.objects.create(
+            name="Dana", agent_code="971", group="CS", status="Active",
+        )
+        r = api.post("/api/portal/tickets/", {
+            "type": tt.code, "reason": "Call the member",
+            "assignee_id": str(assignee.id),
+        }, format="json")
+        self.assertEqual(r.status_code, 201, r.content)
+        t = Ticket.objects.get(pk=r.json()["id"])
+        self.assertEqual(t.created_by_id, agent.id)
+        actions = list(t.activities.values_list("action", flat=True))
+        self.assertIn(TicketActivityAction.CREATED, actions)
+        self.assertIn(TicketActivityAction.ASSIGNED, actions)
+
+    def test_status_note_and_resolve_append_activity(self):
+        from .models import Ticket, TicketActivityAction
+
+        api, agent = self._api()
+        tt = self._ticket_type()
+        r = api.post("/api/portal/tickets/", {"type": tt.code, "reason": "x"}, format="json")
+        tid = r.json()["id"]
+
+        # Add a note.
+        api.post(f"/api/portal/tickets/{tid}/notes/", {"body": "Left a voicemail"}, format="json")
+        # Resolve it.
+        api.patch(f"/api/portal/tickets/{tid}/", {"status": "resolved"}, format="json")
+
+        feed = api.get(f"/api/portal/tickets/{tid}/activity/")
+        self.assertEqual(feed.status_code, 200, feed.content)
+        actions = [e["action"] for e in feed.json()]
+        self.assertIn(TicketActivityAction.CREATED, actions)
+        self.assertIn(TicketActivityAction.NOTE_ADDED, actions)
+        self.assertIn(TicketActivityAction.RESOLVED, actions)
+        # Feed is chronological (created first).
+        self.assertEqual(actions[0], TicketActivityAction.CREATED)
+
+    def test_serializer_exposes_created_by(self):
+        api, agent = self._api()
+        tt = self._ticket_type()
+        r = api.post("/api/portal/tickets/", {"type": tt.code, "reason": "x"}, format="json")
+        self.assertEqual(r.json()["created_by"], agent.name)
+        self.assertEqual(r.json()["created_by_id"], str(agent.id))

@@ -120,6 +120,7 @@ class WorkQueueView(PortalGenericAPIView):
             )
             if gov is not None:
                 case_id = gov.pk
+        agent = current_agent(request)
         ticket = Ticket.objects.create(
             type=data["type"],
             severity=data.get("severity", "medium"),
@@ -130,7 +131,23 @@ class WorkQueueView(PortalGenericAPIView):
             client_id=client_id,
             case_id=case_id,
             assigned_to_id=data.get("assignee_id"),
+            created_by=agent,
+            created_by_label=(agent.name if agent else ""),
         )
+        from ..services.tickets import log_ticket_activity
+        from ..models import TicketActivityAction
+
+        log_ticket_activity(
+            ticket, TicketActivityAction.CREATED, actor_agent=agent,
+            actor_label=(agent.name if agent else ""), detail="Ticket created.",
+        )
+        if ticket.assigned_to_id:
+            log_ticket_activity(
+                ticket, TicketActivityAction.ASSIGNED, actor_agent=agent,
+                actor_label=(agent.name if agent else ""),
+                detail=f"Assigned to {ticket.assigned_to.name}.",
+                metadata={"assignee_id": str(ticket.assigned_to_id)},
+            )
         ticket = (
             Ticket.objects.select_related(*TICKET_SELECT)
             .prefetch_related(*TICKET_PREFETCH)
@@ -178,6 +195,10 @@ class TicketDetailView(PortalAPIView):
     def patch(self, request, ticket_id):
         ticket = _load_ticket(ticket_id)
         update_fields = []
+        actor = current_agent(request)
+        actor_label = (actor.name if actor else "")
+        prev_assignee_id = ticket.assigned_to_id
+        prev_status = ticket.status
 
         # Reassignment: the presence of the `assignee_id` key signals intent to
         # change the assignee (an empty/null value unassigns). Done independently
@@ -224,8 +245,55 @@ class TicketDetailView(PortalAPIView):
 
         update_fields.append("updated_at")
         ticket.save(update_fields=update_fields)
+
+        # Record the activity feed entries for what actually changed.
+        from ..models import TicketActivityAction
+        from ..services.tickets import log_ticket_activity
+
+        if "assigned_to" in update_fields and ticket.assigned_to_id != prev_assignee_id:
+            if ticket.assigned_to_id:
+                log_ticket_activity(
+                    ticket, TicketActivityAction.ASSIGNED, actor_agent=actor,
+                    actor_label=actor_label,
+                    detail=f"Assigned to {ticket.assigned_to.name}.",
+                    metadata={"assignee_id": str(ticket.assigned_to_id)},
+                )
+            else:
+                log_ticket_activity(
+                    ticket, TicketActivityAction.UNASSIGNED, actor_agent=actor,
+                    actor_label=actor_label, detail="Unassigned.",
+                )
+        if "status" in update_fields and ticket.status != prev_status:
+            if ticket.status == "resolved":
+                action = TicketActivityAction.RESOLVED
+            elif prev_status == "resolved":
+                action = TicketActivityAction.REOPENED
+            else:
+                action = TicketActivityAction.STATUS_CHANGED
+            log_ticket_activity(
+                ticket, action, actor_agent=actor, actor_label=actor_label,
+                detail=(
+                    f"Status: {prev_status.replace('_', ' ').title()} \u2192 "
+                    f"{ticket.status.replace('_', ' ').title()}"
+                ),
+                metadata={"from": prev_status, "to": ticket.status},
+            )
+
         ticket = _load_ticket(ticket.pk)
         return Response(s.PortalTicketSerializer(ticket).data)
+
+
+class TicketActivityView(PortalAPIView):
+    """GET a ticket's activity/history feed (created, assigned, status changes,
+    notes, resolved, ...), oldest-first, so the Work Queue can show a timestamped
+    history of what happened to the ticket and who did it."""
+
+    def get(self, request, ticket_id):
+        ticket = get_object_or_404(Ticket, pk=ticket_id)
+        activities = (
+            ticket.activities.select_related("actor_agent").order_by("created_at", "pk")
+        )
+        return Response(s.PortalTicketActivitySerializer(activities, many=True).data)
 
 
 class TicketNotesView(PortalAPIView):
@@ -242,6 +310,14 @@ class TicketNotesView(PortalAPIView):
             author_agent=agent,
             author_name=agent.name if agent else "",
             body=body,
+        )
+        from ..models import TicketActivityAction
+        from ..services.tickets import log_ticket_activity
+
+        excerpt = body if len(body) <= 140 else body[:139] + "\u2026"
+        log_ticket_activity(
+            ticket, TicketActivityAction.NOTE_ADDED, actor_agent=agent,
+            actor_label=(agent.name if agent else ""), detail=excerpt,
         )
         return Response(
             s.PortalTicketNoteSerializer(note).data, status=http.HTTP_201_CREATED

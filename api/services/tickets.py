@@ -19,6 +19,8 @@ from api.models import (
     SocialCareCoverage,
     SocialCareCoverageStatus,
     Ticket,
+    TicketActivity,
+    TicketActivityAction,
     TicketStatus,
     TicketSeverity,
     TicketType,
@@ -28,6 +30,21 @@ from api.models import (
 logger = logging.getLogger(__name__)
 
 OPEN_STATUSES = (TicketStatus.OPEN, TicketStatus.IN_PROGRESS)
+
+
+def log_ticket_activity(ticket, action, *, actor_agent=None, actor_label="",
+                        detail="", metadata=None):
+    """Append one entry to a ticket's activity/history feed. Best-effort: never
+    let activity logging break the underlying ticket action."""
+    try:
+        return TicketActivity.objects.create(
+            ticket=ticket, action=action,
+            actor_agent=actor_agent, actor_label=actor_label or "",
+            detail=detail or "", metadata=metadata or {},
+        )
+    except Exception:  # noqa: BLE001
+        logger.warning("log_ticket_activity failed", exc_info=True)
+        return None
 
 
 def _resolve_ticket_type(ticket_type):
@@ -102,6 +119,12 @@ def open_ticket(ticket_type, *, reason, severity=TicketSeverity.MEDIUM,
     ticket = Ticket.objects.create(
         type=type_obj, reason=reason, severity=severity,
         client=client, case=case, import_run=import_run,
+        created_by_label=actor or (str(source) if source else "System"),
+    )
+    log_ticket_activity(
+        ticket, TicketActivityAction.CREATED,
+        actor_label=actor or (str(source) if source else "System"),
+        detail="Ticket created.",
     )
     # Mirror the new ticket onto the client's timeline (best-effort: a timeline
     # hiccup must never fail the ticket write). Deduped on the ticket pk.
