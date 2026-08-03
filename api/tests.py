@@ -64,6 +64,27 @@ class InsuranceReconcileTest(TestCase):
             RecordStatus.ACTIVE,
         )
 
+    def test_active_no_end_date_clears_stale_expired_at(self):
+        # A renewed policy: an old span stored a past end date; the new capture
+        # sends it ACTIVE with no end date -> the stale expired_at must be CLEARED
+        # (so the date-based eligibility gate stops reading it as expired).
+        client, cid = self._client_with(
+            dict(
+                plan_name="Anthem", external_member_id="1",
+                status=RecordStatus.ACTIVE,
+                expired_at=timezone.now() - timedelta(days=400),
+            )
+        )
+        self._save({
+            "client_id": cid,
+            "insurances": [
+                {"plan_name": "Anthem", "external_member_id": "1", "status": "active"}
+            ],
+            "reconcile_insurances": True,
+        })
+        row = Insurance.objects.get(client=client, plan_name="Anthem")
+        self.assertIsNone(row.expired_at)
+
     def test_reconcile_skips_verified_rows(self):
         client, cid = self._client_with(
             dict(
@@ -6712,6 +6733,29 @@ class MemberEligibilityTest(TestCase):
         self._reconcile(c)
         c.refresh_from_db()
         self.assertEqual(c.lifecycle_stage, ClientStage.INELIGIBLE)
+
+    def test_expired_ffs_with_active_commercial_is_eligible(self):
+        # The b49f6d32/2e863cc0 scenario: an EXPIRED FFS Medicaid must not
+        # off-ramp a member who has current (active, no end date) commercial
+        # coverage. The dead FFS is ignored by the wrong-type gate; the active
+        # commercial clears the medical gate.
+        from .models import ClientStage, Insurance, InsurancePlanType, RecordStatus
+
+        c = self._client()
+        Insurance.objects.create(
+            client=c, plan_type=InsurancePlanType.MEDICAID,
+            plan_name="New York State Medicaid FFS", external_member_id="1",
+            status=RecordStatus.INACTIVE,
+            expired_at=timezone.now() - timedelta(days=3),
+        )
+        Insurance.objects.create(
+            client=c, plan_type="commercial",
+            plan_name="Anthem Blue Cross Blue Shield (NY)", external_member_id="2",
+            status=RecordStatus.ACTIVE, expired_at=None,
+        )
+        self._reconcile(c)
+        c.refresh_from_db()
+        self.assertNotEqual(c.lifecycle_stage, ClientStage.INELIGIBLE)
 
     def test_zip_out_of_range_is_ineligible(self):
         from .models import (

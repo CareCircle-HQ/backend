@@ -445,6 +445,13 @@ class ClientSerializer(serializers.ModelSerializer):
                         ins["status"] = RecordStatus.ACTIVE
                     elif self._is_expired(exp):
                         ins["status"] = RecordStatus.EXPIRED
+                # End date is authoritative for an ACTIVE policy: if the source
+                # says the policy is Active but sends NO end date ("End --" = no
+                # expiry / currently in force), explicitly clear any stale past
+                # end date already stored -- otherwise a renewed policy keeps its
+                # old expired date and reads as expired by the date-based gate.
+                if ins.get("status") == RecordStatus.ACTIVE and not ins.get("expired_at"):
+                    ins["expired_at"] = None
                 key = ins.get("insurance_id")
                 if key:
                     obj, _ = _safe_update_or_create(

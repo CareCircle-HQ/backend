@@ -532,11 +532,27 @@ def check_insurance_expiring(ctx):
     return out
 
 
+def _medicaid_coverage_expired(end_dt):
+    """Date-based expiry for a Medicaid plan (mirrors eligibility.coverage_expired,
+    inlined to avoid a circular import): blank/9999 => not expired; a past end
+    date => expired."""
+    if end_dt is None:
+        return False
+    if getattr(end_dt, "year", None) == 9999:
+        return False
+    end = end_dt.date() if hasattr(end_dt, "date") else end_dt
+    return end is not None and end < timezone.localdate()
+
+
 def _medicaid_plans(client):
-    """The client's Medicaid insurance records (plan_type == medicaid)."""
+    """The client's CURRENT Medicaid insurance records (plan_type == medicaid,
+    not date-expired). An EXPIRED Medicaid plan is no longer the member's
+    coverage, so it must not drive the wrong-type gate or the warning -- a stale
+    expired FFS/MLTC/MAP should never off-ramp a member on its own."""
     return [
         i for i in client.insurances.all()
         if (i.plan_type or "").lower() == InsurancePlanType.MEDICAID
+        and not _medicaid_coverage_expired(i.expired_at)
     ]
 
 
