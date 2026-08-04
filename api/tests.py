@@ -5052,7 +5052,8 @@ class DashboardServingClientIdsTests(TestCase):
         )
         on_hold = self._member(stage=EnrollmentStage.ON_HOLD)  # status Active
         active = self._member()
-        # Out-of-Range members surface under their own reason -- never here.
+        # An on-hold PROGRAM counts regardless of the member's own status -- it's
+        # a pure program fact (the member also shows on the Out-of-Range card).
         oor_on_hold = self._member(
             status=MemberStatus.OUT_OF_RANGE, stage=EnrollmentStage.ON_HOLD
         )
@@ -5060,16 +5061,16 @@ class DashboardServingClientIdsTests(TestCase):
         on_hold_ids = serving_client_ids("programs_on_hold", start=None, end=None)
         paused_ids = serving_client_ids("members_paused", start=None, end=None)
 
-        # On-hold program -> counted under programs_on_hold (as its primary), not
-        # members_paused.
+        # Every on-hold program (open governing case) counts, whatever the member
+        # status -- and never under members_paused.
         self.assertIn(on_hold.client_id, on_hold_ids)
+        self.assertIn(oor_on_hold.client_id, on_hold_ids)
         self.assertNotIn(on_hold.client_id, paused_ids)
         # Individually paused (active program) -> members_paused only.
         self.assertIn(paused.client_id, paused_ids)
         self.assertNotIn(paused.client_id, on_hold_ids)
-        # Neither flags a plain active member or the out-of-range one.
+        # A plain active (not on-hold) member is in neither.
         self.assertNotIn(active.client_id, on_hold_ids | paused_ids)
-        self.assertNotIn(oor_on_hold.client_id, paused_ids)
 
     def test_closed_governing_case_excludes_from_reasons(self):
         # Every serving/watchlist reason is gated to an OPEN governing case: a

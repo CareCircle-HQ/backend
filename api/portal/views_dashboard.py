@@ -250,15 +250,15 @@ def serving_client_ids(reason, *, start, end, governing_ids=None):
             mdp.filter(status=MemberStatus.OUT_OF_ORBIT)
         ).values_list("client_id", flat=True)) & open_gov_clients()
     if reason == "programs_on_hold":
-        # PROGRAM-level pause: the enrollment (the household's meal/box program)
-        # is On Hold -- a household-wide state. Counted by PROGRAM: collapse each
-        # member of an on-hold enrollment to its household primary (the case
-        # holder), so the count is the number of on-hold programs, not the number
-        # of members inside them. Excludes Out-of-Orbit/Out-of-Range members
-        # (they surface under their own reasons).
+        # PROGRAM-level state: the enrollment (the household's meal/box program) is
+        # On Hold while its GOVERNING internal-service case is still OPEN. A pure
+        # program fact -- independent of individual member status -- so every
+        # on-hold program counts (a member who is also Out of Orbit/Range still
+        # surfaces on their own card too). Counted by PROGRAM: collapse the
+        # on-hold enrollment's members to their household primary (the case
+        # holder), so the count is on-hold programs, not members inside them.
         member_ids = set(scope(mdp.filter(
             enrollment__stage=EnrollmentStage.ON_HOLD,
-            status__in=[MemberStatus.ACTIVE, MemberStatus.PAUSED],
         )).values_list("client_id", flat=True)) & open_gov_clients()
         return set(_primary_map(member_ids).values())
     if reason == "members_paused":
