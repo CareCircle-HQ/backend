@@ -12273,3 +12273,71 @@ class CaselessCrossClientHolderTest(TestCase):
         serv.refresh_from_db(); stray.refresh_from_db()
         self.assertIsNone(serv.case_id)
         self.assertEqual(stray.stage, "pending_verification")
+
+
+class VerificationVerifiedByDateRangeTest(TestCase):
+    """The 'verified by' filter binds to the SAME enrollment as the verification
+    date window (so it means 'verifications this agent completed in the window',
+    not a member who merely has some other enrollment in the window)."""
+
+    def _api(self):
+        from rest_framework.test import APIClient
+        from rest_framework_simplejwt.tokens import AccessToken
+
+        from .models import Agent
+        a = Agent.objects.create(name="Mgr", agent_code="909", group="Management")
+        acc = AccessToken()
+        acc["agent_id"] = str(a.id); acc["agent_code"] = a.agent_code
+        acc["agent_name"] = a.name; acc["agent_group"] = a.group
+        api = APIClient(); api.credentials(HTTP_AUTHORIZATION=f"Bearer {acc}")
+        return api
+
+    def _ids(self, resp):
+        out = set()
+        for g in resp.json()["results"]:
+            out.add(g["primary"]["id"])
+            out.update(m["id"] for m in g.get("members", []))
+        return out
+
+    def test_verified_by_binds_to_same_enrollment(self):
+        import datetime
+
+        from .models import (
+            Agent, Case, CaseStatus, CaseType, Client, EnrollmentStage,
+            EnrollmentVerification, Household, HouseholdMember,
+        )
+
+        X = Agent.objects.create(name="Xavier V", agent_code="800", group="Verifiers", status="Active")
+        Y = Agent.objects.create(name="Yolanda V", agent_code="801", group="Verifiers", status="Active")
+        c = Client.objects.create(client_id=str(uuid.uuid4()), first_name="Vee", last_name="Bee")
+        hh = Household.objects.create(name="HH")
+        HouseholdMember.objects.create(household=hh, client=c, is_primary=True)
+        # scope=verification requires the primary to hold an internal-service case.
+        Case.objects.create(
+            case_id=uuid.uuid4(), client=c, case_type=CaseType.INTERNAL_SERVICE,
+            case_status=CaseStatus.OPEN, program_name="Medically Tailored Meals",
+        )
+        utc = datetime.timezone.utc
+        # X verified this member in JANUARY.
+        EnrollmentVerification.objects.create(
+            client=c, household=hh, stage=EnrollmentStage.VERIFIED, verified_by=X,
+            opened_at=datetime.datetime(2026, 1, 5, tzinfo=utc),
+            verified_at=datetime.datetime(2026, 1, 10, tzinfo=utc),
+        )
+        api = self._api()
+        cid = str(c.client_id)
+
+        base = f"/api/portal/members/?scope=verification&verified_by={X.id}"
+        self.assertIn(cid, self._ids(api.get(base)))                                   # X's member
+        self.assertIn(cid, self._ids(api.get(base + "&completed_from=2026-01-01&completed_to=2026-01-31")))
+        self.assertNotIn(cid, self._ids(api.get(base + "&completed_from=2026-02-01&completed_to=2026-02-28")))
+
+        # A LATER enrollment verified by SOMEONE ELSE in February must NOT make the
+        # member match "verified_by=X within February" (same-enrollment binding).
+        EnrollmentVerification.objects.create(
+            client=c, household=hh, stage=EnrollmentStage.VERIFIED, verified_by=Y,
+            opened_at=datetime.datetime(2026, 2, 10, tzinfo=utc),
+            verified_at=datetime.datetime(2026, 2, 15, tzinfo=utc),
+        )
+        self.assertNotIn(cid, self._ids(api.get(base + "&completed_from=2026-02-01&completed_to=2026-02-28")))
+        self.assertIn(cid, self._ids(api.get(base + "&completed_from=2026-01-01&completed_to=2026-01-31")))
