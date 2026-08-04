@@ -64,6 +64,27 @@ class InsuranceReconcileTest(TestCase):
             RecordStatus.ACTIVE,
         )
 
+    def test_active_no_end_date_clears_stale_expired_at(self):
+        # A renewed policy: an old span stored a past end date; the new capture
+        # sends it ACTIVE with no end date -> the stale expired_at must be CLEARED
+        # (so the date-based eligibility gate stops reading it as expired).
+        client, cid = self._client_with(
+            dict(
+                plan_name="Anthem", external_member_id="1",
+                status=RecordStatus.ACTIVE,
+                expired_at=timezone.now() - timedelta(days=400),
+            )
+        )
+        self._save({
+            "client_id": cid,
+            "insurances": [
+                {"plan_name": "Anthem", "external_member_id": "1", "status": "active"}
+            ],
+            "reconcile_insurances": True,
+        })
+        row = Insurance.objects.get(client=client, plan_name="Anthem")
+        self.assertIsNone(row.expired_at)
+
     def test_reconcile_skips_verified_rows(self):
         client, cid = self._client_with(
             dict(
@@ -800,6 +821,44 @@ class AssignKitchenFromVerifiedTest(TestCase):
         enr.refresh_from_db()
         self.assertEqual(enr.stage, EnrollmentStage.SERVICE_ACTIVE)
         self.assertEqual(enr.kitchen_id, kitchen.pk)
+
+    def test_assign_kitchen_rejected_before_verification(self):
+        # Regression: assigning a kitchen to a member still at PENDING_VERIFICATION
+        # force-advanced to SERVICE_ACTIVE with no valid transition -> a 500. It
+        # must return a clean 400 telling the agent to verify first.
+        from rest_framework.test import APIClient
+        from rest_framework_simplejwt.tokens import AccessToken
+
+        from .models import (
+            Agent, Client, EnrollmentStage, EnrollmentVerification, Household,
+            HouseholdMember, Kitchen, KitchenStatus,
+        )
+
+        client = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Pend", last_name="Ver",
+            lifecycle_stage="pending_verification",
+        )
+        hh = Household.objects.create(name="HH")
+        HouseholdMember.objects.create(household=hh, client=client, is_primary=True)
+        EnrollmentVerification.objects.create(
+            client=client, household=hh, stage=EnrollmentStage.PENDING_VERIFICATION,
+        )
+        kitchen = Kitchen.objects.create(name="K", status=KitchenStatus.ACTIVE)
+        agent = Agent.objects.create(name="Mgr", agent_code="961", group="Management")
+        access = AccessToken()
+        access["agent_id"] = str(agent.id)
+        access["agent_code"] = agent.agent_code
+        access["agent_name"] = agent.name
+        access["agent_group"] = agent.group
+        api = APIClient()
+        api.credentials(HTTP_AUTHORIZATION=f"Bearer {access}")
+        r = api.post(
+            f"/api/portal/members/{client.client_id}/assign-kitchen/",
+            {"kitchen_id": str(kitchen.pk), "cadence": "tue_only", "member_overrides": []},
+            format="json",
+        )
+        self.assertEqual(r.status_code, 400, r.content)
+        self.assertIn("verification", r.json()["error"].lower())
 
 
 class HouseholdEnrollmentActivationTest(TestCase):
@@ -1935,6 +1994,52 @@ class LogisticsRosterFilterTest(TestCase):
         view.kwargs = {}
         return view._build_groups_for_page(view._group_entries())
 
+    def _checks(self, primary, member_clients, *, kitchens=None):
+        # Refetch from the DB so client_id is a UUID (matching the profile FK),
+        # as the real endpoint's querysets provide -- passing in-memory instances
+        # created with a str client_id would mismatch the profile lookup.
+        from .portal.views_members import MembersListView
+        primary = Client.objects.get(pk=primary.pk)
+        member_clients = list(
+            Client.objects.filter(pk__in=[c.pk for c in member_clients])
+        )
+        return MembersListView()._logistics_checks(
+            primary, member_clients, kitchens or [], is_boxes=False,
+        )
+
+    def test_no_menu_member_not_double_counted_as_out_of_orbit(self):
+        # A member with no menu type is a 'missing menu type' blocker only -- it
+        # must NOT ALSO be counted as 'may get out of orbit' (the old double
+        # count that inflated Has Blockers).
+        from .models import MemberStatus
+
+        primary = self._client("Nomenu", "Primary")
+        hh = self._household(primary)
+        self._internal_case(primary)
+        self._enrollment(primary, hh, {primary: MemberStatus.ACTIVE})  # no menu_type
+        per, agg = self._checks(primary, [primary])
+        self.assertFalse(per[str(primary.client_id)]["predicted_out_of_orbit"])
+        self.assertEqual(agg["predicted_out_of_orbit"], 0)
+        self.assertTrue(any("missing menu" in b for b in agg["blockers"]))
+        self.assertFalse(any("out of orbit" in b for b in agg["blockers"]))
+
+    def test_out_of_orbit_prediction_is_kitchen_aware(self):
+        # A member WITH a menu but for whom NO available kitchen can serve is
+        # predicted out of orbit (kitchen-aware) -- not from the old global rule.
+        from .models import EnrollmentStage, MemberDietaryProfile, MemberStatus
+
+        primary = self._client("Menu", "Primary")
+        hh = self._household(primary)
+        self._internal_case(primary)
+        enr = self._enrollment(primary, hh, {})
+        MemberDietaryProfile.objects.create(
+            enrollment=enr, client=primary, status=MemberStatus.ACTIVE,
+            menu_type="Standard",
+        )
+        per, agg = self._checks(primary, [primary], kitchens=[])  # no kitchens
+        self.assertTrue(per[str(primary.client_id)]["predicted_out_of_orbit"])
+        self.assertIn("kitchen", per[str(primary.client_id)]["predicted_reason"].lower())
+
     def test_out_of_orbit_member_hidden_from_household(self):
         from .models import ClientStage, MemberStatus
 
@@ -2158,6 +2263,93 @@ class MemberListGroupedStatusFilterTest(TestCase):
         all_ids = self._ids()
         self.assertIn(str(household.client_id), all_ids)
         self.assertIn(str(individual.client_id), all_ids)
+
+    def test_member_status_flag_ignores_stale_closed_enrollment_profile(self):
+        # The individual member-status flags (Out of Orbit / Out of Range /
+        # Paused) reflect the CURRENT enrollment. A stale status on a CLOSED /
+        # superseded enrollment (left behind by a governing-case replacement) must
+        # NOT surface a member whose live profile is Active.
+        from .models import (
+            EnrollmentStage, EnrollmentVerification, HouseholdMember,
+            MemberDietaryProfile, MemberStatus,
+        )
+
+        # Currently ACTIVE, but with a leftover OUT_OF_ORBIT profile on a closed
+        # (superseded) enrollment.
+        stale = self._member("Stale", member_status=MemberStatus.ACTIVE)
+        hh = HouseholdMember.objects.get(client=stale).household
+        closed = EnrollmentVerification.objects.create(
+            client=stale, household=hh, stage=EnrollmentStage.CLOSED,
+            program_name="Medically Tailored Meals",
+        )
+        MemberDietaryProfile.objects.create(
+            enrollment=closed, client=stale, status=MemberStatus.OUT_OF_ORBIT,
+        )
+        # A genuinely current out-of-orbit member (live enrollment).
+        current = self._member("Orbit", member_status=MemberStatus.OUT_OF_ORBIT)
+
+        ids = self._ids(flag="out_of_orbit")
+        self.assertNotIn(str(stale.client_id), ids)   # stale closed profile ignored
+        self.assertIn(str(current.client_id), ids)     # current profile matches
+
+    def test_term_closed_excludes_members_with_a_live_enrollment(self):
+        # "Closed" means NO current live enrollment -- a member actively served on
+        # a live enrollment must NOT read as Closed just because an old superseded
+        # enrollment in their history is closed.
+        from .models import (
+            EnrollmentStage, EnrollmentVerification, HouseholdMember,
+        )
+
+        served = self._member("Served", enr_stage=EnrollmentStage.SERVICE_ACTIVE)
+        hh = HouseholdMember.objects.get(client=served).household
+        EnrollmentVerification.objects.create(
+            client=served, household=hh, stage=EnrollmentStage.CLOSED,
+            program_name="Medically Tailored Meals",
+            closed_at=timezone.now(),  # a real closed enrollment is closed
+        )
+        done = self._member("Done", enr_stage=EnrollmentStage.CLOSED)
+
+        ids = self._ids(status="term_closed")
+        self.assertNotIn(str(served.client_id), ids)  # has a live enrollment
+        self.assertIn(str(done.client_id), ids)         # only a closed enrollment
+
+    def test_stage_filter_uses_governing_enrollment_not_any(self):
+        # A member with a stray ON_HOLD enrollment PLUS a newer live SERVICE_ACTIVE
+        # one: the governing (newer, open) enrollment is Active, so they read as
+        # Open -- NOT On Hold. The filter must key off the governing enrollment,
+        # not "any enrollment at this stage".
+        from .models import (
+            EnrollmentStage, EnrollmentVerification, HouseholdMember,
+        )
+
+        m = self._member("Dual", enr_stage=EnrollmentStage.ON_HOLD)
+        hh = HouseholdMember.objects.get(client=m).household
+        EnrollmentVerification.objects.create(
+            client=m, household=hh, stage=EnrollmentStage.SERVICE_ACTIVE,
+            program_name="Medically Tailored Meals",
+        )
+        self.assertNotIn(str(m.client_id), self._ids(status="on_hold"))
+        self.assertIn(str(m.client_id), self._ids(status="term_open"))
+
+    def test_paused_flag_splits_agent_vs_eligibility(self):
+        # Paused splits into agent (manual) vs eligibility (auto) so the two are
+        # distinguishable on the list; both are status=PAUSED, told apart by the
+        # eligibility_paused flag.
+        from .models import MemberDietaryProfile, MemberStatus
+
+        agent = self._member("AgentPause", member_status=MemberStatus.PAUSED)
+        elig = self._member("EligPause", member_status=MemberStatus.PAUSED)
+        p = MemberDietaryProfile.objects.get(client=elig)
+        p.eligibility_paused = True
+        p.save(update_fields=["eligibility_paused"])
+
+        agent_ids = self._ids(flag="paused")
+        self.assertIn(str(agent.client_id), agent_ids)
+        self.assertNotIn(str(elig.client_id), agent_ids)
+
+        elig_ids = self._ids(flag="eligibility_paused")
+        self.assertIn(str(elig.client_id), elig_ids)
+        self.assertNotIn(str(agent.client_id), elig_ids)
 
     def test_verification_axis(self):
         from .models import ClientStage, EnrollmentStage
@@ -6713,6 +6905,29 @@ class MemberEligibilityTest(TestCase):
         c.refresh_from_db()
         self.assertEqual(c.lifecycle_stage, ClientStage.INELIGIBLE)
 
+    def test_expired_ffs_with_active_commercial_is_eligible(self):
+        # The b49f6d32/2e863cc0 scenario: an EXPIRED FFS Medicaid must not
+        # off-ramp a member who has current (active, no end date) commercial
+        # coverage. The dead FFS is ignored by the wrong-type gate; the active
+        # commercial clears the medical gate.
+        from .models import ClientStage, Insurance, InsurancePlanType, RecordStatus
+
+        c = self._client()
+        Insurance.objects.create(
+            client=c, plan_type=InsurancePlanType.MEDICAID,
+            plan_name="New York State Medicaid FFS", external_member_id="1",
+            status=RecordStatus.INACTIVE,
+            expired_at=timezone.now() - timedelta(days=3),
+        )
+        Insurance.objects.create(
+            client=c, plan_type="commercial",
+            plan_name="Anthem Blue Cross Blue Shield (NY)", external_member_id="2",
+            status=RecordStatus.ACTIVE, expired_at=None,
+        )
+        self._reconcile(c)
+        c.refresh_from_db()
+        self.assertNotEqual(c.lifecycle_stage, ClientStage.INELIGIBLE)
+
     def test_zip_out_of_range_is_ineligible(self):
         from .models import (
             Address, AddressType, ClientStage, ExcludedZipCode, Insurance,
@@ -10650,4 +10865,425 @@ class CloseDuplicateHoldsTest(TestCase):
         self.assertEqual(
             EnrollmentStage(boxes_hold.stage), EnrollmentStage.ON_HOLD,
             "a different-product hold must NOT be closed",
+        )
+
+
+class TicketGoverningCaseAutoLinkTest(TestCase):
+    """Every ticket we open for a known member auto-links their GOVERNING
+    internal-service case, so the case travels with the ticket -- not just the
+    member. An explicitly passed case still wins."""
+
+    def _client_with_case(self, *, stamp=True, status=None):
+        from .models import Case, CaseStatus, CaseType, Client
+
+        c = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Tick", last_name="Case",
+        )
+        case = Case.objects.create(
+            case_id=str(uuid.uuid4()), client=c,
+            case_type=CaseType.INTERNAL_SERVICE,
+            case_status=status or CaseStatus.OPEN,
+            program_name="Medically Tailored Meals", date_opened=timezone.now(),
+        )
+        if stamp:
+            c.governing_internal_case_id = str(case.case_id)
+            c.save(update_fields=["governing_internal_case_id"])
+        return c, case
+
+    def test_open_ticket_auto_links_stamped_governing_case(self):
+        from .models import TicketTypeCode
+        from .services.tickets import open_ticket
+
+        c, case = self._client_with_case(stamp=True)
+        t, created = open_ticket(
+            TicketTypeCode.SYSTEM_CHANGE_DETECTED, reason="x", client=c,
+        )
+        self.assertTrue(created)
+        self.assertEqual(str(t.case_id), str(case.case_id))
+
+    def test_governing_case_falls_back_to_open_internal_case(self):
+        from .services.tickets import governing_case_for_client
+
+        c, case = self._client_with_case(stamp=False)  # not stamped
+        self.assertEqual(
+            str(governing_case_for_client(c).case_id), str(case.case_id)
+        )
+
+    def test_open_ticket_explicit_case_is_kept(self):
+        from .models import Case, CaseStatus, CaseType, TicketTypeCode
+        from .services.tickets import open_ticket
+
+        c, gov = self._client_with_case(stamp=True)
+        other = Case.objects.create(
+            case_id=str(uuid.uuid4()), client=c,
+            case_type=CaseType.INTERNAL_SERVICE, case_status=CaseStatus.OPEN,
+            date_opened=timezone.now(),
+        )
+        t, _ = open_ticket(
+            TicketTypeCode.SYSTEM_CHANGE_DETECTED, reason="x", client=c, case=other,
+        )
+        self.assertEqual(str(t.case_id), str(other.case_id))
+
+    def test_no_internal_case_leaves_ticket_member_only(self):
+        from .models import Client, TicketTypeCode
+        from .services.tickets import open_ticket
+
+        c = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="No", last_name="Case",
+        )
+        t, _ = open_ticket(TicketTypeCode.SYSTEM_CHANGE_DETECTED, reason="x", client=c)
+        self.assertIsNone(t.case_id)
+
+    def test_manual_create_endpoint_auto_links_governing_case(self):
+        from rest_framework.test import APIClient
+        from rest_framework_simplejwt.tokens import AccessToken
+
+        from .models import Agent, TicketType, TicketTypeCode
+
+        c, case = self._client_with_case(stamp=True)
+        tt, _ = TicketType.objects.get_or_create(
+            code=TicketTypeCode.VERIFICATION, defaults={"label": "Verification"},
+        )
+        agent = Agent.objects.create(name="Mgr", agent_code="962", group="Management")
+        access = AccessToken()
+        access["agent_id"] = str(agent.id)
+        access["agent_code"] = agent.agent_code
+        access["agent_name"] = agent.name
+        access["agent_group"] = agent.group
+        api = APIClient()
+        api.credentials(HTTP_AUTHORIZATION=f"Bearer {access}")
+        r = api.post("/api/portal/tickets/", {
+            "type": tt.code, "reason": "Follow up", "client_id": str(c.client_id),
+        }, format="json")
+        self.assertEqual(r.status_code, 201, r.content)
+        from .models import Ticket
+        t = Ticket.objects.get(pk=r.json()["id"])
+        self.assertEqual(str(t.case_id), str(case.case_id))
+
+
+class TicketCreatedByAndActivityTest(TestCase):
+    """Manual ticket creation records created_by + assignment, and every ticket
+    action (create / assign / status / note / resolve) appends to the ticket's
+    activity feed exposed at /tickets/<id>/activity/."""
+
+    def _api(self, group="Management", code="970"):
+        from rest_framework.test import APIClient
+        from rest_framework_simplejwt.tokens import AccessToken
+
+        from .models import Agent
+
+        agent = Agent.objects.create(name="Quinn", agent_code=code, group=group, status="Active")
+        access = AccessToken()
+        access["agent_id"] = str(agent.id)
+        access["agent_code"] = agent.agent_code
+        access["agent_name"] = agent.name
+        access["agent_group"] = agent.group
+        api = APIClient()
+        api.credentials(HTTP_AUTHORIZATION=f"Bearer {access}")
+        return api, agent
+
+    def _ticket_type(self):
+        from .models import TicketType, TicketTypeCode
+
+        tt, _ = TicketType.objects.get_or_create(
+            code=TicketTypeCode.VERIFICATION, defaults={"label": "Verification"},
+        )
+        return tt
+
+    def test_manual_create_records_created_by_and_activity(self):
+        from .models import Agent, Ticket, TicketActivityAction
+
+        api, agent = self._api()
+        tt = self._ticket_type()
+        assignee = Agent.objects.create(
+            name="Dana", agent_code="971", group="CS", status="Active",
+        )
+        r = api.post("/api/portal/tickets/", {
+            "type": tt.code, "reason": "Call the member",
+            "assignee_id": str(assignee.id),
+        }, format="json")
+        self.assertEqual(r.status_code, 201, r.content)
+        t = Ticket.objects.get(pk=r.json()["id"])
+        self.assertEqual(t.created_by_id, agent.id)
+        actions = list(t.activities.values_list("action", flat=True))
+        self.assertIn(TicketActivityAction.CREATED, actions)
+        self.assertIn(TicketActivityAction.ASSIGNED, actions)
+
+    def test_status_note_and_resolve_append_activity(self):
+        from .models import Ticket, TicketActivityAction
+
+        api, agent = self._api()
+        tt = self._ticket_type()
+        r = api.post("/api/portal/tickets/", {"type": tt.code, "reason": "x"}, format="json")
+        tid = r.json()["id"]
+
+        # Add a note.
+        api.post(f"/api/portal/tickets/{tid}/notes/", {"body": "Left a voicemail"}, format="json")
+        # Resolve it.
+        api.patch(f"/api/portal/tickets/{tid}/", {"status": "resolved"}, format="json")
+
+        feed = api.get(f"/api/portal/tickets/{tid}/activity/")
+        self.assertEqual(feed.status_code, 200, feed.content)
+        actions = [e["action"] for e in feed.json()]
+        self.assertIn(TicketActivityAction.CREATED, actions)
+        self.assertIn(TicketActivityAction.NOTE_ADDED, actions)
+        self.assertIn(TicketActivityAction.RESOLVED, actions)
+        # Feed is chronological (created first).
+        self.assertEqual(actions[0], TicketActivityAction.CREATED)
+
+    def test_serializer_exposes_created_by(self):
+        api, agent = self._api()
+        tt = self._ticket_type()
+        r = api.post("/api/portal/tickets/", {"type": tt.code, "reason": "x"}, format="json")
+        self.assertEqual(r.json()["created_by"], agent.name)
+        self.assertEqual(r.json()["created_by_id"], str(agent.id))
+
+
+class NeedAttentionScopeCaseRuleTest(TestCase):
+    """The Urgent Care 'No Verification requested' tab (scope=need_attention)
+    must enforce rule 1 LIVE: only members who currently hold an OPEN
+    internal-service case appear. A stale is_new flag on a member with no
+    internal-service case (e.g. only an eligibility case) must NOT surface."""
+
+    def setUp(self):
+        from .models import Agent
+
+        self.agent = Agent.objects.create(name="UC", agent_code="963", group="Management")
+
+    def _member(self, *, case_type, is_new=True):
+        from .models import (
+            Case, CaseStatus, CaseType, Client, Household, HouseholdMember,
+            InsurancePlanType, RecordStatus, SocialCareCoverage,
+            SocialCareCoverageStatus,
+        )
+
+        c = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="N", last_name="A", is_new=is_new,
+        )
+        hh = Household.objects.create(name="HH")
+        HouseholdMember.objects.create(household=hh, client=c, is_primary=True)
+        Insurance.objects.create(
+            client=c, plan_type=InsurancePlanType.MEDICAID,
+            status=RecordStatus.ACTIVE, plan_name="Medicaid",
+        )
+        SocialCareCoverage.objects.create(
+            client=c, status=SocialCareCoverageStatus.ENROLLED, plan_name="SC",
+        )
+        Case.objects.create(
+            case_id=str(uuid.uuid4()), client=c, case_type=case_type,
+            case_status=CaseStatus.OPEN, program_name="P",
+        )
+        return c
+
+    def _ids(self):
+        from rest_framework.request import Request
+        from rest_framework.test import APIRequestFactory
+
+        from .portal.views_members import MembersListView
+
+        v = MembersListView()
+        v.request = Request(APIRequestFactory().get("/x", {"scope": "need_attention"}))
+        v.kwargs = {}
+        groups = v._build_groups_for_page(v._group_entries())
+        return {m["id"] for g in groups for m in ([g["primary"]] + g.get("members", []))}
+
+    def test_internal_service_case_shows_eligibility_only_hidden(self):
+        from .models import CaseType
+
+        internal = self._member(case_type=CaseType.INTERNAL_SERVICE)
+        elig_only = self._member(case_type=CaseType.ELIGIBILITY)  # stale is_new, no IS case
+
+        ids = self._ids()
+        self.assertIn(str(internal.client_id), ids)
+        self.assertNotIn(str(elig_only.client_id), ids)
+
+
+class KitchenAbbreviationPoNumberTest(TestCase):
+    """The PO number uses the kitchen's configured abbreviation when set, and
+    the abbreviation is editable via the kitchen settings endpoint."""
+
+    def test_po_number_uses_kitchen_abbreviation(self):
+        from datetime import date
+
+        from .models import Kitchen, KitchenStatus, ProductTypeKind
+        from .services.purchase_orders import build_po_number
+
+        k = Kitchen.objects.create(
+            name="Hicksville", abbreviation="HICK", status=KitchenStatus.ACTIVE,
+        )
+        # 2026-08-06 is a Thursday in ISO week 32.
+        meals = build_po_number(ProductTypeKind.MEALS, date(2026, 8, 6), k)
+        self.assertEqual(meals, "PO-MEALS-2026-W32-THU-HICK")
+        # Boxes omit the weekday.
+        boxes = build_po_number(ProductTypeKind.BOXES, date(2026, 8, 6), k)
+        self.assertEqual(boxes, "PO-BOX-2026-W32-HICK")
+
+    def test_abbreviation_is_sanitized_and_uppercased(self):
+        from datetime import date
+
+        from .models import Kitchen, KitchenStatus, ProductTypeKind
+        from .services.purchase_orders import build_po_number
+
+        k = Kitchen.objects.create(name="X", abbreviation="k-1 a")
+        self.assertEqual(
+            build_po_number(ProductTypeKind.MEALS, date(2026, 8, 6), k),
+            "PO-MEALS-2026-W32-THU-K1A",
+        )
+
+    def test_kitchen_abbreviation_editable_via_settings_api(self):
+        from rest_framework.test import APIClient
+        from rest_framework_simplejwt.tokens import AccessToken
+
+        from .models import Agent, Kitchen, KitchenStatus
+
+        k = Kitchen.objects.create(name="West Side", status=KitchenStatus.ACTIVE)
+        agent = Agent.objects.create(name="S", agent_code="964", group="Management")
+        access = AccessToken()
+        access["agent_id"] = str(agent.id)
+        access["agent_code"] = agent.agent_code
+        access["agent_name"] = agent.name
+        access["agent_group"] = agent.group
+        api = APIClient()
+        api.credentials(HTTP_AUTHORIZATION=f"Bearer {access}")
+        r = api.patch(f"/api/portal/settings/kitchens/{k.pk}/",
+                      {"name": "West Side Kitchen", "abbreviation": "WSK"}, format="json")
+        self.assertEqual(r.status_code, 200, r.content)
+        k.refresh_from_db()
+        self.assertEqual(k.name, "West Side Kitchen")
+        self.assertEqual(k.abbreviation, "WSK")
+
+
+class AllVerificationsReportTest(TestCase):
+    """The Admin > Reports 'All Verifications' export: one row per verification
+    with Member ID + the milestone dates, management-gated."""
+
+    def _api(self, group="Management", code="965"):
+        from rest_framework.test import APIClient
+        from rest_framework_simplejwt.tokens import AccessToken
+
+        from .models import Agent
+
+        agent = Agent.objects.create(name="M", agent_code=code, group=group)
+        access = AccessToken()
+        access["agent_id"] = str(agent.id)
+        access["agent_code"] = agent.agent_code
+        access["agent_name"] = agent.name
+        access["agent_group"] = agent.group
+        api = APIClient()
+        api.credentials(HTTP_AUTHORIZATION=f"Bearer {access}")
+        return api
+
+    def test_export_rows_and_management_gate(self):
+        from datetime import timedelta
+
+        from .models import (
+            Case, CaseStatus, CaseType, Client, EnrollmentStage,
+            EnrollmentVerification, Household, HouseholdMember,
+            ServiceAuthorizationStatus,
+        )
+
+        now = timezone.now()
+        client = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Vera", last_name="Fied",
+        )
+        hh = Household.objects.create(name="HH")
+        HouseholdMember.objects.create(household=hh, client=client, is_primary=True)
+        case = Case.objects.create(
+            case_id=str(uuid.uuid4()), client=client,
+            case_type=CaseType.INTERNAL_SERVICE, case_status=CaseStatus.OPEN,
+            service_authorization_status=ServiceAuthorizationStatus.APPROVED,
+            service_authorization_approval_starts_at=now - timedelta(days=1),
+            program_name="Medically Tailored Meals",
+        )
+        EnrollmentVerification.objects.create(
+            client=client, household=hh, case=case,
+            stage=EnrollmentStage.VERIFIED,
+            requested_at=now - timedelta(days=3),
+            verified_at=now - timedelta(days=2),
+        )
+
+        # Non-management is refused.
+        self.assertEqual(self._api(group="CS", code="966").get("/api/portal/reports/all-verifications/").status_code, 403)
+
+        r = self._api().get("/api/portal/reports/all-verifications/")
+        self.assertEqual(r.status_code, 200, r.content)
+        body = r.content.decode()
+        lines = [ln for ln in body.splitlines() if ln.strip()]
+        self.assertEqual(
+            lines[0],
+            "Member ID,Verification Requested,Verification Completed,Authorization Approved",
+        )
+        self.assertIn(str(client.client_id), lines[1])
+        # All three dates present (requested/completed/authorized).
+        self.assertEqual(lines[1].count(str((now - timedelta(days=2)).date())), 1)
+
+
+class SyncHouseholdOutOfOrbitEventGateTest(TestCase):
+    """A placeholder member profile created before a kitchen is assigned (e.g.
+    right after Request Verification, still Pending Verification) must NOT emit a
+    'Household set as Out of Orbit' event/note -- out of orbit only means a
+    kitchen can't fulfill the member, which is meaningless with no kitchen. Once
+    a kitchen IS assigned, the event fires as before."""
+
+    def _setup(self, *, with_kitchen):
+        from .models import (
+            Client, EnrollmentStage, EnrollmentVerification, Household,
+            HouseholdMember, Kitchen, KitchenStatus, MemberDietaryProfile,
+            MemberStatus,
+        )
+
+        primary = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Pat", last_name="Primary",
+        )
+        hh = Household.objects.create(name="HH")
+        HouseholdMember.objects.create(household=hh, client=primary, is_primary=True)
+        kitchen = (
+            Kitchen.objects.create(name="K", status=KitchenStatus.ACTIVE)
+            if with_kitchen else None
+        )
+        enr = EnrollmentVerification.objects.create(
+            client=primary, household=hh, kitchen=kitchen,
+            stage=EnrollmentStage.KITCHEN_ASSIGNMENT if with_kitchen
+            else EnrollmentStage.PENDING_VERIFICATION,
+        )
+        MemberDietaryProfile.objects.create(
+            enrollment=enr, client=primary, menu_type="Standard",
+            status=MemberStatus.ACTIVE,
+        )
+        dep = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Dee", last_name="Pendent",
+        )
+        HouseholdMember.objects.create(household=hh, client=dep, is_primary=False)
+        return primary, dep, enr
+
+    def test_no_out_of_orbit_event_before_kitchen(self):
+        from .models import (
+            MemberDietaryProfile, MemberStatus, Note, NoteSource, TimelineEvent,
+            TimelineEventType,
+        )
+        from .serializers import sync_household_members
+
+        primary, dep, enr = self._setup(with_kitchen=False)
+        sync_household_members(primary, enrollment=enr)
+
+        prof = MemberDietaryProfile.objects.get(enrollment=enr, client=dep)
+        self.assertEqual(prof.status, MemberStatus.OUT_OF_ORBIT)  # placeholder kept
+        self.assertFalse(
+            TimelineEvent.objects.filter(
+                client=dep, event_type=TimelineEventType.OUT_OF_ORBIT
+            ).exists()
+        )
+        self.assertFalse(Note.objects.filter(client=dep, source=NoteSource.SYSTEM).exists())
+
+    def test_out_of_orbit_event_fires_with_kitchen(self):
+        from .models import TimelineEvent, TimelineEventType
+        from .serializers import sync_household_members
+
+        primary, dep, enr = self._setup(with_kitchen=True)
+        sync_household_members(primary, enrollment=enr)
+
+        self.assertTrue(
+            TimelineEvent.objects.filter(
+                client=dep, event_type=TimelineEventType.OUT_OF_ORBIT
+            ).exists()
         )

@@ -445,6 +445,13 @@ class ClientSerializer(serializers.ModelSerializer):
                         ins["status"] = RecordStatus.ACTIVE
                     elif self._is_expired(exp):
                         ins["status"] = RecordStatus.EXPIRED
+                # End date is authoritative for an ACTIVE policy: if the source
+                # says the policy is Active but sends NO end date ("End --" = no
+                # expiry / currently in force), explicitly clear any stale past
+                # end date already stored -- otherwise a renewed policy keeps its
+                # old expired date and reads as expired by the date-based gate.
+                if ins.get("status") == RecordStatus.ACTIVE and not ins.get("expired_at"):
+                    ins["expired_at"] = None
                 key = ins.get("insurance_id")
                 if key:
                     obj, _ = _safe_update_or_create(
@@ -701,6 +708,17 @@ def sync_household_members(client, enrollment=None, agent=None):
                 )
             except Exception:
                 logger.warning("household member out-of-range event failed", exc_info=True)
+            continue
+        # "Out of Orbit" means a member's menu/allergies can't be fulfilled by
+        # the assigned KITCHEN -- it is meaningless before a kitchen exists. When
+        # the household has no kitchen yet (e.g. the placeholder profile created
+        # right after Request Verification, still Pending Verification), the
+        # profile stays Out of Orbit as an internal "needs a menu type"
+        # placeholder, but we DON'T emit the note/timeline event: firing
+        # "Household set as Out of Orbit" on a member who was just requested for
+        # verification (no kitchen, not yet verified) is misleading. The event
+        # fires later, if warranted, once a kitchen is assigned.
+        if not enrollment.kitchen_id:
             continue
         # This member was added outside the verification wizard, so leave a
         # system note explaining why they start Out of Orbit + what's needed to

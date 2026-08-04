@@ -19,6 +19,8 @@ from api.models import (
     SocialCareCoverage,
     SocialCareCoverageStatus,
     Ticket,
+    TicketActivity,
+    TicketActivityAction,
     TicketStatus,
     TicketSeverity,
     TicketType,
@@ -28,6 +30,21 @@ from api.models import (
 logger = logging.getLogger(__name__)
 
 OPEN_STATUSES = (TicketStatus.OPEN, TicketStatus.IN_PROGRESS)
+
+
+def log_ticket_activity(ticket, action, *, actor_agent=None, actor_label="",
+                        detail="", metadata=None):
+    """Append one entry to a ticket's activity/history feed. Best-effort: never
+    let activity logging break the underlying ticket action."""
+    try:
+        return TicketActivity.objects.create(
+            ticket=ticket, action=action,
+            actor_agent=actor_agent, actor_label=actor_label or "",
+            detail=detail or "", metadata=metadata or {},
+        )
+    except Exception:  # noqa: BLE001
+        logger.warning("log_ticket_activity failed", exc_info=True)
+        return None
 
 
 def _resolve_ticket_type(ticket_type):
@@ -42,6 +59,31 @@ def _resolve_ticket_type(ticket_type):
     return obj
 
 
+def governing_case_for_client(client):
+    """The internal-service case that governs a member, used to auto-link a
+    ticket to the member's case whenever we know the member (so a ticket about a
+    member's situation also points at the case it concerns, not just the member).
+
+    Prefers the reconcile's authoritative pointer (``Client.governing_internal_
+    case_id``), then the member's own internal-service case (open + most recent),
+    else their most recent internal-service case. ``None`` when the member has no
+    internal-service case (e.g. a dependent who owns none)."""
+    if client is None:
+        return None
+    from api.models import Case, CaseType
+
+    gid = (getattr(client, "governing_internal_case_id", "") or "").strip()
+    if gid:
+        case = Case.objects.filter(case_id=gid).first()
+        if case is not None:
+            return case
+    qs = Case.objects.filter(client=client, case_type=CaseType.INTERNAL_SERVICE)
+    return (
+        qs.filter(case_status=CaseStatus.OPEN).order_by("-date_opened").first()
+        or qs.order_by("-date_opened").first()
+    )
+
+
 def open_ticket(ticket_type, *, reason, severity=TicketSeverity.MEDIUM,
                 client=None, case=None, import_run=None, source="", actor=""):
     """Create (or refresh) an open ticket of ``ticket_type`` for this subject.
@@ -54,8 +96,14 @@ def open_ticket(ticket_type, *, reason, severity=TicketSeverity.MEDIUM,
     'New Ticket Created' timeline event is emitted (attributed to ``source`` /
     ``actor``) so every ticket -- from the import, the daily sync, or a live
     extension write -- lands on the client's history.
+
+    When we know the member but the caller didn't pin a specific case, the
+    ticket is auto-linked to the member's GOVERNING internal-service case so the
+    case travels with the ticket.
     """
     type_obj = _resolve_ticket_type(ticket_type)
+    if case is None and client is not None:
+        case = governing_case_for_client(client)
     # Dedupe on (type, client, case, reason): now that the import routes every
     # detection through SYSTEM_CHANGE_DETECTED, the reason is what distinguishes
     # one detected change from another for the same subject.
@@ -71,6 +119,12 @@ def open_ticket(ticket_type, *, reason, severity=TicketSeverity.MEDIUM,
     ticket = Ticket.objects.create(
         type=type_obj, reason=reason, severity=severity,
         client=client, case=case, import_run=import_run,
+        created_by_label=actor or (str(source) if source else "System"),
+    )
+    log_ticket_activity(
+        ticket, TicketActivityAction.CREATED,
+        actor_label=actor or (str(source) if source else "System"),
+        detail="Ticket created.",
     )
     # Mirror the new ticket onto the client's timeline (best-effort: a timeline
     # hiccup must never fail the ticket write). Deduped on the ticket pk.

@@ -277,6 +277,71 @@ class MembersPendingVerificationReportView(PortalAPIView):
         return response
 
 
+class AllVerificationsReportView(PortalAPIView):
+    """Management-only CSV export of every verification (one row per enrollment
+    verification), with the key milestone dates.
+
+    Columns: Member ID, Verification Requested (date), Verification Completed
+    (date), Authorization Approved (date).
+
+    Query params (optional, on the verification-requested date):
+        requested_from / requested_to -- inclusive [from, to] bounds.
+    """
+
+    def get(self, request):
+        from ..services.lifecycle import governing_internal_case
+
+        agent = current_agent(request)
+        if not (agent and (agent.group == "Management" or getattr(agent, "is_manager", False))):
+            return Response({"detail": "Management access required."}, status=403)
+
+        requested_from = _parse_date(request.query_params.get("requested_from"))
+        requested_to = _parse_date(request.query_params.get("requested_to"))
+
+        qs = (
+            EnrollmentVerification.objects.select_related("client", "case")
+            .prefetch_related("client__cases")
+            .order_by("-requested_at", "-opened_at")
+        )
+        if requested_from:
+            qs = qs.filter(requested_at__date__gte=requested_from)
+        if requested_to:
+            qs = qs.filter(requested_at__date__lte=requested_to)
+
+        response = HttpResponse(content_type="text/csv")
+        filename = f"all_verifications_{timezone.localdate().isoformat()}.csv"
+        response["Content-Disposition"] = f'attachment; filename="{filename}"'
+
+        writer = csv.writer(response)
+        writer.writerow([
+            "Member ID",
+            "Verification Requested",
+            "Verification Completed",
+            "Authorization Approved",
+        ])
+
+        for enr in qs:
+            client = enr.client
+            gov = governing_internal_case(enr) or enr.case
+            # The authorization-approved date is the governing case's approval
+            # window start, shown only when that case is actually approved.
+            auth_approved = None
+            if gov is not None and gov.service_authorization_status in (
+                ServiceAuthorizationStatus.APPROVED,
+                ServiceAuthorizationStatus.NOT_REQUIRED,
+            ):
+                auth_approved = gov.service_authorization_approval_starts_at
+
+            writer.writerow([
+                str(client.client_id) if client else "",
+                _date_str(enr.requested_at),
+                _date_str(enr.verified_at),
+                _date_str(auth_approved),
+            ])
+
+        return response
+
+
 _CLOSED_CASE_STATUSES = (CaseStatus.CLOSED, CaseStatus.CANCELLED)
 
 

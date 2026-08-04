@@ -52,6 +52,7 @@ from ..models import (
     SocialCareCoverage,
     StageEvent,
     Ticket,
+    TicketActivity,
     TicketNote,
     TicketSource,
     TicketType,
@@ -288,11 +289,26 @@ def member_out_of_range(client):
 
 
 def member_paused(client):
-    """True when the client's active-enrollment dietary profile is Paused (an
-    agent manually paused them). Paused members are excluded from delivery
-    schedules/POs."""
+    """True when the client's active-enrollment dietary profile is Paused (agent
+    OR eligibility). Paused members are excluded from delivery schedules/POs."""
     mp = active_member_profile(client)
     return mp is not None and mp.status == MemberStatus.PAUSED
+
+
+def member_pause_type(client):
+    """WHICH kind of pause the member's active-enrollment profile is in, so the
+    list can tell them apart at a glance:
+
+      * "eligibility" -> auto/system pause because the member failed their OWN
+        eligibility (expired insurance / missing coverage); reversible only via
+        the eligibility-recovery flow.
+      * "agent"       -> a manual agent pause (with a pause_reason note).
+      * ""            -> not paused.
+    """
+    mp = active_member_profile(client)
+    if mp is None or mp.status != MemberStatus.PAUSED:
+        return ""
+    return "eligibility" if getattr(mp, "eligibility_paused", False) else "agent"
 
 
 def _main_stage_value(client):
@@ -545,6 +561,10 @@ class MemberListSerializer(serializers.Serializer):
     out_of_orbit = serializers.SerializerMethodField()
     out_of_range = serializers.SerializerMethodField()
     paused = serializers.SerializerMethodField()
+    # WHICH pause the member is in: "eligibility" (auto -- failed own eligibility)
+    # vs "agent" (manual), so the list badge/tooltip can tell them apart. "" when
+    # not paused.
+    pause_type = serializers.SerializerMethodField()
     start_date = serializers.SerializerMethodField()
     end_date = serializers.SerializerMethodField()
     verification_requested_at = serializers.SerializerMethodField()
@@ -720,6 +740,9 @@ class MemberListSerializer(serializers.Serializer):
 
     def get_paused(self, obj):
         return member_paused(obj)
+
+    def get_pause_type(self, obj):
+        return member_pause_type(obj)
 
     def get_verification_status(self, obj):
         return verification_status(obj)
@@ -1288,6 +1311,8 @@ class PortalTicketSerializer(serializers.ModelSerializer):
     case_code = serializers.SerializerMethodField()
     assignee = serializers.SerializerMethodField()
     assignee_id = serializers.SerializerMethodField()
+    created_by = serializers.SerializerMethodField()
+    created_by_id = serializers.SerializerMethodField()
     origin = serializers.CharField(read_only=True)
     notes = PortalTicketNoteSerializer(many=True, read_only=True)
 
@@ -1296,12 +1321,23 @@ class PortalTicketSerializer(serializers.ModelSerializer):
         fields = [
             "id", "code", "type", "type_label", "status", "status_label",
             "severity", "source", "source_label", "reason", "client_id",
-            "client_name", "case_code", "assignee", "assignee_id", "origin",
+            "client_name", "case_code", "assignee", "assignee_id",
+            "created_by", "created_by_id", "origin",
             "vip", "created_at", "updated_at", "resolved_at", "notes",
         ]
 
     def get_code(self, obj):
         return ticket_code(obj)
+
+    def get_created_by(self, obj):
+        # Prefer the linked agent's current name; fall back to the snapshot label
+        # (system-raised tickets have no agent -> show the label, e.g. "System").
+        if obj.created_by_id and obj.created_by:
+            return obj.created_by.name
+        return obj.created_by_label or ("System" if obj.origin == "system" else "")
+
+    def get_created_by_id(self, obj):
+        return str(obj.created_by_id) if obj.created_by_id else None
 
     def get_client_id(self, obj):
         return str(obj.client_id) if obj.client_id else None
@@ -1322,6 +1358,26 @@ class PortalTicketSerializer(serializers.ModelSerializer):
         return str(obj.assigned_to_id) if obj.assigned_to_id else None
 
 
+class PortalTicketActivitySerializer(serializers.ModelSerializer):
+    """One entry in a ticket's activity/history feed."""
+
+    id = serializers.IntegerField(source="pk", read_only=True)
+    action_label = serializers.CharField(source="get_action_display", read_only=True)
+    actor = serializers.SerializerMethodField()
+
+    class Meta:
+        model = TicketActivity
+        fields = [
+            "id", "action", "action_label", "actor", "detail", "metadata",
+            "created_at",
+        ]
+
+    def get_actor(self, obj):
+        if obj.actor_agent_id and obj.actor_agent:
+            return obj.actor_agent.name
+        return obj.actor_label or "System"
+
+
 class PortalTicketTypeSerializer(serializers.ModelSerializer):
     id = serializers.UUIDField(source="ticket_type_id", read_only=True)
 
@@ -1339,16 +1395,24 @@ class PortalCaseOptionSerializer(serializers.ModelSerializer):
     status_label = serializers.CharField(source="get_case_status_display", read_only=True)
     type_label = serializers.CharField(source="get_case_type_display", read_only=True)
     date_opened = serializers.DateTimeField(read_only=True)
+    # True for the member's GOVERNING internal-service case, so the New-Ticket
+    # modal can auto-select it (matches the stage bar / Cases-tab star). Passed
+    # in via context by MemberCasesView.
+    governing = serializers.SerializerMethodField()
 
     class Meta:
         model = Case
         fields = [
             "id", "code", "status", "status_label", "type_label",
-            "service_type", "program_name", "date_opened",
+            "service_type", "program_name", "date_opened", "governing",
         ]
 
     def get_code(self, obj):
         return f"CSE-{str(obj.case_id)[:8]}"
+
+    def get_governing(self, obj):
+        gid = self.context.get("governing_case_id")
+        return bool(gid) and str(obj.case_id) == str(gid)
 
 
 class PortalMemberCaseSerializer(serializers.ModelSerializer):
@@ -2069,10 +2133,10 @@ class PortalKitchenSerializer(serializers.ModelSerializer):
     class Meta:
         model = Kitchen
         fields = [
-            "id", "name", "address", "phone", "email", "status", "status_label",
-            "max_orders_per_day", "supported_products", "product_options",
-            "menu_type_ids", "menu_types", "cadence_ids", "cadences",
-            "integrations",
+            "id", "name", "abbreviation", "address", "phone", "email", "status",
+            "status_label", "max_orders_per_day", "supported_products",
+            "product_options", "menu_type_ids", "menu_types", "cadence_ids",
+            "cadences", "integrations",
         ]
 
     def get_menu_type_ids(self, obj):

@@ -10,17 +10,21 @@ from datetime import datetime, timedelta
 from django.db import transaction
 from django.utils import timezone
 from django.db.models import (
+    Case as SQLCase,
     Count,
     Exists,
     F,
+    IntegerField,
     Max,
     Min,
     OuterRef,
     Prefetch,
     Q,
     Subquery,
+    Value,
+    When,
 )
-from django.db.models.functions import Lower
+from django.db.models.functions import Coalesce, Lower
 from django.shortcuts import get_object_or_404
 from rest_framework import status as http
 from rest_framework.response import Response
@@ -184,14 +188,24 @@ def _open_out_of_range_ticket(enrollment, reason):
     )
     if exists:
         return False
-    Ticket.objects.create(
+    ticket = Ticket.objects.create(
         type=type_obj,
         status=TicketStatus.OPEN,
         severity=TicketSeverity.HIGH,
         source=TicketSource.OTHER,
         reason=reason,
         client=client,
-        case=getattr(enrollment, "case", None),
+        # Auto-link the member's GOVERNING internal-service case (fall back to
+        # the enrollment's tied case) so the ticket points at the case too.
+        case=governing_internal_case(enrollment) or getattr(enrollment, "case", None),
+        created_by_label="System",
+    )
+    from ..models import TicketActivityAction
+    from ..services.tickets import log_ticket_activity
+
+    log_ticket_activity(
+        ticket, TicketActivityAction.CREATED, actor_label="System",
+        detail="Out-of-range ticket opened by the system.",
     )
     return True
 
@@ -206,11 +220,21 @@ def _resolve_out_of_range_tickets(enrollment, actor=""):
         client=client, type__code=TicketTypeCode.CASE_CLOSURE,
         reason__startswith=_OUT_OF_RANGE_TICKET_MARKER,
     ).exclude(status=TicketStatus.RESOLVED)
-    return qs.update(
+    from ..models import TicketActivityAction
+    from ..services.tickets import log_ticket_activity
+
+    resolved_tickets = list(qs)
+    count = qs.update(
         status=TicketStatus.RESOLVED,
         resolved_at=timezone.now(),
         resolved_by=actor,
     )
+    for t in resolved_tickets:
+        log_ticket_activity(
+            t, TicketActivityAction.RESOLVED, actor_label=actor or "System",
+            detail="Resolved: delivery ZIP is serviceable again.",
+        )
+    return count
 
 
 def _hold_household_for_range(enrollment, author):
@@ -587,6 +611,42 @@ def apply_authorization_filter(qs, value):
     return qs
 
 
+# Enrollment stages that are NOT the member's current/live service: a dietary
+# profile attached to one of these is HISTORY (a superseded/closed/off-boarded
+# enrollment) and must not drive a "current member status" filter.
+_NON_CURRENT_ENROLLMENT_STAGES = [
+    EnrollmentStage.CLOSED,
+    EnrollmentStage.CANCELLED,
+    EnrollmentStage.DISREGARDED,
+    EnrollmentStage.SERVICE_COMPLETE,
+]
+
+
+
+def current_member_status_exists(member_status, *, eligibility_paused=None):
+    """``Exists`` over the client's member dietary profiles in ``member_status``
+    on a CURRENT (non-terminal) enrollment.
+
+    The individual member-status flags (Out of Orbit / Out of Range / Paused) are
+    a CURRENT state, but a client accumulates a profile per enrollment -- so a
+    plain ``member_profiles__status=X`` also matches a STALE status on a closed or
+    superseded enrollment (e.g. an out-of-orbit profile left behind by a
+    governing-case replacement), surfacing members whose live profile is Active.
+    Scoping to a non-terminal enrollment fixes that, and ``Exists`` avoids the
+    join duplicates a multi-valued ``.filter`` would add.
+
+    ``eligibility_paused`` (True/False) further splits Paused into the auto
+    (eligibility-driven) vs manual (agent) pause; None leaves it unfiltered."""
+    profiles = (
+        MemberDietaryProfile.objects
+        .filter(client=OuterRef("pk"), status=member_status)
+        .exclude(enrollment__stage__in=[s.value for s in _NON_CURRENT_ENROLLMENT_STAGES])
+    )
+    if eligibility_paused is not None:
+        profiles = profiles.filter(eligibility_paused=eligibility_paused)
+    return Exists(profiles)
+
+
 # Page-level base scope: restricts the list to the lifecycle stages a given
 # work area cares about (independent of the per-status filter chips).
 SCOPE_TO_STAGES = {
@@ -680,6 +740,37 @@ def enrollment_stage_q(*stages):
     ``.distinct()`` (this adds multi-valued joins)."""
     return Q(enrollments__stage__in=stages) | Q(
         household_membership__household__enrollment_verifications__stage__in=stages
+    )
+
+
+def governing_enrollment_stage():
+    """A ``Subquery`` yielding the stage of the client's GOVERNING enrollment --
+    the SQL mirror of ``serializers.active_enrollment`` (most-recent non-
+    disregarded enrollment, preferring an OPEN one, with a household fallback).
+
+    Stage-based status filters (On Hold / Open / Closed) must key off this ONE
+    governing enrollment, the same way the rest of the app does -- NOT off "any
+    enrollment at this stage" (``enrollment_stage_q``), which over-matches a
+    member who has a stray extra live enrollment (e.g. an On Hold enrollment
+    alongside a newer Service Active one). Validated to match ``active_enrollment``
+    exactly on the production snapshot."""
+    def _latest(rel):
+        return Subquery(
+            EnrollmentVerification.objects
+            .filter(**rel)
+            .exclude(stage=EnrollmentStage.DISREGARDED)
+            .annotate(_open=SQLCase(
+                When(closed_at__isnull=True, then=Value(1)),
+                default=Value(0), output_field=IntegerField(),
+            ))
+            .order_by("-_open", "-opened_at")
+            .values("stage")[:1]
+        )
+    # Own enrollments take precedence; a dependent with none inherits the
+    # household's governing enrollment.
+    return Coalesce(
+        _latest({"client": OuterRef("pk")}),
+        _latest({"household__members__client": OuterRef("pk")}),
     )
 
 
@@ -1056,7 +1147,16 @@ class MembersListView(PortalGenericAPIView):
             # verification was already requested/handled, so a stale is_new flag
             # must never keep them on the list. Leaves only members with no
             # enrollment yet.
-            qs = qs.filter(is_new=True).exclude(
+            # Enforce rule 1 LIVE: the member must currently hold an OPEN
+            # internal-service (meal/box) case. is_new is a set-only flag that is
+            # never cleared when the internal-service case later closes or is
+            # replaced by an eligibility-only case, so trusting it alone leaves
+            # stale members on the tab (e.g. a member with only an eligibility
+            # case). The Exists check drops them regardless of the stale flag.
+            open_internal_case = Case.objects.filter(
+                client=OuterRef("pk"), case_type=CaseType.INTERNAL_SERVICE,
+            ).exclude(case_status__in=[CaseStatus.CLOSED, CaseStatus.CANCELLED])
+            qs = qs.filter(is_new=True).filter(Exists(open_internal_case)).exclude(
                 Q(enrollments__isnull=False)
                 | Q(household_membership__household__enrollment_verifications__isnull=False)
             ).distinct()
@@ -1157,26 +1257,36 @@ class MembersListView(PortalGenericAPIView):
                 qs = apply_authorization_filter(qs, "denied")
             # ── Service axis ──
             elif status_val in ("On Hold", "on_hold"):
-                # On Hold is a service-state overlay (not a lifecycle_stage), so it
-                # is filtered on the member's/household's enrollment stage.
-                qs = qs.filter(enrollment_stage_q(EnrollmentStage.ON_HOLD))
+                # On Hold is a PROGRAM (enrollment) state -- scope to the member's
+                # GOVERNING enrollment (not "any enrollment"), so a stray On Hold
+                # enrollment alongside a newer live one doesn't misfile them.
+                qs = qs.annotate(_gov_stage=governing_enrollment_stage()).filter(
+                    _gov_stage=EnrollmentStage.ON_HOLD
+                )
             elif sv == "out_of_range":
-                qs = qs.filter(member_profiles__status=MemberStatus.OUT_OF_RANGE)
-            # ── Terminal axis (program / enrollment stage) ──
+                qs = qs.filter(current_member_status_exists(MemberStatus.OUT_OF_RANGE))
+            # ── Terminal axis (program / enrollment stage) ── all keyed off the
+            # GOVERNING enrollment (mirrors active_enrollment), never "any".
             elif sv == "term_open":
-                # Open program: an active service enrollment.
-                qs = qs.filter(enrollment_stage_q(EnrollmentStage.SERVICE_ACTIVE))
+                # Open program: the governing enrollment is actively serving.
+                qs = qs.annotate(_gov_stage=governing_enrollment_stage()).filter(
+                    _gov_stage=EnrollmentStage.SERVICE_ACTIVE
+                )
             elif sv == "term_expired":
                 # Authorization window/status expired on the governing case.
                 qs = qs.filter(governing_auth_expired_q())
             elif sv == "term_closed":
-                # Closed/off-boarded program (enrollment closed, cancelled or
-                # service-complete).
-                qs = qs.filter(enrollment_stage_q(
-                    EnrollmentStage.CLOSED,
-                    EnrollmentStage.CANCELLED,
-                    EnrollmentStage.SERVICE_COMPLETE,
-                ))
+                # Closed/off-boarded program: the GOVERNING enrollment is terminal
+                # (closed / cancelled / service-complete). Keyed off the governing
+                # enrollment so a member actively served on a live enrollment isn't
+                # shown as Closed just because an old superseded enrollment is.
+                qs = qs.annotate(_gov_stage=governing_enrollment_stage()).filter(
+                    _gov_stage__in=[
+                        EnrollmentStage.CLOSED,
+                        EnrollmentStage.CANCELLED,
+                        EnrollmentStage.SERVICE_COMPLETE,
+                    ]
+                )
             # ── Logistics / plain lifecycle-stage buckets ──
             elif sv == "kitchen_assignment":
                 qs = qs.filter(lifecycle_stage="kitchen_assignment")
@@ -1269,36 +1379,25 @@ class MembersListView(PortalGenericAPIView):
         #     (On Hold). NB: lifecycle_stage keeps the held-from stage, so this
         #     must be filtered on the enrollment stage, not lifecycle_stage.
         flag = (params.get("flag") or "").strip().lower()
+        # The `flag` filter is for INDIVIDUAL member-level statuses only. Program-
+        # level states (On Hold / Cancelled) live on the grouped status filter, not
+        # here, and are intentionally NOT member flags.
         if flag == "out_of_orbit":
-            qs = qs.filter(member_profiles__status=MemberStatus.OUT_OF_ORBIT)
+            qs = qs.filter(current_member_status_exists(MemberStatus.OUT_OF_ORBIT))
         elif flag == "out_of_range":
-            qs = qs.filter(member_profiles__status=MemberStatus.OUT_OF_RANGE)
+            qs = qs.filter(current_member_status_exists(MemberStatus.OUT_OF_RANGE))
         elif flag == "paused":
-            qs = qs.filter(member_profiles__status=MemberStatus.PAUSED)
-        elif flag == "inactive":
-            # Members whose service ended (terminal member status). Set when a
-            # household is cancelled, so this surfaces off-boarded members.
-            qs = qs.filter(member_profiles__status=MemberStatus.INACTIVE)
-        elif flag == "cancelled":
-            # Cancelled households: the member's own OR their household's
-            # enrollment is at the terminal CANCELLED stage. Keyed off the
-            # enrollment stage (not lifecycle_stage, which collapses to
-            # not_eligible and can't be told apart from an eligibility denial).
-            qs = qs.filter(
-                Q(enrollments__stage=EnrollmentStage.CANCELLED)
-                | Q(
-                    household_membership__household__enrollment_verifications__stage=(
-                        EnrollmentStage.CANCELLED
-                    )
-                )
-            )
-        elif flag == "on_hold":
-            qs = qs.filter(
-                Q(enrollments__stage=EnrollmentStage.ON_HOLD)
-                | Q(
-                    household_membership__household__enrollment_verifications__stage=EnrollmentStage.ON_HOLD
-                )
-            )
+            # AGENT (manual) pause only -- exclude the eligibility-driven pause so
+            # the two are distinguishable on the list.
+            qs = qs.filter(current_member_status_exists(
+                MemberStatus.PAUSED, eligibility_paused=False,
+            ))
+        elif flag == "eligibility_paused":
+            # AUTO pause: the member failed their own eligibility (expired
+            # insurance / missing coverage).
+            qs = qs.filter(current_member_status_exists(
+                MemberStatus.PAUSED, eligibility_paused=True,
+            ))
         # TEMP diagnostic flags (to be removed): members missing dietary/logistics
         # data. "no_menu_type" -> no dietary profile carries a menu type at all;
         # "no_kitchen" -> neither the member's nor their household's enrollment has
@@ -1742,28 +1841,44 @@ class MembersListView(PortalGenericAPIView):
         missing_menu = predicted_out = 0
         for c in member_clients:
             mp = profiles.get(c.client_id)
-            out, reason = predict_member_out_of_orbit(mp)
             menu_type = (mp.menu_type if mp else "") or ""
+            allergies = _allergy_labels(mp.food_allergies if mp else [])
             if not menu_type:
+                # No menu type is its OWN blocker (missing menu) -- it must NOT
+                # ALSO be counted as "may get out of orbit" (that double-reported
+                # the same gap).
                 missing_menu += 1
-            if out:
-                predicted_out += 1
-            else:
-                # Kitchens that can serve this member's menu + allergies for the
-                # household's product (meals/boxes). A household is servable only
-                # if ONE kitchen serves every eligible member (set intersection).
-                serving_sets.append({
-                    sk["kitchen"].pk
-                    for sk in serving_kitchens_for_member(
-                        mp, kitchens=kitchens, required_product=required,
-                    )
-                })
-            per_member[str(c.client_id)] = {
-                "menu_type": menu_type,
-                "allergies": _allergy_labels(mp.food_allergies if mp else []),
-                "predicted_out_of_orbit": out,
-                "predicted_reason": reason,
+                per_member[str(c.client_id)] = {
+                    "menu_type": "", "allergies": allergies,
+                    "predicted_out_of_orbit": False, "predicted_reason": "",
+                }
+                continue
+            # KITCHEN-AWARE out-of-orbit prediction: the member is only a blocker
+            # when NO available kitchen can actually serve their menu + allergies.
+            # The old kitchen-AGNOSTIC rule (predict_member_out_of_orbit) flagged
+            # members a real kitchen could serve, so it hugely over-inflated
+            # "Has blockers" and hid them from the kitchen serviceability check.
+            serving = {
+                sk["kitchen"].pk
+                for sk in serving_kitchens_for_member(
+                    mp, kitchens=kitchens, required_product=required,
+                )
             }
+            if not serving:
+                predicted_out += 1
+                per_member[str(c.client_id)] = {
+                    "menu_type": menu_type, "allergies": allergies,
+                    "predicted_out_of_orbit": True,
+                    "predicted_reason": "No available kitchen can serve this menu + allergies",
+                }
+            else:
+                # A household is servable only if ONE kitchen serves EVERY member
+                # (set intersection below).
+                serving_sets.append(serving)
+                per_member[str(c.client_id)] = {
+                    "menu_type": menu_type, "allergies": allergies,
+                    "predicted_out_of_orbit": False, "predicted_reason": "",
+                }
 
         kitchen_available = bool(set.intersection(*serving_sets)) if serving_sets else False
         address = _format_address(enr.delivery_address) if enr else ""
@@ -3915,23 +4030,23 @@ class MemberCasesView(PortalAPIView):
     def get(self, request, client_id):
         client = get_object_or_404(Client, pk=client_id)
         cases = Case.objects.filter(client_id=client_id).order_by("-date_opened")
-        if request.query_params.get("detail"):
-            # Flag the governing internal-service case the SAME way the stage
-            # progress bar stars it (lifecycle.program_tracks), so the Cases tab
-            # star always matches the bar.
-            from api.services.lifecycle import program_tracks
+        # Flag the governing internal-service case the SAME way the stage progress
+        # bar stars it (lifecycle.program_tracks), so both the Cases-tab star AND
+        # the New-Ticket "related case" dropdown auto-select the same case.
+        from api.services.lifecycle import program_tracks
 
-            tracks = program_tracks(client)
-            governing_case_id = next(
-                (t["case_id"] for t in tracks if t["governing"]), None
-            )
+        tracks = program_tracks(client)
+        governing_case_id = next(
+            (t["case_id"] for t in tracks if t["governing"]), None
+        )
+        context = {"governing_case_id": governing_case_id}
+        if request.query_params.get("detail"):
             return Response(
-                s.PortalMemberCaseSerializer(
-                    cases, many=True,
-                    context={"governing_case_id": governing_case_id},
-                ).data
+                s.PortalMemberCaseSerializer(cases, many=True, context=context).data
             )
-        return Response(s.PortalCaseOptionSerializer(cases, many=True).data)
+        return Response(
+            s.PortalCaseOptionSerializer(cases, many=True, context=context).data
+        )
 
 
 class MemberCaseDetailView(PortalAPIView):
@@ -4917,6 +5032,19 @@ class MemberKitchenOptionsView(PortalAPIView):
         return Response(data)
 
 
+# Enrollment stages from which a kitchen can be assigned + service activated:
+# VERIFIED (Williamsburg fast-track), KITCHEN_ASSIGNMENT (the normal Logistics
+# step), SERVICE_ACTIVE (a re-assignment / kitchen change -- a no-op advance),
+# and ON_HOLD (which has a valid edge to SERVICE_ACTIVE). Any earlier stage has
+# no valid transition to SERVICE_ACTIVE, so assignment must be rejected.
+_KITCHEN_ASSIGNABLE_STAGES = {
+    EnrollmentStage.VERIFIED,
+    EnrollmentStage.KITCHEN_ASSIGNMENT,
+    EnrollmentStage.SERVICE_ACTIVE,
+    EnrollmentStage.ON_HOLD,
+}
+
+
 class MemberAssignKitchenView(PortalAPIView):
     """Logistics: assign a kitchen + cadence to the whole household, build the
     per-member delivery plans, and activate the household (Service Active).
@@ -4934,6 +5062,18 @@ class MemberAssignKitchenView(PortalAPIView):
         # (re)assignment, which would otherwise re-activate a closed member.
         if _program_locked(enr):
             return _program_locked_response()
+
+        # A kitchen can only be assigned once the member is VERIFIED and awaiting
+        # kitchen assignment (or already served -- a re-assignment). An earlier
+        # stage (e.g. Pending Verification) has NO valid path to Service Active,
+        # so assign_kitchen_to_household's force-advance would raise
+        # InvalidTransition (a 500). Reject it cleanly instead.
+        if EnrollmentStage(enr.stage) not in _KITCHEN_ASSIGNABLE_STAGES:
+            return Response(
+                {"error": "This member must complete verification before a "
+                          "kitchen can be assigned."},
+                status=http.HTTP_400_BAD_REQUEST,
+            )
 
         # CHANGING an already-assigned kitchen (the program tab's "Kitchen &
         # Delivery" Change control) is Management-only: verification / CS /
@@ -5073,15 +5213,21 @@ def enrollment_ready_for_assignment(enr, kitchens):
     required = required_product_for_program(enr.program_name)
     serving_sets = []
     for mp in members:
-        out, _ = predict_member_out_of_orbit(mp)
-        if out:
+        # Kitchen-AWARE (matches the Logistics list): missing menu, or NO
+        # available kitchen able to serve the member's menu + allergies, means
+        # not ready. The old kitchen-agnostic predict_member_out_of_orbit flagged
+        # members a real kitchen could serve, wrongly excluding ready households.
+        if not (mp.menu_type or "").strip():
             return False
-        serving_sets.append({
+        serving = {
             sk["kitchen"].pk
             for sk in serving_kitchens_for_member(
                 mp, kitchens=kitchens, required_product=required,
             )
-        })
+        }
+        if not serving:
+            return False
+        serving_sets.append(serving)
     return bool(set.intersection(*serving_sets))
 
 

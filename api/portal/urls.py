@@ -110,6 +110,7 @@ from .views_kitchen_output import KitchenOutputView
 from .views_po_blockers import POBlockersFixView, POBlockersStatsView, POBlockersView
 from .views_reports import (
     AllMembersReportView,
+    AllVerificationsReportView,
     CasesReportView,
     MembersByLeadSourceReportView,
     MembersForPurchaseOrderReportView,
@@ -153,6 +154,7 @@ from .views_settings import (
 )
 from .views_tickets import (
     AgentsListView,
+    TicketActivityView,
     TicketDetailView,
     TicketNotesView,
     TicketsStatsView,
@@ -289,6 +291,7 @@ urlpatterns = [
     path("tickets/stats/", TicketsStatsView.as_view(), name="portal-tickets-stats"),
     path("tickets/<int:ticket_id>/", TicketDetailView.as_view(), name="portal-ticket-detail"),
     path("tickets/<int:ticket_id>/notes/", TicketNotesView.as_view()),
+    path("tickets/<int:ticket_id>/activity/", TicketActivityView.as_view()),
     path("agents/", AgentsListView.as_view(), name="portal-agents"),
 
     # Leads (agent-created from the Work Queue + Leads page)
@@ -405,6 +408,11 @@ urlpatterns = [
         "reports/members-pending-verification/",
         MembersPendingVerificationReportView.as_view(),
         name="portal-report-members-pending-verification",
+    ),
+    path(
+        "reports/all-verifications/",
+        AllVerificationsReportView.as_view(),
+        name="portal-report-all-verifications",
     ),
     path(
         "reports/all-members/",

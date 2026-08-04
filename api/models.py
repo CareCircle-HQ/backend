@@ -3257,6 +3257,14 @@ class Ticket(models.Model):
         "Agent", on_delete=models.SET_NULL, null=True, blank=True,
         related_name="tickets",
     )
+    # The agent who created the ticket (manual create). Null for system-raised
+    # tickets (origin=SYSTEM); ``created_by_label`` keeps a readable snapshot
+    # (agent name, "System", etc.) that survives an agent record change.
+    created_by = models.ForeignKey(
+        "Agent", on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="created_tickets",
+    )
+    created_by_label = models.CharField(max_length=255, blank=True)
     resolved_at = models.DateTimeField(null=True, blank=True)
     resolved_by = models.CharField(max_length=120, blank=True)  # agent:355 / user:alex
     created_at = models.DateTimeField(auto_now_add=True)
@@ -3706,6 +3714,10 @@ class Kitchen(models.Model):
         primary_key=True, default=uuid.uuid4, editable=False
     )
     name = models.CharField(max_length=255)
+    # Short code used in the human-readable PO number (e.g. "HICK" ->
+    # PO-MEALS-2026-W32-THU-HICK). Falls back to an auto "K01"-style code when
+    # blank, so PO naming keeps working before abbreviations are configured.
+    abbreviation = models.CharField(max_length=12, blank=True)
     address = models.CharField(max_length=255, blank=True)
     phone = models.CharField(max_length=40, blank=True)
     email = models.EmailField(blank=True)
@@ -4134,6 +4146,52 @@ class TicketNote(models.Model):
 
     def __str__(self):
         return f"Note on ticket {self.ticket_id} by {self.author_name or 'system'}"
+
+
+class TicketActivityAction(models.TextChoices):
+    """What happened to a ticket, for the ticket activity/history feed."""
+
+    CREATED = "created", "Created"
+    ASSIGNED = "assigned", "Assigned"
+    UNASSIGNED = "unassigned", "Unassigned"
+    STATUS_CHANGED = "status_changed", "Status Changed"
+    RESOLVED = "resolved", "Resolved"
+    REOPENED = "reopened", "Reopened"
+    NOTE_ADDED = "note_added", "Note Added"
+    SEVERITY_CHANGED = "severity_changed", "Severity Changed"
+    VIP_CHANGED = "vip_changed", "VIP Changed"
+
+
+class TicketActivity(models.Model):
+    """A chronological activity/history entry for a Ticket -- one row per action
+    (created, assigned, status changed, note added, resolved, ...), so the Work
+    Queue can show a full timestamped history of what happened to a ticket and
+    who did it. Explicitly written by the ticket actions (see
+    :func:`api.services.tickets.log_ticket_activity`)."""
+
+    ticket = models.ForeignKey(
+        Ticket, on_delete=models.CASCADE, related_name="activities"
+    )
+    action = models.CharField(max_length=24, choices=TicketActivityAction.choices)
+    # WHO did it: an optional structured Agent link + a readable snapshot label
+    # ("Casey CS", "System", "system:cancelled-reconcile", ...).
+    actor_agent = models.ForeignKey(
+        "Agent", on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="ticket_activities",
+    )
+    actor_label = models.CharField(max_length=255, blank=True)
+    # Human-readable one-liner (e.g. "Status: Open -> In Progress", a note
+    # excerpt) plus structured context for the frontend.
+    detail = models.TextField(blank=True)
+    metadata = models.JSONField(default=dict, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["created_at", "pk"]
+        indexes = [models.Index(fields=["ticket", "created_at"])]
+
+    def __str__(self):
+        return f"Ticket {self.ticket_id} {self.action} @ {self.created_at:%Y-%m-%d %H:%M}"
 
 
 # ===========================================================================
