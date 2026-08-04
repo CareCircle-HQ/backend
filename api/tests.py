@@ -11330,3 +11330,87 @@ class DedupePoDeliveryOrdersCommandTest(TestCase):
         self.assertEqual(live.count(), 1)  # kept exactly one
         solo.refresh_from_db()
         self.assertEqual(solo.status, DeliveryOrderStatus.PENDING)  # untouched
+
+
+class DeliveryCalendarNoDuplicateTest(TestCase):
+    """_dedupe_calendar_occurrences never lets the same client land on the same
+    delivery date + product kind twice -- across enrollments AND within a batch.
+    This is the upstream guard that stops duplicate PO lines."""
+
+    def _profile(self, client, enrollment):
+        from .models import MemberDietaryProfile, MemberStatus
+        return MemberDietaryProfile.objects.create(
+            enrollment=enrollment, client=client, status=MemberStatus.ACTIVE,
+        )
+
+    def test_dedupes_across_enrollments_and_within_batch(self):
+        from datetime import date
+
+        from .models import (
+            Client, EnrollmentStage, EnrollmentVerification, OrderSchedule,
+            OrderStatus,
+        )
+        from .services.orders import _dedupe_calendar_occurrences
+
+        client = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Dup", last_name="Cal",
+        )
+        prog = "Medically Tailored Meals"
+        d = date(2026, 8, 6)
+
+        # Enrollment A already has a LIVE order for this client on date d.
+        enrA = EnrollmentVerification.objects.create(
+            client=client, stage=EnrollmentStage.SERVICE_ACTIVE, program_name=prog,
+        )
+        mpA = self._profile(client, enrA)
+        OrderSchedule.objects.create(
+            enrollment=enrA, member=mpA, program_name=prog,
+            anticipated_delivery_date=d, status=OrderStatus.SCHEDULED,
+        )
+
+        # Enrollment B (same client, same program) tries to build the SAME date
+        # plus a different date -> only the new date survives.
+        enrB = EnrollmentVerification.objects.create(
+            client=client, stage=EnrollmentStage.SERVICE_ACTIVE, program_name=prog,
+        )
+        mpB = self._profile(client, enrB)
+        other = date(2026, 8, 13)
+        candidates = [
+            OrderSchedule(enrollment=enrB, member=mpB, program_name=prog,
+                          anticipated_delivery_date=d),           # dup of enrA -> drop
+            OrderSchedule(enrollment=enrB, member=mpB, program_name=prog,
+                          anticipated_delivery_date=other),       # new date -> keep
+            OrderSchedule(enrollment=enrB, member=mpB, program_name=prog,
+                          anticipated_delivery_date=other),       # intra-batch dup -> drop
+        ]
+        kept = _dedupe_calendar_occurrences(candidates)
+        self.assertEqual(len(kept), 1)
+        self.assertEqual(kept[0].anticipated_delivery_date, other)
+
+    def test_cancelled_existing_does_not_block(self):
+        from datetime import date
+
+        from .models import (
+            Client, EnrollmentStage, EnrollmentVerification, OrderSchedule,
+            OrderStatus,
+        )
+        from .services.orders import _dedupe_calendar_occurrences
+
+        client = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Canc", last_name="Cal",
+        )
+        prog = "Medically Tailored Meals"
+        d = date(2026, 8, 6)
+        enr = EnrollmentVerification.objects.create(
+            client=client, stage=EnrollmentStage.SERVICE_ACTIVE, program_name=prog,
+        )
+        mp = self._profile(client, enr)
+        OrderSchedule.objects.create(
+            enrollment=enr, member=mp, program_name=prog,
+            anticipated_delivery_date=d, status=OrderStatus.CANCELLED,
+        )
+        kept = _dedupe_calendar_occurrences([
+            OrderSchedule(enrollment=enr, member=mp, program_name=prog,
+                          anticipated_delivery_date=d),
+        ])
+        self.assertEqual(len(kept), 1)  # cancelled order doesn't block a new one

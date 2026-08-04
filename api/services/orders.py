@@ -52,6 +52,59 @@ def _format_address(address):
     return ", ".join(p for p in (line, tail) if p)
 
 
+def _dedupe_calendar_occurrences(orders):
+    """Guard: never let the SAME client land on the SAME delivery date for the
+    SAME product kind more than once in the delivery calendar.
+
+    Drops such occurrences both WITHIN this batch and against any LIVE
+    (non-cancelled) ``OrderSchedule`` that already exists for that
+    client+date+kind on ANOTHER enrollment. A client with two active enrollments
+    for the same program (a data anomaly -- e.g. a spurious caseless duplicate
+    alongside the real, case-linked one) would otherwise build two calendars and
+    land twice on a date, doubling their meals/boxes downstream in the Purchase
+    Order. A meals + boxes client legitimately has two orders on one date
+    (different kinds), so the product kind is part of the dedupe key.
+    """
+    from api.services.catalog import product_type_kind_for_name
+
+    if not orders:
+        return orders
+
+    def _kind(program_name):
+        return product_type_kind_for_name(program_name or "") or ""
+
+    def _key(order):
+        member = order.member
+        client_id = getattr(member, "client_id", None) if member else None
+        if not client_id or not order.anticipated_delivery_date:
+            return None  # can't dedupe without a client + date -> keep as-is
+        return (str(client_id), order.anticipated_delivery_date, _kind(order.program_name))
+
+    keys = [_key(o) for o in orders]
+    client_ids = {k[0] for k in keys if k}
+    dates = {k[1] for k in keys if k}
+
+    existing = set()
+    if client_ids and dates:
+        rows = (
+            OrderSchedule.objects
+            .filter(member__client_id__in=client_ids, anticipated_delivery_date__in=dates)
+            .exclude(status=OrderStatus.CANCELLED)
+            .values_list("member__client_id", "anticipated_delivery_date", "program_name")
+        )
+        existing = {(str(cid), d, _kind(prog)) for cid, d, prog in rows}
+
+    seen = set()
+    kept = []
+    for order, key in zip(orders, keys):
+        if key is not None:
+            if key in seen or key in existing:
+                continue
+            seen.add(key)
+        kept.append(order)
+    return kept
+
+
 def _delivery_window(enrollment):
     """(start_date, end_date) from the linked case's authorization approval
     window, or (None, None) if the case / dates are missing."""
@@ -159,7 +212,7 @@ def generate_orders_for_enrollment(enrollment):
                     how_many_meals_or_boxes=m.meals_per_delivery,
                 )
             )
-    return OrderSchedule.objects.bulk_create(orders)
+    return OrderSchedule.objects.bulk_create(_dedupe_calendar_occurrences(orders))
 
 
 @transaction.atomic
@@ -228,7 +281,7 @@ def generate_delivery_calendar(enrollment):
                     how_many_meals_or_boxes=qty,
                 )
             )
-    return OrderSchedule.objects.bulk_create(orders)
+    return OrderSchedule.objects.bulk_create(_dedupe_calendar_occurrences(orders))
 
 
 @transaction.atomic
@@ -464,6 +517,7 @@ def sync_delivery_calendar(enrollment, from_date=None):
         removed = OrderSchedule.objects.filter(pk__in=stale_ids).delete()[0]
 
     if to_create:
+        to_create = _dedupe_calendar_occurrences(to_create)
         OrderSchedule.objects.bulk_create(to_create)
 
     return {"added": len(to_create), "removed": removed, "updated": updated}
