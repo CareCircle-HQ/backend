@@ -11730,3 +11730,29 @@ class KitchenExportFilenameTest(TestCase):
         )
         # No suffix -> just the K-code; missing abbreviation -> falls back to K-code.
         self.assertEqual(kitchen_export_filename(po), "K01_Meals_07.23.26_PHS_K01.csv")
+
+
+class TicketHouseholdPrimaryIdSerializerTest(TestCase):
+    """PortalTicketSerializer exposes household_primary_id (the ticket client's
+    household primary) so the Work Queue can show the 'open household' icon --
+    same as the Members list."""
+
+    def test_household_primary_id(self):
+        from .models import Client, Household, HouseholdMember, Ticket, TicketType
+        from .portal import serializers as s
+
+        prim = Client.objects.create(client_id=str(uuid.uuid4()), first_name="P", last_name="R")
+        dep = Client.objects.create(client_id=str(uuid.uuid4()), first_name="D", last_name="P")
+        hh = Household.objects.create(name="HH")
+        HouseholdMember.objects.create(household=hh, client=prim, is_primary=True)
+        HouseholdMember.objects.create(household=hh, client=dep, is_primary=False)
+        tt, _ = TicketType.objects.get_or_create(code="coverage", defaults={"label": "Coverage"})
+
+        t = Ticket.objects.create(type=tt, client=dep, reason="x")
+        self.assertEqual(
+            s.PortalTicketSerializer(t).data["household_primary_id"], str(prim.client_id)
+        )
+
+        lone = Client.objects.create(client_id=str(uuid.uuid4()), first_name="L", last_name="N")
+        tl = Ticket.objects.create(type=tt, client=lone, reason="y")
+        self.assertIsNone(s.PortalTicketSerializer(tl).data["household_primary_id"])

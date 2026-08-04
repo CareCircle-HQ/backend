@@ -13,7 +13,7 @@ from ..services import timeline
 from .base import PortalAPIView, PortalGenericAPIView, current_agent
 from . import serializers as s
 
-TICKET_PREFETCH = ("notes",)
+TICKET_PREFETCH = ("notes", "client__household_membership__household__members")
 TICKET_SELECT = ("assigned_to", "client", "case", "type")
 
 # open -> in_progress -> resolved -> open
