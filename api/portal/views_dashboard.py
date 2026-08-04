@@ -50,7 +50,7 @@ _TERMINAL_CASE_STATUSES = [CaseStatus.CLOSED, CaseStatus.CANCELLED]
 _SERVING_REASONS = frozenset({
     "needs_verification", "rejected_case", "out_of_range",
     "services_paused", "pending_closure", "out_of_orbit",
-    "insurance_expiring", "no_social_coverage", "no_insurance",
+    "insurance_expiring", "no_social_coverage",
 })
 
 
@@ -185,6 +185,21 @@ def serving_client_ids(reason, *, start, end, governing_ids=None):
     def gov():
         return governing_ids if governing_ids is not None else governing_internal_case_ids()
 
+    _open_gov_cache = {}
+
+    def open_gov_clients():
+        """client_ids whose GOVERNING internal-service case is currently OPEN
+        (non-terminal). Every serving/watchlist reason is intersected with this
+        so a member whose governing case has CLOSED is never flagged -- we only
+        surface actionable members whose governing case is still open."""
+        if "v" not in _open_gov_cache:
+            _open_gov_cache["v"] = set(
+                Case.objects.filter(case_id__in=gov())
+                .exclude(case_status__in=_TERMINAL_CASE_STATUSES)
+                .values_list("client_id", flat=True)
+            )
+        return _open_gov_cache["v"]
+
     if reason == "needs_verification":
         # Mirror the Verification page's "Pending + Requested-date" filter EXACTLY
         # (same helpers) so this card can never drift from what agents see there:
@@ -229,11 +244,11 @@ def serving_client_ids(reason, *, start, end, governing_ids=None):
     if reason == "out_of_range":
         return set(scope(
             mdp.filter(status=MemberStatus.OUT_OF_RANGE)
-        ).values_list("client_id", flat=True))
+        ).values_list("client_id", flat=True)) & open_gov_clients()
     if reason == "out_of_orbit":
         return set(scope(
             mdp.filter(status=MemberStatus.OUT_OF_ORBIT)
-        ).values_list("client_id", flat=True))
+        ).values_list("client_id", flat=True)) & open_gov_clients()
     if reason == "services_paused":
         # A member individually Paused within the active-service pipeline, OR an
         # otherwise-Active member whose household is On Hold -- the "not currently
@@ -249,7 +264,7 @@ def serving_client_ids(reason, *, start, end, governing_ids=None):
                 ],
             )
             | Q(status=MemberStatus.ACTIVE, enrollment__stage=EnrollmentStage.ON_HOLD)
-        )).values_list("client_id", flat=True))
+        )).values_list("client_id", flat=True)) & open_gov_clients()
     if reason == "pending_closure":
         # Only a closure ticket on the GOVERNING case flags the member -- a ticket
         # on a non-governing case is not their service closing.
@@ -268,8 +283,10 @@ def serving_client_ids(reason, *, start, end, governing_ids=None):
         )
 
     # --- Watchlist (client-level facts, intersected with enrolled members) ---
-    enrolled = set(scope(mdp).values_list("client_id", flat=True))
-    if not enrolled and start is not None:
+    # Only members whose GOVERNING internal-service case is OPEN: a coverage gap
+    # on someone whose service case has closed isn't actionable follow-up.
+    enrolled = set(scope(mdp).values_list("client_id", flat=True)) & open_gov_clients()
+    if not enrolled:
         return set()
     if reason == "insurance_expiring":
         # "No active Medicaid" watchlist. Imports don't reliably populate a
@@ -287,11 +304,6 @@ def serving_client_ids(reason, *, start, end, governing_ids=None):
         have = set(SocialCareCoverage.objects.filter(
             client_id__in=enrolled,
             status=SocialCareCoverageStatus.ENROLLED,
-        ).values_list("client_id", flat=True))
-        return enrolled - have
-    if reason == "no_insurance":
-        have = set(Insurance.objects.filter(
-            client_id__in=enrolled, status=RecordStatus.ACTIVE,
         ).values_list("client_id", flat=True))
         return enrolled - have
     return None
@@ -409,8 +421,6 @@ def _serving_details(reason, client_ids, *, start, end, governing_ids=None):
         return {cid: "No active Medicaid on file" for cid in ids}
     if reason == "no_social_coverage":
         return {cid: "No enrolled social care coverage" for cid in ids}
-    if reason == "no_insurance":
-        return {cid: "No active insurance on file" for cid in ids}
     return {}
 
 
@@ -675,7 +685,6 @@ class DashboardView(PortalAPIView):
             "watchlist": {
                 "insurance_expiring": _count("insurance_expiring"),
                 "no_social_coverage": _count("no_social_coverage"),
-                "no_insurance": _count("no_insurance"),
             },
         }
 

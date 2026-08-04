@@ -5011,10 +5011,11 @@ class DashboardServingClientIdsTests(TestCase):
     insurance/social-coverage watchlist. Uses all-time (start=None), a live
     snapshot over every member profile."""
 
-    def _member(self, *, status=None, stage=None):
+    def _member(self, *, status=None, stage=None, case_status=None):
         from .models import (
-            Client, EnrollmentStage, EnrollmentVerification, Household,
-            HouseholdMember, MemberDietaryProfile, MemberStatus,
+            Case, CaseStatus, CaseType, Client, EnrollmentStage,
+            EnrollmentVerification, Household, HouseholdMember,
+            MemberDietaryProfile, MemberStatus,
         )
 
         client = Client.objects.create(
@@ -5022,8 +5023,16 @@ class DashboardServingClientIdsTests(TestCase):
         )
         hh = Household.objects.create(name="HH")
         HouseholdMember.objects.create(household=hh, client=client, is_primary=True)
+        # Every dashboard serving/watchlist reason is gated to members whose
+        # GOVERNING internal-service case is OPEN, so give the member one (open by
+        # default; pass case_status to test the closed-case exclusion).
+        case = Case.objects.create(
+            case_id=uuid.uuid4(), client=client, case_type=CaseType.INTERNAL_SERVICE,
+            case_status=case_status or CaseStatus.OPEN,
+            program_name="Medically Tailored Meals",
+        )
         enr = EnrollmentVerification.objects.create(
-            client=client, household=hh,
+            client=client, household=hh, case=case,
             stage=stage or EnrollmentStage.KITCHEN_ASSIGNMENT,
         )
         MemberDietaryProfile.objects.create(
@@ -5053,21 +5062,24 @@ class DashboardServingClientIdsTests(TestCase):
         self.assertNotIn(active.client_id, ids)
         self.assertNotIn(oor_on_hold.client_id, ids)
 
-    def test_no_insurance_clears_when_active_plan_added(self):
-        from .models import Insurance, InsurancePlanType, RecordStatus
+    def test_closed_governing_case_excludes_from_reasons(self):
+        # Every serving/watchlist reason is gated to an OPEN governing case: a
+        # member whose governing internal-service case is CLOSED must not be
+        # flagged (they're no longer being served).
+        from .models import CaseStatus, MemberStatus
         from .portal.views_dashboard import serving_client_ids
 
-        c = self._member()
-        self.assertIn(
-            c.client_id, serving_client_ids("no_insurance", start=None, end=None)
+        open_m = self._member(status=MemberStatus.OUT_OF_ORBIT)
+        closed_m = self._member(
+            status=MemberStatus.OUT_OF_ORBIT, case_status=CaseStatus.CLOSED
         )
-        Insurance.objects.create(
-            client=c, plan_type=InsurancePlanType.MEDICAID,
-            status=RecordStatus.ACTIVE,
-        )
-        self.assertNotIn(
-            c.client_id, serving_client_ids("no_insurance", start=None, end=None)
-        )
+        oob = serving_client_ids("out_of_orbit", start=None, end=None)
+        self.assertIn(open_m.client_id, oob)
+        self.assertNotIn(closed_m.client_id, oob)
+        # Same gate on a watchlist reason.
+        social = serving_client_ids("no_social_coverage", start=None, end=None)
+        self.assertIn(open_m.client_id, social)
+        self.assertNotIn(closed_m.client_id, social)
 
     def test_no_social_coverage_clears_when_enrolled_coverage_added(self):
         from .models import SocialCareCoverage, SocialCareCoverageStatus
