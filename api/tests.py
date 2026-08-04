@@ -11681,3 +11681,52 @@ class PurgeOutOfScopeCasesCommandTest(TestCase):
         self.assertTrue(Case.objects.filter(pk=keeper.pk).exists())   # in scope
         self.assertFalse(Case.objects.filter(pk=doomed.pk).exists())  # out of scope
         self.assertTrue(Case.objects.filter(pk=backed.pk).exists())   # enrollment-backed, preserved
+
+
+class KitchenExportFilenameTest(TestCase):
+    """The kitchen export CSV filename: Order#_(Meals|Boxes)_MM.DD.YY_PHS_ABBR.csv
+    Order# = stable K-code + PO sequence suffix; abbreviation at the end. Only
+    the exported file is renamed -- po.po_number is untouched."""
+
+    def test_meals_and_box_filenames(self):
+        from datetime import date
+
+        from .models import (
+            Kitchen, KitchenStatus, ProductTypeKind, PurchaseOrder,
+            PurchaseOrderStatus,
+        )
+        from .services.purchase_orders import kitchen_export_filename
+
+        eng = Kitchen.objects.create(name="Englewood", abbreviation="ENG", status=KitchenStatus.ACTIVE)
+        ast = Kitchen.objects.create(name="Astoria", abbreviation="AST", status=KitchenStatus.ACTIVE)
+
+        meals = PurchaseOrder.objects.create(
+            po_number="PO-MEALS-2026-W30-FRI-ENG-2", kind=ProductTypeKind.MEALS,
+            delivery_date=date(2026, 7, 24), kitchen=eng, status=PurchaseOrderStatus.DRAFT,
+        )
+        box = PurchaseOrder.objects.create(
+            po_number="PO-BOX-2026-W30-AST-3", kind=ProductTypeKind.BOXES,
+            delivery_date=date(2026, 7, 24), kitchen=ast, status=PurchaseOrderStatus.DRAFT,
+        )
+
+        self.assertEqual(kitchen_export_filename(meals), "K01-2_Meals_07.24.26_PHS_ENG.csv")
+        self.assertEqual(kitchen_export_filename(box), "K02-3_Boxes_07.24.26_PHS_AST.csv")
+        # PO number itself is unchanged.
+        self.assertEqual(meals.po_number, "PO-MEALS-2026-W30-FRI-ENG-2")
+
+    def test_no_suffix_and_missing_abbreviation(self):
+        from datetime import date
+
+        from .models import (
+            Kitchen, KitchenStatus, ProductTypeKind, PurchaseOrder,
+            PurchaseOrderStatus,
+        )
+        from .services.purchase_orders import kitchen_export_filename
+
+        k = Kitchen.objects.create(name="NoAbbr", status=KitchenStatus.ACTIVE)  # no abbreviation
+        po = PurchaseOrder.objects.create(
+            po_number="PO-MEALS-2026-W30-THU-K01", kind=ProductTypeKind.MEALS,
+            delivery_date=date(2026, 7, 23), kitchen=k, status=PurchaseOrderStatus.DRAFT,
+        )
+        # No suffix -> just the K-code; missing abbreviation -> falls back to K-code.
+        self.assertEqual(kitchen_export_filename(po), "K01_Meals_07.23.26_PHS_K01.csv")
