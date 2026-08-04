@@ -702,11 +702,13 @@ class DashboardView(PortalAPIView):
             .count()
         )
 
-        # --- 1.6 Cancel rate (TIME-FRAME SENSITIVE) -----------------------
-        # Attrition: distinct members who fell out of / are blocked from active
-        # service (Paused, household On Hold, Out of Orbit, Out of Range, or a
-        # Cancelled enrollment) as a share of the members enrolled in
-        # accepted-authorization (open + APPROVED) cases.
+        # --- 1.6 Inactive Member Rate (TIME-FRAME SENSITIVE) --------------
+        # Attrition: distinct MEMBERS who fell out of / are blocked from active
+        # service (Paused, household On Hold, Out of Orbit, Out of Range, or on an
+        # INELIGIBLE program) as a share of the members enrolled in
+        # accepted-authorization (open + APPROVED) cases. Every component counts
+        # MEMBERS (on_hold counts every member on an on-hold enrollment;
+        # ineligible counts every member whose program is Ineligible).
         mdp = MemberDietaryProfile.objects
 
         def _lost(**flt):
@@ -719,9 +721,11 @@ class DashboardView(PortalAPIView):
         cr_on_hold = _lost(enrollment__stage=EnrollmentStage.ON_HOLD)
         cr_out_of_orbit = _lost(status=MemberStatus.OUT_OF_ORBIT)
         cr_out_of_range = _lost(status=MemberStatus.OUT_OF_RANGE)
-        cr_cancelled = _lost(enrollment__stage=EnrollmentStage.CANCELLED)
+        # Members on an INELIGIBLE program (client hard off-ramped to Ineligible),
+        # replacing the old Cancelled-enrollment bucket.
+        cr_ineligible = _lost(client__lifecycle_stage=ClientStage.INELIGIBLE)
         lost_total = (
-            cr_paused + cr_on_hold + cr_out_of_orbit + cr_out_of_range + cr_cancelled
+            cr_paused + cr_on_hold + cr_out_of_orbit + cr_out_of_range + cr_ineligible
         )
 
         # Base: Total Members across open cases (the "Total Members" card's
@@ -733,7 +737,7 @@ class DashboardView(PortalAPIView):
             "on_hold": cr_on_hold,
             "out_of_orbit": cr_out_of_orbit,
             "out_of_range": cr_out_of_range,
-            "cancelled": cr_cancelled,
+            "ineligible": cr_ineligible,
             "lost_total": lost_total,
             "base": base_members,
             "rate": (
