@@ -5203,20 +5203,6 @@ class DashboardGoverningCaseTests(TestCase):
             date_opened=datetime(2026, 1, opened, 12, tzinfo=dt_tz.utc),
         )
 
-    def _enroll(self, client):
-        # The Total Open Cases card mirrors the Members page: only members with an
-        # enrollment (own or household) are counted. Give the client one.
-        from .models import (
-            EnrollmentStage, EnrollmentVerification, Household, HouseholdMember,
-        )
-
-        hh = Household.objects.create(name="HH")
-        HouseholdMember.objects.create(household=hh, client=client, is_primary=True)
-        return EnrollmentVerification.objects.create(
-            client=client, household=hh, stage=EnrollmentStage.SERVICE_ACTIVE,
-            program_name="Medically Tailored Meals",
-        )
-
     def test_governing_case_ids_picks_one_per_client(self):
         from .models import ServiceAuthorizationStatus
         from .portal.views_dashboard import governing_internal_case_ids
@@ -5239,11 +5225,9 @@ class DashboardGoverningCaseTests(TestCase):
         a = self._client("Appr", "Oved")
         self._case(a, ServiceAuthorizationStatus.APPROVED, opened=1)
         self._case(a, ServiceAuthorizationStatus.DENIED, opened=20)
-        self._enroll(a)
         # Client B: sole case DENIED -> that IS their governing case.
         b = self._client("Den", "Ied")
         self._case(b, ServiceAuthorizationStatus.DENIED, opened=5)
-        self._enroll(b)
 
         resp = self._auth().get(reverse("portal-dashboard"))
         self.assertEqual(resp.status_code, 200, resp.content)

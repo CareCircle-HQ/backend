@@ -13,7 +13,7 @@ all-time live snapshot. ``All Time`` applies no date filter to any metric. See
 
 from datetime import date, timedelta
 
-from django.db.models import Exists, OuterRef, Q
+from django.db.models import Q
 from django.utils import timezone
 from django.utils.dateparse import parse_date
 from rest_framework.response import Response
@@ -591,59 +591,34 @@ class DashboardView(PortalAPIView):
         open_cases = ic_in_range.exclude(case_status__in=_TERMINAL_CASE_STATUSES)
 
         # --- 1.1 Open cases + authorization breakdown (TIME-FRAME SENSITIVE) ---
-        # Mirrors the Members page "Eligible -> Internal Service = Open ->
-        # Household / Individual" filter EXACTLY: ELIGIBLE members (lifecycle !=
-        # INELIGIBLE) who have ANY non-terminal internal-service case (Exists) AND
-        # an enrollment (own or household). Household vs Individual is read from
-        # the ENROLLMENT program name (own or household enrollment), the same rule
-        # the Members page uses -- NOT the case's program. Counted per member
-        # (case holder); a member with no enrollment/program is excluded (neither
-        # bucket), so household + individual == total.
-        open_isc_sub = Case.objects.filter(
-            client=OuterRef("pk"), case_type=CaseType.INTERNAL_SERVICE,
-        ).exclude(case_status__in=_TERMINAL_CASE_STATUSES)
-        if start is not None:  # time-frame: an ISC case OPENED in the window
-            open_isc_sub = open_isc_sub.filter(
-                date_opened__date__gte=start, date_opened__date__lte=end
+        # Count the OPEN internal-service cases -- one GOVERNING case per client
+        # (governing_internal_case_ids already excludes blank / never_requested
+        # authorizations, which can never govern). No eligibility or enrollment
+        # requirement, so members still in NAVIGATION (open case, verification not
+        # yet requested) ARE counted. Scoped to cases opened in the date range.
+        scoped_rows = list(
+            open_cases.values(
+                "client_id", "service_authorization_status", "program_name"
             )
-        eligible_open = (
-            Client.objects.exclude(lifecycle_stage=ClientStage.INELIGIBLE)
-            .filter(Exists(open_isc_sub))
         )
-        household_prog = (
-            Q(enrollments__program_name__icontains="household")
-            | Q(household_membership__household__enrollment_verifications__program_name__icontains="household")
-        )
-        has_prog = (
-            Q(enrollments__isnull=False)
-            | Q(household_membership__household__enrollment_verifications__isnull=False)
-        )
-        hh_ids = set(eligible_open.filter(household_prog).values_list("client_id", flat=True))
-        ind_ids = set(
-            eligible_open.filter(has_prog).exclude(household_prog)
-            .values_list("client_id", flat=True)
-        )
-        counted = hh_ids | ind_ids
-
-        # Authorization bucket per counted member, from their GOVERNING case
-        # (blank / never_requested never govern -> those fall to "other").
+        auth_counts = {"accepted": 0, "requested": 0, "rejected": 0, "other": 0}
         _AUTH_BUCKET = {
             ServiceAuthorizationStatus.APPROVED: "accepted",
             ServiceAuthorizationStatus.PENDING: "requested",
             ServiceAuthorizationStatus.DENIED: "rejected",
         }
-        gov_auth = dict(
-            Case.objects.filter(case_id__in=gov_ids)
-            .values_list("client_id", "service_authorization_status")
-        )
-        auth_counts = {"accepted": 0, "requested": 0, "rejected": 0, "other": 0}
-        for cid in counted:
-            auth_counts[_AUTH_BUCKET.get(gov_auth.get(cid), "other")] += 1
+        # Household vs Individual from the case PROGRAM NAME keyword -- the same
+        # live rule as ``derive_household_type`` / the Cases export.
+        household_cases = 0
+        for row in scoped_rows:
+            auth_counts[_AUTH_BUCKET.get(row["service_authorization_status"], "other")] += 1
+            if "household" in (row["program_name"] or "").casefold():
+                household_cases += 1
 
         open_cases_payload = {
-            "total": len(counted),
-            "household": len(hh_ids),
-            "individual": len(ind_ids),
+            "total": len(scoped_rows),
+            "household": household_cases,
+            "individual": len(scoped_rows) - household_cases,
             "accepted": auth_counts["accepted"],
             "requested": auth_counts["requested"],
             "rejected": auth_counts["rejected"],
@@ -688,8 +663,9 @@ class DashboardView(PortalAPIView):
         }
 
         # --- 1.2 Members across open cases (Primary vs Household) ----------
-        # TIME-FRAME SENSITIVE: households of the counted open-case members above.
-        members_payload = self._members_breakdown(counted)
+        # TIME-FRAME SENSITIVE: households of the in-range open cases above.
+        open_client_ids = {row["client_id"] for row in scoped_rows}
+        members_payload = self._members_breakdown(open_client_ids)
 
         # --- 1.3 Total enrolled (ALL TIME, any status) --------------------
         enrolled_client_ids = set(ic.values_list("client_id", flat=True))
