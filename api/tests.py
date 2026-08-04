@@ -12169,3 +12169,36 @@ class FixCaselessServingEnrollmentsTest(TestCase):
         self.assertEqual(serving2.case_id, case2.case_id)               # bound
         self.assertIsNone(servingA.case_id)                            # ambiguous -> skipped
         self.assertEqual(servingB.case_id, case3.case_id)              # untouched
+
+
+class ReconcileBindsCaselessServingTest(TestCase):
+    """Root-cause fix: reconcile_internal_service_authorization binds the
+    governing case onto a caseless serving enrollment (freeing a stray), so the
+    split can't persist/recur."""
+
+    def test_reconcile_binds_and_frees_stray(self):
+        from .models import (
+            Case, CaseStatus, CaseType, Client, EnrollmentStage,
+            EnrollmentVerification, ServiceAuthorizationStatus,
+        )
+        from .services.lifecycle import reconcile_internal_service_authorization
+
+        c = Client.objects.create(client_id=str(uuid.uuid4()), first_name="S", last_name="P")
+        case = Case.objects.create(
+            case_id=uuid.uuid4(), client=c, case_type=CaseType.INTERNAL_SERVICE,
+            case_status=CaseStatus.OPEN, program_name="Medically Tailored Meals",
+            service_authorization_status=ServiceAuthorizationStatus.APPROVED,
+        )
+        serving = EnrollmentVerification.objects.create(
+            client=c, stage=EnrollmentStage.SERVICE_ACTIVE, case=None,
+        )
+        stray = EnrollmentVerification.objects.create(
+            client=c, stage=EnrollmentStage.PENDING_VERIFICATION, case=case,
+        )
+
+        reconcile_internal_service_authorization(c)
+
+        serving.refresh_from_db(); stray.refresh_from_db()
+        self.assertEqual(serving.case_id, case.case_id)              # bound
+        self.assertEqual(stray.stage, EnrollmentStage.DISREGARDED)   # freed
+        self.assertIsNone(stray.case_id)
