@@ -5011,7 +5011,7 @@ class DashboardServingClientIdsTests(TestCase):
     insurance/social-coverage watchlist. Uses all-time (start=None), a live
     snapshot over every member profile."""
 
-    def _member(self, *, status=None, stage=None, case_status=None):
+    def _member(self, *, status=None, stage=None, case_status=None, auth=None):
         from .models import (
             Case, CaseStatus, CaseType, Client, EnrollmentStage,
             EnrollmentVerification, Household, HouseholdMember,
@@ -5025,10 +5025,12 @@ class DashboardServingClientIdsTests(TestCase):
         HouseholdMember.objects.create(household=hh, client=client, is_primary=True)
         # Every dashboard serving/watchlist reason is gated to members whose
         # GOVERNING internal-service case is OPEN, so give the member one (open by
-        # default; pass case_status to test the closed-case exclusion).
+        # default; pass case_status to test the closed-case exclusion, auth to set
+        # the authorization status -- members_paused needs it APPROVED).
         case = Case.objects.create(
             case_id=uuid.uuid4(), client=client, case_type=CaseType.INTERNAL_SERVICE,
             case_status=case_status or CaseStatus.OPEN,
+            service_authorization_status=auth or "",
             program_name="Medically Tailored Meals",
         )
         enr = EnrollmentVerification.objects.create(
@@ -5042,18 +5044,26 @@ class DashboardServingClientIdsTests(TestCase):
         return client
 
     def test_programs_on_hold_and_members_paused_split(self):
-        # PROGRAM on hold (household-wide, enrollment stage ON_HOLD) vs an
-        # individually PAUSED member (program still active) are separate reasons.
-        from .models import EnrollmentStage, MemberStatus
+        # PROGRAM on hold (household-wide, enrollment stage ON_HOLD) vs a program
+        # with a PAUSED member (open + APPROVED governing case) are separate.
+        from .models import (
+            EnrollmentStage, MemberStatus, ServiceAuthorizationStatus,
+        )
         from .portal.views_dashboard import serving_client_ids
 
+        # Paused member on an OPEN + APPROVED program -> members_paused.
         paused = self._member(
-            status=MemberStatus.PAUSED, stage=EnrollmentStage.SERVICE_ACTIVE
+            status=MemberStatus.PAUSED, stage=EnrollmentStage.SERVICE_ACTIVE,
+            auth=ServiceAuthorizationStatus.APPROVED,
+        )
+        # Paused member but auth NOT approved -> excluded from members_paused.
+        paused_unapproved = self._member(
+            status=MemberStatus.PAUSED, stage=EnrollmentStage.SERVICE_ACTIVE,
+            auth=ServiceAuthorizationStatus.PENDING,
         )
         on_hold = self._member(stage=EnrollmentStage.ON_HOLD)  # status Active
         active = self._member()
-        # An on-hold PROGRAM counts regardless of the member's own status -- it's
-        # a pure program fact (the member also shows on the Out-of-Range card).
+        # An on-hold PROGRAM counts regardless of the member's own status.
         oor_on_hold = self._member(
             status=MemberStatus.OUT_OF_RANGE, stage=EnrollmentStage.ON_HOLD
         )
@@ -5061,13 +5071,13 @@ class DashboardServingClientIdsTests(TestCase):
         on_hold_ids = serving_client_ids("programs_on_hold", start=None, end=None)
         paused_ids = serving_client_ids("members_paused", start=None, end=None)
 
-        # Every on-hold program (open governing case) counts, whatever the member
-        # status -- and never under members_paused.
+        # On-hold programs (open governing case) count whatever the member status.
         self.assertIn(on_hold.client_id, on_hold_ids)
         self.assertIn(oor_on_hold.client_id, on_hold_ids)
         self.assertNotIn(on_hold.client_id, paused_ids)
-        # Individually paused (active program) -> members_paused only.
+        # members_paused: only the paused member on an OPEN + APPROVED program.
         self.assertIn(paused.client_id, paused_ids)
+        self.assertNotIn(paused_unapproved.client_id, paused_ids)
         self.assertNotIn(paused.client_id, on_hold_ids)
         # A plain active (not on-hold) member is in neither.
         self.assertNotIn(active.client_id, on_hold_ids | paused_ids)

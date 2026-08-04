@@ -200,6 +200,18 @@ def serving_client_ids(reason, *, start, end, governing_ids=None):
             )
         return _open_gov_cache["v"]
 
+    def open_approved_gov_clients():
+        """client_ids whose GOVERNING case is OPEN *and* authorization APPROVED --
+        a live, authorized program. Used by members_paused."""
+        if "a" not in _open_gov_cache:
+            _open_gov_cache["a"] = set(
+                Case.objects.filter(case_id__in=gov())
+                .exclude(case_status__in=_TERMINAL_CASE_STATUSES)
+                .filter(service_authorization_status=ServiceAuthorizationStatus.APPROVED)
+                .values_list("client_id", flat=True)
+            )
+        return _open_gov_cache["a"]
+
     if reason == "needs_verification":
         # Mirror the Verification page's "Pending + Requested-date" filter EXACTLY
         # (same helpers) so this card can never drift from what agents see there:
@@ -262,12 +274,15 @@ def serving_client_ids(reason, *, start, end, governing_ids=None):
         )).values_list("client_id", flat=True)) & open_gov_clients()
         return set(_primary_map(member_ids).values())
     if reason == "members_paused":
-        # MEMBER-level pause: an individual member Paused while their program is
-        # still active (the household is NOT on hold). Counted per member.
-        return set(scope(mdp.filter(
-            status=MemberStatus.PAUSED,
-            enrollment__stage=EnrollmentStage.SERVICE_ACTIVE,
-        )).values_list("client_id", flat=True)) & open_gov_clients()
+        # PROGRAMS that have at least one individually-PAUSED member, whose
+        # GOVERNING case is OPEN *and* APPROVED (a live, authorized program).
+        # Counted per PROGRAM: collapse the paused members to their household
+        # primary (the case holder) so the drill-down link drives to the program.
+        paused = set(scope(
+            mdp.filter(status=MemberStatus.PAUSED)
+        ).values_list("client_id", flat=True))
+        primaries = set(_primary_map(paused).values())
+        return primaries & open_approved_gov_clients()
     if reason == "pending_closure":
         # Only a closure ticket on the GOVERNING case flags the member -- a ticket
         # on a non-governing case is not their service closing.
@@ -413,15 +428,29 @@ def _serving_details(reason, client_ids, *, start, end, governing_ids=None):
             out[p.client_id] = f"Program on hold · {name}" if name else "Program on hold (under review)"
         return out
     if reason == "members_paused":
+        # ids are program primaries. Count paused members per program (mapped to
+        # their primary) and label with the program name.
+        paused_ids = list(
+            mdp.filter(status=MemberStatus.PAUSED).values_list("client_id", flat=True)
+        )
+        prim = _primary_map(set(paused_ids))
+        counts = {}
+        for cid in paused_ids:
+            pk = prim.get(cid, cid)
+            counts[pk] = counts.get(pk, 0) + 1
         out = {}
         for p in (
-            mdp.filter(client_id__in=ids, status=MemberStatus.PAUSED)
+            mdp.filter(client_id__in=ids)
+            .select_related("enrollment__case")
             .order_by("client_id")
         ):
             if p.client_id in out:
                 continue
-            since = _fmt_date(p.status_changed_at)
-            out[p.client_id] = f"Paused{f' · since {since}' if since else ''}"
+            case = getattr(p.enrollment, "case", None)
+            name = (getattr(case, "program_name", "") or "").strip()
+            n = counts.get(p.client_id, 1)
+            base = f"{n} paused member{'' if n == 1 else 's'}"
+            out[p.client_id] = f"{base} · {name}" if name else base
         return out
     if reason == "pending_closure":
         tickets = Ticket.objects.filter(
