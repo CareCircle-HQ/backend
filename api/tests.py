@@ -11330,3 +11330,203 @@ class DedupePoDeliveryOrdersCommandTest(TestCase):
         self.assertEqual(live.count(), 1)  # kept exactly one
         solo.refresh_from_db()
         self.assertEqual(solo.status, DeliveryOrderStatus.PENDING)  # untouched
+
+
+class DeliveryCalendarNoDuplicateTest(TestCase):
+    """_dedupe_calendar_occurrences never lets the same client land on the same
+    delivery date + product kind twice -- across enrollments AND within a batch.
+    This is the upstream guard that stops duplicate PO lines."""
+
+    def _profile(self, client, enrollment):
+        from .models import MemberDietaryProfile, MemberStatus
+        return MemberDietaryProfile.objects.create(
+            enrollment=enrollment, client=client, status=MemberStatus.ACTIVE,
+        )
+
+    def test_dedupes_across_enrollments_and_within_batch(self):
+        from datetime import date
+
+        from .models import (
+            Client, EnrollmentStage, EnrollmentVerification, OrderSchedule,
+            OrderStatus,
+        )
+        from .services.orders import _dedupe_calendar_occurrences
+
+        client = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Dup", last_name="Cal",
+        )
+        prog = "Medically Tailored Meals"
+        d = date(2026, 8, 6)
+
+        # Enrollment A already has a LIVE order for this client on date d.
+        enrA = EnrollmentVerification.objects.create(
+            client=client, stage=EnrollmentStage.SERVICE_ACTIVE, program_name=prog,
+        )
+        mpA = self._profile(client, enrA)
+        OrderSchedule.objects.create(
+            enrollment=enrA, member=mpA, program_name=prog,
+            anticipated_delivery_date=d, status=OrderStatus.SCHEDULED,
+        )
+
+        # Enrollment B (same client, same program) tries to build the SAME date
+        # plus a different date -> only the new date survives.
+        enrB = EnrollmentVerification.objects.create(
+            client=client, stage=EnrollmentStage.SERVICE_ACTIVE, program_name=prog,
+        )
+        mpB = self._profile(client, enrB)
+        other = date(2026, 8, 13)
+        candidates = [
+            OrderSchedule(enrollment=enrB, member=mpB, program_name=prog,
+                          anticipated_delivery_date=d),           # dup of enrA -> drop
+            OrderSchedule(enrollment=enrB, member=mpB, program_name=prog,
+                          anticipated_delivery_date=other),       # new date -> keep
+            OrderSchedule(enrollment=enrB, member=mpB, program_name=prog,
+                          anticipated_delivery_date=other),       # intra-batch dup -> drop
+        ]
+        kept = _dedupe_calendar_occurrences(candidates)
+        self.assertEqual(len(kept), 1)
+        self.assertEqual(kept[0].anticipated_delivery_date, other)
+
+    def test_cancelled_existing_does_not_block(self):
+        from datetime import date
+
+        from .models import (
+            Client, EnrollmentStage, EnrollmentVerification, OrderSchedule,
+            OrderStatus,
+        )
+        from .services.orders import _dedupe_calendar_occurrences
+
+        client = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Canc", last_name="Cal",
+        )
+        prog = "Medically Tailored Meals"
+        d = date(2026, 8, 6)
+        enr = EnrollmentVerification.objects.create(
+            client=client, stage=EnrollmentStage.SERVICE_ACTIVE, program_name=prog,
+        )
+        mp = self._profile(client, enr)
+        OrderSchedule.objects.create(
+            enrollment=enr, member=mp, program_name=prog,
+            anticipated_delivery_date=d, status=OrderStatus.CANCELLED,
+        )
+        kept = _dedupe_calendar_occurrences([
+            OrderSchedule(enrollment=enr, member=mp, program_name=prog,
+                          anticipated_delivery_date=d),
+        ])
+        self.assertEqual(len(kept), 1)  # cancelled order doesn't block a new one
+
+
+class DeliveryCalendarExcludesDeadEnrollmentsTest(TestCase):
+    """The member delivery calendar reflects only LIVE enrollments: a closed
+    (superseded) enrollment's occurrences -- even on a different kitchen -- must
+    not show, so a member never reads as served by two kitchens. The
+    ?enrollment=<id> override still surfaces a dead enrollment read-only."""
+
+    def _api(self):
+        from rest_framework.test import APIClient
+        from rest_framework_simplejwt.tokens import AccessToken
+
+        from .models import Agent
+
+        agent = Agent.objects.create(name="Cal", agent_code="967", group="Management")
+        access = AccessToken()
+        access["agent_id"] = str(agent.id)
+        access["agent_code"] = agent.agent_code
+        access["agent_name"] = agent.name
+        access["agent_group"] = agent.group
+        api = APIClient()
+        api.credentials(HTTP_AUTHORIZATION=f"Bearer {access}")
+        return api
+
+    def test_dead_enrollment_kitchen_hidden_by_default(self):
+        from datetime import date
+
+        from .models import (
+            Client, EnrollmentStage, EnrollmentVerification, Household,
+            HouseholdMember, Kitchen, KitchenStatus, MemberDietaryProfile,
+            MemberStatus, OrderSchedule, OrderStatus,
+        )
+
+        client = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Two", last_name="Kitchen",
+        )
+        hh = Household.objects.create(name="HH")
+        HouseholdMember.objects.create(household=hh, client=client, is_primary=True)
+        live_k = Kitchen.objects.create(name="LiveKitchenAAA", status=KitchenStatus.ACTIVE)
+        dead_k = Kitchen.objects.create(name="DeadKitchenBBB", status=KitchenStatus.ACTIVE)
+        d = date(2026, 8, 7)
+
+        live = EnrollmentVerification.objects.create(
+            client=client, household=hh, kitchen=live_k,
+            stage=EnrollmentStage.SERVICE_ACTIVE, program_name="Meals",
+        )
+        live_mp = MemberDietaryProfile.objects.create(
+            enrollment=live, client=client, status=MemberStatus.ACTIVE,
+        )
+        OrderSchedule.objects.create(
+            enrollment=live, member=live_mp, kitchen=live_k, program_name="Meals",
+            anticipated_delivery_date=d, status=OrderStatus.SCHEDULED, household=hh,
+        )
+        dead = EnrollmentVerification.objects.create(
+            client=client, household=hh, kitchen=dead_k,
+            stage=EnrollmentStage.CLOSED, program_name="Meals",
+        )
+        dead_mp = MemberDietaryProfile.objects.create(
+            enrollment=dead, client=client, status=MemberStatus.ACTIVE,
+        )
+        OrderSchedule.objects.create(
+            enrollment=dead, member=dead_mp, kitchen=dead_k, program_name="Meals",
+            anticipated_delivery_date=d, status=OrderStatus.SCHEDULED, household=hh,
+        )
+
+        api = self._api()
+        url = f"/api/portal/members/{client.client_id}/delivery-calendar/"
+        body = api.get(url).content.decode()
+        self.assertIn("LiveKitchenAAA", body)
+        self.assertNotIn("DeadKitchenBBB", body)  # dead enrollment hidden
+
+        # The override still surfaces the dead enrollment's own calendar.
+        override = api.get(f"{url}?enrollment={dead.pk}").content.decode()
+        self.assertIn("DeadKitchenBBB", override)
+
+
+class ClosingEnrollmentClearsCalendarTest(TestCase):
+    """Advancing an enrollment to a terminal stage (Closed/Cancelled) must stop
+    its future deliveries -- so a superseded enrollment can't keep a live
+    calendar (the root cause of a member showing two kitchens after a governing
+    case replacement). Centralized in advance_enrollment, covering every close
+    path."""
+
+    def test_close_removes_future_scheduled_occurrences(self):
+        from datetime import timedelta
+
+        from django.utils import timezone
+
+        from .models import (
+            Client, EnrollmentStage, EnrollmentVerification, MemberDietaryProfile,
+            MemberStatus, OrderSchedule, OrderStatus,
+        )
+        from .services.lifecycle import advance_enrollment
+
+        client = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Close", last_name="Cal",
+        )
+        enr = EnrollmentVerification.objects.create(
+            client=client, stage=EnrollmentStage.SERVICE_ACTIVE, program_name="Meals",
+        )
+        mp = MemberDietaryProfile.objects.create(
+            enrollment=enr, client=client, status=MemberStatus.ACTIVE,
+        )
+        future = timezone.localdate() + timedelta(days=7)
+        OrderSchedule.objects.create(
+            enrollment=enr, member=mp, program_name="Meals",
+            anticipated_delivery_date=future, status=OrderStatus.SCHEDULED,
+        )
+
+        advance_enrollment(enr, EnrollmentStage.CLOSED, force=True)
+
+        live_future = (
+            OrderSchedule.objects.filter(enrollment=enr, anticipated_delivery_date=future)
+            .exclude(status=OrderStatus.CANCELLED)
+        )
+        self.assertEqual(live_future.count(), 0)  # future delivery stopped on close

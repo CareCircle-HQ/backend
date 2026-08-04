@@ -66,6 +66,14 @@ _MEMBER_EXCLUSION = {
 _TERMINAL_STAGES = (
     EnrollmentStage.SERVICE_COMPLETE, EnrollmentStage.CLOSED, EnrollmentStage.CANCELLED,
 )
+# DEAD enrollments -- closed (e.g. superseded when the governing case was
+# replaced), cancelled, or disregarded. Their delivery occurrences are stale
+# history and must NOT appear on the member's live calendar (otherwise a member
+# reads as served by two kitchens / duplicate service). The ?enrollment=<id>
+# override still surfaces a specific dead enrollment's calendar read-only.
+_DEAD_ENROLLMENT_STAGES = (
+    EnrollmentStage.CLOSED, EnrollmentStage.CANCELLED, EnrollmentStage.DISREGARDED,
+)
 
 
 def _exclusion_state(enrollment, member):
@@ -124,9 +132,16 @@ class MemberDeliveryCalendarView(PortalAPIView):
                 .values_list("pk", flat=True)
             )
 
+        occ_qs = OrderSchedule.objects.filter(member_id__in=profile_ids)
+        if not override:
+            # Default (household) calendar reflects only LIVE enrollments; a dead
+            # (closed/superseded/cancelled) enrollment's occurrences are stale
+            # history -- excluding them stops a member reading as served by two
+            # kitchens. A specific dead enrollment is still viewable via
+            # ?enrollment=<id>.
+            occ_qs = occ_qs.exclude(enrollment__stage__in=_DEAD_ENROLLMENT_STAGES)
         occurrences = list(
-            OrderSchedule.objects.filter(member_id__in=profile_ids)
-            .select_related("kitchen", "enrollment", "member")
+            occ_qs.select_related("kitchen", "enrollment", "member")
             .order_by("anticipated_delivery_date")
         ) if profile_ids else []
 
