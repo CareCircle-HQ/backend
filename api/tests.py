@@ -11216,3 +11216,74 @@ class AllVerificationsReportTest(TestCase):
         self.assertIn(str(client.client_id), lines[1])
         # All three dates present (requested/completed/authorized).
         self.assertEqual(lines[1].count(str((now - timedelta(days=2)).date())), 1)
+
+
+class SyncHouseholdOutOfOrbitEventGateTest(TestCase):
+    """A placeholder member profile created before a kitchen is assigned (e.g.
+    right after Request Verification, still Pending Verification) must NOT emit a
+    'Household set as Out of Orbit' event/note -- out of orbit only means a
+    kitchen can't fulfill the member, which is meaningless with no kitchen. Once
+    a kitchen IS assigned, the event fires as before."""
+
+    def _setup(self, *, with_kitchen):
+        from .models import (
+            Client, EnrollmentStage, EnrollmentVerification, Household,
+            HouseholdMember, Kitchen, KitchenStatus, MemberDietaryProfile,
+            MemberStatus,
+        )
+
+        primary = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Pat", last_name="Primary",
+        )
+        hh = Household.objects.create(name="HH")
+        HouseholdMember.objects.create(household=hh, client=primary, is_primary=True)
+        kitchen = (
+            Kitchen.objects.create(name="K", status=KitchenStatus.ACTIVE)
+            if with_kitchen else None
+        )
+        enr = EnrollmentVerification.objects.create(
+            client=primary, household=hh, kitchen=kitchen,
+            stage=EnrollmentStage.KITCHEN_ASSIGNMENT if with_kitchen
+            else EnrollmentStage.PENDING_VERIFICATION,
+        )
+        MemberDietaryProfile.objects.create(
+            enrollment=enr, client=primary, menu_type="Standard",
+            status=MemberStatus.ACTIVE,
+        )
+        dep = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Dee", last_name="Pendent",
+        )
+        HouseholdMember.objects.create(household=hh, client=dep, is_primary=False)
+        return primary, dep, enr
+
+    def test_no_out_of_orbit_event_before_kitchen(self):
+        from .models import (
+            MemberDietaryProfile, MemberStatus, Note, NoteSource, TimelineEvent,
+            TimelineEventType,
+        )
+        from .serializers import sync_household_members
+
+        primary, dep, enr = self._setup(with_kitchen=False)
+        sync_household_members(primary, enrollment=enr)
+
+        prof = MemberDietaryProfile.objects.get(enrollment=enr, client=dep)
+        self.assertEqual(prof.status, MemberStatus.OUT_OF_ORBIT)  # placeholder kept
+        self.assertFalse(
+            TimelineEvent.objects.filter(
+                client=dep, event_type=TimelineEventType.OUT_OF_ORBIT
+            ).exists()
+        )
+        self.assertFalse(Note.objects.filter(client=dep, source=NoteSource.SYSTEM).exists())
+
+    def test_out_of_orbit_event_fires_with_kitchen(self):
+        from .models import TimelineEvent, TimelineEventType
+        from .serializers import sync_household_members
+
+        primary, dep, enr = self._setup(with_kitchen=True)
+        sync_household_members(primary, enrollment=enr)
+
+        self.assertTrue(
+            TimelineEvent.objects.filter(
+                client=dep, event_type=TimelineEventType.OUT_OF_ORBIT
+            ).exists()
+        )

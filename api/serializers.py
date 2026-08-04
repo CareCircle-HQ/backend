@@ -709,6 +709,17 @@ def sync_household_members(client, enrollment=None, agent=None):
             except Exception:
                 logger.warning("household member out-of-range event failed", exc_info=True)
             continue
+        # "Out of Orbit" means a member's menu/allergies can't be fulfilled by
+        # the assigned KITCHEN -- it is meaningless before a kitchen exists. When
+        # the household has no kitchen yet (e.g. the placeholder profile created
+        # right after Request Verification, still Pending Verification), the
+        # profile stays Out of Orbit as an internal "needs a menu type"
+        # placeholder, but we DON'T emit the note/timeline event: firing
+        # "Household set as Out of Orbit" on a member who was just requested for
+        # verification (no kitchen, not yet verified) is misleading. The event
+        # fires later, if warranted, once a kitchen is assigned.
+        if not enrollment.kitchen_id:
+            continue
         # This member was added outside the verification wizard, so leave a
         # system note explaining why they start Out of Orbit + what's needed to
         # activate them, AND log the Out-of-Orbit event to the timeline (same as
