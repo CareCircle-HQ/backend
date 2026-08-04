@@ -5041,7 +5041,9 @@ class DashboardServingClientIdsTests(TestCase):
         )
         return client
 
-    def test_services_paused_covers_member_paused_and_household_on_hold(self):
+    def test_programs_on_hold_and_members_paused_split(self):
+        # PROGRAM on hold (household-wide, enrollment stage ON_HOLD) vs an
+        # individually PAUSED member (program still active) are separate reasons.
         from .models import EnrollmentStage, MemberStatus
         from .portal.views_dashboard import serving_client_ids
 
@@ -5050,17 +5052,24 @@ class DashboardServingClientIdsTests(TestCase):
         )
         on_hold = self._member(stage=EnrollmentStage.ON_HOLD)  # status Active
         active = self._member()
-        # Out-of-Range members of an on-hold household surface under their own
-        # reason, so they must NOT also be counted here (no double counting).
+        # Out-of-Range members surface under their own reason -- never here.
         oor_on_hold = self._member(
             status=MemberStatus.OUT_OF_RANGE, stage=EnrollmentStage.ON_HOLD
         )
 
-        ids = serving_client_ids("services_paused", start=None, end=None)
-        self.assertIn(paused.client_id, ids)
-        self.assertIn(on_hold.client_id, ids)
-        self.assertNotIn(active.client_id, ids)
-        self.assertNotIn(oor_on_hold.client_id, ids)
+        on_hold_ids = serving_client_ids("programs_on_hold", start=None, end=None)
+        paused_ids = serving_client_ids("members_paused", start=None, end=None)
+
+        # On-hold program -> counted under programs_on_hold (as its primary), not
+        # members_paused.
+        self.assertIn(on_hold.client_id, on_hold_ids)
+        self.assertNotIn(on_hold.client_id, paused_ids)
+        # Individually paused (active program) -> members_paused only.
+        self.assertIn(paused.client_id, paused_ids)
+        self.assertNotIn(paused.client_id, on_hold_ids)
+        # Neither flags a plain active member or the out-of-range one.
+        self.assertNotIn(active.client_id, on_hold_ids | paused_ids)
+        self.assertNotIn(oor_on_hold.client_id, paused_ids)
 
     def test_closed_governing_case_excludes_from_reasons(self):
         # Every serving/watchlist reason is gated to an OPEN governing case: a

@@ -49,7 +49,7 @@ _TERMINAL_CASE_STATUSES = [CaseStatus.CLOSED, CaseStatus.CANCELLED]
 # watchlist (which can overlap with actively-served members).
 _SERVING_REASONS = frozenset({
     "needs_verification", "rejected_case", "out_of_range",
-    "services_paused", "pending_closure", "out_of_orbit",
+    "programs_on_hold", "members_paused", "pending_closure", "out_of_orbit",
     "insurance_expiring", "no_social_coverage",
 })
 
@@ -249,21 +249,24 @@ def serving_client_ids(reason, *, start, end, governing_ids=None):
         return set(scope(
             mdp.filter(status=MemberStatus.OUT_OF_ORBIT)
         ).values_list("client_id", flat=True)) & open_gov_clients()
-    if reason == "services_paused":
-        # A member individually Paused within the active-service pipeline, OR an
-        # otherwise-Active member whose household is On Hold -- the "not currently
-        # served" states the Receiving Meals card excludes. Out-of-Orbit /
-        # Out-of-Range members of on-hold households are deliberately excluded --
-        # they surface under their own reasons, so counting them here too would
-        # double-count them.
+    if reason == "programs_on_hold":
+        # PROGRAM-level pause: the enrollment (the household's meal/box program)
+        # is On Hold -- a household-wide state. Counted by PROGRAM: collapse each
+        # member of an on-hold enrollment to its household primary (the case
+        # holder), so the count is the number of on-hold programs, not the number
+        # of members inside them. Excludes Out-of-Orbit/Out-of-Range members
+        # (they surface under their own reasons).
+        member_ids = set(scope(mdp.filter(
+            enrollment__stage=EnrollmentStage.ON_HOLD,
+            status__in=[MemberStatus.ACTIVE, MemberStatus.PAUSED],
+        )).values_list("client_id", flat=True)) & open_gov_clients()
+        return set(_primary_map(member_ids).values())
+    if reason == "members_paused":
+        # MEMBER-level pause: an individual member Paused while their program is
+        # still active (the household is NOT on hold). Counted per member.
         return set(scope(mdp.filter(
-            Q(
-                status=MemberStatus.PAUSED,
-                enrollment__stage__in=[
-                    EnrollmentStage.SERVICE_ACTIVE, EnrollmentStage.ON_HOLD,
-                ],
-            )
-            | Q(status=MemberStatus.ACTIVE, enrollment__stage=EnrollmentStage.ON_HOLD)
+            status=MemberStatus.PAUSED,
+            enrollment__stage=EnrollmentStage.SERVICE_ACTIVE,
         )).values_list("client_id", flat=True)) & open_gov_clients()
     if reason == "pending_closure":
         # Only a closure ticket on the GOVERNING case flags the member -- a ticket
@@ -392,20 +395,33 @@ def _serving_details(reason, client_ids, *, start, end, governing_ids=None):
             since = _fmt_date(p.status_changed_at)
             out[p.client_id] = f"Since {since}" if since else ""
         return out
-    if reason == "services_paused":
+    if reason == "programs_on_hold":
+        # ids are household primaries (the program holders). Label each with its
+        # program name when available.
         out = {}
         for p in (
-            mdp.filter(client_id__in=ids)
-            .select_related("enrollment")
+            mdp.filter(
+                client_id__in=ids, enrollment__stage=EnrollmentStage.ON_HOLD
+            )
+            .select_related("enrollment__case")
             .order_by("client_id")
         ):
             if p.client_id in out:
                 continue
-            if p.status == MemberStatus.PAUSED:
-                since = _fmt_date(p.status_changed_at)
-                out[p.client_id] = f"Paused{f' · since {since}' if since else ''}"
-            elif getattr(p.enrollment, "stage", None) == EnrollmentStage.ON_HOLD:
-                out[p.client_id] = "Household on hold (under review)"
+            case = getattr(p.enrollment, "case", None)
+            name = (getattr(case, "program_name", "") or "").strip()
+            out[p.client_id] = f"Program on hold · {name}" if name else "Program on hold (under review)"
+        return out
+    if reason == "members_paused":
+        out = {}
+        for p in (
+            mdp.filter(client_id__in=ids, status=MemberStatus.PAUSED)
+            .order_by("client_id")
+        ):
+            if p.client_id in out:
+                continue
+            since = _fmt_date(p.status_changed_at)
+            out[p.client_id] = f"Paused{f' · since {since}' if since else ''}"
         return out
     if reason == "pending_closure":
         tickets = Ticket.objects.filter(
@@ -674,8 +690,10 @@ class DashboardView(PortalAPIView):
                 "rejected_case": _count("rejected_case"),
                 # 2.3d Delivery/primary ZIP outside coverage (geographic block).
                 "out_of_range": _count("out_of_range"),
-                # 2.3e Member Paused (benign) OR household On Hold (under review).
-                "services_paused": _count("services_paused"),
+                # 2.3e PROGRAM on hold (household-wide, counted per program) vs a
+                # MEMBER individually paused (counted per member).
+                "programs_on_hold": _count("programs_on_hold"),
+                "members_paused": _count("members_paused"),
                 # 2.3f Closure initiated (open Case Closure ticket).
                 "pending_closure": _count("pending_closure"),
                 # 2.3g Dietary/allergy profile unfulfillable by any kitchen.
