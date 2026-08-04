@@ -12066,3 +12066,25 @@ class MemberSearchExpandedTest(TestCase):
         self.assertIn(cid, self._ids(api.get("/api/portal/members/?search=14212")))
         # a non-matching query does not return them
         self.assertNotIn(cid, self._ids(api.get("/api/portal/members/?search=Nonexistent Zzz")))
+
+
+class NoteAuthorFallbackTest(TestCase):
+    """A note with no recorded author shows its SOURCE label, not a blank the UI
+    renders as 'Unknown'."""
+
+    def test_blank_author_falls_back_to_source_label(self):
+        from .models import Client, Note, NoteSource
+        from .portal.serializers import PortalNoteSerializer
+
+        c = Client.objects.create(client_id=str(uuid.uuid4()), first_name="A", last_name="B")
+        cases = {
+            NoteSource.SYSTEM: "System",
+            NoteSource.UNITE_US: "Unite Us",
+            NoteSource.GHL: "GoHighLevel",
+        }
+        for src, label in cases.items():
+            n = Note.objects.create(client=c, source=src, author_name="", body="x")
+            self.assertEqual(PortalNoteSerializer(n).data["author_name"], label)
+        # A real author is preserved.
+        n = Note.objects.create(client=c, source=NoteSource.UNITE_US, author_name="Jane Doe", body="y")
+        self.assertEqual(PortalNoteSerializer(n).data["author_name"], "Jane Doe")

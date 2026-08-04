@@ -1267,6 +1267,7 @@ class ActivityEventSerializer(HistoryEventSummarySerializer):
 class PortalNoteSerializer(serializers.ModelSerializer):
     id = serializers.IntegerField(source="pk", read_only=True)
     scope = serializers.SerializerMethodField()
+    author_name = serializers.SerializerMethodField()
     created = serializers.SerializerMethodField()
 
     class Meta:
@@ -1275,6 +1276,15 @@ class PortalNoteSerializer(serializers.ModelSerializer):
 
     def get_scope(self, obj):
         return "case" if obj.case_id else "client"
+
+    def get_author_name(self, obj):
+        # Many notes carry no recorded author -- imported Unite Us / GoHighLevel
+        # notes whose source record had none, and some system-generated notes.
+        # Rather than a blank that the UI renders as "Unknown", fall back to the
+        # note's SOURCE label ("Unite Us" / "GoHighLevel" / "System" / "Agent")
+        # so it's clear where the note came from.
+        name = (obj.author_name or "").strip()
+        return name or obj.get_source_display()
 
     def get_created(self, obj):
         dt = obj.source_created_at or obj.created_at
