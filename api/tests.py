@@ -5011,7 +5011,8 @@ class DashboardServingClientIdsTests(TestCase):
     insurance/social-coverage watchlist. Uses all-time (start=None), a live
     snapshot over every member profile."""
 
-    def _member(self, *, status=None, stage=None, case_status=None, auth=None):
+    def _member(self, *, status=None, stage=None, case_status=None, auth=None,
+                lifecycle=None):
         from .models import (
             Case, CaseStatus, CaseType, Client, EnrollmentStage,
             EnrollmentVerification, Household, HouseholdMember,
@@ -5020,6 +5021,7 @@ class DashboardServingClientIdsTests(TestCase):
 
         client = Client.objects.create(
             client_id=uuid.uuid4(), first_name="Dash", last_name="Board",
+            **({"lifecycle_stage": lifecycle} if lifecycle else {}),
         )
         hh = Household.objects.create(name="HH")
         HouseholdMember.objects.create(household=hh, client=client, is_primary=True)
@@ -5047,7 +5049,8 @@ class DashboardServingClientIdsTests(TestCase):
         # PROGRAM on hold (household-wide, enrollment stage ON_HOLD) vs a program
         # with a PAUSED member (open + APPROVED governing case) are separate.
         from .models import (
-            EnrollmentStage, MemberStatus, ServiceAuthorizationStatus,
+            ClientStage, EnrollmentStage, MemberStatus,
+            ServiceAuthorizationStatus,
         )
         from .portal.views_dashboard import serving_client_ids
 
@@ -5067,6 +5070,14 @@ class DashboardServingClientIdsTests(TestCase):
         oor_on_hold = self._member(
             status=MemberStatus.OUT_OF_RANGE, stage=EnrollmentStage.ON_HOLD
         )
+        # INELIGIBLE members are excluded from both reasons (must be Eligible).
+        on_hold_inelig = self._member(
+            stage=EnrollmentStage.ON_HOLD, lifecycle=ClientStage.INELIGIBLE
+        )
+        paused_inelig = self._member(
+            status=MemberStatus.PAUSED, stage=EnrollmentStage.SERVICE_ACTIVE,
+            auth=ServiceAuthorizationStatus.APPROVED, lifecycle=ClientStage.INELIGIBLE,
+        )
 
         on_hold_ids = serving_client_ids("programs_on_hold", start=None, end=None)
         paused_ids = serving_client_ids("members_paused", start=None, end=None)
@@ -5081,6 +5092,9 @@ class DashboardServingClientIdsTests(TestCase):
         self.assertNotIn(paused.client_id, on_hold_ids)
         # A plain active (not on-hold) member is in neither.
         self.assertNotIn(active.client_id, on_hold_ids | paused_ids)
+        # INELIGIBLE members are excluded from both (must be Eligible).
+        self.assertNotIn(on_hold_inelig.client_id, on_hold_ids)
+        self.assertNotIn(paused_inelig.client_id, paused_ids)
 
     def test_closed_governing_case_excludes_from_reasons(self):
         # Every serving/watchlist reason is gated to an OPEN governing case: a

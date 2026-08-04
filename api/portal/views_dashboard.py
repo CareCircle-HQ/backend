@@ -23,6 +23,7 @@ from ..models import (
     CaseStatus,
     CaseType,
     Client,
+    ClientStage,
     EnrollmentStage,
     HouseholdMember,
     Insurance,
@@ -271,6 +272,8 @@ def serving_client_ids(reason, *, start, end, governing_ids=None):
         # holder), so the count is on-hold programs, not members inside them.
         member_ids = set(scope(mdp.filter(
             enrollment__stage=EnrollmentStage.ON_HOLD,
+        ).exclude(
+            client__lifecycle_stage=ClientStage.INELIGIBLE  # member must be Eligible
         )).values_list("client_id", flat=True)) & open_gov_clients()
         return set(_primary_map(member_ids).values())
     if reason == "members_paused":
@@ -279,7 +282,9 @@ def serving_client_ids(reason, *, start, end, governing_ids=None):
         # Counted per PROGRAM: collapse the paused members to their household
         # primary (the case holder) so the drill-down link drives to the program.
         paused = set(scope(
-            mdp.filter(status=MemberStatus.PAUSED)
+            mdp.filter(status=MemberStatus.PAUSED).exclude(
+                client__lifecycle_stage=ClientStage.INELIGIBLE  # member must be Eligible
+            )
         ).values_list("client_id", flat=True))
         primaries = set(_primary_map(paused).values())
         return primaries & open_approved_gov_clients()
