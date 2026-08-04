@@ -869,6 +869,9 @@ class DashboardView(PortalAPIView):
             ),
             "active": active_members,
             "total": max(base_members - lost_total, 0),
+            # Quantity of OPEN (governing, in-range) internal-service cases that
+            # actually have an enrollment -- shown in the card's headline label.
+            "cases": open_cases.filter(enrollments__isnull=False).distinct().count(),
         }
 
         # Total Receiving Meals: LIVE members we are actively serving in a PO --
