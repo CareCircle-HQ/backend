@@ -12007,3 +12007,62 @@ class CareManagementRescanTest(TestCase):
         self.assertEqual(
             MemberWarning.objects.get(client=c, code=NO_KITCHEN).status, WarningStatus.RESOLVED
         )
+
+
+class MemberSearchExpandedTest(TestCase):
+    """The Members list omni-search matches phone, email, member address, and the
+    TRUE (enrollment) delivery address -- not just name / IDs."""
+
+    def _api(self):
+        from rest_framework.test import APIClient
+        from rest_framework_simplejwt.tokens import AccessToken
+
+        from .models import Agent
+        a = Agent.objects.create(name="Mgr", agent_code="905", group="Management")
+        acc = AccessToken()
+        acc["agent_id"] = str(a.id); acc["agent_code"] = a.agent_code
+        acc["agent_name"] = a.name; acc["agent_group"] = a.group
+        api = APIClient(); api.credentials(HTTP_AUTHORIZATION=f"Bearer {acc}")
+        return api
+
+    def _ids(self, resp):
+        out = set()
+        for g in resp.json()["results"]:
+            out.add(g["primary"]["id"])
+            out.update(m["id"] for m in g.get("members", []))
+        return out
+
+    def test_search_by_phone_email_and_delivery_address(self):
+        from .models import (
+            Address, ClientPhone, EnrollmentStage, EnrollmentVerification,
+            Household, HouseholdMember,
+        )
+
+        api = self._api()
+        c = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Sam", last_name="Search",
+            client_email_address="sam.search@example.com",
+        )
+        ClientPhone.objects.create(client=c, raw="(716) 555-0142", normalized="7165550142")
+        # True delivery address on the enrollment (not the profile).
+        addr = Address.objects.create(
+            client=c, type="delivery", street="69 Gatchell St", city="Buffalo",
+            state="NY", zip="14212",
+        )
+        hh = Household.objects.create(name="HH")
+        HouseholdMember.objects.create(household=hh, client=c, is_primary=True)
+        EnrollmentVerification.objects.create(
+            client=c, household=hh, stage=EnrollmentStage.SERVICE_ACTIVE,
+            delivery_address=addr,
+        )
+
+        cid = str(c.client_id)
+        # phone (formatted query -> digits)
+        self.assertIn(cid, self._ids(api.get("/api/portal/members/?search=716-555-0142")))
+        # email
+        self.assertIn(cid, self._ids(api.get("/api/portal/members/?search=sam.search@example.com")))
+        # delivery address street + zip
+        self.assertIn(cid, self._ids(api.get("/api/portal/members/?search=Gatchell")))
+        self.assertIn(cid, self._ids(api.get("/api/portal/members/?search=14212")))
+        # a non-matching query does not return them
+        self.assertNotIn(cid, self._ids(api.get("/api/portal/members/?search=Nonexistent Zzz")))
