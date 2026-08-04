@@ -49,7 +49,7 @@ _TERMINAL_CASE_STATUSES = [CaseStatus.CLOSED, CaseStatus.CANCELLED]
 # group mirrors the "Not Being Served" cards; the second is the follow-up
 # watchlist (which can overlap with actively-served members).
 _SERVING_REASONS = frozenset({
-    "needs_verification", "rejected_case", "out_of_range",
+    "needs_verification", "rejected_case", "out_of_range", "not_eligible",
     "programs_on_hold", "members_paused_agent", "members_paused_eligibility",
     "pending_closure", "out_of_orbit",
     "insurance_expiring", "no_social_coverage",
@@ -262,6 +262,13 @@ def serving_client_ids(reason, *, start, end, governing_ids=None):
         return set(scope(
             mdp.filter(status=MemberStatus.OUT_OF_ORBIT)
         ).values_list("client_id", flat=True)) & open_gov_clients()
+    if reason == "not_eligible":
+        # Every MEMBER set to the hard Ineligible off-ramp (client lifecycle ==
+        # INELIGIBLE). Per member (not collapsed) -- "all members set not
+        # eligible". Scoped to the in-range internal-service case like the others.
+        return set(scope(
+            mdp.filter(client__lifecycle_stage=ClientStage.INELIGIBLE)
+        ).values_list("client_id", flat=True))
     if reason == "programs_on_hold":
         # PROGRAM-level, matching the Members page "On Hold" filter EXACTLY: the
         # member's GOVERNING enrollment is On Hold (governing_enrollment_stage --
@@ -446,6 +453,8 @@ def _serving_details(reason, client_ids, *, start, end, governing_ids=None):
             since = _fmt_date(p.status_changed_at)
             out[p.client_id] = f"Since {since}" if since else ""
         return out
+    if reason == "not_eligible":
+        return {cid: "Set Not Eligible" for cid in ids}
     if reason == "programs_on_hold":
         # ids are household primaries (the program holders). Label each with its
         # program name when available.
@@ -782,6 +791,8 @@ class DashboardView(PortalAPIView):
                 "rejected_case": _count("rejected_case"),
                 # 2.3d Delivery/primary ZIP outside coverage (geographic block).
                 "out_of_range": _count("out_of_range"),
+                # 2.3d.1 Members set to the hard Ineligible off-ramp.
+                "not_eligible": _count("not_eligible"),
                 # 2.3e PROGRAM on hold (household-wide) vs programs with a member
                 # paused -- split by who paused them (agent vs eligibility).
                 "programs_on_hold": _count("programs_on_hold"),
