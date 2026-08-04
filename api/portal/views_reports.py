@@ -30,6 +30,8 @@ from ..models import (
     FoodAllergy,
     MemberStatus,
     ProductTypeKind,
+    ReportExport,
+    ReportExportStatus,
     ServiceAuthorizationStatus,
     SocialCareCoverageStatus,
     UniteUsAgent,
@@ -107,78 +109,19 @@ class MembersByLeadSourceReportView(PortalAPIView):
         if not lead_sources:
             return Response({"detail": "At least one lead_source is required."}, status=400)
 
-        created_from = _parse_date(request.query_params.get("created_from"))
-        created_to = _parse_date(request.query_params.get("created_to"))
-
-        # Match ANY of the selected sources (case-insensitive).
-        source_filter = functools.reduce(
-            operator.or_, (Q(lead_source__iexact=v) for v in lead_sources)
+        from .report_exports import (
+            default_filename, members_by_lead_source_rows, stream_csv_response,
         )
-        qs = (
-            Client.objects.filter(source_filter)
-            .prefetch_related(
-                "insurances",
-                "screenings",
-                "cases",
-                "household_membership__household__members",
-            )
-            .order_by("created_at")
+
+        params = {
+            "lead_sources": lead_sources,
+            "created_from": request.query_params.get("created_from"),
+            "created_to": request.query_params.get("created_to"),
+        }
+        return stream_csv_response(
+            members_by_lead_source_rows(params),
+            default_filename("members-by-lead-source"),
         )
-        if created_from:
-            qs = qs.filter(created_at__date__gte=created_from)
-        if created_to:
-            qs = qs.filter(created_at__date__lte=created_to)
-
-        label_map = _lead_source_label_map()
-
-        response = HttpResponse(content_type="text/csv")
-        filename = f"members_by_lead_source_{timezone.localdate().isoformat()}.csv"
-        response["Content-Disposition"] = f'attachment; filename="{filename}"'
-
-        writer = csv.writer(response)
-        writer.writerow([
-            "Member ID",
-            "Phone Number",
-            "Medicaid ID",
-            "Is there Screening",
-            "Is there Eligibility",
-            "Is there Internal Service Case",
-            "Household Member Count (if multi-member)",
-            "Lead Source",
-        ])
-
-        for client in qs:
-            cases = list(client.cases.all())
-            has_screening = len(list(client.screenings.all())) > 0
-            has_eligibility = any(c.case_type == CaseType.ELIGIBILITY for c in cases)
-            has_internal_service = any(
-                c.case_type == CaseType.INTERNAL_SERVICE for c in cases
-            )
-
-            # Household member count only when the client belongs to a
-            # multi-member household; blank otherwise (per the report spec).
-            household_count = ""
-            membership = getattr(client, "household_membership", None)
-            if membership is not None:
-                member_total = len(list(membership.household.members.all()))
-                if member_total > 1:
-                    household_count = member_total
-
-            raw_source = (client.lead_source or "").strip()
-            source_label = label_map.get(raw_source, raw_source)
-
-            writer.writerow([
-                str(client.client_id),
-                client.client_phone_number or "",
-                medicaid_member_id(client),
-                "Yes" if has_screening else "No",
-                "Yes" if has_eligibility else "No",
-                "Yes" if has_internal_service else "No",
-                household_count,
-                source_label,
-            ])
-
-        return response
 
 
 def _enrollment_member_clients(enrollment):
@@ -233,48 +176,18 @@ class MembersPendingVerificationReportView(PortalAPIView):
         if not (agent and (agent.group == "Management" or getattr(agent, "is_manager", False))):
             return Response({"detail": "Management access required."}, status=403)
 
-        created_from = _parse_date(request.query_params.get("created_from"))
-        created_to = _parse_date(request.query_params.get("created_to"))
-
-        qs = (
-            EnrollmentVerification.objects.filter(
-                stage=EnrollmentStage.PENDING_VERIFICATION
-            )
-            .select_related("client", "household")
-            .prefetch_related(
-                "member_profiles__client__phones",
-                "household__members__client__phones",
-            )
-            .order_by("opened_at")
+        from .report_exports import (
+            default_filename, members_pending_verification_rows, stream_csv_response,
         )
-        if created_from:
-            qs = qs.filter(opened_at__date__gte=created_from)
-        if created_to:
-            qs = qs.filter(opened_at__date__lte=created_to)
 
-        response = HttpResponse(content_type="text/csv")
-        filename = (
-            f"members_pending_verification_{timezone.localdate().isoformat()}.csv"
+        params = {
+            "created_from": request.query_params.get("created_from"),
+            "created_to": request.query_params.get("created_to"),
+        }
+        return stream_csv_response(
+            members_pending_verification_rows(params),
+            default_filename("members-pending-verification"),
         )
-        response["Content-Disposition"] = f'attachment; filename="{filename}"'
-
-        writer = csv.writer(response)
-        writer.writerow(["Client ID", "First Name", "Last Name", "Phone Numbers"])
-
-        seen = set()
-        for enr in qs:
-            for client in _enrollment_member_clients(enr):
-                if client is None or client.pk in seen:
-                    continue
-                seen.add(client.pk)
-                writer.writerow([
-                    str(client.client_id),
-                    client.first_name or "",
-                    client.last_name or "",
-                    _client_phone_numbers(client),
-                ])
-
-        return response
 
 
 class AllVerificationsReportView(PortalAPIView):
@@ -289,57 +202,21 @@ class AllVerificationsReportView(PortalAPIView):
     """
 
     def get(self, request):
-        from ..services.lifecycle import governing_internal_case
-
         agent = current_agent(request)
         if not (agent and (agent.group == "Management" or getattr(agent, "is_manager", False))):
             return Response({"detail": "Management access required."}, status=403)
 
-        requested_from = _parse_date(request.query_params.get("requested_from"))
-        requested_to = _parse_date(request.query_params.get("requested_to"))
-
-        qs = (
-            EnrollmentVerification.objects.select_related("client", "case")
-            .prefetch_related("client__cases")
-            .order_by("-requested_at", "-opened_at")
+        from .report_exports import (
+            all_verifications_rows, default_filename, stream_csv_response,
         )
-        if requested_from:
-            qs = qs.filter(requested_at__date__gte=requested_from)
-        if requested_to:
-            qs = qs.filter(requested_at__date__lte=requested_to)
 
-        response = HttpResponse(content_type="text/csv")
-        filename = f"all_verifications_{timezone.localdate().isoformat()}.csv"
-        response["Content-Disposition"] = f'attachment; filename="{filename}"'
-
-        writer = csv.writer(response)
-        writer.writerow([
-            "Member ID",
-            "Verification Requested",
-            "Verification Completed",
-            "Authorization Approved",
-        ])
-
-        for enr in qs:
-            client = enr.client
-            gov = governing_internal_case(enr) or enr.case
-            # The authorization-approved date is the governing case's approval
-            # window start, shown only when that case is actually approved.
-            auth_approved = None
-            if gov is not None and gov.service_authorization_status in (
-                ServiceAuthorizationStatus.APPROVED,
-                ServiceAuthorizationStatus.NOT_REQUIRED,
-            ):
-                auth_approved = gov.service_authorization_approval_starts_at
-
-            writer.writerow([
-                str(client.client_id) if client else "",
-                _date_str(enr.requested_at),
-                _date_str(enr.verified_at),
-                _date_str(auth_approved),
-            ])
-
-        return response
+        params = {
+            "requested_from": request.query_params.get("requested_from"),
+            "requested_to": request.query_params.get("requested_to"),
+        }
+        return stream_csv_response(
+            all_verifications_rows(params), default_filename("all-verifications"),
+        )
 
 
 _CLOSED_CASE_STATUSES = (CaseStatus.CLOSED, CaseStatus.CANCELLED)
@@ -580,181 +457,21 @@ class AllMembersReportView(PortalAPIView):
         if not (agent and (agent.group == "Management" or getattr(agent, "is_manager", False))):
             return Response({"detail": "Management access required."}, status=403)
 
-        created_from = _parse_date(request.query_params.get("created_from"))
-        created_to = _parse_date(request.query_params.get("created_to"))
-
-        qs = (
-            Client.objects.all()
-            .prefetch_related(
-                "insurances",
-                "social_care_coverages",
-                "addresses",
-                "phones",
-                "cases",
-                "screenings",
-                "assessments",
-                "member_profiles",
-                "enrollments__kitchen",
-                "enrollments__delivery_schedules",
-                "household_membership__household__members",
-                "household_membership__household__enrollment_verifications__kitchen",
-                "household_membership__household__enrollment_verifications__delivery_schedules",
-            )
-            .order_by("last_name", "first_name", "created_at")
+        from .report_exports import (
+            all_members_rows, default_filename, stream_csv_response,
         )
-        if created_from:
-            qs = qs.filter(created_at__date__gte=created_from)
-        if created_to:
-            qs = qs.filter(created_at__date__lte=created_to)
 
-        # Live eligibility inputs, resolved once for the whole run.
-        from ..services.eligibility import evaluate_client
-        from ..services.service_area import excluded_zips
-        from ..services.state_area import allowed_state_codes
-
-        zips = excluded_zips()
-        states = allowed_state_codes()
-        lead_labels = _lead_source_label_map()
-
-        # Case-creator team lookup (Unite Us user_id -> Originating Team), built
-        # once and reused per row for the governing internal-service case's
-        # creator. Mirrors the Cases export "Team of Case Creator" column.
-        team_map = {
-            str(u.user_id): (u.originating_team or "")
-            for u in UniteUsAgent.objects.all()
+        params = {
+            "created_from": request.query_params.get("created_from"),
+            "created_to": request.query_params.get("created_to"),
         }
-
-        response = HttpResponse(content_type="text/csv")
-        filename = f"all_members_{timezone.localdate().isoformat()}.csv"
-        response["Content-Disposition"] = f'attachment; filename="{filename}"'
-
-        writer = csv.writer(response)
-        writer.writerow([
-            # Identification
-            "Household Primary Member ID",
-            "Member ID",
-            "Medicaid ID (active)",
-            "Member Name",
-            "DOB",
-            # Contact & Address
-            "Phone Number",
-            "Street Address",
-            "Apt",
-            "City",
-            "State",
-            "Zip",
-            # Household
-            "Total members in household",
-            # Program & Case Status
-            "Internal Service Program Name",
-            "Team of Case Creator",
-            "Is there Screening",
-            "Is there Eligibility",
-            "Is there Navigation",
-            "Is there Internal Service Case",
-            "Client Eligibility",
-            "Eligible for:",
-            "Currently servicing",
-            "Cadence",
-            "Facility",
-            "Out of Orbit?",
-            "Out of Orbit reason",
-            "Out of Range",
-            "Authorized amount for the open internal service case",
-            # Lead & Enrollment
-            "Lead Source in CRM",
-            "Enrollment Platform",
-            # Insurance / Medicaid
-            "Medicaid Plan",
-            "Medicaid Type",
-            "Insurance Effective Date",
-            "Insurance Expiration Date",
-            # Social Care Coverage
-            "Social Care Coverage Status",
-            "Social Care Coverage Expiration Date",
-            # Extras
-            "Menu Type",
-            "Dietary Restrictions",
-        ])
-
-        for client in qs:
-            med = _medicaid_insurance(client)
-            scc = _social_care_coverage(client)
-            enr = active_enrollment(client)
-            profile = active_member_profile(client)
-            addr = _current_address(client)
-            cases = list(client.cases.all())
-            # Governing Internal Service case: the one delivery/auth attach to.
-            isc = internal_service_case(client)
-            # Team of that case's creator: on-roster Unite Us creators carry an
-            # Originating Team; a creator not on the roster is Met Council staff.
-            # Blank when there's no governing case or no recorded creator.
-            if isc is not None and isc.created_by_id:
-                isc_team = team_map.get(str(isc.created_by_id), "Met Council Team")
-            else:
-                isc_team = ""
-
-            out_of_orbit = member_out_of_orbit(client)
-            reason = _out_of_orbit_reason(enr, profile) if out_of_orbit else ""
-
-            verdict = evaluate_client(client, zips=zips, states=states)
-            eligibility = "Ineligible" if verdict.ineligible else "Eligible"
-
-            facility = ""
-            if enr is not None and enr.kitchen_id:
-                facility = enr.kitchen.name or ""
-
-            raw_source = (client.lead_source or "").strip()
-
-            writer.writerow([
-                # Identification
-                _household_primary_member_id(client),
-                str(client.client_id),
-                medicaid_member_id(client),
-                f"{client.first_name or ''} {client.last_name or ''}".strip(),
-                _date_str(client.date_of_birth),
-                # Contact & Address
-                _client_phone_numbers(client),
-                (addr.street if addr else ""),
-                (addr.unit if addr else ""),
-                (addr.city if addr else ""),
-                (addr.state if addr else ""),
-                (addr.zip if addr else ""),
-                # Household
-                _household_member_count(client),
-                # Program & Case Status
-                (isc.program_name if isc else ""),
-                isc_team,
-                _yn(len(client.screenings.all()) > 0),
-                _yn(any(c.case_type == CaseType.ELIGIBILITY for c in cases)),
-                _yn(any(c.case_type == CaseType.NAVIGATION for c in cases)),
-                _yn(isc is not None),
-                eligibility,
-                "; ".join(_assessment_eligible(client)),
-                _currently_servicing(enr),
-                _cadence_label(profile, enr),
-                facility,
-                _yn(out_of_orbit),
-                reason,
-                _yn(member_out_of_range(client)),
-                (isc.authorized_amount if isc else ""),
-                # Lead & Enrollment
-                lead_labels.get(raw_source, raw_source),
-                "UniteUs",
-                # Insurance / Medicaid
-                (med.plan_name if med else ""),
-                _medicaid_type_label(med.plan_name if med else ""),
-                _date_str(med.enrolled_at if med else None),
-                _date_str(med.expired_at if med else None),
-                # Social Care Coverage
-                (_SCC_STATUS_LABELS.get(scc.status, scc.status) if scc else ""),
-                _date_str(scc.expired_at if scc else None),
-                # Extras
-                (profile.menu_type if profile else ""),
-                _dietary_restrictions(profile),
-            ])
-
-        return response
+        # Streamed (stream_csv_response): starts sending immediately + keeps
+        # memory bounded. The heavy full-member export is normally run via the
+        # background export flow (POST /reports/exports/); this sync path is the
+        # no-S3 fallback + small filtered pulls.
+        return stream_csv_response(
+            all_members_rows(params), default_filename("all-members"),
+        )
 
 
 _WEEKDAY_ABBR = {
@@ -822,108 +539,13 @@ class CasesReportView(PortalAPIView):
         if not (agent and (agent.group == "Management" or getattr(agent, "is_manager", False))):
             return Response({"detail": "Management access required."}, status=403)
 
-        created_from = _parse_date(request.query_params.get("created_from"))
-        created_to = _parse_date(request.query_params.get("created_to"))
+        from .report_exports import cases_rows, default_filename, stream_csv_response
 
-        qs = (
-            Case.objects.select_related("client")
-            .prefetch_related(
-                "client__phones",
-                "enrollments__kitchen",
-                "enrollments__delivery_schedules",
-            )
-            .order_by("date_opened")
-        )
-        if created_from:
-            qs = qs.filter(date_opened__date__gte=created_from)
-        if created_to:
-            qs = qs.filter(date_opened__date__lte=created_to)
-
-        # Case-creator team (Unite Us user_id -> Originating Team) and care
-        # coordinator (agent_code -> agent name) lookups, built once.
-        team_map = {
-            str(u.user_id): (u.originating_team or "")
-            for u in UniteUsAgent.objects.all()
+        params = {
+            "created_from": request.query_params.get("created_from"),
+            "created_to": request.query_params.get("created_to"),
         }
-        coord_map = {
-            a.agent_code: a.name
-            for a in Agent.objects.exclude(agent_code__isnull=True).exclude(agent_code="")
-        }
-        auth_status_labels = dict(ServiceAuthorizationStatus.choices)
-
-        response = HttpResponse(content_type="text/csv")
-        filename = f"cases_{timezone.localdate().isoformat()}.csv"
-        response["Content-Disposition"] = f'attachment; filename="{filename}"'
-
-        writer = csv.writer(response)
-        writer.writerow([
-            "Client ID",
-            "Case ID",
-            "Member Name",
-            "Member Phone Number",
-            "Team of Case Creator",
-            "Case Created By Name",
-            "Case Created Date",
-            "Case Closed Date",
-            "Case Status",
-            "Originating Provider Name",
-            "Provider Name",
-            "Program Name",
-            "Is Program Household?",
-            "Case Type",
-            "Meals/Boxes",
-            "Kitchen",
-            "Cadence",
-            "Primary Worker Name",
-            "Care Coordinator",
-            "Service Authorization Status",
-            "Service Authorization End Date",
-        ])
-
-        for case in qs:
-            client = case.client
-            enr = _case_enrollment(case)
-            # Team: on-roster Unite Us creators carry an Originating Team; a
-            # creator not on the roster is Met Council staff. Blank when the case
-            # has no recorded creator.
-            if case.created_by_id:
-                team = team_map.get(str(case.created_by_id), "Met Council Team")
-            else:
-                team = ""
-
-            care_coordinator = coord_map.get(case.agent_code, case.agent_code or "")
-            case_status = (
-                "Closed" if case.case_status in _CLOSED_CASE_STATUSES else "Open"
-            )
-            auth_status = case.service_authorization_status_label or auth_status_labels.get(
-                case.service_authorization_status, case.service_authorization_status or ""
-            )
-
-            writer.writerow([
-                str(case.client_id),
-                str(case.case_id),
-                f"{client.first_name or ''} {client.last_name or ''}".strip() if client else "",
-                _primary_phone(client) if client else "",
-                team,
-                case.created_by_name or "",
-                _date_str(case.date_opened),
-                _date_str(case.case_closed_at),
-                case_status,
-                case.originating_provider_name or "",
-                case.provider_name or "",
-                case.program_name or "",
-                _yn("household" in (case.program_name or "").casefold()),
-                case.get_case_type_display(),
-                _meals_or_boxes(case.program_name),
-                _enrollment_kitchen(enr),
-                _enrollment_cadence(enr),
-                case.primary_worker_name or "",
-                care_coordinator,
-                auth_status,
-                _date_str(case.service_authorization_approval_ends_at),
-            ])
-
-        return response
+        return stream_csv_response(cases_rows(params), default_filename("cases"))
 
 
 class MembersForPurchaseOrderReportView(PortalAPIView):
@@ -952,154 +574,24 @@ class MembersForPurchaseOrderReportView(PortalAPIView):
         if not (agent and (agent.group == "Management" or getattr(agent, "is_manager", False))):
             return Response({"detail": "Management access required."}, status=403)
 
-        from datetime import timedelta
-
-        from ..models import (
-            HouseholdMember,
-            OrderSchedule,
-            OrderStatus,
-            SERVICE_EXCLUDED_ENROLLMENT_STAGES,
-            SERVICE_EXCLUDED_MEMBER_STATUSES,
-        )
-        from ..services.purchase_orders import (
-            _WEEKDAY_CADENCE,
-            _household_group_code,
-            _household_is_primary,
-            authorized_internal_service_case_exists,
-            open_internal_service_case_exists,
+        from .report_exports import (
+            default_filename, members_for_po_rows, stream_csv_response,
         )
 
         today = timezone.localdate()
         scope = (request.query_params.get("scope") or "date").lower()
-
-        cadence = ""
-        if scope == "week":
-            monday = today - timedelta(days=today.weekday())
-            sunday = monday + timedelta(days=6)
-            base = OrderSchedule.objects.filter(
-                anticipated_delivery_date__gte=monday,
-                anticipated_delivery_date__lte=sunday,
-            )
-        else:
+        params = {"scope": scope}
+        if scope != "week":
             d = _parse_date(request.query_params.get("date"))
             if d is None:
                 return Response({"detail": "A valid date is required."}, status=400)
             if d <= today:
                 return Response({"detail": "Date must be in the future."}, status=400)
-            base = OrderSchedule.objects.filter(anticipated_delivery_date=d)
-            cadence = (request.query_params.get("cadence") or "").strip()
-
-        qs = (
-            base.filter(status=OrderStatus.SCHEDULED, member__isnull=False)
-            .exclude(enrollment__stage__in=SERVICE_EXCLUDED_ENROLLMENT_STAGES)
-            .exclude(member__status__in=SERVICE_EXCLUDED_MEMBER_STATUSES)
-            .annotate(_has_open_isc=open_internal_service_case_exists())
-            .filter(_has_open_isc=True)
-            .annotate(_has_auth_isc=authorized_internal_service_case_exists())
-            .filter(_has_auth_isc=True)
-            .select_related("member__client", "household", "kitchen")
-            .prefetch_related("member__client__cases")
-            .order_by(
-                "anticipated_delivery_date", "household__name",
-                "household_group_code", "member_name",
-            )
+            params["date"] = request.query_params.get("date")
+            params["cadence"] = (request.query_params.get("cadence") or "").strip()
+        return stream_csv_response(
+            members_for_po_rows(params), default_filename("members-for-po"),
         )
-
-        rows = list(qs)
-        if cadence:
-            rows = [
-                o for o in rows
-                if o.anticipated_delivery_date
-                and _WEEKDAY_CADENCE.get(o.anticipated_delivery_date.weekday()) == cadence
-            ]
-
-        # Primary (head-of-household) client id per household, shared by every
-        # member row so a group can be tied to its head.
-        hh_ids = {o.household_id for o in rows if o.household_id}
-        primary_by_hh = {}
-        if hh_ids:
-            primary_by_hh = dict(
-                HouseholdMember.objects.filter(
-                    household_id__in=hh_ids, is_primary=True
-                ).values_list("household_id", "client_id")
-            )
-
-        response = HttpResponse(content_type="text/csv")
-        filename = f"members_for_po_{today.isoformat()}.csv"
-        response["Content-Disposition"] = f'attachment; filename="{filename}"'
-
-        writer = csv.writer(response)
-        writer.writerow([
-            "Delivery Date",
-            "HouseholdGroup",
-            "PrimaryMemberID",
-            "Client ID",
-            "PrimaryHousehold",
-            "Quantity",
-            "Delivery Address",
-            "Menu Type",
-            "Meal Type",
-            "Kitchen",
-            "Cadence",
-            "Case ID",
-            "Case Status",
-            "Case Authorization",
-            "Member Status",
-        ])
-
-        for o in rows:
-            client = o.member.client if (o.member and o.member.client_id) else None
-            client_id = str(client.client_id) if client else ""
-            # Household head id (shared across the group); a lone member is their
-            # own head.
-            primary_id = client_id
-            if o.household_id and primary_by_hh.get(o.household_id):
-                primary_id = str(primary_by_hh[o.household_id])
-
-            weekday = (
-                o.anticipated_delivery_date.weekday()
-                if o.anticipated_delivery_date else None
-            )
-            meal_type = _meals_or_boxes(o.program_name)
-            if not meal_type:
-                meal_type = "Boxes" if weekday == 2 else "Meals"
-            cad_code = _WEEKDAY_CADENCE.get(weekday, "") if weekday is not None else ""
-
-            # Internal-service case backing this member's delivery + its status,
-            # and the member's current sub-status (Active / Out of Orbit / ...).
-            case = internal_service_case(client) if client else None
-            case_id = str(case.case_id) if case else ""
-            case_status = case.get_case_status_display() if case else ""
-            # Authorization is a separate dimension from case status; prefer the
-            # human-readable label (e.g. "Accepted"), falling back to the enum's
-            # display when only the normalized value is stored.
-            case_authorization = ""
-            if case:
-                case_authorization = case.service_authorization_status_label or (
-                    case.get_service_authorization_status_display()
-                    if case.service_authorization_status else ""
-                )
-            member_status = o.member.get_status_display() if o.member else ""
-
-            writer.writerow([
-                _date_str(o.anticipated_delivery_date),
-                _household_group_code(o.household),
-                primary_id,
-                client_id,
-                _yn(_household_is_primary(client)),
-                o.how_many_meals_or_boxes if o.how_many_meals_or_boxes is not None else 0,
-                (o.delivery_address or "").replace("\n", ", ").strip(),
-                o.menu_type or "",
-                meal_type,
-                (o.kitchen.name if o.kitchen_id else ""),
-                _CADENCE_LABELS.get(cad_code, cad_code),
-                case_id,
-                case_status,
-                case_authorization,
-                member_status,
-            ])
-
-        return response
 
 
 class MembersNotServedReportView(PortalAPIView):
@@ -1121,168 +613,13 @@ class MembersNotServedReportView(PortalAPIView):
         agent = current_agent(request)
         if not (agent and (agent.group == "Management" or getattr(agent, "is_manager", False))):
             return Response({"detail": "Management access required."}, status=403)
-
-        from ..models import (
-            OrderSchedule,
-            OrderStatus,
-            SERVICE_EXCLUDED_ENROLLMENT_STAGES,
-            SERVICE_EXCLUDED_MEMBER_STATUSES,
-        )
-        from ..services.purchase_orders import (
-            _household_group_code,
-            _household_is_primary,
-            authorized_internal_service_case_exists,
-            open_internal_service_case_exists,
+        from .report_exports import (
+            default_filename, members_not_served_rows, stream_csv_response,
         )
 
-        # Clients currently scheduled for a delivery (i.e. on/heading to a PO).
-        # Mirror PO candidate selection (services.purchase_orders._due_schedules)
-        # so a stale SCHEDULED occurrence on a cancelled/closed enrollment, an
-        # out-of-service member, or a member with no OPEN internal-service case
-        # is NOT counted as "served" -- otherwise those members would be wrongly
-        # excluded from this not-served report.
-        served_ids = set(
-            OrderSchedule.objects.filter(
-                status=OrderStatus.SCHEDULED, member__client__isnull=False
-            )
-            .exclude(enrollment__stage__in=SERVICE_EXCLUDED_ENROLLMENT_STAGES)
-            .exclude(member__status__in=SERVICE_EXCLUDED_MEMBER_STATUSES)
-            .annotate(_has_open_isc=open_internal_service_case_exists())
-            .filter(_has_open_isc=True)
-            .annotate(_has_auth_isc=authorized_internal_service_case_exists())
-            .filter(_has_auth_isc=True)
-            .values_list("member__client_id", flat=True)
+        return stream_csv_response(
+            members_not_served_rows({}), default_filename("members-not-served"),
         )
-
-        qs = (
-            Client.objects.filter(cases__case_type=CaseType.INTERNAL_SERVICE)
-            .exclude(client_id__in=served_ids)
-            .distinct()
-            .prefetch_related(
-                "cases",
-                "enrollments__member_profiles",
-                "enrollments__kitchen",
-                "enrollments__delivery_schedules",
-                "member_profiles",
-                "household_membership__household__members",
-            )
-            .order_by("last_name", "first_name")
-        )
-
-        response = HttpResponse(content_type="text/csv")
-        filename = f"members_not_on_po_{timezone.localdate().isoformat()}.csv"
-        response["Content-Disposition"] = f'attachment; filename="{filename}"'
-
-        writer = csv.writer(response)
-        writer.writerow([
-            "Client ID",
-            "Case ID",
-            "Case Status",
-            "Case Type",
-            "Case Authorization",
-            "Program Name",
-            "Meals/Boxes",
-            "Is Part of a Household",
-            "Household Group",
-            "Primary Member ID",
-            "Is Primary",
-            "Full Name",
-            "Member Stage",
-            "Kitchen",
-            "Cadence",
-            "Menu Type",
-            "Out of Orbit",
-            "Out of Range",
-            "On Hold",
-            "Cancelled",
-        ])
-
-        for client in qs:
-            case = internal_service_case(client)
-            profile = active_member_profile(client)
-            status = profile.status if profile else ""
-
-            # Authorization is a separate dimension from case status; prefer the
-            # human-readable label (e.g. "Accepted") and fall back to the enum's
-            # display when only the normalized value is stored.
-            case_authorization = ""
-            program_name = ""
-            if case:
-                case_authorization = case.service_authorization_status_label or (
-                    case.get_service_authorization_status_display()
-                    if case.service_authorization_status else ""
-                )
-                program_name = case.program_name or ""
-
-            # "Part of a household" = the client's household has more than one
-            # member (mirrors the Members-for-PO report's household rule).
-            membership = getattr(client, "household_membership", None)
-            household = membership.household if membership is not None else None
-            members = list(household.members.all()) if household is not None else []
-            in_household = len(members) > 1
-
-            # Household grouping columns (mirror the Members-for-PO report): the
-            # stable per-household group code, the head-of-household's client id
-            # (a lone member is their own head), and whether THIS member is that
-            # head.
-            group_code = _household_group_code(household)
-            primary_id = str(client.client_id)
-            prim = next((m for m in members if m.is_primary), None)
-            if prim is not None:
-                primary_id = str(prim.client_id)
-            is_primary = _household_is_primary(client)
-
-            # On Hold / Cancelled are household-level (enrollment) states; read
-            # the latest enrollment (any status) so a terminal one still shows.
-            enrollments = list(client.enrollments.all())
-            latest = (
-                max(enrollments, key=lambda e: e.opened_at or timezone.now())
-                if enrollments else None
-            )
-            on_hold = (
-                status == MemberStatus.PAUSED
-                or (latest is not None and latest.stage == EnrollmentStage.ON_HOLD)
-            )
-            cancelled = (
-                status == MemberStatus.INACTIVE
-                or (latest is not None and latest.stage == EnrollmentStage.CANCELLED)
-            )
-
-            # Member service assignments (blank until set): the enrollment stage
-            # label, the assigned kitchen, the delivery cadence, and the menu
-            # type from the member's dietary profile.
-            member_stage = (
-                _ENROLLMENT_STAGE_LABELS.get(latest.stage, latest.stage or "")
-                if latest is not None else ""
-            )
-            kitchen = latest.kitchen.name if (latest and latest.kitchen_id) else ""
-            cadence = _cadence_label(profile, latest)
-            menu_type = profile.menu_type if profile else ""
-
-            writer.writerow([
-                str(client.client_id),
-                str(case.case_id) if case else "",
-                case.get_case_status_display() if case else "",
-                case.get_case_type_display() if case else "",
-                case_authorization,
-                program_name,
-                _meals_or_boxes(program_name),
-                _yn(in_household),
-                group_code,
-                primary_id,
-                _yn(is_primary),
-                f"{client.first_name or ''} {client.last_name or ''}".strip(),
-                member_stage,
-                kitchen,
-                cadence,
-                menu_type,
-                _yn(member_out_of_orbit(client)),
-                _yn(member_out_of_range(client)),
-                _yn(on_hold),
-                _yn(cancelled),
-            ])
-
-        return response
 
 
 class UniteUsAgentsReportView(PortalAPIView):
@@ -1297,29 +634,101 @@ class UniteUsAgentsReportView(PortalAPIView):
         if not (agent and (agent.group == "Management" or getattr(agent, "is_manager", False))):
             return Response({"detail": "Management access required."}, status=403)
 
-        response = HttpResponse(content_type="text/csv")
-        filename = f"unite_us_agents_{timezone.localdate().isoformat()}.csv"
-        response["Content-Disposition"] = f'attachment; filename="{filename}"'
+        from .report_exports import (
+            default_filename, stream_csv_response, unite_us_agents_rows,
+        )
 
-        writer = csv.writer(response)
-        writer.writerow([
-            "Unite Us user_id",
-            "Full Name",
-            "Email",
-            "Team",
-            "Status",
-        ])
+        return stream_csv_response(
+            unite_us_agents_rows({}), default_filename("unite-us-agents"),
+        )
 
-        for a in UniteUsAgent.objects.all():
-            full_name = a.name or " ".join(
-                p for p in [a.first_name, a.last_name] if p
+
+# ===========================================================================
+# Background report exports (POST start job -> Celery -> S3; GET poll status)
+# ===========================================================================
+def _is_management(agent):
+    return bool(
+        agent and (agent.group == "Management" or getattr(agent, "is_manager", False))
+    )
+
+
+def _report_export_payload(export):
+    """Serialize a ReportExport for the UI. When completed, include a short-lived
+    presigned download URL."""
+    from ..services import import_storage
+
+    download_url = ""
+    if (
+        export.status == ReportExportStatus.COMPLETED
+        and export.file_key
+        and import_storage.s3_enabled()
+    ):
+        try:
+            download_url = import_storage.presign_get(
+                export.file_key, download_name=export.filename,
             )
-            writer.writerow([
-                str(a.user_id),
-                full_name,
-                a.email or "",
-                a.originating_team or "",
-                (a.status or "").title(),
-            ])
+        except Exception:  # noqa: BLE001 - a presign hiccup must not break polling
+            download_url = ""
+    return {
+        "id": str(export.export_id),
+        "report_key": export.report_key,
+        "status": export.status,
+        "filename": export.filename,
+        "row_count": export.row_count,
+        "error": export.error_log,
+        "created_at": export.created_at.isoformat() if export.created_at else None,
+        "finished_at": export.finished_at.isoformat() if export.finished_at else None,
+        "download_url": download_url,
+    }
 
-        return response
+
+class StartReportExportView(PortalAPIView):
+    """POST: start a background CSV export for ``report_key`` with ``params``.
+
+    Returns the ReportExport job (poll GET /reports/exports/<id>/). When S3 isn't
+    configured (local dev), there's no worker/storage, so it STREAMS the CSV back
+    synchronously instead -- the frontend detects the CSV response and downloads
+    it directly (no polling)."""
+
+    def post(self, request):
+        agent = current_agent(request)
+        if not _is_management(agent):
+            return Response({"detail": "Management access required."}, status=403)
+
+        from ..services import import_storage
+        from .report_exports import REPORT_BUILDERS, default_filename, stream_csv_response
+
+        report_key = (request.data.get("report_key") or "").strip()
+        params = request.data.get("params") or {}
+        if not isinstance(params, dict):
+            params = {}
+        builder = REPORT_BUILDERS.get(report_key)
+        if builder is None:
+            return Response({"error": f"Unknown report: {report_key!r}"}, status=400)
+
+        filename = default_filename(report_key)
+        if not import_storage.s3_enabled():
+            # Dev / no-S3 fallback: stream the CSV directly (no background job).
+            return stream_csv_response(builder(params), filename)
+
+        export = ReportExport.objects.create(
+            report_key=report_key, params=params, filename=filename,
+            requested_by=agent,
+        )
+        from ..tasks import generate_report_export
+
+        generate_report_export.delay(str(export.export_id))
+        return Response(_report_export_payload(export), status=201)
+
+
+class ReportExportDetailView(PortalAPIView):
+    """GET: poll a background export's status + (when done) its download URL."""
+
+    def get(self, request, export_id):
+        agent = current_agent(request)
+        if not _is_management(agent):
+            return Response({"detail": "Management access required."}, status=403)
+        export = ReportExport.objects.filter(pk=export_id).first()
+        if export is None:
+            return Response({"detail": "Not found."}, status=404)
+        return Response(_report_export_payload(export))

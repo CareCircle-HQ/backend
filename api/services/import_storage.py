@@ -18,6 +18,7 @@ from botocore.exceptions import BotoCoreError, ClientError
 from django.conf import settings
 
 IMPORTS_PREFIX = "imports"
+EXPORTS_PREFIX = "exports"
 
 
 def s3_enabled():
@@ -56,12 +57,32 @@ def build_key(filename):
     return f"{IMPORTS_PREFIX}/{uuid.uuid4()}/{safe}"
 
 
+def build_export_key(filename):
+    """A unique key under the exports/ prefix for a generated report CSV,
+    keeping the readable filename (used as the download name)."""
+    safe = os.path.basename((filename or "export.csv")).strip().replace(" ", "_")
+    if not safe:
+        safe = "export.csv"
+    return f"{EXPORTS_PREFIX}/{uuid.uuid4()}/{safe}"
+
+
 def presign_put(key, *, content_type="text/csv", expires=900):
     """Short-lived presigned URL the browser PUTs the file directly to."""
     return _client().generate_presigned_url(
         "put_object",
         Params={"Bucket": _bucket(), "Key": key, "ContentType": content_type},
         ExpiresIn=expires,
+    )
+
+
+def presign_get(key, *, expires=900, download_name=""):
+    """Short-lived presigned URL to download an object (e.g. a generated report
+    CSV). ``download_name`` sets the browser's save-as filename."""
+    params = {"Bucket": _bucket(), "Key": key}
+    if download_name:
+        params["ResponseContentDisposition"] = f'attachment; filename="{download_name}"'
+    return _client().generate_presigned_url(
+        "get_object", Params=params, ExpiresIn=expires,
     )
 
 

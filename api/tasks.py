@@ -206,3 +206,71 @@ def request_uniteus_exports(self, export_types=None, days=7, triggered_by="cron:
             logger.exception("request_uniteus_exports: %s failed", etype)
     # Nudge the poller so freshly-requested exports start advancing.
     poll_uniteus_exports.delay()
+
+
+@shared_task(bind=True, ignore_result=True)
+def generate_report_export(self, export_id):
+    """Build an Admin > Reports CSV in the background, upload it to S3, and flip
+    the ReportExport status the UI polls. Mirrors process_import: the heavy work
+    runs here so it survives request timeouts. Best-effort status on failure."""
+    import csv
+    import tempfile
+
+    from .models import ReportExport, ReportExportStatus
+    from .portal.report_exports import REPORT_BUILDERS, default_filename
+
+    export = ReportExport.objects.filter(pk=export_id).first()
+    if export is None:
+        logger.warning("generate_report_export: ReportExport %s not found", export_id)
+        return
+
+    builder = REPORT_BUILDERS.get(export.report_key)
+    if builder is None:
+        export.status = ReportExportStatus.FAILED
+        export.error_log = f"Unknown report_key: {export.report_key!r}"
+        export.finished_at = timezone.now()
+        export.save(update_fields=["status", "error_log", "finished_at"])
+        return
+
+    export.status = ReportExportStatus.RUNNING
+    export.save(update_fields=["status"])
+
+    tmp = None
+    try:
+        filename = export.filename or default_filename(export.report_key)
+        tmp = tempfile.NamedTemporaryFile(
+            mode="w+", suffix=".csv", newline="", delete=False,
+        )
+        writer = csv.writer(tmp)
+        data_rows = 0
+        for i, row in enumerate(builder(export.params or {})):
+            writer.writerow(row)
+            if i > 0:  # first row is the header
+                data_rows += 1
+        tmp.flush()
+        tmp.close()
+
+        key = import_storage.build_export_key(filename)
+        with open(tmp.name, "rb") as fh:
+            import_storage.upload_fileobj(key, fh)
+
+        export.status = ReportExportStatus.COMPLETED
+        export.file_key = key
+        export.filename = filename
+        export.row_count = data_rows
+        export.finished_at = timezone.now()
+        export.save(update_fields=[
+            "status", "file_key", "filename", "row_count", "finished_at",
+        ])
+    except Exception as exc:  # noqa: BLE001 - always record the failure
+        logger.exception("generate_report_export failed for %s", export_id)
+        export.status = ReportExportStatus.FAILED
+        export.error_log = str(exc)[:2000]
+        export.finished_at = timezone.now()
+        export.save(update_fields=["status", "error_log", "finished_at"])
+    finally:
+        if tmp is not None:
+            try:
+                os.unlink(tmp.name)
+            except OSError:
+                pass

@@ -3004,6 +3004,50 @@ class ImportRun(models.Model):
         return f"ImportRun {self.pk} {self.source} ({self.status})"
 
 
+class ReportExportStatus(models.TextChoices):
+    PENDING = "pending", "Pending"
+    RUNNING = "running", "Running"
+    COMPLETED = "completed", "Completed"
+    FAILED = "failed", "Failed"
+
+
+class ReportExport(models.Model):
+    """One background CSV export of an Admin > Reports report. Anchors the async
+    export flow (mirrors ImportRun for imports): the Celery task builds the CSV,
+    uploads it to S3, and flips the status the UI polls. Also a durable audit of
+    who exported what, when. One table for EVERY report, keyed by ``report_key``
+    (see api.portal.report_exports.REPORT_BUILDERS)."""
+
+    export_id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    report_key = models.CharField(max_length=64, db_index=True)
+    params = models.JSONField(default=dict, blank=True)
+    status = models.CharField(
+        max_length=20, choices=ReportExportStatus.choices,
+        default=ReportExportStatus.PENDING, db_index=True,
+    )
+    file_key = models.CharField(max_length=512, blank=True)  # S3 key under exports/
+    filename = models.CharField(max_length=255, blank=True)  # download name
+    row_count = models.PositiveIntegerField(null=True, blank=True)  # data rows
+    error_log = models.TextField(blank=True)
+    requested_by = models.ForeignKey(
+        "Agent", on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="report_exports",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    finished_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["report_key"]),
+            models.Index(fields=["status"]),
+            models.Index(fields=["requested_by", "created_at"]),
+        ]
+
+    def __str__(self):
+        return f"ReportExport {self.pk} {self.report_key} ({self.status})"
+
+
 class UniteUsExportStatus(models.TextChoices):
     """Our processing lifecycle for a requested Unite Us export (distinct from
     Unite Us' own ``state``, which we mirror in ``unite_state``)."""

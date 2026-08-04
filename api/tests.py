@@ -9328,9 +9328,13 @@ class ReportExportsTest(TestCase):
         import io
 
         resp = self.api.get(url)
-        self.assertEqual(resp.status_code, 200, resp.content)
-        text = resp.content.decode()
-        return list(csv.DictReader(io.StringIO(text)))
+        # Report CSVs may be streamed (StreamingHttpResponse) or buffered.
+        if getattr(resp, "streaming", False):
+            body = b"".join(resp.streaming_content)
+        else:
+            body = resp.content
+        self.assertEqual(resp.status_code, 200, body)
+        return list(csv.DictReader(io.StringIO(body.decode())))
 
     def test_all_members_export_columns_and_values(self):
         from datetime import datetime, timezone as dt_tz
@@ -11206,8 +11210,9 @@ class AllVerificationsReportTest(TestCase):
         self.assertEqual(self._api(group="CS", code="966").get("/api/portal/reports/all-verifications/").status_code, 403)
 
         r = self._api().get("/api/portal/reports/all-verifications/")
-        self.assertEqual(r.status_code, 200, r.content)
-        body = r.content.decode()
+        raw = b"".join(r.streaming_content) if getattr(r, "streaming", False) else r.content
+        self.assertEqual(r.status_code, 200, raw)
+        body = raw.decode()
         lines = [ln for ln in body.splitlines() if ln.strip()]
         self.assertEqual(
             lines[0],
@@ -11267,7 +11272,9 @@ class SyncHouseholdOutOfOrbitEventGateTest(TestCase):
         sync_household_members(primary, enrollment=enr)
 
         prof = MemberDietaryProfile.objects.get(enrollment=enr, client=dep)
-        self.assertEqual(prof.status, MemberStatus.OUT_OF_ORBIT)  # placeholder kept
+        # No kitchen yet -> not Out of Orbit (stays the default Active); the meal
+        # rule decides the real status at kitchen assignment.
+        self.assertEqual(prof.status, MemberStatus.ACTIVE)
         self.assertFalse(
             TimelineEvent.objects.filter(
                 client=dep, event_type=TimelineEventType.OUT_OF_ORBIT
@@ -11530,3 +11537,147 @@ class ClosingEnrollmentClearsCalendarTest(TestCase):
             .exclude(status=OrderStatus.CANCELLED)
         )
         self.assertEqual(live_future.count(), 0)  # future delivery stopped on close
+
+
+class ReportExportBackgroundTest(TestCase):
+    """Background report export: generator output, the Celery task (storage
+    mocked), and the start/poll endpoints incl. the no-S3 sync fallback."""
+
+    def _api(self, group="Management", code="980"):
+        from rest_framework.test import APIClient
+        from rest_framework_simplejwt.tokens import AccessToken
+
+        from .models import Agent
+
+        agent = Agent.objects.create(name="Rep", agent_code=code, group=group)
+        access = AccessToken()
+        access["agent_id"] = str(agent.id)
+        access["agent_code"] = agent.agent_code
+        access["agent_name"] = agent.name
+        access["agent_group"] = agent.group
+        api = APIClient()
+        api.credentials(HTTP_AUTHORIZATION=f"Bearer {access}")
+        return api
+
+    def test_all_members_rows_header_and_rows(self):
+        from .portal.report_exports import all_members_rows
+
+        Client.objects.create(client_id=str(uuid.uuid4()), first_name="A", last_name="One")
+        Client.objects.create(client_id=str(uuid.uuid4()), first_name="B", last_name="Two")
+        gen = all_members_rows({})
+        header = next(gen)
+        self.assertIn("Member ID", header)
+        rows = list(gen)
+        self.assertEqual(len(rows), 2)
+        self.assertTrue(all(len(r) == len(header) for r in rows))
+
+    def test_task_completes_and_uploads(self):
+        from unittest.mock import patch
+
+        from .models import ReportExport, ReportExportStatus
+        from .tasks import generate_report_export
+
+        Client.objects.create(client_id=str(uuid.uuid4()), first_name="A", last_name="One")
+        exp = ReportExport.objects.create(report_key="all-members", params={}, filename="x.csv")
+        with patch("api.services.import_storage.upload_fileobj") as up:
+            generate_report_export(str(exp.export_id))
+        exp.refresh_from_db()
+        self.assertEqual(exp.status, ReportExportStatus.COMPLETED)
+        self.assertTrue(exp.file_key.startswith("exports/"))
+        self.assertEqual(exp.row_count, 1)
+        up.assert_called_once()
+
+    def test_task_unknown_report_fails(self):
+        from .models import ReportExport, ReportExportStatus
+        from .tasks import generate_report_export
+
+        exp = ReportExport.objects.create(report_key="nope", params={})
+        generate_report_export(str(exp.export_id))
+        exp.refresh_from_db()
+        self.assertEqual(exp.status, ReportExportStatus.FAILED)
+        self.assertIn("nope", exp.error_log)
+
+    def test_start_streams_without_s3(self):
+        from unittest.mock import patch
+
+        api = self._api(code="984")
+        with patch("api.services.import_storage.s3_enabled", return_value=False):
+            r = api.post("/api/portal/reports/exports/",
+                         {"report_key": "all-members", "params": {}}, format="json")
+        self.assertEqual(r.status_code, 200, r)
+        self.assertEqual(r["Content-Type"], "text/csv")
+
+    def test_start_creates_job_with_s3(self):
+        from unittest.mock import patch
+
+        from .models import ReportExport
+
+        api = self._api(code="985")
+        with patch("api.services.import_storage.s3_enabled", return_value=True), \
+                patch("api.tasks.generate_report_export.delay") as delay:
+            r = api.post("/api/portal/reports/exports/",
+                         {"report_key": "all-members", "params": {}}, format="json")
+        self.assertEqual(r.status_code, 201, r.content)
+        self.assertEqual(r.json()["status"], "pending")
+        self.assertTrue(ReportExport.objects.filter(report_key="all-members").exists())
+        delay.assert_called_once()
+
+    def test_detail_returns_download_url_and_gate(self):
+        from unittest.mock import patch
+
+        from .models import ReportExport, ReportExportStatus
+
+        exp = ReportExport.objects.create(
+            report_key="all-members", filename="x.csv",
+            status=ReportExportStatus.COMPLETED, file_key="exports/abc/x.csv",
+        )
+        api = self._api(code="986")
+        with patch("api.services.import_storage.s3_enabled", return_value=True), \
+                patch("api.services.import_storage.presign_get", return_value="https://signed/x"):
+            r = api.get(f"/api/portal/reports/exports/{exp.export_id}/")
+        self.assertEqual(r.status_code, 200, r.content)
+        self.assertEqual(r.json()["download_url"], "https://signed/x")
+
+        cs = self._api(group="CS", code="987")
+        self.assertEqual(
+            cs.get(f"/api/portal/reports/exports/{exp.export_id}/").status_code, 403
+        )
+
+
+class PurgeOutOfScopeCasesCommandTest(TestCase):
+    """purge_out_of_scope_cases deletes only cases the import would reject
+    (out of program scope / not Met Council), keeps in-scope cases, and never
+    deletes a case backing a verification enrollment."""
+
+    def test_purges_out_of_scope_keeps_in_scope_and_enrollment_backed(self):
+        from io import StringIO
+
+        from django.core.management import call_command
+
+        from .models import (
+            Case, CaseStatus, CaseType, Client, EnrollmentStage,
+            EnrollmentVerification,
+        )
+
+        MET = "Met Council - SCN - PHS"
+        client = Client.objects.create(client_id=str(uuid.uuid4()), first_name="C", last_name="L")
+
+        def mkcase(case_type, service_type="", program_name=""):
+            return Case.objects.create(
+                case_id=str(uuid.uuid4()), client=client, case_type=case_type,
+                provider_name=MET, service_type=service_type,
+                program_name=program_name, case_status=CaseStatus.OPEN,
+            )
+
+        keeper = mkcase(CaseType.INTERNAL_SERVICE, service_type="medically tailored meals")
+        doomed = mkcase(CaseType.EXTERNAL_SERVICE, program_name="Furniture / Home Goods")
+        backed = mkcase(CaseType.EXTERNAL_SERVICE, program_name="Housing Case Management")
+        EnrollmentVerification.objects.create(
+            client=client, case=backed, stage=EnrollmentStage.SERVICE_ACTIVE,
+        )
+
+        call_command("purge_out_of_scope_cases", "--apply", stdout=StringIO())
+
+        self.assertTrue(Case.objects.filter(pk=keeper.pk).exists())   # in scope
+        self.assertFalse(Case.objects.filter(pk=doomed.pk).exists())  # out of scope
+        self.assertTrue(Case.objects.filter(pk=backed.pk).exists())   # enrollment-backed, preserved
