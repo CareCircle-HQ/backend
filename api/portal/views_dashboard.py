@@ -676,6 +676,40 @@ class DashboardView(PortalAPIView):
         open_client_ids = {row["client_id"] for row in scoped_rows}
         members_payload = self._members_breakdown(open_client_ids)
 
+        # CS tab Section 2 breakdowns: members (of the open-case households) by
+        # their governing case's CASE TYPE (individual/household) and SERVICE TYPE
+        # (meals/boxes). Each case holder's whole household inherits the case's
+        # type/kind, so multiply by the household size.
+        case_rows = open_cases.values(
+            "client_id", "program_name",
+            "program__product_type__type", "service_type",
+        )
+        client_hh = {
+            m["client_id"]: m["household_id"]
+            for m in HouseholdMember.objects.filter(
+                client_id__in=open_client_ids
+            ).values("client_id", "household_id")
+        }
+        hh_sizes = {}
+        for hid in HouseholdMember.objects.filter(
+            household_id__in=set(client_hh.values())
+        ).values_list("household_id", flat=True):
+            hh_sizes[hid] = hh_sizes.get(hid, 0) + 1
+        mem_by_type = {"individual": 0, "household": 0}
+        mem_by_service = {"meals": 0, "boxes": 0}
+        for row in case_rows:
+            size = hh_sizes.get(client_hh.get(row["client_id"]), 1)
+            is_hh = "household" in (row["program_name"] or "").casefold()
+            mem_by_type["household" if is_hh else "individual"] += size
+            kind = _case_product_kind(
+                row["program__product_type__type"],
+                row["program_name"], row["service_type"],
+            )
+            if kind is not None and kind.value in mem_by_service:
+                mem_by_service[kind.value] += size
+        members_payload["by_case_type"] = mem_by_type
+        members_payload["by_service_type"] = mem_by_service
+
         # --- 1.3 Total enrolled (ALL TIME, any status) --------------------
         enrolled_client_ids = set(ic.values_list("client_id", flat=True))
         total_enrolled = self._household_member_count(enrolled_client_ids)
