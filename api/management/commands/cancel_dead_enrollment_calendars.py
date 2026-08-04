@@ -16,6 +16,7 @@ A single client:
 """
 from django.core.management.base import BaseCommand
 from django.db.models import Count
+from django.utils import timezone
 
 from api.models import EnrollmentStage, OrderSchedule, OrderStatus
 
@@ -27,13 +28,18 @@ DEAD_STAGES = (
 
 
 class Command(BaseCommand):
-    help = "Cancel SCHEDULED calendar occurrences left on dead (closed) enrollments."
+    help = "Cancel FUTURE scheduled calendar occurrences left on dead (closed) enrollments."
 
     def add_arguments(self, parser):
         parser.add_argument("--apply", action="store_true",
                             help="Cancel them (default: review only).")
         parser.add_argument("--client", default="",
                             help="Limit to one client_id.")
+        parser.add_argument(
+            "--include-past", action="store_true",
+            help="Also cancel PAST scheduled occurrences (default: future only; "
+                 "past rows are inert history and left alone).",
+        )
 
     def handle(self, *args, **options):
         apply = options["apply"]
@@ -44,6 +50,11 @@ class Command(BaseCommand):
             )
             .select_related("enrollment", "kitchen", "member__client")
         )
+        # A closed enrollment should never have a FUTURE delivery. Past occurrences
+        # are inert history (also hidden by the calendar view guard + excluded from
+        # POs), so they're left alone unless --include-past is given.
+        if not options["include_past"]:
+            qs = qs.filter(anticipated_delivery_date__gte=timezone.localdate())
         if options["client"]:
             qs = qs.filter(member__client_id=options["client"])
 
