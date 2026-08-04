@@ -12007,3 +12007,165 @@ class CareManagementRescanTest(TestCase):
         self.assertEqual(
             MemberWarning.objects.get(client=c, code=NO_KITCHEN).status, WarningStatus.RESOLVED
         )
+
+
+class MemberSearchExpandedTest(TestCase):
+    """The Members list omni-search matches phone, email, member address, and the
+    TRUE (enrollment) delivery address -- not just name / IDs."""
+
+    def _api(self):
+        from rest_framework.test import APIClient
+        from rest_framework_simplejwt.tokens import AccessToken
+
+        from .models import Agent
+        a = Agent.objects.create(name="Mgr", agent_code="905", group="Management")
+        acc = AccessToken()
+        acc["agent_id"] = str(a.id); acc["agent_code"] = a.agent_code
+        acc["agent_name"] = a.name; acc["agent_group"] = a.group
+        api = APIClient(); api.credentials(HTTP_AUTHORIZATION=f"Bearer {acc}")
+        return api
+
+    def _ids(self, resp):
+        out = set()
+        for g in resp.json()["results"]:
+            out.add(g["primary"]["id"])
+            out.update(m["id"] for m in g.get("members", []))
+        return out
+
+    def test_search_by_phone_email_and_delivery_address(self):
+        from .models import (
+            Address, ClientPhone, EnrollmentStage, EnrollmentVerification,
+            Household, HouseholdMember,
+        )
+
+        api = self._api()
+        c = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Sam", last_name="Search",
+            client_email_address="sam.search@example.com",
+        )
+        ClientPhone.objects.create(client=c, raw="(716) 555-0142", normalized="7165550142")
+        # True delivery address on the enrollment (not the profile).
+        addr = Address.objects.create(
+            client=c, type="delivery", street="69 Gatchell St", city="Buffalo",
+            state="NY", zip="14212",
+        )
+        hh = Household.objects.create(name="HH")
+        HouseholdMember.objects.create(household=hh, client=c, is_primary=True)
+        EnrollmentVerification.objects.create(
+            client=c, household=hh, stage=EnrollmentStage.SERVICE_ACTIVE,
+            delivery_address=addr,
+        )
+
+        cid = str(c.client_id)
+        # phone (formatted query -> digits)
+        self.assertIn(cid, self._ids(api.get("/api/portal/members/?search=716-555-0142")))
+        # email
+        self.assertIn(cid, self._ids(api.get("/api/portal/members/?search=sam.search@example.com")))
+        # delivery address street + zip
+        self.assertIn(cid, self._ids(api.get("/api/portal/members/?search=Gatchell")))
+        self.assertIn(cid, self._ids(api.get("/api/portal/members/?search=14212")))
+        # a non-matching query does not return them
+        self.assertNotIn(cid, self._ids(api.get("/api/portal/members/?search=Nonexistent Zzz")))
+
+
+class NoteAuthorFallbackTest(TestCase):
+    """A note with no recorded author shows its SOURCE label, not a blank the UI
+    renders as 'Unknown'."""
+
+    def test_blank_author_falls_back_to_source_label(self):
+        from .models import Client, Note, NoteSource
+        from .portal.serializers import PortalNoteSerializer
+
+        c = Client.objects.create(client_id=str(uuid.uuid4()), first_name="A", last_name="B")
+        cases = {
+            NoteSource.SYSTEM: "System",
+            NoteSource.UNITE_US: "Unite Us",
+            NoteSource.GHL: "GoHighLevel",
+        }
+        for src, label in cases.items():
+            n = Note.objects.create(client=c, source=src, author_name="", body="x")
+            self.assertEqual(PortalNoteSerializer(n).data["author_name"], label)
+        # A real author is preserved.
+        n = Note.objects.create(client=c, source=NoteSource.UNITE_US, author_name="Jane Doe", body="y")
+        self.assertEqual(PortalNoteSerializer(n).data["author_name"], "Jane Doe")
+
+
+class AttributeSystemNotesCommandTest(TestCase):
+    """attribute_system_notes stamps a blank-author SYSTEM note with the agent
+    inferred from a co-timed timeline event, and leaves non-agent (import/
+    system) ones as System."""
+
+    def test_infers_agent_and_leaves_system(self):
+        from io import StringIO
+
+        from django.core.management import call_command
+
+        from .models import Agent, Client, Note, NoteSource, TimelineEvent
+
+        agent = Agent.objects.create(name="Javier Almenar", agent_code="614", group="Verifiers")
+
+        # Agent-triggered: co-timed event with an agent actor -> attributed.
+        c1 = Client.objects.create(client_id=str(uuid.uuid4()), first_name="L", last_name="O")
+        n1 = Note.objects.create(client=c1, source=NoteSource.SYSTEM, author_name="", body="x")
+        from django.utils import timezone as _tz
+        TimelineEvent.objects.create(client=c1, event_type="verification_requested", actor="agent:614", source="system", occurred_at=_tz.now())
+
+        # Import-triggered: only a system actor nearby -> stays System (blank).
+        c2 = Client.objects.create(client_id=str(uuid.uuid4()), first_name="I", last_name="M")
+        n2 = Note.objects.create(client=c2, source=NoteSource.SYSTEM, author_name="", body="y")
+        TimelineEvent.objects.create(client=c2, event_type="case_opened", actor="system:csv-import", source="import", occurred_at=_tz.now())
+
+        call_command("attribute_system_notes", "--apply", stdout=StringIO())
+
+        n1.refresh_from_db(); n2.refresh_from_db()
+        self.assertEqual(n1.author_name, "Javier Almenar")   # inferred agent
+        self.assertEqual(n2.author_name, "")                 # non-agent -> stays System
+
+
+class FixCaselessServingEnrollmentsTest(TestCase):
+    """Binds the governing case back onto a caseless serving enrollment: frees a
+    stray holder (SPLIT), binds directly (UNBOUND), and skips two-serving."""
+
+    def _case(self, client):
+        from .models import Case, CaseStatus, CaseType
+        return Case.objects.create(
+            case_id=uuid.uuid4(), client=client, case_type=CaseType.INTERNAL_SERVICE,
+            case_status=CaseStatus.OPEN, program_name="Medically Tailored Meals",
+        )
+
+    def test_split_unbound_and_ambiguous(self):
+        from io import StringIO
+
+        from django.core.management import call_command
+
+        from .models import Client, EnrollmentStage, EnrollmentVerification
+
+        # SPLIT: serving caseless + pending holds the case.
+        c1 = Client.objects.create(client_id=str(uuid.uuid4()), first_name="S", last_name="P")
+        case1 = self._case(c1)
+        serving1 = EnrollmentVerification.objects.create(client=c1, stage=EnrollmentStage.SERVICE_ACTIVE, case=None)
+        stray1 = EnrollmentVerification.objects.create(client=c1, stage=EnrollmentStage.PENDING_VERIFICATION, case=case1)
+
+        # UNBOUND: serving caseless + open case on no enrollment.
+        c2 = Client.objects.create(client_id=str(uuid.uuid4()), first_name="U", last_name="B")
+        case2 = self._case(c2)
+        serving2 = EnrollmentVerification.objects.create(client=c2, stage=EnrollmentStage.SERVICE_ACTIVE, case=None)
+
+        # AMBIGUOUS: two serving enrollments, one holds the case -> skip.
+        c3 = Client.objects.create(client_id=str(uuid.uuid4()), first_name="A", last_name="M")
+        case3 = self._case(c3)
+        servingA = EnrollmentVerification.objects.create(client=c3, stage=EnrollmentStage.SERVICE_ACTIVE, case=None)
+        servingB = EnrollmentVerification.objects.create(client=c3, stage=EnrollmentStage.ON_HOLD, case=case3)
+
+        call_command("fix_caseless_serving_enrollments", "--apply", stdout=StringIO())
+
+        serving1.refresh_from_db(); stray1.refresh_from_db()
+        serving2.refresh_from_db()
+        servingA.refresh_from_db(); servingB.refresh_from_db()
+
+        self.assertEqual(serving1.case_id, case1.case_id)               # bound
+        self.assertEqual(stray1.stage, EnrollmentStage.DISREGARDED)     # freed
+        self.assertIsNone(stray1.case_id)
+        self.assertEqual(serving2.case_id, case2.case_id)               # bound
+        self.assertIsNone(servingA.case_id)                            # ambiguous -> skipped
+        self.assertEqual(servingB.case_id, case3.case_id)              # untouched

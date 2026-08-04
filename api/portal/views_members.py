@@ -1128,10 +1128,27 @@ class MembersListView(PortalGenericAPIView):
 
         search = (params.get("search") or "").strip()
         if search:
+            import re
+
             cond = (
                 Q(first_name__icontains=search)
                 | Q(last_name__icontains=search)
-                | Q(insurances__external_member_id__icontains=search)
+                | Q(insurances__external_member_id__icontains=search)  # Medicaid ID
+                | Q(client_email_address__icontains=search)            # email
+                # Member address (any type stored on the client profile) ...
+                | Q(addresses__street__icontains=search)
+                | Q(addresses__city__icontains=search)
+                | Q(addresses__zip__icontains=search)
+                # ... and the TRUE delivery address, which lives on the ENROLLMENT
+                # (the profile copy can be stale). Match the member's own
+                # enrollment AND -- for a dependent with no own enrollment -- their
+                # household's enrollment, so every member is findable by it.
+                | Q(enrollments__delivery_address__street__icontains=search)
+                | Q(enrollments__delivery_address__city__icontains=search)
+                | Q(enrollments__delivery_address__zip__icontains=search)
+                | Q(household_membership__household__enrollment_verifications__delivery_address__street__icontains=search)
+                | Q(household_membership__household__enrollment_verifications__delivery_address__city__icontains=search)
+                | Q(household_membership__household__enrollment_verifications__delivery_address__zip__icontains=search)
             )
             # Multi-word "first last" search.
             parts = search.split()
@@ -1146,6 +1163,15 @@ class MembersListView(PortalGenericAPIView):
                 cond |= Q(client_id=uuid.UUID(search))
             except (ValueError, TypeError, AttributeError):
                 pass
+            # Phone: match the indexed last-10-digit normalized column (and the
+            # raw field) once the query carries enough digits to be a phone
+            # fragment -- so formatting in the query "(716) 555-..." still hits.
+            digits = re.sub(r"\D", "", search)
+            if len(digits) >= 7:
+                cond |= (
+                    Q(phones__normalized__icontains=digits)
+                    | Q(client_phone_number__icontains=digits)
+                )
             qs = qs.filter(cond)
 
         # Page-level scope (Verification / Logistics) restricts which members are
