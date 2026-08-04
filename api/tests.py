@@ -12120,3 +12120,52 @@ class AttributeSystemNotesCommandTest(TestCase):
         n1.refresh_from_db(); n2.refresh_from_db()
         self.assertEqual(n1.author_name, "Javier Almenar")   # inferred agent
         self.assertEqual(n2.author_name, "")                 # non-agent -> stays System
+
+
+class FixCaselessServingEnrollmentsTest(TestCase):
+    """Binds the governing case back onto a caseless serving enrollment: frees a
+    stray holder (SPLIT), binds directly (UNBOUND), and skips two-serving."""
+
+    def _case(self, client):
+        from .models import Case, CaseStatus, CaseType
+        return Case.objects.create(
+            case_id=uuid.uuid4(), client=client, case_type=CaseType.INTERNAL_SERVICE,
+            case_status=CaseStatus.OPEN, program_name="Medically Tailored Meals",
+        )
+
+    def test_split_unbound_and_ambiguous(self):
+        from io import StringIO
+
+        from django.core.management import call_command
+
+        from .models import Client, EnrollmentStage, EnrollmentVerification
+
+        # SPLIT: serving caseless + pending holds the case.
+        c1 = Client.objects.create(client_id=str(uuid.uuid4()), first_name="S", last_name="P")
+        case1 = self._case(c1)
+        serving1 = EnrollmentVerification.objects.create(client=c1, stage=EnrollmentStage.SERVICE_ACTIVE, case=None)
+        stray1 = EnrollmentVerification.objects.create(client=c1, stage=EnrollmentStage.PENDING_VERIFICATION, case=case1)
+
+        # UNBOUND: serving caseless + open case on no enrollment.
+        c2 = Client.objects.create(client_id=str(uuid.uuid4()), first_name="U", last_name="B")
+        case2 = self._case(c2)
+        serving2 = EnrollmentVerification.objects.create(client=c2, stage=EnrollmentStage.SERVICE_ACTIVE, case=None)
+
+        # AMBIGUOUS: two serving enrollments, one holds the case -> skip.
+        c3 = Client.objects.create(client_id=str(uuid.uuid4()), first_name="A", last_name="M")
+        case3 = self._case(c3)
+        servingA = EnrollmentVerification.objects.create(client=c3, stage=EnrollmentStage.SERVICE_ACTIVE, case=None)
+        servingB = EnrollmentVerification.objects.create(client=c3, stage=EnrollmentStage.ON_HOLD, case=case3)
+
+        call_command("fix_caseless_serving_enrollments", "--apply", stdout=StringIO())
+
+        serving1.refresh_from_db(); stray1.refresh_from_db()
+        serving2.refresh_from_db()
+        servingA.refresh_from_db(); servingB.refresh_from_db()
+
+        self.assertEqual(serving1.case_id, case1.case_id)               # bound
+        self.assertEqual(stray1.stage, EnrollmentStage.DISREGARDED)     # freed
+        self.assertIsNone(stray1.case_id)
+        self.assertEqual(serving2.case_id, case2.case_id)               # bound
+        self.assertIsNone(servingA.case_id)                            # ambiguous -> skipped
+        self.assertEqual(servingB.case_id, case3.case_id)              # untouched
