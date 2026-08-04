@@ -45,6 +45,110 @@ from .base import PortalAPIView, current_agent
 # Case statuses that mean the case is no longer open/serviceable.
 _TERMINAL_CASE_STATUSES = [CaseStatus.CLOSED, CaseStatus.CANCELLED]
 
+# Enrollment stages that mean the member is off-boarded (not a current member).
+_TERMINAL_ENROLLMENT_STAGES = [
+    EnrollmentStage.CLOSED, EnrollmentStage.CANCELLED,
+    EnrollmentStage.DISREGARDED, EnrollmentStage.SERVICE_COMPLETE,
+]
+
+# CS tab Section 3 -- Member Status. Every member (with a live enrollment on an
+# internal-service case, plus never-verified navigation members) is classified
+# into EXACTLY ONE of these, in PRIORITY ORDER (first match wins, no
+# double-counting). "other" is a catch-all that should stay ~empty.
+CS_MEMBER_TIERS = [
+    "receiving_meals", "pending_meals",       # being served
+    "out_of_range", "rejected", "services_paused", "no_coverage",
+    "requires_verification", "no_menu",       # Not Being Served (6 tiers)
+]
+
+
+def cs_member_status(start, end):
+    """Classify members into exactly one CS Member-Status tier (priority order).
+
+    Receiving Meals = ACTIVE on a Service-Active enrollment with a kitchen +
+    cadence + APPROVED auth. Pending Meals = verified but auth PENDING. Then the
+    six Not-Being-Served tiers by priority: Out of Range -> Rejected (auth denied)
+    -> Services Paused (member Paused or program On Hold) -> No Coverage (no
+    active Medicaid OR no social care coverage) -> Requires Verification (not
+    completed, incl. never-requested navigation members) -> No Menu (no menu type
+    assigned). Returns a {tier: count} dict (distinct members)."""
+    from api.models import (
+        Case, CaseType, EnrollmentStage as ES, Insurance, InsurancePlanType,
+        MemberDietaryProfile, MemberStatus, RecordStatus,
+        ServiceAuthorizationStatus as SAS, SocialCareCoverage,
+        SocialCareCoverageStatus,
+    )
+
+    rows = list(
+        _scope_members(MemberDietaryProfile.objects, start, end)
+        .exclude(enrollment__stage__in=_TERMINAL_ENROLLMENT_STAGES)
+        .values(
+            "client_id", "status", "menu_type",
+            "enrollment__stage", "enrollment__kitchen_id",
+            "enrollment__verified_at", "enrollment__delivery_weekdays",
+            "enrollment__case__service_authorization_status",
+        )
+    )
+    client_ids = {r["client_id"] for r in rows}
+    have_medicaid = set(Insurance.objects.filter(
+        client_id__in=client_ids,
+        plan_type__in=[InsurancePlanType.MEDICAID, InsurancePlanType.DUAL],
+        status=RecordStatus.ACTIVE,
+    ).values_list("client_id", flat=True))
+    have_social = set(SocialCareCoverage.objects.filter(
+        client_id__in=client_ids, status=SocialCareCoverageStatus.ENROLLED,
+    ).values_list("client_id", flat=True))
+
+    def classify(r):
+        cid = r["client_id"]
+        auth = r["enrollment__case__service_authorization_status"]
+        stage = r["enrollment__stage"]
+        status = r["status"]
+        verified = r["enrollment__verified_at"] is not None
+        if (status == MemberStatus.ACTIVE and stage == ES.SERVICE_ACTIVE
+                and r["enrollment__kitchen_id"] and r["enrollment__delivery_weekdays"]
+                and auth == SAS.APPROVED):
+            return "receiving_meals"
+        if verified and auth == SAS.PENDING:
+            return "pending_meals"
+        if status == MemberStatus.OUT_OF_RANGE:
+            return "out_of_range"
+        if auth == SAS.DENIED:
+            return "rejected"
+        if status == MemberStatus.PAUSED or stage == ES.ON_HOLD:
+            return "services_paused"
+        if cid not in have_medicaid or cid not in have_social:
+            return "no_coverage"
+        if not verified:
+            return "requires_verification"
+        # Everyone remaining is verified + covered but not yet receiving -- no
+        # menu / not yet set up on a kitchen. Catch-all last tier ("assign a
+        # kitchen").
+        return "no_menu"
+
+    idx = {t: i for i, t in enumerate(CS_MEMBER_TIERS)}
+    best = {}
+    for r in rows:
+        t = classify(r)
+        cid = r["client_id"]
+        if cid not in best or idx[t] < idx[best[cid]]:
+            best[cid] = t
+
+    # Navigation members: an OPEN internal-service case but no enrollment/profile
+    # (verification never requested) -> Requires Verification.
+    open_isc = set(_scope_by_opened(
+        Case.objects.filter(case_type=CaseType.INTERNAL_SERVICE)
+        .exclude(case_status__in=_TERMINAL_CASE_STATUSES),
+        start, end,
+    ).values_list("client_id", flat=True))
+    for cid in open_isc - set(best):
+        best[cid] = "requires_verification"
+
+    counts = {t: 0 for t in CS_MEMBER_TIERS}
+    for t in best.values():
+        counts[t] += 1
+    return counts
+
 # The drill-down reasons the serving-status list endpoint understands. The first
 # group mirrors the "Not Being Served" cards; the second is the follow-up
 # watchlist (which can overlap with actively-served members).
@@ -974,6 +1078,8 @@ class DashboardView(PortalAPIView):
                 "enrolled": enrolled,
                 "receiving": receiving_meals,
                 "pending": pending,
+                # CS tab Section 3 -- member status (priority-ordered, one bucket).
+                "member_status": cs_member_status(start, end),
             }
         )
 

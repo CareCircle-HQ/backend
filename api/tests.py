@@ -12412,3 +12412,71 @@ class GoverningCaseExcludesUnauthorizedTest(TestCase):
         self.assertIn(denied.case_id, gov)          # denied still governs
         self.assertNotIn(blank.case_id, gov)        # blank never governs
         self.assertNotIn(never.case_id, gov)        # never_requested never governs
+
+
+class CSMemberStatusTest(TestCase):
+    """cs_member_status classifies each member into exactly ONE tier, priority
+    order (first match wins, no double-counting)."""
+
+    def _m(self, *, status, stage, auth, kitchen=False, weekdays=None,
+           verified=False, menu="Standard", medicaid=False, social=False):
+        from django.utils import timezone
+        from .models import (
+            Case, CaseStatus, CaseType, Client, EnrollmentStage,
+            EnrollmentVerification, Household, HouseholdMember, Insurance,
+            InsurancePlanType, Kitchen, KitchenStatus, MemberDietaryProfile,
+            RecordStatus, SocialCareCoverage, SocialCareCoverageStatus,
+        )
+        c = Client.objects.create(client_id=str(uuid.uuid4()), first_name="M", last_name="S")
+        hh = Household.objects.create(name="HH")
+        HouseholdMember.objects.create(household=hh, client=c, is_primary=True)
+        case = Case.objects.create(
+            case_id=uuid.uuid4(), client=c, case_type=CaseType.INTERNAL_SERVICE,
+            case_status=CaseStatus.OPEN, service_authorization_status=auth,
+            program_name="Medically Tailored Meals",
+        )
+        k = Kitchen.objects.create(name="K", status=KitchenStatus.ACTIVE) if kitchen else None
+        enr = EnrollmentVerification.objects.create(
+            client=c, household=hh, case=case, stage=stage, kitchen=k,
+            delivery_weekdays=weekdays or [],
+            verified_at=timezone.now() if verified else None,
+        )
+        MemberDietaryProfile.objects.create(
+            enrollment=enr, client=c, menu_type=menu, status=status,
+        )
+        if medicaid:
+            Insurance.objects.create(client=c, plan_type=InsurancePlanType.MEDICAID, status=RecordStatus.ACTIVE)
+        if social:
+            SocialCareCoverage.objects.create(client=c, status=SocialCareCoverageStatus.ENROLLED)
+        return c
+
+    def test_priority_classification(self):
+        from .models import (
+            EnrollmentStage, MemberStatus, ServiceAuthorizationStatus as SAS,
+        )
+        from .portal.views_dashboard import cs_member_status
+
+        self._m(status=MemberStatus.ACTIVE, stage=EnrollmentStage.SERVICE_ACTIVE,
+                auth=SAS.APPROVED, kitchen=True, weekdays=["mon"], verified=True,
+                medicaid=True, social=True)                                  # receiving
+        self._m(status=MemberStatus.ACTIVE, stage=EnrollmentStage.VERIFIED,
+                auth=SAS.PENDING, verified=True)                             # pending_meals
+        self._m(status=MemberStatus.OUT_OF_RANGE, stage=EnrollmentStage.SERVICE_ACTIVE,
+                auth=SAS.APPROVED)                                           # out_of_range
+        self._m(status=MemberStatus.ACTIVE, stage=EnrollmentStage.ON_HOLD,
+                auth=SAS.DENIED)                                            # rejected (beats paused)
+        self._m(status=MemberStatus.PAUSED, stage=EnrollmentStage.SERVICE_ACTIVE,
+                auth=SAS.APPROVED, medicaid=True, social=True)               # services_paused
+        self._m(status=MemberStatus.ACTIVE, stage=EnrollmentStage.SERVICE_ACTIVE,
+                auth=SAS.APPROVED, verified=True)                            # no_coverage
+        self._m(status=MemberStatus.ACTIVE, stage=EnrollmentStage.KITCHEN_ASSIGNMENT,
+                auth=SAS.APPROVED, verified=False, medicaid=True, social=True)  # requires_verification
+        self._m(status=MemberStatus.ACTIVE, stage=EnrollmentStage.KITCHEN_ASSIGNMENT,
+                auth=SAS.APPROVED, verified=True, menu="", medicaid=True, social=True)  # no_menu
+
+        ms = cs_member_status(None, None)
+        self.assertEqual(ms, {
+            "receiving_meals": 1, "pending_meals": 1, "out_of_range": 1,
+            "rejected": 1, "services_paused": 1, "no_coverage": 1,
+            "requires_verification": 1, "no_menu": 1,
+        })
