@@ -50,7 +50,8 @@ _TERMINAL_CASE_STATUSES = [CaseStatus.CLOSED, CaseStatus.CANCELLED]
 # watchlist (which can overlap with actively-served members).
 _SERVING_REASONS = frozenset({
     "needs_verification", "rejected_case", "out_of_range",
-    "programs_on_hold", "members_paused", "pending_closure", "out_of_orbit",
+    "programs_on_hold", "members_paused_agent", "members_paused_eligibility",
+    "pending_closure", "out_of_orbit",
     "insurance_expiring", "no_social_coverage",
 })
 
@@ -201,18 +202,6 @@ def serving_client_ids(reason, *, start, end, governing_ids=None):
             )
         return _open_gov_cache["v"]
 
-    def open_approved_gov_clients():
-        """client_ids whose GOVERNING case is OPEN *and* authorization APPROVED --
-        a live, authorized program. Used by members_paused."""
-        if "a" not in _open_gov_cache:
-            _open_gov_cache["a"] = set(
-                Case.objects.filter(case_id__in=gov())
-                .exclude(case_status__in=_TERMINAL_CASE_STATUSES)
-                .filter(service_authorization_status=ServiceAuthorizationStatus.APPROVED)
-                .values_list("client_id", flat=True)
-            )
-        return _open_gov_cache["a"]
-
     if reason == "needs_verification":
         # Mirror the Verification page's "Pending + Requested-date" filter EXACTLY
         # (same helpers) so this card can never drift from what agents see there:
@@ -292,18 +281,25 @@ def serving_client_ids(reason, *, start, end, governing_ids=None):
             )
         member_ids = set(cq.values_list("client_id", flat=True)) & open_case_clients
         return set(_primary_map(member_ids).values())
-    if reason == "members_paused":
-        # PROGRAMS that have at least one individually-PAUSED member, whose
-        # GOVERNING case is OPEN *and* APPROVED (a live, authorized program).
-        # Counted per PROGRAM: collapse the paused members to their household
-        # primary (the case holder) so the drill-down link drives to the program.
-        paused = set(scope(
-            mdp.filter(status=MemberStatus.PAUSED).exclude(
-                client__lifecycle_stage=ClientStage.INELIGIBLE  # member must be Eligible
-            )
-        ).values_list("client_id", flat=True))
-        primaries = set(_primary_map(paused).values())
-        return primaries & open_approved_gov_clients()
+    if reason in ("members_paused_agent", "members_paused_eligibility"):
+        # PROGRAMS with a PAUSED member, split by WHO paused them: an agent
+        # (manual, eligibility_paused=False) vs eligibility (auto,
+        # eligibility_paused=True). Mirrors the Members page chain: any
+        # eligibility ("All") -> Internal Service = Open (client has ANY
+        # non-terminal internal-service case) -> Paused. No Eligible filter --
+        # eligibility-paused members are on the Ineligible off-ramp, so requiring
+        # Eligible would drop them all. Counted per PROGRAM (collapse the paused
+        # members to their household primary so the link drives to the program).
+        open_case_clients = set(
+            Case.objects.filter(case_type=CaseType.INTERNAL_SERVICE)
+            .exclude(case_status__in=_TERMINAL_CASE_STATUSES)
+            .values_list("client_id", flat=True)
+        )
+        paused = set(scope(mdp.filter(
+            status=MemberStatus.PAUSED,
+            eligibility_paused=(reason == "members_paused_eligibility"),
+        )).values_list("client_id", flat=True)) & open_case_clients
+        return set(_primary_map(paused).values())
     if reason == "pending_closure":
         # Only a closure ticket on the GOVERNING case flags the member -- a ticket
         # on a non-governing case is not their service closing.
@@ -458,12 +454,14 @@ def _serving_details(reason, client_ids, *, start, end, governing_ids=None):
         for cid in ids:
             out.setdefault(cid, "Program on hold (under review)")
         return out
-    if reason == "members_paused":
-        # ids are program primaries. Count paused members per program (mapped to
-        # their primary) and label with the program name.
-        paused_ids = list(
-            mdp.filter(status=MemberStatus.PAUSED).values_list("client_id", flat=True)
-        )
+    if reason in ("members_paused_agent", "members_paused_eligibility"):
+        # ids are program primaries. Count paused members (of the matching kind)
+        # per program and label with the program name.
+        elig = reason == "members_paused_eligibility"
+        kind = "eligibility" if elig else "agent"
+        paused_ids = list(mdp.filter(
+            status=MemberStatus.PAUSED, eligibility_paused=elig,
+        ).values_list("client_id", flat=True))
         prim = _primary_map(set(paused_ids))
         counts = {}
         for cid in paused_ids:
@@ -480,7 +478,7 @@ def _serving_details(reason, client_ids, *, start, end, governing_ids=None):
             case = getattr(p.enrollment, "case", None)
             name = (getattr(case, "program_name", "") or "").strip()
             n = counts.get(p.client_id, 1)
-            base = f"{n} paused member{'' if n == 1 else 's'}"
+            base = f"{n} member{'' if n == 1 else 's'} paused by {kind}"
             out[p.client_id] = f"{base} · {name}" if name else base
         return out
     if reason == "pending_closure":
@@ -767,10 +765,11 @@ class DashboardView(PortalAPIView):
                 "rejected_case": _count("rejected_case"),
                 # 2.3d Delivery/primary ZIP outside coverage (geographic block).
                 "out_of_range": _count("out_of_range"),
-                # 2.3e PROGRAM on hold (household-wide, counted per program) vs a
-                # MEMBER individually paused (counted per member).
+                # 2.3e PROGRAM on hold (household-wide) vs programs with a member
+                # paused -- split by who paused them (agent vs eligibility).
                 "programs_on_hold": _count("programs_on_hold"),
-                "members_paused": _count("members_paused"),
+                "members_paused_agent": _count("members_paused_agent"),
+                "members_paused_eligibility": _count("members_paused_eligibility"),
                 # 2.3f Closure initiated (open Case Closure ticket).
                 "pending_closure": _count("pending_closure"),
                 # 2.3g Dietary/allergy profile unfulfillable by any kitchen.

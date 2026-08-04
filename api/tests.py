@@ -5012,7 +5012,7 @@ class DashboardServingClientIdsTests(TestCase):
     snapshot over every member profile."""
 
     def _member(self, *, status=None, stage=None, case_status=None, auth=None,
-                lifecycle=None):
+                lifecycle=None, elig_paused=False):
         from .models import (
             Case, CaseStatus, CaseType, Client, EnrollmentStage,
             EnrollmentVerification, Household, HouseholdMember,
@@ -5042,59 +5042,55 @@ class DashboardServingClientIdsTests(TestCase):
         MemberDietaryProfile.objects.create(
             enrollment=enr, client=client, menu_type="Standard",
             status=status or MemberStatus.ACTIVE,
+            eligibility_paused=elig_paused,
         )
         return client
 
     def test_programs_on_hold_and_members_paused_split(self):
-        # PROGRAM on hold (household-wide, enrollment stage ON_HOLD) vs a program
-        # with a PAUSED member (open + APPROVED governing case) are separate.
+        # On Hold (governing enrollment ON_HOLD, Eligible) vs Members Paused,
+        # itself split by who paused: agent (manual) vs eligibility (auto).
         from .models import (
-            ClientStage, EnrollmentStage, MemberStatus,
-            ServiceAuthorizationStatus,
+            CaseStatus, ClientStage, EnrollmentStage, MemberStatus,
         )
         from .portal.views_dashboard import serving_client_ids
 
-        # Paused member on an OPEN + APPROVED program -> members_paused.
-        paused = self._member(
+        # Paused by an AGENT (manual) on an open program.
+        agent_paused = self._member(
             status=MemberStatus.PAUSED, stage=EnrollmentStage.SERVICE_ACTIVE,
-            auth=ServiceAuthorizationStatus.APPROVED,
         )
-        # Paused member but auth NOT approved -> excluded from members_paused.
-        paused_unapproved = self._member(
+        # Paused by ELIGIBILITY (auto) -- these are typically on the Ineligible
+        # off-ramp, and must STILL be counted (no Eligible filter for paused).
+        elig_paused = self._member(
             status=MemberStatus.PAUSED, stage=EnrollmentStage.SERVICE_ACTIVE,
-            auth=ServiceAuthorizationStatus.PENDING,
+            elig_paused=True, lifecycle=ClientStage.INELIGIBLE,
+        )
+        # Paused but NO open internal-service case -> excluded from both.
+        paused_closed = self._member(
+            status=MemberStatus.PAUSED, stage=EnrollmentStage.SERVICE_ACTIVE,
+            case_status=CaseStatus.CLOSED,
         )
         on_hold = self._member(stage=EnrollmentStage.ON_HOLD)  # status Active
-        active = self._member()
-        # An on-hold PROGRAM counts regardless of the member's own status.
-        oor_on_hold = self._member(
-            status=MemberStatus.OUT_OF_RANGE, stage=EnrollmentStage.ON_HOLD
-        )
-        # INELIGIBLE members are excluded from both reasons (must be Eligible).
         on_hold_inelig = self._member(
             stage=EnrollmentStage.ON_HOLD, lifecycle=ClientStage.INELIGIBLE
         )
-        paused_inelig = self._member(
-            status=MemberStatus.PAUSED, stage=EnrollmentStage.SERVICE_ACTIVE,
-            auth=ServiceAuthorizationStatus.APPROVED, lifecycle=ClientStage.INELIGIBLE,
-        )
+        active = self._member()
 
         on_hold_ids = serving_client_ids("programs_on_hold", start=None, end=None)
-        paused_ids = serving_client_ids("members_paused", start=None, end=None)
+        agent_ids = serving_client_ids("members_paused_agent", start=None, end=None)
+        elig_ids = serving_client_ids("members_paused_eligibility", start=None, end=None)
 
-        # On-hold programs (open governing case) count whatever the member status.
+        # On Hold: eligible governing-on-hold programs only.
         self.assertIn(on_hold.client_id, on_hold_ids)
-        self.assertIn(oor_on_hold.client_id, on_hold_ids)
-        self.assertNotIn(on_hold.client_id, paused_ids)
-        # members_paused: only the paused member on an OPEN + APPROVED program.
-        self.assertIn(paused.client_id, paused_ids)
-        self.assertNotIn(paused_unapproved.client_id, paused_ids)
-        self.assertNotIn(paused.client_id, on_hold_ids)
-        # A plain active (not on-hold) member is in neither.
-        self.assertNotIn(active.client_id, on_hold_ids | paused_ids)
-        # INELIGIBLE members are excluded from both (must be Eligible).
-        self.assertNotIn(on_hold_inelig.client_id, on_hold_ids)
-        self.assertNotIn(paused_inelig.client_id, paused_ids)
+        self.assertNotIn(on_hold_inelig.client_id, on_hold_ids)  # must be Eligible
+        # Paused split: agent vs eligibility, each in its own bucket only.
+        self.assertIn(agent_paused.client_id, agent_ids)
+        self.assertNotIn(agent_paused.client_id, elig_ids)
+        self.assertIn(elig_paused.client_id, elig_ids)
+        self.assertNotIn(elig_paused.client_id, agent_ids)
+        # No open internal-service case -> not counted as paused.
+        self.assertNotIn(paused_closed.client_id, agent_ids | elig_ids)
+        # A plain active member is in none.
+        self.assertNotIn(active.client_id, on_hold_ids | agent_ids | elig_ids)
 
     def test_closed_governing_case_excludes_from_reasons(self):
         # Every serving/watchlist reason is gated to an OPEN governing case: a
