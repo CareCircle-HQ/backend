@@ -31,6 +31,7 @@ from rest_framework.response import Response
 
 from ..models import (
     Address,
+    Agent,
     Cadence,
     Case,
     CaseHouseholdType,
@@ -1095,6 +1096,25 @@ class TeamsListView(PortalAPIView):
         return Response([{"value": t, "label": t} for t in options])
 
 
+class VerifiersListView(PortalAPIView):
+    """Verifier-group agents for the Members-page 'Verified by' filter dropdown.
+
+    ``value`` == the Agent id (matched against
+    ``EnrollmentVerification.verified_by`` by the members list ``verified_by``
+    filter); ``label`` == the agent's name. Only ACTIVE agents in the Verifiers
+    group are offered."""
+
+    def get(self, request):
+        agents = (
+            Agent.objects.filter(status="Active", group="Verifiers")
+            .order_by("name")
+            .values_list("id", "name")
+        )
+        return Response(
+            [{"value": str(aid), "label": name or str(aid)} for aid, name in agents]
+        )
+
+
 class MembersListView(PortalGenericAPIView):
     serializer_class = s.MemberListSerializer
 
@@ -1498,6 +1518,23 @@ class MembersListView(PortalGenericAPIView):
             qs = qs.filter(
                 cases__case_type=CaseType.INTERNAL_SERVICE,
                 cases__created_by_id__in=team_creator_ids,
+            )
+
+        # "Verified by" filter (Members page): keep members whose household (or
+        # own) enrollment verification was COMPLETED by the selected Verifier
+        # agent (EnrollmentVerification.verified_by). Matches via the household so
+        # every member of a verified household is included (dependents follow the
+        # primary), plus any direct client enrollment. Covers both household and
+        # individual programs. Trailing .distinct() dedupes the join.
+        verified_by_val = (params.get("verified_by") or "").strip()
+        if verified_by_val:
+            qs = qs.filter(
+                Q(enrollments__verified_by_id=verified_by_val)
+                | Q(
+                    household_membership__household__enrollment_verifications__verified_by_id=(
+                        verified_by_val
+                    )
+                )
             )
 
         # Created-date range filter (Members page): filters on the date the

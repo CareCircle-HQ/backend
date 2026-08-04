@@ -11756,3 +11756,52 @@ class TicketHouseholdPrimaryIdSerializerTest(TestCase):
         lone = Client.objects.create(client_id=str(uuid.uuid4()), first_name="L", last_name="N")
         tl = Ticket.objects.create(type=tt, client=lone, reason="y")
         self.assertIsNone(s.PortalTicketSerializer(tl).data["household_primary_id"])
+
+
+class MembersVerifiedByFilterTest(TestCase):
+    """/verifiers/ lists Verifier-group agents; the members list ?verified_by=
+    filter keeps only members verified by that agent."""
+
+    def _api(self):
+        from rest_framework.test import APIClient
+        from rest_framework_simplejwt.tokens import AccessToken
+
+        from .models import Agent
+        a = Agent.objects.create(name="Mgr", agent_code="900", group="Management")
+        acc = AccessToken()
+        acc["agent_id"] = str(a.id); acc["agent_code"] = a.agent_code
+        acc["agent_name"] = a.name; acc["agent_group"] = a.group
+        api = APIClient(); api.credentials(HTTP_AUTHORIZATION=f"Bearer {acc}")
+        return api
+
+    def test_verifiers_endpoint_and_filter(self):
+        from .models import (
+            Agent, Client, EnrollmentStage, EnrollmentVerification,
+        )
+
+        verifier = Agent.objects.create(name="Vera Verifier", group="Verifiers", status="Active")
+        Agent.objects.create(name="Cassie CS", group="CS", status="Active")
+        api = self._api()
+
+        # /verifiers/ returns only the Verifier-group agent.
+        vs = api.get("/api/portal/verifiers/").json()
+        labels = {v["label"] for v in vs}
+        self.assertIn("Vera Verifier", labels)
+        self.assertNotIn("Cassie CS", labels)
+
+        verified = Client.objects.create(client_id=str(uuid.uuid4()), first_name="Ver", last_name="Ified")
+        other = Client.objects.create(client_id=str(uuid.uuid4()), first_name="No", last_name="One")
+        EnrollmentVerification.objects.create(
+            client=verified, stage=EnrollmentStage.VERIFIED, verified_by=verifier,
+        )
+
+        def ids(resp):
+            out = set()
+            for g in resp.json()["results"]:
+                out.add(g["primary"]["id"])
+                out.update(m["id"] for m in g.get("members", []))
+            return out
+
+        got = ids(api.get(f"/api/portal/members/?verified_by={verifier.id}"))
+        self.assertIn(str(verified.client_id), got)
+        self.assertNotIn(str(other.client_id), got)
