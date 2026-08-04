@@ -11836,3 +11836,48 @@ class MembersVerifiedByFilterTest(TestCase):
         self.assertIn(str(shadowed.client_id), got)   # verified enrollment closed, still matches
         self.assertNotIn(str(other.client_id), got)
         self.assertNotIn(str(bob_client.client_id), got)
+
+
+class CarriedVerificationTest(TestCase):
+    """Verification carries forward when a governing-case replacement reuses a
+    pre-existing enrollment, and the backfill fixes historical rows."""
+
+    def test_backfill_copies_from_superseded_and_skips_verified(self):
+        from io import StringIO
+
+        from django.core.management import call_command
+        from django.utils import timezone
+
+        from .models import Agent, Client, EnrollmentStage, EnrollmentVerification
+
+        a = Agent.objects.create(name="Vera", group="Verifiers", status="Active")
+        b = Agent.objects.create(name="Bob", group="Verifiers", status="Active")
+        now = timezone.now()
+
+        # Live enrollment missing verification, superseding a verified closed one.
+        c1 = Client.objects.create(client_id=str(uuid.uuid4()), first_name="A", last_name="A")
+        closed1 = EnrollmentVerification.objects.create(
+            client=c1, stage=EnrollmentStage.CLOSED, verified_by=a, verified_at=now,
+            closed_at=now,
+        )
+        live1 = EnrollmentVerification.objects.create(
+            client=c1, stage=EnrollmentStage.SERVICE_ACTIVE, supersedes=closed1,
+        )
+
+        # Live enrollment ALREADY verified (by Bob) -> must NOT be overwritten.
+        c2 = Client.objects.create(client_id=str(uuid.uuid4()), first_name="B", last_name="B")
+        closed2 = EnrollmentVerification.objects.create(
+            client=c2, stage=EnrollmentStage.CLOSED, verified_by=a, verified_at=now,
+            closed_at=now,
+        )
+        live2 = EnrollmentVerification.objects.create(
+            client=c2, stage=EnrollmentStage.SERVICE_ACTIVE, supersedes=closed2,
+            verified_by=b, verified_at=now,
+        )
+
+        call_command("backfill_carried_verification", "--apply", stdout=StringIO())
+
+        live1.refresh_from_db(); live2.refresh_from_db()
+        self.assertEqual(live1.verified_by_id, a.id)   # carried from superseded
+        self.assertIsNotNone(live1.verified_at)
+        self.assertEqual(live2.verified_by_id, b.id)   # own verification preserved

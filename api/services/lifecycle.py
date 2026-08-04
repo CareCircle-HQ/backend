@@ -2662,6 +2662,38 @@ def _handle_household_scope_switch(
     return True
 
 
+def _carry_verification_fields(target, source):
+    """Copy the verification FACT (who/when completed + requested + the verified
+    flags) from ``source`` onto ``target`` when ``target`` isn't itself verified.
+
+    Used when a governing-case replacement reuses a pre-existing (unverified)
+    enrollment: the household was already verified on ``source`` and shouldn't be
+    re-verified, so the surviving enrollment inherits that fact. No-op when the
+    source has no verification or the target is already verified (its own
+    verification wins). Best-effort."""
+    if source is None or target is None:
+        return
+    if target.verified_at is not None or source.verified_at is None:
+        return
+    fields = ["verified_at", "verified_by"]
+    target.verified_at = source.verified_at
+    target.verified_by = source.verified_by
+    if target.requested_at is None and source.requested_at is not None:
+        target.requested_at = source.requested_at
+        fields.append("requested_at")
+    if target.requested_by_id is None and source.requested_by_id is not None:
+        target.requested_by = source.requested_by
+        fields.append("requested_by")
+    for flag in ("delivery_address_verified", "is_family_verified", "medicaid_type_verified"):
+        if not getattr(target, flag, False) and getattr(source, flag, False):
+            setattr(target, flag, True)
+            fields.append(flag)
+    try:
+        target.save(update_fields=fields)
+    except Exception:  # pragma: no cover - defensive
+        pass
+
+
 def _close_old_and_link_to_existing(
     live, existing, new_governing_case, actor=None, actor_label="", note="",
 ):
@@ -2711,6 +2743,16 @@ def _close_old_and_link_to_existing(
                 existing.save(update_fields=["supersedes"])
             except Exception:  # pragma: no cover - defensive
                 pass
+
+        # Carry the VERIFICATION FACT forward. A household is verified once; when
+        # the governing case is replaced we keep the same verification instead of
+        # forcing a re-verify. The other replacement path (a freshly CREATED
+        # enrollment) already copies these; this path reused a pre-existing
+        # (usually unverified Pending) enrollment, so copy them here too --
+        # otherwise the surviving enrollment reaches Service Active with a BLANK
+        # "Verified by" (the completer/date are lost). Only fill fields the
+        # survivor doesn't already carry, so a genuine own verification wins.
+        _carry_verification_fields(existing, live)
 
         # Carry the closed enrollment's service forward: if ``live`` was serving a
         # SAME-KIND program, drive ``existing`` back to Service Active with the
