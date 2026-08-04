@@ -1308,6 +1308,7 @@ class PortalTicketSerializer(serializers.ModelSerializer):
     source_label = serializers.CharField(source="get_source_display", read_only=True)
     client_id = serializers.SerializerMethodField()
     client_name = serializers.SerializerMethodField()
+    household_primary_id = serializers.SerializerMethodField()
     case_code = serializers.SerializerMethodField()
     assignee = serializers.SerializerMethodField()
     assignee_id = serializers.SerializerMethodField()
@@ -1321,8 +1322,8 @@ class PortalTicketSerializer(serializers.ModelSerializer):
         fields = [
             "id", "code", "type", "type_label", "status", "status_label",
             "severity", "source", "source_label", "reason", "client_id",
-            "client_name", "case_code", "assignee", "assignee_id",
-            "created_by", "created_by_id", "origin",
+            "client_name", "household_primary_id", "case_code", "assignee",
+            "assignee_id", "created_by", "created_by_id", "origin",
             "vip", "created_at", "updated_at", "resolved_at", "notes",
         ]
 
@@ -1344,6 +1345,20 @@ class PortalTicketSerializer(serializers.ModelSerializer):
 
     def get_client_name(self, obj):
         return _full_name(obj.client) if obj.client else ""
+
+    def get_household_primary_id(self, obj):
+        # client_id of the ticket client's household PRIMARY (to open the
+        # household head in the CRM). Mirrors MemberListSerializer; None when the
+        # client has no household. Returned for the primary too (self-link),
+        # matching the Members list.
+        client = obj.client if obj.client_id else None
+        membership = getattr(client, "household_membership", None) if client else None
+        if membership is None:
+            return None
+        for m in membership.household.members.all():
+            if m.is_primary:
+                return str(m.client_id)
+        return None
 
     def get_case_code(self, obj):
         if not obj.case_id:

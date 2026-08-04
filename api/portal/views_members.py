@@ -31,6 +31,7 @@ from rest_framework.response import Response
 
 from ..models import (
     Address,
+    Agent,
     Cadence,
     Case,
     CaseHouseholdType,
@@ -1095,6 +1096,25 @@ class TeamsListView(PortalAPIView):
         return Response([{"value": t, "label": t} for t in options])
 
 
+class VerifiersListView(PortalAPIView):
+    """Verifier-group agents for the Members-page 'Verified by' filter dropdown.
+
+    ``value`` == the Agent id (matched against
+    ``EnrollmentVerification.verified_by`` by the members list ``verified_by``
+    filter); ``label`` == the agent's name. Only ACTIVE agents in the Verifiers
+    group are offered."""
+
+    def get(self, request):
+        agents = (
+            Agent.objects.filter(status="Active", group="Verifiers")
+            .order_by("name")
+            .values_list("id", "name")
+        )
+        return Response(
+            [{"value": str(aid), "label": name or str(aid)} for aid, name in agents]
+        )
+
+
 class MembersListView(PortalGenericAPIView):
     serializer_class = s.MemberListSerializer
 
@@ -1498,6 +1518,24 @@ class MembersListView(PortalGenericAPIView):
             qs = qs.filter(
                 cases__case_type=CaseType.INTERNAL_SERVICE,
                 cases__created_by_id__in=team_creator_ids,
+            )
+
+        # "Verified by" filter (Members page): keep members for whom the selected
+        # Verifier agent COMPLETED a verification pop-up -- i.e. verified_by is
+        # stamped on one of the member's OWN (non-disregarded) enrollments. This
+        # is the verification FACT and must survive the enrollment later being
+        # closed/superseded (a duplicate or re-enrollment must NOT hide that the
+        # agent did the verification). Own enrollments only: a household
+        # verification is stamped on the PRIMARY's enrollment, so the household
+        # still surfaces via its primary, while matching every household member's
+        # enrollment would drag in dependents who carry a blank / different
+        # verifier. Both conditions are in one .filter() so they bind to the SAME
+        # enrollment row; the trailing .distinct() dedupes the join.
+        verified_by_val = (params.get("verified_by") or "").strip()
+        if verified_by_val:
+            qs = qs.filter(
+                Q(enrollments__verified_by_id=verified_by_val)
+                & ~Q(enrollments__stage=EnrollmentStage.DISREGARDED)
             )
 
         # Created-date range filter (Members page): filters on the date the

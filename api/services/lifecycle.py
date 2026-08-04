@@ -2662,6 +2662,111 @@ def _handle_household_scope_switch(
     return True
 
 
+def _carry_verification_fields(target, source):
+    """Carry the verified capture from ``source`` onto ``target`` after a
+    governing-case replacement reused a pre-existing enrollment.
+
+    Two independent parts:
+      1. The captured DELIVERY ADDRESS + household size -- carried whenever the
+         survivor lacks them, REGARDLESS of verification state (a verified
+         enrollment can still be missing the address if an earlier carry copied
+         the verified flag but not the FK).
+      2. The verification FACT (who/when completed + requested + the verified
+         flags) -- carried only when the survivor isn't itself verified (its own
+         verification wins).
+
+    Only fills empties; never overwrites. Returns the number of fields changed.
+    Best-effort."""
+    if source is None or target is None:
+        return 0
+
+    # (1) Captured delivery address + household size (ungated by verification).
+    addr_fields = []
+    if target.delivery_address_id is None and source.delivery_address_id is not None:
+        target.delivery_address_id = source.delivery_address_id
+        addr_fields.append("delivery_address")
+    if target.household_size is None and source.household_size is not None:
+        target.household_size = source.household_size
+        addr_fields.append("household_size")
+    if addr_fields:
+        try:
+            target.save(update_fields=addr_fields)
+        except Exception:  # pragma: no cover - defensive
+            addr_fields = []
+
+    # (2) Verification fact -- only when the survivor isn't already verified.
+    if target.verified_at is not None or source.verified_at is None:
+        return len(addr_fields)
+    fields = ["verified_at", "verified_by"]
+    target.verified_at = source.verified_at
+    target.verified_by = source.verified_by
+    if target.requested_at is None and source.requested_at is not None:
+        target.requested_at = source.requested_at
+        fields.append("requested_at")
+    if target.requested_by_id is None and source.requested_by_id is not None:
+        target.requested_by = source.requested_by
+        fields.append("requested_by")
+    for flag in ("delivery_address_verified", "is_family_verified", "medicaid_type_verified"):
+        if not getattr(target, flag, False) and getattr(source, flag, False):
+            setattr(target, flag, True)
+            fields.append(flag)
+    try:
+        target.save(update_fields=fields)
+    except Exception:  # pragma: no cover - defensive
+        fields = []
+    return len(addr_fields) + len(fields)
+
+
+def _carry_dietary_profiles(target, source):
+    """Fill BLANK dietary fields on ``target``'s member profiles from ``source``'s
+    matching (by client) profiles.
+
+    A household is verified once, capturing each member's menu type / allergies /
+    restrictions. When a governing-case replacement REUSES a pre-existing
+    (usually placeholder) enrollment, those profiles start blank -- so copy the
+    verified dietary config forward (the create-new path already does). Only
+    fills empties; never overwrites data the survivor already carries. Returns
+    the number of member profiles changed. Best-effort."""
+    if target is None or source is None:
+        return 0
+    src_by_client = {
+        p.client_id: p for p in source.member_profiles.all() if p.client_id
+    }
+    if not src_by_client:
+        return 0
+    changed = 0
+    for tp in target.member_profiles.all():
+        sp = src_by_client.get(tp.client_id)
+        if sp is None:
+            continue
+        fields = []
+        if not (tp.menu_type or "").strip() and (sp.menu_type or "").strip():
+            tp.menu_type = sp.menu_type; fields.append("menu_type")
+        if not tp.food_allergies and sp.food_allergies:
+            tp.food_allergies = sp.food_allergies; fields.append("food_allergies")
+        if not tp.dietary_restrictions and sp.dietary_restrictions:
+            tp.dietary_restrictions = sp.dietary_restrictions
+            fields.append("dietary_restrictions")
+        if not (tp.other_dietary_restrictions or "").strip() and (sp.other_dietary_restrictions or "").strip():
+            tp.other_dietary_restrictions = sp.other_dietary_restrictions
+            fields.append("other_dietary_restrictions")
+        if not (tp.meal_category or "").strip() and (sp.meal_category or "").strip():
+            tp.meal_category = sp.meal_category; fields.append("meal_category")
+        if tp.meals_per_delivery is None and sp.meals_per_delivery is not None:
+            tp.meals_per_delivery = sp.meals_per_delivery
+            fields.append("meals_per_delivery")
+        if not (tp.general_verification_notes or "").strip() and (sp.general_verification_notes or "").strip():
+            tp.general_verification_notes = sp.general_verification_notes
+            fields.append("general_verification_notes")
+        if fields:
+            try:
+                tp.save(update_fields=fields)
+                changed += 1
+            except Exception:  # pragma: no cover - defensive
+                pass
+    return changed
+
+
 def _close_old_and_link_to_existing(
     live, existing, new_governing_case, actor=None, actor_label="", note="",
 ):
@@ -2711,6 +2816,21 @@ def _close_old_and_link_to_existing(
                 existing.save(update_fields=["supersedes"])
             except Exception:  # pragma: no cover - defensive
                 pass
+
+        # Carry the VERIFICATION FACT forward. A household is verified once; when
+        # the governing case is replaced we keep the same verification instead of
+        # forcing a re-verify. The other replacement path (a freshly CREATED
+        # enrollment) already copies these; this path reused a pre-existing
+        # (usually unverified Pending) enrollment, so copy them here too --
+        # otherwise the surviving enrollment reaches Service Active with a BLANK
+        # "Verified by" (the completer/date are lost). Only fill fields the
+        # survivor doesn't already carry, so a genuine own verification wins.
+        _carry_verification_fields(existing, live)
+        # ...and the verified dietary config (menu/allergies/restrictions), so a
+        # reused placeholder enrollment doesn't strand members with a blank menu
+        # (which would push them Out of Orbit). Done BEFORE the service carry so
+        # the meal-rule reconcile below sees the carried menu. Blanks only.
+        _carry_dietary_profiles(existing, live)
 
         # Carry the closed enrollment's service forward: if ``live`` was serving a
         # SAME-KIND program, drive ``existing`` back to Service Active with the

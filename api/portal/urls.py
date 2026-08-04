@@ -81,6 +81,7 @@ from .views_members import (
     UnlinkedMembersListView,
     MenuTypesListView,
     TeamsListView,
+    VerifiersListView,
 )
 from .views_places import (
     PortalPlacesAutocompleteView,
@@ -199,6 +200,7 @@ urlpatterns = [
     path("food-allergies/", FoodAllergiesListView.as_view(), name="portal-food-allergies"),
     path("lead-sources/", LeadSourcesListView.as_view(), name="portal-lead-sources"),
     path("teams/", TeamsListView.as_view(), name="portal-teams"),
+    path("verifiers/", VerifiersListView.as_view(), name="portal-verifiers"),
     path("members/<uuid:client_id>/", MemberDetailView.as_view(), name="portal-member-detail"),
     path("members/<uuid:client_id>/insurance/", MemberInsuranceView.as_view()),
     path("members/<uuid:client_id>/social-coverage/", MemberSocialCoverageView.as_view()),

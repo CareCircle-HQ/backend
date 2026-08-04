@@ -930,11 +930,56 @@ def _allergies_note(client):
     return ", ".join(parts)
 
 
+def _kitchen_auto_code(kitchen):
+    """Stable ``K01``/``K02``... code for a kitchen by creation order, IGNORING
+    the abbreviation (unlike ``_kitchen_code``). Used as the Order# kitchen code
+    in the export filename so it stays distinct from the trailing abbreviation."""
+    if kitchen is None:
+        return "K00"
+    ids = list(Kitchen.objects.order_by("created_at").values_list("pk", flat=True))
+    try:
+        return "K%02d" % (ids.index(kitchen.pk) + 1)
+    except ValueError:
+        return "K00"
+
+
+def _po_number_suffix(po):
+    """The trailing sequence suffix of the PO number after the kitchen token --
+    e.g. ``-2`` (collision de-dupe) or ``-S2`` (split) -- or ``""`` when none.
+
+    Parsed structurally from the known PO-number layout
+    (``PO-{KIND}-{YEAR}-W{WW}-[{WKDAY}-]{KITCHEN}[-suffix...]``) so it works
+    whether the stored kitchen token is a K-code or an abbreviation."""
+    parts = (po.po_number or "").split("-")
+    is_box = (po.kind == ProductTypeKind.BOXES) or (
+        len(parts) > 1 and parts[1].upper() == "BOX"
+    )
+    kitchen_idx = 4 if is_box else 5  # boxes have no weekday segment
+    if len(parts) <= kitchen_idx:
+        return ""
+    tail = parts[kitchen_idx + 1:]
+    return ("-" + "-".join(tail)) if tail else ""
+
+
 def kitchen_export_filename(po):
-    """e.g. PO-BOX-2026-W27-K01_ENG.csv — includes PO number + kitchen."""
-    po_part = _slug(po.po_number or str(po.pk))
-    kitchen_part = _slug(po.kitchen.name if po.kitchen else "Unassigned")
-    return f"{po_part}_{kitchen_part}.csv"
+    """Download name for the CSV handed to the kitchen, e.g.
+    ``K01-2_Meals_07.24.26_PHS_ENG.csv``:
+
+        {Order#}_{Meals|Boxes}_{MM.DD.YY delivery date}_PHS_{kitchen abbrev}
+
+    Order# = the stable kitchen K-code + the PO's sequence suffix. This renames
+    ONLY the exported file; the system PO number (po.po_number) is unchanged."""
+    order_num = f"{_kitchen_auto_code(po.kitchen)}{_po_number_suffix(po)}"
+    kind_label = "Boxes" if po.kind == ProductTypeKind.BOXES else "Meals"
+    date_part = po.delivery_date.strftime("%m.%d.%y") if po.delivery_date else "00.00.00"
+    abbrev = ""
+    if po.kitchen:
+        abbrev = re.sub(
+            r"[^A-Z0-9]", "", (po.kitchen.abbreviation or "").strip().upper()
+        )
+        if not abbrev:
+            abbrev = _kitchen_auto_code(po.kitchen)  # never blank
+    return f"{order_num}_{kind_label}_{date_part}_PHS_{abbrev}.csv"
 
 
 def _household_group_code(household):

@@ -37,6 +37,42 @@ _SEVERITY_RANK = {WarningSeverity.RED: 2, WarningSeverity.ORANGE: 1}
 
 PAGE_SIZE = 25
 
+# Safety cap on how many flagged households the list re-scans on load. The queue
+# is the set of OPEN problems (self-limiting: it shrinks as CS fixes them), but
+# cap it so a pathological snapshot can never blow up the request.
+_RESCAN_CAP = 500
+
+
+def _refresh_flagged_snapshot():
+    """Re-evaluate the warnings for the currently-flagged households so anything
+    an agent just fixed drops off the Care Management queue IMMEDIATELY -- not
+    only after the next case-save hook or the nightly sweep. Scoped to the
+    already-flagged set (the working queue) and capped. Best-effort: a failure
+    must never break the list."""
+    from api.models import EnrollmentVerification
+    from api.services.warnings import sync_household_warnings
+
+    try:
+        enr_ids = list(
+            MemberWarning.objects.filter(
+                status=WarningStatus.ACTIVE, code__in=CARE_MANAGEMENT_CODES,
+            )
+            .exclude(enrollment__isnull=True)
+            .values_list("enrollment_id", flat=True)
+            .distinct()[:_RESCAN_CAP]
+        )
+        if not enr_ids:
+            return
+        for enr in EnrollmentVerification.objects.filter(pk__in=enr_ids).select_related(
+            "client", "household", "kitchen"
+        ):
+            try:
+                sync_household_warnings(enr)
+            except Exception:  # pragma: no cover - one bad household can't stall the queue
+                pass
+    except Exception:  # pragma: no cover - defensive
+        pass
+
 
 def _can_access(agent):
     if not agent:
@@ -69,6 +105,12 @@ class CareManagementListView(PortalAPIView):
             return Response(
                 {"detail": "Care Management access required."}, status=403
             )
+
+        # Refresh the snapshot for the flagged households FIRST, so issues an
+        # agent just remediated (on any path -- kitchen/cadence fix, insurance
+        # update, case change) are resolved before we read + count. This is the
+        # fix for warnings lingering on the queue after they're resolved.
+        _refresh_flagged_snapshot()
 
         params = request.query_params
         severity = (params.get("severity") or "").lower()

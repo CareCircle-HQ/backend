@@ -11681,3 +11681,329 @@ class PurgeOutOfScopeCasesCommandTest(TestCase):
         self.assertTrue(Case.objects.filter(pk=keeper.pk).exists())   # in scope
         self.assertFalse(Case.objects.filter(pk=doomed.pk).exists())  # out of scope
         self.assertTrue(Case.objects.filter(pk=backed.pk).exists())   # enrollment-backed, preserved
+
+
+class KitchenExportFilenameTest(TestCase):
+    """The kitchen export CSV filename: Order#_(Meals|Boxes)_MM.DD.YY_PHS_ABBR.csv
+    Order# = stable K-code + PO sequence suffix; abbreviation at the end. Only
+    the exported file is renamed -- po.po_number is untouched."""
+
+    def test_meals_and_box_filenames(self):
+        from datetime import date
+
+        from .models import (
+            Kitchen, KitchenStatus, ProductTypeKind, PurchaseOrder,
+            PurchaseOrderStatus,
+        )
+        from .services.purchase_orders import kitchen_export_filename
+
+        eng = Kitchen.objects.create(name="Englewood", abbreviation="ENG", status=KitchenStatus.ACTIVE)
+        ast = Kitchen.objects.create(name="Astoria", abbreviation="AST", status=KitchenStatus.ACTIVE)
+
+        meals = PurchaseOrder.objects.create(
+            po_number="PO-MEALS-2026-W30-FRI-ENG-2", kind=ProductTypeKind.MEALS,
+            delivery_date=date(2026, 7, 24), kitchen=eng, status=PurchaseOrderStatus.DRAFT,
+        )
+        box = PurchaseOrder.objects.create(
+            po_number="PO-BOX-2026-W30-AST-3", kind=ProductTypeKind.BOXES,
+            delivery_date=date(2026, 7, 24), kitchen=ast, status=PurchaseOrderStatus.DRAFT,
+        )
+
+        self.assertEqual(kitchen_export_filename(meals), "K01-2_Meals_07.24.26_PHS_ENG.csv")
+        self.assertEqual(kitchen_export_filename(box), "K02-3_Boxes_07.24.26_PHS_AST.csv")
+        # PO number itself is unchanged.
+        self.assertEqual(meals.po_number, "PO-MEALS-2026-W30-FRI-ENG-2")
+
+    def test_no_suffix_and_missing_abbreviation(self):
+        from datetime import date
+
+        from .models import (
+            Kitchen, KitchenStatus, ProductTypeKind, PurchaseOrder,
+            PurchaseOrderStatus,
+        )
+        from .services.purchase_orders import kitchen_export_filename
+
+        k = Kitchen.objects.create(name="NoAbbr", status=KitchenStatus.ACTIVE)  # no abbreviation
+        po = PurchaseOrder.objects.create(
+            po_number="PO-MEALS-2026-W30-THU-K01", kind=ProductTypeKind.MEALS,
+            delivery_date=date(2026, 7, 23), kitchen=k, status=PurchaseOrderStatus.DRAFT,
+        )
+        # No suffix -> just the K-code; missing abbreviation -> falls back to K-code.
+        self.assertEqual(kitchen_export_filename(po), "K01_Meals_07.23.26_PHS_K01.csv")
+
+
+class TicketHouseholdPrimaryIdSerializerTest(TestCase):
+    """PortalTicketSerializer exposes household_primary_id (the ticket client's
+    household primary) so the Work Queue can show the 'open household' icon --
+    same as the Members list."""
+
+    def test_household_primary_id(self):
+        from .models import Client, Household, HouseholdMember, Ticket, TicketType
+        from .portal import serializers as s
+
+        prim = Client.objects.create(client_id=str(uuid.uuid4()), first_name="P", last_name="R")
+        dep = Client.objects.create(client_id=str(uuid.uuid4()), first_name="D", last_name="P")
+        hh = Household.objects.create(name="HH")
+        HouseholdMember.objects.create(household=hh, client=prim, is_primary=True)
+        HouseholdMember.objects.create(household=hh, client=dep, is_primary=False)
+        tt, _ = TicketType.objects.get_or_create(code="coverage", defaults={"label": "Coverage"})
+
+        t = Ticket.objects.create(type=tt, client=dep, reason="x")
+        self.assertEqual(
+            s.PortalTicketSerializer(t).data["household_primary_id"], str(prim.client_id)
+        )
+
+        lone = Client.objects.create(client_id=str(uuid.uuid4()), first_name="L", last_name="N")
+        tl = Ticket.objects.create(type=tt, client=lone, reason="y")
+        self.assertIsNone(s.PortalTicketSerializer(tl).data["household_primary_id"])
+
+
+class MembersVerifiedByFilterTest(TestCase):
+    """/verifiers/ lists Verifier-group agents; the members list ?verified_by=
+    filter keeps only members verified by that agent."""
+
+    def _api(self):
+        from rest_framework.test import APIClient
+        from rest_framework_simplejwt.tokens import AccessToken
+
+        from .models import Agent
+        a = Agent.objects.create(name="Mgr", agent_code="900", group="Management")
+        acc = AccessToken()
+        acc["agent_id"] = str(a.id); acc["agent_code"] = a.agent_code
+        acc["agent_name"] = a.name; acc["agent_group"] = a.group
+        api = APIClient(); api.credentials(HTTP_AUTHORIZATION=f"Bearer {acc}")
+        return api
+
+    def test_verifiers_endpoint_and_filter(self):
+        from .models import (
+            Agent, Client, EnrollmentStage, EnrollmentVerification,
+        )
+
+        verifier = Agent.objects.create(name="Vera Verifier", group="Verifiers", status="Active")
+        Agent.objects.create(name="Cassie CS", group="CS", status="Active")
+        api = self._api()
+
+        # /verifiers/ returns only the Verifier-group agent.
+        vs = api.get("/api/portal/verifiers/").json()
+        labels = {v["label"] for v in vs}
+        self.assertIn("Vera Verifier", labels)
+        self.assertNotIn("Cassie CS", labels)
+
+        from datetime import timedelta
+
+        from django.utils import timezone
+
+        other_agent = Agent.objects.create(name="Bob Other", group="Verifiers", status="Active")
+        now = timezone.now()
+
+        verified = Client.objects.create(client_id=str(uuid.uuid4()), first_name="Ver", last_name="Ified")
+        other = Client.objects.create(client_id=str(uuid.uuid4()), first_name="No", last_name="One")
+        EnrollmentVerification.objects.create(
+            client=verified, stage=EnrollmentStage.VERIFIED, verified_by=verifier,
+            opened_at=now,
+        )
+
+        # Real-data pattern: the enrollment our agent VERIFIED is now closed, and a
+        # duplicate/unverified enrollment is the live (governing) one. The member
+        # must STILL match our agent -- the verification fact survives the close.
+        shadowed = Client.objects.create(client_id=str(uuid.uuid4()), first_name="Sha", last_name="Dowed")
+        EnrollmentVerification.objects.create(
+            client=shadowed, stage=EnrollmentStage.SERVICE_ACTIVE, verified_by=None,
+            opened_at=now - timedelta(minutes=5),  # older, but OPEN -> governing
+        )
+        EnrollmentVerification.objects.create(
+            client=shadowed, stage=EnrollmentStage.CLOSED, verified_by=verifier,
+            opened_at=now, closed_at=now + timedelta(days=1),
+        )
+
+        # A member whose OWN verification was done by the OTHER agent must not
+        # match our agent (proves we don't leak via household / other members).
+        bob_client = Client.objects.create(client_id=str(uuid.uuid4()), first_name="Bo", last_name="Bby")
+        EnrollmentVerification.objects.create(
+            client=bob_client, stage=EnrollmentStage.VERIFIED, verified_by=other_agent,
+            opened_at=now,
+        )
+
+        def ids(resp):
+            out = set()
+            for g in resp.json()["results"]:
+                out.add(g["primary"]["id"])
+                out.update(m["id"] for m in g.get("members", []))
+            return out
+
+        got = ids(api.get(f"/api/portal/members/?verified_by={verifier.id}"))
+        self.assertIn(str(verified.client_id), got)
+        self.assertIn(str(shadowed.client_id), got)   # verified enrollment closed, still matches
+        self.assertNotIn(str(other.client_id), got)
+        self.assertNotIn(str(bob_client.client_id), got)
+
+
+class CarriedVerificationTest(TestCase):
+    """Verification carries forward when a governing-case replacement reuses a
+    pre-existing enrollment, and the backfill fixes historical rows."""
+
+    def test_backfill_copies_from_superseded_and_skips_verified(self):
+        from io import StringIO
+
+        from django.core.management import call_command
+        from django.utils import timezone
+
+        from .models import Agent, Client, EnrollmentStage, EnrollmentVerification
+
+        a = Agent.objects.create(name="Vera", group="Verifiers", status="Active")
+        b = Agent.objects.create(name="Bob", group="Verifiers", status="Active")
+        now = timezone.now()
+
+        # Live enrollment missing verification, superseding a verified closed one.
+        c1 = Client.objects.create(client_id=str(uuid.uuid4()), first_name="A", last_name="A")
+        closed1 = EnrollmentVerification.objects.create(
+            client=c1, stage=EnrollmentStage.CLOSED, verified_by=a, verified_at=now,
+            closed_at=now,
+        )
+        live1 = EnrollmentVerification.objects.create(
+            client=c1, stage=EnrollmentStage.SERVICE_ACTIVE, supersedes=closed1,
+        )
+
+        # Live enrollment ALREADY verified (by Bob) -> must NOT be overwritten.
+        c2 = Client.objects.create(client_id=str(uuid.uuid4()), first_name="B", last_name="B")
+        closed2 = EnrollmentVerification.objects.create(
+            client=c2, stage=EnrollmentStage.CLOSED, verified_by=a, verified_at=now,
+            closed_at=now,
+        )
+        live2 = EnrollmentVerification.objects.create(
+            client=c2, stage=EnrollmentStage.SERVICE_ACTIVE, supersedes=closed2,
+            verified_by=b, verified_at=now,
+        )
+
+        call_command("backfill_carried_verification", "--apply", stdout=StringIO())
+
+        live1.refresh_from_db(); live2.refresh_from_db()
+        self.assertEqual(live1.verified_by_id, a.id)   # carried from superseded
+        self.assertIsNotNone(live1.verified_at)
+        self.assertEqual(live2.verified_by_id, b.id)   # own verification preserved
+
+    def test_dietary_carry_forward(self):
+        from io import StringIO
+
+        from django.core.management import call_command
+        from django.utils import timezone
+
+        from .models import (
+            Agent, Client, EnrollmentStage, EnrollmentVerification,
+            MemberDietaryProfile,
+        )
+
+        a = Agent.objects.create(name="Vera", group="Verifiers", status="Active")
+        now = timezone.now()
+        c = Client.objects.create(client_id=str(uuid.uuid4()), first_name="A", last_name="A")
+        closed = EnrollmentVerification.objects.create(
+            client=c, stage=EnrollmentStage.CLOSED, verified_by=a, verified_at=now, closed_at=now,
+        )
+        MemberDietaryProfile.objects.create(
+            enrollment=closed, client=c, member_name="A A", menu_type="Vegetarian",
+            food_allergies=["peanuts"],
+        )
+        live = EnrollmentVerification.objects.create(
+            client=c, stage=EnrollmentStage.SERVICE_ACTIVE, supersedes=closed,
+        )
+        # Survivor's placeholder profile: blank menu (the gap).
+        tp = MemberDietaryProfile.objects.create(
+            enrollment=live, client=c, member_name="A A", menu_type="",
+        )
+
+        call_command("backfill_carried_verification", "--apply", stdout=StringIO())
+
+        tp.refresh_from_db()
+        self.assertEqual(tp.menu_type, "Vegetarian")     # carried from superseded
+        self.assertEqual(tp.food_allergies, ["peanuts"])
+
+    def test_delivery_address_carries_even_when_already_verified(self):
+        # Regression: a survivor that already carried the verified FLAG but not the
+        # delivery-address FK reads as "verified but no delivery address". The
+        # address must carry regardless of verification state.
+        from io import StringIO
+
+        from django.core.management import call_command
+        from django.utils import timezone
+
+        from .models import (
+            Address, Agent, Client, EnrollmentStage, EnrollmentVerification,
+        )
+
+        a = Agent.objects.create(name="Vera", group="Verifiers", status="Active")
+        now = timezone.now()
+        c = Client.objects.create(client_id=str(uuid.uuid4()), first_name="Tah", last_name="Ji")
+        addr = Address.objects.create(
+            client=c, type="current", street="69 Gatchell St", city="Buffalo",
+            state="NY", zip="14212",
+        )
+        closed = EnrollmentVerification.objects.create(
+            client=c, stage=EnrollmentStage.CLOSED, verified_by=a, verified_at=now,
+            closed_at=now, delivery_address=addr, delivery_address_verified=True,
+        )
+        # Survivor: already verified, but NO delivery address (the bug).
+        live = EnrollmentVerification.objects.create(
+            client=c, stage=EnrollmentStage.SERVICE_ACTIVE, supersedes=closed,
+            verified_by=a, verified_at=now, delivery_address=None,
+        )
+
+        call_command("backfill_carried_verification", "--apply", stdout=StringIO())
+
+        live.refresh_from_db()
+        self.assertEqual(live.delivery_address_id, addr.pk)
+
+
+class CareManagementRescanTest(TestCase):
+    """The Care Management list re-scans flagged households on load, so an issue
+    an agent just fixed clears from the queue immediately (not only after the
+    nightly sweep)."""
+
+    def _api(self):
+        from rest_framework.test import APIClient
+        from rest_framework_simplejwt.tokens import AccessToken
+
+        from .models import Agent
+        a = Agent.objects.create(name="CS", agent_code="700", group="CS")
+        acc = AccessToken()
+        acc["agent_id"] = str(a.id); acc["agent_code"] = a.agent_code
+        acc["agent_name"] = a.name; acc["agent_group"] = a.group
+        api = APIClient(); api.credentials(HTTP_AUTHORIZATION=f"Bearer {acc}")
+        return api
+
+    def test_fixed_warning_clears_on_list_load(self):
+        from .models import (
+            EnrollmentStage, EnrollmentVerification, Household, HouseholdMember,
+            Kitchen, KitchenProductType, KitchenStatus, MemberDietaryProfile,
+            MemberWarning, WarningStatus,
+        )
+        from .services.warnings import NO_KITCHEN, sync_household_warnings
+
+        c = Client.objects.create(client_id=str(uuid.uuid4()), first_name="Woe", last_name="W")
+        hh = Household.objects.create(name="HH")
+        HouseholdMember.objects.create(household=hh, client=c, is_primary=True)
+        enr = EnrollmentVerification.objects.create(
+            client=c, household=hh, stage=EnrollmentStage.SERVICE_ACTIVE,
+        )
+        MemberDietaryProfile.objects.create(enrollment=enr, client=c)
+        sync_household_warnings(enr)  # -> NO_KITCHEN active
+        self.assertEqual(
+            MemberWarning.objects.get(client=c, code=NO_KITCHEN).status, WarningStatus.ACTIVE
+        )
+
+        api = self._api()
+        r1 = api.get("/api/portal/care-management/").json()
+        self.assertIn("no_kitchen", r1["summary"]["by_code"])
+
+        # Fix the issue -- assign a kitchen -- WITHOUT manually re-syncing.
+        enr.kitchen = Kitchen.objects.create(
+            name="K", status=KitchenStatus.ACTIVE,
+            supported_products=[KitchenProductType.MEAL],
+        )
+        enr.save(update_fields=["kitchen"])
+
+        # Next list load must re-scan and drop the fixed warning.
+        r2 = api.get("/api/portal/care-management/").json()
+        self.assertNotIn("no_kitchen", r2["summary"]["by_code"])
+        self.assertEqual(
+            MemberWarning.objects.get(client=c, code=NO_KITCHEN).status, WarningStatus.RESOLVED
+        )
