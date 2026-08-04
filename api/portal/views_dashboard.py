@@ -300,30 +300,38 @@ def serving_client_ids(reason, *, start, end, governing_ids=None):
             cid for cid in tickets.values_list("client_id", flat=True) if cid
         )
 
-    # --- Watchlist (client-level facts, intersected with enrolled members) ---
-    # Only members whose GOVERNING internal-service case is OPEN: a coverage gap
-    # on someone whose service case has closed isn't actionable follow-up.
-    enrolled = set(scope(mdp).values_list("client_id", flat=True)) & open_gov_clients()
+    # --- Watchlist: PROGRAMS with >=1 member lacking coverage ----------------
+    # Program-level: a household is flagged when ANY of its members (primary or
+    # dependent) lacks the coverage, and its GOVERNING internal-service case is
+    # OPEN. "Enrolled" is therefore every member of a household whose primary
+    # holds an open governing case; the lacking members are collapsed back to
+    # their household primary so the count/drill-down is PROGRAMS, not members.
+    open_primaries = open_gov_clients()
+    member_ids = set(scope(mdp).values_list("client_id", flat=True))
+    prim = _primary_map(member_ids)
+    enrolled = {cid for cid in member_ids if prim.get(cid, cid) in open_primaries}
     if not enrolled:
         return set()
+
+    def programs_lacking(have):
+        return {prim.get(cid, cid) for cid in (enrolled - have)}
+
     if reason == "insurance_expiring":
-        # "No active Medicaid" watchlist. Imports don't reliably populate a
-        # coverage end date, so an expiry-date window can't be trusted; we
-        # trust the imported STATUS instead and flag enrolled members with NO
-        # ACTIVE Medicaid (or Dual Medicare/Medicaid) plan on file. Mirrors
-        # lifecycle.has_valid_medicaid (same status-based rule used elsewhere).
+        # "No active Medicaid": trust the imported STATUS (import doesn't reliably
+        # carry an end date) -- a member with NO ACTIVE Medicaid/Dual plan lacks
+        # it. Mirrors lifecycle.has_valid_medicaid.
         have = set(Insurance.objects.filter(
             client_id__in=enrolled,
             plan_type__in=[InsurancePlanType.MEDICAID, InsurancePlanType.DUAL],
             status=RecordStatus.ACTIVE,
         ).values_list("client_id", flat=True))
-        return enrolled - have
+        return programs_lacking(have)
     if reason == "no_social_coverage":
         have = set(SocialCareCoverage.objects.filter(
             client_id__in=enrolled,
             status=SocialCareCoverageStatus.ENROLLED,
         ).values_list("client_id", flat=True))
-        return enrolled - have
+        return programs_lacking(have)
     return None
 
 
@@ -462,10 +470,27 @@ def _serving_details(reason, client_ids, *, start, end, governing_ids=None):
                 continue
             out[t.client_id] = (t.reason or "Case closure in progress")[:140]
         return out
-    if reason == "insurance_expiring":
-        return {cid: "No active Medicaid on file" for cid in ids}
-    if reason == "no_social_coverage":
-        return {cid: "No enrolled social care coverage" for cid in ids}
+    if reason in ("insurance_expiring", "no_social_coverage"):
+        # ids are program primaries; label with the program name.
+        prefix = (
+            "Member(s) without active Medicaid"
+            if reason == "insurance_expiring"
+            else "Member(s) without social care coverage"
+        )
+        out = {}
+        for p in (
+            mdp.filter(client_id__in=ids)
+            .select_related("enrollment__case")
+            .order_by("client_id")
+        ):
+            if p.client_id in out:
+                continue
+            case = getattr(p.enrollment, "case", None)
+            name = (getattr(case, "program_name", "") or "").strip()
+            out[p.client_id] = f"{prefix} · {name}" if name else prefix
+        for cid in ids:  # primaries without a profile row still get a label
+            out.setdefault(cid, prefix)
+        return out
     return {}
 
 
