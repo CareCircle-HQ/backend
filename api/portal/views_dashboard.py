@@ -263,18 +263,34 @@ def serving_client_ids(reason, *, start, end, governing_ids=None):
             mdp.filter(status=MemberStatus.OUT_OF_ORBIT)
         ).values_list("client_id", flat=True)) & open_gov_clients()
     if reason == "programs_on_hold":
-        # PROGRAM-level state: the enrollment (the household's meal/box program) is
-        # On Hold while its GOVERNING internal-service case is still OPEN. A pure
-        # program fact -- independent of individual member status -- so every
-        # on-hold program counts (a member who is also Out of Orbit/Range still
-        # surfaces on their own card too). Counted by PROGRAM: collapse the
-        # on-hold enrollment's members to their household primary (the case
-        # holder), so the count is on-hold programs, not members inside them.
-        member_ids = set(scope(mdp.filter(
-            enrollment__stage=EnrollmentStage.ON_HOLD,
-        ).exclude(
-            client__lifecycle_stage=ClientStage.INELIGIBLE  # member must be Eligible
-        )).values_list("client_id", flat=True)) & open_gov_clients()
+        # PROGRAM-level, matching the Members page "On Hold" filter EXACTLY: the
+        # member's GOVERNING enrollment is On Hold (governing_enrollment_stage --
+        # so a stray/superseded on-hold enrollment alongside a live one is
+        # ignored), the member is ELIGIBLE (not on the Ineligible off-ramp), and
+        # the GOVERNING internal-service case is OPEN. Counted per PROGRAM
+        # (collapsed to the household primary).
+        from .views_members import governing_enrollment_stage
+
+        # "Open" here mirrors the Members page "Internal Service = Open" filter:
+        # the client has ANY non-terminal internal-service case (Exists), NOT
+        # specifically that the governing case is open.
+        open_case_clients = set(
+            Case.objects.filter(case_type=CaseType.INTERNAL_SERVICE)
+            .exclude(case_status__in=_TERMINAL_CASE_STATUSES)
+            .values_list("client_id", flat=True)
+        )
+        cq = (
+            Client.objects.annotate(_gov=governing_enrollment_stage())
+            .filter(_gov=EnrollmentStage.ON_HOLD)
+            .exclude(lifecycle_stage=ClientStage.INELIGIBLE)
+        )
+        if start is not None:  # mirror scope(): in-range internal-service case
+            cq = cq.filter(
+                cases__case_type=CaseType.INTERNAL_SERVICE,
+                cases__date_opened__date__gte=start,
+                cases__date_opened__date__lte=end,
+            )
+        member_ids = set(cq.values_list("client_id", flat=True)) & open_case_clients
         return set(_primary_map(member_ids).values())
     if reason == "members_paused":
         # PROGRAMS that have at least one individually-PAUSED member, whose
@@ -439,6 +455,8 @@ def _serving_details(reason, client_ids, *, start, end, governing_ids=None):
             case = getattr(p.enrollment, "case", None)
             name = (getattr(case, "program_name", "") or "").strip()
             out[p.client_id] = f"Program on hold · {name}" if name else "Program on hold (under review)"
+        for cid in ids:
+            out.setdefault(cid, "Program on hold (under review)")
         return out
     if reason == "members_paused":
         # ids are program primaries. Count paused members per program (mapped to
