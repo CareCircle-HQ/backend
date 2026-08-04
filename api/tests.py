@@ -11414,3 +11414,77 @@ class DeliveryCalendarNoDuplicateTest(TestCase):
                           anticipated_delivery_date=d),
         ])
         self.assertEqual(len(kept), 1)  # cancelled order doesn't block a new one
+
+
+class DeliveryCalendarExcludesDeadEnrollmentsTest(TestCase):
+    """The member delivery calendar reflects only LIVE enrollments: a closed
+    (superseded) enrollment's occurrences -- even on a different kitchen -- must
+    not show, so a member never reads as served by two kitchens. The
+    ?enrollment=<id> override still surfaces a dead enrollment read-only."""
+
+    def _api(self):
+        from rest_framework.test import APIClient
+        from rest_framework_simplejwt.tokens import AccessToken
+
+        from .models import Agent
+
+        agent = Agent.objects.create(name="Cal", agent_code="967", group="Management")
+        access = AccessToken()
+        access["agent_id"] = str(agent.id)
+        access["agent_code"] = agent.agent_code
+        access["agent_name"] = agent.name
+        access["agent_group"] = agent.group
+        api = APIClient()
+        api.credentials(HTTP_AUTHORIZATION=f"Bearer {access}")
+        return api
+
+    def test_dead_enrollment_kitchen_hidden_by_default(self):
+        from datetime import date
+
+        from .models import (
+            Client, EnrollmentStage, EnrollmentVerification, Household,
+            HouseholdMember, Kitchen, KitchenStatus, MemberDietaryProfile,
+            MemberStatus, OrderSchedule, OrderStatus,
+        )
+
+        client = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Two", last_name="Kitchen",
+        )
+        hh = Household.objects.create(name="HH")
+        HouseholdMember.objects.create(household=hh, client=client, is_primary=True)
+        live_k = Kitchen.objects.create(name="LiveKitchenAAA", status=KitchenStatus.ACTIVE)
+        dead_k = Kitchen.objects.create(name="DeadKitchenBBB", status=KitchenStatus.ACTIVE)
+        d = date(2026, 8, 7)
+
+        live = EnrollmentVerification.objects.create(
+            client=client, household=hh, kitchen=live_k,
+            stage=EnrollmentStage.SERVICE_ACTIVE, program_name="Meals",
+        )
+        live_mp = MemberDietaryProfile.objects.create(
+            enrollment=live, client=client, status=MemberStatus.ACTIVE,
+        )
+        OrderSchedule.objects.create(
+            enrollment=live, member=live_mp, kitchen=live_k, program_name="Meals",
+            anticipated_delivery_date=d, status=OrderStatus.SCHEDULED, household=hh,
+        )
+        dead = EnrollmentVerification.objects.create(
+            client=client, household=hh, kitchen=dead_k,
+            stage=EnrollmentStage.CLOSED, program_name="Meals",
+        )
+        dead_mp = MemberDietaryProfile.objects.create(
+            enrollment=dead, client=client, status=MemberStatus.ACTIVE,
+        )
+        OrderSchedule.objects.create(
+            enrollment=dead, member=dead_mp, kitchen=dead_k, program_name="Meals",
+            anticipated_delivery_date=d, status=OrderStatus.SCHEDULED, household=hh,
+        )
+
+        api = self._api()
+        url = f"/api/portal/members/{client.client_id}/delivery-calendar/"
+        body = api.get(url).content.decode()
+        self.assertIn("LiveKitchenAAA", body)
+        self.assertNotIn("DeadKitchenBBB", body)  # dead enrollment hidden
+
+        # The override still surfaces the dead enrollment's own calendar.
+        override = api.get(f"{url}?enrollment={dead.pk}").content.decode()
+        self.assertIn("DeadKitchenBBB", override)
