@@ -11642,3 +11642,42 @@ class ReportExportBackgroundTest(TestCase):
         self.assertEqual(
             cs.get(f"/api/portal/reports/exports/{exp.export_id}/").status_code, 403
         )
+
+
+class PurgeOutOfScopeCasesCommandTest(TestCase):
+    """purge_out_of_scope_cases deletes only cases the import would reject
+    (out of program scope / not Met Council), keeps in-scope cases, and never
+    deletes a case backing a verification enrollment."""
+
+    def test_purges_out_of_scope_keeps_in_scope_and_enrollment_backed(self):
+        from io import StringIO
+
+        from django.core.management import call_command
+
+        from .models import (
+            Case, CaseStatus, CaseType, Client, EnrollmentStage,
+            EnrollmentVerification,
+        )
+
+        MET = "Met Council - SCN - PHS"
+        client = Client.objects.create(client_id=str(uuid.uuid4()), first_name="C", last_name="L")
+
+        def mkcase(case_type, service_type="", program_name=""):
+            return Case.objects.create(
+                case_id=str(uuid.uuid4()), client=client, case_type=case_type,
+                provider_name=MET, service_type=service_type,
+                program_name=program_name, case_status=CaseStatus.OPEN,
+            )
+
+        keeper = mkcase(CaseType.INTERNAL_SERVICE, service_type="medically tailored meals")
+        doomed = mkcase(CaseType.EXTERNAL_SERVICE, program_name="Furniture / Home Goods")
+        backed = mkcase(CaseType.EXTERNAL_SERVICE, program_name="Housing Case Management")
+        EnrollmentVerification.objects.create(
+            client=client, case=backed, stage=EnrollmentStage.SERVICE_ACTIVE,
+        )
+
+        call_command("purge_out_of_scope_cases", "--apply", stdout=StringIO())
+
+        self.assertTrue(Case.objects.filter(pk=keeper.pk).exists())   # in scope
+        self.assertFalse(Case.objects.filter(pk=doomed.pk).exists())  # out of scope
+        self.assertTrue(Case.objects.filter(pk=backed.pk).exists())   # enrollment-backed, preserved
