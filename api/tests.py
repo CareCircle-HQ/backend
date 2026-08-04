@@ -11916,3 +11916,59 @@ class CarriedVerificationTest(TestCase):
         tp.refresh_from_db()
         self.assertEqual(tp.menu_type, "Vegetarian")     # carried from superseded
         self.assertEqual(tp.food_allergies, ["peanuts"])
+
+
+class CareManagementRescanTest(TestCase):
+    """The Care Management list re-scans flagged households on load, so an issue
+    an agent just fixed clears from the queue immediately (not only after the
+    nightly sweep)."""
+
+    def _api(self):
+        from rest_framework.test import APIClient
+        from rest_framework_simplejwt.tokens import AccessToken
+
+        from .models import Agent
+        a = Agent.objects.create(name="CS", agent_code="700", group="CS")
+        acc = AccessToken()
+        acc["agent_id"] = str(a.id); acc["agent_code"] = a.agent_code
+        acc["agent_name"] = a.name; acc["agent_group"] = a.group
+        api = APIClient(); api.credentials(HTTP_AUTHORIZATION=f"Bearer {acc}")
+        return api
+
+    def test_fixed_warning_clears_on_list_load(self):
+        from .models import (
+            EnrollmentStage, EnrollmentVerification, Household, HouseholdMember,
+            Kitchen, KitchenProductType, KitchenStatus, MemberDietaryProfile,
+            MemberWarning, WarningStatus,
+        )
+        from .services.warnings import NO_KITCHEN, sync_household_warnings
+
+        c = Client.objects.create(client_id=str(uuid.uuid4()), first_name="Woe", last_name="W")
+        hh = Household.objects.create(name="HH")
+        HouseholdMember.objects.create(household=hh, client=c, is_primary=True)
+        enr = EnrollmentVerification.objects.create(
+            client=c, household=hh, stage=EnrollmentStage.SERVICE_ACTIVE,
+        )
+        MemberDietaryProfile.objects.create(enrollment=enr, client=c)
+        sync_household_warnings(enr)  # -> NO_KITCHEN active
+        self.assertEqual(
+            MemberWarning.objects.get(client=c, code=NO_KITCHEN).status, WarningStatus.ACTIVE
+        )
+
+        api = self._api()
+        r1 = api.get("/api/portal/care-management/").json()
+        self.assertIn("no_kitchen", r1["summary"]["by_code"])
+
+        # Fix the issue -- assign a kitchen -- WITHOUT manually re-syncing.
+        enr.kitchen = Kitchen.objects.create(
+            name="K", status=KitchenStatus.ACTIVE,
+            supported_products=[KitchenProductType.MEAL],
+        )
+        enr.save(update_fields=["kitchen"])
+
+        # Next list load must re-scan and drop the fixed warning.
+        r2 = api.get("/api/portal/care-management/").json()
+        self.assertNotIn("no_kitchen", r2["summary"]["by_code"])
+        self.assertEqual(
+            MemberWarning.objects.get(client=c, code=NO_KITCHEN).status, WarningStatus.RESOLVED
+        )
