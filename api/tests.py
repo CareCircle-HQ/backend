@@ -11287,3 +11287,46 @@ class SyncHouseholdOutOfOrbitEventGateTest(TestCase):
                 client=dep, event_type=TimelineEventType.OUT_OF_ORBIT
             ).exists()
         )
+
+
+class DedupePoDeliveryOrdersCommandTest(TestCase):
+    """dedupe_po_delivery_orders cancels the extra LIVE delivery order(s) for a
+    member duplicated on one PO, keeping one; leaves single/all-cancelled alone."""
+
+    def test_apply_keeps_one_cancels_extras(self):
+        from io import StringIO
+
+        from django.core.management import call_command
+
+        from .models import (
+            Client, DeliveryOrder, DeliveryOrderStatus, PurchaseOrder,
+            PurchaseOrderStatus,
+        )
+
+        client = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Dup", last_name="Member",
+        )
+        other = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Solo", last_name="Member",
+        )
+        po = PurchaseOrder.objects.create(status=PurchaseOrderStatus.DRAFT)
+        # Member duplicated: two live orders on the same PO.
+        d1 = DeliveryOrder.objects.create(
+            purchase_order=po, member=client, status=DeliveryOrderStatus.READY_FOR_DELIVERY,
+        )
+        d2 = DeliveryOrder.objects.create(
+            purchase_order=po, member=client, status=DeliveryOrderStatus.READY_FOR_DELIVERY,
+        )
+        # A single (fine) order for another member.
+        solo = DeliveryOrder.objects.create(
+            purchase_order=po, member=other, status=DeliveryOrderStatus.PENDING,
+        )
+
+        call_command("dedupe_po_delivery_orders", "--apply", stdout=StringIO())
+
+        live = DeliveryOrder.objects.filter(
+            purchase_order=po, member=client,
+        ).exclude(status=DeliveryOrderStatus.CANCELLED)
+        self.assertEqual(live.count(), 1)  # kept exactly one
+        solo.refresh_from_db()
+        self.assertEqual(solo.status, DeliveryOrderStatus.PENDING)  # untouched
