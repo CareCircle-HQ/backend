@@ -5016,7 +5016,7 @@ class DashboardServingClientIdsTests(TestCase):
         from .models import (
             Case, CaseStatus, CaseType, Client, EnrollmentStage,
             EnrollmentVerification, Household, HouseholdMember,
-            MemberDietaryProfile, MemberStatus,
+            MemberDietaryProfile, MemberStatus, ServiceAuthorizationStatus,
         )
 
         client = Client.objects.create(
@@ -5025,14 +5025,14 @@ class DashboardServingClientIdsTests(TestCase):
         )
         hh = Household.objects.create(name="HH")
         HouseholdMember.objects.create(household=hh, client=client, is_primary=True)
-        # Every dashboard serving/watchlist reason is gated to members whose
-        # GOVERNING internal-service case is OPEN, so give the member one (open by
-        # default; pass case_status to test the closed-case exclusion, auth to set
-        # the authorization status -- members_paused needs it APPROVED).
+        # Every dashboard serving/watchlist reason is gated to the member's
+        # GOVERNING internal-service case. Give them one -- APPROVED + OPEN by
+        # default (blank/never_requested never govern), pass case_status/auth to
+        # vary it.
         case = Case.objects.create(
             case_id=uuid.uuid4(), client=client, case_type=CaseType.INTERNAL_SERVICE,
             case_status=case_status or CaseStatus.OPEN,
-            service_authorization_status=auth or "",
+            service_authorization_status=auth or ServiceAuthorizationStatus.APPROVED,
             program_name="Medically Tailored Meals",
         )
         enr = EnrollmentVerification.objects.create(
@@ -12383,3 +12383,32 @@ class VerificationVerifiedByDateRangeTest(TestCase):
         )
         self.assertNotIn(cid, self._ids(api.get(base + "&completed_from=2026-02-01&completed_to=2026-02-28")))
         self.assertIn(cid, self._ids(api.get(base + "&completed_from=2026-01-01&completed_to=2026-01-31")))
+
+
+class GoverningCaseExcludesUnauthorizedTest(TestCase):
+    """A blank or never_requested internal-service case can never be a governing
+    case (dashboard governing_internal_case_ids)."""
+
+    def _case(self, auth):
+        from .models import Case, CaseStatus, CaseType, Client
+        c = Client.objects.create(client_id=uuid.uuid4(), first_name="G", last_name="C")
+        return c, Case.objects.create(
+            case_id=uuid.uuid4(), client=c, case_type=CaseType.INTERNAL_SERVICE,
+            case_status=CaseStatus.OPEN, service_authorization_status=auth,
+            program_name="Medically Tailored Meals",
+        )
+
+    def test_blank_and_never_requested_never_govern(self):
+        from .models import ServiceAuthorizationStatus
+        from .portal.views_dashboard import governing_internal_case_ids
+
+        _, approved = self._case(ServiceAuthorizationStatus.APPROVED)
+        _, denied = self._case(ServiceAuthorizationStatus.DENIED)
+        _, blank = self._case("")
+        _, never = self._case(ServiceAuthorizationStatus.NEVER_REQUESTED)
+
+        gov = governing_internal_case_ids()
+        self.assertIn(approved.case_id, gov)
+        self.assertIn(denied.case_id, gov)          # denied still governs
+        self.assertNotIn(blank.case_id, gov)        # blank never governs
+        self.assertNotIn(never.case_id, gov)        # never_requested never governs

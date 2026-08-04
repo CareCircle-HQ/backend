@@ -114,15 +114,24 @@ def _scope_by_opened(qs, start, end):
 
 def governing_internal_case_ids():
     """The ``case_id`` of each client's GOVERNING internal-service case, using
-    the system-wide governing rule (:func:`governing_case_key` over ALL of the
-    client's internal-service cases -- an approved authorization beats a denial
-    regardless of dates, then OPEN over closed, then most recent).
+    the system-wide governing rule (:func:`governing_case_key` over the client's
+    internal-service cases -- an approved authorization beats a denial regardless
+    of dates, then OPEN over closed, then most recent).
+
+    A case with NO real authorization -- a BLANK status or ``never_requested`` --
+    can NEVER be a governing case: it's excluded from the candidate pool. So a
+    client whose only internal-service case is blank/never-requested contributes
+    NO governing case (and drops off every dashboard case metric), rather than
+    that unauthorized case being counted as their open case.
 
     Every dashboard case metric is restricted to these ids, so a superseded or
     parallel NON-governing case is never counted or considered anywhere: a
     client contributes exactly ONE (their governing) internal-service case.
     """
     from ..services.lifecycle import governing_case_key
+
+    # Statuses that confer no authorization and must never govern.
+    _NON_GOVERNING = {"", ServiceAuthorizationStatus.NEVER_REQUESTED}
 
     best = {}
     for c in (
@@ -132,6 +141,8 @@ def governing_internal_case_ids():
             "case_status", "case_created_at", "date_opened", "updated_at",
         )
     ):
+        if (c.service_authorization_status or "") in _NON_GOVERNING:
+            continue  # blank / never_requested can never be a governing case
         cur = best.get(c.client_id)
         if cur is None or governing_case_key(c) > governing_case_key(cur):
             best[c.client_id] = c
