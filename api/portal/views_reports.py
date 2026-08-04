@@ -235,48 +235,18 @@ class MembersPendingVerificationReportView(PortalAPIView):
         if not (agent and (agent.group == "Management" or getattr(agent, "is_manager", False))):
             return Response({"detail": "Management access required."}, status=403)
 
-        created_from = _parse_date(request.query_params.get("created_from"))
-        created_to = _parse_date(request.query_params.get("created_to"))
-
-        qs = (
-            EnrollmentVerification.objects.filter(
-                stage=EnrollmentStage.PENDING_VERIFICATION
-            )
-            .select_related("client", "household")
-            .prefetch_related(
-                "member_profiles__client__phones",
-                "household__members__client__phones",
-            )
-            .order_by("opened_at")
+        from .report_exports import (
+            default_filename, members_pending_verification_rows, stream_csv_response,
         )
-        if created_from:
-            qs = qs.filter(opened_at__date__gte=created_from)
-        if created_to:
-            qs = qs.filter(opened_at__date__lte=created_to)
 
-        response = HttpResponse(content_type="text/csv")
-        filename = (
-            f"members_pending_verification_{timezone.localdate().isoformat()}.csv"
+        params = {
+            "created_from": request.query_params.get("created_from"),
+            "created_to": request.query_params.get("created_to"),
+        }
+        return stream_csv_response(
+            members_pending_verification_rows(params),
+            default_filename("members-pending-verification"),
         )
-        response["Content-Disposition"] = f'attachment; filename="{filename}"'
-
-        writer = csv.writer(response)
-        writer.writerow(["Client ID", "First Name", "Last Name", "Phone Numbers"])
-
-        seen = set()
-        for enr in qs:
-            for client in _enrollment_member_clients(enr):
-                if client is None or client.pk in seen:
-                    continue
-                seen.add(client.pk)
-                writer.writerow([
-                    str(client.client_id),
-                    client.first_name or "",
-                    client.last_name or "",
-                    _client_phone_numbers(client),
-                ])
-
-        return response
 
 
 class AllVerificationsReportView(PortalAPIView):
@@ -291,57 +261,21 @@ class AllVerificationsReportView(PortalAPIView):
     """
 
     def get(self, request):
-        from ..services.lifecycle import governing_internal_case
-
         agent = current_agent(request)
         if not (agent and (agent.group == "Management" or getattr(agent, "is_manager", False))):
             return Response({"detail": "Management access required."}, status=403)
 
-        requested_from = _parse_date(request.query_params.get("requested_from"))
-        requested_to = _parse_date(request.query_params.get("requested_to"))
-
-        qs = (
-            EnrollmentVerification.objects.select_related("client", "case")
-            .prefetch_related("client__cases")
-            .order_by("-requested_at", "-opened_at")
+        from .report_exports import (
+            all_verifications_rows, default_filename, stream_csv_response,
         )
-        if requested_from:
-            qs = qs.filter(requested_at__date__gte=requested_from)
-        if requested_to:
-            qs = qs.filter(requested_at__date__lte=requested_to)
 
-        response = HttpResponse(content_type="text/csv")
-        filename = f"all_verifications_{timezone.localdate().isoformat()}.csv"
-        response["Content-Disposition"] = f'attachment; filename="{filename}"'
-
-        writer = csv.writer(response)
-        writer.writerow([
-            "Member ID",
-            "Verification Requested",
-            "Verification Completed",
-            "Authorization Approved",
-        ])
-
-        for enr in qs:
-            client = enr.client
-            gov = governing_internal_case(enr) or enr.case
-            # The authorization-approved date is the governing case's approval
-            # window start, shown only when that case is actually approved.
-            auth_approved = None
-            if gov is not None and gov.service_authorization_status in (
-                ServiceAuthorizationStatus.APPROVED,
-                ServiceAuthorizationStatus.NOT_REQUIRED,
-            ):
-                auth_approved = gov.service_authorization_approval_starts_at
-
-            writer.writerow([
-                str(client.client_id) if client else "",
-                _date_str(enr.requested_at),
-                _date_str(enr.verified_at),
-                _date_str(auth_approved),
-            ])
-
-        return response
+        params = {
+            "requested_from": request.query_params.get("requested_from"),
+            "requested_to": request.query_params.get("requested_to"),
+        }
+        return stream_csv_response(
+            all_verifications_rows(params), default_filename("all-verifications"),
+        )
 
 
 _CLOSED_CASE_STATUSES = (CaseStatus.CLOSED, CaseStatus.CANCELLED)
@@ -1139,32 +1073,13 @@ class UniteUsAgentsReportView(PortalAPIView):
         if not (agent and (agent.group == "Management" or getattr(agent, "is_manager", False))):
             return Response({"detail": "Management access required."}, status=403)
 
-        response = HttpResponse(content_type="text/csv")
-        filename = f"unite_us_agents_{timezone.localdate().isoformat()}.csv"
-        response["Content-Disposition"] = f'attachment; filename="{filename}"'
+        from .report_exports import (
+            default_filename, stream_csv_response, unite_us_agents_rows,
+        )
 
-        writer = csv.writer(response)
-        writer.writerow([
-            "Unite Us user_id",
-            "Full Name",
-            "Email",
-            "Team",
-            "Status",
-        ])
-
-        for a in UniteUsAgent.objects.all():
-            full_name = a.name or " ".join(
-                p for p in [a.first_name, a.last_name] if p
-            )
-            writer.writerow([
-                str(a.user_id),
-                full_name,
-                a.email or "",
-                a.originating_team or "",
-                (a.status or "").title(),
-            ])
-
-        return response
+        return stream_csv_response(
+            unite_us_agents_rows({}), default_filename("unite-us-agents"),
+        )
 
 
 # ===========================================================================

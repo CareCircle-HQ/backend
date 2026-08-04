@@ -213,9 +213,107 @@ def all_members_rows(params):
         ]
 
 
+# --- Members Pending Verification -------------------------------------------
+def members_pending_verification_rows(params):
+    """One row per household member on a pending-verification enrollment.
+    ``params``: created_from / created_to (inclusive, on enrollment opened_at)."""
+    from ..models import EnrollmentStage, EnrollmentVerification
+    from .views_members import _parse_date
+    from .views_reports import _client_phone_numbers, _enrollment_member_clients
+
+    created_from = _parse_date(params.get("created_from"))
+    created_to = _parse_date(params.get("created_to"))
+    qs = (
+        EnrollmentVerification.objects
+        .filter(stage=EnrollmentStage.PENDING_VERIFICATION)
+        .select_related("client", "household")
+        .prefetch_related(
+            "member_profiles__client__phones",
+            "household__members__client__phones",
+        )
+        .order_by("opened_at")
+    )
+    if created_from:
+        qs = qs.filter(opened_at__date__gte=created_from)
+    if created_to:
+        qs = qs.filter(opened_at__date__lte=created_to)
+
+    yield ["Client ID", "First Name", "Last Name", "Phone Numbers"]
+    seen = set()
+    for enr in qs.iterator(chunk_size=1000):
+        for client in _enrollment_member_clients(enr):
+            if client is None or client.pk in seen:
+                continue
+            seen.add(client.pk)
+            yield [
+                str(client.client_id),
+                client.first_name or "",
+                client.last_name or "",
+                _client_phone_numbers(client),
+            ]
+
+
+# --- All Verifications ------------------------------------------------------
+def all_verifications_rows(params):
+    """One row per verification with milestone dates. ``params``: requested_from
+    / requested_to (inclusive, on requested_at)."""
+    from ..models import EnrollmentVerification, ServiceAuthorizationStatus
+    from ..services.lifecycle import governing_internal_case
+    from .views_members import _parse_date
+    from .views_reports import _date_str
+
+    requested_from = _parse_date(params.get("requested_from"))
+    requested_to = _parse_date(params.get("requested_to"))
+    qs = (
+        EnrollmentVerification.objects.select_related("client", "case")
+        .prefetch_related("client__cases")
+        .order_by("-requested_at", "-opened_at")
+    )
+    if requested_from:
+        qs = qs.filter(requested_at__date__gte=requested_from)
+    if requested_to:
+        qs = qs.filter(requested_at__date__lte=requested_to)
+
+    yield [
+        "Member ID", "Verification Requested", "Verification Completed",
+        "Authorization Approved",
+    ]
+    for enr in qs.iterator(chunk_size=1000):
+        client = enr.client
+        gov = governing_internal_case(enr) or enr.case
+        auth_approved = None
+        if gov is not None and gov.service_authorization_status in (
+            ServiceAuthorizationStatus.APPROVED,
+            ServiceAuthorizationStatus.NOT_REQUIRED,
+        ):
+            auth_approved = gov.service_authorization_approval_starts_at
+        yield [
+            str(client.client_id) if client else "",
+            _date_str(enr.requested_at),
+            _date_str(enr.verified_at),
+            _date_str(auth_approved),
+        ]
+
+
+# --- Unite Us Agents --------------------------------------------------------
+def unite_us_agents_rows(params):
+    from ..models import UniteUsAgent
+
+    yield ["Unite Us user_id", "Full Name", "Email", "Team", "Status"]
+    for a in UniteUsAgent.objects.all().iterator(chunk_size=2000):
+        full_name = a.name or " ".join(p for p in [a.first_name, a.last_name] if p)
+        yield [
+            str(a.user_id), full_name, a.email or "",
+            a.originating_team or "", (a.status or "").title(),
+        ]
+
+
 # ---------------------------------------------------------------------------
 # Registry: report_key -> row generator. Extend as reports are ported.
 # ---------------------------------------------------------------------------
 REPORT_BUILDERS = {
     "all-members": all_members_rows,
+    "members-pending-verification": members_pending_verification_rows,
+    "all-verifications": all_verifications_rows,
+    "unite-us-agents": unite_us_agents_rows,
 }

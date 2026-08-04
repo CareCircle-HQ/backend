@@ -11210,8 +11210,9 @@ class AllVerificationsReportTest(TestCase):
         self.assertEqual(self._api(group="CS", code="966").get("/api/portal/reports/all-verifications/").status_code, 403)
 
         r = self._api().get("/api/portal/reports/all-verifications/")
-        self.assertEqual(r.status_code, 200, r.content)
-        body = r.content.decode()
+        raw = b"".join(r.streaming_content) if getattr(r, "streaming", False) else r.content
+        self.assertEqual(r.status_code, 200, raw)
+        body = raw.decode()
         lines = [ln for ln in body.splitlines() if ln.strip()]
         self.assertEqual(
             lines[0],
