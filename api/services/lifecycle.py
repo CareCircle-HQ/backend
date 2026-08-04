@@ -2694,6 +2694,56 @@ def _carry_verification_fields(target, source):
         pass
 
 
+def _carry_dietary_profiles(target, source):
+    """Fill BLANK dietary fields on ``target``'s member profiles from ``source``'s
+    matching (by client) profiles.
+
+    A household is verified once, capturing each member's menu type / allergies /
+    restrictions. When a governing-case replacement REUSES a pre-existing
+    (usually placeholder) enrollment, those profiles start blank -- so copy the
+    verified dietary config forward (the create-new path already does). Only
+    fills empties; never overwrites data the survivor already carries. Returns
+    the number of member profiles changed. Best-effort."""
+    if target is None or source is None:
+        return 0
+    src_by_client = {
+        p.client_id: p for p in source.member_profiles.all() if p.client_id
+    }
+    if not src_by_client:
+        return 0
+    changed = 0
+    for tp in target.member_profiles.all():
+        sp = src_by_client.get(tp.client_id)
+        if sp is None:
+            continue
+        fields = []
+        if not (tp.menu_type or "").strip() and (sp.menu_type or "").strip():
+            tp.menu_type = sp.menu_type; fields.append("menu_type")
+        if not tp.food_allergies and sp.food_allergies:
+            tp.food_allergies = sp.food_allergies; fields.append("food_allergies")
+        if not tp.dietary_restrictions and sp.dietary_restrictions:
+            tp.dietary_restrictions = sp.dietary_restrictions
+            fields.append("dietary_restrictions")
+        if not (tp.other_dietary_restrictions or "").strip() and (sp.other_dietary_restrictions or "").strip():
+            tp.other_dietary_restrictions = sp.other_dietary_restrictions
+            fields.append("other_dietary_restrictions")
+        if not (tp.meal_category or "").strip() and (sp.meal_category or "").strip():
+            tp.meal_category = sp.meal_category; fields.append("meal_category")
+        if tp.meals_per_delivery is None and sp.meals_per_delivery is not None:
+            tp.meals_per_delivery = sp.meals_per_delivery
+            fields.append("meals_per_delivery")
+        if not (tp.general_verification_notes or "").strip() and (sp.general_verification_notes or "").strip():
+            tp.general_verification_notes = sp.general_verification_notes
+            fields.append("general_verification_notes")
+        if fields:
+            try:
+                tp.save(update_fields=fields)
+                changed += 1
+            except Exception:  # pragma: no cover - defensive
+                pass
+    return changed
+
+
 def _close_old_and_link_to_existing(
     live, existing, new_governing_case, actor=None, actor_label="", note="",
 ):
@@ -2753,6 +2803,11 @@ def _close_old_and_link_to_existing(
         # "Verified by" (the completer/date are lost). Only fill fields the
         # survivor doesn't already carry, so a genuine own verification wins.
         _carry_verification_fields(existing, live)
+        # ...and the verified dietary config (menu/allergies/restrictions), so a
+        # reused placeholder enrollment doesn't strand members with a blank menu
+        # (which would push them Out of Orbit). Done BEFORE the service carry so
+        # the meal-rule reconcile below sees the carried menu. Blanks only.
+        _carry_dietary_profiles(existing, live)
 
         # Carry the closed enrollment's service forward: if ``live`` was serving a
         # SAME-KIND program, drive ``existing`` back to Service Active with the

@@ -20,7 +20,7 @@ from django.core.management.base import BaseCommand
 from django.db import transaction
 
 from api.models import EnrollmentStage, EnrollmentVerification
-from api.services.lifecycle import _carry_verification_fields
+from api.services.lifecycle import _carry_dietary_profiles, _carry_verification_fields
 
 TERMINAL = [EnrollmentStage.CLOSED, EnrollmentStage.CANCELLED, EnrollmentStage.DISREGARDED]
 
@@ -36,18 +36,25 @@ class Command(BaseCommand):
 
     def handle(self, *args, **options):
         apply = options["apply"]
+        # Every live (non-terminal) enrollment that supersedes a VERIFIED closed
+        # enrollment: carry forward both the verification fact (when the survivor
+        # isn't itself verified) AND the verified dietary config (blank fields).
         qs = (
             EnrollmentVerification.objects.exclude(stage__in=TERMINAL)
-            .filter(verified_at__isnull=True, supersedes__verified_at__isnull=False)
+            .filter(supersedes__verified_at__isnull=False)
             .select_related("supersedes", "supersedes__verified_by")
         )
         total = qs.count()
+        need_verif = qs.filter(verified_at__isnull=True).count()
         by_verifier = Counter()
-        for vb in qs.values_list("supersedes__verified_by__name", flat=True):
+        for vb in qs.filter(verified_at__isnull=True).values_list(
+            "supersedes__verified_by__name", flat=True
+        ):
             by_verifier[vb or "(unknown)"] += 1
 
         self.stdout.write(self.style.MIGRATE_HEADING("\n=== Backfill carried verification ==="))
-        self.stdout.write(f"  live enrollments to fix: {total}")
+        self.stdout.write(f"  live enrollments superseding a verified one: {total}")
+        self.stdout.write(f"    missing verified_at (verification carry): {need_verif}")
         self.stdout.write("  by carried verifier (top 12):")
         for name, c in by_verifier.most_common(12):
             self.stdout.write(f"     {c:6}  {name}")
@@ -56,7 +63,7 @@ class Command(BaseCommand):
             self.stdout.write(self.style.WARNING("\nDRY RUN: nothing changed. Re-run with --apply."))
             return
 
-        fixed = 0
+        fixed = dietary_fixed = 0
         ids = list(qs.values_list("pk", flat=True))
         for i in range(0, len(ids), 500):
             chunk = ids[i:i + 500]
@@ -70,4 +77,8 @@ class Command(BaseCommand):
                     enr.refresh_from_db(fields=["verified_at"])
                     if enr.verified_at is not None and before is None:
                         fixed += 1
-        self.stdout.write(self.style.SUCCESS(f"\nAPPLIED: backfilled {fixed} enrollment(s)."))
+                    dietary_fixed += _carry_dietary_profiles(enr, enr.supersedes)
+        self.stdout.write(self.style.SUCCESS(
+            f"\nAPPLIED: verification carried onto {fixed} enrollment(s); "
+            f"dietary fields filled on {dietary_fixed} member profile(s)."
+        ))

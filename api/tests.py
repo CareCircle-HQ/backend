@@ -11881,3 +11881,38 @@ class CarriedVerificationTest(TestCase):
         self.assertEqual(live1.verified_by_id, a.id)   # carried from superseded
         self.assertIsNotNone(live1.verified_at)
         self.assertEqual(live2.verified_by_id, b.id)   # own verification preserved
+
+    def test_dietary_carry_forward(self):
+        from io import StringIO
+
+        from django.core.management import call_command
+        from django.utils import timezone
+
+        from .models import (
+            Agent, Client, EnrollmentStage, EnrollmentVerification,
+            MemberDietaryProfile,
+        )
+
+        a = Agent.objects.create(name="Vera", group="Verifiers", status="Active")
+        now = timezone.now()
+        c = Client.objects.create(client_id=str(uuid.uuid4()), first_name="A", last_name="A")
+        closed = EnrollmentVerification.objects.create(
+            client=c, stage=EnrollmentStage.CLOSED, verified_by=a, verified_at=now, closed_at=now,
+        )
+        MemberDietaryProfile.objects.create(
+            enrollment=closed, client=c, member_name="A A", menu_type="Vegetarian",
+            food_allergies=["peanuts"],
+        )
+        live = EnrollmentVerification.objects.create(
+            client=c, stage=EnrollmentStage.SERVICE_ACTIVE, supersedes=closed,
+        )
+        # Survivor's placeholder profile: blank menu (the gap).
+        tp = MemberDietaryProfile.objects.create(
+            enrollment=live, client=c, member_name="A A", menu_type="",
+        )
+
+        call_command("backfill_carried_verification", "--apply", stdout=StringIO())
+
+        tp.refresh_from_db()
+        self.assertEqual(tp.menu_type, "Vegetarian")     # carried from superseded
+        self.assertEqual(tp.food_allergies, ["peanuts"])
