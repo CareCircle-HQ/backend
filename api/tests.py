@@ -11789,10 +11789,31 @@ class MembersVerifiedByFilterTest(TestCase):
         self.assertIn("Vera Verifier", labels)
         self.assertNotIn("Cassie CS", labels)
 
+        from datetime import timedelta
+
+        from django.utils import timezone
+
+        other_agent = Agent.objects.create(name="Bob Other", group="Verifiers", status="Active")
+        now = timezone.now()
+
         verified = Client.objects.create(client_id=str(uuid.uuid4()), first_name="Ver", last_name="Ified")
         other = Client.objects.create(client_id=str(uuid.uuid4()), first_name="No", last_name="One")
         EnrollmentVerification.objects.create(
             client=verified, stage=EnrollmentStage.VERIFIED, verified_by=verifier,
+            opened_at=now,
+        )
+
+        # Superseded case: an OLD closed enrollment verified by our agent, then a
+        # NEWER open enrollment verified by someone else -> the GOVERNING verifier
+        # is the other agent, so filtering by our agent must NOT return this member.
+        superseded = Client.objects.create(client_id=str(uuid.uuid4()), first_name="Sup", last_name="Erseded")
+        EnrollmentVerification.objects.create(
+            client=superseded, stage=EnrollmentStage.CLOSED, verified_by=verifier,
+            opened_at=now - timedelta(days=30), closed_at=now - timedelta(days=20),
+        )
+        EnrollmentVerification.objects.create(
+            client=superseded, stage=EnrollmentStage.VERIFIED, verified_by=other_agent,
+            opened_at=now,
         )
 
         def ids(resp):
@@ -11805,3 +11826,9 @@ class MembersVerifiedByFilterTest(TestCase):
         got = ids(api.get(f"/api/portal/members/?verified_by={verifier.id}"))
         self.assertIn(str(verified.client_id), got)
         self.assertNotIn(str(other.client_id), got)
+        # Governing verifier is the other agent -> excluded from our agent's filter.
+        self.assertNotIn(str(superseded.client_id), got)
+        # ...and INCLUDED when filtering by the other (governing) agent.
+        got_other = ids(api.get(f"/api/portal/members/?verified_by={other_agent.id}"))
+        self.assertIn(str(superseded.client_id), got_other)
+        self.assertNotIn(str(verified.client_id), got_other)

@@ -1520,22 +1520,35 @@ class MembersListView(PortalGenericAPIView):
                 cases__created_by_id__in=team_creator_ids,
             )
 
-        # "Verified by" filter (Members page): keep members whose household (or
-        # own) enrollment verification was COMPLETED by the selected Verifier
-        # agent (EnrollmentVerification.verified_by). Matches via the household so
-        # every member of a verified household is included (dependents follow the
-        # primary), plus any direct client enrollment. Covers both household and
-        # individual programs. Trailing .distinct() dedupes the join.
+        # "Verified by" filter (Members page): keep members whose GOVERNING
+        # enrollment was verified by the selected Verifier agent -- i.e. the exact
+        # value the "Verified by" column shows (serializers.active_enrollment):
+        # the client's own non-disregarded enrollment, else their household's,
+        # preferring OPEN ones, newest opened_at first. Matching ANY historical /
+        # superseded enrollment (the naive approach) wrongly surfaced households
+        # whose CURRENT verification was done by a different agent, or not stamped
+        # at all (blank column).
         verified_by_val = (params.get("verified_by") or "").strip()
         if verified_by_val:
-            qs = qs.filter(
-                Q(enrollments__verified_by_id=verified_by_val)
-                | Q(
-                    household_membership__household__enrollment_verifications__verified_by_id=(
-                        verified_by_val
+            governing_verified_by = (
+                EnrollmentVerification.objects.filter(
+                    Q(client_id=OuterRef("pk"))
+                    | Q(household__members__client_id=OuterRef("pk"))
+                )
+                .exclude(stage=EnrollmentStage.DISREGARDED)
+                .annotate(
+                    _open=SQLCase(
+                        When(closed_at__isnull=True, then=Value(1)),
+                        default=Value(0),
+                        output_field=IntegerField(),
                     )
                 )
+                .order_by("-_open", "-opened_at")
+                .values("verified_by_id")[:1]
             )
+            qs = qs.annotate(
+                _gov_verified_by=Subquery(governing_verified_by)
+            ).filter(_gov_verified_by=verified_by_val)
 
         # Created-date range filter (Members page): filters on the date the
         # member's INTERNAL-SERVICE case was created (its ``date_opened``) --
