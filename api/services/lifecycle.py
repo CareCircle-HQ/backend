@@ -3439,6 +3439,55 @@ def _mark_kitchen_assignment_ineligible(client, *, reason, actor=None, actor_lab
     return True
 
 
+def _bind_governing_case_to_serving_enrollment(client, governing):
+    """Prevent (and self-heal) the 'serving enrollment left caseless' split.
+
+    When a client has exactly ONE serving (SERVICE_ACTIVE/ON_HOLD) enrollment that
+    is CASELESS while an OPEN governing internal-service case sits on a NON-serving
+    stray (pending_verification/verified/kitchen_assignment) -- the per-case
+    unique constraint blocks the normal reconcile from binding -- disregard the
+    stray(s) holding that case and bind it onto the serving enrollment, so the
+    member never delivers without a governing case (which breaks the auth/PO
+    window). Skips when there are 0 or 2+ serving enrollments, when the serving
+    one is already bound, or when the governing case is closed/cancelled. Runs on
+    every case-save reconcile. Best-effort. Returns True when it bound."""
+    if governing is None or governing.case_status in _CLOSED_CASE_STATUSES:
+        return False
+    from api.models import EnrollmentVerification
+
+    terminal = (
+        EnrollmentStage.CLOSED, EnrollmentStage.CANCELLED, EnrollmentStage.DISREGARDED,
+    )
+    serving_stages = (EnrollmentStage.SERVICE_ACTIVE, EnrollmentStage.ON_HOLD)
+    live = [
+        e for e in EnrollmentVerification.objects.filter(client=client)
+        if EnrollmentStage(e.stage) not in terminal
+    ]
+    serving = [e for e in live if EnrollmentStage(e.stage) in serving_stages]
+    if len(serving) != 1:
+        return False
+    serv = serving[0]
+    if serv.case_id is not None:
+        return False  # bound already (a genuine case change is handled elsewhere)
+    holders = [e for e in live if e.case_id == governing.case_id and e.pk != serv.pk]
+    if any(EnrollmentStage(e.stage) in serving_stages for e in holders):
+        return False  # another SERVING enrollment owns it -> ambiguous, leave it
+    for e in holders:
+        e.case = None
+        e.stage = EnrollmentStage.DISREGARDED
+        e.close_reason = "caseless_serving_fix"
+        try:
+            e.save(update_fields=["case", "stage", "close_reason"])
+        except Exception:  # pragma: no cover - defensive
+            pass
+    serv.case = governing
+    try:
+        serv.save(update_fields=["case"])
+    except Exception:  # pragma: no cover - defensive
+        return False
+    return True
+
+
 def reconcile_internal_service_authorization(client, *, actor=None, actor_label=""):
     """React to a change in the client's internal-service case authorization.
 
@@ -3475,6 +3524,11 @@ def reconcile_internal_service_authorization(client, *, actor=None, actor_label=
 
     open_cases = open_internal_service_cases(client)
     governing = max(cases, key=governing_case_key)
+    # Heal the 'serving enrollment left caseless' split at the source: a member
+    # delivering without a governing case (its case stranded on a stray pending
+    # enrollment) breaks the authorization/PO window. Bind it back before the
+    # auth branches read enrollment.case.
+    _bind_governing_case_to_serving_enrollment(client, governing)
     # Record an old -> new governing-case switch (timeline event + primary note)
     # before acting on it, so the history captures WHY service state changed.
     _record_governing_case_change(
