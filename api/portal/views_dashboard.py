@@ -98,6 +98,11 @@ def cs_member_status(start, end):
     have_social = set(SocialCareCoverage.objects.filter(
         client_id__in=client_ids, status=SocialCareCoverageStatus.ENROLLED,
     ).values_list("client_id", flat=True))
+    # Members with an open Case Closure request -> surface under Services Paused
+    # (the closure ticket keeps the case open until it is closed).
+    closure_ticket = set(Ticket.objects.filter(
+        type__code=TicketTypeCode.CASE_CLOSURE,
+    ).exclude(status=TicketStatus.RESOLVED).values_list("client_id", flat=True))
 
     def classify(r):
         cid = r["client_id"]
@@ -115,7 +120,8 @@ def cs_member_status(start, end):
             return "out_of_range"
         if auth == SAS.DENIED:
             return "rejected"
-        if status == MemberStatus.PAUSED or stage == ES.ON_HOLD:
+        if (status == MemberStatus.PAUSED or stage == ES.ON_HOLD
+                or cid in closure_ticket):
             return "services_paused"
         if cid not in have_medicaid or cid not in have_social:
             return "no_coverage"
@@ -143,14 +149,20 @@ def cs_member_status(start, end):
     ).values_list("client_id", flat=True))
     never_requested = open_isc - set(best)
     for cid in never_requested:
-        best[cid] = "requires_verification"
+        # A never-verified member with a closure request still surfaces under
+        # Services Paused; otherwise it's a verification gap.
+        best[cid] = "services_paused" if cid in closure_ticket else "requires_verification"
+    never_requested -= closure_ticket
 
     tier_clients = {t: set() for t in CS_MEMBER_TIERS}
     for cid, t in best.items():
         tier_clients[t].add(cid)
-    # never_requested (navigation) vs requested-not-completed, for tagging the
-    # Requires Verification drill-down.
-    return tier_clients, never_requested
+    # Tag sets for the drill-down: never_requested (navigation) vs
+    # requested-not-completed; closure_ticket flags Services Paused rows.
+    return tier_clients, {
+        "never_requested": never_requested,
+        "closure_ticket": closure_ticket,
+    }
 
 # The drill-down reasons the serving-status list endpoint understands. The first
 # group mirrors the "Not Being Served" cards; the second is the follow-up
@@ -1084,7 +1096,7 @@ class DashboardView(PortalAPIView):
                 # CS tab Section 3 -- member status (priority-ordered, one bucket).
                 "member_status": {
                     t: len(s) for t, s in cs_member_status(start, end)[0].items()
-                },
+                },  # [1] = tag sets (never_requested / closure_ticket)
             }
         )
 
@@ -1202,7 +1214,9 @@ class DashboardMemberStatusListView(PortalAPIView):
             return Response({"detail": "Unknown tier."}, status=404)
 
         start, end = resolve_window(request)
-        tier_clients, never_requested = cs_member_status(start, end)
+        tier_clients, tags = cs_member_status(start, end)
+        never_requested = tags["never_requested"]
+        closure_ticket = tags["closure_ticket"]
         client_ids = tier_clients.get(tier, set())
         primary_map = _primary_map(client_ids)
         needed = set(client_ids) | set(primary_map.values())
@@ -1214,14 +1228,19 @@ class DashboardMemberStatusListView(PortalAPIView):
         for cid in client_ids:
             pid = primary_map.get(cid, cid)
             detail = ""
+            has_ticket = False
             if tier == "requires_verification":
                 detail = "Never requested" if cid in never_requested else "Requested"
+            elif tier == "services_paused" and cid in closure_ticket:
+                detail = "Closure requested"
+                has_ticket = True
             results.append({
                 "id": str(cid),
                 "name": names.get(cid, str(cid)),
                 "primary_id": str(pid),
                 "primary_name": names.get(pid, names.get(cid, str(cid))),
                 "detail": detail,
+                "ticket": has_ticket,
             })
         results.sort(key=lambda r: r["name"].lower())
         return Response({"reason": tier, "count": len(results), "results": results})

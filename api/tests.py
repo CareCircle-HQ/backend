@@ -12474,7 +12474,7 @@ class CSMemberStatusTest(TestCase):
         self._m(status=MemberStatus.ACTIVE, stage=EnrollmentStage.KITCHEN_ASSIGNMENT,
                 auth=SAS.APPROVED, verified=True, menu="", medicaid=True, social=True)  # no_menu
 
-        tier_clients, _ = cs_member_status(None, None)
+        tier_clients, _tags = cs_member_status(None, None)
         ms = {t: len(s) for t, s in tier_clients.items()}
         self.assertEqual(ms, {
             "receiving_meals": 1, "pending_meals": 1, "out_of_range": 1,
