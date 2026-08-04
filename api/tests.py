@@ -12088,3 +12088,35 @@ class NoteAuthorFallbackTest(TestCase):
         # A real author is preserved.
         n = Note.objects.create(client=c, source=NoteSource.UNITE_US, author_name="Jane Doe", body="y")
         self.assertEqual(PortalNoteSerializer(n).data["author_name"], "Jane Doe")
+
+
+class AttributeSystemNotesCommandTest(TestCase):
+    """attribute_system_notes stamps a blank-author SYSTEM note with the agent
+    inferred from a co-timed timeline event, and leaves non-agent (import/
+    system) ones as System."""
+
+    def test_infers_agent_and_leaves_system(self):
+        from io import StringIO
+
+        from django.core.management import call_command
+
+        from .models import Agent, Client, Note, NoteSource, TimelineEvent
+
+        agent = Agent.objects.create(name="Javier Almenar", agent_code="614", group="Verifiers")
+
+        # Agent-triggered: co-timed event with an agent actor -> attributed.
+        c1 = Client.objects.create(client_id=str(uuid.uuid4()), first_name="L", last_name="O")
+        n1 = Note.objects.create(client=c1, source=NoteSource.SYSTEM, author_name="", body="x")
+        from django.utils import timezone as _tz
+        TimelineEvent.objects.create(client=c1, event_type="verification_requested", actor="agent:614", source="system", occurred_at=_tz.now())
+
+        # Import-triggered: only a system actor nearby -> stays System (blank).
+        c2 = Client.objects.create(client_id=str(uuid.uuid4()), first_name="I", last_name="M")
+        n2 = Note.objects.create(client=c2, source=NoteSource.SYSTEM, author_name="", body="y")
+        TimelineEvent.objects.create(client=c2, event_type="case_opened", actor="system:csv-import", source="import", occurred_at=_tz.now())
+
+        call_command("attribute_system_notes", "--apply", stdout=StringIO())
+
+        n1.refresh_from_db(); n2.refresh_from_db()
+        self.assertEqual(n1.author_name, "Javier Almenar")   # inferred agent
+        self.assertEqual(n2.author_name, "")                 # non-agent -> stays System
