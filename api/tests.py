@@ -11917,6 +11917,41 @@ class CarriedVerificationTest(TestCase):
         self.assertEqual(tp.menu_type, "Vegetarian")     # carried from superseded
         self.assertEqual(tp.food_allergies, ["peanuts"])
 
+    def test_delivery_address_carries_even_when_already_verified(self):
+        # Regression: a survivor that already carried the verified FLAG but not the
+        # delivery-address FK reads as "verified but no delivery address". The
+        # address must carry regardless of verification state.
+        from io import StringIO
+
+        from django.core.management import call_command
+        from django.utils import timezone
+
+        from .models import (
+            Address, Agent, Client, EnrollmentStage, EnrollmentVerification,
+        )
+
+        a = Agent.objects.create(name="Vera", group="Verifiers", status="Active")
+        now = timezone.now()
+        c = Client.objects.create(client_id=str(uuid.uuid4()), first_name="Tah", last_name="Ji")
+        addr = Address.objects.create(
+            client=c, type="current", street="69 Gatchell St", city="Buffalo",
+            state="NY", zip="14212",
+        )
+        closed = EnrollmentVerification.objects.create(
+            client=c, stage=EnrollmentStage.CLOSED, verified_by=a, verified_at=now,
+            closed_at=now, delivery_address=addr, delivery_address_verified=True,
+        )
+        # Survivor: already verified, but NO delivery address (the bug).
+        live = EnrollmentVerification.objects.create(
+            client=c, stage=EnrollmentStage.SERVICE_ACTIVE, supersedes=closed,
+            verified_by=a, verified_at=now, delivery_address=None,
+        )
+
+        call_command("backfill_carried_verification", "--apply", stdout=StringIO())
+
+        live.refresh_from_db()
+        self.assertEqual(live.delivery_address_id, addr.pk)
+
 
 class CareManagementRescanTest(TestCase):
     """The Care Management list re-scans flagged households on load, so an issue

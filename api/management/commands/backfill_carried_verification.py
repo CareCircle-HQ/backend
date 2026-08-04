@@ -46,6 +46,12 @@ class Command(BaseCommand):
         )
         total = qs.count()
         need_verif = qs.filter(verified_at__isnull=True).count()
+        # Verified survivors still missing the captured delivery address (the FK
+        # wasn't carried, only the verified flag) -- these read as "verified but
+        # no delivery address".
+        need_addr = qs.filter(
+            delivery_address__isnull=True, supersedes__delivery_address__isnull=False
+        ).count()
         by_verifier = Counter()
         for vb in qs.filter(verified_at__isnull=True).values_list(
             "supersedes__verified_by__name", flat=True
@@ -55,6 +61,7 @@ class Command(BaseCommand):
         self.stdout.write(self.style.MIGRATE_HEADING("\n=== Backfill carried verification ==="))
         self.stdout.write(f"  live enrollments superseding a verified one: {total}")
         self.stdout.write(f"    missing verified_at (verification carry): {need_verif}")
+        self.stdout.write(f"    missing delivery address (address carry): {need_addr}")
         self.stdout.write("  by carried verifier (top 12):")
         for name, c in by_verifier.most_common(12):
             self.stdout.write(f"     {c:6}  {name}")
@@ -63,7 +70,7 @@ class Command(BaseCommand):
             self.stdout.write(self.style.WARNING("\nDRY RUN: nothing changed. Re-run with --apply."))
             return
 
-        fixed = dietary_fixed = 0
+        fixed = addr_fixed = dietary_fixed = 0
         ids = list(qs.values_list("pk", flat=True))
         for i in range(0, len(ids), 500):
             chunk = ids[i:i + 500]
@@ -72,13 +79,17 @@ class Command(BaseCommand):
                     EnrollmentVerification.objects.filter(pk__in=chunk)
                     .select_related("supersedes", "supersedes__verified_by")
                 ):
-                    before = enr.verified_at
+                    before_v = enr.verified_at
+                    before_addr = enr.delivery_address_id
                     _carry_verification_fields(enr, enr.supersedes)
-                    enr.refresh_from_db(fields=["verified_at"])
-                    if enr.verified_at is not None and before is None:
+                    enr.refresh_from_db(fields=["verified_at", "delivery_address_id"])
+                    if enr.verified_at is not None and before_v is None:
                         fixed += 1
+                    if enr.delivery_address_id is not None and before_addr is None:
+                        addr_fixed += 1
                     dietary_fixed += _carry_dietary_profiles(enr, enr.supersedes)
         self.stdout.write(self.style.SUCCESS(
             f"\nAPPLIED: verification carried onto {fixed} enrollment(s); "
+            f"delivery address filled on {addr_fixed}; "
             f"dietary fields filled on {dietary_fixed} member profile(s)."
         ))

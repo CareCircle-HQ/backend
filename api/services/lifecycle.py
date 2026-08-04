@@ -2663,18 +2663,40 @@ def _handle_household_scope_switch(
 
 
 def _carry_verification_fields(target, source):
-    """Copy the verification FACT (who/when completed + requested + the verified
-    flags) from ``source`` onto ``target`` when ``target`` isn't itself verified.
+    """Carry the verified capture from ``source`` onto ``target`` after a
+    governing-case replacement reused a pre-existing enrollment.
 
-    Used when a governing-case replacement reuses a pre-existing (unverified)
-    enrollment: the household was already verified on ``source`` and shouldn't be
-    re-verified, so the surviving enrollment inherits that fact. No-op when the
-    source has no verification or the target is already verified (its own
-    verification wins). Best-effort."""
+    Two independent parts:
+      1. The captured DELIVERY ADDRESS + household size -- carried whenever the
+         survivor lacks them, REGARDLESS of verification state (a verified
+         enrollment can still be missing the address if an earlier carry copied
+         the verified flag but not the FK).
+      2. The verification FACT (who/when completed + requested + the verified
+         flags) -- carried only when the survivor isn't itself verified (its own
+         verification wins).
+
+    Only fills empties; never overwrites. Returns the number of fields changed.
+    Best-effort."""
     if source is None or target is None:
-        return
+        return 0
+
+    # (1) Captured delivery address + household size (ungated by verification).
+    addr_fields = []
+    if target.delivery_address_id is None and source.delivery_address_id is not None:
+        target.delivery_address_id = source.delivery_address_id
+        addr_fields.append("delivery_address")
+    if target.household_size is None and source.household_size is not None:
+        target.household_size = source.household_size
+        addr_fields.append("household_size")
+    if addr_fields:
+        try:
+            target.save(update_fields=addr_fields)
+        except Exception:  # pragma: no cover - defensive
+            addr_fields = []
+
+    # (2) Verification fact -- only when the survivor isn't already verified.
     if target.verified_at is not None or source.verified_at is None:
-        return
+        return len(addr_fields)
     fields = ["verified_at", "verified_by"]
     target.verified_at = source.verified_at
     target.verified_by = source.verified_by
@@ -2691,7 +2713,8 @@ def _carry_verification_fields(target, source):
     try:
         target.save(update_fields=fields)
     except Exception:  # pragma: no cover - defensive
-        pass
+        fields = []
+    return len(addr_fields) + len(fields)
 
 
 def _carry_dietary_profiles(target, source):
