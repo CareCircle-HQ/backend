@@ -12202,3 +12202,33 @@ class ReconcileBindsCaselessServingTest(TestCase):
         self.assertEqual(serving.case_id, case.case_id)              # bound
         self.assertEqual(stray.stage, EnrollmentStage.DISREGARDED)   # freed
         self.assertIsNone(stray.case_id)
+
+
+class FixCaselessTwoServingCompetingTest(TestCase):
+    """Two caseless serving enrollments competing for one case are SKIPPED (not
+    attempted then failed on the unique constraint)."""
+
+    def test_competing_serving_skipped(self):
+        from io import StringIO
+
+        from django.core.management import call_command
+
+        from .models import (
+            Case, CaseStatus, CaseType, Client, EnrollmentStage,
+            EnrollmentVerification,
+        )
+
+        c = Client.objects.create(client_id=str(uuid.uuid4()), first_name="T", last_name="S")
+        case = Case.objects.create(
+            case_id=uuid.uuid4(), client=c, case_type=CaseType.INTERNAL_SERVICE,
+            case_status=CaseStatus.OPEN, program_name="Medically Tailored Meals",
+        )
+        a = EnrollmentVerification.objects.create(client=c, stage=EnrollmentStage.SERVICE_ACTIVE, case=None)
+        b = EnrollmentVerification.objects.create(client=c, stage=EnrollmentStage.ON_HOLD, case=None)
+
+        # Must not raise / must leave both caseless (ambiguous -> skipped).
+        call_command("fix_caseless_serving_enrollments", "--apply", "--client", str(c.client_id), stdout=StringIO())
+
+        a.refresh_from_db(); b.refresh_from_db()
+        self.assertIsNone(a.case_id)
+        self.assertIsNone(b.case_id)

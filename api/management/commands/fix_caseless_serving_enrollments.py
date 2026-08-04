@@ -74,6 +74,13 @@ class Command(BaseCommand):
             if gov is None:
                 buckets["no_open_case"] += 1
                 continue
+            # The client must have EXACTLY ONE serving enrollment. Two serving
+            # enrollments both wanting the one case is ambiguous -- and would make
+            # two plans try to bind the same case, the second hitting the per-case
+            # unique constraint. Skip for review (mirrors the reconcile helper).
+            if EnrollmentVerification.objects.filter(client=c, stage__in=SERVING).count() != 1:
+                buckets["ambiguous_two_serving"] += 1
+                continue
             holders = list(
                 EnrollmentVerification.objects.filter(client=c, case=gov)
                 .exclude(pk=enr.pk)
