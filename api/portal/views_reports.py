@@ -30,6 +30,8 @@ from ..models import (
     FoodAllergy,
     MemberStatus,
     ProductTypeKind,
+    ReportExport,
+    ReportExportStatus,
     ServiceAuthorizationStatus,
     SocialCareCoverageStatus,
     UniteUsAgent,
@@ -580,181 +582,21 @@ class AllMembersReportView(PortalAPIView):
         if not (agent and (agent.group == "Management" or getattr(agent, "is_manager", False))):
             return Response({"detail": "Management access required."}, status=403)
 
-        created_from = _parse_date(request.query_params.get("created_from"))
-        created_to = _parse_date(request.query_params.get("created_to"))
-
-        qs = (
-            Client.objects.all()
-            .prefetch_related(
-                "insurances",
-                "social_care_coverages",
-                "addresses",
-                "phones",
-                "cases",
-                "screenings",
-                "assessments",
-                "member_profiles",
-                "enrollments__kitchen",
-                "enrollments__delivery_schedules",
-                "household_membership__household__members",
-                "household_membership__household__enrollment_verifications__kitchen",
-                "household_membership__household__enrollment_verifications__delivery_schedules",
-            )
-            .order_by("last_name", "first_name", "created_at")
+        from .report_exports import (
+            all_members_rows, default_filename, stream_csv_response,
         )
-        if created_from:
-            qs = qs.filter(created_at__date__gte=created_from)
-        if created_to:
-            qs = qs.filter(created_at__date__lte=created_to)
 
-        # Live eligibility inputs, resolved once for the whole run.
-        from ..services.eligibility import evaluate_client
-        from ..services.service_area import excluded_zips
-        from ..services.state_area import allowed_state_codes
-
-        zips = excluded_zips()
-        states = allowed_state_codes()
-        lead_labels = _lead_source_label_map()
-
-        # Case-creator team lookup (Unite Us user_id -> Originating Team), built
-        # once and reused per row for the governing internal-service case's
-        # creator. Mirrors the Cases export "Team of Case Creator" column.
-        team_map = {
-            str(u.user_id): (u.originating_team or "")
-            for u in UniteUsAgent.objects.all()
+        params = {
+            "created_from": request.query_params.get("created_from"),
+            "created_to": request.query_params.get("created_to"),
         }
-
-        response = HttpResponse(content_type="text/csv")
-        filename = f"all_members_{timezone.localdate().isoformat()}.csv"
-        response["Content-Disposition"] = f'attachment; filename="{filename}"'
-
-        writer = csv.writer(response)
-        writer.writerow([
-            # Identification
-            "Household Primary Member ID",
-            "Member ID",
-            "Medicaid ID (active)",
-            "Member Name",
-            "DOB",
-            # Contact & Address
-            "Phone Number",
-            "Street Address",
-            "Apt",
-            "City",
-            "State",
-            "Zip",
-            # Household
-            "Total members in household",
-            # Program & Case Status
-            "Internal Service Program Name",
-            "Team of Case Creator",
-            "Is there Screening",
-            "Is there Eligibility",
-            "Is there Navigation",
-            "Is there Internal Service Case",
-            "Client Eligibility",
-            "Eligible for:",
-            "Currently servicing",
-            "Cadence",
-            "Facility",
-            "Out of Orbit?",
-            "Out of Orbit reason",
-            "Out of Range",
-            "Authorized amount for the open internal service case",
-            # Lead & Enrollment
-            "Lead Source in CRM",
-            "Enrollment Platform",
-            # Insurance / Medicaid
-            "Medicaid Plan",
-            "Medicaid Type",
-            "Insurance Effective Date",
-            "Insurance Expiration Date",
-            # Social Care Coverage
-            "Social Care Coverage Status",
-            "Social Care Coverage Expiration Date",
-            # Extras
-            "Menu Type",
-            "Dietary Restrictions",
-        ])
-
-        for client in qs:
-            med = _medicaid_insurance(client)
-            scc = _social_care_coverage(client)
-            enr = active_enrollment(client)
-            profile = active_member_profile(client)
-            addr = _current_address(client)
-            cases = list(client.cases.all())
-            # Governing Internal Service case: the one delivery/auth attach to.
-            isc = internal_service_case(client)
-            # Team of that case's creator: on-roster Unite Us creators carry an
-            # Originating Team; a creator not on the roster is Met Council staff.
-            # Blank when there's no governing case or no recorded creator.
-            if isc is not None and isc.created_by_id:
-                isc_team = team_map.get(str(isc.created_by_id), "Met Council Team")
-            else:
-                isc_team = ""
-
-            out_of_orbit = member_out_of_orbit(client)
-            reason = _out_of_orbit_reason(enr, profile) if out_of_orbit else ""
-
-            verdict = evaluate_client(client, zips=zips, states=states)
-            eligibility = "Ineligible" if verdict.ineligible else "Eligible"
-
-            facility = ""
-            if enr is not None and enr.kitchen_id:
-                facility = enr.kitchen.name or ""
-
-            raw_source = (client.lead_source or "").strip()
-
-            writer.writerow([
-                # Identification
-                _household_primary_member_id(client),
-                str(client.client_id),
-                medicaid_member_id(client),
-                f"{client.first_name or ''} {client.last_name or ''}".strip(),
-                _date_str(client.date_of_birth),
-                # Contact & Address
-                _client_phone_numbers(client),
-                (addr.street if addr else ""),
-                (addr.unit if addr else ""),
-                (addr.city if addr else ""),
-                (addr.state if addr else ""),
-                (addr.zip if addr else ""),
-                # Household
-                _household_member_count(client),
-                # Program & Case Status
-                (isc.program_name if isc else ""),
-                isc_team,
-                _yn(len(client.screenings.all()) > 0),
-                _yn(any(c.case_type == CaseType.ELIGIBILITY for c in cases)),
-                _yn(any(c.case_type == CaseType.NAVIGATION for c in cases)),
-                _yn(isc is not None),
-                eligibility,
-                "; ".join(_assessment_eligible(client)),
-                _currently_servicing(enr),
-                _cadence_label(profile, enr),
-                facility,
-                _yn(out_of_orbit),
-                reason,
-                _yn(member_out_of_range(client)),
-                (isc.authorized_amount if isc else ""),
-                # Lead & Enrollment
-                lead_labels.get(raw_source, raw_source),
-                "UniteUs",
-                # Insurance / Medicaid
-                (med.plan_name if med else ""),
-                _medicaid_type_label(med.plan_name if med else ""),
-                _date_str(med.enrolled_at if med else None),
-                _date_str(med.expired_at if med else None),
-                # Social Care Coverage
-                (_SCC_STATUS_LABELS.get(scc.status, scc.status) if scc else ""),
-                _date_str(scc.expired_at if scc else None),
-                # Extras
-                (profile.menu_type if profile else ""),
-                _dietary_restrictions(profile),
-            ])
-
-        return response
+        # Streamed (stream_csv_response): starts sending immediately + keeps
+        # memory bounded. The heavy full-member export is normally run via the
+        # background export flow (POST /reports/exports/); this sync path is the
+        # no-S3 fallback + small filtered pulls.
+        return stream_csv_response(
+            all_members_rows(params), default_filename("all-members"),
+        )
 
 
 _WEEKDAY_ABBR = {
@@ -1323,3 +1165,94 @@ class UniteUsAgentsReportView(PortalAPIView):
             ])
 
         return response
+
+
+# ===========================================================================
+# Background report exports (POST start job -> Celery -> S3; GET poll status)
+# ===========================================================================
+def _is_management(agent):
+    return bool(
+        agent and (agent.group == "Management" or getattr(agent, "is_manager", False))
+    )
+
+
+def _report_export_payload(export):
+    """Serialize a ReportExport for the UI. When completed, include a short-lived
+    presigned download URL."""
+    from ..services import import_storage
+
+    download_url = ""
+    if (
+        export.status == ReportExportStatus.COMPLETED
+        and export.file_key
+        and import_storage.s3_enabled()
+    ):
+        try:
+            download_url = import_storage.presign_get(
+                export.file_key, download_name=export.filename,
+            )
+        except Exception:  # noqa: BLE001 - a presign hiccup must not break polling
+            download_url = ""
+    return {
+        "id": str(export.export_id),
+        "report_key": export.report_key,
+        "status": export.status,
+        "filename": export.filename,
+        "row_count": export.row_count,
+        "error": export.error_log,
+        "created_at": export.created_at.isoformat() if export.created_at else None,
+        "finished_at": export.finished_at.isoformat() if export.finished_at else None,
+        "download_url": download_url,
+    }
+
+
+class StartReportExportView(PortalAPIView):
+    """POST: start a background CSV export for ``report_key`` with ``params``.
+
+    Returns the ReportExport job (poll GET /reports/exports/<id>/). When S3 isn't
+    configured (local dev), there's no worker/storage, so it STREAMS the CSV back
+    synchronously instead -- the frontend detects the CSV response and downloads
+    it directly (no polling)."""
+
+    def post(self, request):
+        agent = current_agent(request)
+        if not _is_management(agent):
+            return Response({"detail": "Management access required."}, status=403)
+
+        from ..services import import_storage
+        from .report_exports import REPORT_BUILDERS, default_filename, stream_csv_response
+
+        report_key = (request.data.get("report_key") or "").strip()
+        params = request.data.get("params") or {}
+        if not isinstance(params, dict):
+            params = {}
+        builder = REPORT_BUILDERS.get(report_key)
+        if builder is None:
+            return Response({"error": f"Unknown report: {report_key!r}"}, status=400)
+
+        filename = default_filename(report_key)
+        if not import_storage.s3_enabled():
+            # Dev / no-S3 fallback: stream the CSV directly (no background job).
+            return stream_csv_response(builder(params), filename)
+
+        export = ReportExport.objects.create(
+            report_key=report_key, params=params, filename=filename,
+            requested_by=agent,
+        )
+        from ..tasks import generate_report_export
+
+        generate_report_export.delay(str(export.export_id))
+        return Response(_report_export_payload(export), status=201)
+
+
+class ReportExportDetailView(PortalAPIView):
+    """GET: poll a background export's status + (when done) its download URL."""
+
+    def get(self, request, export_id):
+        agent = current_agent(request)
+        if not _is_management(agent):
+            return Response({"detail": "Management access required."}, status=403)
+        export = ReportExport.objects.filter(pk=export_id).first()
+        if export is None:
+            return Response({"detail": "Not found."}, status=404)
+        return Response(_report_export_payload(export))

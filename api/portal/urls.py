@@ -112,6 +112,8 @@ from .views_reports import (
     AllMembersReportView,
     AllVerificationsReportView,
     CasesReportView,
+    ReportExportDetailView,
+    StartReportExportView,
     MembersByLeadSourceReportView,
     MembersForPurchaseOrderReportView,
     MembersNotServedReportView,
@@ -413,6 +415,17 @@ urlpatterns = [
         "reports/all-verifications/",
         AllVerificationsReportView.as_view(),
         name="portal-report-all-verifications",
+    ),
+    # Background report exports (job start + status poll)
+    path(
+        "reports/exports/",
+        StartReportExportView.as_view(),
+        name="portal-report-export-start",
+    ),
+    path(
+        "reports/exports/<uuid:export_id>/",
+        ReportExportDetailView.as_view(),
+        name="portal-report-export-detail",
     ),
     path(
         "reports/all-members/",
