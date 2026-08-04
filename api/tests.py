@@ -11488,3 +11488,45 @@ class DeliveryCalendarExcludesDeadEnrollmentsTest(TestCase):
         # The override still surfaces the dead enrollment's own calendar.
         override = api.get(f"{url}?enrollment={dead.pk}").content.decode()
         self.assertIn("DeadKitchenBBB", override)
+
+
+class ClosingEnrollmentClearsCalendarTest(TestCase):
+    """Advancing an enrollment to a terminal stage (Closed/Cancelled) must stop
+    its future deliveries -- so a superseded enrollment can't keep a live
+    calendar (the root cause of a member showing two kitchens after a governing
+    case replacement). Centralized in advance_enrollment, covering every close
+    path."""
+
+    def test_close_removes_future_scheduled_occurrences(self):
+        from datetime import timedelta
+
+        from django.utils import timezone
+
+        from .models import (
+            Client, EnrollmentStage, EnrollmentVerification, MemberDietaryProfile,
+            MemberStatus, OrderSchedule, OrderStatus,
+        )
+        from .services.lifecycle import advance_enrollment
+
+        client = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Close", last_name="Cal",
+        )
+        enr = EnrollmentVerification.objects.create(
+            client=client, stage=EnrollmentStage.SERVICE_ACTIVE, program_name="Meals",
+        )
+        mp = MemberDietaryProfile.objects.create(
+            enrollment=enr, client=client, status=MemberStatus.ACTIVE,
+        )
+        future = timezone.localdate() + timedelta(days=7)
+        OrderSchedule.objects.create(
+            enrollment=enr, member=mp, program_name="Meals",
+            anticipated_delivery_date=future, status=OrderStatus.SCHEDULED,
+        )
+
+        advance_enrollment(enr, EnrollmentStage.CLOSED, force=True)
+
+        live_future = (
+            OrderSchedule.objects.filter(enrollment=enr, anticipated_delivery_date=future)
+            .exclude(status=OrderStatus.CANCELLED)
+        )
+        self.assertEqual(live_future.count(), 0)  # future delivery stopped on close

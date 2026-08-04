@@ -823,6 +823,28 @@ def advance_enrollment(enrollment, to_stage, *, actor=None, actor_label="", note
         update_fields.append("closed_at")
     enrollment.save(update_fields=update_fields)
 
+    # Entering a terminal stage (Closed / Cancelled) STOPS service: shorten the
+    # delivery plans and drop future non-batched calendar occurrences so a dead
+    # enrollment can never keep a live delivery calendar. Without this, closing
+    # the old enrollment when a governing case is replaced left its calendar
+    # scheduled -- making the member read as served by a SECOND kitchen (the old
+    # enrollment's). Centralized here so EVERY close path is covered, not just
+    # the ones that remember to clean up. Only on the ENTRY transition; batched
+    # (PO-committed) occurrences are preserved by sync_delivery_calendar.
+    # Best-effort: a cleanup hiccup must never roll back the stage change.
+    if to_stage in _TERMINAL_STAGES and from_stage not in _TERMINAL_STAGES:
+        try:
+            from api.services.orders import truncate_future_deliveries
+
+            truncate_future_deliveries(enrollment)
+        except Exception:  # pragma: no cover - defensive
+            import logging
+
+            logging.getLogger(__name__).warning(
+                "terminal calendar cleanup failed for enrollment %s",
+                enrollment.pk, exc_info=True,
+            )
+
     # Verification complete -> clear the "new client needs attention" flag. The
     # flag was set when the client's first internal-service case was created
     # (see CaseSerializer); reaching VERIFIED (or beyond) means the verification
