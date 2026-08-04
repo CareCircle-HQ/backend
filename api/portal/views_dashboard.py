@@ -141,13 +141,16 @@ def cs_member_status(start, end):
         .exclude(case_status__in=_TERMINAL_CASE_STATUSES),
         start, end,
     ).values_list("client_id", flat=True))
-    for cid in open_isc - set(best):
+    never_requested = open_isc - set(best)
+    for cid in never_requested:
         best[cid] = "requires_verification"
 
-    counts = {t: 0 for t in CS_MEMBER_TIERS}
-    for t in best.values():
-        counts[t] += 1
-    return counts
+    tier_clients = {t: set() for t in CS_MEMBER_TIERS}
+    for cid, t in best.items():
+        tier_clients[t].add(cid)
+    # never_requested (navigation) vs requested-not-completed, for tagging the
+    # Requires Verification drill-down.
+    return tier_clients, never_requested
 
 # The drill-down reasons the serving-status list endpoint understands. The first
 # group mirrors the "Not Being Served" cards; the second is the follow-up
@@ -1079,7 +1082,9 @@ class DashboardView(PortalAPIView):
                 "receiving": receiving_meals,
                 "pending": pending,
                 # CS tab Section 3 -- member status (priority-ordered, one bucket).
-                "member_status": cs_member_status(start, end),
+                "member_status": {
+                    t: len(s) for t, s in cs_member_status(start, end)[0].items()
+                },
             }
         )
 
@@ -1182,3 +1187,41 @@ class DashboardServingListView(PortalAPIView):
         results.sort(key=lambda r: r["name"].lower())
 
         return Response({"reason": reason, "count": len(results), "results": results})
+
+
+class DashboardMemberStatusListView(PortalAPIView):
+    """Management-only drill-down for a CS-tab Member-Status tier (see
+    :data:`CS_MEMBER_TIERS`). Same shape as the serving list. For Requires
+    Verification each row is tagged Requested vs Never requested."""
+
+    def get(self, request, tier):
+        agent = current_agent(request)
+        if not (agent and (agent.group == "Management" or getattr(agent, "is_manager", False))):
+            return Response({"detail": "Management access required."}, status=403)
+        if tier not in CS_MEMBER_TIERS:
+            return Response({"detail": "Unknown tier."}, status=404)
+
+        start, end = resolve_window(request)
+        tier_clients, never_requested = cs_member_status(start, end)
+        client_ids = tier_clients.get(tier, set())
+        primary_map = _primary_map(client_ids)
+        needed = set(client_ids) | set(primary_map.values())
+        names = {
+            c.client_id: (f"{c.first_name} {c.last_name}".strip() or str(c.client_id))
+            for c in Client.objects.filter(client_id__in=needed)
+        }
+        results = []
+        for cid in client_ids:
+            pid = primary_map.get(cid, cid)
+            detail = ""
+            if tier == "requires_verification":
+                detail = "Never requested" if cid in never_requested else "Requested"
+            results.append({
+                "id": str(cid),
+                "name": names.get(cid, str(cid)),
+                "primary_id": str(pid),
+                "primary_name": names.get(pid, names.get(cid, str(cid))),
+                "detail": detail,
+            })
+        results.sort(key=lambda r: r["name"].lower())
+        return Response({"reason": tier, "count": len(results), "results": results})

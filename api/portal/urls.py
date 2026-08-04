@@ -16,7 +16,11 @@ from .views_cs_dashboard import (
 )
 from .views_delivery_address import DeliveryAddressListView
 from .views_member_uniteus import MemberUniteUsRefreshView
-from .views_dashboard import DashboardServingListView, DashboardView
+from .views_dashboard import (
+    DashboardMemberStatusListView,
+    DashboardServingListView,
+    DashboardView,
+)
 from .views_dashboard_verification import (
     VerificationDashboardListView,
     VerificationDashboardView,
@@ -502,6 +506,11 @@ urlpatterns = [
         "dashboard/serving/<str:reason>/",
         DashboardServingListView.as_view(),
         name="portal-dashboard-serving-list",
+    ),
+    path(
+        "dashboard/member-status/<str:tier>/",
+        DashboardMemberStatusListView.as_view(),
+        name="portal-dashboard-member-status-list",
     ),
     path(
         "dashboard/verification/",
