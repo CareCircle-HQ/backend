@@ -660,15 +660,17 @@ def sync_household_members(client, enrollment=None, agent=None):
         member = hm.client
         if member is None or member.pk in profiles:
             continue
-        # New members carry NO default menu type / allergies and start Out of
-        # Orbit: an agent must assign a menu type + restrictions, and only then
-        # (on save) is the kitchen output computed and the member activated.
+        # New members carry NO default menu type / allergies. Their real service
+        # status is decided at KITCHEN ASSIGNMENT by the meal rule, so the
+        # placeholder stays at the model default (Active) until then. Marking a
+        # pre-kitchen / pending-verification member Out of Orbit is wrong: there's
+        # no kitchen to fail and no menu has been chosen yet. Out of Orbit is only
+        # applied below once a kitchen actually exists.
         profile = MemberDietaryProfile.objects.create(
             enrollment=enrollment,
             client=member,
             member_name=f"{member.first_name} {member.last_name}".strip(),
             menu_type="",
-            status=MemberStatus.OUT_OF_ORBIT,
         )
         created += 1
         # Delivery Coverage takes priority over the default Out of Orbit: if this
@@ -710,21 +712,19 @@ def sync_household_members(client, enrollment=None, agent=None):
                 logger.warning("household member out-of-range event failed", exc_info=True)
             continue
         # "Out of Orbit" means a member's menu/allergies can't be fulfilled by
-        # the assigned KITCHEN -- it is meaningless before a kitchen exists. When
-        # the household has no kitchen yet (e.g. the placeholder profile created
-        # right after Request Verification, still Pending Verification), the
-        # profile stays Out of Orbit as an internal "needs a menu type"
-        # placeholder, but we DON'T emit the note/timeline event: firing
-        # "Household set as Out of Orbit" on a member who was just requested for
-        # verification (no kitchen, not yet verified) is misleading. The event
-        # fires later, if warranted, once a kitchen is assigned.
+        # the assigned KITCHEN -- it is meaningless before a kitchen exists. With
+        # no kitchen yet (e.g. right after Request Verification, still Pending
+        # Verification), leave the member at the default Active status and do NOT
+        # flag Out of Orbit -- neither the status, the note, nor the timeline
+        # event. The meal rule sets the real status when a kitchen is assigned.
         if not enrollment.kitchen_id:
             continue
-        # This member was added outside the verification wizard, so leave a
-        # system note explaining why they start Out of Orbit + what's needed to
-        # activate them, AND log the Out-of-Orbit event to the timeline (same as
-        # the other paths that set a member Out of Orbit). Best-effort: never let
-        # history/note-logging break the add.
+        # Kitchen exists: a member added to an already-served household with no
+        # menu yet IS Out of Orbit until an agent configures them. Set the status,
+        # leave a system note explaining what's needed, and log the event.
+        # Best-effort: never let history/note-logging break the add.
+        profile.status = MemberStatus.OUT_OF_ORBIT
+        profile.save(update_fields=["status"])
         reason = (
             "New member added outside of the verification process. "
             "This member needs a menu type and dietary preferences to be "

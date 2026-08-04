@@ -11267,7 +11267,9 @@ class SyncHouseholdOutOfOrbitEventGateTest(TestCase):
         sync_household_members(primary, enrollment=enr)
 
         prof = MemberDietaryProfile.objects.get(enrollment=enr, client=dep)
-        self.assertEqual(prof.status, MemberStatus.OUT_OF_ORBIT)  # placeholder kept
+        # No kitchen yet -> not Out of Orbit (stays the default Active); the meal
+        # rule decides the real status at kitchen assignment.
+        self.assertEqual(prof.status, MemberStatus.ACTIVE)
         self.assertFalse(
             TimelineEvent.objects.filter(
                 client=dep, event_type=TimelineEventType.OUT_OF_ORBIT
