@@ -81,12 +81,16 @@ class Command(BaseCommand):
             if EnrollmentVerification.objects.filter(client=c, stage__in=SERVING).count() != 1:
                 buckets["ambiguous_two_serving"] += 1
                 continue
+            # Holders across ALL clients (the per-case unique constraint is
+            # global). Skip when a SERVING enrollment holds it (ambiguous) or when
+            # ANY holder belongs to a DIFFERENT client (cross-client mislink --
+            # binding would collide with the global constraint; leave for review).
             holders = list(
-                EnrollmentVerification.objects.filter(client=c, case=gov)
+                EnrollmentVerification.objects.filter(case=gov)
                 .exclude(pk=enr.pk)
                 .exclude(stage__in=TERMINAL)
             )
-            if any(h.stage in SERVING for h in holders):
+            if any((h.stage in SERVING) or (h.client_id != enr.client_id) for h in holders):
                 buckets["ambiguous_two_serving"] += 1
                 continue
             buckets["split" if holders else "unbound"] += 1

@@ -12232,3 +12232,44 @@ class FixCaselessTwoServingCompetingTest(TestCase):
         a.refresh_from_db(); b.refresh_from_db()
         self.assertIsNone(a.case_id)
         self.assertIsNone(b.case_id)
+
+
+class CaselessCrossClientHolderTest(TestCase):
+    """When the governing case is held by a DIFFERENT client's enrollment, both
+    the command and the reconcile skip it (no bind, no IntegrityError)."""
+
+    def _setup(self):
+        from .models import (
+            Case, CaseStatus, CaseType, Client, EnrollmentStage,
+            EnrollmentVerification,
+        )
+        c = Client.objects.create(client_id=str(uuid.uuid4()), first_name="Serv", last_name="Ing")
+        other = Client.objects.create(client_id=str(uuid.uuid4()), first_name="Oth", last_name="Er")
+        case = Case.objects.create(
+            case_id=uuid.uuid4(), client=c, case_type=CaseType.INTERNAL_SERVICE,
+            case_status=CaseStatus.OPEN, program_name="Medically Tailored Meals",
+        )
+        serv = EnrollmentVerification.objects.create(client=c, stage=EnrollmentStage.SERVICE_ACTIVE, case=None)
+        # A DIFFERENT client's pending enrollment holds c's case (cross-client mislink).
+        stray = EnrollmentVerification.objects.create(client=other, stage=EnrollmentStage.PENDING_VERIFICATION, case=case)
+        return c, serv, stray
+
+    def test_command_skips_cross_client(self):
+        from io import StringIO
+
+        from django.core.management import call_command
+
+        c, serv, stray = self._setup()
+        call_command("fix_caseless_serving_enrollments", "--apply", "--client", str(c.client_id), stdout=StringIO())
+        serv.refresh_from_db(); stray.refresh_from_db()
+        self.assertIsNone(serv.case_id)                      # not bound
+        self.assertEqual(stray.stage, "pending_verification")  # untouched
+
+    def test_reconcile_skips_cross_client_without_error(self):
+        from .services.lifecycle import reconcile_internal_service_authorization
+
+        c, serv, stray = self._setup()
+        reconcile_internal_service_authorization(c)  # must not raise
+        serv.refresh_from_db(); stray.refresh_from_db()
+        self.assertIsNone(serv.case_id)
+        self.assertEqual(stray.stage, "pending_verification")
