@@ -11803,16 +11803,24 @@ class MembersVerifiedByFilterTest(TestCase):
             opened_at=now,
         )
 
-        # Superseded case: an OLD closed enrollment verified by our agent, then a
-        # NEWER open enrollment verified by someone else -> the GOVERNING verifier
-        # is the other agent, so filtering by our agent must NOT return this member.
-        superseded = Client.objects.create(client_id=str(uuid.uuid4()), first_name="Sup", last_name="Erseded")
+        # Real-data pattern: the enrollment our agent VERIFIED is now closed, and a
+        # duplicate/unverified enrollment is the live (governing) one. The member
+        # must STILL match our agent -- the verification fact survives the close.
+        shadowed = Client.objects.create(client_id=str(uuid.uuid4()), first_name="Sha", last_name="Dowed")
         EnrollmentVerification.objects.create(
-            client=superseded, stage=EnrollmentStage.CLOSED, verified_by=verifier,
-            opened_at=now - timedelta(days=30), closed_at=now - timedelta(days=20),
+            client=shadowed, stage=EnrollmentStage.SERVICE_ACTIVE, verified_by=None,
+            opened_at=now - timedelta(minutes=5),  # older, but OPEN -> governing
         )
         EnrollmentVerification.objects.create(
-            client=superseded, stage=EnrollmentStage.VERIFIED, verified_by=other_agent,
+            client=shadowed, stage=EnrollmentStage.CLOSED, verified_by=verifier,
+            opened_at=now, closed_at=now + timedelta(days=1),
+        )
+
+        # A member whose OWN verification was done by the OTHER agent must not
+        # match our agent (proves we don't leak via household / other members).
+        bob_client = Client.objects.create(client_id=str(uuid.uuid4()), first_name="Bo", last_name="Bby")
+        EnrollmentVerification.objects.create(
+            client=bob_client, stage=EnrollmentStage.VERIFIED, verified_by=other_agent,
             opened_at=now,
         )
 
@@ -11825,10 +11833,6 @@ class MembersVerifiedByFilterTest(TestCase):
 
         got = ids(api.get(f"/api/portal/members/?verified_by={verifier.id}"))
         self.assertIn(str(verified.client_id), got)
+        self.assertIn(str(shadowed.client_id), got)   # verified enrollment closed, still matches
         self.assertNotIn(str(other.client_id), got)
-        # Governing verifier is the other agent -> excluded from our agent's filter.
-        self.assertNotIn(str(superseded.client_id), got)
-        # ...and INCLUDED when filtering by the other (governing) agent.
-        got_other = ids(api.get(f"/api/portal/members/?verified_by={other_agent.id}"))
-        self.assertIn(str(superseded.client_id), got_other)
-        self.assertNotIn(str(verified.client_id), got_other)
+        self.assertNotIn(str(bob_client.client_id), got)
