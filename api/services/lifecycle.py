@@ -1171,6 +1171,22 @@ def _verification_phase(enrollment):
     return ("verified", "Verified")
 
 
+def _nutritionist_phase(enrollment):
+    """Nutritionist sign-off phase for the program bar -- sits between
+    Verification and Authorization. Blank until the household is verified.
+
+        Pending Nutritionist -> verified, awaiting the Nutritionist's sign-off
+        Nutritionist Approved -> a Nutritionist has signed off
+    """
+    if enrollment is None:
+        return ("", "")
+    if EnrollmentStage(enrollment.stage) in _PRE_VERIFICATION_STAGES:
+        return ("", "")  # not verified yet -> the nutritionist step isn't reached
+    if enrollment.nutritionist_approved_at:
+        return ("approved", "Nutritionist Approved")
+    return ("pending", "Pending Nutritionist")
+
+
 def _member_status_on(client, enrollment):
     """The client's own per-member status on the given enrollment (or None)."""
     if enrollment is None or client is None:
@@ -1359,6 +1375,7 @@ def program_tracks(client):
         # every FOOD case reflects it. Non-food programs model Authorization
         # only, so verification stays blank there.
         v_val, v_lbl = _verification_phase(enr) if is_food else ("", "")
+        n_val, n_lbl = _nutritionist_phase(enr) if is_food else ("", "")
         if is_governing and is_food:
             s_val, s_lbl = _service_phase(client, enr, c)
         elif is_duplicate:
@@ -1397,6 +1414,7 @@ def program_tracks(client):
             "scope": {"value": ht, "label": CaseHouseholdType(ht).label},
             "authorization": {"value": a_val, "label": a_lbl},
             "verification": {"value": v_val, "label": v_lbl},
+            "nutritionist": {"value": n_val, "label": n_lbl},
             "service": {"value": s_val, "label": s_lbl},
         })
     # Governing first, then by service-type label + case id (a stable,
