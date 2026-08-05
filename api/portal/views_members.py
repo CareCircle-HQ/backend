@@ -4430,7 +4430,7 @@ class MemberNutritionistApproveView(PortalAPIView):
     @transaction.atomic
     def post(self, request, client_id):
         agent = current_agent(request)
-        if not (agent and agent.group == "Nutritionist"):
+        if not (agent and (agent.group in ("Nutritionist", "Management") or getattr(agent, "is_manager", False))):
             return Response(
                 {"detail": "Only a Nutritionist can approve."},
                 status=http.HTTP_403_FORBIDDEN,
@@ -4553,7 +4553,7 @@ class MemberNutritionistHoldView(PortalAPIView):
     @transaction.atomic
     def post(self, request, client_id):
         agent = current_agent(request)
-        if not (agent and agent.group == "Nutritionist"):
+        if not (agent and (agent.group in ("Nutritionist", "Management") or getattr(agent, "is_manager", False))):
             return Response({"detail": "Only a Nutritionist can place a hold."}, status=http.HTTP_403_FORBIDDEN)
         client = get_object_or_404(Client, pk=client_id)
         reason = (request.data.get("reason") or "").strip()
@@ -4589,7 +4589,7 @@ class MemberNutritionistDenyMemberView(PortalAPIView):
     @transaction.atomic
     def post(self, request, client_id):
         agent = current_agent(request)
-        if not (agent and agent.group == "Nutritionist"):
+        if not (agent and (agent.group in ("Nutritionist", "Management") or getattr(agent, "is_manager", False))):
             return Response({"detail": "Only a Nutritionist can deny a member."}, status=http.HTTP_403_FORBIDDEN)
         client = get_object_or_404(Client, pk=client_id)
         member_id = request.data.get("member_id") or ""
