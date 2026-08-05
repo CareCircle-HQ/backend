@@ -2030,6 +2030,11 @@ class EnrollmentVerification(models.Model):
     )
     # The Nutritionist's typed signature captured at approval (their full name).
     nutritionist_signature = models.CharField(max_length=255, blank=True)
+    # The drawn signature (PNG data URL) captured at approval, and the S3 key of
+    # the generated signed Nutrition Review PDF (downloadable from the member's
+    # Nutrition tab).
+    nutritionist_signature_image = models.TextField(blank=True)
+    nutritionist_approval_pdf_key = models.CharField(max_length=500, blank=True)
     # Short display code, e.g. "ENR-8754". Assigned on creation.
     code = models.CharField(max_length=20, blank=True, db_index=True)
     # Renewal cycle counter. Renewals reuse the SAME enrollment (re-run
@@ -2151,6 +2156,11 @@ class MemberDietaryProfile(models.Model):
     months_postpartum = models.PositiveSmallIntegerField(  # when "Postpartum"
         null=True, blank=True
     )
+    # Clinical intake captured at verification, shown to the Nutritionist. Free
+    # text so agents can enter units / notes (e.g. "180 lb", "5 ft 10 in").
+    medications = models.TextField(blank=True)
+    weight = models.CharField(max_length=50, blank=True)
+    height = models.CharField(max_length=50, blank=True)
     meal_category = models.CharField(
         max_length=20, choices=MenuCategory.choices, blank=True
     )

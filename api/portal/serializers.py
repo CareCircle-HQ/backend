@@ -1846,6 +1846,7 @@ class PortalHouseholdMemberSerializer(serializers.ModelSerializer):
             "id", "client_id", "name", "mobile_number", "mobile_number_suggested",
             "dietary_restrictions", "food_allergies", "other_dietary_restrictions",
             "conditions", "weeks_gestation", "months_postpartum",
+            "medications", "weight", "height",
             "meal_category", "menu_type", "general_verification_notes",
             "status", "status_label", "kitchen_meal_type", "kitchen_food_notes",
             "is_primary", "pause_locked",
@@ -2230,6 +2231,10 @@ class VerificationMemberInputSerializer(serializers.Serializer):
     months_postpartum = serializers.IntegerField(
         required=False, allow_null=True, min_value=0
     )
+    # Clinical intake for the Nutritionist review.
+    medications = serializers.CharField(required=False, allow_blank=True)
+    weight = serializers.CharField(required=False, allow_blank=True, max_length=50)
+    height = serializers.CharField(required=False, allow_blank=True, max_length=50)
     meal_category = serializers.CharField(required=False, allow_blank=True)
     menu_type = serializers.CharField(required=False, allow_blank=True)
     notes = serializers.CharField(required=False, allow_blank=True)

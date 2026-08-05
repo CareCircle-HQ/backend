@@ -4563,6 +4563,9 @@ class MemberVerificationCreateView(PortalAPIView):
                     m.get("months_postpartum")
                     if "Postpartum" in (m.get("conditions") or []) else None
                 ),
+                medications=m.get("medications", ""),
+                weight=m.get("weight", ""),
+                height=m.get("height", ""),
                 meal_category=m.get("meal_category", ""),
                 # Williamsburg households are always served the Kosher menu (the
                 # agent's allergies/restrictions are still honored). Otherwise the
