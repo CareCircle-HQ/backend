@@ -4470,6 +4470,17 @@ class MemberVerificationCreateView(PortalAPIView):
                 dietary_restrictions=m.get("dietary_restrictions", []),
                 food_allergies=m.get("food_allergies", []),
                 other_dietary_restrictions=m.get("other_dietary_restrictions", ""),
+                # Medical Conditions (empty -> "No Restriction"). Gestation /
+                # postpartum only meaningful when their condition is selected.
+                conditions=m.get("conditions") or ["No Restriction"],
+                weeks_gestation=(
+                    m.get("weeks_gestation")
+                    if "Pregnant" in (m.get("conditions") or []) else None
+                ),
+                months_postpartum=(
+                    m.get("months_postpartum")
+                    if "Postpartum" in (m.get("conditions") or []) else None
+                ),
                 meal_category=m.get("meal_category", ""),
                 # Williamsburg households are always served the Kosher menu (the
                 # agent's allergies/restrictions are still honored). Otherwise the

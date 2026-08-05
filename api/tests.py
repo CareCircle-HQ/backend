@@ -3074,6 +3074,67 @@ class RemovalAndVerificationGuardsTest(TestCase):
         client.refresh_from_db()
         self.assertNotEqual(client.lifecycle_stage, ClientStage.INELIGIBLE)
 
+    def test_verification_saves_conditions_and_gestation(self):
+        # Conditions multi-select + conditional Weeks Gestation (Pregnant) are
+        # persisted on the member's dietary profile; Postpartum stays null.
+        from rest_framework.parsers import JSONParser
+        from rest_framework.request import Request
+        from rest_framework.test import APIRequestFactory
+
+        from .models import Address, AddressType, Insurance, MemberDietaryProfile
+        from .portal.views_members import MemberVerificationCreateView
+
+        client = self._client("Con", "Dition")
+        self._internal_case(client)
+        Insurance.objects.create(client=client, plan_name="P", external_member_id="1")
+        Address.objects.create(
+            client=client, type=AddressType.CURRENT, zip="10001", street="1 St",
+        )
+        raw = APIRequestFactory().post(
+            "/",
+            {"members": [{
+                "client_id": str(client.pk), "mobile_number": "3475550142",
+                "conditions": ["Diabetic", "Pregnant"],
+                "weeks_gestation": 24, "months_postpartum": 5,
+            }], "zip": "10001"},
+            format="json",
+        )
+        req = Request(raw, parsers=[JSONParser()])
+        resp = MemberVerificationCreateView().post(req, client.pk)
+        self.assertEqual(resp.status_code, 201, resp.data)
+
+        prof = MemberDietaryProfile.objects.get(client=client)
+        self.assertEqual(prof.conditions, ["Diabetic", "Pregnant"])
+        self.assertEqual(prof.weeks_gestation, 24)
+        # Postpartum not selected -> months_postpartum ignored (null).
+        self.assertIsNone(prof.months_postpartum)
+
+    def test_verification_defaults_conditions_to_no_restriction(self):
+        from rest_framework.parsers import JSONParser
+        from rest_framework.request import Request
+        from rest_framework.test import APIRequestFactory
+
+        from .models import Address, AddressType, Insurance, MemberDietaryProfile
+        from .portal.views_members import MemberVerificationCreateView
+
+        client = self._client("Def", "Ault")
+        self._internal_case(client)
+        Insurance.objects.create(client=client, plan_name="P", external_member_id="1")
+        Address.objects.create(
+            client=client, type=AddressType.CURRENT, zip="10001", street="1 St",
+        )
+        raw = APIRequestFactory().post(
+            "/",
+            {"members": [{"client_id": str(client.pk), "mobile_number": "3475550142"}], "zip": "10001"},
+            format="json",
+        )
+        req = Request(raw, parsers=[JSONParser()])
+        resp = MemberVerificationCreateView().post(req, client.pk)
+        self.assertEqual(resp.status_code, 201, resp.data)
+        prof = MemberDietaryProfile.objects.get(client=client)
+        self.assertEqual(prof.conditions, ["No Restriction"])
+        self.assertIsNone(prof.weeks_gestation)
+
 
 class MainStageIneligibleTest(TestCase):
     """The headline stage bar's Eligibility node must read Ineligible whenever

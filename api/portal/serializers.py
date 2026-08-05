@@ -1845,6 +1845,7 @@ class PortalHouseholdMemberSerializer(serializers.ModelSerializer):
         fields = [
             "id", "client_id", "name", "mobile_number", "mobile_number_suggested",
             "dietary_restrictions", "food_allergies", "other_dietary_restrictions",
+            "conditions", "weeks_gestation", "months_postpartum",
             "meal_category", "menu_type", "general_verification_notes",
             "status", "status_label", "kitchen_meal_type", "kitchen_food_notes",
             "is_primary", "pause_locked",
@@ -2216,6 +2217,19 @@ class VerificationMemberInputSerializer(serializers.Serializer):
         child=serializers.CharField(), required=False, default=list
     )
     other_dietary_restrictions = serializers.CharField(required=False, allow_blank=True)
+    # Medical Conditions multi-select (see models.MEMBER_CONDITIONS). Empty ==
+    # "No Restriction" (enforced in the view).
+    conditions = serializers.ListField(
+        child=serializers.CharField(), required=False, default=list
+    )
+    # Conditional follow-ups: weeks gestation (Pregnant), months postpartum
+    # (Postpartum). Null when the triggering condition isn't selected.
+    weeks_gestation = serializers.IntegerField(
+        required=False, allow_null=True, min_value=0
+    )
+    months_postpartum = serializers.IntegerField(
+        required=False, allow_null=True, min_value=0
+    )
     meal_category = serializers.CharField(required=False, allow_blank=True)
     menu_type = serializers.CharField(required=False, allow_blank=True)
     notes = serializers.CharField(required=False, allow_blank=True)

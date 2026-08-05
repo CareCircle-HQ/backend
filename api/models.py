@@ -2075,6 +2075,24 @@ class EnrollmentVerification(models.Model):
         return f"{self.client_id} ({self.stage})"
 
 
+# Canonical medical Conditions offered in the verification wizard (Step 2).
+# Stored as labels on MemberDietaryProfile.conditions. "No Restriction" is the
+# default / nothing-selected sentinel.
+MEMBER_CONDITIONS = [
+    "Cancer", "Cardiometabolic", "Crohn’s Disease", "Diabetic",
+    "Gestational Diabetes", "Heart disease", "High blood pressure",
+    "High cholesterol", "Hypothyroidism", "Hyperthyroidism", "IBS",
+    "Kidney Disease", "Liver Disease", "Overweight (determined by BMI)",
+    "Obesity (determined by BMI)", "Pre-Diabetes", "Postpartum", "Pregnant",
+    "Ulcerative Colitis", "No Restriction",
+]
+
+
+def default_member_conditions():
+    """Default value for MemberDietaryProfile.conditions (nothing selected)."""
+    return ["No Restriction"]
+
+
 class MemberDietaryProfile(models.Model):
     """Per-household-member dietary profile captured during the household
     verification (wizard Step 2).
@@ -2103,6 +2121,18 @@ class MemberDietaryProfile(models.Model):
     dietary_restrictions = models.JSONField(default=list, blank=True)
     food_allergies = models.JSONField(default=list, blank=True)
     other_dietary_restrictions = models.TextField(blank=True)
+    # Medical Conditions captured during verification (wizard Step 2). A
+    # multi-select stored as a list of labels (see MEMBER_CONDITIONS); empty /
+    # unselected means "No Restriction". Distinct from ``dietary_restrictions``
+    # (which drives menu/meal rules) -- this is clinical context.
+    conditions = models.JSONField(default=default_member_conditions, blank=True)
+    # Conditional follow-ups tied to specific conditions above.
+    weeks_gestation = models.PositiveSmallIntegerField(  # when "Pregnant"
+        null=True, blank=True
+    )
+    months_postpartum = models.PositiveSmallIntegerField(  # when "Postpartum"
+        null=True, blank=True
+    )
     meal_category = models.CharField(
         max_length=20, choices=MenuCategory.choices, blank=True
     )
