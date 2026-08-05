@@ -4348,20 +4348,34 @@ class NutritionistPendingListView(PortalAPIView):
                 nutritionist_approved_at__isnull=True,
             )
             .select_related("client", "case")
+            .prefetch_related("member_profiles")
             .order_by("verified_at")
         )
+        # One group per household (enrollment), with its members -- mirrors the
+        # Members page grouping. Clicking any member opens the household review.
         results = []
         for enr in qs:
             c = enr.client
             if c is None:
                 continue
             case = enr.case
+            members = [
+                {
+                    "name": p.member_name or (
+                        f"{p.client.first_name} {p.client.last_name}".strip()
+                        if p.client_id else ""
+                    ) or "Member",
+                    "status": p.status,
+                }
+                for p in enr.member_profiles.all()
+            ]
             results.append({
                 "client_id": str(c.client_id),
-                "name": f"{c.first_name} {c.last_name}".strip() or str(c.client_id),
+                "primary_name": f"{c.first_name} {c.last_name}".strip() or str(c.client_id),
                 "program_name": enr.program_name or getattr(case, "program_name", "") or "",
                 "verified_at": enr.verified_at.isoformat() if enr.verified_at else None,
                 "authorization_status": getattr(case, "service_authorization_status", "") or "",
+                "members": members,
             })
         return Response({"count": len(results), "results": results})
 
@@ -4403,9 +4417,89 @@ class MemberNutritionistApproveView(PortalAPIView):
                           "approval for this member."},
                 status=http.HTTP_400_BAD_REQUEST,
             )
+        signature_image = request.data.get("signature_image") or ""
+
+        # Generate the signed Nutrition Review PDF and store it on S3 (best-effort
+        # -- when S3 isn't configured the approval still proceeds without a PDF).
+        pdf_key = ""
+        from ..services import import_storage
+        from ..services.nutrition_pdf import render_nutrition_pdf
+        if import_storage.s3_enabled():
+            pdf_bytes = render_nutrition_pdf(
+                enr, agent=agent, signature_image=signature_image,
+            )
+            pdf_key = import_storage.build_nutrition_key(str(client.client_id))
+            import_storage.upload_bytes(
+                pdf_key, pdf_bytes, content_type="application/pdf",
+            )
+
         from ..services.lifecycle import nutritionist_approve
-        nutritionist_approve(enr, agent=agent, signature=signature)
+        nutritionist_approve(
+            enr, agent=agent, signature=signature,
+            signature_image=signature_image, pdf_key=pdf_key,
+        )
         return Response({"ok": True, "client_id": str(client.client_id)})
+
+
+class MemberNutritionistReviewView(PortalAPIView):
+    """GET /members/<id>/nutritionist-review/: the household's review data (for
+    the Nutritionist drawer) plus the acting Nutritionist's auto-fill details and
+    any existing signed PDF. Visible to Nutritionist + Management."""
+
+    def get(self, request, client_id):
+        agent = current_agent(request)
+        allowed = bool(agent and (
+            agent.group in ("Nutritionist", "Management")
+            or getattr(agent, "is_manager", False)
+        ))
+        if not allowed:
+            return Response({"detail": "Nutritionist access required."}, status=http.HTTP_403_FORBIDDEN)
+        client = get_object_or_404(Client, pk=client_id)
+        enr = (
+            EnrollmentVerification.objects
+            .filter(client=client, stage=EnrollmentStage.VERIFIED)
+            .order_by("-verified_at")
+            .first()
+        ) or EnrollmentVerification.objects.filter(client=client).order_by("-verified_at").first()
+        if enr is None:
+            return Response({"error": "No enrollment for this member."}, status=http.HTTP_404_NOT_FOUND)
+        from ..services.nutrition_pdf import nutrition_review_context
+        ctx = nutrition_review_context(enr)
+        return Response({
+            **ctx,
+            "already_approved": bool(enr.nutritionist_approved_at),
+            "has_pdf": bool(enr.nutritionist_approval_pdf_key),
+            # Auto-fill for the signature form from the acting agent.
+            "nutritionist": {
+                "name": agent.name or "",
+                "credentials": getattr(agent, "title", "") or "",
+                "email": getattr(agent, "email", "") or "",
+            },
+        })
+
+
+class MemberNutritionReviewPdfView(PortalAPIView):
+    """GET /members/<id>/nutrition-review-pdf/: a short-lived download URL for the
+    member's signed Nutrition Review PDF (shown on the member Nutrition tab)."""
+
+    def get(self, request, client_id):
+        client = get_object_or_404(Client, pk=client_id)
+        enr = (
+            EnrollmentVerification.objects
+            .filter(client=client, nutritionist_approval_pdf_key__gt="")
+            .order_by("-nutritionist_approved_at")
+            .first()
+        )
+        if enr is None:
+            return Response({"error": "No nutrition review on file."}, status=http.HTTP_404_NOT_FOUND)
+        from ..services import import_storage
+        if not import_storage.s3_enabled():
+            return Response({"error": "Document storage is not configured."}, status=http.HTTP_404_NOT_FOUND)
+        url = import_storage.presign_get(
+            enr.nutritionist_approval_pdf_key,
+            download_name="nutrition-review.pdf",
+        )
+        return Response({"url": url})
 
 
 class MemberVerificationCreateView(PortalAPIView):

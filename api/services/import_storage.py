@@ -19,6 +19,7 @@ from django.conf import settings
 
 IMPORTS_PREFIX = "imports"
 EXPORTS_PREFIX = "exports"
+NUTRITION_PREFIX = "nutrition-reviews"
 
 
 def s3_enabled():
@@ -64,6 +65,20 @@ def build_export_key(filename):
     if not safe:
         safe = "export.csv"
     return f"{EXPORTS_PREFIX}/{uuid.uuid4()}/{safe}"
+
+
+def build_nutrition_key(client_id, filename="nutrition-review.pdf"):
+    """A unique key under the nutrition-reviews/ prefix for a signed PDF."""
+    safe = os.path.basename((filename or "nutrition-review.pdf")).strip().replace(" ", "_")
+    return f"{NUTRITION_PREFIX}/{client_id}/{uuid.uuid4()}/{safe or 'nutrition-review.pdf'}"
+
+
+def upload_bytes(key, data, *, content_type="application/octet-stream"):
+    """Upload raw bytes directly to S3 (server-side), returning the key."""
+    _client().put_object(
+        Bucket=_bucket(), Key=key, Body=data, ContentType=content_type,
+    )
+    return key
 
 
 def presign_put(key, *, content_type="text/csv", expires=900):

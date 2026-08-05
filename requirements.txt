@@ -40,3 +40,6 @@ django-storages>=1.14,<2.0
 # broker/result backend (runs on the same EC2 to start: redis://127.0.0.1).
 celery>=5.4,<6.0
 redis>=5.0,<6.0
+
+# PDF generation (Nutritionist signed review documents).
+reportlab>=4.0,<5.0

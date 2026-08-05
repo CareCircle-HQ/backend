@@ -1532,14 +1532,15 @@ def reconcile_enrollment_authorization(enrollment, *, actor=None, actor_label=""
         return enrollment
 
 
-def nutritionist_approve(enrollment, *, agent, signature):
+def nutritionist_approve(enrollment, *, agent, signature, signature_image="", pdf_key=""):
     """Record a Nutritionist's legal sign-off on a VERIFIED enrollment (the
     Pending Nutritionist gate), then let an approved authorization advance it to
     Kitchen Assignment.
 
-    Captures the audit trail -- who / when / typed signature -- and emits a
-    timeline event. Idempotent: re-approving an already-approved enrollment is a
-    no-op. Returns the (possibly advanced) enrollment.
+    Captures the audit trail -- who / when / typed signature / drawn signature /
+    generated PDF key -- and emits a timeline event. Idempotent: re-approving an
+    already-approved enrollment is a no-op. Returns the (possibly advanced)
+    enrollment.
     """
     from api.models import TimelineEventType
     from api.services.timeline import emit_timeline_event
@@ -1551,9 +1552,12 @@ def nutritionist_approve(enrollment, *, agent, signature):
     enrollment.nutritionist_approved_at = now
     enrollment.nutritionist_approved_by = agent
     enrollment.nutritionist_signature = (signature or "").strip()
+    enrollment.nutritionist_signature_image = signature_image or ""
+    enrollment.nutritionist_approval_pdf_key = pdf_key or ""
     enrollment.save(update_fields=[
         "nutritionist_approved_at", "nutritionist_approved_by",
-        "nutritionist_signature",
+        "nutritionist_signature", "nutritionist_signature_image",
+        "nutritionist_approval_pdf_key",
     ])
 
     client = getattr(enrollment, "client", None)
