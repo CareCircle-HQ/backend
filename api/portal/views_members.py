@@ -4803,12 +4803,23 @@ class MemberVerificationCreateView(PortalAPIView):
             # Wire the member's mobile-app login number onto their HouseholdMember
             # row (the field powers the Benefully member app login). Only members
             # that map to a real client/household-member can be wired here.
+            # mobile_app_username is UNIQUE: if another member already uses this
+            # number as their app login (e.g. a shared household phone), skip the
+            # write rather than 500 the whole verification -- the number is still
+            # captured on the member's dietary profile (mobile_number).
             mobile = (m.get("mobile_number") or "").strip()
             member_client_id = m.get("client_id")
             if mobile and member_client_id:
-                HouseholdMember.objects.filter(
-                    client_id=member_client_id
-                ).update(mobile_app_username=mobile)
+                taken = (
+                    HouseholdMember.objects
+                    .filter(mobile_app_username=mobile)
+                    .exclude(client_id=member_client_id)
+                    .exists()
+                )
+                if not taken:
+                    HouseholdMember.objects.filter(
+                        client_id=member_client_id
+                    ).update(mobile_app_username=mobile)
 
         # Attach any members added via the Step-1 search to the household and
         # record each addition on the primary's timeline. Skip clients already
