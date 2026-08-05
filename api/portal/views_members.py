@@ -4373,14 +4373,28 @@ class NutritionistPendingListView(PortalAPIView):
             except (ValueError, AttributeError, TypeError):
                 pass
             qs = qs.filter(cond).distinct()
-        # One group per household (enrollment), with its members -- mirrors the
-        # Members page grouping. Clicking any member opens the household review.
+        # One row per HOUSEHOLD. A household can carry several verified
+        # enrollments (renewals / stray superseded rows), and only the client's
+        # GOVERNING enrollment (active_enrollment -- most recent, open-preferred)
+        # actually reflects "Pending Nutritionist". So dedupe by client and keep
+        # only those whose governing enrollment is verified + not yet approved.
+        from .serializers import active_enrollment
+
         results = []
+        seen = set()
         for enr in qs:
             c = enr.client
-            if c is None:
+            if c is None or c.client_id in seen:
                 continue
-            case = enr.case
+            seen.add(c.client_id)
+            gov = active_enrollment(c)
+            if (
+                gov is None
+                or EnrollmentStage(gov.stage) != EnrollmentStage.VERIFIED
+                or gov.nutritionist_approved_at is not None
+            ):
+                continue  # household isn't actually Pending Nutritionist
+            case = gov.case
             members = [
                 {
                     "name": p.member_name or (
@@ -4389,16 +4403,17 @@ class NutritionistPendingListView(PortalAPIView):
                     ) or "Member",
                     "status": p.status,
                 }
-                for p in enr.member_profiles.all()
+                for p in gov.member_profiles.all()
             ]
             results.append({
                 "client_id": str(c.client_id),
                 "primary_name": f"{c.first_name} {c.last_name}".strip() or str(c.client_id),
-                "program_name": enr.program_name or getattr(case, "program_name", "") or "",
-                "verified_at": enr.verified_at.isoformat() if enr.verified_at else None,
+                "program_name": gov.program_name or getattr(case, "program_name", "") or "",
+                "verified_at": gov.verified_at.isoformat() if gov.verified_at else None,
                 "authorization_status": getattr(case, "service_authorization_status", "") or "",
                 "members": members,
             })
+        results.sort(key=lambda r: r["primary_name"].lower())
         return Response({"count": len(results), "results": results})
 
 
