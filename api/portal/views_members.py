@@ -4379,6 +4379,7 @@ class NutritionistPendingListView(PortalAPIView):
         # actually reflects "Pending Nutritionist". So dedupe by client and keep
         # only those whose governing enrollment is verified + not yet approved.
         from .serializers import active_enrollment
+        from ..services.lifecycle import governing_internal_case
 
         results = []
         seen = set()
@@ -4394,7 +4395,10 @@ class NutritionistPendingListView(PortalAPIView):
                 or gov.nutritionist_approved_at is not None
             ):
                 continue  # household isn't actually Pending Nutritionist
-            case = gov.case
+            # Authorization comes from the governing INTERNAL-SERVICE case (the
+            # same source the stage bar uses) -- the enrollment's own case link
+            # may be blank, so fall back to the client's governing case.
+            case = gov.case or governing_internal_case(gov)
             members = [
                 {
                     "name": p.member_name or (
