@@ -94,7 +94,6 @@ def render_nutrition_pdf(enrollment, *, agent, signature_image="", signed_at=Non
     from reportlab.platypus import (
         SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image,
     )
-    from reportlab.lib.utils import ImageReader
 
     ctx = nutrition_review_context(enrollment)
     signed_at = signed_at or timezone.now()
@@ -163,7 +162,7 @@ def render_nutrition_pdf(enrollment, *, agent, signature_image="", signed_at=Non
         flow.append(Spacer(1, 6))
         flow.append(Paragraph("Signature:", small))
         try:
-            flow.append(Image(ImageReader(BytesIO(sig_bytes)), width=2.4 * inch, height=0.9 * inch))
+            flow.append(Image(BytesIO(sig_bytes), width=2.4 * inch, height=0.9 * inch))
         except Exception:
             pass
 
