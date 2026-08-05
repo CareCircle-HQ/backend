@@ -1183,7 +1183,13 @@ def _nutritionist_phase(enrollment):
     if EnrollmentStage(enrollment.stage) in _PRE_VERIFICATION_STAGES:
         return ("", "")  # not verified yet -> the nutritionist step isn't reached
     if enrollment.nutritionist_approved_at:
-        return ("approved", "Nutritionist Approved")
+        # Only a REAL sign-off (nutritionist_approved_by set) reads "Nutritionist
+        # Approved". Grandfathered households (back-stamped approved_at with no
+        # approved_by, verified before the gate launched) never went through the
+        # step, so the node stays blank.
+        if enrollment.nutritionist_approved_by_id:
+            return ("approved", "Nutritionist Approved")
+        return ("", "")
     return ("pending", "Pending Nutritionist")
 
 

@@ -209,14 +209,20 @@ def pipeline_stage_label(client):
         return "On Hold"
     # The Nutritionist gate lives inside the "verified" lifecycle window: a
     # verified household that hasn't been signed off reads "Pending Nutritionist",
-    # then "Nutritionist Approved" (waiting on authorization) once signed off --
-    # instead of the coarse "Verification" phase. Approval advances the enrollment
-    # to Kitchen Assignment (a different lifecycle stage), so this only fires while
-    # the governing enrollment is still at Verified.
+    # then "Nutritionist Approved" (waiting on authorization) once a Nutritionist
+    # ACTUALLY signs off -- instead of the coarse "Verification" phase. Approval
+    # advances the enrollment to Kitchen Assignment (a different lifecycle stage),
+    # so this only fires while the governing enrollment is still at Verified.
+    # Grandfathered households (verified before the gate launched -- back-stamped
+    # nutritionist_approved_at with NO nutritionist_approved_by) never went through
+    # a review, so they fall through to the normal "Verification" label.
     if client.lifecycle_stage == "verified":
         enr = active_enrollment(client)
         if enr is not None and enr.stage == "verified":
-            return "Nutritionist Approved" if enr.nutritionist_approved_at else "Pending Nutritionist"
+            if not enr.nutritionist_approved_at:
+                return "Pending Nutritionist"
+            if enr.nutritionist_approved_by_id:
+                return "Nutritionist Approved"
     return _STAGE_PHASE_LABELS.get(
         client.lifecycle_stage, client.get_lifecycle_stage_display()
     )
