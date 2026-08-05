@@ -1265,8 +1265,13 @@ def _service_phase(client, enrollment, gov_case):
     # a kitchen). If the authorization hasn't been approved yet (still
     # pending/requested) the Authorization phase carries that state and Service
     # stays blank until approval lands.
+    # The Nutritionist gate sits before kitchen assignment: a verified household
+    # that hasn't been Nutritionist-approved is NOT yet waiting on a kitchen (it's
+    # Pending Nutritionist), so the Service phase stays blank until sign-off.
     verified_awaiting_kitchen = (
-        stage == EnrollmentStage.VERIFIED and auth in (A.APPROVED, A.NOT_REQUIRED)
+        stage == EnrollmentStage.VERIFIED
+        and auth in (A.APPROVED, A.NOT_REQUIRED)
+        and enrollment.nutritionist_approved_at is not None
     )
     if stage in (EnrollmentStage.SERVICE_ACTIVE, EnrollmentStage.KITCHEN_ASSIGNMENT) or verified_awaiting_kitchen:
         mv = _member_status_on(client, enrollment)

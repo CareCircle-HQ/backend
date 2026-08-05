@@ -4210,7 +4210,7 @@ class ProgramTracksTest(TestCase):
     -> Verification -> Service phase + status."""
 
     def _setup(self, *, stage, auth, case_status=None, client_stage="active",
-               household_type=None):
+               household_type=None, nutritionist_approved=True):
         from .models import (
             Case, CaseHouseholdType, CaseStatus, CaseType, Client,
             EnrollmentVerification, Household, HouseholdMember,
@@ -4240,6 +4240,10 @@ class ProgramTracksTest(TestCase):
         )
         EnrollmentVerification.objects.create(
             client=client, household=hh, stage=stage,
+            # Post-verification households on the bar have cleared the Nutritionist
+            # gate by default (so the Service phase can reach kitchen/active); set
+            # False to exercise the Pending Nutritionist state.
+            nutritionist_approved_at=timezone.now() if nutritionist_approved else None,
         )
         return client
 
@@ -4285,6 +4289,22 @@ class ProgramTracksTest(TestCase):
         self.assertEqual(t["verification"]["label"], "Verified")
         self.assertEqual(t["service"]["value"], "waiting_kitchen")
         self.assertEqual(t["service"]["label"], "Kitchen Assignment")
+
+    def test_verified_approved_pending_nutritionist_service_blank(self):
+        """A VERIFIED + APPROVED household that has NOT been Nutritionist-approved
+        is Pending Nutritionist -- it has NOT reached kitchen assignment, so the
+        Service phase stays blank (not 'Kitchen Assignment')."""
+        from .models import EnrollmentStage, ServiceAuthorizationStatus
+        from .services.lifecycle import program_tracks
+
+        c = self._setup(
+            stage=EnrollmentStage.VERIFIED,
+            auth=ServiceAuthorizationStatus.APPROVED,
+            nutritionist_approved=False,
+        )
+        t = program_tracks(c)[0]
+        self.assertEqual(t["nutritionist"]["value"], "pending")
+        self.assertEqual(t["service"]["value"], "")
 
     def test_verified_pending_auth_keeps_service_blank(self):
         """A VERIFIED enrollment whose authorization is still pending/requested
