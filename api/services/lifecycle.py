@@ -3469,9 +3469,21 @@ def _bind_governing_case_to_serving_enrollment(client, governing):
     serv = serving[0]
     if serv.case_id is not None:
         return False  # bound already (a genuine case change is handled elsewhere)
-    holders = [e for e in live if e.case_id == governing.case_id and e.pk != serv.pk]
-    if any(EnrollmentStage(e.stage) in serving_stages for e in holders):
-        return False  # another SERVING enrollment owns it -> ambiguous, leave it
+    # Holders across ALL clients (the per-case unique constraint is global): skip
+    # if the case is held by a SERVING enrollment (ambiguous) OR by an enrollment
+    # of a DIFFERENT client (cross-client mislink -- never steal another member's
+    # enrollment; attempting the bind would raise IntegrityError and poison the
+    # case-save transaction). Only free THIS client's non-serving strays.
+    holders = list(
+        EnrollmentVerification.objects.filter(case=governing)
+        .exclude(pk=serv.pk)
+        .exclude(stage__in=terminal)
+    )
+    if any(
+        EnrollmentStage(e.stage) in serving_stages or e.client_id != serv.client_id
+        for e in holders
+    ):
+        return False
     for e in holders:
         e.case = None
         e.stage = EnrollmentStage.DISREGARDED

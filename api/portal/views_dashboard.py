@@ -23,6 +23,7 @@ from ..models import (
     CaseStatus,
     CaseType,
     Client,
+    ClientStage,
     EnrollmentStage,
     HouseholdMember,
     Insurance,
@@ -44,13 +45,133 @@ from .base import PortalAPIView, current_agent
 # Case statuses that mean the case is no longer open/serviceable.
 _TERMINAL_CASE_STATUSES = [CaseStatus.CLOSED, CaseStatus.CANCELLED]
 
+# Enrollment stages that mean the member is off-boarded (not a current member).
+_TERMINAL_ENROLLMENT_STAGES = [
+    EnrollmentStage.CLOSED, EnrollmentStage.CANCELLED,
+    EnrollmentStage.DISREGARDED, EnrollmentStage.SERVICE_COMPLETE,
+]
+
+# CS tab Section 3 -- Member Status. Every member (with a live enrollment on an
+# internal-service case, plus never-verified navigation members) is classified
+# into EXACTLY ONE of these, in PRIORITY ORDER (first match wins, no
+# double-counting). "other" is a catch-all that should stay ~empty.
+CS_MEMBER_TIERS = [
+    "receiving_meals", "pending_meals",       # being served
+    "out_of_range", "rejected", "services_paused", "no_coverage",
+    "requires_verification", "no_menu",       # Not Being Served (6 tiers)
+]
+
+
+def cs_member_status(start, end):
+    """Classify members into exactly one CS Member-Status tier (priority order).
+
+    Receiving Meals = ACTIVE on a Service-Active enrollment with a kitchen +
+    cadence + APPROVED auth. Pending Meals = verified but auth PENDING. Then the
+    six Not-Being-Served tiers by priority: Out of Range -> Rejected (auth denied)
+    -> Services Paused (member Paused or program On Hold) -> No Coverage (no
+    active Medicaid OR no social care coverage) -> Requires Verification (not
+    completed, incl. never-requested navigation members) -> No Menu (no menu type
+    assigned). Returns a {tier: count} dict (distinct members)."""
+    from api.models import (
+        Case, CaseType, EnrollmentStage as ES, Insurance, InsurancePlanType,
+        MemberDietaryProfile, MemberStatus, RecordStatus,
+        ServiceAuthorizationStatus as SAS, SocialCareCoverage,
+        SocialCareCoverageStatus,
+    )
+
+    rows = list(
+        _scope_members(MemberDietaryProfile.objects, start, end)
+        .exclude(enrollment__stage__in=_TERMINAL_ENROLLMENT_STAGES)
+        .values(
+            "client_id", "status", "menu_type",
+            "enrollment__stage", "enrollment__kitchen_id",
+            "enrollment__verified_at", "enrollment__delivery_weekdays",
+            "enrollment__case__service_authorization_status",
+        )
+    )
+    client_ids = {r["client_id"] for r in rows}
+    have_medicaid = set(Insurance.objects.filter(
+        client_id__in=client_ids,
+        plan_type__in=[InsurancePlanType.MEDICAID, InsurancePlanType.DUAL],
+        status=RecordStatus.ACTIVE,
+    ).values_list("client_id", flat=True))
+    have_social = set(SocialCareCoverage.objects.filter(
+        client_id__in=client_ids, status=SocialCareCoverageStatus.ENROLLED,
+    ).values_list("client_id", flat=True))
+    # Members with an open Case Closure request -> surface under Services Paused
+    # (the closure ticket keeps the case open until it is closed).
+    closure_ticket = set(Ticket.objects.filter(
+        type__code=TicketTypeCode.CASE_CLOSURE,
+    ).exclude(status=TicketStatus.RESOLVED).values_list("client_id", flat=True))
+
+    def classify(r):
+        cid = r["client_id"]
+        auth = r["enrollment__case__service_authorization_status"]
+        stage = r["enrollment__stage"]
+        status = r["status"]
+        verified = r["enrollment__verified_at"] is not None
+        if (status == MemberStatus.ACTIVE and stage == ES.SERVICE_ACTIVE
+                and r["enrollment__kitchen_id"] and r["enrollment__delivery_weekdays"]
+                and auth == SAS.APPROVED):
+            return "receiving_meals"
+        if verified and auth == SAS.PENDING:
+            return "pending_meals"
+        if status == MemberStatus.OUT_OF_RANGE:
+            return "out_of_range"
+        if auth == SAS.DENIED:
+            return "rejected"
+        if (status == MemberStatus.PAUSED or stage == ES.ON_HOLD
+                or cid in closure_ticket):
+            return "services_paused"
+        if cid not in have_medicaid or cid not in have_social:
+            return "no_coverage"
+        if not verified:
+            return "requires_verification"
+        # Everyone remaining is verified + covered but not yet receiving -- no
+        # menu / not yet set up on a kitchen. Catch-all last tier ("assign a
+        # kitchen").
+        return "no_menu"
+
+    idx = {t: i for i, t in enumerate(CS_MEMBER_TIERS)}
+    best = {}
+    for r in rows:
+        t = classify(r)
+        cid = r["client_id"]
+        if cid not in best or idx[t] < idx[best[cid]]:
+            best[cid] = t
+
+    # Navigation members: an OPEN internal-service case but no enrollment/profile
+    # (verification never requested) -> Requires Verification.
+    open_isc = set(_scope_by_opened(
+        Case.objects.filter(case_type=CaseType.INTERNAL_SERVICE)
+        .exclude(case_status__in=_TERMINAL_CASE_STATUSES),
+        start, end,
+    ).values_list("client_id", flat=True))
+    never_requested = open_isc - set(best)
+    for cid in never_requested:
+        # A never-verified member with a closure request still surfaces under
+        # Services Paused; otherwise it's a verification gap.
+        best[cid] = "services_paused" if cid in closure_ticket else "requires_verification"
+    never_requested -= closure_ticket
+
+    tier_clients = {t: set() for t in CS_MEMBER_TIERS}
+    for cid, t in best.items():
+        tier_clients[t].add(cid)
+    # Tag sets for the drill-down: never_requested (navigation) vs
+    # requested-not-completed; closure_ticket flags Services Paused rows.
+    return tier_clients, {
+        "never_requested": never_requested,
+        "closure_ticket": closure_ticket,
+    }
+
 # The drill-down reasons the serving-status list endpoint understands. The first
 # group mirrors the "Not Being Served" cards; the second is the follow-up
 # watchlist (which can overlap with actively-served members).
 _SERVING_REASONS = frozenset({
-    "needs_verification", "rejected_case", "out_of_range",
-    "services_paused", "pending_closure", "out_of_orbit",
-    "insurance_expiring", "no_social_coverage", "no_insurance",
+    "needs_verification", "rejected_case", "out_of_range", "not_eligible",
+    "programs_on_hold", "members_paused_agent", "members_paused_eligibility",
+    "pending_closure", "out_of_orbit",
+    "insurance_expiring", "no_social_coverage",
 })
 
 
@@ -112,15 +233,24 @@ def _scope_by_opened(qs, start, end):
 
 def governing_internal_case_ids():
     """The ``case_id`` of each client's GOVERNING internal-service case, using
-    the system-wide governing rule (:func:`governing_case_key` over ALL of the
-    client's internal-service cases -- an approved authorization beats a denial
-    regardless of dates, then OPEN over closed, then most recent).
+    the system-wide governing rule (:func:`governing_case_key` over the client's
+    internal-service cases -- an approved authorization beats a denial regardless
+    of dates, then OPEN over closed, then most recent).
+
+    A case with NO real authorization -- a BLANK status or ``never_requested`` --
+    can NEVER be a governing case: it's excluded from the candidate pool. So a
+    client whose only internal-service case is blank/never-requested contributes
+    NO governing case (and drops off every dashboard case metric), rather than
+    that unauthorized case being counted as their open case.
 
     Every dashboard case metric is restricted to these ids, so a superseded or
     parallel NON-governing case is never counted or considered anywhere: a
     client contributes exactly ONE (their governing) internal-service case.
     """
     from ..services.lifecycle import governing_case_key
+
+    # Statuses that confer no authorization and must never govern.
+    _NON_GOVERNING = {"", ServiceAuthorizationStatus.NEVER_REQUESTED}
 
     best = {}
     for c in (
@@ -130,6 +260,8 @@ def governing_internal_case_ids():
             "case_status", "case_created_at", "date_opened", "updated_at",
         )
     ):
+        if (c.service_authorization_status or "") in _NON_GOVERNING:
+            continue  # blank / never_requested can never be a governing case
         cur = best.get(c.client_id)
         if cur is None or governing_case_key(c) > governing_case_key(cur):
             best[c.client_id] = c
@@ -185,6 +317,21 @@ def serving_client_ids(reason, *, start, end, governing_ids=None):
     def gov():
         return governing_ids if governing_ids is not None else governing_internal_case_ids()
 
+    _open_gov_cache = {}
+
+    def open_gov_clients():
+        """client_ids whose GOVERNING internal-service case is currently OPEN
+        (non-terminal). Every serving/watchlist reason is intersected with this
+        so a member whose governing case has CLOSED is never flagged -- we only
+        surface actionable members whose governing case is still open."""
+        if "v" not in _open_gov_cache:
+            _open_gov_cache["v"] = set(
+                Case.objects.filter(case_id__in=gov())
+                .exclude(case_status__in=_TERMINAL_CASE_STATUSES)
+                .values_list("client_id", flat=True)
+            )
+        return _open_gov_cache["v"]
+
     if reason == "needs_verification":
         # Mirror the Verification page's "Pending + Requested-date" filter EXACTLY
         # (same helpers) so this card can never drift from what agents see there:
@@ -229,27 +376,67 @@ def serving_client_ids(reason, *, start, end, governing_ids=None):
     if reason == "out_of_range":
         return set(scope(
             mdp.filter(status=MemberStatus.OUT_OF_RANGE)
-        ).values_list("client_id", flat=True))
+        ).values_list("client_id", flat=True)) & open_gov_clients()
     if reason == "out_of_orbit":
         return set(scope(
             mdp.filter(status=MemberStatus.OUT_OF_ORBIT)
+        ).values_list("client_id", flat=True)) & open_gov_clients()
+    if reason == "not_eligible":
+        # Every MEMBER set to the hard Ineligible off-ramp (client lifecycle ==
+        # INELIGIBLE). Per member (not collapsed) -- "all members set not
+        # eligible". Scoped to the in-range internal-service case like the others.
+        return set(scope(
+            mdp.filter(client__lifecycle_stage=ClientStage.INELIGIBLE)
         ).values_list("client_id", flat=True))
-    if reason == "services_paused":
-        # A member individually Paused within the active-service pipeline, OR an
-        # otherwise-Active member whose household is On Hold -- the "not currently
-        # served" states the Receiving Meals card excludes. Out-of-Orbit /
-        # Out-of-Range members of on-hold households are deliberately excluded --
-        # they surface under their own reasons, so counting them here too would
-        # double-count them.
-        return set(scope(mdp.filter(
-            Q(
-                status=MemberStatus.PAUSED,
-                enrollment__stage__in=[
-                    EnrollmentStage.SERVICE_ACTIVE, EnrollmentStage.ON_HOLD,
-                ],
+    if reason == "programs_on_hold":
+        # PROGRAM-level, matching the Members page "On Hold" filter EXACTLY: the
+        # member's GOVERNING enrollment is On Hold (governing_enrollment_stage --
+        # so a stray/superseded on-hold enrollment alongside a live one is
+        # ignored), the member is ELIGIBLE (not on the Ineligible off-ramp), and
+        # the GOVERNING internal-service case is OPEN. Counted per PROGRAM
+        # (collapsed to the household primary).
+        from .views_members import governing_enrollment_stage
+
+        # "Open" here mirrors the Members page "Internal Service = Open" filter:
+        # the client has ANY non-terminal internal-service case (Exists), NOT
+        # specifically that the governing case is open.
+        open_case_clients = set(
+            Case.objects.filter(case_type=CaseType.INTERNAL_SERVICE)
+            .exclude(case_status__in=_TERMINAL_CASE_STATUSES)
+            .values_list("client_id", flat=True)
+        )
+        cq = (
+            Client.objects.annotate(_gov=governing_enrollment_stage())
+            .filter(_gov=EnrollmentStage.ON_HOLD)
+            .exclude(lifecycle_stage=ClientStage.INELIGIBLE)
+        )
+        if start is not None:  # mirror scope(): in-range internal-service case
+            cq = cq.filter(
+                cases__case_type=CaseType.INTERNAL_SERVICE,
+                cases__date_opened__date__gte=start,
+                cases__date_opened__date__lte=end,
             )
-            | Q(status=MemberStatus.ACTIVE, enrollment__stage=EnrollmentStage.ON_HOLD)
-        )).values_list("client_id", flat=True))
+        member_ids = set(cq.values_list("client_id", flat=True)) & open_case_clients
+        return set(_primary_map(member_ids).values())
+    if reason in ("members_paused_agent", "members_paused_eligibility"):
+        # PROGRAMS with a PAUSED member, split by WHO paused them: an agent
+        # (manual, eligibility_paused=False) vs eligibility (auto,
+        # eligibility_paused=True). Mirrors the Members page chain: any
+        # eligibility ("All") -> Internal Service = Open (client has ANY
+        # non-terminal internal-service case) -> Paused. No Eligible filter --
+        # eligibility-paused members are on the Ineligible off-ramp, so requiring
+        # Eligible would drop them all. Counted per PROGRAM (collapse the paused
+        # members to their household primary so the link drives to the program).
+        open_case_clients = set(
+            Case.objects.filter(case_type=CaseType.INTERNAL_SERVICE)
+            .exclude(case_status__in=_TERMINAL_CASE_STATUSES)
+            .values_list("client_id", flat=True)
+        )
+        paused = set(scope(mdp.filter(
+            status=MemberStatus.PAUSED,
+            eligibility_paused=(reason == "members_paused_eligibility"),
+        )).values_list("client_id", flat=True)) & open_case_clients
+        return set(_primary_map(paused).values())
     if reason == "pending_closure":
         # Only a closure ticket on the GOVERNING case flags the member -- a ticket
         # on a non-governing case is not their service closing.
@@ -267,33 +454,38 @@ def serving_client_ids(reason, *, start, end, governing_ids=None):
             cid for cid in tickets.values_list("client_id", flat=True) if cid
         )
 
-    # --- Watchlist (client-level facts, intersected with enrolled members) ---
-    enrolled = set(scope(mdp).values_list("client_id", flat=True))
-    if not enrolled and start is not None:
+    # --- Watchlist: PROGRAMS with >=1 member lacking coverage ----------------
+    # Program-level: a household is flagged when ANY of its members (primary or
+    # dependent) lacks the coverage, and its GOVERNING internal-service case is
+    # OPEN. "Enrolled" is therefore every member of a household whose primary
+    # holds an open governing case; the lacking members are collapsed back to
+    # their household primary so the count/drill-down is PROGRAMS, not members.
+    open_primaries = open_gov_clients()
+    member_ids = set(scope(mdp).values_list("client_id", flat=True))
+    prim = _primary_map(member_ids)
+    enrolled = {cid for cid in member_ids if prim.get(cid, cid) in open_primaries}
+    if not enrolled:
         return set()
+
+    def programs_lacking(have):
+        return {prim.get(cid, cid) for cid in (enrolled - have)}
+
     if reason == "insurance_expiring":
-        # "No active Medicaid" watchlist. Imports don't reliably populate a
-        # coverage end date, so an expiry-date window can't be trusted; we
-        # trust the imported STATUS instead and flag enrolled members with NO
-        # ACTIVE Medicaid (or Dual Medicare/Medicaid) plan on file. Mirrors
-        # lifecycle.has_valid_medicaid (same status-based rule used elsewhere).
+        # "No active Medicaid": trust the imported STATUS (import doesn't reliably
+        # carry an end date) -- a member with NO ACTIVE Medicaid/Dual plan lacks
+        # it. Mirrors lifecycle.has_valid_medicaid.
         have = set(Insurance.objects.filter(
             client_id__in=enrolled,
             plan_type__in=[InsurancePlanType.MEDICAID, InsurancePlanType.DUAL],
             status=RecordStatus.ACTIVE,
         ).values_list("client_id", flat=True))
-        return enrolled - have
+        return programs_lacking(have)
     if reason == "no_social_coverage":
         have = set(SocialCareCoverage.objects.filter(
             client_id__in=enrolled,
             status=SocialCareCoverageStatus.ENROLLED,
         ).values_list("client_id", flat=True))
-        return enrolled - have
-    if reason == "no_insurance":
-        have = set(Insurance.objects.filter(
-            client_id__in=enrolled, status=RecordStatus.ACTIVE,
-        ).values_list("client_id", flat=True))
-        return enrolled - have
+        return programs_lacking(have)
     return None
 
 
@@ -380,20 +572,53 @@ def _serving_details(reason, client_ids, *, start, end, governing_ids=None):
             since = _fmt_date(p.status_changed_at)
             out[p.client_id] = f"Since {since}" if since else ""
         return out
-    if reason == "services_paused":
+    if reason == "not_eligible":
+        return {cid: "Set Not Eligible" for cid in ids}
+    if reason == "programs_on_hold":
+        # ids are household primaries (the program holders). Label each with its
+        # program name when available.
         out = {}
         for p in (
-            mdp.filter(client_id__in=ids)
-            .select_related("enrollment")
+            mdp.filter(
+                client_id__in=ids, enrollment__stage=EnrollmentStage.ON_HOLD
+            )
+            .select_related("enrollment__case")
             .order_by("client_id")
         ):
             if p.client_id in out:
                 continue
-            if p.status == MemberStatus.PAUSED:
-                since = _fmt_date(p.status_changed_at)
-                out[p.client_id] = f"Paused{f' · since {since}' if since else ''}"
-            elif getattr(p.enrollment, "stage", None) == EnrollmentStage.ON_HOLD:
-                out[p.client_id] = "Household on hold (under review)"
+            case = getattr(p.enrollment, "case", None)
+            name = (getattr(case, "program_name", "") or "").strip()
+            out[p.client_id] = f"Program on hold · {name}" if name else "Program on hold (under review)"
+        for cid in ids:
+            out.setdefault(cid, "Program on hold (under review)")
+        return out
+    if reason in ("members_paused_agent", "members_paused_eligibility"):
+        # ids are program primaries. Count paused members (of the matching kind)
+        # per program and label with the program name.
+        elig = reason == "members_paused_eligibility"
+        kind = "eligibility" if elig else "agent"
+        paused_ids = list(mdp.filter(
+            status=MemberStatus.PAUSED, eligibility_paused=elig,
+        ).values_list("client_id", flat=True))
+        prim = _primary_map(set(paused_ids))
+        counts = {}
+        for cid in paused_ids:
+            pk = prim.get(cid, cid)
+            counts[pk] = counts.get(pk, 0) + 1
+        out = {}
+        for p in (
+            mdp.filter(client_id__in=ids)
+            .select_related("enrollment__case")
+            .order_by("client_id")
+        ):
+            if p.client_id in out:
+                continue
+            case = getattr(p.enrollment, "case", None)
+            name = (getattr(case, "program_name", "") or "").strip()
+            n = counts.get(p.client_id, 1)
+            base = f"{n} member{'' if n == 1 else 's'} paused by {kind}"
+            out[p.client_id] = f"{base} · {name}" if name else base
         return out
     if reason == "pending_closure":
         tickets = Ticket.objects.filter(
@@ -405,12 +630,27 @@ def _serving_details(reason, client_ids, *, start, end, governing_ids=None):
                 continue
             out[t.client_id] = (t.reason or "Case closure in progress")[:140]
         return out
-    if reason == "insurance_expiring":
-        return {cid: "No active Medicaid on file" for cid in ids}
-    if reason == "no_social_coverage":
-        return {cid: "No enrolled social care coverage" for cid in ids}
-    if reason == "no_insurance":
-        return {cid: "No active insurance on file" for cid in ids}
+    if reason in ("insurance_expiring", "no_social_coverage"):
+        # ids are program primaries; label with the program name.
+        prefix = (
+            "Member(s) without active Medicaid"
+            if reason == "insurance_expiring"
+            else "Member(s) without social care coverage"
+        )
+        out = {}
+        for p in (
+            mdp.filter(client_id__in=ids)
+            .select_related("enrollment__case")
+            .order_by("client_id")
+        ):
+            if p.client_id in out:
+                continue
+            case = getattr(p.enrollment, "case", None)
+            name = (getattr(case, "program_name", "") or "").strip()
+            out[p.client_id] = f"{prefix} · {name}" if name else prefix
+        for cid in ids:  # primaries without a profile row still get a label
+            out.setdefault(cid, prefix)
+        return out
     return {}
 
 
@@ -478,8 +718,12 @@ class DashboardView(PortalAPIView):
         ic_in_range = _scope_by_opened(ic, start, end)
         open_cases = ic_in_range.exclude(case_status__in=_TERMINAL_CASE_STATUSES)
 
-        # --- 1.1 Open cases + authorization breakdown (TIME-FRAME SENSITIVE)
-        # Scoped to cases opened in the selected date range.
+        # --- 1.1 Open cases + authorization breakdown (TIME-FRAME SENSITIVE) ---
+        # Count the OPEN internal-service cases -- one GOVERNING case per client
+        # (governing_internal_case_ids already excludes blank / never_requested
+        # authorizations, which can never govern). No eligibility or enrollment
+        # requirement, so members still in NAVIGATION (open case, verification not
+        # yet requested) ARE counted. Scoped to cases opened in the date range.
         scoped_rows = list(
             open_cases.values(
                 "client_id", "service_authorization_status", "program_name"
@@ -491,10 +735,8 @@ class DashboardView(PortalAPIView):
             ServiceAuthorizationStatus.PENDING: "requested",
             ServiceAuthorizationStatus.DENIED: "rejected",
         }
-        # Household vs Individual, from the PROGRAM NAME keyword only -- the same
-        # live rule as ``derive_household_type`` / the Cases export, so the card
-        # reconciles with the export's "Is Program Household?" column even when a
-        # stored ``household_type`` predates the unified classification.
+        # Household vs Individual from the case PROGRAM NAME keyword -- the same
+        # live rule as ``derive_household_type`` / the Cases export.
         household_cases = 0
         for row in scoped_rows:
             auth_counts[_AUTH_BUCKET.get(row["service_authorization_status"], "other")] += 1
@@ -553,6 +795,40 @@ class DashboardView(PortalAPIView):
         open_client_ids = {row["client_id"] for row in scoped_rows}
         members_payload = self._members_breakdown(open_client_ids)
 
+        # CS tab Section 2 breakdowns: members (of the open-case households) by
+        # their governing case's CASE TYPE (individual/household) and SERVICE TYPE
+        # (meals/boxes). Each case holder's whole household inherits the case's
+        # type/kind, so multiply by the household size.
+        case_rows = open_cases.values(
+            "client_id", "program_name",
+            "program__product_type__type", "service_type",
+        )
+        client_hh = {
+            m["client_id"]: m["household_id"]
+            for m in HouseholdMember.objects.filter(
+                client_id__in=open_client_ids
+            ).values("client_id", "household_id")
+        }
+        hh_sizes = {}
+        for hid in HouseholdMember.objects.filter(
+            household_id__in=set(client_hh.values())
+        ).values_list("household_id", flat=True):
+            hh_sizes[hid] = hh_sizes.get(hid, 0) + 1
+        mem_by_type = {"individual": 0, "household": 0}
+        mem_by_service = {"meals": 0, "boxes": 0}
+        for row in case_rows:
+            size = hh_sizes.get(client_hh.get(row["client_id"]), 1)
+            is_hh = "household" in (row["program_name"] or "").casefold()
+            mem_by_type["household" if is_hh else "individual"] += size
+            kind = _case_product_kind(
+                row["program__product_type__type"],
+                row["program_name"], row["service_type"],
+            )
+            if kind is not None and kind.value in mem_by_service:
+                mem_by_service[kind.value] += size
+        members_payload["by_case_type"] = mem_by_type
+        members_payload["by_service_type"] = mem_by_service
+
         # --- 1.3 Total enrolled (ALL TIME, any status) --------------------
         enrolled_client_ids = set(ic.values_list("client_id", flat=True))
         total_enrolled = self._household_member_count(enrolled_client_ids)
@@ -588,11 +864,13 @@ class DashboardView(PortalAPIView):
             .count()
         )
 
-        # --- 1.6 Cancel rate (TIME-FRAME SENSITIVE) -----------------------
-        # Attrition: distinct members who fell out of / are blocked from active
-        # service (Paused, household On Hold, Out of Orbit, Out of Range, or a
-        # Cancelled enrollment) as a share of the members enrolled in
-        # accepted-authorization (open + APPROVED) cases.
+        # --- 1.6 Inactive Member Rate (TIME-FRAME SENSITIVE) --------------
+        # Attrition: distinct MEMBERS who fell out of / are blocked from active
+        # service (Paused, household On Hold, Out of Orbit, Out of Range, or on an
+        # INELIGIBLE program) as a share of the members enrolled in
+        # accepted-authorization (open + APPROVED) cases. Every component counts
+        # MEMBERS (on_hold counts every member on an on-hold enrollment;
+        # ineligible counts every member whose program is Ineligible).
         mdp = MemberDietaryProfile.objects
 
         def _lost(**flt):
@@ -605,9 +883,11 @@ class DashboardView(PortalAPIView):
         cr_on_hold = _lost(enrollment__stage=EnrollmentStage.ON_HOLD)
         cr_out_of_orbit = _lost(status=MemberStatus.OUT_OF_ORBIT)
         cr_out_of_range = _lost(status=MemberStatus.OUT_OF_RANGE)
-        cr_cancelled = _lost(enrollment__stage=EnrollmentStage.CANCELLED)
+        # Members on an INELIGIBLE program (client hard off-ramped to Ineligible),
+        # replacing the old Cancelled-enrollment bucket.
+        cr_ineligible = _lost(client__lifecycle_stage=ClientStage.INELIGIBLE)
         lost_total = (
-            cr_paused + cr_on_hold + cr_out_of_orbit + cr_out_of_range + cr_cancelled
+            cr_paused + cr_on_hold + cr_out_of_orbit + cr_out_of_range + cr_ineligible
         )
 
         # Base: Total Members across open cases (the "Total Members" card's
@@ -619,7 +899,7 @@ class DashboardView(PortalAPIView):
             "on_hold": cr_on_hold,
             "out_of_orbit": cr_out_of_orbit,
             "out_of_range": cr_out_of_range,
-            "cancelled": cr_cancelled,
+            "ineligible": cr_ineligible,
             "lost_total": lost_total,
             "base": base_members,
             "rate": (
@@ -664,8 +944,13 @@ class DashboardView(PortalAPIView):
                 "rejected_case": _count("rejected_case"),
                 # 2.3d Delivery/primary ZIP outside coverage (geographic block).
                 "out_of_range": _count("out_of_range"),
-                # 2.3e Member Paused (benign) OR household On Hold (under review).
-                "services_paused": _count("services_paused"),
+                # 2.3d.1 Members set to the hard Ineligible off-ramp.
+                "not_eligible": _count("not_eligible"),
+                # 2.3e PROGRAM on hold (household-wide) vs programs with a member
+                # paused -- split by who paused them (agent vs eligibility).
+                "programs_on_hold": _count("programs_on_hold"),
+                "members_paused_agent": _count("members_paused_agent"),
+                "members_paused_eligibility": _count("members_paused_eligibility"),
                 # 2.3f Closure initiated (open Case Closure ticket).
                 "pending_closure": _count("pending_closure"),
                 # 2.3g Dietary/allergy profile unfulfillable by any kitchen.
@@ -675,7 +960,6 @@ class DashboardView(PortalAPIView):
             "watchlist": {
                 "insurance_expiring": _count("insurance_expiring"),
                 "no_social_coverage": _count("no_social_coverage"),
-                "no_insurance": _count("no_insurance"),
             },
         }
 
@@ -749,6 +1033,9 @@ class DashboardView(PortalAPIView):
             ),
             "active": active_members,
             "total": max(base_members - lost_total, 0),
+            # Quantity of OPEN (governing, in-range) internal-service cases that
+            # actually have an enrollment -- shown in the card's headline label.
+            "cases": open_cases.filter(enrollments__isnull=False).distinct().count(),
         }
 
         # Total Receiving Meals: LIVE members we are actively serving in a PO --
@@ -806,6 +1093,10 @@ class DashboardView(PortalAPIView):
                 "enrolled": enrolled,
                 "receiving": receiving_meals,
                 "pending": pending,
+                # CS tab Section 3 -- member status (priority-ordered, one bucket).
+                "member_status": {
+                    t: len(s) for t, s in cs_member_status(start, end)[0].items()
+                },  # [1] = tag sets (never_requested / closure_ticket)
             }
         )
 
@@ -908,3 +1199,48 @@ class DashboardServingListView(PortalAPIView):
         results.sort(key=lambda r: r["name"].lower())
 
         return Response({"reason": reason, "count": len(results), "results": results})
+
+
+class DashboardMemberStatusListView(PortalAPIView):
+    """Management-only drill-down for a CS-tab Member-Status tier (see
+    :data:`CS_MEMBER_TIERS`). Same shape as the serving list. For Requires
+    Verification each row is tagged Requested vs Never requested."""
+
+    def get(self, request, tier):
+        agent = current_agent(request)
+        if not (agent and (agent.group == "Management" or getattr(agent, "is_manager", False))):
+            return Response({"detail": "Management access required."}, status=403)
+        if tier not in CS_MEMBER_TIERS:
+            return Response({"detail": "Unknown tier."}, status=404)
+
+        start, end = resolve_window(request)
+        tier_clients, tags = cs_member_status(start, end)
+        never_requested = tags["never_requested"]
+        closure_ticket = tags["closure_ticket"]
+        client_ids = tier_clients.get(tier, set())
+        primary_map = _primary_map(client_ids)
+        needed = set(client_ids) | set(primary_map.values())
+        names = {
+            c.client_id: (f"{c.first_name} {c.last_name}".strip() or str(c.client_id))
+            for c in Client.objects.filter(client_id__in=needed)
+        }
+        results = []
+        for cid in client_ids:
+            pid = primary_map.get(cid, cid)
+            detail = ""
+            has_ticket = False
+            if tier == "requires_verification":
+                detail = "Never requested" if cid in never_requested else "Requested"
+            elif tier == "services_paused" and cid in closure_ticket:
+                detail = "Closure requested"
+                has_ticket = True
+            results.append({
+                "id": str(cid),
+                "name": names.get(cid, str(cid)),
+                "primary_id": str(pid),
+                "primary_name": names.get(pid, names.get(cid, str(cid))),
+                "detail": detail,
+                "ticket": has_ticket,
+            })
+        results.sort(key=lambda r: r["name"].lower())
+        return Response({"reason": tier, "count": len(results), "results": results})

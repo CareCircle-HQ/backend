@@ -943,27 +943,34 @@ def apply_case_created_date_filter(qs, start, end):
     return qs.filter(Exists(cases))
 
 
-def apply_verification_date_filters(qs, params):
+def apply_verification_date_filters(qs, params, *, skip_enrollment_bounds=False):
     """Apply the Verification-page case-created/requested/completed/authorized
     date-range filters from query params (``case_from``/``case_to`` ->
     internal-service case ``date_opened``; ``requested_from``/``requested_to``
     -> enrollment ``opened_at``; ``completed_from``/``completed_to`` ->
     enrollment ``verified_at``; ``authorized_from``/``authorized_to`` ->
     internal-service case ``service_authorization_approval_starts_at``). Returns
-    (qs, changed) where ``changed`` signals the caller to ``.distinct()``."""
+    (qs, changed) where ``changed`` signals the caller to ``.distinct()``.
+
+    ``skip_enrollment_bounds`` omits the enrollment-level requested/completed
+    windows -- used when a "verified by" filter already binds those bounds to the
+    SAME enrollment the agent verified (so they aren't re-applied as a separate,
+    possibly-different, enrollment join). The case-based bounds (case-created /
+    authorized) still apply, since they're on the internal-service case."""
     changed = False
     case_from, case_to = _parse_date(params.get("case_from")), _parse_date(params.get("case_to"))
     if case_from or case_to:
         qs = apply_case_created_date_filter(qs, case_from, case_to)
         # Exists-based, so no distinct is required for this bound alone.
-    req_from, req_to = _parse_date(params.get("requested_from")), _parse_date(params.get("requested_to"))
-    if req_from or req_to:
-        qs = apply_enrollment_date_filter(qs, "opened_at", req_from, req_to)
-        changed = True
-    comp_from, comp_to = _parse_date(params.get("completed_from")), _parse_date(params.get("completed_to"))
-    if comp_from or comp_to:
-        qs = apply_enrollment_date_filter(qs, "verified_at", comp_from, comp_to)
-        changed = True
+    if not skip_enrollment_bounds:
+        req_from, req_to = _parse_date(params.get("requested_from")), _parse_date(params.get("requested_to"))
+        if req_from or req_to:
+            qs = apply_enrollment_date_filter(qs, "opened_at", req_from, req_to)
+            changed = True
+        comp_from, comp_to = _parse_date(params.get("completed_from")), _parse_date(params.get("completed_to"))
+        if comp_from or comp_to:
+            qs = apply_enrollment_date_filter(qs, "verified_at", comp_from, comp_to)
+            changed = True
     auth_from, auth_to = _parse_date(params.get("authorized_from")), _parse_date(params.get("authorized_to"))
     if auth_from or auth_to:
         qs = apply_authorization_date_filter(qs, auth_from, auth_to)
@@ -1557,12 +1564,34 @@ class MembersListView(PortalGenericAPIView):
         # enrollment would drag in dependents who carry a blank / different
         # verifier. Both conditions are in one .filter() so they bind to the SAME
         # enrollment row; the trailing .distinct() dedupes the join.
+        # When combined with the Verification-page date window (period /
+        # requested / completed), the date bounds are ANDed onto the SAME
+        # enrollment the agent verified -- so the result is "verifications this
+        # agent completed within the window", not a member who merely has some
+        # OTHER enrollment in the window. Requested -> opened_at, completed ->
+        # verified_at, period -> opened_at, all on the verifier's own enrollment.
         verified_by_val = (params.get("verified_by") or "").strip()
         if verified_by_val:
-            qs = qs.filter(
+            enr_q = (
                 Q(enrollments__verified_by_id=verified_by_val)
                 & ~Q(enrollments__stage=EnrollmentStage.DISREGARDED)
             )
+            rng = period_date_range(params.get("period"))
+            if rng:
+                enr_q &= Q(enrollments__opened_at__date__gte=rng[0]) & Q(
+                    enrollments__opened_at__date__lte=rng[1]
+                )
+            vreq_from, vreq_to = _parse_date(params.get("requested_from")), _parse_date(params.get("requested_to"))
+            if vreq_from:
+                enr_q &= Q(enrollments__opened_at__date__gte=vreq_from)
+            if vreq_to:
+                enr_q &= Q(enrollments__opened_at__date__lte=vreq_to)
+            vcomp_from, vcomp_to = _parse_date(params.get("completed_from")), _parse_date(params.get("completed_to"))
+            if vcomp_from:
+                enr_q &= Q(enrollments__verified_at__date__gte=vcomp_from)
+            if vcomp_to:
+                enr_q &= Q(enrollments__verified_at__date__lte=vcomp_to)
+            qs = qs.filter(enr_q)
 
         # Created-date range filter (Members page): filters on the date the
         # member's INTERNAL-SERVICE case was created (its ``date_opened``) --
@@ -1601,12 +1630,21 @@ class MembersListView(PortalGenericAPIView):
             qs = qs.filter(case_closed_q)
 
         # Date-period filter (Verification page dropdown): narrow to households
-        # whose enrollment record was OPENED within the selected window.
-        qs = apply_period_filter(qs, params.get("period"))
+        # whose enrollment record was OPENED within the selected window. Skipped
+        # when a "verified by" filter is active -- the period window is already
+        # bound to the verifier's own enrollment above (so it can't match a
+        # different enrollment).
+        if not verified_by_val:
+            qs = apply_period_filter(qs, params.get("period"))
 
         # Verification page requested/completed date-range filters (from/to on
-        # the enrollment's opened_at / verified_at respectively).
-        qs, _ = apply_verification_date_filters(qs, params)
+        # the enrollment's opened_at / verified_at respectively). The
+        # enrollment-level bounds are skipped when "verified by" is active (they
+        # were folded onto the verifier's enrollment above); the case-based
+        # bounds (case-created / authorized) still apply.
+        qs, _ = apply_verification_date_filters(
+            qs, params, skip_enrollment_bounds=bool(verified_by_val)
+        )
 
         return qs.distinct()
 

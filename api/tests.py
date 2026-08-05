@@ -5011,63 +5011,105 @@ class DashboardServingClientIdsTests(TestCase):
     insurance/social-coverage watchlist. Uses all-time (start=None), a live
     snapshot over every member profile."""
 
-    def _member(self, *, status=None, stage=None):
+    def _member(self, *, status=None, stage=None, case_status=None, auth=None,
+                lifecycle=None, elig_paused=False):
         from .models import (
-            Client, EnrollmentStage, EnrollmentVerification, Household,
-            HouseholdMember, MemberDietaryProfile, MemberStatus,
+            Case, CaseStatus, CaseType, Client, EnrollmentStage,
+            EnrollmentVerification, Household, HouseholdMember,
+            MemberDietaryProfile, MemberStatus, ServiceAuthorizationStatus,
         )
 
         client = Client.objects.create(
             client_id=uuid.uuid4(), first_name="Dash", last_name="Board",
+            **({"lifecycle_stage": lifecycle} if lifecycle else {}),
         )
         hh = Household.objects.create(name="HH")
         HouseholdMember.objects.create(household=hh, client=client, is_primary=True)
+        # Every dashboard serving/watchlist reason is gated to the member's
+        # GOVERNING internal-service case. Give them one -- APPROVED + OPEN by
+        # default (blank/never_requested never govern), pass case_status/auth to
+        # vary it.
+        case = Case.objects.create(
+            case_id=uuid.uuid4(), client=client, case_type=CaseType.INTERNAL_SERVICE,
+            case_status=case_status or CaseStatus.OPEN,
+            service_authorization_status=auth or ServiceAuthorizationStatus.APPROVED,
+            program_name="Medically Tailored Meals",
+        )
         enr = EnrollmentVerification.objects.create(
-            client=client, household=hh,
+            client=client, household=hh, case=case,
             stage=stage or EnrollmentStage.KITCHEN_ASSIGNMENT,
         )
         MemberDietaryProfile.objects.create(
             enrollment=enr, client=client, menu_type="Standard",
             status=status or MemberStatus.ACTIVE,
+            eligibility_paused=elig_paused,
         )
         return client
 
-    def test_services_paused_covers_member_paused_and_household_on_hold(self):
-        from .models import EnrollmentStage, MemberStatus
+    def test_programs_on_hold_and_members_paused_split(self):
+        # On Hold (governing enrollment ON_HOLD, Eligible) vs Members Paused,
+        # itself split by who paused: agent (manual) vs eligibility (auto).
+        from .models import (
+            CaseStatus, ClientStage, EnrollmentStage, MemberStatus,
+        )
         from .portal.views_dashboard import serving_client_ids
 
-        paused = self._member(
-            status=MemberStatus.PAUSED, stage=EnrollmentStage.SERVICE_ACTIVE
+        # Paused by an AGENT (manual) on an open program.
+        agent_paused = self._member(
+            status=MemberStatus.PAUSED, stage=EnrollmentStage.SERVICE_ACTIVE,
+        )
+        # Paused by ELIGIBILITY (auto) -- these are typically on the Ineligible
+        # off-ramp, and must STILL be counted (no Eligible filter for paused).
+        elig_paused = self._member(
+            status=MemberStatus.PAUSED, stage=EnrollmentStage.SERVICE_ACTIVE,
+            elig_paused=True, lifecycle=ClientStage.INELIGIBLE,
+        )
+        # Paused but NO open internal-service case -> excluded from both.
+        paused_closed = self._member(
+            status=MemberStatus.PAUSED, stage=EnrollmentStage.SERVICE_ACTIVE,
+            case_status=CaseStatus.CLOSED,
         )
         on_hold = self._member(stage=EnrollmentStage.ON_HOLD)  # status Active
-        active = self._member()
-        # Out-of-Range members of an on-hold household surface under their own
-        # reason, so they must NOT also be counted here (no double counting).
-        oor_on_hold = self._member(
-            status=MemberStatus.OUT_OF_RANGE, stage=EnrollmentStage.ON_HOLD
+        on_hold_inelig = self._member(
+            stage=EnrollmentStage.ON_HOLD, lifecycle=ClientStage.INELIGIBLE
         )
+        active = self._member()
 
-        ids = serving_client_ids("services_paused", start=None, end=None)
-        self.assertIn(paused.client_id, ids)
-        self.assertIn(on_hold.client_id, ids)
-        self.assertNotIn(active.client_id, ids)
-        self.assertNotIn(oor_on_hold.client_id, ids)
+        on_hold_ids = serving_client_ids("programs_on_hold", start=None, end=None)
+        agent_ids = serving_client_ids("members_paused_agent", start=None, end=None)
+        elig_ids = serving_client_ids("members_paused_eligibility", start=None, end=None)
 
-    def test_no_insurance_clears_when_active_plan_added(self):
-        from .models import Insurance, InsurancePlanType, RecordStatus
+        # On Hold: eligible governing-on-hold programs only.
+        self.assertIn(on_hold.client_id, on_hold_ids)
+        self.assertNotIn(on_hold_inelig.client_id, on_hold_ids)  # must be Eligible
+        # Paused split: agent vs eligibility, each in its own bucket only.
+        self.assertIn(agent_paused.client_id, agent_ids)
+        self.assertNotIn(agent_paused.client_id, elig_ids)
+        self.assertIn(elig_paused.client_id, elig_ids)
+        self.assertNotIn(elig_paused.client_id, agent_ids)
+        # No open internal-service case -> not counted as paused.
+        self.assertNotIn(paused_closed.client_id, agent_ids | elig_ids)
+        # A plain active member is in none.
+        self.assertNotIn(active.client_id, on_hold_ids | agent_ids | elig_ids)
+
+    def test_closed_governing_case_excludes_from_reasons(self):
+        # Every serving/watchlist reason is gated to an OPEN governing case: a
+        # member whose governing internal-service case is CLOSED must not be
+        # flagged (they're no longer being served).
+        from .models import CaseStatus, MemberStatus
         from .portal.views_dashboard import serving_client_ids
 
-        c = self._member()
-        self.assertIn(
-            c.client_id, serving_client_ids("no_insurance", start=None, end=None)
+        open_m = self._member(status=MemberStatus.OUT_OF_ORBIT)
+        closed_m = self._member(
+            status=MemberStatus.OUT_OF_ORBIT, case_status=CaseStatus.CLOSED
         )
-        Insurance.objects.create(
-            client=c, plan_type=InsurancePlanType.MEDICAID,
-            status=RecordStatus.ACTIVE,
-        )
-        self.assertNotIn(
-            c.client_id, serving_client_ids("no_insurance", start=None, end=None)
-        )
+        oob = serving_client_ids("out_of_orbit", start=None, end=None)
+        self.assertIn(open_m.client_id, oob)
+        self.assertNotIn(closed_m.client_id, oob)
+        # Same gate on a watchlist reason.
+        social = serving_client_ids("no_social_coverage", start=None, end=None)
+        self.assertIn(open_m.client_id, social)
+        self.assertNotIn(closed_m.client_id, social)
 
     def test_no_social_coverage_clears_when_enrolled_coverage_added(self):
         from .models import SocialCareCoverage, SocialCareCoverageStatus
@@ -12232,3 +12274,210 @@ class FixCaselessTwoServingCompetingTest(TestCase):
         a.refresh_from_db(); b.refresh_from_db()
         self.assertIsNone(a.case_id)
         self.assertIsNone(b.case_id)
+
+
+class CaselessCrossClientHolderTest(TestCase):
+    """When the governing case is held by a DIFFERENT client's enrollment, both
+    the command and the reconcile skip it (no bind, no IntegrityError)."""
+
+    def _setup(self):
+        from .models import (
+            Case, CaseStatus, CaseType, Client, EnrollmentStage,
+            EnrollmentVerification,
+        )
+        c = Client.objects.create(client_id=str(uuid.uuid4()), first_name="Serv", last_name="Ing")
+        other = Client.objects.create(client_id=str(uuid.uuid4()), first_name="Oth", last_name="Er")
+        case = Case.objects.create(
+            case_id=uuid.uuid4(), client=c, case_type=CaseType.INTERNAL_SERVICE,
+            case_status=CaseStatus.OPEN, program_name="Medically Tailored Meals",
+        )
+        serv = EnrollmentVerification.objects.create(client=c, stage=EnrollmentStage.SERVICE_ACTIVE, case=None)
+        # A DIFFERENT client's pending enrollment holds c's case (cross-client mislink).
+        stray = EnrollmentVerification.objects.create(client=other, stage=EnrollmentStage.PENDING_VERIFICATION, case=case)
+        return c, serv, stray
+
+    def test_command_skips_cross_client(self):
+        from io import StringIO
+
+        from django.core.management import call_command
+
+        c, serv, stray = self._setup()
+        call_command("fix_caseless_serving_enrollments", "--apply", "--client", str(c.client_id), stdout=StringIO())
+        serv.refresh_from_db(); stray.refresh_from_db()
+        self.assertIsNone(serv.case_id)                      # not bound
+        self.assertEqual(stray.stage, "pending_verification")  # untouched
+
+    def test_reconcile_skips_cross_client_without_error(self):
+        from .services.lifecycle import reconcile_internal_service_authorization
+
+        c, serv, stray = self._setup()
+        reconcile_internal_service_authorization(c)  # must not raise
+        serv.refresh_from_db(); stray.refresh_from_db()
+        self.assertIsNone(serv.case_id)
+        self.assertEqual(stray.stage, "pending_verification")
+
+
+class VerificationVerifiedByDateRangeTest(TestCase):
+    """The 'verified by' filter binds to the SAME enrollment as the verification
+    date window (so it means 'verifications this agent completed in the window',
+    not a member who merely has some other enrollment in the window)."""
+
+    def _api(self):
+        from rest_framework.test import APIClient
+        from rest_framework_simplejwt.tokens import AccessToken
+
+        from .models import Agent
+        a = Agent.objects.create(name="Mgr", agent_code="909", group="Management")
+        acc = AccessToken()
+        acc["agent_id"] = str(a.id); acc["agent_code"] = a.agent_code
+        acc["agent_name"] = a.name; acc["agent_group"] = a.group
+        api = APIClient(); api.credentials(HTTP_AUTHORIZATION=f"Bearer {acc}")
+        return api
+
+    def _ids(self, resp):
+        out = set()
+        for g in resp.json()["results"]:
+            out.add(g["primary"]["id"])
+            out.update(m["id"] for m in g.get("members", []))
+        return out
+
+    def test_verified_by_binds_to_same_enrollment(self):
+        import datetime
+
+        from .models import (
+            Agent, Case, CaseStatus, CaseType, Client, EnrollmentStage,
+            EnrollmentVerification, Household, HouseholdMember,
+        )
+
+        X = Agent.objects.create(name="Xavier V", agent_code="800", group="Verifiers", status="Active")
+        Y = Agent.objects.create(name="Yolanda V", agent_code="801", group="Verifiers", status="Active")
+        c = Client.objects.create(client_id=str(uuid.uuid4()), first_name="Vee", last_name="Bee")
+        hh = Household.objects.create(name="HH")
+        HouseholdMember.objects.create(household=hh, client=c, is_primary=True)
+        # scope=verification requires the primary to hold an internal-service case.
+        Case.objects.create(
+            case_id=uuid.uuid4(), client=c, case_type=CaseType.INTERNAL_SERVICE,
+            case_status=CaseStatus.OPEN, program_name="Medically Tailored Meals",
+        )
+        utc = datetime.timezone.utc
+        # X verified this member in JANUARY.
+        EnrollmentVerification.objects.create(
+            client=c, household=hh, stage=EnrollmentStage.VERIFIED, verified_by=X,
+            opened_at=datetime.datetime(2026, 1, 5, tzinfo=utc),
+            verified_at=datetime.datetime(2026, 1, 10, tzinfo=utc),
+        )
+        api = self._api()
+        cid = str(c.client_id)
+
+        base = f"/api/portal/members/?scope=verification&verified_by={X.id}"
+        self.assertIn(cid, self._ids(api.get(base)))                                   # X's member
+        self.assertIn(cid, self._ids(api.get(base + "&completed_from=2026-01-01&completed_to=2026-01-31")))
+        self.assertNotIn(cid, self._ids(api.get(base + "&completed_from=2026-02-01&completed_to=2026-02-28")))
+
+        # A LATER enrollment verified by SOMEONE ELSE in February must NOT make the
+        # member match "verified_by=X within February" (same-enrollment binding).
+        EnrollmentVerification.objects.create(
+            client=c, household=hh, stage=EnrollmentStage.VERIFIED, verified_by=Y,
+            opened_at=datetime.datetime(2026, 2, 10, tzinfo=utc),
+            verified_at=datetime.datetime(2026, 2, 15, tzinfo=utc),
+        )
+        self.assertNotIn(cid, self._ids(api.get(base + "&completed_from=2026-02-01&completed_to=2026-02-28")))
+        self.assertIn(cid, self._ids(api.get(base + "&completed_from=2026-01-01&completed_to=2026-01-31")))
+
+
+class GoverningCaseExcludesUnauthorizedTest(TestCase):
+    """A blank or never_requested internal-service case can never be a governing
+    case (dashboard governing_internal_case_ids)."""
+
+    def _case(self, auth):
+        from .models import Case, CaseStatus, CaseType, Client
+        c = Client.objects.create(client_id=uuid.uuid4(), first_name="G", last_name="C")
+        return c, Case.objects.create(
+            case_id=uuid.uuid4(), client=c, case_type=CaseType.INTERNAL_SERVICE,
+            case_status=CaseStatus.OPEN, service_authorization_status=auth,
+            program_name="Medically Tailored Meals",
+        )
+
+    def test_blank_and_never_requested_never_govern(self):
+        from .models import ServiceAuthorizationStatus
+        from .portal.views_dashboard import governing_internal_case_ids
+
+        _, approved = self._case(ServiceAuthorizationStatus.APPROVED)
+        _, denied = self._case(ServiceAuthorizationStatus.DENIED)
+        _, blank = self._case("")
+        _, never = self._case(ServiceAuthorizationStatus.NEVER_REQUESTED)
+
+        gov = governing_internal_case_ids()
+        self.assertIn(approved.case_id, gov)
+        self.assertIn(denied.case_id, gov)          # denied still governs
+        self.assertNotIn(blank.case_id, gov)        # blank never governs
+        self.assertNotIn(never.case_id, gov)        # never_requested never governs
+
+
+class CSMemberStatusTest(TestCase):
+    """cs_member_status classifies each member into exactly ONE tier, priority
+    order (first match wins, no double-counting)."""
+
+    def _m(self, *, status, stage, auth, kitchen=False, weekdays=None,
+           verified=False, menu="Standard", medicaid=False, social=False):
+        from django.utils import timezone
+        from .models import (
+            Case, CaseStatus, CaseType, Client, EnrollmentStage,
+            EnrollmentVerification, Household, HouseholdMember, Insurance,
+            InsurancePlanType, Kitchen, KitchenStatus, MemberDietaryProfile,
+            RecordStatus, SocialCareCoverage, SocialCareCoverageStatus,
+        )
+        c = Client.objects.create(client_id=str(uuid.uuid4()), first_name="M", last_name="S")
+        hh = Household.objects.create(name="HH")
+        HouseholdMember.objects.create(household=hh, client=c, is_primary=True)
+        case = Case.objects.create(
+            case_id=uuid.uuid4(), client=c, case_type=CaseType.INTERNAL_SERVICE,
+            case_status=CaseStatus.OPEN, service_authorization_status=auth,
+            program_name="Medically Tailored Meals",
+        )
+        k = Kitchen.objects.create(name="K", status=KitchenStatus.ACTIVE) if kitchen else None
+        enr = EnrollmentVerification.objects.create(
+            client=c, household=hh, case=case, stage=stage, kitchen=k,
+            delivery_weekdays=weekdays or [],
+            verified_at=timezone.now() if verified else None,
+        )
+        MemberDietaryProfile.objects.create(
+            enrollment=enr, client=c, menu_type=menu, status=status,
+        )
+        if medicaid:
+            Insurance.objects.create(client=c, plan_type=InsurancePlanType.MEDICAID, status=RecordStatus.ACTIVE)
+        if social:
+            SocialCareCoverage.objects.create(client=c, status=SocialCareCoverageStatus.ENROLLED)
+        return c
+
+    def test_priority_classification(self):
+        from .models import (
+            EnrollmentStage, MemberStatus, ServiceAuthorizationStatus as SAS,
+        )
+        from .portal.views_dashboard import cs_member_status
+
+        self._m(status=MemberStatus.ACTIVE, stage=EnrollmentStage.SERVICE_ACTIVE,
+                auth=SAS.APPROVED, kitchen=True, weekdays=["mon"], verified=True,
+                medicaid=True, social=True)                                  # receiving
+        self._m(status=MemberStatus.ACTIVE, stage=EnrollmentStage.VERIFIED,
+                auth=SAS.PENDING, verified=True)                             # pending_meals
+        self._m(status=MemberStatus.OUT_OF_RANGE, stage=EnrollmentStage.SERVICE_ACTIVE,
+                auth=SAS.APPROVED)                                           # out_of_range
+        self._m(status=MemberStatus.ACTIVE, stage=EnrollmentStage.ON_HOLD,
+                auth=SAS.DENIED)                                            # rejected (beats paused)
+        self._m(status=MemberStatus.PAUSED, stage=EnrollmentStage.SERVICE_ACTIVE,
+                auth=SAS.APPROVED, medicaid=True, social=True)               # services_paused
+        self._m(status=MemberStatus.ACTIVE, stage=EnrollmentStage.SERVICE_ACTIVE,
+                auth=SAS.APPROVED, verified=True)                            # no_coverage
+        self._m(status=MemberStatus.ACTIVE, stage=EnrollmentStage.KITCHEN_ASSIGNMENT,
+                auth=SAS.APPROVED, verified=False, medicaid=True, social=True)  # requires_verification
+        self._m(status=MemberStatus.ACTIVE, stage=EnrollmentStage.KITCHEN_ASSIGNMENT,
+                auth=SAS.APPROVED, verified=True, menu="", medicaid=True, social=True)  # no_menu
+
+        tier_clients, _tags = cs_member_status(None, None)
+        ms = {t: len(s) for t, s in tier_clients.items()}
+        self.assertEqual(ms, {
+            "receiving_meals": 1, "pending_meals": 1, "out_of_range": 1,
+            "rejected": 1, "services_paused": 1, "no_coverage": 1,
+            "requires_verification": 1, "no_menu": 1,
+        })
