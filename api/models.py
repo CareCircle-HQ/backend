@@ -1833,17 +1833,24 @@ class MemberStatus(models.TextChoices):
     # schedules and Purchase Orders. Unlike a pause this is an end state (their
     # service ended), not a temporary hold.
     INACTIVE = "inactive", "Inactive"
+    # A Nutritionist reviewed the member and denied them (requires a reason note).
+    # Like OUT_OF_ORBIT, a denied member is excluded from all delivery schedules
+    # and Purchase Orders. Set per member from the Nutritionist review drawer;
+    # independent of the rest of the household.
+    NUTRITIONIST_DENIED = "nutritionist_denied", "Nutritionist Denied"
 
 
 # Member statuses that exclude a member from every delivery schedule / order /
 # Purchase Order: OUT_OF_ORBIT (meal rule can't fulfill them), OUT_OF_RANGE
-# (delivery/primary ZIP outside coverage), PAUSED (agent manually paused them)
-# and INACTIVE (service ended). Only ACTIVE members receive deliveries.
+# (delivery/primary ZIP outside coverage), PAUSED (agent manually paused them),
+# INACTIVE (service ended) and NUTRITIONIST_DENIED (a Nutritionist denied them).
+# Only ACTIVE members receive deliveries.
 SERVICE_EXCLUDED_MEMBER_STATUSES = (
     MemberStatus.OUT_OF_ORBIT,
     MemberStatus.OUT_OF_RANGE,
     MemberStatus.PAUSED,
     MemberStatus.INACTIVE,
+    MemberStatus.NUTRITIONIST_DENIED,
 )
 
 # Enrollment stages that exclude a whole household from Purchase Order / delivery
@@ -3412,6 +3419,8 @@ class TimelineEventType(models.TextChoices):
     DENIED = "denied", "Denied"
     # Nutritionist legal sign-off (between Verified and Kitchen Assignment).
     NUTRITIONIST_APPROVED = "nutritionist_approved", "Nutritionist Approved"
+    # A Nutritionist denied an individual member (per-member off-ramp).
+    NUTRITIONIST_DENIED = "nutritionist_denied", "Nutritionist Denied"
     # --- Service-delivery lifecycle: one granular type per event. ---
     KITCHEN_ASSIGNED = "kitchen_assigned", "Kitchen Assigned"
     SERVICE_ACTIVATED = "service_activated", "Service Activated"

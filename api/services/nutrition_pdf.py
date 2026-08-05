@@ -49,6 +49,8 @@ def nutrition_review_context(enrollment):
     for p in profiles:
         conditions = list(p.conditions or [])
         members.append({
+            "client_id": str(p.client_id) if p.client_id else "",
+            "status": p.status,
             "name": p.member_name or _full_name(p.client),
             "meal_type": p.menu_type or "",
             "conditions": conditions,
