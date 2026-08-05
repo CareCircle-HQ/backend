@@ -4657,7 +4657,7 @@ class MemberVerificationCreateView(PortalAPIView):
                     m.get("months_postpartum")
                     if "Postpartum" in (m.get("conditions") or []) else None
                 ),
-                medications=m.get("medications", ""),
+                medications=m.get("medications") or [],
                 weight=m.get("weight", ""),
                 height=m.get("height", ""),
                 meal_category=m.get("meal_category", ""),

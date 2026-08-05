@@ -2231,8 +2231,10 @@ class VerificationMemberInputSerializer(serializers.Serializer):
     months_postpartum = serializers.IntegerField(
         required=False, allow_null=True, min_value=0
     )
-    # Clinical intake for the Nutritionist review.
-    medications = serializers.CharField(required=False, allow_blank=True)
+    # Clinical intake for the Nutritionist review. Medications is a multi-select.
+    medications = serializers.ListField(
+        child=serializers.CharField(), required=False, default=list
+    )
     weight = serializers.CharField(required=False, allow_blank=True, max_length=50)
     height = serializers.CharField(required=False, allow_blank=True, max_length=50)
     meal_category = serializers.CharField(required=False, allow_blank=True)

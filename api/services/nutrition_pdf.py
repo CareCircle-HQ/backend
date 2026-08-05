@@ -52,7 +52,7 @@ def nutrition_review_context(enrollment):
             "name": p.member_name or _full_name(p.client),
             "meal_type": p.menu_type or "",
             "conditions": conditions,
-            "medications": p.medications or "",
+            "medications": list(p.medications or []),
             "weight": p.weight or "",
             "height": p.height or "",
             "weeks_gestation": p.weeks_gestation if "Pregnant" in conditions else None,
@@ -138,7 +138,7 @@ def render_nutrition_pdf(enrollment, *, agent, signature_image="", signed_at=Non
         rows = [
             ("Meal Type", m["meal_type"]),
             ("Medical Conditions", ", ".join(m["conditions"]) or "No Restriction"),
-            ("Medications", m["medications"]),
+            ("Medications", ", ".join(m["medications"])),
             ("Weight", m["weight"]), ("Height", m["height"]),
         ]
         if m["weeks_gestation"] is not None:

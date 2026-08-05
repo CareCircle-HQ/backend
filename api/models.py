@@ -2156,9 +2156,10 @@ class MemberDietaryProfile(models.Model):
     months_postpartum = models.PositiveSmallIntegerField(  # when "Postpartum"
         null=True, blank=True
     )
-    # Clinical intake captured at verification, shown to the Nutritionist. Free
-    # text so agents can enter units / notes (e.g. "180 lb", "5 ft 10 in").
-    medications = models.TextField(blank=True)
+    # Clinical intake captured at verification, shown to the Nutritionist.
+    # Medications is a multi-select (list of labels, see MEDICATION_OPTIONS);
+    # weight/height are free text so agents can add units (e.g. "180 lb").
+    medications = models.JSONField(default=list, blank=True)
     weight = models.CharField(max_length=50, blank=True)
     height = models.CharField(max_length=50, blank=True)
     meal_category = models.CharField(
