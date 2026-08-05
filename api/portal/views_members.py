@@ -4351,6 +4351,28 @@ class NutritionistPendingListView(PortalAPIView):
             .prefetch_related("member_profiles")
             .order_by("verified_at")
         )
+        # Omni-search across the primary + household members: name, client ID,
+        # Medicaid / insurance member ID.
+        search = (request.query_params.get("search") or "").strip()
+        if search:
+            cond = (
+                Q(client__first_name__icontains=search)
+                | Q(client__last_name__icontains=search)
+                | Q(client__insurances__external_member_id__icontains=search)
+                | Q(member_profiles__client__first_name__icontains=search)
+                | Q(member_profiles__client__last_name__icontains=search)
+                | Q(member_profiles__member_name__icontains=search)
+                | Q(member_profiles__client__insurances__external_member_id__icontains=search)
+            )
+            parts = search.split()
+            if len(parts) >= 2:
+                cond |= Q(client__first_name__icontains=parts[0]) & Q(client__last_name__icontains=parts[-1])
+            try:
+                cid = uuid.UUID(search)
+                cond |= Q(client__client_id=cid) | Q(member_profiles__client__client_id=cid)
+            except (ValueError, AttributeError, TypeError):
+                pass
+            qs = qs.filter(cond).distinct()
         # One group per household (enrollment), with its members -- mirrors the
         # Members page grouping. Clicking any member opens the household review.
         results = []
