@@ -53,6 +53,7 @@ from ..models import (
     MemberDietaryProfile,
     KitchenProductType,
     MemberStatus,
+    SERVICE_EXCLUDED_MEMBER_STATUSES,
     MenuType,
     Note,
     MemberWarning,
@@ -4618,48 +4619,71 @@ class MemberNutritionistHoldView(PortalAPIView):
 
 
 class MemberNutritionistDenyMemberView(PortalAPIView):
-    """POST /members/<id>/nutritionist-deny-member/: a Nutritionist denies an
+    """POST /members/<id>/nutritionist-deny-member/: a Nutritionist PAUSES an
     INDIVIDUAL household member (Nutritionist role only). Sets that member's
-    status to Nutritionist Denied -- excluded from all delivery schedules / POs,
+    status to Nutritionist Paused -- excluded from all delivery schedules / POs,
     like Out of Orbit -- and records a reason note + a per-member timeline event.
-    Independent of the rest of the household (does not hold the household)."""
+    When this pauses the LAST still-active member, the whole household is placed
+    On Hold with the same reason."""
 
     @transaction.atomic
     def post(self, request, client_id):
         agent = current_agent(request)
         if not (agent and (agent.group in ("Nutritionist", "Management") or getattr(agent, "is_manager", False))):
-            return Response({"detail": "Only a Nutritionist can deny a member."}, status=http.HTTP_403_FORBIDDEN)
+            return Response({"detail": "Only a Nutritionist can pause a member."}, status=http.HTTP_403_FORBIDDEN)
         client = get_object_or_404(Client, pk=client_id)
         member_id = request.data.get("member_id") or ""
         reason = (request.data.get("reason") or "").strip()
         if not reason:
-            return Response({"reason": "A reason is required to deny a member."}, status=http.HTTP_400_BAD_REQUEST)
+            return Response({"reason": "A reason is required to pause a member."}, status=http.HTTP_400_BAD_REQUEST)
         enr = s.active_enrollment(client)
         if enr is None:
             return Response({"error": "This household has no active enrollment."}, status=http.HTTP_404_NOT_FOUND)
         mv = enr.member_profiles.filter(client_id=member_id).first() if member_id else None
         if mv is None:
             return Response({"error": "Member not found in this household."}, status=http.HTTP_400_BAD_REQUEST)
-        if mv.status == MemberStatus.NUTRITIONIST_DENIED:
-            return Response({"error": "Member is already Nutritionist Denied."}, status=http.HTTP_400_BAD_REQUEST)
-        mv.status = MemberStatus.NUTRITIONIST_DENIED
+        if mv.status == MemberStatus.NUTRITIONIST_PAUSED:
+            return Response({"error": "Member is already Nutritionist Paused."}, status=http.HTTP_400_BAD_REQUEST)
+        mv.status = MemberStatus.NUTRITIONIST_PAUSED
         mv.kitchen_meal_type = ""
         mv.kitchen_food_notes = ""
         mv.save(update_fields=["status", "kitchen_meal_type", "kitchen_food_notes"])
+        from ..services.timeline import emit_timeline_event
         if mv.client_id:
-            from ..services.timeline import emit_timeline_event
             emit_timeline_event(
-                client=mv.client, event_type=TimelineEventType.NUTRITIONIST_DENIED,
-                occurred_at=timezone.now(), title="Nutritionist Denied",
-                subtitle=reason, badge_text="Denied", badge_tone=TimelineBadgeTone.DANGER,
+                client=mv.client, event_type=TimelineEventType.NUTRITIONIST_PAUSED,
+                occurred_at=timezone.now(), title="Nutritionist Paused",
+                subtitle=reason, badge_text="Paused", badge_tone=TimelineBadgeTone.DANGER,
                 actor=agent.name or "", enrollment=enr, metadata={"reason": reason},
             )
             Note.objects.create(
                 client=mv.client, source=NoteSource.AGENT, author_name=agent.name or "",
-                body=f"Member denied by Nutritionist. Reason: {reason}",
+                body=f"Member paused by Nutritionist. Reason: {reason}",
             )
+
+        # If this paused the LAST still-active member, hold the whole household
+        # with the same reason (mirrors the manual Nutritionist hold).
+        held = False
+        remaining_active = enr.member_profiles.exclude(
+            status__in=SERVICE_EXCLUDED_MEMBER_STATUSES
+        ).exists()
+        if not remaining_active and EnrollmentStage(enr.stage) != EnrollmentStage.ON_HOLD:
+            try:
+                advance_enrollment(
+                    enr, EnrollmentStage.ON_HOLD,
+                    actor_label=agent.name or "Nutritionist",
+                    note=f"All members Nutritionist Paused. Reason: {reason}",
+                )
+                held = True
+                Note.objects.create(
+                    client=client, source=NoteSource.AGENT, author_name=agent.name or "",
+                    body=f"Household placed on hold (last member Nutritionist Paused). Reason: {reason}",
+                )
+            except InvalidTransition:
+                pass
         return Response({"ok": True, "client_id": str(client.client_id),
-                         "member_id": str(mv.client_id) if mv.client_id else ""})
+                         "member_id": str(mv.client_id) if mv.client_id else "",
+                         "household_held": held})
 
 
 class MemberVerificationCreateView(PortalAPIView):
