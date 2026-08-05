@@ -1565,15 +1565,26 @@ class UnapprovedActivePullBackTest(TestCase):
         )
 
     def _enrollment(self, client, stage):
-        from .models import EnrollmentVerification, Household, HouseholdMember
+        from .models import (
+            EnrollmentStage, EnrollmentVerification, Household, HouseholdMember,
+        )
 
         household = Household.objects.create(name="HH")
         HouseholdMember.objects.create(
             household=household, client=client, is_primary=True
         )
+        # An enrollment created already at/past Kitchen Assignment represents a
+        # household that has cleared the Nutritionist gate (grandfathered), so
+        # stamp the sign-off -- a pull-back + re-approval must still re-advance.
+        past_gate = stage in (
+            EnrollmentStage.KITCHEN_ASSIGNMENT,
+            EnrollmentStage.SERVICE_ACTIVE,
+            EnrollmentStage.SERVICE_COMPLETE,
+        )
         return EnrollmentVerification.objects.create(
             client=client, household=household, stage=stage,
             verified_at=timezone.now(),
+            nutritionist_approved_at=timezone.now() if past_gate else None,
         )
 
     def _save_case(self, client, case_id, auth_status):
@@ -1600,7 +1611,9 @@ class UnapprovedActivePullBackTest(TestCase):
         self._save_case(client, str(uuid.uuid4()), "pending")
         enr.refresh_from_db()
         self.assertEqual(enr.stage, EnrollmentStage.VERIFIED)
-        self.assertEqual(program_status(enr), ProgramStatus.WAITING_AUTHORIZATION)
+        # Grandfathered (nutritionist-approved), pending auth -> waiting on auth,
+        # surfaced as Nutritionist Approved.
+        self.assertEqual(program_status(enr), ProgramStatus.NUTRITIONIST_APPROVED)
 
     def test_never_requested_full_stops_like_denial(self):
         # A NEVER_REQUESTED authorization is treated exactly like a DENIAL: an
@@ -9275,12 +9288,14 @@ class ProgramStatusComputationTest(TestCase):
         enr = self._enrollment(EnrollmentStage.PENDING_VERIFICATION)
         self.assertEqual(program_status(enr), ProgramStatus.PENDING_VERIFICATION)
 
-    def test_verified_without_authorization_is_verified(self):
+    def test_verified_without_nutritionist_is_pending_nutritionist(self):
+        # A verified household not yet signed off by a Nutritionist sits at
+        # Pending Nutritionist (the gate between Verified and Kitchen Assignment).
         from .models import EnrollmentStage, ProgramStatus
         from .services.lifecycle import program_status
 
         enr = self._enrollment(EnrollmentStage.VERIFIED)
-        self.assertEqual(program_status(enr), ProgramStatus.VERIFIED)
+        self.assertEqual(program_status(enr), ProgramStatus.PENDING_NUTRITIONIST)
 
     def test_kitchen_assignment_without_kitchen_is_authorized(self):
         from .models import EnrollmentStage, ProgramStatus
@@ -12542,3 +12557,90 @@ class CSMemberStatusTest(TestCase):
             "rejected": 1, "services_paused": 1, "no_coverage": 1,
             "requires_verification": 1, "no_menu": 1,
         })
+
+
+class NutritionistGateTest(TestCase):
+    """The Nutritionist sign-off gate sits between Verified and Kitchen
+    Assignment: a verified household can't advance to kitchen (and thus service)
+    until a Nutritionist approves, regardless of the case authorization."""
+
+    def _enr(self, auth):
+        from django.utils import timezone
+        from .models import (
+            Case, CaseStatus, CaseType, Client, EnrollmentStage,
+            EnrollmentVerification, Household, HouseholdMember,
+        )
+        c = Client.objects.create(client_id=str(uuid.uuid4()), first_name="Nut", last_name="Ri")
+        hh = Household.objects.create(name="HH")
+        HouseholdMember.objects.create(household=hh, client=c, is_primary=True)
+        case = Case.objects.create(
+            case_id=uuid.uuid4(), client=c, case_type=CaseType.INTERNAL_SERVICE,
+            case_status=CaseStatus.OPEN, service_authorization_status=auth,
+            program_name="Medically Tailored Meals",
+        )
+        enr = EnrollmentVerification.objects.create(
+            client=c, household=hh, case=case, stage=EnrollmentStage.VERIFIED,
+            verified_at=timezone.now(),
+        )
+        return c, enr, case
+
+    def test_gate_blocks_advance_until_approved(self):
+        from .models import EnrollmentStage, ProgramStatus, ServiceAuthorizationStatus
+        from .services.lifecycle import program_status, reconcile_enrollment_authorization
+
+        _, enr, _ = self._enr(ServiceAuthorizationStatus.APPROVED)
+        reconcile_enrollment_authorization(enr)
+        enr.refresh_from_db()
+        # Approved auth alone does NOT advance -- nutritionist gate not satisfied.
+        self.assertEqual(enr.stage, EnrollmentStage.VERIFIED)
+        self.assertEqual(program_status(enr), ProgramStatus.PENDING_NUTRITIONIST)
+
+    def test_approve_advances_when_authorized(self):
+        from .models import Agent, EnrollmentStage, ServiceAuthorizationStatus
+        from .services.lifecycle import nutritionist_approve
+
+        agent = Agent.objects.create(name="Jane RD", agent_code="700", group="Nutritionist")
+        _, enr, _ = self._enr(ServiceAuthorizationStatus.APPROVED)
+        nutritionist_approve(enr, agent=agent, signature="Jane RD")
+        enr.refresh_from_db()
+        self.assertIsNotNone(enr.nutritionist_approved_at)
+        self.assertEqual(enr.nutritionist_signature, "Jane RD")
+        self.assertEqual(enr.stage, EnrollmentStage.KITCHEN_ASSIGNMENT)
+
+    def test_approve_waits_when_auth_pending(self):
+        from .models import Agent, EnrollmentStage, ProgramStatus, ServiceAuthorizationStatus
+        from .services.lifecycle import nutritionist_approve, program_status
+
+        agent = Agent.objects.create(name="Jane RD", agent_code="701", group="Nutritionist")
+        _, enr, _ = self._enr(ServiceAuthorizationStatus.PENDING)
+        nutritionist_approve(enr, agent=agent, signature="Jane RD")
+        enr.refresh_from_db()
+        self.assertEqual(enr.stage, EnrollmentStage.VERIFIED)
+        self.assertEqual(program_status(enr), ProgramStatus.NUTRITIONIST_APPROVED)
+
+    def _api(self, group):
+        from .models import Agent
+        agent = Agent.objects.create(name="A", agent_code=str(uuid.uuid4())[:8], group=group)
+        access = AccessToken()
+        access["agent_id"] = str(agent.id)
+        access["agent_code"] = agent.agent_code
+        access["agent_name"] = agent.name
+        access["agent_group"] = group
+        api = APIClient()
+        api.credentials(HTTP_AUTHORIZATION=f"Bearer {access}")
+        return api
+
+    def test_approve_endpoint_role_and_signature(self):
+        from .models import EnrollmentStage, ServiceAuthorizationStatus
+
+        c, enr, _ = self._enr(ServiceAuthorizationStatus.APPROVED)
+        url = f"/api/portal/members/{c.client_id}/nutritionist-approve/"
+        # Non-nutritionist is forbidden.
+        self.assertEqual(self._api("CS").post(url, {"signature": "X"}, format="json").status_code, 403)
+        # Nutritionist without a signature -> 400.
+        self.assertEqual(self._api("Nutritionist").post(url, {}, format="json").status_code, 400)
+        # Nutritionist with signature -> ok, advances (approved auth).
+        resp = self._api("Nutritionist").post(url, {"signature": "Jane RD"}, format="json")
+        self.assertEqual(resp.status_code, 200, resp.content)
+        enr.refresh_from_db()
+        self.assertEqual(enr.stage, EnrollmentStage.KITCHEN_ASSIGNMENT)

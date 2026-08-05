@@ -1091,16 +1091,23 @@ def program_status(enrollment):
             else ProgramStatus.AUTHORIZED
         )
     if stage == EnrollmentStage.VERIFIED:
+        # Nutritionist gate sits between Verified and Kitchen Assignment. Until a
+        # Nutritionist signs off, the household is Pending Nutritionist regardless
+        # of the authorization outcome.
+        if not enrollment.nutritionist_approved_at:
+            return ProgramStatus.PENDING_NUTRITIONIST
+        # Nutritionist-approved. An approved authorization advances the stage to
+        # Kitchen Assignment (reconcile), so at VERIFIED it only rests here while
+        # the authorization is still pending/denied/blank.
+        if auth == ServiceAuthorizationStatus.DENIED:
+            return ProgramStatus.DENIED
         if auth in (
             ServiceAuthorizationStatus.APPROVED,
             ServiceAuthorizationStatus.NOT_REQUIRED,
         ):
             return ProgramStatus.AUTHORIZED
-        if auth == ServiceAuthorizationStatus.DENIED:
-            return ProgramStatus.DENIED
-        if auth == ServiceAuthorizationStatus.PENDING:
-            return ProgramStatus.WAITING_AUTHORIZATION
-        return ProgramStatus.VERIFIED
+        # Pending / blank authorization: nutritionist done, waiting on auth.
+        return ProgramStatus.NUTRITIONIST_APPROVED
 
     return ProgramStatus.PENDING_VERIFICATION
 
@@ -1507,6 +1514,13 @@ def reconcile_enrollment_authorization(enrollment, *, actor=None, actor_label=""
         # The household stays Verified; the status is surfaced from the Case.
         return enrollment
 
+    # Nutritionist sign-off gate: a verified household may NOT advance to kitchen
+    # assignment (and thus into service / POs) until a Nutritionist has approved
+    # it, even when the case authorization is approved. It waits at Verified
+    # (Pending Nutritionist) until then.
+    if not enrollment.nutritionist_approved_at:
+        return enrollment
+
     if EnrollmentStage(enrollment.stage) == target:
         return enrollment
     try:
@@ -1516,6 +1530,58 @@ def reconcile_enrollment_authorization(enrollment, *, actor=None, actor_label=""
     except InvalidTransition:
         # Defensive: an illegal projection (e.g. terminal stage) is a no-op.
         return enrollment
+
+
+def nutritionist_approve(enrollment, *, agent, signature):
+    """Record a Nutritionist's legal sign-off on a VERIFIED enrollment (the
+    Pending Nutritionist gate), then let an approved authorization advance it to
+    Kitchen Assignment.
+
+    Captures the audit trail -- who / when / typed signature -- and emits a
+    timeline event. Idempotent: re-approving an already-approved enrollment is a
+    no-op. Returns the (possibly advanced) enrollment.
+    """
+    from api.models import TimelineEventType
+    from api.services.timeline import emit_timeline_event
+
+    if enrollment.nutritionist_approved_at:
+        return enrollment
+
+    now = timezone.now()
+    enrollment.nutritionist_approved_at = now
+    enrollment.nutritionist_approved_by = agent
+    enrollment.nutritionist_signature = (signature or "").strip()
+    enrollment.save(update_fields=[
+        "nutritionist_approved_at", "nutritionist_approved_by",
+        "nutritionist_signature",
+    ])
+
+    client = getattr(enrollment, "client", None)
+    if client is not None:
+        emit_timeline_event(
+            client=client,
+            event_type=TimelineEventType.NUTRITIONIST_APPROVED,
+            occurred_at=now,
+            title="Nutritionist Approved",
+            subtitle=(
+                f"Signed by {enrollment.nutritionist_signature}"
+                if enrollment.nutritionist_signature else ""
+            ),
+            actor=getattr(agent, "name", "") or "",
+            enrollment=enrollment,
+            case=enrollment.case,
+            metadata={"signature": enrollment.nutritionist_signature},
+        )
+
+    # An approved authorization can now advance the enrollment to kitchen
+    # assignment (the gate in reconcile_enrollment_authorization is satisfied).
+    # actor is a StageEvent User FK (agents aren't Users), so pass the name as a
+    # label only.
+    return reconcile_enrollment_authorization(
+        enrollment, actor=None,
+        actor_label=getattr(agent, "name", "") or "",
+        note="Nutritionist approved",
+    )
 
 
 # ---------------------------------------------------------------------------

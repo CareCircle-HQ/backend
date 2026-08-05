@@ -4326,6 +4326,88 @@ class MemberTicketsView(PortalAPIView):
         return Response(s.PortalTicketSerializer(qs, many=True).data)
 
 
+class NutritionistPendingListView(PortalAPIView):
+    """GET: households awaiting Nutritionist approval -- VERIFIED enrollments not
+    yet signed off (Pending Nutritionist). Visible to Nutritionist + Management."""
+
+    def get(self, request):
+        agent = current_agent(request)
+        allowed = bool(agent and (
+            agent.group in ("Nutritionist", "Management")
+            or getattr(agent, "is_manager", False)
+        ))
+        if not allowed:
+            return Response(
+                {"detail": "Nutritionist access required."},
+                status=http.HTTP_403_FORBIDDEN,
+            )
+        qs = (
+            EnrollmentVerification.objects
+            .filter(
+                stage=EnrollmentStage.VERIFIED,
+                nutritionist_approved_at__isnull=True,
+            )
+            .select_related("client", "case")
+            .order_by("verified_at")
+        )
+        results = []
+        for enr in qs:
+            c = enr.client
+            if c is None:
+                continue
+            case = enr.case
+            results.append({
+                "client_id": str(c.client_id),
+                "name": f"{c.first_name} {c.last_name}".strip() or str(c.client_id),
+                "program_name": enr.program_name or getattr(case, "program_name", "") or "",
+                "verified_at": enr.verified_at.isoformat() if enr.verified_at else None,
+                "authorization_status": getattr(case, "service_authorization_status", "") or "",
+            })
+        return Response({"count": len(results), "results": results})
+
+
+class MemberNutritionistApproveView(PortalAPIView):
+    """POST /members/<id>/nutritionist-approve/: a Nutritionist signs off on the
+    member's VERIFIED enrollment (the legal sign-off gate). Nutritionist role
+    ONLY. Requires a typed ``signature``; records who/when/signature as the audit
+    trail and lets an approved authorization advance the household to kitchen."""
+
+    @transaction.atomic
+    def post(self, request, client_id):
+        agent = current_agent(request)
+        if not (agent and agent.group == "Nutritionist"):
+            return Response(
+                {"detail": "Only a Nutritionist can approve."},
+                status=http.HTTP_403_FORBIDDEN,
+            )
+        client = get_object_or_404(Client, pk=client_id)
+        signature = (request.data.get("signature") or "").strip()
+        if not signature:
+            return Response(
+                {"signature": "A signature is required to approve."},
+                status=http.HTTP_400_BAD_REQUEST,
+            )
+        enr = (
+            EnrollmentVerification.objects
+            .filter(
+                client=client,
+                stage=EnrollmentStage.VERIFIED,
+                nutritionist_approved_at__isnull=True,
+            )
+            .order_by("-verified_at")
+            .first()
+        )
+        if enr is None:
+            return Response(
+                {"error": "No verified enrollment awaiting nutritionist "
+                          "approval for this member."},
+                status=http.HTTP_400_BAD_REQUEST,
+            )
+        from ..services.lifecycle import nutritionist_approve
+        nutritionist_approve(enr, agent=agent, signature=signature)
+        return Response({"ok": True, "client_id": str(client.client_id)})
+
+
 class MemberVerificationCreateView(PortalAPIView):
     """POST: create an EnrollmentVerification + MemberDietaryProfiles + delivery
     Address for a member (the 5-step wizard).

@@ -109,6 +109,12 @@ class ProgramStatus(models.TextChoices):
 
     PENDING_VERIFICATION = "pending_verification", "Pending Verification"
     VERIFIED = "verified", "Verified"
+    # Nutritionist review gate -- sits between Verified and Kitchen Assignment.
+    # A verified household waits here for a Nutritionist to sign off before it can
+    # advance to kitchen assignment (and thus into service / POs), regardless of
+    # the case authorization outcome.
+    PENDING_NUTRITIONIST = "pending_nutritionist", "Pending Nutritionist"
+    NUTRITIONIST_APPROVED = "nutritionist_approved", "Nutritionist Approved"
     WAITING_AUTHORIZATION = "waiting_authorization", "Waiting Authorization"
     AUTHORIZED = "authorized", "Authorized"
     DENIED = "denied", "Denied"
@@ -2012,6 +2018,18 @@ class EnrollmentVerification(models.Model):
         "Agent", on_delete=models.SET_NULL, null=True, blank=True,
         related_name="verified_enrollments",
     )
+    # Nutritionist sign-off gate. A verified household sits at Pending Nutritionist
+    # until a Nutritionist approves it here (a legal sign-off: the typed signature
+    # + who + when are the audit trail). Only then may an approved authorization
+    # advance the enrollment to Kitchen Assignment (see
+    # reconcile_enrollment_authorization). NULL == not yet approved.
+    nutritionist_approved_at = models.DateTimeField(null=True, blank=True, db_index=True)
+    nutritionist_approved_by = models.ForeignKey(
+        "Agent", on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="nutritionist_approved_enrollments",
+    )
+    # The Nutritionist's typed signature captured at approval (their full name).
+    nutritionist_signature = models.CharField(max_length=255, blank=True)
     # Short display code, e.g. "ENR-8754". Assigned on creation.
     code = models.CharField(max_length=20, blank=True, db_index=True)
     # Renewal cycle counter. Renewals reuse the SAME enrollment (re-run
@@ -2560,6 +2578,7 @@ class Agent(models.Model):
     AGENT_GROUPS = [
         ("Screeners", "Screeners"),
         ("Verifiers", "Verifiers"),
+        ("Nutritionist", "Nutritionist"),
         ("Logistics", "Logistics"),
         ("Management", "Management"),
         ("CS", "CS"),
@@ -3380,6 +3399,8 @@ class TimelineEventType(models.TextChoices):
     WAITING_AUTHORIZATION = "waiting_authorization", "Waiting Authorization"
     AUTHORIZED = "authorized", "Authorized"
     DENIED = "denied", "Denied"
+    # Nutritionist legal sign-off (between Verified and Kitchen Assignment).
+    NUTRITIONIST_APPROVED = "nutritionist_approved", "Nutritionist Approved"
     # --- Service-delivery lifecycle: one granular type per event. ---
     KITCHEN_ASSIGNED = "kitchen_assigned", "Kitchen Assigned"
     SERVICE_ACTIVATED = "service_activated", "Service Activated"
