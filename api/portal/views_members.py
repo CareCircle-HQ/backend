@@ -775,6 +775,37 @@ def governing_enrollment_stage():
     )
 
 
+def governing_enrollment_is_nutritionist_approved():
+    """1 when the client's GOVERNING enrollment has been Nutritionist-approved,
+    else 0 -- mirrors ``governing_enrollment_stage``'s selection. Returned as an
+    INT (not the nullable ``nutritionist_approved_at``) so Coalesce prefers the
+    OWN enrollment even when it's unapproved (a NULL datetime would make Coalesce
+    fall through to the household enrollment and mislabel the member)."""
+    def _latest(rel):
+        return Subquery(
+            EnrollmentVerification.objects
+            .filter(**rel)
+            .exclude(stage=EnrollmentStage.DISREGARDED)
+            .annotate(
+                _open=SQLCase(
+                    When(closed_at__isnull=True, then=Value(1)),
+                    default=Value(0), output_field=IntegerField(),
+                ),
+                _appr=SQLCase(
+                    When(nutritionist_approved_at__isnull=False, then=Value(1)),
+                    default=Value(0), output_field=IntegerField(),
+                ),
+            )
+            .order_by("-_open", "-opened_at")
+            .values("_appr")[:1]
+        )
+    return Coalesce(
+        _latest({"client": OuterRef("pk")}),
+        _latest({"household__members__client": OuterRef("pk")}),
+        Value(0), output_field=IntegerField(),
+    )
+
+
 def governing_auth_expired_q():
     """Match a client whose GOVERNING internal-service case authorization has
     EXPIRED (``service_authorization_status`` = expired). Anchored on the
@@ -1301,6 +1332,13 @@ class MembersListView(PortalGenericAPIView):
                         "pending_verification", "verified", "kitchen_assignment",
                     ]
                 ).exclude(verification_completed_q())
+            # ── Nutritionist axis (gate between Verified and Kitchen Assignment) ──
+            elif sv == "pending_nutritionist":
+                # Governing enrollment is Verified but NOT yet Nutritionist-approved.
+                qs = qs.annotate(
+                    _gov_stage=governing_enrollment_stage(),
+                    _gov_nutri=governing_enrollment_is_nutritionist_approved(),
+                ).filter(_gov_stage=EnrollmentStage.VERIFIED, _gov_nutri=0)
             # ── Authorization axis (governing internal-service case) ──
             elif sv in ("auth_pending", "waiting_authorization"):
                 qs = apply_authorization_filter(qs, "pending")
