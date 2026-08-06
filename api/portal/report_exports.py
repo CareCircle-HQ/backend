@@ -257,6 +257,50 @@ def members_pending_verification_rows(params):
             ]
 
 
+# --- Pending Verification over 1 month --------------------------------------
+def pending_verification_over_month_rows(params):
+    """One row per household member on an enrollment that has been PENDING
+    VERIFICATION for more than one month (opened over 30 days ago and still not
+    verified). Columns: First Name, Last Name, Phone, Client ID, Case ID."""
+    from datetime import timedelta
+
+    from ..models import EnrollmentStage, EnrollmentVerification
+    from ..services.lifecycle import governing_internal_case
+    from .views_reports import _client_phone_numbers, _enrollment_member_clients
+
+    cutoff = timezone.now() - timedelta(days=30)
+    qs = (
+        EnrollmentVerification.objects
+        .filter(stage=EnrollmentStage.PENDING_VERIFICATION, opened_at__lt=cutoff)
+        .select_related("client", "household", "case")
+        .prefetch_related(
+            "member_profiles__client__phones",
+            "household__members__client__phones",
+        )
+        .order_by("opened_at")
+    )
+
+    yield ["First Name", "Last Name", "Phone", "Client ID", "Case ID"]
+    seen = set()
+    for enr in qs.iterator(chunk_size=1000):
+        # The enrollment's own case, else the household's governing internal case.
+        case_id = str(enr.case_id) if enr.case_id else ""
+        if not case_id:
+            gc = governing_internal_case(enr)
+            case_id = str(gc.case_id) if gc is not None else ""
+        for client in _enrollment_member_clients(enr):
+            if client is None or client.pk in seen:
+                continue
+            seen.add(client.pk)
+            yield [
+                client.first_name or "",
+                client.last_name or "",
+                _client_phone_numbers(client),
+                str(client.client_id),
+                case_id,
+            ]
+
+
 # --- All Verifications ------------------------------------------------------
 def all_verifications_rows(params):
     """One row per verification with milestone dates. ``params``: requested_from
@@ -686,6 +730,7 @@ def members_not_served_rows(params):
 REPORT_BUILDERS = {
     "members-by-lead-source": members_by_lead_source_rows,
     "members-pending-verification": members_pending_verification_rows,
+    "pending-verification-over-month": pending_verification_over_month_rows,
     "all-verifications": all_verifications_rows,
     "all-members": all_members_rows,
     "cases": cases_rows,
