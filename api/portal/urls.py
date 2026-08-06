@@ -76,6 +76,7 @@ from .views_members import (
     MemberRequestVerificationView,
     MemberSocialCoverageView,
     MemberNutritionistApproveView,
+    MemberNutritionistAssessmentNotesView,
     MemberNutritionistDenyMemberView,
     MemberNutritionistHoldView,
     MemberNutritionistMealPlanView,
@@ -294,6 +295,7 @@ urlpatterns = [
     path("members/<uuid:client_id>/nutritionist-hold/", MemberNutritionistHoldView.as_view(), name="portal-nutritionist-hold"),
     path("members/<uuid:client_id>/nutritionist-deny-member/", MemberNutritionistDenyMemberView.as_view(), name="portal-nutritionist-deny-member"),
     path("members/<uuid:client_id>/nutritionist-meal-plan/", MemberNutritionistMealPlanView.as_view(), name="portal-nutritionist-meal-plan"),
+    path("members/<uuid:client_id>/nutritionist-assessment-notes/", MemberNutritionistAssessmentNotesView.as_view(), name="portal-nutritionist-assessment-notes"),
     path("members/<uuid:client_id>/nutrition-review-pdf/", MemberNutritionReviewPdfView.as_view(), name="portal-nutrition-review-pdf"),
     path(
         "members/<uuid:client_id>/verification/disregard/",
