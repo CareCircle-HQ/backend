@@ -84,6 +84,7 @@ _ALL_MEMBERS_HEADER = [
     # Lead & Enrollment
     "Lead Source in CRM",
     "Enrollment Platform",
+    "Enrolled By",
     # Insurance / Medicaid
     "Medicaid Plan",
     "Medicaid Type",
@@ -128,9 +129,11 @@ def all_members_rows(params):
             "insurances", "social_care_coverages", "addresses", "phones", "cases",
             "screenings", "assessments", "member_profiles",
             "enrollments__kitchen", "enrollments__delivery_schedules",
+            "enrollments__verified_by",
             "household_membership__household__members",
             "household_membership__household__enrollment_verifications__kitchen",
             "household_membership__household__enrollment_verifications__delivery_schedules",
+            "household_membership__household__enrollment_verifications__verified_by",
         )
         .order_by("last_name", "first_name", "created_at")
     )
@@ -202,6 +205,7 @@ def all_members_rows(params):
             (isc.authorized_amount if isc else ""),
             lead_labels.get(raw_source, raw_source),
             "UniteUs",
+            (enr.verified_by.name if (enr is not None and enr.verified_by_id) else ""),
             (med.plan_name if med else ""),
             _medicaid_type_label(med.plan_name if med else ""),
             _date_str(med.enrolled_at if med else None),
