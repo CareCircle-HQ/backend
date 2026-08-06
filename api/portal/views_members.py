@@ -5348,6 +5348,14 @@ class MemberRequestVerificationView(PortalAPIView):
                 requested_by=agent,
                 requested_at=timezone.now(),
             )
+            # Link the household's GOVERNING internal-service case onto the
+            # enrollment right now (at request time) via the canonical resolver,
+            # so a pending verification already carries the right case FK instead
+            # of waiting for verification completion. Safe on a pending stage:
+            # reconcile only wires the case here (the authorization projection
+            # no-ops until VERIFIED). The verification pop-up re-runs this on
+            # completion, so it self-corrects if a newer case landed meanwhile.
+            reconcile_enrollment_authorization(enr, actor=actor)
             # Drives the whole household to Pending Verification and drops the
             # primary off the Urgent Care list (clears is_new).
             recompute_enrollment_household(enr)

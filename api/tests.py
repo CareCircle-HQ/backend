@@ -9814,17 +9814,17 @@ class ReportExportsTest(TestCase):
         rows = self._rows(reverse("portal-report-unite-us-agents"))
         self.assertEqual(
             list(rows[0].keys()),
-            ["Unite Us user_id", "Full Name", "Email", "Team", "Status"],
+            ["Status", "User ID", "Name", "Email", "Team"],
         )
 
-        r1 = next(r for r in rows if r["Unite Us user_id"] == str(a1.user_id))
-        self.assertEqual(r1["Full Name"], "Rosa Reviewer")
+        r1 = next(r for r in rows if r["User ID"] == str(a1.user_id))
+        self.assertEqual(r1["Name"], "Rosa Reviewer")
         self.assertEqual(r1["Email"], "rosa@example.org")
         self.assertEqual(r1["Team"], "CareCircle Call Center")
         self.assertEqual(r1["Status"], "Active")
 
-        r2 = next(r for r in rows if r["Unite Us user_id"] == str(a2.user_id))
-        self.assertEqual(r2["Full Name"], "Manny Council")
+        r2 = next(r for r in rows if r["User ID"] == str(a2.user_id))
+        self.assertEqual(r2["Name"], "Manny Council")
         self.assertEqual(r2["Team"], "Met Council Team")
         self.assertEqual(r2["Status"], "Inactive")
 
