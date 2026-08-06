@@ -4583,9 +4583,19 @@ class MemberNutritionReviewPdfView(PortalAPIView):
         if not import_storage.s3_enabled():
             return Response({"error": "Document storage is not configured."}, status=http.HTTP_404_NOT_FOUND)
         inline = (request.query_params.get("mode") or "").lower() == "view"
+        # Unique, readable filename: member name + approval date + short id.
+        import re
+        raw_name = mv.member_name or (
+            f"{mv.client.first_name} {mv.client.last_name}".strip() if mv.client_id else ""
+        ) or "member"
+        slug = re.sub(r"[^A-Za-z0-9]+", "-", raw_name).strip("-").lower() or "member"
+        approved = getattr(mv.enrollment, "nutritionist_approved_at", None)
+        stamp = approved.strftime("%Y%m%d") if approved else ""
+        short = (str(mv.client_id).replace("-", "")[:8] if mv.client_id else "") or "review"
+        filename = "-".join(p for p in [slug, "nutrition-review", stamp, short] if p) + ".pdf"
         url = import_storage.presign_get(
             mv.nutritionist_pdf_key,
-            download_name="nutrition-review.pdf",
+            download_name=filename,
             inline=inline,
             content_type="application/pdf" if inline else "",
         )
