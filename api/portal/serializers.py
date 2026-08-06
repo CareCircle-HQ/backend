@@ -1864,6 +1864,7 @@ class PortalHouseholdMemberSerializer(serializers.ModelSerializer):
             "dietary_restrictions", "food_allergies", "other_dietary_restrictions",
             "conditions", "weeks_gestation", "months_postpartum",
             "medications", "weight", "height", "meal_plan", "meal_plan_other",
+            "on_medical_diet", "medical_diet_details",
             "meal_category", "menu_type", "general_verification_notes",
             "status", "status_label", "kitchen_meal_type", "kitchen_food_notes",
             "is_primary", "pause_locked",
@@ -2264,6 +2265,8 @@ class VerificationMemberInputSerializer(serializers.Serializer):
     )
     weight = serializers.CharField(required=False, allow_blank=True, max_length=50)
     height = serializers.CharField(required=False, allow_blank=True, max_length=50)
+    on_medical_diet = serializers.BooleanField(required=False, default=False)
+    medical_diet_details = serializers.CharField(required=False, allow_blank=True)
     meal_category = serializers.CharField(required=False, allow_blank=True)
     menu_type = serializers.CharField(required=False, allow_blank=True)
     notes = serializers.CharField(required=False, allow_blank=True)

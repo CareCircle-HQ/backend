@@ -4873,6 +4873,10 @@ class MemberVerificationCreateView(PortalAPIView):
                 medications=m.get("medications") or ["No Medications"],
                 weight=m.get("weight", ""),
                 height=m.get("height", ""),
+                on_medical_diet=bool(m.get("on_medical_diet")),
+                medical_diet_details=(
+                    m.get("medical_diet_details", "") if m.get("on_medical_diet") else ""
+                ),
                 meal_category=m.get("meal_category", ""),
                 # Williamsburg households are always served the Kosher menu (the
                 # agent's allergies/restrictions are still honored). Otherwise the

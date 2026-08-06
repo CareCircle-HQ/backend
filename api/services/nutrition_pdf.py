@@ -62,6 +62,8 @@ def nutrition_review_context(enrollment):
             "height": p.height or "",
             "weeks_gestation": p.weeks_gestation if "Pregnant" in conditions else None,
             "months_postpartum": p.months_postpartum if "Postpartum" in conditions else None,
+            "on_medical_diet": p.on_medical_diet,
+            "medical_diet_details": p.medical_diet_details or "",
             "nutrition_concern": p.general_verification_notes or "",
         })
 
@@ -155,6 +157,9 @@ def render_nutrition_pdf(enrollment, *, agent, signature_image="", signed_at=Non
             rows.append(("Weeks Gestation", m["weeks_gestation"]))
         if m["months_postpartum"] is not None:
             rows.append(("Months Postpartum", m["months_postpartum"]))
+        rows.append(("On Medical Diet", "Yes" if m["on_medical_diet"] else "No"))
+        if m["on_medical_diet"] and m["medical_diet_details"]:
+            rows.append(("Medical Diet Details", m["medical_diet_details"]))
         rows.append(("Primary Nutrition Concern", m["nutrition_concern"]))
         flow.append(kv_table(rows))
         flow.append(Spacer(1, 8))

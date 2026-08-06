@@ -2175,6 +2175,10 @@ class MemberDietaryProfile(models.Model):
     # Nutritionist type a custom plan in ``meal_plan_other``.
     meal_plan = models.CharField(max_length=150, blank=True)
     meal_plan_other = models.TextField(blank=True)
+    # Verification question: is the member on any medical diet? When yes, the
+    # free-text details are captured for the Nutritionist.
+    on_medical_diet = models.BooleanField(default=False)
+    medical_diet_details = models.TextField(blank=True)
     meal_category = models.CharField(
         max_length=20, choices=MenuCategory.choices, blank=True
     )
