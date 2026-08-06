@@ -3267,6 +3267,13 @@ class TicketTypeCode(models.TextChoices):
     MISSING_WRONG_ORDER = "missing_wrong_order", "Missing / Wrong Order"
     NUTRITIONAL_COUNSELING = "nutritional_counseling", "Nutritional Counseling"
     KITCHEN_SWITCH = "kitchen_switch", "Kitchen Switch"
+    # Agent-facing categories added in the 2026 ticket-category refresh.
+    INELIGIBLE_FOR_SERVICE = "ineligible_for_service", "Ineligible for Service"
+    MEAL_TYPE_UPDATE = "meal_type_update", "Meal Type Update"
+    SOMOS_MEMBER = "somos_member", "SOMOS member"
+    SIPPS_MEMBER = "sipps_member", "SIPPS member"
+    TRANSFERRED_TO_SCREENING = "transferred_to_screening", "Transferred to Screening"
+    OTHER = "other", "Other"
     # Raised by the daily import when an internal-service case has no contracted
     # services (the member has no active internal-services contract).
     CASE_NO_SERVICES = "case_no_services", "No Internal services Case"
