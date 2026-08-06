@@ -44,6 +44,7 @@ from ..models import (
     KitchenProductType,
     MemberDietaryProfile,
     MemberStatus,
+    MealPlan,
     MenuType,
     Note,
     ProgramMainCategory,
@@ -207,6 +208,22 @@ def pipeline_stage_label(client):
         return "Cancelled"
     if service_hold_state(client)["on_hold"]:
         return "On Hold"
+    # The Nutritionist gate lives inside the "verified" lifecycle window: a
+    # verified household that hasn't been signed off reads "Pending Nutritionist",
+    # then "Nutritionist Approved" (waiting on authorization) once a Nutritionist
+    # ACTUALLY signs off -- instead of the coarse "Verification" phase. Approval
+    # advances the enrollment to Kitchen Assignment (a different lifecycle stage),
+    # so this only fires while the governing enrollment is still at Verified.
+    # Grandfathered households (verified before the gate launched -- back-stamped
+    # nutritionist_approved_at with NO nutritionist_approved_by) never went through
+    # a review, so they fall through to the normal "Verification" label.
+    if client.lifecycle_stage == "verified":
+        enr = active_enrollment(client)
+        if enr is not None and enr.stage == "verified":
+            if not enr.nutritionist_approved_at:
+                return "Pending Nutritionist"
+            if enr.nutritionist_approved_by_id:
+                return "Nutritionist Approved"
     return _STAGE_PHASE_LABELS.get(
         client.lifecycle_stage, client.get_lifecycle_stage_display()
     )
@@ -1839,12 +1856,18 @@ class PortalHouseholdMemberSerializer(serializers.ModelSerializer):
     mobile_number_suggested = serializers.SerializerMethodField()
     status_label = serializers.CharField(source="get_status_display", read_only=True)
     is_primary = serializers.SerializerMethodField()
+    has_nutrition_pdf = serializers.SerializerMethodField()
+    nutrition_review_status = serializers.SerializerMethodField()
 
     class Meta:
         model = MemberDietaryProfile
         fields = [
             "id", "client_id", "name", "mobile_number", "mobile_number_suggested",
             "dietary_restrictions", "food_allergies", "other_dietary_restrictions",
+            "conditions", "weeks_gestation", "months_postpartum",
+            "medications", "weight", "height", "meal_plan", "meal_plan_other",
+            "on_medical_diet", "medical_diet_details", "assessment_notes",
+            "has_nutrition_pdf", "nutrition_review_status",
             "meal_category", "menu_type", "general_verification_notes",
             "status", "status_label", "kitchen_meal_type", "kitchen_food_notes",
             "is_primary", "pause_locked",
@@ -1857,6 +1880,24 @@ class PortalHouseholdMemberSerializer(serializers.ModelSerializer):
         # The primary household member can't be removed from the Household tab.
         membership = getattr(obj.client, "household_membership", None) if obj.client_id else None
         return bool(getattr(membership, "is_primary", False))
+
+    def get_has_nutrition_pdf(self, obj):
+        return bool(obj.nutritionist_pdf_key)
+
+    def get_nutrition_review_status(self, obj):
+        """The member's Nutritionist-review state (for the Nutritionist tab chip),
+        so a member awaiting review reads 'Pending Nutritionist' instead of the
+        default 'Active'. Empty once past the gate (grandfathered / in service),
+        where the real member status is shown instead."""
+        if obj.status == "nutritionist_paused":
+            return "paused"
+        enr = obj.enrollment
+        if enr and enr.stage == "verified":
+            if not enr.nutritionist_approved_at:
+                return "pending"
+            if enr.nutritionist_approved_by_id:
+                return "approved"
+        return ""
 
     def get_name(self, obj):
         return obj.member_name or (_full_name(obj.client) if obj.client else "")
@@ -1975,6 +2016,16 @@ class PortalMenuTypeSerializer(serializers.ModelSerializer):
 
     def get_tag_ids(self, obj):
         return [str(t.pk) for t in obj.tags.all()]
+
+
+class PortalMealPlanSerializer(serializers.ModelSerializer):
+    """Settings > Meal Plans: a simple named plan (name + description + active)."""
+
+    id = serializers.UUIDField(source="pk", read_only=True)
+
+    class Meta:
+        model = MealPlan
+        fields = ["id", "name", "description", "is_active"]
 
 
 class PortalCadenceSerializer(serializers.ModelSerializer):
@@ -2216,6 +2267,27 @@ class VerificationMemberInputSerializer(serializers.Serializer):
         child=serializers.CharField(), required=False, default=list
     )
     other_dietary_restrictions = serializers.CharField(required=False, allow_blank=True)
+    # Medical Conditions multi-select (see models.MEMBER_CONDITIONS). Empty ==
+    # "No Restriction" (enforced in the view).
+    conditions = serializers.ListField(
+        child=serializers.CharField(), required=False, default=list
+    )
+    # Conditional follow-ups: weeks gestation (Pregnant), months postpartum
+    # (Postpartum). Null when the triggering condition isn't selected.
+    weeks_gestation = serializers.IntegerField(
+        required=False, allow_null=True, min_value=0
+    )
+    months_postpartum = serializers.IntegerField(
+        required=False, allow_null=True, min_value=0
+    )
+    # Clinical intake for the Nutritionist review. Medications is a multi-select.
+    medications = serializers.ListField(
+        child=serializers.CharField(), required=False, default=list
+    )
+    weight = serializers.CharField(required=False, allow_blank=True, max_length=50)
+    height = serializers.CharField(required=False, allow_blank=True, max_length=50)
+    on_medical_diet = serializers.BooleanField(required=False, default=False)
+    medical_diet_details = serializers.CharField(required=False, allow_blank=True)
     meal_category = serializers.CharField(required=False, allow_blank=True)
     menu_type = serializers.CharField(required=False, allow_blank=True)
     notes = serializers.CharField(required=False, allow_blank=True)

@@ -109,6 +109,12 @@ class ProgramStatus(models.TextChoices):
 
     PENDING_VERIFICATION = "pending_verification", "Pending Verification"
     VERIFIED = "verified", "Verified"
+    # Nutritionist review gate -- sits between Verified and Kitchen Assignment.
+    # A verified household waits here for a Nutritionist to sign off before it can
+    # advance to kitchen assignment (and thus into service / POs), regardless of
+    # the case authorization outcome.
+    PENDING_NUTRITIONIST = "pending_nutritionist", "Pending Nutritionist"
+    NUTRITIONIST_APPROVED = "nutritionist_approved", "Nutritionist Approved"
     WAITING_AUTHORIZATION = "waiting_authorization", "Waiting Authorization"
     AUTHORIZED = "authorized", "Authorized"
     DENIED = "denied", "Denied"
@@ -1827,17 +1833,25 @@ class MemberStatus(models.TextChoices):
     # schedules and Purchase Orders. Unlike a pause this is an end state (their
     # service ended), not a temporary hold.
     INACTIVE = "inactive", "Inactive"
+    # A Nutritionist reviewed the member and paused them (requires a reason note).
+    # Like OUT_OF_ORBIT, a paused member is excluded from all delivery schedules
+    # and Purchase Orders. Set per member from the Nutritionist review drawer;
+    # independent of the rest of the household (but pausing the LAST active member
+    # holds the whole household -- see MemberNutritionistDenyMemberView).
+    NUTRITIONIST_PAUSED = "nutritionist_paused", "Nutritionist Paused"
 
 
 # Member statuses that exclude a member from every delivery schedule / order /
 # Purchase Order: OUT_OF_ORBIT (meal rule can't fulfill them), OUT_OF_RANGE
-# (delivery/primary ZIP outside coverage), PAUSED (agent manually paused them)
-# and INACTIVE (service ended). Only ACTIVE members receive deliveries.
+# (delivery/primary ZIP outside coverage), PAUSED (agent manually paused them),
+# INACTIVE (service ended) and NUTRITIONIST_PAUSED (a Nutritionist paused them).
+# Only ACTIVE members receive deliveries.
 SERVICE_EXCLUDED_MEMBER_STATUSES = (
     MemberStatus.OUT_OF_ORBIT,
     MemberStatus.OUT_OF_RANGE,
     MemberStatus.PAUSED,
     MemberStatus.INACTIVE,
+    MemberStatus.NUTRITIONIST_PAUSED,
 )
 
 # Enrollment stages that exclude a whole household from Purchase Order / delivery
@@ -2012,6 +2026,23 @@ class EnrollmentVerification(models.Model):
         "Agent", on_delete=models.SET_NULL, null=True, blank=True,
         related_name="verified_enrollments",
     )
+    # Nutritionist sign-off gate. A verified household sits at Pending Nutritionist
+    # until a Nutritionist approves it here (a legal sign-off: the typed signature
+    # + who + when are the audit trail). Only then may an approved authorization
+    # advance the enrollment to Kitchen Assignment (see
+    # reconcile_enrollment_authorization). NULL == not yet approved.
+    nutritionist_approved_at = models.DateTimeField(null=True, blank=True, db_index=True)
+    nutritionist_approved_by = models.ForeignKey(
+        "Agent", on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="nutritionist_approved_enrollments",
+    )
+    # The Nutritionist's typed signature captured at approval (their full name).
+    nutritionist_signature = models.CharField(max_length=255, blank=True)
+    # The drawn signature (PNG data URL) captured at approval, and the S3 key of
+    # the generated signed Nutrition Review PDF (downloadable from the member's
+    # Nutrition tab).
+    nutritionist_signature_image = models.TextField(blank=True)
+    nutritionist_approval_pdf_key = models.CharField(max_length=500, blank=True)
     # Short display code, e.g. "ENR-8754". Assigned on creation.
     code = models.CharField(max_length=20, blank=True, db_index=True)
     # Renewal cycle counter. Renewals reuse the SAME enrollment (re-run
@@ -2075,6 +2106,24 @@ class EnrollmentVerification(models.Model):
         return f"{self.client_id} ({self.stage})"
 
 
+# Canonical medical Conditions offered in the verification wizard (Step 2).
+# Stored as labels on MemberDietaryProfile.conditions. "No Restriction" is the
+# default / nothing-selected sentinel.
+MEMBER_CONDITIONS = [
+    "Cancer", "Cardiometabolic", "Crohn’s Disease", "Diabetic",
+    "Gestational Diabetes", "Heart disease", "High blood pressure",
+    "High cholesterol", "Hypothyroidism", "Hyperthyroidism", "IBS",
+    "Kidney Disease", "Liver Disease", "Overweight (determined by BMI)",
+    "Obesity (determined by BMI)", "Pre-Diabetes", "Postpartum", "Pregnant",
+    "Ulcerative Colitis", "No Restriction",
+]
+
+
+def default_member_conditions():
+    """Default value for MemberDietaryProfile.conditions (nothing selected)."""
+    return ["No Restriction"]
+
+
 class MemberDietaryProfile(models.Model):
     """Per-household-member dietary profile captured during the household
     verification (wizard Step 2).
@@ -2103,6 +2152,39 @@ class MemberDietaryProfile(models.Model):
     dietary_restrictions = models.JSONField(default=list, blank=True)
     food_allergies = models.JSONField(default=list, blank=True)
     other_dietary_restrictions = models.TextField(blank=True)
+    # Medical Conditions captured during verification (wizard Step 2). A
+    # multi-select stored as a list of labels (see MEMBER_CONDITIONS); empty /
+    # unselected means "No Restriction". Distinct from ``dietary_restrictions``
+    # (which drives menu/meal rules) -- this is clinical context.
+    conditions = models.JSONField(default=default_member_conditions, blank=True)
+    # Conditional follow-ups tied to specific conditions above.
+    weeks_gestation = models.PositiveSmallIntegerField(  # when "Pregnant"
+        null=True, blank=True
+    )
+    months_postpartum = models.PositiveSmallIntegerField(  # when "Postpartum"
+        null=True, blank=True
+    )
+    # Clinical intake captured at verification, shown to the Nutritionist.
+    # Medications is a multi-select (list of labels, see MEDICATION_OPTIONS);
+    # weight/height are free text so agents can add units (e.g. "180 lb").
+    medications = models.JSONField(default=list, blank=True)
+    weight = models.CharField(max_length=50, blank=True)
+    height = models.CharField(max_length=50, blank=True)
+    # Meal plan the Nutritionist selects for this member (free text -- the name of
+    # a MealPlan catalog entry; see Settings > Meal Plans). "Other" lets the
+    # Nutritionist type a custom plan in ``meal_plan_other``.
+    meal_plan = models.CharField(max_length=150, blank=True)
+    meal_plan_other = models.TextField(blank=True)
+    # Verification question: is the member on any medical diet? When yes, the
+    # free-text details are captured for the Nutritionist.
+    on_medical_diet = models.BooleanField(default=False)
+    medical_diet_details = models.TextField(blank=True)
+    # The Nutritionist's assessment notes for this member (set from the review
+    # drawer; shown on the member Nutritionist tab + the signed PDF).
+    assessment_notes = models.TextField(blank=True)
+    # S3 key of this member's OWN signed Nutrition Review PDF (one per member,
+    # generated at approval with the shared signature).
+    nutritionist_pdf_key = models.CharField(max_length=500, blank=True)
     meal_category = models.CharField(
         max_length=20, choices=MenuCategory.choices, blank=True
     )
@@ -2530,6 +2612,7 @@ class Agent(models.Model):
     AGENT_GROUPS = [
         ("Screeners", "Screeners"),
         ("Verifiers", "Verifiers"),
+        ("Nutritionist", "Nutritionist"),
         ("Logistics", "Logistics"),
         ("Management", "Management"),
         ("CS", "CS"),
@@ -3350,6 +3433,10 @@ class TimelineEventType(models.TextChoices):
     WAITING_AUTHORIZATION = "waiting_authorization", "Waiting Authorization"
     AUTHORIZED = "authorized", "Authorized"
     DENIED = "denied", "Denied"
+    # Nutritionist legal sign-off (between Verified and Kitchen Assignment).
+    NUTRITIONIST_APPROVED = "nutritionist_approved", "Nutritionist Approved"
+    # A Nutritionist paused an individual member (per-member off-ramp).
+    NUTRITIONIST_PAUSED = "nutritionist_paused", "Nutritionist Paused"
     # --- Service-delivery lifecycle: one granular type per event. ---
     KITCHEN_ASSIGNED = "kitchen_assigned", "Kitchen Assigned"
     SERVICE_ACTIVATED = "service_activated", "Service Activated"
@@ -3726,6 +3813,27 @@ class MenuTypeTag(models.Model):
 
     def __str__(self):
         return f"{self.menu_type} - {self.dietary_tag}"
+
+
+class MealPlan(models.Model):
+    """A named meal plan, managed from Settings. A simple catalog entry
+    (name + description + active flag) referenced elsewhere in the app."""
+
+    meal_plan_id = models.UUIDField(
+        primary_key=True, default=uuid.uuid4, editable=False
+    )
+    name = models.CharField(max_length=150, unique=True)
+    description = models.TextField(blank=True)
+    # Disabled plans are hidden from selection but kept for historical records.
+    is_active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["name"]
+
+    def __str__(self):
+        return self.name
 
 
 # ---------------------------------------------------------------------------

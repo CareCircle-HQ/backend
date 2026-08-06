@@ -17,6 +17,7 @@ from ..models import (
     Kitchen,
     KitchenIntegration,
     KitchenMenuType,
+    MealPlan,
     MenuType,
     MenuTypeTag,
     ProductType,
@@ -53,6 +54,12 @@ class MenuTypeViewSet(viewsets.ModelViewSet):
                 MenuTypeTag.objects.get_or_create(menu_type=menu, dietary_tag=tag)
         menu.refresh_from_db()
         return Response(self.get_serializer(menu).data)
+
+
+class MealPlanViewSet(viewsets.ModelViewSet):
+    permission_classes = [IsPortalAgent]
+    queryset = MealPlan.objects.all()
+    serializer_class = s.PortalMealPlanSerializer
 
 
 class DietaryTagViewSet(viewsets.ModelViewSet):

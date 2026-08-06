@@ -561,6 +561,9 @@ def event_for_verification(enrollment, *, stage_event=None, source=ChangeSource.
         EnrollmentStage.DISREGARDED,
         EnrollmentStage.CANCELLED,
         EnrollmentStage.CLOSED,
+        # On Hold carries the reason (e.g. a Nutritionist hold) so the timeline
+        # explains WHY the household was held, mirroring the client note.
+        EnrollmentStage.ON_HOLD,
     )
     note = stage_event.note if stage_event is not None else ""
     if enrollment.stage in _REASON_STAGES and note:

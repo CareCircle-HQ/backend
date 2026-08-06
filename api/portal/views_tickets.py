@@ -81,6 +81,10 @@ class WorkQueueView(PortalGenericAPIView):
             qs = qs.filter(assigned_to__isnull=True)
         elif assignee_val:
             qs = qs.filter(assigned_to_id=assignee_val)
+        # Filter by the agent who CREATED the ticket.
+        created_by_val = (p.get("created_by") or "").strip()
+        if created_by_val:
+            qs = qs.filter(created_by_id=created_by_val)
         # Date-created range (inclusive). ``created_at`` is a datetime; ``__date``
         # extraction uses the active timezone (America/New_York), so the window
         # matches the local calendar day the agent selects.

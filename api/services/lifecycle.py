@@ -1091,16 +1091,23 @@ def program_status(enrollment):
             else ProgramStatus.AUTHORIZED
         )
     if stage == EnrollmentStage.VERIFIED:
+        # Nutritionist gate sits between Verified and Kitchen Assignment. Until a
+        # Nutritionist signs off, the household is Pending Nutritionist regardless
+        # of the authorization outcome.
+        if not enrollment.nutritionist_approved_at:
+            return ProgramStatus.PENDING_NUTRITIONIST
+        # Nutritionist-approved. An approved authorization advances the stage to
+        # Kitchen Assignment (reconcile), so at VERIFIED it only rests here while
+        # the authorization is still pending/denied/blank.
+        if auth == ServiceAuthorizationStatus.DENIED:
+            return ProgramStatus.DENIED
         if auth in (
             ServiceAuthorizationStatus.APPROVED,
             ServiceAuthorizationStatus.NOT_REQUIRED,
         ):
             return ProgramStatus.AUTHORIZED
-        if auth == ServiceAuthorizationStatus.DENIED:
-            return ProgramStatus.DENIED
-        if auth == ServiceAuthorizationStatus.PENDING:
-            return ProgramStatus.WAITING_AUTHORIZATION
-        return ProgramStatus.VERIFIED
+        # Pending / blank authorization: nutritionist done, waiting on auth.
+        return ProgramStatus.NUTRITIONIST_APPROVED
 
     return ProgramStatus.PENDING_VERIFICATION
 
@@ -1162,6 +1169,28 @@ def _verification_phase(enrollment):
     if EnrollmentStage(enrollment.stage) in _PRE_VERIFICATION_STAGES:
         return ("pending", "Pending Verification")
     return ("verified", "Verified")
+
+
+def _nutritionist_phase(enrollment):
+    """Nutritionist sign-off phase for the program bar -- sits between
+    Verification and Authorization. Blank until the household is verified.
+
+        Pending Nutritionist -> verified, awaiting the Nutritionist's sign-off
+        Nutritionist Approved -> a Nutritionist has signed off
+    """
+    if enrollment is None:
+        return ("", "")
+    if EnrollmentStage(enrollment.stage) in _PRE_VERIFICATION_STAGES:
+        return ("", "")  # not verified yet -> the nutritionist step isn't reached
+    if enrollment.nutritionist_approved_at:
+        # Only a REAL sign-off (nutritionist_approved_by set) reads "Nutritionist
+        # Approved". Grandfathered households (back-stamped approved_at with no
+        # approved_by, verified before the gate launched) never went through the
+        # step, so the node stays blank.
+        if enrollment.nutritionist_approved_by_id:
+            return ("approved", "Nutritionist Approved")
+        return ("", "")
+    return ("pending", "Pending Nutritionist")
 
 
 def _member_status_on(client, enrollment):
@@ -1242,8 +1271,13 @@ def _service_phase(client, enrollment, gov_case):
     # a kitchen). If the authorization hasn't been approved yet (still
     # pending/requested) the Authorization phase carries that state and Service
     # stays blank until approval lands.
+    # The Nutritionist gate sits before kitchen assignment: a verified household
+    # that hasn't been Nutritionist-approved is NOT yet waiting on a kitchen (it's
+    # Pending Nutritionist), so the Service phase stays blank until sign-off.
     verified_awaiting_kitchen = (
-        stage == EnrollmentStage.VERIFIED and auth in (A.APPROVED, A.NOT_REQUIRED)
+        stage == EnrollmentStage.VERIFIED
+        and auth in (A.APPROVED, A.NOT_REQUIRED)
+        and enrollment.nutritionist_approved_at is not None
     )
     if stage in (EnrollmentStage.SERVICE_ACTIVE, EnrollmentStage.KITCHEN_ASSIGNMENT) or verified_awaiting_kitchen:
         mv = _member_status_on(client, enrollment)
@@ -1352,6 +1386,7 @@ def program_tracks(client):
         # every FOOD case reflects it. Non-food programs model Authorization
         # only, so verification stays blank there.
         v_val, v_lbl = _verification_phase(enr) if is_food else ("", "")
+        n_val, n_lbl = _nutritionist_phase(enr) if is_food else ("", "")
         if is_governing and is_food:
             s_val, s_lbl = _service_phase(client, enr, c)
         elif is_duplicate:
@@ -1390,6 +1425,7 @@ def program_tracks(client):
             "scope": {"value": ht, "label": CaseHouseholdType(ht).label},
             "authorization": {"value": a_val, "label": a_lbl},
             "verification": {"value": v_val, "label": v_lbl},
+            "nutritionist": {"value": n_val, "label": n_lbl},
             "service": {"value": s_val, "label": s_lbl},
         })
     # Governing first, then by service-type label + case id (a stable,
@@ -1507,6 +1543,13 @@ def reconcile_enrollment_authorization(enrollment, *, actor=None, actor_label=""
         # The household stays Verified; the status is surfaced from the Case.
         return enrollment
 
+    # Nutritionist sign-off gate: a verified household may NOT advance to kitchen
+    # assignment (and thus into service / POs) until a Nutritionist has approved
+    # it, even when the case authorization is approved. It waits at Verified
+    # (Pending Nutritionist) until then.
+    if not enrollment.nutritionist_approved_at:
+        return enrollment
+
     if EnrollmentStage(enrollment.stage) == target:
         return enrollment
     try:
@@ -1516,6 +1559,62 @@ def reconcile_enrollment_authorization(enrollment, *, actor=None, actor_label=""
     except InvalidTransition:
         # Defensive: an illegal projection (e.g. terminal stage) is a no-op.
         return enrollment
+
+
+def nutritionist_approve(enrollment, *, agent, signature, signature_image="", pdf_key=""):
+    """Record a Nutritionist's legal sign-off on a VERIFIED enrollment (the
+    Pending Nutritionist gate), then let an approved authorization advance it to
+    Kitchen Assignment.
+
+    Captures the audit trail -- who / when / typed signature / drawn signature /
+    generated PDF key -- and emits a timeline event. Idempotent: re-approving an
+    already-approved enrollment is a no-op. Returns the (possibly advanced)
+    enrollment.
+    """
+    from api.models import TimelineEventType
+    from api.services.timeline import emit_timeline_event
+
+    if enrollment.nutritionist_approved_at:
+        return enrollment
+
+    now = timezone.now()
+    enrollment.nutritionist_approved_at = now
+    enrollment.nutritionist_approved_by = agent
+    enrollment.nutritionist_signature = (signature or "").strip()
+    enrollment.nutritionist_signature_image = signature_image or ""
+    enrollment.nutritionist_approval_pdf_key = pdf_key or ""
+    enrollment.save(update_fields=[
+        "nutritionist_approved_at", "nutritionist_approved_by",
+        "nutritionist_signature", "nutritionist_signature_image",
+        "nutritionist_approval_pdf_key",
+    ])
+
+    client = getattr(enrollment, "client", None)
+    if client is not None:
+        emit_timeline_event(
+            client=client,
+            event_type=TimelineEventType.NUTRITIONIST_APPROVED,
+            occurred_at=now,
+            title="Nutritionist Approved",
+            subtitle=(
+                f"Signed by {enrollment.nutritionist_signature}"
+                if enrollment.nutritionist_signature else ""
+            ),
+            actor=getattr(agent, "name", "") or "",
+            enrollment=enrollment,
+            case=enrollment.case,
+            metadata={"signature": enrollment.nutritionist_signature},
+        )
+
+    # An approved authorization can now advance the enrollment to kitchen
+    # assignment (the gate in reconcile_enrollment_authorization is satisfied).
+    # actor is a StageEvent User FK (agents aren't Users), so pass the name as a
+    # label only.
+    return reconcile_enrollment_authorization(
+        enrollment, actor=None,
+        actor_label=getattr(agent, "name", "") or "",
+        note="Nutritionist approved",
+    )
 
 
 # ---------------------------------------------------------------------------

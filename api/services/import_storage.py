@@ -19,6 +19,7 @@ from django.conf import settings
 
 IMPORTS_PREFIX = "imports"
 EXPORTS_PREFIX = "exports"
+NUTRITION_PREFIX = "nutrition-reviews"
 
 
 def s3_enabled():
@@ -66,6 +67,20 @@ def build_export_key(filename):
     return f"{EXPORTS_PREFIX}/{uuid.uuid4()}/{safe}"
 
 
+def build_nutrition_key(client_id, filename="nutrition-review.pdf"):
+    """A unique key under the nutrition-reviews/ prefix for a signed PDF."""
+    safe = os.path.basename((filename or "nutrition-review.pdf")).strip().replace(" ", "_")
+    return f"{NUTRITION_PREFIX}/{client_id}/{uuid.uuid4()}/{safe or 'nutrition-review.pdf'}"
+
+
+def upload_bytes(key, data, *, content_type="application/octet-stream"):
+    """Upload raw bytes directly to S3 (server-side), returning the key."""
+    _client().put_object(
+        Bucket=_bucket(), Key=key, Body=data, ContentType=content_type,
+    )
+    return key
+
+
 def presign_put(key, *, content_type="text/csv", expires=900):
     """Short-lived presigned URL the browser PUTs the file directly to."""
     return _client().generate_presigned_url(
@@ -75,12 +90,16 @@ def presign_put(key, *, content_type="text/csv", expires=900):
     )
 
 
-def presign_get(key, *, expires=900, download_name=""):
-    """Short-lived presigned URL to download an object (e.g. a generated report
-    CSV). ``download_name`` sets the browser's save-as filename."""
+def presign_get(key, *, expires=900, download_name="", inline=False, content_type=""):
+    """Short-lived presigned URL to fetch an object. ``download_name`` sets the
+    save-as filename; ``inline=True`` opens it in the browser (view) instead of
+    forcing a download; ``content_type`` overrides the response Content-Type."""
     params = {"Bucket": _bucket(), "Key": key}
     if download_name:
-        params["ResponseContentDisposition"] = f'attachment; filename="{download_name}"'
+        disp = "inline" if inline else "attachment"
+        params["ResponseContentDisposition"] = f'{disp}; filename="{download_name}"'
+    if content_type:
+        params["ResponseContentType"] = content_type
     return _client().generate_presigned_url(
         "get_object", Params=params, ExpiresIn=expires,
     )

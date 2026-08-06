@@ -75,9 +75,17 @@ from .views_members import (
     MemberDoctorView,
     MemberRequestVerificationView,
     MemberSocialCoverageView,
+    MemberNutritionistApproveView,
+    MemberNutritionistAssessmentNotesView,
+    MemberNutritionistDenyMemberView,
+    MemberNutritionistHoldView,
+    MemberNutritionistMealPlanView,
+    MemberNutritionistReviewView,
+    MemberNutritionReviewPdfView,
     MemberTicketsView,
     MemberVerificationCreateView,
     MemberVerificationDisregardView,
+    NutritionistPendingListView,
     MembersListView,
     MembersStatsView,
     NeedAttestationMembersListView,
@@ -156,6 +164,7 @@ from .views_settings import (
     DietaryTagViewSet,
     KitchenIntegrationDetailView,
     KitchenViewSet,
+    MealPlanViewSet,
     MenuTypeViewSet,
     ProgramMainCategoryViewSet,
 )
@@ -171,6 +180,7 @@ from .views_tickets import (
 
 router = SimpleRouter()
 router.register("settings/menu-types", MenuTypeViewSet, basename="portal-menu-type")
+router.register("settings/meal-plans", MealPlanViewSet, basename="portal-meal-plan")
 router.register("settings/dietary-tags", DietaryTagViewSet, basename="portal-dietary-tag")
 router.register("settings/cadences", CadenceViewSet, basename="portal-cadence")
 router.register("settings/kitchens", KitchenViewSet, basename="portal-kitchen")
@@ -279,6 +289,14 @@ urlpatterns = [
     ),
     path("members/<uuid:client_id>/tickets/", MemberTicketsView.as_view()),
     path("members/<uuid:client_id>/verification/", MemberVerificationCreateView.as_view()),
+    path("nutritionist/pending/", NutritionistPendingListView.as_view(), name="portal-nutritionist-pending"),
+    path("members/<uuid:client_id>/nutritionist-review/", MemberNutritionistReviewView.as_view(), name="portal-nutritionist-review"),
+    path("members/<uuid:client_id>/nutritionist-approve/", MemberNutritionistApproveView.as_view(), name="portal-nutritionist-approve"),
+    path("members/<uuid:client_id>/nutritionist-hold/", MemberNutritionistHoldView.as_view(), name="portal-nutritionist-hold"),
+    path("members/<uuid:client_id>/nutritionist-deny-member/", MemberNutritionistDenyMemberView.as_view(), name="portal-nutritionist-deny-member"),
+    path("members/<uuid:client_id>/nutritionist-meal-plan/", MemberNutritionistMealPlanView.as_view(), name="portal-nutritionist-meal-plan"),
+    path("members/<uuid:client_id>/nutritionist-assessment-notes/", MemberNutritionistAssessmentNotesView.as_view(), name="portal-nutritionist-assessment-notes"),
+    path("members/<uuid:client_id>/nutrition-review-pdf/", MemberNutritionReviewPdfView.as_view(), name="portal-nutrition-review-pdf"),
     path(
         "members/<uuid:client_id>/verification/disregard/",
         MemberVerificationDisregardView.as_view(),

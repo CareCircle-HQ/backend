@@ -53,6 +53,7 @@ from ..models import (
     MemberDietaryProfile,
     KitchenProductType,
     MemberStatus,
+    SERVICE_EXCLUDED_MEMBER_STATUSES,
     MenuType,
     Note,
     MemberWarning,
@@ -775,6 +776,37 @@ def governing_enrollment_stage():
     )
 
 
+def governing_enrollment_is_nutritionist_approved():
+    """1 when the client's GOVERNING enrollment has been Nutritionist-approved,
+    else 0 -- mirrors ``governing_enrollment_stage``'s selection. Returned as an
+    INT (not the nullable ``nutritionist_approved_at``) so Coalesce prefers the
+    OWN enrollment even when it's unapproved (a NULL datetime would make Coalesce
+    fall through to the household enrollment and mislabel the member)."""
+    def _latest(rel):
+        return Subquery(
+            EnrollmentVerification.objects
+            .filter(**rel)
+            .exclude(stage=EnrollmentStage.DISREGARDED)
+            .annotate(
+                _open=SQLCase(
+                    When(closed_at__isnull=True, then=Value(1)),
+                    default=Value(0), output_field=IntegerField(),
+                ),
+                _appr=SQLCase(
+                    When(nutritionist_approved_at__isnull=False, then=Value(1)),
+                    default=Value(0), output_field=IntegerField(),
+                ),
+            )
+            .order_by("-_open", "-opened_at")
+            .values("_appr")[:1]
+        )
+    return Coalesce(
+        _latest({"client": OuterRef("pk")}),
+        _latest({"household__members__client": OuterRef("pk")}),
+        Value(0), output_field=IntegerField(),
+    )
+
+
 def governing_auth_expired_q():
     """Match a client whose GOVERNING internal-service case authorization has
     EXPIRED (``service_authorization_status`` = expired). Anchored on the
@@ -1301,6 +1333,13 @@ class MembersListView(PortalGenericAPIView):
                         "pending_verification", "verified", "kitchen_assignment",
                     ]
                 ).exclude(verification_completed_q())
+            # ── Nutritionist axis (gate between Verified and Kitchen Assignment) ──
+            elif sv == "pending_nutritionist":
+                # Governing enrollment is Verified but NOT yet Nutritionist-approved.
+                qs = qs.annotate(
+                    _gov_stage=governing_enrollment_stage(),
+                    _gov_nutri=governing_enrollment_is_nutritionist_approved(),
+                ).filter(_gov_stage=EnrollmentStage.VERIFIED, _gov_nutri=0)
             # ── Authorization axis (governing internal-service case) ──
             elif sv in ("auth_pending", "waiting_authorization"):
                 qs = apply_authorization_filter(qs, "pending")
@@ -4326,6 +4365,402 @@ class MemberTicketsView(PortalAPIView):
         return Response(s.PortalTicketSerializer(qs, many=True).data)
 
 
+class NutritionistPendingListView(PortalAPIView):
+    """GET: households awaiting Nutritionist approval -- VERIFIED enrollments not
+    yet signed off (Pending Nutritionist). Visible to Nutritionist + Management."""
+
+    def get(self, request):
+        agent = current_agent(request)
+        allowed = bool(agent and (
+            agent.group in ("Nutritionist", "Management")
+            or getattr(agent, "is_manager", False)
+        ))
+        if not allowed:
+            return Response(
+                {"detail": "Nutritionist access required."},
+                status=http.HTTP_403_FORBIDDEN,
+            )
+        qs = (
+            EnrollmentVerification.objects
+            .filter(
+                stage=EnrollmentStage.VERIFIED,
+                nutritionist_approved_at__isnull=True,
+            )
+            .select_related("client", "case")
+            .prefetch_related("member_profiles")
+            .order_by("verified_at")
+        )
+        # Omni-search across the primary + household members: name, client ID,
+        # Medicaid / insurance member ID.
+        search = (request.query_params.get("search") or "").strip()
+        if search:
+            cond = (
+                Q(client__first_name__icontains=search)
+                | Q(client__last_name__icontains=search)
+                | Q(client__insurances__external_member_id__icontains=search)
+                | Q(member_profiles__client__first_name__icontains=search)
+                | Q(member_profiles__client__last_name__icontains=search)
+                | Q(member_profiles__member_name__icontains=search)
+                | Q(member_profiles__client__insurances__external_member_id__icontains=search)
+            )
+            parts = search.split()
+            if len(parts) >= 2:
+                cond |= Q(client__first_name__icontains=parts[0]) & Q(client__last_name__icontains=parts[-1])
+            try:
+                cid = uuid.UUID(search)
+                cond |= Q(client__client_id=cid) | Q(member_profiles__client__client_id=cid)
+            except (ValueError, AttributeError, TypeError):
+                pass
+            qs = qs.filter(cond).distinct()
+        # One row per HOUSEHOLD. A household can carry several verified
+        # enrollments (renewals / stray superseded rows), and only the client's
+        # GOVERNING enrollment (active_enrollment -- most recent, open-preferred)
+        # actually reflects "Pending Nutritionist". So dedupe by client and keep
+        # only those whose governing enrollment is verified + not yet approved.
+        from .serializers import active_enrollment
+        from ..services.lifecycle import governing_internal_case
+
+        results = []
+        seen = set()
+        for enr in qs:
+            c = enr.client
+            if c is None or c.client_id in seen:
+                continue
+            seen.add(c.client_id)
+            gov = active_enrollment(c)
+            if (
+                gov is None
+                or EnrollmentStage(gov.stage) != EnrollmentStage.VERIFIED
+                or gov.nutritionist_approved_at is not None
+            ):
+                continue  # household isn't actually Pending Nutritionist
+            # Authorization comes from the governing INTERNAL-SERVICE case (the
+            # same source the stage bar uses) -- the enrollment's own case link
+            # may be blank, so fall back to the client's governing case.
+            case = gov.case or governing_internal_case(gov)
+            members = [
+                {
+                    "name": p.member_name or (
+                        f"{p.client.first_name} {p.client.last_name}".strip()
+                        if p.client_id else ""
+                    ) or "Member",
+                    "status": p.status,
+                }
+                for p in gov.member_profiles.all()
+            ]
+            results.append({
+                "client_id": str(c.client_id),
+                "primary_name": f"{c.first_name} {c.last_name}".strip() or str(c.client_id),
+                "program_name": gov.program_name or getattr(case, "program_name", "") or "",
+                "verified_at": gov.verified_at.isoformat() if gov.verified_at else None,
+                "authorization_status": getattr(case, "service_authorization_status", "") or "",
+                "members": members,
+            })
+        results.sort(key=lambda r: r["primary_name"].lower())
+        return Response({"count": len(results), "results": results})
+
+
+class MemberNutritionistApproveView(PortalAPIView):
+    """POST /members/<id>/nutritionist-approve/: a Nutritionist signs off on the
+    member's VERIFIED enrollment (the legal sign-off gate). Nutritionist role
+    ONLY. Requires a typed ``signature``; records who/when/signature as the audit
+    trail and lets an approved authorization advance the household to kitchen."""
+
+    @transaction.atomic
+    def post(self, request, client_id):
+        agent = current_agent(request)
+        if not (agent and (agent.group in ("Nutritionist", "Management") or getattr(agent, "is_manager", False))):
+            return Response(
+                {"detail": "Only a Nutritionist can approve."},
+                status=http.HTTP_403_FORBIDDEN,
+            )
+        client = get_object_or_404(Client, pk=client_id)
+        signature = (request.data.get("signature") or "").strip()
+        if not signature:
+            return Response(
+                {"signature": "A signature is required to approve."},
+                status=http.HTTP_400_BAD_REQUEST,
+            )
+        enr = (
+            EnrollmentVerification.objects
+            .filter(
+                client=client,
+                stage=EnrollmentStage.VERIFIED,
+                nutritionist_approved_at__isnull=True,
+            )
+            .order_by("-verified_at")
+            .first()
+        )
+        if enr is None:
+            return Response(
+                {"error": "No verified enrollment awaiting nutritionist "
+                          "approval for this member."},
+                status=http.HTTP_400_BAD_REQUEST,
+            )
+        signature_image = request.data.get("signature_image") or ""
+
+        # One SEPARATE signed PDF per member (the signature is collected once and
+        # embedded in each). Stored on S3 + keyed on each member's dietary profile.
+        # Best-effort: when S3 isn't configured the approval still proceeds.
+        from ..services import import_storage
+        from ..services.nutrition_pdf import render_member_nutrition_pdf
+        from django.utils import timezone as _tz
+        if import_storage.s3_enabled():
+            signed_at = _tz.now()
+            for mv in enr.member_profiles.select_related("client").all():
+                # Never generate a PDF for a Nutritionist-Paused member.
+                if mv.status == MemberStatus.NUTRITIONIST_PAUSED:
+                    continue
+                pdf_bytes = render_member_nutrition_pdf(
+                    mv, agent=agent, signature_image=signature_image, signed_at=signed_at,
+                )
+                key = import_storage.build_nutrition_key(
+                    str(mv.client_id or client.client_id)
+                )
+                import_storage.upload_bytes(key, pdf_bytes, content_type="application/pdf")
+                mv.nutritionist_pdf_key = key
+                mv.save(update_fields=["nutritionist_pdf_key"])
+
+        from ..services.lifecycle import nutritionist_approve
+        nutritionist_approve(
+            enr, agent=agent, signature=signature,
+            signature_image=signature_image,
+        )
+        return Response({"ok": True, "client_id": str(client.client_id)})
+
+
+class MemberNutritionistReviewView(PortalAPIView):
+    """GET /members/<id>/nutritionist-review/: the household's review data (for
+    the Nutritionist drawer) plus the acting Nutritionist's auto-fill details and
+    any existing signed PDF. Visible to Nutritionist + Management."""
+
+    def get(self, request, client_id):
+        agent = current_agent(request)
+        allowed = bool(agent and (
+            agent.group in ("Nutritionist", "Management")
+            or getattr(agent, "is_manager", False)
+        ))
+        if not allowed:
+            return Response({"detail": "Nutritionist access required."}, status=http.HTTP_403_FORBIDDEN)
+        client = get_object_or_404(Client, pk=client_id)
+        enr = (
+            EnrollmentVerification.objects
+            .filter(client=client, stage=EnrollmentStage.VERIFIED)
+            .order_by("-verified_at")
+            .first()
+        ) or EnrollmentVerification.objects.filter(client=client).order_by("-verified_at").first()
+        if enr is None:
+            return Response({"error": "No enrollment for this member."}, status=http.HTTP_404_NOT_FOUND)
+        from ..services.nutrition_pdf import nutrition_review_context
+        ctx = nutrition_review_context(enr)
+        return Response({
+            **ctx,
+            "already_approved": bool(enr.nutritionist_approved_at),
+            "has_pdf": bool(enr.nutritionist_approval_pdf_key),
+            # Auto-fill for the signature form from the acting agent.
+            "nutritionist": {
+                "name": agent.name or "",
+                "credentials": getattr(agent, "title", "") or "",
+                "email": getattr(agent, "email", "") or "",
+            },
+        })
+
+
+class MemberNutritionReviewPdfView(PortalAPIView):
+    """GET /members/<id>/nutrition-review-pdf/?mode=view|download: a short-lived
+    URL for THIS member's own signed Nutrition Review PDF (one per member).
+    ``mode=view`` opens inline; anything else downloads."""
+
+    def get(self, request, client_id):
+        client = get_object_or_404(Client, pk=client_id)
+        # This member's OWN profile PDF (client_id is the member being viewed).
+        mv = (
+            MemberDietaryProfile.objects
+            .filter(client_id=client_id, nutritionist_pdf_key__gt="")
+            .order_by("-enrollment__nutritionist_approved_at")
+            .first()
+        )
+        if mv is None:
+            return Response({"error": "No nutrition review on file."}, status=http.HTTP_404_NOT_FOUND)
+        from ..services import import_storage
+        if not import_storage.s3_enabled():
+            return Response({"error": "Document storage is not configured."}, status=http.HTTP_404_NOT_FOUND)
+        inline = (request.query_params.get("mode") or "").lower() == "view"
+        # Unique, readable filename: member name + approval date + short id.
+        import re
+        raw_name = mv.member_name or (
+            f"{mv.client.first_name} {mv.client.last_name}".strip() if mv.client_id else ""
+        ) or "member"
+        slug = re.sub(r"[^A-Za-z0-9]+", "-", raw_name).strip("-").lower() or "member"
+        approved = getattr(mv.enrollment, "nutritionist_approved_at", None)
+        stamp = approved.strftime("%Y%m%d") if approved else ""
+        short = (str(mv.client_id).replace("-", "")[:8] if mv.client_id else "") or "review"
+        filename = "-".join(p for p in [slug, "nutrition-review", stamp, short] if p) + ".pdf"
+        url = import_storage.presign_get(
+            mv.nutritionist_pdf_key,
+            download_name=filename,
+            inline=inline,
+            content_type="application/pdf" if inline else "",
+        )
+        return Response({"url": url})
+
+
+class MemberNutritionistHoldView(PortalAPIView):
+    """POST /members/<id>/nutritionist-hold/: a Nutritionist places the household
+    On Hold with a reason (Nutritionist role only). Moves the governing enrollment
+    to On Hold -- which logs a StageEvent + a timeline event that now carries the
+    reason -- and records a client note. The household then drops off the pending
+    Nutritionist list (its stage is no longer Verified)."""
+
+    @transaction.atomic
+    def post(self, request, client_id):
+        agent = current_agent(request)
+        if not (agent and (agent.group in ("Nutritionist", "Management") or getattr(agent, "is_manager", False))):
+            return Response({"detail": "Only a Nutritionist can place a hold."}, status=http.HTTP_403_FORBIDDEN)
+        client = get_object_or_404(Client, pk=client_id)
+        reason = (request.data.get("reason") or "").strip()
+        if not reason:
+            return Response({"reason": "A reason is required to place the household on hold."}, status=http.HTTP_400_BAD_REQUEST)
+        enr = s.active_enrollment(client)
+        if enr is None:
+            return Response({"error": "This member has no active enrollment."}, status=http.HTTP_404_NOT_FOUND)
+        if EnrollmentStage(enr.stage) == EnrollmentStage.ON_HOLD:
+            return Response({"error": "Service is already on hold."}, status=http.HTTP_400_BAD_REQUEST)
+        try:
+            advance_enrollment(
+                enr, EnrollmentStage.ON_HOLD,
+                actor_label=agent.name or "Nutritionist",
+                note=f"Placed on hold by Nutritionist {agent.name}. Reason: {reason}",
+            )
+        except InvalidTransition as exc:
+            return Response({"error": str(exc)}, status=http.HTTP_400_BAD_REQUEST)
+        Note.objects.create(
+            client=client, source=NoteSource.AGENT, author_name=agent.name or "",
+            body=f"Household placed on hold by Nutritionist. Reason: {reason}",
+        )
+        return Response({"ok": True, "client_id": str(client.client_id)})
+
+
+class MemberNutritionistDenyMemberView(PortalAPIView):
+    """POST /members/<id>/nutritionist-deny-member/: a Nutritionist PAUSES an
+    INDIVIDUAL household member (Nutritionist role only). Sets that member's
+    status to Nutritionist Paused -- excluded from all delivery schedules / POs,
+    like Out of Orbit -- and records a reason note + a per-member timeline event.
+    When this pauses the LAST still-active member, the whole household is placed
+    On Hold with the same reason."""
+
+    @transaction.atomic
+    def post(self, request, client_id):
+        agent = current_agent(request)
+        if not (agent and (agent.group in ("Nutritionist", "Management") or getattr(agent, "is_manager", False))):
+            return Response({"detail": "Only a Nutritionist can pause a member."}, status=http.HTTP_403_FORBIDDEN)
+        client = get_object_or_404(Client, pk=client_id)
+        member_id = request.data.get("member_id") or ""
+        reason = (request.data.get("reason") or "").strip()
+        if not reason:
+            return Response({"reason": "A reason is required to pause a member."}, status=http.HTTP_400_BAD_REQUEST)
+        enr = s.active_enrollment(client)
+        if enr is None:
+            return Response({"error": "This household has no active enrollment."}, status=http.HTTP_404_NOT_FOUND)
+        mv = enr.member_profiles.filter(client_id=member_id).first() if member_id else None
+        if mv is None:
+            return Response({"error": "Member not found in this household."}, status=http.HTTP_400_BAD_REQUEST)
+        if mv.status == MemberStatus.NUTRITIONIST_PAUSED:
+            return Response({"error": "Member is already Nutritionist Paused."}, status=http.HTTP_400_BAD_REQUEST)
+        mv.status = MemberStatus.NUTRITIONIST_PAUSED
+        mv.kitchen_meal_type = ""
+        mv.kitchen_food_notes = ""
+        mv.save(update_fields=["status", "kitchen_meal_type", "kitchen_food_notes"])
+        from ..services.timeline import emit_timeline_event
+        if mv.client_id:
+            emit_timeline_event(
+                client=mv.client, event_type=TimelineEventType.NUTRITIONIST_PAUSED,
+                occurred_at=timezone.now(), title="Nutritionist Paused",
+                subtitle=reason, badge_text="Paused", badge_tone=TimelineBadgeTone.DANGER,
+                actor=agent.name or "", enrollment=enr, metadata={"reason": reason},
+            )
+            Note.objects.create(
+                client=mv.client, source=NoteSource.AGENT, author_name=agent.name or "",
+                body=f"Member paused by Nutritionist. Reason: {reason}",
+            )
+
+        # If this paused the LAST still-active member, hold the whole household
+        # with the same reason (mirrors the manual Nutritionist hold).
+        held = False
+        remaining_active = enr.member_profiles.exclude(
+            status__in=SERVICE_EXCLUDED_MEMBER_STATUSES
+        ).exists()
+        if not remaining_active and EnrollmentStage(enr.stage) != EnrollmentStage.ON_HOLD:
+            try:
+                advance_enrollment(
+                    enr, EnrollmentStage.ON_HOLD,
+                    actor_label=agent.name or "Nutritionist",
+                    note=f"All members Nutritionist Paused. Reason: {reason}",
+                )
+                held = True
+                Note.objects.create(
+                    client=client, source=NoteSource.AGENT, author_name=agent.name or "",
+                    body=f"Household placed on hold (last member Nutritionist Paused). Reason: {reason}",
+                )
+            except InvalidTransition:
+                pass
+        return Response({"ok": True, "client_id": str(client.client_id),
+                         "member_id": str(mv.client_id) if mv.client_id else "",
+                         "household_held": held})
+
+
+class MemberNutritionistMealPlanView(PortalAPIView):
+    """POST /members/<id>/nutritionist-meal-plan/: set an individual household
+    member's Meal Plan (Nutritionist / Management). Body: member_id, meal_plan
+    (free text -- a MealPlan name, or "" to clear)."""
+
+    def post(self, request, client_id):
+        agent = current_agent(request)
+        if not (agent and (agent.group in ("Nutritionist", "Management") or getattr(agent, "is_manager", False))):
+            return Response({"detail": "Nutritionist access required."}, status=http.HTTP_403_FORBIDDEN)
+        client = get_object_or_404(Client, pk=client_id)
+        member_id = request.data.get("member_id") or ""
+        meal_plan = (request.data.get("meal_plan") or "").strip()
+        meal_plan_other = (request.data.get("meal_plan_other") or "").strip()
+        # The custom text only applies to the "Other" selection.
+        if meal_plan != "Other":
+            meal_plan_other = ""
+        enr = s.active_enrollment(client)
+        if enr is None:
+            return Response({"error": "This household has no active enrollment."}, status=http.HTTP_404_NOT_FOUND)
+        mv = enr.member_profiles.filter(client_id=member_id).first() if member_id else None
+        if mv is None:
+            return Response({"error": "Member not found in this household."}, status=http.HTTP_400_BAD_REQUEST)
+        mv.meal_plan = meal_plan
+        mv.meal_plan_other = meal_plan_other
+        mv.save(update_fields=["meal_plan", "meal_plan_other"])
+        return Response({"ok": True, "member_id": str(mv.client_id) if mv.client_id else "",
+                         "meal_plan": meal_plan, "meal_plan_other": meal_plan_other})
+
+
+class MemberNutritionistAssessmentNotesView(PortalAPIView):
+    """POST /members/<id>/nutritionist-assessment-notes/: set an individual
+    household member's Nutritionist assessment notes (Nutritionist / Management).
+    Body: member_id, assessment_notes."""
+
+    def post(self, request, client_id):
+        agent = current_agent(request)
+        if not (agent and (agent.group in ("Nutritionist", "Management") or getattr(agent, "is_manager", False))):
+            return Response({"detail": "Nutritionist access required."}, status=http.HTTP_403_FORBIDDEN)
+        client = get_object_or_404(Client, pk=client_id)
+        member_id = request.data.get("member_id") or ""
+        notes = request.data.get("assessment_notes") or ""
+        enr = s.active_enrollment(client)
+        if enr is None:
+            return Response({"error": "This household has no active enrollment."}, status=http.HTTP_404_NOT_FOUND)
+        mv = enr.member_profiles.filter(client_id=member_id).first() if member_id else None
+        if mv is None:
+            return Response({"error": "Member not found in this household."}, status=http.HTTP_400_BAD_REQUEST)
+        mv.assessment_notes = notes
+        mv.save(update_fields=["assessment_notes"])
+        return Response({"ok": True, "member_id": str(mv.client_id) if mv.client_id else ""})
+
+
 class MemberVerificationCreateView(PortalAPIView):
     """POST: create an EnrollmentVerification + MemberDietaryProfiles + delivery
     Address for a member (the 5-step wizard).
@@ -4470,6 +4905,24 @@ class MemberVerificationCreateView(PortalAPIView):
                 dietary_restrictions=m.get("dietary_restrictions", []),
                 food_allergies=m.get("food_allergies", []),
                 other_dietary_restrictions=m.get("other_dietary_restrictions", ""),
+                # Medical Conditions (empty -> "No Restriction"). Gestation /
+                # postpartum only meaningful when their condition is selected.
+                conditions=m.get("conditions") or ["No Restriction"],
+                weeks_gestation=(
+                    m.get("weeks_gestation")
+                    if "Pregnant" in (m.get("conditions") or []) else None
+                ),
+                months_postpartum=(
+                    m.get("months_postpartum")
+                    if "Postpartum" in (m.get("conditions") or []) else None
+                ),
+                medications=m.get("medications") or ["No Medications"],
+                weight=m.get("weight", ""),
+                height=m.get("height", ""),
+                on_medical_diet=bool(m.get("on_medical_diet")),
+                medical_diet_details=(
+                    m.get("medical_diet_details", "") if m.get("on_medical_diet") else ""
+                ),
                 meal_category=m.get("meal_category", ""),
                 # Williamsburg households are always served the Kosher menu (the
                 # agent's allergies/restrictions are still honored). Otherwise the
@@ -4491,12 +4944,23 @@ class MemberVerificationCreateView(PortalAPIView):
             # Wire the member's mobile-app login number onto their HouseholdMember
             # row (the field powers the Benefully member app login). Only members
             # that map to a real client/household-member can be wired here.
+            # mobile_app_username is UNIQUE: if another member already uses this
+            # number as their app login (e.g. a shared household phone), skip the
+            # write rather than 500 the whole verification -- the number is still
+            # captured on the member's dietary profile (mobile_number).
             mobile = (m.get("mobile_number") or "").strip()
             member_client_id = m.get("client_id")
             if mobile and member_client_id:
-                HouseholdMember.objects.filter(
-                    client_id=member_client_id
-                ).update(mobile_app_username=mobile)
+                taken = (
+                    HouseholdMember.objects
+                    .filter(mobile_app_username=mobile)
+                    .exclude(client_id=member_client_id)
+                    .exists()
+                )
+                if not taken:
+                    HouseholdMember.objects.filter(
+                        client_id=member_client_id
+                    ).update(mobile_app_username=mobile)
 
         # Attach any members added via the Step-1 search to the household and
         # record each addition on the primary's timeline. Skip clients already

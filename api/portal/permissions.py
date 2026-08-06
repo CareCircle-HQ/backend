@@ -11,7 +11,7 @@ from rest_framework.permissions import BasePermission
 # Groups allowed into the support portal. Screeners are intentionally excluded
 # (they use the Chrome extension). Logistics staff work the kitchen-assignment /
 # Logistics page, so they must be able to sign in too.
-PORTAL_ALLOWED_GROUPS = frozenset({"Verifiers", "Management", "CS", "Logistics"})
+PORTAL_ALLOWED_GROUPS = frozenset({"Verifiers", "Management", "CS", "Logistics", "Nutritionist"})
 
 # The management group. High-impact, shared-household actions (e.g. changing the
 # household's assigned kitchen from the program tab) are locked to this group so
