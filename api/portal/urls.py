@@ -71,6 +71,7 @@ from .views_members import (
     MemberPhonesView,
     MemberServiceHoldView,
     MemberServiceResumeView,
+    MemberTagsView,
     MemberDismissAttentionView,
     MemberDoctorView,
     MemberRequestVerificationView,
@@ -158,6 +159,7 @@ from .views_imports import (
 from .views_settings import (
     ActiveProgramViewSet,
     CadenceViewSet,
+    ClientTagViewSet,
     CrmAgentViewSet,
     DeliveryCompanyIntegrationDetailView,
     DeliveryCompanyIntegrationSetPrimaryView,
@@ -183,6 +185,7 @@ router = SimpleRouter()
 router.register("settings/menu-types", MenuTypeViewSet, basename="portal-menu-type")
 router.register("settings/meal-plans", MealPlanViewSet, basename="portal-meal-plan")
 router.register("settings/dietary-tags", DietaryTagViewSet, basename="portal-dietary-tag")
+router.register("settings/client-tags", ClientTagViewSet, basename="portal-client-tag")
 router.register("settings/cadences", CadenceViewSet, basename="portal-cadence")
 router.register("settings/kitchens", KitchenViewSet, basename="portal-kitchen")
 router.register(
@@ -218,6 +221,7 @@ urlpatterns = [
     path("teams/", TeamsListView.as_view(), name="portal-teams"),
     path("verifiers/", VerifiersListView.as_view(), name="portal-verifiers"),
     path("members/<uuid:client_id>/", MemberDetailView.as_view(), name="portal-member-detail"),
+    path("members/<uuid:client_id>/tags/", MemberTagsView.as_view(), name="portal-member-tags"),
     path("members/<uuid:client_id>/insurance/", MemberInsuranceView.as_view()),
     path("members/<uuid:client_id>/social-coverage/", MemberSocialCoverageView.as_view()),
     path("members/<uuid:client_id>/doctor/", MemberDoctorView.as_view(), name="portal-member-doctor"),

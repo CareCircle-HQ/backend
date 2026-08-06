@@ -711,24 +711,19 @@ def sync_household_members(client, enrollment=None, agent=None):
             except Exception:
                 logger.warning("household member out-of-range event failed", exc_info=True)
             continue
-        # "Out of Orbit" means a member's menu/allergies can't be fulfilled by
-        # the assigned KITCHEN -- it is meaningless before a kitchen exists. With
-        # no kitchen yet (e.g. right after Request Verification, still Pending
-        # Verification), leave the member at the default Active status and do NOT
-        # flag Out of Orbit -- neither the status, the note, nor the timeline
-        # event. The meal rule sets the real status when a kitchen is assigned.
+        # New members stay PENDING (the model default): they are only activated
+        # by the kitchen-assignment meal rule (or the explicit "reactivate" edit
+        # once an agent gives them a menu type). A PENDING member is excluded from
+        # every delivery schedule / Purchase Order, so this is safe whether or not
+        # the household already has a kitchen. We leave an informational system
+        # note when the household is already served, so it's clear the new member
+        # needs configuration before they can join deliveries.
         if not enrollment.kitchen_id:
             continue
-        # Kitchen exists: a member added to an already-served household with no
-        # menu yet IS Out of Orbit until an agent configures them. Set the status,
-        # leave a system note explaining what's needed, and log the event.
-        # Best-effort: never let history/note-logging break the add.
-        profile.status = MemberStatus.OUT_OF_ORBIT
-        profile.save(update_fields=["status"])
         reason = (
             "New member added outside of the verification process. "
-            "This member needs a menu type and dietary preferences to be "
-            "active (added Out of Orbit by default)."
+            "This member needs a menu type and dietary preferences before they "
+            "can be activated (kept Pending)."
         )
         try:
             Note.objects.create(
@@ -737,13 +732,6 @@ def sync_household_members(client, enrollment=None, agent=None):
             )
         except Exception:
             logger.warning("household member note failed", exc_info=True)
-        try:
-            from .services import timeline
-            timeline.event_for_out_of_orbit(
-                profile, enrollment=enrollment, reason=reason, actor=agent_actor,
-            )
-        except Exception:
-            logger.warning("household member out-of-orbit event failed", exc_info=True)
 
     # 2) profiled members -> ensure a roster row (one-household-per-client).
     for cid in profiles:

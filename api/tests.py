@@ -7166,8 +7166,14 @@ class MemberEligibilityTest(TestCase):
         enr = EnrollmentVerification.objects.create(
             client=primary, household=hh, stage=EnrollmentStage.SERVICE_ACTIVE,
         )
-        pmv = MemberDietaryProfile.objects.create(enrollment=enr, client=primary)
-        dmv = MemberDietaryProfile.objects.create(enrollment=enr, client=dep)
+        # Serving (SERVICE_ACTIVE) household -> members are ACTIVE (they went
+        # through kitchen assignment); PENDING is only the pre-kitchen default.
+        pmv = MemberDietaryProfile.objects.create(
+            enrollment=enr, client=primary, status=MemberStatus.ACTIVE,
+        )
+        dmv = MemberDietaryProfile.objects.create(
+            enrollment=enr, client=dep, status=MemberStatus.ACTIVE,
+        )
 
         self._reconcile(dep)
 
@@ -11361,11 +11367,11 @@ class AllVerificationsReportTest(TestCase):
 
 
 class SyncHouseholdOutOfOrbitEventGateTest(TestCase):
-    """A placeholder member profile created before a kitchen is assigned (e.g.
-    right after Request Verification, still Pending Verification) must NOT emit a
-    'Household set as Out of Orbit' event/note -- out of orbit only means a
-    kitchen can't fulfill the member, which is meaningless with no kitchen. Once
-    a kitchen IS assigned, the event fires as before."""
+    """A member added via the household roster lands PENDING (the pre-kitchen
+    initial state), NOT Out of Orbit -- out of orbit only means a kitchen can't
+    fulfill the member and is decided by the meal rule at kitchen assignment. So
+    adding a member never emits an Out of Orbit event, whether or not the
+    household already has a kitchen; an informational note is left when it does."""
 
     def _setup(self, *, with_kitchen):
         from .models import (
@@ -11409,9 +11415,9 @@ class SyncHouseholdOutOfOrbitEventGateTest(TestCase):
         sync_household_members(primary, enrollment=enr)
 
         prof = MemberDietaryProfile.objects.get(enrollment=enr, client=dep)
-        # No kitchen yet -> not Out of Orbit (stays the default Active); the meal
-        # rule decides the real status at kitchen assignment.
-        self.assertEqual(prof.status, MemberStatus.ACTIVE)
+        # No kitchen yet -> PENDING (pre-kitchen initial state); the meal rule
+        # decides the real status at kitchen assignment. No event, no note.
+        self.assertEqual(prof.status, MemberStatus.PENDING)
         self.assertFalse(
             TimelineEvent.objects.filter(
                 client=dep, event_type=TimelineEventType.OUT_OF_ORBIT
@@ -11419,18 +11425,27 @@ class SyncHouseholdOutOfOrbitEventGateTest(TestCase):
         )
         self.assertFalse(Note.objects.filter(client=dep, source=NoteSource.SYSTEM).exists())
 
-    def test_out_of_orbit_event_fires_with_kitchen(self):
-        from .models import TimelineEvent, TimelineEventType
+    def test_added_member_is_pending_with_kitchen(self):
+        # Adding a member to an already-served (kitchen-assigned) household still
+        # lands them PENDING -- NOT Out of Orbit -- with an informational note
+        # (they need a menu type before they can be activated). No OOB event.
+        from .models import (
+            MemberDietaryProfile, MemberStatus, Note, NoteSource, TimelineEvent,
+            TimelineEventType,
+        )
         from .serializers import sync_household_members
 
         primary, dep, enr = self._setup(with_kitchen=True)
         sync_household_members(primary, enrollment=enr)
 
-        self.assertTrue(
+        prof = MemberDietaryProfile.objects.get(enrollment=enr, client=dep)
+        self.assertEqual(prof.status, MemberStatus.PENDING)
+        self.assertFalse(
             TimelineEvent.objects.filter(
                 client=dep, event_type=TimelineEventType.OUT_OF_ORBIT
             ).exists()
         )
+        self.assertTrue(Note.objects.filter(client=dep, source=NoteSource.SYSTEM).exists())
 
 
 class DedupePoDeliveryOrdersCommandTest(TestCase):

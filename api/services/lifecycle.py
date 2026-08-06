@@ -1591,6 +1591,35 @@ def nutritionist_approve(enrollment, *, agent, signature, signature_image="", pd
 
     client = getattr(enrollment, "client", None)
     if client is not None:
+        # Capture WHAT was reviewed/approved so the event is self-explanatory:
+        # the acting Nutritionist + signature/PDF, plus the per-member nutrition
+        # data that was signed off (meal plan, meal type, conditions, meds,
+        # allergies, weight/height, assessment notes). Best-effort -- never let
+        # the summary break the approval.
+        review_members = []
+        try:
+            from api.services.nutrition_pdf import nutrition_review_context
+
+            ctx = nutrition_review_context(enrollment)
+            for m in ctx.get("members", []):
+                review_members.append({
+                    "client_id": m.get("client_id", ""),
+                    "name": m.get("name", ""),
+                    "status": m.get("status", ""),
+                    "meal_plan": m.get("meal_plan", ""),
+                    "meal_plan_other": m.get("meal_plan_other", ""),
+                    "meal_type": m.get("meal_type", ""),
+                    "food_allergies": m.get("food_allergies", []),
+                    "conditions": m.get("conditions", []),
+                    "medications": m.get("medications", []),
+                    "weight": m.get("weight", ""),
+                    "height": m.get("height", ""),
+                    "on_medical_diet": m.get("on_medical_diet"),
+                    "medical_diet_details": m.get("medical_diet_details", ""),
+                    "assessment_notes": m.get("assessment_notes", ""),
+                })
+        except Exception:  # pragma: no cover - defensive
+            review_members = []
         emit_timeline_event(
             client=client,
             event_type=TimelineEventType.NUTRITIONIST_APPROVED,
@@ -1603,7 +1632,14 @@ def nutritionist_approve(enrollment, *, agent, signature, signature_image="", pd
             actor=getattr(agent, "name", "") or "",
             enrollment=enrollment,
             case=enrollment.case,
-            metadata={"signature": enrollment.nutritionist_signature},
+            metadata={
+                "signature": enrollment.nutritionist_signature,
+                "approved_by": getattr(agent, "name", "") or "",
+                "approved_at": now.isoformat(),
+                "pdf_key": enrollment.nutritionist_approval_pdf_key or "",
+                "members_reviewed": len(review_members),
+                "members": review_members,
+            },
         )
 
     # An approved authorization can now advance the enrollment to kitchen

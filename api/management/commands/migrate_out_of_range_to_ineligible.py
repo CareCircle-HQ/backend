@@ -9,7 +9,7 @@ converts every existing Out-of-Range member on a LIVE (non-terminal) enrollment
 to that state, attaching the proper reason (with the offending ZIP when it can
 still be determined).
 
-Idempotent + safe to re-run. Use ``--dry-run`` to preview.
+Idempotent + safe to re-run. Previews by default; pass ``--apply`` to write.
 """
 
 from django.core.management.base import BaseCommand
@@ -21,8 +21,12 @@ class Command(BaseCommand):
 
     def add_arguments(self, parser):
         parser.add_argument(
+            "--apply", action="store_true",
+            help="Write changes. Without this flag the command only previews (dry run).",
+        )
+        parser.add_argument(
             "--dry-run", action="store_true",
-            help="Report what would change without writing anything.",
+            help="Report what would change without writing anything (default behaviour).",
         )
         parser.add_argument(
             "--limit", type=int, default=0,
@@ -34,7 +38,7 @@ class Command(BaseCommand):
         from api.services.eligibility import apply_out_of_range_ineligibility
         from api.services.service_area import excluded_zips, member_excluded_info
 
-        dry_run = opts["dry_run"]
+        dry_run = not opts["apply"]
         limit = opts["limit"]
         terminal = [
             EnrollmentStage.CLOSED, EnrollmentStage.CANCELLED,

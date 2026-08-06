@@ -39,6 +39,7 @@ from ..models import (
     CaseType,
     Client,
     ClientPhone,
+    ClientTag,
     ClientPhoneSource,
     ClientStage,
     DeliveryCadence,
@@ -53,6 +54,7 @@ from ..models import (
     MemberDietaryProfile,
     KitchenProductType,
     MemberStatus,
+    MEMBER_PAUSED_STATUSES,
     SERVICE_EXCLUDED_MEMBER_STATUSES,
     MenuType,
     Note,
@@ -705,6 +707,8 @@ SCOPE_TO_STAGES = {
 # so the Verification list's agent columns don't trigger an extra query per row.
 MEMBER_LIST_PREFETCH = (
     "insurances",
+    # Colour-coded labels (Settings > Tags), rendered as tag chips on the list.
+    "tags",
     # Addresses, so the eligibility-reason recompute (address_range_reason, shown
     # under a Not Eligible badge) resolves without an extra query per row.
     "addresses",
@@ -1538,6 +1542,9 @@ class MembersListView(PortalGenericAPIView):
             qs = qs.filter(current_member_status_exists(
                 MemberStatus.PAUSED, eligibility_paused=True,
             ))
+        elif flag == "nutritionist_paused":
+            # A Nutritionist reviewed and paused the member from the review drawer.
+            qs = qs.filter(current_member_status_exists(MemberStatus.NUTRITIONIST_PAUSED))
         # TEMP diagnostic flags (to be removed): members missing dietary/logistics
         # data. "no_menu_type" -> no dietary profile carries a menu type at all;
         # "no_kitchen" -> neither the member's nor their household's enrollment has
@@ -1551,6 +1558,14 @@ class MembersListView(PortalGenericAPIView):
                     household_membership__household__enrollment_verifications__kitchen_id__isnull=False
                 )
             )
+
+        # Tag filter (Settings > Tags): keep members carrying the given tag.
+        # A household matches when ANY member carries it (grouped scopes call
+        # .distinct()); with the primary-only tagging convention that's the
+        # household's own tag.
+        tag = (params.get("tag") or "").strip()
+        if tag:
+            qs = qs.filter(tags__pk=tag)
 
         # Household-composition filter:
         #   "multi"  -> members whose household has more than one member.
@@ -2222,6 +2237,7 @@ class MembersListView(PortalGenericAPIView):
                 .select_related("household", "client")
                 .prefetch_related(
                     "client__insurances", "client__military_profile",
+                    "client__tags",
                     Prefetch(
                         "client__enrollments",
                         queryset=EnrollmentVerification.objects.select_related(
@@ -2466,7 +2482,7 @@ class UnlinkedMembersListView(PortalGenericAPIView):
         case_to = _parse_date(params.get("case_to"))
 
         qs = self.base_queryset(case_from, case_to).prefetch_related(
-            "insurances", "cases", "assessments"
+            "insurances", "cases", "assessments", "tags"
         )
 
         search = (params.get("search") or "").strip()
@@ -2486,6 +2502,10 @@ class UnlinkedMembersListView(PortalGenericAPIView):
             except (ValueError, TypeError, AttributeError):
                 pass
             qs = qs.filter(cond)
+
+        tag = (params.get("tag") or "").strip()
+        if tag:
+            qs = qs.filter(tags__pk=tag)
 
         # Optionally keep only members that ARE referenced in some other member's
         # case description (the "Referenced In" column). Resolved in a single
@@ -2643,6 +2663,7 @@ class UnlinkedMembersListView(PortalGenericAPIView):
                         self._case_of_type(c, CaseType.NAVIGATION)
                     ),
                     "description_match": self._description_match(c),
+                    "tags": _client_tags_payload(c),
                 }
             )
         return self.get_paginated_response(rows)
@@ -2684,7 +2705,7 @@ class NoNavigationMembersListView(UnlinkedMembersListView):
                 _has_nav=Exists(nav_case),
             )
             .filter(_has_ic=True, _has_nav=False)
-            .prefetch_related("insurances", "cases", "assessments")
+            .prefetch_related("insurances", "cases", "assessments", "tags")
         )
 
         search = (params.get("search") or "").strip()
@@ -2704,6 +2725,10 @@ class NoNavigationMembersListView(UnlinkedMembersListView):
             except (ValueError, TypeError, AttributeError):
                 pass
             qs = qs.filter(cond)
+
+        tag = (params.get("tag") or "").strip()
+        if tag:
+            qs = qs.filter(tags__pk=tag)
 
         return qs.order_by(Lower("first_name"), Lower("last_name")).distinct()
 
@@ -2729,7 +2754,7 @@ class NeedAttestationMembersListView(UnlinkedMembersListView):
         params = self.request.query_params
 
         qs = Client.objects.filter(attestation_needed=True).prefetch_related(
-            "insurances", "cases", "assessments"
+            "insurances", "cases", "assessments", "tags"
         )
 
         search = (params.get("search") or "").strip()
@@ -2749,6 +2774,10 @@ class NeedAttestationMembersListView(UnlinkedMembersListView):
             except (ValueError, TypeError, AttributeError):
                 pass
             qs = qs.filter(cond)
+
+        tag = (params.get("tag") or "").strip()
+        if tag:
+            qs = qs.filter(tags__pk=tag)
 
         return qs.order_by(Lower("first_name"), Lower("last_name")).distinct()
 
@@ -2791,6 +2820,7 @@ class NeedAttestationMembersListView(UnlinkedMembersListView):
                     ),
                     # The screening question + answer we keyed the flag on.
                     "attestation": self._attestation_qa(c),
+                    "tags": _client_tags_payload(c),
                 }
             )
         return self.get_paginated_response(rows)
@@ -2884,6 +2914,34 @@ class MemberDetailView(PortalAPIView):
     def get(self, request, client_id):
         client = _get_member(client_id)
         return Response(s.MemberDetailSerializer(client).data)
+
+
+def _client_tags_payload(client):
+    return [
+        {"id": str(t.pk), "name": t.name, "color": t.color,
+         "color_label": t.get_color_display()}
+        for t in client.tags.all()
+    ]
+
+
+class MemberTagsView(PortalAPIView):
+    """GET/PUT /members/<client_id>/tags/ — the colour-coded labels (Settings >
+    Tags) attached to a client. PUT replaces the full set from a ``tag_ids``
+    list. Used by the member profile header and by the Care Management page
+    (which tags the household's PRIMARY client)."""
+
+    def get(self, request, client_id):
+        client = get_object_or_404(Client, pk=client_id)
+        return Response(_client_tags_payload(client))
+
+    def put(self, request, client_id):
+        client = get_object_or_404(Client, pk=client_id)
+        tag_ids = request.data.get("tag_ids", [])
+        if not isinstance(tag_ids, list):
+            return Response({"error": "tag_ids must be a list."}, status=http.HTTP_400_BAD_REQUEST)
+        tags = list(ClientTag.objects.filter(pk__in=tag_ids))
+        client.tags.set(tags)
+        return Response(_client_tags_payload(client))
 
 
 class MemberInsuranceView(PortalAPIView):
@@ -3681,11 +3739,14 @@ class HouseholdMemberEditView(PortalAPIView):
                     )
                 except Exception:  # never let note-writing break the edit
                     pass
-        elif reactivate and mv.status == MemberStatus.OUT_OF_ORBIT:
+        elif reactivate and mv.status in (
+            MemberStatus.OUT_OF_ORBIT, MemberStatus.PENDING,
+        ):
             # Re-run the kitchen-aware rules against the edited menu type /
             # allergies. Only return the member to Active if the new combination
             # can actually be fulfilled by the household's assigned kitchen;
-            # otherwise the agent must pick a different menu type.
+            # otherwise the agent must pick a different menu type. Also promotes a
+            # still-PENDING member (pre-kitchen add) once they have a menu.
             out, _became, reason = reconcile_member_kitchen_output(
                 mv, enr.kitchen, save=False,
             )
@@ -4752,11 +4813,13 @@ class MemberNutritionistDenyMemberView(PortalAPIView):
                 body=f"Member paused by Nutritionist. Reason: {reason}",
             )
 
-        # If this paused the LAST still-active member, hold the whole household
-        # with the same reason (mirrors the manual Nutritionist hold).
+        # If this paused the LAST member still in play, hold the whole household
+        # with the same reason (mirrors the manual Nutritionist hold). PENDING
+        # members are still in play (under review / pre-kitchen), so they count
+        # as remaining -- only genuinely paused/off-ramped statuses don't.
         held = False
         remaining_active = enr.member_profiles.exclude(
-            status__in=SERVICE_EXCLUDED_MEMBER_STATUSES
+            status__in=MEMBER_PAUSED_STATUSES
         ).exists()
         if not remaining_active and EnrollmentStage(enr.stage) != EnrollmentStage.ON_HOLD:
             try:
@@ -5470,9 +5533,10 @@ def assign_kitchen_to_household(
     actor = _agent_actor(agent)
 
     # Capture the pre-assignment kitchen + cadence so a RE-assignment (the
-    # household already had a kitchen) logs a precise 'Kitchen Changed' diff.
-    # First-time assignment (no previous kitchen) is already recorded by the
-    # KITCHEN_ASSIGNED stage event, so we skip the change row there.
+    # household already had a kitchen) logs a precise 'Kitchen Changed' diff,
+    # while a first-time assignment logs a 'Kitchen Assigned' event (emitted
+    # below, once the kitchen is actually set -- NOT when the enrollment merely
+    # reaches the Kitchen Assignment stage).
     previous_kitchen = enr.kitchen.name if enr.kitchen_id else ""
     previous_cadence = current_household_cadence(enr) or ""
 
@@ -5619,12 +5683,14 @@ def assign_kitchen_to_household(
             "warning sync failed after kitchen assignment for enrollment %s", enr.pk
         )
 
-    # Log the kitchen/cadence change on a RE-assignment (skipped on first-time
-    # assignment, where previous_kitchen is blank). event_for_kitchen_changed is
-    # itself a no-op when nothing actually changed. Best-effort.
-    if previous_kitchen:
-        try:
-            _cad_label = {c.code: c.label for c in Cadence.objects.all()}
+    # Log the kitchen event: a 'Kitchen Assigned' on first-time assignment
+    # (previous_kitchen blank), else a precise 'Kitchen Changed' diff on
+    # re-assignment. This is the ONLY place a real kitchen assignment is logged
+    # now that reaching the Kitchen Assignment STAGE emits AWAITING_KITCHEN
+    # instead. Best-effort -- never let history-logging break assignment.
+    try:
+        _cad_label = {c.code: c.label for c in Cadence.objects.all()}
+        if previous_kitchen:
             timeline.event_for_kitchen_changed(
                 enr,
                 previous_kitchen=previous_kitchen,
@@ -5633,8 +5699,15 @@ def assign_kitchen_to_household(
                 new_cadence=_cad_label.get(cadence, cadence),
                 actor=actor,
             )
-        except Exception:  # never let history-logging break assignment
-            pass
+        else:
+            timeline.event_for_kitchen_assigned(
+                enr,
+                kitchen_name=kitchen.name if kitchen else "",
+                cadence_label=_cad_label.get(cadence, cadence),
+                actor=actor,
+            )
+    except Exception:  # never let history-logging break assignment
+        pass
 
     return {
         "out_of_orbit": out_of_orbit,
