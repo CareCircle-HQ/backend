@@ -2170,6 +2170,9 @@ class MemberDietaryProfile(models.Model):
     medications = models.JSONField(default=list, blank=True)
     weight = models.CharField(max_length=50, blank=True)
     height = models.CharField(max_length=50, blank=True)
+    # Meal plan the Nutritionist selects for this member (free text -- the name of
+    # a MealPlan catalog entry; see Settings > Meal Plans).
+    meal_plan = models.CharField(max_length=150, blank=True)
     meal_category = models.CharField(
         max_length=20, choices=MenuCategory.choices, blank=True
     )

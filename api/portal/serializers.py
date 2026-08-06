@@ -1863,7 +1863,7 @@ class PortalHouseholdMemberSerializer(serializers.ModelSerializer):
             "id", "client_id", "name", "mobile_number", "mobile_number_suggested",
             "dietary_restrictions", "food_allergies", "other_dietary_restrictions",
             "conditions", "weeks_gestation", "months_postpartum",
-            "medications", "weight", "height",
+            "medications", "weight", "height", "meal_plan",
             "meal_category", "menu_type", "general_verification_notes",
             "status", "status_label", "kitchen_meal_type", "kitchen_food_notes",
             "is_primary", "pause_locked",

@@ -4686,6 +4686,29 @@ class MemberNutritionistDenyMemberView(PortalAPIView):
                          "household_held": held})
 
 
+class MemberNutritionistMealPlanView(PortalAPIView):
+    """POST /members/<id>/nutritionist-meal-plan/: set an individual household
+    member's Meal Plan (Nutritionist / Management). Body: member_id, meal_plan
+    (free text -- a MealPlan name, or "" to clear)."""
+
+    def post(self, request, client_id):
+        agent = current_agent(request)
+        if not (agent and (agent.group in ("Nutritionist", "Management") or getattr(agent, "is_manager", False))):
+            return Response({"detail": "Nutritionist access required."}, status=http.HTTP_403_FORBIDDEN)
+        client = get_object_or_404(Client, pk=client_id)
+        member_id = request.data.get("member_id") or ""
+        meal_plan = (request.data.get("meal_plan") or "").strip()
+        enr = s.active_enrollment(client)
+        if enr is None:
+            return Response({"error": "This household has no active enrollment."}, status=http.HTTP_404_NOT_FOUND)
+        mv = enr.member_profiles.filter(client_id=member_id).first() if member_id else None
+        if mv is None:
+            return Response({"error": "Member not found in this household."}, status=http.HTTP_400_BAD_REQUEST)
+        mv.meal_plan = meal_plan
+        mv.save(update_fields=["meal_plan"])
+        return Response({"ok": True, "member_id": str(mv.client_id) if mv.client_id else "", "meal_plan": meal_plan})
+
+
 class MemberVerificationCreateView(PortalAPIView):
     """POST: create an EnrollmentVerification + MemberDietaryProfiles + delivery
     Address for a member (the 5-step wizard).
