@@ -3550,7 +3550,9 @@ class TimelineEvent(models.Model):
     occurred_at = models.DateTimeField(db_index=True)
 
     title = models.CharField(max_length=255, blank=True)
-    subtitle = models.CharField(max_length=255, blank=True)
+    # Free-text reason/detail -- can be long (e.g. a hold reason with a Unite Us
+    # case URL), so store it unbounded rather than a varchar(255).
+    subtitle = models.TextField(blank=True)
     badge_text = models.CharField(max_length=120, blank=True)
     badge_tone = models.CharField(
         max_length=10, choices=TimelineBadgeTone.choices,
