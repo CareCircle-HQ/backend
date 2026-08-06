@@ -2171,8 +2171,10 @@ class MemberDietaryProfile(models.Model):
     weight = models.CharField(max_length=50, blank=True)
     height = models.CharField(max_length=50, blank=True)
     # Meal plan the Nutritionist selects for this member (free text -- the name of
-    # a MealPlan catalog entry; see Settings > Meal Plans).
+    # a MealPlan catalog entry; see Settings > Meal Plans). "Other" lets the
+    # Nutritionist type a custom plan in ``meal_plan_other``.
     meal_plan = models.CharField(max_length=150, blank=True)
+    meal_plan_other = models.TextField(blank=True)
     meal_category = models.CharField(
         max_length=20, choices=MenuCategory.choices, blank=True
     )

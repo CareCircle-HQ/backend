@@ -54,6 +54,7 @@ def nutrition_review_context(enrollment):
             "status_label": p.get_status_display(),
             "name": p.member_name or _full_name(p.client),
             "meal_plan": p.meal_plan or "",
+            "meal_plan_other": p.meal_plan_other or "",
             "meal_type": p.menu_type or "",
             "conditions": conditions,
             "medications": list(p.medications or []),
@@ -141,6 +142,10 @@ def render_nutrition_pdf(enrollment, *, agent, signature_image="", signed_at=Non
         rows = [
             ("Status", m["status_label"]),
             ("Meal Plan", m["meal_plan"]),
+        ]
+        if m["meal_plan"] == "Other" and m["meal_plan_other"]:
+            rows.append(("Other Meal Plan", m["meal_plan_other"]))
+        rows += [
             ("Meal Type", m["meal_type"]),
             ("Medical Conditions", ", ".join(m["conditions"]) or "No Restriction"),
             ("Medications", ", ".join(m["medications"])),

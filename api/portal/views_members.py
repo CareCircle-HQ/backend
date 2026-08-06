@@ -4698,6 +4698,10 @@ class MemberNutritionistMealPlanView(PortalAPIView):
         client = get_object_or_404(Client, pk=client_id)
         member_id = request.data.get("member_id") or ""
         meal_plan = (request.data.get("meal_plan") or "").strip()
+        meal_plan_other = (request.data.get("meal_plan_other") or "").strip()
+        # The custom text only applies to the "Other" selection.
+        if meal_plan != "Other":
+            meal_plan_other = ""
         enr = s.active_enrollment(client)
         if enr is None:
             return Response({"error": "This household has no active enrollment."}, status=http.HTTP_404_NOT_FOUND)
@@ -4705,8 +4709,10 @@ class MemberNutritionistMealPlanView(PortalAPIView):
         if mv is None:
             return Response({"error": "Member not found in this household."}, status=http.HTTP_400_BAD_REQUEST)
         mv.meal_plan = meal_plan
-        mv.save(update_fields=["meal_plan"])
-        return Response({"ok": True, "member_id": str(mv.client_id) if mv.client_id else "", "meal_plan": meal_plan})
+        mv.meal_plan_other = meal_plan_other
+        mv.save(update_fields=["meal_plan", "meal_plan_other"])
+        return Response({"ok": True, "member_id": str(mv.client_id) if mv.client_id else "",
+                         "meal_plan": meal_plan, "meal_plan_other": meal_plan_other})
 
 
 class MemberVerificationCreateView(PortalAPIView):
