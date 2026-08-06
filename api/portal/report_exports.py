@@ -347,12 +347,12 @@ def all_verifications_rows(params):
 def unite_us_agents_rows(params):
     from ..models import UniteUsAgent
 
-    yield ["Unite Us user_id", "Full Name", "Email", "Team", "Status"]
+    yield ["Status", "User ID", "Name", "Email", "Team"]
     for a in UniteUsAgent.objects.all().iterator(chunk_size=2000):
         full_name = a.name or " ".join(p for p in [a.first_name, a.last_name] if p)
         yield [
-            str(a.user_id), full_name, a.email or "",
-            a.originating_team or "", (a.status or "").title(),
+            (a.status or "").title(), str(a.user_id), full_name,
+            a.email or "", a.originating_team or "",
         ]
 
 
