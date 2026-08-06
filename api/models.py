@@ -3800,6 +3800,27 @@ class MenuTypeTag(models.Model):
         return f"{self.menu_type} - {self.dietary_tag}"
 
 
+class MealPlan(models.Model):
+    """A named meal plan, managed from Settings. A simple catalog entry
+    (name + description + active flag) referenced elsewhere in the app."""
+
+    meal_plan_id = models.UUIDField(
+        primary_key=True, default=uuid.uuid4, editable=False
+    )
+    name = models.CharField(max_length=150, unique=True)
+    description = models.TextField(blank=True)
+    # Disabled plans are hidden from selection but kept for historical records.
+    is_active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["name"]
+
+    def __str__(self):
+        return self.name
+
+
 # ---------------------------------------------------------------------------
 # Kitchens
 # ---------------------------------------------------------------------------

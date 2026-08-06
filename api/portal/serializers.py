@@ -44,6 +44,7 @@ from ..models import (
     KitchenProductType,
     MemberDietaryProfile,
     MemberStatus,
+    MealPlan,
     MenuType,
     Note,
     ProgramMainCategory,
@@ -1993,6 +1994,16 @@ class PortalMenuTypeSerializer(serializers.ModelSerializer):
 
     def get_tag_ids(self, obj):
         return [str(t.pk) for t in obj.tags.all()]
+
+
+class PortalMealPlanSerializer(serializers.ModelSerializer):
+    """Settings > Meal Plans: a simple named plan (name + description + active)."""
+
+    id = serializers.UUIDField(source="pk", read_only=True)
+
+    class Meta:
+        model = MealPlan
+        fields = ["id", "name", "description", "is_active"]
 
 
 class PortalCadenceSerializer(serializers.ModelSerializer):

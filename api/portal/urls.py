@@ -162,6 +162,7 @@ from .views_settings import (
     DietaryTagViewSet,
     KitchenIntegrationDetailView,
     KitchenViewSet,
+    MealPlanViewSet,
     MenuTypeViewSet,
     ProgramMainCategoryViewSet,
 )
@@ -177,6 +178,7 @@ from .views_tickets import (
 
 router = SimpleRouter()
 router.register("settings/menu-types", MenuTypeViewSet, basename="portal-menu-type")
+router.register("settings/meal-plans", MealPlanViewSet, basename="portal-meal-plan")
 router.register("settings/dietary-tags", DietaryTagViewSet, basename="portal-dietary-tag")
 router.register("settings/cadences", CadenceViewSet, basename="portal-cadence")
 router.register("settings/kitchens", KitchenViewSet, basename="portal-kitchen")
