@@ -659,6 +659,92 @@ def current_member_status_exists(member_status, *, eligibility_paused=None):
     return Exists(profiles)
 
 
+# --- Care Management tabs -----------------------------------------------------
+# Ordered tabs for the Care Management page. A household shows in the FIRST tab
+# it matches; matching an earlier tab excludes it from every later one (mutual
+# exclusion), so no household repeats across tabs.
+CARE_MANAGEMENT_TABS = [
+    ("out_of_range", "Out of Range"),
+    ("rejected_case", "Rejected Case"),
+    ("services_paused", "Services Paused"),
+    ("no_coverage", "No Active Coverage"),
+    ("requires_verification", "Requires Verification"),
+    ("no_matching_menu", "No Matching Menu"),
+]
+
+
+def care_management_base_q():
+    """The care-management population: members in the meal/box service pipeline --
+    they hold an internal-service case, or an enrollment on their own or their
+    household's roster. Keeps unrelated leads (e.g. an uninsured screening-only
+    contact) out of the No-Active-Coverage tab."""
+    return (
+        Q(cases__case_type=CaseType.INTERNAL_SERVICE)
+        | Q(enrollments__isnull=False)
+        | Q(household_membership__household__enrollment_verifications__isnull=False)
+    )
+
+
+def annotate_care_management(qs):
+    """Annotate the client qs with the boolean flags the Care Management tabs key
+    off (member status on a live enrollment, a denied internal-service case,
+    active Medicaid / enrolled social care, and the governing enrollment stage)."""
+    from ..models import (
+        Insurance, RecordStatus, SocialCareCoverage, SocialCareCoverageStatus,
+    )
+    from ..services.lifecycle import MEDICAID_PLAN_TYPES
+
+    internal = Case.objects.filter(
+        client=OuterRef("pk"), case_type=CaseType.INTERNAL_SERVICE,
+    )
+    active_medicaid = Insurance.objects.filter(
+        client=OuterRef("pk"), plan_type__in=MEDICAID_PLAN_TYPES,
+        status=RecordStatus.ACTIVE,
+    )
+    enrolled_scc = SocialCareCoverage.objects.filter(
+        client=OuterRef("pk"), status=SocialCareCoverageStatus.ENROLLED,
+    )
+    return qs.annotate(
+        _cm_oor=current_member_status_exists(MemberStatus.OUT_OF_RANGE),
+        _cm_oob=current_member_status_exists(MemberStatus.OUT_OF_ORBIT),
+        _cm_paused=current_member_status_exists(MemberStatus.PAUSED),
+        _cm_denied=Exists(
+            internal.filter(service_authorization_status=ServiceAuthorizationStatus.DENIED)
+        ),
+        _cm_medicaid=Exists(active_medicaid),
+        _cm_scc=Exists(enrolled_scc),
+        _cm_gov_stage=governing_enrollment_stage(),
+    )
+
+
+def care_management_predicates():
+    """Tab Q-predicates over the annotations from ``annotate_care_management``,
+    in the same precedence order as ``CARE_MANAGEMENT_TABS``."""
+    return [
+        Q(_cm_oor=True),                                                    # Out of Range
+        Q(_cm_denied=True),                                                 # Rejected Case
+        Q(_cm_paused=True) | Q(_cm_gov_stage=EnrollmentStage.ON_HOLD),      # Services Paused
+        Q(_cm_medicaid=False) & Q(_cm_scc=False),                          # No Active Coverage
+        Q(lifecycle_stage=ClientStage.PENDING_VERIFICATION),               # Requires Verification
+        Q(_cm_oob=True),                                                    # No Matching Menu
+    ]
+
+
+def care_management_tab_queryset(qs, tab):
+    """Filter ``qs`` (already base-scoped + annotated) to a single Care Management
+    tab, applying mutual exclusion: the tab's own predicate AND none of the
+    higher-precedence tabs' predicates."""
+    codes = [c for c, _ in CARE_MANAGEMENT_TABS]
+    preds = care_management_predicates()
+    try:
+        n = codes.index((tab or "").strip())
+    except ValueError:
+        n = 0
+    for i in range(n):
+        qs = qs.exclude(preds[i])
+    return qs.filter(preds[n])
+
+
 # Page-level base scope: restricts the list to the lifecycle stages a given
 # work area cares about (independent of the per-status filter chips).
 SCOPE_TO_STAGES = {
@@ -1271,6 +1357,12 @@ class MembersListView(PortalGenericAPIView):
                 qs = qs.filter(
                     Q(cases__case_type=CaseType.INTERNAL_SERVICE) & date_q
                 ).distinct()
+        elif scope == "care_management":
+            # Care Management tabs: the meal/box pipeline population, split into
+            # mutually-exclusive tabs (a household shows in the FIRST tab it
+            # matches). ``tab`` selects which one.
+            qs = annotate_care_management(qs.filter(care_management_base_q()).distinct())
+            qs = care_management_tab_queryset(qs, params.get("tab"))
         else:
             scope_stages = SCOPE_TO_STAGES.get(scope)
             if scope_stages:
@@ -2810,6 +2902,26 @@ class MembersStatsView(PortalAPIView):
             )
         }
         return Response(counts)
+
+
+class CareManagementTabCountsView(PortalAPIView):
+    """Per-tab counts for the Care Management page. Each count is the number of
+    DISTINCT members in that tab AFTER mutual exclusion (so tabs never overlap)."""
+
+    def get(self, request):
+        base = annotate_care_management(
+            Client.objects.filter(care_management_base_q()).distinct()
+        )
+        return Response({
+            "tabs": [
+                {
+                    "code": code,
+                    "label": label,
+                    "count": care_management_tab_queryset(base, code).distinct().count(),
+                }
+                for code, label in CARE_MANAGEMENT_TABS
+            ],
+        })
 
 
 def _get_member(client_id):

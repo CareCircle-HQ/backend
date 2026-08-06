@@ -86,6 +86,7 @@ from .views_members import (
     MemberVerificationCreateView,
     MemberVerificationDisregardView,
     NutritionistPendingListView,
+    CareManagementTabCountsView,
     MembersListView,
     MembersStatsView,
     NeedAttestationMembersListView,
@@ -207,6 +208,7 @@ urlpatterns = [
     # Members + sub-resources
     path("members/", MembersListView.as_view(), name="portal-members"),
     path("members/stats/", MembersStatsView.as_view(), name="portal-members-stats"),
+    path("care-management/tabs/", CareManagementTabCountsView.as_view(), name="portal-care-management-tabs"),
     path("members/unlinked/", UnlinkedMembersListView.as_view(), name="portal-members-unlinked"),
     path("members/no-navigation/", NoNavigationMembersListView.as_view(), name="portal-members-no-navigation"),
     path("members/need-attestation/", NeedAttestationMembersListView.as_view(), name="portal-members-need-attestation"),
