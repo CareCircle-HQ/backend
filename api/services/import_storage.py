@@ -90,12 +90,16 @@ def presign_put(key, *, content_type="text/csv", expires=900):
     )
 
 
-def presign_get(key, *, expires=900, download_name=""):
-    """Short-lived presigned URL to download an object (e.g. a generated report
-    CSV). ``download_name`` sets the browser's save-as filename."""
+def presign_get(key, *, expires=900, download_name="", inline=False, content_type=""):
+    """Short-lived presigned URL to fetch an object. ``download_name`` sets the
+    save-as filename; ``inline=True`` opens it in the browser (view) instead of
+    forcing a download; ``content_type`` overrides the response Content-Type."""
     params = {"Bucket": _bucket(), "Key": key}
     if download_name:
-        params["ResponseContentDisposition"] = f'attachment; filename="{download_name}"'
+        disp = "inline" if inline else "attachment"
+        params["ResponseContentDisposition"] = f'{disp}; filename="{download_name}"'
+    if content_type:
+        params["ResponseContentType"] = content_type
     return _client().generate_presigned_url(
         "get_object", Params=params, ExpiresIn=expires,
     )

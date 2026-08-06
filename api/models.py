@@ -2182,6 +2182,9 @@ class MemberDietaryProfile(models.Model):
     # The Nutritionist's assessment notes for this member (set from the review
     # drawer; shown on the member Nutritionist tab + the signed PDF).
     assessment_notes = models.TextField(blank=True)
+    # S3 key of this member's OWN signed Nutrition Review PDF (one per member,
+    # generated at approval with the shared signature).
+    nutritionist_pdf_key = models.CharField(max_length=500, blank=True)
     meal_category = models.CharField(
         max_length=20, choices=MenuCategory.choices, blank=True
     )

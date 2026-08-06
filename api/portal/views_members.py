@@ -4499,24 +4499,29 @@ class MemberNutritionistApproveView(PortalAPIView):
             )
         signature_image = request.data.get("signature_image") or ""
 
-        # Generate the signed Nutrition Review PDF and store it on S3 (best-effort
-        # -- when S3 isn't configured the approval still proceeds without a PDF).
-        pdf_key = ""
+        # One SEPARATE signed PDF per member (the signature is collected once and
+        # embedded in each). Stored on S3 + keyed on each member's dietary profile.
+        # Best-effort: when S3 isn't configured the approval still proceeds.
         from ..services import import_storage
-        from ..services.nutrition_pdf import render_nutrition_pdf
+        from ..services.nutrition_pdf import render_member_nutrition_pdf
+        from django.utils import timezone as _tz
         if import_storage.s3_enabled():
-            pdf_bytes = render_nutrition_pdf(
-                enr, agent=agent, signature_image=signature_image,
-            )
-            pdf_key = import_storage.build_nutrition_key(str(client.client_id))
-            import_storage.upload_bytes(
-                pdf_key, pdf_bytes, content_type="application/pdf",
-            )
+            signed_at = _tz.now()
+            for mv in enr.member_profiles.select_related("client").all():
+                pdf_bytes = render_member_nutrition_pdf(
+                    mv, agent=agent, signature_image=signature_image, signed_at=signed_at,
+                )
+                key = import_storage.build_nutrition_key(
+                    str(mv.client_id or client.client_id)
+                )
+                import_storage.upload_bytes(key, pdf_bytes, content_type="application/pdf")
+                mv.nutritionist_pdf_key = key
+                mv.save(update_fields=["nutritionist_pdf_key"])
 
         from ..services.lifecycle import nutritionist_approve
         nutritionist_approve(
             enr, agent=agent, signature=signature,
-            signature_image=signature_image, pdf_key=pdf_key,
+            signature_image=signature_image,
         )
         return Response({"ok": True, "client_id": str(client.client_id)})
 
@@ -4559,25 +4564,30 @@ class MemberNutritionistReviewView(PortalAPIView):
 
 
 class MemberNutritionReviewPdfView(PortalAPIView):
-    """GET /members/<id>/nutrition-review-pdf/: a short-lived download URL for the
-    member's signed Nutrition Review PDF (shown on the member Nutrition tab)."""
+    """GET /members/<id>/nutrition-review-pdf/?mode=view|download: a short-lived
+    URL for THIS member's own signed Nutrition Review PDF (one per member).
+    ``mode=view`` opens inline; anything else downloads."""
 
     def get(self, request, client_id):
         client = get_object_or_404(Client, pk=client_id)
-        enr = (
-            EnrollmentVerification.objects
-            .filter(client=client, nutritionist_approval_pdf_key__gt="")
-            .order_by("-nutritionist_approved_at")
+        # This member's OWN profile PDF (client_id is the member being viewed).
+        mv = (
+            MemberDietaryProfile.objects
+            .filter(client_id=client_id, nutritionist_pdf_key__gt="")
+            .order_by("-enrollment__nutritionist_approved_at")
             .first()
         )
-        if enr is None:
+        if mv is None:
             return Response({"error": "No nutrition review on file."}, status=http.HTTP_404_NOT_FOUND)
         from ..services import import_storage
         if not import_storage.s3_enabled():
             return Response({"error": "Document storage is not configured."}, status=http.HTTP_404_NOT_FOUND)
+        inline = (request.query_params.get("mode") or "").lower() == "view"
         url = import_storage.presign_get(
-            enr.nutritionist_approval_pdf_key,
+            mv.nutritionist_pdf_key,
             download_name="nutrition-review.pdf",
+            inline=inline,
+            content_type="application/pdf" if inline else "",
         )
         return Response({"url": url})
 
