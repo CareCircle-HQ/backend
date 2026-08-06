@@ -101,13 +101,7 @@ def _decode_signature(data_url):
 
 def _health_rows(m):
     """The ordered (label, value) rows for one member's Health section."""
-    # A signed PDF exists only post sign-off, so the status reads Nutritionist
-    # Approved (or Nutritionist Paused for a member the nutritionist paused).
-    nutri_status = (
-        "Nutritionist Paused" if m["status"] == "nutritionist_paused"
-        else "Nutritionist Approved"
-    )
-    rows = [("Nutritionist Status", nutri_status), ("Meal Plan", m["meal_plan"])]
+    rows = [("Meal Plan", m["meal_plan"])]
     if m["meal_plan"] == "Other" and m["meal_plan_other"]:
         rows.append(("Other Meal Plan", m["meal_plan_other"]))
     rows += [

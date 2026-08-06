@@ -4508,6 +4508,9 @@ class MemberNutritionistApproveView(PortalAPIView):
         if import_storage.s3_enabled():
             signed_at = _tz.now()
             for mv in enr.member_profiles.select_related("client").all():
+                # Never generate a PDF for a Nutritionist-Paused member.
+                if mv.status == MemberStatus.NUTRITIONIST_PAUSED:
+                    continue
                 pdf_bytes = render_member_nutrition_pdf(
                     mv, agent=agent, signature_image=signature_image, signed_at=signed_at,
                 )
