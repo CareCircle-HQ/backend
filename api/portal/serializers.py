@@ -1857,6 +1857,7 @@ class PortalHouseholdMemberSerializer(serializers.ModelSerializer):
     status_label = serializers.CharField(source="get_status_display", read_only=True)
     is_primary = serializers.SerializerMethodField()
     has_nutrition_pdf = serializers.SerializerMethodField()
+    nutrition_review_status = serializers.SerializerMethodField()
 
     class Meta:
         model = MemberDietaryProfile
@@ -1866,7 +1867,7 @@ class PortalHouseholdMemberSerializer(serializers.ModelSerializer):
             "conditions", "weeks_gestation", "months_postpartum",
             "medications", "weight", "height", "meal_plan", "meal_plan_other",
             "on_medical_diet", "medical_diet_details", "assessment_notes",
-            "has_nutrition_pdf",
+            "has_nutrition_pdf", "nutrition_review_status",
             "meal_category", "menu_type", "general_verification_notes",
             "status", "status_label", "kitchen_meal_type", "kitchen_food_notes",
             "is_primary", "pause_locked",
@@ -1882,6 +1883,21 @@ class PortalHouseholdMemberSerializer(serializers.ModelSerializer):
 
     def get_has_nutrition_pdf(self, obj):
         return bool(obj.nutritionist_pdf_key)
+
+    def get_nutrition_review_status(self, obj):
+        """The member's Nutritionist-review state (for the Nutritionist tab chip),
+        so a member awaiting review reads 'Pending Nutritionist' instead of the
+        default 'Active'. Empty once past the gate (grandfathered / in service),
+        where the real member status is shown instead."""
+        if obj.status == "nutritionist_paused":
+            return "paused"
+        enr = obj.enrollment
+        if enr and enr.stage == "verified":
+            if not enr.nutritionist_approved_at:
+                return "pending"
+            if enr.nutritionist_approved_by_id:
+                return "approved"
+        return ""
 
     def get_name(self, obj):
         return obj.member_name or (_full_name(obj.client) if obj.client else "")
