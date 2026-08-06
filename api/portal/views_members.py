@@ -437,39 +437,38 @@ def _reconcile_all_paused_hold(enrollment):
             pass
 
 
-def _enforce_delivery_coverage(enrollment, agent, *, allow_reactivate=False):
+def _enforce_delivery_coverage(enrollment, agent):
     """Delivery Coverage Eligibility Check for every member of ``enrollment``.
 
     A member whose enrollment's DELIVERY address OR their PRIMARY (Current/Home)
-    address ZIP is in the excluded-ZIP list is set Out of Range (reason "Delivery
-    Address Outside Coverage Area"), with a system note + timeline event
-    attributed to ``agent``. Manually Paused / Inactive members are left
-    untouched. When any member is newly set Out of Range the whole household is
-    placed On Hold and a Case Closure ticket is opened (pre-filled with the
-    offending ZIP) for an agent to review.
+    address ZIP is in the excluded-ZIP list is handled exactly like the
+    eligibility off-ramp: the member is set **Not Eligible** (client lifecycle
+    ``INELIGIBLE``, with the stable "Delivery Address Outside Coverage Area"
+    reason + a ZIP-specific note/timeline) and PAUSED (``eligibility_paused``,
+    dropped from the delivery schedule). Because the household shares the delivery
+    address this is a household-wide geographic block, so EVERY non-terminal
+    member is off-ramped (Inactive/off-boarded members are skipped).
 
-    When ``allow_reactivate`` is True (the delivery ZIP just became serviceable)
-    an Out-of-Range member is re-checked against the kitchen-aware meal rule
-    (which itself re-checks both addresses) and returned to Active only if it now
-    passes (so a dietary/kitchen block or a still-excluded primary ZIP keeps them
-    excluded). If that clears every member, the auto-hold is resumed and the
-    Out-of-Range Case Closure ticket is resolved.
+    This is a hard, STICKY off-ramp -- it is never auto-reversed when the ZIP
+    later becomes serviceable; an agent must resolve it. A Case Closure ticket is
+    opened (pre-filled with the offending ZIP) for that review.
 
-    Returns ``{"out_of_range": [...], "reactivated": [...]}``.
+    Returns ``{"out_of_range": [...]}`` (the member names newly off-ramped or
+    already Not Eligible for coverage this run).
     """
+    from ..services.eligibility import apply_out_of_range_ineligibility
     from ..services.service_area import (
-        SERVICE_AREA_REASON,
         excluded_zips,
         member_excluded_info,
         out_of_range_ticket_reason,
-        service_area_note_body,
     )
 
     excluded = excluded_zips()
-    actor = _agent_actor(agent)
+    # Portal agents are Agents, not Django Users, so there is no StageEvent.actor
+    # User to attribute -- pass the agent NAME as the string label used on the
+    # note / timeline (StageEvent is logged as an automatic system transition).
     author = agent.name if agent else ""
     out_names = []
-    reactivated_names = []
     # The first offending ZIP/source seen, used to pre-fill the closure ticket.
     ticket_zip, ticket_source = "", "delivery address"
 
@@ -480,63 +479,24 @@ def _enforce_delivery_coverage(enrollment, agent, *, allow_reactivate=False):
 
     for mv in enrollment.member_profiles.select_related("client").all():
         offending_zip, source = member_excluded_info(mv, excluded=excluded)
-        if offending_zip:
-            # An out-of-range ZIP is a household-wide geographic block: the whole
-            # household shares the delivery address, so EVERY non-terminal member
-            # is set Out of Range (individually excluded from future POs /
-            # deliveries and individually countable), not just the Active ones.
-            # We skip only INACTIVE (terminal off-boarded) and members already
-            # Out of Range (idempotent -- avoids duplicate note/timeline rows).
-            if mv.status in (MemberStatus.INACTIVE, MemberStatus.OUT_OF_RANGE):
-                continue
-            mv.status = MemberStatus.OUT_OF_RANGE
-            mv.kitchen_meal_type = ""
-            mv.kitchen_food_notes = ""
-            mv.save(update_fields=[
-                "status", "kitchen_meal_type", "kitchen_food_notes", "updated_at",
-            ])
-            out_names.append(_member_name(mv))
-            if not ticket_zip:
-                ticket_zip, ticket_source = offending_zip, source
-            try:
-                timeline.event_for_out_of_range(
-                    mv, enrollment=enrollment, reason=SERVICE_AREA_REASON,
-                    zip_code=offending_zip, actor=actor,
-                )
-            except Exception:  # never let history-logging break the save
-                pass
-            if mv.client_id:
-                try:
-                    Note.objects.create(
-                        client=mv.client, source=NoteSource.SYSTEM,
-                        author_name=author,
-                        body=service_area_note_body(offending_zip, source),
-                    )
-                except Exception:  # never let note-writing break the save
-                    pass
-        elif allow_reactivate and mv.status == MemberStatus.OUT_OF_RANGE:
-            # ZIP is now serviceable: return to Active only if the meal rule
-            # (now ZIP-aware) also passes. A dietary/kitchen block leaves them
-            # excluded (reconcile mutates mv in memory; we only persist when it
-            # clears). Explicit restore-range flow, so allow_resume=True lets the
-            # meal rule move the member OFF OUT_OF_RANGE (the ZIP re-check still
-            # keeps them excluded if the ZIP is still out of coverage).
-            out, _became, _reason = reconcile_member_kitchen_output(
-                mv, enrollment.kitchen, save=False, allow_resume=True,
-            )
-            if not out:
-                mv.save()
-                reactivated_names.append(_member_name(mv))
-                try:
-                    timeline.event_for_member_reactivated(
-                        mv, enrollment=enrollment, actor=actor,
-                    )
-                except Exception:  # never let history-logging break the save
-                    pass
+        if not offending_zip:
+            continue
+        # Skip terminal off-boarded members; everyone else in the household shares
+        # the out-of-coverage delivery address, so they are all off-ramped.
+        if mv.status == MemberStatus.INACTIVE or not mv.client_id:
+            continue
+        reason_detail = (
+            f"The {source} ZIP {offending_zip} is outside the delivery coverage area."
+        )
+        apply_out_of_range_ineligibility(
+            mv.client, reason_detail=reason_detail, actor_label=author,
+        )
+        out_names.append(_member_name(mv))
+        if not ticket_zip:
+            ticket_zip, ticket_source = offending_zip, source
 
-    # Side effects: opening members drive a household hold + Case Closure ticket;
-    # a full reactivation (no member still Out of Range) resumes the hold and
-    # resolves the ticket.
+    # Open the Case Closure ticket for an agent to review (idempotent -- skipped
+    # when an unresolved out-of-range ticket already exists).
     if out_names:
         try:
             _open_out_of_range_ticket(
@@ -545,25 +505,8 @@ def _enforce_delivery_coverage(enrollment, agent, *, allow_reactivate=False):
             )
         except Exception:  # never let ticket-writing break the coverage check
             pass
-        try:
-            _hold_household_for_range(enrollment, author)
-        except Exception:  # never let the hold break the coverage check
-            pass
-    elif reactivated_names:
-        still_out = enrollment.member_profiles.filter(
-            status=MemberStatus.OUT_OF_RANGE,
-        ).exists()
-        if not still_out:
-            try:
-                _resume_household_after_range(enrollment)
-            except Exception:
-                pass
-            try:
-                _resolve_out_of_range_tickets(enrollment, actor=actor)
-            except Exception:
-                pass
 
-    return {"out_of_range": out_names, "reactivated": reactivated_names}
+    return {"out_of_range": out_names}
 
 
 # Reverse of serializers._STATUS_MAP: a filter value -> the lifecycle stages it covers.
@@ -705,7 +648,6 @@ def annotate_care_management(qs):
         client=OuterRef("pk"), status=SocialCareCoverageStatus.ENROLLED,
     )
     return qs.annotate(
-        _cm_oor=current_member_status_exists(MemberStatus.OUT_OF_RANGE),
         _cm_oob=current_member_status_exists(MemberStatus.OUT_OF_ORBIT),
         _cm_paused=current_member_status_exists(MemberStatus.PAUSED),
         _cm_denied=Exists(
@@ -720,8 +662,12 @@ def annotate_care_management(qs):
 def care_management_predicates():
     """Tab Q-predicates over the annotations from ``annotate_care_management``,
     in the same precedence order as ``CARE_MANAGEMENT_TABS``."""
+    from ..services.service_area import SERVICE_AREA_REASON
+
     return [
-        Q(_cm_oor=True),                                                    # Out of Range
+        # Out of Range: households off-ramped to Not Eligible because a delivery /
+        # primary ZIP is outside the coverage area (stable coverage reason stored).
+        Q(lifecycle_stage=ClientStage.INELIGIBLE, ineligible_reasons__contains=[SERVICE_AREA_REASON]),
         Q(_cm_denied=True),                                                 # Rejected Case
         Q(_cm_paused=True) | Q(_cm_gov_stage=EnrollmentStage.ON_HOLD),      # Services Paused
         Q(_cm_medicaid=False) & Q(_cm_scc=False),                          # No Active Coverage
@@ -3342,17 +3288,15 @@ class MemberHouseholdView(PortalAPIView):
                 )
             except Exception:  # never let history-logging break the edit
                 pass
-        # Delivery Coverage Eligibility Check on the updated address: flag members
-        # Out of Orbit when the new ZIP is out of area; when the ZIP just became
-        # serviceable (was excluded, now isn't), return them to Active if the
-        # meal rule also passes.
+        # Delivery Coverage Eligibility Check on the updated address: when the new
+        # ZIP is outside the coverage area, off-ramp the household to Not Eligible
+        # (Paused members + a Case Closure ticket). This is a sticky off-ramp --
+        # editing the address back to a serviceable ZIP does NOT auto-restore
+        # service; an agent must resolve the Not-Eligible state.
         from ..services.service_area import is_zip_excluded
-        new_excluded = is_zip_excluded(addr.zip)
         coverage = None
-        if new_excluded:
+        if is_zip_excluded(addr.zip):
             coverage = _enforce_delivery_coverage(enr, agent)
-        elif is_zip_excluded(prev_zip):
-            coverage = _enforce_delivery_coverage(enr, agent, allow_reactivate=True)
         resp = {
             "street": addr.street, "unit": addr.unit, "city": addr.city,
             "state": addr.state, "zip": addr.zip, "notes": addr.notes,
@@ -3361,16 +3305,9 @@ class MemberHouseholdView(PortalAPIView):
             names = coverage["out_of_range"]
             resp["coverage_warning"] = (
                 f"ZIP {addr.zip} is outside the delivery coverage area — "
-                f"{len(names)} member(s) set Out of Range (excluded from "
-                f"deliveries): {', '.join(names)}. The household has been placed "
-                f"on hold and a Case Closure ticket opened for review."
-            )
-        if coverage and coverage.get("reactivated"):
-            names = coverage["reactivated"]
-            resp["coverage_info"] = (
-                f"ZIP {addr.zip} is now serviceable — "
-                f"{len(names)} member(s) returned to Active: {', '.join(names)}. "
-                f"The household hold was resumed and the Out-of-Range ticket resolved."
+                f"{len(names)} member(s) set Not Eligible (paused + excluded from "
+                f"deliveries): {', '.join(names)}. A Case Closure ticket was opened "
+                f"for review."
             )
         return Response(resp)
 

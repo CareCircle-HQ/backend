@@ -3561,7 +3561,7 @@ class DeliveryCoverageEligibilityTest(TestCase):
 
     def test_out_of_orbit_when_primary_address_excluded(self):
         # Delivery ZIP serviceable, but the PRIMARY (Current) ZIP is excluded.
-        from .models import MemberStatus, Note, NoteSource
+        from .models import ClientStage, MemberStatus, Note, NoteSource
         from .portal.views_members import _enforce_delivery_coverage
         from .services.meal_rules import reconcile_member_kitchen_output
         from .services.service_area import SERVICE_AREA_REASON
@@ -3574,77 +3574,84 @@ class DeliveryCoverageEligibilityTest(TestCase):
         mv2 = self._profile("10001", primary_zip="11209")
         _enforce_delivery_coverage(mv2.enrollment, None)
         mv2.refresh_from_db()
-        self.assertEqual(mv2.status, MemberStatus.OUT_OF_RANGE)
-        note = Note.objects.filter(client=mv2.client, source=NoteSource.SYSTEM).first()
+        # New behavior: off-ramped to Not Eligible + Paused (like the eligibility
+        # off-ramp), NOT the Out-of-Range status.
+        self.assertEqual(mv2.status, MemberStatus.PAUSED)
+        self.assertTrue(mv2.eligibility_paused)
+        mv2.client.refresh_from_db()
+        self.assertEqual(mv2.client.lifecycle_stage, ClientStage.INELIGIBLE)
+        note = Note.objects.filter(
+            client=mv2.client, source=NoteSource.SYSTEM, body__icontains="primary address",
+        ).first()
         self.assertIsNotNone(note)
-        self.assertIn("primary address", note.body)
         self.assertIn("11209", note.body)
 
-    def test_enforce_sets_out_of_range_with_note_ticket_hold_and_event(self):
+    def test_enforce_sets_not_eligible_with_note_ticket_and_event(self):
         from .models import (
-            EnrollmentStage, MemberStatus, Note, NoteSource, Ticket,
+            ClientStage, MemberStatus, Note, NoteSource, Ticket,
             TicketStatus, TicketTypeCode, TimelineEvent,
         )
         from .portal.views_members import _enforce_delivery_coverage
+        from .services.service_area import SERVICE_AREA_REASON
 
         mv = self._profile("11209")
         result = _enforce_delivery_coverage(mv.enrollment, None)
         self.assertEqual(len(result["out_of_range"]), 1)
         mv.refresh_from_db()
-        self.assertEqual(mv.status, MemberStatus.OUT_OF_RANGE)
+        # Member is PAUSED (eligibility) and their client is Not Eligible with the
+        # stable coverage reason stored.
+        self.assertEqual(mv.status, MemberStatus.PAUSED)
+        self.assertTrue(mv.eligibility_paused)
+        mv.client.refresh_from_db()
+        self.assertEqual(mv.client.lifecycle_stage, ClientStage.INELIGIBLE)
+        self.assertIn(SERVICE_AREA_REASON, mv.client.ineligible_reasons or [])
         note = Note.objects.filter(client=mv.client, source=NoteSource.SYSTEM).first()
         self.assertIsNotNone(note)
-        self.assertIn("11209", note.body)
         self.assertTrue(
             TimelineEvent.objects.filter(
-                client=mv.client, event_type="out_of_range"
+                client=mv.client, event_type="member_ineligible"
             ).exists()
         )
-        # A Case Closure ticket was opened on the household primary...
+        # A Case Closure ticket was opened on the household primary (pre-filled ZIP).
         ticket = Ticket.objects.filter(
             client=mv.client, type__code=TicketTypeCode.CASE_CLOSURE,
         ).exclude(status=TicketStatus.RESOLVED).first()
         self.assertIsNotNone(ticket)
         self.assertIn("11209", ticket.reason)
-        # ...and the whole household was placed On Hold.
-        mv.enrollment.refresh_from_db()
-        self.assertEqual(
-            EnrollmentStage(mv.enrollment.stage), EnrollmentStage.ON_HOLD
-        )
 
-    def test_reactivate_resolves_ticket_and_resumes_hold(self):
+    def test_serviceable_zip_does_not_auto_restore(self):
+        # The out-of-range off-ramp is STICKY: editing the delivery ZIP back to a
+        # serviceable one does NOT auto-restore the member -- an agent must resolve
+        # the Not-Eligible state.
         from .models import (
-            EnrollmentStage, MemberStatus, Ticket, TicketStatus, TicketTypeCode,
+            ClientStage, MemberStatus, Ticket, TicketStatus, TicketTypeCode,
         )
         from .portal.views_members import _enforce_delivery_coverage
 
-        # Excluded ZIP -> Out of Range + ticket + hold.
         mv = self._profile("11209")
         _enforce_delivery_coverage(mv.enrollment, None)
-        # Fix the ZIP to a serviceable one and re-run with reactivation.
         addr = mv.enrollment.delivery_address
         addr.zip = "10001"
         addr.save(update_fields=["zip"])
-        _enforce_delivery_coverage(mv.enrollment, None, allow_reactivate=True)
+        # Re-running the coverage check on a serviceable ZIP is a no-op.
+        _enforce_delivery_coverage(mv.enrollment, None)
         mv.refresh_from_db()
-        self.assertEqual(mv.status, MemberStatus.ACTIVE)
-        # Ticket resolved + hold resumed.
-        open_tickets = Ticket.objects.filter(
-            client=mv.client, type__code=TicketTypeCode.CASE_CLOSURE,
-        ).exclude(status=TicketStatus.RESOLVED)
-        self.assertFalse(open_tickets.exists())
-        mv.enrollment.refresh_from_db()
-        self.assertNotEqual(
-            EnrollmentStage(mv.enrollment.stage), EnrollmentStage.ON_HOLD
+        mv.client.refresh_from_db()
+        self.assertEqual(mv.status, MemberStatus.PAUSED)
+        self.assertEqual(mv.client.lifecycle_stage, ClientStage.INELIGIBLE)
+        # The Case Closure ticket stays open for the agent to resolve.
+        self.assertTrue(
+            Ticket.objects.filter(
+                client=mv.client, type__code=TicketTypeCode.CASE_CLOSURE,
+            ).exclude(status=TicketStatus.RESOLVED).exists()
         )
 
-    def test_out_of_range_flags_every_non_terminal_household_member(self):
+    def test_out_of_range_offramps_every_non_terminal_household_member(self):
         # An out-of-range DELIVERY ZIP is a household-wide geographic block: every
-        # non-terminal member (Active, manually Paused, Out of Orbit) is set Out of
-        # Range so each is individually excluded from POs/deliveries and countable.
-        # Only terminal INACTIVE members are left alone.
+        # non-terminal member (Active, manually Paused, Out of Orbit) is off-ramped
+        # to Not Eligible + Paused. Only terminal INACTIVE members are left alone.
         from .models import (
-            Client, HouseholdMember, MemberDietaryProfile, MemberStatus,
+            Client, ClientStage, HouseholdMember, MemberDietaryProfile, MemberStatus,
         )
         from .portal.views_members import _enforce_delivery_coverage
 
@@ -3668,19 +3675,11 @@ class DeliveryCoverageEligibilityTest(TestCase):
 
         for mv in (primary, paused, orbit):
             mv.refresh_from_db()
-            self.assertEqual(mv.status, MemberStatus.OUT_OF_RANGE)
+            self.assertEqual(mv.status, MemberStatus.PAUSED)
+            mv.client.refresh_from_db()
+            self.assertEqual(mv.client.lifecycle_stage, ClientStage.INELIGIBLE)
         inactive.refresh_from_db()
         self.assertEqual(inactive.status, MemberStatus.INACTIVE)  # terminal, untouched
-
-    def test_reactivate_when_zip_becomes_serviceable(self):
-        from .models import MemberStatus
-        from .portal.views_members import _enforce_delivery_coverage
-
-        # Out of Range at a now-serviceable ZIP + fulfillable menu -> Active.
-        mv = self._profile("10001", status=MemberStatus.OUT_OF_RANGE)
-        _enforce_delivery_coverage(mv.enrollment, None, allow_reactivate=True)
-        mv.refresh_from_db()
-        self.assertEqual(mv.status, MemberStatus.ACTIVE)
 
 
 class KitchenExportSharedAddressTest(TestCase):
