@@ -303,31 +303,53 @@ def pending_verification_over_month_rows(params):
 
 # --- All Verifications ------------------------------------------------------
 def all_verifications_rows(params):
-    """One row per verification with milestone dates. ``params``: requested_from
-    / requested_to (inclusive, on requested_at)."""
-    from ..models import EnrollmentVerification, ServiceAuthorizationStatus
+    """COMPLETED verifications only -- one row per household/individual, so the
+    count matches the Verification page filtered to "Verified" + a completed-date
+    range. Authorization status is irrelevant here (a verification counts once its
+    pop-up completed, regardless of the case's auth outcome).
+
+    ``params``: completed_from / completed_to (inclusive, on ``verified_at`` --
+    the Verification page's "verification completed" date, i.e. Verification page
+    ``completed_from``/``completed_to``)."""
+    from ..models import (
+        EnrollmentStage, EnrollmentVerification, ServiceAuthorizationStatus,
+    )
     from ..services.lifecycle import governing_internal_case
     from .views_members import _parse_date
     from .views_reports import _date_str
 
-    requested_from = _parse_date(params.get("requested_from"))
-    requested_to = _parse_date(params.get("requested_to"))
+    completed_from = _parse_date(params.get("completed_from"))
+    completed_to = _parse_date(params.get("completed_to"))
     qs = (
-        EnrollmentVerification.objects.select_related("client", "case")
+        EnrollmentVerification.objects
+        # ONLY completed verifications; dismissed (Disregarded) requests never count.
+        .filter(verified_at__isnull=False)
+        .exclude(stage=EnrollmentStage.DISREGARDED)
+        .select_related("client", "household", "case")
         .prefetch_related("client__cases")
-        .order_by("-requested_at", "-opened_at")
+        .order_by("-verified_at", "-opened_at")
     )
-    if requested_from:
-        qs = qs.filter(requested_at__date__gte=requested_from)
-    if requested_to:
-        qs = qs.filter(requested_at__date__lte=requested_to)
+    if completed_from:
+        qs = qs.filter(verified_at__date__gte=completed_from)
+    if completed_to:
+        qs = qs.filter(verified_at__date__lte=completed_to)
 
     yield [
-        "Member ID", "Verification Requested", "Verification Completed",
-        "Authorization Approved",
+        "Member ID", "Household/Individual", "Verification Requested",
+        "Verification Completed", "Authorization Approved",
     ]
+    # One row per HOUSEHOLD (else per client for solo members with no household
+    # record), keeping the most-recent verified enrollment -- mirrors how the
+    # Verification page groups members into household/individual rows, so the row
+    # count matches the page's Verified count exactly.
+    seen = set()
     for enr in qs.iterator(chunk_size=1000):
+        key = ("hh", enr.household_id) if enr.household_id else ("c", enr.client_id)
+        if key in seen:
+            continue
+        seen.add(key)
         client = enr.client
+        scope = "Household" if "household" in (enr.program_name or "").casefold() else "Individual"
         gov = governing_internal_case(enr) or enr.case
         auth_approved = None
         if gov is not None and gov.service_authorization_status in (
@@ -337,6 +359,7 @@ def all_verifications_rows(params):
             auth_approved = gov.service_authorization_approval_starts_at
         yield [
             str(client.client_id) if client else "",
+            scope,
             _date_str(enr.requested_at),
             _date_str(enr.verified_at),
             _date_str(auth_approved),

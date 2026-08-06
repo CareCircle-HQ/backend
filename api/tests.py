@@ -11354,7 +11354,7 @@ class AllVerificationsReportTest(TestCase):
         lines = [ln for ln in body.splitlines() if ln.strip()]
         self.assertEqual(
             lines[0],
-            "Member ID,Verification Requested,Verification Completed,Authorization Approved",
+            "Member ID,Household/Individual,Verification Requested,Verification Completed,Authorization Approved",
         )
         self.assertIn(str(client.client_id), lines[1])
         # All three dates present (requested/completed/authorized).
