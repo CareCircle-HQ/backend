@@ -381,6 +381,16 @@ def _resume_household_after_range(enrollment):
 _ALL_PAUSED_HOLD_NOTE = "Automatically placed on hold — all household members paused."
 _ALL_PAUSED_RESUME_NOTE = "Service resumed — a household member returned from pause."
 
+# The all-paused rule only holds a household that is actually SERVING (or cleared
+# for service). A not-yet-verified enrollment isn't serving anyone, so pausing its
+# members must NOT drive it to On Hold -- otherwise a later resume would advance it
+# to Service Active and strand it Active without ever being verified.
+_ALL_PAUSED_HOLDABLE_STAGES = {
+    EnrollmentStage.VERIFIED,
+    EnrollmentStage.KITCHEN_ASSIGNMENT,
+    EnrollmentStage.SERVICE_ACTIVE,
+}
+
 
 def _reconcile_all_paused_hold(enrollment):
     """Roll a manual member pause up to the PROGRAM.
@@ -398,7 +408,7 @@ def _reconcile_all_paused_hold(enrollment):
     all_paused = all(p.status == MemberStatus.PAUSED for p in profiles)
     stage = EnrollmentStage(enrollment.stage)
 
-    if all_paused and stage != EnrollmentStage.ON_HOLD:
+    if all_paused and stage in _ALL_PAUSED_HOLDABLE_STAGES:
         try:
             advance_enrollment(
                 enrollment, EnrollmentStage.ON_HOLD, note=_ALL_PAUSED_HOLD_NOTE,
@@ -3999,15 +4009,17 @@ class MemberServiceResumeView(PortalAPIView):
                 )},
                 status=http.HTTP_400_BAD_REQUEST,
             )
-        # Resume to the SERVICE stage the enrollment was held from -- but NEVER
-        # back into a terminal stage. A household that was REACTIVATED from
-        # Cancelled lands in On Hold via a ``cancelled -> on_hold`` StageEvent, so
-        # the most-recent hold's ``from_stage`` is ``cancelled``; resuming to that
-        # re-cancelled the member on every click (the endless reactivate/resume
-        # loop this fixes). Only a genuine service stage (Verified / Kitchen
-        # Assignment / Service Active) is a valid resume target -- restrict the
-        # lookup to those, and default to Service Active when none is found.
+        # Resume to the stage the enrollment was held from -- but NEVER back into a
+        # terminal stage. A household that was REACTIVATED from Cancelled lands in
+        # On Hold via a ``cancelled -> on_hold`` StageEvent, so the most-recent
+        # hold's ``from_stage`` is ``cancelled``; resuming to that re-cancelled the
+        # member on every click (the endless reactivate/resume loop this fixes).
+        # Only genuine non-terminal stages are valid resume targets -- crucially
+        # PENDING_VERIFICATION is included so a household held BEFORE verification
+        # resumes back to Pending Verification instead of being force-defaulted to
+        # Service Active (which would leave it Active + unverified).
         _RESUMABLE_FROM_STAGES = (
+            EnrollmentStage.PENDING_VERIFICATION,
             EnrollmentStage.VERIFIED,
             EnrollmentStage.KITCHEN_ASSIGNMENT,
             EnrollmentStage.SERVICE_ACTIVE,
@@ -4021,12 +4033,19 @@ class MemberServiceResumeView(PortalAPIView):
             .order_by("-entered_at")
             .first()
         )
-        target = EnrollmentStage.SERVICE_ACTIVE
+        # Default resume floor: a never-verified enrollment goes back to Pending
+        # Verification (NOT Service Active), so a missing/odd hold history can't
+        # strand it Active + unverified.
+        default_target = (
+            EnrollmentStage.PENDING_VERIFICATION if enr.verified_at is None
+            else EnrollmentStage.SERVICE_ACTIVE
+        )
+        target = default_target
         if last_hold and last_hold.from_stage:
             try:
                 target = EnrollmentStage(last_hold.from_stage)
             except ValueError:
-                target = EnrollmentStage.SERVICE_ACTIVE
+                target = default_target
         reason = (request.data.get("reason") or "").strip()
         agent = current_agent(request)
         author = agent.name if agent else ""
