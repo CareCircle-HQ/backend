@@ -209,6 +209,27 @@ def request_uniteus_exports(self, export_types=None, days=7, triggered_by="cron:
 
 
 @shared_task(bind=True, ignore_result=True)
+def import_uniteus_assessment_results(self, limit=0, since=None):
+    """Nightly: enrich assessments missing ``eligible_services`` from the Unite
+    Us screenings-ingestion host (drives catalog + client Level 1/2). Gated by
+    ``UNITEUS_ASSESSMENT_API_ENABLED`` so it can be dark-launched. Scheduled to
+    run AFTER the CSV assessments export lands (which is what creates the
+    results-less rows this fills in)."""
+    from django.conf import settings
+
+    if not getattr(settings, "UNITEUS_ASSESSMENT_API_ENABLED", False):
+        logger.info("assessment-results enrichment skipped (flag off)")
+        return
+    from .services.assessment_enrichment import run_assessment_enrichment
+
+    run = run_assessment_enrichment(limit=limit, since=since)
+    logger.info(
+        "assessment-results enrichment: run=%s status=%s enriched=%s errors=%s",
+        run.pk, run.status, run.updated_count, run.error_count,
+    )
+
+
+@shared_task(bind=True, ignore_result=True)
 def generate_report_export(self, export_id):
     """Build an Admin > Reports CSV in the background, upload it to S3, and flip
     the ReportExport status the UI polls. Mirrors process_import: the heavy work

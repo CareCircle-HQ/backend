@@ -417,6 +417,132 @@ def _provided_description(a):
     return ""
 
 
+# --- assessments (screenings-ingestion API) --------------------------------
+def _clean_text(value):
+    """Collapse whitespace + strip (mirrors the extension's ``cleanText``)."""
+    if value is None:
+        return ""
+    return " ".join(str(value).split()).strip()
+
+
+def _api_answer_value(q):
+    """Resolve a SurveyJS question's answer to a display string.
+
+    Mirrors the extension's ``apiAnswerValue``: single answers carry an
+    ``answer`` (object or scalar); select_multiple carry an ``answers`` array;
+    booleans map to Yes/No; otherwise probe the known scalar keys."""
+    scalar_keys = ("value", "string", "number", "numeric", "integer", "text", "label")
+
+    def from_one(ans):
+        if ans is None:
+            return ""
+        if not isinstance(ans, dict):
+            return "" if ans == "" else str(ans)
+        if isinstance(ans.get("boolean"), bool):
+            return "Yes" if ans["boolean"] else "No"
+        for k in scalar_keys:
+            v = ans.get(k)
+            if v not in (None, ""):
+                return str(v)
+        return ""
+
+    if q.get("answer") is not None:
+        v = from_one(q["answer"])
+        if v:
+            return v
+    answers = q.get("answers")
+    if isinstance(answers, list) and answers:
+        return ", ".join(p for p in (from_one(a) for a in answers) if p)
+    return ""
+
+
+def _assessment_eligible_services(detail, summary):
+    """``eligible_services`` from the detail (preferred) or list summary,
+    cleaned to a list of program-name strings (matches the extension)."""
+    svc = None
+    if isinstance((detail or {}).get("eligible_services"), list):
+        svc = detail["eligible_services"]
+    elif isinstance((summary or {}).get("eligible_services"), list):
+        svc = summary["eligible_services"]
+    out = []
+    for x in svc or []:
+        name = x.get("name") or x.get("code") if isinstance(x, dict) else x
+        name = _clean_text(name)
+        if name:
+            out.append(name)
+    return out
+
+
+def _template_name(*records):
+    """First non-empty template display name / consent_code across records."""
+    for rec in records:
+        tmpl = (rec or {}).get("template")
+        if isinstance(tmpl, dict):
+            name = _clean_text(tmpl.get("name") or tmpl.get("consent_code"))
+            if name:
+                return name
+    return ""
+
+
+def map_assessment_api(detail, summary, *, person_id):
+    """A screenings-ingestion assessment (detail + its list ``summary``) ->
+    ``AssessmentSerializer`` dict. Mirrors the extension's
+    ``parseApiAssessmentDetail`` + ``buildEligibilityPayloads`` so the headless
+    nightly pull produces the same shape the extension POSTs today.
+
+    Only ``assessment_id`` / ``subject_id`` are guaranteed; every other field is
+    included only when present so a sparse record never blanks a value another
+    source (e.g. the CSV import) already set on the same ``assessment_id``.
+    """
+    detail = detail or {}
+    summary = summary or {}
+    aid = detail.get("id") or summary.get("id")
+
+    out = {
+        "assessment_id": aid,
+        "subject_id": person_id,
+    }
+
+    def set_(k, v):
+        if v:
+            out[k] = v
+
+    # Questions & answers (SurveyJS ``questions``, ordered).
+    questions = detail.get("questions")
+    if isinstance(questions, list):
+        ordered = sorted(questions, key=lambda q: (q or {}).get("order") or 0)
+        qa = []
+        for q in ordered:
+            question = _clean_text((q or {}).get("primary_text"))
+            answer = _clean_text(_api_answer_value(q or {}))
+            if question and answer:
+                qa.append({"question": question, "answer": answer})
+        if qa:
+            out["questions_answers"] = qa
+
+    services = _assessment_eligible_services(detail, summary)
+    if services:
+        out["eligible_services"] = services
+
+    set_("form_name", _template_name(detail, summary))
+    # The list summary carries the created/updated timestamps; DRF parses ISO.
+    set_(
+        "screen_created_at",
+        _dt(
+            summary.get("status_at")
+            or summary.get("updated_at")
+            or summary.get("created_at")
+            or detail.get("created_at")
+        ),
+    )
+    # "Client May Be Eligible" is surfaced once the assessment is complete; match
+    # the extension's rule (status containing "complete" -> eligible).
+    status = str(summary.get("status") or detail.get("status") or "")
+    if "complete" in status.lower():
+        out["eligible_status"] = "eligible"
+    return out
+
+
 # --- notes -----------------------------------------------------------------
 def map_note(note_rec, *, client_id=None, case_id=None):
     """A ``/notes`` record -> kwargs for api.models.Note (created directly)."""
