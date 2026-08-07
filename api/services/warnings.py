@@ -37,6 +37,7 @@ from api.models import (
     InsurancePlanType,
     KitchenProductType,
     MemberStatus,
+    MEMBER_PAUSED_STATUSES,
     ProductType,
     ProductTypeKind,
     RecordStatus,
@@ -255,18 +256,20 @@ def _household_members(enrollment):
 
 
 def _has_servable_member(enrollment):
-    """True when >=1 household member is being served (status ACTIVE). When every
-    member is out of orbit / out of range / paused / inactive there is no
-    delivery plan to configure, so a missing kitchen/cadence (or a stale
-    cadence/kitchen mismatch) is expected-absent, not an actionable problem.
-    Empty membership returns True so we never over-suppress on unknown data."""
+    """True when >=1 household member is still in play (ACTIVE or PENDING -- i.e.
+    someone who needs a delivery plan now or once activated). When every member
+    is out of orbit / out of range / paused / inactive there is no delivery plan
+    to configure, so a missing kitchen/cadence (or a stale cadence/kitchen
+    mismatch) is expected-absent, not an actionable problem. A PENDING member
+    (pre-kitchen) still counts -- they need a kitchen assigned. Empty membership
+    returns True so we never over-suppress on unknown data."""
     statuses = [
         mp.status for mp in enrollment.member_profiles.all()
         if mp.client_id is not None
     ]
     if not statuses:
         return True
-    return any(s not in SERVICE_EXCLUDED_MEMBER_STATUSES for s in statuses)
+    return any(s not in MEMBER_PAUSED_STATUSES for s in statuses)
 
 
 def _build_context(enrollment):

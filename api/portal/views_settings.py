@@ -10,6 +10,7 @@ from ..models import (
     ActiveProgram,
     Agent,
     Cadence,
+    ClientTag,
     DeliveryCompany,
     DeliveryCompanyIntegration,
     DietaryTag,
@@ -75,6 +76,14 @@ class DietaryTagViewSet(viewsets.ModelViewSet):
                 status=http.HTTP_409_CONFLICT,
             )
         return super().destroy(request, *args, **kwargs)
+
+
+class ClientTagViewSet(viewsets.ModelViewSet):
+    """Settings > Tags: manage colour-coded client labels (name + colour)."""
+
+    permission_classes = [IsPortalAgent]
+    queryset = ClientTag.objects.all()
+    serializer_class = s.PortalClientTagSerializer
 
 
 class CadenceViewSet(viewsets.ModelViewSet):
@@ -247,15 +256,21 @@ class CrmAgentViewSet(viewsets.ModelViewSet):
     """Settings > CareCircle Agents: manage our internal CRM agent roster.
 
     Full list (no pagination, so the UI can search/filter client-side) plus
-    create/update. Optional ``?search=`` (name/email/code) and ``?group=``
-    query filters. Delete is disabled -- agents are deactivated via ``status``
-    so historical references (tickets, cases) stay intact.
+    create/update/delete. Optional ``?search=`` (name/email/code) and ``?group=``
+    query filters.
+
+    Deleting is allowed, but deactivating via ``status`` is preferred for agents
+    with history: every reference to an agent (enrollment verified_by/requested_by,
+    ticket created_by/assigned_to, lead assigned_to, report exports) is a
+    ``SET_NULL`` FK, so a delete never cascades -- it just detaches those rows,
+    which loses the agent attribution on that history. Tickets keep their
+    ``created_by_label`` snapshot regardless.
     """
 
     permission_classes = [IsPortalAgent]
     serializer_class = s.PortalCrmAgentSerializer
     pagination_class = None
-    http_method_names = ["get", "post", "patch", "put", "head", "options"]
+    http_method_names = ["get", "post", "patch", "put", "delete", "head", "options"]
 
     def get_queryset(self):
         qs = Agent.objects.all().order_by("name")

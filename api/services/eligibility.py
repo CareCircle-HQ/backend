@@ -591,3 +591,60 @@ def reconcile_client_eligibility(client, *, actor=None, actor_label="", source=N
         )
 
     return client.lifecycle_stage
+
+
+def apply_out_of_range_ineligibility(client, *, reason_detail, actor=None, actor_label="", today=None):
+    """Mark ``client`` Not Eligible (INELIGIBLE) because a delivery / primary ZIP
+    is outside the coverage area, and pause their member profile(s) exactly like
+    the eligibility off-ramp (Paused + ``eligibility_paused``, kitchen result
+    cleared, dropped from the delivery schedule).
+
+    This is a HARD, sticky off-ramp: it is never auto-reversed when the ZIP later
+    becomes serviceable -- an agent must resolve it (mirrors the import
+    ineligibility off-ramp). ``reason_detail`` is a clear, ZIP-specific sentence
+    used in the member note / timeline; the STORED ineligible reason is the stable
+    ``SERVICE_AREA_REASON`` label so downstream views (e.g. the Care Management
+    "Out of Range" tab) can detect a coverage-area ineligibility. Idempotent;
+    returns True when the client was newly set INELIGIBLE."""
+    from api.history import ChangeSource
+    from api.services import timeline
+    from api.services.service_area import SERVICE_AREA_REASON
+
+    if client is None:
+        return False
+    author = actor_label or (getattr(actor, "name", "") if actor else "") or "System"
+    today_str = (today or timezone.localdate()).isoformat()
+
+    newly = client.lifecycle_stage != ClientStage.INELIGIBLE
+    if newly:
+        _set_client_stage(client, ClientStage.INELIGIBLE, actor=actor)
+        _write_client_system_note(
+            client,
+            (
+                f"Marked Not Eligible on {today_str}: {reason_detail} "
+                "This can't be fixed in the CRM \u2014 an agent must review the case "
+                "for closure."
+            ),
+            author_name=author,
+        )
+        try:
+            timeline.event_for_member_ineligible(
+                client, reasons=[SERVICE_AREA_REASON],
+                source=ChangeSource.ADMIN, actor=author,
+            )
+        except Exception:  # pragma: no cover - never let history-logging break it
+            pass
+    # Merge the stable coverage-area reason in WITHOUT clobbering any other stored
+    # ineligible reason (a member could be ineligible for several causes).
+    reasons = list(client.ineligible_reasons or [])
+    if SERVICE_AREA_REASON not in reasons:
+        reasons.append(SERVICE_AREA_REASON)
+        client.ineligible_reasons = reasons
+        client.save(update_fields=["ineligible_reasons"])
+    # Pause the member the eligibility way (idempotent; drops them from the
+    # schedule + holds the program when every member is paused).
+    _pause_members_for_eligibility(
+        client, [reason_detail], kind="ineligible",
+        actor=actor, author=author, today_str=today_str,
+    )
+    return newly

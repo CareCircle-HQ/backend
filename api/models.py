@@ -382,6 +382,11 @@ class Client(models.Model):
     # governing case directly. Empty until the first internal-service case lands.
     governing_internal_case_id = models.CharField(max_length=64, blank=True)
 
+    # --- Tags (colour-coded labels managed in Settings) ---
+    tags = models.ManyToManyField(
+        "ClientTag", related_name="clients", blank=True,
+    )
+
     # --- CRM Sync (External - GoHighLevel) ---
     crm_contact_id = models.CharField(max_length=64, blank=True, db_index=True)
     crm_sync_hash = models.CharField(max_length=64, blank=True)
@@ -1813,8 +1818,19 @@ class MemberStatus(models.TextChoices):
     ``api.services.meal_rules``). Out-of-orbit members are excluded from all
     delivery schedules and Purchase Orders until their dietary data changes and
     the rule is re-applied.
+
+    ``PENDING`` is the INITIAL state every member (incl. the primary) sits at
+    from creation through verification and Nutritionist review -- i.e. before a
+    kitchen is assigned. A member only becomes ``ACTIVE`` once the kitchen-
+    assignment meal rule can fulfill them (else ``OUT_OF_ORBIT``). Unlike the
+    terminal ``INACTIVE``, the automatic meal rule DOES evaluate + promote a
+    PENDING member; but like every non-ACTIVE status, a PENDING member is NEVER
+    placed on a delivery schedule or Purchase Order.
     """
 
+    # Initial / pre-kitchen state: created here and held through verification +
+    # Nutritionist review until kitchen assignment activates them.
+    PENDING = "pending", "Pending"
     ACTIVE = "active", "Active"
     OUT_OF_ORBIT = "out_of_orbit", "Out of Orbit"
     # Set automatically when the member's DELIVERY or PRIMARY address ZIP is
@@ -1842,11 +1858,25 @@ class MemberStatus(models.TextChoices):
 
 
 # Member statuses that exclude a member from every delivery schedule / order /
-# Purchase Order: OUT_OF_ORBIT (meal rule can't fulfill them), OUT_OF_RANGE
-# (delivery/primary ZIP outside coverage), PAUSED (agent manually paused them),
-# INACTIVE (service ended) and NUTRITIONIST_PAUSED (a Nutritionist paused them).
-# Only ACTIVE members receive deliveries.
+# Purchase Order: PENDING (pre-kitchen, not activated yet), OUT_OF_ORBIT (meal
+# rule can't fulfill them), OUT_OF_RANGE (delivery/primary ZIP outside coverage),
+# PAUSED (agent manually paused them), INACTIVE (service ended) and
+# NUTRITIONIST_PAUSED (a Nutritionist paused them). Only ACTIVE members receive
+# deliveries.
 SERVICE_EXCLUDED_MEMBER_STATUSES = (
+    MemberStatus.PENDING,
+    MemberStatus.OUT_OF_ORBIT,
+    MemberStatus.OUT_OF_RANGE,
+    MemberStatus.PAUSED,
+    MemberStatus.INACTIVE,
+    MemberStatus.NUTRITIONIST_PAUSED,
+)
+
+# Statuses that mean a member is no longer "in play" for the household -- a
+# genuine pause / off-ramp (NOT the pre-kitchen PENDING, which is still active in
+# the pipeline). Used to decide when the LAST real member has been paused so the
+# whole household should be held.
+MEMBER_PAUSED_STATUSES = (
     MemberStatus.OUT_OF_ORBIT,
     MemberStatus.OUT_OF_RANGE,
     MemberStatus.PAUSED,
@@ -2193,11 +2223,12 @@ class MemberDietaryProfile(models.Model):
     # this held a short code from the ``MenuType`` TextChoices; a data migration
     # converts those to names.)
     menu_type = models.CharField(max_length=120, blank=True)
-    # Per-member service status. Set to OUT_OF_ORBIT automatically when the meal
-    # rule (api.services.meal_rules) can't safely fulfill the member.
+    # Per-member service status. Defaults to PENDING (pre-kitchen): a member is
+    # only promoted to ACTIVE (or OUT_OF_ORBIT) by the meal rule at kitchen
+    # assignment. See api.services.meal_rules.
     status = models.CharField(
         max_length=20, choices=MemberStatus.choices,
-        default=MemberStatus.ACTIVE, db_index=True,
+        default=MemberStatus.PENDING, db_index=True,
     )
     # Result of applying the meal rule at kitchen-assignment time. These (not
     # ``menu_type``/derived food notes) are what we send to the kitchen on the
@@ -3445,6 +3476,10 @@ class TimelineEventType(models.TextChoices):
     # A Nutritionist paused an individual member (per-member off-ramp).
     NUTRITIONIST_PAUSED = "nutritionist_paused", "Nutritionist Paused"
     # --- Service-delivery lifecycle: one granular type per event. ---
+    # Reached the Kitchen Assignment STAGE (awaiting a kitchen) -- NOT an actual
+    # kitchen assignment. Distinct from KITCHEN_ASSIGNED so nutritionist approval
+    # (which advances into this stage) doesn't read as "Kitchen Assigned".
+    AWAITING_KITCHEN = "awaiting_kitchen", "Awaiting Kitchen Assignment"
     KITCHEN_ASSIGNED = "kitchen_assigned", "Kitchen Assigned"
     SERVICE_ACTIVATED = "service_activated", "Service Activated"
     SERVICE_ON_HOLD = "service_on_hold", "Service On Hold"
@@ -3550,7 +3585,9 @@ class TimelineEvent(models.Model):
     occurred_at = models.DateTimeField(db_index=True)
 
     title = models.CharField(max_length=255, blank=True)
-    subtitle = models.CharField(max_length=255, blank=True)
+    # Free-text reason/detail -- can be long (e.g. a hold reason with a Unite Us
+    # case URL), so store it unbounded rather than a varchar(255).
+    subtitle = models.TextField(blank=True)
     badge_text = models.CharField(max_length=120, blank=True)
     badge_tone = models.CharField(
         max_length=10, choices=TimelineBadgeTone.choices,
@@ -3841,6 +3878,42 @@ class MealPlan(models.Model):
 
     def __str__(self):
         return self.name
+
+
+class ClientTagColor(models.TextChoices):
+    """Preset colours for a client tag, roughly ordered by implied importance
+    (red = most urgent). The value is a stable slug; the label is shown in
+    Settings and the frontend maps the slug to a colour swatch."""
+
+    RED = "red", "Red"
+    ORANGE = "orange", "Orange"
+    YELLOW = "yellow", "Yellow"
+    GREEN = "green", "Green"
+    BLUE = "blue", "Blue"
+    PURPLE = "purple", "Purple"
+    GRAY = "gray", "Gray"
+
+
+class ClientTag(models.Model):
+    """A colour-coded label managed from Settings and attached to clients/members
+    (see ``Client.tags``). A simple catalog entry: name + colour."""
+
+    client_tag_id = models.UUIDField(
+        primary_key=True, default=uuid.uuid4, editable=False
+    )
+    name = models.CharField(max_length=120, unique=True)
+    color = models.CharField(
+        max_length=20, choices=ClientTagColor.choices,
+        default=ClientTagColor.BLUE,
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["name"]
+
+    def __str__(self):
+        return f"{self.name} ({self.get_color_display()})"
 
 
 # ---------------------------------------------------------------------------

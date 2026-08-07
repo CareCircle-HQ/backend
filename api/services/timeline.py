@@ -498,7 +498,7 @@ _STAGE_TIMELINE = {
     EnrollmentStage.VALIDATED: (TimelineEventType.VALIDATED, "Validated"),
     EnrollmentStage.PENDING_VERIFICATION: (TimelineEventType.VERIFICATION_REQUESTED, "Verification Requested"),
     EnrollmentStage.VERIFIED: (TimelineEventType.VERIFICATION_COMPLETED, "Verification Completed"),
-    EnrollmentStage.KITCHEN_ASSIGNMENT: (TimelineEventType.KITCHEN_ASSIGNED, "Kitchen Assigned"),
+    EnrollmentStage.KITCHEN_ASSIGNMENT: (TimelineEventType.AWAITING_KITCHEN, "Awaiting Kitchen Assignment"),
     EnrollmentStage.SERVICE_ACTIVE: (TimelineEventType.SERVICE_ACTIVATED, "Service Activated"),
     EnrollmentStage.SERVICE_COMPLETE: (TimelineEventType.SERVICE_COMPLETED, "Service Completed"),
     EnrollmentStage.ON_HOLD: (TimelineEventType.SERVICE_ON_HOLD, "Service On Hold"),
@@ -746,6 +746,39 @@ def event_for_delivery_address_change(
             "previous": previous,
             "new": new_addr,
             "changes": changes,
+        },
+    )
+
+
+def event_for_kitchen_assigned(
+    enrollment, *, kitchen_name="", cadence_label="", source=ChangeSource.CRM, actor="",
+):
+    """Emit a 'Kitchen Assigned' event when a kitchen is ACTUALLY assigned to a
+    household for the first time (the Logistics kitchen-assignment step). Distinct
+    from reaching the Kitchen Assignment stage (AWAITING_KITCHEN), which only
+    means the household is READY for assignment. Logged on the primary client."""
+    client = getattr(enrollment, "client", None)
+    if client is None:
+        return None
+    subtitle = (kitchen_name or "").strip()
+    if cadence_label:
+        subtitle = f"{subtitle} \u00b7 {cadence_label}" if subtitle else cadence_label
+    return emit_timeline_event(
+        client=client,
+        event_type=TimelineEventType.KITCHEN_ASSIGNED,
+        occurred_at=timezone.now(),
+        title="Kitchen Assigned",
+        subtitle=subtitle,
+        badge_text=(kitchen_name or "").strip() or "Assigned",
+        badge_tone=TimelineBadgeTone.SUCCESS,
+        source=source,
+        actor=actor,
+        entity=enrollment,
+        enrollment=enrollment,
+        case=getattr(enrollment, "case", None),
+        metadata={
+            "kitchen": (kitchen_name or "").strip(),
+            "cadence": (cadence_label or "").strip(),
         },
     )
 

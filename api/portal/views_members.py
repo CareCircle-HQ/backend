@@ -39,6 +39,7 @@ from ..models import (
     CaseType,
     Client,
     ClientPhone,
+    ClientTag,
     ClientPhoneSource,
     ClientStage,
     DeliveryCadence,
@@ -53,6 +54,7 @@ from ..models import (
     MemberDietaryProfile,
     KitchenProductType,
     MemberStatus,
+    MEMBER_PAUSED_STATUSES,
     SERVICE_EXCLUDED_MEMBER_STATUSES,
     MenuType,
     Note,
@@ -381,6 +383,16 @@ def _resume_household_after_range(enrollment):
 _ALL_PAUSED_HOLD_NOTE = "Automatically placed on hold — all household members paused."
 _ALL_PAUSED_RESUME_NOTE = "Service resumed — a household member returned from pause."
 
+# The all-paused rule only holds a household that is actually SERVING (or cleared
+# for service). A not-yet-verified enrollment isn't serving anyone, so pausing its
+# members must NOT drive it to On Hold -- otherwise a later resume would advance it
+# to Service Active and strand it Active without ever being verified.
+_ALL_PAUSED_HOLDABLE_STAGES = {
+    EnrollmentStage.VERIFIED,
+    EnrollmentStage.KITCHEN_ASSIGNMENT,
+    EnrollmentStage.SERVICE_ACTIVE,
+}
+
 
 def _reconcile_all_paused_hold(enrollment):
     """Roll a manual member pause up to the PROGRAM.
@@ -398,7 +410,7 @@ def _reconcile_all_paused_hold(enrollment):
     all_paused = all(p.status == MemberStatus.PAUSED for p in profiles)
     stage = EnrollmentStage(enrollment.stage)
 
-    if all_paused and stage != EnrollmentStage.ON_HOLD:
+    if all_paused and stage in _ALL_PAUSED_HOLDABLE_STAGES:
         try:
             advance_enrollment(
                 enrollment, EnrollmentStage.ON_HOLD, note=_ALL_PAUSED_HOLD_NOTE,
@@ -427,39 +439,38 @@ def _reconcile_all_paused_hold(enrollment):
             pass
 
 
-def _enforce_delivery_coverage(enrollment, agent, *, allow_reactivate=False):
+def _enforce_delivery_coverage(enrollment, agent):
     """Delivery Coverage Eligibility Check for every member of ``enrollment``.
 
     A member whose enrollment's DELIVERY address OR their PRIMARY (Current/Home)
-    address ZIP is in the excluded-ZIP list is set Out of Range (reason "Delivery
-    Address Outside Coverage Area"), with a system note + timeline event
-    attributed to ``agent``. Manually Paused / Inactive members are left
-    untouched. When any member is newly set Out of Range the whole household is
-    placed On Hold and a Case Closure ticket is opened (pre-filled with the
-    offending ZIP) for an agent to review.
+    address ZIP is in the excluded-ZIP list is handled exactly like the
+    eligibility off-ramp: the member is set **Not Eligible** (client lifecycle
+    ``INELIGIBLE``, with the stable "Delivery Address Outside Coverage Area"
+    reason + a ZIP-specific note/timeline) and PAUSED (``eligibility_paused``,
+    dropped from the delivery schedule). Because the household shares the delivery
+    address this is a household-wide geographic block, so EVERY non-terminal
+    member is off-ramped (Inactive/off-boarded members are skipped).
 
-    When ``allow_reactivate`` is True (the delivery ZIP just became serviceable)
-    an Out-of-Range member is re-checked against the kitchen-aware meal rule
-    (which itself re-checks both addresses) and returned to Active only if it now
-    passes (so a dietary/kitchen block or a still-excluded primary ZIP keeps them
-    excluded). If that clears every member, the auto-hold is resumed and the
-    Out-of-Range Case Closure ticket is resolved.
+    This is a hard, STICKY off-ramp -- it is never auto-reversed when the ZIP
+    later becomes serviceable; an agent must resolve it. A Case Closure ticket is
+    opened (pre-filled with the offending ZIP) for that review.
 
-    Returns ``{"out_of_range": [...], "reactivated": [...]}``.
+    Returns ``{"out_of_range": [...]}`` (the member names newly off-ramped or
+    already Not Eligible for coverage this run).
     """
+    from ..services.eligibility import apply_out_of_range_ineligibility
     from ..services.service_area import (
-        SERVICE_AREA_REASON,
         excluded_zips,
         member_excluded_info,
         out_of_range_ticket_reason,
-        service_area_note_body,
     )
 
     excluded = excluded_zips()
-    actor = _agent_actor(agent)
+    # Portal agents are Agents, not Django Users, so there is no StageEvent.actor
+    # User to attribute -- pass the agent NAME as the string label used on the
+    # note / timeline (StageEvent is logged as an automatic system transition).
     author = agent.name if agent else ""
     out_names = []
-    reactivated_names = []
     # The first offending ZIP/source seen, used to pre-fill the closure ticket.
     ticket_zip, ticket_source = "", "delivery address"
 
@@ -470,63 +481,24 @@ def _enforce_delivery_coverage(enrollment, agent, *, allow_reactivate=False):
 
     for mv in enrollment.member_profiles.select_related("client").all():
         offending_zip, source = member_excluded_info(mv, excluded=excluded)
-        if offending_zip:
-            # An out-of-range ZIP is a household-wide geographic block: the whole
-            # household shares the delivery address, so EVERY non-terminal member
-            # is set Out of Range (individually excluded from future POs /
-            # deliveries and individually countable), not just the Active ones.
-            # We skip only INACTIVE (terminal off-boarded) and members already
-            # Out of Range (idempotent -- avoids duplicate note/timeline rows).
-            if mv.status in (MemberStatus.INACTIVE, MemberStatus.OUT_OF_RANGE):
-                continue
-            mv.status = MemberStatus.OUT_OF_RANGE
-            mv.kitchen_meal_type = ""
-            mv.kitchen_food_notes = ""
-            mv.save(update_fields=[
-                "status", "kitchen_meal_type", "kitchen_food_notes", "updated_at",
-            ])
-            out_names.append(_member_name(mv))
-            if not ticket_zip:
-                ticket_zip, ticket_source = offending_zip, source
-            try:
-                timeline.event_for_out_of_range(
-                    mv, enrollment=enrollment, reason=SERVICE_AREA_REASON,
-                    zip_code=offending_zip, actor=actor,
-                )
-            except Exception:  # never let history-logging break the save
-                pass
-            if mv.client_id:
-                try:
-                    Note.objects.create(
-                        client=mv.client, source=NoteSource.SYSTEM,
-                        author_name=author,
-                        body=service_area_note_body(offending_zip, source),
-                    )
-                except Exception:  # never let note-writing break the save
-                    pass
-        elif allow_reactivate and mv.status == MemberStatus.OUT_OF_RANGE:
-            # ZIP is now serviceable: return to Active only if the meal rule
-            # (now ZIP-aware) also passes. A dietary/kitchen block leaves them
-            # excluded (reconcile mutates mv in memory; we only persist when it
-            # clears). Explicit restore-range flow, so allow_resume=True lets the
-            # meal rule move the member OFF OUT_OF_RANGE (the ZIP re-check still
-            # keeps them excluded if the ZIP is still out of coverage).
-            out, _became, _reason = reconcile_member_kitchen_output(
-                mv, enrollment.kitchen, save=False, allow_resume=True,
-            )
-            if not out:
-                mv.save()
-                reactivated_names.append(_member_name(mv))
-                try:
-                    timeline.event_for_member_reactivated(
-                        mv, enrollment=enrollment, actor=actor,
-                    )
-                except Exception:  # never let history-logging break the save
-                    pass
+        if not offending_zip:
+            continue
+        # Skip terminal off-boarded members; everyone else in the household shares
+        # the out-of-coverage delivery address, so they are all off-ramped.
+        if mv.status == MemberStatus.INACTIVE or not mv.client_id:
+            continue
+        reason_detail = (
+            f"The {source} ZIP {offending_zip} is outside the delivery coverage area."
+        )
+        apply_out_of_range_ineligibility(
+            mv.client, reason_detail=reason_detail, actor_label=author,
+        )
+        out_names.append(_member_name(mv))
+        if not ticket_zip:
+            ticket_zip, ticket_source = offending_zip, source
 
-    # Side effects: opening members drive a household hold + Case Closure ticket;
-    # a full reactivation (no member still Out of Range) resumes the hold and
-    # resolves the ticket.
+    # Open the Case Closure ticket for an agent to review (idempotent -- skipped
+    # when an unresolved out-of-range ticket already exists).
     if out_names:
         try:
             _open_out_of_range_ticket(
@@ -535,25 +507,8 @@ def _enforce_delivery_coverage(enrollment, agent, *, allow_reactivate=False):
             )
         except Exception:  # never let ticket-writing break the coverage check
             pass
-        try:
-            _hold_household_for_range(enrollment, author)
-        except Exception:  # never let the hold break the coverage check
-            pass
-    elif reactivated_names:
-        still_out = enrollment.member_profiles.filter(
-            status=MemberStatus.OUT_OF_RANGE,
-        ).exists()
-        if not still_out:
-            try:
-                _resume_household_after_range(enrollment)
-            except Exception:
-                pass
-            try:
-                _resolve_out_of_range_tickets(enrollment, actor=actor)
-            except Exception:
-                pass
 
-    return {"out_of_range": out_names, "reactivated": reactivated_names}
+    return {"out_of_range": out_names}
 
 
 # Reverse of serializers._STATUS_MAP: a filter value -> the lifecycle stages it covers.
@@ -649,6 +604,95 @@ def current_member_status_exists(member_status, *, eligibility_paused=None):
     return Exists(profiles)
 
 
+# --- Care Management tabs -----------------------------------------------------
+# Ordered tabs for the Care Management page. A household shows in the FIRST tab
+# it matches; matching an earlier tab excludes it from every later one (mutual
+# exclusion), so no household repeats across tabs.
+CARE_MANAGEMENT_TABS = [
+    ("out_of_range", "Out of Range"),
+    ("rejected_case", "Rejected Case"),
+    ("services_paused", "Services Paused"),
+    ("no_coverage", "No Active Coverage"),
+    ("requires_verification", "Requires Verification"),
+    ("no_matching_menu", "No Matching Menu"),
+]
+
+
+def care_management_base_q():
+    """The care-management population: members in the meal/box service pipeline --
+    they hold an internal-service case, or an enrollment on their own or their
+    household's roster. Keeps unrelated leads (e.g. an uninsured screening-only
+    contact) out of the No-Active-Coverage tab."""
+    return (
+        Q(cases__case_type=CaseType.INTERNAL_SERVICE)
+        | Q(enrollments__isnull=False)
+        | Q(household_membership__household__enrollment_verifications__isnull=False)
+    )
+
+
+def annotate_care_management(qs):
+    """Annotate the client qs with the boolean flags the Care Management tabs key
+    off (member status on a live enrollment, a denied internal-service case,
+    active Medicaid / enrolled social care, and the governing enrollment stage)."""
+    from ..models import (
+        Insurance, RecordStatus, SocialCareCoverage, SocialCareCoverageStatus,
+    )
+    from ..services.lifecycle import MEDICAID_PLAN_TYPES
+
+    internal = Case.objects.filter(
+        client=OuterRef("pk"), case_type=CaseType.INTERNAL_SERVICE,
+    )
+    active_medicaid = Insurance.objects.filter(
+        client=OuterRef("pk"), plan_type__in=MEDICAID_PLAN_TYPES,
+        status=RecordStatus.ACTIVE,
+    )
+    enrolled_scc = SocialCareCoverage.objects.filter(
+        client=OuterRef("pk"), status=SocialCareCoverageStatus.ENROLLED,
+    )
+    return qs.annotate(
+        _cm_oob=current_member_status_exists(MemberStatus.OUT_OF_ORBIT),
+        _cm_paused=current_member_status_exists(MemberStatus.PAUSED),
+        _cm_denied=Exists(
+            internal.filter(service_authorization_status=ServiceAuthorizationStatus.DENIED)
+        ),
+        _cm_medicaid=Exists(active_medicaid),
+        _cm_scc=Exists(enrolled_scc),
+        _cm_gov_stage=governing_enrollment_stage(),
+    )
+
+
+def care_management_predicates():
+    """Tab Q-predicates over the annotations from ``annotate_care_management``,
+    in the same precedence order as ``CARE_MANAGEMENT_TABS``."""
+    from ..services.service_area import SERVICE_AREA_REASON
+
+    return [
+        # Out of Range: households off-ramped to Not Eligible because a delivery /
+        # primary ZIP is outside the coverage area (stable coverage reason stored).
+        Q(lifecycle_stage=ClientStage.INELIGIBLE, ineligible_reasons__contains=[SERVICE_AREA_REASON]),
+        Q(_cm_denied=True),                                                 # Rejected Case
+        Q(_cm_paused=True) | Q(_cm_gov_stage=EnrollmentStage.ON_HOLD),      # Services Paused
+        Q(_cm_medicaid=False) & Q(_cm_scc=False),                          # No Active Coverage
+        Q(lifecycle_stage=ClientStage.PENDING_VERIFICATION),               # Requires Verification
+        Q(_cm_oob=True),                                                    # No Matching Menu
+    ]
+
+
+def care_management_tab_queryset(qs, tab):
+    """Filter ``qs`` (already base-scoped + annotated) to a single Care Management
+    tab, applying mutual exclusion: the tab's own predicate AND none of the
+    higher-precedence tabs' predicates."""
+    codes = [c for c, _ in CARE_MANAGEMENT_TABS]
+    preds = care_management_predicates()
+    try:
+        n = codes.index((tab or "").strip())
+    except ValueError:
+        n = 0
+    for i in range(n):
+        qs = qs.exclude(preds[i])
+    return qs.filter(preds[n])
+
+
 # Page-level base scope: restricts the list to the lifecycle stages a given
 # work area cares about (independent of the per-status filter chips).
 SCOPE_TO_STAGES = {
@@ -663,6 +707,8 @@ SCOPE_TO_STAGES = {
 # so the Verification list's agent columns don't trigger an extra query per row.
 MEMBER_LIST_PREFETCH = (
     "insurances",
+    # Colour-coded labels (Settings > Tags), rendered as tag chips on the list.
+    "tags",
     # Addresses, so the eligibility-reason recompute (address_range_reason, shown
     # under a Not Eligible badge) resolves without an extra query per row.
     "addresses",
@@ -1261,6 +1307,12 @@ class MembersListView(PortalGenericAPIView):
                 qs = qs.filter(
                     Q(cases__case_type=CaseType.INTERNAL_SERVICE) & date_q
                 ).distinct()
+        elif scope == "care_management":
+            # Care Management tabs: the meal/box pipeline population, split into
+            # mutually-exclusive tabs (a household shows in the FIRST tab it
+            # matches). ``tab`` selects which one.
+            qs = annotate_care_management(qs.filter(care_management_base_q()).distinct())
+            qs = care_management_tab_queryset(qs, params.get("tab"))
         else:
             scope_stages = SCOPE_TO_STAGES.get(scope)
             if scope_stages:
@@ -1490,6 +1542,9 @@ class MembersListView(PortalGenericAPIView):
             qs = qs.filter(current_member_status_exists(
                 MemberStatus.PAUSED, eligibility_paused=True,
             ))
+        elif flag == "nutritionist_paused":
+            # A Nutritionist reviewed and paused the member from the review drawer.
+            qs = qs.filter(current_member_status_exists(MemberStatus.NUTRITIONIST_PAUSED))
         # TEMP diagnostic flags (to be removed): members missing dietary/logistics
         # data. "no_menu_type" -> no dietary profile carries a menu type at all;
         # "no_kitchen" -> neither the member's nor their household's enrollment has
@@ -1503,6 +1558,14 @@ class MembersListView(PortalGenericAPIView):
                     household_membership__household__enrollment_verifications__kitchen_id__isnull=False
                 )
             )
+
+        # Tag filter (Settings > Tags): keep members carrying the given tag.
+        # A household matches when ANY member carries it (grouped scopes call
+        # .distinct()); with the primary-only tagging convention that's the
+        # household's own tag.
+        tag = (params.get("tag") or "").strip()
+        if tag:
+            qs = qs.filter(tags__pk=tag)
 
         # Household-composition filter:
         #   "multi"  -> members whose household has more than one member.
@@ -2174,6 +2237,7 @@ class MembersListView(PortalGenericAPIView):
                 .select_related("household", "client")
                 .prefetch_related(
                     "client__insurances", "client__military_profile",
+                    "client__tags",
                     Prefetch(
                         "client__enrollments",
                         queryset=EnrollmentVerification.objects.select_related(
@@ -2418,7 +2482,7 @@ class UnlinkedMembersListView(PortalGenericAPIView):
         case_to = _parse_date(params.get("case_to"))
 
         qs = self.base_queryset(case_from, case_to).prefetch_related(
-            "insurances", "cases", "assessments"
+            "insurances", "cases", "assessments", "tags"
         )
 
         search = (params.get("search") or "").strip()
@@ -2438,6 +2502,10 @@ class UnlinkedMembersListView(PortalGenericAPIView):
             except (ValueError, TypeError, AttributeError):
                 pass
             qs = qs.filter(cond)
+
+        tag = (params.get("tag") or "").strip()
+        if tag:
+            qs = qs.filter(tags__pk=tag)
 
         # Optionally keep only members that ARE referenced in some other member's
         # case description (the "Referenced In" column). Resolved in a single
@@ -2595,6 +2663,7 @@ class UnlinkedMembersListView(PortalGenericAPIView):
                         self._case_of_type(c, CaseType.NAVIGATION)
                     ),
                     "description_match": self._description_match(c),
+                    "tags": _client_tags_payload(c),
                 }
             )
         return self.get_paginated_response(rows)
@@ -2636,7 +2705,7 @@ class NoNavigationMembersListView(UnlinkedMembersListView):
                 _has_nav=Exists(nav_case),
             )
             .filter(_has_ic=True, _has_nav=False)
-            .prefetch_related("insurances", "cases", "assessments")
+            .prefetch_related("insurances", "cases", "assessments", "tags")
         )
 
         search = (params.get("search") or "").strip()
@@ -2656,6 +2725,10 @@ class NoNavigationMembersListView(UnlinkedMembersListView):
             except (ValueError, TypeError, AttributeError):
                 pass
             qs = qs.filter(cond)
+
+        tag = (params.get("tag") or "").strip()
+        if tag:
+            qs = qs.filter(tags__pk=tag)
 
         return qs.order_by(Lower("first_name"), Lower("last_name")).distinct()
 
@@ -2681,7 +2754,7 @@ class NeedAttestationMembersListView(UnlinkedMembersListView):
         params = self.request.query_params
 
         qs = Client.objects.filter(attestation_needed=True).prefetch_related(
-            "insurances", "cases", "assessments"
+            "insurances", "cases", "assessments", "tags"
         )
 
         search = (params.get("search") or "").strip()
@@ -2701,6 +2774,10 @@ class NeedAttestationMembersListView(UnlinkedMembersListView):
             except (ValueError, TypeError, AttributeError):
                 pass
             qs = qs.filter(cond)
+
+        tag = (params.get("tag") or "").strip()
+        if tag:
+            qs = qs.filter(tags__pk=tag)
 
         return qs.order_by(Lower("first_name"), Lower("last_name")).distinct()
 
@@ -2743,6 +2820,7 @@ class NeedAttestationMembersListView(UnlinkedMembersListView):
                     ),
                     # The screening question + answer we keyed the flag on.
                     "attestation": self._attestation_qa(c),
+                    "tags": _client_tags_payload(c),
                 }
             )
         return self.get_paginated_response(rows)
@@ -2802,6 +2880,26 @@ class MembersStatsView(PortalAPIView):
         return Response(counts)
 
 
+class CareManagementTabCountsView(PortalAPIView):
+    """Per-tab counts for the Care Management page. Each count is the number of
+    DISTINCT members in that tab AFTER mutual exclusion (so tabs never overlap)."""
+
+    def get(self, request):
+        base = annotate_care_management(
+            Client.objects.filter(care_management_base_q()).distinct()
+        )
+        return Response({
+            "tabs": [
+                {
+                    "code": code,
+                    "label": label,
+                    "count": care_management_tab_queryset(base, code).distinct().count(),
+                }
+                for code, label in CARE_MANAGEMENT_TABS
+            ],
+        })
+
+
 def _get_member(client_id):
     return get_object_or_404(
         Client.objects.prefetch_related(
@@ -2816,6 +2914,34 @@ class MemberDetailView(PortalAPIView):
     def get(self, request, client_id):
         client = _get_member(client_id)
         return Response(s.MemberDetailSerializer(client).data)
+
+
+def _client_tags_payload(client):
+    return [
+        {"id": str(t.pk), "name": t.name, "color": t.color,
+         "color_label": t.get_color_display()}
+        for t in client.tags.all()
+    ]
+
+
+class MemberTagsView(PortalAPIView):
+    """GET/PUT /members/<client_id>/tags/ — the colour-coded labels (Settings >
+    Tags) attached to a client. PUT replaces the full set from a ``tag_ids``
+    list. Used by the member profile header and by the Care Management page
+    (which tags the household's PRIMARY client)."""
+
+    def get(self, request, client_id):
+        client = get_object_or_404(Client, pk=client_id)
+        return Response(_client_tags_payload(client))
+
+    def put(self, request, client_id):
+        client = get_object_or_404(Client, pk=client_id)
+        tag_ids = request.data.get("tag_ids", [])
+        if not isinstance(tag_ids, list):
+            return Response({"error": "tag_ids must be a list."}, status=http.HTTP_400_BAD_REQUEST)
+        tags = list(ClientTag.objects.filter(pk__in=tag_ids))
+        client.tags.set(tags)
+        return Response(_client_tags_payload(client))
 
 
 class MemberInsuranceView(PortalAPIView):
@@ -3220,17 +3346,15 @@ class MemberHouseholdView(PortalAPIView):
                 )
             except Exception:  # never let history-logging break the edit
                 pass
-        # Delivery Coverage Eligibility Check on the updated address: flag members
-        # Out of Orbit when the new ZIP is out of area; when the ZIP just became
-        # serviceable (was excluded, now isn't), return them to Active if the
-        # meal rule also passes.
+        # Delivery Coverage Eligibility Check on the updated address: when the new
+        # ZIP is outside the coverage area, off-ramp the household to Not Eligible
+        # (Paused members + a Case Closure ticket). This is a sticky off-ramp --
+        # editing the address back to a serviceable ZIP does NOT auto-restore
+        # service; an agent must resolve the Not-Eligible state.
         from ..services.service_area import is_zip_excluded
-        new_excluded = is_zip_excluded(addr.zip)
         coverage = None
-        if new_excluded:
+        if is_zip_excluded(addr.zip):
             coverage = _enforce_delivery_coverage(enr, agent)
-        elif is_zip_excluded(prev_zip):
-            coverage = _enforce_delivery_coverage(enr, agent, allow_reactivate=True)
         resp = {
             "street": addr.street, "unit": addr.unit, "city": addr.city,
             "state": addr.state, "zip": addr.zip, "notes": addr.notes,
@@ -3239,16 +3363,9 @@ class MemberHouseholdView(PortalAPIView):
             names = coverage["out_of_range"]
             resp["coverage_warning"] = (
                 f"ZIP {addr.zip} is outside the delivery coverage area — "
-                f"{len(names)} member(s) set Out of Range (excluded from "
-                f"deliveries): {', '.join(names)}. The household has been placed "
-                f"on hold and a Case Closure ticket opened for review."
-            )
-        if coverage and coverage.get("reactivated"):
-            names = coverage["reactivated"]
-            resp["coverage_info"] = (
-                f"ZIP {addr.zip} is now serviceable — "
-                f"{len(names)} member(s) returned to Active: {', '.join(names)}. "
-                f"The household hold was resumed and the Out-of-Range ticket resolved."
+                f"{len(names)} member(s) set Not Eligible (paused + excluded from "
+                f"deliveries): {', '.join(names)}. A Case Closure ticket was opened "
+                f"for review."
             )
         return Response(resp)
 
@@ -3622,11 +3739,14 @@ class HouseholdMemberEditView(PortalAPIView):
                     )
                 except Exception:  # never let note-writing break the edit
                     pass
-        elif reactivate and mv.status == MemberStatus.OUT_OF_ORBIT:
+        elif reactivate and mv.status in (
+            MemberStatus.OUT_OF_ORBIT, MemberStatus.PENDING,
+        ):
             # Re-run the kitchen-aware rules against the edited menu type /
             # allergies. Only return the member to Active if the new combination
             # can actually be fulfilled by the household's assigned kitchen;
-            # otherwise the agent must pick a different menu type.
+            # otherwise the agent must pick a different menu type. Also promotes a
+            # still-PENDING member (pre-kitchen add) once they have a menu.
             out, _became, reason = reconcile_member_kitchen_output(
                 mv, enr.kitchen, save=False,
             )
@@ -3999,15 +4119,17 @@ class MemberServiceResumeView(PortalAPIView):
                 )},
                 status=http.HTTP_400_BAD_REQUEST,
             )
-        # Resume to the SERVICE stage the enrollment was held from -- but NEVER
-        # back into a terminal stage. A household that was REACTIVATED from
-        # Cancelled lands in On Hold via a ``cancelled -> on_hold`` StageEvent, so
-        # the most-recent hold's ``from_stage`` is ``cancelled``; resuming to that
-        # re-cancelled the member on every click (the endless reactivate/resume
-        # loop this fixes). Only a genuine service stage (Verified / Kitchen
-        # Assignment / Service Active) is a valid resume target -- restrict the
-        # lookup to those, and default to Service Active when none is found.
+        # Resume to the stage the enrollment was held from -- but NEVER back into a
+        # terminal stage. A household that was REACTIVATED from Cancelled lands in
+        # On Hold via a ``cancelled -> on_hold`` StageEvent, so the most-recent
+        # hold's ``from_stage`` is ``cancelled``; resuming to that re-cancelled the
+        # member on every click (the endless reactivate/resume loop this fixes).
+        # Only genuine non-terminal stages are valid resume targets -- crucially
+        # PENDING_VERIFICATION is included so a household held BEFORE verification
+        # resumes back to Pending Verification instead of being force-defaulted to
+        # Service Active (which would leave it Active + unverified).
         _RESUMABLE_FROM_STAGES = (
+            EnrollmentStage.PENDING_VERIFICATION,
             EnrollmentStage.VERIFIED,
             EnrollmentStage.KITCHEN_ASSIGNMENT,
             EnrollmentStage.SERVICE_ACTIVE,
@@ -4021,12 +4143,19 @@ class MemberServiceResumeView(PortalAPIView):
             .order_by("-entered_at")
             .first()
         )
-        target = EnrollmentStage.SERVICE_ACTIVE
+        # Default resume floor: a never-verified enrollment goes back to Pending
+        # Verification (NOT Service Active), so a missing/odd hold history can't
+        # strand it Active + unverified.
+        default_target = (
+            EnrollmentStage.PENDING_VERIFICATION if enr.verified_at is None
+            else EnrollmentStage.SERVICE_ACTIVE
+        )
+        target = default_target
         if last_hold and last_hold.from_stage:
             try:
                 target = EnrollmentStage(last_hold.from_stage)
             except ValueError:
-                target = EnrollmentStage.SERVICE_ACTIVE
+                target = default_target
         reason = (request.data.get("reason") or "").strip()
         agent = current_agent(request)
         author = agent.name if agent else ""
@@ -4684,11 +4813,13 @@ class MemberNutritionistDenyMemberView(PortalAPIView):
                 body=f"Member paused by Nutritionist. Reason: {reason}",
             )
 
-        # If this paused the LAST still-active member, hold the whole household
-        # with the same reason (mirrors the manual Nutritionist hold).
+        # If this paused the LAST member still in play, hold the whole household
+        # with the same reason (mirrors the manual Nutritionist hold). PENDING
+        # members are still in play (under review / pre-kitchen), so they count
+        # as remaining -- only genuinely paused/off-ramped statuses don't.
         held = False
         remaining_active = enr.member_profiles.exclude(
-            status__in=SERVICE_EXCLUDED_MEMBER_STATUSES
+            status__in=MEMBER_PAUSED_STATUSES
         ).exists()
         if not remaining_active and EnrollmentStage(enr.stage) != EnrollmentStage.ON_HOLD:
             try:
@@ -5348,6 +5479,14 @@ class MemberRequestVerificationView(PortalAPIView):
                 requested_by=agent,
                 requested_at=timezone.now(),
             )
+            # Link the household's GOVERNING internal-service case onto the
+            # enrollment right now (at request time) via the canonical resolver,
+            # so a pending verification already carries the right case FK instead
+            # of waiting for verification completion. Safe on a pending stage:
+            # reconcile only wires the case here (the authorization projection
+            # no-ops until VERIFIED). The verification pop-up re-runs this on
+            # completion, so it self-corrects if a newer case landed meanwhile.
+            reconcile_enrollment_authorization(enr, actor=actor)
             # Drives the whole household to Pending Verification and drops the
             # primary off the Urgent Care list (clears is_new).
             recompute_enrollment_household(enr)
@@ -5394,9 +5533,10 @@ def assign_kitchen_to_household(
     actor = _agent_actor(agent)
 
     # Capture the pre-assignment kitchen + cadence so a RE-assignment (the
-    # household already had a kitchen) logs a precise 'Kitchen Changed' diff.
-    # First-time assignment (no previous kitchen) is already recorded by the
-    # KITCHEN_ASSIGNED stage event, so we skip the change row there.
+    # household already had a kitchen) logs a precise 'Kitchen Changed' diff,
+    # while a first-time assignment logs a 'Kitchen Assigned' event (emitted
+    # below, once the kitchen is actually set -- NOT when the enrollment merely
+    # reaches the Kitchen Assignment stage).
     previous_kitchen = enr.kitchen.name if enr.kitchen_id else ""
     previous_cadence = current_household_cadence(enr) or ""
 
@@ -5543,12 +5683,14 @@ def assign_kitchen_to_household(
             "warning sync failed after kitchen assignment for enrollment %s", enr.pk
         )
 
-    # Log the kitchen/cadence change on a RE-assignment (skipped on first-time
-    # assignment, where previous_kitchen is blank). event_for_kitchen_changed is
-    # itself a no-op when nothing actually changed. Best-effort.
-    if previous_kitchen:
-        try:
-            _cad_label = {c.code: c.label for c in Cadence.objects.all()}
+    # Log the kitchen event: a 'Kitchen Assigned' on first-time assignment
+    # (previous_kitchen blank), else a precise 'Kitchen Changed' diff on
+    # re-assignment. This is the ONLY place a real kitchen assignment is logged
+    # now that reaching the Kitchen Assignment STAGE emits AWAITING_KITCHEN
+    # instead. Best-effort -- never let history-logging break assignment.
+    try:
+        _cad_label = {c.code: c.label for c in Cadence.objects.all()}
+        if previous_kitchen:
             timeline.event_for_kitchen_changed(
                 enr,
                 previous_kitchen=previous_kitchen,
@@ -5557,8 +5699,15 @@ def assign_kitchen_to_household(
                 new_cadence=_cad_label.get(cadence, cadence),
                 actor=actor,
             )
-        except Exception:  # never let history-logging break assignment
-            pass
+        else:
+            timeline.event_for_kitchen_assigned(
+                enr,
+                kitchen_name=kitchen.name if kitchen else "",
+                cadence_label=_cad_label.get(cadence, cadence),
+                actor=actor,
+            )
+    except Exception:  # never let history-logging break assignment
+        pass
 
     return {
         "out_of_orbit": out_of_orbit,

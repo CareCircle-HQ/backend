@@ -33,6 +33,7 @@ from ..models import (
     CommunicationChannel,
     CommunicationTimeOfDay,
     DeliveryCompany,
+    ClientTag,
     DeliveryCompanyIntegration,
     DeliveryOrder,
     DietaryTag,
@@ -629,9 +630,18 @@ class MemberListSerializer(serializers.Serializer):
     out_of_orbit_at = serializers.SerializerMethodField()
     out_of_range_at = serializers.SerializerMethodField()
     paused_at = serializers.SerializerMethodField()
+    # Colour-coded labels attached to this client (managed in Settings > Tags).
+    tags = serializers.SerializerMethodField()
 
     def get_name(self, obj):
         return _full_name(obj)
+
+    def get_tags(self, obj):
+        return [
+            {"id": str(t.pk), "name": t.name, "color": t.color,
+             "color_label": t.get_color_display()}
+            for t in obj.tags.all()
+        ]
 
     def get_lead_source(self, obj):
         return getattr(obj, "lead_source", "") or ""
@@ -975,6 +985,13 @@ class MemberDetailSerializer(serializers.Serializer):
                 # Flagged by the ext when the member needs a provider (doctor)
                 # attestation -- drives the profile's Attestation warning banner.
                 "attestation_needed": bool(getattr(client, "attestation_needed", False)),
+                # Colour-coded labels (Settings > Tags) attached to this client,
+                # shown + editable in the ClientHeader.
+                "tags": [
+                    {"id": str(t.pk), "name": t.name, "color": t.color,
+                     "color_label": t.get_color_display()}
+                    for t in client.tags.all()
+                ],
             },
             "lifecycle": {
                 "stage": client.lifecycle_stage,
@@ -1892,7 +1909,12 @@ class PortalHouseholdMemberSerializer(serializers.ModelSerializer):
         if obj.status == "nutritionist_paused":
             return "paused"
         enr = obj.enrollment
-        if enr and enr.stage == "verified":
+        # Verification not yet completed -> the Nutritionist stage hasn't begun.
+        # Don't fall through to the member's service status (Active / Out of
+        # Orbit), which isn't meaningful before the household is verified.
+        if not (enr and enr.verified_at):
+            return "awaiting_verification"
+        if enr.stage == "verified":
             if not enr.nutritionist_approved_at:
                 return "pending"
             if enr.nutritionist_approved_by_id:
@@ -2026,6 +2048,21 @@ class PortalMealPlanSerializer(serializers.ModelSerializer):
     class Meta:
         model = MealPlan
         fields = ["id", "name", "description", "is_active"]
+
+
+class PortalClientTagSerializer(serializers.ModelSerializer):
+    """Settings > Tags: a colour-coded label (name + colour) attached to clients."""
+
+    id = serializers.UUIDField(source="pk", read_only=True)
+    color_label = serializers.CharField(source="get_color_display", read_only=True)
+    usage_count = serializers.SerializerMethodField()
+
+    class Meta:
+        model = ClientTag
+        fields = ["id", "name", "color", "color_label", "usage_count"]
+
+    def get_usage_count(self, obj):
+        return obj.clients.count()
 
 
 class PortalCadenceSerializer(serializers.ModelSerializer):

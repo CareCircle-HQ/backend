@@ -11,6 +11,15 @@ from io import BytesIO
 from django.utils import timezone
 
 
+def _allergy_labels(codes):
+    """Human labels for a member's food-allergy codes (captured at verification),
+    dropping the no-op 'none' sentinel."""
+    from api.models import FoodAllergy
+
+    labels = dict(FoodAllergy.choices)
+    return [labels.get(c, c) for c in (codes or []) if c and c != "none"]
+
+
 def _full_name(client):
     if client is None:
         return ""
@@ -43,6 +52,8 @@ def _member_dict(p):
         "meal_plan": p.meal_plan or "",
         "meal_plan_other": p.meal_plan_other or "",
         "meal_type": p.menu_type or "",
+        # Food allergies captured at verification (human labels).
+        "food_allergies": _allergy_labels(p.food_allergies),
         "conditions": conditions,
         "medications": list(p.medications or []),
         "weight": p.weight or "",
@@ -106,6 +117,7 @@ def _health_rows(m):
         rows.append(("Other Meal Plan", m["meal_plan_other"]))
     rows += [
         ("Meal Type", m["meal_type"]),
+        ("Food Allergies", ", ".join(m["food_allergies"]) or "None"),
         ("Medical Conditions", ", ".join(m["conditions"]) or "No Restriction"),
         ("Medications", ", ".join(m["medications"])),
         ("Weight", f"{m['weight']} Lbs" if m["weight"] else ""),
