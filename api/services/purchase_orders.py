@@ -1143,10 +1143,16 @@ def _report_filename(po):
 
 
 def _kitchen_menu_label(do):
-    """The kitchen menu type for a delivery order (the meal-rule result sent to
-    the kitchen), falling back to the system menu type, then a dash."""
-    return (do.kitchen_meal_type or "").strip() or (
-        do.menu_type.name if do.menu_type else "—"
+    """The menu type shown for a delivery order on the summary report: the
+    member's SYSTEM menu type (e.g. Kosher) -- the same value the kitchen export's
+    MenuType column uses, so the two reports for one PO always agree.
+
+    Falls back to the meal-rule ``kitchen_meal_type`` snapshot only when the
+    system menu type is absent (then a dash). The kitchen snapshot alone is NOT
+    authoritative: it can be stale/blank (e.g. it reads "Standard" for members at
+    a Kosher-only kitchen), which previously mislabeled the summary report."""
+    return (do.menu_type.name if do.menu_type else "").strip() or (
+        (do.kitchen_meal_type or "").strip() or "—"
     )
 
 
