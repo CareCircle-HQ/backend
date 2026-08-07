@@ -83,17 +83,6 @@ def _safe_timeline(builder, obj, request):
         logger.exception("timeline emit failed for %s", type(obj).__name__)
 
 
-def _safe_timeline_case_switch(enrollment, previous_case, request):
-    """Emit the verification 'case switched' timeline event, isolated from the
-    API write (carries the previous case for the history)."""
-    try:
-        timeline.event_for_verification_case_switched(
-            enrollment, previous_case=previous_case, actor=_agent_actor(request)
-        )
-    except Exception:  # noqa: BLE001
-        logger.exception("case-switch timeline emit failed for %s", enrollment.pk)
-
-
 def _safe_recompute_stage(obj):
     """Recompute the client's lifecycle stage after a screening/assessment write,
     never letting a failure break the API write."""
@@ -764,7 +753,6 @@ class EnrollmentVerificationViewSet(viewsets.ModelViewSet):
         # Re-requesting means the household is being handled again -> drop it off
         # the Urgent Care list.
         clear_new_flag_on_verification_request(enrollment)
-        _safe_timeline(timeline.event_for_verification_renewed, enrollment, request)
         _safe_recompute_household(enrollment)
         return Response(self.get_serializer(enrollment).data, status=status.HTTP_200_OK)
 
@@ -829,10 +817,8 @@ class EnrollmentVerificationViewSet(viewsets.ModelViewSet):
         if str(enrollment.case_id) == str(case_id):
             return Response(self.get_serializer(enrollment).data)
 
-        previous_case = enrollment.case
         enrollment.case = case
         enrollment.save(update_fields=["case"])
-        _safe_timeline_case_switch(enrollment, previous_case, request)
         # Project the newly-selected case's authorization (approved -> advance;
         # denied -> pause) and re-drive the household.
         try:

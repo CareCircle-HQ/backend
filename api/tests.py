@@ -761,6 +761,174 @@ class ScreeningAssessmentTimelineMetadataTest(TestCase):
         self.assertEqual(ev2.metadata["eligible_services"], [])
 
 
+class VerificationEventTimelineTest(TestCase):
+    """The verification events record who + governing case + member roster
+    (requested/disregarded) and a full per-member clinical snapshot + governing
+    case status/auth at save time (completed)."""
+
+    def setUp(self):
+        from .models import (
+            Case, CaseStatus, CaseType, EnrollmentStage, EnrollmentVerification,
+            ServiceAuthorizationStatus,
+        )
+
+        self.client_obj = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Ada", last_name="Lovelace"
+        )
+        self.case = Case.objects.create(
+            case_id=uuid.uuid4(), client=self.client_obj,
+            case_type=CaseType.INTERNAL_SERVICE, case_status=CaseStatus.MANAGED,
+            service_authorization_status=ServiceAuthorizationStatus.APPROVED,
+            program_name="Medically Tailored Meals (MTM)",
+        )
+        self.enr = EnrollmentVerification.objects.create(
+            client=self.client_obj, case=self.case,
+            stage=EnrollmentStage.PENDING_VERIFICATION,
+            program_name="Medically Tailored Meals (MTM)",
+        )
+
+    def _member(self, **kwargs):
+        from .models import MemberDietaryProfile
+
+        defaults = dict(
+            enrollment=self.enr, client=self.client_obj, member_name="Ada Lovelace",
+        )
+        defaults.update(kwargs)
+        return MemberDietaryProfile.objects.create(**defaults)
+
+    def test_requested_event_has_governing_case_and_members(self):
+        from .services import timeline
+
+        self._member()
+        ev = timeline.event_for_verification(self.enr, actor="agent:1")
+        self.assertIsNotNone(ev)
+        self.assertEqual(ev.event_type, "verification_requested")
+        self.assertEqual(ev.metadata["governing_case_id"], str(self.case.case_id))
+        self.assertIn("Ada Lovelace", ev.metadata["members"])
+        self.assertEqual(ev.actor, "agent:1")
+
+    def test_completed_event_snapshots_member_clinical_detail(self):
+        from .services import timeline
+
+        self._member(
+            conditions=["Diabetes"], medications=["Insulin"], weight="180 lb",
+            height="5ft 9in", on_medical_diet=True, medical_diet_details="Low sodium",
+            menu_type="Standard", food_allergies=["peanuts"],
+            other_dietary_restrictions="No pork", general_verification_notes="ok",
+        )
+        ev = timeline.event_for_verification_submitted(
+            self.enr,
+            delivery_address="1 Main St, NY",
+            governing_case_id=str(self.case.case_id),
+            case_status=self.case.case_status,
+            auth_status=self.case.service_authorization_status,
+            actor="agent:1",
+        )
+        self.assertIsNotNone(ev)
+        self.assertEqual(ev.event_type, "verification_completed")
+        md = ev.metadata
+        self.assertEqual(md["governing_case_id"], str(self.case.case_id))
+        self.assertEqual(md["case_status"], self.case.case_status)
+        self.assertEqual(md["authorization_status"], self.case.service_authorization_status)
+        m = md["members"][0]
+        self.assertEqual(m["conditions"], ["Diabetes"])
+        self.assertEqual(m["medications"], ["Insulin"])
+        self.assertEqual(m["weight"], "180 lb")
+        self.assertEqual(m["height"], "5ft 9in")
+        self.assertTrue(m["on_medical_diet"])
+        self.assertEqual(m["medical_diet_details"], "Low sodium")
+        self.assertEqual(m["menu_type"], "Standard")
+        self.assertEqual(m["food_allergies"], ["peanuts"])
+        self.assertEqual(m["other_dietary_restrictions"], "No pork")
+        self.assertEqual(m["general_verification_notes"], "ok")
+
+    def test_completed_snapshot_frozen_against_later_profile_edit(self):
+        from .models import MemberDietaryProfile
+        from .services import timeline
+
+        p = self._member(menu_type="Standard")
+        ev = timeline.event_for_verification_submitted(self.enr, actor="agent:1")
+        # Edit the live profile afterward -> the event snapshot must NOT change.
+        p.menu_type = "Kosher"
+        p.save(update_fields=["menu_type"])
+        ev.refresh_from_db()
+        self.assertEqual(ev.metadata["members"][0]["menu_type"], "Standard")
+
+    def test_product_type_changed_records_before_after_and_dedupes(self):
+        from .services import timeline
+
+        key = f"product_type_changed:{self.client_obj.pk}:a:b"
+        ev1 = timeline.event_for_product_type_changed(
+            self.enr, previous_label="Meals", new_label="Boxes", dedupe_key=key,
+        )
+        self.assertIsNotNone(ev1)
+        self.assertEqual(ev1.event_type, "product_type_changed")
+        self.assertEqual(ev1.metadata, {"previous": "Meals", "new": "Boxes"})
+        # Same switch re-run -> create-once (no duplicate row).
+        ev2 = timeline.event_for_product_type_changed(
+            self.enr, previous_label="Meals", new_label="Boxes", dedupe_key=key,
+        )
+        self.assertEqual(ev2.pk, ev1.pk)
+
+
+class GoverningCaseReplacementVerificationGateTest(TestCase):
+    """Regression: a governing-case replacement must NOT promote an UNVERIFIED
+    household. Previously a pending-verification enrollment was force-stepped to
+    Kitchen Assignment when a new governing case was approved -- skipping the
+    verification gate. An approved new case must never bypass verification."""
+
+    def setUp(self):
+        self.client_obj = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Pat", last_name="Pending",
+        )
+
+    def _carry(self, *, verified):
+        from .models import (
+            Case, CaseStatus, CaseType, EnrollmentStage, EnrollmentVerification,
+            ProductTypeKind, ServiceAuthorizationStatus,
+        )
+        from .services.lifecycle import _carry_service_and_activate
+
+        prior = EnrollmentVerification.objects.create(
+            client=self.client_obj, stage=EnrollmentStage.PENDING_VERIFICATION,
+            program_name="MTM Meals",
+        )
+        new_case = Case.objects.create(
+            case_id=uuid.uuid4(), client=self.client_obj,
+            case_type=CaseType.INTERNAL_SERVICE, case_status=CaseStatus.MANAGED,
+            service_authorization_status=ServiceAuthorizationStatus.APPROVED,
+            program_name="MTM Meals",
+        )
+        new_enr = EnrollmentVerification.objects.create(
+            client=self.client_obj, case=new_case,
+            stage=EnrollmentStage.PENDING_VERIFICATION, program_name="MTM Meals",
+            verified_at=(timezone.now() if verified else None),
+        )
+        carried = _carry_service_and_activate(
+            new_enr, prior, new_case, ProductTypeKind.MEALS,
+            prior_was_serving=False, actor=None, actor_label="",
+        )
+        new_enr.refresh_from_db()
+        return carried, new_enr
+
+    def test_unverified_stays_pending_verification(self):
+        from .models import EnrollmentStage
+
+        carried, new_enr = self._carry(verified=False)
+        self.assertFalse(carried)
+        self.assertEqual(new_enr.stage, EnrollmentStage.PENDING_VERIFICATION)
+        self.assertIsNone(new_enr.verified_at)
+
+    def test_verified_advances_to_kitchen_assignment(self):
+        from .models import EnrollmentStage
+
+        # A genuinely verified household is unaffected by the gate: with no prior
+        # serving state it still advances to Kitchen Assignment.
+        carried, new_enr = self._carry(verified=True)
+        self.assertFalse(carried)  # prior wasn't serving -> no service carried
+        self.assertEqual(new_enr.stage, EnrollmentStage.KITCHEN_ASSIGNMENT)
+
+
 class CaseInsuranceCoverageTimelineMetadataTest(TestCase):
     """Case / Insurance / Social Care Coverage timeline events record the audit
     fields the manager history needs: product kind (meals/boxes), governing
@@ -2333,6 +2501,9 @@ class LogisticsRosterFilterTest(TestCase):
         enr = EnrollmentVerification.objects.create(
             client=primary, household=household,
             stage=EnrollmentStage.KITCHEN_ASSIGNMENT,
+            # A real kitchen-assignment household is always verified; set it so the
+            # Logistics queue's verification gate keeps the roster in scope.
+            verified_at=timezone.now(),
         )
         for client, status in member_statuses.items():
             MemberDietaryProfile.objects.create(
@@ -3765,8 +3936,16 @@ class VerificationSubmittedTimelineTest(TestCase):
             ev.metadata.get("delivery_address"), "1 Main St, 2B, Brooklyn, NY 11201"
         )
         self.assertEqual(ev.metadata.get("delivery_weekdays"), ["mon", "thu"])
-        self.assertIn("Vera Verified (Standard)", ev.metadata.get("members", []))
+        # members is now a per-member clinical/dietary snapshot (list of dicts).
+        members = ev.metadata.get("members", [])
+        self.assertTrue(any(
+            m.get("member_name") == "Vera Verified" and m.get("menu_type") == "Standard"
+            and m.get("food_allergies") == ["peanuts"]
+            for m in members
+        ), members)
         self.assertEqual(ev.metadata.get("verified", {}).get("family"), True)
+        # Governing case is now captured on the completion event.
+        self.assertTrue(ev.metadata.get("governing_case_id"))
 
     def test_primary_mobile_required_and_persisted(self):
         from .models import MemberDietaryProfile
@@ -3954,6 +4133,13 @@ class DeliveryCoverageEligibilityTest(TestCase):
         self.assertTrue(
             TimelineEvent.objects.filter(
                 client=mv.client, event_type="member_ineligible"
+            ).exists()
+        )
+        # Out of range now also KEEPS the out_of_range tracking event alongside
+        # the ineligible off-ramp.
+        self.assertTrue(
+            TimelineEvent.objects.filter(
+                client=mv.client, event_type="out_of_range"
             ).exists()
         )
         # A Case Closure ticket was opened on the household primary (pre-filled ZIP).
@@ -5349,12 +5535,13 @@ class VerificationDisregardTest(TestCase):
         self.assertIn("Requested in error", enr.note)
         # Client reverts OUT of the verification window.
         self.assertNotEqual(client.lifecycle_stage, ClientStage.PENDING_VERIFICATION)
-        # Timeline event carries the reason.
-        ev = TimelineEvent.objects.filter(
-            client=client, event_type=TimelineEventType.VERIFICATION_DISREGARDED
-        ).first()
-        self.assertIsNotNone(ev)
-        self.assertIn("Requested in error", ev.subtitle)
+        # Disregard no longer writes a timeline event (the enrollment note is the
+        # record); the DISREGARDED stage is deliberately not surfaced on history.
+        self.assertFalse(
+            TimelineEvent.objects.filter(
+                client=client, event_type=TimelineEventType.VERIFICATION_DISREGARDED
+            ).exists()
+        )
 
     def test_reason_required(self):
         client = self._client()
@@ -5377,11 +5564,12 @@ class VerificationDisregardTest(TestCase):
 
         client.refresh_from_db()
         self.assertNotEqual(client.lifecycle_stage, ClientStage.PENDING_VERIFICATION)
-        ev = TimelineEvent.objects.filter(
-            client=client, event_type=TimelineEventType.VERIFICATION_DISREGARDED
-        ).first()
-        self.assertIsNotNone(ev)
-        self.assertIn("Imported in error", ev.subtitle)
+        # No timeline event for a disregard (kept as an audit Note only).
+        self.assertFalse(
+            TimelineEvent.objects.filter(
+                client=client, event_type=TimelineEventType.VERIFICATION_DISREGARDED
+            ).exists()
+        )
 
     def test_button_visibility_follows_pending_request(self):
         # The Verification button shows ONLY while a pending request exists. After
@@ -12839,6 +13027,65 @@ class VerificationVerifiedByDateRangeTest(TestCase):
         self.assertIn(cid, self._ids(api.get(base + "&completed_from=2026-01-01&completed_to=2026-01-31")))
 
 
+class LogisticsQueueExclusionsTest(TestCase):
+    """The kitchen-assignment (Logistics) queue excludes Not Eligible clients and
+    any household that was never verified (verified_at IS NULL)."""
+
+    def _api(self):
+        from rest_framework.test import APIClient
+        from rest_framework_simplejwt.tokens import AccessToken
+
+        from .models import Agent
+        a = Agent.objects.create(name="Log", agent_code="915", group="Logistics")
+        acc = AccessToken()
+        acc["agent_id"] = str(a.id); acc["agent_code"] = a.agent_code
+        acc["agent_name"] = a.name; acc["agent_group"] = a.group
+        api = APIClient(); api.credentials(HTTP_AUTHORIZATION=f"Bearer {acc}")
+        return api
+
+    def _ids(self, resp):
+        out = set()
+        for g in resp.json()["results"]:
+            out.add(g["primary"]["id"])
+            out.update(m["id"] for m in g.get("members", []))
+        return out
+
+    def _member(self, *, verified, lifecycle="kitchen_assignment"):
+        from django.utils import timezone as tz
+
+        from .models import (
+            Case, CaseStatus, CaseType, Client, EnrollmentStage,
+            EnrollmentVerification, Household, HouseholdMember,
+        )
+
+        c = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Kay", last_name="Ann",
+            lifecycle_stage=lifecycle,
+        )
+        hh = Household.objects.create(name="HH")
+        HouseholdMember.objects.create(household=hh, client=c, is_primary=True)
+        Case.objects.create(
+            case_id=uuid.uuid4(), client=c, case_type=CaseType.INTERNAL_SERVICE,
+            case_status=CaseStatus.OPEN, program_name="Medically Tailored Meals",
+        )
+        EnrollmentVerification.objects.create(
+            client=c, household=hh, stage=EnrollmentStage.KITCHEN_ASSIGNMENT,
+            verified_at=(tz.now() if verified else None),
+        )
+        return c
+
+    def test_queue_excludes_unverified_and_ineligible(self):
+        from .models import ClientStage
+
+        verified = self._member(verified=True)
+        unverified = self._member(verified=False)
+        ineligible = self._member(verified=True, lifecycle=ClientStage.INELIGIBLE)
+        ids = self._ids(self._api().get("/api/portal/members/?scope=logistics"))
+        self.assertIn(str(verified.client_id), ids)
+        self.assertNotIn(str(unverified.client_id), ids)
+        self.assertNotIn(str(ineligible.client_id), ids)
+
+
 class GoverningCaseExcludesUnauthorizedTest(TestCase):
     """A blank or never_requested internal-service case can never be a governing
     case (dashboard governing_internal_case_ids)."""
@@ -13022,6 +13269,56 @@ class NutritionistGateTest(TestCase):
         self.assertEqual(resp.status_code, 200, resp.content)
         enr.refresh_from_db()
         self.assertEqual(enr.stage, EnrollmentStage.KITCHEN_ASSIGNMENT)
+
+
+class MeSignatureViewTest(TestCase):
+    """A logged-in agent can save + reuse their signature via /portal/me/signature/."""
+
+    def _api(self, agent):
+        access = AccessToken()
+        access["agent_id"] = str(agent.id)
+        access["agent_code"] = agent.agent_code
+        access["agent_name"] = agent.name
+        access["agent_group"] = agent.group
+        api = APIClient()
+        api.credentials(HTTP_AUTHORIZATION=f"Bearer {access}")
+        return api
+
+    def _agent(self, **kw):
+        from .models import Agent
+
+        defaults = dict(
+            name="Nita RD", agent_code=str(uuid.uuid4())[:8], group="Nutritionist",
+        )
+        defaults.update(kw)
+        return Agent.objects.create(**defaults)
+
+    def test_get_blank_then_save_then_get(self):
+        agent = self._agent()
+        api = self._api(agent)
+        self.assertEqual(api.get("/api/portal/me/signature/").json()["signature_image"], "")
+        img = "data:image/png;base64,iVBORw0KGgo="
+        r = api.put("/api/portal/me/signature/", {"signature_image": img}, format="json")
+        self.assertEqual(r.status_code, 200, r.content)
+        agent.refresh_from_db()
+        self.assertEqual(agent.signature_image, img)
+        self.assertEqual(api.get("/api/portal/me/signature/").json()["signature_image"], img)
+
+    def test_put_rejects_non_data_url(self):
+        api = self._api(self._agent())
+        r = api.put(
+            "/api/portal/me/signature/", {"signature_image": "http://evil/x.png"},
+            format="json",
+        )
+        self.assertEqual(r.status_code, 400)
+
+    def test_put_blank_clears_saved_signature(self):
+        agent = self._agent(signature_image="data:image/png;base64,zzz")
+        api = self._api(agent)
+        r = api.put("/api/portal/me/signature/", {"signature_image": ""}, format="json")
+        self.assertEqual(r.status_code, 200, r.content)
+        agent.refresh_from_db()
+        self.assertEqual(agent.signature_image, "")
 
 
 class AssessmentApiMapperTest(SimpleTestCase):
@@ -13290,3 +13587,113 @@ class AssessmentEnrichmentServiceTest(TestCase):
         enricher = svc.enrich_assessments(apply=True)
         self.assertTrue(any("No active" in e for e in enricher.errors))
         self.assertEqual(enricher.stats["enriched"], 0)
+
+
+class ReconcileUnverifiedAdvancedEnrollmentsTest(TestCase):
+    """The cleanup command reverts kitchen-assignment/verified enrollments that
+    never had verified_at set back to Pending Verification, but leaves genuinely
+    verified rows and serving rows (by default) alone."""
+
+    def _enr(self, stage, *, verified):
+        from django.utils import timezone as tz
+
+        from .models import Client, EnrollmentVerification
+
+        c = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="U", last_name="V",
+        )
+        return EnrollmentVerification.objects.create(
+            client=c, stage=stage, verified_at=(tz.now() if verified else None),
+        )
+
+    def test_reverts_only_unverified_pre_service(self):
+        from django.core.management import call_command
+
+        from .models import EnrollmentStage
+
+        ka_null = self._enr(EnrollmentStage.KITCHEN_ASSIGNMENT, verified=False)
+        ka_ok = self._enr(EnrollmentStage.KITCHEN_ASSIGNMENT, verified=True)
+        serving_null = self._enr(EnrollmentStage.SERVICE_ACTIVE, verified=False)
+
+        call_command("reconcile_unverified_advanced_enrollments", "--apply")
+
+        ka_null.refresh_from_db()
+        ka_ok.refresh_from_db()
+        serving_null.refresh_from_db()
+        # Unverified kitchen-assignment -> reverted to Pending Verification.
+        self.assertEqual(ka_null.stage, EnrollmentStage.PENDING_VERIFICATION)
+        # Genuinely verified -> untouched.
+        self.assertEqual(ka_ok.stage, EnrollmentStage.KITCHEN_ASSIGNMENT)
+        # Serving row -> untouched by default (needs --include-serving).
+        self.assertEqual(serving_null.stage, EnrollmentStage.SERVICE_ACTIVE)
+
+
+class CaseSwitchCarriesClinicalDataTest(TestCase):
+    """A governing-case switch carries the full clinical/nutrition intake AND the
+    Nutritionist sign-off forward onto the replacement enrollment (regression:
+    these were previously dropped, forcing a needless re-review)."""
+
+    def test_replacement_carries_clinical_and_nutritionist_approval(self):
+        from datetime import timedelta
+
+        from .models import (
+            Case, CaseStatus, CaseType, Client, EnrollmentStage,
+            EnrollmentVerification, Household, HouseholdMember, Kitchen,
+            KitchenStatus, MemberDietaryProfile, MemberStatus,
+            ServiceAuthorizationStatus,
+        )
+        from .services.lifecycle import replace_enrollment_for_case_change
+
+        now = timezone.now()
+        client = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Cl", last_name="In",
+        )
+        hh = Household.objects.create(name="HH")
+        HouseholdMember.objects.create(household=hh, client=client, is_primary=True)
+        kitchen = Kitchen.objects.create(name="K", status=KitchenStatus.ACTIVE)
+
+        def _case(day):
+            return Case.objects.create(
+                case_id=str(uuid.uuid4()), client=client,
+                case_type=CaseType.INTERNAL_SERVICE, case_status=CaseStatus.OPEN,
+                service_authorization_status=ServiceAuthorizationStatus.APPROVED,
+                service_authorization_approval_starts_at=now,
+                service_authorization_approval_ends_at=now + timedelta(days=90),
+                program_name="Medically Tailored Meals",
+                case_created_at=now + timedelta(days=day),
+                date_opened=now + timedelta(days=day),
+            )
+
+        old_case = _case(1)
+        live = EnrollmentVerification.objects.create(
+            client=client, household=hh, case=old_case, kitchen=kitchen,
+            stage=EnrollmentStage.SERVICE_ACTIVE, program_name="Medically Tailored Meals",
+            delivery_weekdays=["mon", "thu"], verified_at=now,
+            nutritionist_approved_at=now, nutritionist_signature="Nita RD",
+        )
+        MemberDietaryProfile.objects.create(
+            enrollment=live, client=client, member_name="Cl In",
+            status=MemberStatus.ACTIVE, menu_type="Standard",
+            conditions=["Diabetes"], medications=["Insulin"], weight="180 lb",
+            height="5ft 9in", on_medical_diet=True, medical_diet_details="Low sodium",
+            meal_plan="Renal", assessment_notes="ok notes",
+        )
+        new_case = _case(30)
+
+        new_enr = replace_enrollment_for_case_change(client, new_case)
+        self.assertIsNotNone(new_enr)
+        new_enr.refresh_from_db()
+        # Nutritionist sign-off carried onto the enrollment.
+        self.assertIsNotNone(new_enr.nutritionist_approved_at)
+        self.assertEqual(new_enr.nutritionist_signature, "Nita RD")
+        # Clinical / nutrition intake carried onto the member profile.
+        mp = new_enr.member_profiles.get()
+        self.assertEqual(mp.conditions, ["Diabetes"])
+        self.assertEqual(mp.medications, ["Insulin"])
+        self.assertEqual(mp.weight, "180 lb")
+        self.assertEqual(mp.height, "5ft 9in")
+        self.assertTrue(mp.on_medical_diet)
+        self.assertEqual(mp.medical_diet_details, "Low sodium")
+        self.assertEqual(mp.meal_plan, "Renal")
+        self.assertEqual(mp.assessment_notes, "ok notes")
+        self.assertEqual(mp.menu_type, "Standard")

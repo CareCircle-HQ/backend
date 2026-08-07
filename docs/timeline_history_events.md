@@ -133,20 +133,18 @@ Legend for the two right-hand columns:
 
 | Event (type) | Emitted by | Trigger | Metadata | Who? | What changed? |
 |---|---|---|---|---|---|
-| **Stage transitions** — Pending Validation, Validated, Verification Requested/Completed, Awaiting Kitchen, Service Activated/On Hold/Resumed/Completed/Closed/Cancelled, Verification Disregarded, Enrolled (`event_for_verification`) | System lifecycle (`advance_enrollment`); also extension & portal request-verification paths | Every guarded stage transition | `previous_stage(+label)`, `new_stage(+label)`, `trigger`, `reason`, `actor_label`, `case_id`, `program`, `kitchen` | ✅ (or `"System"`) | 🟡 rich prev/new stage + trigger + reason (not a `changes` list) |
-| **Verification Renewed** (`event_for_verification_renewed`) | Extension re-request, portal | Verification re-requested | — | ✅ | ❌ |
-| **Verification Case Switched** (`event_for_verification_case_switched`) | Extension set-case, portal | Governing case swapped on an enrollment | `previous_case`, `new_case` | ✅ | 🟡 prev/new case |
-| **Verification Completed (submitted)** (`event_for_verification_submitted`) | Portal verification wizard | Agent completes verification | members list, delivery address, verified flags | ✅ `actor_label` | ❌ |
-| **Verification Disregarded** (`verification_disregarded`, direct emit) | Portal | Agent dismisses a pending verification | reason in subtitle | ⚠️ `agent.name`; **`source="portal"`** (inconsistent literal) | ❌ |
-| **Nutritionist Approved** (`nutritionist_approved`, direct emit) | System lifecycle (`approve_nutritionist`) | Nutritionist legal sign-off | signature, approved_by/at, pdf_key, members_reviewed | ⚠️ `agent.name`; **`source=""`** (not set) | ❌ |
-| **Nutritionist Paused** (`nutritionist_paused`, direct emit) | Portal (`NutritionistPauseView`) | Nutritionist pauses a member | reason | ⚠️ `agent.name`; **`source=""`** (not set) | ❌ |
+| **Stage transitions** — Pending Validation, Validated, Verification Requested/Completed, Awaiting Kitchen, Service Activated/On Hold/Resumed/Completed/Closed/Cancelled, Verification Disregarded, Enrolled (`event_for_verification`) | System lifecycle (`advance_enrollment`); also extension & portal request-verification paths | Every guarded stage transition | `previous_stage(+label)`, `new_stage(+label)`, `trigger`, `reason`, `actor_label`, `case_id`, **`governing_case_id`, `members`** (roster names), `program`, `kitchen` | ✅ (or `"System"`) | 🟡 rich prev/new stage + trigger + reason (not a `changes` list) |
+| **Verification Requested** (`event_for_verification`, PENDING_VERIFICATION) | Extension E-Form + portal wizard + Request-Verification | A verification is requested | `governing_case_id`, `members` (roster on the initial request), who via actor | ✅ | n/a (request fact) |
+| **Verification Completed** (`event_for_verification_submitted`) | Portal verification wizard | Agent completes verification | **per-member clinical snapshot** (`conditions`, `medications`, `weight`, `height`, `on_medical_diet`+details, `menu_type`, `food_allergies`, `other_dietary_restrictions`, `general_verification_notes`), `delivery_address`, `governing_case_id`, **`case_status` + `authorization_status` at save time**, verified flags | ✅ `actor_label` | ✅ frozen snapshot of what was verified |
+| **Nutritionist Approved** (`nutritionist_approved`) | System lifecycle (`approve_nutritionist`) | Nutritionist legal sign-off | signature, approved_by/at, pdf_key, **per-member: `meal_plan`(+other), `meal_type`, `food_allergies`, `conditions`, `medications`, `weight`, `height`, `on_medical_diet`(+details), `nutrition_concern` (Primary Nutrition Concern), `assessment_notes`** | ⚠️ `agent.name`; `source=""` | ✅ per-member review snapshot |
+| **Nutritionist Paused** (`nutritionist_paused`) | Portal (`NutritionistPauseView`) | Nutritionist pauses a member | `member_name`, `menu_type`, `reason` | ⚠️ `agent.name`; `source=""` | n/a |
 
 ### D. Member lifecycle / eligibility events
 
 | Event (type) | Emitted by | Trigger | Metadata | Who? | What changed? |
 |---|---|---|---|---|---|
 | **Out of Orbit** (`out_of_orbit`) | Portal (manual deactivate / auto from dietary edit), kitchen-assign flow | Member set out of orbit | `reason`, `menu_type` | ✅ | ❌ (reason only) |
-| **Out of Range** (`out_of_range`) | Household add (serializer), eligibility | Member outside delivery range | `reason`, `zip` | ✅ | 🟡 reason + zip |
+| **Out of Range** (`out_of_range`) | Household add (serializer); coverage enforcement (verification pop-up + **program-tab address edit**) | Delivery/primary ZIP outside coverage | `reason`, `zip` — **now also drives Ineligible**: `_enforce_delivery_coverage` emits `member_ineligible` (cause `address`) *and* keeps this `out_of_range` event | ✅ | 🟡 reason + zip |
 | **Member Ineligible** (`member_ineligible`) | System eligibility / lifecycle | Client fails eligibility (insurance / Medicaid type / address / etc.) | `reasons`, **`causes`, `reason_causes`** (each reason tagged `insurance` / `medicaid_type` / `address` / `social_coverage` / `other`) | ✅ (or `"System"`) | ✅ cause-tagged reasons |
 | **Eligibility Restored** (`member_eligibility_restored`) | System eligibility | Client passes again | — | ✅ | ❌ |
 | **Coverage Hold** (`member_coverage_hold`) | System eligibility | Recoverable coverage gap pauses service | `reasons` | ✅ (or `"System"`) | 🟡 reasons |
@@ -172,25 +170,22 @@ These already record **both** who and a precise field-level before → after dif
 | **Delivery Address Changed** (`delivery_address_changed`) | Portal (`DeliveryAddressView`) | Agent edits delivery address | Street, Unit, City, State, ZIP, Delivery notes | ✅ | ✅ |
 | **Dietary Info Updated** (`dietary_changed`) | Portal (dietary edit) | Agent edits dietary data | dietary_restrictions, food_allergies, other_dietary_restrictions, meal_category, menu_type, general_verification_notes | ✅ | ✅ |
 | **Kitchen Assigned / Changed** (`kitchen_assigned` / `kitchen_changed`) | Portal (kitchen assign / edit / cadence edit) | First assignment or re-assignment | Kitchen, Cadence | ✅ | ✅ (change variant only; first-assign has nothing to diff) |
-| **Product Type Changed** (`product_type_changed`) | System lifecycle | Product kind changes | `previous`, `new` | ✅ (or `"System"`) | 🟡 prev/new (not full `changes` list) |
+| **Product Type Changed** (`product_type_changed`) | System lifecycle (governing-case product switch, alongside Program Switched) + Household-tab correction | Product kind changes (meals↔boxes) | `previous`, `new` (de-duped on the case pair for the governing-case switch) | ✅ (or `"System"`) | 🟡 prev/new |
 
 ### F. Tickets
 
-| Event (type) | Emitted by | Trigger | Metadata | Who? | What changed? |
-|---|---|---|---|---|---|
-| **New Ticket Created** (`ticket_created`) | Portal (`views_tickets`), system (`services/tickets.open_ticket`) | A ticket is opened for a client | `ticket_type`, `severity`, `ticket_source` | ⚠️ portal=`agent:<code>` else `""`; system=passed-in actor | ❌ |
+Tickets are **not** mirrored onto the client timeline (they live on the Tickets
+tab / ticket activity log). The `ticket_created` type is retained on the enum for
+legacy rows but is no longer emitted.
 
 ---
 
 ## Gap analysis — what's missing today
 
 **"Who" (actor) is broadly covered**, but with a few soft spots:
-- `event_for_ticket_created` from the portal records `""` when the agent has no
-  code (should fall back to `user:<name>` like the other portal actions).
-- Direct `emit_timeline_event` calls for **Nutritionist Approved / Paused** and
-  **Verification Disregarded** use `agent.name` (not the normalized
-  `agent:<code>` / `user:<name>` form) and set `source` to `""` or the literal
-  `"portal"` instead of a `ChangeSource` value. These should be normalized.
+- Direct `emit_timeline_event` calls for **Nutritionist Approved / Paused** use
+  `agent.name` (not the normalized `agent:<code>` / `user:<name>` form) and leave
+  `source` blank. These should be normalized.
 - System lifecycle events fall back to `"System"` when no acting agent is threaded
   through — correct for cron, but where a portal action *triggers* the lifecycle
   path we could thread the real agent through so it reads `user:<name>` instead of
