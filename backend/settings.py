@@ -375,6 +375,14 @@ CELERY_BEAT_SCHEDULE = {
         "task": "api.tasks.sync_delivery_calendars",
         "schedule": crontab(minute=0, hour=5),
     },
+    # Nightly assessment-results enrichment: fills eligible_services (and thus
+    # Client Level 1/2) on assessments that the CSV import lands without results.
+    # Runs at 03:30 America/New_York -- after the 02:00 pull, before the 04:00
+    # closed-case sweep. No-op unless UNITEUS_ASSESSMENT_API_ENABLED is set.
+    "import-uniteus-assessment-results": {
+        "task": "api.tasks.import_uniteus_assessment_results",
+        "schedule": crontab(minute=30, hour=3),
+    },
 }
 
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
@@ -524,6 +532,16 @@ UNITEUS_TOKEN_URL = os.getenv('UNITEUS_TOKEN_URL', '')  # OAuth token endpoint
 UNITEUS_CLIENT_ID = os.getenv('UNITEUS_CLIENT_ID', '')
 UNITEUS_CLIENT_SECRET = os.getenv('UNITEUS_CLIENT_SECRET', '')  # blank for PKCE/public
 UNITEUS_API_BASE = os.getenv('UNITEUS_API_BASE', 'https://core.uniteus.io')
+# Host that serves assessment/screening RESULTS (eligible_services), distinct
+# from the core JSON:API host above. Same session bearer + provider/employee ids.
+UNITEUS_SCREENINGS_INGESTION_BASE = os.getenv(
+    'UNITEUS_SCREENINGS_INGESTION_BASE', 'https://screenings-ingestion.uniteus.io'
+)
+# Master switch for the headless assessment-results enrichment (nightly pull of
+# eligible_services from the ingestion host). OFF until validated in prod.
+UNITEUS_ASSESSMENT_API_ENABLED = (
+    os.getenv('UNITEUS_ASSESSMENT_API_ENABLED', 'False').lower() == 'true'
+)
 UNITEUS_TIMEOUT = int(os.getenv('UNITEUS_TIMEOUT', '30'))
 # Refresh the access token when it expires within this many seconds.
 UNITEUS_REFRESH_SKEW = int(os.getenv('UNITEUS_REFRESH_SKEW', '120'))

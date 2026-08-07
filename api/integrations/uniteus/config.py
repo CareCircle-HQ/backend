@@ -23,6 +23,15 @@ def api_base():
     return getattr(settings, "UNITEUS_API_BASE", "") or ""
 
 
+def screenings_ingestion_base():
+    """Host the assessment/screening RESULTS live on (a different host than the
+    core JSON:API). The extension reads eligible_services from here."""
+    return (
+        getattr(settings, "UNITEUS_SCREENINGS_INGESTION_BASE", "")
+        or "https://screenings-ingestion.uniteus.io"
+    )
+
+
 def timeout():
     return int(getattr(settings, "UNITEUS_TIMEOUT", 30))
 

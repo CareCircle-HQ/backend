@@ -29,6 +29,7 @@ from django.utils import timezone
 from api.history import ChangeSource
 from api.models import (
     CaseStatus,
+    CaseType,
     EnrollmentStage,
     RecordStatus,
     SocialCareCoverageStatus,
@@ -79,6 +80,7 @@ def emit_timeline_event(
     renewal_number=None,
     metadata=None,
     dedupe_key="",
+    update_metadata=False,
 ):
     """Create a single timeline event the first time it's seen. Returns the
     event (new or pre-existing), or None when required data is missing
@@ -89,6 +91,14 @@ def emit_timeline_event(
     updated on subsequent saves / daily re-imports. This keeps each domain
     occurrence (consent, screening, assessment, case, insurance, coverage) as a
     single, stable point on the timeline.
+
+    ``update_metadata`` is a narrow, opt-in exception to create-once: when True
+    and the event already exists, the supplied ``metadata`` keys are merged into
+    the existing row (title / date / dedupe_key stay stable). This lets a later
+    pass back-fill data that wasn't available when the row was first written --
+    e.g. an assessment's ``eligible_services`` arriving from the enrichment pull
+    after the CSV import created a results-less row. Only the passed keys are
+    touched; other metadata is preserved.
     """
     if client is None or occurred_at is None:
         return None
@@ -124,7 +134,12 @@ def emit_timeline_event(
         dedupe_key = _clamp_dedupe_key(dedupe_key)
         existing = TimelineEvent.objects.filter(dedupe_key=dedupe_key).first()
         if existing is not None:
-            return existing  # create-once: leave the original event untouched
+            if update_metadata and metadata:
+                merged = {**(existing.metadata or {}), **metadata}
+                if merged != existing.metadata:
+                    existing.metadata = merged
+                    existing.save(update_fields=["metadata"])
+            return existing  # create-once: row identity is left untouched
         return TimelineEvent.objects.create(dedupe_key=dedupe_key, **defaults)
     return TimelineEvent.objects.create(dedupe_key="", **defaults)
 
@@ -172,6 +187,85 @@ def build_change_list(pairs):
     return changes
 
 
+def _service_names(services):
+    """Normalize an ``eligible_services`` JSON blob to a flat list of service-name
+    strings. Entries may be plain strings (``["Medicaid", "SNAP"]``) or dicts
+    (``{"name"|"service"|"label"|"service_type": ...}``)."""
+    out = []
+    for s in services or []:
+        if isinstance(s, dict):
+            name = (
+                s.get("name") or s.get("service") or s.get("label")
+                or s.get("service_type") or ""
+            )
+            if name:
+                out.append(str(name))
+        elif s:
+            out.append(str(s))
+    return out
+
+
+def _social_need_names(needs):
+    """Normalize ``identified_social_needs`` to a flat list of names. Entries may
+    be plain strings or dicts (``{"name"|"identified_social_need_name"|"code"}``)."""
+    out = []
+    for n in needs or []:
+        if isinstance(n, dict):
+            name = (
+                n.get("name") or n.get("identified_social_need_name")
+                or n.get("code") or ""
+            )
+            if name:
+                out.append(str(name))
+        elif n:
+            out.append(str(n))
+    return out
+
+
+def _case_product_kind(case):
+    """'meals' / 'boxes' / '' for an internal-service case, by mapping its
+    program/service name through the catalog keyword rules."""
+    if case.case_type != CaseType.INTERNAL_SERVICE:
+        return ""
+    from api.services.catalog import product_type_kind_for_name
+
+    kind = (
+        product_type_kind_for_name(case.program_name or "")
+        or product_type_kind_for_name(case.service_type or "")
+    )
+    return kind or ""
+
+
+def _is_governing_case(case):
+    """True when ``case`` is the client's current GOVERNING internal-service case
+    (an approved authorization outranks a denied/pending one). Snapshotted onto
+    the case timeline event so the history shows which case was driving service
+    at the time. Lazy import avoids a lifecycle<->timeline import cycle."""
+    if case.case_type != CaseType.INTERNAL_SERVICE or case.client_id is None:
+        return False
+    from api.services.lifecycle import (
+        governing_case_key,
+        open_internal_service_cases,
+    )
+
+    cases = open_internal_service_cases(case.client)
+    if not cases:
+        return False
+    governing = max(cases, key=governing_case_key)
+    return str(governing.case_id) == str(case.case_id)
+
+
+def _auth_window(case):
+    """``(start_iso, end_iso)`` for the case's effective authorization window
+    (approval window, falling back to the request window on an approved case).
+    Empty strings when a bound isn't set."""
+    start, end = case.effective_authorization_window()
+    return (
+        start.isoformat() if start else "",
+        end.isoformat() if end else "",
+    )
+
+
 def event_for_consent(client, *, source=ChangeSource.EXTENSION, actor=""):
     """Emit a 'Consent Granted' event once the client's consent is granted.
 
@@ -205,7 +299,7 @@ def event_for_consent(client, *, source=ChangeSource.EXTENSION, actor=""):
     )
 
 
-def event_for_screening(screening, *, source=ChangeSource.EXTENSION, actor=""):
+def event_for_screening(screening, *, source=ChangeSource.EXTENSION, actor="", resync=False):
     client = screening.client
     if client is None:
         return None
@@ -237,11 +331,21 @@ def event_for_screening(screening, *, source=ChangeSource.EXTENSION, actor=""):
         source=source,
         actor=actor,
         entity=screening,
+        metadata={
+            # What the member was found eligible for + the screening results, so
+            # the History tab shows outcomes without opening the Screenings tab.
+            # Full Q&A stays on the Screening entity (linked via entity_id).
+            "eligible_status": screening.eligible_status or "",
+            "eligible_services": _service_names(screening.eligible_services),
+            "identified_social_needs": _social_need_names(needs),
+            "results_count": len(screening.questions_answers or []),
+        },
         dedupe_key=f"screening:{screening.pk}",
+        update_metadata=resync,
     )
 
 
-def event_for_assessment(assessment, *, source=ChangeSource.EXTENSION, actor=""):
+def event_for_assessment(assessment, *, source=ChangeSource.EXTENSION, actor="", resync=False):
     client = assessment.client
     if client is None:
         return None
@@ -268,7 +372,19 @@ def event_for_assessment(assessment, *, source=ChangeSource.EXTENSION, actor="")
         source=source,
         actor=actor,
         entity=assessment,
+        metadata={
+            # What the member was found eligible for + the assessment results.
+            # ``eligible_services`` often arrives AFTER the CSV import creates the
+            # row (via the screenings-ingestion enrichment pull), so this builder
+            # is re-invoked with resync=True there to back-fill it. Full Q&A stays
+            # on the Assessment entity (linked via entity_id).
+            "eligible_status": assessment.eligible_status or "",
+            "eligible_services": _service_names(assessment.eligible_services),
+            "form_name": assessment.form_name or "",
+            "results_count": len(assessment.questions_answers or []),
+        },
         dedupe_key=f"assessment:{assessment.pk}",
+        update_metadata=resync,
     )
 
 
@@ -300,6 +416,7 @@ def event_for_case(case, *, source=ChangeSource.EXTENSION, actor=""):
     type_label = case.get_case_type_display()
     provider = case.provider_name or case.originating_provider_name or ""
     subtitle = " \u00b7 ".join(p for p in (type_label, provider) if p)
+    auth_start, auth_end = _auth_window(case)
     return emit_timeline_event(
         client=client,
         event_type=TimelineEventType.CASE_OPENED,
@@ -312,8 +429,25 @@ def event_for_case(case, *, source=ChangeSource.EXTENSION, actor=""):
         actor=actor,
         entity=case,
         case=case,
-        metadata={"case_type": case.case_type},
+        metadata={
+            "case_type": case.case_type,
+            # Meals vs boxes (internal-service cases), whether this case is the
+            # one currently GOVERNING service, and the authorization status +
+            # window. Auth state changes over time, so this row's metadata is
+            # re-synced on each re-import (update_metadata=True) to stay current
+            # while keeping a single stable "Case" point on the timeline.
+            "product_kind": _case_product_kind(case),
+            "is_governing": _is_governing_case(case),
+            "auth_status": case.service_authorization_status or "",
+            "auth_status_label": (
+                case.service_authorization_status_label
+                or (case.service_authorization_status or "").replace("_", " ").title()
+            ),
+            "auth_window_start": auth_start,
+            "auth_window_end": auth_end,
+        },
         dedupe_key=f"case_opened:{case.pk}",
+        update_metadata=True,
     )
 
 
@@ -356,6 +490,7 @@ def event_for_case_status_change(
             "previous_status": previous_status or "",
             "new_status": case.case_status,
             "closed_reason": (case.closed_note or "").strip(),
+            "product_kind": _case_product_kind(case),
             "import_run": import_run.pk if import_run is not None else None,
         },
         dedupe_key=f"case_status:{case.pk}:{case.case_status}:{day}",
@@ -392,6 +527,12 @@ def event_for_case_authorization_change(
     prev_label = (previous_auth or "").replace("_", " ").title()
     subtitle = f"{prev_label} \u2192 {new_label}" if prev_label else new_label
     day = occurred.date().isoformat() if occurred else ""
+    auth_start, auth_end = _auth_window(case)
+    # Surface the authorization window on the transition subtitle so the history
+    # reads "Pending -> Approved · 2026-02-01 -> 2027-01-31" at a glance.
+    if auth_start or auth_end:
+        window = f"{auth_start or '?'} \u2192 {auth_end or '?'}"
+        subtitle = f"{subtitle} \u00b7 {window}"
     return emit_timeline_event(
         client=client,
         event_type=TimelineEventType.CASE_AUTH_CHANGED,
@@ -407,6 +548,12 @@ def event_for_case_authorization_change(
         metadata={
             "previous_auth": previous_auth or "",
             "new_auth": new_auth,
+            # The authorization WINDOW that this decision established, plus the
+            # meals/boxes product it authorizes -- the core "what/when" of an auth.
+            "auth_window_start": auth_start,
+            "auth_window_end": auth_end,
+            "product_kind": _case_product_kind(case),
+            "authorized_amount": case.authorized_amount or "",
             "import_run": import_run.pk if import_run is not None else None,
         },
         dedupe_key=f"case_auth:{case.pk}:{new_auth}:{day}",
@@ -428,6 +575,11 @@ def event_for_insurance(insurance, *, source=ChangeSource.IMPORT, actor=""):
     else:
         tone = TimelineBadgeTone.NEUTRAL
     member = insurance.external_member_id or insurance.insurance_id
+    # Medicaid-type rule is client-level (some Medicaid subtypes -- MLTC/MAP/FFS
+    # -- aren't served); surface whether the member meets it alongside the plan.
+    from api.services import eligibility
+
+    medicaid_note = eligibility.medicaid_type_reason(client)
     return emit_timeline_event(
         client=client,
         event_type=TimelineEventType.INSURANCE,
@@ -440,8 +592,23 @@ def event_for_insurance(insurance, *, source=ChangeSource.IMPORT, actor=""):
         source=source,
         actor=actor,
         entity=insurance,
-        metadata={"verified": insurance.verified},
+        metadata={
+            "verified": insurance.verified,
+            "plan_type": insurance.plan_type or "",
+            "plan_type_label": (
+                insurance.get_plan_type_display() if insurance.plan_type else ""
+            ),
+            "status": insurance.status or insurance.record_status or "",
+            "is_primary": insurance.is_primary,
+            "enrolled_at": insurance.enrolled_at.isoformat() if insurance.enrolled_at else "",
+            "expired_at": insurance.expired_at.isoformat() if insurance.expired_at else "",
+            "expired": eligibility.coverage_expired(insurance.expired_at),
+            # True when the member's Medicaid type is one we serve.
+            "meets_medicaid_rule": not medicaid_note,
+            "medicaid_rule_note": medicaid_note,  # "" when the rule is met
+        },
         dedupe_key=f"insurance:{insurance.pk}",
+        update_metadata=True,
     )
 
 
@@ -457,6 +624,8 @@ def event_for_social_care_coverage(coverage, *, source=ChangeSource.IMPORT, acto
     else:
         tone = TimelineBadgeTone.NEUTRAL
     member = coverage.external_member_id
+    from api.services import eligibility
+
     return emit_timeline_event(
         client=client,
         event_type=TimelineEventType.SOCIAL_CARE_COVERAGE,
@@ -469,8 +638,16 @@ def event_for_social_care_coverage(coverage, *, source=ChangeSource.IMPORT, acto
         source=source,
         actor=actor,
         entity=coverage,
-        metadata={"verified": coverage.verified},
+        metadata={
+            "verified": coverage.verified,
+            "plan_type": coverage.plan_type or "",
+            "status": coverage.status or "",
+            "enrolled_at": coverage.enrolled_at.isoformat() if coverage.enrolled_at else "",
+            "expired_at": coverage.expired_at.isoformat() if coverage.expired_at else "",
+            "expired": eligibility.coverage_expired(coverage.expired_at),
+        },
         dedupe_key=f"social_care_coverage:{coverage.pk}",
+        update_metadata=True,
     )
 
 
@@ -965,6 +1142,33 @@ def event_for_out_of_range(
     )
 
 
+def classify_ineligible_reason(reason):
+    """Tag a human ineligibility ``reason`` string with a stable cause CODE so the
+    History tab (and downstream filters) can tell WHY a member was made ineligible
+    without parsing prose. Mirrors the reason strings produced in
+    ``api.services.eligibility``:
+
+    - ``medicaid_type``  -> Medicaid plan type not served (MLTC/MAP/FFS)
+    - ``insurance``      -> no medical insurance / all plans expired
+    - ``address``        -> out-of-range ZIP / unserved state (coverage area)
+    - ``social_coverage``-> social-care-coverage gap (recoverable hold)
+    - ``other``          -> anything else
+    """
+    r = (reason or "").lower()
+    if "medicaid plan type" in r or "medicaid type" in r:
+        return "medicaid_type"
+    if "insurance" in r:
+        return "insurance"
+    if (
+        "coverage area" in r or "out of range" in r or "not served" in r
+        or "zip" in r or "state" in r
+    ):
+        return "address"
+    if "social care coverage" in r:
+        return "social_coverage"
+    return "other"
+
+
 def event_for_member_ineligible(
     client, *, reasons=None, source=ChangeSource.IMPORT, actor="",
 ):
@@ -972,10 +1176,18 @@ def event_for_member_ineligible(
     check fails a CareCircle-unfixable gate (expired/missing insurance, wrong
     Medicaid type, out-of-range address). Logged on the member's own client. Not
     de-duped: it fires only on the transition INTO ineligible (the caller gates
-    it), so a later recovery + re-flag records a fresh point."""
+    it), so a later recovery + re-flag records a fresh point.
+
+    The metadata tags each reason with a stable CAUSE code (``causes`` +
+    ``reason_causes``) so the history distinguishes an insurance-type off-ramp
+    from an address/out-of-range one without re-parsing the reason text."""
     if client is None:
         return None
     reasons = [r for r in (reasons or []) if r]
+    reason_causes = [
+        {"reason": r, "cause": classify_ineligible_reason(r)} for r in reasons
+    ]
+    causes = sorted({rc["cause"] for rc in reason_causes})
     return emit_timeline_event(
         client=client,
         event_type=TimelineEventType.MEMBER_INELIGIBLE,
@@ -987,7 +1199,7 @@ def event_for_member_ineligible(
         source=source,
         actor=actor,
         entity=client,
-        metadata={"reasons": reasons},
+        metadata={"reasons": reasons, "causes": causes, "reason_causes": reason_causes},
     )
 
 

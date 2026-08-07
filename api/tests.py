@@ -654,6 +654,350 @@ class KitchenAndDietaryTimelineBuilderTest(TestCase):
         self.assertFalse(self._events("delivery_address_changed").exists())
 
 
+class ScreeningAssessmentTimelineMetadataTest(TestCase):
+    """The screening/assessment timeline builders record WHAT the member is
+    eligible for (eligible_services) and the screening results (social needs +
+    Q&A count), and eligibility that arrives late (via the enrichment pull) is
+    re-synced onto the already-created, create-once event."""
+
+    def setUp(self):
+        self.client_obj = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Ada", last_name="Lovelace"
+        )
+
+    def _screening(self, **kwargs):
+        from .models import Screening
+
+        defaults = dict(
+            enhanced_screen_id=uuid.uuid4(),
+            subject_id=uuid.uuid4(),
+            client=self.client_obj,
+            screen_status="completed",
+            screen_type="SCN",
+        )
+        defaults.update(kwargs)
+        return Screening.objects.create(**defaults)
+
+    def _assessment(self, **kwargs):
+        from .models import Assessment
+
+        defaults = dict(
+            assessment_id=uuid.uuid4(),
+            subject_id=uuid.uuid4(),
+            client=self.client_obj,
+            eligible_status="Eligible",
+        )
+        defaults.update(kwargs)
+        return Assessment.objects.create(**defaults)
+
+    def test_screening_event_records_eligibility_and_results(self):
+        from .services import timeline
+
+        scr = self._screening(
+            eligible_status="Eligible",
+            eligible_services=["Medicaid", {"name": "SNAP"}],
+            identified_social_needs=["Food", {"identified_social_need_name": "Housing"}],
+            questions_answers=[{"question": "Q1", "answer": "A1"}],
+        )
+        ev = timeline.event_for_screening(scr)
+        self.assertIsNotNone(ev)
+        self.assertEqual(ev.metadata["eligible_services"], ["Medicaid", "SNAP"])
+        self.assertEqual(ev.metadata["identified_social_needs"], ["Food", "Housing"])
+        self.assertEqual(ev.metadata["eligible_status"], "Eligible")
+        self.assertEqual(ev.metadata["results_count"], 1)
+
+    def test_assessment_event_records_eligibility(self):
+        from .services import timeline
+
+        asmt = self._assessment(
+            eligible_services=["Enhanced Care Management (Level 2)"],
+            form_name="Food Assistance Assessment",
+            questions_answers=[{"question": "Q1", "answer": "A1"}],
+        )
+        ev = timeline.event_for_assessment(asmt)
+        self.assertIsNotNone(ev)
+        self.assertEqual(
+            ev.metadata["eligible_services"], ["Enhanced Care Management (Level 2)"]
+        )
+        self.assertEqual(ev.metadata["form_name"], "Food Assistance Assessment")
+        self.assertEqual(ev.metadata["results_count"], 1)
+
+    def test_late_eligibility_resyncs_onto_existing_event(self):
+        from .models import TimelineEvent
+        from .services import timeline
+
+        # 1) CSV-style create: no eligible_services yet.
+        asmt = self._assessment(eligible_services=[])
+        ev1 = timeline.event_for_assessment(asmt)
+        self.assertEqual(ev1.metadata["eligible_services"], [])
+
+        # 2) Enrichment lands eligibility, re-emit with resync=True.
+        asmt.eligible_services = ["Medicaid"]
+        asmt.save(update_fields=["eligible_services"])
+        ev2 = timeline.event_for_assessment(
+            asmt, source="import", actor="system:assessment-results", resync=True
+        )
+        # Same create-once row, metadata now back-filled.
+        self.assertEqual(ev2.pk, ev1.pk)
+        self.assertEqual(ev2.metadata["eligible_services"], ["Medicaid"])
+        self.assertEqual(
+            TimelineEvent.objects.filter(
+                dedupe_key=f"assessment:{asmt.pk}"
+            ).count(),
+            1,
+        )
+
+    def test_without_resync_create_once_preserves_original_metadata(self):
+        from .services import timeline
+
+        asmt = self._assessment(eligible_services=[])
+        ev1 = timeline.event_for_assessment(asmt)
+        asmt.eligible_services = ["Medicaid"]
+        asmt.save(update_fields=["eligible_services"])
+        # Default resync=False: the existing row is left untouched.
+        ev2 = timeline.event_for_assessment(asmt)
+        self.assertEqual(ev2.pk, ev1.pk)
+        ev2.refresh_from_db()
+        self.assertEqual(ev2.metadata["eligible_services"], [])
+
+
+class CaseInsuranceCoverageTimelineMetadataTest(TestCase):
+    """Case / Insurance / Social Care Coverage timeline events record the audit
+    fields the manager history needs: product kind (meals/boxes), governing
+    flag, authorization status + window (case); Medicaid-rule + status + expiry
+    (insurance); status + expiry (coverage)."""
+
+    def setUp(self):
+        self.client_obj = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Ada", last_name="Lovelace"
+        )
+        self.now = timezone.now()
+
+    def _case(self, **kwargs):
+        from .models import Case, CaseType
+
+        defaults = dict(
+            case_id=uuid.uuid4(),
+            client=self.client_obj,
+            case_type=CaseType.INTERNAL_SERVICE,
+            case_status="managed",
+            program_name="Medically Tailored Meals (MTM)",
+            date_opened=self.now,
+        )
+        defaults.update(kwargs)
+        return Case.objects.create(**defaults)
+
+    def test_case_event_records_kind_governing_and_auth_window(self):
+        from datetime import timedelta
+
+        from .models import ServiceAuthorizationStatus
+        from .services import timeline
+
+        start = self.now
+        end = self.now + timedelta(days=365)
+        case = self._case(
+            service_authorization_status=ServiceAuthorizationStatus.APPROVED,
+            service_authorization_approval_starts_at=start,
+            service_authorization_approval_ends_at=end,
+            authorized_amount="$8,736.00",
+        )
+        ev = timeline.event_for_case(case)
+        self.assertIsNotNone(ev)
+        md = ev.metadata
+        self.assertEqual(md["product_kind"], "meals")
+        self.assertTrue(md["is_governing"])  # the only open internal case
+        self.assertEqual(md["auth_status"], ServiceAuthorizationStatus.APPROVED)
+        self.assertEqual(md["auth_window_start"], start.isoformat())
+        self.assertEqual(md["auth_window_end"], end.isoformat())
+
+    def test_case_event_metadata_resyncs_auth_status(self):
+        from .models import ServiceAuthorizationStatus
+        from .services import timeline
+
+        case = self._case(
+            service_authorization_status=ServiceAuthorizationStatus.PENDING
+        )
+        ev1 = timeline.event_for_case(case)
+        self.assertEqual(ev1.metadata["auth_status"], ServiceAuthorizationStatus.PENDING)
+        # Authorization is later approved; re-emitting updates the existing row.
+        case.service_authorization_status = ServiceAuthorizationStatus.APPROVED
+        case.save(update_fields=["service_authorization_status"])
+        ev2 = timeline.event_for_case(case)
+        self.assertEqual(ev2.pk, ev1.pk)
+        self.assertEqual(ev2.metadata["auth_status"], ServiceAuthorizationStatus.APPROVED)
+
+    def test_insurance_event_records_medicaid_rule_and_expiry(self):
+        from .models import Insurance, InsurancePlanType, RecordStatus
+        from .services import timeline
+
+        ins = Insurance.objects.create(
+            client=self.client_obj,
+            plan_type=InsurancePlanType.MEDICAID,
+            plan_name="NY Medicaid",
+            status=RecordStatus.ACTIVE,
+            enrolled_at=self.now,
+        )
+        ev = timeline.event_for_insurance(ins)
+        self.assertIsNotNone(ev)
+        md = ev.metadata
+        self.assertEqual(md["plan_type"], InsurancePlanType.MEDICAID)
+        self.assertEqual(md["status"], RecordStatus.ACTIVE)
+        self.assertFalse(md["expired"])
+        self.assertIn("meets_medicaid_rule", md)
+
+    def test_coverage_event_records_status_and_expiry(self):
+        from datetime import timedelta
+
+        from .models import SocialCareCoverage, SocialCareCoverageStatus
+        from .services import timeline
+
+        cov = SocialCareCoverage.objects.create(
+            client=self.client_obj,
+            plan_name="MLTC Plan",
+            status=SocialCareCoverageStatus.EXPIRED,
+            enrolled_at=self.now - timedelta(days=400),
+            expired_at=self.now - timedelta(days=1),
+        )
+        ev = timeline.event_for_social_care_coverage(cov)
+        self.assertIsNotNone(ev)
+        md = ev.metadata
+        self.assertEqual(md["status"], SocialCareCoverageStatus.EXPIRED)
+        self.assertTrue(md["expired"])
+        self.assertEqual(md["expired_at"], cov.expired_at.isoformat())
+
+    def test_member_ineligible_tags_reason_causes(self):
+        from .services import timeline
+
+        ev = timeline.event_for_member_ineligible(
+            self.client_obj,
+            reasons=[
+                "no medical insurance on file",
+                "Medicaid plan type not served (MLTC/MAP/FFS): MLTC",
+                "delivery ZIP 10001 is outside the coverage area",
+            ],
+        )
+        self.assertIsNotNone(ev)
+        causes = {rc["cause"] for rc in ev.metadata["reason_causes"]}
+        self.assertEqual(causes, {"insurance", "medicaid_type", "address"})
+        self.assertEqual(ev.metadata["causes"], ["address", "insurance", "medicaid_type"])
+
+
+class CareManagementNoCadenceQuerysetTest(TestCase):
+    """The Care Management 'No Cadence' tab lists members on a live enrollment
+    assigned to a chosen kitchen that still has no delivery cadence."""
+
+    def setUp(self):
+        from .models import Kitchen, KitchenStatus
+
+        self.client_obj = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Ada", last_name="Lovelace"
+        )
+        self.kitchen = Kitchen.objects.create(name="K1", status=KitchenStatus.ACTIVE)
+        self.other_kitchen = Kitchen.objects.create(name="K2", status=KitchenStatus.ACTIVE)
+
+    def _qs_ids(self, kitchen_id):
+        from .portal.views_members import care_management_no_cadence_qs
+
+        return {
+            str(cid)
+            for cid in care_management_no_cadence_qs(
+                Client.objects.all(), str(kitchen_id)
+            ).values_list("client_id", flat=True)
+        }
+
+    def test_no_kitchen_returns_nothing(self):
+        from .models import EnrollmentStage, EnrollmentVerification
+
+        EnrollmentVerification.objects.create(
+            client=self.client_obj, kitchen=self.kitchen,
+            stage=EnrollmentStage.KITCHEN_ASSIGNMENT,
+        )
+        self.assertEqual(self._qs_ids(""), set())
+
+    def test_kitchen_no_cadence_includes_member(self):
+        from .models import EnrollmentStage, EnrollmentVerification
+
+        EnrollmentVerification.objects.create(
+            client=self.client_obj, kitchen=self.kitchen,
+            stage=EnrollmentStage.KITCHEN_ASSIGNMENT,
+        )
+        self.assertIn(str(self.client_obj.client_id), self._qs_ids(self.kitchen.pk))
+        # A different kitchen must not include them.
+        self.assertNotIn(str(self.client_obj.client_id), self._qs_ids(self.other_kitchen.pk))
+
+    def test_member_with_cadence_is_excluded(self):
+        from .models import (
+            DeliveryCadence, EnrollmentStage, EnrollmentVerification,
+            MemberDeliverySchedule, ScheduleStatus,
+        )
+
+        enr = EnrollmentVerification.objects.create(
+            client=self.client_obj, kitchen=self.kitchen,
+            stage=EnrollmentStage.SERVICE_ACTIVE,
+        )
+        MemberDeliverySchedule.objects.create(
+            enrollment=enr, member_name="Ada",
+            delivery_days_cadence=DeliveryCadence.MON_THU,
+            status=ScheduleStatus.SCHEDULED,
+        )
+        self.assertNotIn(str(self.client_obj.client_id), self._qs_ids(self.kitchen.pk))
+
+
+class CareManagementRejectedCaseGoverningTest(TestCase):
+    """The 'Rejected Case' tab must key off the GOVERNING internal-service case
+    and only when it's OPEN: an open denied case flags the household, but an open
+    approved case (which would govern instead) or a merely CLOSED denial does not."""
+
+    def _client(self):
+        return Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="C", last_name="X"
+        )
+
+    def _case(self, client, *, auth, status):
+        from .models import Case, CaseType
+
+        return Case.objects.create(
+            case_id=uuid.uuid4(), client=client, case_type=CaseType.INTERNAL_SERVICE,
+            case_status=status, service_authorization_status=auth,
+        )
+
+    def _rejected_ids(self):
+        from .portal.views_members import (
+            annotate_care_management, care_management_base_q,
+            care_management_tab_queryset,
+        )
+
+        qs = annotate_care_management(
+            Client.objects.filter(care_management_base_q()).distinct()
+        )
+        qs = care_management_tab_queryset(qs, "rejected_case")
+        return {str(cid) for cid in qs.values_list("client_id", flat=True)}
+
+    def test_open_denied_no_favorable_is_rejected(self):
+        from .models import CaseStatus, ServiceAuthorizationStatus
+
+        c = self._client()
+        self._case(c, auth=ServiceAuthorizationStatus.DENIED, status=CaseStatus.MANAGED)
+        self.assertIn(str(c.client_id), self._rejected_ids())
+
+    def test_open_denied_but_open_approved_not_rejected(self):
+        from .models import CaseStatus, ServiceAuthorizationStatus
+
+        c = self._client()
+        self._case(c, auth=ServiceAuthorizationStatus.DENIED, status=CaseStatus.MANAGED)
+        # An OPEN approved case outranks the denial and would govern instead.
+        self._case(c, auth=ServiceAuthorizationStatus.APPROVED, status=CaseStatus.MANAGED)
+        self.assertNotIn(str(c.client_id), self._rejected_ids())
+
+    def test_closed_denied_not_rejected(self):
+        from .models import CaseStatus, ServiceAuthorizationStatus
+
+        c = self._client()
+        # Only a CLOSED denial -> no OPEN governing denial, so not "rejected".
+        self._case(c, auth=ServiceAuthorizationStatus.DENIED, status=CaseStatus.CLOSED)
+        self.assertNotIn(str(c.client_id), self._rejected_ids())
+
+
 class MemberHouseholdAddressTimelineTest(TestCase):
     """PATCH /members/<id>/household/ must log a Delivery Address Changed event
     on the timeline of the member whose profile the agent is viewing -- including
@@ -12678,3 +13022,271 @@ class NutritionistGateTest(TestCase):
         self.assertEqual(resp.status_code, 200, resp.content)
         enr.refresh_from_db()
         self.assertEqual(enr.stage, EnrollmentStage.KITCHEN_ASSIGNMENT)
+
+
+class AssessmentApiMapperTest(SimpleTestCase):
+    """map_assessment_api mirrors the extension's parse + payload shape."""
+
+    def _detail(self, **over):
+        d = {
+            "id": "aid-1",
+            "template": {"name": "Unite NYC - Food Assistance Assessment"},
+            "eligible_services": [
+                {"name": "Home Delivered Meals - Level 2"},
+                "Produce Prescription",
+            ],
+            "questions": [
+                {"order": 2, "primary_text": "How many in household?",
+                 "answer": {"number": 3}},
+                {"order": 1, "primary_text": "Do you need food?",
+                 "answer": {"boolean": True}},
+                {"order": 3, "primary_text": "Blank one", "answer": None},
+            ],
+        }
+        d.update(over)
+        return d
+
+    def test_shape_and_ordering(self):
+        from api.integrations.uniteus import mappers
+
+        summary = {"id": "aid-1", "status": "complete",
+                   "status_at": "2026-08-01T12:00:00Z"}
+        out = mappers.map_assessment_api(self._detail(), summary, person_id="p-1")
+        self.assertEqual(out["assessment_id"], "aid-1")
+        self.assertEqual(out["subject_id"], "p-1")
+        self.assertEqual(out["form_name"], "Unite NYC - Food Assistance Assessment")
+        self.assertEqual(out["screen_created_at"], "2026-08-01T12:00:00Z")
+        self.assertEqual(out["eligible_status"], "eligible")
+        # dict + string services both cleaned to names, in source order.
+        self.assertEqual(
+            out["eligible_services"],
+            ["Home Delivered Meals - Level 2", "Produce Prescription"],
+        )
+        # Questions sorted by order; blank answers dropped; bool -> Yes.
+        self.assertEqual(
+            out["questions_answers"],
+            [
+                {"question": "Do you need food?", "answer": "Yes"},
+                {"question": "How many in household?", "answer": "3"},
+            ],
+        )
+
+    def test_incomplete_status_omits_eligible_status(self):
+        from api.integrations.uniteus import mappers
+
+        out = mappers.map_assessment_api(
+            self._detail(), {"id": "aid-1", "status": "in_progress"}, person_id="p-1"
+        )
+        self.assertNotIn("eligible_status", out)
+
+    def test_falls_back_to_summary_services(self):
+        from api.integrations.uniteus import mappers
+
+        detail = self._detail(eligible_services=None)
+        summary = {"id": "aid-1", "eligible_services": ["Level 1 Boxes"]}
+        out = mappers.map_assessment_api(detail, summary, person_id="p-1")
+        self.assertEqual(out["eligible_services"], ["Level 1 Boxes"])
+
+    def test_missing_services_key_absent(self):
+        from api.integrations.uniteus import mappers
+
+        out = mappers.map_assessment_api(
+            {"id": "aid-1", "questions": []}, {"id": "aid-1"}, person_id="p-1"
+        )
+        self.assertNotIn("eligible_services", out)
+        self.assertNotIn("questions_answers", out)
+
+
+class AssessmentApiSerializerTest(TestCase):
+    """The mapped payload drives catalog + client level via AssessmentSerializer."""
+
+    def test_upsert_sets_client_level_and_catalog(self):
+        from api.integrations.uniteus import mappers
+        from api.models import Assessment, ClientLevel
+        from api.serializers import AssessmentSerializer
+
+        cid = str(uuid.uuid4())
+        client = Client.objects.create(client_id=cid, first_name="A", last_name="B")
+        detail = {
+            "id": str(uuid.uuid4()),
+            "eligible_services": [{"name": "Home Delivered Meals - Level 2"}],
+            "questions": [],
+        }
+        data = mappers.map_assessment_api(
+            detail, {"id": detail["id"], "status": "complete"}, person_id=cid
+        )
+        ser = AssessmentSerializer(data=data)
+        self.assertTrue(ser.is_valid(), ser.errors)
+        ser.save()
+
+        client.refresh_from_db()
+        self.assertEqual(client.is_level, ClientLevel.LEVEL_2)
+        assessment = Assessment.objects.get(pk=detail["id"])
+        self.assertEqual(assessment.subject_id, client.pk)
+        self.assertEqual(assessment.client_id, client.pk)
+        self.assertEqual(assessment.eligible_status, "eligible")
+
+
+class ScreeningsIngestionClientTest(SimpleTestCase):
+    """Pagination + provider scoping for the screenings-ingestion client."""
+
+    class _Resp:
+        def __init__(self, payload, status=200):
+            self._payload = payload
+            self.status_code = status
+            self.text = ""
+
+        def json(self):
+            return self._payload
+
+    class _Session:
+        def __init__(self, pages):
+            self.pages = pages
+            self.calls = []
+
+        def get(self, url, headers=None, params=None, timeout=None):
+            self.calls.append(params)
+            return ScreeningsIngestionClientTest._Resp(self.pages.pop(0))
+
+    def _client(self, pages):
+        from api.integrations.uniteus.screenings_api import ScreeningsIngestionClient
+
+        cred = SimpleNamespace(
+            pk=1, access_token="tok", token_type="Bearer",
+            employee_id="emp", provider_id="prov",
+        )
+        c = ScreeningsIngestionClient(cred, allow_refresh=False)
+        c._session = self._Session(pages)
+        return c
+
+    def test_paginates_until_total_reached(self):
+        page1 = {"screens": [{"id": "1", "organization_id": "prov"}] * 20, "total": 25}
+        page2 = {"screens": [{"id": "2", "organization_id": "prov"}] * 5, "total": 25}
+        c = self._client([page1, page2])
+        out = c.list_assessments("p-1")
+        self.assertEqual(len(out), 25)
+        # Two pages requested at offset 0 then 20, both type=assessment.
+        self.assertEqual([p["offset"] for p in c._session.calls], [0, 20])
+        self.assertTrue(all(p["type"] == "assessment" for p in c._session.calls))
+
+    def test_provider_scoping_filters_other_orgs(self):
+        page = {
+            "screens": [
+                {"id": "1", "organization_id": "prov"},
+                {"id": "2", "organization_id": "OTHER"},
+            ],
+            "total": 2,
+        }
+        c = self._client([page])
+        out = c.list_assessments("p-1", provider_id="prov")
+        self.assertEqual([s["id"] for s in out], ["1"])
+
+    def test_detail_unwraps_screen(self):
+        c = self._client([{"screen": {"id": "1", "eligible_services": ["X"]}}])
+        self.assertEqual(c.get_screen_detail("1")["eligible_services"], ["X"])
+
+
+class AssessmentEnrichmentServiceTest(TestCase):
+    """The enrichment service: target selection + list/detail/map/upsert + ImportRun."""
+
+    def setUp(self):
+        from .models import UniteUsCredential, UniteUsCredentialStatus
+
+        self.cred = UniteUsCredential.objects.create(
+            provider_id="prov", employee_id="emp",
+            access_token="tok", status=UniteUsCredentialStatus.ACTIVE,
+            last_captured_at=timezone.now(),
+        )
+
+    def _client_with_bare_assessment(self):
+        from .models import Assessment
+
+        cid = str(uuid.uuid4())
+        client = Client.objects.create(client_id=cid, first_name="A", last_name="B")
+        aid = str(uuid.uuid4())
+        Assessment.objects.create(
+            assessment_id=aid, subject_id=cid, client=client, eligible_services=[]
+        )
+        return client, cid, aid
+
+    def _fake_api(self, aid, services):
+        """A stand-in ScreeningsIngestionClient class returning canned data."""
+        class _FakeApi:
+            def __init__(self, cred, allow_refresh=False):
+                pass
+
+            def list_assessments(self, person_id, provider_id=None):
+                return [{"id": aid, "organization_id": "prov", "status": "complete"}]
+
+            def get_screen_detail(self, screen_id):
+                return {"id": aid, "eligible_services": services, "questions": []}
+
+        return _FakeApi
+
+    def test_run_enrichment_writes_results_and_level(self):
+        from unittest import mock
+
+        from .models import Assessment, ClientLevel, ImportRunStatus
+        from api.services import assessment_enrichment as svc
+
+        client, cid, aid = self._client_with_bare_assessment()
+        fake = self._fake_api(aid, [{"name": "Enhanced Care Management (Level 2)"}])
+        with mock.patch.object(svc, "ScreeningsIngestionClient", fake):
+            run = svc.run_assessment_enrichment(triggered_by="test")
+
+        self.assertEqual(run.status, ImportRunStatus.COMPLETED)
+        self.assertEqual(run.updated_count, 1)
+        self.assertEqual(run.error_count, 0)
+        client.refresh_from_db()
+        self.assertEqual(client.is_level, ClientLevel.LEVEL_2)
+        assessment = Assessment.objects.get(pk=aid)
+        self.assertEqual(
+            assessment.eligible_services, ["Enhanced Care Management (Level 2)"]
+        )
+        self.assertEqual(assessment.eligible_status, "eligible")
+        self.assertEqual(run.stats["enriched_preview"][0]["assessment_id"], aid)
+
+    def test_dry_run_writes_nothing(self):
+        from unittest import mock
+
+        from .models import Assessment
+        from api.services import assessment_enrichment as svc
+
+        client, cid, aid = self._client_with_bare_assessment()
+        fake = self._fake_api(aid, ["Home Delivered Meals - Level 1"])
+        with mock.patch.object(svc, "ScreeningsIngestionClient", fake):
+            enricher = svc.enrich_assessments(apply=False)
+
+        self.assertEqual(enricher.stats["enriched"], 1)
+        self.assertEqual(len(enricher.previews), 1)
+        # Nothing persisted.
+        self.assertEqual(Assessment.objects.get(pk=aid).eligible_services, [])
+        client.refresh_from_db()
+        self.assertFalse(client.is_level)
+
+    def test_target_person_ids_skips_already_enriched(self):
+        from .models import Assessment
+        from api.services.assessment_enrichment import target_person_ids
+
+        client, cid, aid = self._client_with_bare_assessment()
+        # A second client whose assessment already HAS results is excluded.
+        other = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="C", last_name="D"
+        )
+        Assessment.objects.create(
+            assessment_id=str(uuid.uuid4()), subject_id=other.client_id,
+            client=other, eligible_services=["X"],
+        )
+        ids = target_person_ids()
+        self.assertIn(cid, ids)
+        self.assertNotIn(str(other.client_id), ids)
+
+    def test_no_credential_records_error(self):
+        from .models import UniteUsCredential
+        from api.services import assessment_enrichment as svc
+
+        UniteUsCredential.objects.all().delete()
+        client, cid, aid = self._client_with_bare_assessment()
+        enricher = svc.enrich_assessments(apply=True)
+        self.assertTrue(any("No active" in e for e in enricher.errors))
+        self.assertEqual(enricher.stats["enriched"], 0)

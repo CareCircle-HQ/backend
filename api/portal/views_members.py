@@ -639,9 +639,17 @@ def annotate_care_management(qs):
     )
     from ..services.lifecycle import MEDICAID_PLAN_TYPES
 
-    internal = Case.objects.filter(
+    # The "Rejected Case" tab must reflect the GOVERNING internal-service case
+    # (the one that actually drives service), and only when it is OPEN -- a stale
+    # or superseded denial must not flag a household whose live/governing case is
+    # approved. We approximate the Python ``governing_case_key`` rule in SQL over
+    # OPEN internal-service cases only: a household is "rejected" when it holds an
+    # OPEN denied case AND holds no OPEN case with a more-favorable authorization
+    # (approved / not-required / pending) that would outrank the denial and become
+    # the governing case instead.
+    open_internal = Case.objects.filter(
         client=OuterRef("pk"), case_type=CaseType.INTERNAL_SERVICE,
-    )
+    ).exclude(case_status__in=(CaseStatus.CLOSED, CaseStatus.CANCELLED))
     active_medicaid = Insurance.objects.filter(
         client=OuterRef("pk"), plan_type__in=MEDICAID_PLAN_TYPES,
         status=RecordStatus.ACTIVE,
@@ -652,8 +660,21 @@ def annotate_care_management(qs):
     return qs.annotate(
         _cm_oob=current_member_status_exists(MemberStatus.OUT_OF_ORBIT),
         _cm_paused=current_member_status_exists(MemberStatus.PAUSED),
-        _cm_denied=Exists(
-            internal.filter(service_authorization_status=ServiceAuthorizationStatus.DENIED)
+        # Governing OPEN case is denied: an OPEN denied case exists and no OPEN
+        # case outranks it. Combined in the predicate below.
+        _cm_open_denied=Exists(
+            open_internal.filter(
+                service_authorization_status=ServiceAuthorizationStatus.DENIED
+            )
+        ),
+        _cm_open_outranks_denied=Exists(
+            open_internal.filter(
+                service_authorization_status__in=(
+                    ServiceAuthorizationStatus.APPROVED,
+                    ServiceAuthorizationStatus.NOT_REQUIRED,
+                    ServiceAuthorizationStatus.PENDING,
+                )
+            )
         ),
         _cm_medicaid=Exists(active_medicaid),
         _cm_scc=Exists(enrolled_scc),
@@ -670,7 +691,7 @@ def care_management_predicates():
         # Out of Range: households off-ramped to Not Eligible because a delivery /
         # primary ZIP is outside the coverage area (stable coverage reason stored).
         Q(lifecycle_stage=ClientStage.INELIGIBLE, ineligible_reasons__contains=[SERVICE_AREA_REASON]),
-        Q(_cm_denied=True),                                                 # Rejected Case
+        Q(_cm_open_denied=True) & Q(_cm_open_outranks_denied=False),        # Rejected Case (governing OPEN case denied)
         Q(_cm_paused=True) | Q(_cm_gov_stage=EnrollmentStage.ON_HOLD),      # Services Paused
         Q(_cm_medicaid=False) & Q(_cm_scc=False),                          # No Active Coverage
         Q(lifecycle_stage=ClientStage.PENDING_VERIFICATION),               # Requires Verification
@@ -691,6 +712,42 @@ def care_management_tab_queryset(qs, tab):
     for i in range(n):
         qs = qs.exclude(preds[i])
     return qs.filter(preds[n])
+
+
+def care_management_no_cadence_qs(qs, kitchen_id):
+    """Members on a LIVE enrollment assigned to ``kitchen_id`` that has NO delivery
+    cadence set yet.
+
+    Kitchen + cadence are household-wide (they live on the enrollment), so this
+    returns the enrollment holder AND their household members. A kitchen must be
+    chosen -- returns nothing when it isn't, since "no cadence" is only meaningful
+    scoped to a specific kitchen's queue."""
+    from ..models import EnrollmentVerification, MemberDeliverySchedule
+
+    kitchen_id = (kitchen_id or "").strip()
+    if not kitchen_id:
+        return qs.none()
+    terminal = [
+        EnrollmentStage.CLOSED,
+        EnrollmentStage.CANCELLED,
+        EnrollmentStage.DISREGARDED,
+        EnrollmentStage.SERVICE_COMPLETE,
+    ]
+    # Cadence lives on the household's delivery schedules; "has cadence" == any
+    # schedule with a non-empty cadence code.
+    has_cadence = MemberDeliverySchedule.objects.filter(
+        enrollment=OuterRef("pk"),
+    ).exclude(delivery_days_cadence="")
+    live_no_cadence = (
+        EnrollmentVerification.objects.filter(kitchen_id=kitchen_id)
+        .exclude(stage__in=[s.value for s in terminal])
+        .annotate(_has_cad=Exists(has_cadence))
+        .filter(_has_cad=False)
+    )
+    return qs.filter(
+        Q(enrollments__in=live_no_cadence)
+        | Q(household_membership__household__enrollment_verifications__in=live_no_cadence)
+    ).distinct()
 
 
 # Page-level base scope: restricts the list to the lifecycle stages a given
@@ -1311,8 +1368,15 @@ class MembersListView(PortalGenericAPIView):
             # Care Management tabs: the meal/box pipeline population, split into
             # mutually-exclusive tabs (a household shows in the FIRST tab it
             # matches). ``tab`` selects which one.
-            qs = annotate_care_management(qs.filter(care_management_base_q()).distinct())
-            qs = care_management_tab_queryset(qs, params.get("tab"))
+            #
+            # "No Cadence" is a special, kitchen-scoped tab (NOT part of the
+            # mutual-exclusion set): pick a kitchen, see everyone assigned to it
+            # that still has no delivery cadence.
+            if (params.get("tab") or "").strip() == "no_cadence":
+                qs = care_management_no_cadence_qs(qs, params.get("kitchen"))
+            else:
+                qs = annotate_care_management(qs.filter(care_management_base_q()).distinct())
+                qs = care_management_tab_queryset(qs, params.get("tab"))
         else:
             scope_stages = SCOPE_TO_STAGES.get(scope)
             if scope_stages:
