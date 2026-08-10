@@ -14128,3 +14128,81 @@ class ReassignRunsFullCalendarReconcileTest(TestCase):
         recon, gen = self._run(created=[1])  # new plan created -> first-time
         gen.assert_called_once()
         recon.assert_not_called()
+
+
+class DedupeIgnoresClosedEnrollmentOccurrencesTest(TestCase):
+    """_dedupe_calendar_occurrences must NOT let a dead (CLOSED/CANCELLED)
+    enrollment's leftover occurrences block the live survivor's calendar -- the
+    bug that stranded a re-kitchened member off the PO. A LIVE enrollment's
+    occurrence still blocks a duplicate."""
+
+    def _client_hh(self):
+        from .models import Client, Household
+        c = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="A", last_name="B",
+        )
+        return c, Household.objects.create(name="HH")
+
+    def _existing_occurrence(self, *, client, hh, stage, day):
+        from .models import (
+            EnrollmentVerification, MemberDietaryProfile, OrderSchedule, OrderStatus,
+        )
+        enr = EnrollmentVerification.objects.create(
+            client=client, household=hh, stage=stage,
+            program_name="Medically Tailored Meals",
+        )
+        mp = MemberDietaryProfile.objects.create(
+            enrollment=enr, client=client, member_name="A B",
+        )
+        OrderSchedule.objects.create(
+            enrollment=enr, member=mp, member_name="A B",
+            anticipated_delivery_date=day, program_name="Medically Tailored Meals",
+            status=OrderStatus.SCHEDULED,
+        )
+        return enr
+
+    def _new_occurrence(self, *, client, hh, day):
+        from .models import (
+            EnrollmentStage, EnrollmentVerification, MemberDietaryProfile,
+            OrderSchedule, OrderStatus,
+        )
+        live = EnrollmentVerification.objects.create(
+            client=client, household=hh, stage=EnrollmentStage.SERVICE_ACTIVE,
+            program_name="Medically Tailored Meals",
+        )
+        lmp = MemberDietaryProfile.objects.create(
+            enrollment=live, client=client, member_name="A B",
+        )
+        return OrderSchedule(
+            enrollment=live, member=lmp, member_name="A B",
+            anticipated_delivery_date=day, program_name="Medically Tailored Meals",
+            status=OrderStatus.SCHEDULED,
+        )
+
+    def test_closed_enrollment_occurrence_does_not_block(self):
+        from datetime import date
+
+        from .models import EnrollmentStage
+        from .services.orders import _dedupe_calendar_occurrences
+
+        c, hh = self._client_hh()
+        day = date(2026, 8, 13)
+        self._existing_occurrence(client=c, hh=hh, stage=EnrollmentStage.CLOSED, day=day)
+        new_occ = self._new_occurrence(client=c, hh=hh, day=day)
+        kept = _dedupe_calendar_occurrences([new_occ])
+        self.assertEqual(len(kept), 1)  # not blocked by the dead enrollment
+
+    def test_live_enrollment_occurrence_still_blocks(self):
+        from datetime import date
+
+        from .models import EnrollmentStage
+        from .services.orders import _dedupe_calendar_occurrences
+
+        c, hh = self._client_hh()
+        day = date(2026, 8, 13)
+        self._existing_occurrence(
+            client=c, hh=hh, stage=EnrollmentStage.SERVICE_ACTIVE, day=day,
+        )
+        new_occ = self._new_occurrence(client=c, hh=hh, day=day)
+        kept = _dedupe_calendar_occurrences([new_occ])
+        self.assertEqual(len(kept), 0)  # duplicate against a LIVE enrollment
