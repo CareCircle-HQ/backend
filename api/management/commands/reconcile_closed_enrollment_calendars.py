@@ -57,13 +57,17 @@ class Command(BaseCommand):
         today = timezone.localdate()
 
         # Terminal enrollments that still hold a future SCHEDULED occurrence.
-        stale_enr_ids = list(
+        # NB: clear ordering before .distinct() -- OrderSchedule has default
+        # ordering, which would otherwise make .distinct() dedupe on
+        # (order_cols, enrollment_id) and over-count.
+        stale_enr_ids = sorted(
             OrderSchedule.objects
             .filter(
                 status=OrderStatus.SCHEDULED,
                 anticipated_delivery_date__gte=today,
                 enrollment__stage__in=[s.value for s in _TERMINAL],
             )
+            .order_by()
             .values_list("enrollment_id", flat=True)
             .distinct()
         )
