@@ -699,6 +699,12 @@ class DistributionOverviewView(PortalAPIView):
             "enrollment__kitchen_id",
             "enrollment__kitchen__name",
             "product_type__type",
+            # The ENROLLMENT's program is authoritative (matches the client
+            # profile + PO resolver); the schedule's own ``program`` snapshot can
+            # be stale (e.g. a boxes plan left behind after the case became meals),
+            # which mislabeled clients. Fall back to it only when the enrollment
+            # carries no program name.
+            "enrollment__program_name",
             "program__name",
         ).annotate(n=Count("member_profile_id", distinct=True))
 
@@ -716,7 +722,8 @@ class DistributionOverviewView(PortalAPIView):
             kid = row["enrollment__kitchen_id"]
             kkey = str(kid) if kid else self.UNASSIGNED
             is_box = _plan_is_box(
-                row["product_type__type"], row["program__name"],
+                row["product_type__type"],
+                row["enrollment__program_name"] or row["program__name"],
                 kitchen_products.get(kkey, []),
             )
             n = row["n"] or 0
@@ -888,6 +895,7 @@ class DistributionKitchenMembersView(PortalAPIView):
             "member_name",
             "delivery_days_cadence",
             "product_type__type",
+            "enrollment__program_name",
             "program__name",
             "enrollment__kitchen_id",
             "enrollment__kitchen__name",
@@ -899,8 +907,10 @@ class DistributionKitchenMembersView(PortalAPIView):
             name = (f"{first} {last}".strip()) or r["member_name"] or "Unknown"
             code = r["delivery_days_cadence"] or ""
             kid = r["enrollment__kitchen_id"]
+            # Enrollment program is authoritative; schedule snapshot is fallback.
             is_box = _plan_is_box(
-                r["product_type__type"], r["program__name"],
+                r["product_type__type"],
+                r["enrollment__program_name"] or r["program__name"],
                 kitchen_products_map.get(str(kid), []) if kid else [],
             )
             return {

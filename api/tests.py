@@ -13697,3 +13697,64 @@ class CaseSwitchCarriesClinicalDataTest(TestCase):
         self.assertEqual(mp.meal_plan, "Renal")
         self.assertEqual(mp.assessment_notes, "ok notes")
         self.assertEqual(mp.menu_type, "Standard")
+
+
+class DistributionOverviewKindFromEnrollmentTest(TestCase):
+    """The Distribution matrix classifies meals/boxes from the ENROLLMENT's live
+    program, not a stale schedule program snapshot (regression: a meals case with
+    a leftover boxes delivery-schedule program was mislabeled as boxes)."""
+
+    def _api(self):
+        from rest_framework.test import APIClient
+        from rest_framework_simplejwt.tokens import AccessToken
+
+        from .models import Agent
+        a = Agent.objects.create(name="Mgr", agent_code="960", group="Management")
+        acc = AccessToken()
+        acc["agent_id"] = str(a.id); acc["agent_code"] = a.agent_code
+        acc["agent_name"] = a.name; acc["agent_group"] = a.group
+        api = APIClient(); api.credentials(HTTP_AUTHORIZATION=f"Bearer {acc}")
+        return api
+
+    def test_meals_case_with_stale_boxes_schedule_counts_as_meals(self):
+        from .models import (
+            Client, DeliveryCadence, EnrollmentStage, EnrollmentVerification,
+            Household, HouseholdMember, Kitchen, KitchenStatus,
+            MemberDeliverySchedule, MemberDietaryProfile, MemberStatus, Program,
+            ScheduleStatus,
+        )
+
+        client = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Wm", last_name="Burg",
+        )
+        hh = Household.objects.create(name="HH")
+        HouseholdMember.objects.create(household=hh, client=client, is_primary=True)
+        kitchen = Kitchen.objects.create(
+            name="Williamsburg", status=KitchenStatus.ACTIVE, supported_products=["meals"],
+        )
+        enr = EnrollmentVerification.objects.create(
+            client=client, household=hh, kitchen=kitchen,
+            stage=EnrollmentStage.SERVICE_ACTIVE, verified_at=timezone.now(),
+            program_name="Clinically Appropriate Meals - Other Eligible Populations - Brooklyn",
+        )
+        member = MemberDietaryProfile.objects.create(
+            enrollment=enr, client=client, member_name="Wm Burg",
+            status=MemberStatus.ACTIVE,
+        )
+        # Stale schedule carrying a BOXES program (the leftover snapshot).
+        boxes_program = Program.objects.create(
+            name="Medically Tailored or Nutritionally Appropriate Food Prescriptions: Boxes - Brooklyn",
+        )
+        MemberDeliverySchedule.objects.create(
+            enrollment=enr, member_profile=member, member_name="Wm Burg",
+            program=boxes_program, delivery_days_cadence=DeliveryCadence.MON_THU,
+            meals_per_day=3, prod_per_delivery=0, meals_boxes_total=12,
+            status=ScheduleStatus.SCHEDULED,
+        )
+
+        resp = self._api().get("/api/portal/dashboard/distribution/?scope=active")
+        self.assertEqual(resp.status_code, 200, resp.content)
+        grand = resp.json()["grand_total"]
+        # Classified from the enrollment's Meals program, NOT the boxes schedule.
+        self.assertEqual(grand["meals"], 1)
+        self.assertEqual(grand["boxes"], 0)
