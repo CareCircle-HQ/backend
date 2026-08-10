@@ -64,6 +64,11 @@ def _dedupe_calendar_occurrences(orders):
     land twice on a date, doubling their meals/boxes downstream in the Purchase
     Order. A meals + boxes client legitimately has two orders on one date
     (different kinds), so the product kind is part of the dedupe key.
+
+    Occurrences on a CLOSED / CANCELLED enrollment are NOT counted as blockers:
+    a dead enrollment's leftover SCHEDULED rows don't feed any Purchase Order, so
+    letting them block the LIVE survivor's calendar would strand that member off
+    the PO forever (the survivor could never build its own occurrences).
     """
     from api.services.catalog import product_type_kind_for_name
 
@@ -90,6 +95,11 @@ def _dedupe_calendar_occurrences(orders):
             OrderSchedule.objects
             .filter(member__client_id__in=client_ids, anticipated_delivery_date__in=dates)
             .exclude(status=OrderStatus.CANCELLED)
+            # A terminated enrollment's leftover occurrences are dead (never on a
+            # PO) -- they must not block the live survivor from building its own.
+            .exclude(enrollment__stage__in=(
+                EnrollmentStage.CLOSED, EnrollmentStage.CANCELLED,
+            ))
             .values_list("member__client_id", "anticipated_delivery_date", "program_name")
         )
         existing = {(str(cid), d, _kind(prog)) for cid, d, prog in rows}
