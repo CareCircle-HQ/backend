@@ -2959,6 +2959,32 @@ def _carry_dietary_profiles(target, source):
     return changed
 
 
+def _force_close_enrollment(enr):
+    """Terminate ``enr`` as CLOSED even when the transition map has no edge from
+    its current stage (e.g. verified / kitchen_assignment). Used ONLY for the
+    SUPERSEDED enrollment in a governing-case replacement -- the replacement makes
+    it read-only history regardless of stage, and a swallowed InvalidTransition
+    previously left it LIVE (a duplicate). Bypasses the map deliberately; also
+    truncates its future deliveries so the dead row can't keep a calendar."""
+    now = timezone.now()
+    if EnrollmentStage(enr.stage) in _TERMINAL_STAGES:
+        return
+    enr.stage = EnrollmentStage.CLOSED
+    enr.stage_at = now
+    if enr.closed_at is None:
+        enr.closed_at = now
+    try:
+        enr.save(update_fields=["stage", "stage_at", "closed_at"])
+    except Exception:  # pragma: no cover - defensive
+        return
+    try:
+        from api.services.orders import truncate_future_deliveries
+
+        truncate_future_deliveries(enr)
+    except Exception:  # pragma: no cover - defensive
+        pass
+
+
 def _close_old_and_link_to_existing(
     live, existing, new_governing_case, actor=None, actor_label="", note="",
 ):
@@ -2986,10 +3012,13 @@ def _close_old_and_link_to_existing(
                 actor=actor,
                 actor_label=actor_label,
                 note=note or "Governing case replaced; enrollment closed as read-only history.",
+                force=True,
                 trigger="case_replaced",
             )
         except InvalidTransition:
-            pass
+            # No map edge to CLOSED from this stage -> close directly (the
+            # replacement supersedes it regardless of stage).
+            _force_close_enrollment(live)
 
         live.close_reason = "case_replaced"
         live.close_context = {
@@ -3131,14 +3160,27 @@ def _carry_service_and_activate(
 
     carries = bool(prior_was_serving and same_kind and kitchen is not None and cadence)
     if not carries:
-        # No service to carry: leave the new enrollment ready for a fresh kitchen
-        # assignment (Verified -> Kitchen Assignment) rather than stranded earlier.
+        # No service to carry. Respect the NUTRITIONIST gate: a household that was
+        # neither already serving NOR Nutritionist-approved rests at VERIFIED
+        # (Pending Nutritionist) -- it must NOT be force-stepped past the sign-off
+        # straight into Kitchen Assignment (which previously let a case switch skip
+        # the nutrition review). An already-serving household (e.g. a meals<->boxes
+        # requeue) has cleared nutrition, so it still goes to Kitchen Assignment.
+        if new_enr.nutritionist_approved_at or prior_was_serving:
+            target = EnrollmentStage.KITCHEN_ASSIGNMENT
+            note = (
+                "Verification (+ prior service/nutrition) carried from the previous "
+                "enrollment; awaiting kitchen assignment for the new governing case."
+            )
+        else:
+            target = EnrollmentStage.VERIFIED
+            note = (
+                "Verification carried from the previous enrollment; pending "
+                "nutritionist review for the new governing case."
+            )
         _step_stage_forward(
-            new_enr, EnrollmentStage.KITCHEN_ASSIGNMENT, actor=actor,
-            actor_label=actor_label,
-            note="Verification carried from the previous enrollment; awaiting "
-                 "kitchen assignment for the new governing case.",
-            trigger="case_replaced",
+            new_enr, target, actor=actor, actor_label=actor_label,
+            note=note, trigger="case_replaced",
         )
         return False
 
@@ -3308,10 +3350,15 @@ def replace_enrollment_for_case_change(
                 actor=actor,
                 actor_label=actor_label,
                 note="Governing case replaced; enrollment closed as read-only history.",
+                force=True,
                 trigger="case_replaced",
             )
         except InvalidTransition:
-            pass
+            # Some source stages (e.g. verified) have no map edge to CLOSED;
+            # swallowing that previously left the old enrollment LIVE -> a
+            # duplicate the nutritionist/kitchen flows could act on. Close it
+            # directly so the superseded row always terminates.
+            _force_close_enrollment(live)
 
         # Build the new enrollment with copied verification data.
         new_fields = {

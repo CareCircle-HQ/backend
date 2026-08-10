@@ -899,10 +899,15 @@ class GoverningCaseReplacementVerificationGateTest(TestCase):
             service_authorization_status=ServiceAuthorizationStatus.APPROVED,
             program_name="MTM Meals",
         )
+        now = timezone.now()
         new_enr = EnrollmentVerification.objects.create(
             client=self.client_obj, case=new_case,
             stage=EnrollmentStage.PENDING_VERIFICATION, program_name="MTM Meals",
-            verified_at=(timezone.now() if verified else None),
+            verified_at=(now if verified else None),
+            # A verified household is also nutritionist-approved here so it clears
+            # BOTH gates and advances to Kitchen Assignment (the nutri gate is
+            # covered separately in CaseSwitchClosesOldAndRespectsNutriGateTest).
+            nutritionist_approved_at=(now if verified else None),
         )
         carried = _carry_service_and_activate(
             new_enr, prior, new_case, ProductTypeKind.MEALS,
@@ -922,8 +927,8 @@ class GoverningCaseReplacementVerificationGateTest(TestCase):
     def test_verified_advances_to_kitchen_assignment(self):
         from .models import EnrollmentStage
 
-        # A genuinely verified household is unaffected by the gate: with no prior
-        # serving state it still advances to Kitchen Assignment.
+        # A verified + nutritionist-approved household advances to Kitchen
+        # Assignment (both gates cleared), even with no prior serving state.
         carried, new_enr = self._carry(verified=True)
         self.assertFalse(carried)  # prior wasn't serving -> no service carried
         self.assertEqual(new_enr.stage, EnrollmentStage.KITCHEN_ASSIGNMENT)
@@ -2290,11 +2295,16 @@ class InternalServiceClosureFullStopTest(TestCase):
     def test_closing_one_of_two_open_cases_keeps_serving(self):
         # Full stop only fires when the LAST open internal-service case closes.
         # With a second open+approved case remaining, the household stays served
-        # and is NOT parked at SERVICE_INACTIVE.
+        # and is NOT parked at SERVICE_INACTIVE. Closing the governing case makes
+        # the OTHER case govern -> the enrollment is cleanly replaced (old CLOSED,
+        # one new live enrollment on the surviving case), NOT left as a duplicate.
         from .models import ClientStage, EnrollmentStage
 
         client = self._client()
         enr = self._enrollment(client, EnrollmentStage.KITCHEN_ASSIGNMENT)
+        # A realistic Kitchen-Assignment enrollment is past the nutritionist gate.
+        enr.nutritionist_approved_at = timezone.now()
+        enr.save(update_fields=["nutritionist_approved_at"])
         case_a = str(uuid.uuid4())
         case_b = str(uuid.uuid4())
         self._save_case(client, case_a, auth="approved", case_status="open")
@@ -2305,9 +2315,16 @@ class InternalServiceClosureFullStopTest(TestCase):
             client, case_a, auth="approved", case_status="closed",
             closed_at=timezone.now(),
         )
-        enr.refresh_from_db()
         client.refresh_from_db()
-        self.assertEqual(enr.stage, EnrollmentStage.KITCHEN_ASSIGNMENT)
+        live = client.enrollments.exclude(
+            stage__in=[EnrollmentStage.CLOSED.value, EnrollmentStage.CANCELLED.value]
+        )
+        # Exactly ONE live enrollment (no duplicate), still serving-ready, and the
+        # client is not parked at SERVICE_INACTIVE.
+        self.assertEqual(live.count(), 1)
+        self.assertEqual(
+            EnrollmentStage(live.first().stage), EnrollmentStage.KITCHEN_ASSIGNMENT
+        )
         self.assertNotEqual(client.lifecycle_stage, ClientStage.SERVICE_INACTIVE)
 
     def test_ineligible_outranks_service_inactive(self):
@@ -13758,3 +13775,71 @@ class DistributionOverviewKindFromEnrollmentTest(TestCase):
         # Classified from the enrollment's Meals program, NOT the boxes schedule.
         self.assertEqual(grand["meals"], 1)
         self.assertEqual(grand["boxes"], 0)
+
+
+class CaseSwitchClosesOldAndRespectsNutriGateTest(TestCase):
+    """A governing-case switch must (1) force-CLOSE the superseded enrollment so
+    no duplicate stays live, and (2) NOT skip the nutritionist gate: a verified
+    but not-yet-approved household rests at VERIFIED, not Kitchen Assignment."""
+
+    def _setup(self, *, nutri):
+        from datetime import timedelta
+
+        from .models import (
+            Case, CaseStatus, CaseType, Client, EnrollmentStage,
+            EnrollmentVerification, Household, HouseholdMember,
+            ServiceAuthorizationStatus,
+        )
+
+        now = timezone.now()
+        client = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Sw", last_name="It",
+        )
+        hh = Household.objects.create(name="HH")
+        HouseholdMember.objects.create(household=hh, client=client, is_primary=True)
+
+        def _case(day):
+            return Case.objects.create(
+                case_id=uuid.uuid4(), client=client,
+                case_type=CaseType.INTERNAL_SERVICE, case_status=CaseStatus.OPEN,
+                service_authorization_status=ServiceAuthorizationStatus.APPROVED,
+                service_authorization_approval_starts_at=now,
+                service_authorization_approval_ends_at=now + timedelta(days=90),
+                program_name="Medically Tailored Meals",
+                case_created_at=now + timedelta(days=day),
+                date_opened=now + timedelta(days=day),
+            )
+
+        old_case = _case(1)
+        live = EnrollmentVerification.objects.create(
+            client=client, household=hh, case=old_case,
+            stage=EnrollmentStage.VERIFIED, program_name="Medically Tailored Meals",
+            verified_at=now, nutritionist_approved_at=(now if nutri else None),
+        )
+        new_case = _case(30)
+        return client, live, new_case
+
+    def test_old_force_closed_and_new_rests_at_verified_when_not_nutri(self):
+        from .models import EnrollmentStage
+        from .services.lifecycle import replace_enrollment_for_case_change
+
+        client, live, new_case = self._setup(nutri=False)
+        new_enr = replace_enrollment_for_case_change(client, new_case)
+        self.assertIsNotNone(new_enr)
+        live.refresh_from_db(); new_enr.refresh_from_db()
+        # The superseded enrollment is CLOSED (previously left non-terminal).
+        self.assertEqual(EnrollmentStage(live.stage), EnrollmentStage.CLOSED)
+        # Not nutritionist-approved -> rests at Verified (Pending Nutritionist),
+        # NOT force-stepped past the gate into Kitchen Assignment.
+        self.assertEqual(EnrollmentStage(new_enr.stage), EnrollmentStage.VERIFIED)
+
+    def test_new_advances_to_kitchen_when_nutri_approved(self):
+        from .models import EnrollmentStage
+        from .services.lifecycle import replace_enrollment_for_case_change
+
+        client, live, new_case = self._setup(nutri=True)
+        new_enr = replace_enrollment_for_case_change(client, new_case)
+        live.refresh_from_db(); new_enr.refresh_from_db()
+        self.assertEqual(EnrollmentStage(live.stage), EnrollmentStage.CLOSED)
+        self.assertEqual(EnrollmentStage(new_enr.stage), EnrollmentStage.KITCHEN_ASSIGNMENT)
+        self.assertIsNotNone(new_enr.nutritionist_approved_at)  # carried forward

@@ -4597,6 +4597,9 @@ class NutritionistPendingListView(PortalAPIView):
                 stage=EnrollmentStage.VERIFIED,
                 nutritionist_approved_at__isnull=True,
             )
+            # Hide superseded (case-replaced) rows so the queue only lists the
+            # current governing enrollment awaiting sign-off.
+            .filter(superseded_by__isnull=True)
             .select_related("client", "case")
             .prefetch_related("member_profiles")
             .order_by("verified_at")
@@ -4738,6 +4741,10 @@ class MemberNutritionistApproveView(PortalAPIView):
                 stage=EnrollmentStage.VERIFIED,
                 nutritionist_approved_at__isnull=True,
             )
+            # Never approve a SUPERSEDED enrollment (one a governing-case switch
+            # already replaced) -- that stale row must not be revived; only the
+            # current governing enrollment can be signed off.
+            .filter(superseded_by__isnull=True)
             .order_by("-verified_at")
             .first()
         )
@@ -4795,7 +4802,7 @@ class MemberNutritionistReviewView(PortalAPIView):
         client = get_object_or_404(Client, pk=client_id)
         enr = (
             EnrollmentVerification.objects
-            .filter(client=client, stage=EnrollmentStage.VERIFIED)
+            .filter(client=client, stage=EnrollmentStage.VERIFIED, superseded_by__isnull=True)
             .order_by("-verified_at")
             .first()
         ) or EnrollmentVerification.objects.filter(client=client).order_by("-verified_at").first()
