@@ -7048,6 +7048,47 @@ class CalendarKeepsOccurrencesOnExclusionTest(TestCase):
             ).exists()
         )
 
+    def test_backfill_second_weekly_delivery_for_2x_cadence(self):
+        """A 2x/week (Mon/Thu) member with a live Thu order that week must still
+        be backfilled for the skipped Mon -- the week-cover guard is per-cadence
+        count, not a flat one-per-week."""
+        from datetime import timedelta
+        from unittest.mock import patch
+
+        from .models import (
+            DeliveryOrder, DeliveryOrderStatus, OrderSchedule, OrderStatus,
+            ProductTypeKind, PurchaseOrder, PurchaseOrderStatus,
+        )
+        from .services import purchase_orders as po
+
+        enr, member = self._make_active_enrollment()
+        mon = self._next_weekday(0)
+        thu = mon + timedelta(days=3)
+        enr.delivery_weekdays = ["mon", "thu"]
+        enr.save(update_fields=["delivery_weekdays"])
+        plan = enr.delivery_schedules.first()
+        plan.starts_on = mon + timedelta(days=7)  # Mon was skipped (cutoff passed)
+        plan.ends_on = mon + timedelta(days=60)
+        plan.save(update_fields=["starts_on", "ends_on"])
+
+        # A LIVE Thu delivery the SAME week (their other cadence day).
+        ppo = PurchaseOrder.objects.create(status=PurchaseOrderStatus.DRAFT)
+        DeliveryOrder.objects.create(
+            purchase_order=ppo, member=member.client, expected_delivery_date=thu,
+            status=DeliveryOrderStatus.PENDING,
+        )
+
+        with patch.object(po, "product_kind_for_enrollment", return_value=ProductTypeKind.MEALS):
+            added = po.backfill_late_occurrences(ProductTypeKind.MEALS, mon)
+        # 1 live delivery this week < 2 cadence days -> Mon is still backfilled.
+        self.assertEqual(added, 1)
+        self.assertTrue(
+            OrderSchedule.objects.filter(
+                enrollment=enr, member=member, anticipated_delivery_date=mon,
+                status=OrderStatus.SCHEDULED,
+            ).exists()
+        )
+
 
 class RebuildDeliveryCalendarTest(TestCase):
     """A member added to an already-active household never got a delivery plan
