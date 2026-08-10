@@ -13999,3 +13999,54 @@ class ClosedCaseHoldDisplayTest(TestCase):
         # Closure full-stop (service_inactive) -> shows the real "Inactive" label,
         # not the On Hold overlay.
         self.assertNotEqual(verification_status(client), "On Hold")
+
+
+class ActiveEnrollmentPrefersGoverningCaseTest(TestCase):
+    """active_enrollment (used by the program tab + all its actions +
+    /assign-kitchen/) targets the enrollment bound to the GOVERNING internal-
+    service case, even when a non-governing enrollment opened more recently."""
+
+    def test_prefers_enrollment_on_governing_case(self):
+        from datetime import timedelta
+
+        from .models import (
+            Case, CaseStatus, CaseType, Client, EnrollmentStage,
+            EnrollmentVerification, Household, HouseholdMember,
+            ServiceAuthorizationStatus,
+        )
+        from .portal.serializers import active_enrollment
+
+        now = timezone.now()
+        client = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Gov", last_name="Case",
+        )
+        hh = Household.objects.create(name="HH")
+        HouseholdMember.objects.create(household=hh, client=client, is_primary=True)
+        gov_case = Case.objects.create(
+            case_id=uuid.uuid4(), client=client, case_type=CaseType.INTERNAL_SERVICE,
+            case_status=CaseStatus.OPEN,
+            service_authorization_status=ServiceAuthorizationStatus.APPROVED,
+            program_name="MTM", case_created_at=now, date_opened=now,
+        )
+        other_case = Case.objects.create(
+            case_id=uuid.uuid4(), client=client, case_type=CaseType.INTERNAL_SERVICE,
+            case_status=CaseStatus.OPEN,
+            service_authorization_status=ServiceAuthorizationStatus.DENIED,
+            program_name="MTM", case_created_at=now + timedelta(days=5),
+            date_opened=now + timedelta(days=5),
+        )
+        gov_enr = EnrollmentVerification.objects.create(
+            client=client, household=hh, case=gov_case,
+            stage=EnrollmentStage.SERVICE_ACTIVE,
+        )
+        other_enr = EnrollmentVerification.objects.create(
+            client=client, household=hh, case=other_case,
+            stage=EnrollmentStage.PENDING_VERIFICATION,
+        )
+        # Force the NON-governing enrollment to look more recent (would win by
+        # recency without the governing-case preference).
+        EnrollmentVerification.objects.filter(pk=gov_enr.pk).update(
+            opened_at=now - timedelta(days=5))
+        EnrollmentVerification.objects.filter(pk=other_enr.pk).update(opened_at=now)
+
+        self.assertEqual(active_enrollment(client).pk, gov_enr.pk)
