@@ -104,6 +104,167 @@ def _age_bucket(stage_at, today):
     return "d15_plus"
 
 
+# ---------------------------------------------------------------------------
+# Week-over-week PO membership diff (who we serve on a PO, by kitchen x cadence)
+# ---------------------------------------------------------------------------
+_WEEKDAY_CODES = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
+
+
+def _completed_week_ranges(today):
+    """(this_start, this_end, last_start, last_end) for the two most recent
+    COMPLETED Mon-Sun weeks. The current (partial) week is excluded so the two
+    columns are always full, comparable weeks."""
+    this_monday = today - timedelta(days=today.weekday())
+    this_end = this_monday - timedelta(days=1)          # last Sunday
+    this_start = this_end - timedelta(days=6)           # its Monday
+    last_end = this_start - timedelta(days=1)
+    last_start = last_end - timedelta(days=6)
+    return this_start, this_end, last_start, last_end
+
+
+def _cadence_key_label(weekday_ints):
+    """Cadence key + display label derived from the weekdays a member was ACTUALLY
+    on a PO that week (e.g. {0, 3} -> ('mon,thu', 'Mon / Thu')). Deriving from the
+    real delivery days -- not the stored plan -- makes a cadence move visible
+    across the two weeks."""
+    codes = [_WEEKDAY_CODES[i] for i in sorted(set(weekday_ints)) if 0 <= i <= 6]
+    if not codes:
+        return "none", "Unscheduled"
+    return ",".join(codes), " / ".join(c.title() for c in codes)
+
+
+def _po_week_membership(start, end):
+    """Distinct members ON A PO (non-cancelled DeliveryOrder) in [start, end],
+    grouped into (kitchen, cadence) cells.
+
+    Returns (cells, members, member_cells, names):
+      cells        cell_key -> set(member_id)
+      members      set(member_id) on ANY PO that week (new-to-service / exited test)
+      member_cells member_id -> set(cell_key)  (for move detection + drill-down)
+      names        member_id -> display name
+    where cell_key = (kitchen_id|None, kitchen_name, cadence_key, cadence_label).
+    A member delivered on two kitchens in one week appears in BOTH kitchen cells.
+    """
+    rows = (
+        DeliveryOrder.objects
+        .filter(expected_delivery_date__gte=start, expected_delivery_date__lte=end)
+        .exclude(status=DeliveryOrderStatus.CANCELLED)
+        .exclude(member__isnull=True)
+        .values_list(
+            "member_id", "member__first_name", "member__last_name",
+            "kitchen_id", "kitchen__name", "expected_delivery_date",
+        )
+    )
+    grp = {}  # (member_id, kitchen_id) -> {name, kitchen_name, weekdays:set}
+    for mid, fn, ln, kid, kname, d in rows:
+        g = grp.setdefault((mid, kid), {
+            "name": (f"{fn or ''} {ln or ''}".strip() or str(mid)),
+            "kitchen_name": kname or "Unassigned",
+            "weekdays": set(),
+        })
+        g["weekdays"].add(d.weekday())
+
+    cells, members, member_cells, names = {}, set(), {}, {}
+    for (mid, kid), g in grp.items():
+        ckey, clabel = _cadence_key_label(g["weekdays"])
+        cell = (str(kid) if kid else None, g["kitchen_name"], ckey, clabel)
+        cells.setdefault(cell, set()).add(mid)
+        member_cells.setdefault(mid, set()).add(cell)
+        members.add(mid)
+        names[mid] = g["name"]
+    return cells, members, member_cells, names
+
+
+def po_membership_diff(today):
+    """Week-over-week churn of members ON A PO, per kitchen x cadence: this vs
+    last completed week, with New split into truly-new-to-service vs moved-in, and
+    Dropped split into exited vs moved-out."""
+    ts, te, ls, le = _completed_week_ranges(today)
+    cells_t, members_t, _mc_t, _n_t = _po_week_membership(ts, te)
+    cells_l, members_l, _mc_l, _n_l = _po_week_membership(ls, le)
+
+    kitchens, cadences, out_cells = {}, {}, []
+    for cell in set(cells_t) | set(cells_l):
+        kid, kname, ckey, clabel = cell
+        this_m = cells_t.get(cell, set())
+        last_m = cells_l.get(cell, set())
+        new = this_m - last_m
+        dropped = last_m - this_m
+        new_true = {m for m in new if m not in members_l}      # not on ANY PO last week
+        exited = {m for m in dropped if m not in members_t}    # not on ANY PO this week
+        kitchens[kid] = kname
+        cadences[ckey] = clabel
+        out_cells.append({
+            "kitchen_id": kid, "kitchen_name": kname,
+            "cadence_key": ckey, "cadence_label": clabel,
+            "this": len(this_m), "last": len(last_m),
+            "new_total": len(new), "new_true": len(new_true),
+            "moved_in": len(new) - len(new_true),
+            "dropped_total": len(dropped), "exited": len(exited),
+            "moved_out": len(dropped) - len(exited),
+        })
+    return {
+        "this_week": {"start": ts.isoformat(), "end": te.isoformat()},
+        "last_week": {"start": ls.isoformat(), "end": le.isoformat()},
+        "kitchens": [
+            {"id": k, "name": v}
+            for k, v in sorted(kitchens.items(), key=lambda kv: (kv[1] or "").lower())
+        ],
+        "cadences": [
+            {"key": k, "label": v} for k, v in sorted(cadences.items())
+        ],
+        "cells": out_cells,
+        "totals": {"this": len(members_t), "last": len(members_l)},
+    }
+
+
+def po_membership_cell_members(today, kitchen_id, cadence_key):
+    """Drill-down: the member NAMES in each churn bucket for one (kitchen,
+    cadence) cell -- new-to-service, moved-in (+ where from last week), exited,
+    moved-out (+ where to this week)."""
+    ts, te, ls, le = _completed_week_ranges(today)
+    cells_t, members_t, mcells_t, names_t = _po_week_membership(ts, te)
+    cells_l, members_l, mcells_l, names_l = _po_week_membership(ls, le)
+    kid = kitchen_id or None
+
+    def _cell_members(cells):
+        out = set()
+        for (c_kid, _c_kname, c_ckey, _c_clabel), ms in cells.items():
+            if (c_kid or None) == kid and c_ckey == cadence_key:
+                out |= ms
+        return out
+
+    this_m, last_m = _cell_members(cells_t), _cell_members(cells_l)
+    new, dropped = this_m - last_m, last_m - this_m
+    new_true = {m for m in new if m not in members_l}
+    moved_in = new - new_true
+    exited = {m for m in dropped if m not in members_t}
+    moved_out = dropped - exited
+
+    def _others(mid, mcells):
+        return sorted(
+            f"{kname} · {clabel}"
+            for (c_kid, kname, c_ckey, clabel) in mcells.get(mid, set())
+            if not ((c_kid or None) == kid and c_ckey == cadence_key)
+        )
+
+    def _rows(ids, names, mcells=None):
+        out = []
+        for mid in ids:
+            row = {"client_id": str(mid), "name": names.get(mid) or str(mid)}
+            if mcells is not None:
+                row["other"] = _others(mid, mcells)
+            out.append(row)
+        return sorted(out, key=lambda r: r["name"].lower())
+
+    return {
+        "new_true": _rows(new_true, names_t),
+        "moved_in": _rows(moved_in, names_t, mcells_l),   # where they were last week
+        "exited": _rows(exited, names_l),
+        "moved_out": _rows(moved_out, names_l, mcells_t),  # where they are this week
+    }
+
+
 def queue_group_rows():
     """The households/individuals awaiting kitchen assignment, using the EXACT
     definition the Logistics page renders (``MembersListView`` scope=logistics +
@@ -221,6 +382,7 @@ class LogisticsDashboardView(PortalAPIView):
             "queue": self._queue(today),
             "capacity": self._capacity(today),
             "forecast": self._forecast(today),
+            "po_membership_diff": po_membership_diff(today),
             "kitchen_orders": self._kitchen_orders(start, end),
             "outcomes": self._outcomes(start, end),
         })
@@ -802,6 +964,11 @@ class DistributionOverviewView(PortalAPIView):
             "row_totals": row_totals,
             "col_totals": col_totals,
             "grand_total": grand,
+            # Week-over-week churn of members actually ON A PO (not the roster
+            # above), by kitchen x cadence -- New (new-to-service / moved-in) and
+            # Dropped (exited / moved-out) between the two most recent completed
+            # weeks. Reconstructed from DeliveryOrder history.
+            "po_membership_diff": po_membership_diff(timezone.localdate()),
         })
 
 
@@ -947,3 +1114,26 @@ class DistributionKitchenMembersView(PortalAPIView):
             "has_more": start + len(results) < total,
             "results": results,
         })
+
+
+class DistributionPoDiffMembersView(PortalAPIView):
+    """Drill-down for the Distribution Overview's week-over-week PO membership
+    diff: the member names in each churn bucket for one (kitchen, cadence) cell.
+
+    ``GET /portal/dashboard/distribution/po-diff/members/?kitchen_id=<id|blank>&cadence_key=<mon,thu>``
+    Returns ``{new_true, moved_in, exited, moved_out}`` -- each a list of
+    ``{client_id, name[, other]}`` (``other`` = the member's other kitchen/cadence
+    cells, for movers).
+    """
+
+    def get(self, request):
+        agent = current_agent(request)
+        if not _is_privileged(agent):
+            return Response(
+                {"detail": "Logistics dashboard access required."}, status=403
+            )
+        kitchen_id = (request.query_params.get("kitchen_id") or "").strip() or None
+        cadence_key = (request.query_params.get("cadence_key") or "").strip()
+        return Response(
+            po_membership_cell_members(timezone.localdate(), kitchen_id, cadence_key)
+        )

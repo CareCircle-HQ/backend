@@ -14428,3 +14428,63 @@ class VerificationCreateEnforcesSingleEnrollmentTest(TestCase):
         enr = ser.save()
         self.assertEqual(
             EnrollmentVerification.objects.filter(client=client).count(), 1)
+
+
+class PoMembershipDiffTest(TestCase):
+    """Week-over-week membership churn per kitchen x cadence, from DeliveryOrders:
+    New (truly-new vs moved-in) and Dropped (exited vs moved-out)."""
+
+    def test_new_moved_exited_buckets(self):
+        from datetime import timedelta
+
+        from .models import (
+            Client, DeliveryOrder, DeliveryOrderStatus, Kitchen, KitchenStatus,
+            PurchaseOrder, PurchaseOrderStatus,
+        )
+        from .portal.views_dashboard_logistics import (
+            _completed_week_ranges, po_membership_cell_members, po_membership_diff,
+        )
+
+        today = timezone.localdate()
+        ts, te, ls, le = _completed_week_ranges(today)
+        A = Kitchen.objects.create(name="Kitchen A", status=KitchenStatus.ACTIVE)
+        B = Kitchen.objects.create(name="Kitchen B", status=KitchenStatus.ACTIVE)
+        po = PurchaseOrder.objects.create(status=PurchaseOrderStatus.DRAFT)
+
+        def client(n):
+            return Client.objects.create(
+                client_id=str(uuid.uuid4()), first_name=n, last_name="X")
+
+        def mk(c, kitchen, day):
+            DeliveryOrder.objects.create(
+                purchase_order=po, member=c, kitchen=kitchen,
+                expected_delivery_date=day, status=DeliveryOrderStatus.PENDING)
+
+        M1, M2, M3, M4 = client("M1"), client("M2"), client("M3"), client("M4")
+        tmon, tthu = ts, ts + timedelta(days=3)      # this completed week Mon/Thu
+        lmon, lthu = ls, ls + timedelta(days=3)      # prior completed week Mon/Thu
+        for d in (tmon, tthu):                        # this week
+            mk(M1, A, d); mk(M2, A, d); mk(M3, B, d)
+        for d in (lmon, lthu):                        # last week
+            mk(M1, A, d); mk(M3, A, d); mk(M4, A, d)
+
+        diff = po_membership_diff(today)
+        cells = {(c["kitchen_name"], c["cadence_key"]): c for c in diff["cells"]}
+
+        a = cells[("Kitchen A", "mon,thu")]
+        self.assertEqual((a["this"], a["last"]), (2, 3))       # {M1,M2} vs {M1,M3,M4}
+        self.assertEqual(a["new_true"], 1)                     # M2 truly new
+        self.assertEqual(a["moved_in"], 0)
+        self.assertEqual(a["exited"], 1)                       # M4 off every PO
+        self.assertEqual(a["moved_out"], 1)                    # M3 -> Kitchen B
+
+        b = cells[("Kitchen B", "mon,thu")]
+        self.assertEqual((b["this"], b["last"]), (1, 0))       # M3 new here
+        self.assertEqual(b["new_true"], 0)
+        self.assertEqual(b["moved_in"], 1)                     # M3 moved in from A
+
+        dr = po_membership_cell_members(today, a["kitchen_id"], "mon,thu")
+        self.assertEqual([r["name"] for r in dr["exited"]], ["M4 X"])
+        self.assertEqual([r["name"] for r in dr["moved_out"]], ["M3 X"])
+        # Mover carries where they went (Kitchen B / Mon/Thu).
+        self.assertTrue(dr["moved_out"][0]["other"])
