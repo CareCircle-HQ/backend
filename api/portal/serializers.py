@@ -278,6 +278,15 @@ def active_enrollment(client):
         return None
     open_ones = [e for e in enrollments if e.closed_at is None]
     pool = open_ones or enrollments
+    # Don't let a fresh PRE-VERIFICATION row (a new/renewal case still awaiting
+    # verification) represent a household that already has a more-advanced live
+    # enrollment: otherwise a Pending-Nutritionist (Verified) or serving
+    # enrollment gets hidden behind an unverified renewal. Restrict to the
+    # verified-or-beyond enrollments when any exist.
+    _PRE_VERIFICATION = {"pending_validation", "validated", "pending_verification"}
+    advanced = [e for e in pool if e.stage not in _PRE_VERIFICATION]
+    if advanced:
+        pool = advanced
     # Prefer the enrollment bound to the client's GOVERNING internal-service case,
     # so the program tab AND every program action (address / dietary / kitchen +
     # cadence / hold / member changes) plus /assign-kitchen/ -- all of which
