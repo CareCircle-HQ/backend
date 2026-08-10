@@ -3345,6 +3345,29 @@ def replace_enrollment_for_case_change(
 
     author = actor_label or _actor_name(actor)
 
+    # PRE-SERVICE REBIND (root-cause fix for the duplicate enrollments): a live
+    # enrollment still IN THE FUNNEL -- never served (Pending Verification /
+    # Verified / Kitchen Assignment) -- has no served history to preserve, so a
+    # SAME-KIND governing-case-id change should simply REBIND the new case onto
+    # it, NOT fork a parallel duplicate. Forking an in-funnel enrollment created
+    # a second verification the nutritionist + logistics then worked
+    # independently (two kitchen assignments for one household). A meals<->boxes
+    # change still forks below (the verification/plan is for the wrong product);
+    # a SERVED enrollment still forks (to keep the old one as read-only history).
+    # Returning None lets the caller's normal path project the new case's
+    # authorization onto the rebound enrollment, exactly as if it had been bound
+    # all along -- and it's idempotent (next reconcile hits the same-case guard).
+    same_kind = old_kind is not None and new_kind is not None and old_kind == new_kind
+    if not live_was_serving and same_kind:
+        try:
+            live.case = new_governing_case
+            live.program_name = new_governing_case.program_name or live.program_name
+            live.service_type = new_governing_case.service_type or live.service_type
+            live.save(update_fields=["case", "program_name", "service_type"])
+        except Exception:  # pragma: no cover - defensive
+            pass
+        return None
+
     with transaction.atomic():
         # Close the old enrollment: stop delivery, move to CLOSED, save metadata.
         try:

@@ -13780,11 +13780,13 @@ class DistributionOverviewKindFromEnrollmentTest(TestCase):
 
 
 class CaseSwitchClosesOldAndRespectsNutriGateTest(TestCase):
-    """A governing-case switch must (1) force-CLOSE the superseded enrollment so
-    no duplicate stays live, and (2) NOT skip the nutritionist gate: a verified
-    but not-yet-approved household rests at VERIFIED, not Kitchen Assignment."""
+    """A same-kind governing-case switch on an IN-FUNNEL (never-served)
+    enrollment REBINDS the new case onto it -- no fork, no duplicate -- and keeps
+    it at its current pre-service stage (so the nutritionist gate is never
+    skipped). A SERVED enrollment still forks, force-closing the old as
+    read-only history."""
 
-    def _setup(self, *, nutri):
+    def _setup(self, *, stage, nutri):
         from datetime import timedelta
 
         from .models import (
@@ -13815,36 +13817,68 @@ class CaseSwitchClosesOldAndRespectsNutriGateTest(TestCase):
         old_case = _case(1)
         live = EnrollmentVerification.objects.create(
             client=client, household=hh, case=old_case,
-            stage=EnrollmentStage.VERIFIED, program_name="Medically Tailored Meals",
+            stage=stage, program_name="Medically Tailored Meals",
             verified_at=now, nutritionist_approved_at=(now if nutri else None),
         )
         new_case = _case(30)
         return client, live, new_case
 
-    def test_old_force_closed_and_new_rests_at_verified_when_not_nutri(self):
+    def test_pre_service_same_kind_rebinds_no_duplicate(self):
+        from .models import EnrollmentStage, EnrollmentVerification
+        from .services.lifecycle import replace_enrollment_for_case_change
+
+        client, live, new_case = self._setup(
+            stage=EnrollmentStage.VERIFIED, nutri=False,
+        )
+        result = replace_enrollment_for_case_change(client, new_case)
+        # REBIND, not fork -> returns None (no new enrollment created).
+        self.assertIsNone(result)
+        live.refresh_from_db()
+        # The existing enrollment is rebound to the new case and stays VERIFIED
+        # (not force-closed, not skipped past the nutritionist gate).
+        self.assertEqual(str(live.case_id), str(new_case.case_id))
+        self.assertEqual(EnrollmentStage(live.stage), EnrollmentStage.VERIFIED)
+        # Exactly ONE live enrollment for the client -> no duplicate.
+        live_count = (
+            EnrollmentVerification.objects.filter(client=client)
+            .exclude(stage__in=["closed", "cancelled"]).count()
+        )
+        self.assertEqual(live_count, 1)
+
+    def test_served_switch_forks_and_closes_old(self):
         from .models import EnrollmentStage
         from .services.lifecycle import replace_enrollment_for_case_change
 
-        client, live, new_case = self._setup(nutri=False)
+        client, live, new_case = self._setup(
+            stage=EnrollmentStage.SERVICE_ACTIVE, nutri=True,
+        )
         new_enr = replace_enrollment_for_case_change(client, new_case)
+        # A SERVED enrollment still forks (old preserved as history).
         self.assertIsNotNone(new_enr)
         live.refresh_from_db(); new_enr.refresh_from_db()
-        # The superseded enrollment is CLOSED (previously left non-terminal).
         self.assertEqual(EnrollmentStage(live.stage), EnrollmentStage.CLOSED)
-        # Not nutritionist-approved -> rests at Verified (Pending Nutritionist),
-        # NOT force-stepped past the gate into Kitchen Assignment.
-        self.assertEqual(EnrollmentStage(new_enr.stage), EnrollmentStage.VERIFIED)
-
-    def test_new_advances_to_kitchen_when_nutri_approved(self):
-        from .models import EnrollmentStage
-        from .services.lifecycle import replace_enrollment_for_case_change
-
-        client, live, new_case = self._setup(nutri=True)
-        new_enr = replace_enrollment_for_case_change(client, new_case)
-        live.refresh_from_db(); new_enr.refresh_from_db()
-        self.assertEqual(EnrollmentStage(live.stage), EnrollmentStage.CLOSED)
-        self.assertEqual(EnrollmentStage(new_enr.stage), EnrollmentStage.KITCHEN_ASSIGNMENT)
+        self.assertEqual(new_enr.supersedes_id, live.pk)
         self.assertIsNotNone(new_enr.nutritionist_approved_at)  # carried forward
+
+    def test_full_reconcile_rebinds_verified_no_duplicate(self):
+        # End-to-end via the real entry point: a governing-case-id change on a
+        # verified (in-funnel) household rebinds instead of forking, so no
+        # duplicate enrollment is ever created for logistics/nutrition to
+        # double-work.
+        from .models import EnrollmentStage, EnrollmentVerification
+        from .services.lifecycle import reconcile_internal_service_authorization
+
+        client, live, new_case = self._setup(
+            stage=EnrollmentStage.VERIFIED, nutri=False,
+        )
+        reconcile_internal_service_authorization(client)
+        live.refresh_from_db()
+        self.assertEqual(str(live.case_id), str(new_case.case_id))  # rebound
+        live_count = (
+            EnrollmentVerification.objects.filter(client=client)
+            .exclude(stage__in=["closed", "cancelled"]).count()
+        )
+        self.assertEqual(live_count, 1)  # no duplicate
 
 
 class ReconcileSupersededLiveEnrollmentsTest(TestCase):
