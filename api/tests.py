@@ -14206,3 +14206,86 @@ class DedupeIgnoresClosedEnrollmentOccurrencesTest(TestCase):
         new_occ = self._new_occurrence(client=c, hh=hh, day=day)
         kept = _dedupe_calendar_occurrences([new_occ])
         self.assertEqual(len(kept), 0)  # duplicate against a LIVE enrollment
+
+
+class ReconcileClosedEnrollmentCalendarsTest(TestCase):
+    """The sweep truncates stale future occurrences off a CLOSED enrollment and
+    rebuilds the client's LIVE enrollment so near-term dates land on the enrollment
+    that actually serves."""
+
+    def test_moves_near_term_dates_from_closed_to_live(self):
+        from datetime import timedelta
+
+        from django.core.management import call_command
+
+        from .models import (
+            Case, CaseStatus, CaseType, Client, DeliveryCadence, EnrollmentStage,
+            EnrollmentVerification, Household, HouseholdMember, Kitchen,
+            KitchenStatus, MemberDeliverySchedule, MemberDietaryProfile,
+            MemberStatus, OrderSchedule, OrderStatus, ScheduleStatus,
+            ServiceAuthorizationStatus,
+        )
+
+        now = timezone.now()
+        client = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Sw", last_name="Eep",
+        )
+        hh = Household.objects.create(name="HH")
+        HouseholdMember.objects.create(household=hh, client=client, is_primary=True)
+        kitchen = Kitchen.objects.create(name="AST", status=KitchenStatus.ACTIVE)
+        case = Case.objects.create(
+            case_id=uuid.uuid4(), client=client, case_type=CaseType.INTERNAL_SERVICE,
+            case_status=CaseStatus.OPEN,
+            service_authorization_status=ServiceAuthorizationStatus.APPROVED,
+            service_authorization_approval_starts_at=now,
+            service_authorization_approval_ends_at=now + timedelta(days=120),
+            program_name="Medically Tailored Meals",
+        )
+        # CLOSED enrollment still holding a future SCHEDULED occurrence.
+        closed = EnrollmentVerification.objects.create(
+            client=client, household=hh, stage=EnrollmentStage.CLOSED,
+            program_name="Medically Tailored Meals",
+        )
+        cmp_ = MemberDietaryProfile.objects.create(
+            enrollment=closed, client=client, member_name="Sw Eep",
+        )
+        soon = timezone.localdate() + timedelta(days=3)
+        OrderSchedule.objects.create(
+            enrollment=closed, member=cmp_, member_name="Sw Eep",
+            anticipated_delivery_date=soon, program_name="Medically Tailored Meals",
+            status=OrderStatus.SCHEDULED, kitchen=kitchen,
+        )
+        # LIVE enrollment with a plan covering the same window, but NO calendar yet.
+        live = EnrollmentVerification.objects.create(
+            client=client, household=hh, case=case,
+            stage=EnrollmentStage.SERVICE_ACTIVE,
+            program_name="Medically Tailored Meals", kitchen=kitchen,
+            verified_at=now, delivery_weekdays=["mon", "thu"],
+        )
+        lmp = MemberDietaryProfile.objects.create(
+            enrollment=live, client=client, member_name="Sw Eep",
+            status=MemberStatus.ACTIVE,
+        )
+        MemberDeliverySchedule.objects.create(
+            enrollment=live, member_profile=lmp, member_name="Sw Eep",
+            delivery_days_cadence=DeliveryCadence.MON_THU, meals_per_day=3,
+            prod_per_delivery=0, meals_boxes_total=12, kitchen=kitchen,
+            status=ScheduleStatus.SCHEDULED,
+            starts_on=timezone.localdate(),
+            ends_on=timezone.localdate() + timedelta(days=120),
+        )
+
+        call_command("reconcile_closed_enrollment_calendars", "--apply")
+
+        # Closed enrollment's future occurrences are gone; live one now has some.
+        today = timezone.localdate()
+        closed_future = OrderSchedule.objects.filter(
+            enrollment=closed, status=OrderStatus.SCHEDULED,
+            anticipated_delivery_date__gte=today,
+        ).count()
+        live_future = OrderSchedule.objects.filter(
+            enrollment=live, status=OrderStatus.SCHEDULED,
+            anticipated_delivery_date__gte=today,
+        ).count()
+        self.assertEqual(closed_future, 0)
+        self.assertGreater(live_future, 0)
