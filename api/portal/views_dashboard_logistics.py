@@ -183,6 +183,34 @@ def po_membership_diff(today):
     cells_t, members_t, _mc_t, _n_t = _po_week_membership(ts, te)
     cells_l, members_l, _mc_l, _n_l = _po_week_membership(ls, le)
 
+    # Program-wide (deduped) weekly summary. "New to service" is the truest
+    # "members we added this week" -- their FIRST-EVER non-cancelled delivery
+    # order falls in this week (vs merely absent from last week's PO, which a
+    # resume/return would also satisfy -- counted separately as "returned").
+    from django.db.models import Min
+
+    added_vs_last = members_t - members_l
+    exited_vs_last = members_l - members_t
+    first_do = dict(
+        DeliveryOrder.objects
+        .filter(member_id__in=members_t)
+        .exclude(status=DeliveryOrderStatus.CANCELLED)
+        .values("member_id").annotate(first=Min("expected_delivery_date"))
+        .values_list("member_id", "first")
+    )
+    new_to_service = sum(
+        1 for m in added_vs_last
+        if first_do.get(m) is not None and first_do[m] >= ts
+    )
+    summary = {
+        "this_total": len(members_t),
+        "last_total": len(members_l),
+        "net": len(members_t) - len(members_l),
+        "new_to_service": new_to_service,               # first-ever PO this week
+        "returned": len(added_vs_last) - new_to_service,  # back after a gap
+        "exited": len(exited_vs_last),                   # off every PO this week
+    }
+
     kitchens, cadences, out_cells = {}, {}, []
     for cell in set(cells_t) | set(cells_l):
         kid, kname, ckey, clabel = cell
@@ -215,6 +243,7 @@ def po_membership_diff(today):
         ],
         "cells": out_cells,
         "totals": {"this": len(members_t), "last": len(members_l)},
+        "summary": summary,
     }
 
 

@@ -14483,6 +14483,12 @@ class PoMembershipDiffTest(TestCase):
         self.assertEqual(b["new_true"], 0)
         self.assertEqual(b["moved_in"], 1)                     # M3 moved in from A
 
+        s = diff["summary"]
+        self.assertEqual((s["this_total"], s["last_total"], s["net"]), (3, 3, 0))
+        self.assertEqual(s["new_to_service"], 1)   # M2 (first-ever PO this week)
+        self.assertEqual(s["returned"], 0)
+        self.assertEqual(s["exited"], 1)           # M4
+
         dr = po_membership_cell_members(today, a["kitchen_id"], "mon,thu")
         self.assertEqual([r["name"] for r in dr["exited"]], ["M4 X"])
         self.assertEqual([r["name"] for r in dr["moved_out"]], ["M3 X"])
