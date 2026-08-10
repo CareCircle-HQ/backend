@@ -2,16 +2,20 @@
 
 A governing-case replacement supersedes the old enrollment and should CLOSE it,
 but a swallowed ``InvalidTransition`` previously left some superseded rows LIVE
-(still at verified / kitchen_assignment). That produced TWO live enrollments for
-one client -- so the profile / PO / nutritionist flows could read or act on the
-stale one (e.g. a kitchen assigned on the real row while the profile showed the
-stale one with no kitchen).
+(still at verified / kitchen_assignment / service_active). That produced TWO live
+enrollments for one client -- inflating the Distribution matrix, double-feeding
+POs, and letting the profile / nutritionist flows read the stale one.
 
 This closes each superseded-but-non-terminal enrollment, first carrying its
-Nutritionist sign-off onto the surviving (superseding) enrollment so the approval
-isn't lost, then recomputing the client's lifecycle stage.
+Nutritionist sign-off onto the surviving (superseding) enrollment, then
+recomputing the client's lifecycle stage.
 
-Dry-run by default; pass --apply to commit.
+SAFETY: it will NOT close a superseded row that still has a live (future)
+delivery schedule when its SURVIVOR has none -- closing that would end the
+member's service. Those are reported for manual review instead.
+
+Dry-run by default; pass --apply to commit. Use --limit N to process a small
+batch first, and --list for per-enrollment detail.
 """
 from collections import Counter
 
@@ -19,7 +23,13 @@ from django.core.management.base import BaseCommand
 from django.db import transaction
 from django.utils import timezone
 
-from api.models import Client, EnrollmentStage, EnrollmentVerification
+from api.models import (
+    Client,
+    EnrollmentStage,
+    EnrollmentVerification,
+    MemberDeliverySchedule,
+    ScheduleStatus,
+)
 from api.services.lifecycle import recompute_client_stage
 
 _TERMINAL = [EnrollmentStage.CLOSED, EnrollmentStage.CANCELLED]
@@ -31,47 +41,91 @@ _NUTRI_FIELDS = [
 ]
 
 
+def _future_sched(enr, today):
+    """Count of live (SCHEDULED, not-yet-ended) delivery schedules on ``enr`` --
+    a proxy for 'this enrollment is actively serving'."""
+    if enr is None:
+        return 0
+    return (
+        MemberDeliverySchedule.objects
+        .filter(enrollment=enr, status=ScheduleStatus.SCHEDULED)
+        .exclude(ends_on__lt=today)
+        .count()
+    )
+
+
 class Command(BaseCommand):
     help = (
         "Close superseded-but-live enrollments (carrying nutritionist approval to "
-        "the survivor). Dry-run unless --apply."
+        "the survivor), skipping any where closing would end active service. "
+        "Dry-run unless --apply."
     )
 
     def add_arguments(self, parser):
         parser.add_argument("--apply", action="store_true", help="Commit the changes.")
+        parser.add_argument("--list", action="store_true", help="Print per-enrollment detail.")
         parser.add_argument(
-            "--list", action="store_true",
-            help="Print each affected enrollment (read-only detail).",
+            "--limit", type=int, default=0,
+            help="Process at most N enrollments this run (0 = no limit).",
         )
 
     def handle(self, *args, **opts):
         apply = opts["apply"]
         list_detail = opts["list"]
+        limit = opts["limit"]
+        today = timezone.localdate()
 
-        # Superseded (something supersedes them) yet NOT terminal -> stale duplicates.
         qs = (
             EnrollmentVerification.objects
             .filter(superseded_by__isnull=False)
             .exclude(stage__in=[s.value for s in _TERMINAL])
             .select_related("client")
             .distinct()
+            .order_by("pk")
         )
-        total = qs.count()
-        by_stage = Counter(qs.values_list("stage", flat=True))
 
+        to_close, unsafe = [], []
+        for old in qs:
+            survivor = old.superseded_by.first()
+            old_future = _future_sched(old, today)
+            surv_future = _future_sched(survivor, today)
+            # DANGER: the superseded row is the one actually serving and the
+            # survivor is not -> closing it would drop the member's only live
+            # plan. Leave it for manual review.
+            if old_future > 0 and surv_future == 0:
+                unsafe.append((old, survivor, old_future, surv_future))
+            else:
+                to_close.append((old, survivor, old_future, surv_future))
+
+        if limit and len(to_close) > limit:
+            to_close = to_close[:limit]
+
+        by_stage = Counter(o.stage for o, *_ in to_close)
         self.stdout.write(self.style.MIGRATE_HEADING(
             "\n=== Close superseded-but-live enrollments ==="
         ))
-        self.stdout.write(f"  stale duplicates to close: {total}")
+        self.stdout.write(f"  safe to close: {len(to_close)}"
+                          + (f"  (limited to {limit})" if limit else ""))
         for stage, n in sorted(by_stage.items()):
             self.stdout.write(f"     {n:6}  {stage}")
+        if unsafe:
+            self.stdout.write(self.style.WARNING(
+                f"  SKIPPED (superseded row is the live server; survivor has no "
+                f"schedule) -- review manually: {len(unsafe)}"
+            ))
+            for old, surv, of, sf in unsafe[:50]:
+                self.stdout.write(
+                    f"     old={old.pk} ({old.stage}, future={of}) "
+                    f"survivor={surv.pk if surv else None} (future={sf}) client={old.client_id}"
+                )
+
         if list_detail:
-            for e in qs.order_by("client__last_name", "client__first_name"):
-                c = e.client
+            for old, surv, of, sf in to_close:
+                c = old.client
                 name = (f"{c.first_name} {c.last_name}".strip() if c else "") or "?"
                 self.stdout.write(
-                    f"    enr={e.pk} client={e.client_id} {name:24.24} "
-                    f"stage={e.stage:20.20} nutri={'Y' if e.nutritionist_approved_at else '-'}"
+                    f"    close old={old.pk} {name:22.22} {old.stage:16.16} "
+                    f"future={of}  ->  survivor={surv.pk if surv else None} future={sf}"
                 )
 
         if not apply:
@@ -83,13 +137,10 @@ class Command(BaseCommand):
         closed = 0
         client_ids = set()
         now = timezone.now()
-        ids = list(qs.values_list("pk", flat=True))
-        for i in range(0, len(ids), 500):
-            chunk = ids[i:i + 500]
+        for i in range(0, len(to_close), 200):
+            batch = to_close[i:i + 200]
             with transaction.atomic():
-                for old in EnrollmentVerification.objects.filter(pk__in=chunk):
-                    survivor = old.superseded_by.first()
-                    # Carry the sign-off to the survivor if it lacks its own.
+                for old, survivor, _of, _sf in batch:
                     if (
                         survivor is not None
                         and old.nutritionist_approved_at
@@ -100,8 +151,17 @@ class Command(BaseCommand):
                         survivor.save(update_fields=_NUTRI_FIELDS)
                     old.stage = EnrollmentStage.CLOSED
                     old.stage_at = now
+                    if old.closed_at is None:
+                        old.closed_at = now
                     old.close_reason = old.close_reason or "duplicate_superseded"
-                    old.save(update_fields=["stage", "stage_at", "close_reason"])
+                    old.save(update_fields=["stage", "stage_at", "closed_at", "close_reason"])
+                    # Drop the stale row's future deliveries so it stops feeding POs
+                    # / the distribution matrix (batched/committed rows preserved).
+                    try:
+                        from api.services.orders import truncate_future_deliveries
+                        truncate_future_deliveries(old)
+                    except Exception:  # noqa: BLE001
+                        pass
                     closed += 1
                     if old.client_id:
                         client_ids.add(old.client_id)
@@ -118,5 +178,6 @@ class Command(BaseCommand):
                 self.stderr.write(f"  recompute failed for client {cid}")
 
         self.stdout.write(self.style.SUCCESS(
-            f"\nAPPLIED: closed {closed} stale enrollment(s); recomputed {healed} client(s)."
+            f"\nAPPLIED: closed {closed} stale enrollment(s); recomputed {healed} "
+            f"client(s). Skipped (unsafe): {len(unsafe)}."
         ))
