@@ -13909,3 +13909,56 @@ class ReconcileSupersededLiveEnrollmentsTest(TestCase):
         old.refresh_from_db()
         # Superseded row is the only server -> must NOT be closed.
         self.assertEqual(EnrollmentStage(old.stage), EnrollmentStage.SERVICE_ACTIVE)
+
+
+class ClosedCaseHoldDisplayTest(TestCase):
+    """A hold over a CLOSED governing case is the closure full-stop, so it reads
+    as Closed / Inactive -- not a confusing On Hold -- on the program + list."""
+
+    def _setup(self, case_status, *, lifecycle=None):
+        from .models import (
+            Case, CaseStatus, CaseType, Client, EnrollmentStage,
+            EnrollmentVerification, Household, HouseholdMember,
+            ServiceAuthorizationStatus,
+        )
+
+        client = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Hold", last_name="Case",
+            lifecycle_stage=(lifecycle or "active"),
+        )
+        hh = Household.objects.create(name="HH")
+        HouseholdMember.objects.create(household=hh, client=client, is_primary=True)
+        case = Case.objects.create(
+            case_id=uuid.uuid4(), client=client, case_type=CaseType.INTERNAL_SERVICE,
+            case_status=case_status,
+            service_authorization_status=ServiceAuthorizationStatus.APPROVED,
+            program_name="Medically Tailored Meals",
+        )
+        enr = EnrollmentVerification.objects.create(
+            client=client, household=hh, case=case,
+            stage=EnrollmentStage.ON_HOLD, verified_at=timezone.now(),
+        )
+        return client, enr
+
+    def test_program_status_hold_over_closed_case_is_closed(self):
+        from .models import CaseStatus, ProgramStatus
+        from .services.lifecycle import program_status
+
+        _, enr = self._setup(CaseStatus.CLOSED)
+        self.assertEqual(program_status(enr), ProgramStatus.CLOSED)
+
+    def test_program_status_hold_over_open_case_is_on_hold(self):
+        from .models import CaseStatus, ProgramStatus
+        from .services.lifecycle import program_status
+
+        _, enr = self._setup(CaseStatus.OPEN)
+        self.assertEqual(program_status(enr), ProgramStatus.ON_HOLD)
+
+    def test_verification_status_inactive_not_on_hold(self):
+        from .models import CaseStatus, ClientStage
+        from .portal.serializers import verification_status
+
+        client, _ = self._setup(CaseStatus.CLOSED, lifecycle=ClientStage.SERVICE_INACTIVE)
+        # Closure full-stop (service_inactive) -> shows the real "Inactive" label,
+        # not the On Hold overlay.
+        self.assertNotEqual(verification_status(client), "On Hold")
