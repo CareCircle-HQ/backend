@@ -13843,3 +13843,69 @@ class CaseSwitchClosesOldAndRespectsNutriGateTest(TestCase):
         self.assertEqual(EnrollmentStage(live.stage), EnrollmentStage.CLOSED)
         self.assertEqual(EnrollmentStage(new_enr.stage), EnrollmentStage.KITCHEN_ASSIGNMENT)
         self.assertIsNotNone(new_enr.nutritionist_approved_at)  # carried forward
+
+
+class ReconcileSupersededLiveEnrollmentsTest(TestCase):
+    """The cleanup closes a superseded duplicate when the survivor is still
+    serving, but SKIPS it when the superseded row is the only one serving (so it
+    never ends a member's service)."""
+
+    def _pair(self, *, survivor_serving):
+        from .models import (
+            Client, DeliveryCadence, EnrollmentStage, EnrollmentVerification,
+            Household, HouseholdMember, MemberDeliverySchedule,
+            MemberDietaryProfile, MemberStatus, ScheduleStatus,
+        )
+
+        client = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Dup", last_name="Lic",
+        )
+        hh = Household.objects.create(name="HH")
+        HouseholdMember.objects.create(household=hh, client=client, is_primary=True)
+        old = EnrollmentVerification.objects.create(
+            client=client, household=hh, stage=EnrollmentStage.SERVICE_ACTIVE,
+            verified_at=timezone.now(),
+        )
+        survivor = EnrollmentVerification.objects.create(
+            client=client, household=hh, stage=EnrollmentStage.SERVICE_ACTIVE,
+            verified_at=timezone.now(), supersedes=old,
+        )
+
+        def _sched(enr):
+            mp = MemberDietaryProfile.objects.create(
+                enrollment=enr, client=client, member_name="Dup Lic",
+                status=MemberStatus.ACTIVE,
+            )
+            MemberDeliverySchedule.objects.create(
+                enrollment=enr, member_profile=mp, member_name="Dup Lic",
+                delivery_days_cadence=DeliveryCadence.MON_THU, meals_per_day=3,
+                prod_per_delivery=0, meals_boxes_total=12,
+                status=ScheduleStatus.SCHEDULED,  # ends_on null -> future
+            )
+
+        _sched(old)  # the superseded row is serving
+        if survivor_serving:
+            _sched(survivor)
+        return old, survivor
+
+    def test_closes_duplicate_when_survivor_serving(self):
+        from django.core.management import call_command
+
+        from .models import EnrollmentStage
+
+        old, survivor = self._pair(survivor_serving=True)
+        call_command("reconcile_superseded_live_enrollments", "--apply")
+        old.refresh_from_db(); survivor.refresh_from_db()
+        self.assertEqual(EnrollmentStage(old.stage), EnrollmentStage.CLOSED)
+        self.assertEqual(EnrollmentStage(survivor.stage), EnrollmentStage.SERVICE_ACTIVE)
+
+    def test_skips_when_survivor_not_serving(self):
+        from django.core.management import call_command
+
+        from .models import EnrollmentStage
+
+        old, survivor = self._pair(survivor_serving=False)
+        call_command("reconcile_superseded_live_enrollments", "--apply")
+        old.refresh_from_db()
+        # Superseded row is the only server -> must NOT be closed.
+        self.assertEqual(EnrollmentStage(old.stage), EnrollmentStage.SERVICE_ACTIVE)
