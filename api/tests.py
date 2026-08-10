@@ -14050,3 +14050,47 @@ class ActiveEnrollmentPrefersGoverningCaseTest(TestCase):
         EnrollmentVerification.objects.filter(pk=other_enr.pk).update(opened_at=now)
 
         self.assertEqual(active_enrollment(client).pk, gov_enr.pk)
+
+
+class ReassignRunsFullCalendarReconcileTest(TestCase):
+    """A kitchen/cadence CHANGE (re-assignment) runs the same per-enrollment
+    reconcile as sync_delivery_calendars (reconcile_enrollment_calendar) so the
+    individual household's calendar is fully rebuilt; a FIRST-TIME assignment
+    still uses the plain calendar expansion."""
+
+    def _run(self, *, created):
+        from unittest.mock import patch
+
+        from .models import (
+            Client, DeliveryCadence, EnrollmentStage, EnrollmentVerification,
+            Kitchen, KitchenStatus,
+        )
+        from .portal import views_members as vm
+
+        client = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Re", last_name="Assign",
+        )
+        kitchen = Kitchen.objects.create(name="K", status=KitchenStatus.ACTIVE)
+        enr = EnrollmentVerification.objects.create(
+            client=client, stage=EnrollmentStage.SERVICE_ACTIVE,
+        )
+        with patch.object(vm, "create_member_delivery_schedules", return_value=created), \
+                patch.object(vm, "update_household_cadence"), \
+                patch.object(vm, "reconcile_enrollment_calendar") as recon, \
+                patch.object(vm, "generate_delivery_calendar") as gen, \
+                patch.object(vm, "resync_scheduled_orders"), \
+                patch.object(vm, "sync_household_warnings"):
+            vm.assign_kitchen_to_household(
+                enr, client, kitchen, cadence=DeliveryCadence.MON_THU,
+            )
+        return recon, gen
+
+    def test_reassignment_runs_full_reconcile(self):
+        recon, gen = self._run(created=[])   # schedules already exist -> re-assign
+        recon.assert_called_once()
+        gen.assert_not_called()
+
+    def test_first_time_uses_generate(self):
+        recon, gen = self._run(created=[1])  # new plan created -> first-time
+        gen.assert_called_once()
+        recon.assert_not_called()

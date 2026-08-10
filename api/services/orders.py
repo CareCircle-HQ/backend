@@ -523,6 +523,38 @@ def sync_delivery_calendar(enrollment, from_date=None):
     return {"added": len(to_create), "removed": removed, "updated": updated}
 
 
+def reconcile_enrollment_calendar(enrollment, from_date=None):
+    """Run the SAME per-enrollment reconcile that :func:`sync_active_calendars`
+    (the ``sync_delivery_calendars`` command / PO "Refresh") applies, but for ONE
+    enrollment:
+
+      1. heal a meals<->boxes governing-case switch (rename / requeue),
+      2. extend a lapsed/drifted plan window from the governing authorization,
+      3. rebuild the dated calendar -- creating a plan for any member missing one
+         and adding/removing/updating future occurrences (PO-batched dates kept).
+
+    Returns ``{action, added, removed, updated, plans_created}`` where ``action``
+    is ``"requeue"`` (wrong-kind household sent back to Kitchen Assignment, no
+    rebuild), ``"rename"`` or ``"rebuild"``. Shared so a per-edit kitchen/cadence
+    save rebuilds its calendar EXACTLY like the batch job -- no member silently
+    dropped from a Purchase Order.
+    """
+    from_date = from_date or timezone.localdate()
+    try:
+        from api.services.lifecycle import remediate_switched_household
+
+        switch_action = remediate_switched_household(enrollment)
+    except Exception:  # pragma: no cover - defensive; never break the caller
+        switch_action = None
+    if switch_action == "requeue":
+        return {"action": "requeue", "added": 0, "removed": 0,
+                "updated": 0, "plans_created": 0}
+    heal_delivery_window(enrollment, from_date=from_date)
+    res = dict(rebuild_delivery_calendar(enrollment, from_date=from_date))
+    res["action"] = "rename" if switch_action == "rename" else "rebuild"
+    return res
+
+
 def sync_active_calendars(from_date=None, progress_cb=None):
     """Reconcile the delivery calendar for every enrollment that either has
     future occurrences OR still has a live plan covering future dates (see
@@ -577,39 +609,19 @@ def sync_active_calendars(from_date=None, progress_cb=None):
     if progress_cb is not None:
         progress_cb(0, total)
     for enr in EnrollmentVerification.objects.filter(pk__in=enr_ids).iterator():
-        # Self-heal a meals<->boxes governing-case switch BEFORE rebuilding, so no
-        # member is served the wrong product or dropped from the correct PO by a
-        # stale plan: a stale-name/correct-plan household is renamed + reconciled;
-        # a wrong-kind / kitchen-incompatible one is requeued to Kitchen
-        # Assignment (and then skipped here -- it's excluded from POs until ops
-        # reassign a compatible kitchen). Best-effort; never breaks the sweep.
-        try:
-            from api.services.lifecycle import remediate_switched_household
-
-            switch_action = remediate_switched_household(enr)
-        except Exception:  # pragma: no cover - defensive
-            switch_action = None
-        if switch_action == "requeue":
+        # Identical per-enrollment reconcile shared with the per-edit
+        # kitchen/cadence save: heal a meals<->boxes switch (rename/requeue),
+        # extend a lapsed/drifted window from the governing authorization, then
+        # rebuild the calendar (creating a plan for any member missing one).
+        res = reconcile_enrollment_calendar(enr, from_date=from_date)
+        totals["enrollments"] += 1
+        if res["action"] == "requeue":
             totals["requeued"] += 1
-            totals["enrollments"] += 1
             if progress_cb is not None:
                 progress_cb(totals["enrollments"], total)
             continue
-        if switch_action == "rename":
+        if res["action"] == "rename":
             totals["renamed"] += 1
-        # First heal a drifted/lapsed plan window from the governing APPROVED
-        # authorization: heal_delivery_window pulls ends_on up to the auth end
-        # (no-op when already in sync, when nothing authorizes the future, or on
-        # a meals<->boxes switch). Without this, rebuild below only regenerates
-        # WITHIN the stale window, so a lapsed-but-authorized member would never
-        # return to a Purchase Order.
-        heal_delivery_window(enr, from_date=from_date)
-        # Then rebuild (not just sync) so a member ADDED to an already-active
-        # household -- who never got a delivery plan and is therefore missing
-        # from the calendar + every future PO -- is created and scheduled. This
-        # is the batch self-heal counterpart to the per-edit activation heal.
-        res = rebuild_delivery_calendar(enr, from_date=from_date)
-        totals["enrollments"] += 1
         totals["added"] += res["added"]
         totals["removed"] += res["removed"]
         totals["updated"] += res["updated"]
