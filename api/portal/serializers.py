@@ -278,6 +278,18 @@ def active_enrollment(client):
         return None
     open_ones = [e for e in enrollments if e.closed_at is None]
     pool = open_ones or enrollments
+    # Prefer the enrollment bound to the client's GOVERNING internal-service case,
+    # so the program tab AND every program action (address / dietary / kitchen +
+    # cadence / hold / member changes) plus /assign-kitchen/ -- all of which
+    # resolve the enrollment through here -- target the SAME enrollment even when
+    # a client briefly has two live enrollments (e.g. two open cases mid-switch).
+    # Falls back to the most-recently-opened when none is bound to the governing
+    # case (or for a dependent, whose case sits on the household primary).
+    gov = internal_service_case(client)
+    if gov is not None:
+        bound = [e for e in pool if str(e.case_id) == str(gov.case_id)]
+        if bound:
+            pool = bound
     return sorted(pool, key=lambda e: e.opened_at or timezone.now(), reverse=True)[0]
 
 

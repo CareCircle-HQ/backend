@@ -98,6 +98,7 @@ from ..services.orders import (
     _format_address,
     generate_delivery_calendar,
     rebuild_delivery_calendar,
+    reconcile_enrollment_calendar,
     resync_scheduled_orders,
     sync_delivery_calendar,
 )
@@ -5774,13 +5775,16 @@ def assign_kitchen_to_household(
         # Re-assignment: the household ALREADY had a plan, so the builder above
         # was a no-op and would otherwise keep the OLD cadence's delivery days.
         # Re-apply the chosen cadence to the existing schedules (recomputes
-        # weekdays, first delivery, per-delivery quantity + totals) and rebuild
-        # the dated calendar so delivery DATES move with the cadence.
+        # weekdays, first delivery, per-delivery quantity + totals), then run the
+        # SAME per-enrollment reconcile as sync_delivery_calendars (heal window +
+        # rebuild calendar + create any missing member plan) so this individual
+        # kitchen/cadence change rebuilds its calendar exactly like the batch job
+        # -- no member silently dropped from the next Purchase Order.
         update_household_cadence(
             enr, cadence=cadence, once_a_week_weekday=once_weekday, case=case,
             product_kind=product_kind_for_enrollment(enr),
         )
-        sync_delivery_calendar(enr)
+        reconcile_enrollment_calendar(enr)
 
     # Push the newly chosen kitchen + refreshed meal-rule results onto the plans
     # and future occurrences so PO generation reflects the change.

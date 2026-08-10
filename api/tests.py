@@ -13999,3 +13999,98 @@ class ClosedCaseHoldDisplayTest(TestCase):
         # Closure full-stop (service_inactive) -> shows the real "Inactive" label,
         # not the On Hold overlay.
         self.assertNotEqual(verification_status(client), "On Hold")
+
+
+class ActiveEnrollmentPrefersGoverningCaseTest(TestCase):
+    """active_enrollment (used by the program tab + all its actions +
+    /assign-kitchen/) targets the enrollment bound to the GOVERNING internal-
+    service case, even when a non-governing enrollment opened more recently."""
+
+    def test_prefers_enrollment_on_governing_case(self):
+        from datetime import timedelta
+
+        from .models import (
+            Case, CaseStatus, CaseType, Client, EnrollmentStage,
+            EnrollmentVerification, Household, HouseholdMember,
+            ServiceAuthorizationStatus,
+        )
+        from .portal.serializers import active_enrollment
+
+        now = timezone.now()
+        client = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Gov", last_name="Case",
+        )
+        hh = Household.objects.create(name="HH")
+        HouseholdMember.objects.create(household=hh, client=client, is_primary=True)
+        gov_case = Case.objects.create(
+            case_id=uuid.uuid4(), client=client, case_type=CaseType.INTERNAL_SERVICE,
+            case_status=CaseStatus.OPEN,
+            service_authorization_status=ServiceAuthorizationStatus.APPROVED,
+            program_name="MTM", case_created_at=now, date_opened=now,
+        )
+        other_case = Case.objects.create(
+            case_id=uuid.uuid4(), client=client, case_type=CaseType.INTERNAL_SERVICE,
+            case_status=CaseStatus.OPEN,
+            service_authorization_status=ServiceAuthorizationStatus.DENIED,
+            program_name="MTM", case_created_at=now + timedelta(days=5),
+            date_opened=now + timedelta(days=5),
+        )
+        gov_enr = EnrollmentVerification.objects.create(
+            client=client, household=hh, case=gov_case,
+            stage=EnrollmentStage.SERVICE_ACTIVE,
+        )
+        other_enr = EnrollmentVerification.objects.create(
+            client=client, household=hh, case=other_case,
+            stage=EnrollmentStage.PENDING_VERIFICATION,
+        )
+        # Force the NON-governing enrollment to look more recent (would win by
+        # recency without the governing-case preference).
+        EnrollmentVerification.objects.filter(pk=gov_enr.pk).update(
+            opened_at=now - timedelta(days=5))
+        EnrollmentVerification.objects.filter(pk=other_enr.pk).update(opened_at=now)
+
+        self.assertEqual(active_enrollment(client).pk, gov_enr.pk)
+
+
+class ReassignRunsFullCalendarReconcileTest(TestCase):
+    """A kitchen/cadence CHANGE (re-assignment) runs the same per-enrollment
+    reconcile as sync_delivery_calendars (reconcile_enrollment_calendar) so the
+    individual household's calendar is fully rebuilt; a FIRST-TIME assignment
+    still uses the plain calendar expansion."""
+
+    def _run(self, *, created):
+        from unittest.mock import patch
+
+        from .models import (
+            Client, DeliveryCadence, EnrollmentStage, EnrollmentVerification,
+            Kitchen, KitchenStatus,
+        )
+        from .portal import views_members as vm
+
+        client = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Re", last_name="Assign",
+        )
+        kitchen = Kitchen.objects.create(name="K", status=KitchenStatus.ACTIVE)
+        enr = EnrollmentVerification.objects.create(
+            client=client, stage=EnrollmentStage.SERVICE_ACTIVE,
+        )
+        with patch.object(vm, "create_member_delivery_schedules", return_value=created), \
+                patch.object(vm, "update_household_cadence"), \
+                patch.object(vm, "reconcile_enrollment_calendar") as recon, \
+                patch.object(vm, "generate_delivery_calendar") as gen, \
+                patch.object(vm, "resync_scheduled_orders"), \
+                patch.object(vm, "sync_household_warnings"):
+            vm.assign_kitchen_to_household(
+                enr, client, kitchen, cadence=DeliveryCadence.MON_THU,
+            )
+        return recon, gen
+
+    def test_reassignment_runs_full_reconcile(self):
+        recon, gen = self._run(created=[])   # schedules already exist -> re-assign
+        recon.assert_called_once()
+        gen.assert_not_called()
+
+    def test_first_time_uses_generate(self):
+        recon, gen = self._run(created=[1])  # new plan created -> first-time
+        gen.assert_called_once()
+        recon.assert_not_called()
