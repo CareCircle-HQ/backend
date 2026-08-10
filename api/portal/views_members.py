@@ -490,9 +490,20 @@ def _enforce_delivery_coverage(enrollment, agent):
         reason_detail = (
             f"The {source} ZIP {offending_zip} is outside the delivery coverage area."
         )
+        # Out of range now makes the program INELIGIBLE (hard, sticky off-ramp)...
         apply_out_of_range_ineligibility(
             mv.client, reason_detail=reason_detail, actor_label=author,
         )
+        # ...while KEEPING the Out of Range tracking event on the member's history
+        # (the eligibility off-ramp emits member_ineligible; this preserves the
+        # out_of_range point with the offending ZIP). De-duped per enrollment+member.
+        try:
+            timeline.event_for_out_of_range(
+                mv, enrollment=enrollment, reason=reason_detail,
+                zip_code=offending_zip, actor=author,
+            )
+        except Exception:  # never let history-logging break the off-ramp
+            logger.warning("out-of-range event emit failed", exc_info=True)
         out_names.append(_member_name(mv))
         if not ticket_zip:
             ticket_zip, ticket_source = offending_zip, source
@@ -1412,6 +1423,13 @@ class MembersListView(PortalGenericAPIView):
                     )
                 )
             )
+            # Only ELIGIBLE, VERIFIED households belong in the kitchen-assignment
+            # queue. Exclude Not Eligible clients, and any household that was never
+            # verified (no governing enrollment with verified_at) -- e.g. one
+            # wrongly advanced to kitchen assignment by a governing-case
+            # replacement before the verification gate, or a stage/lifecycle drift.
+            qs = qs.exclude(lifecycle_stage=ClientStage.INELIGIBLE)
+            qs = qs.filter(verification_completed_q()).distinct()
 
         # Status filter (Members page grouped dropdown). One selection spanning
         # several axes; each value maps to exactly one query. Legacy Verification
@@ -4653,6 +4671,45 @@ class NutritionistPendingListView(PortalAPIView):
         return Response({"count": len(results), "results": results})
 
 
+class MeSignatureView(PortalAPIView):
+    """GET/PUT the logged-in agent's SAVED signature image (a PNG data URL).
+
+    Lets a Nutritionist store their signature once and reuse it on the Nutrition
+    Case Review sign-off with one click, instead of drawing it every time. PUT an
+    empty ``signature_image`` to clear it."""
+
+    def get(self, request):
+        agent = current_agent(request)
+        if agent is None:
+            return Response({"signature_image": "", "name": ""})
+        return Response({
+            "signature_image": agent.signature_image or "",
+            "name": agent.name or "",
+        })
+
+    def put(self, request):
+        agent = current_agent(request)
+        if agent is None:
+            return Response(
+                {"error": "No agent for this session."},
+                status=http.HTTP_400_BAD_REQUEST,
+            )
+        image = (request.data.get("signature_image") or "").strip()
+        # Accept only a data-URL image (what the signature pad produces) or blank
+        # (to clear). Guards against storing arbitrary payloads in the text field.
+        if image and not image.startswith("data:image/"):
+            return Response(
+                {"signature_image": "A signature image (data URL) is required."},
+                status=http.HTTP_400_BAD_REQUEST,
+            )
+        agent.signature_image = image
+        agent.save(update_fields=["signature_image", "updated_at"])
+        return Response({
+            "signature_image": agent.signature_image or "",
+            "name": agent.name or "",
+        })
+
+
 class MemberNutritionistApproveView(PortalAPIView):
     """POST /members/<id>/nutritionist-approve/: a Nutritionist signs off on the
     member's VERIFIED enrollment (the legal sign-off gate). Nutritionist role
@@ -4866,11 +4923,18 @@ class MemberNutritionistDenyMemberView(PortalAPIView):
         mv.save(update_fields=["status", "kitchen_meal_type", "kitchen_food_notes"])
         from ..services.timeline import emit_timeline_event
         if mv.client_id:
+            member_name = (mv.member_name or "").strip()
             emit_timeline_event(
                 client=mv.client, event_type=TimelineEventType.NUTRITIONIST_PAUSED,
                 occurred_at=timezone.now(), title="Nutritionist Paused",
-                subtitle=reason, badge_text="Paused", badge_tone=TimelineBadgeTone.DANGER,
-                actor=agent.name or "", enrollment=enr, metadata={"reason": reason},
+                subtitle=f"{member_name} \u00b7 {reason}" if member_name else reason,
+                badge_text="Paused", badge_tone=TimelineBadgeTone.DANGER,
+                actor=agent.name or "", enrollment=enr,
+                metadata={
+                    "member_name": member_name,
+                    "menu_type": mv.menu_type or "",
+                    "reason": reason,
+                },
             )
             Note.objects.create(
                 client=mv.client, source=NoteSource.AGENT, author_name=agent.name or "",
@@ -5197,6 +5261,13 @@ class MemberVerificationCreateView(PortalAPIView):
         actor_label = (
             agent.name or (f"agent:{agent.agent_code}" if agent.agent_code else "")
         ) if agent else ""
+        # Record the REQUEST first (who + governing case + member roster) while the
+        # enrollment is still PENDING_VERIFICATION, so the history reads request ->
+        # completion. The wizard both requests and completes in one call.
+        try:
+            timeline.event_for_verification(enrollment, actor=actor_label)
+        except Exception:  # never let history-logging break the verification
+            pass
         advance_enrollment(
             enrollment, EnrollmentStage.VERIFIED, force=True,
             actor_label=actor_label,
@@ -5214,13 +5285,14 @@ class MemberVerificationCreateView(PortalAPIView):
                     " ".join(x for x in [address.state, address.zip] if x),
                 ] if p
             )
-            submitted_members = [
-                {"member_name": mp.member_name, "menu_type": mp.menu_type}
-                for mp in enrollment.member_profiles.all()
-            ]
+            # Snapshot the governing case + its status/authorization AT SAVE TIME
+            # so the completion record captures the authorization the member was
+            # verified under (the case can change later).
+            gov_case = (
+                governing_internal_case(enrollment) or enrollment.case or selected_case
+            )
             timeline.event_for_verification_submitted(
                 enrollment,
-                members=submitted_members,
                 delivery_address=addr_str,
                 delivery_weekdays=data.get("delivery_weekdays", []),
                 verified_flags={
@@ -5228,6 +5300,9 @@ class MemberVerificationCreateView(PortalAPIView):
                     "medicaid_type": data.get("medicaid_type_verified"),
                     "delivery_address": data.get("delivery_address_verified"),
                 },
+                governing_case_id=str(gov_case.case_id) if gov_case else "",
+                case_status=(gov_case.case_status if gov_case else ""),
+                auth_status=(gov_case.service_authorization_status if gov_case else ""),
                 actor=actor_label,
             )
         except Exception:  # never let history-logging break the verification
@@ -5246,12 +5321,6 @@ class MemberVerificationCreateView(PortalAPIView):
         ):
             enrollment.case = selected_case
             enrollment.save(update_fields=["case"])
-            try:
-                timeline.event_for_verification_case_switched(
-                    enrollment, previous_case=None, actor=actor_label
-                )
-            except Exception:  # never let history-logging break the save
-                pass
 
         # Snapshot the scope (Household / Individual) this household was VERIFIED
         # under onto the enrollment itself. This is the enrollment's own scope --
@@ -5438,17 +5507,10 @@ class MemberVerificationDisregardView(PortalAPIView):
             # here, so emit the event directly).
             # actor is a Django User FK on StageEvent (not our Agent); agent
             # attribution is captured on the Note + timeline event instead.
+            # No enrollment on this path; just revert the client's stage out of
+            # the verification window. 'Verification Disregarded' is no longer
+            # recorded on the timeline (the audit Note below still captures it).
             recompute_client_stage(client)
-            timeline.emit_timeline_event(
-                client=client,
-                event_type=TimelineEventType.VERIFICATION_DISREGARDED,
-                occurred_at=timezone.now(),
-                title="Verification Request Disregarded",
-                subtitle=f"Reason: {reason}",
-                badge_tone=TimelineBadgeTone.WARNING,
-                source="portal",
-                actor=actor_label,
-            )
 
         # Audit stamp: record WHEN this member's request was last disregarded.
         # (The Verification button visibility is driven by whether a pending

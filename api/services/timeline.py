@@ -701,6 +701,36 @@ def stage_timeline_fields(stage, *, from_stage=None):
     return _STAGE_TIMELINE.get(stage, (TimelineEventType.VERIFICATION, stage.label))
 
 
+def _enrollment_member_names(enrollment):
+    """Roster of member names captured on an enrollment's household (the members
+    on the verification), for the verification timeline events."""
+    if enrollment is None:
+        return []
+    try:
+        return [
+            (mp.member_name or "").strip()
+            for mp in enrollment.member_profiles.all()
+            if (mp.member_name or "").strip()
+        ]
+    except Exception:  # noqa: BLE001 - never let history-logging break a save
+        return []
+
+
+def _governing_case_id_for(enrollment):
+    """The id (str) of the internal-service case that GOVERNS this enrollment --
+    the same case the rest of the app treats as authoritative -- falling back to
+    the enrollment's tied case. Lazy import avoids a lifecycle<->timeline cycle."""
+    if enrollment is None:
+        return ""
+    try:
+        from api.services.lifecycle import governing_internal_case
+
+        case = governing_internal_case(enrollment) or enrollment.case
+    except Exception:  # noqa: BLE001
+        case = getattr(enrollment, "case", None)
+    return str(case.case_id) if case is not None else ""
+
+
 def event_for_verification(enrollment, *, stage_event=None, source=ChangeSource.SYSTEM,
                            actor="", trigger=""):
     """Emit a timeline event for an enrollment stage change.
@@ -718,6 +748,11 @@ def event_for_verification(enrollment, *, stage_event=None, source=ChangeSource.
     """
     client = enrollment.client
     if client is None:
+        return None
+    # 'Verification Disregarded' is intentionally NOT surfaced on the timeline:
+    # the disregard action still transitions the enrollment + writes a Note, but
+    # it no longer produces a history event.
+    if enrollment.stage == EnrollmentStage.DISREGARDED:
         return None
     occurred = enrollment.stage_at or timezone.now()
     try:
@@ -765,8 +800,14 @@ def event_for_verification(enrollment, *, stage_event=None, source=ChangeSource.
         "reason": note,
         "actor_label": (stage_meta or {}).get("actor_label", ""),
         "case_id": str(enrollment.case_id) if enrollment.case_id else "",
+        # The GOVERNING internal-service case (may differ from the tied case) so
+        # requested/disregarded rows record which case drove the action.
+        "governing_case_id": _governing_case_id_for(enrollment),
         "program": enrollment.program_name or "",
         "kitchen": enrollment.kitchen.name if enrollment.kitchen_id else "",
+        # Household roster at the time of the stage change (names of the members
+        # on the request / disregard).
+        "members": _enrollment_member_names(enrollment),
     }
     return emit_timeline_event(
         client=client,
@@ -783,101 +824,6 @@ def event_for_verification(enrollment, *, stage_event=None, source=ChangeSource.
         case=enrollment.case,
         metadata=metadata,
         dedupe_key=dedupe,
-    )
-
-
-def event_for_verification_renewed(enrollment, *, source=ChangeSource.CRM, actor=""):
-    """Emit a 'Verification Re-requested' event each time an agent renews a
-    still-pending verification request (stamps a fresh ``requested_at`` + acting
-    agent). Deliberately NOT de-duped, so every renewal -- and the prior
-    requester -- stays preserved in the client's history."""
-    client = enrollment.client
-    if client is None:
-        return None
-    return emit_timeline_event(
-        client=client,
-        event_type=TimelineEventType.VERIFICATION_REQUESTED,
-        occurred_at=enrollment.requested_at or timezone.now(),
-        title="Verification Re-requested",
-        subtitle=enrollment.program_name or "",
-        badge_text="Verification Requested",
-        badge_tone=TimelineBadgeTone.INFO,
-        source=source,
-        actor=actor,
-        entity=enrollment,
-        enrollment=enrollment,
-        case=enrollment.case,
-        dedupe_key="",  # never dedupe: keep every renewal in the history
-    )
-
-
-def event_for_verification_case_switched(enrollment, *, previous_case=None, source=ChangeSource.CRM, actor=""):
-    """Emit a 'Verification Case Switched' event when an agent re-points the
-    enrollment's governing internal-service case (e.g. the client has two meal/box
-    cases and the agent selects which one this verification is tied to). Not
-    de-duped, so each switch is preserved in the history."""
-    client = enrollment.client
-    if client is None:
-        return None
-    prev = ""
-    if previous_case is not None:
-        prev = previous_case.program_name or previous_case.service_type or str(previous_case.case_id)
-    new = ""
-    if enrollment.case_id:
-        new = enrollment.case.program_name or enrollment.case.service_type or str(enrollment.case_id)
-    return emit_timeline_event(
-        client=client,
-        event_type=TimelineEventType.VERIFICATION_REQUESTED,
-        occurred_at=timezone.now(),
-        title="Verification Case Switched",
-        subtitle=new or "",
-        badge_text="Case Switched",
-        badge_tone=TimelineBadgeTone.INFO,
-        source=source,
-        actor=actor,
-        entity=enrollment,
-        enrollment=enrollment,
-        case=enrollment.case,
-        metadata={"previous_case": prev, "new_case": new},
-        dedupe_key="",  # never dedupe: keep every switch in the history
-    )
-
-
-_TICKET_SEVERITY_TONE = {
-    "high": TimelineBadgeTone.DANGER,
-    "medium": TimelineBadgeTone.WARNING,
-    "low": TimelineBadgeTone.INFO,
-}
-
-
-def event_for_ticket_created(ticket, *, source=ChangeSource.CRM, actor=""):
-    """Emit a 'New Ticket Created' event the first time a ticket is opened for a
-    client. No-op for client-less tickets (e.g. member-not-found). De-duped on
-    the ticket pk so re-saves don't duplicate the row."""
-    client = ticket.client
-    if client is None:
-        return None
-    occurred = ticket.created_at or timezone.now()
-    type_label = ticket.type.label if ticket.type_id else "Ticket"
-    severity = (ticket.severity or "").lower()
-    return emit_timeline_event(
-        client=client,
-        event_type=TimelineEventType.TICKET_CREATED,
-        occurred_at=occurred,
-        title="New Ticket Created",
-        subtitle=ticket.reason or type_label,
-        badge_text=ticket.get_severity_display() if ticket.severity else "",
-        badge_tone=_TICKET_SEVERITY_TONE.get(severity, TimelineBadgeTone.NEUTRAL),
-        source=source,
-        actor=actor,
-        entity=ticket,
-        case=ticket.case,
-        metadata={
-            "ticket_type": type_label,
-            "severity": severity,
-            "ticket_source": ticket.source or "",
-        },
-        dedupe_key=f"ticket_created:{ticket.pk}",
     )
 
 
@@ -1036,28 +982,47 @@ def event_for_dietary_changed(profile, *, changes, enrollment=None, source=Chang
     )
 
 
-def event_for_verification_submitted(
-    enrollment, *, members=None, delivery_address="", delivery_weekdays=None,
-    verified_flags=None, source=ChangeSource.CRM, actor="",
-):
-    """Emit a 'Verification Submitted' summary event capturing what an agent
-    entered on the verification pop-up: the household roster + each member's
-    menu type, the delivery address + days, and which verification checkboxes
-    were confirmed. Reuses the VERIFICATION_COMPLETED type. De-duped per
-    enrollment so a re-save doesn't duplicate the summary.
+def member_verification_snapshot(profile):
+    """A point-in-time snapshot of one member's clinical/dietary verification data,
+    stored on the 'Verification Submitted' event. The member's live
+    ``MemberDietaryProfile`` can be edited later, but this preserves EXACTLY what
+    was captured at verification (the audit record of what was verified)."""
+    return {
+        "member_name": (profile.member_name or "").strip(),
+        "client_id": str(profile.client_id) if profile.client_id else "",
+        "conditions": list(profile.conditions or []),          # Medical Conditions
+        "medications": list(profile.medications or []),
+        "weight": profile.weight or "",
+        "height": profile.height or "",
+        "on_medical_diet": bool(profile.on_medical_diet),
+        "medical_diet_details": profile.medical_diet_details or "",
+        "menu_type": profile.menu_type or "",
+        "food_allergies": list(profile.food_allergies or []),
+        "other_dietary_restrictions": profile.other_dietary_restrictions or "",
+        "general_verification_notes": profile.general_verification_notes or "",
+    }
 
+
+def event_for_verification_submitted(
+    enrollment, *, delivery_address="", delivery_weekdays=None,
+    verified_flags=None, governing_case_id="", case_status="", auth_status="",
+    source=ChangeSource.CRM, actor="",
+):
+    """Emit a 'Verification Completed' summary event capturing WHAT was verified:
+    the governing case used (id + its status + authorization status AT SAVE TIME),
+    the delivery address + days, the confirmed checkboxes, and a full per-member
+    clinical/dietary snapshot (``member_verification_snapshot``) so the record
+    preserves the verification even after the member's live profile changes.
+
+    Reuses the VERIFICATION_COMPLETED type. De-duped per enrollment.
     Logged on the subject client's history.
     """
     client = getattr(enrollment, "client", None)
     if client is None:
         return None
-    members = members or []
     verified_flags = verified_flags or {}
-    member_lines = []
-    for m in members:
-        nm = (m.get("member_name") or "").strip() or "Member"
-        menu = (m.get("menu_type") or "").strip()
-        member_lines.append(f"{nm} ({menu})" if menu else nm)
+    profiles = list(enrollment.member_profiles.all())
+    members = [member_verification_snapshot(p) for p in profiles]
     n = len(members)
     subtitle = f"{n} member" + ("s" if n != 1 else "")
     if delivery_address:
@@ -1066,9 +1031,9 @@ def event_for_verification_submitted(
         client=client,
         event_type=TimelineEventType.VERIFICATION_COMPLETED,
         occurred_at=timezone.now(),
-        title="Verification Submitted",
+        title="Verification Completed",
         subtitle=subtitle,
-        badge_text="Submitted",
+        badge_text="Completed",
         badge_tone=TimelineBadgeTone.SUCCESS,
         source=source,
         actor=actor,
@@ -1076,7 +1041,10 @@ def event_for_verification_submitted(
         enrollment=enrollment,
         case=getattr(enrollment, "case", None),
         metadata={
-            "members": member_lines,
+            "governing_case_id": governing_case_id or _governing_case_id_for(enrollment),
+            "case_status": case_status or "",
+            "authorization_status": auth_status or "",
+            "members": members,
             "delivery_address": delivery_address,
             "delivery_weekdays": list(delivery_weekdays or []),
             "verified": verified_flags,
@@ -1495,6 +1463,7 @@ def event_for_household_member_added(
         metadata={
             "member_client_id": str(member_client.pk),
             "added_from": added_from,
+            "governing_case_id": _governing_case_id_for(enrollment),
         },
         dedupe_key=f"household_member_added:{primary_client.pk}:{member_client.pk}",
     )
@@ -1534,16 +1503,22 @@ def event_for_household_member_removed(
         metadata={
             "member_client_id": str(member_client.pk) if member_client else "",
             "removed_from": removed_from,
+            "governing_case_id": _governing_case_id_for(enrollment),
         },
     )
 
 
 def event_for_product_type_changed(
-    enrollment, *, previous_label="", new_label="", source=ChangeSource.CRM, actor="",
+    enrollment, *, previous_label="", new_label="", source=ChangeSource.CRM,
+    actor="", dedupe_key="",
 ):
-    """Emit a 'Product Type Changed' event when an agent corrects a household's
-    meals/boxes classification on the Household tab. Logged on the primary
-    client. Not de-duped, so every correction is recorded."""
+    """Emit a 'Product Type Changed' event when a household's meals/boxes product
+    changes -- both an agent's Household-tab correction and the system's
+    governing-case product switch (meals<->boxes). Logged on the primary client.
+
+    ``dedupe_key`` (e.g. the case pair on a governing-case switch) makes the write
+    create-once for that switch; left blank (manual corrections) every change is
+    recorded."""
     client = getattr(enrollment, "client", None)
     if client is None:
         return None
@@ -1563,6 +1538,7 @@ def event_for_product_type_changed(
         entity=enrollment,
         enrollment=enrollment,
         metadata={"previous": prev, "new": new},
+        dedupe_key=dedupe_key,
     )
 
 

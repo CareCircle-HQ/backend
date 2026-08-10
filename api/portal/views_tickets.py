@@ -9,7 +9,6 @@ from rest_framework import status as http
 from rest_framework.response import Response
 
 from ..models import Agent, Ticket, TicketNote, TicketOrigin, TicketType
-from ..services import timeline
 from .base import PortalAPIView, PortalGenericAPIView, current_agent
 from . import serializers as s
 
@@ -157,16 +156,6 @@ class WorkQueueView(PortalGenericAPIView):
             .prefetch_related(*TICKET_PREFETCH)
             .get(pk=ticket.pk)
         )
-        # Mirror the manual ticket onto the client's history timeline.
-        if ticket.client_id:
-            agent = current_agent(request)
-            try:
-                timeline.event_for_ticket_created(
-                    ticket,
-                    actor=(f"agent:{agent.code}" if agent and agent.code else ""),
-                )
-            except Exception:  # never let history-logging break ticket creation
-                pass
         return Response(
             s.PortalTicketSerializer(ticket).data, status=http.HTTP_201_CREATED
         )

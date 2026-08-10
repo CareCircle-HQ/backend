@@ -1616,6 +1616,7 @@ def nutritionist_approve(enrollment, *, agent, signature, signature_image="", pd
                     "height": m.get("height", ""),
                     "on_medical_diet": m.get("on_medical_diet"),
                     "medical_diet_details": m.get("medical_diet_details", ""),
+                    "nutrition_concern": m.get("nutrition_concern", ""),  # Primary Nutrition Concern
                     "assessment_notes": m.get("assessment_notes", ""),
                 })
         except Exception:  # pragma: no cover - defensive
@@ -2291,6 +2292,18 @@ def _handle_program_switch(
         reason=reason,
         actor=author,
     )
+    # Also record the explicit product-type before -> after (meals<->boxes) on the
+    # governing-case switch. De-duped on the case pair so re-running the reconcile
+    # against an unchanged governing case never duplicates it.
+    timeline.event_for_product_type_changed(
+        enr,
+        previous_label=old_label,
+        new_label=new_label,
+        actor=author,
+        dedupe_key=(
+            f"product_type_changed:{client.pk}:{old_case.case_id}:{governing.case_id}"
+        ),
+    )
     return True
 
 
@@ -2829,6 +2842,24 @@ def _carry_verification_fields(target, source):
         except Exception:  # pragma: no cover - defensive
             addr_fields = []
 
+    # (1b) Nutritionist sign-off -- carry it forward when the survivor lacks its
+    # own (a governing-case switch doesn't change the clinical picture, so the
+    # approval must not be dropped). Ungated by verification, like the address.
+    if target.nutritionist_approved_at is None and source.nutritionist_approved_at is not None:
+        target.nutritionist_approved_at = source.nutritionist_approved_at
+        target.nutritionist_approved_by = source.nutritionist_approved_by
+        target.nutritionist_signature = source.nutritionist_signature
+        target.nutritionist_signature_image = source.nutritionist_signature_image
+        target.nutritionist_approval_pdf_key = source.nutritionist_approval_pdf_key
+        try:
+            target.save(update_fields=[
+                "nutritionist_approved_at", "nutritionist_approved_by",
+                "nutritionist_signature", "nutritionist_signature_image",
+                "nutritionist_approval_pdf_key",
+            ])
+        except Exception:  # pragma: no cover - defensive
+            pass
+
     # (2) Verification fact -- only when the survivor isn't already verified.
     if target.verified_at is not None or source.verified_at is None:
         return len(addr_fields)
@@ -2893,6 +2924,32 @@ def _carry_dietary_profiles(target, source):
         if not (tp.general_verification_notes or "").strip() and (sp.general_verification_notes or "").strip():
             tp.general_verification_notes = sp.general_verification_notes
             fields.append("general_verification_notes")
+        # Clinical / nutrition intake captured at verification -- carry it forward
+        # (blanks only) so a reused placeholder enrollment keeps the member's
+        # conditions / meds / measurements / meal plan / nutritionist notes.
+        # ``conditions`` / ``medications`` default to sentinel single-item lists
+        # (["No Restriction"] / ["No Medications"]); treat those as blank so real
+        # captured data still copies over.
+        _COND_SENTINEL = ["No Restriction"]
+        _MEDS_SENTINEL = ["No Medications"]
+        if (not tp.conditions or tp.conditions == _COND_SENTINEL) and (
+            sp.conditions and sp.conditions != _COND_SENTINEL
+        ):
+            tp.conditions = sp.conditions; fields.append("conditions")
+        if (not tp.medications or tp.medications == _MEDS_SENTINEL) and (
+            sp.medications and sp.medications != _MEDS_SENTINEL
+        ):
+            tp.medications = sp.medications; fields.append("medications")
+        for f in ("weight", "height", "medical_diet_details", "meal_plan",
+                  "meal_plan_other", "assessment_notes", "nutritionist_pdf_key"):
+            if not (getattr(tp, f) or "").strip() and (getattr(sp, f) or "").strip():
+                setattr(tp, f, getattr(sp, f)); fields.append(f)
+        if not tp.on_medical_diet and sp.on_medical_diet:
+            tp.on_medical_diet = True; fields.append("on_medical_diet")
+        if tp.weeks_gestation is None and sp.weeks_gestation is not None:
+            tp.weeks_gestation = sp.weeks_gestation; fields.append("weeks_gestation")
+        if tp.months_postpartum is None and sp.months_postpartum is not None:
+            tp.months_postpartum = sp.months_postpartum; fields.append("months_postpartum")
         if fields:
             try:
                 tp.save(update_fields=fields)
@@ -3046,6 +3103,16 @@ def _carry_service_and_activate(
     meals<->boxes switch, or no prior kitchen/cadence -> a fresh kitchen
     assignment is required). Returns True when service was carried.
     """
+    # HARD verification gate. A governing-case replacement must NOT promote a
+    # household that was never verified: an approved NEW case does not skip
+    # verification. When the surviving enrollment carries no verification fact
+    # (``verified_at`` is blank) it stays at Pending Verification -- the earlier
+    # ladder-forward would otherwise force it up to Kitchen Assignment (stamping
+    # a VERIFIED it never had). Once a real verification completes,
+    # ``reconcile_enrollment_authorization`` advances it normally.
+    if not new_enr.verified_at:
+        return False
+
     from api.services.catalog import product_type_kind_for_name
     from api.services.delivery import (
         create_member_delivery_schedules,
@@ -3262,6 +3329,14 @@ def replace_enrollment_for_case_change(
             "verified_by": live.verified_by,
             "requested_by": live.requested_by,
             "requested_at": live.requested_at,
+            # Carry the Nutritionist legal sign-off forward: a governing-case
+            # switch doesn't change the member's clinical picture, so it must not
+            # silently drop the approval and force a needless re-review.
+            "nutritionist_approved_at": live.nutritionist_approved_at,
+            "nutritionist_approved_by": live.nutritionist_approved_by,
+            "nutritionist_signature": live.nutritionist_signature,
+            "nutritionist_signature_image": live.nutritionist_signature_image,
+            "nutritionist_approval_pdf_key": live.nutritionist_approval_pdf_key,
             "supersedes": live,
             "stage": EnrollmentStage.PENDING_VERIFICATION.value,
         }
@@ -3290,7 +3365,12 @@ def replace_enrollment_for_case_change(
         except Exception:  # pragma: no cover - defensive
             pass
 
-        # Copy member dietary profiles (D3).
+        # Copy member dietary profiles (D3) -- including the full clinical /
+        # nutrition intake captured at verification (conditions, meds, weight /
+        # height, medical diet, meal plan, assessment notes, gestation /
+        # postpartum) so a governing-case switch never loses it. Only the
+        # kitchen-rule RESULT (kitchen_meal_type / _food_notes) is cleared; it is
+        # recomputed against the (possibly new) kitchen.
         for mv in live.member_profiles.all():
             MemberDietaryProfile.objects.create(
                 enrollment=new_enrollment,
@@ -3308,6 +3388,19 @@ def replace_enrollment_for_case_change(
                 general_verification_notes=mv.general_verification_notes,
                 pause_locked=mv.pause_locked,
                 mobile_number=mv.mobile_number,
+                # Clinical / nutrition intake (carried, not re-collected).
+                conditions=mv.conditions,
+                weeks_gestation=mv.weeks_gestation,
+                months_postpartum=mv.months_postpartum,
+                medications=mv.medications,
+                weight=mv.weight,
+                height=mv.height,
+                on_medical_diet=mv.on_medical_diet,
+                medical_diet_details=mv.medical_diet_details,
+                meal_plan=mv.meal_plan,
+                meal_plan_other=mv.meal_plan_other,
+                assessment_notes=mv.assessment_notes,
+                nutritionist_pdf_key=mv.nutritionist_pdf_key,
             )
 
         # Carry the prior kitchen/cadence and drive the new enrollment to the

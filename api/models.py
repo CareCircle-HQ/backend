@@ -2679,6 +2679,10 @@ class Agent(models.Model):
     # fast-tracks verification). Set from Settings > Williamsburg Setup and
     # enforced in api.views.ClientViewSet on save.
     is_williamsburg_agent = models.BooleanField(default=False, db_index=True)
+    # Saved handwritten signature (a PNG data URL) the agent can reuse instead of
+    # drawing it every time -- e.g. a Nutritionist applying it to the Nutrition
+    # Case Review sign-off with one click. Blank until they save one.
+    signature_image = models.TextField(blank=True)
     calltools_synced_at = models.DateTimeField(null=True, blank=True)
 
     created_at = models.DateTimeField(auto_now_add=True)

@@ -10,7 +10,6 @@ by the import orchestration after each entity is upserted.
 import logging
 from dataclasses import dataclass
 
-from api.history import ChangeSource
 from api.models import (
     CaseStatus,
     Insurance,
@@ -92,10 +91,8 @@ def open_ticket(ticket_type, *, reason, severity=TicketSeverity.MEDIUM,
     (e.g. ``TicketTypeCode.CASE_CLOSED``).
 
     Returns (ticket, created). Idempotent: an existing open/in-progress ticket of
-    the same type for the same (client, case) is reused. On a NEW ticket a
-    'New Ticket Created' timeline event is emitted (attributed to ``source`` /
-    ``actor``) so every ticket -- from the import, the daily sync, or a live
-    extension write -- lands on the client's history.
+    the same type for the same (client, case) is reused. Tickets are NOT mirrored
+    onto the client's history timeline (they live on the Tickets tab / activity).
 
     When we know the member but the caller didn't pin a specific case, the
     ticket is auto-linked to the member's GOVERNING internal-service case so the
@@ -126,17 +123,6 @@ def open_ticket(ticket_type, *, reason, severity=TicketSeverity.MEDIUM,
         actor_label=actor or (str(source) if source else "System"),
         detail="Ticket created.",
     )
-    # Mirror the new ticket onto the client's timeline (best-effort: a timeline
-    # hiccup must never fail the ticket write). Deduped on the ticket pk.
-    if client is not None:
-        try:
-            from api.services import timeline
-
-            timeline.event_for_ticket_created(
-                ticket, source=source or ChangeSource.SYSTEM, actor=actor,
-            )
-        except Exception:  # noqa: BLE001
-            logger.warning("open_ticket timeline emit failed", exc_info=True)
     return ticket, True
 
 
