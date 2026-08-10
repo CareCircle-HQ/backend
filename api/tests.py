@@ -4285,10 +4285,10 @@ class KitchenExportSharedAddressTest(TestCase):
 
 
 class KitchenChangeManagementOnlyTest(TestCase):
-    """Changing an ALREADY-assigned household kitchen (the program tab's "Kitchen
-    & Delivery" Change control) is Management-only: verification / CS / logistics
-    agents are blocked. The INITIAL assignment (no kitchen yet -- the Logistics
-    Kitchen Assignment step) stays open to non-management staff."""
+    """Changing an ALREADY-assigned household kitchen via /assign-kitchen/ (the
+    program tab's "Kitchen & Delivery" Change control) is open to any portal
+    agent (the Management-only restriction was removed). The dedicated /kitchen/
+    PATCH endpoint remains Management-only."""
 
     def _api(self, group):
         agent = Agent.objects.create(
@@ -4328,12 +4328,14 @@ class KitchenChangeManagementOnlyTest(TestCase):
     def _assign_url(self, client):
         return f"/api/portal/members/{client.pk}/assign-kitchen/"
 
-    def test_non_management_cannot_change_assigned_kitchen(self):
-        # Kitchen already assigned + non-management agent -> 403 (the management
-        # guard fires before any body validation).
+    def test_non_management_can_change_assigned_kitchen(self):
+        # Kitchen already assigned + non-management agent -> NO LONGER 403. The
+        # empty body then fails normal validation (400), proving the old
+        # Management-only guard was removed (logistics can change the kitchen).
         client = self._enrollment(with_kitchen=True)
         resp = self._api("CS").post(self._assign_url(client), {}, format="json")
-        self.assertEqual(resp.status_code, 403)
+        self.assertNotEqual(resp.status_code, 403)
+        self.assertEqual(resp.status_code, 400)
 
     def test_management_not_blocked_by_kitchen_change_guard(self):
         # Management passes the guard; an empty body then fails normal validation
@@ -13909,3 +13911,91 @@ class ReconcileSupersededLiveEnrollmentsTest(TestCase):
         old.refresh_from_db()
         # Superseded row is the only server -> must NOT be closed.
         self.assertEqual(EnrollmentStage(old.stage), EnrollmentStage.SERVICE_ACTIVE)
+
+    def test_skips_when_old_holds_distinct_open_case(self):
+        from django.core.management import call_command
+
+        from .models import (
+            Case, CaseStatus, CaseType, Client, EnrollmentStage,
+            EnrollmentVerification, Household, HouseholdMember,
+        )
+
+        client = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Two", last_name="Cases",
+        )
+        hh = Household.objects.create(name="HH")
+        HouseholdMember.objects.create(household=hh, client=client, is_primary=True)
+        old_case = Case.objects.create(
+            case_id=uuid.uuid4(), client=client, case_type=CaseType.INTERNAL_SERVICE,
+            case_status=CaseStatus.OPEN, program_name="Medically Tailored Meals",
+        )
+        new_case = Case.objects.create(
+            case_id=uuid.uuid4(), client=client, case_type=CaseType.INTERNAL_SERVICE,
+            case_status=CaseStatus.OPEN, program_name="Medically Tailored Meals",
+        )
+        # Superseded row bound to a DISTINCT still-open case; survivor on the new
+        # case. Closing the old would orphan its open case -> must be skipped.
+        old = EnrollmentVerification.objects.create(
+            client=client, household=hh, case=old_case,
+            stage=EnrollmentStage.PENDING_VERIFICATION, verified_at=timezone.now(),
+        )
+        EnrollmentVerification.objects.create(
+            client=client, household=hh, case=new_case, supersedes=old,
+            stage=EnrollmentStage.PENDING_VERIFICATION, verified_at=timezone.now(),
+        )
+        call_command("reconcile_superseded_live_enrollments", "--apply")
+        old.refresh_from_db()
+        self.assertEqual(EnrollmentStage(old.stage), EnrollmentStage.PENDING_VERIFICATION)
+
+
+class ClosedCaseHoldDisplayTest(TestCase):
+    """A hold over a CLOSED governing case is the closure full-stop, so it reads
+    as Closed / Inactive -- not a confusing On Hold -- on the program + list."""
+
+    def _setup(self, case_status, *, lifecycle=None):
+        from .models import (
+            Case, CaseStatus, CaseType, Client, EnrollmentStage,
+            EnrollmentVerification, Household, HouseholdMember,
+            ServiceAuthorizationStatus,
+        )
+
+        client = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Hold", last_name="Case",
+            lifecycle_stage=(lifecycle or "active"),
+        )
+        hh = Household.objects.create(name="HH")
+        HouseholdMember.objects.create(household=hh, client=client, is_primary=True)
+        case = Case.objects.create(
+            case_id=uuid.uuid4(), client=client, case_type=CaseType.INTERNAL_SERVICE,
+            case_status=case_status,
+            service_authorization_status=ServiceAuthorizationStatus.APPROVED,
+            program_name="Medically Tailored Meals",
+        )
+        enr = EnrollmentVerification.objects.create(
+            client=client, household=hh, case=case,
+            stage=EnrollmentStage.ON_HOLD, verified_at=timezone.now(),
+        )
+        return client, enr
+
+    def test_program_status_hold_over_closed_case_is_closed(self):
+        from .models import CaseStatus, ProgramStatus
+        from .services.lifecycle import program_status
+
+        _, enr = self._setup(CaseStatus.CLOSED)
+        self.assertEqual(program_status(enr), ProgramStatus.CLOSED)
+
+    def test_program_status_hold_over_open_case_is_on_hold(self):
+        from .models import CaseStatus, ProgramStatus
+        from .services.lifecycle import program_status
+
+        _, enr = self._setup(CaseStatus.OPEN)
+        self.assertEqual(program_status(enr), ProgramStatus.ON_HOLD)
+
+    def test_verification_status_inactive_not_on_hold(self):
+        from .models import CaseStatus, ClientStage
+        from .portal.serializers import verification_status
+
+        client, _ = self._setup(CaseStatus.CLOSED, lifecycle=ClientStage.SERVICE_INACTIVE)
+        # Closure full-stop (service_inactive) -> shows the real "Inactive" label,
+        # not the On Hold overlay.
+        self.assertNotEqual(verification_status(client), "On Hold")

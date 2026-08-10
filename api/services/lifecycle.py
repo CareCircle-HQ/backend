@@ -1060,6 +1060,15 @@ def program_status(enrollment):
     if stage == EnrollmentStage.ON_HOLD:
         if _enrollment_has_out_of_range_member(enrollment):
             return ProgramStatus.OUT_OF_RANGE
+        # A hold whose governing case is CLOSED/CANCELLED is the closure
+        # full-stop (the last open case closed -> the enrollment is parked On
+        # Hold and the client at Service Inactive), NOT a manual/temporary hold.
+        # Surface the terminal Closed status so the member list + Program tab
+        # don't read a confusing "On Hold" over a closed program. Display-only:
+        # if a case reopens, this re-derives back to the live status.
+        gov_hold = enrollment.case or governing_internal_case(enrollment)
+        if gov_hold and gov_hold.case_status in _CLOSED_CASE_STATUSES:
+            return ProgramStatus.CLOSED
         return ProgramStatus.ON_HOLD
 
     # Each enrollment is bound to one case; terminal enrollments in particular

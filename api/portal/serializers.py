@@ -148,10 +148,18 @@ _STATUS_MAP = {
 
 
 def verification_status(client):
+    from api.models import ClientStage
+
     # On Hold is a service-state overlay on top of the member's real stage: a
     # held member keeps their underlying stage (e.g. Active) but the list shows
-    # "On Hold" until service resumes.
-    if service_hold_state(client)["on_hold"]:
+    # "On Hold" until service resumes. EXCEPT the closure full-stop, which parks
+    # the client at SERVICE_INACTIVE with the enrollment held -- that's a closed
+    # program, not a manual hold, so fall through to the real stage label
+    # ("Inactive") instead of a confusing "On Hold" over a closed case.
+    if (
+        service_hold_state(client)["on_hold"]
+        and client.lifecycle_stage != ClientStage.SERVICE_INACTIVE
+    ):
         return "On Hold"
     # Verification is a yes/no fact: until the pop-up is completed the member is
     # Pending Verification, regardless of any case authorization status (which is
