@@ -5923,19 +5923,10 @@ class MemberAssignKitchenView(PortalAPIView):
                 status=http.HTTP_400_BAD_REQUEST,
             )
 
-        # CHANGING an already-assigned kitchen (the program tab's "Kitchen &
-        # Delivery" Change control) is Management-only: verification / CS /
-        # logistics agents can't alter a household's kitchen once set. The
-        # INITIAL assignment (no kitchen yet -- the Logistics Kitchen Assignment
-        # step) stays open to non-management logistics staff.
-        if enr.kitchen_id and not is_management_group(
-            getattr(getattr(request, "user", None), "group", None)
-        ):
-            return Response(
-                {"error": "Only Management users can change the household's kitchen."},
-                status=http.HTTP_403_FORBIDDEN,
-            )
-
+        # Changing an already-assigned kitchen (the program tab's "Kitchen &
+        # Delivery" Change control) is open to any logistics/portal agent -- the
+        # previous Management-only restriction was removed so logistics staff can
+        # correct a household's kitchen/cadence directly.
         kitchen_id = request.data.get("kitchen_id")
         cadence = (request.data.get("cadence") or "").strip()
         once_weekday = (request.data.get("once_a_week_weekday") or "").strip() or None

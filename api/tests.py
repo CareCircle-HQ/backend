@@ -4285,10 +4285,10 @@ class KitchenExportSharedAddressTest(TestCase):
 
 
 class KitchenChangeManagementOnlyTest(TestCase):
-    """Changing an ALREADY-assigned household kitchen (the program tab's "Kitchen
-    & Delivery" Change control) is Management-only: verification / CS / logistics
-    agents are blocked. The INITIAL assignment (no kitchen yet -- the Logistics
-    Kitchen Assignment step) stays open to non-management staff."""
+    """Changing an ALREADY-assigned household kitchen via /assign-kitchen/ (the
+    program tab's "Kitchen & Delivery" Change control) is open to any portal
+    agent (the Management-only restriction was removed). The dedicated /kitchen/
+    PATCH endpoint remains Management-only."""
 
     def _api(self, group):
         agent = Agent.objects.create(
@@ -4328,12 +4328,14 @@ class KitchenChangeManagementOnlyTest(TestCase):
     def _assign_url(self, client):
         return f"/api/portal/members/{client.pk}/assign-kitchen/"
 
-    def test_non_management_cannot_change_assigned_kitchen(self):
-        # Kitchen already assigned + non-management agent -> 403 (the management
-        # guard fires before any body validation).
+    def test_non_management_can_change_assigned_kitchen(self):
+        # Kitchen already assigned + non-management agent -> NO LONGER 403. The
+        # empty body then fails normal validation (400), proving the old
+        # Management-only guard was removed (logistics can change the kitchen).
         client = self._enrollment(with_kitchen=True)
         resp = self._api("CS").post(self._assign_url(client), {}, format="json")
-        self.assertEqual(resp.status_code, 403)
+        self.assertNotEqual(resp.status_code, 403)
+        self.assertEqual(resp.status_code, 400)
 
     def test_management_not_blocked_by_kitchen_change_guard(self):
         # Management passes the guard; an empty body then fails normal validation
