@@ -13912,6 +13912,41 @@ class ReconcileSupersededLiveEnrollmentsTest(TestCase):
         # Superseded row is the only server -> must NOT be closed.
         self.assertEqual(EnrollmentStage(old.stage), EnrollmentStage.SERVICE_ACTIVE)
 
+    def test_skips_when_old_holds_distinct_open_case(self):
+        from django.core.management import call_command
+
+        from .models import (
+            Case, CaseStatus, CaseType, Client, EnrollmentStage,
+            EnrollmentVerification, Household, HouseholdMember,
+        )
+
+        client = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Two", last_name="Cases",
+        )
+        hh = Household.objects.create(name="HH")
+        HouseholdMember.objects.create(household=hh, client=client, is_primary=True)
+        old_case = Case.objects.create(
+            case_id=uuid.uuid4(), client=client, case_type=CaseType.INTERNAL_SERVICE,
+            case_status=CaseStatus.OPEN, program_name="Medically Tailored Meals",
+        )
+        new_case = Case.objects.create(
+            case_id=uuid.uuid4(), client=client, case_type=CaseType.INTERNAL_SERVICE,
+            case_status=CaseStatus.OPEN, program_name="Medically Tailored Meals",
+        )
+        # Superseded row bound to a DISTINCT still-open case; survivor on the new
+        # case. Closing the old would orphan its open case -> must be skipped.
+        old = EnrollmentVerification.objects.create(
+            client=client, household=hh, case=old_case,
+            stage=EnrollmentStage.PENDING_VERIFICATION, verified_at=timezone.now(),
+        )
+        EnrollmentVerification.objects.create(
+            client=client, household=hh, case=new_case, supersedes=old,
+            stage=EnrollmentStage.PENDING_VERIFICATION, verified_at=timezone.now(),
+        )
+        call_command("reconcile_superseded_live_enrollments", "--apply")
+        old.refresh_from_db()
+        self.assertEqual(EnrollmentStage(old.stage), EnrollmentStage.PENDING_VERIFICATION)
+
 
 class ClosedCaseHoldDisplayTest(TestCase):
     """A hold over a CLOSED governing case is the closure full-stop, so it reads

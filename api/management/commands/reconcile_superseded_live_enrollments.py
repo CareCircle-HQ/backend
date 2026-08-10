@@ -24,6 +24,7 @@ from django.db import transaction
 from django.utils import timezone
 
 from api.models import (
+    CaseStatus,
     Client,
     EnrollmentStage,
     EnrollmentVerification,
@@ -33,6 +34,7 @@ from api.models import (
 from api.services.lifecycle import recompute_client_stage
 
 _TERMINAL = [EnrollmentStage.CLOSED, EnrollmentStage.CANCELLED]
+_CLOSED_CASE_STATUSES = {CaseStatus.CLOSED, CaseStatus.CANCELLED}
 
 _NUTRI_FIELDS = [
     "nutritionist_approved_at", "nutritionist_approved_by",
@@ -84,18 +86,35 @@ class Command(BaseCommand):
             .order_by("pk")
         )
 
-        to_close, unsafe = [], []
+        to_close, unsafe, open_case = [], [], []
         for old in qs:
             survivor = old.superseded_by.first()
             old_future = _future_sched(old, today)
             surv_future = _future_sched(survivor, today)
-            # DANGER: the superseded row is the one actually serving and the
+            # DANGER 1: the superseded row is the one actually serving and the
             # survivor is not -> closing it would drop the member's only live
             # plan. Leave it for manual review.
             if old_future > 0 and surv_future == 0:
                 unsafe.append((old, survivor, old_future, surv_future))
-            else:
-                to_close.append((old, survivor, old_future, surv_future))
+                continue
+            # DANGER 2: the superseded row is bound to a DISTINCT, still-OPEN
+            # internal-service case that no live enrollment covers -> closing it
+            # would ORPHAN that open case (an open program with no enrollment).
+            # That's a separate program, not a pure duplicate, so leave it.
+            oc = getattr(old, "case", None)
+            if (
+                oc is not None
+                and oc.case_status not in _CLOSED_CASE_STATUSES
+                and (survivor is None or survivor.case_id != old.case_id)
+                and not EnrollmentVerification.objects
+                    .filter(case_id=old.case_id)
+                    .exclude(pk=old.pk)
+                    .exclude(stage__in=[s.value for s in _TERMINAL])
+                    .exists()
+            ):
+                open_case.append((old, survivor))
+                continue
+            to_close.append((old, survivor, old_future, surv_future))
 
         if limit and len(to_close) > limit:
             to_close = to_close[:limit]
@@ -117,6 +136,16 @@ class Command(BaseCommand):
                 self.stdout.write(
                     f"     old={old.pk} ({old.stage}, future={of}) "
                     f"survivor={surv.pk if surv else None} (future={sf}) client={old.client_id}"
+                )
+        if open_case:
+            self.stdout.write(self.style.WARNING(
+                f"  SKIPPED (superseded row holds a DISTINCT open case -> would "
+                f"orphan that open program): {len(open_case)}"
+            ))
+            for old, surv in open_case[:50]:
+                self.stdout.write(
+                    f"     old={old.pk} case={old.case_id} (open) "
+                    f"survivor={surv.pk if surv else None} client={old.client_id}"
                 )
 
         if list_detail:
@@ -179,5 +208,5 @@ class Command(BaseCommand):
 
         self.stdout.write(self.style.SUCCESS(
             f"\nAPPLIED: closed {closed} stale enrollment(s); recomputed {healed} "
-            f"client(s). Skipped (unsafe): {len(unsafe)}."
+            f"client(s). Skipped -- serving: {len(unsafe)}, open-case: {len(open_case)}."
         ))
