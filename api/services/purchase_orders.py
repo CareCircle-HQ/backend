@@ -514,9 +514,15 @@ def backfill_late_occurrences(kind, delivery_date):
     if delivery_code is None:
         return 0
 
+    # How many LIVE deliveries each member already has THIS WEEK. A member is
+    # "already covered" only once they hold as many as their cadence prescribes:
+    # a 2x/week (Mon/Thu) member with a live Thu order can still be backfilled for
+    # a skipped Mon, while a 1x/week member who already got their weekly delivery
+    # is never doubled. Cancelled orders don't count.
+    from collections import Counter
+
     week_start, week_end = _delivery_week_range(delivery_date)
-    # Clients already covered by a live delivery that week -- never double-book.
-    covered = set(
+    live_week_counts = Counter(
         DeliveryOrder.objects.filter(
             expected_delivery_date__gte=week_start,
             expected_delivery_date__lte=week_end,
@@ -525,10 +531,13 @@ def backfill_late_occurrences(kind, delivery_date):
         .exclude(status=DeliveryOrderStatus.CANCELLED)
         .values_list("member_id", flat=True)
     )
-    # Members already having an occurrence on the exact date (any status).
+    # Members already holding a LIVE occurrence on the exact date -- skip so we
+    # don't duplicate. A CANCELLED occurrence (e.g. from a cancelled PO) does NOT
+    # count: the date is free again, so the member can be backfilled onto a late PO.
     existing_members = set(
         OrderSchedule.objects.filter(anticipated_delivery_date=delivery_date)
         .exclude(member__isnull=True)
+        .exclude(status=ScheduleStatus.CANCELLED)
         .values_list("member_id", flat=True)
     )
 
@@ -565,8 +574,15 @@ def backfill_late_occurrences(kind, delivery_date):
             continue
         client = getattr(m, "client", None)
         client_id = getattr(client, "client_id", None)
-        if client_id is not None and client_id in covered:
-            continue  # already delivered/ordered this week -- no double delivery
+        # Skip only when the member already has ALL of this week's cadence
+        # deliveries live -- so a Mon/Thu member missing one day still gets it,
+        # but a member already fully served this week is never over-delivered.
+        weekly = len(enr.delivery_weekdays or [])
+        if (
+            client_id is not None and weekly
+            and live_week_counts.get(client_id, 0) >= weekly
+        ):
+            continue
 
         if enr.pk not in group_codes:
             first = (
