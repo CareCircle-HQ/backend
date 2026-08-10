@@ -1031,6 +1031,41 @@ class EnrollmentVerificationSerializer(serializers.ModelSerializer):
         # Snapshot the case's Service Type when the ext didn't send one.
         if case is not None and not validated_data.get("service_type"):
             validated_data["service_type"] = case.service_type
+
+        # INVARIANT: a client has at most ONE live internal-service enrollment.
+        # If one is already IN THE FUNNEL (not terminal and not yet serving),
+        # REBIND + refresh it instead of opening a SECOND live row -- a new/renewal
+        # case must never fork a duplicate enrollment (which then gets worked
+        # independently by verification / nutrition / logistics). ``stage`` is
+        # read-only here, so the enrollment keeps its funnel progress; a later
+        # set-stage advances it. A SERVING enrollment is left untouched -- a
+        # governing-case change for a serving household is carried by reconcile,
+        # not overwritten by a fresh verification.
+        from api.models import EnrollmentStage
+        _TERMINAL_OR_SERVING = [
+            EnrollmentStage.CLOSED, EnrollmentStage.CANCELLED,
+            EnrollmentStage.DISREGARDED, EnrollmentStage.SERVICE_ACTIVE,
+            EnrollmentStage.ON_HOLD, EnrollmentStage.SERVICE_COMPLETE,
+        ]
+        existing = (
+            EnrollmentVerification.objects.filter(client=client)
+            .exclude(stage__in=[s.value for s in _TERMINAL_OR_SERVING])
+            .order_by("-opened_at").first()
+        )
+        if existing is not None:
+            if hid:
+                existing.household = Household.objects.filter(pk=hid).first()
+            if case is not None:
+                existing.case = case
+            if aid:
+                existing.delivery_address = Address.objects.filter(pk=aid).first()
+            for field, value in validated_data.items():
+                setattr(existing, field, value)
+            existing.save()
+            if members:
+                self._sync_members(existing, members)
+            return existing
+
         enrollment = EnrollmentVerification.objects.create(
             client=client,
             household=Household.objects.filter(pk=hid).first() if hid else None,

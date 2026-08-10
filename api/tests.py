@@ -14377,3 +14377,54 @@ class ReconcileClosedEnrollmentCalendarsTest(TestCase):
         ).count()
         self.assertEqual(closed_future, 0)
         self.assertGreater(live_future, 0)
+
+
+class VerificationCreateEnforcesSingleEnrollmentTest(TestCase):
+    """Creating a verification for a client who already has a live in-funnel
+    enrollment REUSES it (rebind) instead of opening a second live row -- so a
+    new/renewal case can never fork a duplicate enrollment."""
+
+    def test_reuses_existing_pending_enrollment(self):
+        from .models import (
+            Client, EnrollmentStage, EnrollmentVerification, Household,
+        )
+        from .serializers import EnrollmentVerificationSerializer
+
+        client = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="One", last_name="Enr",
+        )
+        hh = Household.objects.create(name="HH")
+        existing = EnrollmentVerification.objects.create(
+            client=client, household=hh,
+            stage=EnrollmentStage.PENDING_VERIFICATION,
+        )
+        ser = EnrollmentVerificationSerializer(data={
+            "client_id": str(client.client_id),
+            "household_id": str(hh.pk),
+            "household_size": 3,
+            "members": [{"member_name": "One Enr"}],
+        })
+        ser.is_valid(raise_exception=True)
+        enr = ser.save()
+        self.assertEqual(enr.pk, existing.pk)  # reused, not a new row
+        self.assertEqual(enr.household_size, 3)  # data applied
+        live = EnrollmentVerification.objects.filter(client=client).exclude(
+            stage__in=["closed", "cancelled"]).count()
+        self.assertEqual(live, 1)  # invariant: one live enrollment
+
+    def test_creates_when_no_live_enrollment(self):
+        from .models import Client, EnrollmentVerification, Household
+        from .serializers import EnrollmentVerificationSerializer
+
+        client = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="New", last_name="Enr",
+        )
+        hh = Household.objects.create(name="HH")
+        ser = EnrollmentVerificationSerializer(data={
+            "client_id": str(client.client_id), "household_id": str(hh.pk),
+            "members": [{"member_name": "New Enr"}],
+        })
+        ser.is_valid(raise_exception=True)
+        enr = ser.save()
+        self.assertEqual(
+            EnrollmentVerification.objects.filter(client=client).count(), 1)
