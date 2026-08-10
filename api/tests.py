@@ -14126,6 +14126,53 @@ class ActiveEnrollmentPrefersGoverningCaseTest(TestCase):
 
         self.assertEqual(active_enrollment(client).pk, gov_enr.pk)
 
+    def test_verified_not_hidden_by_newer_pending_on_governing_case(self):
+        # Regression: a household with a VERIFIED (pending-nutritionist)
+        # enrollment plus a NEWER pending_verification row on the governing case
+        # must still resolve to the VERIFIED one -- otherwise the whole
+        # Nutritionist queue gets hidden behind unverified renewal rows.
+        from datetime import timedelta
+
+        from .models import (
+            Case, CaseStatus, CaseType, Client, EnrollmentStage,
+            EnrollmentVerification, Household, HouseholdMember,
+            ServiceAuthorizationStatus,
+        )
+        from .portal.serializers import active_enrollment
+
+        now = timezone.now()
+        client = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Pend", last_name="Hide",
+        )
+        hh = Household.objects.create(name="HH")
+        HouseholdMember.objects.create(household=hh, client=client, is_primary=True)
+        old_case = Case.objects.create(
+            case_id=uuid.uuid4(), client=client, case_type=CaseType.INTERNAL_SERVICE,
+            case_status=CaseStatus.OPEN,
+            service_authorization_status=ServiceAuthorizationStatus.APPROVED,
+            program_name="MTM", case_created_at=now,
+        )
+        gov_case = Case.objects.create(
+            case_id=uuid.uuid4(), client=client, case_type=CaseType.INTERNAL_SERVICE,
+            case_status=CaseStatus.OPEN,
+            service_authorization_status=ServiceAuthorizationStatus.APPROVED,
+            program_name="MTM", case_created_at=now + timedelta(days=5),
+        )
+        verified = EnrollmentVerification.objects.create(
+            client=client, household=hh, case=old_case,
+            stage=EnrollmentStage.VERIFIED, verified_at=now,
+        )
+        pending = EnrollmentVerification.objects.create(
+            client=client, household=hh, case=gov_case,
+            stage=EnrollmentStage.PENDING_VERIFICATION,
+        )
+        # Pending row is NEWER + on the governing case -- must NOT win.
+        EnrollmentVerification.objects.filter(pk=verified.pk).update(
+            opened_at=now - timedelta(days=5))
+        EnrollmentVerification.objects.filter(pk=pending.pk).update(opened_at=now)
+
+        self.assertEqual(active_enrollment(client).pk, verified.pk)
+
 
 class ReassignRunsFullCalendarReconcileTest(TestCase):
     """A kitchen/cadence CHANGE (re-assignment) runs the same per-enrollment
