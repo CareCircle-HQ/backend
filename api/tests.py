@@ -14494,3 +14494,75 @@ class PoMembershipDiffTest(TestCase):
         self.assertEqual([r["name"] for r in dr["moved_out"]], ["M3 X"])
         # Mover carries where they went (Kitchen B / Mon/Thu).
         self.assertTrue(dr["moved_out"][0]["other"])
+
+
+class DetectPoDropsTest(TestCase):
+    """Members served in the past/current week but missing from the upcoming PO
+    are flagged with the right reason."""
+
+    def test_drop_reasons(self):
+        from datetime import timedelta
+
+        from .models import (
+            Client, DeliveryOrder, DeliveryOrderStatus, EnrollmentStage,
+            EnrollmentVerification, Household, Kitchen, KitchenStatus,
+            MemberDietaryProfile, MemberStatus, OrderSchedule, OrderStatus,
+            PurchaseOrder, PurchaseOrderStatus,
+        )
+        from .services.po_blockers import detect_po_drops
+
+        today = timezone.localdate()
+        last_monday = today - timedelta(days=today.weekday()) - timedelta(days=7)
+        K = Kitchen.objects.create(name="K", status=KitchenStatus.ACTIVE)
+        hh = Household.objects.create(name="HH")
+        po = PurchaseOrder.objects.create(status=PurchaseOrderStatus.DRAFT)
+
+        def client(n):
+            return Client.objects.create(
+                client_id=str(uuid.uuid4()), first_name=n, last_name="Z")
+
+        def served(c):  # a non-cancelled delivery last week
+            DeliveryOrder.objects.create(
+                purchase_order=po, member=c, kitchen=K,
+                expected_delivery_date=last_monday,
+                status=DeliveryOrderStatus.PENDING)
+
+        def enr(c, stage):
+            return EnrollmentVerification.objects.create(
+                client=c, household=hh, stage=stage, kitchen=K,
+                program_name="Medically Tailored Meals")
+
+        # M1: served + has an upcoming occurrence -> still on, NOT dropped.
+        M1 = client("M1"); served(M1)
+        e1 = enr(M1, EnrollmentStage.SERVICE_ACTIVE)
+        p1 = MemberDietaryProfile.objects.create(
+            enrollment=e1, client=M1, member_name="M1 Z", status=MemberStatus.ACTIVE)
+        OrderSchedule.objects.create(
+            enrollment=e1, member=p1, member_name="M1 Z",
+            anticipated_delivery_date=today + timedelta(days=1),
+            status=OrderStatus.SCHEDULED)
+
+        # M2: served, no upcoming, active on a serving enrollment -> the bug.
+        M2 = client("M2"); served(M2)
+        e2 = enr(M2, EnrollmentStage.SERVICE_ACTIVE)
+        MemberDietaryProfile.objects.create(
+            enrollment=e2, client=M2, member_name="M2 Z", status=MemberStatus.ACTIVE)
+
+        # M3: served, no live enrollment (closed) -> off-boarded.
+        M3 = client("M3"); served(M3)
+        enr(M3, EnrollmentStage.CLOSED)
+
+        # M4: served, no upcoming, member PAUSED on a serving enrollment.
+        M4 = client("M4"); served(M4)
+        e4 = enr(M4, EnrollmentStage.SERVICE_ACTIVE)
+        MemberDietaryProfile.objects.create(
+            enrollment=e4, client=M4, member_name="M4 Z", status=MemberStatus.PAUSED)
+
+        res = detect_po_drops(today)
+        by_client = {r["client_id"]: r for r in res["dropped"]}
+        self.assertNotIn(str(M1.client_id), by_client)          # still on
+        self.assertEqual(by_client[str(M2.client_id)]["reason"], "missing_from_calendar")
+        self.assertTrue(by_client[str(M2.client_id)]["urgent"])
+        self.assertEqual(by_client[str(M3.client_id)]["reason"], "off_boarded")
+        self.assertEqual(by_client[str(M4.client_id)]["reason"], "paused")
+        self.assertFalse(by_client[str(M4.client_id)]["urgent"])
