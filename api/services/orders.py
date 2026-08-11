@@ -746,13 +746,19 @@ def rebuild_delivery_calendar(enrollment, from_date=None):
                 from api.models import DeliveryCadence
                 from api.services.catalog import product_kind_for_enrollment
 
+                from api.services.lifecycle import governing_internal_case
+
                 once_weekday = None
                 if cadence == DeliveryCadence.ONCE_A_WEEK.value:
                     wds = enrollment.delivery_weekdays or []
                     once_weekday = wds[0] if wds else None
+                # Build the first plan against the GOVERNING internal-service case
+                # (its authorization window), NOT the enrollment's own case link --
+                # which may point at a stale/non-governing case when the client has
+                # several. Falls back to the enrollment's case when none governs.
                 created = create_member_delivery_schedules(
                     enrollment,
-                    case=enrollment.case,
+                    case=governing_internal_case(enrollment) or enrollment.case,
                     cadence=cadence,
                     once_a_week_weekday=once_weekday,
                     kitchen=enrollment.kitchen,
