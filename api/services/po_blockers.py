@@ -344,6 +344,7 @@ def summarize_po_blockers(rows):
 # stranded ghost calendar or a plan that never regenerated).
 DROP_REASON_LABELS = {
     "missing_from_calendar": "Active but missing from the calendar",
+    "kitchen_assignment": "Stuck in Kitchen Assignment",
     "off_boarded": "No live enrollment (closed)",
     "on_hold": "Program on hold",
     "not_eligible": "Not eligible",
@@ -353,8 +354,10 @@ DROP_REASON_LABELS = {
     "out_of_range": "Out of Range (ZIP)",
 }
 # The drops that are almost certainly a DATA problem to fix (vs an intended
-# pause/eligibility off-ramp) -- surfaced first.
-DROP_URGENT_REASONS = {"missing_from_calendar", "off_boarded"}
+# pause/eligibility off-ramp) -- surfaced first. A served member whose enrollment
+# is still parked at KITCHEN_ASSIGNMENT is a stale-stage bug (the stage excludes
+# them from POs even though they're being served), so it's urgent too.
+DROP_URGENT_REASONS = {"missing_from_calendar", "kitchen_assignment", "off_boarded"}
 
 
 def household_primary_map(client_ids):
@@ -485,6 +488,11 @@ def detect_po_drops(today=None):
             return "off_boarded"
         if EnrollmentStage(enr.stage) == EnrollmentStage.ON_HOLD:
             return "on_hold"
+        if EnrollmentStage(enr.stage) == EnrollmentStage.KITCHEN_ASSIGNMENT:
+            # Served last week but the enrollment is still parked at Kitchen
+            # Assignment (a stale stage that excludes it from POs) -- report that
+            # explicitly rather than the generic "missing from the calendar".
+            return "kitchen_assignment"
         st = prof_status.get(cid)
         if st == MemberStatus.PAUSED:
             return "paused"

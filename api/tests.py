@@ -14573,10 +14573,20 @@ class DetectPoDropsTest(TestCase):
             anticipated_delivery_date=today + timedelta(days=1),
             status=OrderStatus.SCHEDULED)
 
+        # M6: served, no upcoming servable occurrence, enrollment still parked at
+        # KITCHEN_ASSIGNMENT (a stale stage) -> reported as kitchen_assignment,
+        # NOT missing_from_calendar.
+        M6 = client("M6"); served(M6)
+        e6 = enr(M6, EnrollmentStage.KITCHEN_ASSIGNMENT)
+        MemberDietaryProfile.objects.create(
+            enrollment=e6, client=M6, member_name="M6 Z", status=MemberStatus.ACTIVE)
+
         res = detect_po_drops(today)
         by_client = {r["client_id"]: r for r in res["dropped"]}
         self.assertNotIn(str(M1.client_id), by_client)          # still on
         self.assertEqual(by_client[str(M5.client_id)]["reason"], "missing_from_calendar")
+        self.assertEqual(by_client[str(M6.client_id)]["reason"], "kitchen_assignment")
+        self.assertTrue(by_client[str(M6.client_id)]["urgent"])
         self.assertEqual(by_client[str(M2.client_id)]["reason"], "missing_from_calendar")
         self.assertTrue(by_client[str(M2.client_id)]["urgent"])
         self.assertEqual(by_client[str(M3.client_id)]["reason"], "off_boarded")
