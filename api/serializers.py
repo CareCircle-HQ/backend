@@ -660,17 +660,37 @@ def sync_household_members(client, enrollment=None, agent=None):
         member = hm.client
         if member is None or member.pk in profiles:
             continue
-        # New members carry NO default menu type / allergies. Their real service
-        # status is decided at KITCHEN ASSIGNMENT by the meal rule, so the
-        # placeholder stays at the model default (Active) until then. Marking a
-        # pre-kitchen / pending-verification member Out of Orbit is wrong: there's
-        # no kitchen to fail and no menu has been chosen yet. Out of Orbit is only
-        # applied below once a kitchen actually exists.
+        # ALWAYS carry a member's dietary/clinical picture forward from their most
+        # recent OTHER enrollment profile (e.g. a superseded enrollment after a
+        # governing-case change): menu type, dietary restrictions, food allergies,
+        # other restrictions, verification notes, meal category + service status
+        # don't change with the case/meal type. Without this, a member who was
+        # ACTIVE with a full profile on the closed enrollment reappeared here as a
+        # blank, PENDING placeholder (losing their menu/dietary and dropping off
+        # deliveries). Only a genuinely NEW member (no prior profile anywhere)
+        # starts blank -- their menu is chosen at kitchen assignment.
+        prior = (
+            MemberDietaryProfile.objects.filter(client=member)
+            .exclude(enrollment=enrollment)
+            .order_by("-enrollment__opened_at")
+            .first()
+        )
+        carried = {"menu_type": ""}
+        if prior is not None:
+            carried = {
+                "menu_type": prior.menu_type,
+                "dietary_restrictions": prior.dietary_restrictions,
+                "food_allergies": prior.food_allergies,
+                "other_dietary_restrictions": prior.other_dietary_restrictions,
+                "meal_category": prior.meal_category,
+                "general_verification_notes": prior.general_verification_notes,
+                "status": prior.status,
+            }
         profile = MemberDietaryProfile.objects.create(
             enrollment=enrollment,
             client=member,
             member_name=f"{member.first_name} {member.last_name}".strip(),
-            menu_type="",
+            **carried,
         )
         created += 1
         # Delivery Coverage takes priority over the default Out of Orbit: if this

@@ -14988,3 +14988,48 @@ class DetectPoDropsDependentInheritsHouseholdTest(TestCase):
         self.assertEqual(rows[str(dep.client_id)]["reason"], "on_hold")       # inherited
         self.assertFalse(rows[str(dep.client_id)]["urgent"])
         self.assertEqual(rows[str(gone.client_id)]["reason"], "off_boarded")  # genuine
+
+
+class SyncHouseholdCarriesPriorProfileTest(TestCase):
+    """sync_household_members must carry a roster member's menu/dietary/status
+    forward from their most recent prior enrollment profile (governing-case
+    change), not re-create them as a blank PENDING placeholder."""
+
+    def test_carries_prior_dietary_and_status(self):
+        from .models import (
+            Client, EnrollmentStage, EnrollmentVerification, Household,
+            HouseholdMember, MemberDietaryProfile, MemberStatus,
+        )
+        from .serializers import sync_household_members
+
+        hh = Household.objects.create(name="HH")
+        primary = Client.objects.create(client_id=str(uuid.uuid4()), first_name="P", last_name="H")
+        dep = Client.objects.create(client_id=str(uuid.uuid4()), first_name="D", last_name="H")
+        HouseholdMember.objects.create(household=hh, client=primary, is_primary=True)
+        HouseholdMember.objects.create(household=hh, client=dep, is_primary=False)
+
+        # Closed prior enrollment: dependent was ACTIVE with a full profile.
+        old = EnrollmentVerification.objects.create(
+            client=primary, household=hh, stage=EnrollmentStage.CLOSED,
+            program_name="Medically Tailored Meals")
+        MemberDietaryProfile.objects.create(
+            enrollment=old, client=dep, member_name="D H", status=MemberStatus.ACTIVE,
+            menu_type="Kosher", dietary_restrictions=["Low Sodium"],
+            food_allergies=["Peanuts"], other_dietary_restrictions="No shellfish",
+            general_verification_notes="prefers soft foods")
+
+        # New live enrollment: dependent is only on the roster, no profile yet.
+        new = EnrollmentVerification.objects.create(
+            client=primary, household=hh, stage=EnrollmentStage.SERVICE_ACTIVE,
+            program_name="Medically Tailored Meals", supersedes=old)
+        MemberDietaryProfile.objects.create(
+            enrollment=new, client=primary, member_name="P H", status=MemberStatus.ACTIVE)
+
+        sync_household_members(primary, enrollment=new)
+
+        dep_profile = MemberDietaryProfile.objects.get(enrollment=new, client=dep)
+        self.assertEqual(dep_profile.menu_type, "Kosher")
+        self.assertEqual(dep_profile.status, MemberStatus.ACTIVE)          # not PENDING
+        self.assertEqual(dep_profile.food_allergies, ["Peanuts"])
+        self.assertEqual(dep_profile.other_dietary_restrictions, "No shellfish")
+        self.assertEqual(dep_profile.general_verification_notes, "prefers soft foods")
