@@ -14377,3 +14377,120 @@ class ReconcileClosedEnrollmentCalendarsTest(TestCase):
         ).count()
         self.assertEqual(closed_future, 0)
         self.assertGreater(live_future, 0)
+
+
+class VerificationCreateEnforcesSingleEnrollmentTest(TestCase):
+    """Creating a verification for a client who already has a live in-funnel
+    enrollment REUSES it (rebind) instead of opening a second live row -- so a
+    new/renewal case can never fork a duplicate enrollment."""
+
+    def test_reuses_existing_pending_enrollment(self):
+        from .models import (
+            Client, EnrollmentStage, EnrollmentVerification, Household,
+        )
+        from .serializers import EnrollmentVerificationSerializer
+
+        client = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="One", last_name="Enr",
+        )
+        hh = Household.objects.create(name="HH")
+        existing = EnrollmentVerification.objects.create(
+            client=client, household=hh,
+            stage=EnrollmentStage.PENDING_VERIFICATION,
+        )
+        ser = EnrollmentVerificationSerializer(data={
+            "client_id": str(client.client_id),
+            "household_id": str(hh.pk),
+            "household_size": 3,
+            "members": [{"member_name": "One Enr"}],
+        })
+        ser.is_valid(raise_exception=True)
+        enr = ser.save()
+        self.assertEqual(enr.pk, existing.pk)  # reused, not a new row
+        self.assertEqual(enr.household_size, 3)  # data applied
+        live = EnrollmentVerification.objects.filter(client=client).exclude(
+            stage__in=["closed", "cancelled"]).count()
+        self.assertEqual(live, 1)  # invariant: one live enrollment
+
+    def test_creates_when_no_live_enrollment(self):
+        from .models import Client, EnrollmentVerification, Household
+        from .serializers import EnrollmentVerificationSerializer
+
+        client = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="New", last_name="Enr",
+        )
+        hh = Household.objects.create(name="HH")
+        ser = EnrollmentVerificationSerializer(data={
+            "client_id": str(client.client_id), "household_id": str(hh.pk),
+            "members": [{"member_name": "New Enr"}],
+        })
+        ser.is_valid(raise_exception=True)
+        enr = ser.save()
+        self.assertEqual(
+            EnrollmentVerification.objects.filter(client=client).count(), 1)
+
+
+class PoMembershipDiffTest(TestCase):
+    """Week-over-week membership churn per kitchen x cadence, from DeliveryOrders:
+    New (truly-new vs moved-in) and Dropped (exited vs moved-out)."""
+
+    def test_new_moved_exited_buckets(self):
+        from datetime import timedelta
+
+        from .models import (
+            Client, DeliveryOrder, DeliveryOrderStatus, Kitchen, KitchenStatus,
+            PurchaseOrder, PurchaseOrderStatus,
+        )
+        from .portal.views_dashboard_logistics import (
+            _completed_week_ranges, po_membership_cell_members, po_membership_diff,
+        )
+
+        today = timezone.localdate()
+        ts, te, ls, le = _completed_week_ranges(today)
+        A = Kitchen.objects.create(name="Kitchen A", status=KitchenStatus.ACTIVE)
+        B = Kitchen.objects.create(name="Kitchen B", status=KitchenStatus.ACTIVE)
+        po = PurchaseOrder.objects.create(status=PurchaseOrderStatus.DRAFT)
+
+        def client(n):
+            return Client.objects.create(
+                client_id=str(uuid.uuid4()), first_name=n, last_name="X")
+
+        def mk(c, kitchen, day):
+            DeliveryOrder.objects.create(
+                purchase_order=po, member=c, kitchen=kitchen,
+                expected_delivery_date=day, status=DeliveryOrderStatus.PENDING)
+
+        M1, M2, M3, M4 = client("M1"), client("M2"), client("M3"), client("M4")
+        tmon, tthu = ts, ts + timedelta(days=3)      # this completed week Mon/Thu
+        lmon, lthu = ls, ls + timedelta(days=3)      # prior completed week Mon/Thu
+        for d in (tmon, tthu):                        # this week
+            mk(M1, A, d); mk(M2, A, d); mk(M3, B, d)
+        for d in (lmon, lthu):                        # last week
+            mk(M1, A, d); mk(M3, A, d); mk(M4, A, d)
+
+        diff = po_membership_diff(today)
+        cells = {(c["kitchen_name"], c["cadence_key"]): c for c in diff["cells"]}
+
+        a = cells[("Kitchen A", "mon,thu")]
+        self.assertEqual((a["this"], a["last"]), (2, 3))       # {M1,M2} vs {M1,M3,M4}
+        self.assertEqual(a["new_true"], 1)                     # M2 truly new
+        self.assertEqual(a["moved_in"], 0)
+        self.assertEqual(a["exited"], 1)                       # M4 off every PO
+        self.assertEqual(a["moved_out"], 1)                    # M3 -> Kitchen B
+
+        b = cells[("Kitchen B", "mon,thu")]
+        self.assertEqual((b["this"], b["last"]), (1, 0))       # M3 new here
+        self.assertEqual(b["new_true"], 0)
+        self.assertEqual(b["moved_in"], 1)                     # M3 moved in from A
+
+        s = diff["summary"]
+        self.assertEqual((s["this_total"], s["last_total"], s["net"]), (3, 3, 0))
+        self.assertEqual(s["new_to_service"], 1)   # M2 (first-ever PO this week)
+        self.assertEqual(s["returned"], 0)
+        self.assertEqual(s["exited"], 1)           # M4
+
+        dr = po_membership_cell_members(today, a["kitchen_id"], "mon,thu")
+        self.assertEqual([r["name"] for r in dr["exited"]], ["M4 X"])
+        self.assertEqual([r["name"] for r in dr["moved_out"]], ["M3 X"])
+        # Mover carries where they went (Kitchen B / Mon/Thu).
+        self.assertTrue(dr["moved_out"][0]["other"])

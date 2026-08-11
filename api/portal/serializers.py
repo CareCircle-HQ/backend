@@ -1904,6 +1904,12 @@ class PortalHouseholdMemberSerializer(serializers.ModelSerializer):
     is_primary = serializers.SerializerMethodField()
     has_nutrition_pdf = serializers.SerializerMethodField()
     nutrition_review_status = serializers.SerializerMethodField()
+    # True when THIS member's client is on the hard eligibility off-ramp
+    # (lifecycle INELIGIBLE) -- shown as a "Not Eligible" badge next to the name,
+    # ALONGSIDE the member's status (e.g. Paused), so agents know the pause is an
+    # eligibility off-ramp that a manual un-pause can't lift.
+    not_eligible = serializers.SerializerMethodField()
+    not_eligible_reason = serializers.SerializerMethodField()
 
     class Meta:
         model = MemberDietaryProfile
@@ -1916,11 +1922,33 @@ class PortalHouseholdMemberSerializer(serializers.ModelSerializer):
             "has_nutrition_pdf", "nutrition_review_status",
             "meal_category", "menu_type", "general_verification_notes",
             "status", "status_label", "kitchen_meal_type", "kitchen_food_notes",
-            "is_primary", "pause_locked",
+            "is_primary", "pause_locked", "not_eligible", "not_eligible_reason",
         ]
 
     def get_client_id(self, obj):
         return str(obj.client_id) if obj.client_id else None
+
+    def _is_ineligible(self, obj):
+        from api.models import ClientStage
+        return bool(
+            obj.client_id and obj.client
+            and obj.client.lifecycle_stage == ClientStage.INELIGIBLE
+        )
+
+    def get_not_eligible(self, obj):
+        return self._is_ineligible(obj)
+
+    def get_not_eligible_reason(self, obj):
+        # The specific gate the member fails (e.g. "Medicaid plan type not served
+        # (FFS): ...") for the badge tooltip. Only computed for ineligible members.
+        if not self._is_ineligible(obj):
+            return ""
+        try:
+            from api.services.eligibility import evaluate_client
+            reasons = evaluate_client(obj.client).reasons
+            return "; ".join(reasons) if reasons else "Not eligible for the program"
+        except Exception:
+            return "Not eligible for the program"
 
     def get_is_primary(self, obj):
         # The primary household member can't be removed from the Household tab.

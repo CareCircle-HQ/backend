@@ -28,6 +28,7 @@ from .views_dashboard_verification import (
 from .views_dashboard_logistics import (
     DistributionKitchenMembersView,
     DistributionOverviewView,
+    DistributionPoDiffMembersView,
     LogisticsDashboardListView,
     LogisticsDashboardView,
 )
@@ -562,6 +563,13 @@ urlpatterns = [
         "dashboard/distribution/",
         DistributionOverviewView.as_view(),
         name="portal-dashboard-distribution",
+    ),
+    # NB: register BEFORE the "<str:kitchen>/members/" route so "po-diff" isn't
+    # captured as a kitchen id.
+    path(
+        "dashboard/distribution/po-diff/members/",
+        DistributionPoDiffMembersView.as_view(),
+        name="portal-dashboard-distribution-po-diff-members",
     ),
     path(
         "dashboard/distribution/<str:kitchen>/members/",
