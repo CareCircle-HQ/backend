@@ -14894,3 +14894,42 @@ class CarryServicePromotesPendingMemberTest(TestCase):
         self.assertEqual(nmp.status, MemberStatus.ACTIVE)                 # promoted
         self.assertTrue(new_enr.delivery_schedules.exists())             # plan/cadence created
         self.assertEqual(EnrollmentStage(new_enr.stage), EnrollmentStage.SERVICE_ACTIVE)
+
+
+class SyncHealsServiceActiveWithoutScheduledPlanTest(TestCase):
+    """sync_active_calendars must pick up a SERVICE_ACTIVE enrollment that has a
+    kitchen but NO scheduled plan (cancelled plan / never created) -- previously
+    invisible to the batch -- and rebuild it so it isn't stranded off POs."""
+
+    def test_sync_rebuilds_service_active_with_cancelled_plan(self):
+        from datetime import timedelta
+
+        from .models import (
+            Client, DeliveryCadence, EnrollmentStage, EnrollmentVerification,
+            Household, Kitchen, KitchenStatus, MemberDeliverySchedule,
+            MemberDietaryProfile, MemberStatus, OrderSchedule, OrderStatus,
+            ScheduleStatus,
+        )
+        from .services.orders import sync_active_calendars
+
+        today = timezone.localdate()
+        k = Kitchen.objects.create(name="K", status=KitchenStatus.ACTIVE)
+        hh = Household.objects.create(name="HH")
+        c = Client.objects.create(client_id=str(uuid.uuid4()), first_name="S", last_name="A")
+        enr = EnrollmentVerification.objects.create(
+            client=c, household=hh, stage=EnrollmentStage.SERVICE_ACTIVE, kitchen=k,
+            program_name="Medically Tailored Meals", delivery_weekdays=["mon", "thu"])
+        mp = MemberDietaryProfile.objects.create(
+            enrollment=enr, client=c, member_name="S A", status=MemberStatus.ACTIVE)
+        MemberDeliverySchedule.objects.create(
+            enrollment=enr, member_profile=mp, member_name="S A",
+            delivery_days_cadence=DeliveryCadence.MON_THU, meals_per_day=3,
+            prod_per_delivery=0, meals_boxes_total=12, kitchen=k,
+            status=ScheduleStatus.CANCELLED,                 # no SCHEDULED plan
+            starts_on=today, ends_on=today + timedelta(days=60))
+
+        sync_active_calendars()
+        self.assertGreater(
+            OrderSchedule.objects.filter(
+                enrollment=enr, status=OrderStatus.SCHEDULED,
+                anticipated_delivery_date__gte=today).count(), 0)

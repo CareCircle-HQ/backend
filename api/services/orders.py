@@ -588,6 +588,7 @@ def sync_active_calendars(from_date=None, progress_cb=None):
     receiving deliveries. Returns aggregate counts.
     """
     from api.models import (
+        EnrollmentStage,
         EnrollmentVerification,
         MemberDeliverySchedule,
         ScheduleStatus,
@@ -612,6 +613,19 @@ def sync_active_calendars(from_date=None, progress_cb=None):
         MemberDeliverySchedule.objects.filter(status=ScheduleStatus.SCHEDULED)
         .exclude(enrollment__stage__in=SERVICE_EXCLUDED_ENROLLMENT_STAGES)
         .values_list("enrollment_id", flat=True)
+    )
+    # ... PLUS every SERVICE_ACTIVE enrollment that has a kitchen but NO scheduled
+    # plan at all -- its plan was CANCELLED (a re-activate-able drift) or a
+    # governing-case carry never created one. These have no scheduled plan AND no
+    # scheduled occurrences, so the two selections above miss them entirely and
+    # they stay stranded (Service Active + a kitchen but no calendar, silently off
+    # every PO). reconcile_enrollment_calendar -> rebuild re-activates/bootstraps
+    # the plan and regenerates the calendar.
+    enr_ids |= set(
+        EnrollmentVerification.objects.filter(
+            stage=EnrollmentStage.SERVICE_ACTIVE, kitchen__isnull=False)
+        .exclude(delivery_schedules__status=ScheduleStatus.SCHEDULED)
+        .values_list("id", flat=True)
     )
     totals = {"enrollments": 0, "added": 0, "removed": 0, "updated": 0,
               "plans_created": 0, "renamed": 0, "requeued": 0}
