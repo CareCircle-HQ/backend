@@ -3638,6 +3638,13 @@ def _resume_auto_paused_enrollment(
 
     ``hold_note`` selects which auto-pause to reverse: the denial hold by default,
     or the closure hold (``_CLOSURE_HOLD_NOTE``) on the reactivation path."""
+    # Only resume a household that is CURRENTLY on hold. Otherwise a STALE
+    # historical auto-hold event lets a re-run (e.g. the eligibility reconcile,
+    # which fires on every import) force an already-resumed, now SERVICE_ACTIVE
+    # enrollment BACK DOWN to its old held-from stage -- regressing a serving
+    # household to Verified/Kitchen Assignment and silently dropping it off POs.
+    if EnrollmentStage(enrollment.stage) != EnrollmentStage.ON_HOLD:
+        return enrollment
     last_hold = (
         StageEvent.objects.filter(
             enrollment=enrollment, to_stage=EnrollmentStage.ON_HOLD

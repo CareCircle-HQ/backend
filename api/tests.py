@@ -14791,3 +14791,29 @@ class DeliveryCalendarRebuildTargetsLiveEnrollmentTest(TestCase):
 
         got = MemberDeliveryCalendarView()._enrollment_for(str(c.client_id))
         self.assertEqual(got.pk, live.pk)
+
+
+class ResumeDoesNotRegressServingEnrollmentTest(TestCase):
+    """_resume_auto_paused_enrollment must NOT force an already-resumed, now
+    SERVICE_ACTIVE enrollment back down to a STALE hold's from_stage (which
+    stranded served members at Kitchen Assignment)."""
+
+    def test_stale_hold_does_not_regress_serving(self):
+        from .models import (
+            Client, EnrollmentStage, EnrollmentVerification, Household, StageEvent,
+        )
+        from .services.eligibility import _INELIGIBLE_HOLD_NOTE
+        from .services.lifecycle import _resume_auto_paused_enrollment
+
+        c = Client.objects.create(client_id=str(uuid.uuid4()), first_name="A", last_name="H")
+        hh = Household.objects.create(name="HH")
+        enr = EnrollmentVerification.objects.create(
+            client=c, household=hh, stage=EnrollmentStage.SERVICE_ACTIVE)
+        # A stale ineligible auto-hold from BEFORE she resumed + activated.
+        StageEvent.objects.create(
+            enrollment=enr, from_stage=EnrollmentStage.VERIFIED,
+            to_stage=EnrollmentStage.ON_HOLD, note=_INELIGIBLE_HOLD_NOTE)
+
+        _resume_auto_paused_enrollment(enr, hold_note=_INELIGIBLE_HOLD_NOTE)
+        enr.refresh_from_db()
+        self.assertEqual(EnrollmentStage(enr.stage), EnrollmentStage.SERVICE_ACTIVE)
