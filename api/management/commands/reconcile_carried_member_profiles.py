@@ -37,11 +37,16 @@ _TERMINAL = [
     EnrollmentStage.DISREGARDED,
 ]
 
-# INFORMATION fields carried forward from the member's prior profile (mirrors
-# sync_household_members). Service STATUS is deliberately NOT carried -- it's
-# governed by the scope rules (Household->Individual pauses extra members;
-# Individual->Household re-activates them), so this backfill only restores the
-# lost menu/dietary picture and never changes a member's active/paused state.
+# Fields carried forward from the member's prior profile (mirrors
+# sync_household_members). This heals a blank PENDING placeholder, so we restore
+# the member's full prior picture VERBATIM -- both the dietary INFORMATION and
+# their service STATUS. A member who was Out of Orbit / Paused / Out of Range /
+# Nutritionist Paused / Inactive on the superseded enrollment must reappear in
+# that same state, not silently reset to the pre-kitchen PENDING placeholder (or
+# ACTIVE). ``pause_locked`` and ``eligibility_paused`` travel with the status so
+# a carried pause stays correctly pinned / recoverable rather than becoming
+# freely un-pausable. ``status_changed_at`` is stamped automatically by
+# ``MemberDietaryProfile.save()`` when the status value flips.
 _CARRY_FIELDS = [
     "menu_type",
     "dietary_restrictions",
@@ -49,6 +54,9 @@ _CARRY_FIELDS = [
     "other_dietary_restrictions",
     "meal_category",
     "general_verification_notes",
+    "status",
+    "pause_locked",
+    "eligibility_paused",
 ]
 
 
@@ -117,7 +125,8 @@ class Command(BaseCommand):
 
         self.stdout.write(
             self.style.SUCCESS(
-                f"Backfilled dietary info onto {fixed} member profile(s). "
-                f"(Service status left to the scope rules.)"
+                f"Backfilled dietary info + service status onto {fixed} member "
+                f"profile(s). Re-run sync_delivery_calendars so any members "
+                f"carried back to Active get delivery occurrences again."
             )
         )

@@ -14896,6 +14896,62 @@ class CarryServicePromotesPendingMemberTest(TestCase):
         self.assertEqual(EnrollmentStage(new_enr.stage), EnrollmentStage.SERVICE_ACTIVE)
 
 
+class ReuseEnrollmentCreatesMissingDependentTest(TestCase):
+    """Root-cause regression: the reuse-existing-enrollment replacement path must
+    CREATE a household dependent that lived only on the closed enrollment onto the
+    reused survivor -- conserving the dependent's PRIOR status -- so they aren't
+    stranded off the delivery calendar while the primary keeps serving."""
+
+    def test_missing_dependent_created_conserving_status(self):
+        from .models import (
+            Client, EnrollmentStage, EnrollmentVerification, Household,
+            MemberDietaryProfile, MemberStatus,
+        )
+        from .services.lifecycle import _create_missing_carried_profiles
+
+        hh = Household.objects.create(name="HH")
+        primary = Client.objects.create(client_id=str(uuid.uuid4()), first_name="P", last_name="One")
+        dep_active = Client.objects.create(client_id=str(uuid.uuid4()), first_name="D", last_name="Active")
+        dep_paused = Client.objects.create(client_id=str(uuid.uuid4()), first_name="D", last_name="Paused")
+
+        closed = EnrollmentVerification.objects.create(
+            client=primary, household=hh, stage=EnrollmentStage.CLOSED,
+            program_name="Medically Tailored Meals")
+        survivor = EnrollmentVerification.objects.create(
+            client=primary, household=hh, stage=EnrollmentStage.SERVICE_ACTIVE,
+            program_name="Medically Tailored Meals")
+
+        # Closed enrollment has ALL members; survivor has ONLY the primary.
+        MemberDietaryProfile.objects.create(
+            enrollment=closed, client=primary, member_name="P One",
+            menu_type="Standard", status=MemberStatus.ACTIVE)
+        MemberDietaryProfile.objects.create(
+            enrollment=closed, client=dep_active, member_name="D Active",
+            menu_type="Standard", food_allergies=["None"], status=MemberStatus.ACTIVE)
+        MemberDietaryProfile.objects.create(
+            enrollment=closed, client=dep_paused, member_name="D Paused",
+            menu_type="Kosher", status=MemberStatus.PAUSED, pause_locked=True)
+        MemberDietaryProfile.objects.create(
+            enrollment=survivor, client=primary, member_name="P One",
+            menu_type="Standard", status=MemberStatus.ACTIVE)
+
+        created = _create_missing_carried_profiles(survivor, closed)
+        self.assertEqual(created, 2)  # both dependents, not the already-present primary
+
+        a = survivor.member_profiles.get(client=dep_active)
+        self.assertEqual(a.status, MemberStatus.ACTIVE)          # Active carried -> Active
+        self.assertEqual(a.menu_type, "Standard")                # dietary carried
+        self.assertEqual(a.food_allergies, ["None"])
+        self.assertEqual(a.kitchen_meal_type, "")                # rule RESULT not copied
+
+        p = survivor.member_profiles.get(client=dep_paused)
+        self.assertEqual(p.status, MemberStatus.PAUSED)          # Paused NEVER revived
+        self.assertTrue(p.pause_locked)                          # pin carried
+
+        # Idempotent: a second run creates nothing.
+        self.assertEqual(_create_missing_carried_profiles(survivor, closed), 0)
+
+
 class SyncHealsServiceActiveWithoutScheduledPlanTest(TestCase):
     """sync_active_calendars must pick up a SERVICE_ACTIVE enrollment that has a
     kitchen but NO scheduled plan (cancelled plan / never created) -- previously
