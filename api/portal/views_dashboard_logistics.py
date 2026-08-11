@@ -63,6 +63,8 @@ from ..services.po_blockers import (
     REASON_DESCRIPTIONS,
     REASON_LABELS,
     classify_po_blockers,
+    detect_po_drops,
+    household_primary_map,
     summarize_po_blockers,
 )
 from .base import PortalAPIView, current_agent
@@ -277,10 +279,15 @@ def po_membership_cell_members(today, kitchen_id, cadence_key):
             if not ((c_kid or None) == kid and c_ckey == cadence_key)
         )
 
+    primary_of = household_primary_map(new_true | moved_in | exited | moved_out)
+
     def _rows(ids, names, mcells=None):
         out = []
         for mid in ids:
-            row = {"client_id": str(mid), "name": names.get(mid) or str(mid)}
+            row = {
+                "client_id": str(mid), "name": names.get(mid) or str(mid),
+                "household_primary_id": primary_of.get(str(mid)),
+            }
             if mcells is not None:
                 row["other"] = _others(mid, mcells)
             out.append(row)
@@ -411,7 +418,6 @@ class LogisticsDashboardView(PortalAPIView):
             "queue": self._queue(today),
             "capacity": self._capacity(today),
             "forecast": self._forecast(today),
-            "po_membership_diff": po_membership_diff(today),
             "kitchen_orders": self._kitchen_orders(start, end),
             "outcomes": self._outcomes(start, end),
         })
@@ -998,6 +1004,9 @@ class DistributionOverviewView(PortalAPIView):
             # Dropped (exited / moved-out) between the two most recent completed
             # weeks. Reconstructed from DeliveryOrder history.
             "po_membership_diff": po_membership_diff(timezone.localdate()),
+            # Members who WERE being served but are missing from the upcoming PO,
+            # each tagged with why (the proactive "who got dropped" alert).
+            "po_drops": detect_po_drops(timezone.localdate()),
         })
 
 
@@ -1132,6 +1141,12 @@ class DistributionKitchenMembersView(PortalAPIView):
             total = rows.count()
             results = [to_row(r) for r in rows[start:start + self.PAGE_SIZE]]
 
+        primary_of = household_primary_map(
+            [r["client_id"] for r in results if r["client_id"]]
+        )
+        for r in results:
+            r["household_primary_id"] = primary_of.get(r["client_id"])
+
         return Response({
             "kitchen": kitchen,
             "kitchen_name": kitchen_name,
@@ -1166,3 +1181,26 @@ class DistributionPoDiffMembersView(PortalAPIView):
         return Response(
             po_membership_cell_members(timezone.localdate(), kitchen_id, cadence_key)
         )
+
+
+class PoDropsView(PortalAPIView):
+    """Members who were being served (past/current week) but are missing from the
+    upcoming PO, each tagged with why. Optional ``?kind=meals|boxes`` filter for
+    the PO-preview panel. Used by the daily "at risk" list and the preview.
+    """
+
+    def get(self, request):
+        agent = current_agent(request)
+        if not _is_privileged(agent):
+            return Response(
+                {"detail": "Logistics dashboard access required."}, status=403
+            )
+        data = detect_po_drops(timezone.localdate())
+        kind = (request.query_params.get("kind") or "").lower()
+        if kind in ("meals", "boxes"):
+            rows = [r for r in data["dropped"] if r["kind"] in (kind, "")]
+            data = {
+                **data, "dropped": rows, "total": len(rows),
+                "summary": summarize_po_blockers(rows),
+            }
+        return Response(data)

@@ -29,6 +29,7 @@ from .views_dashboard_logistics import (
     DistributionKitchenMembersView,
     DistributionOverviewView,
     DistributionPoDiffMembersView,
+    PoDropsView,
     LogisticsDashboardListView,
     LogisticsDashboardView,
 )
@@ -570,6 +571,11 @@ urlpatterns = [
         "dashboard/distribution/po-diff/members/",
         DistributionPoDiffMembersView.as_view(),
         name="portal-dashboard-distribution-po-diff-members",
+    ),
+    path(
+        "dashboard/po-drops/",
+        PoDropsView.as_view(),
+        name="portal-dashboard-po-drops",
     ),
     path(
         "dashboard/distribution/<str:kitchen>/members/",

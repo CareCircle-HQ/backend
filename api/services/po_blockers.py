@@ -338,6 +338,220 @@ def summarize_po_blockers(rows):
     return counts
 
 
+# Why a member who WAS being served fell off the upcoming PO. Ordered most- to
+# least-urgent; "missing_from_calendar" is the silent bug class (an active,
+# servable member whose calendar simply has no upcoming occurrence -- e.g. a
+# stranded ghost calendar or a plan that never regenerated).
+DROP_REASON_LABELS = {
+    "missing_from_calendar": "Active but missing from the calendar",
+    "kitchen_assignment": "Stuck in Kitchen Assignment",
+    "awaiting_kitchen": "Awaiting Kitchen Assignment",
+    "off_boarded": "No live enrollment (closed)",
+    "on_hold": "Program on hold",
+    "not_eligible": "Not eligible",
+    "paused": "Paused",
+    "nutritionist_paused": "Paused by nutritionist",
+    "out_of_orbit": "Out of Orbit (kitchen can't fulfill)",
+    "out_of_range": "Out of Range (ZIP)",
+}
+# The drops that are almost certainly a DATA problem to fix (vs an intended
+# pause/eligibility off-ramp) -- surfaced first. A served member whose enrollment
+# is still parked at KITCHEN_ASSIGNMENT is a stale-stage bug (the stage excludes
+# them from POs even though they're being served), so it's urgent too.
+DROP_URGENT_REASONS = {"missing_from_calendar", "kitchen_assignment", "off_boarded"}
+
+
+def household_primary_map(client_ids):
+    """``client_id -> household PRIMARY's client_id`` (as str), ONLY when the
+    primary differs from the member (i.e. the member is a dependent) -- so the UI
+    can offer an "Open Household" link that points at the primary."""
+    from api.models import HouseholdMember
+
+    ids = list(client_ids)
+    if not ids:
+        return {}
+    hh_of = dict(
+        HouseholdMember.objects.filter(client_id__in=ids)
+        .values_list("client_id", "household_id")
+    )
+    primaries = dict(
+        HouseholdMember.objects.filter(
+            household_id__in=set(v for v in hh_of.values() if v), is_primary=True)
+        .values_list("household_id", "client_id")
+    )
+    out = {}
+    for cid, hid in hh_of.items():
+        pid = primaries.get(hid)
+        if pid and pid != cid:
+            out[str(cid)] = str(pid)
+    return out
+
+
+def detect_po_drops(today=None):
+    """Members who WERE being served (a non-cancelled delivery in the past or
+    current week) but have NO upcoming delivery -- i.e. taken off the next PO --
+    each tagged with WHY. Reconstructed from live data; no snapshot.
+
+    Returns ``{window, total, summary: {reason: count}, dropped: [row]}`` where a
+    row is ``{client_id, name, last_delivery, reason, reason_label, urgent,
+    kind, kitchen_name, enrollment_id}``.
+    """
+    from datetime import timedelta
+
+    from api.models import (
+        Client, ClientStage, DeliveryOrder, DeliveryOrderStatus,
+        EnrollmentStage, EnrollmentVerification, MemberDietaryProfile,
+        MemberStatus,
+    )
+
+    today = today or timezone.localdate()
+    this_monday = today - timedelta(days=today.weekday())
+    last_monday = this_monday - timedelta(days=7)
+    week_end = this_monday + timedelta(days=6)          # this Sunday
+
+    # WAS being served: non-cancelled delivery order in the past or current week.
+    served = {}   # client_id -> last delivery date + kitchen name
+    for cid, d, kname in (
+        DeliveryOrder.objects
+        .filter(expected_delivery_date__gte=last_monday,
+                expected_delivery_date__lte=week_end)
+        .exclude(member__isnull=True)
+        .exclude(status=DeliveryOrderStatus.CANCELLED)
+        .values_list("member_id", "expected_delivery_date", "kitchen__name")
+    ):
+        if cid not in served or d > served[cid][0]:
+            served[cid] = (d, kname or "")
+
+    # STILL ON: a committed future delivery order OR a planned SCHEDULED
+    # occurrence from today onward.
+    still_on = set(
+        DeliveryOrder.objects.filter(expected_delivery_date__gte=today)
+        .exclude(member__isnull=True)
+        .exclude(status=DeliveryOrderStatus.CANCELLED)
+        .values_list("member_id", flat=True)
+    )
+    still_on |= set(
+        OrderSchedule.objects.filter(
+            status=ScheduleStatus.SCHEDULED, anticipated_delivery_date__gte=today)
+        # A scheduled occurrence only keeps a member "on" the PO if it's on a
+        # SERVABLE enrollment. Occurrences stranded on a closed/on-hold/etc.
+        # enrollment never feed a PO, so they must NOT mask a real drop (a member
+        # whose live enrollment has no upcoming occurrence -- the ghost-calendar
+        # case where the live rows are cancelled and the scheduled ones sit on a
+        # dead enrollment).
+        .exclude(enrollment__stage__in=SERVICE_EXCLUDED_ENROLLMENT_STAGES)
+        .exclude(member__client__isnull=True)
+        .values_list("member__client_id", flat=True)
+    )
+
+    dropped_ids = [cid for cid in served if cid not in still_on]
+    if not dropped_ids:
+        return {
+            "window": {"served_from": last_monday.isoformat(),
+                       "served_to": week_end.isoformat()},
+            "total": 0, "summary": {}, "dropped": [],
+        }
+
+    # Best live (non-terminal) enrollment + member status per dropped client.
+    terminal = [EnrollmentStage.CLOSED, EnrollmentStage.CANCELLED,
+                EnrollmentStage.DISREGARDED]
+    # Prefer the MOST-ADVANCED / actually-serving non-terminal enrollment to
+    # explain the drop -- not merely the most recent. A client can hold both a
+    # served enrollment now ON_HOLD (its case closed) and a fresh
+    # PENDING_VERIFICATION on a new case; the reason must reflect the served one
+    # (on_hold), not the pending row (which reads as a false missing_from_calendar).
+    _ENR_PRIORITY = {
+        EnrollmentStage.SERVICE_ACTIVE: 5,
+        EnrollmentStage.ON_HOLD: 4,
+        EnrollmentStage.KITCHEN_ASSIGNMENT: 3,
+        EnrollmentStage.VERIFIED: 2,
+        EnrollmentStage.PENDING_VERIFICATION: 1,
+    }
+    live_by_client = {}
+    _best_pri = {}
+    for enr in (
+        EnrollmentVerification.objects.filter(client_id__in=dropped_ids)
+        .exclude(stage__in=[s.value for s in terminal])
+        .order_by("client_id", "-stage_at")   # newest first -> ties keep newest
+    ):
+        pri = _ENR_PRIORITY.get(EnrollmentStage(enr.stage), 0)
+        if enr.client_id not in _best_pri or pri > _best_pri[enr.client_id]:
+            _best_pri[enr.client_id] = pri
+            live_by_client[enr.client_id] = enr
+    prof_status = {}
+    for cid, st in (
+        MemberDietaryProfile.objects
+        .filter(client_id__in=dropped_ids,
+                enrollment__in=[e.pk for e in live_by_client.values()])
+        .values_list("client_id", "status")
+    ):
+        prof_status.setdefault(cid, st)
+    ineligible = set(
+        Client.objects.filter(pk__in=dropped_ids,
+                              lifecycle_stage=ClientStage.INELIGIBLE)
+        .values_list("pk", flat=True)
+    )
+    names = {
+        cid: (f"{fn or ''} {ln or ''}".strip() or str(cid))
+        for cid, fn, ln in Client.objects.filter(pk__in=dropped_ids)
+        .values_list("pk", "first_name", "last_name")
+    }
+
+    def _reason(cid):
+        if cid in ineligible:
+            return "not_eligible"
+        enr = live_by_client.get(cid)
+        if enr is None:
+            return "off_boarded"
+        if EnrollmentStage(enr.stage) == EnrollmentStage.ON_HOLD:
+            return "on_hold"
+        if EnrollmentStage(enr.stage) == EnrollmentStage.KITCHEN_ASSIGNMENT:
+            # Split by whether a kitchen is already assigned:
+            #  - HAS a kitchen -> a STALE/STUCK stage (should be Service Active);
+            #    a data bug that excludes a serving household from POs.
+            #  - NO kitchen -> genuinely AWAITING assignment (e.g. a meals<->boxes
+            #    switch needs a new kitchen + cadence); a real ops to-do, expected.
+            return "kitchen_assignment" if enr.kitchen_id else "awaiting_kitchen"
+        st = prof_status.get(cid)
+        if st == MemberStatus.PAUSED:
+            return "paused"
+        if st == MemberStatus.NUTRITIONIST_PAUSED:
+            return "nutritionist_paused"
+        if st == MemberStatus.OUT_OF_ORBIT:
+            return "out_of_orbit"
+        if st == MemberStatus.OUT_OF_RANGE:
+            return "out_of_range"
+        return "missing_from_calendar"   # active + live but no upcoming delivery
+
+    primary_of = household_primary_map(dropped_ids)
+    rows = []
+    for cid in dropped_ids:
+        last_d, kname = served[cid]
+        enr = live_by_client.get(cid)
+        reason = _reason(cid)
+        kind = product_type_kind_for_name(enr.program_name) if enr else None
+        rows.append({
+            "client_id": str(cid),
+            "name": names.get(cid, str(cid)),
+            "last_delivery": last_d.isoformat(),
+            "reason": reason,
+            "reason_label": DROP_REASON_LABELS.get(reason, reason),
+            "urgent": reason in DROP_URGENT_REASONS,
+            "kitchen_name": kname,
+            "kind": kind or "",
+            "enrollment_id": enr.pk if enr else None,
+            "household_primary_id": primary_of.get(str(cid)),
+        })
+    rows.sort(key=lambda r: (not r["urgent"], r["reason"], r["name"].lower()))
+    return {
+        "window": {"served_from": last_monday.isoformat(),
+                   "served_to": week_end.isoformat()},
+        "total": len(rows),
+        "summary": summarize_po_blockers(rows),
+        "dropped": rows,
+    }
+
+
 def duplicate_enrollment_keeper(enr, governing_case=None):
     """When ``enr`` is a spurious DUPLICATE, return the enrollment that already
     owns the governing internal-service case (the one to KEEP); else None.

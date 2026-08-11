@@ -3205,9 +3205,21 @@ def _carry_service_and_activate(
         new_enr.save(update_fields=fields)
 
     # Return servable members to Active against the carried kitchen.
+    from api.models import MemberStatus
+
     for mv in new_enr.member_profiles.all():
         if getattr(mv, "eligibility_paused", False):
             continue
+        # A carried, still-serving household's members must be ACTIVE so they get
+        # a delivery plan. A PENDING copy (the pre-service default) is EXCLUDED by
+        # create_member_delivery_schedules (PENDING is in
+        # SERVICE_EXCLUDED_MEMBER_STATUSES), so a served member would silently end
+        # up with NO plan and NO cadence -- Service Active + a kitchen but nothing
+        # to deliver. Promote PENDING -> ACTIVE before reconciling the kitchen
+        # rule (which may still flip them Out-of-Orbit if unfulfillable).
+        if mv.status == MemberStatus.PENDING:
+            mv.status = MemberStatus.ACTIVE
+            mv.save(update_fields=["status"])
         try:
             reconcile_member_kitchen_output(mv, kitchen=kitchen, allow_resume=True, save=True)
         except Exception:  # pragma: no cover - defensive
@@ -3638,6 +3650,13 @@ def _resume_auto_paused_enrollment(
 
     ``hold_note`` selects which auto-pause to reverse: the denial hold by default,
     or the closure hold (``_CLOSURE_HOLD_NOTE``) on the reactivation path."""
+    # Only resume a household that is CURRENTLY on hold. Otherwise a STALE
+    # historical auto-hold event lets a re-run (e.g. the eligibility reconcile,
+    # which fires on every import) force an already-resumed, now SERVICE_ACTIVE
+    # enrollment BACK DOWN to its old held-from stage -- regressing a serving
+    # household to Verified/Kitchen Assignment and silently dropping it off POs.
+    if EnrollmentStage(enrollment.stage) != EnrollmentStage.ON_HOLD:
+        return enrollment
     last_hold = (
         StageEvent.objects.filter(
             enrollment=enrollment, to_stage=EnrollmentStage.ON_HOLD

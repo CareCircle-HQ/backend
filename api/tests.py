@@ -14494,3 +14494,442 @@ class PoMembershipDiffTest(TestCase):
         self.assertEqual([r["name"] for r in dr["moved_out"]], ["M3 X"])
         # Mover carries where they went (Kitchen B / Mon/Thu).
         self.assertTrue(dr["moved_out"][0]["other"])
+
+
+class DetectPoDropsTest(TestCase):
+    """Members served in the past/current week but missing from the upcoming PO
+    are flagged with the right reason."""
+
+    def test_drop_reasons(self):
+        from datetime import timedelta
+
+        from .models import (
+            Client, DeliveryOrder, DeliveryOrderStatus, EnrollmentStage,
+            EnrollmentVerification, Household, Kitchen, KitchenStatus,
+            MemberDietaryProfile, MemberStatus, OrderSchedule, OrderStatus,
+            PurchaseOrder, PurchaseOrderStatus,
+        )
+        from .services.po_blockers import detect_po_drops
+
+        today = timezone.localdate()
+        last_monday = today - timedelta(days=today.weekday()) - timedelta(days=7)
+        K = Kitchen.objects.create(name="K", status=KitchenStatus.ACTIVE)
+        hh = Household.objects.create(name="HH")
+        po = PurchaseOrder.objects.create(status=PurchaseOrderStatus.DRAFT)
+
+        def client(n):
+            return Client.objects.create(
+                client_id=str(uuid.uuid4()), first_name=n, last_name="Z")
+
+        def served(c):  # a non-cancelled delivery last week
+            DeliveryOrder.objects.create(
+                purchase_order=po, member=c, kitchen=K,
+                expected_delivery_date=last_monday,
+                status=DeliveryOrderStatus.PENDING)
+
+        def enr(c, stage):
+            return EnrollmentVerification.objects.create(
+                client=c, household=hh, stage=stage, kitchen=K,
+                program_name="Medically Tailored Meals")
+
+        # M1: served + has an upcoming occurrence -> still on, NOT dropped.
+        M1 = client("M1"); served(M1)
+        e1 = enr(M1, EnrollmentStage.SERVICE_ACTIVE)
+        p1 = MemberDietaryProfile.objects.create(
+            enrollment=e1, client=M1, member_name="M1 Z", status=MemberStatus.ACTIVE)
+        OrderSchedule.objects.create(
+            enrollment=e1, member=p1, member_name="M1 Z",
+            anticipated_delivery_date=today + timedelta(days=1),
+            status=OrderStatus.SCHEDULED)
+
+        # M2: served, no upcoming, active on a serving enrollment -> the bug.
+        M2 = client("M2"); served(M2)
+        e2 = enr(M2, EnrollmentStage.SERVICE_ACTIVE)
+        MemberDietaryProfile.objects.create(
+            enrollment=e2, client=M2, member_name="M2 Z", status=MemberStatus.ACTIVE)
+
+        # M3: served, no live enrollment (closed) -> off-boarded.
+        M3 = client("M3"); served(M3)
+        enr(M3, EnrollmentStage.CLOSED)
+
+        # M4: served, no upcoming, member PAUSED on a serving enrollment.
+        M4 = client("M4"); served(M4)
+        e4 = enr(M4, EnrollmentStage.SERVICE_ACTIVE)
+        MemberDietaryProfile.objects.create(
+            enrollment=e4, client=M4, member_name="M4 Z", status=MemberStatus.PAUSED)
+
+        # M5: served; the only upcoming occurrence sits on a CLOSED enrollment
+        # (never feeds a PO), while the live serving enrollment has none -> the
+        # ghost-calendar drop must NOT be masked.
+        M5 = client("M5"); served(M5)
+        e5 = enr(M5, EnrollmentStage.SERVICE_ACTIVE)
+        MemberDietaryProfile.objects.create(
+            enrollment=e5, client=M5, member_name="M5 Z", status=MemberStatus.ACTIVE)
+        e5closed = enr(M5, EnrollmentStage.CLOSED)
+        p5c = MemberDietaryProfile.objects.create(
+            enrollment=e5closed, client=M5, member_name="M5 Z", status=MemberStatus.ACTIVE)
+        OrderSchedule.objects.create(
+            enrollment=e5closed, member=p5c, member_name="M5 Z",
+            anticipated_delivery_date=today + timedelta(days=1),
+            status=OrderStatus.SCHEDULED)
+
+        # M6: served, no upcoming servable occurrence, enrollment still parked at
+        # KITCHEN_ASSIGNMENT (a stale stage) -> reported as kitchen_assignment,
+        # NOT missing_from_calendar.
+        M6 = client("M6"); served(M6)
+        e6 = enr(M6, EnrollmentStage.KITCHEN_ASSIGNMENT)   # enr() assigns kitchen K
+        MemberDietaryProfile.objects.create(
+            enrollment=e6, client=M6, member_name="M6 Z", status=MemberStatus.ACTIVE)
+
+        # M7: served, KITCHEN_ASSIGNMENT but NO kitchen -> awaiting_kitchen (a
+        # genuine assignment to-do, e.g. a meals<->boxes switch), NOT urgent.
+        M7 = client("M7"); served(M7)
+        EnrollmentVerification.objects.create(
+            client=M7, household=hh, stage=EnrollmentStage.KITCHEN_ASSIGNMENT,
+            kitchen=None, program_name="Medically Tailored Meals")
+
+        # M8: served; has an ON_HOLD (served, case closed) enrollment AND a fresh
+        # PENDING_VERIFICATION on a new case -> reason must reflect the served
+        # ON_HOLD one, not the pending row.
+        M8 = client("M8"); served(M8)
+        EnrollmentVerification.objects.create(
+            client=M8, household=hh, stage=EnrollmentStage.ON_HOLD, kitchen=K,
+            program_name="Medically Tailored Meals")
+        EnrollmentVerification.objects.create(
+            client=M8, household=hh, stage=EnrollmentStage.PENDING_VERIFICATION,
+            kitchen=None, program_name="Medically Tailored Meals")
+
+        res = detect_po_drops(today)
+        by_client = {r["client_id"]: r for r in res["dropped"]}
+        self.assertNotIn(str(M1.client_id), by_client)          # still on
+        self.assertEqual(by_client[str(M5.client_id)]["reason"], "missing_from_calendar")
+        self.assertEqual(by_client[str(M6.client_id)]["reason"], "kitchen_assignment")
+        self.assertTrue(by_client[str(M6.client_id)]["urgent"])
+        self.assertEqual(by_client[str(M7.client_id)]["reason"], "awaiting_kitchen")
+        self.assertFalse(by_client[str(M7.client_id)]["urgent"])
+        self.assertEqual(by_client[str(M8.client_id)]["reason"], "on_hold")
+        self.assertEqual(by_client[str(M2.client_id)]["reason"], "missing_from_calendar")
+        self.assertTrue(by_client[str(M2.client_id)]["urgent"])
+        self.assertEqual(by_client[str(M3.client_id)]["reason"], "off_boarded")
+        self.assertEqual(by_client[str(M4.client_id)]["reason"], "paused")
+        self.assertFalse(by_client[str(M4.client_id)]["urgent"])
+
+
+class RebuildReactivatesCancelledPlanTest(TestCase):
+    """A live (servable) enrollment whose only delivery plan is CANCELLED -- a
+    tangled-duplicate drift where the scheduled plan ended up on a dead
+    enrollment -- gets its plan re-activated so "Rebuild calendar" works."""
+
+    def test_rebuild_reactivates_cancelled_plan(self):
+        from datetime import timedelta
+
+        from .models import (
+            Client, DeliveryCadence, EnrollmentStage, EnrollmentVerification,
+            Household, Kitchen, KitchenStatus, MemberDeliverySchedule,
+            MemberDietaryProfile, MemberStatus, OrderSchedule, OrderStatus,
+            ScheduleStatus,
+        )
+        from .services.orders import rebuild_delivery_calendar
+
+        today = timezone.localdate()
+        k = Kitchen.objects.create(name="K", status=KitchenStatus.ACTIVE)
+        hh = Household.objects.create(name="HH")
+        c = Client.objects.create(client_id=str(uuid.uuid4()), first_name="Al", last_name="H")
+        enr = EnrollmentVerification.objects.create(
+            client=c, household=hh, stage=EnrollmentStage.SERVICE_ACTIVE, kitchen=k,
+            program_name="Medically Tailored Meals", delivery_weekdays=["mon", "thu"],
+        )
+        mp = MemberDietaryProfile.objects.create(
+            enrollment=enr, client=c, member_name="Al H", status=MemberStatus.ACTIVE)
+        MemberDeliverySchedule.objects.create(
+            enrollment=enr, member_profile=mp, member_name="Al H",
+            delivery_days_cadence=DeliveryCadence.MON_THU, meals_per_day=3,
+            prod_per_delivery=0, meals_boxes_total=12, kitchen=k,
+            status=ScheduleStatus.CANCELLED,               # <- the drift
+            starts_on=today, ends_on=today + timedelta(days=120),
+        )
+
+        res = rebuild_delivery_calendar(enr)
+        self.assertEqual(res["plans_reactivated"], 1)
+        self.assertGreater(
+            OrderSchedule.objects.filter(
+                enrollment=enr, status=OrderStatus.SCHEDULED,
+                anticipated_delivery_date__gte=today).count(),
+            0,
+        )
+
+
+class RebuildHealsFromGoverningCaseTest(TestCase):
+    """rebuild_delivery_calendar heals the plan from the GOVERNING case
+    (recompute) when one exists, and falls back to a plain sync when the
+    enrollment has no case (pre-case), so its window isn't blanked."""
+
+    def _enr(self, *, with_case):
+        from datetime import timedelta
+
+        from .models import (
+            Case, CaseStatus, CaseType, Client, DeliveryCadence, EnrollmentStage,
+            EnrollmentVerification, Household, Kitchen, KitchenStatus,
+            MemberDeliverySchedule, MemberDietaryProfile, MemberStatus,
+            ScheduleStatus, ServiceAuthorizationStatus,
+        )
+
+        now = timezone.now()
+        c = Client.objects.create(client_id=str(uuid.uuid4()), first_name="G", last_name="C")
+        hh = Household.objects.create(name="HH")
+        k = Kitchen.objects.create(name="K", status=KitchenStatus.ACTIVE)
+        case = None
+        if with_case:
+            case = Case.objects.create(
+                case_id=uuid.uuid4(), client=c, case_type=CaseType.INTERNAL_SERVICE,
+                case_status=CaseStatus.OPEN,
+                service_authorization_status=ServiceAuthorizationStatus.APPROVED,
+                service_authorization_approval_starts_at=now,
+                service_authorization_approval_ends_at=now + timedelta(days=90),
+                program_name="Medically Tailored Meals",
+            )
+        enr = EnrollmentVerification.objects.create(
+            client=c, household=hh, case=case, kitchen=k,
+            stage=EnrollmentStage.SERVICE_ACTIVE,
+            program_name="Medically Tailored Meals", delivery_weekdays=["mon", "thu"],
+        )
+        mp = MemberDietaryProfile.objects.create(
+            enrollment=enr, client=c, member_name="G C", status=MemberStatus.ACTIVE)
+        MemberDeliverySchedule.objects.create(
+            enrollment=enr, member_profile=mp, member_name="G C",
+            delivery_days_cadence=DeliveryCadence.MON_THU, meals_per_day=3,
+            prod_per_delivery=0, meals_boxes_total=12, kitchen=k,
+            status=ScheduleStatus.SCHEDULED,
+            starts_on=timezone.localdate(),
+            ends_on=timezone.localdate() + timedelta(days=90),
+        )
+        return enr
+
+    def test_rebuild_heals_stale_window_from_case(self):
+        from datetime import timedelta
+
+        from .services.orders import rebuild_delivery_calendar
+
+        enr = self._enr(with_case=True)
+        today = timezone.localdate()
+        plan = enr.delivery_schedules.get()
+        # A STALE (short) plan window vs the governing auth (ends ~today+90):
+        # rebuild should heal it to the authorization end.
+        plan.ends_on = today + timedelta(days=10)
+        plan.save(update_fields=["ends_on"])
+
+        rebuild_delivery_calendar(enr)
+        plan.refresh_from_db()
+        self.assertGreater(plan.ends_on, today + timedelta(days=10))  # window extended
+
+    def test_no_case_keeps_plan_window(self):
+        from datetime import timedelta
+
+        from .services.orders import rebuild_delivery_calendar
+
+        enr = self._enr(with_case=False)
+        today = timezone.localdate()
+        plan = enr.delivery_schedules.get()
+        plan.ends_on = today + timedelta(days=10)
+        plan.save(update_fields=["ends_on"])
+
+        rebuild_delivery_calendar(enr)
+        plan.refresh_from_db()
+        self.assertEqual(plan.ends_on, today + timedelta(days=10))  # no case -> unchanged
+
+
+class RebuildDropsFutureCancelledOccurrencesTest(TestCase):
+    """Rebuild clears stale FUTURE cancelled occurrences (old/again kitchen or a
+    cancelled PO) so the forward calendar reflects reality, while PRESERVING past
+    cancelled rows as history."""
+
+    def test_future_cancelled_removed_past_kept(self):
+        from datetime import timedelta
+
+        from .models import (
+            Client, DeliveryCadence, EnrollmentStage, EnrollmentVerification,
+            Household, Kitchen, KitchenStatus, MemberDeliverySchedule,
+            MemberDietaryProfile, MemberStatus, OrderSchedule, OrderStatus,
+            ScheduleStatus,
+        )
+        from .services.orders import rebuild_delivery_calendar
+
+        today = timezone.localdate()
+        k = Kitchen.objects.create(name="K", status=KitchenStatus.ACTIVE)
+        hh = Household.objects.create(name="HH")
+        c = Client.objects.create(client_id=str(uuid.uuid4()), first_name="C", last_name="X")
+        enr = EnrollmentVerification.objects.create(
+            client=c, household=hh, stage=EnrollmentStage.SERVICE_ACTIVE, kitchen=k,
+            program_name="Medically Tailored Meals", delivery_weekdays=["mon", "thu"])
+        mp = MemberDietaryProfile.objects.create(
+            enrollment=enr, client=c, member_name="C X", status=MemberStatus.ACTIVE)
+        MemberDeliverySchedule.objects.create(
+            enrollment=enr, member_profile=mp, member_name="C X",
+            delivery_days_cadence=DeliveryCadence.MON_THU, meals_per_day=3,
+            prod_per_delivery=0, meals_boxes_total=12, kitchen=k,
+            status=ScheduleStatus.SCHEDULED,
+            starts_on=today, ends_on=today + timedelta(days=60))
+        past = OrderSchedule.objects.create(
+            enrollment=enr, member=mp, member_name="C X",
+            anticipated_delivery_date=today - timedelta(days=7),
+            status=OrderStatus.CANCELLED)
+        fut = OrderSchedule.objects.create(
+            enrollment=enr, member=mp, member_name="C X",
+            anticipated_delivery_date=today + timedelta(days=7),
+            status=OrderStatus.CANCELLED)
+
+        rebuild_delivery_calendar(enr)
+        self.assertTrue(OrderSchedule.objects.filter(pk=past.pk).exists())   # history kept
+        self.assertFalse(OrderSchedule.objects.filter(pk=fut.pk).exists())   # future cancelled dropped
+
+
+class DeliveryCalendarRebuildTargetsLiveEnrollmentTest(TestCase):
+    """The Delivery Schedule 'Rebuild calendar' button must target the client's
+    LIVE enrollment, not a more-recently-opened CLOSED one (rebuilding a closed
+    enrollment is a no-op -- which made the button look dead)."""
+
+    def test_prefers_live_over_recent_closed(self):
+        from datetime import timedelta
+
+        from .models import (
+            Client, EnrollmentStage, EnrollmentVerification, Household,
+            MemberDietaryProfile,
+        )
+        from .portal.views_delivery_calendar import MemberDeliveryCalendarView
+
+        now = timezone.now()
+        c = Client.objects.create(client_id=str(uuid.uuid4()), first_name="A", last_name="H")
+        hh = Household.objects.create(name="HH")
+        live = EnrollmentVerification.objects.create(
+            client=c, household=hh, stage=EnrollmentStage.SERVICE_ACTIVE)
+        closed = EnrollmentVerification.objects.create(
+            client=c, household=hh, stage=EnrollmentStage.CLOSED)
+        # closed opened MORE recently than live
+        EnrollmentVerification.objects.filter(pk=live.pk).update(opened_at=now - timedelta(days=30))
+        EnrollmentVerification.objects.filter(pk=closed.pk).update(opened_at=now)
+        MemberDietaryProfile.objects.create(enrollment=live, client=c, member_name="A H")
+        MemberDietaryProfile.objects.create(enrollment=closed, client=c, member_name="A H")
+
+        got = MemberDeliveryCalendarView()._enrollment_for(str(c.client_id))
+        self.assertEqual(got.pk, live.pk)
+
+
+class ResumeDoesNotRegressServingEnrollmentTest(TestCase):
+    """_resume_auto_paused_enrollment must NOT force an already-resumed, now
+    SERVICE_ACTIVE enrollment back down to a STALE hold's from_stage (which
+    stranded served members at Kitchen Assignment)."""
+
+    def test_stale_hold_does_not_regress_serving(self):
+        from .models import (
+            Client, EnrollmentStage, EnrollmentVerification, Household, StageEvent,
+        )
+        from .services.eligibility import _INELIGIBLE_HOLD_NOTE
+        from .services.lifecycle import _resume_auto_paused_enrollment
+
+        c = Client.objects.create(client_id=str(uuid.uuid4()), first_name="A", last_name="H")
+        hh = Household.objects.create(name="HH")
+        enr = EnrollmentVerification.objects.create(
+            client=c, household=hh, stage=EnrollmentStage.SERVICE_ACTIVE)
+        # A stale ineligible auto-hold from BEFORE she resumed + activated.
+        StageEvent.objects.create(
+            enrollment=enr, from_stage=EnrollmentStage.VERIFIED,
+            to_stage=EnrollmentStage.ON_HOLD, note=_INELIGIBLE_HOLD_NOTE)
+
+        _resume_auto_paused_enrollment(enr, hold_note=_INELIGIBLE_HOLD_NOTE)
+        enr.refresh_from_db()
+        self.assertEqual(EnrollmentStage(enr.stage), EnrollmentStage.SERVICE_ACTIVE)
+
+
+class CarryServicePromotesPendingMemberTest(TestCase):
+    """Carrying a serving household to a new governing case must leave its
+    members ACTIVE (not PENDING) so a delivery plan/cadence is created -- a
+    PENDING member is excluded from plan creation and would get no cadence."""
+
+    def test_pending_member_promoted_and_plan_created(self):
+        from datetime import timedelta
+        from unittest.mock import patch
+
+        from .models import (
+            Case, CaseStatus, CaseType, Client, DeliveryCadence, EnrollmentStage,
+            EnrollmentVerification, Household, Kitchen, KitchenStatus,
+            MemberDeliverySchedule, MemberDietaryProfile, MemberStatus,
+            ProductTypeKind, ScheduleStatus, ServiceAuthorizationStatus,
+        )
+        from .services.lifecycle import _carry_service_and_activate
+
+        now = timezone.now(); today = timezone.localdate()
+        c = Client.objects.create(client_id=str(uuid.uuid4()), first_name="G", last_name="S")
+        hh = Household.objects.create(name="HH")
+        k = Kitchen.objects.create(name="Williamsburg", status=KitchenStatus.ACTIVE)
+        new_case = Case.objects.create(
+            case_id=uuid.uuid4(), client=c, case_type=CaseType.INTERNAL_SERVICE,
+            case_status=CaseStatus.OPEN,
+            service_authorization_status=ServiceAuthorizationStatus.APPROVED,
+            service_authorization_approval_starts_at=now,
+            service_authorization_approval_ends_at=now + timedelta(days=90),
+            program_name="Medically Tailored Meals")
+        prior = EnrollmentVerification.objects.create(
+            client=c, household=hh, stage=EnrollmentStage.SERVICE_ACTIVE, kitchen=k,
+            program_name="Medically Tailored Meals", delivery_weekdays=["mon", "thu"])
+        pmp = MemberDietaryProfile.objects.create(
+            enrollment=prior, client=c, member_name="G S", status=MemberStatus.ACTIVE)
+        MemberDeliverySchedule.objects.create(
+            enrollment=prior, member_profile=pmp, member_name="G S",
+            delivery_days_cadence=DeliveryCadence.MON_THU, meals_per_day=3,
+            prod_per_delivery=0, meals_boxes_total=12, kitchen=k,
+            status=ScheduleStatus.SCHEDULED, starts_on=today, ends_on=today + timedelta(days=90))
+        new_enr = EnrollmentVerification.objects.create(
+            client=c, household=hh, case=new_case,
+            stage=EnrollmentStage.PENDING_VERIFICATION,
+            program_name="Medically Tailored Meals", verified_at=now)
+        nmp = MemberDietaryProfile.objects.create(
+            enrollment=new_enr, client=c, member_name="G S", status=MemberStatus.PENDING)
+
+        with patch("api.services.meal_rules.reconcile_member_kitchen_output", return_value=None):
+            _carry_service_and_activate(
+                new_enr, prior, new_case, ProductTypeKind.MEALS,
+                prior_was_serving=True, actor=None, actor_label="")
+
+        nmp.refresh_from_db(); new_enr.refresh_from_db()
+        self.assertEqual(nmp.status, MemberStatus.ACTIVE)                 # promoted
+        self.assertTrue(new_enr.delivery_schedules.exists())             # plan/cadence created
+        self.assertEqual(EnrollmentStage(new_enr.stage), EnrollmentStage.SERVICE_ACTIVE)
+
+
+class SyncHealsServiceActiveWithoutScheduledPlanTest(TestCase):
+    """sync_active_calendars must pick up a SERVICE_ACTIVE enrollment that has a
+    kitchen but NO scheduled plan (cancelled plan / never created) -- previously
+    invisible to the batch -- and rebuild it so it isn't stranded off POs."""
+
+    def test_sync_rebuilds_service_active_with_cancelled_plan(self):
+        from datetime import timedelta
+
+        from .models import (
+            Client, DeliveryCadence, EnrollmentStage, EnrollmentVerification,
+            Household, Kitchen, KitchenStatus, MemberDeliverySchedule,
+            MemberDietaryProfile, MemberStatus, OrderSchedule, OrderStatus,
+            ScheduleStatus,
+        )
+        from .services.orders import sync_active_calendars
+
+        today = timezone.localdate()
+        k = Kitchen.objects.create(name="K", status=KitchenStatus.ACTIVE)
+        hh = Household.objects.create(name="HH")
+        c = Client.objects.create(client_id=str(uuid.uuid4()), first_name="S", last_name="A")
+        enr = EnrollmentVerification.objects.create(
+            client=c, household=hh, stage=EnrollmentStage.SERVICE_ACTIVE, kitchen=k,
+            program_name="Medically Tailored Meals", delivery_weekdays=["mon", "thu"])
+        mp = MemberDietaryProfile.objects.create(
+            enrollment=enr, client=c, member_name="S A", status=MemberStatus.ACTIVE)
+        MemberDeliverySchedule.objects.create(
+            enrollment=enr, member_profile=mp, member_name="S A",
+            delivery_days_cadence=DeliveryCadence.MON_THU, meals_per_day=3,
+            prod_per_delivery=0, meals_boxes_total=12, kitchen=k,
+            status=ScheduleStatus.CANCELLED,                 # no SCHEDULED plan
+            starts_on=today, ends_on=today + timedelta(days=60))
+
+        sync_active_calendars()
+        self.assertGreater(
+            OrderSchedule.objects.filter(
+                enrollment=enr, status=OrderStatus.SCHEDULED,
+                anticipated_delivery_date__gte=today).count(), 0)
