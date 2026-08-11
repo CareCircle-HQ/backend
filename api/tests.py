@@ -14817,3 +14817,59 @@ class ResumeDoesNotRegressServingEnrollmentTest(TestCase):
         _resume_auto_paused_enrollment(enr, hold_note=_INELIGIBLE_HOLD_NOTE)
         enr.refresh_from_db()
         self.assertEqual(EnrollmentStage(enr.stage), EnrollmentStage.SERVICE_ACTIVE)
+
+
+class CarryServicePromotesPendingMemberTest(TestCase):
+    """Carrying a serving household to a new governing case must leave its
+    members ACTIVE (not PENDING) so a delivery plan/cadence is created -- a
+    PENDING member is excluded from plan creation and would get no cadence."""
+
+    def test_pending_member_promoted_and_plan_created(self):
+        from datetime import timedelta
+        from unittest.mock import patch
+
+        from .models import (
+            Case, CaseStatus, CaseType, Client, DeliveryCadence, EnrollmentStage,
+            EnrollmentVerification, Household, Kitchen, KitchenStatus,
+            MemberDeliverySchedule, MemberDietaryProfile, MemberStatus,
+            ProductTypeKind, ScheduleStatus, ServiceAuthorizationStatus,
+        )
+        from .services.lifecycle import _carry_service_and_activate
+
+        now = timezone.now(); today = timezone.localdate()
+        c = Client.objects.create(client_id=str(uuid.uuid4()), first_name="G", last_name="S")
+        hh = Household.objects.create(name="HH")
+        k = Kitchen.objects.create(name="Williamsburg", status=KitchenStatus.ACTIVE)
+        new_case = Case.objects.create(
+            case_id=uuid.uuid4(), client=c, case_type=CaseType.INTERNAL_SERVICE,
+            case_status=CaseStatus.OPEN,
+            service_authorization_status=ServiceAuthorizationStatus.APPROVED,
+            service_authorization_approval_starts_at=now,
+            service_authorization_approval_ends_at=now + timedelta(days=90),
+            program_name="Medically Tailored Meals")
+        prior = EnrollmentVerification.objects.create(
+            client=c, household=hh, stage=EnrollmentStage.SERVICE_ACTIVE, kitchen=k,
+            program_name="Medically Tailored Meals", delivery_weekdays=["mon", "thu"])
+        pmp = MemberDietaryProfile.objects.create(
+            enrollment=prior, client=c, member_name="G S", status=MemberStatus.ACTIVE)
+        MemberDeliverySchedule.objects.create(
+            enrollment=prior, member_profile=pmp, member_name="G S",
+            delivery_days_cadence=DeliveryCadence.MON_THU, meals_per_day=3,
+            prod_per_delivery=0, meals_boxes_total=12, kitchen=k,
+            status=ScheduleStatus.SCHEDULED, starts_on=today, ends_on=today + timedelta(days=90))
+        new_enr = EnrollmentVerification.objects.create(
+            client=c, household=hh, case=new_case,
+            stage=EnrollmentStage.PENDING_VERIFICATION,
+            program_name="Medically Tailored Meals", verified_at=now)
+        nmp = MemberDietaryProfile.objects.create(
+            enrollment=new_enr, client=c, member_name="G S", status=MemberStatus.PENDING)
+
+        with patch("api.services.meal_rules.reconcile_member_kitchen_output", return_value=None):
+            _carry_service_and_activate(
+                new_enr, prior, new_case, ProductTypeKind.MEALS,
+                prior_was_serving=True, actor=None, actor_label="")
+
+        nmp.refresh_from_db(); new_enr.refresh_from_db()
+        self.assertEqual(nmp.status, MemberStatus.ACTIVE)                 # promoted
+        self.assertTrue(new_enr.delivery_schedules.exists())             # plan/cadence created
+        self.assertEqual(EnrollmentStage(new_enr.stage), EnrollmentStage.SERVICE_ACTIVE)

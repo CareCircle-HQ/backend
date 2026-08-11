@@ -3205,9 +3205,21 @@ def _carry_service_and_activate(
         new_enr.save(update_fields=fields)
 
     # Return servable members to Active against the carried kitchen.
+    from api.models import MemberStatus
+
     for mv in new_enr.member_profiles.all():
         if getattr(mv, "eligibility_paused", False):
             continue
+        # A carried, still-serving household's members must be ACTIVE so they get
+        # a delivery plan. A PENDING copy (the pre-service default) is EXCLUDED by
+        # create_member_delivery_schedules (PENDING is in
+        # SERVICE_EXCLUDED_MEMBER_STATUSES), so a served member would silently end
+        # up with NO plan and NO cadence -- Service Active + a kitchen but nothing
+        # to deliver. Promote PENDING -> ACTIVE before reconciling the kitchen
+        # rule (which may still flip them Out-of-Orbit if unfulfillable).
+        if mv.status == MemberStatus.PENDING:
+            mv.status = MemberStatus.ACTIVE
+            mv.save(update_fields=["status"])
         try:
             reconcile_member_kitchen_output(mv, kitchen=kitchen, allow_resume=True, save=True)
         except Exception:  # pragma: no cover - defensive
