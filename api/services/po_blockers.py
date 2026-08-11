@@ -522,6 +522,15 @@ def detect_po_drops(today=None):
         for cid, fn, ln in Client.objects.filter(pk__in=dropped_ids)
         .values_list("pk", "first_name", "last_name")
     }
+    # Colour-coded client tags (Settings > Tags) for the drop row -- shown +
+    # editable inline on the Distribution list.
+    tags_by_client = {}
+    for c in Client.objects.filter(pk__in=dropped_ids).prefetch_related("tags"):
+        tags_by_client[str(c.client_id)] = [
+            {"id": str(t.pk), "name": t.name, "color": t.color,
+             "color_label": t.get_color_display()}
+            for t in c.tags.all()
+        ]
 
     def _reason(cid):
         if cid in ineligible:
@@ -567,6 +576,7 @@ def detect_po_drops(today=None):
             "kind": kind or "",
             "enrollment_id": enr.pk if enr else None,
             "household_primary_id": primary_of.get(str(cid)),
+            "tags": tags_by_client.get(str(cid), []),
         })
     rows.sort(key=lambda r: (not r["urgent"], r["reason"], r["name"].lower()))
     return {
