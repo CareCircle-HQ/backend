@@ -14582,3 +14582,47 @@ class DetectPoDropsTest(TestCase):
         self.assertEqual(by_client[str(M3.client_id)]["reason"], "off_boarded")
         self.assertEqual(by_client[str(M4.client_id)]["reason"], "paused")
         self.assertFalse(by_client[str(M4.client_id)]["urgent"])
+
+
+class RebuildReactivatesCancelledPlanTest(TestCase):
+    """A live (servable) enrollment whose only delivery plan is CANCELLED -- a
+    tangled-duplicate drift where the scheduled plan ended up on a dead
+    enrollment -- gets its plan re-activated so "Rebuild calendar" works."""
+
+    def test_rebuild_reactivates_cancelled_plan(self):
+        from datetime import timedelta
+
+        from .models import (
+            Client, DeliveryCadence, EnrollmentStage, EnrollmentVerification,
+            Household, Kitchen, KitchenStatus, MemberDeliverySchedule,
+            MemberDietaryProfile, MemberStatus, OrderSchedule, OrderStatus,
+            ScheduleStatus,
+        )
+        from .services.orders import rebuild_delivery_calendar
+
+        today = timezone.localdate()
+        k = Kitchen.objects.create(name="K", status=KitchenStatus.ACTIVE)
+        hh = Household.objects.create(name="HH")
+        c = Client.objects.create(client_id=str(uuid.uuid4()), first_name="Al", last_name="H")
+        enr = EnrollmentVerification.objects.create(
+            client=c, household=hh, stage=EnrollmentStage.SERVICE_ACTIVE, kitchen=k,
+            program_name="Medically Tailored Meals", delivery_weekdays=["mon", "thu"],
+        )
+        mp = MemberDietaryProfile.objects.create(
+            enrollment=enr, client=c, member_name="Al H", status=MemberStatus.ACTIVE)
+        MemberDeliverySchedule.objects.create(
+            enrollment=enr, member_profile=mp, member_name="Al H",
+            delivery_days_cadence=DeliveryCadence.MON_THU, meals_per_day=3,
+            prod_per_delivery=0, meals_boxes_total=12, kitchen=k,
+            status=ScheduleStatus.CANCELLED,               # <- the drift
+            starts_on=today, ends_on=today + timedelta(days=120),
+        )
+
+        res = rebuild_delivery_calendar(enr)
+        self.assertEqual(res["plans_reactivated"], 1)
+        self.assertGreater(
+            OrderSchedule.objects.filter(
+                enrollment=enr, status=OrderStatus.SCHEDULED,
+                anticipated_delivery_date__gte=today).count(),
+            0,
+        )

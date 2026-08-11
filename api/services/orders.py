@@ -715,31 +715,55 @@ def rebuild_delivery_calendar(enrollment, from_date=None):
     # only snapshots from an EXISTING plan, so it is a no-op here. Bootstrap the
     # first plan from the superseded enrollment's cadence so the manual "Rebuild
     # calendar" action (and any auto-rebuild) works for the new case.
+    from api.models import EnrollmentStage, ScheduleStatus
+
     created = []
-    if enrollment.kitchen_id and not enrollment.delivery_schedules.exists():
-        prior = enrollment.supersedes
-        cadence = current_household_cadence(prior) if prior else ""
-        if cadence:
-            from api.models import DeliveryCadence
-            from api.services.catalog import product_kind_for_enrollment
-
-            once_weekday = None
-            if cadence == DeliveryCadence.ONCE_A_WEEK.value:
-                wds = enrollment.delivery_weekdays or []
-                once_weekday = wds[0] if wds else None
-            created = create_member_delivery_schedules(
-                enrollment,
-                case=enrollment.case,
-                cadence=cadence,
-                once_a_week_weekday=once_weekday,
-                kitchen=enrollment.kitchen,
-                product_kind=product_kind_for_enrollment(enrollment),
+    reactivated = 0
+    has_scheduled = enrollment.delivery_schedules.filter(
+        status=ScheduleStatus.SCHEDULED
+    ).exists()
+    terminal = EnrollmentStage(enrollment.stage) in (
+        EnrollmentStage.CLOSED, EnrollmentStage.CANCELLED, EnrollmentStage.DISREGARDED,
+    )
+    if enrollment.kitchen_id and not has_scheduled and not terminal:
+        if enrollment.delivery_schedules.exists():
+            # The enrollment HAS a plan but it's not SCHEDULED (e.g. a tangled
+            # duplicate where the live enrollment's plan was cancelled while the
+            # scheduled one ended up on a dead enrollment). Re-activate its own
+            # cancelled plans so "Rebuild calendar" can regenerate occurrences --
+            # the enrollment is live/servable, so a cancelled plan is the drift.
+            reactivated = (
+                enrollment.delivery_schedules
+                .exclude(status=ScheduleStatus.SCHEDULED)
+                .update(status=ScheduleStatus.SCHEDULED)
             )
+        else:
+            # A carried-over enrollment (superseded a prior one, kept its kitchen)
+            # has NO plan yet -- bootstrap the first plan from the prior's cadence.
+            prior = enrollment.supersedes
+            cadence = current_household_cadence(prior) if prior else ""
+            if cadence:
+                from api.models import DeliveryCadence
+                from api.services.catalog import product_kind_for_enrollment
 
-    if not created:
+                once_weekday = None
+                if cadence == DeliveryCadence.ONCE_A_WEEK.value:
+                    wds = enrollment.delivery_weekdays or []
+                    once_weekday = wds[0] if wds else None
+                created = create_member_delivery_schedules(
+                    enrollment,
+                    case=enrollment.case,
+                    cadence=cadence,
+                    once_a_week_weekday=once_weekday,
+                    kitchen=enrollment.kitchen,
+                    product_kind=product_kind_for_enrollment(enrollment),
+                )
+
+    if not created and not reactivated:
         created = ensure_member_delivery_schedules(enrollment)
     result = sync_delivery_calendar(enrollment, from_date=from_date)
     result["plans_created"] = len(created)
+    result["plans_reactivated"] = reactivated
     return result
 
 
