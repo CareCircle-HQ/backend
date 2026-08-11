@@ -64,6 +64,7 @@ from ..services.po_blockers import (
     REASON_LABELS,
     classify_po_blockers,
     detect_po_drops,
+    household_primary_map,
     summarize_po_blockers,
 )
 from .base import PortalAPIView, current_agent
@@ -278,10 +279,15 @@ def po_membership_cell_members(today, kitchen_id, cadence_key):
             if not ((c_kid or None) == kid and c_ckey == cadence_key)
         )
 
+    primary_of = household_primary_map(new_true | moved_in | exited | moved_out)
+
     def _rows(ids, names, mcells=None):
         out = []
         for mid in ids:
-            row = {"client_id": str(mid), "name": names.get(mid) or str(mid)}
+            row = {
+                "client_id": str(mid), "name": names.get(mid) or str(mid),
+                "household_primary_id": primary_of.get(str(mid)),
+            }
             if mcells is not None:
                 row["other"] = _others(mid, mcells)
             out.append(row)
@@ -1134,6 +1140,12 @@ class DistributionKitchenMembersView(PortalAPIView):
         else:
             total = rows.count()
             results = [to_row(r) for r in rows[start:start + self.PAGE_SIZE]]
+
+        primary_of = household_primary_map(
+            [r["client_id"] for r in results if r["client_id"]]
+        )
+        for r in results:
+            r["household_primary_id"] = primary_of.get(r["client_id"])
 
         return Response({
             "kitchen": kitchen,

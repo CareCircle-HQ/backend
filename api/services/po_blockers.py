@@ -357,6 +357,32 @@ DROP_REASON_LABELS = {
 DROP_URGENT_REASONS = {"missing_from_calendar", "off_boarded"}
 
 
+def household_primary_map(client_ids):
+    """``client_id -> household PRIMARY's client_id`` (as str), ONLY when the
+    primary differs from the member (i.e. the member is a dependent) -- so the UI
+    can offer an "Open Household" link that points at the primary."""
+    from api.models import HouseholdMember
+
+    ids = list(client_ids)
+    if not ids:
+        return {}
+    hh_of = dict(
+        HouseholdMember.objects.filter(client_id__in=ids)
+        .values_list("client_id", "household_id")
+    )
+    primaries = dict(
+        HouseholdMember.objects.filter(
+            household_id__in=set(v for v in hh_of.values() if v), is_primary=True)
+        .values_list("household_id", "client_id")
+    )
+    out = {}
+    for cid, hid in hh_of.items():
+        pid = primaries.get(hid)
+        if pid and pid != cid:
+            out[str(cid)] = str(pid)
+    return out
+
+
 def detect_po_drops(today=None):
     """Members who WERE being served (a non-cancelled delivery in the past or
     current week) but have NO upcoming delivery -- i.e. taken off the next PO --
@@ -463,6 +489,7 @@ def detect_po_drops(today=None):
             return "out_of_range"
         return "missing_from_calendar"   # active + live but no upcoming delivery
 
+    primary_of = household_primary_map(dropped_ids)
     rows = []
     for cid in dropped_ids:
         last_d, kname = served[cid]
@@ -479,6 +506,7 @@ def detect_po_drops(today=None):
             "kitchen_name": kname,
             "kind": kind or "",
             "enrollment_id": enr.pk if enr else None,
+            "household_primary_id": primary_of.get(str(cid)),
         })
     rows.sort(key=lambda r: (not r["urgent"], r["reason"], r["name"].lower()))
     return {
