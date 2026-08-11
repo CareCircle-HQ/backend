@@ -660,15 +660,21 @@ def sync_household_members(client, enrollment=None, agent=None):
         member = hm.client
         if member is None or member.pk in profiles:
             continue
-        # ALWAYS carry a member's dietary/clinical picture forward from their most
+        # ALWAYS carry a member's dietary INFORMATION forward from their most
         # recent OTHER enrollment profile (e.g. a superseded enrollment after a
         # governing-case change): menu type, dietary restrictions, food allergies,
-        # other restrictions, verification notes, meal category + service status
-        # don't change with the case/meal type. Without this, a member who was
-        # ACTIVE with a full profile on the closed enrollment reappeared here as a
-        # blank, PENDING placeholder (losing their menu/dietary and dropping off
-        # deliveries). Only a genuinely NEW member (no prior profile anywhere)
-        # starts blank -- their menu is chosen at kitchen assignment.
+        # other restrictions, verification notes and meal category don't change
+        # with the case/meal type. Without this, a member who had a full profile
+        # on the closed enrollment reappeared here BLANK (losing their menu /
+        # dietary). Only a genuinely NEW member (no prior profile anywhere) starts
+        # blank -- their menu is chosen at kitchen assignment.
+        #
+        # NB: service STATUS is deliberately NOT carried -- it's governed by the
+        # scope rules elsewhere (a Household->Individual switch PAUSES the extra
+        # members; Individual->Household re-activates them). Carrying the prior
+        # status here would fight those rules (e.g. re-activate a member the
+        # individual switch just paused). Status stays at the model default and
+        # the scope/activation logic sets it.
         prior = (
             MemberDietaryProfile.objects.filter(client=member)
             .exclude(enrollment=enrollment)
@@ -684,7 +690,6 @@ def sync_household_members(client, enrollment=None, agent=None):
                 "other_dietary_restrictions": prior.other_dietary_restrictions,
                 "meal_category": prior.meal_category,
                 "general_verification_notes": prior.general_verification_notes,
-                "status": prior.status,
             }
         profile = MemberDietaryProfile.objects.create(
             enrollment=enrollment,

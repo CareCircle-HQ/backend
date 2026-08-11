@@ -14991,9 +14991,10 @@ class DetectPoDropsDependentInheritsHouseholdTest(TestCase):
 
 
 class SyncHouseholdCarriesPriorProfileTest(TestCase):
-    """sync_household_members must carry a roster member's menu/dietary/status
+    """sync_household_members must carry a roster member's dietary INFORMATION
     forward from their most recent prior enrollment profile (governing-case
-    change), not re-create them as a blank PENDING placeholder."""
+    change), not re-create it blank. Service STATUS is NOT carried -- it's owned
+    by the scope rules (Household<->Individual), so it stays at the default."""
 
     def test_carries_prior_dietary_and_status(self):
         from .models import (
@@ -15028,8 +15029,10 @@ class SyncHouseholdCarriesPriorProfileTest(TestCase):
         sync_household_members(primary, enrollment=new)
 
         dep_profile = MemberDietaryProfile.objects.get(enrollment=new, client=dep)
+        # INFORMATION is carried forward...
         self.assertEqual(dep_profile.menu_type, "Kosher")
-        self.assertEqual(dep_profile.status, MemberStatus.ACTIVE)          # not PENDING
         self.assertEqual(dep_profile.food_allergies, ["Peanuts"])
         self.assertEqual(dep_profile.other_dietary_restrictions, "No shellfish")
         self.assertEqual(dep_profile.general_verification_notes, "prefers soft foods")
+        # ...but STATUS is NOT (left to the scope rules; stays the model default).
+        self.assertEqual(dep_profile.status, MemberStatus.PENDING)

@@ -24,15 +24,12 @@ Usage:
     python manage.py reconcile_carried_member_profiles --apply --limit 50
 """
 from django.core.management.base import BaseCommand
-from django.db import transaction
-from django.utils import timezone
 
 from api.models import (
     EnrollmentStage,
     MemberDietaryProfile,
     MemberStatus,
 )
-from api.services.orders import rebuild_delivery_calendar
 
 _TERMINAL = [
     EnrollmentStage.CLOSED,
@@ -40,8 +37,11 @@ _TERMINAL = [
     EnrollmentStage.DISREGARDED,
 ]
 
-# Fields carried forward from the member's prior profile (mirrors the fork copy
-# + sync_household_members): the dietary/clinical picture + service status.
+# INFORMATION fields carried forward from the member's prior profile (mirrors
+# sync_household_members). Service STATUS is deliberately NOT carried -- it's
+# governed by the scope rules (Household->Individual pauses extra members;
+# Individual->Household re-activates them), so this backfill only restores the
+# lost menu/dietary picture and never changes a member's active/paused state.
 _CARRY_FIELDS = [
     "menu_type",
     "dietary_restrictions",
@@ -49,7 +49,6 @@ _CARRY_FIELDS = [
     "other_dietary_restrictions",
     "meal_category",
     "general_verification_notes",
-    "status",
 ]
 
 
@@ -110,32 +109,15 @@ class Command(BaseCommand):
             return
 
         fixed = 0
-        rebuilt_enrs = set()
         for mp, prior in to_fix:
-            with transaction.atomic():
-                for f in _CARRY_FIELDS:
-                    setattr(mp, f, getattr(prior, f))
-                mp.save(update_fields=_CARRY_FIELDS)
-                fixed += 1
-                # A reactivated member needs their calendar (re)built. Rebuild the
-                # live enrollment once per enrollment.
-                if (
-                    mp.status == MemberStatus.ACTIVE
-                    and mp.enrollment_id not in rebuilt_enrs
-                ):
-                    try:
-                        rebuild_delivery_calendar(mp.enrollment)
-                    except Exception as exc:  # pragma: no cover - defensive
-                        self.stdout.write(
-                            self.style.WARNING(
-                                f"  rebuild failed for enr {mp.enrollment_id}: {exc}"
-                            )
-                        )
-                    rebuilt_enrs.add(mp.enrollment_id)
+            for f in _CARRY_FIELDS:
+                setattr(mp, f, getattr(prior, f))
+            mp.save(update_fields=_CARRY_FIELDS)
+            fixed += 1
 
         self.stdout.write(
             self.style.SUCCESS(
-                f"Backfilled {fixed} member profile(s); rebuilt "
-                f"{len(rebuilt_enrs)} calendar(s)."
+                f"Backfilled dietary info onto {fixed} member profile(s). "
+                f"(Service status left to the scope rules.)"
             )
         )
