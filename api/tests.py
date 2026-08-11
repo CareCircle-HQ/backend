@@ -14933,3 +14933,58 @@ class SyncHealsServiceActiveWithoutScheduledPlanTest(TestCase):
             OrderSchedule.objects.filter(
                 enrollment=enr, status=OrderStatus.SCHEDULED,
                 anticipated_delivery_date__gte=today).count(), 0)
+
+
+class DetectPoDropsDependentInheritsHouseholdTest(TestCase):
+    """A dependent (no own enrollment) inherits the household PRIMARY's
+    enrollment for the drop reason -- so a held household's dependents read
+    on_hold, not a false off_boarded. A genuinely enrollment-less served client
+    stays off_boarded."""
+
+    def test_dependent_inherits_primary_reason(self):
+        from datetime import timedelta
+
+        from .models import (
+            Client, DeliveryOrder, DeliveryOrderStatus, EnrollmentStage,
+            EnrollmentVerification, Household, HouseholdMember, Kitchen,
+            KitchenStatus, MemberDietaryProfile, MemberStatus, PurchaseOrder,
+            PurchaseOrderStatus,
+        )
+        from .services.po_blockers import detect_po_drops
+
+        today = timezone.localdate()
+        last_monday = today - timedelta(days=today.weekday()) - timedelta(days=7)
+        k = Kitchen.objects.create(name="K", status=KitchenStatus.ACTIVE)
+        hh = Household.objects.create(name="HH")
+        po = PurchaseOrder.objects.create(status=PurchaseOrderStatus.DRAFT)
+
+        def served(c):
+            DeliveryOrder.objects.create(
+                purchase_order=po, member=c, kitchen=k,
+                expected_delivery_date=last_monday,
+                status=DeliveryOrderStatus.PENDING)
+
+        primary = Client.objects.create(client_id=str(uuid.uuid4()), first_name="P", last_name="H")
+        dep = Client.objects.create(client_id=str(uuid.uuid4()), first_name="D", last_name="H")
+        HouseholdMember.objects.create(household=hh, client=primary, is_primary=True)
+        HouseholdMember.objects.create(household=hh, client=dep, is_primary=False)
+        # Primary holds the household enrollment, currently ON HOLD.
+        penr = EnrollmentVerification.objects.create(
+            client=primary, household=hh, stage=EnrollmentStage.ON_HOLD, kitchen=k,
+            program_name="Medically Tailored Meals")
+        MemberDietaryProfile.objects.create(
+            enrollment=penr, client=primary, member_name="P H", status=MemberStatus.ACTIVE)
+        # Dependent has NO enrollment of their own -- only a profile on the
+        # household enrollment.
+        MemberDietaryProfile.objects.create(
+            enrollment=penr, client=dep, member_name="D H", status=MemberStatus.ACTIVE)
+        served(primary); served(dep)
+
+        # Genuinely enrollment-less served client (no household / no primary).
+        gone = Client.objects.create(client_id=str(uuid.uuid4()), first_name="G", last_name="X")
+        served(gone)
+
+        rows = {r["client_id"]: r for r in detect_po_drops(today)["dropped"]}
+        self.assertEqual(rows[str(dep.client_id)]["reason"], "on_hold")       # inherited
+        self.assertFalse(rows[str(dep.client_id)]["urgent"])
+        self.assertEqual(rows[str(gone.client_id)]["reason"], "off_boarded")  # genuine

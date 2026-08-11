@@ -478,6 +478,32 @@ def detect_po_drops(today=None):
         if enr.client_id not in _best_pri or pri > _best_pri[enr.client_id]:
             _best_pri[enr.client_id] = pri
             live_by_client[enr.client_id] = enr
+
+    # Household fallback: a DEPENDENT has no enrollment of their own -- their
+    # meal/box service rides on the household PRIMARY's enrollment. Resolve the
+    # primary's live enrollment so the reason reflects the HOUSEHOLD (on_hold /
+    # kitchen_assignment / ...) instead of a false "off_boarded". The dependent's
+    # OWN member-profile status is still used by _reason below, so a dependent who
+    # genuinely fell off the calendar while the household serves still surfaces.
+    _missing = [cid for cid in dropped_ids if cid not in live_by_client]
+    if _missing:
+        prim_map = household_primary_map(_missing)   # dependent(str) -> primary(str)
+        prim_live, prim_pri = {}, {}
+        for enr in (
+            EnrollmentVerification.objects.filter(client_id__in=set(prim_map.values()))
+            .exclude(stage__in=[s.value for s in terminal])
+            .order_by("client_id", "-stage_at")
+        ):
+            pri = _ENR_PRIORITY.get(EnrollmentStage(enr.stage), 0)
+            key = str(enr.client_id)
+            if key not in prim_pri or pri > prim_pri[key]:
+                prim_pri[key] = pri
+                prim_live[key] = enr
+        for dep in _missing:
+            enr = prim_live.get(prim_map.get(str(dep)))
+            if enr is not None:
+                live_by_client[dep] = enr
+
     prof_status = {}
     for cid, st in (
         MemberDietaryProfile.objects
