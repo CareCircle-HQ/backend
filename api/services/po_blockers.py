@@ -345,6 +345,7 @@ def summarize_po_blockers(rows):
 DROP_REASON_LABELS = {
     "missing_from_calendar": "Active but missing from the calendar",
     "kitchen_assignment": "Stuck in Kitchen Assignment",
+    "awaiting_kitchen": "Awaiting Kitchen Assignment",
     "off_boarded": "No live enrollment (closed)",
     "on_hold": "Program on hold",
     "not_eligible": "Not eligible",
@@ -454,13 +455,29 @@ def detect_po_drops(today=None):
     # Best live (non-terminal) enrollment + member status per dropped client.
     terminal = [EnrollmentStage.CLOSED, EnrollmentStage.CANCELLED,
                 EnrollmentStage.DISREGARDED]
+    # Prefer the MOST-ADVANCED / actually-serving non-terminal enrollment to
+    # explain the drop -- not merely the most recent. A client can hold both a
+    # served enrollment now ON_HOLD (its case closed) and a fresh
+    # PENDING_VERIFICATION on a new case; the reason must reflect the served one
+    # (on_hold), not the pending row (which reads as a false missing_from_calendar).
+    _ENR_PRIORITY = {
+        EnrollmentStage.SERVICE_ACTIVE: 5,
+        EnrollmentStage.ON_HOLD: 4,
+        EnrollmentStage.KITCHEN_ASSIGNMENT: 3,
+        EnrollmentStage.VERIFIED: 2,
+        EnrollmentStage.PENDING_VERIFICATION: 1,
+    }
     live_by_client = {}
+    _best_pri = {}
     for enr in (
         EnrollmentVerification.objects.filter(client_id__in=dropped_ids)
         .exclude(stage__in=[s.value for s in terminal])
-        .order_by("client_id", "-stage_at")
+        .order_by("client_id", "-stage_at")   # newest first -> ties keep newest
     ):
-        live_by_client.setdefault(enr.client_id, enr)   # most-recent per client
+        pri = _ENR_PRIORITY.get(EnrollmentStage(enr.stage), 0)
+        if enr.client_id not in _best_pri or pri > _best_pri[enr.client_id]:
+            _best_pri[enr.client_id] = pri
+            live_by_client[enr.client_id] = enr
     prof_status = {}
     for cid, st in (
         MemberDietaryProfile.objects
@@ -489,10 +506,12 @@ def detect_po_drops(today=None):
         if EnrollmentStage(enr.stage) == EnrollmentStage.ON_HOLD:
             return "on_hold"
         if EnrollmentStage(enr.stage) == EnrollmentStage.KITCHEN_ASSIGNMENT:
-            # Served last week but the enrollment is still parked at Kitchen
-            # Assignment (a stale stage that excludes it from POs) -- report that
-            # explicitly rather than the generic "missing from the calendar".
-            return "kitchen_assignment"
+            # Split by whether a kitchen is already assigned:
+            #  - HAS a kitchen -> a STALE/STUCK stage (should be Service Active);
+            #    a data bug that excludes a serving household from POs.
+            #  - NO kitchen -> genuinely AWAITING assignment (e.g. a meals<->boxes
+            #    switch needs a new kitchen + cadence); a real ops to-do, expected.
+            return "kitchen_assignment" if enr.kitchen_id else "awaiting_kitchen"
         st = prof_status.get(cid)
         if st == MemberStatus.PAUSED:
             return "paused"

@@ -14577,9 +14577,27 @@ class DetectPoDropsTest(TestCase):
         # KITCHEN_ASSIGNMENT (a stale stage) -> reported as kitchen_assignment,
         # NOT missing_from_calendar.
         M6 = client("M6"); served(M6)
-        e6 = enr(M6, EnrollmentStage.KITCHEN_ASSIGNMENT)
+        e6 = enr(M6, EnrollmentStage.KITCHEN_ASSIGNMENT)   # enr() assigns kitchen K
         MemberDietaryProfile.objects.create(
             enrollment=e6, client=M6, member_name="M6 Z", status=MemberStatus.ACTIVE)
+
+        # M7: served, KITCHEN_ASSIGNMENT but NO kitchen -> awaiting_kitchen (a
+        # genuine assignment to-do, e.g. a meals<->boxes switch), NOT urgent.
+        M7 = client("M7"); served(M7)
+        EnrollmentVerification.objects.create(
+            client=M7, household=hh, stage=EnrollmentStage.KITCHEN_ASSIGNMENT,
+            kitchen=None, program_name="Medically Tailored Meals")
+
+        # M8: served; has an ON_HOLD (served, case closed) enrollment AND a fresh
+        # PENDING_VERIFICATION on a new case -> reason must reflect the served
+        # ON_HOLD one, not the pending row.
+        M8 = client("M8"); served(M8)
+        EnrollmentVerification.objects.create(
+            client=M8, household=hh, stage=EnrollmentStage.ON_HOLD, kitchen=K,
+            program_name="Medically Tailored Meals")
+        EnrollmentVerification.objects.create(
+            client=M8, household=hh, stage=EnrollmentStage.PENDING_VERIFICATION,
+            kitchen=None, program_name="Medically Tailored Meals")
 
         res = detect_po_drops(today)
         by_client = {r["client_id"]: r for r in res["dropped"]}
@@ -14587,6 +14605,9 @@ class DetectPoDropsTest(TestCase):
         self.assertEqual(by_client[str(M5.client_id)]["reason"], "missing_from_calendar")
         self.assertEqual(by_client[str(M6.client_id)]["reason"], "kitchen_assignment")
         self.assertTrue(by_client[str(M6.client_id)]["urgent"])
+        self.assertEqual(by_client[str(M7.client_id)]["reason"], "awaiting_kitchen")
+        self.assertFalse(by_client[str(M7.client_id)]["urgent"])
+        self.assertEqual(by_client[str(M8.client_id)]["reason"], "on_hold")
         self.assertEqual(by_client[str(M2.client_id)]["reason"], "missing_from_calendar")
         self.assertTrue(by_client[str(M2.client_id)]["urgent"])
         self.assertEqual(by_client[str(M3.client_id)]["reason"], "off_boarded")
