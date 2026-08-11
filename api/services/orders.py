@@ -717,6 +717,7 @@ def rebuild_delivery_calendar(enrollment, from_date=None):
     # calendar" action (and any auto-rebuild) works for the new case.
     from api.models import EnrollmentStage, ScheduleStatus
 
+    from_date = from_date or timezone.localdate()
     created = []
     reactivated = 0
     has_scheduled = enrollment.delivery_schedules.filter(
@@ -767,6 +768,14 @@ def rebuild_delivery_calendar(enrollment, from_date=None):
 
     if not created and not reactivated:
         created = ensure_member_delivery_schedules(enrollment)
+    # The FUTURE calendar must reflect reality: drop stale CANCELLED occurrences
+    # from today onward (left behind by a previous/again kitchen or a cancelled
+    # PO) so only the live scheduled plan projects forward. PAST cancelled rows
+    # are preserved as history. (sync only manages SCHEDULED rows, so it would
+    # otherwise leave these dangling on the calendar.)
+    enrollment.orders.filter(
+        status=OrderStatus.CANCELLED, anticipated_delivery_date__gte=from_date,
+    ).delete()
     # Heal the plan window from the GOVERNING authorization first: the case's
     # approval window may differ from the plan's stored one (a renewal moved it,
     # or a re-activated plan carries a stale window). heal_delivery_window acts

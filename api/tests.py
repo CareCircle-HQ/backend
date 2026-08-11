@@ -14705,3 +14705,48 @@ class RebuildHealsFromGoverningCaseTest(TestCase):
         rebuild_delivery_calendar(enr)
         plan.refresh_from_db()
         self.assertEqual(plan.ends_on, today + timedelta(days=10))  # no case -> unchanged
+
+
+class RebuildDropsFutureCancelledOccurrencesTest(TestCase):
+    """Rebuild clears stale FUTURE cancelled occurrences (old/again kitchen or a
+    cancelled PO) so the forward calendar reflects reality, while PRESERVING past
+    cancelled rows as history."""
+
+    def test_future_cancelled_removed_past_kept(self):
+        from datetime import timedelta
+
+        from .models import (
+            Client, DeliveryCadence, EnrollmentStage, EnrollmentVerification,
+            Household, Kitchen, KitchenStatus, MemberDeliverySchedule,
+            MemberDietaryProfile, MemberStatus, OrderSchedule, OrderStatus,
+            ScheduleStatus,
+        )
+        from .services.orders import rebuild_delivery_calendar
+
+        today = timezone.localdate()
+        k = Kitchen.objects.create(name="K", status=KitchenStatus.ACTIVE)
+        hh = Household.objects.create(name="HH")
+        c = Client.objects.create(client_id=str(uuid.uuid4()), first_name="C", last_name="X")
+        enr = EnrollmentVerification.objects.create(
+            client=c, household=hh, stage=EnrollmentStage.SERVICE_ACTIVE, kitchen=k,
+            program_name="Medically Tailored Meals", delivery_weekdays=["mon", "thu"])
+        mp = MemberDietaryProfile.objects.create(
+            enrollment=enr, client=c, member_name="C X", status=MemberStatus.ACTIVE)
+        MemberDeliverySchedule.objects.create(
+            enrollment=enr, member_profile=mp, member_name="C X",
+            delivery_days_cadence=DeliveryCadence.MON_THU, meals_per_day=3,
+            prod_per_delivery=0, meals_boxes_total=12, kitchen=k,
+            status=ScheduleStatus.SCHEDULED,
+            starts_on=today, ends_on=today + timedelta(days=60))
+        past = OrderSchedule.objects.create(
+            enrollment=enr, member=mp, member_name="C X",
+            anticipated_delivery_date=today - timedelta(days=7),
+            status=OrderStatus.CANCELLED)
+        fut = OrderSchedule.objects.create(
+            enrollment=enr, member=mp, member_name="C X",
+            anticipated_delivery_date=today + timedelta(days=7),
+            status=OrderStatus.CANCELLED)
+
+        rebuild_delivery_calendar(enr)
+        self.assertTrue(OrderSchedule.objects.filter(pk=past.pk).exists())   # history kept
+        self.assertFalse(OrderSchedule.objects.filter(pk=fut.pk).exists())   # future cancelled dropped
