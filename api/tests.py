@@ -14626,3 +14626,82 @@ class RebuildReactivatesCancelledPlanTest(TestCase):
                 anticipated_delivery_date__gte=today).count(),
             0,
         )
+
+
+class RebuildHealsFromGoverningCaseTest(TestCase):
+    """rebuild_delivery_calendar heals the plan from the GOVERNING case
+    (recompute) when one exists, and falls back to a plain sync when the
+    enrollment has no case (pre-case), so its window isn't blanked."""
+
+    def _enr(self, *, with_case):
+        from datetime import timedelta
+
+        from .models import (
+            Case, CaseStatus, CaseType, Client, DeliveryCadence, EnrollmentStage,
+            EnrollmentVerification, Household, Kitchen, KitchenStatus,
+            MemberDeliverySchedule, MemberDietaryProfile, MemberStatus,
+            ScheduleStatus, ServiceAuthorizationStatus,
+        )
+
+        now = timezone.now()
+        c = Client.objects.create(client_id=str(uuid.uuid4()), first_name="G", last_name="C")
+        hh = Household.objects.create(name="HH")
+        k = Kitchen.objects.create(name="K", status=KitchenStatus.ACTIVE)
+        case = None
+        if with_case:
+            case = Case.objects.create(
+                case_id=uuid.uuid4(), client=c, case_type=CaseType.INTERNAL_SERVICE,
+                case_status=CaseStatus.OPEN,
+                service_authorization_status=ServiceAuthorizationStatus.APPROVED,
+                service_authorization_approval_starts_at=now,
+                service_authorization_approval_ends_at=now + timedelta(days=90),
+                program_name="Medically Tailored Meals",
+            )
+        enr = EnrollmentVerification.objects.create(
+            client=c, household=hh, case=case, kitchen=k,
+            stage=EnrollmentStage.SERVICE_ACTIVE,
+            program_name="Medically Tailored Meals", delivery_weekdays=["mon", "thu"],
+        )
+        mp = MemberDietaryProfile.objects.create(
+            enrollment=enr, client=c, member_name="G C", status=MemberStatus.ACTIVE)
+        MemberDeliverySchedule.objects.create(
+            enrollment=enr, member_profile=mp, member_name="G C",
+            delivery_days_cadence=DeliveryCadence.MON_THU, meals_per_day=3,
+            prod_per_delivery=0, meals_boxes_total=12, kitchen=k,
+            status=ScheduleStatus.SCHEDULED,
+            starts_on=timezone.localdate(),
+            ends_on=timezone.localdate() + timedelta(days=90),
+        )
+        return enr
+
+    def test_rebuild_heals_stale_window_from_case(self):
+        from datetime import timedelta
+
+        from .services.orders import rebuild_delivery_calendar
+
+        enr = self._enr(with_case=True)
+        today = timezone.localdate()
+        plan = enr.delivery_schedules.get()
+        # A STALE (short) plan window vs the governing auth (ends ~today+90):
+        # rebuild should heal it to the authorization end.
+        plan.ends_on = today + timedelta(days=10)
+        plan.save(update_fields=["ends_on"])
+
+        rebuild_delivery_calendar(enr)
+        plan.refresh_from_db()
+        self.assertGreater(plan.ends_on, today + timedelta(days=10))  # window extended
+
+    def test_no_case_keeps_plan_window(self):
+        from datetime import timedelta
+
+        from .services.orders import rebuild_delivery_calendar
+
+        enr = self._enr(with_case=False)
+        today = timezone.localdate()
+        plan = enr.delivery_schedules.get()
+        plan.ends_on = today + timedelta(days=10)
+        plan.save(update_fields=["ends_on"])
+
+        rebuild_delivery_calendar(enr)
+        plan.refresh_from_db()
+        self.assertEqual(plan.ends_on, today + timedelta(days=10))  # no case -> unchanged

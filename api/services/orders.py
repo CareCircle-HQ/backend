@@ -767,7 +767,16 @@ def rebuild_delivery_calendar(enrollment, from_date=None):
 
     if not created and not reactivated:
         created = ensure_member_delivery_schedules(enrollment)
-    result = sync_delivery_calendar(enrollment, from_date=from_date)
+    # Heal the plan window from the GOVERNING authorization first: the case's
+    # approval window may differ from the plan's stored one (a renewal moved it,
+    # or a re-activated plan carries a stale window). heal_delivery_window acts
+    # ONLY on a real same-kind window drift (and never flips product kind); it
+    # returns None when there's nothing to heal (no governing case, no drift), in
+    # which case we just expand the calendar from the plan as-is.
+    result = heal_delivery_window(enrollment, from_date=from_date)
+    if result is None:
+        result = sync_delivery_calendar(enrollment, from_date=from_date)
+    result = dict(result)
     result["plans_created"] = len(created)
     result["plans_reactivated"] = reactivated
     return result
