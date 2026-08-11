@@ -305,17 +305,27 @@ class MemberDeliveryCalendarView(PortalAPIView):
         })
 
     def _enrollment_for(self, client_id):
-        """The household enrollment this member belongs to. Prefers the member's
-        own dietary-profile enrollment (works for non-primary members too),
-        falling back to the client's active enrollment."""
-        profile = (
+        """The LIVE household enrollment this member belongs to, to rebuild.
+
+        Prefers the member's own dietary-profile enrollment (works for non-primary
+        members too) but ONLY a non-terminal one -- a client with several
+        enrollments can have a CLOSED one that opened most recently, and rebuilding
+        a closed enrollment is a no-op (which made the button appear dead). Falls
+        back to the client's active/governing enrollment."""
+        from api.models import EnrollmentStage
+
+        terminal = {
+            EnrollmentStage.CLOSED, EnrollmentStage.CANCELLED,
+            EnrollmentStage.DISREGARDED,
+        }
+        profiles = (
             MemberDietaryProfile.objects.filter(client_id=client_id)
             .select_related("enrollment")
             .order_by("-enrollment__opened_at")
-            .first()
         )
-        if profile is not None and profile.enrollment_id:
-            return profile.enrollment
+        for p in profiles:
+            if p.enrollment_id and EnrollmentStage(p.enrollment.stage) not in terminal:
+                return p.enrollment
         client = Client.objects.filter(pk=client_id).first()
         return active_enrollment(client) if client else None
 

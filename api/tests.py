@@ -14750,3 +14750,34 @@ class RebuildDropsFutureCancelledOccurrencesTest(TestCase):
         rebuild_delivery_calendar(enr)
         self.assertTrue(OrderSchedule.objects.filter(pk=past.pk).exists())   # history kept
         self.assertFalse(OrderSchedule.objects.filter(pk=fut.pk).exists())   # future cancelled dropped
+
+
+class DeliveryCalendarRebuildTargetsLiveEnrollmentTest(TestCase):
+    """The Delivery Schedule 'Rebuild calendar' button must target the client's
+    LIVE enrollment, not a more-recently-opened CLOSED one (rebuilding a closed
+    enrollment is a no-op -- which made the button look dead)."""
+
+    def test_prefers_live_over_recent_closed(self):
+        from datetime import timedelta
+
+        from .models import (
+            Client, EnrollmentStage, EnrollmentVerification, Household,
+            MemberDietaryProfile,
+        )
+        from .portal.views_delivery_calendar import MemberDeliveryCalendarView
+
+        now = timezone.now()
+        c = Client.objects.create(client_id=str(uuid.uuid4()), first_name="A", last_name="H")
+        hh = Household.objects.create(name="HH")
+        live = EnrollmentVerification.objects.create(
+            client=c, household=hh, stage=EnrollmentStage.SERVICE_ACTIVE)
+        closed = EnrollmentVerification.objects.create(
+            client=c, household=hh, stage=EnrollmentStage.CLOSED)
+        # closed opened MORE recently than live
+        EnrollmentVerification.objects.filter(pk=live.pk).update(opened_at=now - timedelta(days=30))
+        EnrollmentVerification.objects.filter(pk=closed.pk).update(opened_at=now)
+        MemberDietaryProfile.objects.create(enrollment=live, client=c, member_name="A H")
+        MemberDietaryProfile.objects.create(enrollment=closed, client=c, member_name="A H")
+
+        got = MemberDeliveryCalendarView()._enrollment_for(str(c.client_id))
+        self.assertEqual(got.pk, live.pk)
