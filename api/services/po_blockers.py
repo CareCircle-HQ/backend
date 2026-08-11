@@ -429,6 +429,13 @@ def detect_po_drops(today=None):
     still_on |= set(
         OrderSchedule.objects.filter(
             status=ScheduleStatus.SCHEDULED, anticipated_delivery_date__gte=today)
+        # A scheduled occurrence only keeps a member "on" the PO if it's on a
+        # SERVABLE enrollment. Occurrences stranded on a closed/on-hold/etc.
+        # enrollment never feed a PO, so they must NOT mask a real drop (a member
+        # whose live enrollment has no upcoming occurrence -- the ghost-calendar
+        # case where the live rows are cancelled and the scheduled ones sit on a
+        # dead enrollment).
+        .exclude(enrollment__stage__in=SERVICE_EXCLUDED_ENROLLMENT_STAGES)
         .exclude(member__client__isnull=True)
         .values_list("member__client_id", flat=True)
     )

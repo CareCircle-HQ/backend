@@ -14558,9 +14558,25 @@ class DetectPoDropsTest(TestCase):
         MemberDietaryProfile.objects.create(
             enrollment=e4, client=M4, member_name="M4 Z", status=MemberStatus.PAUSED)
 
+        # M5: served; the only upcoming occurrence sits on a CLOSED enrollment
+        # (never feeds a PO), while the live serving enrollment has none -> the
+        # ghost-calendar drop must NOT be masked.
+        M5 = client("M5"); served(M5)
+        e5 = enr(M5, EnrollmentStage.SERVICE_ACTIVE)
+        MemberDietaryProfile.objects.create(
+            enrollment=e5, client=M5, member_name="M5 Z", status=MemberStatus.ACTIVE)
+        e5closed = enr(M5, EnrollmentStage.CLOSED)
+        p5c = MemberDietaryProfile.objects.create(
+            enrollment=e5closed, client=M5, member_name="M5 Z", status=MemberStatus.ACTIVE)
+        OrderSchedule.objects.create(
+            enrollment=e5closed, member=p5c, member_name="M5 Z",
+            anticipated_delivery_date=today + timedelta(days=1),
+            status=OrderStatus.SCHEDULED)
+
         res = detect_po_drops(today)
         by_client = {r["client_id"]: r for r in res["dropped"]}
         self.assertNotIn(str(M1.client_id), by_client)          # still on
+        self.assertEqual(by_client[str(M5.client_id)]["reason"], "missing_from_calendar")
         self.assertEqual(by_client[str(M2.client_id)]["reason"], "missing_from_calendar")
         self.assertTrue(by_client[str(M2.client_id)]["urgent"])
         self.assertEqual(by_client[str(M3.client_id)]["reason"], "off_boarded")
