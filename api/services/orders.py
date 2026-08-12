@@ -95,10 +95,12 @@ def _dedupe_calendar_occurrences(orders):
             OrderSchedule.objects
             .filter(member__client_id__in=client_ids, anticipated_delivery_date__in=dates)
             .exclude(status=OrderStatus.CANCELLED)
-            # A terminated enrollment's leftover occurrences are dead (never on a
-            # PO) -- they must not block the live survivor from building its own.
+            # A terminated (or parked reauthorization) enrollment's leftover
+            # occurrences are dead (never on a PO) -- they must not block the live
+            # survivor from building its own.
             .exclude(enrollment__stage__in=(
                 EnrollmentStage.CLOSED, EnrollmentStage.CANCELLED,
+                EnrollmentStage.SCHEDULED_EXTENSION,
             ))
             .values_list("member__client_id", "anticipated_delivery_date", "program_name")
         )
@@ -739,6 +741,7 @@ def rebuild_delivery_calendar(enrollment, from_date=None):
     ).exists()
     terminal = EnrollmentStage(enrollment.stage) in (
         EnrollmentStage.CLOSED, EnrollmentStage.CANCELLED, EnrollmentStage.DISREGARDED,
+        EnrollmentStage.SCHEDULED_EXTENSION,
     )
     if enrollment.kitchen_id and not has_scheduled and not terminal:
         if enrollment.delivery_schedules.exists():

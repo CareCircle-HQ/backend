@@ -9395,6 +9395,30 @@ class CsvImportRulesTest(TestCase):
             derive_household_type(fam, "MTM - Brooklyn"), CaseHouseholdType.INDIVIDUAL
         )
 
+    def test_is_extension_from_to_extend_program(self):
+        from .models import ActiveProgram
+        from .serializers import derive_is_extension
+
+        ActiveProgram.objects.create(
+            program_name="Reauthorization: Medically Tailored Meals (MTM) - Brooklyn",
+            case_category="Internal Services",
+            to_extend=True,
+        )
+        ActiveProgram.objects.create(
+            program_name="Medically Tailored Meals (MTM) - Brooklyn",
+            case_category="Internal Services",
+            to_extend=False,
+        )
+        # Matches a to_extend program (case-insensitive) -> True.
+        self.assertTrue(
+            derive_is_extension("reauthorization: medically tailored meals (mtm) - brooklyn")
+        )
+        # A normal (non-to_extend) program -> False.
+        self.assertFalse(derive_is_extension("Medically Tailored Meals (MTM) - Brooklyn"))
+        # Blank / unmatched -> False.
+        self.assertFalse(derive_is_extension(""))
+        self.assertFalse(derive_is_extension("Some Unlisted Program"))
+
     def _case_row(self, client_id, originating_provider_id, **over):
         row = {
             "case_id": str(uuid.uuid4()),
@@ -11956,6 +11980,495 @@ class AllVerificationsReportTest(TestCase):
         self.assertIn(str(client.client_id), lines[1])
         # All three dates present (requested/completed/authorized).
         self.assertEqual(lines[1].count(str((now - timedelta(days=2)).date())), 1)
+
+
+class DeferredReauthGoverningTest(TestCase):
+    """A future-dated reauthorization extension (same kind + scope) must NOT
+    become the governing case while the current case still serves; a parked
+    SCHEDULED_EXTENSION enrollment is created instead."""
+
+    def _setup(self, *, reauth_start_days, reauth_kind_program=None, reauth_scope=None):
+        from datetime import timedelta
+
+        from .models import (
+            Case, CaseHouseholdType, CaseStatus, CaseType, Client,
+            EnrollmentStage, EnrollmentVerification, Household, HouseholdMember,
+            MemberDietaryProfile, ServiceAuthorizationStatus,
+        )
+
+        now = timezone.now()
+        primary = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Rea", last_name="Auth",
+        )
+        hh = Household.objects.create(name="HH")
+        HouseholdMember.objects.create(household=hh, client=primary, is_primary=True)
+
+        current = Case.objects.create(
+            case_id=str(uuid.uuid4()), client=primary,
+            case_type=CaseType.INTERNAL_SERVICE, case_status=CaseStatus.OPEN,
+            household_type=CaseHouseholdType.INDIVIDUAL,
+            program_name="Medically Tailored Meals (MTM) - Other Eligible Populations - Brooklyn",
+            service_type="Medically Tailored Meals",
+            service_authorization_status=ServiceAuthorizationStatus.APPROVED,
+            service_authorization_approval_starts_at=now - timedelta(days=30),
+            service_authorization_approval_ends_at=now + timedelta(days=30),
+        )
+        serving = EnrollmentVerification.objects.create(
+            client=primary, household=hh, case=current,
+            stage=EnrollmentStage.SERVICE_ACTIVE, verified_at=now - timedelta(days=25),
+        )
+        MemberDietaryProfile.objects.create(
+            enrollment=serving, client=primary, menu_type="Standard",
+        )
+
+        reauth = Case.objects.create(
+            case_id=str(uuid.uuid4()), client=primary,
+            case_type=CaseType.INTERNAL_SERVICE, case_status=CaseStatus.OPEN,
+            household_type=reauth_scope or CaseHouseholdType.INDIVIDUAL,
+            is_extension=True,
+            program_name=reauth_kind_program
+            or "Reauthorization: Medically Tailored Meals (MTM) - Other Eligible Populations - Brooklyn",
+            service_type="Medically Tailored Meals",
+            service_authorization_status=ServiceAuthorizationStatus.APPROVED,
+            service_authorization_approval_starts_at=now + timedelta(days=reauth_start_days),
+            service_authorization_approval_ends_at=now + timedelta(days=reauth_start_days + 60),
+        )
+        return primary, hh, current, serving, reauth
+
+    def test_future_reauth_is_deferred_and_parked(self):
+        from .models import Case, EnrollmentStage, EnrollmentVerification
+        from .services.lifecycle import (
+            deferred_extension_case_ids, pick_governing_case,
+            reconcile_internal_service_authorization,
+        )
+
+        primary, hh, current, serving, reauth = self._setup(reauth_start_days=20)
+        cases = list(Case.objects.filter(client=primary))
+
+        # The future reauth is deferred; the current case governs.
+        deferred = {str(x) for x in deferred_extension_case_ids(cases)}
+        self.assertIn(str(reauth.case_id), deferred)
+        self.assertEqual(str(pick_governing_case(cases).case_id), str(current.case_id))
+
+        reconcile_internal_service_authorization(primary)
+
+        # A parked SCHEDULED_EXTENSION enrollment now exists for the reauth case,
+        # and the serving enrollment is untouched.
+        parked = EnrollmentVerification.objects.filter(
+            case=reauth, stage=EnrollmentStage.SCHEDULED_EXTENSION,
+        )
+        self.assertTrue(parked.exists())
+        serving.refresh_from_db()
+        self.assertEqual(EnrollmentStage(serving.stage), EnrollmentStage.SERVICE_ACTIVE)
+
+    def test_backdated_reauth_after_current_ended_not_deferred(self):
+        # A reauth whose window started in the past AND whose current case's
+        # window has ALSO ended -> nothing left to protect -> NOT deferred
+        # (immediate switch). (An overlap with a still-active current is covered
+        # separately and DOES defer until the current ends.)
+        from datetime import timedelta
+
+        from .models import Case
+        from .services.lifecycle import deferred_extension_case_ids
+
+        primary, _hh, current, _serving, reauth = self._setup(reauth_start_days=-5)
+        # End the current window in the past so there's no active case to protect.
+        current.service_authorization_approval_ends_at = timezone.now() - timedelta(days=1)
+        current.save(update_fields=["service_authorization_approval_ends_at"])
+        cases = list(Case.objects.filter(client=primary))
+        deferred = {str(x) for x in deferred_extension_case_ids(cases)}
+        self.assertNotIn(str(reauth.case_id), deferred)
+
+    def test_different_scope_reauth_not_deferred(self):
+        from .models import Case, CaseHouseholdType
+        from .services.lifecycle import deferred_extension_case_ids
+
+        primary, *_rest, reauth = self._setup(
+            reauth_start_days=20, reauth_scope=CaseHouseholdType.HOUSEHOLD,
+        )
+        cases = list(Case.objects.filter(client=primary))
+        # Different scope than the serving case -> a real switch, not deferred.
+        deferred = {str(x) for x in deferred_extension_case_ids(cases)}
+        self.assertNotIn(str(reauth.case_id), deferred)
+
+    def test_overlap_defers_until_current_window_ends(self):
+        # Current window ends +30; reauth starts +10 (overlap). Between S2 and E1
+        # the reauth must STILL be deferred (switch point = max(E1,S2) = E1).
+        from datetime import timedelta
+
+        from .models import Case
+        from .services.lifecycle import deferred_extension_case_ids
+
+        primary, _hh, _current, _serving, reauth = self._setup(reauth_start_days=10)
+        cases = list(Case.objects.filter(client=primary))
+        # "today" = +20: past reauth start (+10) but before current end (+30).
+        today = (timezone.now() + timedelta(days=20)).date()
+        deferred = {str(x) for x in deferred_extension_case_ids(cases, today=today)}
+        self.assertIn(str(reauth.case_id), deferred)
+        # "today" = +31: past the current window end -> no longer deferred.
+        later = (timezone.now() + timedelta(days=31)).date()
+        deferred2 = {str(x) for x in deferred_extension_case_ids(cases, today=later)}
+        self.assertNotIn(str(reauth.case_id), deferred2)
+
+
+class ReauthExtensionActivationTest(TestCase):
+    """process_scheduled_extensions advances a parked reauthorization by the
+    calendar: activate at max(E1,S2), gap-pause between windows."""
+
+    def _build(self, *, current_end_days, reauth_start_days):
+        from datetime import timedelta
+
+        from .models import (
+            Case, CaseHouseholdType, CaseStatus, CaseType, Client,
+            EnrollmentStage, EnrollmentVerification, Household, HouseholdMember,
+            MemberDietaryProfile, MemberStatus, ServiceAuthorizationStatus,
+        )
+        from .services.lifecycle import reconcile_internal_service_authorization
+
+        now = timezone.now()
+        primary = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Ex", last_name="Tend",
+        )
+        hh = Household.objects.create(name="HH")
+        HouseholdMember.objects.create(household=hh, client=primary, is_primary=True)
+        current = Case.objects.create(
+            case_id=str(uuid.uuid4()), client=primary,
+            case_type=CaseType.INTERNAL_SERVICE, case_status=CaseStatus.OPEN,
+            household_type=CaseHouseholdType.INDIVIDUAL,
+            program_name="Medically Tailored Meals (MTM) - Other Eligible Populations - Brooklyn",
+            service_type="Medically Tailored Meals",
+            service_authorization_status=ServiceAuthorizationStatus.APPROVED,
+            service_authorization_approval_starts_at=now - timedelta(days=30),
+            service_authorization_approval_ends_at=now + timedelta(days=current_end_days),
+        )
+        serving = EnrollmentVerification.objects.create(
+            client=primary, household=hh, case=current,
+            stage=EnrollmentStage.SERVICE_ACTIVE, verified_at=now - timedelta(days=25),
+        )
+        MemberDietaryProfile.objects.create(
+            enrollment=serving, client=primary, menu_type="Standard",
+            status=MemberStatus.ACTIVE,
+        )
+        Case.objects.create(
+            case_id=str(uuid.uuid4()), client=primary,
+            case_type=CaseType.INTERNAL_SERVICE, case_status=CaseStatus.OPEN,
+            household_type=CaseHouseholdType.INDIVIDUAL, is_extension=True,
+            program_name="Reauthorization: Medically Tailored Meals (MTM) - Other Eligible Populations - Brooklyn",
+            service_type="Medically Tailored Meals",
+            service_authorization_status=ServiceAuthorizationStatus.APPROVED,
+            service_authorization_approval_starts_at=now + timedelta(days=reauth_start_days),
+            service_authorization_approval_ends_at=now + timedelta(days=reauth_start_days + 60),
+        )
+        # Park the reauth as a SCHEDULED_EXTENSION enrollment.
+        reconcile_internal_service_authorization(primary)
+        return primary, serving
+
+    def test_activation_at_switch_point(self):
+        from datetime import timedelta
+
+        from .models import EnrollmentStage, EnrollmentVerification, MemberStatus
+        from .services.lifecycle import process_scheduled_extensions
+
+        primary, serving = self._build(current_end_days=30, reauth_start_days=20)
+        waiting = EnrollmentVerification.objects.get(
+            client=primary, stage=EnrollmentStage.SCHEDULED_EXTENSION,
+        )
+        # today past max(E1=+30, S2=+20) -> activate.
+        today = (timezone.now() + timedelta(days=31)).date()
+        res = process_scheduled_extensions(client=primary, today=today, apply=True)
+        self.assertEqual(res["activated"], 1)
+
+        waiting.refresh_from_db()
+        serving.refresh_from_db()
+        # Activated off the parked stage (Service Active when a kitchen+cadence
+        # carries; Kitchen Assignment when none is set up to carry, as here).
+        self.assertIn(
+            EnrollmentStage(waiting.stage),
+            (EnrollmentStage.SERVICE_ACTIVE, EnrollmentStage.KITCHEN_ASSIGNMENT),
+        )
+        self.assertEqual(EnrollmentStage(serving.stage), EnrollmentStage.CLOSED)
+        self.assertEqual(waiting.supersedes_id, serving.pk)
+        # Member resumed active on the activated extension (park-time snapshot).
+        prof = waiting.member_profiles.get(client=primary)
+        self.assertEqual(prof.status, MemberStatus.ACTIVE)
+
+    def test_parking_logs_scheduled_stage_event(self):
+        from .models import (
+            EnrollmentStage, EnrollmentVerification, StageEntityType, StageEvent,
+        )
+
+        primary, _serving = self._build(current_end_days=30, reauth_start_days=20)
+        waiting = EnrollmentVerification.objects.get(
+            client=primary, stage=EnrollmentStage.SCHEDULED_EXTENSION,
+        )
+        ev = StageEvent.objects.filter(
+            entity_type=StageEntityType.ENROLLMENT, enrollment=waiting,
+            to_stage=EnrollmentStage.SCHEDULED_EXTENSION,
+        )
+        self.assertTrue(ev.exists())
+
+    def test_activation_refreshes_dietary_from_current(self):
+        # A dietary change made on the CURRENT enrollment during the wait must be
+        # reflected on the extension at activation (not the stale park snapshot).
+        from datetime import timedelta
+
+        from .models import EnrollmentStage, EnrollmentVerification, MemberDietaryProfile
+        from .services.lifecycle import process_scheduled_extensions
+
+        primary, serving = self._build(current_end_days=30, reauth_start_days=20)
+        waiting = EnrollmentVerification.objects.get(
+            client=primary, stage=EnrollmentStage.SCHEDULED_EXTENSION,
+        )
+        # Park snapshot carried menu_type="Standard". Change it on the CURRENT
+        # enrollment after parking.
+        sp = serving.member_profiles.get(client=primary)
+        sp.menu_type = "Kosher"
+        sp.save(update_fields=["menu_type"])
+        # Sanity: the parked snapshot is still stale here.
+        self.assertEqual(
+            waiting.member_profiles.get(client=primary).menu_type, "Standard"
+        )
+
+        today = (timezone.now() + timedelta(days=31)).date()
+        process_scheduled_extensions(client=primary, today=today, apply=True)
+
+        waiting.refresh_from_db()
+        self.assertEqual(
+            waiting.member_profiles.get(client=primary).menu_type, "Kosher"
+        )
+
+    def test_gap_pauses_members(self):
+        from datetime import timedelta
+
+        from .models import EnrollmentStage, MemberStatus
+        from .services.lifecycle import process_scheduled_extensions
+
+        primary, serving = self._build(current_end_days=10, reauth_start_days=20)
+        # E1=+10 < today=+15 < S2=+20 -> gap.
+        today = (timezone.now() + timedelta(days=15)).date()
+        res = process_scheduled_extensions(client=primary, today=today, apply=True)
+        self.assertEqual(res["gapped"], 1)
+
+        serving.refresh_from_db()
+        self.assertEqual(EnrollmentStage(serving.stage), EnrollmentStage.SERVICE_COMPLETE)
+        self.assertEqual(serving.close_reason, "reauth_gap")
+        prof = serving.member_profiles.get(client=primary)
+        self.assertEqual(prof.status, MemberStatus.PAUSED)
+
+    def test_parking_applies_reauthorized_tag_cleared_on_activation(self):
+        from datetime import timedelta
+
+        from .models import EnrollmentStage, EnrollmentVerification
+        from .services.lifecycle import (
+            REAUTHORIZED_TAG_NAME, process_scheduled_extensions,
+        )
+
+        # _build parks a reauth via reconcile -> green "Reauthorized" tag applied.
+        primary, serving = self._build(current_end_days=30, reauth_start_days=20)
+        self.assertTrue(
+            primary.tags.filter(name=REAUTHORIZED_TAG_NAME).exists()
+        )
+        # Once activated (no parked reauth remains), the tag clears.
+        today = (timezone.now() + timedelta(days=31)).date()
+        process_scheduled_extensions(client=primary, today=today, apply=True)
+        self.assertFalse(
+            primary.tags.filter(name=REAUTHORIZED_TAG_NAME).exists()
+        )
+
+    def test_gap_applies_reauth_attention_tag(self):
+        from datetime import timedelta
+
+        from .services.lifecycle import (
+            REAUTH_ATTENTION_TAG_NAME, process_scheduled_extensions,
+        )
+
+        primary, serving = self._build(current_end_days=10, reauth_start_days=20)
+        today = (timezone.now() + timedelta(days=15)).date()
+        process_scheduled_extensions(client=primary, today=today, apply=True)
+        self.assertTrue(
+            primary.tags.filter(name=REAUTH_ATTENTION_TAG_NAME).exists()
+        )
+
+    def test_clean_activation_clears_attention_tag(self):
+        from datetime import timedelta
+
+        from .services.lifecycle import (
+            REAUTH_ATTENTION_TAG_NAME, _reauth_attention_tag,
+            process_scheduled_extensions,
+        )
+
+        primary, serving = self._build(current_end_days=30, reauth_start_days=20)
+        # Pre-seed the tag as if a gap had flagged it earlier.
+        primary.tags.add(_reauth_attention_tag())
+        today = (timezone.now() + timedelta(days=31)).date()
+        process_scheduled_extensions(client=primary, today=today, apply=True)
+        self.assertFalse(
+            primary.tags.filter(name=REAUTH_ATTENTION_TAG_NAME).exists()
+        )
+
+    def test_gap_program_status_reads_reauthorization(self):
+        from datetime import timedelta
+
+        from .models import ProgramStatus
+        from .services.lifecycle import process_scheduled_extensions, program_status
+
+        primary, serving = self._build(current_end_days=10, reauth_start_days=20)
+        today = (timezone.now() + timedelta(days=15)).date()
+        process_scheduled_extensions(client=primary, today=today, apply=True)
+        serving.refresh_from_db()
+        self.assertEqual(program_status(serving), ProgramStatus.REAUTHORIZATION)
+
+
+class ScheduledExtensionInertStageTest(TestCase):
+    """The parked SCHEDULED_EXTENSION (Reauthorization - Waiting) enrollment must
+    be inert: excluded from serving surfaces, never the active/governing
+    enrollment, and never shown as pending verification."""
+
+    def _client(self, first="A", last="B"):
+        from .models import Client
+        return Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name=first, last_name=last
+        )
+
+    def test_stage_in_service_excluded_set(self):
+        from .models import SERVICE_EXCLUDED_ENROLLMENT_STAGES, EnrollmentStage
+        self.assertIn(
+            EnrollmentStage.SCHEDULED_EXTENSION, SERVICE_EXCLUDED_ENROLLMENT_STAGES
+        )
+
+    def test_not_chosen_as_active_or_governing_enrollment(self):
+        from .models import (
+            EnrollmentStage, EnrollmentVerification, Household, HouseholdMember,
+        )
+        from .portal.serializers import active_enrollment
+        from .services.lifecycle import _governing_enrollments
+
+        primary = self._client("Pat", "Primary")
+        hh = Household.objects.create(name="HH")
+        HouseholdMember.objects.create(household=hh, client=primary, is_primary=True)
+        serving = EnrollmentVerification.objects.create(
+            client=primary, household=hh, stage=EnrollmentStage.SERVICE_ACTIVE,
+        )
+        waiting = EnrollmentVerification.objects.create(
+            client=primary, household=hh,
+            stage=EnrollmentStage.SCHEDULED_EXTENSION,
+        )
+        # active_enrollment picks the serving one, never the parked reauth.
+        self.assertEqual(active_enrollment(primary).pk, serving.pk)
+        # governance ignores the parked reauth entirely.
+        gov_pks = {e.pk for e in _governing_enrollments(primary)}
+        self.assertIn(serving.pk, gov_pks)
+        self.assertNotIn(waiting.pk, gov_pks)
+
+    def test_excluded_from_pending_verification_report(self):
+        from .models import (
+            EnrollmentStage, EnrollmentVerification, Household, HouseholdMember,
+        )
+        from .portal.report_exports import members_pending_verification_rows
+
+        primary = self._client("Wanda", "Waiting")
+        hh = Household.objects.create(name="HH")
+        HouseholdMember.objects.create(household=hh, client=primary, is_primary=True)
+        # A stale pending row + a parked reauth (already verified) -> excluded.
+        EnrollmentVerification.objects.create(
+            client=primary, household=hh,
+            stage=EnrollmentStage.PENDING_VERIFICATION,
+        )
+        EnrollmentVerification.objects.create(
+            client=primary, household=hh,
+            stage=EnrollmentStage.SCHEDULED_EXTENSION,
+        )
+        ids = {r[0] for r in list(members_pending_verification_rows({}))[1:]}
+        self.assertNotIn(str(primary.client_id), ids)
+
+
+class MembersPendingVerificationReportTest(TestCase):
+    """The Admin > Reports 'Members Pending Verification' export: only members
+    genuinely awaiting verification (not already verified/served on a later
+    enrollment), a Case Created column, and a date filter on the governing
+    case's created date."""
+
+    def _rows(self, **params):
+        from .portal.report_exports import members_pending_verification_rows
+        return list(members_pending_verification_rows(params))
+
+    def _household(self, first, last, *, stage, case_created=None, case_status=None):
+        from datetime import date
+
+        from .models import (
+            Case, CaseStatus, CaseType, Client, EnrollmentVerification,
+            Household, HouseholdMember,
+        )
+
+        client = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name=first, last_name=last,
+        )
+        hh = Household.objects.create(name=f"{last} HH")
+        HouseholdMember.objects.create(household=hh, client=client, is_primary=True)
+        case = Case.objects.create(
+            case_id=str(uuid.uuid4()), client=client,
+            case_type=CaseType.INTERNAL_SERVICE,
+            case_status=case_status or CaseStatus.OPEN,
+            date_opened=case_created or timezone.now(),
+        )
+        enr = EnrollmentVerification.objects.create(
+            client=client, household=hh, case=case, stage=stage,
+        )
+        return client, hh, enr
+
+    def test_excludes_already_verified_and_adds_case_created(self):
+        from datetime import datetime
+
+        from .models import EnrollmentStage
+
+        pending_dt = timezone.make_aware(datetime(2026, 8, 5, 12, 0))
+        pending, _, _ = self._household(
+            "Penny", "Pending",
+            stage=EnrollmentStage.PENDING_VERIFICATION, case_created=pending_dt,
+        )
+        # A household with BOTH a stale pending row AND a later served
+        # enrollment must be excluded (this is the "already verified" bug).
+        served, served_hh, _ = self._household(
+            "Vera", "Fied",
+            stage=EnrollmentStage.PENDING_VERIFICATION,
+            case_created=timezone.now(),
+        )
+        from .models import EnrollmentVerification
+        EnrollmentVerification.objects.create(
+            client=served, household=served_hh,
+            stage=EnrollmentStage.SERVICE_ACTIVE,
+        )
+
+        rows = self._rows()
+        header, data = rows[0], rows[1:]
+        self.assertEqual(
+            header,
+            ["Client ID", "First Name", "Last Name", "Phone Numbers", "Case Created"],
+        )
+        ids = {r[0] for r in data}
+        self.assertIn(str(pending.client_id), ids)
+        self.assertNotIn(str(served.client_id), ids)  # verified household excluded
+        # Case Created column carries the governing case's date_opened.
+        penny_row = next(r for r in data if r[0] == str(pending.client_id))
+        self.assertEqual(penny_row[4], "2026-08-05")
+
+    def test_date_range_filters_on_case_created(self):
+        from datetime import datetime
+
+        from .models import EnrollmentStage
+
+        early, _, _ = self._household(
+            "Early", "Bird", stage=EnrollmentStage.PENDING_VERIFICATION,
+            case_created=timezone.make_aware(datetime(2026, 7, 1, 9, 0)),
+        )
+        late, _, _ = self._household(
+            "Late", "Comer", stage=EnrollmentStage.PENDING_VERIFICATION,
+            case_created=timezone.make_aware(datetime(2026, 8, 20, 9, 0)),
+        )
+
+        ids = {r[0] for r in self._rows(created_from="2026-08-01", created_to="2026-08-31")[1:]}
+        self.assertIn(str(late.client_id), ids)
+        self.assertNotIn(str(early.client_id), ids)
 
 
 class SyncHouseholdOutOfOrbitEventGateTest(TestCase):

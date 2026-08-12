@@ -219,32 +219,79 @@ def all_members_rows(params):
 
 # --- Members Pending Verification -------------------------------------------
 def members_pending_verification_rows(params):
-    """One row per household member on a pending-verification enrollment.
-    ``params``: created_from / created_to (inclusive, on enrollment opened_at)."""
-    from ..models import EnrollmentStage, EnrollmentVerification
+    """One row per household member genuinely awaiting verification.
+
+    Only members whose enrollment is at ``pending_verification`` AND who are not
+    already verified elsewhere are included -- a household that has since been
+    verified/served on a later enrollment (leaving a stale earlier
+    pending_verification row behind) is excluded.
+
+    ``params``: created_from / created_to (inclusive), applied to the governing
+    internal-service case's created date (``date_opened``)."""
+    from ..models import CaseType, EnrollmentStage, EnrollmentVerification
+    from ..services.lifecycle import governing_internal_case
     from .views_members import _parse_date
-    from .views_reports import _client_phone_numbers, _enrollment_member_clients
+    from .views_reports import _client_phone_numbers, _date_str, _enrollment_member_clients
 
     created_from = _parse_date(params.get("created_from"))
     created_to = _parse_date(params.get("created_to"))
+
+    # Stages that mean a client/household is (at or beyond) verified -- so a
+    # lingering earlier pending_verification enrollment must NOT be reported.
+    verified_or_beyond = [
+        EnrollmentStage.VERIFIED,
+        EnrollmentStage.KITCHEN_ASSIGNMENT,
+        EnrollmentStage.SERVICE_ACTIVE,
+        EnrollmentStage.SERVICE_COMPLETE,
+        EnrollmentStage.ON_HOLD,
+        # A parked reauthorization means the household is already verified.
+        EnrollmentStage.SCHEDULED_EXTENSION,
+    ]
+    verified = EnrollmentVerification.objects.filter(stage__in=verified_or_beyond)
+    verified_household_ids = set(
+        verified.exclude(household__isnull=True).values_list("household_id", flat=True)
+    )
+    verified_client_ids = set(verified.values_list("client_id", flat=True))
+
     qs = (
         EnrollmentVerification.objects
         .filter(stage=EnrollmentStage.PENDING_VERIFICATION)
-        .select_related("client", "household")
+        .select_related("client", "household", "case")
         .prefetch_related(
             "member_profiles__client__phones",
             "household__members__client__phones",
         )
         .order_by("opened_at")
     )
-    if created_from:
-        qs = qs.filter(opened_at__date__gte=created_from)
-    if created_to:
-        qs = qs.filter(opened_at__date__lte=created_to)
 
-    yield ["Client ID", "First Name", "Last Name", "Phone Numbers"]
+    yield ["Client ID", "First Name", "Last Name", "Phone Numbers", "Case Created"]
     seen = set()
     for enr in qs.iterator(chunk_size=1000):
+        # Skip a household/client already verified on a later enrollment (the
+        # pending row is stale, e.g. a superseded first enrollment).
+        if enr.household_id and enr.household_id in verified_household_ids:
+            continue
+        if enr.client_id and enr.client_id in verified_client_ids:
+            continue
+
+        # Governing internal-service case + its created date ("Case Created").
+        gc = enr.case if (
+            enr.case_id
+            and getattr(enr.case, "case_type", None) == CaseType.INTERNAL_SERVICE
+        ) else governing_internal_case(enr)
+        case_created = getattr(gc, "date_opened", None) if gc is not None else None
+
+        # Case-created date-range filter (inclusive). Drop rows with no case
+        # date once a bound is set, so the window is meaningful.
+        if created_from or created_to:
+            cd = case_created.date() if case_created is not None else None
+            if cd is None:
+                continue
+            if created_from and cd < created_from:
+                continue
+            if created_to and cd > created_to:
+                continue
+
         for client in _enrollment_member_clients(enr):
             if client is None or client.pk in seen:
                 continue
@@ -254,6 +301,7 @@ def members_pending_verification_rows(params):
                 client.first_name or "",
                 client.last_name or "",
                 _client_phone_numbers(client),
+                _date_str(case_created),
             ]
 
 

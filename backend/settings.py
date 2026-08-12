@@ -383,6 +383,15 @@ CELERY_BEAT_SCHEDULE = {
         "task": "api.tasks.sweep_closed_case_service",
         "schedule": crontab(minute=0, hour=4),
     },
+    # Daily: activate / gap-pause parked reauthorization (service-extension)
+    # enrollments by the calendar -- a parked extension takes over once its
+    # authorization window begins. Runs at 04:15 America/New_York, AFTER the
+    # closed-case sweep and BEFORE the 05:00 delivery-calendar reconcile so
+    # activations/pauses are reflected before the day's PO work.
+    "process-reauthorization-extensions": {
+        "task": "api.tasks.process_reauthorization_extensions",
+        "schedule": crontab(minute=15, hour=4),
+    },
     # Daily delivery-calendar reconcile so no eligible member is missing from
     # upcoming Purchase Orders (members added get scheduled; paused/removed get
     # dropped). Runs at 05:00 America/New_York, after the 02:00 daily_pull import
