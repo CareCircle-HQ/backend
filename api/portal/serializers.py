@@ -18,6 +18,7 @@ from api.services.lifecycle import (
     has_open_internal_service_case,
     has_valid_medicaid,
     has_valid_social_care,
+    program_status,
     verification_completed,
 )
 
@@ -975,6 +976,58 @@ class MemberListSerializer(serializers.Serializer):
         return _agent_name(enr.verified_by) if enr else None
 
 
+def _household_context(client):
+    """Household context for the profile stage bar. When this member is a
+    DEPENDENT (a household member who is NOT their household's primary), the
+    meal/box enrollment belongs to the primary -- so the bar shows "Member of
+    {primary}'s household" + the household enrollment's current status, and the
+    profile locks enrollment edits (they must be made on the primary).
+
+    Returns ``{is_dependent, primary: {client_id, name}|None, enrollment_status,
+    enrollment_status_label}``."""
+    from api.models import HouseholdMember
+
+    hm = (
+        HouseholdMember.objects.filter(client=client)
+        .select_related("household")
+        .first()
+    )
+    is_dependent = False
+    primary = None
+    if hm is not None and not hm.is_primary:
+        pm = (
+            HouseholdMember.objects.filter(
+                household_id=hm.household_id, is_primary=True
+            )
+            .select_related("client")
+            .first()
+        )
+        if pm is not None and pm.client_id != client.client_id:
+            is_dependent = True
+            primary = {
+                "client_id": str(pm.client_id),
+                "name": (
+                    f"{pm.client.first_name or ''} {pm.client.last_name or ''}".strip()
+                    or str(pm.client_id)
+                ),
+            }
+    # The household enrollment's current status (for a dependent this is the
+    # primary's enrollment, resolved via active_enrollment's household fallback).
+    status = ""
+    status_label = ""
+    enr = active_enrollment(client)
+    if enr is not None:
+        ps = program_status(enr)
+        status = getattr(ps, "value", "") or ""
+        status_label = getattr(ps, "label", "") or ""
+    return {
+        "is_dependent": is_dependent,
+        "primary": primary,
+        "enrollment_status": status,
+        "enrollment_status_label": status_label,
+    }
+
+
 class MemberDetailSerializer(serializers.Serializer):
     """Composed member profile: core / lifecycle / demographics / contact /
     address / flags / care_team / alerts. SSN intentionally omitted."""
@@ -1048,6 +1101,10 @@ class MemberDetailSerializer(serializers.Serializer):
                 # "Client May Be Eligible" program names from the assessments --
                 # shown as a sub-label under the stage bar's Assessment node.
                 "assessment_eligible": _assessment_eligible(client),
+                # Dependent context: when this member isn't their household's
+                # primary, who the primary is + the household enrollment status,
+                # so the bar shows "Member of {primary}'s household".
+                "household": _household_context(client),
             },
             # Read-only authorization status sourced from the client's GOVERNING
             # internal-service case (the meal/box case that gates kitchen

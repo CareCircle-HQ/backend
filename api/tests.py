@@ -14896,6 +14896,62 @@ class CarryServicePromotesPendingMemberTest(TestCase):
         self.assertEqual(EnrollmentStage(new_enr.stage), EnrollmentStage.SERVICE_ACTIVE)
 
 
+class ReuseEnrollmentCreatesMissingDependentTest(TestCase):
+    """Root-cause regression: the reuse-existing-enrollment replacement path must
+    CREATE a household dependent that lived only on the closed enrollment onto the
+    reused survivor -- conserving the dependent's PRIOR status -- so they aren't
+    stranded off the delivery calendar while the primary keeps serving."""
+
+    def test_missing_dependent_created_conserving_status(self):
+        from .models import (
+            Client, EnrollmentStage, EnrollmentVerification, Household,
+            MemberDietaryProfile, MemberStatus,
+        )
+        from .services.lifecycle import _create_missing_carried_profiles
+
+        hh = Household.objects.create(name="HH")
+        primary = Client.objects.create(client_id=str(uuid.uuid4()), first_name="P", last_name="One")
+        dep_active = Client.objects.create(client_id=str(uuid.uuid4()), first_name="D", last_name="Active")
+        dep_paused = Client.objects.create(client_id=str(uuid.uuid4()), first_name="D", last_name="Paused")
+
+        closed = EnrollmentVerification.objects.create(
+            client=primary, household=hh, stage=EnrollmentStage.CLOSED,
+            program_name="Medically Tailored Meals")
+        survivor = EnrollmentVerification.objects.create(
+            client=primary, household=hh, stage=EnrollmentStage.SERVICE_ACTIVE,
+            program_name="Medically Tailored Meals")
+
+        # Closed enrollment has ALL members; survivor has ONLY the primary.
+        MemberDietaryProfile.objects.create(
+            enrollment=closed, client=primary, member_name="P One",
+            menu_type="Standard", status=MemberStatus.ACTIVE)
+        MemberDietaryProfile.objects.create(
+            enrollment=closed, client=dep_active, member_name="D Active",
+            menu_type="Standard", food_allergies=["None"], status=MemberStatus.ACTIVE)
+        MemberDietaryProfile.objects.create(
+            enrollment=closed, client=dep_paused, member_name="D Paused",
+            menu_type="Kosher", status=MemberStatus.PAUSED, pause_locked=True)
+        MemberDietaryProfile.objects.create(
+            enrollment=survivor, client=primary, member_name="P One",
+            menu_type="Standard", status=MemberStatus.ACTIVE)
+
+        created = _create_missing_carried_profiles(survivor, closed)
+        self.assertEqual(created, 2)  # both dependents, not the already-present primary
+
+        a = survivor.member_profiles.get(client=dep_active)
+        self.assertEqual(a.status, MemberStatus.ACTIVE)          # Active carried -> Active
+        self.assertEqual(a.menu_type, "Standard")                # dietary carried
+        self.assertEqual(a.food_allergies, ["None"])
+        self.assertEqual(a.kitchen_meal_type, "")                # rule RESULT not copied
+
+        p = survivor.member_profiles.get(client=dep_paused)
+        self.assertEqual(p.status, MemberStatus.PAUSED)          # Paused NEVER revived
+        self.assertTrue(p.pause_locked)                          # pin carried
+
+        # Idempotent: a second run creates nothing.
+        self.assertEqual(_create_missing_carried_profiles(survivor, closed), 0)
+
+
 class SyncHealsServiceActiveWithoutScheduledPlanTest(TestCase):
     """sync_active_calendars must pick up a SERVICE_ACTIVE enrollment that has a
     kitchen but NO scheduled plan (cancelled plan / never created) -- previously
@@ -14933,3 +14989,106 @@ class SyncHealsServiceActiveWithoutScheduledPlanTest(TestCase):
             OrderSchedule.objects.filter(
                 enrollment=enr, status=OrderStatus.SCHEDULED,
                 anticipated_delivery_date__gte=today).count(), 0)
+
+
+class DetectPoDropsDependentInheritsHouseholdTest(TestCase):
+    """A dependent (no own enrollment) inherits the household PRIMARY's
+    enrollment for the drop reason -- so a held household's dependents read
+    on_hold, not a false off_boarded. A genuinely enrollment-less served client
+    stays off_boarded."""
+
+    def test_dependent_inherits_primary_reason(self):
+        from datetime import timedelta
+
+        from .models import (
+            Client, DeliveryOrder, DeliveryOrderStatus, EnrollmentStage,
+            EnrollmentVerification, Household, HouseholdMember, Kitchen,
+            KitchenStatus, MemberDietaryProfile, MemberStatus, PurchaseOrder,
+            PurchaseOrderStatus,
+        )
+        from .services.po_blockers import detect_po_drops
+
+        today = timezone.localdate()
+        last_monday = today - timedelta(days=today.weekday()) - timedelta(days=7)
+        k = Kitchen.objects.create(name="K", status=KitchenStatus.ACTIVE)
+        hh = Household.objects.create(name="HH")
+        po = PurchaseOrder.objects.create(status=PurchaseOrderStatus.DRAFT)
+
+        def served(c):
+            DeliveryOrder.objects.create(
+                purchase_order=po, member=c, kitchen=k,
+                expected_delivery_date=last_monday,
+                status=DeliveryOrderStatus.PENDING)
+
+        primary = Client.objects.create(client_id=str(uuid.uuid4()), first_name="P", last_name="H")
+        dep = Client.objects.create(client_id=str(uuid.uuid4()), first_name="D", last_name="H")
+        HouseholdMember.objects.create(household=hh, client=primary, is_primary=True)
+        HouseholdMember.objects.create(household=hh, client=dep, is_primary=False)
+        # Primary holds the household enrollment, currently ON HOLD.
+        penr = EnrollmentVerification.objects.create(
+            client=primary, household=hh, stage=EnrollmentStage.ON_HOLD, kitchen=k,
+            program_name="Medically Tailored Meals")
+        MemberDietaryProfile.objects.create(
+            enrollment=penr, client=primary, member_name="P H", status=MemberStatus.ACTIVE)
+        # Dependent has NO enrollment of their own -- only a profile on the
+        # household enrollment.
+        MemberDietaryProfile.objects.create(
+            enrollment=penr, client=dep, member_name="D H", status=MemberStatus.ACTIVE)
+        served(primary); served(dep)
+
+        # Genuinely enrollment-less served client (no household / no primary).
+        gone = Client.objects.create(client_id=str(uuid.uuid4()), first_name="G", last_name="X")
+        served(gone)
+
+        rows = {r["client_id"]: r for r in detect_po_drops(today)["dropped"]}
+        self.assertEqual(rows[str(dep.client_id)]["reason"], "on_hold")       # inherited
+        self.assertFalse(rows[str(dep.client_id)]["urgent"])
+        self.assertEqual(rows[str(gone.client_id)]["reason"], "off_boarded")  # genuine
+
+
+class SyncHouseholdCarriesPriorProfileTest(TestCase):
+    """sync_household_members must carry a roster member's dietary INFORMATION
+    forward from their most recent prior enrollment profile (governing-case
+    change), not re-create it blank. Service STATUS is NOT carried -- it's owned
+    by the scope rules (Household<->Individual), so it stays at the default."""
+
+    def test_carries_prior_dietary_and_status(self):
+        from .models import (
+            Client, EnrollmentStage, EnrollmentVerification, Household,
+            HouseholdMember, MemberDietaryProfile, MemberStatus,
+        )
+        from .serializers import sync_household_members
+
+        hh = Household.objects.create(name="HH")
+        primary = Client.objects.create(client_id=str(uuid.uuid4()), first_name="P", last_name="H")
+        dep = Client.objects.create(client_id=str(uuid.uuid4()), first_name="D", last_name="H")
+        HouseholdMember.objects.create(household=hh, client=primary, is_primary=True)
+        HouseholdMember.objects.create(household=hh, client=dep, is_primary=False)
+
+        # Closed prior enrollment: dependent was ACTIVE with a full profile.
+        old = EnrollmentVerification.objects.create(
+            client=primary, household=hh, stage=EnrollmentStage.CLOSED,
+            program_name="Medically Tailored Meals")
+        MemberDietaryProfile.objects.create(
+            enrollment=old, client=dep, member_name="D H", status=MemberStatus.ACTIVE,
+            menu_type="Kosher", dietary_restrictions=["Low Sodium"],
+            food_allergies=["Peanuts"], other_dietary_restrictions="No shellfish",
+            general_verification_notes="prefers soft foods")
+
+        # New live enrollment: dependent is only on the roster, no profile yet.
+        new = EnrollmentVerification.objects.create(
+            client=primary, household=hh, stage=EnrollmentStage.SERVICE_ACTIVE,
+            program_name="Medically Tailored Meals", supersedes=old)
+        MemberDietaryProfile.objects.create(
+            enrollment=new, client=primary, member_name="P H", status=MemberStatus.ACTIVE)
+
+        sync_household_members(primary, enrollment=new)
+
+        dep_profile = MemberDietaryProfile.objects.get(enrollment=new, client=dep)
+        # INFORMATION is carried forward...
+        self.assertEqual(dep_profile.menu_type, "Kosher")
+        self.assertEqual(dep_profile.food_allergies, ["Peanuts"])
+        self.assertEqual(dep_profile.other_dietary_restrictions, "No shellfish")
+        self.assertEqual(dep_profile.general_verification_notes, "prefers soft foods")
+        # ...but STATUS is NOT (left to the scope rules; stays the model default).
+        self.assertEqual(dep_profile.status, MemberStatus.PENDING)

@@ -2968,6 +2968,60 @@ def _carry_dietary_profiles(target, source):
     return changed
 
 
+# Fields copied when CREATING a carried member profile on a reused enrollment --
+# mirrors the fresh-fork copy in ``replace_enrollment_for_case_change`` so both
+# replacement paths carry a member's full dietary + clinical picture (and status)
+# forward. The kitchen-rule RESULT (kitchen_meal_type/_food_notes) is recomputed
+# against the surviving enrollment's kitchen, so it is intentionally NOT copied.
+_CARRY_PROFILE_FIELDS = (
+    "member_name", "dietary_restrictions", "food_allergies",
+    "other_dietary_restrictions", "meal_category", "menu_type",
+    "status", "meals_per_delivery", "general_verification_notes",
+    "pause_locked", "eligibility_paused", "mobile_number",
+    "conditions", "weeks_gestation", "months_postpartum", "medications",
+    "weight", "height", "on_medical_diet", "medical_diet_details",
+    "meal_plan", "meal_plan_other", "assessment_notes", "nutritionist_pdf_key",
+)
+
+
+def _create_missing_carried_profiles(target, source):
+    """Create member profiles on ``target`` for every ``source`` member that has
+    no profile there yet -- CONSERVING the member's prior status.
+
+    Root-cause fix for stranded dependents: the reuse-existing-enrollment
+    replacement path (:func:`_close_old_and_link_to_existing`) previously only
+    filled BLANKS on profiles that already existed on the reused enrollment
+    (:func:`_carry_dietary_profiles`). A household DEPENDENT present on the
+    closed enrollment but missing from the reused survivor was never created --
+    so they had no profile, no delivery plan and silently fell off the calendar
+    while the primary kept being served. The fresh-CREATE replacement path
+    already copies every member; this brings the reuse path to parity.
+
+    The member's PRIOR status is preserved (an Active member stays Active so the
+    downstream kitchen reconcile can plan them; a Paused / Inactive / Out-of-Range
+    member carries that status verbatim and is not revived). Returns the number
+    of profiles created. Best-effort."""
+    from api.models import MemberDietaryProfile
+
+    if target is None or source is None:
+        return 0
+    existing = {p.client_id for p in target.member_profiles.all() if p.client_id}
+    created = 0
+    for sp in source.member_profiles.all():
+        if not sp.client_id or sp.client_id in existing:
+            continue
+        carried = {f: getattr(sp, f) for f in _CARRY_PROFILE_FIELDS}
+        try:
+            MemberDietaryProfile.objects.create(
+                enrollment=target, client_id=sp.client_id,
+                kitchen_meal_type="", kitchen_food_notes="", **carried,
+            )
+            created += 1
+        except Exception:  # pragma: no cover - defensive
+            pass
+    return created
+
+
 def _force_close_enrollment(enr):
     """Terminate ``enr`` as CLOSED even when the transition map has no edge from
     its current stage (e.g. verified / kitchen_assignment). Used ONLY for the
@@ -3061,6 +3115,14 @@ def _close_old_and_link_to_existing(
         # (which would push them Out of Orbit). Done BEFORE the service carry so
         # the meal-rule reconcile below sees the carried menu. Blanks only.
         _carry_dietary_profiles(existing, live)
+        # CREATE any member profile missing entirely from the reused survivor (a
+        # household DEPENDENT that lived only on the closed enrollment) conserving
+        # their prior status -- otherwise they have no profile, no delivery plan
+        # and silently fall off the calendar while the primary keeps serving. The
+        # fresh-CREATE path already copies every member; this brings the reuse
+        # path to parity. Done BEFORE the service carry so the promotion + calendar
+        # rebuild below picks the new profiles up.
+        _create_missing_carried_profiles(existing, live)
 
         # Carry the closed enrollment's service forward: if ``live`` was serving a
         # SAME-KIND program, drive ``existing`` back to Service Active with the

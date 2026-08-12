@@ -3230,6 +3230,13 @@ class MemberHouseholdView(PortalAPIView):
         if enr is None:
             return Response({"enrollment": None, "address": None, "members": []})
         read_only = self._is_scoped_override(client_id, enr)
+        # Whether the VIEWED member holds an internal-service (meal/box) case of
+        # their OWN. Only such a member can be the primary of a meal/box
+        # household; a dependent with no internal-service case can never be
+        # re-anchored as primary, so the UI must hide the "Make primary" action.
+        viewer_has_internal_service_case = Case.objects.filter(
+            client_id=client_id, case_type=CaseType.INTERNAL_SERVICE,
+        ).exists()
         # Heal any drift between the household roster and this enrollment's
         # per-member profiles, so members tied via the extension picker (which
         # only writes a HouseholdMember row) appear here with dietary/menu/status
@@ -3365,6 +3372,9 @@ class MemberHouseholdView(PortalAPIView):
                 # True when scoped to a superseded enrollment: the frontend hides
                 # every edit/action control and renders the tab read-only.
                 "read_only": read_only,
+                # Gate the "Make primary" re-anchor: only a member with their own
+                # internal-service case can become a meal/box household primary.
+                "viewer_has_internal_service_case": viewer_has_internal_service_case,
                 "address": {
                     "street": addr.street, "unit": addr.unit, "city": addr.city,
                     "state": addr.state, "zip": addr.zip,
