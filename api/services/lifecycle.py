@@ -1523,7 +1523,7 @@ def program_tracks(client):
         if is_governing and is_food:
             s_val, s_lbl = _service_phase(client, enr, c)
         elif c.case_id in scheduled_ext_case_ids:
-            s_val, s_lbl = ("scheduled_extension", "Reauthorization - Waiting")
+            s_val, s_lbl = ("scheduled_extension", "Reauthorization")
         elif is_duplicate:
             s_val, s_lbl = ("duplicated", "Duplicated")
         elif is_conflicting:
