@@ -15002,6 +15002,51 @@ class BackfillVerifiedAtTest(TestCase):
         self.assertIsNone(never.verified_at)              # no evidence: untouched
 
 
+class ReconcileOnHoldClosedCasesTest(TestCase):
+    """Close an on_hold enrollment whose internal-service case has ended, but
+    leave a hold with a still-open internal-service case alone."""
+
+    def _client(self, first):
+        from .models import Client
+        return Client.objects.create(client_id=str(uuid.uuid4()), first_name=first, last_name="X")
+
+    def _isc(self, client, status):
+        from .models import Case, CaseStatus, CaseType, ServiceAuthorizationStatus
+        return Case.objects.create(
+            case_id=uuid.uuid4(), client=client, case_type=CaseType.INTERNAL_SERVICE,
+            case_status=status,
+            service_authorization_status=ServiceAuthorizationStatus.APPROVED,
+            program_name="Medically Tailored Meals")
+
+    def test_closes_ended_hold_and_keeps_open_hold(self):
+        from io import StringIO
+        from django.core.management import call_command
+        from .models import (
+            CaseStatus, EnrollmentStage, EnrollmentVerification, Household,
+        )
+        hh = Household.objects.create(name="HH")
+
+        # Ended: on_hold + only a CLOSED internal-service case -> should close.
+        c_ended = self._client("Ended")
+        ended_case = self._isc(c_ended, CaseStatus.CLOSED)
+        ended = EnrollmentVerification.objects.create(
+            client=c_ended, household=hh, case=ended_case,
+            stage=EnrollmentStage.ON_HOLD, program_name="Medically Tailored Meals")
+
+        # Still open: on_hold + an OPEN internal-service case -> leave on hold.
+        c_open = self._client("Openish")
+        open_case = self._isc(c_open, CaseStatus.OPEN)
+        held = EnrollmentVerification.objects.create(
+            client=c_open, household=hh, case=open_case,
+            stage=EnrollmentStage.ON_HOLD, program_name="Medically Tailored Meals")
+
+        call_command("reconcile_onhold_closed_cases", "--apply", stdout=StringIO())
+
+        ended.refresh_from_db(); held.refresh_from_db()
+        self.assertEqual(EnrollmentStage(ended.stage), EnrollmentStage.CLOSED)   # ended -> closed
+        self.assertEqual(EnrollmentStage(held.stage), EnrollmentStage.ON_HOLD)   # open case -> untouched
+
+
 class SyncHealsServiceActiveWithoutScheduledPlanTest(TestCase):
     """sync_active_calendars must pick up a SERVICE_ACTIVE enrollment that has a
     kitchen but NO scheduled plan (cancelled plan / never created) -- previously
