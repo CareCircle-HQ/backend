@@ -14952,6 +14952,56 @@ class ReuseEnrollmentCreatesMissingDependentTest(TestCase):
         self.assertEqual(_create_missing_carried_profiles(survivor, closed), 0)
 
 
+class BackfillVerifiedAtTest(TestCase):
+    """An enrollment that reached Verified (per the StageEvent audit) but never
+    had verified_at stamped is healed from the event time -- so a later case
+    change carries service instead of bouncing to Pending Verification. Reverted
+    pending_verification / terminal rows are left alone."""
+
+    def _evt(self, enr, to_stage, when):
+        from .models import StageEvent
+        se = StageEvent.objects.create(
+            entity_type="enrollment", enrollment=enr,
+            from_stage="", to_stage=to_stage, source="manual")
+        StageEvent.objects.filter(pk=se.pk).update(entered_at=when)  # auto_now_add override
+
+    def test_stamps_serving_but_unstamped_and_skips_others(self):
+        from io import StringIO
+        from django.core.management import call_command
+        from .models import (
+            Client, EnrollmentStage, EnrollmentVerification, Household, MemberStatus,
+        )
+        now = timezone.now()
+        hh = Household.objects.create(name="HH")
+        c = Client.objects.create(client_id=str(uuid.uuid4()), first_name="A", last_name="B")
+
+        # Serving, verified in the audit log, but verified_at NULL -> should heal.
+        serving = EnrollmentVerification.objects.create(
+            client=c, household=hh, stage=EnrollmentStage.SERVICE_ACTIVE,
+            program_name="Medically Tailored Meals", verified_at=None)
+        vtime = now - timezone.timedelta(days=10)
+        self._evt(serving, EnrollmentStage.VERIFIED, vtime)
+
+        # Reverted to pending_verification (reached verified once) -> left alone.
+        reverted = EnrollmentVerification.objects.create(
+            client=c, household=hh, stage=EnrollmentStage.PENDING_VERIFICATION,
+            program_name="Medically Tailored Meals", verified_at=None)
+        self._evt(reverted, EnrollmentStage.VERIFIED, now - timezone.timedelta(days=5))
+
+        # Never reached verified -> left alone.
+        never = EnrollmentVerification.objects.create(
+            client=c, household=hh, stage=EnrollmentStage.SERVICE_ACTIVE,
+            program_name="Medically Tailored Meals", verified_at=None)
+
+        call_command("backfill_verified_at", "--apply", stdout=StringIO())
+
+        serving.refresh_from_db(); reverted.refresh_from_db(); never.refresh_from_db()
+        self.assertEqual(serving.verified_at, vtime)      # healed from the event time
+        self.assertTrue(serving.is_family_verified)
+        self.assertIsNone(reverted.verified_at)           # reverted: untouched
+        self.assertIsNone(never.verified_at)              # no evidence: untouched
+
+
 class SyncHealsServiceActiveWithoutScheduledPlanTest(TestCase):
     """sync_active_calendars must pick up a SERVICE_ACTIVE enrollment that has a
     kitchen but NO scheduled plan (cancelled plan / never created) -- previously

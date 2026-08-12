@@ -195,6 +195,22 @@ if os.getenv('DB_SSLMODE'):
         'connect_timeout': int(os.getenv('DB_CONNECT_TIMEOUT', '10')),
     }
 
+# Optional read-only comparison database (a PRIOR snapshot restored locally),
+# exposed as the ``old`` alias for ``.using('old')`` diff queries. Only added
+# when OLD_DB_NAME is set (local dev), so prod/CI are unaffected. Inherits the
+# default connection params unless overridden by OLD_DB_* envs.
+if os.getenv('OLD_DB_NAME'):
+    DATABASES['old'] = {
+        'ENGINE': os.getenv('DB_ENGINE', 'django.db.backends.postgresql'),
+        'NAME': os.getenv('OLD_DB_NAME'),
+        'USER': os.getenv('OLD_DB_USER', os.getenv('DB_USER', '')),
+        'PASSWORD': os.getenv('OLD_DB_PASSWORD', os.getenv('DB_PASSWORD', '')),
+        'HOST': os.getenv('OLD_DB_HOST', os.getenv('DB_HOST', '')),
+        'PORT': os.getenv('OLD_DB_PORT', os.getenv('DB_PORT', '')),
+        'CONN_MAX_AGE': 0,
+        'TIME_ZONE': None,
+    }
+
 # ---------------------------------------------------------------------------
 # Test database
 # ---------------------------------------------------------------------------
