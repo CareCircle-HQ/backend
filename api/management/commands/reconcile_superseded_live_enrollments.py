@@ -86,11 +86,24 @@ class Command(BaseCommand):
             .order_by("pk")
         )
 
-        to_close, unsafe, open_case = [], [], []
+        to_close, unsafe, open_case, stale_link = [], [], [], []
         for old in qs:
             survivor = old.superseded_by.first()
             old_future = _future_sched(old, today)
             surv_future = _future_sched(survivor, today)
+            # STALE LINK: the "survivor" is actually a DISREGARDED (abandoned
+            # duplicate) stub while ``old`` is the real live-serving enrollment.
+            # The supersession pointer is inverted/stale -- a disregarded row
+            # can't be a genuine survivor -- so this is NOT a duplicate to close;
+            # ``old`` must keep serving. On --apply we just clear the stale
+            # ``supersedes`` pointer so the live row stops reading as superseded.
+            if (
+                survivor is not None
+                and EnrollmentStage(survivor.stage) == EnrollmentStage.DISREGARDED
+                and old_future > 0
+            ):
+                stale_link.append((old, survivor, old_future, surv_future))
+                continue
             # DANGER 1: the superseded row is the one actually serving and the
             # survivor is not -> closing it would drop the member's only live
             # plan. Leave it for manual review.
@@ -147,6 +160,17 @@ class Command(BaseCommand):
                     f"     old={old.pk} case={old.case_id} (open) "
                     f"survivor={surv.pk if surv else None} client={old.client_id}"
                 )
+        if stale_link:
+            self.stdout.write(self.style.WARNING(
+                f"  STALE LINK (survivor is a DISREGARDED abandoned duplicate; the "
+                f"live row keeps serving -- will clear the stale pointer): "
+                f"{len(stale_link)}"
+            ))
+            for old, surv, of, sf in stale_link[:50]:
+                self.stdout.write(
+                    f"     live={old.pk} ({old.stage}, future={of}) <- stale "
+                    f"survivor={surv.pk} (disregarded) client={old.client_id}"
+                )
 
         if list_detail:
             for old, surv, of, sf in to_close:
@@ -195,6 +219,19 @@ class Command(BaseCommand):
                     if old.client_id:
                         client_ids.add(old.client_id)
 
+        # Clear the stale supersession pointer where a DISREGARDED abandoned
+        # duplicate spuriously supersedes the real live-serving row. Only the
+        # (already-terminal) survivor's ``supersedes`` FK is nulled -- the live
+        # enrollment and its service are untouched.
+        cleared = 0
+        for old, surv, _of, _sf in stale_link:
+            try:
+                surv.supersedes = None
+                surv.save(update_fields=["supersedes"])
+                cleared += 1
+            except Exception:  # noqa: BLE001
+                self.stderr.write(f"  clear stale pointer failed for survivor {surv.pk}")
+
         healed = 0
         for cid in client_ids:
             c = Client.objects.filter(pk=cid).first()
@@ -207,6 +244,7 @@ class Command(BaseCommand):
                 self.stderr.write(f"  recompute failed for client {cid}")
 
         self.stdout.write(self.style.SUCCESS(
-            f"\nAPPLIED: closed {closed} stale enrollment(s); recomputed {healed} "
+            f"\nAPPLIED: closed {closed} stale enrollment(s); cleared "
+            f"{cleared} stale supersession pointer(s); recomputed {healed} "
             f"client(s). Skipped -- serving: {len(unsafe)}, open-case: {len(open_case)}."
         ))
