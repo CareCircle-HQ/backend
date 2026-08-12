@@ -189,4 +189,11 @@ A **daily** re-evaluation (see #6) performs the calendar-day transitions:
   pause is a reauthorization handoff, not an agent pause.
 
 - **Waiting `SCHEDULED_EXTENSION` enrollment is visible on the member Programs
-  tab, read-only**, showing its scheduled start.
+  tab, read-only**, showing its scheduled start, own authorization window, and
+  planned kitchen + cadence.
+- **`ScheduleStatus.WAITING`**: a parked reauth gets DISPLAY-only `WAITING`
+  delivery schedules mirroring the current kitchen/cadence. `WAITING` never
+  generates PO occurrences (every occurrence/PO path filters `status=SCHEDULED`);
+  at activation the `WAITING` rows are dropped and a fresh `SCHEDULED` plan +
+  calendar are rebuilt from the live kitchen/cadence. Only OPEN reauth cases are
+  parked (a closed/cancelled reauth is never parked and is discarded if found).

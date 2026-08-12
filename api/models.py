@@ -1958,6 +1958,12 @@ class ScheduleStatus(models.TextChoices):
     COMPLETED = "completed", "Completed"
     CANCELLED = "cancelled", "Cancelled"
     RESCHEDULED = "rescheduled", "Rescheduled"
+    # A schedule that exists for DISPLAY on a parked reauthorization
+    # (SCHEDULED_EXTENSION) enrollment but is NOT yet serving: never generates
+    # Purchase Order occurrences (every occurrence/PO path filters
+    # status=SCHEDULED). Flipped to SCHEDULED — actually rebuilt fresh — when the
+    # reauthorization activates. See docs/reauthorization_extension_plan.md.
+    WAITING = "waiting", "Waiting"
 
 
 class ScheduleCadence(models.TextChoices):

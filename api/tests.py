@@ -12091,6 +12091,18 @@ class DeferredReauthGoverningTest(TestCase):
         deferred = {str(x) for x in deferred_extension_case_ids(cases)}
         self.assertNotIn(str(reauth.case_id), deferred)
 
+    def test_closed_reauth_case_not_deferred(self):
+        from .models import Case, CaseStatus
+        from .services.lifecycle import deferred_extension_case_ids
+
+        primary, _hh, _current, _serving, reauth = self._setup(reauth_start_days=20)
+        # A reauth case that has since closed must never be deferred/parked.
+        reauth.case_status = CaseStatus.CLOSED
+        reauth.save(update_fields=["case_status"])
+        cases = list(Case.objects.filter(client=primary))
+        deferred = {str(x) for x in deferred_extension_case_ids(cases)}
+        self.assertNotIn(str(reauth.case_id), deferred)
+
     def test_overlap_defers_until_current_window_ends(self):
         # Current window ends +30; reauth starts +10 (overlap). Between S2 and E1
         # the reauth must STILL be deferred (switch point = max(E1,S2) = E1).
@@ -12191,6 +12203,45 @@ class ReauthExtensionActivationTest(TestCase):
         # Member resumed active on the activated extension (park-time snapshot).
         prof = waiting.member_profiles.get(client=primary)
         self.assertEqual(prof.status, MemberStatus.ACTIVE)
+
+    def test_parking_creates_waiting_schedule_not_serving(self):
+        from datetime import timedelta
+
+        from .models import (
+            EnrollmentStage, EnrollmentVerification, Kitchen, KitchenStatus,
+            MemberDeliverySchedule, ScheduleStatus,
+        )
+        from .services.lifecycle import reconcile_internal_service_authorization
+
+        # Build with a serving enrollment that HAS a kitchen + a cadence schedule,
+        # so parking can mirror it as a WAITING schedule.
+        primary, serving = self._build(current_end_days=30, reauth_start_days=20)
+        kitchen = Kitchen.objects.create(name="K", status=KitchenStatus.ACTIVE)
+        serving.kitchen = kitchen
+        serving.save(update_fields=["kitchen"])
+        MemberDeliverySchedule.objects.create(
+            enrollment=serving,
+            member_profile=serving.member_profiles.get(client=primary),
+            member_name="Ex Tend", kitchen=kitchen,
+            delivery_days_cadence="mon_thu",
+            status=ScheduleStatus.SCHEDULED,
+            starts_on=timezone.now().date(),
+            ends_on=(timezone.now() + timedelta(days=30)).date(),
+        )
+        # Re-run the reconcile so parking mirrors the (now-present) kitchen/cadence.
+        reconcile_internal_service_authorization(primary)
+
+        waiting = EnrollmentVerification.objects.get(
+            client=primary, stage=EnrollmentStage.SCHEDULED_EXTENSION,
+        )
+        # WAITING schedule(s) exist; NONE are SCHEDULED -> never on a PO.
+        self.assertTrue(
+            waiting.delivery_schedules.filter(status=ScheduleStatus.WAITING).exists()
+        )
+        self.assertFalse(
+            waiting.delivery_schedules.filter(status=ScheduleStatus.SCHEDULED).exists()
+        )
+        self.assertEqual(waiting.kitchen_id, kitchen.pk)
 
     def test_parking_logs_scheduled_stage_event(self):
         from .models import (

@@ -1052,6 +1052,9 @@ def deferred_extension_case_ids(cases, *, today=None):
             continue
         if c.service_authorization_status not in favorable:
             continue
+        # A closed/cancelled reauth case never activates -> never defer/park it.
+        if c.case_status in _CLOSED_CASE_STATUSES:
+            continue
         start, _end = c.effective_authorization_window()
         if start is None:
             continue  # no window -> can't defer, switch per the normal rule
@@ -4147,6 +4150,42 @@ def _record_reauth_scheduled_event(enrollment, *, actor=None, actor_label=""):
         pass
 
 
+def _carry_waiting_schedule(waiting, live, reauth):
+    """Give a parked reauthorization enrollment a DISPLAY-only ``WAITING`` delivery
+    schedule mirroring the live enrollment's kitchen + cadence, so the Program tab
+    shows the planned kitchen/cadence/schedule. A ``WAITING`` schedule never
+    generates Purchase Order occurrences (every occurrence/PO path filters
+    ``status=SCHEDULED``); the real SCHEDULED plan + calendar are (re)built when
+    the reauthorization activates. Best-effort; idempotent."""
+    from api.models import ScheduleStatus
+    from api.services.delivery import (
+        create_member_delivery_schedules,
+        current_household_cadence,
+    )
+
+    if waiting is None or live is None:
+        return
+    if live.kitchen_id and waiting.kitchen_id != live.kitchen_id:
+        waiting.kitchen = live.kitchen
+        try:
+            waiting.save(update_fields=["kitchen"])
+        except Exception:  # pragma: no cover - defensive
+            pass
+    if waiting.delivery_schedules.exists():
+        return
+    cadence = current_household_cadence(live)
+    if not (waiting.kitchen_id and cadence):
+        return  # nothing to mirror (no kitchen/cadence on the live enrollment yet)
+    try:
+        create_member_delivery_schedules(
+            waiting, case=reauth, cadence=cadence, kitchen=waiting.kitchen,
+            product_kind=_case_product_kind(reauth),
+            status=ScheduleStatus.WAITING,
+        )
+    except Exception:  # pragma: no cover - defensive
+        pass
+
+
 def _park_deferred_extensions(client, cases, *, actor=None, actor_label=""):
     """Ensure each DEFERRED future reauthorization extension has a parked,
     NON-SERVING ``SCHEDULED_EXTENSION`` enrollment bound to its case.
@@ -4193,6 +4232,10 @@ def _park_deferred_extensions(client, cases, *, actor=None, actor_label=""):
                 except InvalidTransition:
                     existing.stage = EnrollmentStage.SCHEDULED_EXTENSION.value
                     existing.save(update_fields=["stage"])
+            # Mirror kitchen/cadence as a WAITING schedule (idempotent; also
+            # backfills an already-parked enrollment once the live kitchen/cadence
+            # becomes known).
+            _carry_waiting_schedule(existing, live, case)
             continue
         # Create a fresh parked enrollment carrying the household's verified data.
         new = EnrollmentVerification.objects.create(
@@ -4218,6 +4261,7 @@ def _park_deferred_extensions(client, cases, *, actor=None, actor_label=""):
             stage=EnrollmentStage.SCHEDULED_EXTENSION.value,
         )
         _create_missing_carried_profiles(new, live)
+        _carry_waiting_schedule(new, live, case)
         # Record the "scheduled" event on the new enrollment's history (the
         # pre-existing-park path already logs one via advance_enrollment).
         _record_reauth_scheduled_event(new, actor=actor, actor_label=actor_label)
@@ -4282,6 +4326,14 @@ def _refresh_scheduled_extension_from_live(waiting, live):
     """
     if waiting is None or live is None:
         return
+    # Drop the display-only WAITING schedule so the activation carry
+    # (_carry_service_and_activate -> create_member_delivery_schedules, which is
+    # idempotent) rebuilds a fresh SCHEDULED plan + calendar from the live kitchen
+    # / cadence.
+    try:
+        waiting.delivery_schedules.all().delete()
+    except Exception:  # pragma: no cover - defensive
+        pass
     for f in (
         "delivery_address", "household_size", "is_family_verified",
         "medicaid_type_verified", "delivery_address_verified",

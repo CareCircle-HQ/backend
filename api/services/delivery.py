@@ -306,6 +306,7 @@ def _resolve_product_type(program_name, cadence, kind=None):
 def create_member_delivery_schedules(
     enrollment, case=None, cadence="", once_a_week_weekday=None,
     kitchen=None, member_quantities=None, product_kind=None,
+    status=ScheduleStatus.SCHEDULED,
 ):
     """Create one MemberDeliverySchedule per household member of ``enrollment``.
 
@@ -432,7 +433,7 @@ def create_member_delivery_schedules(
                 kitchen_food_notes=m.kitchen_food_notes,
                 starts_on=start,
                 ends_on=end,
-                status=ScheduleStatus.SCHEDULED,
+                status=status,
             )
         )
     return MemberDeliverySchedule.objects.bulk_create(schedules)
