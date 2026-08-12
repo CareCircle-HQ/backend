@@ -612,7 +612,19 @@ class Command(BaseCommand):
                 missing.append("menu type")
             return ("needs_verification", "missing " + " + ".join(missing))
 
-        # Address + menu type present -> the household is Verified.
+        # Address + menu type present -> the household is Verified. Stamp the
+        # verification FACT (``verified_at`` + flags), mirroring the verification
+        # pop-up completion -- not just the stage. Without this, an import-verified
+        # household carries ``verified_at=None``, so a later governing-case change
+        # fails the carry's verification gate and silently bounces the whole
+        # household back to Pending Verification (dropping it off service).
+        if not enr.verified_at:
+            enr.verified_at = timezone.now()
+            enr.is_family_verified = True
+            enr.delivery_address_verified = True
+            enr.save(update_fields=[
+                "verified_at", "is_family_verified", "delivery_address_verified",
+            ])
         advance_enrollment(
             enr, EnrollmentStage.VERIFIED, force=True,
             note="Imported from Meal Inputs verification sheet.",
