@@ -9,6 +9,8 @@ expansion). Each occurrence is enriched with its committed
 :class:`~api.models.DeliveryOrder` (matched by client + date) when one exists,
 so the row shows the real fulfillment status, proof, and PO number.
 """
+from datetime import timedelta
+
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from rest_framework.response import Response
@@ -18,6 +20,7 @@ from ..models import (
     DeliveryCadence,
     DeliveryOrder,
     EnrollmentStage,
+    EnrollmentVerification,
     HouseholdMember,
     MemberDeliverySchedule,
     MemberDietaryProfile,
@@ -144,6 +147,23 @@ class MemberDeliveryCalendarView(PortalAPIView):
             occ_qs.select_related("kitchen", "enrollment", "member")
             .order_by("anticipated_delivery_date")
         ) if profile_ids else []
+
+        # A parked reauthorization (SCHEDULED_EXTENSION) has no real occurrences
+        # yet -- it isn't serving. Show a READ-ONLY PREVIEW of the deliveries it
+        # WILL make, computed from its WAITING schedule (cadence + reauth window).
+        # Nothing is persisted; these never hit a Purchase Order.
+        if override:
+            scoped_enr = (
+                EnrollmentVerification.objects.filter(pk=override).first()
+            )
+            if scoped_enr and EnrollmentStage(scoped_enr.stage) == EnrollmentStage.SCHEDULED_EXTENSION:
+                preview = self._scheduled_extension_preview(scoped_enr)
+                summary = self._scheduled_extension_summary(scoped_enr, preview)
+                summary["is_household"] = is_household
+                summary["member_count"] = len(
+                    {r["member_id"] for r in preview if r["member_id"]}
+                )
+                return Response({"summary": summary, "occurrences": preview})
 
         # Committed deliveries for the in-scope client(s), keyed by
         # (client, date) so multiple household members on the SAME date don't
@@ -328,6 +348,78 @@ class MemberDeliveryCalendarView(PortalAPIView):
                 return p.enrollment
         client = Client.objects.filter(pk=client_id).first()
         return active_enrollment(client) if client else None
+
+    def _scheduled_extension_preview(self, enrollment):
+        """Read-only preview rows for a parked reauthorization: expand each WAITING
+        schedule's cadence across its (reauth) window into per-date rows. Not
+        persisted; never on a PO."""
+        from api.services.delivery import weekdays_for_cadence
+
+        rows = []
+        scheds = (
+            enrollment.delivery_schedules.filter(status=ScheduleStatus.WAITING)
+            .select_related("member_profile", "member_profile__client", "kitchen")
+        )
+        for sc in scheds:
+            weekdays = weekdays_for_cadence(sc.delivery_days_cadence)
+            wd_ints = {_WEEKDAY_CODES.index(w) for w in weekdays if w in _WEEKDAY_CODES}
+            if not (sc.starts_on and sc.ends_on and wd_ints):
+                continue
+            mp = sc.member_profile
+            mcid = mp.client_id if mp else None
+            d = sc.starts_on
+            while d <= sc.ends_on:
+                if d.weekday() in wd_ints:
+                    rows.append({
+                        "date": d.isoformat(),
+                        "weekday": d.strftime("%a"),
+                        "member_name": sc.member_name or (mp.member_name if mp else ""),
+                        "member_id": str(mcid) if mcid else None,
+                        "quantity": sc.prod_per_delivery,
+                        "menu_type": sc.menu_type or "",
+                        "kitchen_name": sc.kitchen.name if sc.kitchen_id else "",
+                        "status": "waiting",
+                        "status_label": "Reauthorization (planned)",
+                        "state": "reauthorization",
+                        "committed": False,
+                        "po_number": "", "po_id": None,
+                        "delivered_at": None, "proof": [],
+                    })
+                d += timedelta(days=1)
+        rows.sort(key=lambda r: (r["date"], r["member_name"]))
+        return rows
+
+    def _scheduled_extension_summary(self, enrollment, preview):
+        """Summary for the parked-reauthorization preview: cadence/kitchen/window
+        from the WAITING schedule; counts derived from the preview rows."""
+        sc = enrollment.delivery_schedules.filter(
+            status=ScheduleStatus.WAITING
+        ).select_related("kitchen", "program", "product_type").first()
+        kind = product_kind_for_enrollment(enrollment)
+        cadence = sc.delivery_days_cadence if sc else ""
+        kitchen = (sc.kitchen if sc and sc.kitchen_id else None) or (
+            enrollment.kitchen if enrollment.kitchen_id else None
+        )
+        window_start = sc.starts_on if sc else None
+        window_end = sc.ends_on if sc else None
+        today = timezone.localdate().isoformat()
+        upcoming = sum(1 for r in preview if r["date"] and r["date"] >= today)
+        return {
+            "kind": kind.value if kind else "",
+            "kind_label": kind.label if kind else "",
+            "cadence": cadence,
+            "cadence_label": dict(DeliveryCadence.choices).get(cadence, ""),
+            "weekdays": enrollment.delivery_weekdays or [],
+            "kitchen_name": kitchen.name if kitchen else "",
+            "program_name": enrollment.program_name or "",
+            "window_start": window_start.isoformat() if window_start else None,
+            "window_end": window_end.isoformat() if window_end else None,
+            "next_delivery": min((r["date"] for r in preview), default=None),
+            "counts": {
+                "total": len(preview), "scheduled": 0, "committed": 0,
+                "delivered": 0, "cancelled": 0, "upcoming": upcoming,
+            },
+        }
 
     def _summary(self, client_id, profile_ids, occurrences):
         plan = (
