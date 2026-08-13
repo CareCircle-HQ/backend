@@ -12243,6 +12243,41 @@ class ReauthExtensionActivationTest(TestCase):
         )
         self.assertEqual(waiting.kitchen_id, kitchen.pk)
 
+    def test_scheduled_extension_calendar_preview(self):
+        from datetime import timedelta
+
+        from .models import (
+            EnrollmentStage, EnrollmentVerification, Kitchen, KitchenStatus,
+            MemberDeliverySchedule, ScheduleStatus,
+        )
+        from .portal.views_delivery_calendar import MemberDeliveryCalendarView
+        from .services.lifecycle import reconcile_internal_service_authorization
+
+        primary, serving = self._build(current_end_days=30, reauth_start_days=20)
+        kitchen = Kitchen.objects.create(name="K", status=KitchenStatus.ACTIVE)
+        serving.kitchen = kitchen
+        serving.save(update_fields=["kitchen"])
+        MemberDeliverySchedule.objects.create(
+            enrollment=serving,
+            member_profile=serving.member_profiles.get(client=primary),
+            member_name="Ex Tend", kitchen=kitchen, delivery_days_cadence="mon_thu",
+            status=ScheduleStatus.SCHEDULED, starts_on=timezone.now().date(),
+            ends_on=(timezone.now() + timedelta(days=30)).date(),
+        )
+        reconcile_internal_service_authorization(primary)
+        waiting = EnrollmentVerification.objects.get(
+            client=primary, stage=EnrollmentStage.SCHEDULED_EXTENSION,
+        )
+        v = MemberDeliveryCalendarView()
+        preview = v._scheduled_extension_preview(waiting)
+        # Preview has planned rows, all in the "reauthorization" state (never on a PO).
+        self.assertTrue(len(preview) > 0)
+        self.assertTrue(all(r["state"] == "reauthorization" for r in preview))
+        self.assertTrue(all(not r["committed"] and not r["po_number"] for r in preview))
+        summary = v._scheduled_extension_summary(waiting, preview)
+        self.assertEqual(summary["cadence"], "mon_thu")
+        self.assertEqual(summary["kitchen_name"], "K")
+
     def test_parking_logs_scheduled_stage_event(self):
         from .models import (
             EnrollmentStage, EnrollmentVerification, StageEntityType, StageEvent,
