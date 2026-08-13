@@ -192,6 +192,39 @@ def verification_pending(client):
     return client.lifecycle_stage == "pending_verification"
 
 
+def can_request_dependent_split(client):
+    """CRM member-profile "Request Verification" gate for a household DEPENDENT.
+
+    True when the client is a NON-primary household member who holds their own
+    program cases -- at least one Internal Service case, one Care Management
+    (Navigation) case, and one Eligibility case -- and has NO verification
+    requested or completed yet. That's the signal they're ready to be split into
+    their own internal-service case (the split runs server-side on request,
+    mirroring the Urgent Care action). Returns False for a primary / household-
+    less client, or once a verification exists."""
+    from ..models import EnrollmentStage, EnrollmentVerification
+
+    membership = getattr(client, "household_membership", None)
+    if membership is None or membership.is_primary:
+        return False
+    # "No verification requested yet" for a DEPENDENT means they hold no
+    # enrollment of their OWN. A dependent served through the household has no
+    # own EnrollmentVerification row (they're a profile on the primary's), so
+    # verification_pending/completed reflect the HOUSEHOLD -- not them. Once the
+    # split runs they own a (non-terminal) enrollment, which hides the button.
+    if (
+        EnrollmentVerification.objects.filter(client=client)
+        .exclude(stage__in=[EnrollmentStage.DISREGARDED, EnrollmentStage.CANCELLED])
+        .exists()
+    ):
+        return False
+    cases = list(client.cases.all())
+    has_internal = any(c.case_type == CaseType.INTERNAL_SERVICE for c in cases)
+    has_nav = any(c.case_type == CaseType.NAVIGATION for c in cases)
+    has_elig = any(c.case_type == CaseType.ELIGIBILITY for c in cases)
+    return has_internal and has_nav and has_elig
+
+
 # Coarse pipeline PHASE for the Verification list's "Stage" column. Both
 # pending_verification and verified (awaiting authorization) are still in the
 # "Verification" phase; the case being approved advances to Kitchen Assignment,
@@ -1065,6 +1098,18 @@ class MemberDetailSerializer(serializers.Serializer):
                 # True only while a PENDING verification request exists -- the
                 # sole state in which the "run verification" pop-up is offered.
                 "verification_pending": verification_pending(client),
+                # True once the household's active enrollment carries a nutritionist
+                # sign-off. Drives (its INVERSE) the member-profile "Nutritionist"
+                # intake button, which is hidden once approved.
+                "nutritionist_approved": bool(
+                    active_enrollment(client)
+                    and active_enrollment(client).nutritionist_approved_at
+                ),
+                # Drives the member-profile "Request Verification" button for a
+                # household DEPENDENT (non-primary member with their own internal-
+                # service + care-management + eligibility cases and no verification
+                # yet). Requesting splits them into their own case server-side.
+                "can_request_dependent_split": can_request_dependent_split(client),
                 # Williamsburg exception (lead source == "Williamsburg"): the
                 # verification wizard forces the Kosher menu and the save
                 # auto-assigns the Williamsburg kitchen + activates directly.
@@ -2449,6 +2494,32 @@ class VerificationMemberInputSerializer(serializers.Serializer):
     meal_category = serializers.CharField(required=False, allow_blank=True)
     menu_type = serializers.CharField(required=False, allow_blank=True)
     notes = serializers.CharField(required=False, allow_blank=True)
+
+
+# ---------------------------------------------------------------------------
+# Nutritionist intake (short pop-up on the member profile) -- captures the
+# recently-added medical questions per member + mobile, then flags the client
+# Pending Nutritionist. Does NOT create a verification enrollment.
+# ---------------------------------------------------------------------------
+class NutritionistIntakeMemberSerializer(serializers.Serializer):
+    client_id = serializers.UUIDField(required=False, allow_null=True)
+    mobile_number = serializers.CharField(required=False, allow_blank=True)
+    conditions = serializers.ListField(
+        child=serializers.CharField(), required=False, default=list
+    )
+    medications = serializers.ListField(
+        child=serializers.CharField(), required=False, default=list
+    )
+    weight = serializers.CharField(required=False, allow_blank=True, max_length=50)
+    height = serializers.CharField(required=False, allow_blank=True, max_length=50)
+    other_dietary_restrictions = serializers.CharField(required=False, allow_blank=True)
+    general_verification_notes = serializers.CharField(required=False, allow_blank=True)
+    on_medical_diet = serializers.BooleanField(required=False, default=False)
+    medical_diet_details = serializers.CharField(required=False, allow_blank=True)
+
+
+class NutritionistIntakeSerializer(serializers.Serializer):
+    members = NutritionistIntakeMemberSerializer(many=True)
 
 
 class VerificationCreateSerializer(serializers.Serializer):

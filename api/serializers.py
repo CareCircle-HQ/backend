@@ -759,8 +759,12 @@ def sync_household_members(client, enrollment=None, agent=None):
             logger.warning("household member note failed", exc_info=True)
 
     # 2) profiled members -> ensure a roster row (one-household-per-client).
-    for cid in profiles:
+    # A REMOVED profile is history (the member was split into their own case);
+    # never re-add them to this household's roster.
+    for cid, prof in profiles.items():
         if not cid or cid in roster_ids:
+            continue
+        if prof.status == MemberStatus.REMOVED:
             continue
         if HouseholdMember.objects.filter(client_id=cid).exists():
             continue
@@ -827,8 +831,20 @@ def add_client_to_household(primary, member_client, agent=None):
     """
     household = ensure_household_with_primary(primary)
 
-    # Idempotent: already a member of THIS household -> nothing to do.
+    # An explicit agent "add" RE-ACTIVATES a member whose profile on this
+    # household's enrollment was left as REMOVED (e.g. they were split out into
+    # their own case earlier). The REMOVED roster-sync exemption is only meant to
+    # stop AUTOMATIC re-adds -- an agent adding them back intends a live member.
+    def _reactivate_removed_profiles(mc):
+        MemberDietaryProfile.objects.filter(
+            client=mc, enrollment__household=household, status=MemberStatus.REMOVED,
+        ).update(status=MemberStatus.ACTIVE, status_changed_at=timezone.now())
+
+    # Idempotent: already a member of THIS household -> still reactivate any
+    # REMOVED profile (so a split-out member can be re-added) and re-sync.
     if household.members.filter(client=member_client).exists():
+        _reactivate_removed_profiles(member_client)
+        sync_household_members(primary, agent=agent)
         return household
 
     # If the client is already in ANOTHER household, move them here: detach from
@@ -847,6 +863,9 @@ def add_client_to_household(primary, member_client, agent=None):
     HouseholdMember.objects.create(
         household=household, client=member_client, is_primary=False
     )
+    # A re-added member may still carry a REMOVED profile on this household's
+    # enrollment from a prior split -- reactivate it so they show + are served.
+    _reactivate_removed_profiles(member_client)
     sync_household_members(primary, agent=agent)
     return household
 
@@ -1550,15 +1569,24 @@ class CaseSerializer(serializers.ModelSerializer):
         except Exception:
             logger.exception("catalog.assign_product_type_for_internal_service failed")
         # Internal Service cases are the ones that go through verification and
-        # meal/box delivery, so ensure the client is the PRIMARY of their own
-        # household here — on case save — rather than on profile save. A client
-        # who was added as a relative's dependent BEFORE their own case existed
-        # is split out into their own household as primary (they can't remain a
-        # non-primary member while holding their own case). Idempotent, so
-        # re-saving the case never duplicates or re-splits the household.
+        # meal/box delivery, so ensure the client is anchored as the PRIMARY of
+        # their own household (and their enrollments re-homed there) on case save.
+        #
+        # BUT: a client who was added as a relative's DEPENDENT (a non-primary
+        # household member) is NOT split out here anymore. The split into their
+        # own case/household now happens only when an agent Requests Verification
+        # for them (split_dependent_into_own_enrollment) -- so they stay visible
+        # in the shared household until then, and the "dependent in a household"
+        # warning on the case-save response can actually surface (the eager split
+        # used to remove their membership before that warning was evaluated).
+        # For a primary / household-less client this still heals mis-anchored
+        # enrollments. Idempotent.
         try:
             if case.case_type == CaseType.INTERNAL_SERVICE:
-                ensure_primary_of_own_household(client)
+                _membership = HouseholdMember.objects.filter(client=client).first()
+                _is_dependent = _membership is not None and not _membership.is_primary
+                if not _is_dependent:
+                    ensure_primary_of_own_household(client)
         except Exception:
             logger.exception("ensure_primary_of_own_household failed for internal service case")
         # "New client needs verification attention": creating a client's FIRST

@@ -122,6 +122,7 @@ from ..services.lifecycle import (
     recompute_client_stage,
     recompute_enrollment_household,
     reconcile_enrollment_authorization,
+    split_dependent_into_own_enrollment,
 )
 from ..services import timeline
 from ..services.warnings import sync_household_warnings
@@ -3276,9 +3277,11 @@ class MemberHouseholdView(PortalAPIView):
         # read-only scoped (superseded) enrollment -- never mutate history.
         if not read_only:
             sync_household_members(enr.client, enrollment=enr)
+        # Exclude REMOVED profiles: a member split into their own case is kept on
+        # this enrollment for history only and must not show in the live roster.
         members = enr.member_profiles.select_related(
             "client__household_membership"
-        ).all()
+        ).exclude(status=MemberStatus.REMOVED)
         addr = enr.delivery_address
         # Product kind (Meals / Boxes). `kind` is the scope the enrollment was
         # VERIFIED under (product_type_override, stamped at verification /
@@ -4736,6 +4739,75 @@ class NutritionistPendingListView(PortalAPIView):
         return Response({"count": len(results), "results": results})
 
 
+class NutritionistPendingSplitListView(PortalAPIView):
+    """GET: clients tagged "Pending Nutritionist" -- members who were split into
+    their OWN internal-service case without a prior nutritionist approval and so
+    still need review. Distinct from the standard queue (a split ACTIVE member is
+    carried straight to Service Active, so they don't show as Verified/Pending
+    there). Same response shape as NutritionistPendingListView. Nutritionist +
+    Management only."""
+
+    def get(self, request):
+        agent = current_agent(request)
+        allowed = bool(agent and (
+            agent.group in ("Nutritionist", "Management")
+            or getattr(agent, "is_manager", False)
+        ))
+        if not allowed:
+            return Response(
+                {"detail": "Nutritionist access required."},
+                status=http.HTTP_403_FORBIDDEN,
+            )
+        from .serializers import active_enrollment
+        from ..services.lifecycle import (
+            PENDING_NUTRITIONIST_TAG_NAME, governing_internal_case,
+        )
+
+        clients = (
+            Client.objects.filter(tags__name=PENDING_NUTRITIONIST_TAG_NAME).distinct()
+        )
+        search = (request.query_params.get("search") or "").strip()
+        if search:
+            cond = (
+                Q(first_name__icontains=search) | Q(last_name__icontains=search)
+                | Q(insurances__external_member_id__icontains=search)
+            )
+            parts = search.split()
+            if len(parts) >= 2:
+                cond |= Q(first_name__icontains=parts[0]) & Q(last_name__icontains=parts[-1])
+            try:
+                cond |= Q(client_id=uuid.UUID(search))
+            except (ValueError, AttributeError, TypeError):
+                pass
+            clients = clients.filter(cond).distinct()
+
+        results = []
+        for c in clients:
+            gov = active_enrollment(c)
+            case = (gov.case or governing_internal_case(gov)) if gov else None
+            members = [
+                {
+                    "name": p.member_name or (
+                        f"{p.client.first_name} {p.client.last_name}".strip()
+                        if p.client_id else ""
+                    ) or "Member",
+                    "status": p.status,
+                }
+                for p in (gov.member_profiles.all() if gov else [])
+            ]
+            results.append({
+                "client_id": str(c.client_id),
+                "primary_name": f"{c.first_name} {c.last_name}".strip() or str(c.client_id),
+                "program_name": (gov.program_name if gov else "")
+                or getattr(case, "program_name", "") or "",
+                "verified_at": gov.verified_at.isoformat() if (gov and gov.verified_at) else None,
+                "authorization_status": getattr(case, "service_authorization_status", "") or "",
+                "members": members,
+            })
+        results.sort(key=lambda r: r["primary_name"].lower())
+        return Response({"count": len(results), "results": results})
+
+
 class MeSignatureView(PortalAPIView):
     """GET/PUT the logged-in agent's SAVED signature image (a PNG data URL).
 
@@ -4810,10 +4882,18 @@ class MemberNutritionistApproveView(PortalAPIView):
             .order_by("-verified_at")
             .first()
         )
+        # A member split into their own case (Nutritionist -> Pending Review) is
+        # already service-active and carries the HOUSEHOLD's sign-off, so the
+        # strict query above misses them. Fall back to their current enrollment
+        # and RE-STAMP the individual sign-off (same PDF-per-member + signature),
+        # then clear the Pending Nutritionist tag below.
+        restamp = False
+        if enr is None:
+            enr = s.active_enrollment(client)
+            restamp = True
         if enr is None:
             return Response(
-                {"error": "No verified enrollment awaiting nutritionist "
-                          "approval for this member."},
+                {"error": "No enrollment to approve for this member."},
                 status=http.HTTP_400_BAD_REQUEST,
             )
         signature_image = request.data.get("signature_image") or ""
@@ -4840,12 +4920,132 @@ class MemberNutritionistApproveView(PortalAPIView):
                 mv.nutritionist_pdf_key = key
                 mv.save(update_fields=["nutritionist_pdf_key"])
 
-        from ..services.lifecycle import nutritionist_approve
-        nutritionist_approve(
-            enr, agent=agent, signature=signature,
-            signature_image=signature_image,
-        )
+        from ..services.lifecycle import nutritionist_approve, set_pending_nutritionist
+
+        if restamp:
+            # Already-approved (carried) enrollment: record the INDIVIDUAL review
+            # (who / when / signature) without changing its stage.
+            enr.nutritionist_approved_at = _tz.now()
+            enr.nutritionist_approved_by = agent
+            enr.nutritionist_signature = signature
+            enr.nutritionist_signature_image = signature_image
+            enr.save(update_fields=[
+                "nutritionist_approved_at", "nutritionist_approved_by",
+                "nutritionist_signature", "nutritionist_signature_image",
+            ])
+        else:
+            nutritionist_approve(
+                enr, agent=agent, signature=signature,
+                signature_image=signature_image,
+            )
+        # An individual nutritionist review is now done -> drop the client off the
+        # Pending Review queue.
+        set_pending_nutritionist(client, False)
         return Response({"ok": True, "client_id": str(client.client_id)})
+
+
+class MemberNutritionistClearPendingView(PortalAPIView):
+    """POST /members/<id>/nutritionist-clear-pending/: mark a split member's
+    Nutritionist review complete by REMOVING the "Pending Nutritionist" tag.
+
+    A member split into their own case carries the household's sign-off and is
+    already active, so there's no VERIFIED enrollment to approve -- the review is
+    simply the Nutritionist looking them over (meal plan / notes captured via the
+    normal review endpoints) and clearing the tag. Nutritionist + Management
+    only. Idempotent."""
+
+    def post(self, request, client_id):
+        agent = current_agent(request)
+        if not (
+            agent
+            and (
+                agent.group in ("Nutritionist", "Management")
+                or getattr(agent, "is_manager", False)
+            )
+        ):
+            return Response(
+                {"detail": "Only a Nutritionist can clear this."},
+                status=http.HTTP_403_FORBIDDEN,
+            )
+        client = get_object_or_404(Client, pk=client_id)
+        from ..services.lifecycle import set_pending_nutritionist
+
+        set_pending_nutritionist(client, False)
+        return Response({"ok": True, "client_id": str(client.client_id)})
+
+
+class MemberNutritionistIntakeView(PortalAPIView):
+    """POST /members/<id>/nutritionist-intake/: capture the per-member medical
+    intake (conditions / medications / weight / height / other dietary
+    restrictions / general notes / on-medical-diet) + mobile numbers onto the
+    client's ACTIVE enrollment, then FLAG the client "Pending Nutritionist" so
+    they surface on the Nutritionist -> Pending Review queue.
+
+    A short alternative to the full verification wizard for capturing the newly
+    added medical questions. It does NOT create or modify a verification
+    enrollment; it only writes the member dietary/medical fields + the tag."""
+
+    _FIELDS = (
+        "conditions", "medications", "weight", "height",
+        "other_dietary_restrictions", "general_verification_notes",
+        "on_medical_diet", "medical_diet_details",
+    )
+
+    @transaction.atomic
+    def post(self, request, client_id):
+        client = get_object_or_404(Client, pk=client_id)
+        enr = s.active_enrollment(client)
+        if enr is None:
+            return Response(
+                {"error": "No active enrollment for this member."},
+                status=http.HTTP_400_BAD_REQUEST,
+            )
+        if _program_locked(enr):
+            return _program_locked_response()
+        ser = s.NutritionistIntakeSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        members = ser.validated_data.get("members", [])
+
+        profiles = {
+            str(p.client_id): p
+            for p in enr.member_profiles.all()
+            if p.client_id
+        }
+        for m in members:
+            mv = profiles.get(str(m.get("client_id") or ""))
+            if mv is None:
+                continue
+            for f in self._FIELDS:
+                if f in m:
+                    setattr(mv, f, m[f])
+            mv.save()
+            mobile = (m.get("mobile_number") or "").strip()
+            if mobile:
+                mv.mobile_number = mobile
+                mv.save(update_fields=["mobile_number", "updated_at"])
+                # Mirror to the Benefully app login (HouseholdMember.
+                # mobile_app_username), which is UNIQUE. Household members often
+                # share a phone, so SKIP the mirror when another member already
+                # uses this number rather than 500 on the unique constraint -- the
+                # number is still saved on the member's dietary profile above.
+                if mv.client_id:
+                    taken = (
+                        HouseholdMember.objects
+                        .filter(mobile_app_username=mobile)
+                        .exclude(client_id=mv.client_id)
+                        .exists()
+                    )
+                    if not taken:
+                        HouseholdMember.objects.filter(client_id=mv.client_id).update(
+                            mobile_app_username=mobile,
+                        )
+
+        # Flag the client for Nutritionist review (Pending Review queue).
+        from ..services.lifecycle import set_pending_nutritionist
+
+        set_pending_nutritionist(client, True)
+        client.refresh_from_db()
+        return Response(s.MemberDetailSerializer(client).data)
 
 
 class MemberNutritionistReviewView(PortalAPIView):
@@ -5121,6 +5321,20 @@ class MemberVerificationCreateView(PortalAPIView):
                           "so they can't be verified."},
                 status=http.HTTP_400_BAD_REQUEST,
             )
+        # SPLITTABLE DEPENDENT: this member is a NON-primary member of a shared
+        # household AND currently carries a live dietary profile on that
+        # household's enrollment. Requesting verification splits them into their
+        # own case (carrying their data) instead of the plain flow. Captured
+        # BEFORE the wizard creates the new enrollment / mutates membership.
+        _dep_membership = (
+            HouseholdMember.objects.filter(client=client, is_primary=False)
+            .select_related("household").first()
+        )
+        is_split_dependent = _dep_membership is not None and (
+            MemberDietaryProfile.objects.filter(
+                client=client, enrollment__household=_dep_membership.household
+            ).exclude(status=MemberStatus.REMOVED).exists()
+        )
         ser = s.VerificationCreateSerializer(data=request.data)
         ser.is_valid(raise_exception=True)
         data = ser.validated_data
@@ -5431,7 +5645,17 @@ class MemberVerificationCreateView(PortalAPIView):
             if is_williamsburg
             else None
         )
-        if is_williamsburg and wburg_kitchen is not None:
+        if is_split_dependent:
+            # Splitting a dependent into their own case: detach from the shared
+            # household (keep history), copy their data + the primary's address,
+            # move nutritionist data / tag Pending Nutritionist, carry kitchen /
+            # cadence and preserve their prior service status. This does its own
+            # stage projection, so the standard authorization projection is
+            # skipped for this path.
+            split_dependent_into_own_enrollment(
+                client, enrollment, actor=None, actor_label=actor_label,
+            )
+        elif is_williamsburg and wburg_kitchen is not None:
             # Williamsburg exception: skip the manual kitchen-assignment step
             # entirely. Auto-assign the Williamsburg kitchen and activate service
             # directly (Mon/Thu). assign_kitchen_to_household applies the kitchen
@@ -5630,6 +5854,45 @@ class MemberRequestVerificationView(PortalAPIView):
 
     def post(self, request, client_id):
         client = get_object_or_404(Client, pk=client_id)
+
+        # SPLITTABLE DEPENDENT: a non-primary household member who still carries a
+        # live dietary profile on the shared household enrollment. Requesting
+        # verification for them SPLITS them into their own internal-service case
+        # (carrying the verified fact) instead of the Urgent Care flow -- and it
+        # bypasses the coverage gate below (they were already verified as part of
+        # the household). Mirrors the split wired into the ext / wizard paths.
+        _dep_membership = (
+            HouseholdMember.objects.filter(client=client, is_primary=False)
+            .select_related("household")
+            .first()
+        )
+        is_split_dependent = _dep_membership is not None and (
+            MemberDietaryProfile.objects.filter(
+                client=client, enrollment__household=_dep_membership.household
+            )
+            .exclude(status=MemberStatus.REMOVED)
+            .exists()
+        )
+        if is_split_dependent:
+            agent = current_agent(request)
+            actor = _agent_actor(agent)
+            with transaction.atomic():
+                case = s.internal_service_case(client)
+                enr = EnrollmentVerification.objects.create(
+                    client=client,
+                    household=_dep_membership.household,
+                    case=case,
+                    program_name=(case.program_name if case else "") or "",
+                    service_type=(case.service_type if case else "") or "",
+                    stage=EnrollmentStage.PENDING_VERIFICATION,
+                    requested_by=agent,
+                    requested_at=timezone.now(),
+                )
+                split_dependent_into_own_enrollment(
+                    client, enr, actor=None, actor_label=actor,
+                )
+            client.refresh_from_db()
+            return Response(s.MemberDetailSerializer(client).data)
 
         # Gate: reject with the specific missing prerequisite(s) so the UI can
         # explain why. Mirrors is_urgent_care_candidate but itemized.

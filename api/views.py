@@ -27,6 +27,7 @@ from .models import (
     FoodAllergy,
     HouseholdMember,
     MemberDietaryProfile,
+    MemberStatus,
     MenuCategory,
     MenuType,
     Program,
@@ -64,6 +65,7 @@ from .services.lifecycle import (
     recompute_enrollment_household,
     reconcile_enrollment_authorization,
     reconcile_internal_service_authorization,
+    split_dependent_into_own_enrollment,
 )
 
 logger = logging.getLogger(__name__)
@@ -227,29 +229,37 @@ class BulkUpsertMixin:
                 {"detail": "Expected a JSON list of records."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
-        created, errors = [], []
+        created, errors, saved = [], [], []
         for index, item in enumerate(items):
             serializer = self.get_serializer(data=item)
             if serializer.is_valid():
                 obj = serializer.save()
                 self.post_upsert(obj)
                 created.append(str(obj.pk))
+                saved.append(obj)
             else:
                 errors.append({"index": index, "errors": serializer.errors})
+        body = {
+            "received": len(items),
+            "succeeded": len(created),
+            "failed": len(errors),
+            "ids": created,
+            "errors": errors,
+        }
+        body.update(self.bulk_response_extra(saved) or {})
         return Response(
-            {
-                "received": len(items),
-                "succeeded": len(created),
-                "failed": len(errors),
-                "ids": created,
-                "errors": errors,
-            },
+            body,
             status=status.HTTP_207_MULTI_STATUS if errors else status.HTTP_200_OK,
         )
 
     def post_upsert(self, obj):
         """Hook called after a successful bulk upsert. No-op by default."""
         return None
+
+    def bulk_response_extra(self, objs):
+        """Hook to add extra keys to the bulk response (e.g. warnings). Receives
+        the successfully-saved objects. Returns a dict merged into the response."""
+        return {}
 
 
 class ClientViewSet(BulkUpsertMixin, viewsets.ModelViewSet):
@@ -470,6 +480,43 @@ class ClientViewSet(BulkUpsertMixin, viewsets.ModelViewSet):
         return self._household_response(primary)
 
 
+def _dependent_household_warning(client):
+    """Return a warning dict when ``client`` is a NON-primary member of a shared
+    household (a dependent) -- so the extension can prompt the agent that saving
+    this member's own case means they should be split out via Request
+    Verification. ``None`` for a primary / household-less client (no warning)."""
+    if client is None:
+        return None
+    from .models import HouseholdMember
+
+    membership = (
+        HouseholdMember.objects.filter(client=client, is_primary=False)
+        .select_related("household").first()
+    )
+    if membership is None:
+        return None
+    primary = (
+        membership.household.members.filter(is_primary=True)
+        .select_related("client").first()
+    )
+    primary_name = ""
+    if primary and primary.client:
+        primary_name = f"{primary.client.first_name} {primary.client.last_name}".strip()
+    member_name = f"{client.first_name} {client.last_name}".strip()
+    return {
+        "type": "dependent_in_household",
+        "client_id": str(client.pk),
+        "member_name": member_name,
+        "primary_name": primary_name,
+        "message": (
+            f"{member_name or 'This member'} is part of "
+            f"{(primary_name + chr(39) + 's') if primary_name else 'an existing'} "
+            "household. To give them their own case, request verification for "
+            "them in the CRM — they'll be split into their own household."
+        ),
+    }
+
+
 class CaseViewSet(BulkUpsertMixin, viewsets.ModelViewSet):
     """CRUD + upsert for cases (keyed on source case_id UUID)."""
 
@@ -563,6 +610,21 @@ class CaseViewSet(BulkUpsertMixin, viewsets.ModelViewSet):
         # ``bulk`` after the full case picture is written.
         if getattr(obj, "client_id", None) and hasattr(self, "_bulk_reconcile_client_ids"):
             self._bulk_reconcile_client_ids.add(obj.client_id)
+
+    def bulk_response_extra(self, objs):
+        """Surface a "this member is a dependent in a household" warning per
+        distinct client whose case was saved, so the extension can prompt the
+        agent to Request Verification (which splits them into their own case)."""
+        warnings, seen = [], set()
+        for obj in objs:
+            cid = getattr(obj, "client_id", None)
+            if not cid or cid in seen:
+                continue
+            seen.add(cid)
+            w = _dependent_household_warning(getattr(obj, "client", None))
+            if w:
+                warnings.append(w)
+        return {"warnings": warnings} if warnings else {}
 
 
 class ContractedServiceViewSet(BulkUpsertMixin, viewsets.ModelViewSet):
@@ -753,7 +815,11 @@ class EnrollmentVerificationViewSet(viewsets.ModelViewSet):
         # Re-requesting means the household is being handled again -> drop it off
         # the Urgent Care list.
         clear_new_flag_on_verification_request(enrollment)
-        _safe_recompute_household(enrollment)
+        # A re-request for a splittable dependent still splits them into their own
+        # case (heals a pending enrollment created before the split was wired in).
+        if not self._maybe_split_dependent(enrollment):
+            _safe_recompute_household(enrollment)
+        enrollment.refresh_from_db()
         return Response(self.get_serializer(enrollment).data, status=status.HTTP_200_OK)
 
     @action(detail=True, methods=["post"], url_path="re-request")
@@ -848,10 +914,55 @@ class EnrollmentVerificationViewSet(viewsets.ModelViewSet):
         # Requesting a verification means the household is now being handled, so
         # clear the primary's is_new flag -> drop it off the Urgent Care list.
         clear_new_flag_on_verification_request(serializer.instance)
+        # SPLITTABLE DEPENDENT: if this verification is for a non-primary household
+        # member who carries a live profile on the shared enrollment, split them
+        # into their own internal-service case (carry data + verified fact, detach
+        # from the shared household). The split does its own stage projection, so
+        # the generic household recompute is skipped for it.
+        if self._maybe_split_dependent(serializer.instance):
+            return
         # A new enrollment (default Pending Verification) drives the WHOLE
         # household's lifecycle stage: the primary and every non-denied member
         # move to Pending Verification together, not just the primary.
         _safe_recompute_household(serializer.instance)
+
+    def _maybe_split_dependent(self, enrollment):
+        """Split a dependent into their own case when verification is requested for
+        them, mirroring the split wired into ``MemberVerificationCreateView`` so
+        the extension's Request-Verification path (which posts here) also splits.
+
+        Fires only when the enrollment's client is a NON-primary household member
+        AND still carries a live dietary profile on the shared household's OTHER
+        enrollment. Returns True when a split ran. Best-effort: a split failure
+        never breaks the verification request."""
+        client = getattr(enrollment, "client", None)
+        if client is None:
+            return False
+        membership = (
+            HouseholdMember.objects.filter(client=client, is_primary=False)
+            .select_related("household")
+            .first()
+        )
+        if membership is None:
+            return False
+        is_dependent = (
+            MemberDietaryProfile.objects.filter(
+                client=client, enrollment__household=membership.household
+            )
+            .exclude(enrollment=enrollment)
+            .exclude(status=MemberStatus.REMOVED)
+            .exists()
+        )
+        if not is_dependent:
+            return False
+        try:
+            result = split_dependent_into_own_enrollment(
+                client, enrollment, actor=None, actor_label=_agent_actor(self.request),
+            )
+            return bool(result and result.get("split"))
+        except Exception:  # noqa: BLE001
+            logger.exception("dependent split failed for enrollment %s", enrollment.pk)
+            return False
 
     @action(detail=False, methods=["get"])
     def choices(self, request):
