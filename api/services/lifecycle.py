@@ -3363,6 +3363,19 @@ def _carry_service_and_activate(
 
     carries = bool(prior_was_serving and same_kind and kitchen is not None and cadence)
     if not carries:
+        # On a genuine product-KIND change (meals<->boxes), any kitchen +
+        # delivery schedule carried onto the new enrollment is for the WRONG
+        # product -- e.g. a Boxes kitchen on a Meals reauthorization. Clear it so
+        # the agent must assign a valid kitchen for the new kind and a manual
+        # calendar rebuild can't plan deliveries on an incompatible kitchen.
+        kind_changed = (
+            prior_kind is not None and new_kind is not None and prior_kind != new_kind
+        )
+        if kind_changed:
+            if new_enr.kitchen_id:
+                new_enr.kitchen = None
+                new_enr.save(update_fields=["kitchen"])
+            new_enr.delivery_schedules.all().delete()
         # No service to carry. Respect the NUTRITIONIST gate: a household that was
         # neither already serving NOR Nutritionist-approved rests at VERIFIED
         # (Pending Nutritionist) -- it must NOT be force-stepped past the sign-off
@@ -4164,12 +4177,19 @@ def _carry_waiting_schedule(waiting, live, reauth):
     ``status=SCHEDULED``); the real SCHEDULED plan + calendar are (re)built when
     the reauthorization activates. Best-effort; idempotent."""
     from api.models import ScheduleStatus
+    from api.services.catalog import product_kind_for_enrollment
     from api.services.delivery import (
         create_member_delivery_schedules,
         current_household_cadence,
     )
 
     if waiting is None or live is None:
+        return
+    # Only mirror kitchen/cadence from a SAME-KIND live program -- a Boxes
+    # kitchen must never be carried onto a Meals reauthorization (or vice versa).
+    live_kind = product_kind_for_enrollment(live)
+    reauth_kind = _case_product_kind(reauth) if reauth is not None else None
+    if live_kind is not None and reauth_kind is not None and live_kind != reauth_kind:
         return
     if live.kitchen_id and waiting.kitchen_id != live.kitchen_id:
         waiting.kitchen = live.kitchen
