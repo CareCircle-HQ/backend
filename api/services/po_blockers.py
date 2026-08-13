@@ -454,7 +454,7 @@ def detect_po_drops(today=None):
 
     # Best live (non-terminal) enrollment + member status per dropped client.
     terminal = [EnrollmentStage.CLOSED, EnrollmentStage.CANCELLED,
-                EnrollmentStage.DISREGARDED]
+                EnrollmentStage.DISREGARDED, EnrollmentStage.SCHEDULED_EXTENSION]
     # Prefer the MOST-ADVANCED / actually-serving non-terminal enrollment to
     # explain the drop -- not merely the most recent. A client can hold both a
     # served enrollment now ON_HOLD (its case closed) and a fresh

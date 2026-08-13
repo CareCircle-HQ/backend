@@ -129,6 +129,10 @@ class ProgramStatus(models.TextChoices):
     # Final: the approval window's end date passed. A re-authorization arrives on
     # a NEW case (a new program row), never on this expired one.
     AUTHORIZATION_EXPIRED = "authorization_expired", "Authorization Expired"
+    # A reauthorization handoff: the current authorization window ended and the
+    # household is paused waiting for the reauthorization window to begin (the
+    # gap between two windows). See docs/reauthorization_extension_plan.md.
+    REAUTHORIZATION = "reauthorization", "Reauthorization"
     # Final: the governing case is closed.
     CLOSED = "closed", "Closed"
 
@@ -1380,6 +1384,11 @@ class Case(models.Model):
         choices=CaseHouseholdType.choices,
         default=CaseHouseholdType.INDIVIDUAL,
     )
+    # True when this case is a REAUTHORIZATION / extension of an existing service
+    # -- derived on upsert from a matching ActiveProgram row with ``to_extend``
+    # set (see api.serializers.derive_is_extension). Drives the scheduled-
+    # extension governing-case handling (see docs/reauthorization_extension_plan).
+    is_extension = models.BooleanField(default=False)
 
     # --- Outcome Information ---
     outcome_id = models.UUIDField(null=True, blank=True)
@@ -1756,6 +1765,13 @@ class EnrollmentStage(models.TextChoices):
     # stage. A fresh request (from the ext) creates a NEW enrollment. See
     # api.services.lifecycle + api.portal.views_members.
     DISREGARDED = "disregarded", "Disregarded"
+    # A verified household's REAUTHORIZATION / extension enrollment, parked and
+    # NON-SERVING until its authorization window becomes effective. It carries the
+    # full (already-verified) roster + dietary data so activation is a clean
+    # promotion to Service Active. Excluded from every serving surface (POs,
+    # Distribution matrix, calendar, verification queue) until it activates. See
+    # docs/reauthorization_extension_plan.md.
+    SCHEDULED_EXTENSION = "scheduled_extension", "Reauthorization - Waiting"
 
 
 class DietaryRestriction(models.TextChoices):
@@ -1906,6 +1922,8 @@ SERVICE_EXCLUDED_ENROLLMENT_STAGES = (
     EnrollmentStage.SERVICE_COMPLETE,
     EnrollmentStage.CLOSED,
     EnrollmentStage.CANCELLED,
+    # A parked reauthorization extension never serves until it activates.
+    EnrollmentStage.SCHEDULED_EXTENSION,
 )
 
 
@@ -1940,6 +1958,12 @@ class ScheduleStatus(models.TextChoices):
     COMPLETED = "completed", "Completed"
     CANCELLED = "cancelled", "Cancelled"
     RESCHEDULED = "rescheduled", "Rescheduled"
+    # A schedule that exists for DISPLAY on a parked reauthorization
+    # (SCHEDULED_EXTENSION) enrollment but is NOT yet serving: never generates
+    # Purchase Order occurrences (every occurrence/PO path filters
+    # status=SCHEDULED). Flipped to SCHEDULED — actually rebuilt fresh — when the
+    # reauthorization activates. See docs/reauthorization_extension_plan.md.
+    WAITING = "waiting", "Waiting"
 
 
 class ScheduleCadence(models.TextChoices):
@@ -2952,6 +2976,10 @@ class ActiveProgram(models.Model):
     case_type = models.CharField(
         max_length=20, choices=CaseType.choices, default=CaseType.FOOD
     )
+    # Opt-in flag (managed from Settings > Programs): this program should be
+    # treated as an extension/reauthorization of an existing service. Seeded True
+    # for internal-service "Reauthorization: ..." programs by data migration.
+    to_extend = models.BooleanField(default=False)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 

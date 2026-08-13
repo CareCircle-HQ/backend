@@ -356,6 +356,35 @@ def _prior_enrollment_chain(enrollment, limit=25):
     return chain
 
 
+def _scheduled_extensions(client):
+    """Parked reauthorization (SCHEDULED_EXTENSION) enrollments for ``client``,
+    shown read-only on the Program tab as upcoming programs. Each carries its
+    scheduled start (the reauth case's authorization window start)."""
+    from api.models import EnrollmentStage, EnrollmentVerification
+
+    out = []
+    qs = (
+        EnrollmentVerification.objects
+        .filter(client=client, stage=EnrollmentStage.SCHEDULED_EXTENSION)
+        .select_related("case")
+        .order_by("pk")
+    )
+    for e in qs:
+        start = None
+        if e.case is not None:
+            start, _end = e.case.effective_authorization_window()
+        out.append({
+            "id": e.pk,
+            "code": e.code,
+            "stage": e.stage,
+            "case_id": str(e.case_id) if e.case_id else None,
+            "program_name": e.program_name or "",
+            "service_type": e.service_type or "",
+            "scheduled_start": start.isoformat() if start else None,
+        })
+    return out
+
+
 def _resume_household_after_range(enrollment):
     """Resume a household that was auto-held for an out-of-range ZIP, back to the
     stage it was held from (defaulting to Service Active). No-op when it isn't
@@ -588,6 +617,8 @@ _NON_CURRENT_ENROLLMENT_STAGES = [
     EnrollmentStage.CANCELLED,
     EnrollmentStage.DISREGARDED,
     EnrollmentStage.SERVICE_COMPLETE,
+    # A parked reauthorization is not the member's current serving enrollment.
+    EnrollmentStage.SCHEDULED_EXTENSION,
 ]
 
 
@@ -744,6 +775,7 @@ def care_management_no_cadence_qs(qs, kitchen_id):
         EnrollmentStage.CANCELLED,
         EnrollmentStage.DISREGARDED,
         EnrollmentStage.SERVICE_COMPLETE,
+        EnrollmentStage.SCHEDULED_EXTENSION,
     ]
     # Cadence lives on the household's delivery schedules; "has cadence" == any
     # schedule with a non-empty cadence code.
@@ -3260,7 +3292,14 @@ class MemberHouseholdView(PortalAPIView):
             and detected is not None
             and kind != detected
         )
-        cadence = current_household_cadence(enr)
+        # A parked reauthorization (SCHEDULED_EXTENSION) is not serving yet, so it
+        # has no kitchen/cadence of its own. For DISPLAY, show the PLANNED values
+        # it will inherit from the current serving program (the one it extends).
+        # Nothing is stored -- the real kitchen/cadence are (re)built at activation.
+        kc_src = enr
+        if EnrollmentStage(enr.stage) == EnrollmentStage.SCHEDULED_EXTENSION:
+            kc_src = s.active_enrollment(enr.client) or enr
+        cadence = current_household_cadence(kc_src)
         cadence_row = Cadence.objects.filter(code=cadence).first() if cadence else None
         # Household vs Individual scope. The enrollment carries the scope it was
         # VERIFIED under (household_type_override, stamped at verification /
@@ -3298,6 +3337,12 @@ class MemberHouseholdView(PortalAPIView):
                     # governing case authorization) shown on the accordion row.
                     "program_status": ps.value,
                     "program_status_label": ps.label,
+                    # This enrollment's OWN case authorization window (status +
+                    # approved_from/to). Used for the window shown on the accordion
+                    # -- correct for a scoped read-only enrollment (e.g. a
+                    # scheduled reauthorization) whose case differs from the
+                    # client's governing one.
+                    "authorization": s.case_authorization(enr.case),
                     # True when the program's governing internal-service case is
                     # closed -- the tab is frozen (read-only history).
                     "program_locked": program_locked,
@@ -3320,8 +3365,8 @@ class MemberHouseholdView(PortalAPIView):
                         and enr.stage == EnrollmentStage.ON_HOLD
                         and not _enrollment_resume_blocked_by_ineligibility(enr)
                     ),
-                    "kitchen_id": str(enr.kitchen_id) if enr.kitchen_id else None,
-                    "kitchen_name": enr.kitchen.name if enr.kitchen_id else "",
+                    "kitchen_id": str(kc_src.kitchen_id) if kc_src.kitchen_id else None,
+                    "kitchen_name": kc_src.kitchen.name if kc_src.kitchen_id else "",
                     # Product kind. `service_type` is the VERIFIED kind; the
                     # `product_type_case_*` is the governing case's (immutable)
                     # kind. They differ only on a case mismatch, the ONLY time the
@@ -3364,6 +3409,9 @@ class MemberHouseholdView(PortalAPIView):
                     # Only the ACTIVE (non-scoped) response carries the chain -- a
                     # scoped prior enrollment shows just its own tab.
                     "prior_enrollments": [] if read_only else _prior_enrollment_chain(enr),
+                    # Parked reauthorization extensions (upcoming programs), shown
+                    # read-only. Only on the active (non-scoped) response.
+                    "scheduled_extensions": [] if read_only else _scheduled_extensions(enr.client),
                     # This enrollment's OWN case description (the new case on the
                     # active program; the old case on a superseded one).
                     "case_description": (enr.case.case_description or "") if enr.case else "",
@@ -3631,7 +3679,10 @@ def _promote_removed_member_to_own_household(
     the household + recompute their stage. Returns the new enrollment (or the
     existing live one) so the caller can report it.
     """
-    terminal = (EnrollmentStage.DISREGARDED, EnrollmentStage.CANCELLED)
+    terminal = (
+        EnrollmentStage.DISREGARDED, EnrollmentStage.CANCELLED,
+        EnrollmentStage.SCHEDULED_EXTENSION,
+    )
     household = ensure_household_with_primary(member_client)
 
     # Already enrolled (their own live enrollment): don't double-create -- just

@@ -33,7 +33,13 @@ from api.models import (
 )
 from api.services.lifecycle import recompute_client_stage
 
-_TERMINAL = [EnrollmentStage.CLOSED, EnrollmentStage.CANCELLED]
+_TERMINAL = [
+    EnrollmentStage.CLOSED,
+    EnrollmentStage.CANCELLED,
+    # A parked reauthorization extension is non-serving; never treat it as a
+    # live duplicate to close.
+    EnrollmentStage.SCHEDULED_EXTENSION,
+]
 _CLOSED_CASE_STATUSES = {CaseStatus.CLOSED, CaseStatus.CANCELLED}
 
 _NUTRI_FIELDS = [

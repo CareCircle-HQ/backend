@@ -18,6 +18,7 @@ from api.services.lifecycle import (
     has_open_internal_service_case,
     has_valid_medicaid,
     has_valid_social_care,
+    pick_governing_case,
     program_status,
     verification_completed,
 )
@@ -262,10 +263,13 @@ def active_enrollment(client):
     while every other member falls back to the coarser ``lifecycle_stage`` (e.g.
     showing "Waiting Authorization" instead of "Authorization Denied").
     """
-    # DISREGARDED enrollments are dismissed verification requests kept only for
-    # history -- never treat them as the client's active enrollment.
+    # DISREGARDED enrollments are dismissed verification requests, and
+    # SCHEDULED_EXTENSION enrollments are parked reauthorizations not yet serving
+    # -- both are kept only for history / future activation and must never
+    # represent the client's active enrollment.
+    _INERT = {"disregarded", "scheduled_extension"}
     enrollments = [
-        e for e in client.enrollments.all() if e.stage != "disregarded"
+        e for e in client.enrollments.all() if e.stage not in _INERT
     ]
     if not enrollments:
         membership = getattr(client, "household_membership", None)
@@ -273,7 +277,7 @@ def active_enrollment(client):
             enrollments = [
                 e
                 for e in membership.household.enrollment_verifications.all()
-                if e.stage != "disregarded"
+                if e.stage not in _INERT
             ]
     if not enrollments:
         return None
@@ -492,16 +496,18 @@ def primary_case(client):
 
 
 def internal_service_case(client):
-    """The client's Internal Service case — the one the verification and meal/box
-    delivery attach to. Chosen by :func:`governing_case_key` (authorization
-    favorability first, then recency), so an approved case wins over a
-    same-or-earlier-dated denial. None when there is no Internal Service case."""
+    """The client's GOVERNING Internal Service case — the one the verification and
+    meal/box delivery attach to. Chosen by :func:`pick_governing_case`, which is
+    deferral-aware: a future-dated reauthorization extension does NOT supplant the
+    currently-serving case until its window begins (see
+    docs/reauthorization_extension_plan.md), so the profile/header keeps showing
+    the case actually in service. None when there is no Internal Service case."""
     cases = [
         c for c in client.cases.all() if c.case_type == CaseType.INTERNAL_SERVICE
     ]
     if not cases:
         return None
-    return max(cases, key=governing_case_key)
+    return pick_governing_case(cases)
 
 
 def governing_service_case_for_display(client):
@@ -1806,6 +1812,7 @@ class PortalActiveProgramSerializer(serializers.ModelSerializer):
             "case_type",
             "case_type_label",
             "is_for_household",
+            "to_extend",
             "updated_at",
         ]
         read_only_fields = ["id", "case_type_label", "is_for_household", "updated_at"]

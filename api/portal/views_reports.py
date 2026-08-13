@@ -158,17 +158,17 @@ def _client_phone_numbers(client):
 
 
 class MembersPendingVerificationReportView(PortalAPIView):
-    """Management-only CSV export of members whose household enrollment is
-    awaiting verification (stage ``pending_verification``), filtered by the
-    enrollment's created date (``opened_at``).
+    """Management-only CSV export of members genuinely awaiting verification
+    (stage ``pending_verification`` and not already verified/served on a later
+    enrollment), filtered by the governing internal-service case's created date.
 
-    Columns: Client ID, First Name, Last Name, Phone Numbers.
+    Columns: Client ID, First Name, Last Name, Phone Numbers, Case Created.
 
     Query params:
-        created_from -- optional inclusive lower bound on the enrollment's
-                        created (opened_at) date.
-        created_to   -- optional inclusive upper bound on the enrollment's
-                        created (opened_at) date.
+        created_from -- optional inclusive lower bound on the governing case's
+                        created (date_opened) date.
+        created_to   -- optional inclusive upper bound on the governing case's
+                        created (date_opened) date.
     """
 
     def get(self, request):

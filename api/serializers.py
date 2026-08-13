@@ -1244,6 +1244,22 @@ def case_in_import_scope(service_type, program_name=None):
     return active_program_category(program_name) in _IN_SCOPE_CASE_CATEGORIES
 
 
+def derive_is_extension(program_name):
+    """True when a case's ``program_name`` matches an ActiveProgram flagged
+    ``to_extend`` -- i.e. a reauthorization / service-extension program.
+
+    Case-insensitive, whitespace-trimmed match (mirrors
+    ``derive_case_type_from_active_program``). False when the program is blank,
+    unmatched, or not flagged to extend.
+    """
+    pn = (program_name or "").strip()
+    if not pn:
+        return False
+    return ActiveProgram.objects.filter(
+        program_name__iexact=pn, to_extend=True
+    ).exists()
+
+
 def derive_household_type(client, program_name=None):
     """Individual vs Household for a case, from the PROGRAM NAME only.
 
@@ -1441,6 +1457,12 @@ class CaseSerializer(serializers.ModelSerializer):
         if "household_type" not in validated_data:
             validated_data["household_type"] = derive_household_type(
                 client, validated_data.get("program_name")
+            )
+        # Reauthorization / extension classification (drives scheduled-extension
+        # governing-case handling). An explicit payload value wins.
+        if "is_extension" not in validated_data:
+            validated_data["is_extension"] = derive_is_extension(
+                validated_data.get("program_name")
             )
 
         # External Service cases are out of scope -- we never track them. Reject

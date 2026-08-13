@@ -340,6 +340,8 @@ def _live_member_profiles(client):
 
     terminal = [
         EnrollmentStage.CLOSED, EnrollmentStage.CANCELLED, EnrollmentStage.DISREGARDED,
+        # A parked reauthorization extension is not a live serving enrollment.
+        EnrollmentStage.SCHEDULED_EXTENSION,
     ]
     return list(
         MemberDietaryProfile.objects.filter(client=client)

@@ -186,6 +186,19 @@ def sweep_closed_case_service(self):
 
 
 @shared_task(bind=True, ignore_result=True)
+def process_reauthorization_extensions(self):
+    """Daily safety-net sweep: activate / gap-pause parked reauthorization
+    (service-extension) enrollments by the calendar. A parked SCHEDULED_EXTENSION
+    is promoted to Service Active once its authorization window begins (closing
+    the current enrollment), or its members are paused during a gap between the
+    current window's end and the reauth window's start. A no-op once everything is
+    aligned. Delegates to the management command so the logic lives in one place."""
+    from django.core.management import call_command
+
+    call_command("process_reauthorization_extensions", "--apply")
+
+
+@shared_task(bind=True, ignore_result=True)
 def request_uniteus_exports(self, export_types=None, days=7, triggered_by="cron:uniteus-export"):
     """Request a rolling-window export for each of ``export_types`` (default: all
     supported), then kick a poll. Used by the nightly schedule; the UI requests

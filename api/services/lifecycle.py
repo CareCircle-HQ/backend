@@ -314,10 +314,13 @@ def _governing_enrollments(client):
         enr = mp.enrollment
         if enr is not None:
             seen.setdefault(enr.pk, enr)
-    # A DISREGARDED enrollment is a dismissed verification request kept only for
-    # history: it must never govern the client's stage, so the member reverts to
-    # their pre-verification funnel stage and leaves the Verification page.
-    return [e for e in seen.values() if e.stage != EnrollmentStage.DISREGARDED]
+    # A DISREGARDED enrollment is a dismissed verification request, and a
+    # SCHEDULED_EXTENSION enrollment is a parked reauthorization not yet serving:
+    # neither governs the client's stage (the member reflects their live
+    # enrollment). The scheduled extension is activated by its own explicit path
+    # (see the reauthorization activation task), not the generic governance here.
+    _inert = {EnrollmentStage.DISREGARDED, EnrollmentStage.SCHEDULED_EXTENSION}
+    return [e for e in seen.values() if EnrollmentStage(e.stage) not in _inert]
 
 
 def _primary_enrollment(client):
@@ -567,6 +570,9 @@ ENROLLMENT_TRANSITIONS = {
         EnrollmentStage.CANCELLED,
         # An agent can disregard (dismiss) a pending verification request.
         EnrollmentStage.DISREGARDED,
+        # A reauthorization case's fresh enrollment is PARKED as a scheduled
+        # extension (verification carried from the household's live enrollment).
+        EnrollmentStage.SCHEDULED_EXTENSION,
     },
     EnrollmentStage.VERIFIED: {
         # An approved authorization advances a verified household to Kitchen
@@ -578,6 +584,8 @@ ENROLLMENT_TRANSITIONS = {
         EnrollmentStage.KITCHEN_ASSIGNMENT,
         EnrollmentStage.ON_HOLD,
         EnrollmentStage.CANCELLED,
+        # An already-verified household's reauthorization can be parked directly.
+        EnrollmentStage.SCHEDULED_EXTENSION,
     },
     EnrollmentStage.KITCHEN_ASSIGNMENT: {
         EnrollmentStage.SERVICE_ACTIVE,
@@ -627,6 +635,16 @@ ENROLLMENT_TRANSITIONS = {
     # verification (the ext normally creates a fresh enrollment instead).
     EnrollmentStage.DISREGARDED: {
         EnrollmentStage.PENDING_VERIFICATION,
+    },
+    # A parked reauthorization extension activates to Service Active (via Kitchen
+    # Assignment when the kitchen must be (re)confirmed), can be held, or be
+    # cancelled/closed if the reauth case never activates.
+    EnrollmentStage.SCHEDULED_EXTENSION: {
+        EnrollmentStage.SERVICE_ACTIVE,
+        EnrollmentStage.KITCHEN_ASSIGNMENT,
+        EnrollmentStage.ON_HOLD,
+        EnrollmentStage.CLOSED,
+        EnrollmentStage.CANCELLED,
     },
 }
 
@@ -996,6 +1014,87 @@ def governing_case_key(case):
     )
 
 
+def _case_product_kind(case):
+    """Product kind (Meals / Boxes) derived from a case's program name /
+    service_type, or None when it can't be resolved."""
+    from api.services.catalog import product_type_kind_for_name
+    return product_type_kind_for_name(
+        (case.program_name or "").strip() or (case.service_type or "").strip()
+    )
+
+
+def deferred_extension_case_ids(cases, *, today=None):
+    """Case ids of REAUTHORIZATION extensions whose activation is still in the
+    FUTURE and must NOT yet govern -- so the currently-serving case keeps
+    governing until the extension's window begins (see
+    docs/reauthorization_extension_plan.md).
+
+    A case ``c`` is deferred while ``today < max(E1, S2)`` and ALL hold:
+      * ``c.is_extension`` and its authorization is APPROVED / NOT_REQUIRED,
+      * its effective window START ``S2`` is in the FUTURE, and
+      * there is ANOTHER approved internal-service case of the SAME product kind
+        AND SAME scope (household/individual) -- the service being extended.
+
+    The switch point is ``max(E1, S2)`` (``E1`` = the current same-kind/scope
+    case's window END), so on an OVERLAP (``S2 < E1``) the extension keeps
+    deferring until the current window actually ends -- matching the daily
+    activation task (``process_scheduled_extensions``). A different-kind /
+    different-scope reauth, or one with no window / a past start, is NOT deferred.
+    """
+    today = today or timezone.localdate()
+    favorable = {
+        ServiceAuthorizationStatus.APPROVED,
+        ServiceAuthorizationStatus.NOT_REQUIRED,
+    }
+    deferred = set()
+    for c in cases:
+        if not getattr(c, "is_extension", False):
+            continue
+        if c.service_authorization_status not in favorable:
+            continue
+        # A closed/cancelled reauth case never activates -> never defer/park it.
+        if c.case_status in _CLOSED_CASE_STATUSES:
+            continue
+        start, _end = c.effective_authorization_window()
+        if start is None:
+            continue  # no window -> can't defer, switch per the normal rule
+        kind_c = _case_product_kind(c)
+        scope_c = c.household_type
+        # The same-kind + same-scope approved case(s) being extended.
+        currents = [
+            other for other in cases
+            if other.case_id != c.case_id
+            and other.service_authorization_status in favorable
+            and other.household_type == scope_c
+            and _case_product_kind(other) == kind_c
+        ]
+        if not currents:
+            continue
+        # Switch point = max(E1, S2). Defer while today hasn't reached it; on an
+        # overlap this keeps deferring past S2 until the current window ends (E1).
+        boundaries = [start.date()]
+        for other in currents:
+            _os, oe = other.effective_authorization_window()
+            if oe is not None:
+                boundaries.append(oe.date())
+        if today < max(boundaries):
+            deferred.add(c.case_id)
+    return deferred
+
+
+def pick_governing_case(cases, *, today=None):
+    """The governing internal-service case, EXCLUDING deferred future
+    reauthorization extensions (which must not supplant the serving case until
+    their window begins). Falls back to the full set if every candidate is a
+    deferred extension. Returns None for an empty input."""
+    cases = list(cases)
+    if not cases:
+        return None
+    deferred = deferred_extension_case_ids(cases, today=today)
+    pool = [c for c in cases if c.case_id not in deferred] or cases
+    return max(pool, key=governing_case_key)
+
+
 def governing_internal_case(enrollment):
     """The internal-service case whose authorization governs this enrollment.
 
@@ -1003,7 +1102,9 @@ def governing_internal_case(enrollment):
     programs, or a denial later followed by a re-approval). The governing one is
     chosen by :func:`governing_case_key` -- an approved authorization wins over a
     denied one regardless of dates -- not whichever case happens to sit on
-    ``enrollment.case`` (which may be stale/superseded). Falls back to
+    ``enrollment.case`` (which may be stale/superseded). A future-dated
+    reauthorization extension is deferred (see :func:`pick_governing_case`) so it
+    doesn't prematurely supplant the serving case. Falls back to
     ``enrollment.case`` when the client has no internal-service case.
     """
     client = enrollment.client
@@ -1013,7 +1114,7 @@ def governing_internal_case(enrollment):
             if c.case_type == CaseType.INTERNAL_SERVICE
         ]
         if cases:
-            return max(cases, key=governing_case_key)
+            return pick_governing_case(cases)
     return enrollment.case
 
 
@@ -1052,6 +1153,11 @@ def program_status(enrollment):
 
     stage = EnrollmentStage(enrollment.stage)
 
+    # A parked reauthorization extension (verified, waiting for its window) reads
+    # as "Reauthorization" -- shown read-only on the Programs tab.
+    if stage == EnrollmentStage.SCHEDULED_EXTENSION:
+        return ProgramStatus.REAUTHORIZATION
+
     # A paused program shows On Hold above everything else -- UNLESS the hold is
     # a delivery-coverage (Out of Range) hold, which surfaces as Out of Range so
     # the program stage matches the members' Out of Range labels. (The main
@@ -1079,6 +1185,16 @@ def program_status(enrollment):
     end = getattr(gov, "service_authorization_approval_ends_at", None) if gov else None
     window_expired = bool(end and end.date() < timezone.localdate())
     auth_expired = auth == ServiceAuthorizationStatus.EXPIRED or window_expired
+
+    # A reauthorization GAP pause: the current window ended and the household is
+    # completed + paused awaiting the reauth window. Surface "Reauthorization"
+    # (not a generic Closed) so it's clear service will resume. Display-only.
+    if (
+        stage == EnrollmentStage.SERVICE_COMPLETE
+        and enrollment.close_reason == "reauth_gap"
+        and not case_closed
+    ):
+        return ProgramStatus.REAUTHORIZATION
 
     # Terminal displays.
     if stage in (EnrollmentStage.CLOSED, EnrollmentStage.CANCELLED) or case_closed:
@@ -1328,7 +1444,7 @@ def program_tracks(client):
     all_cases = _internal_service_cases(client)
     if not all_cases:
         return []
-    governing = max(all_cases, key=governing_case_key)
+    governing = pick_governing_case(all_cases)
     cases = [
         c for c in all_cases
         if c.service_authorization_status != A.NEVER_REQUESTED
@@ -1368,6 +1484,14 @@ def program_tracks(client):
          or governing.program_name or "").strip().casefold()
         if governing else ""
     )
+    # Reauth cases parked as a scheduled extension surface as
+    # "Reauthorization - Waiting" (not the generic "Duplicated" same-kind label).
+    from api.models import EnrollmentVerification as _EV, EnrollmentStage as _ES
+    scheduled_ext_case_ids = set(
+        _EV.objects
+        .filter(client=client, stage=_ES.SCHEDULED_EXTENSION)
+        .values_list("case_id", flat=True)
+    )
     tracks = []
     for c in cases:
         kind = product_type_kind_for_name(c.service_type or c.program_name)
@@ -1398,6 +1522,8 @@ def program_tracks(client):
         n_val, n_lbl = _nutritionist_phase(enr) if is_food else ("", "")
         if is_governing and is_food:
             s_val, s_lbl = _service_phase(client, enr, c)
+        elif c.case_id in scheduled_ext_case_ids:
+            s_val, s_lbl = ("scheduled_extension", "Reauthorization")
         elif is_duplicate:
             s_val, s_lbl = ("duplicated", "Duplicated")
         elif is_conflicting:
@@ -3888,6 +4014,504 @@ def _bind_governing_case_to_serving_enrollment(client, governing):
     return True
 
 
+REAUTH_ATTENTION_TAG_NAME = "Reauth Attention"
+REAUTHORIZED_TAG_NAME = "Reauthorized"
+
+
+def _reauth_attention_tag():
+    """Get-or-create the red "Reauth Attention" ClientTag."""
+    from api.models import ClientTag, ClientTagColor
+
+    tag, _ = ClientTag.objects.get_or_create(
+        name=REAUTH_ATTENTION_TAG_NAME,
+        defaults={"color": ClientTagColor.RED},
+    )
+    return tag
+
+
+def _reauthorized_tag():
+    """Get-or-create the green "Reauthorized" ClientTag -- a positive indicator
+    that a reauthorization is parked/scheduled for the client."""
+    from api.models import ClientTag, ClientTagColor
+
+    tag, _ = ClientTag.objects.get_or_create(
+        name=REAUTHORIZED_TAG_NAME,
+        defaults={"color": ClientTagColor.GREEN},
+    )
+    return tag
+
+
+def set_reauth_attention(client, needed):
+    """Apply or clear the "Reauth Attention" tag on ``client``. Idempotent."""
+    if client is None:
+        return
+    tag = _reauth_attention_tag()
+    if needed:
+        client.tags.add(tag)
+    else:
+        client.tags.remove(tag)
+
+
+def set_reauthorized(client, needed):
+    """Apply or clear the green "Reauthorized" tag on ``client`` -- applied while a
+    reauthorization is parked (scheduled), cleared once none remain. Idempotent."""
+    if client is None:
+        return
+    tag = _reauthorized_tag()
+    if needed:
+        client.tags.add(tag)
+    else:
+        client.tags.remove(tag)
+
+
+def sync_reauthorized_tag(client):
+    """Keep the "Reauthorized" tag in sync with whether the client currently has a
+    parked (SCHEDULED_EXTENSION) reauthorization enrollment."""
+    from api.models import EnrollmentStage, EnrollmentVerification
+
+    if client is None:
+        return
+    has_parked = EnrollmentVerification.objects.filter(
+        client=client, stage=EnrollmentStage.SCHEDULED_EXTENSION,
+    ).exists()
+    set_reauthorized(client, has_parked)
+
+
+def _reauth_kind_scope_mismatch(cases):
+    """True when an approved reauthorization (``is_extension``) case does NOT line
+    up (same product kind + same scope) with any currently-served case -- a
+    reauth that can't be auto-extended and needs a human (it will switch normally
+    rather than defer). Requires a current served case to compare against."""
+    favorable = {
+        ServiceAuthorizationStatus.APPROVED,
+        ServiceAuthorizationStatus.NOT_REQUIRED,
+    }
+    current = [
+        c for c in cases
+        if not getattr(c, "is_extension", False)
+        and c.service_authorization_status in favorable
+    ]
+    if not current:
+        return False
+    for c in cases:
+        if not getattr(c, "is_extension", False):
+            continue
+        if c.service_authorization_status not in favorable:
+            continue
+        kind_c = _case_product_kind(c)
+        scope_c = c.household_type
+        if not any(
+            _case_product_kind(o) == kind_c and o.household_type == scope_c
+            for o in current
+        ):
+            return True
+    return False
+
+
+def _record_reauth_scheduled_event(enrollment, *, actor=None, actor_label=""):
+    """Log a 'Reauthorization scheduled' event on the enrollment's history (a
+    StageEvent + the client timeline), so parking a reauth is auditable just like
+    its later activation."""
+    from api.models import StageEntityType, StageEvent, StageEventSource
+
+    note = "Reauthorization scheduled; parked until its authorization window begins."
+    is_system = actor is None and (
+        not actor_label or actor_label.strip().lower().startswith("system:")
+    )
+    try:
+        StageEvent.objects.create(
+            entity_type=StageEntityType.ENROLLMENT,
+            enrollment=enrollment,
+            client=enrollment.client,
+            from_stage="",
+            to_stage=EnrollmentStage.SCHEDULED_EXTENSION.value,
+            source=StageEventSource.AUTO if is_system else StageEventSource.MANUAL,
+            actor=actor,
+            note=note,
+        )
+    except Exception:  # pragma: no cover - defensive
+        pass
+    try:
+        from api.models import TimelineEventType
+        from api.services.timeline import emit_timeline_event
+
+        emit_timeline_event(
+            client=enrollment.client,
+            event_type=TimelineEventType.MEMBER_GOVERNING_CASE_CHANGED,
+            occurred_at=timezone.now(),
+            title="Reauthorization scheduled",
+            subtitle=note,
+            enrollment=enrollment,
+            case=enrollment.case,
+            source="system",
+            actor=actor_label or "",
+        )
+    except Exception:  # pragma: no cover - defensive
+        pass
+
+
+def _carry_waiting_schedule(waiting, live, reauth):
+    """Give a parked reauthorization enrollment a DISPLAY-only ``WAITING`` delivery
+    schedule mirroring the live enrollment's kitchen + cadence, so the Program tab
+    shows the planned kitchen/cadence/schedule. A ``WAITING`` schedule never
+    generates Purchase Order occurrences (every occurrence/PO path filters
+    ``status=SCHEDULED``); the real SCHEDULED plan + calendar are (re)built when
+    the reauthorization activates. Best-effort; idempotent."""
+    from api.models import ScheduleStatus
+    from api.services.delivery import (
+        create_member_delivery_schedules,
+        current_household_cadence,
+    )
+
+    if waiting is None or live is None:
+        return
+    if live.kitchen_id and waiting.kitchen_id != live.kitchen_id:
+        waiting.kitchen = live.kitchen
+        try:
+            waiting.save(update_fields=["kitchen"])
+        except Exception:  # pragma: no cover - defensive
+            pass
+    if waiting.delivery_schedules.exists():
+        return
+    cadence = current_household_cadence(live)
+    if not (waiting.kitchen_id and cadence):
+        return  # nothing to mirror (no kitchen/cadence on the live enrollment yet)
+    try:
+        create_member_delivery_schedules(
+            waiting, case=reauth, cadence=cadence, kitchen=waiting.kitchen,
+            product_kind=_case_product_kind(reauth),
+            status=ScheduleStatus.WAITING,
+        )
+    except Exception:  # pragma: no cover - defensive
+        pass
+
+
+def _park_deferred_extensions(client, cases, *, actor=None, actor_label=""):
+    """Ensure each DEFERRED future reauthorization extension has a parked,
+    NON-SERVING ``SCHEDULED_EXTENSION`` enrollment bound to its case.
+
+    Carries the household's verified capture + member roster from the live
+    serving enrollment so activation (later, at the window boundary -- see the
+    reauthorization activation task) is a clean promotion. Idempotent: an
+    already-parked case is left untouched. Does nothing when there's no live
+    serving enrollment to extend from. The ``supersedes`` link to the serving
+    enrollment is set at ACTIVATION, not here, so the serving row never reads as
+    superseded while the extension is merely waiting.
+    """
+    from api.models import EnrollmentStage, EnrollmentVerification
+
+    deferred = deferred_extension_case_ids(cases)
+    if not deferred:
+        return
+    live = _primary_enrollment(client)
+    if live is None:
+        return  # nothing serving to extend yet
+    terminal = {EnrollmentStage.CLOSED, EnrollmentStage.CANCELLED}
+    for case in cases:
+        if case.case_id not in deferred:
+            continue
+        existing = (
+            EnrollmentVerification.objects
+            .filter(client=client, case=case)
+            .exclude(stage__in=[s.value for s in terminal])
+            .first()
+        )
+        if existing is not None:
+            if EnrollmentStage(existing.stage) != EnrollmentStage.SCHEDULED_EXTENSION:
+                # Park a pre-existing (e.g. pending) enrollment for the reauth,
+                # carrying the household's verified capture + roster first.
+                _carry_verification_fields(existing, live)
+                _create_missing_carried_profiles(existing, live)
+                try:
+                    advance_enrollment(
+                        existing, EnrollmentStage.SCHEDULED_EXTENSION,
+                        actor=actor, actor_label=actor_label,
+                        note="Reauthorization parked; awaiting its authorization window.",
+                        force=True, trigger="reauth_parked",
+                    )
+                except InvalidTransition:
+                    existing.stage = EnrollmentStage.SCHEDULED_EXTENSION.value
+                    existing.save(update_fields=["stage"])
+            # Mirror kitchen/cadence as a WAITING schedule (idempotent; also
+            # backfills an already-parked enrollment once the live kitchen/cadence
+            # becomes known).
+            _carry_waiting_schedule(existing, live, case)
+            continue
+        # Create a fresh parked enrollment carrying the household's verified data.
+        new = EnrollmentVerification.objects.create(
+            client=live.client,
+            household=live.household,
+            case=case,
+            program_name=case.program_name or "",
+            service_type=case.service_type or "",
+            delivery_address=live.delivery_address,
+            household_size=live.household_size,
+            is_family_verified=live.is_family_verified,
+            medicaid_type_verified=live.medicaid_type_verified,
+            delivery_address_verified=live.delivery_address_verified,
+            verified_at=live.verified_at,
+            verified_by=live.verified_by,
+            requested_by=live.requested_by,
+            requested_at=live.requested_at,
+            nutritionist_approved_at=live.nutritionist_approved_at,
+            nutritionist_approved_by=live.nutritionist_approved_by,
+            nutritionist_signature=live.nutritionist_signature,
+            nutritionist_signature_image=live.nutritionist_signature_image,
+            nutritionist_approval_pdf_key=live.nutritionist_approval_pdf_key,
+            stage=EnrollmentStage.SCHEDULED_EXTENSION.value,
+        )
+        _create_missing_carried_profiles(new, live)
+        _carry_waiting_schedule(new, live, case)
+        # Record the "scheduled" event on the new enrollment's history (the
+        # pre-existing-park path already logs one via advance_enrollment).
+        _record_reauth_scheduled_event(new, actor=actor, actor_label=actor_label)
+
+
+def _gap_pause_current_for_reauth(cur, *, actor=None, actor_label=""):
+    """The current authorization window ended before the reauthorization's
+    window begins (a GAP): complete the current enrollment and PAUSE its members
+    so the household is off deliveries until the reauth activates. The pause is
+    marked ``reauth_gap`` so the UI can surface a "Reauthorization" label."""
+    from api.models import EnrollmentStage, MemberStatus
+    from api.services.orders import truncate_future_deliveries
+
+    if cur is None:
+        return
+    stage = EnrollmentStage(cur.stage)
+    if stage not in (
+        EnrollmentStage.SERVICE_COMPLETE,
+        EnrollmentStage.CLOSED,
+        EnrollmentStage.CANCELLED,
+    ):
+        try:
+            advance_enrollment(
+                cur, EnrollmentStage.SERVICE_COMPLETE, actor=actor,
+                actor_label=actor_label,
+                note="Authorization window ended; awaiting reauthorization window "
+                     "(service paused).",
+                force=True, trigger="reauth_gap",
+            )
+        except InvalidTransition:
+            pass
+    # Pause any still-active members for the duration of the gap.
+    cur.member_profiles.filter(status=MemberStatus.ACTIVE).update(
+        status=MemberStatus.PAUSED
+    )
+    # Attribute the pause to the reauthorization gap (UI label in Phase 5).
+    if cur.close_reason != "reauth_gap":
+        cur.close_reason = "reauth_gap"
+        try:
+            cur.save(update_fields=["close_reason"])
+        except Exception:  # pragma: no cover - defensive
+            pass
+    try:
+        truncate_future_deliveries(cur)
+    except Exception:  # pragma: no cover - defensive
+        pass
+
+
+def _refresh_scheduled_extension_from_live(waiting, live):
+    """Refresh a parked extension from the CURRENT live serving enrollment right
+    before activation, so it activates with the household's LATEST verification,
+    delivery address, dietary/clinical data and roster -- not the (possibly
+    months-old) park-time snapshot.
+
+    Overwrites the enrollment's verified capture + address, overwrites each
+    surviving member's DIETARY/clinical fields, and drops members no longer on the
+    live roster. Service STATUS (and pause flags) are deliberately NOT copied: the
+    live enrollment may be in a gap pause (members paused), which must not carry
+    onto the activating extension -- the parked snapshot's status stands and the
+    activation reconcile resumes service. New members added during the wait are
+    created by ``_create_missing_carried_profiles`` in the close helper.
+    """
+    if waiting is None or live is None:
+        return
+    # Drop the display-only WAITING schedule so the activation carry
+    # (_carry_service_and_activate -> create_member_delivery_schedules, which is
+    # idempotent) rebuilds a fresh SCHEDULED plan + calendar from the live kitchen
+    # / cadence.
+    try:
+        waiting.delivery_schedules.all().delete()
+    except Exception:  # pragma: no cover - defensive
+        pass
+    for f in (
+        "delivery_address", "household_size", "is_family_verified",
+        "medicaid_type_verified", "delivery_address_verified",
+        "verified_at", "verified_by", "requested_by", "requested_at",
+        "nutritionist_approved_at", "nutritionist_approved_by",
+        "nutritionist_signature", "nutritionist_signature_image",
+        "nutritionist_approval_pdf_key",
+    ):
+        setattr(waiting, f, getattr(live, f))
+    try:
+        waiting.save()
+    except Exception:  # pragma: no cover - defensive
+        pass
+
+    dietary_fields = [
+        f for f in _CARRY_PROFILE_FIELDS
+        if f not in ("status", "pause_locked", "eligibility_paused")
+    ]
+    live_by_client = {
+        p.client_id: p for p in live.member_profiles.all() if p.client_id
+    }
+    for wp in list(waiting.member_profiles.all()):
+        if not wp.client_id:
+            continue
+        lp = live_by_client.get(wp.client_id)
+        if lp is None:
+            # No longer on the live roster -> drop from the activating extension.
+            wp.delete()
+            continue
+        for f in dietary_fields:
+            setattr(wp, f, getattr(lp, f))
+        try:
+            wp.save(update_fields=dietary_fields)
+        except Exception:  # pragma: no cover - defensive
+            pass
+
+
+def _activate_scheduled_extension(waiting, cur, reauth, *, actor=None, actor_label=""):
+    """Promote a parked SCHEDULED_EXTENSION enrollment to Service Active, closing
+    the current (being-extended) enrollment and linking it via ``supersedes``.
+    Refreshes the parked enrollment from the current live enrollment first (latest
+    verification / address / dietary / roster), then carries kitchen/cadence/
+    calendar via the shared reuse-path helper; members resume active. Emits a
+    timeline event."""
+    from api.models import EnrollmentStage, TimelineEventType
+    from api.services.timeline import emit_timeline_event
+
+    terminal = {EnrollmentStage.CLOSED, EnrollmentStage.CANCELLED}
+    if cur is not None and EnrollmentStage(cur.stage) not in terminal:
+        # Pull the freshest household data onto the parked enrollment BEFORE the
+        # close (the close helper's carries are blank-fill only).
+        _refresh_scheduled_extension_from_live(waiting, cur)
+        # Closes cur, links supersedes, carries verification/roster, and drives
+        # the waiting enrollment up to Service Active with the carried calendar.
+        _close_old_and_link_to_existing(
+            cur, waiting, reauth, actor, actor_label,
+            note="Reauthorization window reached; service extended onto the new case.",
+        )
+        # Final roster alignment against the household membership (adds/reconciles
+        # any member tied only via the household roster).
+        try:
+            from api.serializers import sync_household_members
+            sync_household_members(waiting.client, enrollment=waiting)
+        except Exception:  # pragma: no cover - defensive
+            pass
+    else:
+        # No current serving enrollment to close -> just activate the waiting one.
+        _step_stage_forward(
+            waiting, EnrollmentStage.SERVICE_ACTIVE, actor=actor,
+            actor_label=actor_label, note="Reauthorization activated.",
+            trigger="reauth_activated",
+        )
+
+    emit_timeline_event(
+        client=waiting.client,
+        event_type=TimelineEventType.MEMBER_GOVERNING_CASE_CHANGED,
+        occurred_at=timezone.now(),
+        title="Service extended via reauthorization",
+        subtitle=(
+            "The reauthorization's authorization window began; service continues "
+            "on the new case."
+        ),
+        enrollment=waiting,
+        case=reauth,
+        source="system",
+        actor=actor_label or "",
+    )
+
+
+def process_scheduled_extensions(
+    *, client=None, today=None, apply=True, actor=None, actor_label=""
+):
+    """Advance parked reauthorization extensions by the calendar.
+
+    For each ``SCHEDULED_EXTENSION`` enrollment (optionally scoped to ``client``),
+    with the current window ending at ``E1`` and the reauth window starting at
+    ``S2``:
+
+      * ``today >= max(E1, S2)`` -> ACTIVATE (promote to Service Active, close the
+        current enrollment).
+      * ``E1 < today < S2``      -> GAP (current -> Service Complete, members
+        paused until the reauth window begins).
+      * otherwise                -> still WAITING (current keeps serving).
+
+    Returns counts ``{activated, gapped, waiting, skipped, discarded}``.
+    ``apply=False`` is a dry run (counts only)."""
+    from api.models import EnrollmentStage, EnrollmentVerification
+
+    today = today or timezone.localdate()
+    qs = (
+        EnrollmentVerification.objects
+        .filter(stage=EnrollmentStage.SCHEDULED_EXTENSION)
+        .select_related("client", "case", "household")
+    )
+    if client is not None:
+        qs = qs.filter(client=client)
+
+    result = {"activated": 0, "gapped": 0, "waiting": 0, "skipped": 0, "discarded": 0}
+    for waiting in qs:
+        reauth = waiting.case
+        if reauth is None:
+            result["skipped"] += 1
+            continue
+        # The reauth case closed/cancelled before it could activate -> discard the
+        # parked enrollment (it will never take over).
+        if reauth.case_status in _CLOSED_CASE_STATUSES:
+            if apply:
+                try:
+                    advance_enrollment(
+                        waiting, EnrollmentStage.CLOSED, actor=actor,
+                        actor_label=actor_label,
+                        note="Reauthorization case closed before activation; parked "
+                             "extension discarded.",
+                        force=True, trigger="reauth_discarded",
+                    )
+                except InvalidTransition:
+                    _force_close_enrollment(waiting)
+                set_reauth_attention(waiting.client, False)
+                sync_reauthorized_tag(waiting.client)
+            result["discarded"] += 1
+            continue
+        s2, _e2 = reauth.effective_authorization_window()
+        if s2 is None:
+            result["skipped"] += 1
+            continue
+        cur = _primary_enrollment(waiting.client)  # excludes the waiting row
+        e1 = None
+        if cur is not None and cur.case is not None:
+            _s1, e1 = cur.case.effective_authorization_window()
+        boundaries = [d.date() for d in (e1, s2) if d is not None]
+        switch_date = max(boundaries) if boundaries else s2.date()
+
+        if today >= switch_date:
+            if apply:
+                _activate_scheduled_extension(
+                    waiting, cur, reauth, actor=actor, actor_label=actor_label,
+                )
+                # Clean handoff -> clear any Reauth Attention flag, and refresh
+                # the Reauthorized indicator (off once no parked reauth remains).
+                set_reauth_attention(waiting.client, False)
+                sync_reauthorized_tag(waiting.client)
+            result["activated"] += 1
+        elif e1 is not None and today > e1.date():
+            if apply:
+                _gap_pause_current_for_reauth(
+                    cur, actor=actor, actor_label=actor_label,
+                )
+                # A service gap needs a human eye.
+                set_reauth_attention(waiting.client, True)
+            result["gapped"] += 1
+        else:
+            if apply:
+                # Still parked -> ensure the "Reauthorized" indicator is present.
+                sync_reauthorized_tag(waiting.client)
+            result["waiting"] += 1
+    return result
+
+
 def reconcile_internal_service_authorization(client, *, actor=None, actor_label=""):
     """React to a change in the client's internal-service case authorization.
 
@@ -3917,13 +4541,34 @@ def reconcile_internal_service_authorization(client, *, actor=None, actor_label=
         "scope_switched": False, "disregarded": False, "ineligible": False,
         "replaced": False,
     }
+    from api.models import EnrollmentVerification
+
     cases = _internal_service_cases(client)
     if not cases:
         recompute_client_stage(client, actor=actor)
         return result
 
     open_cases = open_internal_service_cases(client)
-    governing = max(cases, key=governing_case_key)
+    governing = pick_governing_case(cases)
+    # Ensure any deferred future reauthorization has a parked (non-serving)
+    # SCHEDULED_EXTENSION enrollment, so it's visible + ready to activate later
+    # WITHOUT supplanting the serving case now.
+    _park_deferred_extensions(
+        client, cases, actor=actor, actor_label=actor_label,
+    )
+    # Positive "Reauthorized" indicator: on while a reauth is parked, off once
+    # none remain.
+    sync_reauthorized_tag(client)
+    # Flag for a human ONLY when a reauth can't be auto-extended (kind/scope
+    # mismatch). A cleanly-deferrable reauth needs no attention here (a GAP later
+    # applies the tag from the daily task). Never clears a gap-applied tag: if
+    # there's no mismatch we only clear when no waiting extension remains.
+    if _reauth_kind_scope_mismatch(cases):
+        set_reauth_attention(client, True)
+    elif not EnrollmentVerification.objects.filter(
+        client=client, stage=EnrollmentStage.SCHEDULED_EXTENSION,
+    ).exists():
+        set_reauth_attention(client, False)
     # Heal the 'serving enrollment left caseless' split at the source: a member
     # delivering without a governing case (its case stranded on a stray pending
     # enrollment) breaks the authorization/PO window. Bind it back before the
