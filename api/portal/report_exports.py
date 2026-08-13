@@ -228,7 +228,7 @@ def members_pending_verification_rows(params):
 
     ``params``: created_from / created_to (inclusive), applied to the governing
     internal-service case's created date (``date_opened``)."""
-    from ..models import CaseType, EnrollmentStage, EnrollmentVerification
+    from ..models import CaseStatus, CaseType, EnrollmentStage, EnrollmentVerification
     from ..services.lifecycle import governing_internal_case
     from .views_members import _parse_date
     from .views_reports import _client_phone_numbers, _date_str, _enrollment_member_clients
@@ -279,6 +279,16 @@ def members_pending_verification_rows(params):
             enr.case_id
             and getattr(enr.case, "case_type", None) == CaseType.INTERNAL_SERVICE
         ) else governing_internal_case(enr)
+
+        # The governing internal-service case must still be OPEN (not closed/
+        # cancelled). A pending_verification enrollment left behind AFTER its case
+        # closed is stale -- the client has since gone service-inactive / ineligible
+        # and is no longer genuinely awaiting verification, so it must NOT be
+        # exported (matches the Verification page, which keys off the live
+        # pending state).
+        if gc is None or gc.case_status in (CaseStatus.CLOSED, CaseStatus.CANCELLED):
+            continue
+
         case_created = getattr(gc, "date_opened", None) if gc is not None else None
 
         # Case-created date-range filter (inclusive). Drop rows with no case

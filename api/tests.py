@@ -3362,6 +3362,82 @@ class EnsurePrimaryOfOwnHouseholdTest(TestCase):
         self.assertFalse(Household.objects.filter(household_id=hh.household_id).exists())
 
 
+class CaseSaveKeepsDependentInHouseholdTest(TestCase):
+    """Saving an internal-service case for a NON-primary household dependent must
+    NOT split them out of the shared household anymore. The split now happens
+    only when an agent Requests Verification for them, so until then they stay a
+    dependent and the "dependent in a household" warning on the case-save
+    response can surface (the eager split used to remove the membership before
+    that warning was evaluated). A primary / household-less client is still
+    anchored as primary on case save."""
+
+    def _client(self, first, last):
+        return Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name=first, last_name=last,
+        )
+
+    def _save_internal_case(self, client):
+        from api.serializers import CaseSerializer
+        from api.services.lifecycle import MET_COUNCIL_PROVIDER_NAME
+
+        ser = CaseSerializer(data={
+            "case_id": str(uuid.uuid4()),
+            "client_id": str(client.client_id),
+            "program_name": "Medically Tailored Meals",
+            "service_type": "Medically Tailored Meals",
+            "provider_name": MET_COUNCIL_PROVIDER_NAME,
+            "date_opened": timezone.now().isoformat(),
+        })
+        ser.is_valid(raise_exception=True)
+        return ser.save()
+
+    def test_dependent_case_save_keeps_them_in_shared_household(self):
+        from .models import CaseType, Household, HouseholdMember
+
+        primary = self._client("Pat", "Primary")
+        dep = self._client("Dee", "Dependent")
+        hh = Household.objects.create(name="Shared HH")
+        HouseholdMember.objects.create(household=hh, client=primary, is_primary=True)
+        HouseholdMember.objects.create(household=hh, client=dep, is_primary=False)
+
+        case = self._save_internal_case(dep)
+        self.assertEqual(case.case_type, CaseType.INTERNAL_SERVICE)
+
+        membership = HouseholdMember.objects.get(client=dep)
+        # Still a non-primary member of the SAME shared household -- not split.
+        self.assertEqual(membership.household_id, hh.household_id)
+        self.assertFalse(membership.is_primary)
+
+    def test_dependent_case_save_surfaces_split_warning(self):
+        from .models import Household, HouseholdMember
+        from .views import _dependent_household_warning
+
+        primary = self._client("Pat", "Primary")
+        dep = self._client("Dee", "Dependent")
+        hh = Household.objects.create(name="Shared HH")
+        HouseholdMember.objects.create(household=hh, client=primary, is_primary=True)
+        HouseholdMember.objects.create(household=hh, client=dep, is_primary=False)
+
+        self._save_internal_case(dep)
+
+        warning = _dependent_household_warning(dep)
+        self.assertIsNotNone(warning)
+        self.assertEqual(warning["type"], "dependent_in_household")
+
+    def test_primary_client_still_anchored_on_case_save(self):
+        from .models import Household, HouseholdMember
+
+        c = self._client("Sol", "Solo")
+        hh = Household.objects.create(name="Own HH")
+        HouseholdMember.objects.create(household=hh, client=c, is_primary=True)
+
+        self._save_internal_case(c)
+
+        membership = HouseholdMember.objects.get(client=c)
+        self.assertEqual(membership.household_id, hh.household_id)
+        self.assertTrue(membership.is_primary)
+
+
 class RemovalAndVerificationGuardsTest(TestCase):
     """Two hard invariants shared by the removal + verification surfaces:
 
@@ -12140,6 +12216,266 @@ class DeferredReauthGoverningTest(TestCase):
         self.assertNotIn(str(reauth.case_id), deferred2)
 
 
+class DependentSplitTest(TestCase):
+    """split_dependent_into_own_enrollment: peel a household dependent into their
+    own internal-service case, carrying their data + status + nutritionist."""
+
+    def _scenario(self, *, dep_status=None, nutritionist_approved=False):
+        from datetime import timedelta
+
+        from .models import (
+            Address, Case, CaseHouseholdType, CaseStatus, CaseType, Client,
+            EnrollmentStage, EnrollmentVerification, Household, HouseholdMember,
+            Kitchen, KitchenStatus, MemberDeliverySchedule, MemberDietaryProfile,
+            MemberStatus, ScheduleStatus, ServiceAuthorizationStatus,
+        )
+
+        dep_status = dep_status or MemberStatus.ACTIVE
+        now = timezone.now()
+        primary = Client.objects.create(client_id=str(uuid.uuid4()), first_name="Prim", last_name="Ary")
+        dep = Client.objects.create(client_id=str(uuid.uuid4()), first_name="Dep", last_name="Endent")
+        hh = Household.objects.create(name="HH")
+        HouseholdMember.objects.create(household=hh, client=primary, is_primary=True)
+        HouseholdMember.objects.create(household=hh, client=dep, is_primary=False)
+        kitchen = Kitchen.objects.create(name="K", status=KitchenStatus.ACTIVE)
+        addr = Address.objects.create(
+            client=primary, type="temporary", street="1 St", city="NY",
+            state="NY", zip="11201", notes="ring bell",
+        )
+        prog = "Medically Tailored Meals (MTM) - Other Eligible Populations - Brooklyn"
+        hh_case = Case.objects.create(
+            case_id=str(uuid.uuid4()), client=primary, case_type=CaseType.INTERNAL_SERVICE,
+            case_status=CaseStatus.OPEN, household_type=CaseHouseholdType.HOUSEHOLD,
+            program_name=prog, service_type="Medically Tailored Meals",
+            service_authorization_status=ServiceAuthorizationStatus.APPROVED,
+        )
+        hh_enr = EnrollmentVerification.objects.create(
+            client=primary, household=hh, case=hh_case, stage=EnrollmentStage.SERVICE_ACTIVE,
+            kitchen=kitchen, delivery_address=addr, delivery_weekdays=["mon", "thu"],
+            household_size=2, is_family_verified=True, verified_at=now, program_name=prog,
+        )
+        if nutritionist_approved:
+            hh_enr.nutritionist_approved_at = now
+            hh_enr.nutritionist_signature = "RD"
+            hh_enr.save(update_fields=["nutritionist_approved_at", "nutritionist_signature"])
+        MemberDietaryProfile.objects.create(
+            enrollment=hh_enr, client=primary, member_name="Prim Ary",
+            status=MemberStatus.ACTIVE, menu_type="Standard",
+        )
+        dep_prof = MemberDietaryProfile.objects.create(
+            enrollment=hh_enr, client=dep, member_name="Dep Endent", status=dep_status,
+            menu_type="Kosher", conditions=["Diabetes"], medications=["Insulin"],
+            weight="150", height="5'6", mobile_number="5551234",
+            meal_plan="Plan A" if nutritionist_approved else "",
+            assessment_notes="assess" if nutritionist_approved else "",
+            nutritionist_pdf_key="key123" if nutritionist_approved else "",
+        )
+        MemberDeliverySchedule.objects.create(
+            enrollment=hh_enr, member_profile=dep_prof, member_name="Dep Endent",
+            kitchen=kitchen, delivery_days_cadence="mon_thu", status=ScheduleStatus.SCHEDULED,
+            starts_on=now.date(), ends_on=(now + timedelta(days=30)).date(),
+        )
+        dep_case = Case.objects.create(
+            case_id=str(uuid.uuid4()), client=dep, case_type=CaseType.INTERNAL_SERVICE,
+            case_status=CaseStatus.OPEN, household_type=CaseHouseholdType.INDIVIDUAL,
+            program_name=prog, service_type="Medically Tailored Meals",
+            service_authorization_status=ServiceAuthorizationStatus.APPROVED,
+        )
+        new_enr = EnrollmentVerification.objects.create(
+            client=dep, household=hh, case=dep_case, stage=EnrollmentStage.VERIFIED,
+            verified_at=now, program_name=prog,
+        )
+        new_prof = MemberDietaryProfile.objects.create(
+            enrollment=new_enr, client=dep, member_name="Dep Endent",
+            status=MemberStatus.PENDING,
+        )
+        return locals()
+
+    def test_bare_enrollment_creates_profile_and_carries_everything(self):
+        # The CRM "Request Verification" button hands the split a BARE enrollment
+        # (no member profile), unlike the wizard which pre-seeds one. The split
+        # must CREATE the dependent's profile from their old household profile and
+        # carry the same data -- so both buttons do identical work.
+        from .models import EnrollmentStage, MemberStatus
+        from .services.lifecycle import split_dependent_into_own_enrollment
+
+        s = self._scenario(dep_status=MemberStatus.ACTIVE, nutritionist_approved=True)
+        # Simulate the CRM path: strip the pre-seeded profile -> bare enrollment.
+        s["new_prof"].delete()
+        self.assertFalse(s["new_enr"].member_profiles.exists())
+
+        out = split_dependent_into_own_enrollment(s["dep"], s["new_enr"])
+        self.assertTrue(out["split"])
+        s["new_enr"].refresh_from_db()
+
+        # A profile was created for the dependent, carrying clinical/dietary data.
+        prof = s["new_enr"].member_profiles.get(client=s["dep"])
+        self.assertEqual(prof.conditions, ["Diabetes"])
+        self.assertEqual(prof.medications, ["Insulin"])
+        self.assertEqual(prof.weight, "150")
+        self.assertEqual(prof.menu_type, "Kosher")
+        self.assertEqual(prof.nutritionist_pdf_key, "key123")
+        # Kitchen + address + cadence (delivery_weekdays) carried, service active.
+        self.assertEqual(s["new_enr"].kitchen_id, s["kitchen"].pk)
+        self.assertEqual(s["new_enr"].delivery_address_id, s["addr"].pk)
+        self.assertEqual(s["new_enr"].delivery_weekdays, ["mon", "thu"])
+        self.assertEqual(EnrollmentStage(s["new_enr"].stage), EnrollmentStage.SERVICE_ACTIVE)
+        # Nutritionist sign-off carried at the enrollment level too.
+        self.assertIsNotNone(s["new_enr"].nutritionist_approved_at)
+
+    def test_active_split_carries_and_removes_history(self):
+        from .models import (
+            HouseholdMember, MemberDietaryProfile, MemberStatus,
+        )
+        from .serializers import sync_household_members
+        from .services.lifecycle import split_dependent_into_own_enrollment
+
+        s = self._scenario(dep_status=MemberStatus.ACTIVE)
+        out = split_dependent_into_own_enrollment(s["dep"], s["new_enr"])
+        self.assertTrue(out["split"])
+        # Old profile kept as REMOVED history.
+        s["dep_prof"].refresh_from_db()
+        self.assertEqual(s["dep_prof"].status, MemberStatus.REMOVED)
+        # Dependent left the shared roster, now primary of their own household.
+        self.assertFalse(s["hh"].members.filter(client=s["dep"]).exists())
+        own = HouseholdMember.objects.get(client=s["dep"])
+        self.assertTrue(own.is_primary)
+        self.assertNotEqual(own.household_id, s["hh"].household_id)
+        # New enrollment carried the kitchen + address and was activated (the
+        # exact member status after the kitchen meal-rule depends on kitchen menu
+        # config, so assert the serving carry advanced the stage, not the status).
+        from .models import EnrollmentStage
+        s["new_enr"].refresh_from_db()
+        s["new_prof"].refresh_from_db()
+        self.assertEqual(s["new_enr"].kitchen_id, s["kitchen"].pk)
+        self.assertEqual(s["new_enr"].delivery_address_id, s["addr"].pk)
+        self.assertEqual(EnrollmentStage(s["new_enr"].stage), EnrollmentStage.SERVICE_ACTIVE)
+        self.assertNotEqual(s["new_prof"].status, MemberStatus.REMOVED)
+        # Per-member data carried (blank-fill from old).
+        self.assertEqual(s["new_prof"].conditions, ["Diabetes"])
+        # Sync must NOT re-add the removed dependent to the shared roster.
+        sync_household_members(s["primary"], enrollment=s["hh_enr"])
+        self.assertFalse(s["hh"].members.filter(client=s["dep"]).exists())
+
+    def test_pending_enrollment_carries_verified_and_prunes_to_dependent_only(self):
+        # Mirrors the extension's Request-Verification path: the new enrollment is
+        # PENDING (not yet verified) and seeded with the WHOLE shared household's
+        # participant rows. The split must carry the verified fact from the shared
+        # enrollment, prune the enrollment to the dependent alone, and activate.
+        from .models import EnrollmentStage, MemberDietaryProfile, MemberStatus
+        from .services.lifecycle import split_dependent_into_own_enrollment
+
+        s = self._scenario(dep_status=MemberStatus.ACTIVE)
+        new_enr = s["new_enr"]
+        new_enr.stage = EnrollmentStage.PENDING_VERIFICATION
+        new_enr.verified_at = None
+        new_enr.save(update_fields=["stage", "verified_at"])
+        # Seed the primary's participant row too (as the ext payload would).
+        MemberDietaryProfile.objects.create(
+            enrollment=new_enr, client=s["primary"], member_name="Prim Ary",
+            status=MemberStatus.PENDING,
+        )
+
+        out = split_dependent_into_own_enrollment(s["dep"], new_enr)
+        self.assertTrue(out["split"])
+        new_enr.refresh_from_db()
+        # Verified fact carried from the shared enrollment (no re-verification).
+        self.assertIsNotNone(new_enr.verified_at)
+        # Pruned to the dependent alone (the primary's seeded row is gone).
+        self.assertEqual(
+            {str(x) for x in new_enr.member_profiles.values_list("client_id", flat=True)},
+            {str(s["dep"].client_id)},
+        )
+        # Service carried + activated (kitchen/address carried, stage advanced).
+        self.assertEqual(new_enr.kitchen_id, s["kitchen"].pk)
+        self.assertEqual(new_enr.delivery_address_id, s["addr"].pk)
+        self.assertEqual(EnrollmentStage(new_enr.stage), EnrollmentStage.SERVICE_ACTIVE)
+        # Old profile REMOVED history.
+        s["dep_prof"].refresh_from_db()
+        self.assertEqual(s["dep_prof"].status, MemberStatus.REMOVED)
+        # The dependent had no INDIVIDUAL nutritionist review (blank per-member
+        # nutrition fields), so they must NOT inherit the household's sign-off and
+        # must be tagged Pending Nutritionist.
+        from .services.lifecycle import PENDING_NUTRITIONIST_TAG_NAME
+        self.assertIsNone(new_enr.nutritionist_approved_at)
+        self.assertTrue(s["dep"].tags.filter(name=PENDING_NUTRITIONIST_TAG_NAME).exists())
+
+    def test_active_dependent_keeps_active_status_and_only_gets_pending_tag(self):
+        # Household is nutritionist-approved but the DEPENDENT was never reviewed
+        # individually. Splitting must keep them ACTIVE (carry the household's
+        # sign-off so service isn't interrupted) and flag the nutritionist look
+        # via the Pending Nutritionist TAG only -- NOT by downgrading their status.
+        from .models import EnrollmentStage, MemberStatus
+        from .services.lifecycle import (
+            PENDING_NUTRITIONIST_TAG_NAME, split_dependent_into_own_enrollment,
+        )
+
+        s = self._scenario(nutritionist_approved=True, dep_status=MemberStatus.ACTIVE)
+        # Wipe the dependent's per-member nutrition data so they read as NOT
+        # individually reviewed (the household enrollment stays approved).
+        dep_prof = s["dep_prof"]
+        dep_prof.meal_plan = ""
+        dep_prof.assessment_notes = ""
+        dep_prof.nutritionist_pdf_key = ""
+        dep_prof.save(update_fields=["meal_plan", "assessment_notes", "nutritionist_pdf_key"])
+
+        split_dependent_into_own_enrollment(s["dep"], s["new_enr"])
+        s["new_enr"].refresh_from_db()
+        # Active service preserved: the household's nutritionist sign-off is kept
+        # (not cleared), so the enrollment reads active, not "Pending Nutritionist".
+        self.assertIsNotNone(s["new_enr"].nutritionist_approved_at)
+        self.assertEqual(EnrollmentStage(s["new_enr"].stage), EnrollmentStage.SERVICE_ACTIVE)
+        # The nutritionist look is flagged by the TAG only.
+        self.assertTrue(s["dep"].tags.filter(name=PENDING_NUTRITIONIST_TAG_NAME).exists())
+
+    def test_paused_split_preserves_status_and_tags_attention(self):
+        from .models import MemberDietaryProfile, MemberStatus
+        from .services.lifecycle import (
+            NEED_ATTENTION_TAG_NAME, split_dependent_into_own_enrollment,
+        )
+
+        s = self._scenario(dep_status=MemberStatus.PAUSED)
+        split_dependent_into_own_enrollment(s["dep"], s["new_enr"])
+        s["new_prof"].refresh_from_db()
+        self.assertEqual(s["new_prof"].status, MemberStatus.PAUSED)
+        self.assertTrue(s["dep"].tags.filter(name=NEED_ATTENTION_TAG_NAME).exists())
+
+    def test_not_approved_tags_pending_nutritionist(self):
+        from .services.lifecycle import (
+            PENDING_NUTRITIONIST_TAG_NAME, split_dependent_into_own_enrollment,
+        )
+
+        s = self._scenario(nutritionist_approved=False)
+        split_dependent_into_own_enrollment(s["dep"], s["new_enr"])
+        self.assertTrue(s["dep"].tags.filter(name=PENDING_NUTRITIONIST_TAG_NAME).exists())
+        s["new_enr"].refresh_from_db()
+        self.assertIsNone(s["new_enr"].nutritionist_approved_at)
+
+    def test_approved_copies_nutritionist_data(self):
+        from .models import MemberDietaryProfile
+        from .services.lifecycle import (
+            PENDING_NUTRITIONIST_TAG_NAME, split_dependent_into_own_enrollment,
+        )
+
+        s = self._scenario(nutritionist_approved=True)
+        split_dependent_into_own_enrollment(s["dep"], s["new_enr"])
+        s["new_enr"].refresh_from_db()
+        s["new_prof"].refresh_from_db()
+        self.assertIsNotNone(s["new_enr"].nutritionist_approved_at)
+        self.assertEqual(s["new_prof"].meal_plan, "Plan A")
+        self.assertEqual(s["new_prof"].nutritionist_pdf_key, "key123")
+        self.assertFalse(s["dep"].tags.filter(name=PENDING_NUTRITIONIST_TAG_NAME).exists())
+
+    def test_non_dependent_is_noop(self):
+        from .models import Client, EnrollmentVerification, EnrollmentStage
+        from .services.lifecycle import split_dependent_into_own_enrollment
+
+        c = Client.objects.create(client_id=str(uuid.uuid4()), first_name="Solo", last_name="Client")
+        enr = EnrollmentVerification.objects.create(client=c, stage=EnrollmentStage.VERIFIED)
+        out = split_dependent_into_own_enrollment(c, enr)
+        self.assertFalse(out["split"])
+
+
 class ReauthExtensionActivationTest(TestCase):
     """process_scheduled_extensions advances a parked reauthorization by the
     calendar: activate at max(E1,S2), gap-pause between windows."""
@@ -12312,7 +12648,10 @@ class ReauthExtensionActivationTest(TestCase):
         hh = Household.objects.create(name="HH")
         HouseholdMember.objects.create(household=hh, client=c, is_primary=True)
         kitchen = Kitchen.objects.create(name="BoxKitchen", status=KitchenStatus.ACTIVE)
-        # Live enrollment is BOXES.
+        # Live enrollment is BOXES (pin the kind via an override so it resolves
+        # deterministically regardless of the client's other cases / seed data).
+        from .models import ProductType, ProductTypeKind
+        box_pt = ProductType.objects.create(type=ProductTypeKind.BOXES)
         boxes_case = Case.objects.create(
             case_id=str(uuid.uuid4()), client=c, case_type=CaseType.INTERNAL_SERVICE,
             case_status=CaseStatus.OPEN, household_type=CaseHouseholdType.INDIVIDUAL,
@@ -12321,7 +12660,7 @@ class ReauthExtensionActivationTest(TestCase):
         )
         live = EnrollmentVerification.objects.create(
             client=c, household=hh, case=boxes_case, stage=EnrollmentStage.SERVICE_ACTIVE,
-            kitchen=kitchen, verified_at=now,
+            kitchen=kitchen, verified_at=now, product_type_override=box_pt,
         )
         MemberDietaryProfile.objects.create(enrollment=live, client=c, status=MemberStatus.ACTIVE)
         # Parked MEALS reauth enrollment (different kind).

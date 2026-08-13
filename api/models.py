@@ -1874,6 +1874,11 @@ class MemberStatus(models.TextChoices):
     # independent of the rest of the household (but pausing the LAST active member
     # holds the whole household -- see MemberNutritionistDenyMemberView).
     NUTRITIONIST_PAUSED = "nutritionist_paused", "Nutritionist Paused"
+    # Terminal HISTORY state: the member was split out of this household into their
+    # OWN internal-service case (see api.services.household_split). Their profile
+    # row is KEPT on the old household enrollment for history but is excluded from
+    # all service AND from the household roster re-sync (so it is not re-added).
+    REMOVED = "removed", "Removed"
 
 
 # Member statuses that exclude a member from every delivery schedule / order /
@@ -1889,6 +1894,7 @@ SERVICE_EXCLUDED_MEMBER_STATUSES = (
     MemberStatus.PAUSED,
     MemberStatus.INACTIVE,
     MemberStatus.NUTRITIONIST_PAUSED,
+    MemberStatus.REMOVED,
 )
 
 # Statuses that mean a member is no longer "in play" for the household -- a

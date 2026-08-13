@@ -3133,7 +3133,7 @@ def _create_missing_carried_profiles(target, source):
     downstream kitchen reconcile can plan them; a Paused / Inactive / Out-of-Range
     member carries that status verbatim and is not revived). Returns the number
     of profiles created. Best-effort."""
-    from api.models import MemberDietaryProfile
+    from api.models import MemberDietaryProfile, MemberStatus
 
     if target is None or source is None:
         return 0
@@ -3141,6 +3141,10 @@ def _create_missing_carried_profiles(target, source):
     created = 0
     for sp in source.member_profiles.all():
         if not sp.client_id or sp.client_id in existing:
+            continue
+        # A REMOVED profile is a split-out dependent kept only as history; never
+        # copy them forward (e.g. onto a reauthorization enrollment).
+        if sp.status == MemberStatus.REMOVED:
             continue
         carried = {f: getattr(sp, f) for f in _CARRY_PROFILE_FIELDS}
         try:
@@ -4035,6 +4039,56 @@ def _bind_governing_case_to_serving_enrollment(client, governing):
 
 REAUTH_ATTENTION_TAG_NAME = "Reauth Attention"
 REAUTHORIZED_TAG_NAME = "Reauthorized"
+NEED_ATTENTION_TAG_NAME = "Need Attention"
+PENDING_NUTRITIONIST_TAG_NAME = "Pending Nutritionist"
+
+
+def _need_attention_tag():
+    """Get-or-create the orange "Need Attention" ClientTag -- flags a client for
+    manual review (e.g. a dependent split out of a household while paused / out of
+    orbit, so their preserved status needs a look)."""
+    from api.models import ClientTag, ClientTagColor
+
+    tag, _ = ClientTag.objects.get_or_create(
+        name=NEED_ATTENTION_TAG_NAME,
+        defaults={"color": ClientTagColor.ORANGE},
+    )
+    return tag
+
+
+def _pending_nutritionist_tag():
+    """Get-or-create the purple "Pending Nutritionist" ClientTag -- a client who
+    was moved into their own case without a prior nutritionist approval and still
+    needs review (surfaced on the Nutritionist section's pending page)."""
+    from api.models import ClientTag, ClientTagColor
+
+    tag, _ = ClientTag.objects.get_or_create(
+        name=PENDING_NUTRITIONIST_TAG_NAME,
+        defaults={"color": ClientTagColor.PURPLE},
+    )
+    return tag
+
+
+def set_need_attention(client, needed):
+    """Apply or clear the "Need Attention" tag on ``client``. Idempotent."""
+    if client is None:
+        return
+    tag = _need_attention_tag()
+    if needed:
+        client.tags.add(tag)
+    else:
+        client.tags.remove(tag)
+
+
+def set_pending_nutritionist(client, needed):
+    """Apply or clear the "Pending Nutritionist" tag on ``client``. Idempotent."""
+    if client is None:
+        return
+    tag = _pending_nutritionist_tag()
+    if needed:
+        client.tags.add(tag)
+    else:
+        client.tags.remove(tag)
 
 
 def _reauth_attention_tag():
@@ -4081,6 +4135,209 @@ def set_reauthorized(client, needed):
         client.tags.add(tag)
     else:
         client.tags.remove(tag)
+
+
+def split_dependent_into_own_enrollment(client, new_enrollment, *, actor=None, actor_label=""):
+    """Split a household DEPENDENT (``client``) into their OWN internal-service
+    case, called right after the verification wizard creates + verifies
+    ``new_enrollment`` for a client who was a NON-primary member of a shared
+    household.
+
+    Steps (see docs/dependent_split_plan.md):
+      * copy the primary's delivery address/notes + weekdays onto the new
+        enrollment, and fill any per-member fields the wizard didn't carry from
+        the member's old household profile;
+      * move nutritionist data when the member was nutritionist-approved (treat
+        the new enrollment as approved); else tag ``Pending Nutritionist``;
+      * detach the member from the shared household roster and KEEP their old
+        profile as ``REMOVED`` history (rebuild the old calendar so they drop
+        off); make the client PRIMARY of their own household and re-home the new
+        enrollment there;
+      * preserve the member's prior service status: ACTIVE -> carry kitchen /
+        cadence and activate; paused / out-of-orbit / inactive -> keep the status,
+        carry the kitchen for continuity, and tag ``Need Attention``.
+
+    No-op (returns ``{"split": False}``) when the client is not a splittable
+    dependent (not in a household, or already primary)."""
+    from api.models import (
+        MEMBER_PAUSED_STATUSES, HouseholdMember, MemberDietaryProfile,
+        MemberStatus, TimelineEventType,
+    )
+    from api.serializers import ensure_household_with_primary
+    from api.services.catalog import product_kind_for_enrollment
+    from api.services.orders import rebuild_delivery_calendar
+    from api.services.timeline import emit_timeline_event
+
+    if client is None or new_enrollment is None:
+        return {"split": False}
+    membership = (
+        HouseholdMember.objects.filter(client=client).select_related("household").first()
+    )
+    if membership is None or membership.is_primary:
+        return {"split": False}  # not a dependent -> nothing to split
+    shared_household = membership.household
+
+    old_profile = (
+        MemberDietaryProfile.objects
+        .filter(client=client, enrollment__household=shared_household)
+        .exclude(enrollment=new_enrollment)
+        .exclude(status=MemberStatus.REMOVED)
+        .select_related("enrollment", "enrollment__delivery_address", "enrollment__kitchen")
+        .order_by("-enrollment__opened_at")
+        .first()
+    )
+    old_enr = old_profile.enrollment if old_profile else None
+    # This enrollment is the DEPENDENT's alone. The verification wizard may have
+    # seeded it with the whole shared household's participant rows (the extension
+    # sends every household member); drop everyone but the dependent so the new
+    # enrollment -- and the dependent's own household roster -- is just them.
+    new_enrollment.member_profiles.exclude(client=client).delete()
+    new_profile = new_enrollment.member_profiles.filter(client=client).first()
+    # The caller may hand us a BARE enrollment with no member profile for the
+    # dependent (e.g. the CRM "Request Verification" button, which creates only
+    # the enrollment row -- unlike the verification wizard, which pre-seeds the
+    # profile). Create it from the old household profile so the per-member carry,
+    # status preservation, cadence/kitchen carry and activation below all run --
+    # i.e. the CRM button does the exact same work as the extension/wizard path.
+    if new_profile is None and old_profile is not None:
+        new_profile = MemberDietaryProfile.objects.create(
+            enrollment=new_enrollment,
+            client=client,
+            member_name=old_profile.member_name or "",
+        )
+    prior_status = old_profile.status if old_profile else MemberStatus.ACTIVE
+    # Per-MEMBER nutritionist review: a dependent can live in a household that is
+    # nutritionist-approved at the ENROLLMENT level while never having been
+    # individually reviewed. Base the decision on THEIR own nutrition data (meal
+    # plan / assessment notes / signed PDF), NOT the household's sign-off -- an
+    # un-reviewed member must surface as Pending Nutritionist.
+    nutritionist_approved = bool(
+        old_profile and (
+            (old_profile.nutritionist_pdf_key or "").strip()
+            or (old_profile.meal_plan or "").strip()
+            or (old_profile.assessment_notes or "").strip()
+        )
+    )
+
+    # (1) Copy common (from primary) + per-member + nutritionist data.
+    if old_enr is not None:
+        # Carry the verification FACT (verified_at/by + flags), delivery address,
+        # household size and nutritionist sign-off from the old household
+        # enrollment so the dependent's new enrollment is already VERIFIED (no
+        # re-verification -- plan decision #3). This also satisfies the
+        # verified_at gate in _carry_service_and_activate below, without which the
+        # kitchen/cadence carry + activation silently no-op.
+        # Carry the household's verified fact + delivery address + nutritionist
+        # sign-off forward so an ACTIVE dependent stays ACTIVE (service is not
+        # interrupted). We do NOT clear the carried nutritionist approval for a
+        # member who wasn't individually reviewed -- keeping their service status
+        # active is what's wanted; the "needs a nutritionist look" signal is the
+        # Pending Nutritionist TAG applied in step 5, not a status downgrade.
+        _carry_verification_fields(new_enrollment, old_enr)
+        enr_fields = []
+        if old_enr.delivery_address_id and not new_enrollment.delivery_address_id:
+            new_enrollment.delivery_address = old_enr.delivery_address
+            enr_fields.append("delivery_address")
+        if old_enr.delivery_weekdays and not new_enrollment.delivery_weekdays:
+            new_enrollment.delivery_weekdays = old_enr.delivery_weekdays
+            enr_fields.append("delivery_weekdays")
+        if nutritionist_approved:
+            for f in (
+                "nutritionist_approved_at", "nutritionist_approved_by_id",
+                "nutritionist_signature", "nutritionist_signature_image",
+                "nutritionist_approval_pdf_key",
+            ):
+                setattr(new_enrollment, f, getattr(old_enr, f))
+                enr_fields.append(f.removesuffix("_id"))
+        if enr_fields:
+            new_enrollment.save(update_fields=list(dict.fromkeys(enr_fields)))
+        if new_profile is not None and old_profile is not None:
+            # AUTHORITATIVE copy of the member's data from their old household
+            # profile -- the whole point is to carry their prior verification
+            # forward, NOT re-verify. Status + pause flags are handled separately;
+            # kitchen_meal_type/_food_notes are recomputed against the new kitchen.
+            copied = []
+            for f in _CARRY_PROFILE_FIELDS:
+                if f in ("status", "pause_locked", "eligibility_paused"):
+                    continue
+                setattr(new_profile, f, getattr(old_profile, f))
+                copied.append(f)
+            if copied:
+                new_profile.save(update_fields=copied)
+
+    # (2) Detach from the shared household; KEEP the old profile as REMOVED.
+    if old_profile is not None:
+        old_profile.status = MemberStatus.REMOVED
+        old_profile.status_changed_at = timezone.now()
+        old_profile.save(update_fields=["status", "status_changed_at"])
+    membership.delete()
+    if old_enr is not None:
+        try:
+            rebuild_delivery_calendar(old_enr)
+        except Exception:  # pragma: no cover - defensive
+            pass
+        if old_enr.household_size and old_enr.household_size > 0:
+            old_enr.household_size -= 1
+            old_enr.save(update_fields=["household_size"])
+
+    # (3) Make the client primary of their OWN household; re-home the new enrollment.
+    own_household = ensure_household_with_primary(client)
+    if new_enrollment.household_id != own_household.household_id:
+        new_enrollment.household = own_household
+        new_enrollment.save(update_fields=["household"])
+
+    # (4) Preserve status + carry kitchen/cadence.
+    if old_enr is not None and prior_status == MemberStatus.ACTIVE:
+        _carry_service_and_activate(
+            new_enrollment, old_enr, new_enrollment.case,
+            product_kind_for_enrollment(new_enrollment),
+            prior_was_serving=True, actor=actor, actor_label=actor_label,
+        )
+    else:
+        if old_enr is not None and old_enr.kitchen_id and not new_enrollment.kitchen_id:
+            new_enrollment.kitchen = old_enr.kitchen
+            new_enrollment.save(update_fields=["kitchen"])
+        if new_profile is not None and new_profile.status != prior_status:
+            new_profile.status = prior_status
+            new_profile.status_changed_at = timezone.now()
+            new_profile.save(update_fields=["status", "status_changed_at"])
+
+    # (5) Tags.
+    if prior_status in MEMBER_PAUSED_STATUSES:
+        set_need_attention(client, True)
+    if not nutritionist_approved:
+        set_pending_nutritionist(client, True)
+
+    # (6) Timeline: removal on the old enrollment + arrival on the new one.
+    member_name = (
+        f"{client.first_name or ''} {client.last_name or ''}".strip()
+        or (old_profile.member_name if old_profile else "")
+        or str(client.pk)
+    )
+    if old_enr is not None:
+        emit_timeline_event(
+            client=old_enr.client, event_type=TimelineEventType.HOUSEHOLD_MEMBER_REMOVED,
+            occurred_at=timezone.now(),
+            title=f"Removed {member_name} from case",
+            subtitle="Moved from this household to their own enrollment (data carried).",
+            enrollment=old_enr, source="system", actor=actor_label or "",
+            metadata={
+                "removed_client_id": str(client.pk),
+                "removed_member_name": member_name,
+            },
+        )
+    emit_timeline_event(
+        client=client, event_type=TimelineEventType.ENROLLED,
+        occurred_at=timezone.now(), title="Split into own case",
+        subtitle="Moved from a shared household into their own enrollment (data carried).",
+        enrollment=new_enrollment, source="system", actor=actor_label or "",
+    )
+    return {
+        "split": True,
+        "old_enrollment_id": old_enr.pk if old_enr else None,
+        "prior_status": prior_status,
+        "nutritionist_approved": nutritionist_approved,
+    }
 
 
 def sync_reauthorized_tag(client):
