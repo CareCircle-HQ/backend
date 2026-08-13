@@ -1388,7 +1388,10 @@ class Case(models.Model):
     # -- derived on upsert from a matching ActiveProgram row with ``to_extend``
     # set (see api.serializers.derive_is_extension). Drives the scheduled-
     # extension governing-case handling (see docs/reauthorization_extension_plan).
-    is_extension = models.BooleanField(default=False)
+    # ``db_default`` so an insert that omits the column (e.g. a not-yet-restarted
+    # process running older code mid-deploy) still gets False instead of a
+    # NOT-NULL violation on api_case / api_historicalcase.
+    is_extension = models.BooleanField(default=False, db_default=False)
 
     # --- Outcome Information ---
     outcome_id = models.UUIDField(null=True, blank=True)
@@ -2979,7 +2982,9 @@ class ActiveProgram(models.Model):
     # Opt-in flag (managed from Settings > Programs): this program should be
     # treated as an extension/reauthorization of an existing service. Seeded True
     # for internal-service "Reauthorization: ..." programs by data migration.
-    to_extend = models.BooleanField(default=False)
+    # ``db_default`` guards against an omitted-column insert during a deploy window
+    # (see Case.is_extension).
+    to_extend = models.BooleanField(default=False, db_default=False)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
