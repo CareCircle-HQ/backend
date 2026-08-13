@@ -1060,11 +1060,17 @@ def deferred_extension_case_ids(cases, *, today=None):
             continue  # no window -> can't defer, switch per the normal rule
         kind_c = _case_product_kind(c)
         scope_c = c.household_type
-        # The same-kind + same-scope approved case(s) being extended.
+        # The same-kind + same-scope approved case(s) being extended. Must be
+        # OPEN: you can only DEFER a reauth that extends a CURRENTLY-SERVING
+        # program. A closed/cancelled same-kind case is NOT being served (e.g. a
+        # client on Boxes with a leftover closed Meals case must not have a Meals
+        # reauth parked as if it extended that dead case) -- such a reauth is a
+        # real switch, handled by the normal governing rule (+ attention flag).
         currents = [
             other for other in cases
             if other.case_id != c.case_id
             and other.service_authorization_status in favorable
+            and other.case_status not in _CLOSED_CASE_STATUSES
             and other.household_type == scope_c
             and _case_product_kind(other) == kind_c
         ]
