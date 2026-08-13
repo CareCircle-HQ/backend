@@ -12103,6 +12103,23 @@ class DeferredReauthGoverningTest(TestCase):
         deferred = {str(x) for x in deferred_extension_case_ids(cases)}
         self.assertNotIn(str(reauth.case_id), deferred)
 
+    def test_reauth_not_deferred_when_only_matching_case_is_closed(self):
+        # A reauth must NOT be parked when the only same-kind case it could extend
+        # is CLOSED (e.g. client is served a DIFFERENT program): it's a real switch,
+        # not an extension of a currently-serving program.
+        from datetime import timedelta
+
+        from .models import Case, CaseStatus, CaseType, ServiceAuthorizationStatus
+        from .services.lifecycle import deferred_extension_case_ids
+
+        primary, _hh, current, _serving, reauth = self._setup(reauth_start_days=20)
+        # The same-kind case being "extended" is CLOSED -> not currently served.
+        current.case_status = CaseStatus.CLOSED
+        current.save(update_fields=["case_status"])
+        cases = list(Case.objects.filter(client=primary))
+        deferred = {str(x) for x in deferred_extension_case_ids(cases)}
+        self.assertNotIn(str(reauth.case_id), deferred)
+
     def test_overlap_defers_until_current_window_ends(self):
         # Current window ends +30; reauth starts +10 (overlap). Between S2 and E1
         # the reauth must STILL be deferred (switch point = max(E1,S2) = E1).
