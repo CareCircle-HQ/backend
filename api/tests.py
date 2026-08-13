@@ -12295,6 +12295,53 @@ class ReauthExtensionActivationTest(TestCase):
         self.assertEqual(summary["cadence"], "mon_thu")
         self.assertEqual(summary["kitchen_name"], "K")
 
+    def test_waiting_schedule_not_carried_across_kinds(self):
+        # A Boxes kitchen must never be mirrored onto a Meals reauthorization.
+        from datetime import timedelta
+
+        from .models import (
+            Case, CaseHouseholdType, CaseStatus, CaseType, Client, EnrollmentStage,
+            EnrollmentVerification, Household, HouseholdMember, Kitchen,
+            KitchenStatus, MemberDietaryProfile, MemberStatus,
+            ServiceAuthorizationStatus,
+        )
+        from .services.lifecycle import _carry_waiting_schedule
+
+        now = timezone.now()
+        c = Client.objects.create(client_id=str(uuid.uuid4()), first_name="K", last_name="C")
+        hh = Household.objects.create(name="HH")
+        HouseholdMember.objects.create(household=hh, client=c, is_primary=True)
+        kitchen = Kitchen.objects.create(name="BoxKitchen", status=KitchenStatus.ACTIVE)
+        # Live enrollment is BOXES.
+        boxes_case = Case.objects.create(
+            case_id=str(uuid.uuid4()), client=c, case_type=CaseType.INTERNAL_SERVICE,
+            case_status=CaseStatus.OPEN, household_type=CaseHouseholdType.INDIVIDUAL,
+            program_name="Medically Tailored or Nutritionally Appropriate Food Prescriptions: Boxes - Other Eligible Populations - Brooklyn",
+            service_type="Produce Prescription/Voucher",
+        )
+        live = EnrollmentVerification.objects.create(
+            client=c, household=hh, case=boxes_case, stage=EnrollmentStage.SERVICE_ACTIVE,
+            kitchen=kitchen, verified_at=now,
+        )
+        MemberDietaryProfile.objects.create(enrollment=live, client=c, status=MemberStatus.ACTIVE)
+        # Parked MEALS reauth enrollment (different kind).
+        meals_case = Case.objects.create(
+            case_id=str(uuid.uuid4()), client=c, case_type=CaseType.INTERNAL_SERVICE,
+            case_status=CaseStatus.OPEN, household_type=CaseHouseholdType.INDIVIDUAL,
+            is_extension=True,
+            program_name="Reauthorization: Medically Tailored Meals (MTM) - Other Eligible Populations - Brooklyn",
+            service_type="Medically Tailored Meals",
+        )
+        waiting = EnrollmentVerification.objects.create(
+            client=c, household=hh, case=meals_case, stage=EnrollmentStage.SCHEDULED_EXTENSION,
+            verified_at=now,
+        )
+        _carry_waiting_schedule(waiting, live, meals_case)
+        waiting.refresh_from_db()
+        # No Boxes kitchen carried, no schedule mirrored across kinds.
+        self.assertIsNone(waiting.kitchen_id)
+        self.assertFalse(waiting.delivery_schedules.exists())
+
     def test_parking_logs_scheduled_stage_event(self):
         from .models import (
             EnrollmentStage, EnrollmentVerification, StageEntityType, StageEvent,
