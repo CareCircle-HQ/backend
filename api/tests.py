@@ -12342,6 +12342,66 @@ class ReauthExtensionActivationTest(TestCase):
         self.assertIsNone(waiting.kitchen_id)
         self.assertFalse(waiting.delivery_schedules.exists())
 
+    def test_scheduled_extension_preview_falls_back_to_serving_plan(self):
+        # A parked reauth with NO WAITING schedule still previews deliveries by
+        # projecting the CURRENT serving plan over the reauth window.
+        from datetime import timedelta
+
+        from .models import (
+            Case, CaseHouseholdType, CaseStatus, CaseType, Client, EnrollmentStage,
+            EnrollmentVerification, Household, HouseholdMember, Kitchen,
+            KitchenStatus, MemberDeliverySchedule, MemberDietaryProfile,
+            MemberStatus, ScheduleStatus, ServiceAuthorizationStatus,
+        )
+        from .portal.views_delivery_calendar import MemberDeliveryCalendarView
+
+        now = timezone.now()
+        c = Client.objects.create(client_id=str(uuid.uuid4()), first_name="P", last_name="V")
+        hh = Household.objects.create(name="HH")
+        HouseholdMember.objects.create(household=hh, client=c, is_primary=True)
+        kitchen = Kitchen.objects.create(name="K", status=KitchenStatus.ACTIVE)
+        cur_case = Case.objects.create(
+            case_id=str(uuid.uuid4()), client=c, case_type=CaseType.INTERNAL_SERVICE,
+            case_status=CaseStatus.OPEN, household_type=CaseHouseholdType.INDIVIDUAL,
+            program_name="Medically Tailored Meals (MTM) - Other Eligible Populations - Brooklyn",
+            service_type="Medically Tailored Meals",
+        )
+        serving = EnrollmentVerification.objects.create(
+            client=c, household=hh, case=cur_case, stage=EnrollmentStage.SERVICE_ACTIVE,
+            kitchen=kitchen, verified_at=now,
+        )
+        sp = MemberDietaryProfile.objects.create(enrollment=serving, client=c, status=MemberStatus.ACTIVE)
+        MemberDeliverySchedule.objects.create(
+            enrollment=serving, member_profile=sp, member_name="P V", kitchen=kitchen,
+            delivery_days_cadence="mon_thu", prod_per_delivery=3,
+            status=ScheduleStatus.SCHEDULED,
+            starts_on=(now - timedelta(days=30)).date(), ends_on=(now + timedelta(days=7)).date(),
+        )
+        # Parked reauth with NO WAITING schedule, window in the near future.
+        reauth = Case.objects.create(
+            case_id=str(uuid.uuid4()), client=c, case_type=CaseType.INTERNAL_SERVICE,
+            case_status=CaseStatus.OPEN, household_type=CaseHouseholdType.INDIVIDUAL,
+            is_extension=True,
+            program_name="Reauthorization: Medically Tailored Meals (MTM) - Other Eligible Populations - Brooklyn",
+            service_type="Medically Tailored Meals",
+            service_authorization_status=ServiceAuthorizationStatus.APPROVED,
+            service_authorization_approval_starts_at=now + timedelta(days=8),
+            service_authorization_approval_ends_at=now + timedelta(days=100),
+        )
+        waiting = EnrollmentVerification.objects.create(
+            client=c, household=hh, case=reauth, stage=EnrollmentStage.SCHEDULED_EXTENSION,
+            verified_at=now,
+        )
+        v = MemberDeliveryCalendarView()
+        preview = v._scheduled_extension_preview(waiting)
+        self.assertTrue(len(preview) > 0)
+        self.assertTrue(all(r["state"] == "reauthorization" for r in preview))
+        # All preview dates fall within the reauth window (not the serving window).
+        self.assertTrue(all(r["date"] >= (now + timedelta(days=8)).date().isoformat() for r in preview))
+        summary = v._scheduled_extension_summary(waiting, preview)
+        self.assertEqual(summary["cadence"], "mon_thu")
+        self.assertEqual(summary["kitchen_name"], "K")
+
     def test_parking_logs_scheduled_stage_event(self):
         from .models import (
             EnrollmentStage, EnrollmentVerification, StageEntityType, StageEvent,

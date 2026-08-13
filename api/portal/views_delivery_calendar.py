@@ -349,26 +349,54 @@ class MemberDeliveryCalendarView(PortalAPIView):
         client = Client.objects.filter(pk=client_id).first()
         return active_enrollment(client) if client else None
 
-    def _scheduled_extension_preview(self, enrollment):
-        """Read-only preview rows for a parked reauthorization: expand each WAITING
-        schedule's cadence across its (reauth) window into per-date rows. Not
-        persisted; never on a PO."""
-        from api.services.delivery import weekdays_for_cadence
+    def _scheduled_extension_plan(self, enrollment):
+        """The (schedules, window) to preview for a parked reauthorization.
 
-        rows = []
-        scheds = (
+        Prefer the parked enrollment's own WAITING schedules (which carry the
+        reauth window). If it has none -- e.g. it was parked before the current
+        program's cadence was set -- FALL BACK to the CURRENT serving enrollment's
+        SCHEDULED plan, projected over the reauth case's authorization window, so
+        the planned deliveries still show. Returns ``(schedules, start, end)``
+        where start/end override the schedule's own dates when set."""
+        waiting = list(
             enrollment.delivery_schedules.filter(status=ScheduleStatus.WAITING)
             .select_related("member_profile", "member_profile__client", "kitchen")
         )
+        if waiting:
+            return waiting, None, None
+        active = active_enrollment(enrollment.client)
+        if active is None or active.pk == enrollment.pk:
+            return [], None, None
+        scheds = list(
+            active.delivery_schedules.filter(status=ScheduleStatus.SCHEDULED)
+            .select_related("member_profile", "member_profile__client", "kitchen")
+        )
+        start = end = None
+        if enrollment.case is not None:
+            s, e = enrollment.case.effective_authorization_window()
+            start = s.date() if s else None
+            end = e.date() if e else None
+        return scheds, start, end
+
+    def _scheduled_extension_preview(self, enrollment):
+        """Read-only preview rows for a parked reauthorization: expand each plan's
+        cadence across the reauth window into per-date rows. Not persisted; never
+        on a PO."""
+        from api.services.delivery import weekdays_for_cadence
+
+        rows = []
+        scheds, win_start, win_end = self._scheduled_extension_plan(enrollment)
         for sc in scheds:
             weekdays = weekdays_for_cadence(sc.delivery_days_cadence)
             wd_ints = {_WEEKDAY_CODES.index(w) for w in weekdays if w in _WEEKDAY_CODES}
-            if not (sc.starts_on and sc.ends_on and wd_ints):
+            start = win_start or sc.starts_on
+            end = win_end or sc.ends_on
+            if not (start and end and wd_ints):
                 continue
             mp = sc.member_profile
             mcid = mp.client_id if mp else None
-            d = sc.starts_on
-            while d <= sc.ends_on:
+            d = start
+            while d <= end:
                 if d.weekday() in wd_ints:
                     rows.append({
                         "date": d.isoformat(),
@@ -390,18 +418,18 @@ class MemberDeliveryCalendarView(PortalAPIView):
         return rows
 
     def _scheduled_extension_summary(self, enrollment, preview):
-        """Summary for the parked-reauthorization preview: cadence/kitchen/window
-        from the WAITING schedule; counts derived from the preview rows."""
-        sc = enrollment.delivery_schedules.filter(
-            status=ScheduleStatus.WAITING
-        ).select_related("kitchen", "program", "product_type").first()
+        """Summary for the parked-reauthorization preview: cadence/kitchen from the
+        plan (own WAITING or the current serving fallback); window from the reauth
+        case; counts derived from the preview rows."""
+        scheds, win_start, win_end = self._scheduled_extension_plan(enrollment)
+        sc = scheds[0] if scheds else None
         kind = product_kind_for_enrollment(enrollment)
         cadence = sc.delivery_days_cadence if sc else ""
         kitchen = (sc.kitchen if sc and sc.kitchen_id else None) or (
             enrollment.kitchen if enrollment.kitchen_id else None
         )
-        window_start = sc.starts_on if sc else None
-        window_end = sc.ends_on if sc else None
+        window_start = win_start or (sc.starts_on if sc else None)
+        window_end = win_end or (sc.ends_on if sc else None)
         today = timezone.localdate().isoformat()
         upcoming = sum(1 for r in preview if r["date"] and r["date"] >= today)
         return {
