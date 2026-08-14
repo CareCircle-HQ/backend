@@ -12985,7 +12985,7 @@ class MembersPendingVerificationReportTest(TestCase):
         from .models import EnrollmentVerification
         EnrollmentVerification.objects.create(
             client=served, household=served_hh,
-            stage=EnrollmentStage.SERVICE_ACTIVE,
+            stage=EnrollmentStage.SERVICE_ACTIVE, verified_at=timezone.now(),
         )
 
         rows = self._rows()
@@ -16328,3 +16328,59 @@ class ClientMigrationMergeTest(TestCase):
         c = Client.objects.create(client_id=str(uuid.uuid4()), first_name="Solo")
         out = merge_migrated_client(c, c)
         self.assertFalse(out["merged"])
+
+
+class VerificationScopeOpenGoverningCaseTest(TestCase):
+    """The Verification page (require_internal_service_primary) is gated LIVE on
+    the household primary's OPEN internal-service (governing) case: when it
+    closes, the whole household -- primary AND dependents -- drops off, even if
+    verified."""
+
+    def _scope(self):
+        from .models import Client
+        from .portal.views_members import (
+            require_internal_service_primary, verification_scope_q,
+        )
+        ids = require_internal_service_primary(
+            Client.objects.filter(verification_scope_q())
+        ).distinct().values_list("client_id", flat=True)
+        return {str(i) for i in ids}
+
+    def test_household_drops_when_primary_governing_case_closes(self):
+        from .models import (
+            Case, CaseStatus, CaseType, Client, ClientStage, EnrollmentStage,
+            EnrollmentVerification, Household, HouseholdMember,
+        )
+
+        primary = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Prim", last_name="Ary",
+            lifecycle_stage=ClientStage.PENDING_VERIFICATION,
+        )
+        dep = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Dep", last_name="Endent",
+            lifecycle_stage=ClientStage.PENDING_VERIFICATION,
+        )
+        hh = Household.objects.create(name="HH")
+        HouseholdMember.objects.create(household=hh, client=primary, is_primary=True)
+        HouseholdMember.objects.create(household=hh, client=dep, is_primary=False)
+        case = Case.objects.create(
+            case_id=str(uuid.uuid4()), client=primary, case_type=CaseType.INTERNAL_SERVICE,
+            case_status=CaseStatus.OPEN,
+        )
+        # Verified household enrollment (so we also prove a VERIFIED client drops).
+        EnrollmentVerification.objects.create(
+            client=primary, household=hh, case=case, stage=EnrollmentStage.VERIFIED,
+            verified_at=timezone.now(),
+        )
+
+        # OPEN governing case -> both primary and dependent are on the page.
+        scope = self._scope()
+        self.assertIn(str(primary.client_id), scope)
+        self.assertIn(str(dep.client_id), scope)
+
+        # Close the primary's governing case -> the whole household drops.
+        case.case_status = CaseStatus.CLOSED
+        case.save(update_fields=["case_status"])
+        scope = self._scope()
+        self.assertNotIn(str(primary.client_id), scope)
+        self.assertNotIn(str(dep.client_id), scope)

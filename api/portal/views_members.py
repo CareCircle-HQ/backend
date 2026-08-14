@@ -843,18 +843,27 @@ MEMBER_LIST_PREFETCH = (
 def require_internal_service_primary(qs):
     """Restrict a Client queryset to the members the Verification page should
     show: everyone must belong to a household whose PRIMARY member holds an
-    Internal Service case (the case the verification + meal/box delivery attach
-    to). The internal-service-case holder is always the household primary, so
-    dependents are kept via their household and strays with no household — or
-    whose primary has no internal-service case — are dropped.
+    **OPEN** internal-service (governing) case -- the case the verification +
+    meal/box delivery attach to.
+
+    Driven LIVE by the governing case's status (mirrors the open-case gate Urgent
+    Care uses): when the primary's internal-service case CLOSES / CANCELS, the
+    whole household -- primary AND dependents -- drops off the Verification page,
+    instead of lingering via a sticky lifecycle/verified fact. Dependents are
+    kept through their shared household; strays with no household, or whose
+    primary has no OPEN internal-service case, are dropped.
 
     Caller is responsible for ``.distinct()`` (this adds multi-valued joins)."""
-    return qs.filter(
-        household_membership__household__members__is_primary=True,
-        household_membership__household__members__client__cases__case_type=(
-            CaseType.INTERNAL_SERVICE
+    # An OPEN internal-service case held by the PRIMARY of this client's household
+    # (dependents inherit it). "Open" == not closed/cancelled, same as everywhere.
+    open_primary_internal_case = Case.objects.filter(
+        case_type=CaseType.INTERNAL_SERVICE,
+        client__household_membership__is_primary=True,
+        client__household_membership__household_id=OuterRef(
+            "household_membership__household_id"
         ),
-    )
+    ).exclude(case_status__in=(CaseStatus.CLOSED, CaseStatus.CANCELLED))
+    return qs.filter(Exists(open_primary_internal_case))
 
 
 def verification_completed_q():
@@ -874,13 +883,17 @@ def verification_completed_q():
 
 
 def verification_scope_q():
-    """Base scope for the Verification page, keyed off the verification FACT so
-    the list reads as a full verification history: households still awaiting
-    verification (lifecycle ``pending_verification``) OR that have EVER been
-    verified (``verified_at`` set on a governing enrollment) -- kept even after
-    they advance to kitchen assignment / active / completed. The ``verified_at``
-    join is multi-valued, so the caller must ``.distinct()``."""
-    return Q(lifecycle_stage="pending_verification") | verification_completed_q()
+    """Base scope for the Verification page: a member is shown when they have an
+    UNVERIFIED (``pending_verification``) enrollment -- own or their household's
+    -- OR have EVER been verified (``verified_at`` set on a governing enrollment,
+    kept even after advancing to kitchen assignment / active / completed).
+
+    The "pending" half is keyed off an actual pending ENROLLMENT (not the
+    client's sticky ``lifecycle_stage``): a member must have a real unverified
+    enrollment to appear as pending -- lifecycle-only pending clients with no
+    enrollment are excluded (matches the Members-Pending-Verification export).
+    The joins are multi-valued, so the caller must ``.distinct()``."""
+    return enrollment_stage_q(EnrollmentStage.PENDING_VERIFICATION) | verification_completed_q()
 
 
 def enrollment_stage_q(*stages):

@@ -218,101 +218,168 @@ def all_members_rows(params):
 
 
 # --- Members Pending Verification -------------------------------------------
-def members_pending_verification_rows(params):
-    """One row per household member genuinely awaiting verification.
+def _governing_internal_case(client):
+    """The client's governing internal-service case -- its created date is the
+    export's 'Case Created' column. Prefers the stored governing pointer, else
+    the most-recently-opened OPEN internal-service case."""
+    from ..models import CaseStatus, CaseType
 
-    Only members whose enrollment is at ``pending_verification`` AND who are not
-    already verified elsewhere are included -- a household that has since been
-    verified/served on a later enrollment (leaving a stale earlier
-    pending_verification row behind) is excluded.
+    cases = list(client.cases.all())
+    gid = (client.governing_internal_case_id or "").strip()
+    if gid:
+        for c in cases:
+            if str(c.case_id) == gid:
+                return c
+    open_ic = [
+        c for c in cases
+        if c.case_type == CaseType.INTERNAL_SERVICE
+        and c.case_status not in (CaseStatus.CLOSED, CaseStatus.CANCELLED)
+    ]
+    open_ic.sort(key=lambda c: c.date_opened or timezone.now(), reverse=True)
+    return open_ic[0] if open_ic else None
+
+
+def members_pending_verification_rows(params):
+    """One row per member the Verification page shows as PENDING -- IDENTICAL
+    population so the export and the page always match: their household PRIMARY
+    holds an OPEN internal-service (governing) case (``require_internal_service_
+    primary``) AND they have an UNVERIFIED (``pending_verification``) enrollment
+    (own or household), and are not already verified.
 
     ``params``: created_from / created_to (inclusive), applied to the governing
-    internal-service case's created date (``date_opened``)."""
-    from ..models import CaseStatus, CaseType, EnrollmentStage, EnrollmentVerification
-    from ..services.lifecycle import governing_internal_case
-    from .views_members import _parse_date
-    from .views_reports import _client_phone_numbers, _date_str, _enrollment_member_clients
+    internal-service case's created date (``date_opened``) via the same
+    ``apply_case_created_date_filter`` the page uses."""
+    from ..models import Client, EnrollmentStage
+    from .views_members import (
+        _parse_date, apply_case_created_date_filter, enrollment_stage_q,
+        require_internal_service_primary, verification_completed_q,
+    )
+    from .views_reports import _client_phone_numbers, _date_str
 
     created_from = _parse_date(params.get("created_from"))
     created_to = _parse_date(params.get("created_to"))
 
-    # Stages that mean a client/household is (at or beyond) verified -- so a
-    # lingering earlier pending_verification enrollment must NOT be reported.
-    verified_or_beyond = [
-        EnrollmentStage.VERIFIED,
-        EnrollmentStage.KITCHEN_ASSIGNMENT,
-        EnrollmentStage.SERVICE_ACTIVE,
-        EnrollmentStage.SERVICE_COMPLETE,
-        EnrollmentStage.ON_HOLD,
-        # A parked reauthorization means the household is already verified.
-        EnrollmentStage.SCHEDULED_EXTENSION,
-    ]
-    verified = EnrollmentVerification.objects.filter(stage__in=verified_or_beyond)
-    verified_household_ids = set(
-        verified.exclude(household__isnull=True).values_list("household_id", flat=True)
-    )
-    verified_client_ids = set(verified.values_list("client_id", flat=True))
-
+    qs = require_internal_service_primary(
+        Client.objects.filter(enrollment_stage_q(EnrollmentStage.PENDING_VERIFICATION))
+    ).exclude(verification_completed_q())
+    qs = apply_case_created_date_filter(qs, created_from, created_to)
     qs = (
-        EnrollmentVerification.objects
-        .filter(stage=EnrollmentStage.PENDING_VERIFICATION)
-        .select_related("client", "household", "case")
-        .prefetch_related(
-            "member_profiles__client__phones",
-            "household__members__client__phones",
-        )
-        .order_by("opened_at")
+        qs.distinct()
+        .prefetch_related("cases", "phones")
+        .order_by("last_name", "first_name")
     )
 
     yield ["Client ID", "First Name", "Last Name", "Phone Numbers", "Case Created"]
-    seen = set()
-    for enr in qs.iterator(chunk_size=1000):
-        # Skip a household/client already verified on a later enrollment (the
-        # pending row is stale, e.g. a superseded first enrollment).
-        if enr.household_id and enr.household_id in verified_household_ids:
+    for client in qs.iterator(chunk_size=1000):
+        gc = _governing_internal_case(client)
+        yield [
+            str(client.client_id),
+            client.first_name or "",
+            client.last_name or "",
+            _client_phone_numbers(client),
+            _date_str(getattr(gc, "date_opened", None) if gc is not None else None),
+        ]
+
+
+# --- Members Verified -------------------------------------------------------
+def members_verified_rows(params):
+    """One row per member the Verification page shows as VERIFIED -- the mirror
+    of the Pending export: their household PRIMARY holds an OPEN internal-service
+    (governing) case (``require_internal_service_primary``) AND they have EVER
+    been verified (``verified_at`` set on a governing enrollment,
+    ``verification_completed_q``).
+
+    Same columns + same case-created date window (governing internal-service
+    case ``date_opened``, via ``apply_case_created_date_filter``) as the Pending
+    export."""
+    from ..models import Client
+    from .views_members import (
+        _parse_date, apply_case_created_date_filter,
+        require_internal_service_primary, verification_completed_q,
+    )
+    from .views_reports import _client_phone_numbers, _date_str
+
+    created_from = _parse_date(params.get("created_from"))
+    created_to = _parse_date(params.get("created_to"))
+
+    qs = require_internal_service_primary(
+        Client.objects.filter(verification_completed_q())
+    )
+    qs = apply_case_created_date_filter(qs, created_from, created_to)
+    qs = (
+        qs.distinct()
+        .prefetch_related("cases", "phones")
+        .order_by("last_name", "first_name")
+    )
+
+    yield ["Client ID", "First Name", "Last Name", "Phone Numbers", "Case Created"]
+    for client in qs.iterator(chunk_size=1000):
+        gc = _governing_internal_case(client)
+        yield [
+            str(client.client_id),
+            client.first_name or "",
+            client.last_name or "",
+            _client_phone_numbers(client),
+            _date_str(getattr(gc, "date_opened", None) if gc is not None else None),
+        ]
+
+
+# --- Urgent Care: No Verification Requested ---------------------------------
+def urgent_care_no_verification_rows(params):
+    """One row per Urgent Care 'No Verification Requested' member -- exactly the
+    population on that tab: flagged ``is_new``, holding an OPEN internal-service
+    (meal/box) case, and with NO verification requested yet (no enrollment on the
+    client OR their household). Mirrors the Members-Pending-Verification export:
+    same columns + a date filter on the governing internal-service case's created
+    (``date_opened``) date.
+
+    ``params``: created_from / created_to (inclusive)."""
+    from ..models import Client
+    from ..services.lifecycle import (
+        has_open_internal_service_case, has_verification_request,
+    )
+    from .views_members import _parse_date, apply_case_created_date_filter
+    from .views_reports import _client_phone_numbers, _date_str
+
+    created_from = _parse_date(params.get("created_from"))
+    created_to = _parse_date(params.get("created_to"))
+
+    qs = Client.objects.filter(is_new=True)
+    # Same case-created window as the Urgent Care tab: an internal-service case
+    # opened within [from, to], via the localized ``__date`` lookup (NOT a naive
+    # UTC .date()), so the export lines up with the tab across the day boundary.
+    qs = apply_case_created_date_filter(qs, created_from, created_to)
+    qs = (
+        qs.distinct()
+        .prefetch_related(
+            "cases",
+            "phones",
+            "enrollments",
+            "household_membership__household__enrollment_verifications",
+        )
+        .order_by("last_name", "first_name")
+    )
+
+    yield ["Client ID", "First Name", "Last Name", "Phone Numbers", "Case Created"]
+    for client in qs.iterator(chunk_size=1000):
+        # Live re-check of the same gate the Urgent Care tab enforces: still holds
+        # an OPEN internal-service case and no verification has been requested
+        # (own or household enrollment) -- so a stale is_new flag can't leak in.
+        if not has_open_internal_service_case(client):
             continue
-        if enr.client_id and enr.client_id in verified_client_ids:
+        if has_verification_request(client):
             continue
 
-        # Governing internal-service case + its created date ("Case Created").
-        gc = enr.case if (
-            enr.case_id
-            and getattr(enr.case, "case_type", None) == CaseType.INTERNAL_SERVICE
-        ) else governing_internal_case(enr)
-
-        # The governing internal-service case must still be OPEN (not closed/
-        # cancelled). A pending_verification enrollment left behind AFTER its case
-        # closed is stale -- the client has since gone service-inactive / ineligible
-        # and is no longer genuinely awaiting verification, so it must NOT be
-        # exported (matches the Verification page, which keys off the live
-        # pending state).
-        if gc is None or gc.case_status in (CaseStatus.CLOSED, CaseStatus.CANCELLED):
-            continue
-
+        gc = _governing_internal_case(client)
         case_created = getattr(gc, "date_opened", None) if gc is not None else None
 
-        # Case-created date-range filter (inclusive). Drop rows with no case
-        # date once a bound is set, so the window is meaningful.
-        if created_from or created_to:
-            cd = case_created.date() if case_created is not None else None
-            if cd is None:
-                continue
-            if created_from and cd < created_from:
-                continue
-            if created_to and cd > created_to:
-                continue
-
-        for client in _enrollment_member_clients(enr):
-            if client is None or client.pk in seen:
-                continue
-            seen.add(client.pk)
-            yield [
-                str(client.client_id),
-                client.first_name or "",
-                client.last_name or "",
-                _client_phone_numbers(client),
-                _date_str(case_created),
-            ]
+        yield [
+            str(client.client_id),
+            client.first_name or "",
+            client.last_name or "",
+            _client_phone_numbers(client),
+            _date_str(case_created),
+        ]
 
 
 # --- Pending Verification over 1 month --------------------------------------
@@ -811,6 +878,8 @@ def members_not_served_rows(params):
 REPORT_BUILDERS = {
     "members-by-lead-source": members_by_lead_source_rows,
     "members-pending-verification": members_pending_verification_rows,
+    "members-verified": members_verified_rows,
+    "urgent-care-no-verification": urgent_care_no_verification_rows,
     "pending-verification-over-month": pending_verification_over_month_rows,
     "all-verifications": all_verifications_rows,
     "all-members": all_members_rows,
