@@ -2942,6 +2942,43 @@ class NeedAttestationMembersListView(UnlinkedMembersListView):
         return self.get_paginated_response(rows)
 
 
+class NeedReviewMembersListView(UnlinkedMembersListView):
+    """Urgent Care -> Need Review tab.
+
+    Members carrying the manually-applied "Need Review" client tag. Reuses the
+    row serialization + eligibility/navigation column helpers from
+    :class:`UnlinkedMembersListView`; only the population differs (the tab IS the
+    tag filter)."""
+
+    NEED_REVIEW_TAG = "Need Review"
+
+    def get_queryset(self):
+        params = self.request.query_params
+        qs = Client.objects.filter(
+            tags__name=self.NEED_REVIEW_TAG
+        ).prefetch_related("insurances", "cases", "assessments", "tags")
+
+        search = (params.get("search") or "").strip()
+        if search:
+            cond = (
+                Q(first_name__icontains=search)
+                | Q(last_name__icontains=search)
+                | Q(insurances__external_member_id__icontains=search)
+            )
+            parts = search.split()
+            if len(parts) >= 2:
+                cond |= Q(first_name__icontains=parts[0]) & Q(
+                    last_name__icontains=parts[-1]
+                )
+            try:
+                cond |= Q(client_id=uuid.UUID(search))
+            except (ValueError, TypeError, AttributeError):
+                pass
+            qs = qs.filter(cond)
+
+        return qs.order_by(Lower("first_name"), Lower("last_name")).distinct()
+
+
 class MembersStatsView(PortalAPIView):
     def get(self, request):
         qs = Client.objects.all()
