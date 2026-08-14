@@ -207,6 +207,14 @@ def kitchen_options(enrollment):
         )
         .order_by("name")
     )
+    # Williamsburg exception: these households are ONLY ever served by the
+    # Williamsburg kitchen (Kosher). Restrict the assignment popup to that one
+    # kitchen so an agent can't route them elsewhere.
+    from api.services.williamsburg import WILLIAMSBURG_KITCHEN_NAME
+
+    client = enrollment.client
+    if client is not None and getattr(client, "is_williamsburg", False):
+        kitchens = kitchens.filter(name__iexact=WILLIAMSBURG_KITCHEN_NAME)
 
     results = []
     for k in kitchens:

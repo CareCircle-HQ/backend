@@ -3197,6 +3197,7 @@ def _close_old_and_link_to_existing(
     # Capture serving state BEFORE the close (the carry reads this, not the
     # post-close CLOSED stage).
     live_was_serving = EnrollmentStage(live.stage) in _PRIOR_SERVING_STAGES
+    live_was_paused = EnrollmentStage(live.stage) == EnrollmentStage.ON_HOLD
 
     with transaction.atomic():
         try:
@@ -3271,7 +3272,7 @@ def _close_old_and_link_to_existing(
         )
         _carry_service_and_activate(
             existing, live, new_governing_case, new_kind,
-            prior_was_serving=live_was_serving,
+            prior_was_serving=live_was_serving, prior_was_paused=live_was_paused,
             actor=actor, actor_label=actor_label,
         )
 
@@ -3325,8 +3326,27 @@ def _step_stage_forward(enrollment, target, *, actor, actor_label, note, trigger
             break
 
 
+NEED_REVIEW_TAG_NAME = "Need Review"
+
+
+def _tag_client_need_review(client):
+    """Attach the 'Need Review' client tag (idempotent) so an agent reviews an
+    automated decision -- e.g. a paused household that received a new governing
+    case (which must NOT silently resume service)."""
+    if client is None:
+        return
+    try:
+        from api.models import ClientTag
+
+        tag, _ = ClientTag.objects.get_or_create(name=NEED_REVIEW_TAG_NAME)
+        client.tags.add(tag)
+    except Exception:  # pragma: no cover - defensive
+        pass
+
+
 def _carry_service_and_activate(
-    new_enr, prior_enr, new_case, new_kind, *, prior_was_serving, actor, actor_label,
+    new_enr, prior_enr, new_case, new_kind, *, prior_was_serving,
+    prior_was_paused=False, actor, actor_label,
 ):
     """Carry the prior enrollment's kitchen/cadence onto ``new_enr`` and drive it
     to the right stage after a governing-case replacement.
@@ -3458,6 +3478,27 @@ def _carry_service_and_activate(
         rebuild_delivery_calendar(new_enr)
     except Exception:  # pragma: no cover - defensive
         pass
+
+    # A PAUSED (On Hold) household must NOT be silently resumed by a new
+    # governing case. The carry above rebuilt the serving enrollment (kitchen /
+    # cadence / calendar preserved for a later manual resume); now re-pause it --
+    # stop future deliveries so it drops off Purchase Orders -- and flag the
+    # client Need Review so an agent decides whether to resume on the new case.
+    if prior_was_paused:
+        try:
+            advance_enrollment(
+                new_enr, EnrollmentStage.ON_HOLD, actor=actor,
+                actor_label=actor_label, force=True, trigger="case_replaced",
+                note=("Kept On Hold: the prior household was paused; a new "
+                      "governing case must not auto-resume service. Flagged "
+                      "Need Review."),
+            )
+            from api.services.orders import truncate_future_deliveries
+
+            truncate_future_deliveries(new_enr)
+        except Exception:  # pragma: no cover - defensive
+            pass
+        _tag_client_need_review(new_enr.client)
     return True
 
 
@@ -3552,6 +3593,7 @@ def replace_enrollment_for_case_change(
     # Capture whether the OLD enrollment was actually serving BEFORE we close it
     # (the carry decision must not read the post-close CLOSED stage).
     live_was_serving = EnrollmentStage(live.stage) in _PRIOR_SERVING_STAGES
+    live_was_paused = EnrollmentStage(live.stage) == EnrollmentStage.ON_HOLD
 
     old_kind = product_type_kind_for_name(live.program_name or "")
     if old_kind is None:
@@ -3711,7 +3753,7 @@ def replace_enrollment_for_case_change(
         # This never strands a previously-serving member at Pending Verification.
         _carry_service_and_activate(
             new_enrollment, live, new_governing_case, new_kind,
-            prior_was_serving=live_was_serving,
+            prior_was_serving=live_was_serving, prior_was_paused=live_was_paused,
             actor=actor, actor_label=actor_label,
         )
 
