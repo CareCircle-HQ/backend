@@ -207,3 +207,51 @@ class UniteUsRunUpdateView(views.APIView):
             },
             status=status.HTTP_200_OK,
         )
+
+
+class UniteUsIdMigrationView(views.APIView):
+    """POST /api/uniteus/id-migrations/
+
+    Record a Unite Us PERSON MIGRATION detected by the extension: navigating to
+    ``/facesheet/<old>`` triggers ``GET /people/<old>`` -> 301, and Unite Us
+    redirects to ``/facesheet/<new>`` (the new canonical id). The person's cases
+    re-parent to the new id, leaving our internal service state on the old
+    duplicate Client. This consolidates them onto the NEW (surviving) client.
+
+    Body: {"requested": "<old id>", "canonical": "<new id>"}
+    No-op (200) when the canonical client isn't imported yet, or when the pair
+    is already reconciled.
+    """
+
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        old_id = str(request.data.get("requested") or "").strip()
+        new_id = str(request.data.get("canonical") or "").strip()
+        if not old_id or not new_id or old_id == new_id:
+            return Response(
+                {"error": "requested and canonical (distinct) are required"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        from .services.client_migration import merge_migrated_client, resolve_client
+
+        new_client = resolve_client(new_id)
+        if new_client is None:
+            # The canonical client hasn't been pulled/imported yet -- nothing to
+            # merge onto. A later pull creates it; the ext will re-report then.
+            return Response(
+                {"merged": False, "reason": "canonical client not found yet",
+                 "old_id": old_id, "new_id": new_id},
+                status=status.HTTP_200_OK,
+            )
+        old_client = resolve_client(old_id)
+        if old_client is None or old_client.pk == new_client.pk:
+            return Response(
+                {"merged": False, "reason": "already reconciled",
+                 "old_id": old_id, "new_id": new_id},
+                status=status.HTTP_200_OK,
+            )
+        summary = merge_migrated_client(
+            old_client, new_client, actor_label="ext:uniteus-id-migration",
+        )
+        return Response(summary, status=status.HTTP_200_OK)

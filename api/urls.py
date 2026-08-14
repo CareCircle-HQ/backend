@@ -40,7 +40,11 @@ from .views_phones import (
     ClientPhonesView,
     PhoneLookupView,
 )
-from .views_uniteus import UniteUsCredentialCaptureView, UniteUsRunUpdateView
+from .views_uniteus import (
+    UniteUsCredentialCaptureView,
+    UniteUsIdMigrationView,
+    UniteUsRunUpdateView,
+)
 
 router = DefaultRouter()
 router.register("clients", ClientViewSet, basename="client")
@@ -103,6 +107,12 @@ urlpatterns = [
         "uniteus/run-update/",
         UniteUsRunUpdateView.as_view(),
         name="uniteus-run-update",
+    ),
+    # Person-migration reconciliation (extension reports old->new canonical id)
+    path(
+        "uniteus/id-migrations/",
+        UniteUsIdMigrationView.as_view(),
+        name="uniteus-id-migration",
     ),
     # Google Places (New) proxy — doctor-address autocomplete
     path("places/autocomplete/", PlacesAutocompleteView.as_view(), name="places-autocomplete"),

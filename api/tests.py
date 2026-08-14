@@ -16249,3 +16249,82 @@ class SyncHouseholdCarriesPriorProfileTest(TestCase):
         self.assertEqual(dep_profile.general_verification_notes, "prefers soft foods")
         # ...but STATUS is NOT (left to the scope rules; stays the model default).
         self.assertEqual(dep_profile.status, MemberStatus.PENDING)
+
+
+class ClientMigrationMergeTest(TestCase):
+    """merge_migrated_client: consolidate a Unite Us person-migration duplicate
+    (old id has our service state; new id has the imported cases) onto the NEW
+    surviving client, reconciling enrollment.client == enrollment.case.client."""
+
+    def test_merge_moves_service_state_and_reconciles_case_link(self):
+        from .models import (
+            Case, CaseStatus, CaseType, Client, ClientTag, EnrollmentStage,
+            EnrollmentVerification, Household, HouseholdMember,
+            MemberDietaryProfile, MemberStatus,
+        )
+        from .services.client_migration import merge_migrated_client, resolve_client
+
+        # OLD: our internal service state (enrollment + household + profile + tag).
+        old = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="AMALIA", last_name="TINSLEY",
+        )
+        old_hh = Household.objects.create(name="OLD HH")
+        HouseholdMember.objects.create(household=old_hh, client=old, is_primary=True)
+
+        # NEW (canonical): the imported cases live here.
+        new = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="AMALIA", last_name="TINSLEY",
+        )
+        new_hh = Household.objects.create(name="NEW HH")
+        HouseholdMember.objects.create(household=new_hh, client=new, is_primary=True)
+        case = Case.objects.create(
+            case_id=str(uuid.uuid4()), client=new, case_type=CaseType.INTERNAL_SERVICE,
+            case_status=CaseStatus.OPEN,
+        )
+        enr = EnrollmentVerification.objects.create(
+            client=old, household=old_hh, case=case, stage=EnrollmentStage.SERVICE_ACTIVE,
+        )
+        prof = MemberDietaryProfile.objects.create(
+            enrollment=enr, client=old, member_name="AMALIA TINSLEY",
+            status=MemberStatus.ACTIVE,
+        )
+        tag, _ = ClientTag.objects.get_or_create(name="Need Review")
+        old.tags.add(tag)
+        old_id = str(old.client_id)
+
+        summary = merge_migrated_client(old, new)
+        self.assertTrue(summary["merged"])
+
+        # Old client + its now-empty household are gone.
+        self.assertFalse(Client.objects.filter(client_id=old_id).exists())
+        self.assertFalse(Household.objects.filter(pk=old_hh.pk).exists())
+
+        # Enrollment moved onto NEW, re-homed under the survivor's household.
+        enr.refresh_from_db()
+        new.refresh_from_db()
+        self.assertEqual(str(enr.client_id), str(new.client_id))
+        self.assertEqual(enr.household_id, new.household_membership.household_id)
+        # THE CORE FIX: enrollment.client == enrollment.case.client again.
+        self.assertEqual(str(enr.client_id), str(enr.case.client_id))
+
+        # Member profile carried; tag unioned; alias stamped + resolvable.
+        prof.refresh_from_db()
+        self.assertEqual(str(prof.client_id), str(new.client_id))
+        self.assertTrue(new.tags.filter(name="Need Review").exists())
+        self.assertTrue(new.tags.filter(name="Migrated").exists())
+        self.assertEqual(new.migrated_from_id, old_id)
+        # A migration event is recorded on the survivor's timeline (old -> new).
+        from .models import TimelineEventType
+        ev = new.timeline_events.filter(event_type=TimelineEventType.CLIENT_MIGRATED).first()
+        self.assertIsNotNone(ev)
+        self.assertEqual(ev.metadata.get("old_id"), old_id)
+        self.assertEqual(ev.metadata.get("new_id"), str(new.client_id))
+        self.assertEqual(str(resolve_client(old_id).client_id), str(new.client_id))
+
+    def test_merge_is_noop_for_same_client(self):
+        from .models import Client
+        from .services.client_migration import merge_migrated_client
+
+        c = Client.objects.create(client_id=str(uuid.uuid4()), first_name="Solo")
+        out = merge_migrated_client(c, c)
+        self.assertFalse(out["merged"])
