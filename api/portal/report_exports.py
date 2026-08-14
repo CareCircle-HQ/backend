@@ -58,11 +58,18 @@ _ALL_MEMBERS_HEADER = [
     "DOB",
     # Contact & Address
     "Phone Number",
-    "Street Address",
-    "Apt",
-    "City",
-    "State",
-    "Zip",
+    # Delivery address (from the member's current enrollment) FIRST, then the
+    # Unite Us primary/current address (from the member's profile).
+    "Delivery Street Address",
+    "Delivery Apt",
+    "Delivery City",
+    "Delivery State",
+    "Delivery Zip",
+    "UniteUs Street Address",
+    "UniteUs Apt",
+    "UniteUs City",
+    "UniteUs State",
+    "UniteUs Zip",
     # Household
     "Total members in household",
     # Program & Case Status
@@ -157,7 +164,10 @@ def all_members_rows(params):
         scc = _social_care_coverage(client)
         enr = active_enrollment(client)
         profile = active_member_profile(client)
-        addr = _current_address(client)
+        # UniteUs primary/current address (from the profile) + the delivery
+        # address (from the member's current enrollment).
+        uniteus_addr = _current_address(client)
+        delivery_addr = enr.delivery_address if (enr is not None and enr.delivery_address_id) else None
         cases = list(client.cases.all())
         isc = internal_service_case(client)
         if isc is not None and isc.created_by_id:
@@ -182,11 +192,18 @@ def all_members_rows(params):
             f"{client.first_name or ''} {client.last_name or ''}".strip(),
             _date_str(client.date_of_birth),
             _client_phone_numbers(client),
-            (addr.street if addr else ""),
-            (addr.unit if addr else ""),
-            (addr.city if addr else ""),
-            (addr.state if addr else ""),
-            (addr.zip if addr else ""),
+            # Delivery address (current enrollment) first ...
+            (delivery_addr.street if delivery_addr else ""),
+            (delivery_addr.unit if delivery_addr else ""),
+            (delivery_addr.city if delivery_addr else ""),
+            (delivery_addr.state if delivery_addr else ""),
+            (delivery_addr.zip if delivery_addr else ""),
+            # ... then the UniteUs primary/current address (profile).
+            (uniteus_addr.street if uniteus_addr else ""),
+            (uniteus_addr.unit if uniteus_addr else ""),
+            (uniteus_addr.city if uniteus_addr else ""),
+            (uniteus_addr.state if uniteus_addr else ""),
+            (uniteus_addr.zip if uniteus_addr else ""),
             _household_member_count(client),
             (isc.program_name if isc else ""),
             isc_team,
