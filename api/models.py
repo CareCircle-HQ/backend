@@ -393,7 +393,7 @@ class Client(models.Model):
     # consolidate onto the NEW (surviving) client and stamp the OLD id here so we
     # never re-create the duplicate and can resolve either id to the survivor.
     migrated_from_id = models.CharField(
-        max_length=64, blank=True, default="", db_index=True,
+        max_length=64, blank=True, null=True, default="", db_index=True,
     )
 
     # --- Tags (colour-coded labels managed in Settings) ---
