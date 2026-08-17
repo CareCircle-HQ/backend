@@ -265,7 +265,14 @@ def members_pending_verification_rows(params):
 
     ``params``: created_from / created_to (inclusive), applied to the governing
     internal-service case's created date (``date_opened``) via the same
-    ``apply_case_created_date_filter`` the page uses."""
+    ``apply_case_created_date_filter`` the page uses.
+
+    Mirrors the Verification page's "Pending" chip EXACTLY: besides having an
+    unverified enrollment, the member's ``lifecycle_stage`` must be in the
+    verification window (pending_verification / verified / kitchen_assignment).
+    Without that gate the export also counted members with a lingering pending
+    enrollment but an off-ramp lifecycle (Ineligible / Service Inactive), which
+    the page excludes -- so the two disagreed."""
     from ..models import Client, EnrollmentStage
     from .views_members import (
         _parse_date, apply_case_created_date_filter, enrollment_stage_q,
@@ -279,6 +286,10 @@ def members_pending_verification_rows(params):
     qs = require_internal_service_primary(
         Client.objects.filter(enrollment_stage_q(EnrollmentStage.PENDING_VERIFICATION))
     ).exclude(verification_completed_q())
+    # Same lifecycle gate as the page's Pending chip (views_members status filter).
+    qs = qs.filter(lifecycle_stage__in=[
+        "pending_verification", "verified", "kitchen_assignment",
+    ])
     qs = apply_case_created_date_filter(qs, created_from, created_to)
     qs = (
         qs.distinct()

@@ -12984,6 +12984,10 @@ class MembersPendingVerificationReportTest(TestCase):
 
         client = Client.objects.create(
             client_id=str(uuid.uuid4()), first_name=first, last_name=last,
+            # A real member's lifecycle_stage tracks their enrollment stage; the
+            # export (like the Verification page) gates on it being in the
+            # verification window.
+            lifecycle_stage=stage,
         )
         hh = Household.objects.create(name=f"{last} HH")
         HouseholdMember.objects.create(household=hh, client=client, is_primary=True)
