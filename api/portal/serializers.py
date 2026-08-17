@@ -587,6 +587,7 @@ def case_authorization(case):
         return {
             "status": "", "status_label": "", "is_accepted": False,
             "approved_from": None, "approved_to": None,
+            "decision_note": "", "denial_reason": "",
         }
     status = case.service_authorization_status or ""
     label = case.service_authorization_status_label or (
@@ -599,6 +600,10 @@ def case_authorization(case):
         "is_accepted": status == ServiceAuthorizationStatus.APPROVED,
         "approved_from": starts.isoformat() if starts else None,
         "approved_to": _fmt_end(case.service_authorization_approval_ends_at),
+        # Adjudicator's Decision Note + coded Denial Reason pulled from the Unite
+        # Us authorization (populated on a decided/rejected auth; blank otherwise).
+        "decision_note": case.service_authorization_decision_note or "",
+        "denial_reason": case.service_authorization_denial_reason or "",
     }
 
 
@@ -1655,6 +1660,10 @@ class PortalMemberCaseSerializer(serializers.ModelSerializer):
             "service_authorization_approval_ends_at",
             "service_authorization_request_starts_at",
             "service_authorization_request_ends_at",
+            # Adjudicator Decision Note + coded Denial Reason (rejected/decided
+            # authorization), pulled from the Unite Us case.
+            "service_authorization_decision_note",
+            "service_authorization_denial_reason",
             "outcome_description", "resolution_type", "resolution_label",
             "case_description", "is_met_council", "governing",
             "product_kind", "product_kind_label",
