@@ -3024,16 +3024,25 @@ def _carry_verification_fields(target, source):
     return len(addr_fields) + len(fields)
 
 
-def _carry_dietary_profiles(target, source):
-    """Fill BLANK dietary fields on ``target``'s member profiles from ``source``'s
+_COND_SENTINEL = ["No Restriction"]
+_MEDS_SENTINEL = ["No Medications"]
+
+
+def _carry_dietary_profiles(target, source, *, overwrite=False):
+    """Carry dietary fields onto ``target``'s member profiles from ``source``'s
     matching (by client) profiles.
 
     A household is verified once, capturing each member's menu type / allergies /
     restrictions. When a governing-case replacement REUSES a pre-existing
-    (usually placeholder) enrollment, those profiles start blank -- so copy the
-    verified dietary config forward (the create-new path already does). Only
-    fills empties; never overwrites data the survivor already carries. Returns
-    the number of member profiles changed. Best-effort."""
+    enrollment, those profiles may be placeholders -- so copy the verified dietary
+    config forward (the create-new path already does).
+
+    ``overwrite=False`` (default): only fills EMPTIES; never clobbers data the
+    survivor already carries. ``overwrite=True``: the SOURCE wins even over a
+    non-blank target value -- used when the survivor was an unverified PLACEHOLDER
+    whose menu/allergies are defaults, so the VERIFIED source is authoritative and
+    a case switch can't silently reset e.g. Halal -> Standard. Returns the number
+    of member profiles changed. Best-effort."""
     if target is None or source is None:
         return 0
     src_by_client = {
@@ -3047,49 +3056,56 @@ def _carry_dietary_profiles(target, source):
         if sp is None:
             continue
         fields = []
-        if not (tp.menu_type or "").strip() and (sp.menu_type or "").strip():
-            tp.menu_type = sp.menu_type; fields.append("menu_type")
-        if not tp.food_allergies and sp.food_allergies:
-            tp.food_allergies = sp.food_allergies; fields.append("food_allergies")
-        if not tp.dietary_restrictions and sp.dietary_restrictions:
-            tp.dietary_restrictions = sp.dietary_restrictions
-            fields.append("dietary_restrictions")
-        if not (tp.other_dietary_restrictions or "").strip() and (sp.other_dietary_restrictions or "").strip():
-            tp.other_dietary_restrictions = sp.other_dietary_restrictions
-            fields.append("other_dietary_restrictions")
-        if not (tp.meal_category or "").strip() and (sp.meal_category or "").strip():
-            tp.meal_category = sp.meal_category; fields.append("meal_category")
-        if tp.meals_per_delivery is None and sp.meals_per_delivery is not None:
+
+        def take_str(f):
+            sval = getattr(sp, f) or ""
+            if not sval.strip():
+                return
+            if (overwrite or not (getattr(tp, f) or "").strip()) and getattr(tp, f) != sval:
+                setattr(tp, f, sval); fields.append(f)
+
+        def take_list(f):
+            sval = getattr(sp, f)
+            if not sval:
+                return
+            if (overwrite or not getattr(tp, f)) and getattr(tp, f) != sval:
+                setattr(tp, f, sval); fields.append(f)
+
+        # Menu / allergies / restrictions + captured meal config.
+        take_str("menu_type")
+        take_list("food_allergies")
+        take_list("dietary_restrictions")
+        take_str("other_dietary_restrictions")
+        take_str("meal_category")
+        if sp.meals_per_delivery is not None and (
+            overwrite or tp.meals_per_delivery is None
+        ) and tp.meals_per_delivery != sp.meals_per_delivery:
             tp.meals_per_delivery = sp.meals_per_delivery
             fields.append("meals_per_delivery")
-        if not (tp.general_verification_notes or "").strip() and (sp.general_verification_notes or "").strip():
-            tp.general_verification_notes = sp.general_verification_notes
-            fields.append("general_verification_notes")
-        # Clinical / nutrition intake captured at verification -- carry it forward
-        # (blanks only) so a reused placeholder enrollment keeps the member's
-        # conditions / meds / measurements / meal plan / nutritionist notes.
-        # ``conditions`` / ``medications`` default to sentinel single-item lists
-        # (["No Restriction"] / ["No Medications"]); treat those as blank so real
-        # captured data still copies over.
-        _COND_SENTINEL = ["No Restriction"]
-        _MEDS_SENTINEL = ["No Medications"]
-        if (not tp.conditions or tp.conditions == _COND_SENTINEL) and (
-            sp.conditions and sp.conditions != _COND_SENTINEL
-        ):
+        take_str("general_verification_notes")
+        # Clinical / nutrition intake captured at verification. ``conditions`` /
+        # ``medications`` default to sentinel single-item lists; treat those as
+        # blank so real captured data still copies over.
+        if (sp.conditions and sp.conditions != _COND_SENTINEL) and (
+            overwrite or not tp.conditions or tp.conditions == _COND_SENTINEL
+        ) and tp.conditions != sp.conditions:
             tp.conditions = sp.conditions; fields.append("conditions")
-        if (not tp.medications or tp.medications == _MEDS_SENTINEL) and (
-            sp.medications and sp.medications != _MEDS_SENTINEL
-        ):
+        if (sp.medications and sp.medications != _MEDS_SENTINEL) and (
+            overwrite or not tp.medications or tp.medications == _MEDS_SENTINEL
+        ) and tp.medications != sp.medications:
             tp.medications = sp.medications; fields.append("medications")
         for f in ("weight", "height", "medical_diet_details", "meal_plan",
                   "meal_plan_other", "assessment_notes", "nutritionist_pdf_key"):
-            if not (getattr(tp, f) or "").strip() and (getattr(sp, f) or "").strip():
-                setattr(tp, f, getattr(sp, f)); fields.append(f)
-        if not tp.on_medical_diet and sp.on_medical_diet:
+            take_str(f)
+        if sp.on_medical_diet and not tp.on_medical_diet:
             tp.on_medical_diet = True; fields.append("on_medical_diet")
-        if tp.weeks_gestation is None and sp.weeks_gestation is not None:
+        if sp.weeks_gestation is not None and (
+            overwrite or tp.weeks_gestation is None
+        ) and tp.weeks_gestation != sp.weeks_gestation:
             tp.weeks_gestation = sp.weeks_gestation; fields.append("weeks_gestation")
-        if tp.months_postpartum is None and sp.months_postpartum is not None:
+        if sp.months_postpartum is not None and (
+            overwrite or tp.months_postpartum is None
+        ) and tp.months_postpartum != sp.months_postpartum:
             tp.months_postpartum = sp.months_postpartum; fields.append("months_postpartum")
         if fields:
             try:
@@ -3246,12 +3262,18 @@ def _close_old_and_link_to_existing(
         # otherwise the surviving enrollment reaches Service Active with a BLANK
         # "Verified by" (the completer/date are lost). Only fill fields the
         # survivor doesn't already carry, so a genuine own verification wins.
+        # Was the survivor a PLACEHOLDER (never verified on its own)? Captured
+        # BEFORE _carry_verification_fields stamps verified_at. When it was, the
+        # closed source (``live``) holds the REAL verified capture, so its dietary
+        # config is authoritative and must OVERWRITE the placeholder's defaults --
+        # otherwise a case switch silently resets e.g. Halal -> Standard (the menu
+        # loss this fixes). A survivor with its OWN verification keeps its data.
+        survivor_was_placeholder = existing.verified_at is None
         _carry_verification_fields(existing, live)
-        # ...and the verified dietary config (menu/allergies/restrictions), so a
-        # reused placeholder enrollment doesn't strand members with a blank menu
-        # (which would push them Out of Orbit). Done BEFORE the service carry so
-        # the meal-rule reconcile below sees the carried menu. Blanks only.
-        _carry_dietary_profiles(existing, live)
+        # ...and the verified dietary config (menu/allergies/restrictions/clinical),
+        # so a reused enrollment keeps the member's verified menu. Done BEFORE the
+        # service carry so the meal-rule reconcile below sees the carried menu.
+        _carry_dietary_profiles(existing, live, overwrite=survivor_was_placeholder)
         # CREATE any member profile missing entirely from the reused survivor (a
         # household DEPENDENT that lived only on the closed enrollment) conserving
         # their prior status -- otherwise they have no profile, no delivery plan

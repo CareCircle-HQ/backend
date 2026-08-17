@@ -16645,3 +16645,61 @@ class ResumeRevalidationTest(TestCase):
         self.assertEqual(ev.metadata.get("resume_reason"), "agent note")
         self.assertTrue(ev.metadata.get("resume_checks", {}).get("kitchen_can_serve"))
         self.assertTrue(ev.metadata.get("resume_checks", {}).get("authorization_valid"))
+
+
+class CaseSwitchDietaryCarryTest(TestCase):
+    """A governing-case replacement that REUSES a placeholder survivor must carry
+    the VERIFIED source's menu/dietary onto it (overwrite) so a switch can't reset
+    e.g. Halal -> Standard. A survivor with its OWN data keeps it (blanks-only)."""
+
+    def _pair(self, *, source_menu, target_menu, target_verified):
+        from .models import (
+            Client, EnrollmentStage, EnrollmentVerification, Household,
+            MemberDietaryProfile, MemberStatus,
+        )
+        c = Client.objects.create(client_id=str(uuid.uuid4()), first_name="D", last_name="C")
+        hh = Household.objects.create(name="HH")
+        src = EnrollmentVerification.objects.create(
+            client=c, household=hh, stage=EnrollmentStage.CLOSED,
+            verified_at=timezone.now(),
+        )
+        tgt = EnrollmentVerification.objects.create(
+            client=c, household=hh, stage=EnrollmentStage.PENDING_VERIFICATION,
+            verified_at=(timezone.now() if target_verified else None),
+        )
+        MemberDietaryProfile.objects.create(
+            enrollment=src, client=c, member_name="D C", menu_type=source_menu,
+            status=MemberStatus.ACTIVE,
+        )
+        MemberDietaryProfile.objects.create(
+            enrollment=tgt, client=c, member_name="D C", menu_type=target_menu,
+            status=MemberStatus.ACTIVE,
+        )
+        return c, src, tgt
+
+    def test_placeholder_survivor_takes_verified_source_menu(self):
+        from .models import MemberDietaryProfile
+        from .services.lifecycle import _carry_dietary_profiles
+        c, src, tgt = self._pair(source_menu="Halal", target_menu="Standard", target_verified=False)
+        _carry_dietary_profiles(tgt, src, overwrite=True)
+        mp = MemberDietaryProfile.objects.get(enrollment=tgt, client=c)
+        self.assertEqual(mp.menu_type, "Halal")
+
+    def test_own_verified_survivor_keeps_its_menu(self):
+        from .models import MemberDietaryProfile
+        from .services.lifecycle import _carry_dietary_profiles
+        c, src, tgt = self._pair(source_menu="Halal", target_menu="Standard", target_verified=True)
+        # overwrite=False (survivor had its own verification) -> blanks-only, keeps Standard
+        _carry_dietary_profiles(tgt, src, overwrite=False)
+        mp = MemberDietaryProfile.objects.get(enrollment=tgt, client=c)
+        self.assertEqual(mp.menu_type, "Standard")
+
+    def test_carried_verification_timeline_relabel(self):
+        from .models import EnrollmentStage, TimelineEventType
+        from .services.timeline import stage_timeline_fields
+        et, title = stage_timeline_fields(EnrollmentStage.VERIFIED, trigger="case_replaced")
+        self.assertEqual(et, TimelineEventType.VERIFICATION_COMPLETED)
+        self.assertEqual(title, "Verification Data Carried over new enrollment")
+        # A genuine verification keeps the normal label.
+        _et, title2 = stage_timeline_fields(EnrollmentStage.VERIFIED)
+        self.assertEqual(title2, "Verification Completed")
