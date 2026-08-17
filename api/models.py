@@ -386,6 +386,16 @@ class Client(models.Model):
     # governing case directly. Empty until the first internal-service case lands.
     governing_internal_case_id = models.CharField(max_length=64, blank=True)
 
+    # --- Unite Us person migration ---
+    # When Unite Us migrates a person to a NEW canonical id (GET /people/<old>
+    # -> 301 -> new), the cases re-parent to the new id while our internal
+    # service state (enrollment/household/delivery) stays on the old record. We
+    # consolidate onto the NEW (surviving) client and stamp the OLD id here so we
+    # never re-create the duplicate and can resolve either id to the survivor.
+    migrated_from_id = models.CharField(
+        max_length=64, blank=True, default="", db_index=True,
+    )
+
     # --- Tags (colour-coded labels managed in Settings) ---
     tags = models.ManyToManyField(
         "ClientTag", related_name="clients", blank=True,
@@ -3536,6 +3546,9 @@ class TimelineEventType(models.TextChoices):
     DELIVERY_ADDRESS_CHANGED = "delivery_address_changed", "Delivery Address Changed"
     OUT_OF_ORBIT = "out_of_orbit", "Out of Orbit"
     OUT_OF_RANGE = "out_of_range", "Out of Range"
+    # Unite Us migrated this person to a new canonical id; our duplicate Client
+    # rows were consolidated onto the survivor (records old id -> new id).
+    CLIENT_MIGRATED = "client_migrated", "Client Migrated"
     MEMBER_REACTIVATED = "member_reactivated", "Member Reactivated"
     MEMBER_PAUSED = "member_paused", "Member Paused"
     MEMBER_UNPAUSED = "member_unpaused", "Member Unpaused"

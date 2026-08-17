@@ -437,8 +437,11 @@ class AllMembersReportView(PortalAPIView):
 
     Columns follow the Reports "All Members" spec, grouped: Identification
     (Household Primary Member ID, Member ID, Medicaid ID (active), Member Name,
-    DOB), Contact & Address (Phone Number, Street Address, Apt, City, State,
-    Zip), Household (Total members in household), Program & Case Status (Internal
+    DOB), Contact & Address (Phone Number, then the Delivery address -- from the
+    member's current enrollment -- as Delivery Street Address/Apt/City/State/Zip,
+    then the UniteUs primary address -- from the profile -- as UniteUs Street
+    Address/Apt/City/State/Zip), Household (Total members in household), Program &
+    Case Status (Internal
     Service Program Name, Is there Screening/Eligibility/Navigation/Internal
     Service Case, Client Eligibility, Currently servicing, Cadence, Facility, Out
     of Orbit? + reason, Out of Range, Authorized amount for the open internal

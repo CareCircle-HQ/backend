@@ -843,18 +843,27 @@ MEMBER_LIST_PREFETCH = (
 def require_internal_service_primary(qs):
     """Restrict a Client queryset to the members the Verification page should
     show: everyone must belong to a household whose PRIMARY member holds an
-    Internal Service case (the case the verification + meal/box delivery attach
-    to). The internal-service-case holder is always the household primary, so
-    dependents are kept via their household and strays with no household — or
-    whose primary has no internal-service case — are dropped.
+    **OPEN** internal-service (governing) case -- the case the verification +
+    meal/box delivery attach to.
+
+    Driven LIVE by the governing case's status (mirrors the open-case gate Urgent
+    Care uses): when the primary's internal-service case CLOSES / CANCELS, the
+    whole household -- primary AND dependents -- drops off the Verification page,
+    instead of lingering via a sticky lifecycle/verified fact. Dependents are
+    kept through their shared household; strays with no household, or whose
+    primary has no OPEN internal-service case, are dropped.
 
     Caller is responsible for ``.distinct()`` (this adds multi-valued joins)."""
-    return qs.filter(
-        household_membership__household__members__is_primary=True,
-        household_membership__household__members__client__cases__case_type=(
-            CaseType.INTERNAL_SERVICE
+    # An OPEN internal-service case held by the PRIMARY of this client's household
+    # (dependents inherit it). "Open" == not closed/cancelled, same as everywhere.
+    open_primary_internal_case = Case.objects.filter(
+        case_type=CaseType.INTERNAL_SERVICE,
+        client__household_membership__is_primary=True,
+        client__household_membership__household_id=OuterRef(
+            "household_membership__household_id"
         ),
-    )
+    ).exclude(case_status__in=(CaseStatus.CLOSED, CaseStatus.CANCELLED))
+    return qs.filter(Exists(open_primary_internal_case))
 
 
 def verification_completed_q():
@@ -874,13 +883,17 @@ def verification_completed_q():
 
 
 def verification_scope_q():
-    """Base scope for the Verification page, keyed off the verification FACT so
-    the list reads as a full verification history: households still awaiting
-    verification (lifecycle ``pending_verification``) OR that have EVER been
-    verified (``verified_at`` set on a governing enrollment) -- kept even after
-    they advance to kitchen assignment / active / completed. The ``verified_at``
-    join is multi-valued, so the caller must ``.distinct()``."""
-    return Q(lifecycle_stage="pending_verification") | verification_completed_q()
+    """Base scope for the Verification page: a member is shown when they have an
+    UNVERIFIED (``pending_verification``) enrollment -- own or their household's
+    -- OR have EVER been verified (``verified_at`` set on a governing enrollment,
+    kept even after advancing to kitchen assignment / active / completed).
+
+    The "pending" half is keyed off an actual pending ENROLLMENT (not the
+    client's sticky ``lifecycle_stage``): a member must have a real unverified
+    enrollment to appear as pending -- lifecycle-only pending clients with no
+    enrollment are excluded (matches the Members-Pending-Verification export).
+    The joins are multi-valued, so the caller must ``.distinct()``."""
+    return enrollment_stage_q(EnrollmentStage.PENDING_VERIFICATION) | verification_completed_q()
 
 
 def enrollment_stage_q(*stages):
@@ -2225,6 +2238,12 @@ class MembersListView(PortalGenericAPIView):
             blockers.append(f"{predicted_out} may get out of orbit")
         if not kitchen_available:
             blockers.append("Kitchen needs review")
+        # Williamsburg exception: these households must be routed to the
+        # Williamsburg kitchen (never bulk/manually assigned elsewhere). Flag them
+        # as a blocker so they surface under "Has blockers" and are excluded from
+        # ready-to-assign bulk actions.
+        if getattr(primary_client, "is_williamsburg", False):
+            blockers.append("Williamsburg — assign the Williamsburg kitchen")
 
         aggregate = {
             "delivery_address": address,
@@ -2940,6 +2959,43 @@ class NeedAttestationMembersListView(UnlinkedMembersListView):
                 }
             )
         return self.get_paginated_response(rows)
+
+
+class NeedReviewMembersListView(UnlinkedMembersListView):
+    """Urgent Care -> Need Review tab.
+
+    Members carrying the manually-applied "Need Review" client tag. Reuses the
+    row serialization + eligibility/navigation column helpers from
+    :class:`UnlinkedMembersListView`; only the population differs (the tab IS the
+    tag filter)."""
+
+    NEED_REVIEW_TAG = "Need Review"
+
+    def get_queryset(self):
+        params = self.request.query_params
+        qs = Client.objects.filter(
+            tags__name=self.NEED_REVIEW_TAG
+        ).prefetch_related("insurances", "cases", "assessments", "tags")
+
+        search = (params.get("search") or "").strip()
+        if search:
+            cond = (
+                Q(first_name__icontains=search)
+                | Q(last_name__icontains=search)
+                | Q(insurances__external_member_id__icontains=search)
+            )
+            parts = search.split()
+            if len(parts) >= 2:
+                cond |= Q(first_name__icontains=parts[0]) & Q(
+                    last_name__icontains=parts[-1]
+                )
+            try:
+                cond |= Q(client_id=uuid.UUID(search))
+            except (ValueError, TypeError, AttributeError):
+                pass
+            qs = qs.filter(cond)
+
+        return qs.order_by(Lower("first_name"), Lower("last_name")).distinct()
 
 
 class MembersStatsView(PortalAPIView):
@@ -4230,13 +4286,174 @@ class MemberServiceHoldView(PortalAPIView):
         return Response(s.MemberDetailSerializer(client).data)
 
 
+# Stages an On Hold enrollment can legitimately have been held FROM (the resume
+# reads the pre-hold stage from the latest -> ON_HOLD StageEvent).
+_RESUMABLE_FROM_STAGES = (
+    EnrollmentStage.PENDING_VERIFICATION,
+    EnrollmentStage.VERIFIED,
+    EnrollmentStage.KITCHEN_ASSIGNMENT,
+    EnrollmentStage.SERVICE_ACTIVE,
+)
+
+
+def _last_hold_from_stage(enr):
+    """The stage the enrollment was in BEFORE its most-recent hold (read from the
+    latest ``-> ON_HOLD`` StageEvent, restricted to genuine non-terminal resume
+    sources). Falls back to a safe floor: Pending Verification when the enrollment
+    was never verified, else Service Active."""
+    last_hold = (
+        StageEvent.objects.filter(
+            enrollment=enr,
+            to_stage=EnrollmentStage.ON_HOLD,
+            from_stage__in=[st.value for st in _RESUMABLE_FROM_STAGES],
+        )
+        .order_by("-entered_at")
+        .first()
+    )
+    if last_hold and last_hold.from_stage:
+        try:
+            return EnrollmentStage(last_hold.from_stage)
+        except ValueError:
+            pass
+    return (
+        EnrollmentStage.PENDING_VERIFICATION if enr.verified_at is None
+        else EnrollmentStage.SERVICE_ACTIVE
+    )
+
+
+def _resolve_resume(enr):
+    """Decide how an ON_HOLD enrollment should resume by RE-VALIDATING the current
+    governing case (state may have changed during the hold). Never switches the
+    case / scope -- it only gates whether the EXISTING enrollment can come back to
+    service, and to which stage.
+
+    Returns ``{allowed, block_reason, target, checks}`` where ``checks`` records
+    every answer for the resume audit event.
+    """
+    from api.models import CaseStatus, ServiceAuthorizationStatus
+    from api.services.kitchens import required_product_for_program
+    from api.services.lifecycle import governing_internal_case
+
+    from_stage = _last_hold_from_stage(enr)
+    checks = {"from_stage": from_stage.value}
+
+    # 1) Held before verification -> nothing to re-validate; back to Pending
+    #    Verification (never force-promoted into service).
+    if from_stage == EnrollmentStage.PENDING_VERIFICATION or enr.verified_at is None:
+        checks["resolved_target"] = EnrollmentStage.PENDING_VERIFICATION.value
+        return {
+            "allowed": True, "block_reason": "",
+            "target": EnrollmentStage.PENDING_VERIFICATION, "checks": checks,
+        }
+
+    # 2) Is there an OPEN governing internal-service case?
+    gov = governing_internal_case(enr)
+    open_case = bool(gov and gov.case_status not in (CaseStatus.CLOSED, CaseStatus.CANCELLED))
+    checks["governing_case_id"] = str(gov.case_id) if gov else None
+    checks["open_governing_case"] = open_case
+    if not open_case:
+        return {
+            "allowed": False,
+            "block_reason": ("No open internal-service case — service resumes only "
+                             "when a new open case is created."),
+            "target": None, "checks": checks,
+        }
+
+    # 3) Is the authorization APPROVED (or Not Required) AND within its window?
+    status = getattr(gov, "service_authorization_status", "") or ""
+    starts = gov.service_authorization_approval_starts_at
+    ends = gov.service_authorization_approval_ends_at
+    today = timezone.localdate()
+    authorized = status in (
+        ServiceAuthorizationStatus.APPROVED, ServiceAuthorizationStatus.NOT_REQUIRED,
+    )
+    started = starts is None or starts.date() <= today
+    not_expired = ends is None or ends.date() >= today
+    auth_valid = authorized and started and not_expired
+    checks["authorization_status"] = status
+    checks["authorization_window"] = {
+        "starts_on": starts.date().isoformat() if starts else None,
+        "ends_on": ends.date().isoformat() if ends else None,
+    }
+    checks["authorization_valid"] = auth_valid
+    if not auth_valid:
+        return {
+            "allowed": False,
+            "block_reason": ("The governing case's authorization is not approved and "
+                             "within its active window."),
+            "target": None, "checks": checks,
+        }
+
+    # 4) Can the CURRENT kitchen make this program's product type? Yes -> Service
+    #    Active (calendar rebuild); No -> back to Kitchen Assignment.
+    required = required_product_for_program(enr.program_name)
+    kitchen = enr.kitchen if enr.kitchen_id else None
+    kitchen_can_serve = bool(
+        kitchen is not None
+        and (required is None or required in (kitchen.supported_products or []))
+    )
+    checks["kitchen_can_serve"] = kitchen_can_serve
+    target = (
+        EnrollmentStage.SERVICE_ACTIVE if kitchen_can_serve
+        else EnrollmentStage.KITCHEN_ASSIGNMENT
+    )
+    checks["resolved_target"] = target.value
+    return {"allowed": True, "block_reason": "", "target": target, "checks": checks}
+
+
+_RESUME_INELIGIBLE_MESSAGE = (
+    "This program is On Hold because a member is Ineligible, which can't be fixed "
+    "in the CRM. The member's Unite Us case must be closed by an agent; service "
+    "resumes automatically only if the eligibility data later passes."
+)
+
+
 class MemberServiceResumeView(PortalAPIView):
     """Resume a held household.
 
-    Returns the enrollment to the stage it was in before the hold (defaulting to
-    Service Active), which logs a StageEvent + timeline entry and re-includes the
+    Re-validates the CURRENT governing case (open? authorization approved + within
+    window? can the current kitchen make the product?) rather than blindly
+    restoring the pre-hold stage, then resumes the EXISTING enrollment to the
+    resolved stage (Service Active, or Kitchen Assignment when the kitchen can no
+    longer serve). Blocks with a clear reason when there is no open case or the
+    authorization isn't valid. Records every check answer + the reason on the
+    resume StageEvent, logs a timeline entry, and re-includes an activated
     household in Purchase Order batching. Records a client note.
+
+    GET returns a read-only PREVIEW of the same resolution (allowed + block reason
+    + resolved target + every check answer) so the Resume popup can show what it's
+    validating and disable the button when a resume isn't allowed.
     """
+
+    def _preview(self, enr):
+        """Shared resume resolution for GET (preview) — includes the manual-guard
+        blocks so the popup shows the same verdict the POST enforces."""
+        if _program_locked(enr):
+            return {"on_hold": True, "allowed": False,
+                    "block_reason": _PROGRAM_LOCKED_MESSAGE, "checks": {}}
+        if _enrollment_resume_blocked_by_ineligibility(enr):
+            return {"on_hold": True, "allowed": False,
+                    "block_reason": _RESUME_INELIGIBLE_MESSAGE, "checks": {}}
+        plan = _resolve_resume(enr)
+        target = plan["target"]
+        return {
+            "on_hold": True,
+            "allowed": plan["allowed"],
+            "block_reason": plan["block_reason"],
+            "target": target.value if target else None,
+            "target_label": EnrollmentStage(target).label if target else "",
+            "checks": plan["checks"],
+        }
+
+    def get(self, request, client_id):
+        client = get_object_or_404(Client, pk=client_id)
+        enr = s.active_enrollment(client)
+        if enr is None or EnrollmentStage(enr.stage) != EnrollmentStage.ON_HOLD:
+            return Response({
+                "on_hold": False, "allowed": False,
+                "block_reason": "Service is not on hold.", "checks": {},
+            })
+        return Response(self._preview(enr))
 
     def post(self, request, client_id):
         client = get_object_or_404(Client, pk=client_id)
@@ -4258,64 +4475,53 @@ class MemberServiceResumeView(PortalAPIView):
         # the ``can_resume`` flag that hides the button.
         if _enrollment_resume_blocked_by_ineligibility(enr):
             return Response(
-                {"error": (
-                    "This program is On Hold because a member is Ineligible, which "
-                    "can't be fixed in the CRM. The member's Unite Us case must be "
-                    "closed by an agent; service resumes automatically only if the "
-                    "eligibility data later passes."
-                )},
+                {"error": _RESUME_INELIGIBLE_MESSAGE},
                 status=http.HTTP_400_BAD_REQUEST,
             )
-        # Resume to the stage the enrollment was held from -- but NEVER back into a
-        # terminal stage. A household that was REACTIVATED from Cancelled lands in
-        # On Hold via a ``cancelled -> on_hold`` StageEvent, so the most-recent
-        # hold's ``from_stage`` is ``cancelled``; resuming to that re-cancelled the
-        # member on every click (the endless reactivate/resume loop this fixes).
-        # Only genuine non-terminal stages are valid resume targets -- crucially
-        # PENDING_VERIFICATION is included so a household held BEFORE verification
-        # resumes back to Pending Verification instead of being force-defaulted to
-        # Service Active (which would leave it Active + unverified).
-        _RESUMABLE_FROM_STAGES = (
-            EnrollmentStage.PENDING_VERIFICATION,
-            EnrollmentStage.VERIFIED,
-            EnrollmentStage.KITCHEN_ASSIGNMENT,
-            EnrollmentStage.SERVICE_ACTIVE,
-        )
-        last_hold = (
-            StageEvent.objects.filter(
-                enrollment=enr,
-                to_stage=EnrollmentStage.ON_HOLD,
-                from_stage__in=[st.value for st in _RESUMABLE_FROM_STAGES],
-            )
-            .order_by("-entered_at")
-            .first()
-        )
-        # Default resume floor: a never-verified enrollment goes back to Pending
-        # Verification (NOT Service Active), so a missing/odd hold history can't
-        # strand it Active + unverified.
-        default_target = (
-            EnrollmentStage.PENDING_VERIFICATION if enr.verified_at is None
-            else EnrollmentStage.SERVICE_ACTIVE
-        )
-        target = default_target
-        if last_hold and last_hold.from_stage:
-            try:
-                target = EnrollmentStage(last_hold.from_stage)
-            except ValueError:
-                target = default_target
+        # RE-VALIDATE the current governing case (state may have changed during the
+        # hold) and resolve the correct resume target -- never blindly restore the
+        # pre-hold stage, which could put a member back in service with stale
+        # information. No case/scope switch here: a warranted switch is handled at
+        # import; resume only gates whether THIS enrollment can serve now.
+        plan = _resolve_resume(enr)
         reason = (request.data.get("reason") or "").strip()
         agent = current_agent(request)
         author = agent.name if agent else ""
         suffix = f" Reason: {reason}" if reason else ""
+        if not plan["allowed"]:
+            # No open case / authorization not valid -> resume refused.
+            return Response(
+                {"error": plan["block_reason"], "checks": plan["checks"]},
+                status=http.HTTP_400_BAD_REQUEST,
+            )
+        target = plan["target"]
+        target_label = EnrollmentStage(target).label
         try:
             # force=True: a prior process gate (e.g. verification) already passed
             # before the hold, so restoring the prior stage must not be re-gated.
             advance_enrollment(
-                enr, target, force=True,
-                note=f"Service resumed by {author or 'support portal'}.{suffix}",
+                enr, target, force=True, actor_label=author, trigger="manual.resume",
+                note=(f"Service resumed by {author or 'support portal'} "
+                      f"-> {target_label}.{suffix}"),
             )
         except InvalidTransition as exc:
             return Response({"error": str(exc)}, status=http.HTTP_400_BAD_REQUEST)
+        # Record the resume checks + reason on the just-logged resume StageEvent so
+        # the History tab shows WHY it resumed to this stage.
+        try:
+            ev = (
+                StageEvent.objects.filter(enrollment=enr, to_stage=target)
+                .order_by("-entered_at")
+                .first()
+            )
+            if ev is not None:
+                md = dict(ev.metadata or {})
+                md["resume_checks"] = plan["checks"]
+                md["resume_reason"] = reason
+                ev.metadata = md
+                ev.save(update_fields=["metadata"])
+        except Exception:  # pragma: no cover - defensive
+            pass
         # Make the resumed household deliverable again -- flipping the enrollment
         # stage back is NOT enough. A cancel/hold can (a) exclude member profiles
         # (INACTIVE), (b) cancel their delivery PLANS, and (c) truncate the plan
@@ -4355,7 +4561,7 @@ class MemberServiceResumeView(PortalAPIView):
                 )
         Note.objects.create(
             client=client, source=NoteSource.AGENT, author_name=author,
-            body=f"Service resumed.{suffix}",
+            body=f"Service resumed -> {target_label}.{suffix}",
         )
         return Response(s.MemberDetailSerializer(client).data)
 
@@ -5990,6 +6196,19 @@ def assign_kitchen_to_household(
     exclude_notes = exclude_notes or {}
     actor = _agent_actor(agent)
 
+    # Williamsburg exception: these households can ONLY be served by the
+    # Williamsburg kitchen. Enforce it centrally so no path (single assign, bulk
+    # assign, ...) can route them to a different kitchen.
+    from api.services.williamsburg import WILLIAMSBURG_KITCHEN_NAME
+
+    if getattr(client, "is_williamsburg", False) and (
+        kitchen is None
+        or (kitchen.name or "").strip().lower() != WILLIAMSBURG_KITCHEN_NAME.lower()
+    ):
+        raise ValueError(
+            "Williamsburg households can only be assigned the Williamsburg kitchen."
+        )
+
     # Capture the pre-assignment kitchen + cadence so a RE-assignment (the
     # household already had a kitchen) logs a precise 'Kitchen Changed' diff,
     # while a first-time assignment logs a 'Kitchen Assigned' event (emitted
@@ -6264,6 +6483,17 @@ class MemberAssignKitchenView(PortalAPIView):
             return Response(
                 {"error": "kitchen_id is required."}, status=http.HTTP_400_BAD_REQUEST
             )
+        # Williamsburg exception: only the Williamsburg kitchen may be assigned.
+        from ..services.williamsburg import WILLIAMSBURG_KITCHEN_NAME
+
+        if getattr(client, "is_williamsburg", False) and (
+            (kitchen.name or "").strip().lower() != WILLIAMSBURG_KITCHEN_NAME.lower()
+        ):
+            return Response(
+                {"error": "Williamsburg households can only be assigned the "
+                          "Williamsburg kitchen."},
+                status=http.HTTP_400_BAD_REQUEST,
+            )
         if cadence not in active_cadence_codes():
             return Response(
                 {"error": "A valid cadence is required."},
@@ -6343,9 +6573,15 @@ def _awaiting_enrollments(kind):
     """Enrollments awaiting kitchen assignment for a given product ``kind``
     (meals/boxes). Mirrors the Logistics queue (stage=kitchen_assignment)
     filtered to the kind, which is derived from the program name so meals/boxes
-    never mix."""
+    never mix.
+
+    Williamsburg lead-source households are ALWAYS excluded: they must only ever
+    be routed to the Williamsburg kitchen, so they must never appear in ANY bulk
+    assignment list/count/preview/apply (this is the single source both the bulk
+    boxes and bulk meals flows draw from)."""
     qs = (
         EnrollmentVerification.objects.filter(stage=EnrollmentStage.KITCHEN_ASSIGNMENT)
+        .exclude(client__is_williamsburg=True)
         .select_related("client", "case", "case__program")
     )
     return [e for e in qs if _enrollment_kind(e) == kind]
@@ -6372,6 +6608,11 @@ def enrollment_ready_for_assignment(enr, kitchens):
     shown on the Logistics list: a delivery address is set, every member has a
     menu type and isn't predicted Out of Orbit, and some single kitchen can serve
     every member. Used by the bulk-assign 'only ready to assign' option."""
+    # Williamsburg households are never "ready" for a generic bulk assignment --
+    # they must be routed to the Williamsburg kitchen (see the Logistics blocker
+    # + the assign guard), so bulk 'ready only' actions skip them.
+    if getattr(enr.client, "is_williamsburg", False):
+        return False
     if enr.delivery_address_id is None:
         return False
     members = list(enr.member_profiles.all())

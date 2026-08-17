@@ -5248,20 +5248,36 @@ class ResumeBlockedWhenIneligibleTest(TestCase):
         self.api.credentials(HTTP_AUTHORIZATION=f"Bearer {access}")
 
     def _held_client(self, lifecycle_stage):
+        from datetime import timedelta
+
         from .models import (
-            Client, ClientStage, EnrollmentStage, EnrollmentVerification,
-            Household, HouseholdMember,
+            Case, CaseStatus, CaseType, Client, EnrollmentStage,
+            EnrollmentVerification, Household, HouseholdMember, Kitchen,
+            KitchenStatus, ServiceAuthorizationStatus,
         )
         from .services.lifecycle import advance_enrollment
 
+        now = timezone.now()
         client = Client.objects.create(
             client_id=str(uuid.uuid4()), first_name="Held", last_name="Member",
             lifecycle_stage=lifecycle_stage,
         )
         hh = Household.objects.create(name="HH")
         HouseholdMember.objects.create(household=hh, client=client, is_primary=True)
+        # Realistic serving enrollment: verified, an OPEN APPROVED case within its
+        # window, and an assigned kitchen -- so a resume can validly reach Service
+        # Active (the resume resolver re-validates all three).
+        case = Case.objects.create(
+            case_id=str(uuid.uuid4()), client=client,
+            case_type=CaseType.INTERNAL_SERVICE, case_status=CaseStatus.OPEN,
+            service_authorization_status=ServiceAuthorizationStatus.APPROVED,
+            service_authorization_approval_starts_at=now - timedelta(days=1),
+            service_authorization_approval_ends_at=now + timedelta(days=90),
+        )
+        kitchen = Kitchen.objects.create(name="ENG", status=KitchenStatus.ACTIVE)
         enr = EnrollmentVerification.objects.create(
-            client=client, household=hh, stage=EnrollmentStage.SERVICE_ACTIVE,
+            client=client, household=hh, case=case, kitchen=kitchen,
+            stage=EnrollmentStage.SERVICE_ACTIVE, verified_at=now,
         )
         advance_enrollment(enr, EnrollmentStage.ON_HOLD, force=True)
         enr.refresh_from_db()
@@ -5475,13 +5491,30 @@ class ResumeAfterReactivationTest(TestCase):
         )
         from .services.lifecycle import advance_enrollment
 
+        from datetime import timedelta
+
+        from .models import (
+            Case, CaseStatus, CaseType, ServiceAuthorizationStatus,
+        )
+
+        now = timezone.now()
         client = Client.objects.create(
             client_id=str(uuid.uuid4()), first_name="Loop", last_name="Member"
         )
         hh = Household.objects.create(name="HH")
         HouseholdMember.objects.create(household=hh, client=client, is_primary=True)
+        # Verified + OPEN APPROVED case but NO kitchen -> a valid resume lands at
+        # Kitchen Assignment (kitchen can't serve), never back into CANCELLED.
+        case = Case.objects.create(
+            case_id=str(uuid.uuid4()), client=client,
+            case_type=CaseType.INTERNAL_SERVICE, case_status=CaseStatus.OPEN,
+            service_authorization_status=ServiceAuthorizationStatus.APPROVED,
+            service_authorization_approval_starts_at=now - timedelta(days=1),
+            service_authorization_approval_ends_at=now + timedelta(days=90),
+        )
         enr = EnrollmentVerification.objects.create(
-            client=client, household=hh, stage=EnrollmentStage.KITCHEN_ASSIGNMENT,
+            client=client, household=hh, case=case,
+            stage=EnrollmentStage.KITCHEN_ASSIGNMENT, verified_at=now,
         )
         # Reproduce the history: held from Kitchen Assignment, cancelled, then
         # reactivated back to On Hold (a `cancelled -> on_hold` event, which is
@@ -12985,7 +13018,7 @@ class MembersPendingVerificationReportTest(TestCase):
         from .models import EnrollmentVerification
         EnrollmentVerification.objects.create(
             client=served, household=served_hh,
-            stage=EnrollmentStage.SERVICE_ACTIVE,
+            stage=EnrollmentStage.SERVICE_ACTIVE, verified_at=timezone.now(),
         )
 
         rows = self._rows()
@@ -16249,3 +16282,366 @@ class SyncHouseholdCarriesPriorProfileTest(TestCase):
         self.assertEqual(dep_profile.general_verification_notes, "prefers soft foods")
         # ...but STATUS is NOT (left to the scope rules; stays the model default).
         self.assertEqual(dep_profile.status, MemberStatus.PENDING)
+
+
+class ClientMigrationMergeTest(TestCase):
+    """merge_migrated_client: consolidate a Unite Us person-migration duplicate
+    (old id has our service state; new id has the imported cases) onto the NEW
+    surviving client, reconciling enrollment.client == enrollment.case.client."""
+
+    def test_merge_moves_service_state_and_reconciles_case_link(self):
+        from .models import (
+            Case, CaseStatus, CaseType, Client, ClientTag, EnrollmentStage,
+            EnrollmentVerification, Household, HouseholdMember,
+            MemberDietaryProfile, MemberStatus,
+        )
+        from .services.client_migration import merge_migrated_client, resolve_client
+
+        # OLD: our internal service state (enrollment + household + profile + tag).
+        old = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="AMALIA", last_name="TINSLEY",
+        )
+        old_hh = Household.objects.create(name="OLD HH")
+        HouseholdMember.objects.create(household=old_hh, client=old, is_primary=True)
+
+        # NEW (canonical): the imported cases live here.
+        new = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="AMALIA", last_name="TINSLEY",
+        )
+        new_hh = Household.objects.create(name="NEW HH")
+        HouseholdMember.objects.create(household=new_hh, client=new, is_primary=True)
+        case = Case.objects.create(
+            case_id=str(uuid.uuid4()), client=new, case_type=CaseType.INTERNAL_SERVICE,
+            case_status=CaseStatus.OPEN,
+        )
+        enr = EnrollmentVerification.objects.create(
+            client=old, household=old_hh, case=case, stage=EnrollmentStage.SERVICE_ACTIVE,
+        )
+        prof = MemberDietaryProfile.objects.create(
+            enrollment=enr, client=old, member_name="AMALIA TINSLEY",
+            status=MemberStatus.ACTIVE,
+        )
+        tag, _ = ClientTag.objects.get_or_create(name="Need Review")
+        old.tags.add(tag)
+        old_id = str(old.client_id)
+
+        summary = merge_migrated_client(old, new)
+        self.assertTrue(summary["merged"])
+
+        # Old client + its now-empty household are gone.
+        self.assertFalse(Client.objects.filter(client_id=old_id).exists())
+        self.assertFalse(Household.objects.filter(pk=old_hh.pk).exists())
+
+        # Enrollment moved onto NEW, re-homed under the survivor's household.
+        enr.refresh_from_db()
+        new.refresh_from_db()
+        self.assertEqual(str(enr.client_id), str(new.client_id))
+        self.assertEqual(enr.household_id, new.household_membership.household_id)
+        # THE CORE FIX: enrollment.client == enrollment.case.client again.
+        self.assertEqual(str(enr.client_id), str(enr.case.client_id))
+
+        # Member profile carried; tag unioned; alias stamped + resolvable.
+        prof.refresh_from_db()
+        self.assertEqual(str(prof.client_id), str(new.client_id))
+        self.assertTrue(new.tags.filter(name="Need Review").exists())
+        self.assertTrue(new.tags.filter(name="Migrated").exists())
+        self.assertEqual(new.migrated_from_id, old_id)
+        # A migration event is recorded on the survivor's timeline (old -> new).
+        from .models import TimelineEventType
+        ev = new.timeline_events.filter(event_type=TimelineEventType.CLIENT_MIGRATED).first()
+        self.assertIsNotNone(ev)
+        self.assertEqual(ev.metadata.get("old_id"), old_id)
+        self.assertEqual(ev.metadata.get("new_id"), str(new.client_id))
+        self.assertEqual(str(resolve_client(old_id).client_id), str(new.client_id))
+
+    def test_merge_is_noop_for_same_client(self):
+        from .models import Client
+        from .services.client_migration import merge_migrated_client
+
+        c = Client.objects.create(client_id=str(uuid.uuid4()), first_name="Solo")
+        out = merge_migrated_client(c, c)
+        self.assertFalse(out["merged"])
+
+
+class VerificationScopeOpenGoverningCaseTest(TestCase):
+    """The Verification page (require_internal_service_primary) is gated LIVE on
+    the household primary's OPEN internal-service (governing) case: when it
+    closes, the whole household -- primary AND dependents -- drops off, even if
+    verified."""
+
+    def _scope(self):
+        from .models import Client
+        from .portal.views_members import (
+            require_internal_service_primary, verification_scope_q,
+        )
+        ids = require_internal_service_primary(
+            Client.objects.filter(verification_scope_q())
+        ).distinct().values_list("client_id", flat=True)
+        return {str(i) for i in ids}
+
+    def test_household_drops_when_primary_governing_case_closes(self):
+        from .models import (
+            Case, CaseStatus, CaseType, Client, ClientStage, EnrollmentStage,
+            EnrollmentVerification, Household, HouseholdMember,
+        )
+
+        primary = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Prim", last_name="Ary",
+            lifecycle_stage=ClientStage.PENDING_VERIFICATION,
+        )
+        dep = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Dep", last_name="Endent",
+            lifecycle_stage=ClientStage.PENDING_VERIFICATION,
+        )
+        hh = Household.objects.create(name="HH")
+        HouseholdMember.objects.create(household=hh, client=primary, is_primary=True)
+        HouseholdMember.objects.create(household=hh, client=dep, is_primary=False)
+        case = Case.objects.create(
+            case_id=str(uuid.uuid4()), client=primary, case_type=CaseType.INTERNAL_SERVICE,
+            case_status=CaseStatus.OPEN,
+        )
+        # Verified household enrollment (so we also prove a VERIFIED client drops).
+        EnrollmentVerification.objects.create(
+            client=primary, household=hh, case=case, stage=EnrollmentStage.VERIFIED,
+            verified_at=timezone.now(),
+        )
+
+        # OPEN governing case -> both primary and dependent are on the page.
+        scope = self._scope()
+        self.assertIn(str(primary.client_id), scope)
+        self.assertIn(str(dep.client_id), scope)
+
+        # Close the primary's governing case -> the whole household drops.
+        case.case_status = CaseStatus.CLOSED
+        case.save(update_fields=["case_status"])
+        scope = self._scope()
+        self.assertNotIn(str(primary.client_id), scope)
+        self.assertNotIn(str(dep.client_id), scope)
+
+
+class WilliamsburgKitchenGuardTest(TestCase):
+    """Williamsburg lead-source households can only ever be served by the
+    Williamsburg kitchen: the assignment popup lists only that kitchen, and any
+    attempt to assign a different one is rejected."""
+
+    def test_options_restricted_and_assignment_guarded(self):
+        from .models import (
+            Client, EnrollmentStage, EnrollmentVerification, Household,
+            HouseholdMember, Kitchen, KitchenStatus, MemberDietaryProfile,
+            MemberStatus,
+        )
+        from .portal.views_members import assign_kitchen_to_household
+        from .services.kitchens import kitchen_options
+        from .services.williamsburg import WILLIAMSBURG_KITCHEN_NAME
+
+        wburg = Kitchen.objects.create(name=WILLIAMSBURG_KITCHEN_NAME, status=KitchenStatus.ACTIVE)
+        Kitchen.objects.create(name="Some Other Kitchen", status=KitchenStatus.ACTIVE)
+
+        c = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Willy", last_name="Burg",
+            is_williamsburg=True,
+        )
+        hh = Household.objects.create(name="HH")
+        HouseholdMember.objects.create(household=hh, client=c, is_primary=True)
+        enr = EnrollmentVerification.objects.create(
+            client=c, household=hh, stage=EnrollmentStage.KITCHEN_ASSIGNMENT,
+        )
+        MemberDietaryProfile.objects.create(
+            enrollment=enr, client=c, member_name="Willy Burg",
+            menu_type="Kosher", status=MemberStatus.ACTIVE,
+        )
+
+        # Popup lists ONLY the Williamsburg kitchen.
+        opts = kitchen_options(enr)
+        self.assertEqual({k["name"] for k in opts["kitchens"]}, {WILLIAMSBURG_KITCHEN_NAME})
+
+        # Assigning any other kitchen is rejected centrally.
+        other = Kitchen.objects.get(name="Some Other Kitchen")
+        with self.assertRaises(ValueError):
+            assign_kitchen_to_household(enr, c, other, cadence="mon_thu")
+
+        # A Williamsburg household NEVER appears in the bulk-assignment population
+        # (neither boxes nor meals) -- the single source both bulk flows use.
+        from .models import ProductTypeKind
+        from .portal.views_members import _awaiting_enrollments
+        for kind in (ProductTypeKind.MEALS, ProductTypeKind.BOXES):
+            ids = {e.client_id for e in _awaiting_enrollments(kind)}
+            self.assertNotIn(c.client_id, ids)
+
+
+class PausedHouseholdGoverningCaseSwitchTest(TestCase):
+    """A new governing case must NOT auto-resume a PAUSED (On Hold) household:
+    it stays On Hold and the client is flagged 'Need Review'."""
+
+    def _meals_case(self, client, *, opened_day):
+        from datetime import timedelta
+        from .models import Case, CaseStatus, CaseType, ServiceAuthorizationStatus
+
+        now = timezone.now()
+        return Case.objects.create(
+            case_id=str(uuid.uuid4()), client=client,
+            case_type=CaseType.INTERNAL_SERVICE, case_status=CaseStatus.OPEN,
+            service_authorization_status=ServiceAuthorizationStatus.APPROVED,
+            service_authorization_approval_starts_at=now,
+            service_authorization_approval_ends_at=now + timedelta(days=90),
+            program_name="Medically Tailored Meals",
+            case_created_at=now + timedelta(days=opened_day),
+            date_opened=now + timedelta(days=opened_day),
+        )
+
+    def test_case_switch_keeps_on_hold_and_flags_need_review(self):
+        from .models import (
+            Client, DeliveryCadence, EnrollmentStage, EnrollmentVerification,
+            Household, HouseholdMember, Kitchen, KitchenStatus,
+            MemberDeliverySchedule, MemberDietaryProfile, MemberStatus,
+            ScheduleStatus,
+        )
+        from .services.lifecycle import (
+            advance_enrollment, replace_enrollment_for_case_change,
+        )
+
+        client = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Hold", last_name="Ing",
+        )
+        hh = Household.objects.create(name="HH")
+        HouseholdMember.objects.create(household=hh, client=client, is_primary=True)
+        kitchen = Kitchen.objects.create(name="ENG", status=KitchenStatus.ACTIVE)
+        old_case = self._meals_case(client, opened_day=1)
+        live = EnrollmentVerification.objects.create(
+            client=client, household=hh, case=old_case, kitchen=kitchen,
+            stage=EnrollmentStage.SERVICE_ACTIVE, program_name="Medically Tailored Meals",
+            delivery_weekdays=["mon", "thu"], verified_at=timezone.now(),
+        )
+        member = MemberDietaryProfile.objects.create(
+            enrollment=live, client=client, member_name="Hold Ing",
+            menu_type="Standard", status=MemberStatus.ACTIVE,
+        )
+        MemberDeliverySchedule.objects.create(
+            enrollment=live, member_profile=member, member_name="Hold Ing",
+            delivery_days_cadence=DeliveryCadence.MON_THU, meals_per_day=3,
+            prod_per_delivery=0, meals_boxes_total=12, status=ScheduleStatus.SCHEDULED,
+        )
+        # Pause the household.
+        advance_enrollment(live, EnrollmentStage.ON_HOLD, force=True)
+
+        # New governing case switches in.
+        new_case = self._meals_case(client, opened_day=30)
+        new_enr = replace_enrollment_for_case_change(client, new_case)
+        enr = new_enr or live
+        enr.refresh_from_db()
+
+        # It must NOT have resumed to Service Active -- stays On Hold + flagged.
+        self.assertEqual(EnrollmentStage(enr.stage), EnrollmentStage.ON_HOLD)
+        self.assertTrue(client.tags.filter(name="Need Review").exists())
+
+
+class ResumeRevalidationTest(TestCase):
+    """Resume-from-On-Hold re-validates the CURRENT governing case: blocks with
+    no open case / invalid authorization, routes to Kitchen Assignment when the
+    kitchen can't serve, Service Active when it can, and Pending Verification when
+    never verified -- recording every check + the reason on the resume event."""
+
+    def setUp(self):
+        self.agent = Agent.objects.create(name="Res", agent_code="944", group="CS")
+        access = AccessToken()
+        access["agent_id"] = str(self.agent.id)
+        access["agent_code"] = self.agent.agent_code
+        access["agent_name"] = self.agent.name
+        access["agent_group"] = self.agent.group
+        self.api = APIClient()
+        self.api.credentials(HTTP_AUTHORIZATION=f"Bearer {access}")
+
+    def _held(self, *, verified=True, with_case=True, ends_days=90,
+              with_kitchen=True, held_from=None):
+        from datetime import timedelta
+        from .models import (
+            Case, CaseStatus, CaseType, Client, EnrollmentStage,
+            EnrollmentVerification, Household, HouseholdMember, Kitchen,
+            KitchenStatus, ServiceAuthorizationStatus,
+        )
+        from .services.lifecycle import advance_enrollment
+
+        now = timezone.now()
+        held_from = held_from or EnrollmentStage.SERVICE_ACTIVE
+        client = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="R", last_name="M",
+        )
+        hh = Household.objects.create(name="HH")
+        HouseholdMember.objects.create(household=hh, client=client, is_primary=True)
+        case = None
+        if with_case:
+            case = Case.objects.create(
+                case_id=str(uuid.uuid4()), client=client,
+                case_type=CaseType.INTERNAL_SERVICE, case_status=CaseStatus.OPEN,
+                service_authorization_status=ServiceAuthorizationStatus.APPROVED,
+                service_authorization_approval_starts_at=now - timedelta(days=1),
+                service_authorization_approval_ends_at=now + timedelta(days=ends_days),
+            )
+        kitchen = (
+            Kitchen.objects.create(name="ENG", status=KitchenStatus.ACTIVE)
+            if with_kitchen else None
+        )
+        enr = EnrollmentVerification.objects.create(
+            client=client, household=hh, case=case, kitchen=kitchen,
+            stage=held_from, verified_at=(now if verified else None),
+        )
+        advance_enrollment(enr, EnrollmentStage.ON_HOLD, force=True)
+        enr.refresh_from_db()
+        return client, enr
+
+    def _resume(self, client):
+        return self.api.post(
+            f"/api/portal/members/{client.client_id}/resume/",
+            {"reason": "agent note"}, format="json",
+        )
+
+    def test_unverified_resumes_to_pending_verification(self):
+        from .models import EnrollmentStage
+        client, enr = self._held(verified=False)
+        resp = self._resume(client)
+        self.assertEqual(resp.status_code, 200, resp.content)
+        enr.refresh_from_db()
+        self.assertEqual(EnrollmentStage(enr.stage), EnrollmentStage.PENDING_VERIFICATION)
+
+    def test_no_open_case_blocks(self):
+        from .models import EnrollmentStage
+        client, enr = self._held(with_case=False)
+        resp = self._resume(client)
+        self.assertEqual(resp.status_code, 400, resp.content)
+        enr.refresh_from_db()
+        self.assertEqual(EnrollmentStage(enr.stage), EnrollmentStage.ON_HOLD)
+
+    def test_expired_authorization_blocks(self):
+        from .models import EnrollmentStage
+        client, enr = self._held(ends_days=-1)  # window ended yesterday
+        resp = self._resume(client)
+        self.assertEqual(resp.status_code, 400, resp.content)
+        enr.refresh_from_db()
+        self.assertEqual(EnrollmentStage(enr.stage), EnrollmentStage.ON_HOLD)
+
+    def test_kitchen_cannot_serve_goes_to_kitchen_assignment(self):
+        from .models import EnrollmentStage
+        client, enr = self._held(with_kitchen=False)
+        resp = self._resume(client)
+        self.assertEqual(resp.status_code, 200, resp.content)
+        enr.refresh_from_db()
+        self.assertEqual(EnrollmentStage(enr.stage), EnrollmentStage.KITCHEN_ASSIGNMENT)
+
+    def test_kitchen_serves_resumes_active_and_records_checks(self):
+        from .models import EnrollmentStage, StageEvent
+        client, enr = self._held(with_kitchen=True)
+        resp = self._resume(client)
+        self.assertEqual(resp.status_code, 200, resp.content)
+        enr.refresh_from_db()
+        self.assertEqual(EnrollmentStage(enr.stage), EnrollmentStage.SERVICE_ACTIVE)
+        ev = (
+            StageEvent.objects.filter(
+                enrollment=enr, to_stage=EnrollmentStage.SERVICE_ACTIVE
+            )
+            .order_by("-entered_at")
+            .first()
+        )
+        self.assertIsNotNone(ev)
+        self.assertEqual(ev.metadata.get("resume_reason"), "agent note")
+        self.assertTrue(ev.metadata.get("resume_checks", {}).get("kitchen_can_serve"))
+        self.assertTrue(ev.metadata.get("resume_checks", {}).get("authorization_valid"))

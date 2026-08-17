@@ -401,9 +401,20 @@ class ClientSerializer(serializers.ModelSerializer):
                 (validated_data.get("lead_source") or "").strip().lower() == "williamsburg"
             )
 
-        client, _ = Client.objects.update_or_create(
-            client_id=client_id, defaults=validated_data
-        )
+        # Unite Us person-migration guard: if this incoming id was already
+        # migrated away to a surviving canonical client, write to the SURVIVOR
+        # instead of resurrecting the retired id (which would recreate the
+        # duplicate we just merged).
+        survivor = Client.objects.filter(migrated_from_id=str(client_id)).first()
+        if survivor is not None:
+            for k, v in validated_data.items():
+                setattr(survivor, k, v)
+            survivor.save()
+            client = survivor
+        else:
+            client, _ = Client.objects.update_or_create(
+                client_id=client_id, defaults=validated_data
+            )
 
         # Mirror the ext's single Client.client_phone_number into the ClientPhone
         # table (what the member-profile "Phone Numbers" widget + caller-ID read),
