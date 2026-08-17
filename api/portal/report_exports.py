@@ -306,11 +306,13 @@ def members_verified_rows(params):
     been verified (``verified_at`` set on a governing enrollment,
     ``verification_completed_q``).
 
-    Same columns as the Pending export, but the date window filters on the
-    VERIFICATION date -- the governing enrollment's ``verified_at`` (own or
-    household), via ``verified_from`` / ``verified_to`` -- NOT the case-created
-    date."""
+    ONE ROW PER HOUSEHOLD -- the client shown is the household PRIMARY (dependents
+    are not listed separately). The date window filters on the VERIFICATION date
+    -- the governing enrollment's ``verified_at`` (own or household), via
+    ``verified_from`` / ``verified_to`` -- NOT the case-created date. A
+    ``Verified Date`` column carries that verification-completed date."""
     from ..models import Client
+    from .serializers import active_enrollment
     from .views_members import (
         _parse_date, apply_enrollment_date_filter,
         require_internal_service_primary, verification_completed_q,
@@ -320,17 +322,31 @@ def members_verified_rows(params):
     verified_from = _parse_date(params.get("verified_from"))
     verified_to = _parse_date(params.get("verified_to"))
 
+    # One row per household: keep only the household PRIMARY (the case/enrollment
+    # holder). require_internal_service_primary already scopes to households whose
+    # primary holds an open governing case.
     qs = require_internal_service_primary(
-        Client.objects.filter(verification_completed_q())
+        Client.objects.filter(
+            verification_completed_q(), household_membership__is_primary=True,
+        )
     )
     qs = apply_enrollment_date_filter(qs, "verified_at", verified_from, verified_to)
     qs = (
         qs.distinct()
-        .prefetch_related("cases", "phones")
+        .prefetch_related("cases", "phones", "enrollments")
         .order_by("last_name", "first_name")
     )
 
-    yield ["Client ID", "First Name", "Last Name", "Phone Numbers", "Case Created"]
+    def _verified_at(client):
+        """The governing enrollment's verification-completed date (falls back to
+        the latest verified_at across the client's enrollments)."""
+        enr = active_enrollment(client)
+        if enr is not None and enr.verified_at:
+            return enr.verified_at
+        stamps = [e.verified_at for e in client.enrollments.all() if e.verified_at]
+        return max(stamps) if stamps else None
+
+    yield ["Client ID", "First Name", "Last Name", "Phone Numbers", "Case Created", "Verified Date"]
     for client in qs.iterator(chunk_size=1000):
         gc = _governing_internal_case(client)
         yield [
@@ -339,6 +355,7 @@ def members_verified_rows(params):
             client.last_name or "",
             _client_phone_numbers(client),
             _date_str(getattr(gc, "date_opened", None) if gc is not None else None),
+            _date_str(_verified_at(client)),
         ]
 
 
