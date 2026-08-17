@@ -306,23 +306,24 @@ def members_verified_rows(params):
     been verified (``verified_at`` set on a governing enrollment,
     ``verification_completed_q``).
 
-    Same columns + same case-created date window (governing internal-service
-    case ``date_opened``, via ``apply_case_created_date_filter``) as the Pending
-    export."""
+    Same columns as the Pending export, but the date window filters on the
+    VERIFICATION date -- the governing enrollment's ``verified_at`` (own or
+    household), via ``verified_from`` / ``verified_to`` -- NOT the case-created
+    date."""
     from ..models import Client
     from .views_members import (
-        _parse_date, apply_case_created_date_filter,
+        _parse_date, apply_enrollment_date_filter,
         require_internal_service_primary, verification_completed_q,
     )
     from .views_reports import _client_phone_numbers, _date_str
 
-    created_from = _parse_date(params.get("created_from"))
-    created_to = _parse_date(params.get("created_to"))
+    verified_from = _parse_date(params.get("verified_from"))
+    verified_to = _parse_date(params.get("verified_to"))
 
     qs = require_internal_service_primary(
         Client.objects.filter(verification_completed_q())
     )
-    qs = apply_case_created_date_filter(qs, created_from, created_to)
+    qs = apply_enrollment_date_filter(qs, "verified_at", verified_from, verified_to)
     qs = (
         qs.distinct()
         .prefetch_related("cases", "phones")
