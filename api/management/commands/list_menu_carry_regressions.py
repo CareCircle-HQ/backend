@@ -13,6 +13,15 @@ from django.core.management.base import BaseCommand
 from api.models import EnrollmentVerification
 
 
+# The bug reset a placeholder survivor to the DEFAULT menu, dropping the verified
+# source's SPECIAL menu -- so ONLY "special -> Standard/blank" is a regression.
+_DEFAULT_MENUS = {"", "standard"}
+
+
+def _is_default_menu(menu):
+    return (menu or "").strip().lower() in _DEFAULT_MENUS
+
+
 class Command(BaseCommand):
     help = (
         "Print client IDs whose verified menu/dietary was reset by a "
@@ -46,12 +55,16 @@ class Command(BaseCommand):
                     continue
                 om = (po.menu_type or "").strip()
                 nm = (pn.menu_type or "").strip()
-                if om and om.lower() != nm.lower():
-                    affected.setdefault(str(pn.client_id), []).append(
-                        (om, nm or "(blank)", e_old.pk, e_new.pk)
-                    )
-                    key = (om, nm or "(blank)")
-                    transitions[key] = transitions.get(key, 0) + 1
+                # Regression ONLY: verified source had a SPECIAL menu and the
+                # survivor was reset to the DEFAULT (Standard/blank). The reverse
+                # + special->special are legitimate menu changes, not the bug.
+                if _is_default_menu(om) or not _is_default_menu(nm):
+                    continue
+                affected.setdefault(str(pn.client_id), []).append(
+                    (om, nm or "(blank)", e_old.pk, e_new.pk)
+                )
+                key = (om, nm or "(blank)")
+                transitions[key] = transitions.get(key, 0) + 1
 
         # Columns: client_id, CURRENT menu type (the survivor/new enrollment --
         # what the member has now) and the OLD menu type (from the closed/old
