@@ -687,17 +687,25 @@ _STAGE_TIMELINE = {
 }
 
 
-def stage_timeline_fields(stage, *, from_stage=None):
+def stage_timeline_fields(stage, *, from_stage=None, trigger=""):
     """(event_type, title) for an enrollment stage. ``from_stage`` lets a
     transition read more naturally (e.g. resuming from hold = 'Service Resumed',
-    which is its own granular event type). Returns None when the stage is
-    unknown."""
+    which is its own granular event type). ``trigger`` distinguishes a carried
+    transition from a genuine one. Returns None when the stage is unknown."""
     try:
         stage = EnrollmentStage(stage)
     except ValueError:
         return None
     if stage == EnrollmentStage.SERVICE_ACTIVE and from_stage == EnrollmentStage.ON_HOLD:
         return TimelineEventType.SERVICE_RESUMED, "Service Resumed"
+    # A governing-case replacement CARRIES the household's existing verification
+    # onto the new/reused enrollment -- it is NOT a fresh verification, so label
+    # it as a carry-over (keeps the VERIFICATION_COMPLETED type for filtering).
+    if stage == EnrollmentStage.VERIFIED and trigger == "case_replaced":
+        return (
+            TimelineEventType.VERIFICATION_COMPLETED,
+            "Verification Data Carried over new enrollment",
+        )
     return _STAGE_TIMELINE.get(stage, (TimelineEventType.VERIFICATION, stage.label))
 
 
@@ -760,8 +768,12 @@ def event_for_verification(enrollment, *, stage_event=None, source=ChangeSource.
     except ValueError:
         label = (enrollment.stage or "").replace("_", " ").title()
     from_stage = stage_event.from_stage if stage_event is not None else None
-    fields = stage_timeline_fields(enrollment.stage, from_stage=from_stage)
+    eff_trigger = trigger or ((stage_event.metadata or {}).get("trigger", "") if stage_event is not None else "")
+    fields = stage_timeline_fields(enrollment.stage, from_stage=from_stage, trigger=eff_trigger)
     event_type, title = fields if fields else (TimelineEventType.VERIFICATION, label or "Verification")
+    carried_verification = (
+        enrollment.stage == EnrollmentStage.VERIFIED and eff_trigger == "case_replaced"
+    )
     tone = _VERIFICATION_STAGE_TONE.get(enrollment.stage, TimelineBadgeTone.NEUTRAL)
     dedupe = f"verification_stage:{stage_event.pk}" if stage_event is not None else ""
     # For an off-ramp (Disregarded / Cancelled / Closed), surface the agent's
@@ -780,6 +792,23 @@ def event_for_verification(enrollment, *, stage_event=None, source=ChangeSource.
     note = stage_event.note if stage_event is not None else ""
     if enrollment.stage in _REASON_STAGES and note:
         subtitle = note
+    # Carried verification: spell out WHY the household reads verified on this new
+    # enrollment (the capture was carried from the superseded one, not re-done),
+    # naming BOTH governing cases involved in the switch.
+    carried_from_case = ""
+    carried_to_case = str(enrollment.case_id) if enrollment.case_id else ""
+    if carried_verification:
+        old = getattr(enrollment, "supersedes", None)
+        ctx = (getattr(old, "close_context", None) or {}) if old is not None else {}
+        carried_from_case = str(
+            ctx.get("previous_case_id") or (getattr(old, "case_id", "") or "") or ""
+        )
+        carried_to_case = carried_to_case or str(ctx.get("new_case_id") or "")
+        subtitle = (
+            "Verification data carried from the previous enrollment during a "
+            f"governing-case change (case {carried_from_case or 'n/a'} \u2192 "
+            f"{carried_to_case or 'n/a'}); not a new verification."
+        )
 
     def _stage_label(value):
         if not value:
@@ -809,6 +838,11 @@ def event_for_verification(enrollment, *, stage_event=None, source=ChangeSource.
         # on the request / disregard).
         "members": _enrollment_member_names(enrollment),
     }
+    # On a carried verification, record BOTH governing cases (previous -> new) so
+    # the history shows exactly which case switch carried the verification.
+    if carried_verification:
+        metadata["carried_from_case_id"] = carried_from_case
+        metadata["carried_to_case_id"] = carried_to_case
     return emit_timeline_event(
         client=client,
         event_type=event_type,
