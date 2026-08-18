@@ -1335,6 +1335,9 @@ class MembersListView(PortalGenericAPIView):
                 | Q(last_name__icontains=search)
                 | Q(insurances__external_member_id__icontains=search)  # Medicaid ID
                 | Q(client_email_address__icontains=search)            # email
+                # Old (migrated-from) Unite Us id: find a merged client by the
+                # prior person id it was migrated from (partial or full).
+                | Q(migrated_from_id__icontains=search)
                 # Member address (any type stored on the client profile) ...
                 | Q(addresses__street__icontains=search)
                 | Q(addresses__city__icontains=search)
@@ -1426,6 +1429,12 @@ class MembersListView(PortalGenericAPIView):
             # Care Management tabs: the meal/box pipeline population, split into
             # mutually-exclusive tabs (a household shows in the FIRST tab it
             # matches). ``tab`` selects which one.
+            #
+            # Exclude finished households whose GOVERNING internal-service case is
+            # CLOSED/CANCELLED -- mirrors the Verification / Urgent-Care open-case
+            # gate (require_internal_service_primary), so a closed case never
+            # lingers on any Care Management tab (incl. Out of Range).
+            qs = require_internal_service_primary(qs)
             #
             # "No Cadence" is a special, kitchen-scoped tab (NOT part of the
             # mutual-exclusion set): pick a kitchen, see everyone assigned to it
@@ -3057,8 +3066,12 @@ class CareManagementTabCountsView(PortalAPIView):
     DISTINCT members in that tab AFTER mutual exclusion (so tabs never overlap)."""
 
     def get(self, request):
+        # Same open-governing-case gate as the list: a CLOSED internal-service
+        # case (finished household) is excluded from every tab count.
         base = annotate_care_management(
-            Client.objects.filter(care_management_base_q()).distinct()
+            require_internal_service_primary(
+                Client.objects.filter(care_management_base_q())
+            ).distinct()
         )
         return Response({
             "tabs": [

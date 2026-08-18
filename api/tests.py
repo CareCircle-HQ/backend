@@ -1171,6 +1171,63 @@ class CareManagementRejectedCaseGoverningTest(TestCase):
         self.assertNotIn(str(c.client_id), self._rejected_ids())
 
 
+class CareManagementClosedCaseExclusionTest(TestCase):
+    """The Care Management page (all tabs, incl. Out of Range) excludes a member
+    whose governing internal-service case is CLOSED -- the household finished
+    service and should drop off the queue."""
+
+    def _api(self):
+        from rest_framework.test import APIClient
+        from rest_framework_simplejwt.tokens import AccessToken
+
+        from .models import Agent
+        a = Agent.objects.create(name="CM", agent_code="951", group="Management")
+        acc = AccessToken()
+        acc["agent_id"] = str(a.id); acc["agent_code"] = a.agent_code
+        acc["agent_name"] = a.name; acc["agent_group"] = a.group
+        api = APIClient(); api.credentials(HTTP_AUTHORIZATION=f"Bearer {acc}")
+        return api
+
+    def _oor_member(self, first, *, case_status):
+        from .models import (
+            Case, CaseStatus, CaseType, Client, ClientStage, Household,
+            HouseholdMember,
+        )
+        from .services.service_area import SERVICE_AREA_REASON
+
+        c = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name=first, last_name="Oor",
+            lifecycle_stage=ClientStage.INELIGIBLE,
+            ineligible_reasons=[SERVICE_AREA_REASON],
+        )
+        hh = Household.objects.create(name=f"{first} HH")
+        HouseholdMember.objects.create(household=hh, client=c, is_primary=True)
+        Case.objects.create(
+            case_id=str(uuid.uuid4()), client=c, case_type=CaseType.INTERNAL_SERVICE,
+            case_status=case_status,
+        )
+        return c
+
+    def _ids(self, resp):
+        out = set()
+        for g in resp.json()["results"]:
+            out.add(g["primary"]["id"])
+            out.update(m["id"] for m in g.get("members", []))
+        return out
+
+    def test_out_of_range_excludes_closed_governing_case(self):
+        from .models import CaseStatus
+
+        api = self._api()
+        openc = self._oor_member("Opal", case_status=CaseStatus.OPEN)
+        closed = self._oor_member("Clyde", case_status=CaseStatus.CLOSED)
+        ids = self._ids(
+            api.get("/api/portal/members/?scope=care_management&tab=out_of_range")
+        )
+        self.assertIn(str(openc.client_id), ids)      # open case -> shown
+        self.assertNotIn(str(closed.client_id), ids)  # closed case -> excluded
+
+
 class MemberHouseholdAddressTimelineTest(TestCase):
     """PATCH /members/<id>/household/ must log a Delivery Address Changed event
     on the timeline of the member whose profile the agent is viewing -- including
@@ -13910,6 +13967,21 @@ class MemberSearchExpandedTest(TestCase):
         # a non-matching query does not return them
         self.assertNotIn(cid, self._ids(api.get("/api/portal/members/?search=Nonexistent Zzz")))
 
+    def test_search_by_migrated_from_old_id(self):
+        # A merged client is findable by the OLD Unite Us id it was migrated from
+        # (full or partial), not just its current client_id.
+        api = self._api()
+        old_id = str(uuid.uuid4())
+        c = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Mig", last_name="Rated",
+            migrated_from_id=old_id,
+        )
+        cid = str(c.client_id)
+        self.assertIn(cid, self._ids(api.get(f"/api/portal/members/?search={old_id}")))
+        self.assertIn(cid, self._ids(api.get(f"/api/portal/members/?search={old_id[:8]}")))
+        # an unrelated old id doesn't match
+        self.assertNotIn(cid, self._ids(api.get(f"/api/portal/members/?search={uuid.uuid4()}")))
+
 
 class NoteAuthorFallbackTest(TestCase):
     """A note with no recorded author shows its SOURCE label, not a blank the UI
@@ -16707,3 +16779,220 @@ class CaseSwitchDietaryCarryTest(TestCase):
         # A genuine verification keeps the normal label.
         _et, title2 = stage_timeline_fields(EnrollmentStage.VERIFIED)
         self.assertEqual(title2, "Verification Completed")
+
+
+class SplitHouseholdPendingLeakTest(TestCase):
+    """A member with their OWN live (verified) enrollment must NOT read as Pending
+    Verification because a household-mate (split into their own case) has a pending
+    enrollment. A TRUE dependent (no own enrollment) still inherits the household's
+    pending so a shared verification moves everyone together."""
+
+    def test_verified_member_not_pending_due_to_sibling(self):
+        from .models import (
+            Client, EnrollmentStage, EnrollmentVerification, Household,
+            HouseholdMember,
+        )
+        from .services.lifecycle import governing_pending_enrollment
+
+        hh = Household.objects.create(name="HH")
+        a = Client.objects.create(client_id=str(uuid.uuid4()), first_name="Ann", last_name="V")
+        b = Client.objects.create(client_id=str(uuid.uuid4()), first_name="Bob", last_name="P")
+        HouseholdMember.objects.create(household=hh, client=a, is_primary=True)
+        HouseholdMember.objects.create(household=hh, client=b, is_primary=False)
+        # A: own verified + serving. B: own pending (split into their own case).
+        EnrollmentVerification.objects.create(
+            client=a, household=hh, stage=EnrollmentStage.SERVICE_ACTIVE,
+            verified_at=timezone.now(),
+        )
+        EnrollmentVerification.objects.create(
+            client=b, household=hh, stage=EnrollmentStage.PENDING_VERIFICATION,
+        )
+        self.assertIsNone(governing_pending_enrollment(a))       # not dragged pending by B
+        self.assertIsNotNone(governing_pending_enrollment(b))    # B is genuinely pending
+
+    def test_true_dependent_still_inherits_household_pending(self):
+        from .models import (
+            Client, EnrollmentStage, EnrollmentVerification, Household,
+            HouseholdMember,
+        )
+        from .services.lifecycle import governing_pending_enrollment
+
+        hh = Household.objects.create(name="HH")
+        p = Client.objects.create(client_id=str(uuid.uuid4()), first_name="Pri", last_name="M")
+        d = Client.objects.create(client_id=str(uuid.uuid4()), first_name="Dep", last_name="E")
+        HouseholdMember.objects.create(household=hh, client=p, is_primary=True)
+        HouseholdMember.objects.create(household=hh, client=d, is_primary=False)
+        # Shared household enrollment (on the primary), pending. Dependent d has
+        # NO own enrollment -> must still inherit the pending state.
+        EnrollmentVerification.objects.create(
+            client=p, household=hh, stage=EnrollmentStage.PENDING_VERIFICATION,
+        )
+        self.assertIsNotNone(governing_pending_enrollment(d))
+
+
+class MakePrimaryReHomesOrdersTest(TestCase):
+    """ensure_primary_of_own_household must re-home the member's PROTECT'd order
+    schedules with their enrollments and never delete a household that still
+    holds a relative's enrollment/orders (the ProtectedError regression)."""
+
+    def _order(self, enr, hh):
+        from .models import OrderSchedule
+        return OrderSchedule.objects.create(
+            enrollment=enr, household=hh, household_group_code="HG-TEST",
+        )
+
+    def test_reanchor_moves_orders_and_keeps_shared_household(self):
+        from .models import (
+            Client, EnrollmentStage, EnrollmentVerification, Household,
+            HouseholdMember, OrderSchedule,
+        )
+        from .serializers import ensure_primary_of_own_household
+
+        hh = Household.objects.create()
+        a = Client.objects.create(client_id=str(uuid.uuid4()), first_name="Ann", last_name="A")
+        b = Client.objects.create(client_id=str(uuid.uuid4()), first_name="Bob", last_name="B")
+        HouseholdMember.objects.create(household=hh, client=a, is_primary=False)
+        enr_a = EnrollmentVerification.objects.create(
+            client=a, household=hh, stage=EnrollmentStage.SERVICE_ACTIVE,
+        )
+        enr_b = EnrollmentVerification.objects.create(
+            client=b, household=hh, stage=EnrollmentStage.PENDING_VERIFICATION,
+        )
+        self._order(enr_a, hh)  # A's PROTECT'd order pins the old household open
+        self._order(enr_a, hh)
+
+        ensure_primary_of_own_household(a)  # must NOT raise ProtectedError
+
+        a.refresh_from_db()
+        new_hh = a.household_membership.household
+        self.assertTrue(a.household_membership.is_primary)
+        self.assertNotEqual(new_hh.pk, hh.pk)
+        # A's orders followed A to the new household.
+        self.assertEqual(OrderSchedule.objects.filter(household=new_hh).count(), 2)
+        # The old household is preserved because B's enrollment still lives there.
+        self.assertTrue(Household.objects.filter(pk=hh.pk).exists())
+        self.assertTrue(hh.enrollment_verifications.filter(pk=enr_b.pk).exists())
+
+    def test_reanchor_still_deletes_truly_empty_household(self):
+        from .models import (
+            Client, EnrollmentStage, EnrollmentVerification, Household,
+            HouseholdMember,
+        )
+        from .serializers import ensure_primary_of_own_household
+
+        hh = Household.objects.create()
+        a = Client.objects.create(client_id=str(uuid.uuid4()), first_name="Sol", last_name="O")
+        HouseholdMember.objects.create(household=hh, client=a, is_primary=False)
+        EnrollmentVerification.objects.create(
+            client=a, household=hh, stage=EnrollmentStage.SERVICE_ACTIVE,
+        )
+        ensure_primary_of_own_household(a)
+        # Nothing else lived in the old household -> it is cleaned up.
+        self.assertFalse(Household.objects.filter(pk=hh.pk).exists())
+
+
+class CaseReplacementReanchorsDependentTest(TestCase):
+    """A governing-case REPLACEMENT for a household DEPENDENT must re-anchor them
+    into their OWN household (the same end-state the verification wizard reaches),
+    while preserving the verification/kitchen/cadence/status carry that
+    replace_enrollment_for_case_change already performs."""
+
+    def _meals_case(self, client, *, opened_day):
+        from datetime import timedelta
+        from .models import Case, CaseStatus, CaseType, ServiceAuthorizationStatus
+        now = timezone.now()
+        return Case.objects.create(
+            case_id=str(uuid.uuid4()), client=client,
+            case_type=CaseType.INTERNAL_SERVICE, case_status=CaseStatus.OPEN,
+            service_authorization_status=ServiceAuthorizationStatus.APPROVED,
+            service_authorization_approval_starts_at=now,
+            service_authorization_approval_ends_at=now + timedelta(days=90),
+            program_name="Medically Tailored Meals",
+            case_created_at=now + timedelta(days=opened_day),
+            date_opened=now + timedelta(days=opened_day),
+        )
+
+    def test_dependent_reanchored_and_carry_preserved(self):
+        from .models import (
+            Client, DeliveryCadence, EnrollmentStage, EnrollmentVerification,
+            Household, HouseholdMember, Kitchen, KitchenStatus,
+            MemberDeliverySchedule, MemberDietaryProfile, MemberStatus,
+            OrderSchedule, ScheduleStatus,
+        )
+        from .services.lifecycle import replace_enrollment_for_case_change
+
+        hh = Household.objects.create(name="Shared")
+        primary = Client.objects.create(client_id=str(uuid.uuid4()), first_name="Pri", last_name="M")
+        dep = Client.objects.create(client_id=str(uuid.uuid4()), first_name="Dep", last_name="E")
+        HouseholdMember.objects.create(household=hh, client=primary, is_primary=True)
+        HouseholdMember.objects.create(household=hh, client=dep, is_primary=False)
+        kitchen = Kitchen.objects.create(name="ENG", status=KitchenStatus.ACTIVE)
+        old_case = self._meals_case(dep, opened_day=1)
+        live = EnrollmentVerification.objects.create(
+            client=dep, household=hh, case=old_case, kitchen=kitchen,
+            stage=EnrollmentStage.SERVICE_ACTIVE, program_name="Medically Tailored Meals",
+            delivery_weekdays=["mon", "thu"], verified_at=timezone.now(),
+        )
+        prof = MemberDietaryProfile.objects.create(
+            enrollment=live, client=dep, member_name="Dep E",
+            menu_type="Standard", status=MemberStatus.ACTIVE,
+        )
+        MemberDeliverySchedule.objects.create(
+            enrollment=live, member_profile=prof, member_name="Dep E",
+            delivery_days_cadence=DeliveryCadence.MON_THU, meals_per_day=3,
+            prod_per_delivery=0, meals_boxes_total=12, status=ScheduleStatus.SCHEDULED,
+        )
+        OrderSchedule.objects.create(enrollment=live, household=hh, household_group_code="HG-X")
+        new_case = self._meals_case(dep, opened_day=30)
+
+        new_enr = replace_enrollment_for_case_change(dep, new_case)
+        self.assertIsNotNone(new_enr)
+        new_enr.refresh_from_db()
+
+        # Carry preserved.
+        self.assertEqual(str(new_enr.case_id), str(new_case.case_id))
+        self.assertIsNotNone(new_enr.verified_at)
+        self.assertEqual(EnrollmentStage(new_enr.stage), EnrollmentStage.SERVICE_ACTIVE)
+        self.assertEqual(new_enr.kitchen_id, kitchen.pk)
+
+        # Re-anchored into their own household; orders + enrollment followed.
+        dep.refresh_from_db()
+        mem = dep.household_membership
+        self.assertTrue(mem.is_primary)
+        self.assertNotEqual(mem.household_id, hh.pk)
+        self.assertEqual(new_enr.household_id, mem.household_id)
+        self.assertEqual(OrderSchedule.objects.filter(household=mem.household).count(), 1)
+        # Shared household preserved (its real primary is untouched).
+        self.assertTrue(Household.objects.filter(pk=hh.pk).exists())
+        self.assertTrue(
+            HouseholdMember.objects.filter(client=primary, household=hh, is_primary=True).exists()
+        )
+
+    def test_primary_client_replacement_is_not_reanchored(self):
+        from .models import (
+            Client, EnrollmentStage, EnrollmentVerification, Household,
+            HouseholdMember, Kitchen, KitchenStatus, MemberDietaryProfile,
+            MemberStatus,
+        )
+        from .services.lifecycle import replace_enrollment_for_case_change
+
+        hh = Household.objects.create(name="Own")
+        c = Client.objects.create(client_id=str(uuid.uuid4()), first_name="Pri", last_name="Solo")
+        HouseholdMember.objects.create(household=hh, client=c, is_primary=True)
+        kitchen = Kitchen.objects.create(name="ENG2", status=KitchenStatus.ACTIVE)
+        old_case = self._meals_case(c, opened_day=1)
+        live = EnrollmentVerification.objects.create(
+            client=c, household=hh, case=old_case, kitchen=kitchen,
+            stage=EnrollmentStage.SERVICE_ACTIVE, program_name="Medically Tailored Meals",
+            delivery_weekdays=["mon", "thu"], verified_at=timezone.now(),
+        )
+        MemberDietaryProfile.objects.create(
+            enrollment=live, client=c, member_name="Pri Solo",
+            menu_type="Standard", status=MemberStatus.ACTIVE,
+        )
+        new_case = self._meals_case(c, opened_day=30)
+        new_enr = replace_enrollment_for_case_change(c, new_case)
+        self.assertIsNotNone(new_enr)
+        c.refresh_from_db()
+        # Already primary -> stays in the same household (no-op re-anchor).
+        self.assertEqual(c.household_membership.household_id, hh.pk)

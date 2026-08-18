@@ -384,6 +384,12 @@ def governing_pending_enrollment(client):
     -- e.g. disregarding a request -- must target whichever governing enrollment
     is actually pending. When more than one qualifies, the most recently
     requested/updated wins.
+
+    Split-household guard: once a member holds their OWN live enrollment (a
+    dependent split into their own case), a HOUSEHOLD-MATE's individual pending
+    enrollment must NOT mark them pending -- their own (verified) enrollment
+    governs them. Household inheritance still applies to a TRUE dependent (no own
+    live enrollment) so a shared verification keeps moving everyone together.
     """
     candidates = [
         e
@@ -391,6 +397,21 @@ def governing_pending_enrollment(client):
         if e.verified_at is None
         and EnrollmentStage(e.stage) == EnrollmentStage.PENDING_VERIFICATION
     ]
+    if not candidates:
+        return None
+    # A member who is themselves an enrollment holder (has their OWN live
+    # enrollment) is governed by their own enrollment -- ignore a household-mate's
+    # separate-case pending row (the split-household leak).
+    own_live = any(
+        EnrollmentStage(e.stage) not in _TERMINAL_STAGES
+        and EnrollmentStage(e.stage) not in (
+            EnrollmentStage.DISREGARDED, EnrollmentStage.SCHEDULED_EXTENSION,
+        )
+        for e in client.enrollments.all()
+    )
+    if own_live:
+        own = [e for e in candidates if str(e.client_id) == str(client.pk)]
+        candidates = own or []
     if not candidates:
         return None
     return max(candidates, key=lambda e: e.stage_at or e.opened_at)
@@ -3539,12 +3560,16 @@ def replace_enrollment_for_case_change(
         CaseHouseholdType,
         EnrollmentStage,
         EnrollmentVerification,
+        HouseholdMember,
         KitchenProductType,
         MemberDietaryProfile,
         ProductTypeKind,
         ServiceAuthorizationStatus,
     )
-    from api.serializers import derive_household_type
+    from api.serializers import (
+        derive_household_type,
+        ensure_primary_of_own_household,
+    )
     from api.services.catalog import product_type_kind_for_name
     from api.services.orders import (
         rebuild_delivery_calendar,
@@ -3800,6 +3825,29 @@ def replace_enrollment_for_case_change(
             ),
             author_name=author,
         )
+
+        # Re-anchor a DEPENDENT. A case switch forks the new enrollment onto the
+        # relative's (shared) household while the member stays a non-primary
+        # roster row -- leaving them "mis-anchored": their own verified/serving
+        # enrollment living on someone else's household. Split them into their
+        # OWN household now (the same end-state the verification wizard reaches
+        # via split_dependent_into_own_enrollment). The verification / dietary /
+        # clinical / kitchen / cadence / nutritionist / status carry above is
+        # left UNTOUCHED; this only moves the household anchor (the client's
+        # enrollments + their order schedules follow) and detaches the shared
+        # roster row. No-op for a primary or household-less client.
+        try:
+            holder = new_enrollment.client
+            membership = HouseholdMember.objects.filter(client=holder).first()
+            if membership is not None and not membership.is_primary:
+                ensure_primary_of_own_household(holder)
+        except Exception:  # pragma: no cover - defensive
+            import logging
+
+            logging.getLogger(__name__).exception(
+                "dependent re-anchor after case replacement failed for %s",
+                getattr(new_enrollment, "pk", None),
+            )
 
         return new_enrollment
 

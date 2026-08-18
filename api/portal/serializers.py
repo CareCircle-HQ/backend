@@ -1103,12 +1103,18 @@ class MemberDetailSerializer(serializers.Serializer):
                 # True only while a PENDING verification request exists -- the
                 # sole state in which the "run verification" pop-up is offered.
                 "verification_pending": verification_pending(client),
-                # True once the household's active enrollment carries a nutritionist
-                # sign-off. Drives (its INVERSE) the member-profile "Nutritionist"
-                # intake button, which is hidden once approved.
+                # True once the household's active enrollment carries a GENUINE
+                # nutritionist sign-off -- both a decision date AND a reviewer.
+                # Drives (its INVERSE) the member-profile "Nutritionist" intake
+                # button, which is hidden once approved. A back-stamped /
+                # grandfathered approval (approved_at set, NO approved_by -- pre-gate
+                # members that were never actually reviewed) does NOT count, so the
+                # button still shows for them (matches the "Nutritionist Approved"
+                # status label, which also requires a reviewer).
                 "nutritionist_approved": bool(
                     active_enrollment(client)
                     and active_enrollment(client).nutritionist_approved_at
+                    and active_enrollment(client).nutritionist_approved_by_id
                 ),
                 # Drives the member-profile "Request Verification" button for a
                 # household DEPENDENT (non-primary member with their own internal-
