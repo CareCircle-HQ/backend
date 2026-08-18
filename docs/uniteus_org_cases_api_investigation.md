@@ -71,6 +71,19 @@ To get related DETAILS (person name/DOB, auth amount/dates, program name):
 - `filter[service_authorization.state]=approved,requested,denied` -- nested
   filter on the case's service authorization state.
 
+## Deep link to a case (built from the list, no detail fetch)
+
+Clicking a dashboard result navigates to:
+
+```
+https://app.uniteus.io/dashboard/cases/{open|closed|all}/{case_id}/contact/{person_id}
+```
+
+Both ids are already in the list row: `{case_id}` = `data[].id`, `{person_id}` =
+`data[].relationships.person.data.id`. So we can render a direct Unite Us link
+per case with nothing beyond the list response. (The `{open|closed|all}` segment
+mirrors the `has_outcome` tab.)
+
 ## Response shape (per case)
 
 ```json
