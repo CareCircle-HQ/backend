@@ -1805,8 +1805,11 @@ class MembersListView(PortalGenericAPIView):
         # reflects untouched outstanding work. Multi-valued join -> .distinct() below.
         ticket_type_val = (params.get("ticket_type") or "").strip()
         if ticket_type_val:
+            # Accept either the TicketType code ("kitchen_switch") or its display
+            # label ("Kitchen Switch"); both bind to the SAME open ticket row.
             qs = qs.filter(
-                tickets__type__code=ticket_type_val,
+                Q(tickets__type__code=ticket_type_val)
+                | Q(tickets__type__label__iexact=ticket_type_val),
                 tickets__status=TicketStatus.OPEN,
             )
 
@@ -1817,8 +1820,18 @@ class MembersListView(PortalGenericAPIView):
         # .distinct() below.
         cadence_val = (params.get("cadence") or "").strip()
         if cadence_val:
+            # Accept either the DeliveryCadence code ("mon_thu") or its label
+            # ("Mon/Thu"); the stored value is the code, so resolve a label first.
+            cadence_code = cadence_val
+            _codes = {c for c, _ in DeliveryCadence.choices}
+            if cadence_val not in _codes:
+                cadence_code = next(
+                    (c for c, lbl in DeliveryCadence.choices
+                     if lbl.lower() == cadence_val.lower()),
+                    cadence_val,
+                )
             qs = qs.filter(
-                member_profiles__delivery_schedules__delivery_days_cadence=cadence_val
+                member_profiles__delivery_schedules__delivery_days_cadence=cadence_code
             )
 
         # Team filter (Members page): keep members whose INTERNAL-SERVICE case
