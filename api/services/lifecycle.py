@@ -3560,12 +3560,16 @@ def replace_enrollment_for_case_change(
         CaseHouseholdType,
         EnrollmentStage,
         EnrollmentVerification,
+        HouseholdMember,
         KitchenProductType,
         MemberDietaryProfile,
         ProductTypeKind,
         ServiceAuthorizationStatus,
     )
-    from api.serializers import derive_household_type
+    from api.serializers import (
+        derive_household_type,
+        ensure_primary_of_own_household,
+    )
     from api.services.catalog import product_type_kind_for_name
     from api.services.orders import (
         rebuild_delivery_calendar,
@@ -3821,6 +3825,29 @@ def replace_enrollment_for_case_change(
             ),
             author_name=author,
         )
+
+        # Re-anchor a DEPENDENT. A case switch forks the new enrollment onto the
+        # relative's (shared) household while the member stays a non-primary
+        # roster row -- leaving them "mis-anchored": their own verified/serving
+        # enrollment living on someone else's household. Split them into their
+        # OWN household now (the same end-state the verification wizard reaches
+        # via split_dependent_into_own_enrollment). The verification / dietary /
+        # clinical / kitchen / cadence / nutritionist / status carry above is
+        # left UNTOUCHED; this only moves the household anchor (the client's
+        # enrollments + their order schedules follow) and detaches the shared
+        # roster row. No-op for a primary or household-less client.
+        try:
+            holder = new_enrollment.client
+            membership = HouseholdMember.objects.filter(client=holder).first()
+            if membership is not None and not membership.is_primary:
+                ensure_primary_of_own_household(holder)
+        except Exception:  # pragma: no cover - defensive
+            import logging
+
+            logging.getLogger(__name__).exception(
+                "dependent re-anchor after case replacement failed for %s",
+                getattr(new_enrollment, "pk", None),
+            )
 
         return new_enrollment
 

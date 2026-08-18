@@ -16889,3 +16889,110 @@ class MakePrimaryReHomesOrdersTest(TestCase):
         ensure_primary_of_own_household(a)
         # Nothing else lived in the old household -> it is cleaned up.
         self.assertFalse(Household.objects.filter(pk=hh.pk).exists())
+
+
+class CaseReplacementReanchorsDependentTest(TestCase):
+    """A governing-case REPLACEMENT for a household DEPENDENT must re-anchor them
+    into their OWN household (the same end-state the verification wizard reaches),
+    while preserving the verification/kitchen/cadence/status carry that
+    replace_enrollment_for_case_change already performs."""
+
+    def _meals_case(self, client, *, opened_day):
+        from datetime import timedelta
+        from .models import Case, CaseStatus, CaseType, ServiceAuthorizationStatus
+        now = timezone.now()
+        return Case.objects.create(
+            case_id=str(uuid.uuid4()), client=client,
+            case_type=CaseType.INTERNAL_SERVICE, case_status=CaseStatus.OPEN,
+            service_authorization_status=ServiceAuthorizationStatus.APPROVED,
+            service_authorization_approval_starts_at=now,
+            service_authorization_approval_ends_at=now + timedelta(days=90),
+            program_name="Medically Tailored Meals",
+            case_created_at=now + timedelta(days=opened_day),
+            date_opened=now + timedelta(days=opened_day),
+        )
+
+    def test_dependent_reanchored_and_carry_preserved(self):
+        from .models import (
+            Client, DeliveryCadence, EnrollmentStage, EnrollmentVerification,
+            Household, HouseholdMember, Kitchen, KitchenStatus,
+            MemberDeliverySchedule, MemberDietaryProfile, MemberStatus,
+            OrderSchedule, ScheduleStatus,
+        )
+        from .services.lifecycle import replace_enrollment_for_case_change
+
+        hh = Household.objects.create(name="Shared")
+        primary = Client.objects.create(client_id=str(uuid.uuid4()), first_name="Pri", last_name="M")
+        dep = Client.objects.create(client_id=str(uuid.uuid4()), first_name="Dep", last_name="E")
+        HouseholdMember.objects.create(household=hh, client=primary, is_primary=True)
+        HouseholdMember.objects.create(household=hh, client=dep, is_primary=False)
+        kitchen = Kitchen.objects.create(name="ENG", status=KitchenStatus.ACTIVE)
+        old_case = self._meals_case(dep, opened_day=1)
+        live = EnrollmentVerification.objects.create(
+            client=dep, household=hh, case=old_case, kitchen=kitchen,
+            stage=EnrollmentStage.SERVICE_ACTIVE, program_name="Medically Tailored Meals",
+            delivery_weekdays=["mon", "thu"], verified_at=timezone.now(),
+        )
+        prof = MemberDietaryProfile.objects.create(
+            enrollment=live, client=dep, member_name="Dep E",
+            menu_type="Standard", status=MemberStatus.ACTIVE,
+        )
+        MemberDeliverySchedule.objects.create(
+            enrollment=live, member_profile=prof, member_name="Dep E",
+            delivery_days_cadence=DeliveryCadence.MON_THU, meals_per_day=3,
+            prod_per_delivery=0, meals_boxes_total=12, status=ScheduleStatus.SCHEDULED,
+        )
+        OrderSchedule.objects.create(enrollment=live, household=hh, household_group_code="HG-X")
+        new_case = self._meals_case(dep, opened_day=30)
+
+        new_enr = replace_enrollment_for_case_change(dep, new_case)
+        self.assertIsNotNone(new_enr)
+        new_enr.refresh_from_db()
+
+        # Carry preserved.
+        self.assertEqual(str(new_enr.case_id), str(new_case.case_id))
+        self.assertIsNotNone(new_enr.verified_at)
+        self.assertEqual(EnrollmentStage(new_enr.stage), EnrollmentStage.SERVICE_ACTIVE)
+        self.assertEqual(new_enr.kitchen_id, kitchen.pk)
+
+        # Re-anchored into their own household; orders + enrollment followed.
+        dep.refresh_from_db()
+        mem = dep.household_membership
+        self.assertTrue(mem.is_primary)
+        self.assertNotEqual(mem.household_id, hh.pk)
+        self.assertEqual(new_enr.household_id, mem.household_id)
+        self.assertEqual(OrderSchedule.objects.filter(household=mem.household).count(), 1)
+        # Shared household preserved (its real primary is untouched).
+        self.assertTrue(Household.objects.filter(pk=hh.pk).exists())
+        self.assertTrue(
+            HouseholdMember.objects.filter(client=primary, household=hh, is_primary=True).exists()
+        )
+
+    def test_primary_client_replacement_is_not_reanchored(self):
+        from .models import (
+            Client, EnrollmentStage, EnrollmentVerification, Household,
+            HouseholdMember, Kitchen, KitchenStatus, MemberDietaryProfile,
+            MemberStatus,
+        )
+        from .services.lifecycle import replace_enrollment_for_case_change
+
+        hh = Household.objects.create(name="Own")
+        c = Client.objects.create(client_id=str(uuid.uuid4()), first_name="Pri", last_name="Solo")
+        HouseholdMember.objects.create(household=hh, client=c, is_primary=True)
+        kitchen = Kitchen.objects.create(name="ENG2", status=KitchenStatus.ACTIVE)
+        old_case = self._meals_case(c, opened_day=1)
+        live = EnrollmentVerification.objects.create(
+            client=c, household=hh, case=old_case, kitchen=kitchen,
+            stage=EnrollmentStage.SERVICE_ACTIVE, program_name="Medically Tailored Meals",
+            delivery_weekdays=["mon", "thu"], verified_at=timezone.now(),
+        )
+        MemberDietaryProfile.objects.create(
+            enrollment=live, client=c, member_name="Pri Solo",
+            menu_type="Standard", status=MemberStatus.ACTIVE,
+        )
+        new_case = self._meals_case(c, opened_day=30)
+        new_enr = replace_enrollment_for_case_change(c, new_case)
+        self.assertIsNotNone(new_enr)
+        c.refresh_from_db()
+        # Already primary -> stays in the same household (no-op re-anchor).
+        self.assertEqual(c.household_membership.household_id, hh.pk)
