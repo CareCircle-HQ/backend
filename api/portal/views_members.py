@@ -1315,6 +1315,28 @@ class VerifiersListView(PortalAPIView):
         )
 
 
+class TicketTypesListView(PortalAPIView):
+    """Ticket-type options for the Members-page ticket-type filter dropdown.
+    ``value`` == ``TicketType.code`` (matched by the ``ticket_type`` list
+    filter); ``label`` == its display label. Active types only."""
+
+    def get(self, request):
+        rows = TicketType.objects.filter(is_active=True).order_by("label")
+        return Response([{"value": t.code, "label": t.label} for t in rows])
+
+
+class CadencesListView(PortalAPIView):
+    """Delivery-cadence options for the Members-page cadence filter dropdown,
+    from the ``DeliveryCadence`` enum. ``value`` == the code stored on
+    ``MemberDeliverySchedule.delivery_days_cadence`` (what the ``cadence`` list
+    filter matches)."""
+
+    def get(self, request):
+        return Response(
+            [{"value": code, "label": label} for code, label in DeliveryCadence.choices]
+        )
+
+
 class MembersListView(PortalGenericAPIView):
     serializer_class = s.MemberListSerializer
 
@@ -1776,6 +1798,28 @@ class MembersListView(PortalGenericAPIView):
                     Q(member_profiles__food_allergies__contains=[code])
                     | Q(member_profiles__food_allergies__contains=[label])
                 )
+
+        # Ticket-type filter (Members page): keep members whose client has an
+        # ACTIVE (open / in-progress) follow-up ticket of the selected type.
+        # ``value`` == TicketType.code; RESOLVED tickets are excluded so the
+        # filter reflects outstanding work. Multi-valued join -> .distinct() below.
+        ticket_type_val = (params.get("ticket_type") or "").strip()
+        if ticket_type_val:
+            qs = qs.filter(
+                tickets__type__code=ticket_type_val,
+                tickets__status__in=[TicketStatus.OPEN, TicketStatus.IN_PROGRESS],
+            )
+
+        # Cadence filter (Members page): keep members whose delivery plan runs at
+        # the selected weekly cadence -- MemberDeliverySchedule.delivery_days_cadence
+        # (a DeliveryCadence code), matched on the member's own delivery schedules.
+        # A household surfaces when ANY member matches. Multi-valued join ->
+        # .distinct() below.
+        cadence_val = (params.get("cadence") or "").strip()
+        if cadence_val:
+            qs = qs.filter(
+                member_profiles__delivery_schedules__delivery_days_cadence=cadence_val
+            )
 
         # Team filter (Members page): keep members whose INTERNAL-SERVICE case
         # was CREATED by a Unite Us agent on the selected CareCircle originating
