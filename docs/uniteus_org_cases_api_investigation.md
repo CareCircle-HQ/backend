@@ -175,10 +175,22 @@ Two ways to enumerate "our clients":
    `relationships.person.data.id` per case -> dedupe = our client set. Add
    `include=person` to the cases call for inline person attributes, or
    `GET /people/<id>` for full detail. Cheapest; reuses the cases work.
-2. DEDICATED CONTACTS/PEOPLE LIST endpoint -- unconfirmed. If it exists it likely
-   mirrors `/cases` (`filter[provider]`, paging). TODO: capture the Contacts/
-   Clients dashboard request URL (DevTools -> Network, filter `people`/`contacts`)
-   to reveal the endpoint + its filters.
+2. DEDICATED CONTACTS/PEOPLE LIST endpoint -- CONFIRMED: there is NO provider-
+   scoped people master list. The `/dashboard/clients/all` page is itself DERIVED
+   FROM CASES: it takes the person ids from the (provider-scoped, filtered) cases
+   list and batch-hydrates them via:
+
+       GET https://core.uniteus.io/v1/people?filter[id]=<person_id,person_id,...>
+           &page[number]=1&page[size]=N
+
+   (observed `page[size]=34` == the number of ids fetched.) So `filter[id]` takes
+   a comma-separated id list (batch <= ~50 like the other comma filters; confirm
+   the exact cap). This is exactly how our derive-from-cases flow should hydrate
+   clients -> no separate clients-list exploration needed.
+
+Canonical clients flow (confirmed): cases sweep -> dedupe `person.data.id` ->
+`GET /people?filter[id]=<batch>` to hydrate full client records. (Single-person
+`GET /people/<id>` still exists; the batch form is `filter[id]`.)
 
 ## TODO (once the feature is defined)
 
