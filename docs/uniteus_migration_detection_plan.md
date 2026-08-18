@@ -108,6 +108,54 @@ Notes / edge cases:
 - Flip on after flag-only has run a few nights and the `Need Review` list looks
   correct.
 
+### 4. Org cases API sweep (efficient bulk detection for 12k)
+
+The dashboard `https://app.uniteus.io/dashboard/cases/open` is backed by an
+ORG-WIDE cases list on the core API. Verified from a live capture:
+
+```
+GET https://core.uniteus.io/v1/cases
+    ?filter[provider]=12706c81-03a1-4cdb-954a-579929cd05df   # our org (== cred.provider_id)
+    &filter[state]=managed,pending_authorization
+    &filter[has_outcome]=false            # Open (true = Closed; omit = All)
+    &filter[updated_after]=<ISO8601>      # incremental delta (nightly)
+    &filter[include_pathways]=false
+    &sort=opened_date&sort_direction=desc
+    &page[number]=N&page[size]=50
+```
+
+Why it matters: one paged stream returns EVERY org case with its
+`relationships.person.data.id`. Diff that against the client we store each
+`case_id` under -- if they differ, the person migrated (old = our stored client,
+new = `person.data.id`). ~12k cases / 50 = ~240 calls (or incremental via
+`updated_after`), instead of 12k per-member `get_person` probes.
+
+Extra narrowing filters (confirm exact param names + ids from a Network capture,
+or resolve via `/services` and `/employees`):
+- `filter[primary_worker]=b04da8b0-71d0-454c-9ec3-3b18c78b3a56` -- Elorr Arama
+  (`eascn@metcouncil.org`); all our cases are assigned to this worker. Fast/default
+  pass; DROP it for a periodic full sweep so unassigned/reassigned cases aren't
+  missed.
+- `filter[service]=<id...>` -- restrict to our food service types: Medically
+  Tailored Meals, Prepared Meals, Produce Prescription/Voucher (the internal-
+  service pipeline). Map the three names -> service ids first.
+
+Response notes:
+- `included[]` resolves related names in the same payload when requested via
+  `include=primary_worker,program,service` (employees expose `first_name`/
+  `last_name`, not `name`).
+- A CLOSED case stays `state=managed` with a non-null `closed_date` + an
+  `outcome`; `has_outcome` is the open/closed discriminator.
+- Pagination: `meta.page.total_pages`.
+
+Build when resuming:
+1. `UniteUsClient.list_org_cases(*, has_outcome=None, updated_after=None,
+   service_ids=None, primary_worker_id=None, state="managed,pending_authorization",
+   page=1, page_size=50)` using `cred.provider_id`.
+2. A reconcile that pages org cases and, per case, compares `person.data.id` to
+   our stored `Case.client_id`; a mismatch -> migration candidate fed through the
+   SAME gate (`identity_matches_for_merge`) + flag-only/auto-merge policy above.
+
 ## Relevant files
 
 - `api/services/client_migration.py` — merge + detection + gate helpers.
