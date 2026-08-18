@@ -16779,3 +16779,52 @@ class CaseSwitchDietaryCarryTest(TestCase):
         # A genuine verification keeps the normal label.
         _et, title2 = stage_timeline_fields(EnrollmentStage.VERIFIED)
         self.assertEqual(title2, "Verification Completed")
+
+
+class SplitHouseholdPendingLeakTest(TestCase):
+    """A member with their OWN live (verified) enrollment must NOT read as Pending
+    Verification because a household-mate (split into their own case) has a pending
+    enrollment. A TRUE dependent (no own enrollment) still inherits the household's
+    pending so a shared verification moves everyone together."""
+
+    def test_verified_member_not_pending_due_to_sibling(self):
+        from .models import (
+            Client, EnrollmentStage, EnrollmentVerification, Household,
+            HouseholdMember,
+        )
+        from .services.lifecycle import governing_pending_enrollment
+
+        hh = Household.objects.create(name="HH")
+        a = Client.objects.create(client_id=str(uuid.uuid4()), first_name="Ann", last_name="V")
+        b = Client.objects.create(client_id=str(uuid.uuid4()), first_name="Bob", last_name="P")
+        HouseholdMember.objects.create(household=hh, client=a, is_primary=True)
+        HouseholdMember.objects.create(household=hh, client=b, is_primary=False)
+        # A: own verified + serving. B: own pending (split into their own case).
+        EnrollmentVerification.objects.create(
+            client=a, household=hh, stage=EnrollmentStage.SERVICE_ACTIVE,
+            verified_at=timezone.now(),
+        )
+        EnrollmentVerification.objects.create(
+            client=b, household=hh, stage=EnrollmentStage.PENDING_VERIFICATION,
+        )
+        self.assertIsNone(governing_pending_enrollment(a))       # not dragged pending by B
+        self.assertIsNotNone(governing_pending_enrollment(b))    # B is genuinely pending
+
+    def test_true_dependent_still_inherits_household_pending(self):
+        from .models import (
+            Client, EnrollmentStage, EnrollmentVerification, Household,
+            HouseholdMember,
+        )
+        from .services.lifecycle import governing_pending_enrollment
+
+        hh = Household.objects.create(name="HH")
+        p = Client.objects.create(client_id=str(uuid.uuid4()), first_name="Pri", last_name="M")
+        d = Client.objects.create(client_id=str(uuid.uuid4()), first_name="Dep", last_name="E")
+        HouseholdMember.objects.create(household=hh, client=p, is_primary=True)
+        HouseholdMember.objects.create(household=hh, client=d, is_primary=False)
+        # Shared household enrollment (on the primary), pending. Dependent d has
+        # NO own enrollment -> must still inherit the pending state.
+        EnrollmentVerification.objects.create(
+            client=p, household=hh, stage=EnrollmentStage.PENDING_VERIFICATION,
+        )
+        self.assertIsNotNone(governing_pending_enrollment(d))

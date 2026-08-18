@@ -384,6 +384,12 @@ def governing_pending_enrollment(client):
     -- e.g. disregarding a request -- must target whichever governing enrollment
     is actually pending. When more than one qualifies, the most recently
     requested/updated wins.
+
+    Split-household guard: once a member holds their OWN live enrollment (a
+    dependent split into their own case), a HOUSEHOLD-MATE's individual pending
+    enrollment must NOT mark them pending -- their own (verified) enrollment
+    governs them. Household inheritance still applies to a TRUE dependent (no own
+    live enrollment) so a shared verification keeps moving everyone together.
     """
     candidates = [
         e
@@ -391,6 +397,21 @@ def governing_pending_enrollment(client):
         if e.verified_at is None
         and EnrollmentStage(e.stage) == EnrollmentStage.PENDING_VERIFICATION
     ]
+    if not candidates:
+        return None
+    # A member who is themselves an enrollment holder (has their OWN live
+    # enrollment) is governed by their own enrollment -- ignore a household-mate's
+    # separate-case pending row (the split-household leak).
+    own_live = any(
+        EnrollmentStage(e.stage) not in _TERMINAL_STAGES
+        and EnrollmentStage(e.stage) not in (
+            EnrollmentStage.DISREGARDED, EnrollmentStage.SCHEDULED_EXTENSION,
+        )
+        for e in client.enrollments.all()
+    )
+    if own_live:
+        own = [e for e in candidates if str(e.client_id) == str(client.pk)]
+        candidates = own or []
     if not candidates:
         return None
     return max(candidates, key=lambda e: e.stage_at or e.opened_at)
