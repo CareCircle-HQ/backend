@@ -46,6 +46,7 @@ from .models import (
     MilitaryProfile,
     Note,
     NoteSource,
+    OrderSchedule,
     ActiveProgram,
     Program,
     ProgramEligibility,
@@ -608,13 +609,26 @@ def ensure_primary_of_own_household(client):
         ).delete()
         enr.household = household
         enr.save(update_fields=["household"])
+        # The enrollment's order schedules carry their OWN household FK
+        # (PROTECT); re-home them alongside the enrollment so they follow the
+        # client and don't pin the old household open.
+        OrderSchedule.objects.filter(enrollment=enr).update(household=household)
     # Drop the client's dietary profile from any enrollments that STAYED in the
     # household they just left (they're no longer a member there).
     if left_household is not None:
         MemberDietaryProfile.objects.filter(
             client=client, enrollment__household=left_household
         ).delete()
-        if not left_household.members.exists():
+        # Only delete the household they left if it is now truly empty. A
+        # malformed household can retain a RELATIVE's enrollment / order
+        # schedules even with no member rows -- deleting it would orphan (or,
+        # for PROTECT'd orders, error on) that live data.
+        still_in_use = (
+            left_household.members.exists()
+            or left_household.enrollment_verifications.exists()
+            or left_household.orders.exists()
+        )
+        if not still_in_use:
             left_household.delete()
     return household
 

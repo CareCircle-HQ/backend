@@ -16828,3 +16828,64 @@ class SplitHouseholdPendingLeakTest(TestCase):
             client=p, household=hh, stage=EnrollmentStage.PENDING_VERIFICATION,
         )
         self.assertIsNotNone(governing_pending_enrollment(d))
+
+
+class MakePrimaryReHomesOrdersTest(TestCase):
+    """ensure_primary_of_own_household must re-home the member's PROTECT'd order
+    schedules with their enrollments and never delete a household that still
+    holds a relative's enrollment/orders (the ProtectedError regression)."""
+
+    def _order(self, enr, hh):
+        from .models import OrderSchedule
+        return OrderSchedule.objects.create(
+            enrollment=enr, household=hh, household_group_code="HG-TEST",
+        )
+
+    def test_reanchor_moves_orders_and_keeps_shared_household(self):
+        from .models import (
+            Client, EnrollmentStage, EnrollmentVerification, Household,
+            HouseholdMember, OrderSchedule,
+        )
+        from .serializers import ensure_primary_of_own_household
+
+        hh = Household.objects.create()
+        a = Client.objects.create(client_id=str(uuid.uuid4()), first_name="Ann", last_name="A")
+        b = Client.objects.create(client_id=str(uuid.uuid4()), first_name="Bob", last_name="B")
+        HouseholdMember.objects.create(household=hh, client=a, is_primary=False)
+        enr_a = EnrollmentVerification.objects.create(
+            client=a, household=hh, stage=EnrollmentStage.SERVICE_ACTIVE,
+        )
+        enr_b = EnrollmentVerification.objects.create(
+            client=b, household=hh, stage=EnrollmentStage.PENDING_VERIFICATION,
+        )
+        self._order(enr_a, hh)  # A's PROTECT'd order pins the old household open
+        self._order(enr_a, hh)
+
+        ensure_primary_of_own_household(a)  # must NOT raise ProtectedError
+
+        a.refresh_from_db()
+        new_hh = a.household_membership.household
+        self.assertTrue(a.household_membership.is_primary)
+        self.assertNotEqual(new_hh.pk, hh.pk)
+        # A's orders followed A to the new household.
+        self.assertEqual(OrderSchedule.objects.filter(household=new_hh).count(), 2)
+        # The old household is preserved because B's enrollment still lives there.
+        self.assertTrue(Household.objects.filter(pk=hh.pk).exists())
+        self.assertTrue(hh.enrollment_verifications.filter(pk=enr_b.pk).exists())
+
+    def test_reanchor_still_deletes_truly_empty_household(self):
+        from .models import (
+            Client, EnrollmentStage, EnrollmentVerification, Household,
+            HouseholdMember,
+        )
+        from .serializers import ensure_primary_of_own_household
+
+        hh = Household.objects.create()
+        a = Client.objects.create(client_id=str(uuid.uuid4()), first_name="Sol", last_name="O")
+        HouseholdMember.objects.create(household=hh, client=a, is_primary=False)
+        EnrollmentVerification.objects.create(
+            client=a, household=hh, stage=EnrollmentStage.SERVICE_ACTIVE,
+        )
+        ensure_primary_of_own_household(a)
+        # Nothing else lived in the old household -> it is cleaned up.
+        self.assertFalse(Household.objects.filter(pk=hh.pk).exists())
