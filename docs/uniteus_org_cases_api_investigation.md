@@ -162,6 +162,24 @@ Findings so far:
 (`UniteUsAgent.employee_id` + `filter[primary_worker]` stays available if we ever
 want the assigned-worker dimension instead.)
 
+## Clients / people (research -- IN PROGRESS)
+
+What we know so far:
+- Extension only calls `GET /people/<id>` (single, `?include=addresses`) + scrapes
+  the facesheet DOM (`/facesheet/<client_id>`). No org-wide people/contacts LIST.
+- Server-side wraps only single-person fetches (`get_person`, `get_consent`,
+  `list_insurances`, `list_record_languages`). No `/people` list wrapper.
+
+Two ways to enumerate "our clients":
+1. DERIVE FROM CASES (no new endpoint): the cases sweep already returns
+   `relationships.person.data.id` per case -> dedupe = our client set. Add
+   `include=person` to the cases call for inline person attributes, or
+   `GET /people/<id>` for full detail. Cheapest; reuses the cases work.
+2. DEDICATED CONTACTS/PEOPLE LIST endpoint -- unconfirmed. If it exists it likely
+   mirrors `/cases` (`filter[provider]`, paging). TODO: capture the Contacts/
+   Clients dashboard request URL (DevTools -> Network, filter `people`/`contacts`)
+   to reveal the endpoint + its filters.
+
 ## TODO (once the feature is defined)
 
 - Confirm the exact `primary_worker` / `service` filter param names + ids.
