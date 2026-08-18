@@ -100,16 +100,22 @@ Comma-list filters accept **max 50 ids** per request (confirmed for
 `primary_worker`; assume the same for any creator filter) -> batch our user_ids
 in groups of <= 50 and union.
 
-KEY OPEN QUESTION: does the org `/cases` endpoint support filtering/returning
-`created_by`? The captured request only had `provider`/`state`/`has_outcome`/
-`updated_after`/`primary_worker`, and the case payload we saw did NOT include a
-`created_by` field/relationship.
-- Best: confirm a `filter[created_by]` (or `filter[user]`) param from a Network
-  capture -> pass our `user_id`s (batched <= 50). Exactly replicates the import.
-- Fallback: if created_by is not filterable, page provider cases and match
-  client-side on created_by -- but that requires created_by IN the payload
-  (confirm via `include=`/a fields param); otherwise per-case detail defeats the
-  bulk efficiency.
+KEY OPEN QUESTION: can the org `/cases` endpoint filter/return `created_by`?
+Findings so far:
+- The dashboard UI does NOT expose a "Created by" filter (user checked).
+- The captured request only had `provider`/`state`/`has_outcome`/`updated_after`/
+  `primary_worker`, and the case payload did NOT include a `created_by` field.
+- BUT the dashboard UI != the full API, so TEST the raw URL directly:
+  - `&filter[created_by]=<user_id>` (also try `filter[user]` / `filter[creator]`)
+    -> if honored, pass our `user_id`s batched <= 50 (exactly replicates import).
+  - `&include=created_by` -> if a created_by relationship appears, we can page
+    provider cases and match client-side on our `user_id`s.
+- If neither works:
+  - Proxy by `filter[primary_worker]=<Elor employee_id>` (all our cases are
+    assigned to Elor; Met Council's are not) -- CLOSE but it's the ASSIGNED
+    dimension, not the import's CREATED_BY, so it can diverge.
+  - Or resolve created_by per case via case detail -- accurate but defeats the
+    bulk efficiency.
 
 (`UniteUsAgent.employee_id` + `filter[primary_worker]` stays available if we ever
 want the assigned-worker dimension instead.)
