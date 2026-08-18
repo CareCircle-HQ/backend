@@ -80,6 +80,36 @@ Provider-scoped, and optionally narrowed by worker + service-type, keeps the
 relevant pipeline much smaller; incremental via `updated_after` makes routine
 runs cheap.
 
+## Filtering by OUR agents
+
+We keep our agent roster in the `UniteUsAgent` model (Settings -> "Unite Us
+Agents", `/settings/unite-us-agents/`). Two ids per agent, two "our cases"
+dimensions:
+
+| Dimension | Case field | Stored id |
+|---|---|---|
+| Creator (opened the case) | `created_by` | `UniteUsAgent.user_id` (== `Case.created_by_id`, complete join) |
+| Assigned worker | `primary_worker` | `UniteUsAgent.employee_id` (optional today) |
+
+The org `/cases` endpoint filters by **assigned worker**:
+`filter[primary_worker]=<employee_id,employee_id,...>`.
+
+CONFIRMED: `filter[primary_worker]` accepts a **comma-separated list, max 50
+workers** per request. So filter by our agents' `employee_id`s in **batches of
+<= 50** (union the pages across batches). Most orgs assign to a handful of
+workers (e.g. Elorr Arama `b04da8b0-71d0-454c-9ec3-3b18c78b3a56`), so this is
+usually 1 batch.
+
+Prereq: `UniteUsAgent.employee_id` must be POPULATED (it's optional/blank now).
+Backfill via `/employees` (each employee record carries both `employee.id` and a
+`user` relationship id), mapping our stored `user_id -> employee_id`. Check
+whether `import_unite_us_agents` can capture `employee_id` during import.
+
+(If "our cases" instead means CREATED BY our agents, that's the `user_id ==
+created_by` join the import already uses; the `/cases` list didn't expose a
+`created_by` filter, so that dimension would be filtered client-side or needs a
+confirmed `filter[created_by]`/`filter[user]` param.)
+
 ## TODO (once the feature is defined)
 
 - Confirm the exact `primary_worker` / `service` filter param names + ids.
