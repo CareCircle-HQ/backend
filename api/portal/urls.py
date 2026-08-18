@@ -148,6 +148,8 @@ from .views_service_area import (
     AllowedStatesView,
     ExcludedZipCodeDetailView,
     ExcludedZipCodesView,
+    ServiceZipCodeDetailView,
+    ServiceZipCodesView,
 )
 from .views_imports import (
     ImportActivityView,
@@ -410,6 +412,17 @@ urlpatterns = [
         "settings/excluded-zip-codes/<int:zip_id>/",
         ExcludedZipCodeDetailView.as_view(),
         name="portal-excluded-zip-code-detail",
+    ),
+    # Settings > Service ZIP Codes: PHS service-area whitelist (add/remove/toggle)
+    path(
+        "settings/service-zip-codes/",
+        ServiceZipCodesView.as_view(),
+        name="portal-service-zip-codes",
+    ),
+    path(
+        "settings/service-zip-codes/<int:zip_id>/",
+        ServiceZipCodeDetailView.as_view(),
+        name="portal-service-zip-code-detail",
     ),
     # Settings > Allowed States: served-states allow-list
     path(

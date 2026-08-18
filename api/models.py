@@ -2812,6 +2812,33 @@ class ExcludedZipCode(models.Model):
         return self.zip
 
 
+class ServiceZipCode(models.Model):
+    """A ZIP code in the PHS service-area WHITELIST (Manhattan / Brooklyn /
+    Queens).
+
+    Editable from Settings (add / remove / activate-deactivate) so the served
+    area can change without a code change. A ZIP counts as served when it has an
+    ``is_active`` row here. Matched on the first 5 digits of the ZIP. The initial
+    list is seeded from the PHS ZIP-code workbook via data migration (all active).
+    """
+
+    zip = models.CharField(max_length=5, unique=True, db_index=True)
+    borough = models.CharField(max_length=64, blank=True)
+    # Deactivate a ZIP without deleting it (keeps the borough/history); only
+    # active rows count as in-coverage.
+    is_active = models.BooleanField(default=True, db_index=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["zip"]
+        verbose_name = "Service ZIP code"
+        verbose_name_plural = "Service ZIP codes"
+
+    def __str__(self):
+        return f"{self.zip} ({self.borough})" if self.borough else self.zip
+
+
 class AgentLoginCode(models.Model):
     """A short-lived, single-use 2FA code emailed to an agent's company email to
     complete extension login.

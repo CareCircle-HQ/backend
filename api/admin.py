@@ -9,6 +9,7 @@ from .models import (
     AllowedZipCode,
     Assessment,
     ExcludedZipCode,
+    ServiceZipCode,
     CadenceRule,
     Case,
     Client,
@@ -468,6 +469,14 @@ class AllowedStateAdmin(admin.ModelAdmin):
 class ExcludedZipCodeAdmin(admin.ModelAdmin):
     list_display = ("zip", "label", "created_at")
     search_fields = ("zip", "label")
+    ordering = ("zip",)
+
+
+@admin.register(ServiceZipCode)
+class ServiceZipCodeAdmin(admin.ModelAdmin):
+    list_display = ("zip", "borough", "is_active", "updated_at")
+    list_filter = ("borough", "is_active")
+    search_fields = ("zip", "borough")
     ordering = ("zip",)
 
 
