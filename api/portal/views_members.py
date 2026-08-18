@@ -1800,14 +1800,14 @@ class MembersListView(PortalGenericAPIView):
                 )
 
         # Ticket-type filter (Members page): keep members whose client has an
-        # ACTIVE (open / in-progress) follow-up ticket of the selected type.
-        # ``value`` == TicketType.code; RESOLVED tickets are excluded so the
-        # filter reflects outstanding work. Multi-valued join -> .distinct() below.
+        # OPEN follow-up ticket of the selected type. ``value`` == TicketType.code;
+        # only status=OPEN counts (in-progress/resolved are excluded) so the filter
+        # reflects untouched outstanding work. Multi-valued join -> .distinct() below.
         ticket_type_val = (params.get("ticket_type") or "").strip()
         if ticket_type_val:
             qs = qs.filter(
                 tickets__type__code=ticket_type_val,
-                tickets__status__in=[TicketStatus.OPEN, TicketStatus.IN_PROGRESS],
+                tickets__status=TicketStatus.OPEN,
             )
 
         # Cadence filter (Members page): keep members whose delivery plan runs at
