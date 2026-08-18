@@ -80,35 +80,39 @@ Provider-scoped, and optionally narrowed by worker + service-type, keeps the
 relevant pipeline much smaller; incremental via `updated_after` makes routine
 runs cheap.
 
-## Filtering by OUR agents
+## Filtering by OUR agents == the SAME filter the CSV import applies
 
-We keep our agent roster in the `UniteUsAgent` model (Settings -> "Unite Us
-Agents", `/settings/unite-us-agents/`). Two ids per agent, two "our cases"
-dimensions:
+Decision: "our cases" means exactly what the **CSV cases import** already
+enforces -- filter by the **CREATOR**, not the assigned worker.
 
-| Dimension | Case field | Stored id |
-|---|---|---|
-| Creator (opened the case) | `created_by` | `UniteUsAgent.user_id` (== `Case.created_by_id`, complete join) |
-| Assigned worker | `primary_worker` | `UniteUsAgent.employee_id` (optional today) |
+Import rule (see `api/services/csv_import.py` ~1160-1203): keep a case only when
+`case_created_by_id` (== `Case.created_by_id`) is in the set of
+`UniteUsAgent.user_id` for agents whose `originating_team` is a CareCircle team
+(`CARECIRCLE_ALLOWLIST_TEAMS` = CareCircle Call Center + CareCircle Street; Met
+Council excluded), plus the Met Council provider gate. Empty roster = accept all.
 
-The org `/cases` endpoint filters by **assigned worker**:
-`filter[primary_worker]=<employee_id,employee_id,...>`.
+So the dimension is **`created_by` in {our CareCircle agents' `user_id`s}** --
+NOT `primary_worker`. (The `primary_worker`/`employee_id` filter the dashboard
+used, e.g. Elorr Arama `b04da8b0-...`, is a DIFFERENT dimension and does not
+match the import.)
 
-CONFIRMED: `filter[primary_worker]` accepts a **comma-separated list, max 50
-workers** per request. So filter by our agents' `employee_id`s in **batches of
-<= 50** (union the pages across batches). Most orgs assign to a handful of
-workers (e.g. Elorr Arama `b04da8b0-71d0-454c-9ec3-3b18c78b3a56`), so this is
-usually 1 batch.
+Comma-list filters accept **max 50 ids** per request (confirmed for
+`primary_worker`; assume the same for any creator filter) -> batch our user_ids
+in groups of <= 50 and union.
 
-Prereq: `UniteUsAgent.employee_id` must be POPULATED (it's optional/blank now).
-Backfill via `/employees` (each employee record carries both `employee.id` and a
-`user` relationship id), mapping our stored `user_id -> employee_id`. Check
-whether `import_unite_us_agents` can capture `employee_id` during import.
+KEY OPEN QUESTION: does the org `/cases` endpoint support filtering/returning
+`created_by`? The captured request only had `provider`/`state`/`has_outcome`/
+`updated_after`/`primary_worker`, and the case payload we saw did NOT include a
+`created_by` field/relationship.
+- Best: confirm a `filter[created_by]` (or `filter[user]`) param from a Network
+  capture -> pass our `user_id`s (batched <= 50). Exactly replicates the import.
+- Fallback: if created_by is not filterable, page provider cases and match
+  client-side on created_by -- but that requires created_by IN the payload
+  (confirm via `include=`/a fields param); otherwise per-case detail defeats the
+  bulk efficiency.
 
-(If "our cases" instead means CREATED BY our agents, that's the `user_id ==
-created_by` join the import already uses; the `/cases` list didn't expose a
-`created_by` filter, so that dimension would be filtered client-side or needs a
-confirmed `filter[created_by]`/`filter[user]` param.)
+(`UniteUsAgent.employee_id` + `filter[primary_worker]` stays available if we ever
+want the assigned-worker dimension instead.)
 
 ## TODO (once the feature is defined)
 
