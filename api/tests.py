@@ -17045,3 +17045,68 @@ class ListUnmergedMigrationsCommandTest(TestCase):
         ids = ids_out.getvalue()
         self.assertIn(str(mig_old.client_id), ids)          # migration id printed
         self.assertNotIn(str(rev_old.client_id), ids)       # review id excluded
+
+
+class DetectApiMigrationTest(TestCase):
+    """detect_api_migration + identity_matches_for_merge: API-based migration
+    detection (no extension) and the strict auto-merge identity gate."""
+
+    class _FakeApi:
+        def __init__(self, mapping):
+            self._m = mapping  # requested_id -> returned data.id
+        def get_person(self, person_id, include="addresses"):
+            return {"data": {"id": self._m.get(str(person_id), str(person_id))}}
+
+    def test_detect_flags_redirected_id(self):
+        from .models import Client
+        from .services.client_migration import detect_api_migration
+        old = Client.objects.create(client_id=str(uuid.uuid4()), first_name="A", last_name="B")
+        new_id = str(uuid.uuid4())
+        api = self._FakeApi({str(old.client_id): new_id})
+        self.assertEqual(detect_api_migration(api, old), new_id)
+
+    def test_detect_none_when_same_id(self):
+        from .models import Client
+        from .services.client_migration import detect_api_migration
+        c = Client.objects.create(client_id=str(uuid.uuid4()), first_name="A", last_name="B")
+        api = self._FakeApi({})  # returns same id -> no migration
+        self.assertIsNone(detect_api_migration(api, c))
+
+    def _with_medicaid(self, client, member_id):
+        from .models import Insurance, InsurancePlanType, RecordStatus
+        Insurance.objects.create(
+            client=client, plan_type=InsurancePlanType.MEDICAID,
+            external_member_id=member_id, status=RecordStatus.ACTIVE, is_primary=True,
+        )
+        return client
+
+    def test_gate_matches_same_person(self):
+        from datetime import date
+        from .models import Client
+        from .services.client_migration import identity_matches_for_merge
+        dob = date(1990, 5, 1)
+        old = self._with_medicaid(Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Ann", last_name="Lee", date_of_birth=dob), "MID123")
+        new = self._with_medicaid(Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="ann", last_name="LEE", date_of_birth=dob), "mid123")
+        self.assertTrue(identity_matches_for_merge(old, new))
+
+    def test_gate_rejects_twin_same_dob_diff_name(self):
+        from datetime import date
+        from .models import Client
+        from .services.client_migration import identity_matches_for_merge
+        dob = date(2015, 3, 3)
+        old = self._with_medicaid(Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Ava", last_name="Kim", date_of_birth=dob), "M1")
+        new = self._with_medicaid(Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Mia", last_name="Kim", date_of_birth=dob), "M2")
+        self.assertFalse(identity_matches_for_merge(old, new))
+
+    def test_gate_rejects_when_medicaid_missing(self):
+        from datetime import date
+        from .models import Client
+        from .services.client_migration import identity_matches_for_merge
+        dob = date(1980, 1, 1)
+        old = Client.objects.create(client_id=str(uuid.uuid4()), first_name="Sam", last_name="Roe", date_of_birth=dob)
+        new = Client.objects.create(client_id=str(uuid.uuid4()), first_name="Sam", last_name="Roe", date_of_birth=dob)
+        self.assertFalse(identity_matches_for_merge(old, new))  # no medicaid on file
