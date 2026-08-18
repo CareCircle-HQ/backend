@@ -39,6 +39,7 @@ from ..models import (
     CaseType,
     Client,
     ClientPhone,
+    Cadence,
     ClientTag,
     ClientPhoneSource,
     ClientStage,
@@ -1327,14 +1328,14 @@ class TicketTypesListView(PortalAPIView):
 
 class CadencesListView(PortalAPIView):
     """Delivery-cadence options for the Members-page cadence filter dropdown,
-    from the ``DeliveryCadence`` enum. ``value`` == the code stored on
-    ``MemberDeliverySchedule.delivery_days_cadence`` (what the ``cadence`` list
-    filter matches)."""
+    from the configurable ``Cadence`` table (Settings > Delivery Cadences), so
+    cadences added beyond the legacy 3-value enum are offered. ``value`` == the
+    ``code`` stored on ``MemberDeliverySchedule.delivery_days_cadence`` (what the
+    ``cadence`` list filter matches)."""
 
     def get(self, request):
-        return Response(
-            [{"value": code, "label": label} for code, label in DeliveryCadence.choices]
-        )
+        rows = Cadence.objects.filter(is_active=True).order_by("label")
+        return Response([{"value": c.code, "label": c.label} for c in rows])
 
 
 class MembersListView(PortalGenericAPIView):
@@ -1820,16 +1821,13 @@ class MembersListView(PortalGenericAPIView):
         # .distinct() below.
         cadence_val = (params.get("cadence") or "").strip()
         if cadence_val:
-            # Accept either the DeliveryCadence code ("mon_thu") or its label
-            # ("Mon/Thu"); the stored value is the code, so resolve a label first.
-            cadence_code = cadence_val
-            _codes = {c for c, _ in DeliveryCadence.choices}
-            if cadence_val not in _codes:
-                cadence_code = next(
-                    (c for c, lbl in DeliveryCadence.choices
-                     if lbl.lower() == cadence_val.lower()),
-                    cadence_val,
-                )
+            # Accept either the cadence code ("mon_thu") or its display label
+            # ("Mon/Thu"); the stored value is the code. Resolve against the
+            # configurable Cadence table (covers cadences beyond the legacy enum).
+            row = Cadence.objects.filter(
+                Q(code__iexact=cadence_val) | Q(label__iexact=cadence_val)
+            ).first()
+            cadence_code = row.code if row else cadence_val
             qs = qs.filter(
                 member_profiles__delivery_schedules__delivery_days_cadence=cadence_code
             )
