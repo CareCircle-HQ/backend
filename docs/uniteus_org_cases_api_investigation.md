@@ -42,6 +42,35 @@ core client already uses; `cred.provider_id` supplies the provider filter.
     Prepared Meals, Produce Prescription/Voucher**. Likely `filter[service]=<ids>`;
     map the three names -> service ids (via `/services` or a capture).
 
+## List vs details (CONFIRMED from a saved response)
+
+`/cases` is a LIST of case summaries + relationship IDs + paging meta -- NOT
+expanded related details:
+- per case: own `attributes` (`state`, `resolution`, `description`,
+  `opened_date`, `closed_date`, `created_at`, `updated_at`) + relationship IDs
+  (`person`, `program`, `service`, `service_authorization`, `primary_worker`,
+  `network`, `provider`).
+- `meta.page`: `number`, `size`, `total_pages`, `total_count` (e.g. 285 pages /
+  14244 count) -- total known up front.
+- `created_by` is NOT present anywhere in the payload (confirmed 0 occurrences).
+
+To get related DETAILS (person name/DOB, auth amount/dates, program name):
+- `include=person,service_authorization,program,service,primary_worker` ->
+  returned in `included[]` in the same response; OR
+- `GET /cases/<case_id>` per case.
+
+## More filters (confirmed valid from captured URLs)
+
+- `filter[state]=draft` is also valid (draft cases).
+- `filter[service]=<id,id,id>` -- our 3 food service types:
+  - Medically Tailored Meals / Prepared Meals / Produce Rx-Voucher (map exact
+    name->id):
+    `edb0ff4f-745c-4c1e-84aa-614f086caf88`,
+    `1f2f3403-f475-425b-b637-2a8dc6b9d79f`,
+    `155847fc-cddb-469b-8dca-50339cd5b6a6`
+- `filter[service_authorization.state]=approved,requested,denied` -- nested
+  filter on the case's service authorization state.
+
 ## Response shape (per case)
 
 ```json
