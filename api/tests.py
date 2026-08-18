@@ -13910,6 +13910,21 @@ class MemberSearchExpandedTest(TestCase):
         # a non-matching query does not return them
         self.assertNotIn(cid, self._ids(api.get("/api/portal/members/?search=Nonexistent Zzz")))
 
+    def test_search_by_migrated_from_old_id(self):
+        # A merged client is findable by the OLD Unite Us id it was migrated from
+        # (full or partial), not just its current client_id.
+        api = self._api()
+        old_id = str(uuid.uuid4())
+        c = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Mig", last_name="Rated",
+            migrated_from_id=old_id,
+        )
+        cid = str(c.client_id)
+        self.assertIn(cid, self._ids(api.get(f"/api/portal/members/?search={old_id}")))
+        self.assertIn(cid, self._ids(api.get(f"/api/portal/members/?search={old_id[:8]}")))
+        # an unrelated old id doesn't match
+        self.assertNotIn(cid, self._ids(api.get(f"/api/portal/members/?search={uuid.uuid4()}")))
+
 
 class NoteAuthorFallbackTest(TestCase):
     """A note with no recorded author shows its SOURCE label, not a blank the UI

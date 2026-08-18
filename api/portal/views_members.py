@@ -1335,6 +1335,9 @@ class MembersListView(PortalGenericAPIView):
                 | Q(last_name__icontains=search)
                 | Q(insurances__external_member_id__icontains=search)  # Medicaid ID
                 | Q(client_email_address__icontains=search)            # email
+                # Old (migrated-from) Unite Us id: find a merged client by the
+                # prior person id it was migrated from (partial or full).
+                | Q(migrated_from_id__icontains=search)
                 # Member address (any type stored on the client profile) ...
                 | Q(addresses__street__icontains=search)
                 | Q(addresses__city__icontains=search)
