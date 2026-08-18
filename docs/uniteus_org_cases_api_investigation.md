@@ -71,9 +71,14 @@ core client already uses; `cred.provider_id` supplies the provider filter.
 
 ## Scale note
 
-Provider-scoped (optionally worker + service-type filtered) means the whole
-managed pipeline is a few hundred paged calls, or incremental via
-`updated_after` — cheap enough for a routine job.
+Observed on Unite Us: the Open filter shows **"1-50 of 14243 open cases"** — so
+~14.2k open cases org-wide. The total count comes back in the response `meta`
+(so we know the total up front, not just `total_pages`). That's ~285 pages at
+`page[size]=50` (~143 at size 100) for ALL open; closed is a separate count.
+
+Provider-scoped, and optionally narrowed by worker + service-type, keeps the
+relevant pipeline much smaller; incremental via `updated_after` makes routine
+runs cheap.
 
 ## TODO (once the feature is defined)
 
