@@ -1171,6 +1171,63 @@ class CareManagementRejectedCaseGoverningTest(TestCase):
         self.assertNotIn(str(c.client_id), self._rejected_ids())
 
 
+class CareManagementClosedCaseExclusionTest(TestCase):
+    """The Care Management page (all tabs, incl. Out of Range) excludes a member
+    whose governing internal-service case is CLOSED -- the household finished
+    service and should drop off the queue."""
+
+    def _api(self):
+        from rest_framework.test import APIClient
+        from rest_framework_simplejwt.tokens import AccessToken
+
+        from .models import Agent
+        a = Agent.objects.create(name="CM", agent_code="951", group="Management")
+        acc = AccessToken()
+        acc["agent_id"] = str(a.id); acc["agent_code"] = a.agent_code
+        acc["agent_name"] = a.name; acc["agent_group"] = a.group
+        api = APIClient(); api.credentials(HTTP_AUTHORIZATION=f"Bearer {acc}")
+        return api
+
+    def _oor_member(self, first, *, case_status):
+        from .models import (
+            Case, CaseStatus, CaseType, Client, ClientStage, Household,
+            HouseholdMember,
+        )
+        from .services.service_area import SERVICE_AREA_REASON
+
+        c = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name=first, last_name="Oor",
+            lifecycle_stage=ClientStage.INELIGIBLE,
+            ineligible_reasons=[SERVICE_AREA_REASON],
+        )
+        hh = Household.objects.create(name=f"{first} HH")
+        HouseholdMember.objects.create(household=hh, client=c, is_primary=True)
+        Case.objects.create(
+            case_id=str(uuid.uuid4()), client=c, case_type=CaseType.INTERNAL_SERVICE,
+            case_status=case_status,
+        )
+        return c
+
+    def _ids(self, resp):
+        out = set()
+        for g in resp.json()["results"]:
+            out.add(g["primary"]["id"])
+            out.update(m["id"] for m in g.get("members", []))
+        return out
+
+    def test_out_of_range_excludes_closed_governing_case(self):
+        from .models import CaseStatus
+
+        api = self._api()
+        openc = self._oor_member("Opal", case_status=CaseStatus.OPEN)
+        closed = self._oor_member("Clyde", case_status=CaseStatus.CLOSED)
+        ids = self._ids(
+            api.get("/api/portal/members/?scope=care_management&tab=out_of_range")
+        )
+        self.assertIn(str(openc.client_id), ids)      # open case -> shown
+        self.assertNotIn(str(closed.client_id), ids)  # closed case -> excluded
+
+
 class MemberHouseholdAddressTimelineTest(TestCase):
     """PATCH /members/<id>/household/ must log a Delivery Address Changed event
     on the timeline of the member whose profile the agent is viewing -- including

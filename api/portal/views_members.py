@@ -1430,6 +1430,12 @@ class MembersListView(PortalGenericAPIView):
             # mutually-exclusive tabs (a household shows in the FIRST tab it
             # matches). ``tab`` selects which one.
             #
+            # Exclude finished households whose GOVERNING internal-service case is
+            # CLOSED/CANCELLED -- mirrors the Verification / Urgent-Care open-case
+            # gate (require_internal_service_primary), so a closed case never
+            # lingers on any Care Management tab (incl. Out of Range).
+            qs = require_internal_service_primary(qs)
+            #
             # "No Cadence" is a special, kitchen-scoped tab (NOT part of the
             # mutual-exclusion set): pick a kitchen, see everyone assigned to it
             # that still has no delivery cadence.
@@ -3060,8 +3066,12 @@ class CareManagementTabCountsView(PortalAPIView):
     DISTINCT members in that tab AFTER mutual exclusion (so tabs never overlap)."""
 
     def get(self, request):
+        # Same open-governing-case gate as the list: a CLOSED internal-service
+        # case (finished household) is excluded from every tab count.
         base = annotate_care_management(
-            Client.objects.filter(care_management_base_q()).distinct()
+            require_internal_service_primary(
+                Client.objects.filter(care_management_base_q())
+            ).distinct()
         )
         return Response({
             "tabs": [
