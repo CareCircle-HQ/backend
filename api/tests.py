@@ -16996,3 +16996,52 @@ class CaseReplacementReanchorsDependentTest(TestCase):
         c.refresh_from_db()
         # Already primary -> stays in the same household (no-op re-anchor).
         self.assertEqual(c.household_membership.household_id, hh.pk)
+
+
+class ListUnmergedMigrationsCommandTest(TestCase):
+    """list_unmerged_migrations: a torn enrollment.client != case.client with a
+    MATCHING dob is a migration; a DIFFERENT dob is REVIEW (not a migration)."""
+
+    def _pair(self, *, old_dob, new_dob, last):
+        from datetime import date
+        from .models import (
+            Case, CaseStatus, CaseType, Client, EnrollmentStage,
+            EnrollmentVerification,
+        )
+        old = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="A", last_name=last, date_of_birth=old_dob,
+        )
+        new = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="A", last_name=last, date_of_birth=new_dob,
+        )
+        case = Case.objects.create(
+            case_id=str(uuid.uuid4()), client=new, case_type=CaseType.INTERNAL_SERVICE,
+            case_status=CaseStatus.OPEN,
+        )
+        EnrollmentVerification.objects.create(
+            client=old, case=case, stage=EnrollmentStage.SERVICE_ACTIVE,
+        )
+        return old, new
+
+    def test_dob_split(self):
+        from datetime import date
+        from io import StringIO
+        from django.core.management import call_command
+
+        mig_old, mig_new = self._pair(old_dob=date(1990, 1, 1), new_dob=date(1990, 1, 1), last="Same")
+        rev_old, rev_new = self._pair(old_dob=date(1990, 1, 1), new_dob=date(2015, 5, 5), last="Diff")
+
+        out = StringIO()
+        call_command("list_unmerged_migrations", stdout=out)
+        text = out.getvalue()
+        # Migration pair appears under MIGRATIONS; review pair flagged separately.
+        self.assertIn(str(mig_old.client_id), text)
+        self.assertIn("MIGRATIONS", text)
+        self.assertIn(str(rev_old.client_id), text)
+        self.assertIn("REVIEW", text)
+
+        ids_out = StringIO()
+        call_command("list_unmerged_migrations", "--ids-only", stdout=ids_out)
+        ids = ids_out.getvalue()
+        self.assertIn(str(mig_old.client_id), ids)          # migration id printed
+        self.assertNotIn(str(rev_old.client_id), ids)       # review id excluded
