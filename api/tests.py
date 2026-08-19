@@ -17296,6 +17296,27 @@ class ResolveCaselessPreviousEnrollmentsTest(TestCase):
         self.assertEqual(str(surv.previous_case_id), str(pick.case_id))
 
 
+class PurchaseOrderPreviewHelpersTest(TestCase):
+    """The PO preview exposes each member's snapshot ZIP + allergy labels so the
+    Generate PO popup can filter/highlight by ZIP and allergy."""
+
+    def test_schedule_zip_and_allergy_labels(self):
+        from types import SimpleNamespace
+        from api.services.purchase_orders import _schedule_zip, _schedule_allergy_labels
+
+        s = SimpleNamespace(
+            delivery_address="123 Main St, Apt 4, Brooklyn NY 11211",
+            allergies=["peanut", "none", "peanut"],
+        )
+        self.assertEqual(_schedule_zip(s), "11211")
+        labels = _schedule_allergy_labels(s)
+        self.assertEqual(len(labels), 1)  # de-duped + 'none' dropped
+        self.assertNotIn("none", [x.lower() for x in labels])
+        # No address -> no zip; no allergies -> empty list.
+        self.assertEqual(_schedule_zip(SimpleNamespace(delivery_address="")), "")
+        self.assertEqual(_schedule_allergy_labels(SimpleNamespace(allergies=[])), [])
+
+
 class BulkAssignFiltersTest(TestCase):
     """The bulk-assign popup filters keep a household when ANY member matches the
     menu type / each selected allergy and the delivery ZIP starts with the typed
