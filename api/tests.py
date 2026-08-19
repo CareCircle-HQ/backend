@@ -17269,6 +17269,32 @@ class ResolveCaselessPreviousEnrollmentsTest(TestCase):
         self.assertEqual(str(prev.case_id), str(replaced.case_id))
         self.assertEqual(str(surv.previous_case_id), str(replaced.case_id))
 
+    def test_bind_override_resolves_ambiguous(self):
+        from io import StringIO
+        from django.core.management import call_command
+        from .models import (
+            CaseStatus, Client, EnrollmentStage, EnrollmentVerification,
+        )
+
+        c = Client.objects.create(client_id=str(uuid.uuid4()), first_name="E", last_name="E")
+        pick = self._case(c, status=CaseStatus.CLOSED, day=1)
+        self._case(c, status=CaseStatus.CLOSED, day=2)
+        prev = EnrollmentVerification.objects.create(
+            client=c, stage=EnrollmentStage.CLOSED, close_reason="case_replaced", case=None,
+        )
+        surv = EnrollmentVerification.objects.create(
+            client=c, stage=EnrollmentStage.SERVICE_ACTIVE,
+            case=self._case(c, status=CaseStatus.OPEN, day=10), supersedes=prev,
+        )
+
+        call_command(
+            "resolve_caseless_previous_enrollments", "--apply",
+            f"--bind={prev.pk}={pick.case_id}", stdout=StringIO(),
+        )
+        prev.refresh_from_db(); surv.refresh_from_db()
+        self.assertEqual(str(prev.case_id), str(pick.case_id))
+        self.assertEqual(str(surv.previous_case_id), str(pick.case_id))
+
 
 class MenuCarryRegressionAuditGuardTest(TestCase):
     """list_menu_carry_regressions must only flag a survivor that is the member's
