@@ -17110,3 +17110,42 @@ class DetectApiMigrationTest(TestCase):
         old = Client.objects.create(client_id=str(uuid.uuid4()), first_name="Sam", last_name="Roe", date_of_birth=dob)
         new = Client.objects.create(client_id=str(uuid.uuid4()), first_name="Sam", last_name="Roe", date_of_birth=dob)
         self.assertFalse(identity_matches_for_merge(old, new))  # no medicaid on file
+
+
+class MenuCarryRegressionAuditGuardTest(TestCase):
+    """list_menu_carry_regressions must only flag a survivor that is the member's
+    LIVE enrollment. A disregarded/closed placeholder that supersedes the now-
+    active (correct) enrollment must NOT be reported (the IZABELLE false positive)."""
+
+    def _enr(self, client, stage, menu, *, supersedes=None, close_reason=""):
+        from .models import EnrollmentVerification, MemberDietaryProfile, MemberStatus
+        e = EnrollmentVerification.objects.create(
+            client=client, stage=stage, supersedes=supersedes, close_reason=close_reason,
+        )
+        MemberDietaryProfile.objects.create(
+            enrollment=e, client=client, member_name=client.first_name,
+            menu_type=menu, status=MemberStatus.ACTIVE,
+        )
+        return e
+
+    def test_live_reset_flagged_but_disregarded_placeholder_not(self):
+        from io import StringIO
+        from django.core.management import call_command
+        from .models import Client, EnrollmentStage
+
+        # Real regression: ACTIVE Standard survivor supersedes a closed Kosher source.
+        a = Client.objects.create(client_id=str(uuid.uuid4()), first_name="Real", last_name="Reg")
+        src_a = self._enr(a, EnrollmentStage.CLOSED, "Kosher", close_reason="case_replaced")
+        self._enr(a, EnrollmentStage.SERVICE_ACTIVE, "Standard", supersedes=src_a)
+
+        # False positive: DISREGARDED Standard placeholder supersedes the ACTIVE
+        # Kosher enrollment (member's real menu is correctly Kosher).
+        b = Client.objects.create(client_id=str(uuid.uuid4()), first_name="False", last_name="Pos")
+        active_kosher = self._enr(b, EnrollmentStage.SERVICE_ACTIVE, "Kosher", close_reason="case_replaced")
+        self._enr(b, EnrollmentStage.DISREGARDED, "Standard", supersedes=active_kosher)
+
+        out = StringIO()
+        call_command("list_menu_carry_regressions", stdout=out)
+        text = out.getvalue()
+        self.assertIn(str(a.client_id), text)      # genuine regression is flagged
+        self.assertNotIn(str(b.client_id), text)   # disregarded placeholder is NOT

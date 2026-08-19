@@ -10,12 +10,23 @@ can visit them; makes NO changes. The fix/repair is a separate command.
 
 from django.core.management.base import BaseCommand
 
-from api.models import EnrollmentVerification
+from api.models import EnrollmentStage, EnrollmentVerification
 
 
 # The bug reset a placeholder survivor to the DEFAULT menu, dropping the verified
 # source's SPECIAL menu -- so ONLY "special -> Standard/blank" is a regression.
 _DEFAULT_MENUS = {"", "standard"}
+
+# A regression only matters when the SURVIVOR is the member's CURRENT (live)
+# enrollment. A DISREGARDED / CLOSED / CANCELLED survivor is not their effective
+# menu -- e.g. a disregarded placeholder that `supersedes` the now-ACTIVE
+# enrollment would otherwise be falsely flagged as "current = Standard" while the
+# member's active enrollment correctly carries the special menu.
+_INERT_SURVIVOR_STAGES = {
+    EnrollmentStage.DISREGARDED,
+    EnrollmentStage.CLOSED,
+    EnrollmentStage.CANCELLED,
+}
 
 
 def _is_default_menu(menu):
@@ -45,6 +56,10 @@ class Command(BaseCommand):
         affected = {}  # client_id -> [(menu_from, menu_to, old_enr, new_enr)]
         transitions = {}
         for e_new in survivors.iterator(chunk_size=500):
+            # Skip survivors that aren't the member's live enrollment (a
+            # disregarded/closed placeholder pointing at the active one).
+            if EnrollmentStage(e_new.stage) in _INERT_SURVIVOR_STAGES:
+                continue
             e_old = e_new.supersedes
             if not e_old or (e_old.close_reason or "") != "case_replaced":
                 continue
