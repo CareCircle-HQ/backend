@@ -342,6 +342,11 @@ def _prior_enrollment_chain(enrollment, limit=25):
     cur = enrollment.supersedes if enrollment else None
     while cur is not None and cur.pk not in seen and len(chain) < limit:
         seen.add(cur.pk)
+        # Skip legacy caseless placeholders flagged as misinformation -- they have
+        # no real prior case to show -- but keep walking the chain past them.
+        if getattr(cur, "hidden_misinformation", False):
+            cur = cur.supersedes
+            continue
         case = cur.case
         chain.append({
             "id": cur.pk,

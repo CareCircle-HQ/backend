@@ -2044,6 +2044,11 @@ class EnrollmentVerification(models.Model):
         Case, on_delete=models.SET_NULL, null=True, blank=True,
         related_name="superseded_by_enrollments",
     )
+    # Set on a legacy CASELESS placeholder "previous enrollment" that has no
+    # distinct prior case to attach to (misinformation from before enrollments
+    # were guaranteed a case). Hidden from the Program tab's previous-enrollments
+    # list and safe to purge later.
+    hidden_misinformation = models.BooleanField(default=False, db_index=True)
     # The kitchen assigned to fulfill this household's deliveries. One kitchen
     # serves the whole household (members are never split across kitchens). Set
     # on the Logistics page; editable from the member profile. NULL until
