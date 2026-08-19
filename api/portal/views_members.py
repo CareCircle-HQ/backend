@@ -6674,7 +6674,8 @@ def _awaiting_enrollments(kind):
     qs = (
         EnrollmentVerification.objects.filter(stage=EnrollmentStage.KITCHEN_ASSIGNMENT)
         .exclude(client__is_williamsburg=True)
-        .select_related("client", "case", "case__program")
+        .select_related("client", "case", "case__program", "delivery_address")
+        .prefetch_related("member_profiles")
     )
     return [e for e in qs if _enrollment_kind(e) == kind]
 
@@ -6778,6 +6779,25 @@ class BulkAssignBoxesView(PortalAPIView):
                 status=http.HTTP_400_BAD_REQUEST,
             )
 
+        # Preview: return the matched households (the filtered set the agent is
+        # about to assign) without writing anything. Cadence isn't needed here --
+        # a box kitchen serves every member -- so it's resolved only on apply.
+        if request.data.get("preview"):
+            enrollments = _awaiting_box_enrollments()
+            if request.data.get("ready_only"):
+                kitchens_ctx = _prefetched_kitchens()
+                enrollments = [
+                    e for e in enrollments
+                    if enrollment_ready_for_assignment(e, kitchens_ctx)
+                ]
+            enrollments = _bulk_filter_enrollments(enrollments, request.data)
+            return Response({
+                "kitchen_id": str(kitchen.pk),
+                "kitchen_name": kitchen.name,
+                "total": len(enrollments),
+                "candidates": [_bulk_candidate_row(e) for e in enrollments],
+            })
+
         # The cadence (and thus the delivery weekday) comes from the SELECTED
         # kitchen -- box kitchens can deliver on different days. Auto-use it when
         # the kitchen runs exactly one; otherwise the agent picks which.
@@ -6817,6 +6837,9 @@ class BulkAssignBoxesView(PortalAPIView):
                 e for e in enrollments
                 if enrollment_ready_for_assignment(e, kitchens_ctx)
             ]
+        # Bulk-assign popup filters (menu type / allergies / ZIP) + household cap,
+        # matching the preview so the applied set equals the reviewed set.
+        enrollments = _bulk_filter_enrollments(enrollments, request.data)
 
         assigned, out_of_orbit, failed, errors = 0, 0, 0, []
         for enr in enrollments:
@@ -6896,6 +6919,77 @@ def _preview_household_for_kitchen(enr, kitchen, offered):
         "member_count": len(members),
         "out_members": out_members,
         "fully_covered": not out_members,
+    }
+
+
+def _bulk_filter_enrollments(enrollments, data):
+    """Filter the awaiting-assignment enrollments by the bulk-assign popup's
+    optional filters, then cap to a household ``limit``. A household is kept when
+    ANY of its members matches (menu type / each selected allergy) and its
+    delivery ZIP starts with the typed prefix. ``data`` is the request body /
+    query params. Order is preserved so the cap is deterministic."""
+    from ..models import FoodAllergy
+
+    menu = (data.get("menu_type") or "").strip()
+    if menu.casefold() == "all":
+        menu = ""
+
+    raw_allergies = data.get("allergies")
+    if isinstance(raw_allergies, str):
+        raw_allergies = raw_allergies.split(",")
+    allergies = [a.strip() for a in (raw_allergies or []) if a and a.strip()]
+    # Stored food_allergies data is mixed (codes + a few labels) -> match either.
+    labels = dict(FoodAllergy.choices)
+    allergy_sets = [{code, labels.get(code, code)} for code in allergies]
+
+    zip_prefix = (data.get("zip") or "").strip()
+
+    def _matches(enr):
+        members = list(enr.member_profiles.all())
+        if menu and not any(
+            (m.menu_type or "").strip().casefold() == menu.casefold() for m in members
+        ):
+            return False
+        for wanted in allergy_sets:  # AND across selected allergies, ANY member each
+            if not any(
+                any(a in wanted for a in (m.food_allergies or [])) for m in members
+            ):
+                return False
+        if zip_prefix:
+            addr = enr.delivery_address if enr.delivery_address_id else None
+            z = (addr.zip if addr else "") or ""
+            if not z.startswith(zip_prefix):
+                return False
+        return True
+
+    filtered = [e for e in enrollments if _matches(e)]
+    try:
+        limit = int(data.get("limit") or 0)
+    except (TypeError, ValueError):
+        limit = 0
+    if limit > 0:
+        filtered = filtered[:limit]
+    return filtered
+
+
+def _bulk_candidate_row(enr):
+    """A matched household for the bulk-assign preview: each member's name, menu
+    type + allergies, plus the shared delivery ZIP."""
+    members = list(enr.member_profiles.all())
+    addr = enr.delivery_address if enr.delivery_address_id else None
+    return {
+        "client_id": str(enr.client_id) if enr.client_id else None,
+        "name": _household_name(enr),
+        "member_count": len(members),
+        "zip": (addr.zip if addr else "") or "",
+        "members": [
+            {
+                "name": m.member_name or "Member",
+                "menu_type": m.menu_type or "",
+                "allergies": _member_allergy_labels(m),
+            }
+            for m in members
+        ],
     }
 
 
@@ -6988,9 +7082,14 @@ class BulkAssignMealsView(PortalAPIView):
                 e for e in enrollments
                 if enrollment_ready_for_assignment(e, kitchens_ctx)
             ]
+        # Optional bulk-assign popup filters (menu type / allergies / ZIP) + a
+        # household cap. Applied to BOTH the preview and the apply so what the
+        # agent reviews is exactly what gets assigned.
+        enrollments = _bulk_filter_enrollments(enrollments, request.data)
         offered = kitchen_offered_menu_index(kitchen)
 
-        # Preview: dry-run only, report households that would have exclusions.
+        # Preview: dry-run only, report the matched households (the filtered set
+        # the agent is about to assign) plus which of them would have exclusions.
         if request.data.get("preview"):
             fully_covered, with_exclusions, households = 0, 0, []
             for enr in enrollments:
@@ -7008,6 +7107,8 @@ class BulkAssignMealsView(PortalAPIView):
                 "with_exclusions": with_exclusions,
                 # Only the households needing attention (keeps the payload bounded).
                 "households": households,
+                # The full matched set (result of the filters) for the preview list.
+                "candidates": [_bulk_candidate_row(e) for e in enrollments],
             })
 
         # Apply.

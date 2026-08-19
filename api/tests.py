@@ -17296,6 +17296,67 @@ class ResolveCaselessPreviousEnrollmentsTest(TestCase):
         self.assertEqual(str(surv.previous_case_id), str(pick.case_id))
 
 
+class BulkAssignFiltersTest(TestCase):
+    """The bulk-assign popup filters keep a household when ANY member matches the
+    menu type / each selected allergy and the delivery ZIP starts with the typed
+    prefix, then cap to `limit` households."""
+
+    def _enr(self, *, zip_code, members):
+        from .models import (
+            Address, Client, EnrollmentStage, EnrollmentVerification,
+            MemberDietaryProfile, MemberStatus,
+        )
+        c = Client.objects.create(client_id=str(uuid.uuid4()), first_name="H", last_name="H")
+        addr = Address.objects.create(client=c, type="temporary", zip=zip_code)
+        e = EnrollmentVerification.objects.create(
+            client=c, stage=EnrollmentStage.KITCHEN_ASSIGNMENT,
+            program_name="Medically Tailored Meals", delivery_address=addr,
+        )
+        for i, (menu, allergies) in enumerate(members):
+            mc = c if i == 0 else Client.objects.create(
+                client_id=str(uuid.uuid4()), first_name=f"M{i}", last_name="H",
+            )
+            MemberDietaryProfile.objects.create(
+                enrollment=e, client=mc, member_name=f"M{i}", menu_type=menu,
+                food_allergies=allergies, status=MemberStatus.ACTIVE,
+            )
+        return e
+
+    def test_filters_and_limit(self):
+        from api.portal.views_members import _bulk_filter_enrollments
+        e1 = self._enr(zip_code="11211", members=[("Kosher", []), ("Standard", ["peanut"])])
+        e2 = self._enr(zip_code="10001", members=[("Standard", [])])
+        e3 = self._enr(zip_code="11215", members=[("Halal", ["shellfish"])])
+        enrolls = [e1, e2, e3]
+
+        # Menu type: any member on Kosher -> only e1.
+        self.assertEqual(
+            [e.pk for e in _bulk_filter_enrollments(enrolls, {"menu_type": "Kosher"})],
+            [e1.pk],
+        )
+        # "all" is treated as no menu filter.
+        self.assertEqual(len(_bulk_filter_enrollments(enrolls, {"menu_type": "all"})), 3)
+        # ZIP prefix 112 -> e1 + e3.
+        self.assertEqual(
+            {e.pk for e in _bulk_filter_enrollments(enrolls, {"zip": "112"})},
+            {e1.pk, e3.pk},
+        )
+        # Allergy peanut -> only e1 (a member carries it).
+        self.assertEqual(
+            [e.pk for e in _bulk_filter_enrollments(enrolls, {"allergies": ["peanut"]})],
+            [e1.pk],
+        )
+        # Combined menu + zip.
+        self.assertEqual(
+            [e.pk for e in _bulk_filter_enrollments(enrolls, {"menu_type": "Halal", "zip": "112"})],
+            [e3.pk],
+        )
+        # Limit caps households (order preserved).
+        self.assertEqual(len(_bulk_filter_enrollments(enrolls, {"limit": 2})), 2)
+        # No filters -> all.
+        self.assertEqual(len(_bulk_filter_enrollments(enrolls, {})), 3)
+
+
 class PurgeHiddenMisinformationEnrollmentsTest(TestCase):
     """Purges flagged caseless terminal placeholders, re-points supersession
     chains past them, and never touches case-backed / non-terminal rows."""
