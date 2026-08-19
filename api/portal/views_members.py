@@ -342,6 +342,11 @@ def _prior_enrollment_chain(enrollment, limit=25):
     cur = enrollment.supersedes if enrollment else None
     while cur is not None and cur.pk not in seen and len(chain) < limit:
         seen.add(cur.pk)
+        # Skip legacy caseless placeholders flagged as misinformation -- they have
+        # no real prior case to show -- but keep walking the chain past them.
+        if getattr(cur, "hidden_misinformation", False):
+            cur = cur.supersedes
+            continue
         case = cur.case
         chain.append({
             "id": cur.pk,
@@ -353,6 +358,14 @@ def _prior_enrollment_chain(enrollment, limit=25):
             "kitchen_name": cur.kitchen.name if cur.kitchen_id else "",
             "close_reason": cur.close_reason or "",
             "verified_at": cur.verified_at.isoformat() if cur.verified_at else None,
+            # When this prior enrollment / its related case closed, so the Program
+            # tab can show "Case <id> · Closed <date>" per previous enrollment.
+            # Prefer the related case's close date; fall back to the enrollment's.
+            "closed_at": cur.closed_at.isoformat() if cur.closed_at else None,
+            "case_closed_at": (
+                case.case_closed_at.isoformat()
+                if case and case.case_closed_at else None
+            ),
         })
         cur = cur.supersedes
     return chain
@@ -5865,19 +5878,30 @@ class MemberVerificationCreateView(PortalAPIView):
         except Exception:  # never let history-logging break the verification
             pass
 
-        # Tie the enrollment to the agent-selected Internal Service case from the
-        # pop-up (when provided + free) BEFORE the authorization projection, so
-        # the switch sticks even while the case is still pending. A case already
-        # owned by another enrollment is skipped (per-case unique constraint).
+        # Tie the governing Internal Service case to this enrollment BEFORE the
+        # authorization projection, so the enrollment is NEVER left caseless:
+        # prefer the case the agent picked in the wizard, otherwise fall back to
+        # the client's governing internal-service case. Also snapshot the program
+        # name / service type from that case so the enrollment carries the info it
+        # needs. A case already owned by another enrollment is skipped (per-case
+        # unique constraint).
+        case_to_bind = selected_case or governing_internal_case(enrollment)
         if (
-            selected_case is not None
+            case_to_bind is not None
             and enrollment.case_id is None
-            and not EnrollmentVerification.objects.filter(case=selected_case)
+            and not EnrollmentVerification.objects.filter(case=case_to_bind)
             .exclude(pk=enrollment.pk)
             .exists()
         ):
-            enrollment.case = selected_case
-            enrollment.save(update_fields=["case"])
+            enrollment.case = case_to_bind
+            bind_fields = ["case"]
+            if not enrollment.program_name and case_to_bind.program_name:
+                enrollment.program_name = case_to_bind.program_name
+                bind_fields.append("program_name")
+            if not enrollment.service_type and case_to_bind.service_type:
+                enrollment.service_type = case_to_bind.service_type
+                bind_fields.append("service_type")
+            enrollment.save(update_fields=bind_fields)
 
         # Snapshot the scope (Household / Individual) this household was VERIFIED
         # under onto the enrollment itself. This is the enrollment's own scope --

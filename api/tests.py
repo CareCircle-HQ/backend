@@ -15072,6 +15072,61 @@ class CaseSwitchClosesOldAndRespectsNutriGateTest(TestCase):
         self.assertEqual(new_enr.supersedes_id, live.pk)
         self.assertIsNotNone(new_enr.nutritionist_approved_at)  # carried forward
 
+    def test_caseless_served_enrollment_retied_to_prior_case_on_fork(self):
+        # INVARIANT: an enrollment must never be left tied to no case. A served
+        # enrollment that lost its case FK when its governing case closed must be
+        # RE-TIED to that prior (closed) case as it's forked to history -- so the
+        # superseded "previous enrollment" always references its case.
+        from datetime import timedelta
+        from .models import (
+            Case, CaseStatus, CaseType, Client, EnrollmentStage,
+            EnrollmentVerification, Household, HouseholdMember,
+            ServiceAuthorizationStatus,
+        )
+        from .services.lifecycle import replace_enrollment_for_case_change
+
+        now = timezone.now()
+        client = Client.objects.create(client_id=str(uuid.uuid4()), first_name="Re", last_name="Tie")
+        hh = Household.objects.create(name="HH")
+        HouseholdMember.objects.create(household=hh, client=client, is_primary=True)
+
+        def _case(day, status):
+            return Case.objects.create(
+                case_id=uuid.uuid4(), client=client,
+                case_type=CaseType.INTERNAL_SERVICE, case_status=status,
+                service_authorization_status=ServiceAuthorizationStatus.APPROVED,
+                service_authorization_approval_starts_at=now,
+                service_authorization_approval_ends_at=now + timedelta(days=90),
+                program_name="Medically Tailored Meals",
+                case_created_at=now + timedelta(days=day),
+                date_opened=now + timedelta(days=day),
+                case_closed_at=(now + timedelta(days=day + 5)) if status == CaseStatus.CLOSED else None,
+            )
+
+        prior_case = _case(1, CaseStatus.CLOSED)  # the case it served under, now closed
+        # A serving enrollment that LOST its case FK when the prior case closed.
+        live = EnrollmentVerification.objects.create(
+            client=client, household=hh, case=None,
+            stage=EnrollmentStage.SERVICE_ACTIVE,
+            program_name="Medically Tailored Meals", verified_at=now,
+        )
+        new_case = _case(30, CaseStatus.OPEN)
+
+        new_enr = replace_enrollment_for_case_change(client, new_case)
+        self.assertIsNotNone(new_enr)  # served -> forks
+        new_enr.refresh_from_db(); live.refresh_from_db()
+        self.assertEqual(str(new_enr.case_id), str(new_case.case_id))
+        self.assertEqual(EnrollmentStage(live.stage), EnrollmentStage.CLOSED)
+        self.assertEqual(new_enr.supersedes_id, live.pk)
+        # CRUCIAL: the superseded enrollment is re-tied to its prior case.
+        self.assertEqual(str(live.case_id), str(prior_case.case_id))
+        # The survivor tracks the case it replaced via previous_case.
+        self.assertEqual(str(new_enr.previous_case_id), str(prior_case.case_id))
+        # No caseless enrollment remains for the client.
+        self.assertFalse(
+            EnrollmentVerification.objects.filter(client=client, case__isnull=True).exists()
+        )
+
     def test_full_reconcile_rebinds_verified_no_duplicate(self):
         # End-to-end via the real entry point: a governing-case-id change on a
         # verified (in-funnel) household rebinds instead of forking, so no
@@ -17110,6 +17165,74 @@ class DetectApiMigrationTest(TestCase):
         old = Client.objects.create(client_id=str(uuid.uuid4()), first_name="Sam", last_name="Roe", date_of_birth=dob)
         new = Client.objects.create(client_id=str(uuid.uuid4()), first_name="Sam", last_name="Roe", date_of_birth=dob)
         self.assertFalse(identity_matches_for_merge(old, new))  # no medicaid on file
+
+
+class ResolveCaselessPreviousEnrollmentsTest(TestCase):
+    """The backlog resolver flags no-prior-case placeholders, backfills the
+    single-candidate ones, and leaves 2+-candidate rows untouched for review."""
+
+    def _case(self, client, *, status, day=0):
+        from datetime import timedelta
+        from .models import Case, CaseType, ServiceAuthorizationStatus
+        now = timezone.now()
+        return Case.objects.create(
+            case_id=uuid.uuid4(), client=client,
+            case_type=CaseType.INTERNAL_SERVICE, case_status=status,
+            service_authorization_status=ServiceAuthorizationStatus.APPROVED,
+            program_name="Medically Tailored Meals",
+            case_created_at=now + timedelta(days=day),
+            date_opened=now + timedelta(days=day),
+        )
+
+    def test_flags_backfills_and_leaves_ambiguous(self):
+        from io import StringIO
+        from django.core.management import call_command
+        from .models import (
+            CaseStatus, Client, EnrollmentStage, EnrollmentVerification,
+        )
+
+        def _prev_and_survivor(client, surv_case):
+            prev = EnrollmentVerification.objects.create(
+                client=client, stage=EnrollmentStage.CLOSED,
+                close_reason="case_replaced", case=None,
+            )
+            surv = EnrollmentVerification.objects.create(
+                client=client, stage=EnrollmentStage.SERVICE_ACTIVE,
+                case=surv_case, supersedes=prev,
+            )
+            return prev, surv
+
+        # A: no distinct prior case -> FLAG as misinformation.
+        a = Client.objects.create(client_id=str(uuid.uuid4()), first_name="A", last_name="A")
+        a_prev, _ = _prev_and_survivor(a, self._case(a, status=CaseStatus.OPEN, day=10))
+
+        # B: exactly one prior case -> BACKFILL onto the row + survivor.previous_case.
+        b = Client.objects.create(client_id=str(uuid.uuid4()), first_name="B", last_name="B")
+        b_prior = self._case(b, status=CaseStatus.CLOSED, day=1)
+        b_prev, b_surv = _prev_and_survivor(b, self._case(b, status=CaseStatus.OPEN, day=10))
+
+        # C: two prior cases -> AMBIGUOUS, untouched.
+        c = Client.objects.create(client_id=str(uuid.uuid4()), first_name="C", last_name="C")
+        self._case(c, status=CaseStatus.CLOSED, day=1)
+        self._case(c, status=CaseStatus.CLOSED, day=2)
+        c_prev, _ = _prev_and_survivor(c, self._case(c, status=CaseStatus.OPEN, day=10))
+
+        out = StringIO()
+        call_command("resolve_caseless_previous_enrollments", "--apply", stdout=out)
+
+        a_prev.refresh_from_db(); b_prev.refresh_from_db()
+        b_surv.refresh_from_db(); c_prev.refresh_from_db()
+        # A flagged, still caseless.
+        self.assertTrue(a_prev.hidden_misinformation)
+        self.assertIsNone(a_prev.case_id)
+        # B backfilled to its single prior case; survivor tracks previous_case.
+        self.assertEqual(str(b_prev.case_id), str(b_prior.case_id))
+        self.assertEqual(str(b_surv.previous_case_id), str(b_prior.case_id))
+        self.assertFalse(b_prev.hidden_misinformation)
+        # C untouched + listed as ambiguous.
+        self.assertIsNone(c_prev.case_id)
+        self.assertFalse(c_prev.hidden_misinformation)
+        self.assertIn(str(c.client_id), out.getvalue())
 
 
 class MenuCarryRegressionAuditGuardTest(TestCase):
