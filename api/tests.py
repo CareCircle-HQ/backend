@@ -17171,7 +17171,7 @@ class ResolveCaselessPreviousEnrollmentsTest(TestCase):
     """The backlog resolver flags no-prior-case placeholders, backfills the
     single-candidate ones, and leaves 2+-candidate rows untouched for review."""
 
-    def _case(self, client, *, status, day=0):
+    def _case(self, client, *, status, day=0, closed_day=None):
         from datetime import timedelta
         from .models import Case, CaseType, ServiceAuthorizationStatus
         now = timezone.now()
@@ -17182,6 +17182,7 @@ class ResolveCaselessPreviousEnrollmentsTest(TestCase):
             program_name="Medically Tailored Meals",
             case_created_at=now + timedelta(days=day),
             date_opened=now + timedelta(days=day),
+            case_closed_at=(now + timedelta(days=closed_day)) if closed_day is not None else None,
         )
 
     def test_flags_backfills_and_leaves_ambiguous(self):
@@ -17233,6 +17234,40 @@ class ResolveCaselessPreviousEnrollmentsTest(TestCase):
         self.assertIsNone(c_prev.case_id)
         self.assertFalse(c_prev.hidden_misinformation)
         self.assertIn(str(c.client_id), out.getvalue())
+
+    def test_resolve_ambiguous_by_close_match(self):
+        from io import StringIO
+        from django.core.management import call_command
+        from .models import (
+            CaseStatus, Client, EnrollmentStage, EnrollmentVerification,
+        )
+
+        # Survivor case created on day 10. Two prior candidates: one CLOSED on
+        # day 10 (the case the survivor directly replaced) and one closed on day 5.
+        c = Client.objects.create(client_id=str(uuid.uuid4()), first_name="D", last_name="D")
+        replaced = self._case(c, status=CaseStatus.CLOSED, day=2, closed_day=10)
+        self._case(c, status=CaseStatus.CLOSED, day=1, closed_day=5)
+        prev = EnrollmentVerification.objects.create(
+            client=c, stage=EnrollmentStage.CLOSED, close_reason="case_replaced", case=None,
+        )
+        surv = EnrollmentVerification.objects.create(
+            client=c, stage=EnrollmentStage.SERVICE_ACTIVE,
+            case=self._case(c, status=CaseStatus.OPEN, day=10), supersedes=prev,
+        )
+
+        # Without the flag it stays ambiguous (no write).
+        call_command("resolve_caseless_previous_enrollments", "--apply", stdout=StringIO())
+        prev.refresh_from_db()
+        self.assertIsNone(prev.case_id)
+
+        # With the flag it binds the close-matching candidate.
+        call_command(
+            "resolve_caseless_previous_enrollments", "--apply",
+            "--resolve-ambiguous-by-close-match", stdout=StringIO(),
+        )
+        prev.refresh_from_db(); surv.refresh_from_db()
+        self.assertEqual(str(prev.case_id), str(replaced.case_id))
+        self.assertEqual(str(surv.previous_case_id), str(replaced.case_id))
 
 
 class MenuCarryRegressionAuditGuardTest(TestCase):

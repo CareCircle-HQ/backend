@@ -11,6 +11,11 @@ cases (excluding the survivor's current case) and act per bucket:
     record it as the survivor's ``previous_case``.
   * 2+ candidates            -> AMBIGUOUS: printed for manual review, unchanged.
 
+With ``--resolve-ambiguous-by-close-match`` an ambiguous row is auto-resolved
+when EXACTLY ONE candidate's case CLOSED on the survivor case's created date --
+i.e. the case the survivor directly replaced. True ties (no such candidate, or
+more than one) are still left for manual review.
+
 DRY-RUN by default (prints what WOULD change); pass ``--apply`` to commit. Use
 ``--client <id>`` to scope to one member. Idempotent.
 """
@@ -36,10 +41,19 @@ class Command(BaseCommand):
             "--client", default="",
             help="Only process this client_id (default: every affected client).",
         )
+        parser.add_argument(
+            "--resolve-ambiguous-by-close-match", action="store_true",
+            help=(
+                "For 2+-candidate rows, bind the candidate that CLOSED on the "
+                "survivor case's created date (the case it directly replaced) when "
+                "exactly one such candidate exists; leave true ties for review."
+            ),
+        )
 
     def handle(self, *args, **opts):
         apply = opts["apply"]
         only = (opts.get("client") or "").strip()
+        close_match = opts["resolve_ambiguous_by_close_match"]
 
         superseded_ids = set(
             EnrollmentVerification.objects
@@ -54,16 +68,35 @@ class Command(BaseCommand):
         if only:
             prev = prev.filter(client__client_id=only)
 
-        flagged = backfilled = 0
+        flagged = backfilled = close_matched = 0
         ambiguous = []  # (client_id, enr_pk, [candidate case ids])
+
+        def _bind(enrollment, prior, survivor):
+            """Bind ``prior`` onto the enrollment + record it as the survivor's
+            previous_case. No-op unless --apply."""
+            if not apply:
+                return
+            with transaction.atomic():
+                enrollment.case = prior
+                fields = ["case"]
+                if not enrollment.program_name and prior.program_name:
+                    enrollment.program_name = prior.program_name
+                    fields.append("program_name")
+                if not enrollment.service_type and prior.service_type:
+                    enrollment.service_type = prior.service_type
+                    fields.append("service_type")
+                enrollment.save(update_fields=fields)
+                if survivor is not None and survivor.previous_case_id is None:
+                    survivor.previous_case = prior
+                    survivor.save(update_fields=["previous_case"])
 
         for e in prev.iterator(chunk_size=500):
             survivor = EnrollmentVerification.objects.filter(supersedes=e).first()
-            surv_case_id = survivor.case_id if survivor else None
+            surv_case = survivor.case if survivor else None
             candidates = list(
                 Case.objects
                 .filter(client_id=e.client_id, case_type=CaseType.INTERNAL_SERVICE)
-                .exclude(case_id=surv_case_id)
+                .exclude(case_id=(surv_case.case_id if surv_case else None))
                 .order_by("-case_created_at", "-date_opened")
             )
 
@@ -75,30 +108,30 @@ class Command(BaseCommand):
                 continue
 
             if len(candidates) == 1:
-                prior = candidates[0]
                 backfilled += 1
-                if apply:
-                    with transaction.atomic():
-                        e.case = prior
-                        fields = ["case"]
-                        if not e.program_name and prior.program_name:
-                            e.program_name = prior.program_name
-                            fields.append("program_name")
-                        if not e.service_type and prior.service_type:
-                            e.service_type = prior.service_type
-                            fields.append("service_type")
-                        e.save(update_fields=fields)
-                        if survivor is not None and survivor.previous_case_id is None:
-                            survivor.previous_case = prior
-                            survivor.save(update_fields=["previous_case"])
+                _bind(e, candidates[0], survivor)
                 continue
+
+            # 2+ candidates. Optionally auto-resolve to the case the survivor
+            # directly replaced: the one that CLOSED on the survivor's created
+            # date. Only when exactly one candidate matches (else it's a real tie).
+            if close_match and surv_case is not None:
+                surv_created = _as_date(surv_case.case_created_at) or _as_date(surv_case.date_opened)
+                matches = [
+                    c for c in candidates
+                    if surv_created is not None and _as_date(c.case_closed_at) == surv_created
+                ]
+                if len(matches) == 1:
+                    close_matched += 1
+                    _bind(e, matches[0], survivor)
+                    continue
 
             ambiguous.append(
                 (str(e.client_id), e.pk, [str(c.case_id) for c in candidates])
             )
 
         if ambiguous:
-            self.stdout.write("AMBIGUOUS (2+ candidate prior cases -- review manually):")
+            self.stdout.write("AMBIGUOUS (still need manual review):")
             self.stdout.write(f"  {'client_id':<38}{'enr':<8}candidate_case_ids")
             for cid, enr_pk, cases in ambiguous:
                 self.stdout.write(f"  {cid:<38}{enr_pk:<8}{', '.join(cases)}")
@@ -106,6 +139,14 @@ class Command(BaseCommand):
         mode = "APPLIED" if apply else "DRY-RUN (no changes written)"
         self.stdout.write(self.style.SUCCESS(
             f"\n{mode}: {flagged} flagged as misinformation (no prior case), "
-            f"{backfilled} backfilled to their single prior case, "
-            f"{len(ambiguous)} ambiguous (left for review)."
+            f"{backfilled} backfilled to their single prior case"
+            + (f", {close_matched} ambiguous auto-resolved by close-match" if close_match else "")
+            + f", {len(ambiguous)} ambiguous (left for review)."
         ))
+
+
+def _as_date(dt):
+    """The date component of a datetime/date, or None."""
+    if dt is None:
+        return None
+    return dt.date() if hasattr(dt, "date") else dt
