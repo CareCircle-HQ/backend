@@ -34,6 +34,17 @@ def _is_default_menu(menu):
     return (menu or "").strip().lower() in _DEFAULT_MENUS
 
 
+# Only repair a survivor that is the member's CURRENT (live) enrollment. A
+# DISREGARDED / CLOSED / CANCELLED survivor is not their effective menu (e.g. a
+# disregarded placeholder that supersedes the now-active enrollment), so it must
+# not be "restored" -- that would mirror the list-audit false positive.
+_INERT_SURVIVOR_STAGES = {
+    EnrollmentStage.DISREGARDED,
+    EnrollmentStage.CLOSED,
+    EnrollmentStage.CANCELLED,
+}
+
+
 class Command(BaseCommand):
     help = (
         "Restore the verified menu onto survivors reset to the default menu by a "
@@ -77,6 +88,10 @@ class Command(BaseCommand):
         profiles_updated = 0
         calendars_rebuilt = 0
         for e_new in survivors.iterator(chunk_size=500):
+            # Skip survivors that aren't the member's live enrollment (a
+            # disregarded/closed placeholder pointing at the active one).
+            if EnrollmentStage(e_new.stage) in _INERT_SURVIVOR_STAGES:
+                continue
             e_old = e_new.supersedes
             if not e_old or (e_old.close_reason or "") != "case_replaced":
                 continue
