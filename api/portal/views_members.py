@@ -4113,13 +4113,16 @@ class HouseholdMemberEditView(PortalAPIView):
             reactivated = False
             reason = ""
             if mv.status == MemberStatus.ACTIVE or (
-                mv.status == MemberStatus.OUT_OF_ORBIT and menu_allergy_changed
+                mv.status in (MemberStatus.OUT_OF_ORBIT, MemberStatus.PENDING)
+                and menu_allergy_changed
             ):
-                was_ooo = mv.status == MemberStatus.OUT_OF_ORBIT
+                was_inactive = mv.status in (
+                    MemberStatus.OUT_OF_ORBIT, MemberStatus.PENDING,
+                )
                 _out, became_out, reason = reconcile_member_kitchen_output(
                     mv, enr.kitchen, save=False,
                 )
-                reactivated = was_ooo and mv.status == MemberStatus.ACTIVE
+                reactivated = was_inactive and mv.status == MemberStatus.ACTIVE
             mv.save()
             if became_out or reactivated:
                 agent = current_agent(request)
