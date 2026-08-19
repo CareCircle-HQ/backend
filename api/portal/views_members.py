@@ -7184,6 +7184,49 @@ class MemberKitchenView(PortalAPIView):
         enr.kitchen = kitchen
         enr.save(update_fields=["kitchen"])
         enr.delivery_schedules.update(kitchen=kitchen)
+
+        # Re-run the kitchen-aware meal rule for EVERY member against the NEW
+        # kitchen (mirrors the Kitchen Assignment popup): a member the new kitchen
+        # can't serve (menu not offered / allergy it can't handle) flips to Out of
+        # Orbit, and a previously-OUT_OF_ORBIT member the new kitchen CAN serve
+        # returns to Active. PAUSED / INACTIVE / OUT_OF_RANGE are left untouched
+        # (reconcile only toggles ACTIVE <-> OUT_OF_ORBIT). Best-effort per member.
+        agent = current_agent(request)
+        actor = _agent_actor(agent)
+        for profile in enr.member_profiles.select_related("client").all():
+            was_out = profile.status == MemberStatus.OUT_OF_ORBIT
+            try:
+                _out, became_out, reason = reconcile_member_kitchen_output(
+                    profile, kitchen, save=True,
+                )
+            except Exception:  # pragma: no cover - never let one member block the switch
+                continue
+            if became_out:
+                try:
+                    timeline.event_for_out_of_orbit(
+                        profile, enrollment=enr,
+                        reason=reason or "The assigned kitchen can't fulfill this member's menu/allergies.",
+                        actor=actor,
+                    )
+                except Exception:  # never let history-logging break the change
+                    pass
+                if profile.client_id:
+                    try:
+                        Note.objects.create(
+                            client=profile.client, source=NoteSource.SYSTEM,
+                            author_name=agent.name if agent else "",
+                            body=NO_KITCHEN_OUT_OF_ORBIT_NOTE,
+                        )
+                    except Exception:  # never let note-writing break the change
+                        pass
+            elif was_out and profile.status == MemberStatus.ACTIVE:
+                try:
+                    timeline.event_for_member_reactivated(
+                        profile, enrollment=enr, actor=actor,
+                    )
+                except Exception:  # never let history-logging break the change
+                    pass
+
         # Record the kitchen change (prev -> new) on the primary's history.
         try:
             timeline.event_for_kitchen_changed(
