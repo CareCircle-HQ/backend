@@ -353,6 +353,14 @@ def _prior_enrollment_chain(enrollment, limit=25):
             "kitchen_name": cur.kitchen.name if cur.kitchen_id else "",
             "close_reason": cur.close_reason or "",
             "verified_at": cur.verified_at.isoformat() if cur.verified_at else None,
+            # When this prior enrollment / its related case closed, so the Program
+            # tab can show "Case <id> · Closed <date>" per previous enrollment.
+            # Prefer the related case's close date; fall back to the enrollment's.
+            "closed_at": cur.closed_at.isoformat() if cur.closed_at else None,
+            "case_closed_at": (
+                case.case_closed_at.isoformat()
+                if case and case.case_closed_at else None
+            ),
         })
         cur = cur.supersedes
     return chain
