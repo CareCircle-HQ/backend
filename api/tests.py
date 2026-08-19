@@ -17296,6 +17296,41 @@ class ResolveCaselessPreviousEnrollmentsTest(TestCase):
         self.assertEqual(str(surv.previous_case_id), str(pick.case_id))
 
 
+class NormalizeFoodAllergyCodesTest(TestCase):
+    """Rewrites label food-allergy values to FoodAllergy codes; the catch-all
+    'Others'->'other' is gated behind --include-other (OOO impact)."""
+
+    def _prof(self, allergies):
+        from .models import (
+            Client, EnrollmentStage, EnrollmentVerification,
+            MemberDietaryProfile, MemberStatus,
+        )
+        c = Client.objects.create(client_id=str(uuid.uuid4()), first_name="A", last_name="A")
+        e = EnrollmentVerification.objects.create(client=c, stage=EnrollmentStage.KITCHEN_ASSIGNMENT)
+        return MemberDietaryProfile.objects.create(
+            enrollment=e, client=c, member_name="A",
+            food_allergies=allergies, status=MemberStatus.ACTIVE,
+        )
+
+    def test_normalizes_labels_and_gates_other(self):
+        from io import StringIO
+        from django.core.management import call_command
+
+        p1 = self._prof(["Milk", "Red Meat"])
+        p2 = self._prof(["Others"])
+        p3 = self._prof(["milk"])  # already a code
+
+        call_command("normalize_food_allergy_codes", "--apply", stdout=StringIO())
+        p1.refresh_from_db(); p2.refresh_from_db(); p3.refresh_from_db()
+        self.assertEqual(p1.food_allergies, ["milk", "red_meat"])
+        self.assertEqual(p2.food_allergies, ["Others"])  # catch-all left untouched
+        self.assertEqual(p3.food_allergies, ["milk"])
+
+        call_command("normalize_food_allergy_codes", "--apply", "--include-other", stdout=StringIO())
+        p2.refresh_from_db()
+        self.assertEqual(p2.food_allergies, ["other"])
+
+
 class PurchaseOrderPreviewHelpersTest(TestCase):
     """The PO preview exposes each member's snapshot ZIP + allergy labels so the
     Generate PO popup can filter/highlight by ZIP and allergy."""
