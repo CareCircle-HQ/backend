@@ -3721,6 +3721,9 @@ def replace_enrollment_for_case_change(
             "client": live.client,
             "household": live.household,
             "case": new_governing_case,
+            # Track the case this enrollment replaced (its predecessor's case) so
+            # the prior-case link survives even after the old row is closed.
+            "previous_case": old_case,
             "program_name": new_governing_case.program_name or "",
             "service_type": new_governing_case.service_type or "",
             "delivery_address": live.delivery_address,

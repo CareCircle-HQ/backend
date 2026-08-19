@@ -15120,6 +15120,8 @@ class CaseSwitchClosesOldAndRespectsNutriGateTest(TestCase):
         self.assertEqual(new_enr.supersedes_id, live.pk)
         # CRUCIAL: the superseded enrollment is re-tied to its prior case.
         self.assertEqual(str(live.case_id), str(prior_case.case_id))
+        # The survivor tracks the case it replaced via previous_case.
+        self.assertEqual(str(new_enr.previous_case_id), str(prior_case.case_id))
         # No caseless enrollment remains for the client.
         self.assertFalse(
             EnrollmentVerification.objects.filter(client=client, case__isnull=True).exists()

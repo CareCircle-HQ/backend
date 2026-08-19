@@ -2027,11 +2027,22 @@ class EnrollmentVerification(models.Model):
         "Household", on_delete=models.SET_NULL, null=True, blank=True,
         related_name="enrollment_verifications",
     )
-    # The Met Council case this enrollment is delivered under (optional until a
-    # case exists).
+    # The Met Council case this enrollment is delivered under. Bound at
+    # verification (the governing internal-service case picked in the wizard) and
+    # kept in sync through governing-case replacements -- every enrollment should
+    # reference its case; it's only ever null in the brief window before the
+    # client's first case exists.
     case = models.ForeignKey(
         Case, on_delete=models.SET_NULL, null=True, blank=True,
         related_name="enrollments",
+    )
+    # The case this enrollment REPLACED (its predecessor's governing case), set
+    # when it's forked from a prior enrollment during a governing-case
+    # replacement. Preserves the prior-case link for history/audit even after the
+    # old enrollment is closed.
+    previous_case = models.ForeignKey(
+        Case, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="superseded_by_enrollments",
     )
     # The kitchen assigned to fulfill this household's deliveries. One kitchen
     # serves the whole household (members are never split across kitchens). Set
