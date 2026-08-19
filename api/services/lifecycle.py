@@ -3625,13 +3625,25 @@ def replace_enrollment_for_case_change(
             EnrollmentStage.ON_HOLD,
             EnrollmentStage.SERVICE_COMPLETE,
         }
-        has_prior_case = (
+        # The PRIOR internal-service case this enrollment used to serve under (the
+        # one that CLOSED and unbound it). Newest by governing-case tie-breaker.
+        prior_case = (
             client.cases.filter(case_type=CaseType.INTERNAL_SERVICE)
             .exclude(case_id=new_governing_case.case_id)
-            .exists()
+            .order_by("-case_created_at", "-date_opened")
+            .first()
         )
-        if EnrollmentStage(live.stage) not in _served_stages or not has_prior_case:
+        if EnrollmentStage(live.stage) not in _served_stages or prior_case is None:
             return None
+        # INVARIANT: every enrollment must reference its case. This served
+        # enrollment lost its case FK when its governing case closed; RE-TIE it to
+        # that prior (closed) case now -- BEFORE the fork below closes it as
+        # read-only history -- so the superseded row is never left caseless.
+        live.case = prior_case
+        try:
+            live.save(update_fields=["case"])
+        except Exception:  # pragma: no cover - defensive
+            pass
 
     old_case = live.case
     old_case_id = str(old_case.case_id) if old_case else ""
