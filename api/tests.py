@@ -17296,6 +17296,61 @@ class ResolveCaselessPreviousEnrollmentsTest(TestCase):
         self.assertEqual(str(surv.previous_case_id), str(pick.case_id))
 
 
+class PurgeHiddenMisinformationEnrollmentsTest(TestCase):
+    """Purges flagged caseless terminal placeholders, re-points supersession
+    chains past them, and never touches case-backed / non-terminal rows."""
+
+    def test_purge_repoints_chain_and_guards(self):
+        from io import StringIO
+        from django.core.management import call_command
+        from .models import (
+            Case, CaseStatus, CaseType, Client, EnrollmentStage,
+            EnrollmentVerification, MemberDietaryProfile, MemberStatus,
+            ServiceAuthorizationStatus,
+        )
+
+        client = Client.objects.create(client_id=str(uuid.uuid4()), first_name="P", last_name="Urge")
+        case = Case.objects.create(
+            case_id=uuid.uuid4(), client=client, case_type=CaseType.INTERNAL_SERVICE,
+            case_status=CaseStatus.OPEN,
+            service_authorization_status=ServiceAuthorizationStatus.APPROVED,
+        )
+
+        # Chain: O (older, kept) <- F (flagged placeholder) <- S (active survivor).
+        older = EnrollmentVerification.objects.create(
+            client=client, stage=EnrollmentStage.CLOSED, case=case,
+        )
+        flagged = EnrollmentVerification.objects.create(
+            client=client, stage=EnrollmentStage.CLOSED, close_reason="case_replaced",
+            case=None, hidden_misinformation=True, supersedes=older,
+        )
+        survivor = EnrollmentVerification.objects.create(
+            client=client, stage=EnrollmentStage.SERVICE_ACTIVE, case=case, supersedes=flagged,
+        )
+        # A cascade child on the flagged row.
+        MemberDietaryProfile.objects.create(
+            enrollment=flagged, client=client, member_name="P", menu_type="Standard",
+            status=MemberStatus.ACTIVE,
+        )
+        # A flagged row that is NOT eligible (still SERVICE_ACTIVE) -> must survive.
+        live_flagged = EnrollmentVerification.objects.create(
+            client=client, stage=EnrollmentStage.SERVICE_ACTIVE,
+            case=None, hidden_misinformation=True,
+        )
+
+        call_command("purge_hidden_misinformation_enrollments", "--apply", stdout=StringIO())
+
+        # Flagged terminal placeholder gone; its cascade child gone.
+        self.assertFalse(EnrollmentVerification.objects.filter(pk=flagged.pk).exists())
+        self.assertFalse(MemberDietaryProfile.objects.filter(enrollment_id=flagged.pk).exists())
+        # Chain re-pointed: survivor now supersedes the older kept enrollment.
+        survivor.refresh_from_db()
+        self.assertEqual(survivor.supersedes_id, older.pk)
+        # Guards: older (case-backed) + non-terminal flagged both survive.
+        self.assertTrue(EnrollmentVerification.objects.filter(pk=older.pk).exists())
+        self.assertTrue(EnrollmentVerification.objects.filter(pk=live_flagged.pk).exists())
+
+
 class MenuCarryRegressionAuditGuardTest(TestCase):
     """list_menu_carry_regressions must only flag a survivor that is the member's
     LIVE enrollment. A disregarded/closed placeholder that supersedes the now-
