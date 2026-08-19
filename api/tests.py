@@ -17296,6 +17296,178 @@ class ResolveCaselessPreviousEnrollmentsTest(TestCase):
         self.assertEqual(str(surv.previous_case_id), str(pick.case_id))
 
 
+class NormalizeFoodAllergyCodesTest(TestCase):
+    """Rewrites label food-allergy values to FoodAllergy codes; the catch-all
+    'Others'->'other' is gated behind --include-other (OOO impact)."""
+
+    def _prof(self, allergies):
+        from .models import (
+            Client, EnrollmentStage, EnrollmentVerification,
+            MemberDietaryProfile, MemberStatus,
+        )
+        c = Client.objects.create(client_id=str(uuid.uuid4()), first_name="A", last_name="A")
+        e = EnrollmentVerification.objects.create(client=c, stage=EnrollmentStage.KITCHEN_ASSIGNMENT)
+        return MemberDietaryProfile.objects.create(
+            enrollment=e, client=c, member_name="A",
+            food_allergies=allergies, status=MemberStatus.ACTIVE,
+        )
+
+    def test_normalizes_labels_and_gates_other(self):
+        from io import StringIO
+        from django.core.management import call_command
+
+        p1 = self._prof(["Milk", "Red Meat"])
+        p2 = self._prof(["Others"])
+        p3 = self._prof(["milk"])  # already a code
+
+        call_command("normalize_food_allergy_codes", "--apply", stdout=StringIO())
+        p1.refresh_from_db(); p2.refresh_from_db(); p3.refresh_from_db()
+        self.assertEqual(p1.food_allergies, ["milk", "red_meat"])
+        self.assertEqual(p2.food_allergies, ["Others"])  # catch-all left untouched
+        self.assertEqual(p3.food_allergies, ["milk"])
+
+        call_command("normalize_food_allergy_codes", "--apply", "--include-other", stdout=StringIO())
+        p2.refresh_from_db()
+        self.assertEqual(p2.food_allergies, ["other"])
+
+
+class PurchaseOrderPreviewHelpersTest(TestCase):
+    """The PO preview exposes each member's snapshot ZIP + allergy labels so the
+    Generate PO popup can filter/highlight by ZIP and allergy."""
+
+    def test_schedule_zip_and_allergy_labels(self):
+        from types import SimpleNamespace
+        from api.services.purchase_orders import _schedule_zip, _schedule_allergy_labels
+
+        s = SimpleNamespace(
+            delivery_address="123 Main St, Apt 4, Brooklyn NY 11211",
+            allergies=["peanut", "none", "peanut"],
+        )
+        self.assertEqual(_schedule_zip(s), "11211")
+        labels = _schedule_allergy_labels(s)
+        self.assertEqual(len(labels), 1)  # de-duped + 'none' dropped
+        self.assertNotIn("none", [x.lower() for x in labels])
+        # No address -> no zip; no allergies -> empty list.
+        self.assertEqual(_schedule_zip(SimpleNamespace(delivery_address="")), "")
+        self.assertEqual(_schedule_allergy_labels(SimpleNamespace(allergies=[])), [])
+
+
+class BulkAssignFiltersTest(TestCase):
+    """The bulk-assign popup filters keep a household when ANY member matches the
+    menu type / each selected allergy and the delivery ZIP starts with the typed
+    prefix, then cap to `limit` households."""
+
+    def _enr(self, *, zip_code, members):
+        from .models import (
+            Address, Client, EnrollmentStage, EnrollmentVerification,
+            MemberDietaryProfile, MemberStatus,
+        )
+        c = Client.objects.create(client_id=str(uuid.uuid4()), first_name="H", last_name="H")
+        addr = Address.objects.create(client=c, type="temporary", zip=zip_code)
+        e = EnrollmentVerification.objects.create(
+            client=c, stage=EnrollmentStage.KITCHEN_ASSIGNMENT,
+            program_name="Medically Tailored Meals", delivery_address=addr,
+        )
+        for i, (menu, allergies) in enumerate(members):
+            mc = c if i == 0 else Client.objects.create(
+                client_id=str(uuid.uuid4()), first_name=f"M{i}", last_name="H",
+            )
+            MemberDietaryProfile.objects.create(
+                enrollment=e, client=mc, member_name=f"M{i}", menu_type=menu,
+                food_allergies=allergies, status=MemberStatus.ACTIVE,
+            )
+        return e
+
+    def test_filters_and_limit(self):
+        from api.portal.views_members import _bulk_filter_enrollments
+        e1 = self._enr(zip_code="11211", members=[("Kosher", []), ("Standard", ["peanut"])])
+        e2 = self._enr(zip_code="10001", members=[("Standard", [])])
+        e3 = self._enr(zip_code="11215", members=[("Halal", ["shellfish"])])
+        enrolls = [e1, e2, e3]
+
+        # Menu type: any member on Kosher -> only e1.
+        self.assertEqual(
+            [e.pk for e in _bulk_filter_enrollments(enrolls, {"menu_type": "Kosher"})],
+            [e1.pk],
+        )
+        # "all" is treated as no menu filter.
+        self.assertEqual(len(_bulk_filter_enrollments(enrolls, {"menu_type": "all"})), 3)
+        # ZIP prefix 112 -> e1 + e3.
+        self.assertEqual(
+            {e.pk for e in _bulk_filter_enrollments(enrolls, {"zip": "112"})},
+            {e1.pk, e3.pk},
+        )
+        # Allergy peanut -> only e1 (a member carries it).
+        self.assertEqual(
+            [e.pk for e in _bulk_filter_enrollments(enrolls, {"allergies": ["peanut"]})],
+            [e1.pk],
+        )
+        # Combined menu + zip.
+        self.assertEqual(
+            [e.pk for e in _bulk_filter_enrollments(enrolls, {"menu_type": "Halal", "zip": "112"})],
+            [e3.pk],
+        )
+        # Limit caps households (order preserved).
+        self.assertEqual(len(_bulk_filter_enrollments(enrolls, {"limit": 2})), 2)
+        # No filters -> all.
+        self.assertEqual(len(_bulk_filter_enrollments(enrolls, {})), 3)
+
+
+class PurgeHiddenMisinformationEnrollmentsTest(TestCase):
+    """Purges flagged caseless terminal placeholders, re-points supersession
+    chains past them, and never touches case-backed / non-terminal rows."""
+
+    def test_purge_repoints_chain_and_guards(self):
+        from io import StringIO
+        from django.core.management import call_command
+        from .models import (
+            Case, CaseStatus, CaseType, Client, EnrollmentStage,
+            EnrollmentVerification, MemberDietaryProfile, MemberStatus,
+            ServiceAuthorizationStatus,
+        )
+
+        client = Client.objects.create(client_id=str(uuid.uuid4()), first_name="P", last_name="Urge")
+        case = Case.objects.create(
+            case_id=uuid.uuid4(), client=client, case_type=CaseType.INTERNAL_SERVICE,
+            case_status=CaseStatus.OPEN,
+            service_authorization_status=ServiceAuthorizationStatus.APPROVED,
+        )
+
+        # Chain: O (older, kept) <- F (flagged placeholder) <- S (active survivor).
+        older = EnrollmentVerification.objects.create(
+            client=client, stage=EnrollmentStage.CLOSED, case=case,
+        )
+        flagged = EnrollmentVerification.objects.create(
+            client=client, stage=EnrollmentStage.CLOSED, close_reason="case_replaced",
+            case=None, hidden_misinformation=True, supersedes=older,
+        )
+        survivor = EnrollmentVerification.objects.create(
+            client=client, stage=EnrollmentStage.SERVICE_ACTIVE, case=case, supersedes=flagged,
+        )
+        # A cascade child on the flagged row.
+        MemberDietaryProfile.objects.create(
+            enrollment=flagged, client=client, member_name="P", menu_type="Standard",
+            status=MemberStatus.ACTIVE,
+        )
+        # A flagged row that is NOT eligible (still SERVICE_ACTIVE) -> must survive.
+        live_flagged = EnrollmentVerification.objects.create(
+            client=client, stage=EnrollmentStage.SERVICE_ACTIVE,
+            case=None, hidden_misinformation=True,
+        )
+
+        call_command("purge_hidden_misinformation_enrollments", "--apply", stdout=StringIO())
+
+        # Flagged terminal placeholder gone; its cascade child gone.
+        self.assertFalse(EnrollmentVerification.objects.filter(pk=flagged.pk).exists())
+        self.assertFalse(MemberDietaryProfile.objects.filter(enrollment_id=flagged.pk).exists())
+        # Chain re-pointed: survivor now supersedes the older kept enrollment.
+        survivor.refresh_from_db()
+        self.assertEqual(survivor.supersedes_id, older.pk)
+        # Guards: older (case-backed) + non-terminal flagged both survive.
+        self.assertTrue(EnrollmentVerification.objects.filter(pk=older.pk).exists())
+        self.assertTrue(EnrollmentVerification.objects.filter(pk=live_flagged.pk).exists())
+
+
 class MenuCarryRegressionAuditGuardTest(TestCase):
     """list_menu_carry_regressions must only flag a survivor that is the member's
     LIVE enrollment. A disregarded/closed placeholder that supersedes the now-

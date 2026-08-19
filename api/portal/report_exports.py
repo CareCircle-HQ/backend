@@ -322,7 +322,7 @@ def members_verified_rows(params):
     -- the governing enrollment's ``verified_at`` (own or household), via
     ``verified_from`` / ``verified_to`` -- NOT the case-created date. A
     ``Verified Date`` column carries that verification-completed date."""
-    from ..models import Client
+    from ..models import Client, ServiceAuthorizationStatus
     from .serializers import active_enrollment
     from .views_members import (
         _parse_date, apply_enrollment_date_filter,
@@ -357,7 +357,20 @@ def members_verified_rows(params):
         stamps = [e.verified_at for e in client.enrollments.all() if e.verified_at]
         return max(stamps) if stamps else None
 
-    yield ["Client ID", "First Name", "Last Name", "Phone Numbers", "Case Created", "Verified Date"]
+    auth_status_labels = dict(ServiceAuthorizationStatus.choices)
+
+    def _auth_status(gc):
+        """The governing case's service authorization status (display label)."""
+        if gc is None:
+            return ""
+        return gc.service_authorization_status_label or auth_status_labels.get(
+            gc.service_authorization_status, gc.service_authorization_status or ""
+        )
+
+    yield [
+        "Client ID", "First Name", "Last Name", "Phone Numbers", "Case Created",
+        "Verified Date", "Authorization Status",
+    ]
     for client in qs.iterator(chunk_size=1000):
         gc = _governing_internal_case(client)
         yield [
@@ -367,6 +380,7 @@ def members_verified_rows(params):
             _client_phone_numbers(client),
             _date_str(getattr(gc, "date_opened", None) if gc is not None else None),
             _date_str(_verified_at(client)),
+            _auth_status(gc),
         ]
 
 

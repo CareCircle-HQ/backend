@@ -624,6 +624,28 @@ def backfill_late_occurrences(kind, delivery_date):
     return len(to_create)
 
 
+def _schedule_allergy_labels(s):
+    """Snapshot food-allergy labels on a delivery occurrence (drops none-like,
+    de-duped, order-preserving) -- for the PO preview's allergy filter/display."""
+    out, seen = [], set()
+    for code in (s.allergies or []):
+        label = (_ALLERGY_LABELS.get(code, code) or "").strip()
+        key = label.lower()
+        if not label or key in _NONE_LIKE or key in seen:
+            continue
+        seen.add(key)
+        out.append(label)
+    return out
+
+
+def _schedule_zip(s):
+    """Best-effort 5-digit ZIP parsed from the occurrence's snapshot delivery
+    address (the ZIP is normally the trailing token)."""
+    import re
+    found = re.findall(r"\d{5}", s.delivery_address or "")
+    return found[-1] if found else ""
+
+
 def preview_purchase_orders(kind, delivery_date):
     """Aggregate the delivery calendar for ``(kind, delivery_date)`` grouped by
     each member's DEFAULT (household) kitchen, with menu-type counts, total
@@ -692,6 +714,9 @@ def preview_purchase_orders(kind, delivery_date):
             "meals": qty,
             "batched": bool(is_batched),
             "supported": bool(supported),
+            # For the PO popup's allergy / ZIP filters + match highlighting.
+            "allergies": _schedule_allergy_labels(s),
+            "zip": _schedule_zip(s),
         })
 
     for g in groups.values():
