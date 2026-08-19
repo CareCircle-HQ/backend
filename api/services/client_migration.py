@@ -205,3 +205,57 @@ def merge_migrated_client(old_client, new_client, *, actor_label="", dry_run=Fal
         pass
 
     return summary
+
+
+# ---------------------------------------------------------------------------
+# Detection (Unite Us API) -- find migrations WITHOUT the browser extension.
+# ---------------------------------------------------------------------------
+def detect_api_migration(api, client):
+    """Probe Unite Us for a person-id migration of ``client``.
+
+    ``GET /people/<old>`` returns 301 Moved Permanently -> the NEW canonical
+    person when Unite Us has migrated the id. ``requests`` follows the redirect,
+    so the returned body is the NEW person and its ``data.id`` is the new id.
+    Returns that new id when it differs from the requested id, else None. Lets the
+    api client's UniteUsAuthExpired / UniteUsApiError propagate (caller handles).
+    """
+    old_id = str(client.client_id)
+    body = api.get_person(old_id) or {}
+    new_id = str(((body.get("data") or {}).get("id")) or "")
+    return new_id if (new_id and new_id != old_id) else None
+
+
+def _medicaid_member_id(client):
+    """The client's MEDICAID insurance member id (``external_member_id``), or ''
+    when none is on file. Used as a strong identity corroborator."""
+    from api.models import InsurancePlanType
+
+    ins = (
+        client.insurances
+        .filter(plan_type=InsurancePlanType.MEDICAID)
+        .exclude(external_member_id="")
+        .order_by("-is_primary", "-pk")
+        .first()
+    )
+    return (ins.external_member_id or "").strip() if ins is not None else ""
+
+
+def identity_matches_for_merge(old_client, new_client):
+    """Strict identity gate for an UNATTENDED migration merge: the two records
+    must be the SAME person by DOB + first name + last name + Medicaid member id.
+
+    Case/whitespace-insensitive on names. A field MISSING on either side fails
+    the gate -- we only auto-merge on positive matches, never on absence (keeps
+    same-DOB siblings/twins and blank-Medicaid records out of auto-merge).
+    """
+    def norm(s):
+        return " ".join((s or "").split()).lower()
+
+    if not old_client.date_of_birth or old_client.date_of_birth != new_client.date_of_birth:
+        return False
+    if not norm(old_client.first_name) or norm(old_client.first_name) != norm(new_client.first_name):
+        return False
+    if not norm(old_client.last_name) or norm(old_client.last_name) != norm(new_client.last_name):
+        return False
+    old_mid = _medicaid_member_id(old_client)
+    return bool(old_mid) and old_mid.lower() == _medicaid_member_id(new_client).lower()

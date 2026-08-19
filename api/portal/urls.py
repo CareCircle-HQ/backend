@@ -103,6 +103,8 @@ from .views_members import (
     MenuTypesListView,
     TeamsListView,
     VerifiersListView,
+    TicketTypesListView,
+    CadencesListView,
 )
 from .views_places import (
     PortalPlacesAutocompleteView,
@@ -230,6 +232,8 @@ urlpatterns = [
     path("lead-sources/", LeadSourcesListView.as_view(), name="portal-lead-sources"),
     path("teams/", TeamsListView.as_view(), name="portal-teams"),
     path("verifiers/", VerifiersListView.as_view(), name="portal-verifiers"),
+    path("ticket-types/", TicketTypesListView.as_view(), name="portal-ticket-types"),
+    path("cadences/", CadencesListView.as_view(), name="portal-cadences"),
     path("members/<uuid:client_id>/", MemberDetailView.as_view(), name="portal-member-detail"),
     path("members/<uuid:client_id>/tags/", MemberTagsView.as_view(), name="portal-member-tags"),
     path("members/<uuid:client_id>/insurance/", MemberInsuranceView.as_view()),

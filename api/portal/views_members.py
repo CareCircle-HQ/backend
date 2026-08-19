@@ -39,6 +39,7 @@ from ..models import (
     CaseType,
     Client,
     ClientPhone,
+    Cadence,
     ClientTag,
     ClientPhoneSource,
     ClientStage,
@@ -1315,6 +1316,28 @@ class VerifiersListView(PortalAPIView):
         )
 
 
+class TicketTypesListView(PortalAPIView):
+    """Ticket-type options for the Members-page ticket-type filter dropdown.
+    ``value`` == ``TicketType.code`` (matched by the ``ticket_type`` list
+    filter); ``label`` == its display label. Active types only."""
+
+    def get(self, request):
+        rows = TicketType.objects.filter(is_active=True).order_by("label")
+        return Response([{"value": t.code, "label": t.label} for t in rows])
+
+
+class CadencesListView(PortalAPIView):
+    """Delivery-cadence options for the Members-page cadence filter dropdown,
+    from the configurable ``Cadence`` table (Settings > Delivery Cadences), so
+    cadences added beyond the legacy 3-value enum are offered. ``value`` == the
+    ``code`` stored on ``MemberDeliverySchedule.delivery_days_cadence`` (what the
+    ``cadence`` list filter matches)."""
+
+    def get(self, request):
+        rows = Cadence.objects.filter(is_active=True).order_by("label")
+        return Response([{"value": c.code, "label": c.label} for c in rows])
+
+
 class MembersListView(PortalGenericAPIView):
     serializer_class = s.MemberListSerializer
 
@@ -1776,6 +1799,38 @@ class MembersListView(PortalGenericAPIView):
                     Q(member_profiles__food_allergies__contains=[code])
                     | Q(member_profiles__food_allergies__contains=[label])
                 )
+
+        # Ticket-type filter (Members page): keep members whose client has an
+        # OPEN follow-up ticket of the selected type. ``value`` == TicketType.code;
+        # only status=OPEN counts (in-progress/resolved are excluded) so the filter
+        # reflects untouched outstanding work. Multi-valued join -> .distinct() below.
+        ticket_type_val = (params.get("ticket_type") or "").strip()
+        if ticket_type_val:
+            # Accept either the TicketType code ("kitchen_switch") or its display
+            # label ("Kitchen Switch"); both bind to the SAME open ticket row.
+            qs = qs.filter(
+                Q(tickets__type__code=ticket_type_val)
+                | Q(tickets__type__label__iexact=ticket_type_val),
+                tickets__status=TicketStatus.OPEN,
+            )
+
+        # Cadence filter (Members page): keep members whose delivery plan runs at
+        # the selected weekly cadence -- MemberDeliverySchedule.delivery_days_cadence
+        # (a DeliveryCadence code), matched on the member's own delivery schedules.
+        # A household surfaces when ANY member matches. Multi-valued join ->
+        # .distinct() below.
+        cadence_val = (params.get("cadence") or "").strip()
+        if cadence_val:
+            # Accept either the cadence code ("mon_thu") or its display label
+            # ("Mon/Thu"); the stored value is the code. Resolve against the
+            # configurable Cadence table (covers cadences beyond the legacy enum).
+            row = Cadence.objects.filter(
+                Q(code__iexact=cadence_val) | Q(label__iexact=cadence_val)
+            ).first()
+            cadence_code = row.code if row else cadence_val
+            qs = qs.filter(
+                member_profiles__delivery_schedules__delivery_days_cadence=cadence_code
+            )
 
         # Team filter (Members page): keep members whose INTERNAL-SERVICE case
         # was CREATED by a Unite Us agent on the selected CareCircle originating
