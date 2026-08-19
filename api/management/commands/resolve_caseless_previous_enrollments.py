@@ -49,11 +49,25 @@ class Command(BaseCommand):
                 "exactly one such candidate exists; leave true ties for review."
             ),
         )
+        parser.add_argument(
+            "--bind", action="append", default=[], metavar="ENR=CASE_ID",
+            help=(
+                "Manual override for a specific ambiguous row: bind CASE_ID onto "
+                "enrollment ENR (the case must belong to that client). Repeatable."
+            ),
+        )
 
     def handle(self, *args, **opts):
         apply = opts["apply"]
         only = (opts.get("client") or "").strip()
         close_match = opts["resolve_ambiguous_by_close_match"]
+        overrides = {}  # enr_pk -> case_id
+        for spec in opts["bind"]:
+            enr_str, _, cid = spec.partition("=")
+            if not enr_str.strip().isdigit() or not cid.strip():
+                self.stderr.write(f"Ignoring malformed --bind '{spec}' (want ENR=CASE_ID)")
+                continue
+            overrides[int(enr_str.strip())] = cid.strip()
 
         superseded_ids = set(
             EnrollmentVerification.objects
@@ -68,7 +82,7 @@ class Command(BaseCommand):
         if only:
             prev = prev.filter(client__client_id=only)
 
-        flagged = backfilled = close_matched = 0
+        flagged = backfilled = close_matched = manual = 0
         ambiguous = []  # (client_id, enr_pk, [candidate case ids])
 
         def _bind(enrollment, prior, survivor):
@@ -93,6 +107,23 @@ class Command(BaseCommand):
         for e in prev.iterator(chunk_size=500):
             survivor = EnrollmentVerification.objects.filter(supersedes=e).first()
             surv_case = survivor.case if survivor else None
+
+            # Manual override wins over every bucket rule below.
+            if e.pk in overrides:
+                forced = Case.objects.filter(
+                    pk=overrides[e.pk], client_id=e.client_id,
+                    case_type=CaseType.INTERNAL_SERVICE,
+                ).first()
+                if forced is None:
+                    self.stderr.write(
+                        f"--bind {e.pk}={overrides[e.pk]} skipped: not an internal-"
+                        f"service case for client {e.client_id}"
+                    )
+                else:
+                    manual += 1
+                    _bind(e, forced, survivor)
+                continue
+
             candidates = list(
                 Case.objects
                 .filter(client_id=e.client_id, case_type=CaseType.INTERNAL_SERVICE)
@@ -140,6 +171,7 @@ class Command(BaseCommand):
         self.stdout.write(self.style.SUCCESS(
             f"\n{mode}: {flagged} flagged as misinformation (no prior case), "
             f"{backfilled} backfilled to their single prior case"
+            + (f", {manual} bound via --bind" if manual else "")
             + (f", {close_matched} ambiguous auto-resolved by close-match" if close_match else "")
             + f", {len(ambiguous)} ambiguous (left for review)."
         ))
