@@ -3564,6 +3564,39 @@ class RemovalAndVerificationGuardsTest(TestCase):
         self.assertEqual(str(e.case_id), str(case.case_id))
         self.assertTrue(e.verified_at)
 
+    def test_verification_blocked_when_already_verified(self):
+        # The wizard runs ONCE per household: if the client already has a
+        # verified/serving enrollment, re-running it is blocked (409) and no
+        # duplicate enrollment is created.
+        from rest_framework.parsers import JSONParser
+        from rest_framework.request import Request
+        from rest_framework.test import APIRequestFactory
+
+        from .models import (
+            EnrollmentStage, EnrollmentVerification, Household, HouseholdMember,
+            MemberDietaryProfile,
+        )
+        from .portal.views_members import MemberVerificationCreateView
+
+        client = self._client("Al", "Ready")
+        hh = Household.objects.create(name="HH")
+        HouseholdMember.objects.create(household=hh, client=client, is_primary=True)
+        case = self._internal_case(client)
+        enr = EnrollmentVerification.objects.create(
+            client=client, household=hh, case=case, stage=EnrollmentStage.SERVICE_ACTIVE,
+        )
+        MemberDietaryProfile.objects.create(enrollment=enr, client=client)
+
+        raw = APIRequestFactory().post(
+            "/",
+            {"members": [{"client_id": str(client.pk), "mobile_number": "3475550142"}], "zip": "10001"},
+            format="json",
+        )
+        resp = MemberVerificationCreateView().post(Request(raw, parsers=[JSONParser()]), client.pk)
+        self.assertEqual(resp.status_code, 409)
+        # No duplicate created -- still the single serving enrollment.
+        self.assertEqual(EnrollmentVerification.objects.filter(client=client).count(), 1)
+
     def test_cannot_remove_primary_member(self):
         from rest_framework.test import APIRequestFactory
 
