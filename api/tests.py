@@ -4816,6 +4816,29 @@ class ReopenEnrollmentForNewCaseTest(TestCase):
         self.assertIsNone(new.verified_at)                         # verification dropped
         self.assertEqual(new.member_profiles.count(), 1)           # roster still carried
 
+    def test_skips_when_case_held_by_another_live_enrollment(self):
+        # Cross-client/shared case (e.g. a relative): the new case is already held
+        # by ANOTHER client's LIVE enrollment. Reopen must SKIP -- no crash, no
+        # duplicate on the shared case -- leaving it for manual review.
+        from .models import (
+            Client, EnrollmentStage, EnrollmentVerification, Household,
+            HouseholdMember,
+        )
+        from .services.lifecycle import reopen_enrollment_for_new_case
+        from django.utils import timezone
+
+        c, prior, new_case = self._setup(closed_days_ago=10)
+        other = Client.objects.create(client_id=str(uuid.uuid4()), first_name="Rel", last_name="Ative")
+        other_hh = Household.objects.create(name="HH2")
+        HouseholdMember.objects.create(household=other_hh, client=other, is_primary=True)
+        EnrollmentVerification.objects.create(
+            client=other, household=other_hh, case=new_case,
+            stage=EnrollmentStage.SERVICE_ACTIVE, verified_at=timezone.now(),
+        )
+        r = reopen_enrollment_for_new_case(c, new_case)   # must not raise
+        self.assertIsNone(r)
+        self.assertFalse(EnrollmentVerification.objects.filter(client=c, case=new_case).exists())
+
 
 class OrphanedScheduledExtensionTest(TestCase):
     """A closed/cancelled case must not leave a dangling SCHEDULED_EXTENSION

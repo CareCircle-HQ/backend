@@ -3625,23 +3625,35 @@ def reopen_enrollment_for_new_case(client, new_governing_case, *, actor=None, ac
     gap_days = (timezone.now() - prior_close).days if prior_close else 0
     reverify = gap_days > _REOPEN_REVERIFY_GAP_DAYS
 
+    # GLOBAL safety: the per-case unique index covers every NON-terminal row
+    # across ALL clients. If the governing case is already held by a live
+    # enrollment (e.g. a relative/cross-client shared or mislinked case, like the
+    # AKALLOO household), we must NOT fork a second live row onto it -- that both
+    # violates the constraint and would double-claim someone else's case. Skip for
+    # manual review. (Terminal rows -- incl. our own closed prior -- are exempt.)
+    if EnrollmentVerification.objects.filter(case=new_governing_case).exclude(
+        stage__in=[
+            EnrollmentStage.CLOSED.value,
+            EnrollmentStage.CANCELLED.value,
+            EnrollmentStage.DISREGARDED.value,
+        ]
+    ).exists():
+        return None
+
     new_kind = product_type_kind_for_name(new_governing_case.program_name or "") or \
         product_type_kind_for_name(new_governing_case.service_type or "")
     author = actor_label or _actor_name(actor)
 
-    with transaction.atomic():
-        # If the new case got rebound onto the dead prior row, free it first so
-        # the fresh enrollment can own it (terminal rows are exempt from the
-        # per-case unique constraint, but we keep the prior pointing at its own).
-        prev_case = prior.case
-        if prior.case_id and str(prior.case_id) == str(new_governing_case.case_id):
-            prev_case = prior.previous_case
-            prior.case = prior.previous_case
-            try:
-                prior.save(update_fields=["case"])
-            except Exception:  # pragma: no cover - defensive
-                pass
+    # The prior's case for the audit link: its own case if that differs from the
+    # new one, else the case before it (same-case reopen). The closed prior can
+    # keep pointing at the case -- the partial unique index exempts terminal rows.
+    prev_case = (
+        prior.case
+        if (prior.case_id and str(prior.case_id) != str(new_governing_case.case_id))
+        else prior.previous_case
+    )
 
+    with transaction.atomic():
         fields = {
             "client": prior.client,
             "household": prior.household,
@@ -5322,11 +5334,16 @@ def reconcile_internal_service_authorization(client, *, actor=None, actor_label=
             # Reopen from the prior's data (re-verify only if the no-open-case gap
             # exceeded 60 days) so the household isn't stranded at Not Eligible
             # with a valid approved case. Self-guards (no-op when a live
-            # enrollment already exists), so it's safe to call unconditionally.
-            if reopen_enrollment_for_new_case(
-                client, governing, actor=actor, actor_label=actor_label,
-            ) is not None:
-                result["reopened"] = True
+            # enrollment already exists or the case is held by another live/
+            # cross-client row), so it's safe to call unconditionally. Never let a
+            # reopen edge case crash the whole reconcile.
+            try:
+                if reopen_enrollment_for_new_case(
+                    client, governing, actor=actor, actor_label=actor_label,
+                ) is not None:
+                    result["reopened"] = True
+            except Exception:  # pragma: no cover - defensive
+                pass
             for enr in _governing_enrollments(client):
                 if EnrollmentStage(enr.stage) == EnrollmentStage.ON_HOLD:
                     # Resume whichever auto-pause holds this enrollment: a denial
