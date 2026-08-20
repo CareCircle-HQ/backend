@@ -4496,6 +4496,129 @@ class KitchenChangeManagementOnlyTest(TestCase):
         self.assertEqual(cs.status_code, 403)
 
 
+class MemberDietaryEditReactivatesOooTest(TestCase):
+    """Editing an OUT_OF_ORBIT member's menu/allergies re-runs the meal rule and
+    auto-reactivates them when now fulfillable -- no reactivate checkbox needed --
+    but an UNRELATED edit leaves a manual out-of-orbit untouched."""
+
+    def _api(self):
+        agent = Agent.objects.create(
+            name="CS", agent_code=str(uuid.uuid4())[:8], group="CS",
+        )
+        access = AccessToken()
+        access["agent_id"] = str(agent.id)
+        access["agent_code"] = agent.agent_code
+        access["agent_name"] = agent.name
+        access["agent_group"] = agent.group
+        api = APIClient()
+        api.credentials(HTTP_AUTHORIZATION=f"Bearer {access}")
+        return api
+
+    def _setup(self):
+        from .models import (
+            EnrollmentStage, EnrollmentVerification, Household, HouseholdMember,
+            MemberDietaryProfile, MemberStatus,
+        )
+        client = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Ob", last_name="Orbit",
+        )
+        hh = Household.objects.create(name="HH")
+        HouseholdMember.objects.create(household=hh, client=client, is_primary=True)
+        enr = EnrollmentVerification.objects.create(
+            client=client, household=hh, stage=EnrollmentStage.SERVICE_ACTIVE,
+            kitchen=None, program_name="Medically Tailored Meals",
+        )
+        mp = MemberDietaryProfile.objects.create(
+            enrollment=enr, client=client, member_name="Ob", menu_type="Standard",
+            food_allergies=["other"], status=MemberStatus.OUT_OF_ORBIT,
+        )
+        return client, mp
+
+    def _url(self, client, mp):
+        return f"/api/portal/members/{client.pk}/household/members/{mp.pk}/"
+
+    def test_menu_fix_auto_reactivates(self):
+        from .models import MemberStatus
+        client, mp = self._setup()
+        # Remove the 'other' allergy -> Standard + no allergies is fulfillable.
+        resp = self._api().patch(self._url(client, mp), {"food_allergies": []}, format="json")
+        self.assertEqual(resp.status_code, 200)
+        mp.refresh_from_db()
+        self.assertEqual(mp.status, MemberStatus.ACTIVE)
+
+    def test_unrelated_edit_keeps_out_of_orbit(self):
+        from .models import MemberStatus
+        client, mp = self._setup()
+        # Editing only the notes must NOT silently reactivate an out-of-orbit member.
+        resp = self._api().patch(
+            self._url(client, mp), {"general_verification_notes": "hi"}, format="json",
+        )
+        self.assertEqual(resp.status_code, 200)
+        mp.refresh_from_db()
+        self.assertEqual(mp.status, MemberStatus.OUT_OF_ORBIT)
+
+
+class MemberKitchenChangeReconcilesTest(TestCase):
+    """Changing the household kitchen from the member profile (/kitchen/ PATCH)
+    re-runs the kitchen-aware meal rule for EVERY member: a member the new
+    kitchen can't serve flips to Out of Orbit, and a previously-OOO member it
+    can serve returns to Active."""
+
+    def _api(self):
+        agent = Agent.objects.create(
+            name="Mgmt", agent_code=str(uuid.uuid4())[:8], group="Management",
+        )
+        access = AccessToken()
+        access["agent_id"] = str(agent.id)
+        access["agent_code"] = agent.agent_code
+        access["agent_name"] = agent.name
+        access["agent_group"] = agent.group
+        api = APIClient()
+        api.credentials(HTTP_AUTHORIZATION=f"Bearer {access}")
+        return api
+
+    def test_kitchen_change_reruns_meal_rule_per_member(self):
+        from .models import (
+            EnrollmentStage, EnrollmentVerification, Household, HouseholdMember,
+            Kitchen, KitchenStatus, MemberDietaryProfile, MemberStatus,
+        )
+
+        client = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Pat", last_name="Primary",
+        )
+        other = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Dee", last_name="Dependent",
+        )
+        hh = Household.objects.create(name="HH")
+        HouseholdMember.objects.create(household=hh, client=client, is_primary=True)
+        HouseholdMember.objects.create(household=hh, client=other, is_primary=False)
+        k = Kitchen.objects.create(name="K1", status=KitchenStatus.ACTIVE)
+        enr = EnrollmentVerification.objects.create(
+            client=client, household=hh, stage=EnrollmentStage.SERVICE_ACTIVE,
+            kitchen=k, program_name="Medically Tailored Meals",
+        )
+        # Previously Out of Orbit but servable (Standard, no allergies).
+        mp_active = MemberDietaryProfile.objects.create(
+            enrollment=enr, client=client, member_name="Pat", menu_type="Standard",
+            food_allergies=[], status=MemberStatus.OUT_OF_ORBIT,
+        )
+        # Active but carries the catch-all 'other' allergy -> never fulfillable.
+        mp_ooo = MemberDietaryProfile.objects.create(
+            enrollment=enr, client=other, member_name="Dee", menu_type="Standard",
+            food_allergies=["other"], status=MemberStatus.ACTIVE,
+        )
+
+        # Clearing the kitchen re-runs the (kitchen-agnostic) meal rule per member.
+        resp = self._api().patch(
+            f"/api/portal/members/{client.pk}/kitchen/", {"kitchen_id": None},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 200)
+        mp_active.refresh_from_db(); mp_ooo.refresh_from_db()
+        self.assertEqual(mp_active.status, MemberStatus.ACTIVE)        # reactivated
+        self.assertEqual(mp_ooo.status, MemberStatus.OUT_OF_ORBIT)     # flipped OOO
+
+
 class EnrollmentHistoryViewTest(TestCase):
     """The Program tab's History sub-tab: the enrollment-scoped timeline. Events
     are filtered to THIS enrollment (regardless of which household member each

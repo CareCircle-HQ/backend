@@ -4097,18 +4097,37 @@ class HouseholdMemberEditView(PortalAPIView):
             # Normal save: reconcile the kitchen output against the global meal
             # rules AND the household's assigned kitchen. An ACTIVE member whose
             # new menu/allergies can't be fulfilled is auto-set Out of Orbit
-            # (excluded from schedules/POs). Out-of-orbit members are NOT
-            # auto-reactivated here -- that requires the explicit reactivate flag
-            # above, so a manual override is never silently undone by an edit.
+            # (excluded from schedules/POs).
+            #
+            # An OUT_OF_ORBIT member is ALSO re-evaluated -- but ONLY when THIS
+            # edit actually changed their menu type / food allergies -- so fixing
+            # the menu auto-reactivates them without needing the reactivate
+            # checkbox, while an unrelated edit never silently undoes a manual
+            # out-of-orbit. (PAUSED / INACTIVE / OUT_OF_RANGE stay protected --
+            # reconcile only toggles ACTIVE <-> OUT_OF_ORBIT.)
+            menu_allergy_changed = bool(timeline.build_change_list([
+                (_DIETARY_LABELS[f], dietary_before[f], getattr(mv, f))
+                for f in ("menu_type", "food_allergies") if f in dietary_before
+            ]))
             became_out = False
-            if mv.status == MemberStatus.ACTIVE:
+            reactivated = False
+            reason = ""
+            if mv.status == MemberStatus.ACTIVE or (
+                mv.status in (MemberStatus.OUT_OF_ORBIT, MemberStatus.PENDING)
+                and menu_allergy_changed
+            ):
+                was_inactive = mv.status in (
+                    MemberStatus.OUT_OF_ORBIT, MemberStatus.PENDING,
+                )
                 _out, became_out, reason = reconcile_member_kitchen_output(
                     mv, enr.kitchen, save=False,
                 )
+                reactivated = was_inactive and mv.status == MemberStatus.ACTIVE
             mv.save()
-            if became_out:
+            if became_out or reactivated:
                 agent = current_agent(request)
                 actor = _agent_actor(agent)
+            if became_out:
                 try:
                     timeline.event_for_out_of_orbit(
                         mv, enrollment=mv.enrollment,
@@ -4128,6 +4147,15 @@ class HouseholdMemberEditView(PortalAPIView):
                         )
                     except Exception:  # never let note-writing break the edit
                         pass
+            if reactivated:
+                # The edited menu/allergies are now fulfillable -> back to Active
+                # (no reactivate checkbox needed).
+                try:
+                    timeline.event_for_member_reactivated(
+                        mv, enrollment=mv.enrollment, actor=actor,
+                    )
+                except Exception:  # never let history-logging break the edit
+                    pass
 
         # Roll a member pause/unpause up to the PROGRAM: when every household
         # member is paused there is no one left to serve, so the enrollment is
@@ -7184,6 +7212,49 @@ class MemberKitchenView(PortalAPIView):
         enr.kitchen = kitchen
         enr.save(update_fields=["kitchen"])
         enr.delivery_schedules.update(kitchen=kitchen)
+
+        # Re-run the kitchen-aware meal rule for EVERY member against the NEW
+        # kitchen (mirrors the Kitchen Assignment popup): a member the new kitchen
+        # can't serve (menu not offered / allergy it can't handle) flips to Out of
+        # Orbit, and a previously-OUT_OF_ORBIT member the new kitchen CAN serve
+        # returns to Active. PAUSED / INACTIVE / OUT_OF_RANGE are left untouched
+        # (reconcile only toggles ACTIVE <-> OUT_OF_ORBIT). Best-effort per member.
+        agent = current_agent(request)
+        actor = _agent_actor(agent)
+        for profile in enr.member_profiles.select_related("client").all():
+            was_out = profile.status == MemberStatus.OUT_OF_ORBIT
+            try:
+                _out, became_out, reason = reconcile_member_kitchen_output(
+                    profile, kitchen, save=True,
+                )
+            except Exception:  # pragma: no cover - never let one member block the switch
+                continue
+            if became_out:
+                try:
+                    timeline.event_for_out_of_orbit(
+                        profile, enrollment=enr,
+                        reason=reason or "The assigned kitchen can't fulfill this member's menu/allergies.",
+                        actor=actor,
+                    )
+                except Exception:  # never let history-logging break the change
+                    pass
+                if profile.client_id:
+                    try:
+                        Note.objects.create(
+                            client=profile.client, source=NoteSource.SYSTEM,
+                            author_name=agent.name if agent else "",
+                            body=NO_KITCHEN_OUT_OF_ORBIT_NOTE,
+                        )
+                    except Exception:  # never let note-writing break the change
+                        pass
+            elif was_out and profile.status == MemberStatus.ACTIVE:
+                try:
+                    timeline.event_for_member_reactivated(
+                        profile, enrollment=enr, actor=actor,
+                    )
+                except Exception:  # never let history-logging break the change
+                    pass
+
         # Record the kitchen change (prev -> new) on the primary's history.
         try:
             timeline.event_for_kitchen_changed(
