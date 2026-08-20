@@ -4707,6 +4707,81 @@ class MemberDietaryEditReactivatesOooTest(TestCase):
         self.assertEqual(mp.status, MemberStatus.OUT_OF_ORBIT)
 
 
+class ConsolidateServingCaselessDuplicatesTest(TestCase):
+    """Calendar-aware consolidation of duplicate serving enrollments (caseless
+    serving + a live sibling holding the case): keep whichever owns the active
+    delivery calendar; skip when both have live calendars."""
+
+    def _setup(self):
+        from .models import (
+            Case, CaseStatus, CaseType, Client, EnrollmentStage,
+            EnrollmentVerification, Household, HouseholdMember,
+            MemberDietaryProfile, ServiceAuthorizationStatus,
+        )
+        c = Client.objects.create(client_id=str(uuid.uuid4()), first_name="Dup", last_name="Serv")
+        hh = Household.objects.create(name="HH")
+        HouseholdMember.objects.create(household=hh, client=c, is_primary=True)
+        case = Case.objects.create(
+            case_id=str(uuid.uuid4()), client=c, case_type=CaseType.INTERNAL_SERVICE,
+            case_status=CaseStatus.OPEN,
+            service_authorization_status=ServiceAuthorizationStatus.APPROVED,
+            program_name="Medically Tailored Meals (MTM)",
+        )
+        keeper = EnrollmentVerification.objects.create(
+            client=c, household=hh, stage=EnrollmentStage.SERVICE_ACTIVE, case=None,
+        )
+        holder = EnrollmentVerification.objects.create(
+            client=c, household=hh, stage=EnrollmentStage.SERVICE_ACTIVE, case=case,
+        )
+        for e in (keeper, holder):
+            MemberDietaryProfile.objects.create(enrollment=e, client=c, member_name="Dup")
+        return c, case, keeper, holder
+
+    def _occ(self, enr):
+        from datetime import timedelta
+        from .models import OrderSchedule
+        OrderSchedule.objects.create(
+            enrollment=enr, anticipated_delivery_date=timezone.localdate() + timedelta(days=7),
+            household_group_code="",
+        )
+
+    def _run(self, c):
+        from io import StringIO
+        from django.core.management import call_command
+        call_command(
+            "consolidate_serving_caseless_duplicates", "--apply",
+            "--client", str(c.client_id), stdout=StringIO(),
+        )
+
+    def test_keeper_owns_calendar_moves_case(self):
+        from .models import EnrollmentStage
+        c, case, keeper, holder = self._setup()
+        self._occ(keeper)  # the caseless serving row owns the deliveries
+        self._run(c)
+        keeper.refresh_from_db(); holder.refresh_from_db()
+        self.assertEqual(str(keeper.case_id), str(case.case_id))            # case moved to keeper
+        self.assertEqual(EnrollmentStage(holder.stage), EnrollmentStage.DISREGARDED)
+
+    def test_holder_owns_calendar_disregards_caseless_dup(self):
+        from .models import EnrollmentStage
+        c, case, keeper, holder = self._setup()
+        self._occ(holder)  # the case-holder owns the deliveries
+        self._run(c)
+        keeper.refresh_from_db(); holder.refresh_from_db()
+        self.assertEqual(EnrollmentStage(keeper.stage), EnrollmentStage.DISREGARDED)
+        self.assertEqual(str(holder.case_id), str(case.case_id))            # holder keeps the case
+
+    def test_both_have_calendars_skipped(self):
+        from .models import EnrollmentStage
+        c, case, keeper, holder = self._setup()
+        self._occ(keeper); self._occ(holder)  # BOTH live -> manual
+        self._run(c)
+        keeper.refresh_from_db(); holder.refresh_from_db()
+        self.assertIsNone(keeper.case_id)                                    # untouched
+        self.assertEqual(EnrollmentStage(keeper.stage), EnrollmentStage.SERVICE_ACTIVE)
+        self.assertEqual(str(holder.case_id), str(case.case_id))
+
+
 class MemberKitchenChangeReconcilesTest(TestCase):
     """Changing the household kitchen from the member profile (/kitchen/ PATCH)
     re-runs the kitchen-aware meal rule for EVERY member: a member the new
