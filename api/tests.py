@@ -3518,6 +3518,52 @@ class RemovalAndVerificationGuardsTest(TestCase):
             case_status=status or CaseStatus.OPEN,
         )
 
+    def test_verification_reuses_pending_enrollment_no_duplicate(self):
+        # The import creates a pending_verification enrollment holding the
+        # governing internal-service case; verifying via the wizard must REUSE it
+        # rather than create a DUPLICATE that ends up caseless. Reproduces the
+        # TEMEKA KING / 6b8f5acd prod bug (two live enrollments, one caseless).
+        from rest_framework.parsers import JSONParser
+        from rest_framework.request import Request
+        from rest_framework.test import APIRequestFactory
+
+        from .models import (
+            EnrollmentStage, EnrollmentVerification, Household, HouseholdMember,
+            MemberDietaryProfile,
+        )
+        from .portal.views_members import MemberVerificationCreateView
+
+        client = self._client("Teme", "King")
+        hh = Household.objects.create(name="HH")
+        HouseholdMember.objects.create(household=hh, client=client, is_primary=True)
+        case = self._internal_case(client)  # open internal-service case
+        pending = EnrollmentVerification.objects.create(
+            client=client, household=hh, case=case,
+            stage=EnrollmentStage.PENDING_VERIFICATION,
+        )
+        MemberDietaryProfile.objects.create(
+            enrollment=pending, client=client, member_name="Teme",
+        )
+
+        raw = APIRequestFactory().post(
+            "/",
+            {"members": [{"client_id": str(client.pk), "mobile_number": "3475550142"}], "zip": "10001"},
+            format="json",
+        )
+        req = Request(raw, parsers=[JSONParser()])
+        resp = MemberVerificationCreateView().post(req, client.pk)
+        self.assertEqual(resp.status_code, 201)
+
+        # Exactly ONE enrollment (the pending one reused), still bound to the case
+        # (NOT caseless), and now verified -- no duplicate created.
+        enrs = EnrollmentVerification.objects.filter(client=client)
+        self.assertEqual(enrs.count(), 1)
+        e = enrs.first()
+        self.assertEqual(e.pk, pending.pk)
+        self.assertEqual(resp.data["id"], pending.pk)
+        self.assertEqual(str(e.case_id), str(case.case_id))
+        self.assertTrue(e.verified_at)
+
     def test_cannot_remove_primary_member(self):
         from rest_framework.test import APIRequestFactory
 
@@ -4494,6 +4540,73 @@ class KitchenChangeManagementOnlyTest(TestCase):
             format="json",
         )
         self.assertEqual(cs.status_code, 403)
+
+
+class ConsolidateCaselessDuplicateEnrollmentsTest(TestCase):
+    """The remediation command binds the governing case onto the real (most-
+    advanced) enrollment and disregards a pending_verification stray holding it;
+    a non-pending sibling makes it skip for manual review."""
+
+    def _client_with_case(self, name):
+        from .models import (
+            Case, CaseStatus, CaseType, Client, Household, HouseholdMember,
+            ServiceAuthorizationStatus,
+        )
+        c = Client.objects.create(client_id=str(uuid.uuid4()), first_name=name, last_name="X")
+        hh = Household.objects.create(name="HH")
+        HouseholdMember.objects.create(household=hh, client=c, is_primary=True)
+        case = Case.objects.create(
+            case_id=str(uuid.uuid4()), client=c, case_type=CaseType.INTERNAL_SERVICE,
+            case_status=CaseStatus.OPEN,
+            service_authorization_status=ServiceAuthorizationStatus.APPROVED,
+            program_name="Medically Tailored Meals (MTM)",
+        )
+        return c, hh, case
+
+    def test_binds_case_to_keeper_and_disregards_pending_stray(self):
+        from io import StringIO
+
+        from django.core.management import call_command
+
+        from .models import EnrollmentStage, EnrollmentVerification, MemberDietaryProfile
+
+        c, hh, case = self._client_with_case("Teme")
+        keeper = EnrollmentVerification.objects.create(
+            client=c, household=hh, stage=EnrollmentStage.VERIFIED, case=None,
+        )
+        MemberDietaryProfile.objects.create(enrollment=keeper, client=c, member_name="Teme")
+        stray = EnrollmentVerification.objects.create(
+            client=c, household=hh, stage=EnrollmentStage.PENDING_VERIFICATION, case=case,
+        )
+
+        call_command("consolidate_caseless_duplicate_enrollments", "--apply", stdout=StringIO())
+        keeper.refresh_from_db(); stray.refresh_from_db()
+        self.assertEqual(str(keeper.case_id), str(case.case_id))
+        self.assertEqual(EnrollmentStage(stray.stage), EnrollmentStage.DISREGARDED)
+        self.assertIsNone(stray.case_id)
+
+    def test_skips_when_non_pending_sibling_holds_case(self):
+        from io import StringIO
+
+        from django.core.management import call_command
+
+        from .models import EnrollmentStage, EnrollmentVerification, MemberDietaryProfile
+
+        c, hh, case = self._client_with_case("Dee")
+        caseless = EnrollmentVerification.objects.create(
+            client=c, household=hh, stage=EnrollmentStage.VERIFIED, case=None,
+        )
+        MemberDietaryProfile.objects.create(enrollment=caseless, client=c, member_name="Dee")
+        # A VERIFIED (non-pending) sibling holds the case -> ambiguous -> skip.
+        sib = EnrollmentVerification.objects.create(
+            client=c, household=hh, stage=EnrollmentStage.VERIFIED, case=case,
+        )
+
+        call_command("consolidate_caseless_duplicate_enrollments", "--apply", stdout=StringIO())
+        sib.refresh_from_db()
+        # Untouched: still verified, still holds the case (manual review needed).
+        self.assertEqual(EnrollmentStage(sib.stage), EnrollmentStage.VERIFIED)
+        self.assertEqual(str(sib.case_id), str(case.case_id))
 
 
 class MemberDietaryEditReactivatesOooTest(TestCase):
@@ -12427,6 +12540,63 @@ class DeferredReauthGoverningTest(TestCase):
         later = (timezone.now() + timedelta(days=31)).date()
         deferred2 = {str(x) for x in deferred_extension_case_ids(cases, today=later)}
         self.assertNotIn(str(reauth.case_id), deferred2)
+
+    _BOXES_REAUTH = (
+        "Reauthorization: Medically Tailored or Nutritionally Appropriate Food "
+        "Prescriptions: Boxes - Other Eligible Populations - Brooklyn"
+    )
+
+    def test_future_different_kind_switch_is_deferred(self):
+        # A FUTURE-dated reauth of a DIFFERENT product kind (Meals -> Boxes) must
+        # ALSO be deferred so it doesn't govern until its window opens -- the LUIS
+        # RAMOS prod bug (a future Boxes reauth supplanting the active Meals case).
+        from .models import Case
+        from .services.lifecycle import (
+            deferred_extension_case_ids, pick_governing_case,
+        )
+
+        primary, _hh, current, _serving, reauth = self._setup(
+            reauth_start_days=35, reauth_kind_program=self._BOXES_REAUTH,
+        )
+        cases = list(Case.objects.filter(client=primary))
+        deferred = {str(x) for x in deferred_extension_case_ids(cases)}
+        self.assertIn(str(reauth.case_id), deferred)
+        self.assertEqual(str(pick_governing_case(cases).case_id), str(current.case_id))
+
+    def test_immediate_different_kind_switch_not_deferred(self):
+        # A different-kind switch whose window has ALREADY started governs now
+        # (not deferred) -- preserves the real, immediate product switch.
+        from .models import Case
+        from .services.lifecycle import deferred_extension_case_ids
+
+        primary, _hh, _current, _serving, reauth = self._setup(
+            reauth_start_days=-2, reauth_kind_program=self._BOXES_REAUTH,
+        )
+        cases = list(Case.objects.filter(client=primary))
+        deferred = {str(x) for x in deferred_extension_case_ids(cases)}
+        self.assertNotIn(str(reauth.case_id), deferred)
+
+    def test_serving_mis_bound_to_future_case_is_repointed_not_parked(self):
+        # Prod bug: the serving enrollment's case FK is the FUTURE deferred case.
+        # reconcile must REPOINT it onto the active case (service continues) and
+        # park the future case as its OWN extension -- NEVER park or close the
+        # serving row (which would stop the member's meals).
+        from .models import EnrollmentStage, EnrollmentVerification
+        from .services.lifecycle import reconcile_internal_service_authorization
+
+        primary, _hh, current, serving, reauth = self._setup(reauth_start_days=20)
+        serving.case = reauth  # mis-bind onto the future reauth
+        serving.save(update_fields=["case"])
+
+        reconcile_internal_service_authorization(primary)
+
+        serving.refresh_from_db()
+        self.assertEqual(EnrollmentStage(serving.stage), EnrollmentStage.SERVICE_ACTIVE)
+        self.assertEqual(str(serving.case_id), str(current.case_id))
+        parked = EnrollmentVerification.objects.filter(
+            case=reauth, stage=EnrollmentStage.SCHEDULED_EXTENSION,
+        )
+        self.assertTrue(parked.exists())
 
 
 class DependentSplitTest(TestCase):

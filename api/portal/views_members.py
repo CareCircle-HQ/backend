@@ -5740,19 +5740,49 @@ class MemberVerificationCreateView(PortalAPIView):
         # move it forward and write the history rows. The agent running the
         # wizard both requests and (below) completes the verification.
         acting_agent = current_agent(request)
-        enrollment = EnrollmentVerification.objects.create(
-            client=client,
-            household=household,
-            program_name=data.get("program_name", ""),
-            delivery_address=address,
-            delivery_weekdays=data.get("delivery_weekdays", []),
-            household_size=len(data["members"]),
-            is_family_verified=data.get("is_family_verified"),
-            medicaid_type_verified=data.get("medicaid_type_verified"),
-            delivery_address_verified=data.get("delivery_address_verified"),
-            stage=EnrollmentStage.PENDING_VERIFICATION,
-            requested_by=acting_agent,
+        # REUSE the client's own existing PENDING_VERIFICATION enrollment instead
+        # of creating a DUPLICATE. The daily/CSV import creates a
+        # pending_verification row (holding the governing internal-service case)
+        # when it first sees the case; if the agent then verifies via the wizard,
+        # creating a NEW enrollment would leave that verified row CASELESS (the
+        # case is already claimed by the pending one) and produce two live
+        # enrollments for the same case. Reusing keeps the case bound and the
+        # history on ONE enrollment. Scoped to this client's OWN pending row, so a
+        # dependent split (no own pending row) still creates its own enrollment.
+        enrollment = (
+            EnrollmentVerification.objects.filter(
+                client=client, stage=EnrollmentStage.PENDING_VERIFICATION,
+            )
+            .order_by("-opened_at")
+            .first()
         )
+        if enrollment is not None:
+            enrollment.household = household or enrollment.household
+            enrollment.program_name = data.get("program_name", "") or enrollment.program_name
+            enrollment.delivery_address = address
+            enrollment.delivery_weekdays = data.get("delivery_weekdays", [])
+            enrollment.household_size = len(data["members"])
+            enrollment.is_family_verified = data.get("is_family_verified")
+            enrollment.medicaid_type_verified = data.get("medicaid_type_verified")
+            enrollment.delivery_address_verified = data.get("delivery_address_verified")
+            enrollment.requested_by = enrollment.requested_by or acting_agent
+            enrollment.save()
+            # The wizard rebuilds the roster below, so clear the placeholder rows.
+            enrollment.member_profiles.all().delete()
+        else:
+            enrollment = EnrollmentVerification.objects.create(
+                client=client,
+                household=household,
+                program_name=data.get("program_name", ""),
+                delivery_address=address,
+                delivery_weekdays=data.get("delivery_weekdays", []),
+                household_size=len(data["members"]),
+                is_family_verified=data.get("is_family_verified"),
+                medicaid_type_verified=data.get("medicaid_type_verified"),
+                delivery_address_verified=data.get("delivery_address_verified"),
+                stage=EnrollmentStage.PENDING_VERIFICATION,
+                requested_by=acting_agent,
+            )
 
         for m in data["members"]:
             MemberDietaryProfile.objects.create(
