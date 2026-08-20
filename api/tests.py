@@ -12576,6 +12576,28 @@ class DeferredReauthGoverningTest(TestCase):
         deferred = {str(x) for x in deferred_extension_case_ids(cases)}
         self.assertNotIn(str(reauth.case_id), deferred)
 
+    def test_serving_mis_bound_to_future_case_is_repointed_not_parked(self):
+        # Prod bug: the serving enrollment's case FK is the FUTURE deferred case.
+        # reconcile must REPOINT it onto the active case (service continues) and
+        # park the future case as its OWN extension -- NEVER park or close the
+        # serving row (which would stop the member's meals).
+        from .models import EnrollmentStage, EnrollmentVerification
+        from .services.lifecycle import reconcile_internal_service_authorization
+
+        primary, _hh, current, serving, reauth = self._setup(reauth_start_days=20)
+        serving.case = reauth  # mis-bind onto the future reauth
+        serving.save(update_fields=["case"])
+
+        reconcile_internal_service_authorization(primary)
+
+        serving.refresh_from_db()
+        self.assertEqual(EnrollmentStage(serving.stage), EnrollmentStage.SERVICE_ACTIVE)
+        self.assertEqual(str(serving.case_id), str(current.case_id))
+        parked = EnrollmentVerification.objects.filter(
+            case=reauth, stage=EnrollmentStage.SCHEDULED_EXTENSION,
+        )
+        self.assertTrue(parked.exists())
+
 
 class DependentSplitTest(TestCase):
     """split_dependent_into_own_enrollment: peel a household dependent into their

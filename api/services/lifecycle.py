@@ -4125,7 +4125,7 @@ def _bind_governing_case_to_serving_enrollment(client, governing):
     every case-save reconcile. Best-effort. Returns True when it bound."""
     if governing is None or governing.case_status in _CLOSED_CASE_STATUSES:
         return False
-    from api.models import EnrollmentVerification
+    from api.models import CaseType, EnrollmentVerification
 
     terminal = (
         EnrollmentStage.CLOSED, EnrollmentStage.CANCELLED, EnrollmentStage.DISREGARDED,
@@ -4139,8 +4139,19 @@ def _bind_governing_case_to_serving_enrollment(client, governing):
     if len(serving) != 1:
         return False
     serv = serving[0]
+    if serv.case_id is not None and str(serv.case_id) == str(governing.case_id):
+        return False  # already correctly bound
     if serv.case_id is not None:
-        return False  # bound already (a genuine case change is handled elsewhere)
+        # The serving row is bound to a DIFFERENT case. Self-heal ONLY when that
+        # case is a DEFERRED future case -- i.e. a mis-binding where a future
+        # reauthorization/switch's FK landed on the actively-serving row (the prod
+        # import bug). REPOINT it to the active governing case so service keeps
+        # running on the right case, instead of letting the switch logic park or
+        # close the serving member. A genuine change to a NON-deferred case is a
+        # real switch and is left to the replace path.
+        _cases = [c for c in client.cases.all() if c.case_type == CaseType.INTERNAL_SERVICE]
+        if str(serv.case_id) not in {str(x) for x in deferred_extension_case_ids(_cases)}:
+            return False  # a genuine case change is handled elsewhere
     # Holders across ALL clients (the per-case unique constraint is global): skip
     # if the case is held by a SERVING enrollment (ambiguous) OR by an enrollment
     # of a DIFFERENT client (cross-client mislink -- never steal another member's
@@ -4635,6 +4646,19 @@ def _park_deferred_extensions(client, cases, *, actor=None, actor_label=""):
             .first()
         )
         if existing is not None:
+            # NEVER park an actively-serving (or kitchen-assigned) enrollment. If
+            # one is bound to a deferred FUTURE case it's a MIS-BINDING (the future
+            # case's FK landed on the serving row), and parking it would STOP the
+            # member's current service. Leave it running for the repoint remediation
+            # to move it back onto the active case; only pre-serving funnel rows are
+            # parked here.
+            if EnrollmentStage(existing.stage) in (
+                EnrollmentStage.SERVICE_ACTIVE,
+                EnrollmentStage.ON_HOLD,
+                EnrollmentStage.SERVICE_COMPLETE,
+                EnrollmentStage.KITCHEN_ASSIGNMENT,
+            ):
+                continue
             if EnrollmentStage(existing.stage) != EnrollmentStage.SCHEDULED_EXTENSION:
                 # Park a pre-existing (e.g. pending) enrollment for the reauth,
                 # carrying the household's verified capture + roster first.
@@ -4968,6 +4992,13 @@ def reconcile_internal_service_authorization(client, *, actor=None, actor_label=
 
     open_cases = open_internal_service_cases(client)
     governing = pick_governing_case(cases)
+    # Heal the 'serving enrollment on the wrong case' split at the source FIRST: a
+    # member serving without a governing case (its case stranded on a stray) OR
+    # mis-bound to a DEFERRED future case is repointed onto the active governing
+    # case. Done BEFORE parking so the future case is freed and then parked as its
+    # OWN row (never the serving one), and before the auth branches read
+    # enrollment.case.
+    _bind_governing_case_to_serving_enrollment(client, governing)
     # Ensure any deferred future reauthorization has a parked (non-serving)
     # SCHEDULED_EXTENSION enrollment, so it's visible + ready to activate later
     # WITHOUT supplanting the serving case now.
@@ -4987,11 +5018,6 @@ def reconcile_internal_service_authorization(client, *, actor=None, actor_label=
         client=client, stage=EnrollmentStage.SCHEDULED_EXTENSION,
     ).exists():
         set_reauth_attention(client, False)
-    # Heal the 'serving enrollment left caseless' split at the source: a member
-    # delivering without a governing case (its case stranded on a stray pending
-    # enrollment) breaks the authorization/PO window. Bind it back before the
-    # auth branches read enrollment.case.
-    _bind_governing_case_to_serving_enrollment(client, governing)
     # Record an old -> new governing-case switch (timeline event + primary note)
     # before acting on it, so the history captures WHY service state changed.
     _record_governing_case_change(
