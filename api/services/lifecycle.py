@@ -1081,30 +1081,38 @@ def deferred_extension_case_ids(cases, *, today=None):
             continue  # no window -> can't defer, switch per the normal rule
         kind_c = _case_product_kind(c)
         scope_c = c.household_type
-        # The same-kind + same-scope approved case(s) being extended. Must be
-        # OPEN: you can only DEFER a reauth that extends a CURRENTLY-SERVING
-        # program. A closed/cancelled same-kind case is NOT being served (e.g. a
-        # client on Boxes with a leftover closed Meals case must not have a Meals
-        # reauth parked as if it extended that dead case) -- such a reauth is a
-        # real switch, handled by the normal governing rule (+ attention flag).
+        # Same-scope, OPEN, approved case(s) currently being served -- the
+        # program(s) this reauth could extend/replace. Must be OPEN: you can only
+        # defer a reauth that extends a CURRENTLY-SERVING program.
         currents = [
             other for other in cases
             if other.case_id != c.case_id
             and other.service_authorization_status in favorable
             and other.case_status not in _CLOSED_CASE_STATUSES
             and other.household_type == scope_c
-            and _case_product_kind(other) == kind_c
         ]
         if not currents:
             continue
-        # Switch point = max(E1, S2). Defer while today hasn't reached it; on an
-        # overlap this keeps deferring past S2 until the current window ends (E1).
-        boundaries = [start.date()]
-        for other in currents:
-            _os, oe = other.effective_authorization_window()
-            if oe is not None:
-                boundaries.append(oe.date())
-        if today < max(boundaries):
+        start_date = start.date()
+        same_kind = [o for o in currents if _case_product_kind(o) == kind_c]
+        if same_kind:
+            # SAME-kind reauth (e.g. Meals reauth extending the served Meals):
+            # switch point = max(E1, S2). Defer while today hasn't reached it; on
+            # an overlap this keeps deferring past S2 until the current window
+            # ends (E1).
+            boundaries = [start_date]
+            for other in same_kind:
+                _os, oe = other.effective_authorization_window()
+                if oe is not None:
+                    boundaries.append(oe.date())
+            if today < max(boundaries):
+                deferred.add(c.case_id)
+        elif today < start_date:
+            # DIFFERENT-kind but FUTURE-dated switch (e.g. Meals -> Boxes starting
+            # next month) behind a currently-serving case: defer so the future
+            # case does NOT supplant the serving case until its window actually
+            # opens. An immediate/past-start different-kind switch is NOT deferred
+            # (start_date <= today) -- it governs now, per the normal rule.
             deferred.add(c.case_id)
     return deferred
 
