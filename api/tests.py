@@ -4816,6 +4816,67 @@ class ReopenEnrollmentForNewCaseTest(TestCase):
         self.assertIsNone(new.verified_at)                         # verification dropped
         self.assertEqual(new.member_profiles.count(), 1)           # roster still carried
 
+    def test_skips_when_case_held_by_another_live_enrollment(self):
+        # Cross-client/shared case (e.g. a relative): the new case is already held
+        # by ANOTHER client's LIVE enrollment. Reopen must SKIP -- no crash, no
+        # duplicate on the shared case -- leaving it for manual review.
+        from .models import (
+            Client, EnrollmentStage, EnrollmentVerification, Household,
+            HouseholdMember,
+        )
+        from .services.lifecycle import reopen_enrollment_for_new_case
+        from django.utils import timezone
+
+        c, prior, new_case = self._setup(closed_days_ago=10)
+        other = Client.objects.create(client_id=str(uuid.uuid4()), first_name="Rel", last_name="Ative")
+        other_hh = Household.objects.create(name="HH2")
+        HouseholdMember.objects.create(household=other_hh, client=other, is_primary=True)
+        EnrollmentVerification.objects.create(
+            client=other, household=other_hh, case=new_case,
+            stage=EnrollmentStage.SERVICE_ACTIVE, verified_at=timezone.now(),
+        )
+        r = reopen_enrollment_for_new_case(c, new_case)   # must not raise
+        self.assertIsNone(r)
+        self.assertFalse(EnrollmentVerification.objects.filter(client=c, case=new_case).exists())
+
+
+class OrphanedScheduledExtensionTest(TestCase):
+    """A closed/cancelled case must not leave a dangling SCHEDULED_EXTENSION
+    (reauthorization) enrollment; one tied to an OPEN case is left alone."""
+
+    def test_closes_dangling_reauth_but_keeps_open_one(self):
+        from .models import (
+            Case, CaseStatus, CaseType, Client, EnrollmentStage,
+            EnrollmentVerification, Household, ServiceAuthorizationStatus,
+        )
+        from .services.lifecycle import _close_orphaned_scheduled_extensions
+
+        c = Client.objects.create(client_id=str(uuid.uuid4()), first_name="Or", last_name="Phan")
+        hh = Household.objects.create(name="HH")
+        closed_case = Case.objects.create(
+            case_id=str(uuid.uuid4()), client=c, case_type=CaseType.INTERNAL_SERVICE,
+            case_status=CaseStatus.CLOSED,
+            service_authorization_status=ServiceAuthorizationStatus.APPROVED,
+        )
+        open_case = Case.objects.create(
+            case_id=str(uuid.uuid4()), client=c, case_type=CaseType.INTERNAL_SERVICE,
+            case_status=CaseStatus.OPEN,
+            service_authorization_status=ServiceAuthorizationStatus.APPROVED,
+        )
+        dangling = EnrollmentVerification.objects.create(
+            client=c, household=hh, case=closed_case,
+            stage=EnrollmentStage.SCHEDULED_EXTENSION,
+        )
+        keep = EnrollmentVerification.objects.create(
+            client=c, household=hh, case=open_case,
+            stage=EnrollmentStage.SCHEDULED_EXTENSION,
+        )
+        n = _close_orphaned_scheduled_extensions(c)
+        dangling.refresh_from_db(); keep.refresh_from_db()
+        self.assertEqual(n, 1)
+        self.assertEqual(EnrollmentStage(dangling.stage), EnrollmentStage.CLOSED)
+        self.assertEqual(EnrollmentStage(keep.stage), EnrollmentStage.SCHEDULED_EXTENSION)
+
 
 class TimelineReasonDetailTest(TestCase):
     """Out-of-Orbit / Out-of-Range timeline rows surface WHY (reason / ZIP), not

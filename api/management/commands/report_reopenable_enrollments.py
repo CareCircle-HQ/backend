@@ -21,12 +21,20 @@ from api.models import (
     EnrollmentVerification,
     ServiceAuthorizationStatus,
 )
+from api.services.catalog import product_type_kind_for_name
+from api.services.delivery import current_household_cadence
 from api.services.lifecycle import (
     _LIVE_ENROLLMENT_STAGES,
     _REOPEN_REVERIFY_GAP_DAYS,
     _REOPEN_SOURCE_STAGES,
     pick_governing_case,
 )
+
+_LIVE_HOLDER_EXCLUDE = [
+    EnrollmentStage.CLOSED.value,
+    EnrollmentStage.CANCELLED.value,
+    EnrollmentStage.DISREGARDED.value,
+]
 
 
 class Command(BaseCommand):
@@ -42,7 +50,7 @@ class Command(BaseCommand):
             ).values_list("client_id", flat=True)
         )
 
-        resume = reverify = 0
+        resume = ka = reverify = blocked = 0
         now = timezone.now()
         for cid in client_ids:
             enrs = list(EnrollmentVerification.objects.filter(client_id=cid))
@@ -70,20 +78,51 @@ class Command(BaseCommand):
             prior = max(priors, key=lambda e: (e.closed_at or e.stage_at or e.opened_at))
             closed = prior.closed_at or prior.stage_at
             gap = (now - closed).days if closed else 0
-            will_reverify = gap > _REOPEN_REVERIFY_GAP_DAYS
-            if will_reverify:
+
+            # BLOCKED: the governing case is already held by another LIVE (often
+            # cross-client/relative) enrollment -> reopen skips it for manual review.
+            holder = (
+                EnrollmentVerification.objects.filter(case=gov)
+                .exclude(stage__in=_LIVE_HOLDER_EXCLUDE)
+                .exclude(client_id=cid)
+                .select_related("client").first()
+            )
+            if holder is not None:
+                blocked += 1
+                outcome = (
+                    f"BLOCKED (manual) - case held by {holder.client.first_name} "
+                    f"{holder.client.last_name} enr {holder.pk} ({holder.stage})"
+                )
+            elif gap > _REOPEN_REVERIFY_GAP_DAYS:
                 reverify += 1
+                outcome = f"RE-VERIFY (gap {gap}d > {_REOPEN_REVERIFY_GAP_DAYS})"
             else:
-                resume += 1
+                # Predict RESUME vs Kitchen Assignment the way the reopen carry does:
+                # needs same product kind + a kitchen + a cadence on the prior.
+                p_kind = product_type_kind_for_name(prior.program_name or "") or \
+                    product_type_kind_for_name(prior.service_type or "")
+                n_kind = product_type_kind_for_name(gov.program_name or "") or \
+                    product_type_kind_for_name(gov.service_type or "")
+                same_kind = p_kind is not None and n_kind is not None and p_kind == n_kind
+                carries = bool(same_kind and prior.kitchen_id and current_household_cadence(prior))
+                if carries:
+                    resume += 1
+                    outcome = f"RESUME service (gap {gap}d)"
+                else:
+                    ka += 1
+                    why = "product kind change" if (p_kind and n_kind and not same_kind) else "no carried kitchen/cadence"
+                    outcome = f"KITCHEN ASSIGNMENT (gap {gap}d; {why})"
+
             self.stdout.write(
                 f"  {client.client_id} {client.first_name} {client.last_name} | "
                 f"prior enr {prior.pk} ({prior.stage}) closed {str(closed)[:10]} | "
                 f"new case {str(gov.case_id)[:8]} ({(gov.program_name or '')[:28]}) | "
-                f"gap {gap}d -> {'RE-VERIFY' if will_reverify else 'RESUME service'}"
+                f"-> {outcome}"
             )
 
+        total = resume + ka + reverify + blocked
         self.stdout.write(self.style.SUCCESS(
-            f"\n{resume + reverify} client(s) will reopen on next reconcile: "
-            f"{resume} resume service (<= {_REOPEN_REVERIFY_GAP_DAYS}d), "
-            f"{reverify} require re-verification (> {_REOPEN_REVERIFY_GAP_DAYS}d)."
+            f"\n{total} stranded client(s): {resume} resume service, "
+            f"{ka} kitchen assignment, {reverify} re-verify (> {_REOPEN_REVERIFY_GAP_DAYS}d), "
+            f"{blocked} BLOCKED/manual (shared case held by another live enrollment)."
         ))
