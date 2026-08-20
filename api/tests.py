@@ -4707,6 +4707,33 @@ class MemberDietaryEditReactivatesOooTest(TestCase):
         self.assertEqual(mp.status, MemberStatus.OUT_OF_ORBIT)
 
 
+class TimelineReasonDetailTest(TestCase):
+    """Out-of-Orbit / Out-of-Range timeline rows surface WHY (reason / ZIP), not
+    just the member name, so the History tab shows the detail directly."""
+
+    def _profile(self, name):
+        from .models import Client, EnrollmentVerification, MemberDietaryProfile
+        c = Client.objects.create(client_id=str(uuid.uuid4()), first_name=name, last_name="X")
+        enr = EnrollmentVerification.objects.create(client=c)
+        return MemberDietaryProfile.objects.create(
+            enrollment=enr, client=c, member_name=name, menu_type="Kosher",
+        )
+
+    def test_out_of_orbit_subtitle_includes_reason(self):
+        from .services import timeline
+        ev = timeline.event_for_out_of_orbit(
+            self._profile("Hassan"), reason="Menu & Allergy Requirements Not Serviceable",
+        )
+        self.assertIn("Hassan", ev.subtitle)
+        self.assertIn("Not Serviceable", ev.subtitle)
+
+    def test_out_of_range_subtitle_includes_zip(self):
+        from .services import timeline
+        ev = timeline.event_for_out_of_range(self._profile("Ada"), zip_code="11209")
+        self.assertIn("Ada", ev.subtitle)
+        self.assertIn("11209", ev.subtitle)
+
+
 class ConsolidateServingCaselessDuplicatesTest(TestCase):
     """Calendar-aware consolidation of duplicate serving enrollments (caseless
     serving + a live sibling holding the case): keep whichever owns the active
