@@ -4783,6 +4783,29 @@ def _carry_waiting_schedule(waiting, live, reauth):
         pass
 
 
+def _close_orphaned_scheduled_extensions(client, *, actor=None, actor_label=""):
+    """Close any parked SCHEDULED_EXTENSION (reauthorization) enrollment whose
+    case has since CLOSED/CANCELLED. The future reauth it was holding never
+    happened (the case was closed), so the parked row must not linger looking like
+    a pending extension. Returns the count closed."""
+    from api.models import EnrollmentVerification, EnrollmentStage
+
+    closed = 0
+    for enr in EnrollmentVerification.objects.filter(
+        client=client, stage=EnrollmentStage.SCHEDULED_EXTENSION.value,
+    ).select_related("case"):
+        if enr.case is None or enr.case.case_status not in _CLOSED_CASE_STATUSES:
+            continue
+        _force_close_enrollment(enr)
+        try:
+            enr.close_reason = "scheduled_extension_case_closed"
+            enr.save(update_fields=["close_reason"])
+        except Exception:  # pragma: no cover - defensive
+            pass
+        closed += 1
+    return closed
+
+
 def _park_deferred_extensions(client, cases, *, actor=None, actor_label=""):
     """Ensure each DEFERRED future reauthorization extension has a parked,
     NON-SERVING ``SCHEDULED_EXTENSION`` enrollment bound to its case.
@@ -5172,6 +5195,11 @@ def reconcile_internal_service_authorization(client, *, actor=None, actor_label=
     # WITHOUT supplanting the serving case now.
     _park_deferred_extensions(
         client, cases, actor=actor, actor_label=actor_label,
+    )
+    # Close any parked reauth whose case has since closed/cancelled, so a closed
+    # case never leaves a dangling SCHEDULED_EXTENSION row behind.
+    _close_orphaned_scheduled_extensions(
+        client, actor=actor, actor_label=actor_label,
     )
     # Positive "Reauthorized" indicator: on while a reauth is parked, off once
     # none remain.

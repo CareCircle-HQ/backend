@@ -4817,6 +4817,44 @@ class ReopenEnrollmentForNewCaseTest(TestCase):
         self.assertEqual(new.member_profiles.count(), 1)           # roster still carried
 
 
+class OrphanedScheduledExtensionTest(TestCase):
+    """A closed/cancelled case must not leave a dangling SCHEDULED_EXTENSION
+    (reauthorization) enrollment; one tied to an OPEN case is left alone."""
+
+    def test_closes_dangling_reauth_but_keeps_open_one(self):
+        from .models import (
+            Case, CaseStatus, CaseType, Client, EnrollmentStage,
+            EnrollmentVerification, Household, ServiceAuthorizationStatus,
+        )
+        from .services.lifecycle import _close_orphaned_scheduled_extensions
+
+        c = Client.objects.create(client_id=str(uuid.uuid4()), first_name="Or", last_name="Phan")
+        hh = Household.objects.create(name="HH")
+        closed_case = Case.objects.create(
+            case_id=str(uuid.uuid4()), client=c, case_type=CaseType.INTERNAL_SERVICE,
+            case_status=CaseStatus.CLOSED,
+            service_authorization_status=ServiceAuthorizationStatus.APPROVED,
+        )
+        open_case = Case.objects.create(
+            case_id=str(uuid.uuid4()), client=c, case_type=CaseType.INTERNAL_SERVICE,
+            case_status=CaseStatus.OPEN,
+            service_authorization_status=ServiceAuthorizationStatus.APPROVED,
+        )
+        dangling = EnrollmentVerification.objects.create(
+            client=c, household=hh, case=closed_case,
+            stage=EnrollmentStage.SCHEDULED_EXTENSION,
+        )
+        keep = EnrollmentVerification.objects.create(
+            client=c, household=hh, case=open_case,
+            stage=EnrollmentStage.SCHEDULED_EXTENSION,
+        )
+        n = _close_orphaned_scheduled_extensions(c)
+        dangling.refresh_from_db(); keep.refresh_from_db()
+        self.assertEqual(n, 1)
+        self.assertEqual(EnrollmentStage(dangling.stage), EnrollmentStage.CLOSED)
+        self.assertEqual(EnrollmentStage(keep.stage), EnrollmentStage.SCHEDULED_EXTENSION)
+
+
 class TimelineReasonDetailTest(TestCase):
     """Out-of-Orbit / Out-of-Range timeline rows surface WHY (reason / ZIP), not
     just the member name, so the History tab shows the detail directly."""
