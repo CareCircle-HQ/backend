@@ -4608,6 +4608,42 @@ class ConsolidateCaselessDuplicateEnrollmentsTest(TestCase):
         self.assertEqual(EnrollmentStage(sib.stage), EnrollmentStage.VERIFIED)
         self.assertEqual(str(sib.case_id), str(case.case_id))
 
+    def test_skips_without_crash_when_case_held_cross_client(self):
+        # The governing case is held by ANOTHER client's live enrollment (a
+        # cross-client mislink the per-client sibling scan can't see). Binding
+        # would violate the GLOBAL uniq_enrollment_verification_per_case -> the
+        # command must SKIP for manual review, not crash mid-run.
+        from io import StringIO
+
+        from django.core.management import call_command
+
+        from .models import (
+            Client, EnrollmentStage, EnrollmentVerification, Household,
+            HouseholdMember, MemberDietaryProfile,
+        )
+
+        c, hh, case = self._client_with_case("Tal")
+        keeper = EnrollmentVerification.objects.create(
+            client=c, household=hh, stage=EnrollmentStage.SERVICE_ACTIVE, case=None,
+        )
+        MemberDietaryProfile.objects.create(enrollment=keeper, client=c, member_name="Tal")
+        # A DIFFERENT client's live enrollment holds c's governing case.
+        other = Client.objects.create(client_id=str(uuid.uuid4()), first_name="Ot", last_name="Her")
+        other_hh = Household.objects.create(name="HH2")
+        HouseholdMember.objects.create(household=other_hh, client=other, is_primary=True)
+        other_enr = EnrollmentVerification.objects.create(
+            client=other, household=other_hh, stage=EnrollmentStage.VERIFIED, case=case,
+        )
+
+        # Must NOT raise.
+        call_command(
+            "consolidate_caseless_duplicate_enrollments", "--apply",
+            "--client", str(c.client_id), stdout=StringIO(),
+        )
+        keeper.refresh_from_db(); other_enr.refresh_from_db()
+        self.assertIsNone(keeper.case_id)                       # skipped, still caseless
+        self.assertEqual(str(other_enr.case_id), str(case.case_id))  # untouched
+
 
 class MemberDietaryEditReactivatesOooTest(TestCase):
     """Editing an OUT_OF_ORBIT member's menu/allergies re-runs the meal rule and

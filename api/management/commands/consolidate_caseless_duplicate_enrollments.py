@@ -19,6 +19,7 @@ DRY-RUN by default; ``--apply`` to write. ``--client`` scopes to one client_id.
 """
 
 from django.core.management.base import BaseCommand
+from django.db import transaction
 
 from api.models import EnrollmentStage, EnrollmentVerification
 from api.services.lifecycle import (
@@ -108,23 +109,51 @@ class Command(BaseCommand):
             if not strays and not need_bind:
                 continue  # nothing to consolidate
 
+            # GLOBAL safety: uniq_enrollment_verification_per_case is enforced
+            # across ALL clients, so binding the case would fail if it's (still)
+            # held by ANY non-terminal enrollment other than the keeper and the
+            # pending strays we're about to disregard (e.g. a cross-client mislink
+            # or another live holder this client's siblings don't include). SKIP
+            # such a client for manual review rather than crashing the whole run.
+            if need_bind:
+                stray_pks = {s.pk for s in strays}
+                other_holder = (
+                    EnrollmentVerification.objects.filter(case=gov)
+                    .exclude(pk=keeper.pk)
+                    .exclude(pk__in=stray_pks)
+                    .exclude(stage__in=_TERMINAL)
+                    .first()
+                )
+                if other_holder is not None:
+                    skipped += 1
+                    self._print(keeper, gov, [other_holder],
+                                note="SKIP: governing case held by another live enrollment (manual)",
+                                label="held by")
+                    continue
+
             serving = keeper.stage in _SERVING
             self._print(keeper, gov, strays,
                         note=("FIX" + (" [SERVING]" if serving else "")
                               + ("" if not need_bind else " (bind case to keeper)")))
             if apply:
-                for h in strays:
-                    h.case = None
-                    h.stage = EnrollmentStage.DISREGARDED.value
-                    h.close_reason = "caseless_duplicate_fix"
-                    h.save(update_fields=["case", "stage", "close_reason"])
-                if need_bind:
-                    keeper.case = gov  # gov is now free (strays holding it were unbound)
-                    keeper.save(update_fields=["case"])
+                # Atomic per client: if anything fails, roll THIS client back
+                # entirely (never leave a stray disregarded but the keeper still
+                # caseless) and keep going with the rest.
                 try:
-                    reconcile_internal_service_authorization(keeper.client)
-                except Exception as exc:  # noqa: BLE001
-                    self.stdout.write(self.style.ERROR(f"      reconcile FAILED: {exc}"))
+                    with transaction.atomic():
+                        for h in strays:
+                            h.case = None
+                            h.stage = EnrollmentStage.DISREGARDED.value
+                            h.close_reason = "caseless_duplicate_fix"
+                            h.save(update_fields=["case", "stage", "close_reason"])
+                        if need_bind:
+                            keeper.case = gov  # freed above (strays holding it unbound)
+                            keeper.save(update_fields=["case"])
+                        reconcile_internal_service_authorization(keeper.client)
+                except Exception as exc:  # noqa: BLE001 - report, roll back, continue
+                    self.stdout.write(self.style.ERROR(f"      FAILED, skipped (rolled back): {exc}"))
+                    skipped += 1
+                    continue
             fixed += 1
             if serving:
                 serving_fixed += 1
