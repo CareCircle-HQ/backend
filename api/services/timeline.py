@@ -1099,12 +1099,15 @@ def event_for_out_of_orbit(
         return None
     enrollment = enrollment or getattr(profile, "enrollment", None)
     dedupe = f"out_of_orbit:{enrollment.pk}:{profile.pk}" if enrollment is not None else ""
+    # Surface WHY on the timeline row, not just who: "<name> — <reason>".
+    name = profile.member_name or ""
+    subtitle = f"{name} \u2014 {reason}".strip(" \u2014") if reason else name
     return emit_timeline_event(
         client=client,
         event_type=TimelineEventType.OUT_OF_ORBIT,
         occurred_at=timezone.now(),
         title="Household set as Out of Orbit",
-        subtitle=profile.member_name or "",
+        subtitle=subtitle,
         badge_text="Out of Orbit",
         badge_tone=TimelineBadgeTone.WARNING,
         source=source,
@@ -1127,12 +1130,16 @@ def event_for_out_of_range(
         return None
     enrollment = enrollment or getattr(profile, "enrollment", None)
     dedupe = f"out_of_range:{enrollment.pk}:{profile.pk}" if enrollment is not None else ""
+    # Surface WHY (reason / offending ZIP) on the row, not just who.
+    name = profile.member_name or ""
+    detail = reason or (f"ZIP {zip_code} outside coverage" if zip_code else "")
+    subtitle = f"{name} \u2014 {detail}".strip(" \u2014") if detail else name
     return emit_timeline_event(
         client=client,
         event_type=TimelineEventType.OUT_OF_RANGE,
         occurred_at=timezone.now(),
         title="Member set as Out of Range",
-        subtitle=profile.member_name or "",
+        subtitle=subtitle,
         badge_text="Out of Range",
         badge_tone=TimelineBadgeTone.WARNING,
         source=source,

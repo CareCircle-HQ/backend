@@ -3553,6 +3553,174 @@ def _carry_service_and_activate(
     return True
 
 
+# A household that goes longer than this with NO open internal-service case must
+# be RE-VERIFIED when a new case reopens service; within it, service resumes.
+_REOPEN_REVERIFY_GAP_DAYS = 60
+
+# Enrollment stages that mean the client still has a live enrollment (in the
+# funnel or serving) -- if ANY exists, the normal resume/replace path owns it and
+# the reopen below must NOT fire.
+_LIVE_ENROLLMENT_STAGES = frozenset({
+    EnrollmentStage.PENDING_VALIDATION,
+    EnrollmentStage.VALIDATED,
+    EnrollmentStage.PENDING_VERIFICATION,
+    EnrollmentStage.VERIFIED,
+    EnrollmentStage.KITCHEN_ASSIGNMENT,
+    EnrollmentStage.SERVICE_ACTIVE,
+    EnrollmentStage.ON_HOLD,
+})
+# Terminal stages a prior enrollment can rest in and still be a clone source.
+_REOPEN_SOURCE_STAGES = frozenset({
+    EnrollmentStage.CLOSED,
+    EnrollmentStage.CANCELLED,
+    EnrollmentStage.SERVICE_COMPLETE,
+})
+
+
+def reopen_enrollment_for_new_case(client, new_governing_case, *, actor=None, actor_label=""):
+    """Reopen service when a client whose ONLY internal-service enrollment is
+    terminal gets a NEW open, approved governing case.
+
+    Opens a fresh enrollment CLONED from the most-recent prior enrollment's data
+    (roster + dietary/clinical intake, delivery address, verification facts,
+    kitchen, cadence, nutritionist sign-off). The 60-day rule decides whether the
+    household must be re-verified:
+
+      * gap since the prior enrollment closed <= 60 days -> carry the verification
+        (and nutritionist) forward and RESUME service (kitchen/cadence/calendar).
+      * gap > 60 days -> DROP the carried verification so the new enrollment rests
+        at Pending Verification: the household must be re-verified.
+
+    Idempotent: once the live enrollment exists the normal resume/replace path
+    takes over. Returns the new enrollment, or None when not applicable.
+    """
+    from api.models import (
+        EnrollmentVerification, MemberDietaryProfile, MemberStatus,
+    )
+    from api.services.catalog import product_type_kind_for_name
+
+    if new_governing_case is None:
+        return None
+    if new_governing_case.service_authorization_status not in (
+        ServiceAuthorizationStatus.APPROVED, ServiceAuthorizationStatus.NOT_REQUIRED,
+    ):
+        return None
+    if new_governing_case.case_status in _CLOSED_CASE_STATUSES:
+        return None
+
+    all_enr = list(EnrollmentVerification.objects.filter(client=client))
+    # A live enrollment (funnel/serving) means the normal path handles it.
+    if any(EnrollmentStage(e.stage) in _LIVE_ENROLLMENT_STAGES for e in all_enr):
+        return None
+    # Clone source: the most-recent VERIFIED terminal enrollment (has data).
+    priors = [
+        e for e in all_enr
+        if e.verified_at and EnrollmentStage(e.stage) in _REOPEN_SOURCE_STAGES
+    ]
+    if not priors:
+        return None
+    prior = max(priors, key=lambda e: (e.closed_at or e.stage_at or e.opened_at))
+
+    prior_close = prior.closed_at or prior.stage_at
+    gap_days = (timezone.now() - prior_close).days if prior_close else 0
+    reverify = gap_days > _REOPEN_REVERIFY_GAP_DAYS
+
+    new_kind = product_type_kind_for_name(new_governing_case.program_name or "") or \
+        product_type_kind_for_name(new_governing_case.service_type or "")
+    author = actor_label or _actor_name(actor)
+
+    with transaction.atomic():
+        # If the new case got rebound onto the dead prior row, free it first so
+        # the fresh enrollment can own it (terminal rows are exempt from the
+        # per-case unique constraint, but we keep the prior pointing at its own).
+        prev_case = prior.case
+        if prior.case_id and str(prior.case_id) == str(new_governing_case.case_id):
+            prev_case = prior.previous_case
+            prior.case = prior.previous_case
+            try:
+                prior.save(update_fields=["case"])
+            except Exception:  # pragma: no cover - defensive
+                pass
+
+        fields = {
+            "client": prior.client,
+            "household": prior.household,
+            "case": new_governing_case,
+            "previous_case": prev_case,
+            "program_name": new_governing_case.program_name or "",
+            "service_type": new_governing_case.service_type or "",
+            "delivery_address": prior.delivery_address,
+            "household_size": prior.household_size,
+            "is_family_verified": prior.is_family_verified,
+            "medicaid_type_verified": prior.medicaid_type_verified,
+            "delivery_address_verified": prior.delivery_address_verified,
+            "requested_by": prior.requested_by,
+            "requested_at": timezone.now() if reverify else prior.requested_at,
+            "supersedes": prior,
+            "stage": EnrollmentStage.PENDING_VERIFICATION.value,
+        }
+        if not reverify:
+            # Within 60 days: carry the verification + nutritionist sign-off so
+            # _carry_service_and_activate can resume service without re-review.
+            fields.update(
+                verified_at=prior.verified_at,
+                verified_by=prior.verified_by,
+                nutritionist_approved_at=prior.nutritionist_approved_at,
+                nutritionist_approved_by=prior.nutritionist_approved_by,
+                nutritionist_signature=prior.nutritionist_signature,
+                nutritionist_signature_image=prior.nutritionist_signature_image,
+                nutritionist_approval_pdf_key=prior.nutritionist_approval_pdf_key,
+            )
+        new_enr = EnrollmentVerification.objects.create(**fields)
+
+        # Clone the roster + full clinical/dietary intake (carried, not recollected).
+        for mv in prior.member_profiles.all():
+            MemberDietaryProfile.objects.create(
+                enrollment=new_enr, client=mv.client, member_name=mv.member_name,
+                dietary_restrictions=mv.dietary_restrictions,
+                food_allergies=mv.food_allergies,
+                other_dietary_restrictions=mv.other_dietary_restrictions,
+                meal_category=mv.meal_category, menu_type=mv.menu_type,
+                status=(MemberStatus.PENDING if reverify else mv.status),
+                kitchen_meal_type="", kitchen_food_notes="",
+                meals_per_delivery=mv.meals_per_delivery,
+                general_verification_notes=mv.general_verification_notes,
+                pause_locked=mv.pause_locked, mobile_number=mv.mobile_number,
+                conditions=mv.conditions, weeks_gestation=mv.weeks_gestation,
+                months_postpartum=mv.months_postpartum, medications=mv.medications,
+                weight=mv.weight, height=mv.height,
+                on_medical_diet=mv.on_medical_diet,
+                medical_diet_details=mv.medical_diet_details,
+                meal_plan=mv.meal_plan, meal_plan_other=mv.meal_plan_other,
+                assessment_notes=mv.assessment_notes,
+                nutritionist_pdf_key=mv.nutritionist_pdf_key,
+            )
+
+        day = timezone.localdate().isoformat()
+        short = str(new_governing_case.case_id)[:8]
+        if reverify:
+            note = (
+                f"Reopened on {day} for new open case {short}: the household went "
+                f"{gap_days} days (> {_REOPEN_REVERIFY_GAP_DAYS}) with no open "
+                "internal-service case, so re-verification is required. Roster + "
+                "dietary data carried; service stays paused until re-verified."
+            )
+        else:
+            _carry_service_and_activate(
+                new_enr, prior, new_governing_case, new_kind,
+                prior_was_serving=True, actor=actor, actor_label=actor_label,
+            )
+            note = (
+                f"Reopened on {day} for new open case {short}: within "
+                f"{_REOPEN_REVERIFY_GAP_DAYS} days ({gap_days}d) of the prior "
+                "enrollment closing, so service resumed from the previous "
+                "enrollment (no re-verification)."
+            )
+        _write_primary_system_note(client, note, author_name=author)
+
+    return new_enr
+
+
 def replace_enrollment_for_case_change(
     client, new_governing_case, *, actor=None, actor_label="",
 ):
@@ -5121,6 +5289,16 @@ def reconcile_internal_service_authorization(client, *, actor=None, actor_label=
             result["switched"] = True
             result["replaced"] = True
         else:
+            # No live enrollment but an open, approved case exists: the prior
+            # enrollment closed (its case ended) and a NEW case has since arrived.
+            # Reopen from the prior's data (re-verify only if the no-open-case gap
+            # exceeded 60 days) so the household isn't stranded at Not Eligible
+            # with a valid approved case. Self-guards (no-op when a live
+            # enrollment already exists), so it's safe to call unconditionally.
+            if reopen_enrollment_for_new_case(
+                client, governing, actor=actor, actor_label=actor_label,
+            ) is not None:
+                result["reopened"] = True
             for enr in _governing_enrollments(client):
                 if EnrollmentStage(enr.stage) == EnrollmentStage.ON_HOLD:
                     # Resume whichever auto-pause holds this enrollment: a denial

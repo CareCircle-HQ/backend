@@ -3564,6 +3564,39 @@ class RemovalAndVerificationGuardsTest(TestCase):
         self.assertEqual(str(e.case_id), str(case.case_id))
         self.assertTrue(e.verified_at)
 
+    def test_verification_blocked_when_already_verified(self):
+        # The wizard runs ONCE per household: if the client already has a
+        # verified/serving enrollment, re-running it is blocked (409) and no
+        # duplicate enrollment is created.
+        from rest_framework.parsers import JSONParser
+        from rest_framework.request import Request
+        from rest_framework.test import APIRequestFactory
+
+        from .models import (
+            EnrollmentStage, EnrollmentVerification, Household, HouseholdMember,
+            MemberDietaryProfile,
+        )
+        from .portal.views_members import MemberVerificationCreateView
+
+        client = self._client("Al", "Ready")
+        hh = Household.objects.create(name="HH")
+        HouseholdMember.objects.create(household=hh, client=client, is_primary=True)
+        case = self._internal_case(client)
+        enr = EnrollmentVerification.objects.create(
+            client=client, household=hh, case=case, stage=EnrollmentStage.SERVICE_ACTIVE,
+        )
+        MemberDietaryProfile.objects.create(enrollment=enr, client=client)
+
+        raw = APIRequestFactory().post(
+            "/",
+            {"members": [{"client_id": str(client.pk), "mobile_number": "3475550142"}], "zip": "10001"},
+            format="json",
+        )
+        resp = MemberVerificationCreateView().post(Request(raw, parsers=[JSONParser()]), client.pk)
+        self.assertEqual(resp.status_code, 409)
+        # No duplicate created -- still the single serving enrollment.
+        self.assertEqual(EnrollmentVerification.objects.filter(client=client).count(), 1)
+
     def test_cannot_remove_primary_member(self):
         from rest_framework.test import APIRequestFactory
 
@@ -4705,6 +4738,110 @@ class MemberDietaryEditReactivatesOooTest(TestCase):
         self.assertEqual(resp.status_code, 200)
         mp.refresh_from_db()
         self.assertEqual(mp.status, MemberStatus.OUT_OF_ORBIT)
+
+
+class ReopenEnrollmentForNewCaseTest(TestCase):
+    """When a client whose only enrollment is CLOSED gets a NEW open/approved
+    meal case, a fresh enrollment is opened from the prior's data. Re-verification
+    is required only if the household went >60 days with no open case."""
+
+    def _setup(self, *, closed_days_ago):
+        import datetime
+
+        from django.utils import timezone
+
+        from .models import (
+            Case, CaseStatus, CaseType, Client, EnrollmentStage,
+            EnrollmentVerification, Household, HouseholdMember,
+            MemberDietaryProfile, MemberStatus, ServiceAuthorizationStatus,
+        )
+        now = timezone.now()
+        c = Client.objects.create(client_id=str(uuid.uuid4()), first_name="Re", last_name="Open")
+        hh = Household.objects.create(name="HH")
+        HouseholdMember.objects.create(household=hh, client=c, is_primary=True)
+        old_case = Case.objects.create(
+            case_id=str(uuid.uuid4()), client=c, case_type=CaseType.INTERNAL_SERVICE,
+            case_status=CaseStatus.CLOSED,
+            service_authorization_status=ServiceAuthorizationStatus.APPROVED,
+            program_name="Medically Tailored Meals (MTM)",
+        )
+        prior = EnrollmentVerification.objects.create(
+            client=c, household=hh, case=old_case, stage=EnrollmentStage.CLOSED,
+            program_name="Medically Tailored Meals (MTM)",
+            verified_at=now - datetime.timedelta(days=closed_days_ago + 30),
+            is_family_verified=True, medicaid_type_verified=True,
+            delivery_address_verified=True,
+            closed_at=now - datetime.timedelta(days=closed_days_ago),
+        )
+        MemberDietaryProfile.objects.create(
+            enrollment=prior, client=c, member_name="Re", menu_type="Standard",
+            status=MemberStatus.ACTIVE,
+        )
+        new_case = Case.objects.create(
+            case_id=str(uuid.uuid4()), client=c, case_type=CaseType.INTERNAL_SERVICE,
+            case_status=CaseStatus.OPEN,
+            service_authorization_status=ServiceAuthorizationStatus.APPROVED,
+            program_name="Clinically Appropriate Meals",
+        )
+        return c, prior, new_case
+
+    def _reopened(self, c, prior, new_case):
+        from .models import EnrollmentVerification
+        return (
+            EnrollmentVerification.objects.filter(client=c, case=new_case)
+            .exclude(pk=prior.pk).first()
+        )
+
+    def test_within_60_days_resumes_without_reverification(self):
+        from .models import EnrollmentStage
+        from .services.lifecycle import reconcile_internal_service_authorization
+        c, prior, new_case = self._setup(closed_days_ago=10)
+        reconcile_internal_service_authorization(c)
+        new = self._reopened(c, prior, new_case)
+        self.assertIsNotNone(new)
+        self.assertEqual(new.supersedes_id, prior.pk)
+        self.assertIsNotNone(new.verified_at)                      # verification carried
+        self.assertNotEqual(EnrollmentStage(new.stage), EnrollmentStage.PENDING_VERIFICATION)
+        self.assertEqual(new.member_profiles.count(), 1)           # roster carried
+
+    def test_over_60_days_requires_reverification(self):
+        from .models import EnrollmentStage
+        from .services.lifecycle import reconcile_internal_service_authorization
+        c, prior, new_case = self._setup(closed_days_ago=90)
+        reconcile_internal_service_authorization(c)
+        new = self._reopened(c, prior, new_case)
+        self.assertIsNotNone(new)
+        self.assertEqual(new.supersedes_id, prior.pk)
+        self.assertEqual(EnrollmentStage(new.stage), EnrollmentStage.PENDING_VERIFICATION)
+        self.assertIsNone(new.verified_at)                         # verification dropped
+        self.assertEqual(new.member_profiles.count(), 1)           # roster still carried
+
+
+class TimelineReasonDetailTest(TestCase):
+    """Out-of-Orbit / Out-of-Range timeline rows surface WHY (reason / ZIP), not
+    just the member name, so the History tab shows the detail directly."""
+
+    def _profile(self, name):
+        from .models import Client, EnrollmentVerification, MemberDietaryProfile
+        c = Client.objects.create(client_id=str(uuid.uuid4()), first_name=name, last_name="X")
+        enr = EnrollmentVerification.objects.create(client=c)
+        return MemberDietaryProfile.objects.create(
+            enrollment=enr, client=c, member_name=name, menu_type="Kosher",
+        )
+
+    def test_out_of_orbit_subtitle_includes_reason(self):
+        from .services import timeline
+        ev = timeline.event_for_out_of_orbit(
+            self._profile("Hassan"), reason="Menu & Allergy Requirements Not Serviceable",
+        )
+        self.assertIn("Hassan", ev.subtitle)
+        self.assertIn("Not Serviceable", ev.subtitle)
+
+    def test_out_of_range_subtitle_includes_zip(self):
+        from .services import timeline
+        ev = timeline.event_for_out_of_range(self._profile("Ada"), zip_code="11209")
+        self.assertIn("Ada", ev.subtitle)
+        self.assertIn("11209", ev.subtitle)
 
 
 class ConsolidateServingCaselessDuplicatesTest(TestCase):

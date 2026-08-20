@@ -5740,22 +5740,50 @@ class MemberVerificationCreateView(PortalAPIView):
         # move it forward and write the history rows. The agent running the
         # wizard both requests and (below) completes the verification.
         acting_agent = current_agent(request)
-        # REUSE the client's own existing PENDING_VERIFICATION enrollment instead
-        # of creating a DUPLICATE. The daily/CSV import creates a
-        # pending_verification row (holding the governing internal-service case)
-        # when it first sees the case; if the agent then verifies via the wizard,
-        # creating a NEW enrollment would leave that verified row CASELESS (the
-        # case is already claimed by the pending one) and produce two live
-        # enrollments for the same case. Reusing keeps the case bound and the
-        # history on ONE enrollment. Scoped to this client's OWN pending row, so a
-        # dependent split (no own pending row) still creates its own enrollment.
-        enrollment = (
-            EnrollmentVerification.objects.filter(
-                client=client, stage=EnrollmentStage.PENDING_VERIFICATION,
-            )
-            .order_by("-opened_at")
-            .first()
+        # The verification wizard runs ONCE per household. Two guards prevent it
+        # from ever creating a DUPLICATE enrollment (the caseless-duplicate bug):
+        #
+        #   1) If the client already has a VERIFIED-or-later live enrollment,
+        #      BLOCK: the household is already verified/serving, so re-running the
+        #      wizard would fork a second (caseless) enrollment. Corrections to an
+        #      active household go through the member profile editor; a genuine
+        #      renewal is a NEW case handled by the reconcile/supersession path.
+        #   2) Otherwise REUSE the client's own PRE-VERIFICATION request row (the
+        #      one the daily/CSV import creates holding the governing case) instead
+        #      of opening a second row.
+        #
+        # A dependent split legitimately creates its own new enrollment, so both
+        # guards are skipped for that path.
+        _PRE_VERIFY_STAGES = (
+            EnrollmentStage.PENDING_VALIDATION,
+            EnrollmentStage.VALIDATED,
+            EnrollmentStage.PENDING_VERIFICATION,
         )
+        _TERMINAL_STAGES = (
+            EnrollmentStage.CLOSED, EnrollmentStage.CANCELLED,
+            EnrollmentStage.DISREGARDED, EnrollmentStage.SCHEDULED_EXTENSION,
+        )
+        enrollment = None
+        if not is_split_dependent:
+            own_live = [
+                e for e in EnrollmentVerification.objects.filter(client=client)
+                if EnrollmentStage(e.stage) not in _TERMINAL_STAGES
+            ]
+            if any(EnrollmentStage(e.stage) not in _PRE_VERIFY_STAGES for e in own_live):
+                return Response(
+                    {"error": (
+                        "This household has already been verified. Update dietary "
+                        "info or the delivery address from the member profile "
+                        "instead \u2014 re-running verification isn't needed."
+                    )},
+                    status=http.HTTP_409_CONFLICT,
+                )
+            enrollment = next(
+                (e for e in sorted(
+                    own_live, key=lambda x: x.opened_at or timezone.now(), reverse=True,
+                ) if EnrollmentStage(e.stage) in _PRE_VERIFY_STAGES),
+                None,
+            )
         if enrollment is not None:
             enrollment.household = household or enrollment.household
             enrollment.program_name = data.get("program_name", "") or enrollment.program_name

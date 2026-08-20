@@ -555,7 +555,15 @@ def reconcile_client_eligibility(client, *, actor=None, actor_label="", source=N
             client, verdict.reasons, kind="ineligible",
             actor=actor, author=author, today_str=today_str,
         ):
-            _stop_future_deliveries(client)
+            # Enrich the whole-household hold note with WHO + WHY so the "Service
+            # On Hold" timeline row explains itself (keeps the _INELIGIBLE_HOLD_NOTE
+            # prefix so the auto-resume matcher still finds it).
+            who = f"{client.first_name} {client.last_name}".strip()
+            detail = "; ".join(verdict.reasons)
+            hold_note = _INELIGIBLE_HOLD_NOTE
+            if who or detail:
+                hold_note = f"{_INELIGIBLE_HOLD_NOTE} {who}: {detail}".rstrip(": ").strip()
+            _stop_future_deliveries(client, note=hold_note)
         return ClientStage.INELIGIBLE
 
     # Not ineligible: recover a previously-ineligible member.
