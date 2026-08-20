@@ -4542,6 +4542,73 @@ class KitchenChangeManagementOnlyTest(TestCase):
         self.assertEqual(cs.status_code, 403)
 
 
+class ConsolidateCaselessDuplicateEnrollmentsTest(TestCase):
+    """The remediation command binds the governing case onto the real (most-
+    advanced) enrollment and disregards a pending_verification stray holding it;
+    a non-pending sibling makes it skip for manual review."""
+
+    def _client_with_case(self, name):
+        from .models import (
+            Case, CaseStatus, CaseType, Client, Household, HouseholdMember,
+            ServiceAuthorizationStatus,
+        )
+        c = Client.objects.create(client_id=str(uuid.uuid4()), first_name=name, last_name="X")
+        hh = Household.objects.create(name="HH")
+        HouseholdMember.objects.create(household=hh, client=c, is_primary=True)
+        case = Case.objects.create(
+            case_id=str(uuid.uuid4()), client=c, case_type=CaseType.INTERNAL_SERVICE,
+            case_status=CaseStatus.OPEN,
+            service_authorization_status=ServiceAuthorizationStatus.APPROVED,
+            program_name="Medically Tailored Meals (MTM)",
+        )
+        return c, hh, case
+
+    def test_binds_case_to_keeper_and_disregards_pending_stray(self):
+        from io import StringIO
+
+        from django.core.management import call_command
+
+        from .models import EnrollmentStage, EnrollmentVerification, MemberDietaryProfile
+
+        c, hh, case = self._client_with_case("Teme")
+        keeper = EnrollmentVerification.objects.create(
+            client=c, household=hh, stage=EnrollmentStage.VERIFIED, case=None,
+        )
+        MemberDietaryProfile.objects.create(enrollment=keeper, client=c, member_name="Teme")
+        stray = EnrollmentVerification.objects.create(
+            client=c, household=hh, stage=EnrollmentStage.PENDING_VERIFICATION, case=case,
+        )
+
+        call_command("consolidate_caseless_duplicate_enrollments", "--apply", stdout=StringIO())
+        keeper.refresh_from_db(); stray.refresh_from_db()
+        self.assertEqual(str(keeper.case_id), str(case.case_id))
+        self.assertEqual(EnrollmentStage(stray.stage), EnrollmentStage.DISREGARDED)
+        self.assertIsNone(stray.case_id)
+
+    def test_skips_when_non_pending_sibling_holds_case(self):
+        from io import StringIO
+
+        from django.core.management import call_command
+
+        from .models import EnrollmentStage, EnrollmentVerification, MemberDietaryProfile
+
+        c, hh, case = self._client_with_case("Dee")
+        caseless = EnrollmentVerification.objects.create(
+            client=c, household=hh, stage=EnrollmentStage.VERIFIED, case=None,
+        )
+        MemberDietaryProfile.objects.create(enrollment=caseless, client=c, member_name="Dee")
+        # A VERIFIED (non-pending) sibling holds the case -> ambiguous -> skip.
+        sib = EnrollmentVerification.objects.create(
+            client=c, household=hh, stage=EnrollmentStage.VERIFIED, case=case,
+        )
+
+        call_command("consolidate_caseless_duplicate_enrollments", "--apply", stdout=StringIO())
+        sib.refresh_from_db()
+        # Untouched: still verified, still holds the case (manual review needed).
+        self.assertEqual(EnrollmentStage(sib.stage), EnrollmentStage.VERIFIED)
+        self.assertEqual(str(sib.case_id), str(case.case_id))
+
+
 class MemberDietaryEditReactivatesOooTest(TestCase):
     """Editing an OUT_OF_ORBIT member's menu/allergies re-runs the meal rule and
     auto-reactivates them when now fulfillable -- no reactivate checkbox needed --
