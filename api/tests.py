@@ -4740,6 +4740,83 @@ class MemberDietaryEditReactivatesOooTest(TestCase):
         self.assertEqual(mp.status, MemberStatus.OUT_OF_ORBIT)
 
 
+class ReopenEnrollmentForNewCaseTest(TestCase):
+    """When a client whose only enrollment is CLOSED gets a NEW open/approved
+    meal case, a fresh enrollment is opened from the prior's data. Re-verification
+    is required only if the household went >60 days with no open case."""
+
+    def _setup(self, *, closed_days_ago):
+        import datetime
+
+        from django.utils import timezone
+
+        from .models import (
+            Case, CaseStatus, CaseType, Client, EnrollmentStage,
+            EnrollmentVerification, Household, HouseholdMember,
+            MemberDietaryProfile, MemberStatus, ServiceAuthorizationStatus,
+        )
+        now = timezone.now()
+        c = Client.objects.create(client_id=str(uuid.uuid4()), first_name="Re", last_name="Open")
+        hh = Household.objects.create(name="HH")
+        HouseholdMember.objects.create(household=hh, client=c, is_primary=True)
+        old_case = Case.objects.create(
+            case_id=str(uuid.uuid4()), client=c, case_type=CaseType.INTERNAL_SERVICE,
+            case_status=CaseStatus.CLOSED,
+            service_authorization_status=ServiceAuthorizationStatus.APPROVED,
+            program_name="Medically Tailored Meals (MTM)",
+        )
+        prior = EnrollmentVerification.objects.create(
+            client=c, household=hh, case=old_case, stage=EnrollmentStage.CLOSED,
+            program_name="Medically Tailored Meals (MTM)",
+            verified_at=now - datetime.timedelta(days=closed_days_ago + 30),
+            is_family_verified=True, medicaid_type_verified=True,
+            delivery_address_verified=True,
+            closed_at=now - datetime.timedelta(days=closed_days_ago),
+        )
+        MemberDietaryProfile.objects.create(
+            enrollment=prior, client=c, member_name="Re", menu_type="Standard",
+            status=MemberStatus.ACTIVE,
+        )
+        new_case = Case.objects.create(
+            case_id=str(uuid.uuid4()), client=c, case_type=CaseType.INTERNAL_SERVICE,
+            case_status=CaseStatus.OPEN,
+            service_authorization_status=ServiceAuthorizationStatus.APPROVED,
+            program_name="Clinically Appropriate Meals",
+        )
+        return c, prior, new_case
+
+    def _reopened(self, c, prior, new_case):
+        from .models import EnrollmentVerification
+        return (
+            EnrollmentVerification.objects.filter(client=c, case=new_case)
+            .exclude(pk=prior.pk).first()
+        )
+
+    def test_within_60_days_resumes_without_reverification(self):
+        from .models import EnrollmentStage
+        from .services.lifecycle import reconcile_internal_service_authorization
+        c, prior, new_case = self._setup(closed_days_ago=10)
+        reconcile_internal_service_authorization(c)
+        new = self._reopened(c, prior, new_case)
+        self.assertIsNotNone(new)
+        self.assertEqual(new.supersedes_id, prior.pk)
+        self.assertIsNotNone(new.verified_at)                      # verification carried
+        self.assertNotEqual(EnrollmentStage(new.stage), EnrollmentStage.PENDING_VERIFICATION)
+        self.assertEqual(new.member_profiles.count(), 1)           # roster carried
+
+    def test_over_60_days_requires_reverification(self):
+        from .models import EnrollmentStage
+        from .services.lifecycle import reconcile_internal_service_authorization
+        c, prior, new_case = self._setup(closed_days_ago=90)
+        reconcile_internal_service_authorization(c)
+        new = self._reopened(c, prior, new_case)
+        self.assertIsNotNone(new)
+        self.assertEqual(new.supersedes_id, prior.pk)
+        self.assertEqual(EnrollmentStage(new.stage), EnrollmentStage.PENDING_VERIFICATION)
+        self.assertIsNone(new.verified_at)                         # verification dropped
+        self.assertEqual(new.member_profiles.count(), 1)           # roster still carried
+
+
 class TimelineReasonDetailTest(TestCase):
     """Out-of-Orbit / Out-of-Range timeline rows surface WHY (reason / ZIP), not
     just the member name, so the History tab shows the detail directly."""
