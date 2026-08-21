@@ -25,6 +25,7 @@ from .views_dashboard_verification import (
     VerificationDashboardListView,
     VerificationDashboardView,
 )
+from .views_dashboard_accountability import AgentAccountabilityView
 from .views_dashboard_logistics import (
     DistributionKitchenMembersView,
     DistributionOverviewView,
@@ -574,6 +575,11 @@ urlpatterns = [
         "dashboard/verification/<str:reason>/",
         VerificationDashboardListView.as_view(),
         name="portal-dashboard-verification-list",
+    ),
+    path(
+        "dashboard/accountability/",
+        AgentAccountabilityView.as_view(),
+        name="portal-dashboard-accountability",
     ),
     path(
         "dashboard/logistics/",
