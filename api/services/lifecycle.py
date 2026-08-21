@@ -470,6 +470,22 @@ def derive_client_stage(client, *, ignore_sticky=False):
     return _ENROLLMENT_DRIVES.get(stage, early)
 
 
+def stage_event_actor(actor):
+    """``StageEvent.actor`` is a FK to the Django auth User, but portal/reconcile
+    callers routinely pass the DRF ``AgentUser`` (a lightweight principal, NOT a
+    DB user) or an ``Agent`` model. Assigning any of those to the FK raises
+    ``ValueError: ... must be a "User" instance`` and aborts the stage change
+    (and, via reconcile, the whole case upsert). Coerce anything that isn't a
+    saved auth-User instance to None so the audit row still writes -- the acting
+    agent's identity is preserved via the note/label + timeline event."""
+    from django.contrib.auth import get_user_model
+
+    user_model = get_user_model()
+    if isinstance(actor, user_model) and getattr(actor, "pk", None) is not None:
+        return actor
+    return None
+
+
 def _set_client_stage(client, target, *, actor=None):
     """Set the client's lifecycle stage + log a StageEvent, unconditionally
     (used for the SERVICE_INACTIVE off-ramp, which ``derive_client_stage`` never
@@ -487,7 +503,7 @@ def _set_client_stage(client, target, *, actor=None):
         from_stage=current or "",
         to_stage=target,
         source=StageEventSource.AUTO,
-        actor=actor,
+        actor=stage_event_actor(actor),
     )
 
 
@@ -516,7 +532,7 @@ def recompute_client_stage(client, *, actor=None, save=True, ignore_sticky=False
         from_stage=current or "",
         to_stage=target,
         source=StageEventSource.AUTO,
-        actor=actor,
+        actor=stage_event_actor(actor),
     )
     return target
 
@@ -912,7 +928,7 @@ def advance_enrollment(enrollment, to_stage, *, actor=None, actor_label="", note
         from_stage=from_stage,
         to_stage=to_stage,
         source=StageEventSource.AUTO if is_system else StageEventSource.MANUAL,
-        actor=actor,
+        actor=stage_event_actor(actor),
         note=note,
         metadata=stage_meta,
     )
@@ -4747,7 +4763,7 @@ def _record_reauth_scheduled_event(enrollment, *, actor=None, actor_label=""):
             from_stage="",
             to_stage=EnrollmentStage.SCHEDULED_EXTENSION.value,
             source=StageEventSource.AUTO if is_system else StageEventSource.MANUAL,
-            actor=actor,
+            actor=stage_event_actor(actor),
             note=note,
         )
     except Exception:  # pragma: no cover - defensive
