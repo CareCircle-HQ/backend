@@ -4878,6 +4878,29 @@ class OrphanedScheduledExtensionTest(TestCase):
         self.assertEqual(EnrollmentStage(keep.stage), EnrollmentStage.SCHEDULED_EXTENSION)
 
 
+class StageEventActorCoercionTest(TestCase):
+    """StageEvent.actor is a FK to the auth User; reconcile/portal callers pass
+    the DRF AgentUser (not a DB user). It must be coerced to None instead of
+    raising ValueError (which aborted the stage change + the whole case upsert)."""
+
+    def test_agentuser_actor_does_not_crash(self):
+        from .authentication import AgentUser
+        from .models import Client, ClientStage, StageEvent
+        from .services.lifecycle import _set_client_stage, stage_event_actor
+
+        au = AgentUser(agent_id=str(uuid.uuid4()), agent_code="x1", name="T", group="CS")
+        self.assertIsNone(stage_event_actor(au))
+        c = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="St", last_name="Age",
+            lifecycle_stage=ClientStage.SCREENED,
+        )
+        _set_client_stage(c, ClientStage.ASSESSMENT, actor=au)  # must not raise
+        c.refresh_from_db()
+        self.assertEqual(ClientStage(c.lifecycle_stage), ClientStage.ASSESSMENT)
+        ev = StageEvent.objects.filter(client=c).order_by("-id").first()
+        self.assertIsNone(ev.actor_id)
+
+
 class MembersExportTest(TestCase):
     """Filtered Members export: management-only; streams CSV using the All-Members
     columns for the members matching the list filters."""

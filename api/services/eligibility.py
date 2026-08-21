@@ -198,13 +198,14 @@ def _set_client_stage(client, target, *, actor=None):
     client.lifecycle_stage = target
     client.lifecycle_stage_at = timezone.now()
     client.save(update_fields=["lifecycle_stage", "lifecycle_stage_at"])
+    from api.services.lifecycle import stage_event_actor
     StageEvent.objects.create(
         entity_type=StageEntityType.CLIENT,
         client=client,
         from_stage=current or "",
         to_stage=target,
         source=StageEventSource.AUTO,
-        actor=actor,
+        actor=stage_event_actor(actor),
     )
 
 
