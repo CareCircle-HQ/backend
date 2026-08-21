@@ -4901,6 +4901,43 @@ class StageEventActorCoercionTest(TestCase):
         self.assertIsNone(ev.actor_id)
 
 
+class MembersListSortDenormTest(TestCase):
+    """The Members list 'Created' sort uses the denormalized, indexed
+    Client.internal_case_opened_at (kept fresh by reconcile), and DISTINCT is only
+    applied when a join-introducing filter is active."""
+
+    def test_reconcile_maintains_sort_key(self):
+        from django.utils import timezone
+
+        from .models import (
+            Case, CaseStatus, CaseType, Client, ServiceAuthorizationStatus,
+        )
+        from .services.lifecycle import refresh_internal_case_sort
+
+        c = Client.objects.create(client_id=str(uuid.uuid4()), first_name="A", last_name="B")
+        self.assertIsNone(c.internal_case_opened_at)
+        d = timezone.now()
+        Case.objects.create(
+            case_id=str(uuid.uuid4()), client=c, case_type=CaseType.INTERNAL_SERVICE,
+            case_status=CaseStatus.OPEN,
+            service_authorization_status=ServiceAuthorizationStatus.APPROVED,
+            date_opened=d, case_created_at=d,
+        )
+        refresh_internal_case_sort(c)
+        c.refresh_from_db()
+        self.assertEqual(c.internal_case_opened_at, d)
+
+    def test_needs_distinct_gating(self):
+        from .portal.views_members import MembersListView as M
+        # unfiltered default -> skip DISTINCT (fast index path)
+        self.assertFalse(M._flat_needs_distinct({"status": "all", "sort": "created", "page": "1"}))
+        self.assertFalse(M._flat_needs_distinct({}))
+        # any join-introducing filter -> keep DISTINCT (correctness)
+        self.assertTrue(M._flat_needs_distinct({"kitchen": "1"}))
+        self.assertTrue(M._flat_needs_distinct({"allergy": "milk"}))
+        self.assertTrue(M._flat_needs_distinct({"status": "verified"}))
+
+
 class MembersExportTest(TestCase):
     """Filtered Members export: management-only; streams CSV using the All-Members
     columns for the members matching the list filters."""

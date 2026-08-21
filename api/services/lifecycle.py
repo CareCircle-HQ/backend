@@ -470,6 +470,27 @@ def derive_client_stage(client, *, ignore_sticky=False):
     return _ENROLLMENT_DRIVES.get(stage, early)
 
 
+def refresh_internal_case_sort(client, *, save=True):
+    """Refresh ``Client.internal_case_opened_at`` = the most recent
+    internal-service case ``date_opened`` (the Members-list "Created" sort key).
+
+    Denormalized so the list can ORDER BY an indexed column (index scan + LIMIT)
+    instead of computing a correlated subquery for every client and sorting the
+    whole table. No-op when the value is already current."""
+    from django.db.models import Max
+
+    from api.models import Case, CaseType
+
+    latest = Case.objects.filter(
+        client=client, case_type=CaseType.INTERNAL_SERVICE,
+    ).aggregate(m=Max("date_opened"))["m"]
+    if client.internal_case_opened_at != latest:
+        client.internal_case_opened_at = latest
+        if save:
+            client.save(update_fields=["internal_case_opened_at"])
+    return latest
+
+
 def stage_event_actor(actor):
     """``StageEvent.actor`` is a FK to the Django auth User, but portal/reconcile
     callers routinely pass the DRF ``AgentUser`` (a lightweight principal, NOT a
@@ -5459,6 +5480,13 @@ def reconcile_internal_service_authorization(client, *, actor=None, actor_label=
         )
         timeline.event_for_member_service_reactivated(client, actor=author)
         result["reactivated"] = True
+
+    # Keep the denormalized Members-list sort key fresh (case add/close/date
+    # change may have moved the latest internal-service case date).
+    try:
+        refresh_internal_case_sort(client)
+    except Exception:  # pragma: no cover - defensive
+        pass
 
     # Refresh the member/household warning snapshot after a case-driven change
     # (fires on both extension case saves and CSV imports, which route through

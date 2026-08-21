@@ -1354,7 +1354,31 @@ class CadencesListView(PortalAPIView):
 class MembersListView(PortalGenericAPIView):
     serializer_class = s.MemberListSerializer
 
-    def get_queryset(self):
+    # Query params that (may) introduce a multi-valued join in get_queryset and
+    # therefore require DISTINCT. If ANY of these is active, we keep DISTINCT;
+    # only the truly unfiltered list skips it. Conservative on purpose -- a param
+    # that doesn't actually join just costs a cheap DISTINCT, whereas wrongly
+    # skipping it would surface duplicate members.
+    _DISTINCT_FILTER_PARAMS = (
+        "search", "scope", "status", "has_internal_service", "internal_status",
+        "program_type", "kitchen", "lead_source", "flag", "tag", "household",
+        "menu_type", "service_type", "ticket_type", "cadence", "team",
+        "verified_by", "allergy", "eligibility", "authorization", "period",
+        "created_from", "created_to", "closed_from", "closed_to",
+        "requested_from", "requested_to", "completed_from", "completed_to",
+        "case_from", "case_to", "authorized_from", "authorized_to",
+    )
+
+    @classmethod
+    def _flat_needs_distinct(cls, params):
+        """True when any join-introducing filter is active (``all``/blank = off)."""
+        for key in cls._DISTINCT_FILTER_PARAMS:
+            val = (params.get(key) or "").strip().lower()
+            if val and val != "all":
+                return True
+        return False
+
+    def get_queryset(self, apply_distinct=True):
         qs = (
             Client.objects.all()
             .select_related("household_membership__household")
@@ -1954,7 +1978,13 @@ class MembersListView(PortalGenericAPIView):
             qs, params, skip_enrollment_bounds=bool(verified_by_val)
         )
 
-        return qs.distinct()
+        # DISTINCT is only needed because some filters join multi-valued relations
+        # (enrollments, member_profiles, tags, ...). For the UNFILTERED default
+        # list -- the common, heaviest case that must stay cheap -- there are no
+        # such joins, so we skip it: the list can then ORDER BY the indexed
+        # ``internal_case_opened_at`` (index scan + LIMIT) instead of DISTINCT-
+        # sorting every client. Any active filter keeps DISTINCT (correctness).
+        return qs.distinct() if apply_distinct else qs
 
     def _serialize_member(self, client, is_primary, relationship=""):
         data = s.MemberListSerializer(client).data
@@ -2556,20 +2586,18 @@ class MembersListView(PortalGenericAPIView):
             # ``updated_at``. Rows with a null sort key sort last; name breaks ties.
             sort_key = (request.query_params.get("sort") or "created").strip().lower()
             descending = (request.query_params.get("dir") or "desc").strip().lower() != "asc"
-            qs = self.get_queryset()
+            # DISTINCT is only needed when a filter joins a multi-valued relation.
+            # For the unfiltered default list we skip it so the sort below can run
+            # off an index (index scan + LIMIT) instead of DISTINCT-sorting all
+            # ~60k clients -- see _flat_needs_distinct.
+            qs = self.get_queryset(apply_distinct=self._flat_needs_distinct(request.query_params))
             if sort_key == "updated":
                 col = F("updated_at")
             else:
-                latest_case_opened = (
-                    Case.objects.filter(
-                        client=OuterRef("pk"),
-                        case_type=CaseType.INTERNAL_SERVICE,
-                    )
-                    .order_by("-date_opened")
-                    .values("date_opened")[:1]
-                )
-                qs = qs.annotate(_case_opened=Subquery(latest_case_opened))
-                col = F("_case_opened")
+                # Denormalized latest internal-service case date_opened (kept fresh
+                # by reconcile). Indexed, so the default list orders via an index
+                # scan rather than a per-row correlated subquery + full sort.
+                col = F("internal_case_opened_at")
             primary = col.desc(nulls_last=True) if descending else col.asc(nulls_last=True)
             qs = qs.order_by(
                 primary,
