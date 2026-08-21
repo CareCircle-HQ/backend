@@ -4878,6 +4878,135 @@ class OrphanedScheduledExtensionTest(TestCase):
         self.assertEqual(EnrollmentStage(keep.stage), EnrollmentStage.SCHEDULED_EXTENSION)
 
 
+class MembersExportTest(TestCase):
+    """Filtered Members export: management-only; streams CSV using the All-Members
+    columns for the members matching the list filters."""
+
+    def _api(self, group="Management"):
+        from rest_framework.test import APIClient
+        from rest_framework_simplejwt.tokens import AccessToken
+
+        from .models import Agent
+        a = Agent.objects.create(name="Mgr", agent_code=str(uuid.uuid4())[:8], group=group)
+        acc = AccessToken()
+        acc["agent_id"] = str(a.id); acc["agent_code"] = a.agent_code
+        acc["agent_name"] = a.name; acc["agent_group"] = a.group
+        api = APIClient(); api.credentials(HTTP_AUTHORIZATION=f"Bearer {acc}")
+        return api
+
+    def test_requires_management(self):
+        resp = self._api(group="Screeners").get("/api/portal/members/export/")
+        self.assertEqual(resp.status_code, 403)
+
+    def test_streams_csv_with_header(self):
+        from .models import Client
+        Client.objects.create(client_id=str(uuid.uuid4()), first_name="Ex", last_name="Port")
+        resp = self._api().get("/api/portal/members/export/?eligibility=eligible")
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn("text/csv", resp["Content-Type"])
+        self.assertIn("attachment", resp["Content-Disposition"])
+        body = b"".join(resp.streaming_content).decode()
+        lines = body.splitlines()
+        self.assertGreaterEqual(len(lines), 2)          # header + the one member
+        self.assertIn("Member Name", lines[0])          # All-Members header reused
+
+
+class AgentAccountabilityDashboardTest(TestCase):
+    """Per-screener accountability: management-only; counts internal cases (by
+    created_by_name), assessments (by provider_name), and screenings (via the
+    client's internal-service case creator) in the date window."""
+
+    def _api(self, group="Management"):
+        from rest_framework.test import APIClient
+        from rest_framework_simplejwt.tokens import AccessToken
+
+        from .models import Agent
+        a = Agent.objects.create(name="Mgr", agent_code=str(uuid.uuid4())[:8], group=group)
+        acc = AccessToken()
+        acc["agent_id"] = str(a.id); acc["agent_code"] = a.agent_code
+        acc["agent_name"] = a.name; acc["agent_group"] = a.group
+        api = APIClient(); api.credentials(HTTP_AUTHORIZATION=f"Bearer {acc}")
+        return api
+
+    def test_requires_management(self):
+        resp = self._api(group="Screeners").get("/api/portal/dashboard/accountability/")
+        self.assertEqual(resp.status_code, 403)
+
+    def test_counts_per_agent(self):
+        from django.utils import timezone
+
+        from .models import (
+            Assessment, Case, CaseStatus, CaseType, Client, Screening,
+        )
+        c = Client.objects.create(client_id=str(uuid.uuid4()), first_name="Cli", last_name="Ent")
+        now = timezone.now()
+        Case.objects.create(
+            case_id=str(uuid.uuid4()), client=c, case_type=CaseType.INTERNAL_SERVICE,
+            case_status=CaseStatus.OPEN, created_by_name="Agent X", case_created_at=now,
+        )
+        Assessment.objects.create(
+            assessment_id=str(uuid.uuid4()), subject_id=c.client_id, client=c,
+            provider_name="Agent X", screen_created_at=now,
+        )
+        Screening.objects.create(
+            enhanced_screen_id=str(uuid.uuid4()), subject_id=c.client_id, client=c,
+            screen_created_at=now,
+        )
+        resp = self._api().get("/api/portal/dashboard/accountability/?period=month")
+        self.assertEqual(resp.status_code, 200, resp.content)
+        rows = {r["agent"]: r for r in resp.json()["screeners"]}
+        self.assertIn("Agent X", rows)
+        self.assertEqual(rows["Agent X"]["internal_cases"], 1)
+        self.assertEqual(rows["Agent X"]["assessments"], 1)
+        self.assertEqual(rows["Agent X"]["screenings"], 1)
+
+
+class HoldPreservedThroughCaseChangeTest(TestCase):
+    """A manually/auto On-Hold household must NOT be silently taken off hold when
+    a new governing case arrives -- even when there's no kitchen to carry (which
+    previously pushed them to Kitchen Assignment)."""
+
+    def test_on_hold_survives_new_case_without_kitchen(self):
+        from django.utils import timezone
+
+        from .models import (
+            Case, CaseStatus, CaseType, Client, EnrollmentStage,
+            EnrollmentVerification, Household, HouseholdMember,
+            MemberDietaryProfile, MemberStatus, ServiceAuthorizationStatus,
+        )
+        from .services.lifecycle import reconcile_internal_service_authorization
+
+        c = Client.objects.create(client_id=str(uuid.uuid4()), first_name="H", last_name="Old")
+        hh = Household.objects.create(name="HH")
+        HouseholdMember.objects.create(household=hh, client=c, is_primary=True)
+        now = timezone.now()
+        closed_case = Case.objects.create(
+            case_id=str(uuid.uuid4()), client=c, case_type=CaseType.INTERNAL_SERVICE,
+            case_status=CaseStatus.CLOSED,
+            service_authorization_status=ServiceAuthorizationStatus.APPROVED,
+            program_name="Medically Tailored Meals (MTM)", case_created_at=now,
+        )
+        Case.objects.create(  # the new open case that arrives
+            case_id=str(uuid.uuid4()), client=c, case_type=CaseType.INTERNAL_SERVICE,
+            case_status=CaseStatus.OPEN,
+            service_authorization_status=ServiceAuthorizationStatus.APPROVED,
+            program_name="Medically Tailored Meals (MTM)", case_created_at=now,
+        )
+        held = EnrollmentVerification.objects.create(
+            client=c, household=hh, case=closed_case, stage=EnrollmentStage.ON_HOLD,
+            verified_at=now, program_name="Medically Tailored Meals (MTM)",
+        )
+        MemberDietaryProfile.objects.create(
+            enrollment=held, client=c, member_name="H", status=MemberStatus.PAUSED,
+        )
+        reconcile_internal_service_authorization(c)
+        live = list(c.enrollments.exclude(
+            stage__in=[EnrollmentStage.CLOSED, EnrollmentStage.CANCELLED, EnrollmentStage.DISREGARDED]
+        ))
+        self.assertEqual(len(live), 1)
+        self.assertEqual(EnrollmentStage(live[0].stage), EnrollmentStage.ON_HOLD)
+
+
 class TimelineReasonDetailTest(TestCase):
     """Out-of-Orbit / Out-of-Range timeline rows surface WHY (reason / ZIP), not
     just the member name, so the History tab shows the detail directly."""

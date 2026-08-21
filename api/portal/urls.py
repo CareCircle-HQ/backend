@@ -25,6 +25,7 @@ from .views_dashboard_verification import (
     VerificationDashboardListView,
     VerificationDashboardView,
 )
+from .views_dashboard_accountability import AgentAccountabilityView
 from .views_dashboard_logistics import (
     DistributionKitchenMembersView,
     DistributionOverviewView,
@@ -95,6 +96,7 @@ from .views_members import (
     NutritionistPendingSplitListView,
     CareManagementTabCountsView,
     MembersListView,
+    MembersExportView,
     MembersStatsView,
     NeedAttestationMembersListView,
     NoNavigationMembersListView,
@@ -221,6 +223,7 @@ urlpatterns = [
 
     # Members + sub-resources
     path("members/", MembersListView.as_view(), name="portal-members"),
+    path("members/export/", MembersExportView.as_view(), name="portal-members-export"),
     path("members/stats/", MembersStatsView.as_view(), name="portal-members-stats"),
     path("care-management/tabs/", CareManagementTabCountsView.as_view(), name="portal-care-management-tabs"),
     path("members/unlinked/", UnlinkedMembersListView.as_view(), name="portal-members-unlinked"),
@@ -574,6 +577,11 @@ urlpatterns = [
         "dashboard/verification/<str:reason>/",
         VerificationDashboardListView.as_view(),
         name="portal-dashboard-verification-list",
+    ),
+    path(
+        "dashboard/accountability/",
+        AgentAccountabilityView.as_view(),
+        name="portal-dashboard-accountability",
     ),
     path(
         "dashboard/logistics/",

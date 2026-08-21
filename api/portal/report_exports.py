@@ -106,132 +106,155 @@ _ALL_MEMBERS_HEADER = [
 ]
 
 
-def all_members_rows(params):
-    """One row per member (Client). ``params``: created_from / created_to
-    (inclusive, on Client.created_at)."""
-    from ..models import CaseType, Client, UniteUsAgent
-    from ..services.eligibility import evaluate_client
+def all_members_header():
+    """The All-Members export column headers (shared with the filtered Members
+    export, so both stay in lockstep)."""
+    return list(_ALL_MEMBERS_HEADER)
+
+
+def all_members_prefetch(qs):
+    """Attach the related-object prefetches the per-row builder needs. Applied by
+    both the All-Members report and the filtered Members export."""
+    return qs.prefetch_related(
+        "insurances", "social_care_coverages", "addresses", "phones", "cases",
+        "screenings", "assessments", "member_profiles",
+        "enrollments__kitchen", "enrollments__delivery_schedules",
+        "enrollments__verified_by",
+        "household_membership__household__members",
+        "household_membership__household__enrollment_verifications__kitchen",
+        "household_membership__household__enrollment_verifications__delivery_schedules",
+        "household_membership__household__enrollment_verifications__verified_by",
+    )
+
+
+def all_members_row_context():
+    """Precompute the request-independent lookups (excluded zips, allowed states,
+    lead-source labels, team map) once per export -- passed to every row."""
+    from ..models import UniteUsAgent
     from ..services.service_area import excluded_zips
     from ..services.state_area import allowed_state_codes
+    from .views_reports import _lead_source_label_map
+    return {
+        "zips": excluded_zips(),
+        "states": allowed_state_codes(),
+        "lead_labels": _lead_source_label_map(),
+        "team_map": {
+            str(u.user_id): (u.originating_team or "")
+            for u in UniteUsAgent.objects.all()
+        },
+    }
+
+
+def all_members_row(client, *, zips, states, lead_labels, team_map):
+    """Build ONE All-Members export row for a client (see _ALL_MEMBERS_HEADER)."""
+    from ..models import CaseType
+    from ..services.eligibility import evaluate_client
     from .serializers import (
         _assessment_eligible, active_enrollment, active_member_profile,
         internal_service_case, medicaid_member_id, member_out_of_orbit,
         member_out_of_range,
     )
-    from .views_members import _parse_date
     from .views_reports import (
         _cadence_label, _client_phone_numbers, _currently_servicing,
         _current_address, _date_str, _dietary_restrictions,
         _household_member_count, _household_primary_member_id,
-        _lead_source_label_map, _medicaid_insurance, _medicaid_type_label,
+        _medicaid_insurance, _medicaid_type_label,
         _out_of_orbit_reason, _social_care_coverage, _SCC_STATUS_LABELS, _yn,
     )
+    med = _medicaid_insurance(client)
+    scc = _social_care_coverage(client)
+    enr = active_enrollment(client)
+    profile = active_member_profile(client)
+    # UniteUs primary/current address (from the profile) + the delivery
+    # address (from the member's current enrollment).
+    uniteus_addr = _current_address(client)
+    delivery_addr = enr.delivery_address if (enr is not None and enr.delivery_address_id) else None
+    cases = list(client.cases.all())
+    isc = internal_service_case(client)
+    if isc is not None and isc.created_by_id:
+        isc_team = team_map.get(str(isc.created_by_id), "Met Council Team")
+    else:
+        isc_team = ""
+
+    out_of_orbit = member_out_of_orbit(client)
+    reason = _out_of_orbit_reason(enr, profile) if out_of_orbit else ""
+    verdict = evaluate_client(client, zips=zips, states=states)
+    eligibility = "Ineligible" if verdict.ineligible else "Eligible"
+
+    facility = ""
+    if enr is not None and enr.kitchen_id:
+        facility = enr.kitchen.name or ""
+    raw_source = (client.lead_source or "").strip()
+
+    return [
+        _household_primary_member_id(client),
+        str(client.client_id),
+        medicaid_member_id(client),
+        f"{client.first_name or ''} {client.last_name or ''}".strip(),
+        _date_str(client.date_of_birth),
+        _client_phone_numbers(client),
+        # Delivery address (current enrollment) first ...
+        (delivery_addr.street if delivery_addr else ""),
+        (delivery_addr.unit if delivery_addr else ""),
+        (delivery_addr.city if delivery_addr else ""),
+        (delivery_addr.state if delivery_addr else ""),
+        (delivery_addr.zip if delivery_addr else ""),
+        # ... then the UniteUs primary/current address (profile).
+        (uniteus_addr.street if uniteus_addr else ""),
+        (uniteus_addr.unit if uniteus_addr else ""),
+        (uniteus_addr.city if uniteus_addr else ""),
+        (uniteus_addr.state if uniteus_addr else ""),
+        (uniteus_addr.zip if uniteus_addr else ""),
+        _household_member_count(client),
+        (isc.program_name if isc else ""),
+        isc_team,
+        _yn(len(client.screenings.all()) > 0),
+        _yn(any(c.case_type == CaseType.ELIGIBILITY for c in cases)),
+        _yn(any(c.case_type == CaseType.NAVIGATION for c in cases)),
+        _yn(isc is not None),
+        eligibility,
+        "; ".join(_assessment_eligible(client)),
+        _currently_servicing(enr),
+        _cadence_label(profile, enr),
+        facility,
+        _yn(out_of_orbit),
+        reason,
+        _yn(member_out_of_range(client)),
+        (isc.authorized_amount if isc else ""),
+        lead_labels.get(raw_source, raw_source),
+        "UniteUs",
+        (enr.verified_by.name if (enr is not None and enr.verified_by_id) else ""),
+        (med.plan_name if med else ""),
+        _medicaid_type_label(med.plan_name if med else ""),
+        _date_str(med.enrolled_at if med else None),
+        _date_str(med.expired_at if med else None),
+        (_SCC_STATUS_LABELS.get(scc.status, scc.status) if scc else ""),
+        _date_str(scc.expired_at if scc else None),
+        (profile.menu_type if profile else ""),
+        _dietary_restrictions(profile),
+    ]
+
+
+def all_members_rows(params):
+    """One row per member (Client). ``params``: created_from / created_to
+    (inclusive, on Client.created_at)."""
+    from ..models import Client
+    from .views_members import _parse_date
 
     created_from = _parse_date(params.get("created_from"))
     created_to = _parse_date(params.get("created_to"))
-
-    qs = (
-        Client.objects.all()
-        .prefetch_related(
-            "insurances", "social_care_coverages", "addresses", "phones", "cases",
-            "screenings", "assessments", "member_profiles",
-            "enrollments__kitchen", "enrollments__delivery_schedules",
-            "enrollments__verified_by",
-            "household_membership__household__members",
-            "household_membership__household__enrollment_verifications__kitchen",
-            "household_membership__household__enrollment_verifications__delivery_schedules",
-            "household_membership__household__enrollment_verifications__verified_by",
-        )
-        .order_by("last_name", "first_name", "created_at")
+    qs = all_members_prefetch(Client.objects.all()).order_by(
+        "last_name", "first_name", "created_at",
     )
     if created_from:
         qs = qs.filter(created_at__date__gte=created_from)
     if created_to:
         qs = qs.filter(created_at__date__lte=created_to)
 
-    zips = excluded_zips()
-    states = allowed_state_codes()
-    lead_labels = _lead_source_label_map()
-    team_map = {
-        str(u.user_id): (u.originating_team or "")
-        for u in UniteUsAgent.objects.all()
-    }
-
-    yield list(_ALL_MEMBERS_HEADER)
-
+    ctx = all_members_row_context()
+    yield all_members_header()
     for client in qs.iterator(chunk_size=2000):
-        med = _medicaid_insurance(client)
-        scc = _social_care_coverage(client)
-        enr = active_enrollment(client)
-        profile = active_member_profile(client)
-        # UniteUs primary/current address (from the profile) + the delivery
-        # address (from the member's current enrollment).
-        uniteus_addr = _current_address(client)
-        delivery_addr = enr.delivery_address if (enr is not None and enr.delivery_address_id) else None
-        cases = list(client.cases.all())
-        isc = internal_service_case(client)
-        if isc is not None and isc.created_by_id:
-            isc_team = team_map.get(str(isc.created_by_id), "Met Council Team")
-        else:
-            isc_team = ""
-
-        out_of_orbit = member_out_of_orbit(client)
-        reason = _out_of_orbit_reason(enr, profile) if out_of_orbit else ""
-        verdict = evaluate_client(client, zips=zips, states=states)
-        eligibility = "Ineligible" if verdict.ineligible else "Eligible"
-
-        facility = ""
-        if enr is not None and enr.kitchen_id:
-            facility = enr.kitchen.name or ""
-        raw_source = (client.lead_source or "").strip()
-
-        yield [
-            _household_primary_member_id(client),
-            str(client.client_id),
-            medicaid_member_id(client),
-            f"{client.first_name or ''} {client.last_name or ''}".strip(),
-            _date_str(client.date_of_birth),
-            _client_phone_numbers(client),
-            # Delivery address (current enrollment) first ...
-            (delivery_addr.street if delivery_addr else ""),
-            (delivery_addr.unit if delivery_addr else ""),
-            (delivery_addr.city if delivery_addr else ""),
-            (delivery_addr.state if delivery_addr else ""),
-            (delivery_addr.zip if delivery_addr else ""),
-            # ... then the UniteUs primary/current address (profile).
-            (uniteus_addr.street if uniteus_addr else ""),
-            (uniteus_addr.unit if uniteus_addr else ""),
-            (uniteus_addr.city if uniteus_addr else ""),
-            (uniteus_addr.state if uniteus_addr else ""),
-            (uniteus_addr.zip if uniteus_addr else ""),
-            _household_member_count(client),
-            (isc.program_name if isc else ""),
-            isc_team,
-            _yn(len(client.screenings.all()) > 0),
-            _yn(any(c.case_type == CaseType.ELIGIBILITY for c in cases)),
-            _yn(any(c.case_type == CaseType.NAVIGATION for c in cases)),
-            _yn(isc is not None),
-            eligibility,
-            "; ".join(_assessment_eligible(client)),
-            _currently_servicing(enr),
-            _cadence_label(profile, enr),
-            facility,
-            _yn(out_of_orbit),
-            reason,
-            _yn(member_out_of_range(client)),
-            (isc.authorized_amount if isc else ""),
-            lead_labels.get(raw_source, raw_source),
-            "UniteUs",
-            (enr.verified_by.name if (enr is not None and enr.verified_by_id) else ""),
-            (med.plan_name if med else ""),
-            _medicaid_type_label(med.plan_name if med else ""),
-            _date_str(med.enrolled_at if med else None),
-            _date_str(med.expired_at if med else None),
-            (_SCC_STATUS_LABELS.get(scc.status, scc.status) if scc else ""),
-            _date_str(scc.expired_at if scc else None),
-            (profile.menu_type if profile else ""),
-            _dietary_restrictions(profile),
-        ]
+        yield all_members_row(client, **ctx)
 
 
 # --- Members Pending Verification -------------------------------------------
