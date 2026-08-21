@@ -4878,6 +4878,39 @@ class OrphanedScheduledExtensionTest(TestCase):
         self.assertEqual(EnrollmentStage(keep.stage), EnrollmentStage.SCHEDULED_EXTENSION)
 
 
+class MembersExportTest(TestCase):
+    """Filtered Members export: management-only; streams CSV using the All-Members
+    columns for the members matching the list filters."""
+
+    def _api(self, group="Management"):
+        from rest_framework.test import APIClient
+        from rest_framework_simplejwt.tokens import AccessToken
+
+        from .models import Agent
+        a = Agent.objects.create(name="Mgr", agent_code=str(uuid.uuid4())[:8], group=group)
+        acc = AccessToken()
+        acc["agent_id"] = str(a.id); acc["agent_code"] = a.agent_code
+        acc["agent_name"] = a.name; acc["agent_group"] = a.group
+        api = APIClient(); api.credentials(HTTP_AUTHORIZATION=f"Bearer {acc}")
+        return api
+
+    def test_requires_management(self):
+        resp = self._api(group="Screeners").get("/api/portal/members/export/")
+        self.assertEqual(resp.status_code, 403)
+
+    def test_streams_csv_with_header(self):
+        from .models import Client
+        Client.objects.create(client_id=str(uuid.uuid4()), first_name="Ex", last_name="Port")
+        resp = self._api().get("/api/portal/members/export/?eligibility=eligible")
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn("text/csv", resp["Content-Type"])
+        self.assertIn("attachment", resp["Content-Disposition"])
+        body = b"".join(resp.streaming_content).decode()
+        lines = body.splitlines()
+        self.assertGreaterEqual(len(lines), 2)          # header + the one member
+        self.assertIn("Member Name", lines[0])          # All-Members header reused
+
+
 class AgentAccountabilityDashboardTest(TestCase):
     """Per-screener accountability: management-only; counts internal cases (by
     created_by_name), assessments (by provider_name), and screenings (via the

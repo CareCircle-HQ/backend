@@ -2651,6 +2651,42 @@ class MembersListView(PortalGenericAPIView):
         return self.get_paginated_response(groups)
 
 
+class MembersExportView(MembersListView):
+    """Stream a CSV of every member matching the SAME filters as the Members list
+    (reuses ``MembersListView.get_queryset`` -- so it honors all current and
+    future filters), using the All-Members column layout. Management-only, since
+    it's a bulk PII pull. Streams with a bounded-memory iterator like the Reports
+    exports."""
+
+    def get(self, request):
+        agent = current_agent(request)
+        if not (agent and (getattr(agent, "is_manager", False) or agent.group == "Management")):
+            return Response(
+                {"detail": "Management access required."},
+                status=http.HTTP_403_FORBIDDEN,
+            )
+        from .report_exports import (
+            all_members_header, all_members_prefetch, all_members_row,
+            all_members_row_context, stream_csv_response,
+        )
+
+        qs = all_members_prefetch(self.get_queryset())
+        ctx = all_members_row_context()
+
+        def rows():
+            yield all_members_header()
+            seen = set()  # the filter joins can repeat a client; emit each once
+            for client in qs.iterator(chunk_size=1000):
+                if client.pk in seen:
+                    continue
+                seen.add(client.pk)
+                yield all_members_row(client, **ctx)
+
+        return stream_csv_response(
+            rows(), f"members_{timezone.localdate().isoformat()}.csv",
+        )
+
+
 class UnlinkedMembersListView(PortalGenericAPIView):
     """Urgent Care -> Un-Linked Members tab.
 
