@@ -2150,26 +2150,18 @@ class MembersListView(PortalGenericAPIView):
         Timestamps are aggregated as the MAX across a client's enrollments and
         then across a household's matching members. Groups with no timestamp sort
         last regardless of direction; name (case-insensitive) breaks ties."""
-        # Latest internal-service case date_opened per client, as a scalar
-        # subquery so the multi-valued cases relation can't multiply rows (it
-        # matches the "Case Created" column the Urgent Care list renders).
-        latest_case_opened = (
-            Case.objects.filter(
-                client=OuterRef("pk"),
-                case_type=CaseType.INTERNAL_SERVICE,
-            )
-            .order_by("-date_opened")
-            .values("date_opened")[:1]
-        )
+        # Latest internal-service case date_opened per client (the "Case Created"
+        # column). Read from the denormalized, indexed Client.internal_case_opened_at
+        # (kept fresh by reconcile) instead of a per-row correlated subquery --
+        # the subquery ran for every client and, combined with the date filters,
+        # pushed this query past the statement timeout on prod.
         # The enrollment join is multi-valued (a client can have several), so a
         # client appears on several rows -- aggregate per client below.
-        rows = self.get_queryset().annotate(
-            _case_opened=Subquery(latest_case_opened)
-        ).values_list(
+        rows = self.get_queryset().values_list(
             "client_id", "household_membership__household_id",
             "first_name", "last_name", "created_at",
             "enrollments__requested_at", "enrollments__opened_at",
-            "enrollments__verified_at", "_case_opened",
+            "enrollments__verified_at", "internal_case_opened_at",
         )
 
         def _max_dt(a, b):
