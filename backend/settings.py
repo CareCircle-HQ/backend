@@ -137,7 +137,14 @@ MIDDLEWARE = [
     # Exposes the current request to simple-history so changes are attributed
     # (api.history reads it lazily to set change source/actor).
     'simple_history.middleware.HistoryRequestMiddleware',
+    # Caps DB statement time for WEB requests only (management commands are
+    # unaffected), so a pathological query fails fast instead of saturating
+    # every worker. Disabled when WEB_STATEMENT_TIMEOUT_MS is 0.
+    'api.middleware.StatementTimeoutMiddleware',
 ]
+
+# Max DB statement time (ms) for web requests; 0 disables the middleware.
+WEB_STATEMENT_TIMEOUT_MS = int(os.getenv('WEB_STATEMENT_TIMEOUT_MS', '30000') or 0)
 
 ROOT_URLCONF = 'backend.urls'
 
