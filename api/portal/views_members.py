@@ -1066,22 +1066,21 @@ def period_date_range(period):
 def apply_period_filter(qs, period):
     """Restrict ``qs`` to clients whose governing enrollment -- their own or
     their household's -- was OPENED within the period window. No-op when the
-    period maps to no range. Caller is responsible for ``.distinct()`` (this
-    adds multi-valued joins)."""
+    period maps to no range. Uses correlated ``Exists`` (no join duplication /
+    no ``.distinct()`` needed), so it doesn't multiply the grouped query."""
     rng = period_date_range(period)
     if not rng:
         return qs
     start, end = rng
-    return qs.filter(
-        Q(
-            enrollments__opened_at__date__gte=start,
-            enrollments__opened_at__date__lte=end,
-        )
-        | Q(
-            household_membership__household__enrollment_verifications__opened_at__date__gte=start,
-            household_membership__household__enrollment_verifications__opened_at__date__lte=end,
-        )
+    own = EnrollmentVerification.objects.filter(
+        client=OuterRef("pk"),
+        opened_at__date__gte=start, opened_at__date__lte=end,
     )
+    hh = EnrollmentVerification.objects.filter(
+        household__members__client=OuterRef("pk"),
+        opened_at__date__gte=start, opened_at__date__lte=end,
+    )
+    return qs.filter(Exists(own) | Exists(hh))
 
 
 def apply_enrollment_date_filter(qs, field, start, end):
@@ -1091,18 +1090,24 @@ def apply_enrollment_date_filter(qs, field, start, end):
     within the inclusive [start, end] date window. Either bound may be None
     (open-ended). No-op when both bounds are None. The conditions for a bound
     are ANDed on the SAME joined row (matching ``apply_period_filter``); the
-    caller is responsible for ``.distinct()`` (this adds multi-valued joins)."""
+    Uses correlated ``Exists`` subqueries (own enrollment OR any household
+    enrollment) rather than joins, so it introduces NO duplicate rows and needs
+    no ``.distinct()``. The join form multiplied the already multi-join grouped
+    query (Verification scope) into a near-cartesian product that blew past the
+    statement timeout as soon as a date filter was applied."""
     if not start and not end:
         return qs
-    hh = "household_membership__household__enrollment_verifications__"
-    own_cond, hh_cond = {}, {}
+    own = EnrollmentVerification.objects.filter(client=OuterRef("pk"))
+    hh = EnrollmentVerification.objects.filter(
+        household__members__client=OuterRef("pk")
+    )
     if start:
-        own_cond[f"enrollments__{field}__date__gte"] = start
-        hh_cond[f"{hh}{field}__date__gte"] = start
+        own = own.filter(**{f"{field}__date__gte": start})
+        hh = hh.filter(**{f"{field}__date__gte": start})
     if end:
-        own_cond[f"enrollments__{field}__date__lte"] = end
-        hh_cond[f"{hh}{field}__date__lte"] = end
-    return qs.filter(Q(**own_cond) | Q(**hh_cond))
+        own = own.filter(**{f"{field}__date__lte": end})
+        hh = hh.filter(**{f"{field}__date__lte": end})
+    return qs.filter(Exists(own) | Exists(hh))
 
 
 def apply_authorization_date_filter(qs, start, end):
