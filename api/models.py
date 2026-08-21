@@ -1485,6 +1485,15 @@ class Case(models.Model):
             models.Index(fields=["program"]),
             models.Index(fields=["case_status"]),
             models.Index(fields=["created_by_id"]),
+            # Powers the Members-list ORDER BY correlated subquery (per client:
+            # latest internal-service case by date_opened). Without it that
+            # subquery scans all a client's cases + filters case_type + sorts,
+            # ~60k times per page -> the query blew up to minutes after a large
+            # purge left api_case bloated. Composite = single index lookup.
+            models.Index(
+                fields=["client", "case_type", "-date_opened"],
+                name="api_case_client_type_dopen_idx",
+            ),
         ]
 
     def __str__(self):
