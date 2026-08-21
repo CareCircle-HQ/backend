@@ -14,7 +14,7 @@ Use ``--client <id>`` to scope to one member. Idempotent.
 """
 
 from django.core.management.base import BaseCommand
-from django.db import transaction
+from django.db import connection, transaction
 
 from api.models import (
     EnrollmentStage, EnrollmentVerification, MemberDeliverySchedule,
@@ -116,4 +116,27 @@ class Command(BaseCommand):
         self.stdout.write(self.style.SUCCESS(
             f"\nAPPLIED: deleted {deleted} row(s) across {len(per_model)} table(s); "
             f"re-pointed {repointed} chain link(s)."
+        ))
+
+        # A large DELETE leaves stale planner statistics (and dead tuples). Without
+        # a follow-up ANALYZE, Postgres can flip a hot query -- notably the Members
+        # list, which sorts every client -- onto a catastrophic plan; that took the
+        # site down after the first run of this purge. Refresh stats on the tables
+        # this touches AND the ones the Members/verification queries join, so the
+        # planner stays honest. (ANALYZE is online and transaction-safe.)
+        self.stdout.write("Refreshing planner statistics (ANALYZE)...")
+        analyze_tables = [
+            "api_enrollmentverification", "api_memberdietaryprofile",
+            "api_memberdeliveryschedule", "api_orderschedule",
+            "api_case", "api_client", "api_householdmember", "api_stageevent",
+        ]
+        with connection.cursor() as cur:
+            for tbl in analyze_tables:
+                try:
+                    cur.execute(f"ANALYZE {tbl};")
+                except Exception as exc:  # pragma: no cover - defensive
+                    self.stderr.write(f"  ANALYZE {tbl} failed: {exc}")
+        self.stdout.write(self.style.SUCCESS(
+            "Statistics refreshed. (For heavy bloat also run VACUUM (ANALYZE) "
+            "on these tables; VACUUM cannot run here inside a transaction.)"
         ))
