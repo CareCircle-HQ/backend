@@ -4928,6 +4928,52 @@ class AgentAccountabilityDashboardTest(TestCase):
         self.assertEqual(rows["Agent X"]["screenings"], 1)
 
 
+class HoldPreservedThroughCaseChangeTest(TestCase):
+    """A manually/auto On-Hold household must NOT be silently taken off hold when
+    a new governing case arrives -- even when there's no kitchen to carry (which
+    previously pushed them to Kitchen Assignment)."""
+
+    def test_on_hold_survives_new_case_without_kitchen(self):
+        from django.utils import timezone
+
+        from .models import (
+            Case, CaseStatus, CaseType, Client, EnrollmentStage,
+            EnrollmentVerification, Household, HouseholdMember,
+            MemberDietaryProfile, MemberStatus, ServiceAuthorizationStatus,
+        )
+        from .services.lifecycle import reconcile_internal_service_authorization
+
+        c = Client.objects.create(client_id=str(uuid.uuid4()), first_name="H", last_name="Old")
+        hh = Household.objects.create(name="HH")
+        HouseholdMember.objects.create(household=hh, client=c, is_primary=True)
+        now = timezone.now()
+        closed_case = Case.objects.create(
+            case_id=str(uuid.uuid4()), client=c, case_type=CaseType.INTERNAL_SERVICE,
+            case_status=CaseStatus.CLOSED,
+            service_authorization_status=ServiceAuthorizationStatus.APPROVED,
+            program_name="Medically Tailored Meals (MTM)", case_created_at=now,
+        )
+        Case.objects.create(  # the new open case that arrives
+            case_id=str(uuid.uuid4()), client=c, case_type=CaseType.INTERNAL_SERVICE,
+            case_status=CaseStatus.OPEN,
+            service_authorization_status=ServiceAuthorizationStatus.APPROVED,
+            program_name="Medically Tailored Meals (MTM)", case_created_at=now,
+        )
+        held = EnrollmentVerification.objects.create(
+            client=c, household=hh, case=closed_case, stage=EnrollmentStage.ON_HOLD,
+            verified_at=now, program_name="Medically Tailored Meals (MTM)",
+        )
+        MemberDietaryProfile.objects.create(
+            enrollment=held, client=c, member_name="H", status=MemberStatus.PAUSED,
+        )
+        reconcile_internal_service_authorization(c)
+        live = list(c.enrollments.exclude(
+            stage__in=[EnrollmentStage.CLOSED, EnrollmentStage.CANCELLED, EnrollmentStage.DISREGARDED]
+        ))
+        self.assertEqual(len(live), 1)
+        self.assertEqual(EnrollmentStage(live[0].stage), EnrollmentStage.ON_HOLD)
+
+
 class TimelineReasonDetailTest(TestCase):
     """Out-of-Orbit / Out-of-Range timeline rows surface WHY (reason / ZIP), not
     just the member name, so the History tab shows the detail directly."""

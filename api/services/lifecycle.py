@@ -3473,6 +3473,25 @@ def _carry_service_and_activate(
             new_enr, target, actor=actor, actor_label=actor_label,
             note=note, trigger="case_replaced",
         )
+        # A manually/auto PAUSED (On Hold) household must NOT be silently taken
+        # off hold by a new governing case just because there was no kitchen to
+        # carry. Re-pause the new enrollment (drop future deliveries) and flag
+        # Need Review so an agent decides whether to resume on the new case.
+        if prior_was_paused:
+            try:
+                advance_enrollment(
+                    new_enr, EnrollmentStage.ON_HOLD, actor=actor,
+                    actor_label=actor_label, force=True, trigger="case_replaced",
+                    note=("Kept On Hold: the prior household was paused; a new "
+                          "governing case must not auto-resume service. Flagged "
+                          "Need Review."),
+                )
+                from api.services.orders import truncate_future_deliveries
+
+                truncate_future_deliveries(new_enr)
+            except Exception:  # pragma: no cover - defensive
+                pass
+            _tag_client_need_review(new_enr.client)
         return False
 
     # Carry kitchen + weekdays.
