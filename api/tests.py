@@ -5020,6 +5020,51 @@ class AgentAccountabilityDashboardTest(TestCase):
         self.assertEqual(rows["Agent X"]["assessments"], 1)
         self.assertEqual(rows["Agent X"]["screenings"], 1)
 
+    def test_unifies_ids_via_uniteus_agent(self):
+        """Cases/assessments key on user_id; screenings key on employee_id. A
+        single UniteUsAgent carries both, so all three collapse into one row."""
+        from django.utils import timezone
+
+        from .models import (
+            Assessment, Case, CaseStatus, CaseType, Client, Screening,
+            UniteUsAgent,
+        )
+        user_id = uuid.uuid4()
+        emp_id = uuid.uuid4()
+        UniteUsAgent.objects.create(
+            user_id=user_id, employee_id=emp_id, name="Jamie Screener",
+            originating_team="CareCircle Call Center",
+        )
+        c = Client.objects.create(client_id=str(uuid.uuid4()), first_name="C", last_name="E")
+        now = timezone.now()
+        # Case + assessment keyed on user_id (raw names deliberately differ to
+        # prove the roster -- not the name -- drives the merge).
+        Case.objects.create(
+            case_id=str(uuid.uuid4()), client=c, case_type=CaseType.INTERNAL_SERVICE,
+            case_status=CaseStatus.OPEN, created_by_id=user_id,
+            created_by_name="J. Screener", case_created_at=now,
+        )
+        Assessment.objects.create(
+            assessment_id=str(uuid.uuid4()), subject_id=c.client_id, client=c,
+            created_by_id=user_id, created_by_name="Jamie S.", screen_created_at=now,
+        )
+        # Screening keyed on the DIFFERENT employee_id id-space.
+        Screening.objects.create(
+            enhanced_screen_id=str(uuid.uuid4()), subject_id=c.client_id, client=c,
+            facilitator_id=emp_id, screen_created_at=now,
+        )
+        resp = self._api().get("/api/portal/dashboard/accountability/?period=month")
+        self.assertEqual(resp.status_code, 200, resp.content)
+        rows = resp.json()["screeners"]
+        # Exactly one merged bucket, displayed via the roster name + team.
+        self.assertEqual(len(rows), 1, rows)
+        row = rows[0]
+        self.assertEqual(row["agent"], "Jamie Screener")
+        self.assertEqual(row["team"], "CareCircle Call Center")
+        self.assertEqual(row["internal_cases"], 1)
+        self.assertEqual(row["assessments"], 1)
+        self.assertEqual(row["screenings"], 1)
+
 
 class HoldPreservedThroughCaseChangeTest(TestCase):
     """A manually/auto On-Hold household must NOT be silently taken off hold when
@@ -13355,6 +13400,60 @@ class DependentSplitTest(TestCase):
         enr = EnrollmentVerification.objects.create(client=c, stage=EnrollmentStage.VERIFIED)
         out = split_dependent_into_own_enrollment(c, enr)
         self.assertFalse(out["split"])
+
+    def test_household_request_with_dependent_case_retargets_and_splits(self):
+        """ROOT-CAUSE guard: the extension requests a household verification
+        anchored on the PRIMARY but carrying a DEPENDENT-owned internal-service
+        case. The serializer must re-target the enrollment onto the dependent and
+        split them into their own case/household -- not leave it on the primary."""
+        from .models import (
+            Case, CaseStatus, CaseType, Client, EnrollmentVerification,
+            Household, HouseholdMember, MemberDietaryProfile, MemberStatus,
+        )
+        from .serializers import EnrollmentVerificationSerializer
+
+        primary = Client.objects.create(client_id=str(uuid.uuid4()), first_name="Prim", last_name="Ary")
+        dep = Client.objects.create(client_id=str(uuid.uuid4()), first_name="Dep", last_name="Endent")
+        hh = Household.objects.create(name="HH")
+        HouseholdMember.objects.create(household=hh, client=primary, is_primary=True)
+        HouseholdMember.objects.create(household=hh, client=dep, is_primary=False)
+        prog = "Medically Tailored or Nutritionally Appropriate Food Prescriptions: Boxes"
+        dep_case = Case.objects.create(
+            case_id=str(uuid.uuid4()), client=dep, case_type=CaseType.INTERNAL_SERVICE,
+            case_status=CaseStatus.OPEN, program_name=prog, service_type="Produce Prescription/Voucher",
+        )
+        # Ext household verification: client=PRIMARY, case=DEPENDENT's, whole roster.
+        payload = {
+            "client_id": str(primary.pk),
+            "household_id": str(hh.household_id),
+            "case_id": str(dep_case.pk),
+            "members": [
+                {"client_id": str(primary.pk), "member_name": "Prim Ary", "status": MemberStatus.PENDING},
+                {"client_id": str(dep.pk), "member_name": "Dep Endent", "status": MemberStatus.OUT_OF_ORBIT},
+            ],
+        }
+        ser = EnrollmentVerificationSerializer(data=payload)
+        ser.is_valid(raise_exception=True)
+        enr = ser.save()
+
+        enr.refresh_from_db()
+        # Enrollment is now the DEPENDENT's, re-homed to their OWN household.
+        self.assertEqual(str(enr.client_id), str(dep.pk))
+        self.assertNotEqual(str(enr.household_id), str(hh.household_id))
+        # Dependent is primary of their own household; gone from the shared one.
+        self.assertTrue(
+            HouseholdMember.objects.filter(client=dep, household=enr.household, is_primary=True).exists()
+        )
+        self.assertFalse(HouseholdMember.objects.filter(client=dep, household=hh).exists())
+        # Enrollment pruned to just the dependent.
+        self.assertEqual(
+            [str(x) for x in enr.member_profiles.values_list("client_id", flat=True)],
+            [str(dep.pk)],
+        )
+        # Primary keeps their own household untouched.
+        self.assertTrue(
+            HouseholdMember.objects.filter(client=primary, household=hh, is_primary=True).exists()
+        )
 
 
 class ReauthExtensionActivationTest(TestCase):

@@ -508,6 +508,12 @@ def map_screening_group(screen_id, rows):
     services = _list_field(_s(head, "eligible_services"))
     if services:
         out["eligible_services"] = services
+    # Accountability: the facilitator who performed the screen. Maps to
+    # UniteUsAgent.employee_id (see import allowlist below). Sparse so an
+    # extension re-sync never blanks it.
+    facilitator_id = _s(head, "facilitator_id")
+    if facilitator_id:
+        out["facilitator_id"] = facilitator_id
 
     # questions_answers: dedupe by answer_id (the cross-join with needs repeats
     # each answer once per identified/verified need on the screen).
@@ -586,6 +592,15 @@ def map_assessment_group(submission_id, rows):
         "provider_name": _s(head, "submission_created_by_name"),
         "performing_organization_name": _s(head, "provider_name"),
     }
+    # Accountability: the Unite Us user who submitted the assessment. Maps to
+    # UniteUsAgent.user_id (same key as cases). Sparse so an extension re-sync
+    # never blanks it.
+    created_by_id = _s(head, "submission_created_by_id")
+    if created_by_id:
+        out["created_by_id"] = created_by_id
+    created_by_name = _s(head, "submission_created_by_name")
+    if created_by_name:
+        out["created_by_name"] = created_by_name
     qa = []
     for r in rows:
         question = _s(r, "question")
@@ -943,8 +958,18 @@ class CsvImporter:
                     continue
             # Append-only + idempotent: screenings are immutable once complete,
             # so skip any enhanced_screen_id we already store. This keeps
-            # re-imports cheap and non-destructive.
-            if Screening.objects.filter(pk=sid).exists():
+            # re-imports cheap and non-destructive. EXCEPTION: backfill the
+            # accountability ``facilitator_id`` onto an existing row that lacks
+            # it -- a single, additive field that leaves the immutable content
+            # untouched (older imports predate the column).
+            existing = Screening.objects.filter(pk=sid).only(
+                "pk", "facilitator_id"
+            ).first()
+            if existing is not None:
+                fid = (head.get("facilitator_id") or "").strip()
+                if fid and not existing.facilitator_id:
+                    existing.facilitator_id = fid
+                    existing.save(update_fields=["facilitator_id"])
                 self._count("skipped")
                 continue
             try:

@@ -1639,6 +1639,13 @@ class Screening(models.Model):
     provider_name = models.CharField(max_length=255, blank=True)
     performing_organization_name = models.CharField(max_length=255, blank=True)
 
+    # --- Accountability ---
+    # The Unite Us facilitator who performed the screening. NB: the screening
+    # export's ``facilitator_id`` maps to ``UniteUsAgent.employee_id`` (NOT
+    # ``user_id``, which is what cases/assessments use) -- see csv_import. Only
+    # populated by the CSV import (the extension push carries no facilitator id).
+    facilitator_id = models.UUIDField(null=True, blank=True, db_index=True)
+
     # --- Screening Content ---
     duration = models.PositiveIntegerField(null=True, blank=True)  # seconds
     questions_answers = models.JSONField(default=list, blank=True)  # [{question, answer}]
@@ -1688,6 +1695,15 @@ class Assessment(models.Model):
     # --- Provider Info ---
     provider_name = models.CharField(max_length=255, blank=True)  # submitter from Unite Us
     performing_organization_name = models.CharField(max_length=255, blank=True)  # org from Unite Us
+
+    # --- Accountability ---
+    # The Unite Us user who submitted the assessment. The assessments export's
+    # ``submission_created_by_id`` maps to ``UniteUsAgent.user_id`` -- the SAME
+    # key the cases export's ``case_created_by_id`` uses (unlike screenings,
+    # whose ``facilitator_id`` maps to ``employee_id``). Only populated by the
+    # CSV import (the extension push carries no creator id).
+    created_by_id = models.UUIDField(null=True, blank=True, db_index=True)
+    created_by_name = models.CharField(max_length=255, blank=True)
 
     # --- Eligibility Content ---
     # Duration from E-form: "BEFORE STARTING NAVIGATION - What is the duration of the phone call?"
