@@ -681,6 +681,8 @@ class Insurance(models.Model):
         indexes = [
             models.Index(fields=["client", "status"]),
             models.Index(fields=["insurance_id"]),
+            # Expiring-insurance filter/warnings (expired_at date range).
+            models.Index(fields=["expired_at"]),
         ]
 
     def __str__(self):
@@ -722,6 +724,8 @@ class SocialCareCoverage(models.Model):
         indexes = [
             models.Index(fields=["client", "status"]),
             models.Index(fields=["external_member_id"]),
+            # Expiring social-care-coverage filter/warnings (expired_at range).
+            models.Index(fields=["expired_at"]),
         ]
 
     def __str__(self):
@@ -1500,6 +1504,18 @@ class Case(models.Model):
                 fields=["client", "case_type", "-date_opened"],
                 name="api_case_client_type_dopen_idx",
             ),
+            # Members/Data list default filter: internal-service cases opened in a
+            # date window (created_from/created_to -> case_type + date_opened,
+            # across ALL cases before the client join). Index the global predicate.
+            models.Index(
+                fields=["case_type", "date_opened"],
+                name="api_case_type_dopen_idx",
+            ),
+            # Closed-date filter (closed_from/closed_to -> case_closed_at).
+            models.Index(
+                fields=["case_type", "case_closed_at"],
+                name="api_case_type_closed_idx",
+            ),
         ]
 
     def __str__(self):
@@ -2213,6 +2229,10 @@ class EnrollmentVerification(models.Model):
         indexes = [
             models.Index(fields=["client", "stage"]),
             models.Index(fields=["household", "stage"]),
+            # Kitchen filter on the Members/Data list.
+            models.Index(fields=["kitchen"]),
+            # Verification-requested date filter (requested_from/to -> opened_at).
+            models.Index(fields=["opened_at"]),
         ]
         constraints = [
             # At most one LIVE verification per (navigation) case. Renewals reuse
@@ -4481,6 +4501,8 @@ class DeliveryOrder(models.Model):
             models.Index(fields=["status"]),
             models.Index(fields=["member"]),
             models.Index(fields=["expected_delivery_date"]),
+            # "Last delivered" lookups (latest delivered_at per member).
+            models.Index(fields=["member", "delivered_at"]),
         ]
 
     def __str__(self):
