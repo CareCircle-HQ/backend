@@ -19,6 +19,7 @@ import io
 import json
 import logging
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from urllib.parse import parse_qs, urlparse
 from zoneinfo import ZoneInfo
@@ -38,7 +39,8 @@ logger = logging.getLogger(__name__)
 POD_SOURCE = "delivery_pod"
 _NY = ZoneInfo("America/New_York")
 _FETCH_TIMEOUT = 10  # seconds per image (fail fast on dead/expired URLs)
-_PROGRESS_EVERY = 50  # flush processed_count to the ImportRun every N rows
+_PROGRESS_EVERY = 25  # flush progress to the ImportRun every N downloads
+_MAX_WORKERS = 12     # concurrent image downloads (I/O-bound)
 _MAX_IMAGE_BYTES = 25 * 1024 * 1024  # 25 MB guard
 
 # --- column mapping (company-agnostic) -------------------------------------
@@ -204,43 +206,117 @@ class PodImporter:
         }
         self.errors = []
 
-    # -- image fetch --------------------------------------------------------
-    def _fetch_and_store(self, order, url):
-        """Download one image and create a DeliveryOrderProof (deduped). Returns
-        'created' | 'deduped' | 'error'."""
-        # FAST re-import: the signed query string changes on every export, but the
-        # CDN object PATH is stable -- if we already stored that object for this
-        # order, skip the download entirely (no HTTP, no re-hash). This is what
-        # makes a re-run cheap and stops it re-fetching thousands of images.
-        path = (urlparse(url).path or "").strip()
-        if path and DeliveryOrderProof.objects.filter(
-            delivery_order=order, source_url__contains=path
-        ).exists():
-            self.stats["proofs_deduped"] += 1
-            return "deduped"
-
+    def _set_progress(self, processed, total):
+        """Best-effort write of progress to the ImportRun so the UI shows a live
+        bar during the long download phase. Never fails the import."""
+        if self.import_run is None:
+            return
         try:
-            resp = requests.get(url, timeout=_FETCH_TIMEOUT, stream=True)
+            self.import_run.progress_total = total
+            self.import_run.processed_count = processed
+            self.import_run.save(update_fields=["progress_total", "processed_count"])
+        except Exception:  # noqa: BLE001
+            pass
+
+    # -- phase 1: resolve orders + update + collect image tasks (DB, main) ---
+    def _prepare(self, idx, rows):
+        """Resolve every row to its DeliveryOrder (one bulk query), update the
+        order's status/delivered_at/company, and return the list of image-fetch
+        tasks (after skipping expired URLs and images we already stored)."""
+        oids = []
+        for row in rows:
+            v = (row.get(idx["order_id"]) or "").strip()
+            if v and _looks_uuid(v):
+                oids.append(v)
+        orders = {
+            str(o.pk): o
+            for o in DeliveryOrder.objects.filter(pk__in=set(oids))
+        }
+        tasks = []
+        for row in rows:
+            oid = (row.get(idx["order_id"]) or "").strip()
+            if not oid:
+                continue
+            self.stats["rows"] += 1
+            order = orders.get(oid)
+            if order is None:
+                self.stats["unmatched"] += 1
+                continue
+            self.stats["matched"] += 1
+
+            member_id = (idx.get("member_id") and row.get(idx["member_id"]) or "").strip()
+            if member_id and str(order.member_id or "").lower() != member_id.lower():
+                self.stats["member_mismatch"] += 1
+                self.errors.append(
+                    f"order {oid}: report member {member_id} != order member {order.member_id}"
+                )
+
+            status = map_pod_status(idx.get("status") and row.get(idx["status"]))
+            delivered_at = parse_delivered_at(
+                idx.get("date") and row.get(idx["date"]),
+                idx.get("time") and row.get(idx["time"]),
+            )
+            driver = (idx.get("driver") and row.get(idx["driver"]) or "").strip()
+            note = (idx.get("note") and row.get(idx["note"]) or "").strip()
+
+            if self.apply:
+                fields = []
+                if status and order.status != status:
+                    order.status = status; fields.append("status")
+                if delivered_at and order.delivered_at != delivered_at:
+                    order.delivered_at = delivered_at; fields.append("delivered_at")
+                if self.company and order.delivery_company_id != self.company.pk:
+                    order.delivery_company = self.company; fields.append("delivery_company")
+                if fields:
+                    order.save(update_fields=fields)
+                    self.stats["orders_updated"] += 1
+
+            if not self.apply or not self.fetch:
+                continue
+            for url in split_photo_urls(idx.get("photos") and row.get(idx["photos"])):
+                if is_url_expired(url):
+                    self.stats["images_expired"] += 1
+                    continue
+                # Already stored this CDN object for the order? (signed query
+                # changes per export, so match the stable path) -> skip download.
+                path = (urlparse(url).path or "").strip()
+                if path and DeliveryOrderProof.objects.filter(
+                    delivery_order=order, source_url__contains=path
+                ).exists():
+                    self.stats["proofs_deduped"] += 1
+                    continue
+                tasks.append({
+                    "order": order, "url": url,
+                    "driver": driver, "note": note, "delivered_at": delivered_at,
+                })
+        return tasks
+
+    # -- phase 2: download one image (network only, NO db -- thread-safe) ----
+    @staticmethod
+    def _download(task):
+        try:
+            resp = requests.get(task["url"], timeout=_FETCH_TIMEOUT)
             if resp.status_code >= 400:
-                raise RuntimeError(f"HTTP {resp.status_code}")
+                return task, None, "", f"HTTP {resp.status_code}"
             data = resp.content
             if not data:
-                raise RuntimeError("empty body")
+                return task, None, "", "empty body"
             if len(data) > _MAX_IMAGE_BYTES:
-                raise RuntimeError(f"image too large ({len(data)} bytes)")
-        except Exception as exc:  # noqa: BLE001 - isolate a bad/expired URL
-            self.stats["images_failed"] += 1
-            self.errors.append(f"order {order.pk}: image fetch failed ({exc})")
-            return "error"
+                return task, None, "", f"image too large ({len(data)} bytes)"
+            ct = (resp.headers.get("Content-Type") or "").split(";")[0].strip()
+            return task, data, ct, None
+        except Exception as exc:  # noqa: BLE001
+            return task, None, "", str(exc)
 
-        content_type = (resp.headers.get("Content-Type") or "").split(";")[0].strip()
+    # -- phase 3: dedup + upload + create (DB, main) ------------------------
+    def _store(self, task, data, content_type):
+        order, url = task["order"], task["url"]
         digest = hashlib.sha256(data).hexdigest()
         if DeliveryOrderProof.objects.filter(
             delivery_order=order, content_hash=digest
         ).exists():
             self.stats["proofs_deduped"] += 1
-            return "deduped"
-
+            return
         ext = _guess_ext(content_type, url)
         key = f"pod/{order.pk}/{digest[:16]}.{ext}"
         try:
@@ -250,101 +326,20 @@ class PodImporter:
         except Exception as exc:  # noqa: BLE001
             self.stats["images_failed"] += 1
             self.errors.append(f"order {order.pk}: S3 upload failed ({exc})")
-            return "error"
-
-        # Guard the insert with a savepoint: if the same image (order,
-        # content_hash) was stored concurrently / earlier in this run, treat the
-        # unique-constraint hit as a dedupe instead of raising (and, crucially,
-        # the atomic() savepoint keeps the surrounding transaction usable).
+            return
         try:
             with transaction.atomic():
                 DeliveryOrderProof.objects.create(
-                    delivery_order=order,
-                    s3_key=key,
-                    content_type=content_type,
-                    content_hash=digest,
-                    source_url=url[:2000],
-                    delivery_company=self.company,
-                    source_report=self.source_report,
+                    delivery_order=order, s3_key=key, content_type=content_type,
+                    content_hash=digest, source_url=url[:2000],
+                    delivery_company=self.company, source_report=self.source_report,
+                    driver=(task["driver"] or "")[:255], note=task["note"] or "",
+                    delivered_at=task["delivered_at"],
                 )
         except IntegrityError:
             self.stats["proofs_deduped"] += 1
-            return "deduped"
+            return
         self.stats["proofs_created"] += 1
-        return "created"
-
-    # -- per row ------------------------------------------------------------
-    def _process_row(self, idx, row):
-        oid = (idx.get("order_id") and row.get(idx["order_id"]) or "").strip()
-        if not oid:
-            return
-        self.stats["rows"] += 1
-        order = (
-            DeliveryOrder.objects.filter(pk=oid).first()
-            if _looks_uuid(oid) else None
-        )
-        if order is None:
-            self.stats["unmatched"] += 1
-            return
-        self.stats["matched"] += 1
-
-        member_id = (idx.get("member_id") and row.get(idx["member_id"]) or "").strip()
-        if member_id and str(order.member_id or "").lower() != member_id.lower():
-            self.stats["member_mismatch"] += 1
-            self.errors.append(
-                f"order {oid}: report member {member_id} != order member {order.member_id}"
-            )
-
-        status = map_pod_status(idx.get("status") and row.get(idx["status"]))
-        delivered_at = parse_delivered_at(
-            idx.get("date") and row.get(idx["date"]),
-            idx.get("time") and row.get(idx["time"]),
-        )
-        driver = (idx.get("driver") and row.get(idx["driver"]) or "").strip()
-        note = (idx.get("note") and row.get(idx["note"]) or "").strip()
-
-        if self.apply:
-            fields = []
-            if status and order.status != status:
-                order.status = status; fields.append("status")
-            if delivered_at and order.delivered_at != delivered_at:
-                order.delivered_at = delivered_at; fields.append("delivered_at")
-            if self.company and order.delivery_company_id != self.company.pk:
-                order.delivery_company = self.company; fields.append("delivery_company")
-            if fields:
-                order.save(update_fields=fields)
-                self.stats["orders_updated"] += 1
-
-        urls = split_photo_urls(idx.get("photos") and row.get(idx["photos"]))
-        if not urls or not self.fetch or not self.apply:
-            return
-        for url in urls:
-            # Skip signed URLs that already expired -- fetching would just 403.
-            # This keeps a stale report (e.g. an old vendor export) from wasting
-            # thousands of round-trips and wedging the worker.
-            if is_url_expired(url):
-                self.stats["images_expired"] += 1
-                continue
-            res = self._fetch_and_store(order, url)
-            # stamp per-image metadata on the freshly created proof
-            if res == "created" and (driver or note or delivered_at):
-                p = order.proofs.order_by("-created_at").first()
-                if p is not None:
-                    p.driver = driver[:255]
-                    p.note = note
-                    p.delivered_at = delivered_at
-                    p.save(update_fields=["driver", "note", "delivered_at"])
-
-    def _flush_progress(self):
-        """Best-effort write of the running row count to the ImportRun so the UI
-        bar advances during a long report. Never fails the import."""
-        if self.import_run is None:
-            return
-        try:
-            self.import_run.processed_count = self.stats["rows"]
-            self.import_run.save(update_fields=["processed_count"])
-        except Exception:  # noqa: BLE001
-            pass
 
     def run(self, reader):
         idx = build_header_index(reader.fieldnames)
@@ -353,26 +348,44 @@ class PodImporter:
                 "Delivery report is missing an 'ORDER #' column "
                 f"(headers: {reader.fieldnames})"
             )
-        # Pre-count rows for a true progress denominator (the file is already in
-        # memory/temp, so a second pass is cheap and keeps the bar honest).
         rows = list(reader)
-        if self.import_run is not None:
+        # Phase 1: resolve + update orders, collect the images to fetch.
+        self._set_progress(0, len(rows) or 1)
+        tasks = self._prepare(idx, rows)
+
+        # Phase 2: download the images CONCURRENTLY (I/O-bound). The threads only
+        # do network work and touch no DB / shared stats, so this is safe and
+        # turns an hours-long sequential fetch into minutes. Progress is streamed
+        # as each download completes so the UI shows a live bar.
+        total = len(tasks) or 1
+        self._set_progress(0, total)
+        done = 0
+        blobs = []
+        if tasks:
+            with ThreadPoolExecutor(max_workers=_MAX_WORKERS) as pool:
+                for task, data, ct, err in pool.map(self._download, tasks):
+                    done += 1
+                    if err is not None:
+                        self.stats["images_failed"] += 1
+                        self.errors.append(
+                            f"order {task['order'].pk}: image fetch failed ({err})"
+                        )
+                    else:
+                        blobs.append((task, data, ct))
+                    if done % _PROGRESS_EVERY == 0:
+                        self._set_progress(done, total)
+        self._set_progress(done, total)
+
+        # Phase 3: dedup + upload to our S3 + create the proof rows (DB, main).
+        for task, data, ct in blobs:
             try:
-                self.import_run.progress_total = len(rows)
-                self.import_run.save(update_fields=["progress_total"])
-            except Exception:  # noqa: BLE001
-                pass
-        for row in rows:
-            try:
-                self._process_row(idx, row)
-            except Exception as exc:  # noqa: BLE001 - never let one row kill the run
+                self._store(task, data, ct)
+            except Exception as exc:  # noqa: BLE001 - never let one image kill the run
                 self.stats.setdefault("row_errors", 0)
                 self.stats["row_errors"] += 1
-                self.errors.append(f"row error: {exc}")
-                logger.warning("pod_import row failed: %s", exc, exc_info=True)
-            if self.stats["rows"] % _PROGRESS_EVERY == 0:
-                self._flush_progress()
-        self._flush_progress()
+                self.errors.append(f"store error: {exc}")
+                logger.warning("pod_import store failed: %s", exc, exc_info=True)
+        self._set_progress(total, total)
         return self.stats
 
 

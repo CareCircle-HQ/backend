@@ -41,6 +41,10 @@ def _pod_summary(run):
         "finished_at": run.finished_at,
         "processed": run.processed_count,
         "progress_total": run.progress_total,
+        "progress_percent": (
+            min(100, round(100 * (run.processed_count or 0) / run.progress_total))
+            if run.progress_total else None
+        ),
         "created": run.created_count,   # proofs created
         "updated": run.updated_count,   # orders updated
         "skipped": run.skipped_count,   # unmatched + deduped
