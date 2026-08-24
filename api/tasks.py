@@ -128,6 +128,16 @@ def process_pod_import(self, run_id):
 
 
 @shared_task(bind=True, ignore_result=True)
+def rebuild_enrollment_analytics(self):
+    """Rebuild the EnrollmentAnalytics read model for the Data page. Scheduled
+    ~hourly on Celery beat (1-hour freshness SLA); also safe to call ad-hoc.
+    Full rebuild today (small table); switch to watermark-incremental at scale."""
+    from django.core.management import call_command
+
+    call_command("rebuild_enrollment_analytics", "--prune")
+
+
+@shared_task(bind=True, ignore_result=True)
 def poll_uniteus_exports(self, limit=50):
     """Advance every pending Unite Us export (poll state -> download -> import ->
     reconcile). Scheduled on Celery beat; also safe to call ad-hoc."""
