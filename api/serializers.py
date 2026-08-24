@@ -1101,6 +1101,28 @@ class EnrollmentVerificationSerializer(serializers.ModelSerializer):
         if case is not None and not validated_data.get("service_type"):
             validated_data["service_type"] = case.service_type
 
+        # DEPENDENT RE-TARGET: an internal-service case whose OWNER is a
+        # NON-PRIMARY household member is that DEPENDENT's own service. The
+        # extension anchors a household verification on the PRIMARY (and attaches
+        # the household's governing internal-service case), so a dependent-owned
+        # case would otherwise land on the PRIMARY's enrollment and the split
+        # would never run -- leaving the dependent with no enrollment of their
+        # own. Re-home the enrollment onto the case owner and split them into
+        # their own case/household below (the same end-state the CRM "Request
+        # Verification" button + the verification wizard reach). Fires whether the
+        # ext sent the primary OR the dependent as ``client_id``.
+        split_dependent = None
+        if case is not None and case.case_type == CaseType.INTERNAL_SERVICE and case.client_id:
+            owner = (
+                client if client is not None and case.client_id == client.pk
+                else Client.objects.filter(pk=case.client_id).first()
+            )
+            if owner is not None and HouseholdMember.objects.filter(
+                client=owner, is_primary=False
+            ).exists():
+                client = owner
+                split_dependent = owner
+
         # INVARIANT: a client has at most ONE live internal-service enrollment.
         # If one is already IN THE FUNNEL (not terminal and not yet serving),
         # REBIND + refresh it instead of opening a SECOND live row -- a new/renewal
@@ -1133,6 +1155,8 @@ class EnrollmentVerificationSerializer(serializers.ModelSerializer):
             existing.save()
             if members:
                 self._sync_members(existing, members)
+            if split_dependent is not None:
+                self._split_dependent(split_dependent, existing)
             return existing
 
         enrollment = EnrollmentVerification.objects.create(
@@ -1143,7 +1167,18 @@ class EnrollmentVerificationSerializer(serializers.ModelSerializer):
             **validated_data,
         )
         self._sync_members(enrollment, members)
+        if split_dependent is not None:
+            self._split_dependent(split_dependent, enrollment)
         return enrollment
+
+    @staticmethod
+    def _split_dependent(client, enrollment):
+        """Peel a re-targeted dependent into their own case/household. Late import
+        avoids a serializers<->lifecycle import cycle; idempotent (no-op once the
+        client is already primary of their own household)."""
+        from api.services.lifecycle import split_dependent_into_own_enrollment
+
+        split_dependent_into_own_enrollment(client, enrollment)
 
     @transaction.atomic
     def update(self, instance, validated_data):
@@ -1740,6 +1775,9 @@ class ScreeningSerializer(serializers.ModelSerializer):
     subject_id = serializers.UUIDField()
     questions_answers = serializers.JSONField(required=False, default=list)
     identified_social_needs = serializers.JSONField(required=False, default=list)
+    # Optional so an extension push (which carries no facilitator id) never
+    # blanks a value provided by the CSV import.
+    facilitator_id = serializers.UUIDField(required=False, allow_null=True)
 
     class Meta:
         model = Screening
@@ -1752,6 +1790,7 @@ class ScreeningSerializer(serializers.ModelSerializer):
             "screen_source",
             "provider_name",
             "performing_organization_name",
+            "facilitator_id",
             "duration",
             "questions_answers",
             "identified_social_needs",
@@ -1796,6 +1835,9 @@ class AssessmentSerializer(serializers.ModelSerializer):
     subject_id = serializers.UUIDField()
     questions_answers = serializers.JSONField(required=False, default=list)
     eligible_services = serializers.JSONField(required=False, default=list)
+    # Optional so an extension push (which carries no creator id) never blanks a
+    # value provided by the CSV import.
+    created_by_id = serializers.UUIDField(required=False, allow_null=True)
 
     class Meta:
         model = Assessment
@@ -1807,6 +1849,8 @@ class AssessmentSerializer(serializers.ModelSerializer):
             "form_name",
             "provider_name",
             "performing_organization_name",
+            "created_by_id",
+            "created_by_name",
             "duration",
             "questions_answers",
             "eligible_services",
