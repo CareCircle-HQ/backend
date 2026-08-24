@@ -25,6 +25,7 @@ from zoneinfo import ZoneInfo
 
 import requests
 
+from django.db import IntegrityError, transaction
 from django.utils import timezone
 
 from ..models import (
@@ -205,8 +206,19 @@ class PodImporter:
 
     # -- image fetch --------------------------------------------------------
     def _fetch_and_store(self, order, url):
-        """Download one image and create a DeliveryOrderProof (deduped by content
-        hash). Returns 'created' | 'deduped' | 'error'."""
+        """Download one image and create a DeliveryOrderProof (deduped). Returns
+        'created' | 'deduped' | 'error'."""
+        # FAST re-import: the signed query string changes on every export, but the
+        # CDN object PATH is stable -- if we already stored that object for this
+        # order, skip the download entirely (no HTTP, no re-hash). This is what
+        # makes a re-run cheap and stops it re-fetching thousands of images.
+        path = (urlparse(url).path or "").strip()
+        if path and DeliveryOrderProof.objects.filter(
+            delivery_order=order, source_url__contains=path
+        ).exists():
+            self.stats["proofs_deduped"] += 1
+            return "deduped"
+
         try:
             resp = requests.get(url, timeout=_FETCH_TIMEOUT, stream=True)
             if resp.status_code >= 400:
@@ -240,15 +252,24 @@ class PodImporter:
             self.errors.append(f"order {order.pk}: S3 upload failed ({exc})")
             return "error"
 
-        DeliveryOrderProof.objects.create(
-            delivery_order=order,
-            s3_key=key,
-            content_type=content_type,
-            content_hash=digest,
-            source_url=url[:2000],
-            delivery_company=self.company,
-            source_report=self.source_report,
-        )
+        # Guard the insert with a savepoint: if the same image (order,
+        # content_hash) was stored concurrently / earlier in this run, treat the
+        # unique-constraint hit as a dedupe instead of raising (and, crucially,
+        # the atomic() savepoint keeps the surrounding transaction usable).
+        try:
+            with transaction.atomic():
+                DeliveryOrderProof.objects.create(
+                    delivery_order=order,
+                    s3_key=key,
+                    content_type=content_type,
+                    content_hash=digest,
+                    source_url=url[:2000],
+                    delivery_company=self.company,
+                    source_report=self.source_report,
+                )
+        except IntegrityError:
+            self.stats["proofs_deduped"] += 1
+            return "deduped"
         self.stats["proofs_created"] += 1
         return "created"
 
