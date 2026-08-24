@@ -441,6 +441,14 @@ CELERY_BEAT_SCHEDULE = {
         "task": "api.tasks.import_uniteus_assessment_results",
         "schedule": crontab(minute=30, hour=3),
     },
+    # Hourly rebuild of the EnrollmentAnalytics read model backing the
+    # Administration > Data page (1-hour freshness SLA). Full rebuild + orphan
+    # prune; safe to run any time. Runs at :20 past each hour to avoid the
+    # top-of-hour crunch with the export poller. See docs/analytics-architecture.md.
+    "rebuild-enrollment-analytics": {
+        "task": "api.tasks.rebuild_enrollment_analytics",
+        "schedule": crontab(minute=20),
+    },
 }
 
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
