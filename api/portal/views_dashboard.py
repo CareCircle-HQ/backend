@@ -1013,6 +1013,20 @@ class DashboardView(PortalAPIView):
             end,
         ).distinct()
         ver_verified = ver_base.filter(verification_completed_q())
+        # Kitchen Assignment: verified clients who have a KITCHEN_ASSIGNMENT
+        # enrollment on their OWN case OR via their household. Computed as two
+        # SINGLE-join id queries unioned in Python -- an OR across the two
+        # multi-valued joins with .distinct() explodes the join and times out on
+        # the full prod dataset (statement timeout).
+        _ka_stage = EnrollmentStage.KITCHEN_ASSIGNMENT
+        _ka_ids = set(
+            ver_verified.filter(enrollments__stage=_ka_stage)
+            .values_list("pk", flat=True)
+        ) | set(
+            ver_verified.filter(
+                household_membership__household__enrollment_verifications__stage=_ka_stage
+            ).values_list("pk", flat=True)
+        )
         enrolled = {
             "pending_verification": (
                 ver_base.exclude(verification_completed_q()).distinct().count()
@@ -1021,16 +1035,7 @@ class DashboardView(PortalAPIView):
                 apply_authorization_filter(ver_verified, "pending")
                 .distinct().count()
             ),
-            "kitchen_assignment": (
-                ver_verified.filter(
-                    Q(enrollments__stage=EnrollmentStage.KITCHEN_ASSIGNMENT)
-                    | Q(
-                        household_membership__household__enrollment_verifications__stage=(
-                            EnrollmentStage.KITCHEN_ASSIGNMENT
-                        )
-                    )
-                ).distinct().count()
-            ),
+            "kitchen_assignment": len(_ka_ids),
             "active": active_members,
             "total": max(base_members - lost_total, 0),
             # Quantity of OPEN (governing, in-range) internal-service cases that
