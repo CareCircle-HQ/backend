@@ -5106,9 +5106,26 @@ class PodImportTest(TestCase):
         self.assertEqual(qari["member_id"], "MEMBERID")
         self.assertEqual(qari["date"], "Actual Start Date")
 
+        # mandated no-space schema (OrderID/DriverID/RouteID/DeliveryDate/...)
+        mand = pod.build_header_index([
+            "OrderID", "DriverID", "RouteID", "DeliveryDate", "DeliveryTime",
+            "DeliveryNote", "Photos",
+        ])
+        self.assertEqual(mand["order_id"], "OrderID")
+        self.assertEqual(mand["driver"], "DriverID")
+        self.assertEqual(mand["route"], "RouteID")
+        self.assertEqual(mand["date"], "DeliveryDate")
+        self.assertEqual(mand["time"], "DeliveryTime")
+        self.assertEqual(mand["note"], "DeliveryNote")
+
         # multi-URL cell (QARI newline-separated) -> list; junk dropped
         urls = pod.split_photo_urls("https://a/1\nhttps://a/2\nnot-a-url\n")
         self.assertEqual(urls, ["https://a/1", "https://a/2"])
+        # mandated comma-separated + bracket-wrapped list
+        self.assertEqual(
+            pod.split_photo_urls("[https://a/1, https://a/2, https://a/3]"),
+            ["https://a/1", "https://a/2", "https://a/3"],
+        )
         self.assertEqual(pod.split_photo_urls(""), [])
 
         self.assertEqual(pod.map_pod_status("Completed"), DeliveryOrderStatus.DELIVERED)
@@ -5157,8 +5174,10 @@ class PodImportTest(TestCase):
         do = DeliveryOrder.objects.create(
             purchase_order=po, member=client, status=DeliveryOrderStatus.READY_FOR_DELIVERY,
         )
-        header = "ORDER #,MEMBERID,Photos,Status,Actual Start Date,Actual Start Time,Driver,PoD - Note"
-        row = f'{do.pk},{client.pk},https://cf/img1.jpg,Completed,08/17/2026,11:30 AM,8024-JESSE,left at door'
+        # Mandated schema: OrderID/DriverID/RouteID/DeliveryDate/DeliveryTime/
+        # DeliveryNote/Photos, photos as a bracketed comma list.
+        header = "OrderID,MEMBERID,Photos,Status,DeliveryDate,DeliveryTime,DriverID,RouteID,DeliveryNote"
+        row = f'{do.pk},{client.pk},[https://cf/img1.jpg],Completed,08/17/2026,11:30 AM,8024-JESSE,RT-7,left at door'
         csv_text = header + "\n" + row + "\n"
 
         class _Resp:
@@ -5180,6 +5199,7 @@ class PodImportTest(TestCase):
         self.assertEqual(do.delivery_company_id, company.pk)
         p = DeliveryOrderProof.objects.get(delivery_order=do)
         self.assertEqual(p.driver, "8024-JESSE")
+        self.assertEqual(p.route_id, "RT-7")
         self.assertEqual(p.note, "left at door")
         self.assertTrue(p.content_hash)
 

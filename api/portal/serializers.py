@@ -1927,6 +1927,7 @@ class PortalDeliveryOrderSerializer(serializers.ModelSerializer):
     delivery_address = serializers.SerializerMethodField()
     proof_of_delivery = serializers.SerializerMethodField()
     delivery_driver = serializers.SerializerMethodField()
+    delivery_route = serializers.SerializerMethodField()
     delivery_note = serializers.SerializerMethodField()
 
     class Meta:
@@ -1936,7 +1937,7 @@ class PortalDeliveryOrderSerializer(serializers.ModelSerializer):
             "status", "status_label", "expected_delivery_date", "delivered_at",
             "kitchen_name", "menu_type_name", "custom_dietary_tags",
             "delivery_company_name", "delivery_address", "proof_of_delivery",
-            "delivery_driver", "delivery_note",
+            "delivery_driver", "delivery_route", "delivery_note",
         ]
 
     def get_delivery_driver(self, obj):
@@ -1944,6 +1945,13 @@ class PortalDeliveryOrderSerializer(serializers.ModelSerializer):
         for p in obj.proofs.all():
             if (p.driver or "").strip():
                 return p.driver
+        return ""
+
+    def get_delivery_route(self, obj):
+        # Route id from the delivery report (first proof that carries one).
+        for p in obj.proofs.all():
+            if (p.route_id or "").strip():
+                return p.route_id
         return ""
 
     def get_delivery_note(self, obj):

@@ -97,6 +97,8 @@ from .views_members import (
     CareManagementTabCountsView,
     MembersListView,
     MembersExportView,
+    DataListView,
+    DataExportView,
     MembersStatsView,
     NeedAttestationMembersListView,
     NoNavigationMembersListView,
@@ -230,6 +232,10 @@ urlpatterns = [
     # Members + sub-resources
     path("members/", MembersListView.as_view(), name="portal-members"),
     path("members/export/", MembersExportView.as_view(), name="portal-members-export"),
+    # Administration > Data: clone of the Members list on its own endpoint so the
+    # two can be optimized independently (see DataListView).
+    path("data/", DataListView.as_view(), name="portal-data"),
+    path("data/export/", DataExportView.as_view(), name="portal-data-export"),
     path("members/stats/", MembersStatsView.as_view(), name="portal-members-stats"),
     path("care-management/tabs/", CareManagementTabCountsView.as_view(), name="portal-care-management-tabs"),
     path("members/unlinked/", UnlinkedMembersListView.as_view(), name="portal-members-unlinked"),

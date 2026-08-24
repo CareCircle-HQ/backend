@@ -4515,6 +4515,7 @@ class DeliveryOrderProof(models.Model):
         related_name="delivery_order_proofs",
     )
     driver = models.CharField(max_length=255, blank=True)
+    route_id = models.CharField(max_length=255, blank=True)
     note = models.TextField(blank=True)
     delivered_at = models.DateTimeField(null=True, blank=True)
     # The source report filename / import identifier this image came from.
