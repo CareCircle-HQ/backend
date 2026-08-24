@@ -1016,8 +1016,14 @@ class MemberListSerializer(serializers.Serializer):
 
     def get_verification_completed_by(self, obj):
         # Agent who completed the verification pop-up (set alongside verified_at).
+        # Only the pop-up wizard attributes a verifier; verifications carried over
+        # from a CRM/import/backfill have verified_at set but no agent -- show
+        # "System" for those (rather than a blank that looks like missing data).
+        # Null only when the household isn't verified at all (no verified_at).
         enr = active_enrollment(obj)
-        return _agent_name(enr.verified_by) if enr else None
+        if enr is None or enr.verified_at is None:
+            return None
+        return _agent_name(enr.verified_by) or "System"
 
 
 def _household_context(client):
