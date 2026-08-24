@@ -1704,6 +1704,13 @@ class Assessment(models.Model):
     # CSV import (the extension push carries no creator id).
     created_by_id = models.UUIDField(null=True, blank=True, db_index=True)
     created_by_name = models.CharField(max_length=255, blank=True)
+    # The screenings-ingestion API attributes an assessment to a ``facilitator_id``
+    # which is an ``employee_id`` (→ UniteUsAgent.employee_id) -- a DIFFERENT id
+    # space than the CSV export's ``submission_created_by_id`` (a ``user_id`` →
+    # created_by_id above). Stored separately so the API-sourced facilitator never
+    # collides with the CSV-sourced creator; the accountability dashboard unifies
+    # both keys through UniteUsAgent. Populated by the API mapper + the extension.
+    facilitator_id = models.UUIDField(null=True, blank=True, db_index=True)
 
     # --- Eligibility Content ---
     # Duration from E-form: "BEFORE STARTING NAVIGATION - What is the duration of the phone call?"

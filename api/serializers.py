@@ -1838,6 +1838,8 @@ class AssessmentSerializer(serializers.ModelSerializer):
     # Optional so an extension push (which carries no creator id) never blanks a
     # value provided by the CSV import.
     created_by_id = serializers.UUIDField(required=False, allow_null=True)
+    # API/ext facilitator (employee_id space); optional/sparse like the others.
+    facilitator_id = serializers.UUIDField(required=False, allow_null=True)
 
     class Meta:
         model = Assessment
@@ -1851,6 +1853,7 @@ class AssessmentSerializer(serializers.ModelSerializer):
             "performing_organization_name",
             "created_by_id",
             "created_by_name",
+            "facilitator_id",
             "duration",
             "questions_answers",
             "eligible_services",

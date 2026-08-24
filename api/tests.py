@@ -5065,6 +5065,29 @@ class AgentAccountabilityDashboardTest(TestCase):
         self.assertEqual(row["assessments"], 1)
         self.assertEqual(row["screenings"], 1)
 
+    def test_assessment_facilitator_id_resolves_via_employee_id(self):
+        """An API-sourced assessment carries only ``facilitator_id`` (employee_id,
+        no CSV user_id creator). It must still attribute to the roster agent via
+        UniteUsAgent.employee_id."""
+        from django.utils import timezone
+
+        from .models import Assessment, Client, UniteUsAgent
+        emp_id = uuid.uuid4()
+        UniteUsAgent.objects.create(
+            user_id=uuid.uuid4(), employee_id=emp_id, name="Kemmil Mendoza",
+            originating_team="CareCircle Call Center",
+        )
+        c = Client.objects.create(client_id=str(uuid.uuid4()), first_name="C", last_name="E")
+        Assessment.objects.create(
+            assessment_id=str(uuid.uuid4()), subject_id=c.client_id, client=c,
+            facilitator_id=emp_id, screen_created_at=timezone.now(),
+        )
+        resp = self._api().get("/api/portal/dashboard/accountability/?period=month")
+        self.assertEqual(resp.status_code, 200, resp.content)
+        rows = {r["agent"]: r for r in resp.json()["screeners"]}
+        self.assertIn("Kemmil Mendoza", rows)
+        self.assertEqual(rows["Kemmil Mendoza"]["assessments"], 1)
+
 
 class HoldPreservedThroughCaseChangeTest(TestCase):
     """A manually/auto On-Hold household must NOT be silently taken off hold when

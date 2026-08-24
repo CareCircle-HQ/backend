@@ -524,6 +524,11 @@ def map_assessment_api(detail, summary, *, person_id):
     if services:
         out["eligible_services"] = services
 
+    # Accountability: the screen's facilitator (== employee_id →
+    # UniteUsAgent.employee_id). Same key the screenings export's facilitator_id
+    # uses; distinct from the CSV assessments export's user_id creator.
+    set_("facilitator_id", summary.get("facilitator_id") or detail.get("facilitator_id"))
+
     set_("form_name", _template_name(detail, summary))
     # The list summary carries the created/updated timestamps; DRF parses ISO.
     set_(

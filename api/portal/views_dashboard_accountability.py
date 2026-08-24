@@ -116,13 +116,19 @@ class AgentAccountabilityView(PortalAPIView):
                 screen_created_at__date__gte=start, screen_created_at__date__lte=end
             )
         for r in (
-            asmt_qs.values("created_by_id", "created_by_name", "provider_name")
+            asmt_qs.values(
+                "created_by_id", "created_by_name", "provider_name", "facilitator_id"
+            )
             .annotate(n=Count("assessment_id"))
         ):
-            # created_by_name is the submitter; provider_name holds the same
-            # value on legacy rows imported before created_by_name existed.
+            # Prefer the CSV creator (user_id). Fall back to the API facilitator
+            # (employee_id) when the CSV creator is absent (API-sourced rows),
+            # then to the raw submitter name. created_by_name is the submitter;
+            # provider_name holds the same value on legacy rows.
             name = r["created_by_name"] or r["provider_name"]
             res = resolve_user(r["created_by_id"], name)
+            if res is None and r["facilitator_id"]:
+                res = resolve_emp(r["facilitator_id"])
             if res:
                 bucket(*res)["assessments"] += r["n"]
 
