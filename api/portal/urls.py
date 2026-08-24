@@ -155,6 +155,12 @@ from .views_service_area import (
     ServiceZipCodeDetailView,
     ServiceZipCodesView,
 )
+from .views_pod import (
+    PodImportPresignView,
+    PodImportRunDetailView,
+    PodImportRunsView,
+    PodImportStartView,
+)
 from .views_imports import (
     ImportActivityView,
     ImportPresignView,
@@ -392,6 +398,11 @@ urlpatterns = [
     path("settings/imports/presign/", ImportPresignView.as_view(), name="portal-import-presign"),
     path("settings/imports/<int:run_id>/", ImportRunDetailView.as_view(), name="portal-import-detail"),
     path("settings/imports/<int:run_id>/start/", ImportStartView.as_view(), name="portal-import-start"),
+    # Settings > Import: delivery Proof-of-Delivery report upload (async S3 flow)
+    path("settings/pod-imports/", PodImportRunsView.as_view(), name="portal-pod-import-runs"),
+    path("settings/pod-imports/presign/", PodImportPresignView.as_view(), name="portal-pod-import-presign"),
+    path("settings/pod-imports/<int:run_id>/", PodImportRunDetailView.as_view(), name="portal-pod-import-detail"),
+    path("settings/pod-imports/<int:run_id>/start/", PodImportStartView.as_view(), name="portal-pod-import-start"),
     # Settings > Import Activity: rollup of follow-up actions across case imports
     path("settings/import-activity/", ImportActivityView.as_view(), name="portal-import-activity"),
     # Settings > Import: automated Unite Us exports (request -> poll -> import)

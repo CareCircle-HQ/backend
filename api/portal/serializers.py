@@ -1925,6 +1925,7 @@ class PortalDeliveryOrderSerializer(serializers.ModelSerializer):
     custom_dietary_tags = serializers.SerializerMethodField()
     delivery_company_name = serializers.SerializerMethodField()
     delivery_address = serializers.SerializerMethodField()
+    proof_of_delivery = serializers.SerializerMethodField()
 
     class Meta:
         model = DeliveryOrder
@@ -1934,6 +1935,25 @@ class PortalDeliveryOrderSerializer(serializers.ModelSerializer):
             "kitchen_name", "menu_type_name", "custom_dietary_tags",
             "delivery_company_name", "delivery_address", "proof_of_delivery",
         ]
+
+    def get_proof_of_delivery(self, obj):
+        # Proofs now live in DeliveryOrderProof; expose short-lived presigned
+        # GET URLs (our bucket is private). Falls back to the stored file_url
+        # when S3 isn't configured. Kept as a plain list for the existing UI.
+        from api.services import import_storage
+
+        urls = []
+        for p in obj.proofs.all():
+            if p.s3_key and import_storage.s3_enabled():
+                try:
+                    urls.append(import_storage.presign_get(
+                        p.s3_key, inline=True, content_type=p.content_type or ""))
+                    continue
+                except Exception:
+                    pass
+            if p.file_url:
+                urls.append(p.file_url)
+        return urls
 
     def get_member_id(self, obj):
         return str(obj.member_id) if obj.member_id else None

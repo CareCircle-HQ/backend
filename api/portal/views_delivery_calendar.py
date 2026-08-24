@@ -47,6 +47,25 @@ def _order_state(status):
     return "scheduled"
 
 
+def _proof_urls(do):
+    """Presigned GET URLs for a DeliveryOrder's proof images (our bucket is
+    private). Falls back to the stored file_url when S3 isn't configured."""
+    from ..services import import_storage
+
+    urls = []
+    for p in do.proofs.all():
+        if p.s3_key and import_storage.s3_enabled():
+            try:
+                urls.append(import_storage.presign_get(
+                    p.s3_key, inline=True, content_type=p.content_type or ""))
+                continue
+            except Exception:
+                pass
+        if p.file_url:
+            urls.append(p.file_url)
+    return urls
+
+
 def _do_state(status):
     """Normalize a DeliveryOrder.status into a calendar state."""
     if status == "delivered":
@@ -172,6 +191,7 @@ class MemberDeliveryCalendarView(PortalAPIView):
         for do in (
             DeliveryOrder.objects.filter(member_id__in=client_ids)
             .select_related("purchase_order", "kitchen", "menu_type")
+            .prefetch_related("proofs")
         ):
             d = do.expected_delivery_date
             if d is None:
@@ -230,7 +250,7 @@ class MemberDeliveryCalendarView(PortalAPIView):
                 po_number = po.po_number if po else ""
                 po_id = str(po.pk) if po else None
                 delivered_at = do.delivered_at.isoformat() if do.delivered_at else None
-                proof = list(do.proof_of_delivery or [])
+                proof = _proof_urls(do)
             else:
                 state = _order_state(o.status)
                 status = o.status

@@ -5089,6 +5089,111 @@ class AgentAccountabilityDashboardTest(TestCase):
         self.assertEqual(rows["Kemmil Mendoza"]["assessments"], 1)
 
 
+class PodImportTest(TestCase):
+    """Proof-of-Delivery ingestion: pure parsers + the apply/dedupe path."""
+
+    def test_pure_helpers(self):
+        from .models import DeliveryOrderStatus
+        from .services import pod_import as pod
+
+        # header index maps both vendor dialects onto canonical fields
+        usp = pod.build_header_index(["ORDER #", "Member ID", "Photo POD", "Delivery Status", "Delivery Date", "Delivery Time", "Driver ID", "Delivery Note"])
+        self.assertEqual(usp["order_id"], "ORDER #")
+        self.assertEqual(usp["member_id"], "Member ID")
+        self.assertEqual(usp["photos"], "Photo POD")
+        qari = pod.build_header_index(["Driver", "Status", "Actual Start Date", "Actual Start Time", "ORDER #", "Photos", "MEMBERID"])
+        self.assertEqual(qari["photos"], "Photos")
+        self.assertEqual(qari["member_id"], "MEMBERID")
+        self.assertEqual(qari["date"], "Actual Start Date")
+
+        # multi-URL cell (QARI newline-separated) -> list; junk dropped
+        urls = pod.split_photo_urls("https://a/1\nhttps://a/2\nnot-a-url\n")
+        self.assertEqual(urls, ["https://a/1", "https://a/2"])
+        self.assertEqual(pod.split_photo_urls(""), [])
+
+        self.assertEqual(pod.map_pod_status("Completed"), DeliveryOrderStatus.DELIVERED)
+        self.assertEqual(pod.map_pod_status("Failed"), DeliveryOrderStatus.FAILED)
+        self.assertEqual(pod.map_pod_status("Returned"), DeliveryOrderStatus.RETURNED)
+        self.assertIsNone(pod.map_pod_status("Whatever"))
+
+        dt = pod.parse_delivered_at("08/03/2026", "9:44 AM")
+        self.assertIsNotNone(dt)
+        self.assertEqual((dt.month, dt.day, dt.year, dt.hour, dt.minute), (8, 3, 2026, 9, 44))
+        self.assertIsNone(pod.parse_delivered_at("", ""))
+
+    def test_signed_url_expiry(self):
+        import base64 as _b64
+        import json as _json
+
+        from .services import pod_import as pod
+
+        # CloudFront custom policy: base64(JSON) with +=/ swapped for -_~.
+        def _cf_policy_url(epoch):
+            doc = {"Statement": [{"Resource": "https://cf/*",
+                    "Condition": {"DateLessThan": {"AWS:EpochTime": epoch}}}]}
+            b64 = _b64.b64encode(_json.dumps(doc).encode()).decode()
+            cf = b64.translate(str.maketrans("+=/", "-_~"))
+            return f"https://cf/img.jpg?Policy={cf}&Signature=s&Key-Pair-Id=k"
+
+        self.assertEqual(pod.url_expiry_epoch(_cf_policy_url(1000000000)), 1000000000)
+        self.assertTrue(pod.is_url_expired(_cf_policy_url(1000000000), now=2000000000))
+        self.assertFalse(pod.is_url_expired(_cf_policy_url(1000000000), now=500000000))
+        # Canned policy (Expires=) + a plain URL with no expiry.
+        self.assertTrue(pod.is_url_expired("https://x/a.jpg?Expires=1000000000", now=2e9))
+        self.assertFalse(pod.is_url_expired("https://x/a.jpg", now=2e9))
+
+    def test_apply_creates_proof_updates_order_and_dedupes(self):
+        from unittest.mock import patch
+
+        from .models import (
+            Client, DeliveryCompany, DeliveryOrder, DeliveryOrderProof,
+            DeliveryOrderStatus, PurchaseOrder,
+        )
+        from .services import pod_import as pod
+
+        company = DeliveryCompany.objects.create(name="QARI Test")
+        client = Client.objects.create(client_id=str(uuid.uuid4()), first_name="P", last_name="O")
+        po = PurchaseOrder.objects.create()
+        do = DeliveryOrder.objects.create(
+            purchase_order=po, member=client, status=DeliveryOrderStatus.READY_FOR_DELIVERY,
+        )
+        header = "ORDER #,MEMBERID,Photos,Status,Actual Start Date,Actual Start Time,Driver,PoD - Note"
+        row = f'{do.pk},{client.pk},https://cf/img1.jpg,Completed,08/17/2026,11:30 AM,8024-JESSE,left at door'
+        csv_text = header + "\n" + row + "\n"
+
+        class _Resp:
+            status_code = 200
+            content = b"\xff\xd8\xff\xe0fakejpeg"
+            headers = {"Content-Type": "image/jpeg"}
+
+        with patch("api.services.pod_import.requests.get", return_value=_Resp()), \
+             patch("api.services.pod_import.import_storage.upload_bytes", side_effect=lambda key, data, **kw: key):
+            imp = pod.run_pod_import_from_bytes(
+                data=csv_text, delivery_company=company, source_report="qari.csv", apply=True,
+            )
+        self.assertEqual(imp.stats["matched"], 1)
+        self.assertEqual(imp.stats["proofs_created"], 1)
+        self.assertEqual(imp.stats["orders_updated"], 1)
+        do.refresh_from_db()
+        self.assertEqual(do.status, DeliveryOrderStatus.DELIVERED)
+        self.assertIsNotNone(do.delivered_at)
+        self.assertEqual(do.delivery_company_id, company.pk)
+        p = DeliveryOrderProof.objects.get(delivery_order=do)
+        self.assertEqual(p.driver, "8024-JESSE")
+        self.assertEqual(p.note, "left at door")
+        self.assertTrue(p.content_hash)
+
+        # Re-import the same report -> same image is deduped (no new proof row).
+        with patch("api.services.pod_import.requests.get", return_value=_Resp()), \
+             patch("api.services.pod_import.import_storage.upload_bytes", side_effect=lambda key, data, **kw: key):
+            imp2 = pod.run_pod_import_from_bytes(
+                data=csv_text, delivery_company=company, source_report="qari.csv", apply=True,
+            )
+        self.assertEqual(imp2.stats["proofs_created"], 0)
+        self.assertEqual(imp2.stats["proofs_deduped"], 1)
+        self.assertEqual(DeliveryOrderProof.objects.filter(delivery_order=do).count(), 1)
+
+
 class HoldPreservedThroughCaseChangeTest(TestCase):
     """A manually/auto On-Hold household must NOT be silently taken off hold when
     a new governing case arrives -- even when there's no kitchen to carry (which
