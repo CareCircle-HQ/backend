@@ -47,14 +47,15 @@ _MAX_IMAGE_BYTES = 25 * 1024 * 1024  # 25 MB guard
 # Each canonical field maps to the header names we've seen across vendors,
 # normalized (lower-cased, stripped). New vendors usually just add an alias.
 _CANDIDATES = {
-    "order_id": ["order #", "order#", "order_id", "order", "order number"],
+    "order_id": ["orderid", "order #", "order#", "order_id", "order", "order number"],
     "member_id": ["member id", "memberid", "member_id"],
-    "photos": ["photo pod", "photos", "photo", "pod photos", "photo url"],
+    "photos": ["photos", "photo pod", "photo", "pod photos", "photo url"],
     "status": ["delivery status", "status"],
-    "date": ["delivery date", "actual start date", "date"],
-    "time": ["delivery time", "actual start time", "time"],
-    "driver": ["driver id", "driver"],
-    "note": ["delivery note", "pod - note", "pod note", "note"],
+    "date": ["deliverydate", "delivery date", "actual start date", "date"],
+    "time": ["deliverytime", "delivery time", "actual start time", "time"],
+    "driver": ["driverid", "driver id", "driver"],
+    "route": ["routeid", "route id", "route_id", "route"],
+    "note": ["deliverynote", "delivery note", "pod - note", "pod note", "note"],
 }
 
 _STATUS_MAP = {
@@ -91,13 +92,15 @@ def build_header_index(fieldnames):
 
 
 def split_photo_urls(value):
-    """Split a photos cell into a de-duped list of http(s) URLs. Handles the
-    newline-separated multi-URL QARI cell and single-URL cells alike."""
+    """Split a photos cell into a de-duped list of http(s) URLs. Handles a
+    newline-separated cell (QARI) AND a comma-separated list, optionally wrapped
+    in brackets/quotes, e.g. ``[URL1, URL2, URL3]`` or ``"URL1","URL2"``."""
     if not value:
         return []
     out, seen = [], set()
     for tok in str(value).replace("\r", "\n").replace(",", "\n").split("\n"):
-        u = tok.strip()
+        # Strip surrounding whitespace, list brackets, and quotes.
+        u = tok.strip().strip("[]\"' ").strip()
         if u.lower().startswith(("http://", "https://")) and u not in seen:
             seen.add(u)
             out.append(u)
@@ -257,6 +260,7 @@ class PodImporter:
                 idx.get("time") and row.get(idx["time"]),
             )
             driver = (idx.get("driver") and row.get(idx["driver"]) or "").strip()
+            route = (idx.get("route") and row.get(idx["route"]) or "").strip()
             note = (idx.get("note") and row.get(idx["note"]) or "").strip()
 
             if self.apply:
@@ -286,8 +290,8 @@ class PodImporter:
                     self.stats["proofs_deduped"] += 1
                     continue
                 tasks.append({
-                    "order": order, "url": url,
-                    "driver": driver, "note": note, "delivered_at": delivered_at,
+                    "order": order, "url": url, "driver": driver, "route": route,
+                    "note": note, "delivered_at": delivered_at,
                 })
         return tasks
 
@@ -333,7 +337,8 @@ class PodImporter:
                     delivery_order=order, s3_key=key, content_type=content_type,
                     content_hash=digest, source_url=url[:2000],
                     delivery_company=self.company, source_report=self.source_report,
-                    driver=(task["driver"] or "")[:255], note=task["note"] or "",
+                    driver=(task["driver"] or "")[:255],
+                    route_id=(task.get("route") or "")[:255], note=task["note"] or "",
                     delivered_at=task["delivered_at"],
                 )
         except IntegrityError:
