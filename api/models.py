@@ -495,6 +495,8 @@ class Client(models.Model):
         indexes = [
             models.Index(fields=["last_name", "first_name"]),
             models.Index(fields=["date_of_birth"]),
+            # Members/Data list "Lead source" filter (exact match).
+            models.Index(fields=["lead_source"]),
         ]
 
     def save(self, *args, **kwargs):
