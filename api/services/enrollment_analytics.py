@@ -214,6 +214,95 @@ def rebuild(enrollment_ids=None, *, chunk=500, progress=None):
     return done
 
 
+def _shift_years(d, years):
+    """``d`` shifted back ``years`` years (Feb-29 safe)."""
+    try:
+        return d.replace(year=d.year - years)
+    except ValueError:
+        return d.replace(month=2, day=28, year=d.year - years)
+
+
+def filter_analytics(params):
+    """Build the filtered/sorted EnrollmentAnalytics queryset for the Data page
+    from request query params. Every filter maps to an indexed column (btree) or
+    a GIN array containment (multi-selects), so any combination stays fast."""
+    import datetime
+
+    from django.db.models import Q
+
+    qs = EnrollmentAnalytics.objects.all()
+    g = lambda k: (params.get(k) or "").strip()  # noqa: E731
+
+    search = g("search")
+    if search:
+        cond = Q(first_name__icontains=search) | Q(last_name__icontains=search) \
+            | Q(medicaid_id__icontains=search)
+        try:
+            import uuid as _uuid
+            cond |= Q(client_id=_uuid.UUID(search)) | Q(enrollment_id=int(search)) \
+                if search.isdigit() else cond | Q(client_id=_uuid.UUID(search))
+        except (ValueError, AttributeError):
+            pass
+        qs = qs.filter(cond)
+
+    # Age range -> DOB bounds.
+    today = datetime.date.today()
+    if g("age_min"):
+        qs = qs.filter(dob__lte=_shift_years(today, int(g("age_min"))))
+    if g("age_max"):
+        qs = qs.filter(dob__gte=_shift_years(today, int(g("age_max")) + 1))
+
+    # Scalar exact-match filters: param -> column.
+    for param, col in {
+        "care_coordinator": "care_coordinator__icontains",
+        "primary_care_coordinator": "primary_care_coordinator__icontains",
+        "cadence": "cadence", "kitchen": "kitchen_id", "menu_type": "menu_type",
+        "current_delivery_status": "current_delivery_status",
+        "last_po_delivery_status": "last_po_delivery_status",
+        "insurance_status": "insurance_status", "social_status": "social_status",
+        "attestation_status": "attestation_status", "stage": "stage",
+        "case_type": "case_type", "case_status": "case_status",
+        "auth_status": "auth_status",
+    }.items():
+        if g(param):
+            qs = qs.filter(**{col: g(param)})
+
+    # Boolean filters.
+    for param, col in {"has_screening": "has_screening",
+                       "has_eligibility_assessment": "has_eligibility_assessment"}.items():
+        if g(param) in ("1", "true", "yes"):
+            qs = qs.filter(**{col: True})
+        elif g(param) in ("0", "false", "no"):
+            qs = qs.filter(**{col: False})
+
+    # Date-range filters: param prefix -> column.
+    for prefix, col in {
+        "created": "member_created_at", "delivered": "last_delivered_at",
+        "insurance_exp": "insurance_expires_at", "social_exp": "social_expires_at",
+        "screening": "screening_at", "assessment": "eligibility_assessment_at",
+        "case_opened": "case_opened_at",
+    }.items():
+        if g(f"{prefix}_from"):
+            qs = qs.filter(**{f"{col}__date__gte": g(f"{prefix}_from")})
+        if g(f"{prefix}_to"):
+            qs = qs.filter(**{f"{col}__date__lte": g(f"{prefix}_to")})
+
+    # Multi-select array filters (GIN __overlap = "matches ANY of").
+    for param, col in {"allergies": "allergies", "medical_conditions": "medical_conditions",
+                       "medications": "medications", "eligible_services": "eligible_services"}.items():
+        vals = [v.strip() for v in g(param).split(",") if v.strip()]
+        if vals:
+            qs = qs.filter(**{f"{col}__overlap": vals})
+
+    # Sort.
+    sort_map = {"created": "member_created_at", "delivered": "last_delivered_at",
+                "name": "last_name", "verified": "verified_at"}
+    col = sort_map.get(g("sort"), "member_created_at")
+    if (params.get("dir") or "desc").lower() != "asc":
+        col = "-" + col
+    return qs.order_by(col, "last_name", "first_name")
+
+
 def prune_orphans():
     """Delete analytics rows whose enrollment no longer exists (CASCADE already
     handles hard deletes; this is a safety net for the nightly reconcile)."""
