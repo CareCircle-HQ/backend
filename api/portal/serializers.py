@@ -1926,6 +1926,8 @@ class PortalDeliveryOrderSerializer(serializers.ModelSerializer):
     delivery_company_name = serializers.SerializerMethodField()
     delivery_address = serializers.SerializerMethodField()
     proof_of_delivery = serializers.SerializerMethodField()
+    delivery_driver = serializers.SerializerMethodField()
+    delivery_note = serializers.SerializerMethodField()
 
     class Meta:
         model = DeliveryOrder
@@ -1934,7 +1936,22 @@ class PortalDeliveryOrderSerializer(serializers.ModelSerializer):
             "status", "status_label", "expected_delivery_date", "delivered_at",
             "kitchen_name", "menu_type_name", "custom_dietary_tags",
             "delivery_company_name", "delivery_address", "proof_of_delivery",
+            "delivery_driver", "delivery_note",
         ]
+
+    def get_delivery_driver(self, obj):
+        # Driver from the delivery report (first proof that carries one).
+        for p in obj.proofs.all():
+            if (p.driver or "").strip():
+                return p.driver
+        return ""
+
+    def get_delivery_note(self, obj):
+        # Delivery note from the report (first proof that carries one).
+        for p in obj.proofs.all():
+            if (p.note or "").strip():
+                return p.note
+        return ""
 
     def get_proof_of_delivery(self, obj):
         # Proofs now live in DeliveryOrderProof; expose short-lived presigned

@@ -3400,7 +3400,7 @@ class MemberOrdersView(PortalGenericAPIView):
         qs = (
             PurchaseOrder.objects.filter(delivery_orders__member_id=client_id)
             .distinct()
-            .prefetch_related("delivery_orders", "kitchen", "delivery_company")
+            .prefetch_related("delivery_orders__proofs", "kitchen", "delivery_company")
         )
         # Optional ?enrollment=<id> scopes orders to a SPECIFIC (superseded)
         # enrollment. DeliveryOrders aren't enrollment-linked, so scope by that

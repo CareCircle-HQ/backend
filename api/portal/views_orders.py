@@ -145,10 +145,12 @@ class PurchaseOrderDeliveryOrdersView(PortalGenericAPIView):
         qs = (
             DeliveryOrder.objects.filter(purchase_order_id=po_id)
             .select_related("member", "group", "kitchen", "menu_type", "delivery_company")
-            .prefetch_related("custom_dietary_tags")
+            .prefetch_related("custom_dietary_tags", "proofs")
         )
-        # Member search within the PO: match the delivery order's member by
-        # Client ID (the primary use), and also by first/last name. Searches the
+        # Search within the PO: match the delivery order's member by Client ID
+        # or name, AND the delivery order itself by its ORDER # (delivery order
+        # id) -- so an agent can paste an ORDER # from a delivery report to
+        # pinpoint that exact order (and its proof) inside the PO. Searches the
         # whole PO, not just the current page.
         search = (request.query_params.get("search") or "").strip()
         if search:
@@ -161,16 +163,18 @@ class PurchaseOrderDeliveryOrdersView(PortalGenericAPIView):
                 cond |= Q(member__first_name__icontains=parts[0]) & Q(
                     member__last_name__icontains=parts[-1]
                 )
-            # Client ID: exact match when a full UUID; otherwise a partial match
-            # on the textual form of the member's client_id (UUIDField can't be
-            # searched with icontains directly, so cast it to text first).
-            try:
-                cond |= Q(member__client_id=uuid.UUID(search))
-            except (ValueError, TypeError, AttributeError):
+            uid = _parse_uuid(search)
+            if uid:
+                # Full UUID -> exact match on the order id or the member id.
+                cond |= Q(delivery_order_id=uid) | Q(member__client_id=uid)
+            else:
+                # Partial -> match against the textual form of either id
+                # (UUIDField can't be icontains-searched directly, so cast).
                 qs = qs.annotate(
-                    _member_cid=Cast("member__client_id", output_field=TextField())
+                    _member_cid=Cast("member__client_id", output_field=TextField()),
+                    _do_id=Cast("delivery_order_id", output_field=TextField()),
                 )
-                cond |= Q(_member_cid__icontains=search)
+                cond |= Q(_member_cid__icontains=search) | Q(_do_id__icontains=search)
             qs = qs.filter(cond)
         page = self.paginate_queryset(qs)
         return self.get_paginated_response(self.get_serializer(page, many=True).data)
