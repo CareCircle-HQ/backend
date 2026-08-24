@@ -2712,6 +2712,32 @@ class MembersExportView(MembersListView):
         )
 
 
+class DataListView(MembersListView):
+    """Administration > Data list.
+
+    A separate endpoint that starts as an exact clone of the Members list, so the
+    two can be optimized independently: the Members list is tuned for Verifiers /
+    CS working recent (day/week/month) queries, while Data serves Admin / the data
+    team working the full picture over wide date ranges. Behaviour is identical
+    today; override :meth:`get_queryset` here to diverge without touching the
+    Members list agents rely on daily.
+    """
+
+
+class DataExportView(MembersExportView):
+    """CSV export for the Administration > Data list (clone of the Members
+    export; kept separate so the Data list can diverge)."""
+
+    def get(self, request):
+        resp = super().get(request)
+        # Only rename the download when the export actually streamed (a 403 from
+        # the management gate is a DRF Response, not the CSV stream).
+        cd = resp.get("Content-Disposition") if hasattr(resp, "get") else None
+        if cd and "members_" in cd:
+            resp["Content-Disposition"] = cd.replace("members_", "data_")
+        return resp
+
+
 class UnlinkedMembersListView(PortalGenericAPIView):
     """Urgent Care -> Un-Linked Members tab.
 
