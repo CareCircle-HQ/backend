@@ -1925,6 +1925,9 @@ class PortalDeliveryOrderSerializer(serializers.ModelSerializer):
     custom_dietary_tags = serializers.SerializerMethodField()
     delivery_company_name = serializers.SerializerMethodField()
     delivery_address = serializers.SerializerMethodField()
+    proof_of_delivery = serializers.SerializerMethodField()
+    delivery_driver = serializers.SerializerMethodField()
+    delivery_note = serializers.SerializerMethodField()
 
     class Meta:
         model = DeliveryOrder
@@ -1933,7 +1936,41 @@ class PortalDeliveryOrderSerializer(serializers.ModelSerializer):
             "status", "status_label", "expected_delivery_date", "delivered_at",
             "kitchen_name", "menu_type_name", "custom_dietary_tags",
             "delivery_company_name", "delivery_address", "proof_of_delivery",
+            "delivery_driver", "delivery_note",
         ]
+
+    def get_delivery_driver(self, obj):
+        # Driver from the delivery report (first proof that carries one).
+        for p in obj.proofs.all():
+            if (p.driver or "").strip():
+                return p.driver
+        return ""
+
+    def get_delivery_note(self, obj):
+        # Delivery note from the report (first proof that carries one).
+        for p in obj.proofs.all():
+            if (p.note or "").strip():
+                return p.note
+        return ""
+
+    def get_proof_of_delivery(self, obj):
+        # Proofs now live in DeliveryOrderProof; expose short-lived presigned
+        # GET URLs (our bucket is private). Falls back to the stored file_url
+        # when S3 isn't configured. Kept as a plain list for the existing UI.
+        from api.services import import_storage
+
+        urls = []
+        for p in obj.proofs.all():
+            if p.s3_key and import_storage.s3_enabled():
+                try:
+                    urls.append(import_storage.presign_get(
+                        p.s3_key, inline=True, content_type=p.content_type or ""))
+                    continue
+                except Exception:
+                    pass
+            if p.file_url:
+                urls.append(p.file_url)
+        return urls
 
     def get_member_id(self, obj):
         return str(obj.member_id) if obj.member_id else None

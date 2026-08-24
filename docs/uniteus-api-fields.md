@@ -154,29 +154,64 @@ Lookup only.
 
 Mapped by `map_case` → `CaseSerializer`.
 
-**attributes**
+**attributes** — ALL fields the `/cases` record returns (verified against a live
+capture 2026-08-24). "Used" = consumed by `map_case`.
 
-| Field | Type | Used as |
-| --- | --- | --- |
-| `state` | string | (info only — NOT used for status; Unite Us leaves "managed" even when closed) |
-| `description` | string | `case_description` |
-| `opened_date` | datetime | fallback for `date_opened` |
-| `closed_date` | datetime | `case_closed_at`; presence drives `case_status` = Closed |
-| `created_at` | datetime | `date_opened` (preferred; has time-of-day) |
-| `updated_at` | datetime | `updated_at` |
+| Field | Type | Used | Used as / notes |
+| --- | --- | --- | --- |
+| `state` | string | info | NOT used for status (Unite Us leaves "managed" even when closed) |
+| `resolution` | string | ✗ | e.g. "pending" — case resolution, not ingested |
+| `description` | string | ✓ | `case_description` |
+| `opened_date` | datetime | ✓ | fallback for `date_opened` |
+| `closed_date` | datetime | ✓ | `case_closed_at`; presence drives `case_status` = Closed |
+| `created_at` | datetime | ✓ | `date_opened` (preferred; has time-of-day) |
+| `ar_submitted_on` | datetime\|null | ✗ | assistance-request submitted date |
+| `client_need_id` | id\|null | ✗ | linked client need |
+| `assistance_request_id` | id\|null | ✗ | originating assistance request |
+| `updated_at` | datetime | ✓ | `updated_at` |
+| `person_condition_ids` | id[] | ✗ | linked person conditions |
 
-**relationships** (each resolved to a name via `get_resource`)
+**relationships** — ALL relationships the record returns (each `{data:{id,type}}`).
 
-| Relationship | Resolved via | Used as |
-| --- | --- | --- |
-| `person` | — | `client_id` / `subject_id` |
-| `service` | `/services` → `name` | `service_type` (the specific service = CSV **service_subtype**) |
-| `service` → **`parent`** | `/services/{id}` → `parent` → `name` | `service_category` (the broad category = CSV **service_type**, e.g. `Food Assistance`) |
-| `program` | `/programs` → `name` | `program_name`, `program_id` |
-| `network` | `/networks` → `name` | `network_name`, `network_id` |
-| `primary_worker` | `/employees` → `full_name`/`name` | `primary_worker_name`, `primary_worker_id` |
-| `provider` | `/providers` → `name` | `provider_name`, `provider_id` (managing org) |
-| `service_authorization` | `/service_authorizations/{id}` | see below |
+| Relationship | Type | Used | Resolved via / notes |
+| --- | --- | --- | --- |
+| `person` | person | ✓ | `client_id` / `subject_id` |
+| `service` | service | ✓ | `/services` → `name` → `service_type` (CSV **service_subtype**) |
+| `service` → **`parent`** | service | ✓ | `/services/{id}` → `parent` → `name` → `service_category` (CSV **service_type**) |
+| `program` | program | ✓ | `/programs` → `name` → `program_name`, `program_id` |
+| `network` | network | ✓ | `/networks` → `name` → `network_name`, `network_id` |
+| `primary_worker` | employee | ✓ | `/employees` → `full_name`/`name` → `primary_worker_name`, `primary_worker_id` |
+| `provider` | provider | ✓ | `/providers` → `name` → `provider_name`, `provider_id` (managing org) |
+| `service_authorization` | service_authorization | ✓ | `/service_authorizations/{id}` (see below) |
+| `outcome` | outcome\|null | ✗ | case outcome (null until resolved) |
+| `originating_form_submission` | form_submission\|null | ✗ | the form submission that opened the case (null for non-form cases) |
+| `person_conditions` | person_condition[] | ✗ | linked conditions |
+
+> **⚠ No case CREATOR on the `/cases` API.** The record exposes **no
+> `created_by`/`submitter`/`requestor`** field — the closest is `primary_worker`
+> (the assigned worker, NOT necessarily the creator) or, for form-opened cases,
+> `originating_form_submission` (null on the sample). The CSV export's
+> `case_created_by_id`/`case_created_by_name` (→ `Case.created_by_id`/`_name`,
+> joins `UniteUsAgent.user_id`) has **no live-API equivalent** on this endpoint.
+> So the case creator can only come from the CSV export today; the extension's
+> "stamp the logged-in agent as creator" fallback is NOT the real Unite Us
+> creator.
+>
+> **CONFIRMED (full HAR of the case page, 2026-08-24):** opening a case in the
+> Unite Us UI fires only `GET /cases/{id}` (identical to the list — no extra
+> attributes, no `include=`), plus `service_authorizations`, `referrals`
+> (empty for a directly-created internal-service case), `notes`,
+> `provided_services`, and per-employee/person/plan lookups. **There is NO
+> audit / activity / history endpoint and NO `created_by` on any case-scoped
+> response.** The case creator is therefore NOT retrievable from the API by any
+> path — cases are **CSV-only** for creator attribution.
+
+**`included` employee** (when a relationship resolves inline): attributes
+`first_name, last_name, email, phone_numbers[], work_title, addresses[],
+notification_preferences, last_checked_notifications_at, timezone, state,
+updated_at`; relationships `provider, user, roles[], programs[], fee_schedules[],
+customers[]`. NB the employee's **`user`** relationship id is the Unite Us
+`user_id` (the same key `Case.created_by_id`/`UniteUsAgent.user_id` use).
 
 Query filters used: `filter[state]=managed,off_platform`,
 `filter[internal_state]=managed,pending_authorization`,
@@ -376,6 +411,7 @@ Captured by **two** paths:
 | `screen_source` | `screen_source` | list-view form | |
 | `provider_name` | `provider_name` | list-view submitter | |
 | `performing_organization_name` | `performing_organization_name` | list-view org | |
+| `facilitator_id` | `facilitator_id` | ingestion `screen.facilitator_id` (API scan) | **employee_id** → `UniteUsAgent.employee_id` |
 | `duration` | `duration` (seconds) | detail minutes \u00d7 60 | PositiveInteger, seconds |
 | `questions_answers` | `question_primary_text` + answer\* (deduped by `answer_id`) | detail Q/A pairs | `[{question, answer}]` JSON |
 | `identified_social_needs` | `identified_social_need_name` (distinct) | screening-results chips | array of name strings |
@@ -433,6 +469,9 @@ Captured by **two** paths:
 | `form_name` | `form_name` | \u2014 | e.g. "Unite NYC - Food Assistance Assessment" |
 | `provider_name` | `submission_created_by_name` (submitter) | list-view submitter | |
 | `performing_organization_name` | `provider_name` (org) | list-view org | |
+| `created_by_id` | `submission_created_by_id` | — | user_id → `UniteUsAgent.user_id` (CSV only) |
+| `created_by_name` | `submission_created_by_name` | — | submitter name (CSV only) |
+| `facilitator_id` | — | ingestion `screen.facilitator_id` (API scan) | **employee_id** → `UniteUsAgent.employee_id`; also set by `map_assessment_api` (nightly pull) |
 | `questions_answers` | `question` + `responses` | detail Q/A pairs | `[{question, answer}]` JSON |
 | `eligible_status` | \u2014 (export has none) | "eligible" when status ~ complete | |
 | `eligible_services` | \u2014 (export has none) | eligibility-results chips | JSON list; drives `Client.is_level` |
@@ -440,6 +479,75 @@ Captured by **two** paths:
 
 > On save, `AssessmentSerializer` derives the client's service level
 > (`Client.is_level`) from any "Level 1"/"Level 2" marker in `eligible_services`.
+
+---
+
+## screenings-ingestion  (`screenings-ingestion.uniteus.io/v2/screenings`)
+
+The RESULTS host (assessments + screenings share one record shape, discriminated
+by `type`). Both the browser extension (`apiFetchScreeningList` /
+`apiFetchScreeningDetail`) and the backend `ScreeningsIngestionClient` read it.
+List: `GET /v2/screenings?person_id&type=assessment|screening&offset&limit`
+(envelope `{limit, offset, total, first/next/previous/last, screens:[…]}`);
+detail: `GET /v2/screenings/{id}?template_format=surveyjs`.
+
+**`screen` object — ALL fields** (verified against a live `type=assessment`
+capture 2026-08-24). "Used" = consumed by `map_assessment_api` / the ext.
+
+| Field | Type | Used | Notes |
+| --- | --- | --- | --- |
+| `id` | uuid | ✓ | `assessment_id` / `enhanced_screen_id` (PK) |
+| `active` | bool | ✗ | soft-delete flag (`deletion_reason` when inactive) |
+| `status` | string | ✓ | e.g. `complete` → drives `eligible_status="eligible"` on the ext |
+| `status_at` | datetime | ✓ | preferred `screen_created_at` |
+| `template_id` | uuid | ✗ | survey template |
+| `template_version` | string | ✗ | |
+| `template` | obj | ✓ | `{id, consent_code, version}` → `form_name` (via consent_code) |
+| `type` | string | ✓ | `assessment` \| `screening` (list filter) |
+| `organization_id` | uuid | ✓ | performing org; **facilitator/provider scoping** (== `x-provider-id`) |
+| `organization_name` | string\|null | ✗ | usually null in API |
+| `organization_identifiers` | any\|null | ✗ | |
+| `source` | string | ✗ | e.g. `web_app` |
+| `subject` | obj | ✓ | `{id, type:"human"}` → `subject_id` |
+| `assigned_to_id` | uuid\|null | ✗ | ASSIGNMENT (not creator); null on sample |
+| `assigned_at` | datetime\|null | ✗ | |
+| **`facilitator_id`** | uuid | ⚠ **(target)** | **the person who performed the screen == `employee_id`** → `UniteUsAgent.employee_id`. See note. |
+| `outreach_status` | string | ✗ | e.g. `success` |
+| `outreach_count` | int | ✗ | |
+| `duration` | int\|null | ✓* | seconds; null on sample |
+| `created_at` | datetime | ✓ | |
+| `updated_at` | datetime | ✓ | |
+| `identified_needs_count` | int | ✗ | |
+| `identified_needs` | array | ✓ (screening) | social needs |
+| `deletion_reason` | string\|null | ✗ | |
+| `answer_language` | string | ✗ | e.g. `en` |
+| `related_screen_id` | uuid | ✗ | links the paired assessment ↔ screening |
+| `interpersonal_safety` | obj | ✗ | `{score, interpretation, loinc_code}` |
+| `consent` | string | ✗ | e.g. `accepted` |
+| `eligible_services` | string[] | ✓ | drives `Client.is_level` (Level 1/2) |
+| `eligible_status` | bool | ✓ | true when eligible |
+
+> **⚠ Creator/facilitator IS available here — as `facilitator_id`, and it is an
+> `employee_id`.** Proven by the capture: an assessment's `facilitator_id`
+> `7da389f6-…` is the same id as the **employee** "Kemmil Mendoza" that the
+> `/cases` `included` returned for `primary_worker`. So on this API both
+> assessments AND screenings carry `facilitator_id` = **`employee_id`** →
+> joins `UniteUsAgent.employee_id`.
+>
+> **This DIFFERS from the CSV assessments export**, whose `submission_created_by_id`
+> is a **`user_id`** (→ `UniteUsAgent.user_id`). Same person, different key space.
+> Consequences for wiring an API-sourced creator:
+>   * Screenings: API `facilitator_id` == CSV `facilitator_id` (both employee_id)
+>     → `Screening.facilitator_id`. Consistent. ✓
+>   * Assessments: API `facilitator_id` (employee_id) is NOT the same key as the
+>     CSV `submission_created_by_id` (user_id) that `Assessment.created_by_id`
+>     holds. **IMPLEMENTED (option a):** the API employee_id is stored in a
+>     distinct `Assessment.facilitator_id` field (never collides with the CSV
+>     `created_by_id`). The accountability dashboard resolves assessments by
+>     `created_by_id` (user_id) first, then falls back to `facilitator_id`
+>     (employee_id), both unified through `UniteUsAgent`.
+>   * `organization_id` scopes to the performing provider (Met Council
+>     `12706c81-…`); assessments from other orgs (e.g. `5be9c12b-…`) appear too.
 
 ---
 

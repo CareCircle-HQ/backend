@@ -67,6 +67,67 @@ def process_import(self, run_id):
 
 
 @shared_task(bind=True, ignore_result=True)
+def process_pod_import(self, run_id):
+    """Download an uploaded delivery Proof-of-Delivery report from S3 and ingest
+    it (match DeliveryOrders, update status, fetch photos -> S3). The delivery
+    company id is stashed in ``run.stats['delivery_company_id']`` at presign."""
+    from .models import DeliveryCompany
+    from .services.pod_import import run_pod_import_from_bytes
+
+    run = ImportRun.objects.filter(pk=run_id).first()
+    if run is None:
+        logger.warning("process_pod_import: ImportRun %s not found", run_id)
+        return
+    if not run.file_key:
+        run.status = ImportRunStatus.FAILED
+        run.error_log = "No file_key on the POD import run -- nothing to process."
+        run.finished_at = timezone.now()
+        run.save(update_fields=["status", "error_log", "finished_at"])
+        return
+
+    company_id = (run.stats or {}).get("delivery_company_id")
+    company = DeliveryCompany.objects.filter(pk=company_id).first() if company_id else None
+
+    tmp = None
+    run.status = ImportRunStatus.RUNNING
+    run.save(update_fields=["status"])
+    try:
+        tmp = import_storage.download_to_temp(run.file_key)
+        with open(tmp.name, "rb") as fh:
+            data = fh.read()
+        importer = run_pod_import_from_bytes(
+            data=data, delivery_company=company,
+            source_report=run.original_filename or "", apply=True, run=run,
+        )
+        s = importer.stats
+        run.status = ImportRunStatus.COMPLETED
+        run.processed_count = s.get("rows", 0)
+        run.progress_total = s.get("rows", 0)
+        run.created_count = s.get("proofs_created", 0)
+        run.updated_count = s.get("orders_updated", 0)
+        run.skipped_count = s.get("unmatched", 0) + s.get("proofs_deduped", 0)
+        run.error_count = s.get("images_failed", 0) + s.get("row_errors", 0)
+        run.stats = {"delivery_pod": s, "delivery_company_id": company_id}
+        run.error_log = "\n".join(importer.errors[:200])
+        run.finished_at = timezone.now()
+        run.save()
+    except Exception as exc:
+        logger.exception("process_pod_import %s failed", run_id)
+        run.refresh_from_db()
+        run.status = ImportRunStatus.FAILED
+        run.error_log = ((run.error_log or "") + f"\nFATAL: {exc}").strip()[:10000]
+        run.finished_at = timezone.now()
+        run.save(update_fields=["status", "error_log", "finished_at"])
+    finally:
+        if tmp is not None:
+            try:
+                tmp.close()
+                os.unlink(tmp.name)
+            except OSError:
+                pass
+
+
+@shared_task(bind=True, ignore_result=True)
 def poll_uniteus_exports(self, limit=50):
     """Advance every pending Unite Us export (poll state -> download -> import ->
     reconcile). Scheduled on Celery beat; also safe to call ad-hoc."""

@@ -1704,6 +1704,13 @@ class Assessment(models.Model):
     # CSV import (the extension push carries no creator id).
     created_by_id = models.UUIDField(null=True, blank=True, db_index=True)
     created_by_name = models.CharField(max_length=255, blank=True)
+    # The screenings-ingestion API attributes an assessment to a ``facilitator_id``
+    # which is an ``employee_id`` (→ UniteUsAgent.employee_id) -- a DIFFERENT id
+    # space than the CSV export's ``submission_created_by_id`` (a ``user_id`` →
+    # created_by_id above). Stored separately so the API-sourced facilitator never
+    # collides with the CSV-sourced creator; the accountability dashboard unifies
+    # both keys through UniteUsAgent. Populated by the API mapper + the extension.
+    facilitator_id = models.UUIDField(null=True, blank=True, db_index=True)
 
     # --- Eligibility Content ---
     # Duration from E-form: "BEFORE STARTING NAVIGATION - What is the duration of the phone call?"
@@ -4461,8 +4468,9 @@ class DeliveryOrder(models.Model):
         blank=True,
         related_name="delivery_orders",
     )
-    # Proof of delivery: list of image references (URLs / storage keys).
-    proof_of_delivery = models.JSONField(default=list, blank=True)
+    # Proof of delivery now lives in the DeliveryOrderProof child model (one row
+    # per image, sourced from the per-company delivery reports). See
+    # docs/proof_of_delivery_plan.md.
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -4477,6 +4485,56 @@ class DeliveryOrder(models.Model):
 
     def __str__(self):
         return f"DeliveryOrder {self.delivery_order_id} ({self.get_status_display()})"
+
+
+class DeliveryOrderProof(models.Model):
+    """A single proof-of-delivery image for a :class:`DeliveryOrder`, ingested
+    from a delivery company's per-PO delivery report (CSV).
+
+    The image binary is copied into OUR S3 (the vendor's Photos URLs are
+    short-lived signed CloudFront links that expire), and this row records the
+    stored object + the delivery metadata from the report row. A delivery order
+    can have many proofs (multiple photos, and/or redeliveries over time).
+    ``content_hash`` (sha256 of the bytes) makes re-imports idempotent and
+    de-dupes the same image seen across reports.
+    """
+
+    delivery_order = models.ForeignKey(
+        DeliveryOrder, on_delete=models.CASCADE, related_name="proofs"
+    )
+    # Where the image lives in OUR bucket (authoritative), + a stored URL.
+    s3_key = models.CharField(max_length=500)
+    file_url = models.URLField(max_length=1000, blank=True)
+    # The original (expiring) vendor URL we fetched from -- kept for audit only.
+    source_url = models.TextField(blank=True)
+    content_type = models.CharField(max_length=100, blank=True)
+    content_hash = models.CharField(max_length=64, blank=True, db_index=True)
+    # Delivery metadata snapshotted from the report row.
+    delivery_company = models.ForeignKey(
+        DeliveryCompany, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="delivery_order_proofs",
+    )
+    driver = models.CharField(max_length=255, blank=True)
+    note = models.TextField(blank=True)
+    delivered_at = models.DateTimeField(null=True, blank=True)
+    # The source report filename / import identifier this image came from.
+    source_report = models.CharField(max_length=255, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["created_at"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["delivery_order", "content_hash"],
+                name="unique_delivery_order_proof_hash",
+            ),
+        ]
+        indexes = [
+            models.Index(fields=["delivery_order"]),
+        ]
+
+    def __str__(self):
+        return f"Proof for delivery order {self.delivery_order_id} ({self.s3_key})"
 
 
 # ===========================================================================
