@@ -179,9 +179,14 @@ def _base_qs(enrollment_ids=None):
     return qs
 
 
+# The read model is always built/read against the PRIMARY here (never the
+# replica), so the rebuild can't compute from -- or dedupe against -- lagging data.
+_PRIMARY = "default"
+
+
 def upsert_enrollment(enrollment):
-    """Build + write one enrollment's analytics row."""
-    EnrollmentAnalytics.objects.update_or_create(
+    """Build + write one enrollment's analytics row (on the primary)."""
+    EnrollmentAnalytics.objects.using(_PRIMARY).update_or_create(
         enrollment=enrollment, defaults=build_row(enrollment),
     )
 
@@ -214,9 +219,12 @@ def prune_orphans():
     handles hard deletes; this is a safety net for the nightly reconcile)."""
     live = set(EnrollmentVerification.objects.values_list("pk", flat=True))
     stale = [
-        pk for pk in EnrollmentAnalytics.objects.values_list("enrollment_id", flat=True)
+        pk for pk in EnrollmentAnalytics.objects.using(_PRIMARY)
+        .values_list("enrollment_id", flat=True)
         if pk not in live
     ]
     if stale:
-        EnrollmentAnalytics.objects.filter(enrollment_id__in=stale).delete()
+        EnrollmentAnalytics.objects.using(_PRIMARY).filter(
+            enrollment_id__in=stale
+        ).delete()
     return len(stale)
