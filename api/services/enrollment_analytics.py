@@ -46,19 +46,13 @@ def _clean(seq):
 def _derive_delivery(client_id):
     """(current_delivery_status, last_po_delivery_status, last_delivered_at) for a
     member, from their delivery orders (latest by expected date)."""
-    # "In any PO": has the member ever been included in a generated Purchase
-    # Order (a DeliveryOrder line tied to a PO), regardless of delivery status?
-    # exists() over ALL orders (not just the recent window below).
-    in_any_po = DeliveryOrder.objects.filter(
-        member_id=client_id, purchase_order__isnull=False
-    ).exists()
     orders = list(
         DeliveryOrder.objects.filter(member_id=client_id)
         .select_related("purchase_order", "delivery_company")
         .order_by("-expected_delivery_date", "-created_at")[:50]
     )
     if not orders:
-        return "", "", None, "", in_any_po
+        return "", "", None, ""
     latest = orders[0]
     current = latest.status or ""
     last_po = (latest.purchase_order.delivery_status
@@ -70,7 +64,18 @@ def _derive_delivery(client_id):
     company = next(
         (o.delivery_company.name for o in orders if o.delivery_company_id), ""
     )
-    return current, last_po, _as_aware(delivered), company, in_any_po
+    return current, last_po, _as_aware(delivered), company
+
+
+def _in_any_po(client_id):
+    """True when the member has ever been included in a generated Purchase Order
+    (a DeliveryOrder line tied to a PO), regardless of delivery status. POs carry
+    a DeliveryOrder line PER MEMBER (dependents included -- confirmed in the
+    data: nearly every member of a delivered household has their own line), so
+    this is a per-member check."""
+    return DeliveryOrder.objects.filter(
+        member_id=client_id, purchase_order__isnull=False
+    ).exists()
 
 
 def _as_aware(value):
@@ -221,7 +226,8 @@ def build_row(enrollment):
     cid = enrollment.client_id
     membership = getattr(client, "household_membership", None)
 
-    cur_del, last_po_del, last_delivered, delivery_company, in_any_po = _derive_delivery(cid)
+    cur_del, last_po_del, last_delivered, delivery_company = _derive_delivery(cid)
+    in_any_po = _in_any_po(cid)
     ins_status, ins_exp, soc_status, soc_exp = _coverage(cid)
     menu_type, allergies, conditions, meds = _dietary(enrollment.pk, cid)
     has_scr, scr_at, has_asm, asm_at, eligible = _screening_assessment(cid)
