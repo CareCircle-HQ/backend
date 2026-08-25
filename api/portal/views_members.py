@@ -2729,6 +2729,38 @@ class DataListView(PortalGenericAPIView):
         return self.get_paginated_response(self.get_serializer(page, many=True).data)
 
 
+class DataSummaryView(PortalAPIView):
+    """Administration > Data: aggregate counts for the current filter set -- the
+    'general numbers that meet the criteria' the data team works from. Same
+    filters as the list/export, served from the EnrollmentAnalytics read model
+    (fast COUNT/GROUP BY on indexed columns; routes to the replica)."""
+
+    def get(self, request):
+        from django.db.models import Count
+        from ..services.enrollment_analytics import filter_analytics
+
+        qs = filter_analytics(request.query_params)
+
+        def breakdown(field):
+            return {
+                (row[field] or "—"): row["n"]
+                for row in qs.values(field).annotate(n=Count("enrollment_id")).order_by("-n")
+            }
+
+        return Response({
+            "total": qs.count(),
+            "members": qs.values("client_id").distinct().count(),
+            "households": qs.exclude(household_id=None).values("household_id").distinct().count(),
+            "with_screening": qs.filter(has_screening=True).count(),
+            "with_eligibility_assessment": qs.filter(has_eligibility_assessment=True).count(),
+            "by_stage": breakdown("stage"),
+            "by_current_delivery_status": breakdown("current_delivery_status"),
+            "by_insurance_status": breakdown("insurance_status"),
+            "by_menu_type": breakdown("menu_type"),
+            "by_auth_status": breakdown("auth_status"),
+        })
+
+
 class DataExportView(PortalAPIView):
     """CSV export of the Data list (same read model + filters). Management-only;
     streams with a bounded-memory iterator."""
