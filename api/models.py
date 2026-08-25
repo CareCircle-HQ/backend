@@ -4856,9 +4856,9 @@ class EnrollmentAnalytics(models.Model):
     # Data-team roll-up: one bucket per member (active / pending / unable / paused
     # / closed / no_case). Derived in the builder; see _company_status.
     company_status = models.CharField(max_length=20, blank=True, db_index=True)
-    # Nutritionist who approved this member's nutrition review (name), and the
-    # delivery company on the member's latest delivery order.
-    nutritionist = models.CharField(max_length=255, blank=True, db_index=True)
+    # Nutritionist review status (pending / approved) and the delivery company on
+    # the member's latest delivery order.
+    nutritionist_status = models.CharField(max_length=20, blank=True, db_index=True)
     delivery_company = models.CharField(max_length=255, blank=True, db_index=True)
     lead_source = models.CharField(max_length=120, blank=True, db_index=True)
     team = models.CharField(max_length=120, blank=True, db_index=True)

@@ -198,6 +198,17 @@ def _company_status(enrollment, case, parity):
     return "active"
 
 
+def _nutritionist_status(enrollment):
+    """Nutrition-review status: 'approved' once a nutritionist has signed off,
+    else 'pending' for a verified member awaiting sign-off, else '' (not yet in
+    the nutrition queue)."""
+    if enrollment.nutritionist_approved_at is not None:
+        return "approved"
+    if enrollment.verified_at is not None:
+        return "pending"
+    return ""
+
+
 def build_row(enrollment):
     """Compute the EnrollmentAnalytics field dict for one enrollment."""
     client = enrollment.client
@@ -276,18 +287,15 @@ def build_row(enrollment):
         # Data-team roll-up bucket (independent: raw verification/auth/nutrition
         # + block flags + case state).
         "company_status": _company_status(enrollment, case, parity),
-        # Nutritionist who approved (name) + delivery company on latest order.
-        "nutritionist": (
-            (enrollment.nutritionist_approved_by.name if enrollment.nutritionist_approved_by_id else "")
-            or (enrollment.nutritionist_signature or "")
-        ),
+        # Nutrition-review status + delivery company on latest order.
+        "nutritionist_status": _nutritionist_status(enrollment),
         "delivery_company": delivery_company,
     }
 
 
 def _base_qs(enrollment_ids=None):
     qs = EnrollmentVerification.objects.select_related(
-        "client", "case", "kitchen", "verified_by", "nutritionist_approved_by",
+        "client", "case", "kitchen", "verified_by",
         "client__household_membership",
     ).prefetch_related(
         # Feed MemberListSerializer + its helpers without N+1 (same shape as the
@@ -399,7 +407,8 @@ def filter_analytics(params):
         "case_type": "case_type", "case_status": "case_status",
         "auth_status": "auth_status", "program": "program_name",
         "company_status": "company_status",
-        "nutritionist": "nutritionist", "delivery_company": "delivery_company",
+        "nutritionist_status": "nutritionist_status",
+        "delivery_company": "delivery_company",
         # Members-parity criteria.
         "eligibility": "eligibility", "verification_state": "verification_state",
         "program_status": "program_status", "lead_source": "lead_source",
