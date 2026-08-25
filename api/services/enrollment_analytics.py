@@ -215,23 +215,23 @@ def _company_status(enrollment, case, parity, in_any_po, has_medicaid, has_socia
     prog = parity.get("program_status") or ""
     # Unable = cannot be delivered though the case is open: out of orbit/range,
     # NOT ELIGIBLE (no valid Medicaid/social OR the hard lifecycle INELIGIBLE
-    # off-ramp), a DENIED authorization, an EXPIRED authorization (approval window
-    # lapsed -> needs reauthorization; raw status can still read "approved", so we
-    # key off the computed program_status), OR the program is ON HOLD.
+    # off-ramp), a DENIED authorization, OR an EXPIRED authorization (approval
+    # window lapsed -> needs reauthorization; raw status can still read "approved",
+    # so we key off the computed program_status).
     not_eligible = (
         (not has_medicaid) or (not has_social)
         or parity.get("eligibility") == "ineligible"
     )
     if (parity.get("out_of_orbit") or parity.get("out_of_range")
             or not_eligible or auth == "denied"
-            or prog == "Authorization Expired"
-            or stage == "on_hold" or prog == "On Hold"):
+            or prog == "Authorization Expired"):
         return "unable"
     # Paused = made it through but service paused, case still open -- by an AGENT
-    # (member status Paused) OR by a NUTRITIONIST (member status Nutritionist
-    # Paused). Program On Hold is Unable (above); eligibility pauses lack coverage
-    # and were also caught above as Unable.
-    if parity.get("paused") or member_status == "nutritionist_paused":
+    # (member status Paused), a NUTRITIONIST (member status Nutritionist Paused),
+    # OR the program is ON HOLD. (Eligibility pauses lack coverage and were caught
+    # above as Unable.)
+    if (parity.get("paused") or member_status == "nutritionist_paused"
+            or stage == "on_hold" or prog == "On Hold"):
         return "paused"
     # Active = who we're ACTUALLY serving RIGHT NOW: at Service Active (being
     # delivered) or Kitchen Assignment (ready to be assigned a kitchen) AND with a
