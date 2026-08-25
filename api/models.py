@@ -2237,6 +2237,8 @@ class EnrollmentVerification(models.Model):
             models.Index(fields=["kitchen"]),
             # Verification-requested date filter (requested_from/to -> opened_at).
             models.Index(fields=["opened_at"]),
+            # "Verified by" filter on the Members + Verification lists.
+            models.Index(fields=["verified_by"]),
         ]
         constraints = [
             # At most one LIVE verification per (navigation) case. Renewals reuse
