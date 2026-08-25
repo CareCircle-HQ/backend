@@ -26,10 +26,15 @@ bug — eligibility is screening/coverage-derived and expected for every member.
 Only the DELIVERY data on a no-case member is the anomaly.
 
 ## Detection query
+The Data page read model now BLANKS delivery fields for no-case members (so the
+Data page no longer shows delivery status on a No Case Created row). Detect the
+orphans authoritatively from the live tables instead:
 ```python
-from api.services import enrollment_analytics as ea
-ea.filter_analytics({"company_status": "no_case"}).exclude(current_delivery_status="")
-# authoritative: Client has DeliveryOrders but no internal-service Case (own or household)
+from api.models import Client, Case, CaseType, DeliveryOrder
+served = set(DeliveryOrder.objects.values_list("member_id", flat=True))
+with_is = set(Case.objects.filter(case_type=CaseType.INTERNAL_SERVICE)
+              .values_list("client_id", flat=True))
+orphans = served - with_is  # have delivery orders but NO internal-service case
 ```
 
 ## Suggested action

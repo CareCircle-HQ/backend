@@ -321,7 +321,7 @@ def build_row(client):
             (vb.name or "").strip() or (vb.agent_code or "") if vb else ""
         ) or "System"
 
-    return {
+    row = {
         "enrollment_id": (enr.pk if enr is not None else None),
         "household_id": (
             enr.household_id if enr is not None
@@ -386,6 +386,29 @@ def build_row(client):
         "nutritionist_status": _nutritionist_status(enr),
         "delivery_company": delivery_company,
     }
+
+    # NO internal-service case (No Case Created) -> the member has no food-program
+    # engagement to describe, so blank every case/enrollment/delivery-derived
+    # field. Any residual here is orphaned data (e.g. a deleted internal-service
+    # case leaving DeliveryOrders behind -- see
+    # docs/known-issue-orphaned-delivery-no-case.md). Case-independent fields
+    # (identity, eligibility, screening, coverage, attestation, tags) are kept.
+    if case is None:
+        row.update({
+            "enrollment_id": None, "stage": "", "cadence": "",
+            "kitchen_id": None, "kitchen_name": "", "menu_type": "",
+            "current_delivery_status": "", "last_po_delivery_status": "",
+            "last_delivered_at": None, "in_any_po": False, "delivery_company": "",
+            "verified_at": None, "verified_by_name": "", "verified_by_id_str": "",
+            "requested_at": None, "nutritionist_status": "",
+            "case_type": "", "case_status": "", "auth_status": "",
+            "case_opened_at": None, "case_closed_at": None, "program_name": "",
+            "service_type": "", "program_type": "", "program_status": "",
+            "verification_state": "", "out_of_orbit": False, "out_of_range": False,
+            "paused": False, "pause_type": "",
+            "allergies": [], "medical_conditions": [], "medications": [],
+        })
+    return row
 
 
 def _base_qs(client_ids=None):

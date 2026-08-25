@@ -5149,8 +5149,16 @@ class EnrollmentAnalyticsTest(TestCase):
             date_of_birth=datetime.date(1980, 5, 1), care_coordinator="CC One",
         )
         HouseholdMember.objects.create(household=hh, client=c, is_primary=True)
+        # An OPEN internal-service case -> a real "cased" member (without one the
+        # member is No Case Created and the food-program fields are blanked).
+        from .models import Case, CaseType, CaseStatus
+        case = Case.objects.create(
+            case_id=str(uuid.uuid4()), client=c, case_type=CaseType.INTERNAL_SERVICE,
+            case_status=CaseStatus.OPEN, service_authorization_status="approved",
+            date_opened=timezone.now(),
+        )
         enr = EnrollmentVerification.objects.create(
-            client=c, household=hh, stage=EnrollmentStage.SERVICE_ACTIVE,
+            client=c, household=hh, case=case, stage=EnrollmentStage.SERVICE_ACTIVE,
             verified_at=timezone.now(), delivery_weekdays=["mon", "thu"],
         )
         MemberDietaryProfile.objects.create(
