@@ -4819,6 +4819,8 @@ class EnrollmentAnalytics(models.Model):
     current_delivery_status = models.CharField(max_length=30, blank=True, db_index=True)
     last_po_delivery_status = models.CharField(max_length=30, blank=True)
     last_delivered_at = models.DateTimeField(null=True, blank=True, db_index=True)
+    # True when the member has EVER had a delivered order in any PO.
+    has_been_delivered = models.BooleanField(default=False, db_index=True)
 
     # Coverage.
     insurance_status = models.CharField(max_length=20, blank=True, db_index=True)

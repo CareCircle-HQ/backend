@@ -46,13 +46,18 @@ def _clean(seq):
 def _derive_delivery(client_id):
     """(current_delivery_status, last_po_delivery_status, last_delivered_at) for a
     member, from their delivery orders (latest by expected date)."""
+    # "Ever delivered in any PO": exists() over ALL orders (not just the recent
+    # window below), so an old delivery is never missed.
+    has_delivered = DeliveryOrder.objects.filter(
+        member_id=client_id, status="delivered"
+    ).exists()
     orders = list(
         DeliveryOrder.objects.filter(member_id=client_id)
         .select_related("purchase_order", "delivery_company")
         .order_by("-expected_delivery_date", "-created_at")[:50]
     )
     if not orders:
-        return "", "", None, ""
+        return "", "", None, "", has_delivered
     latest = orders[0]
     current = latest.status or ""
     last_po = (latest.purchase_order.delivery_status
@@ -64,7 +69,7 @@ def _derive_delivery(client_id):
     company = next(
         (o.delivery_company.name for o in orders if o.delivery_company_id), ""
     )
-    return current, last_po, _as_aware(delivered), company
+    return current, last_po, _as_aware(delivered), company, has_delivered
 
 
 def _as_aware(value):
@@ -215,7 +220,7 @@ def build_row(enrollment):
     cid = enrollment.client_id
     membership = getattr(client, "household_membership", None)
 
-    cur_del, last_po_del, last_delivered, delivery_company = _derive_delivery(cid)
+    cur_del, last_po_del, last_delivered, delivery_company, has_delivered = _derive_delivery(cid)
     ins_status, ins_exp, soc_status, soc_exp = _coverage(cid)
     menu_type, allergies, conditions, meds = _dietary(enrollment.pk, cid)
     has_scr, scr_at, has_asm, asm_at, eligible = _screening_assessment(cid)
@@ -256,6 +261,7 @@ def build_row(enrollment):
         "current_delivery_status": cur_del,
         "last_po_delivery_status": last_po_del,
         "last_delivered_at": last_delivered,
+        "has_been_delivered": has_delivered,
         "insurance_status": ins_status or "",
         "insurance_expires_at": ins_exp,
         "social_status": soc_status or "",
@@ -376,6 +382,13 @@ def filter_analytics(params):
         except (ValueError, AttributeError):
             pass
         qs = qs.filter(cond)
+
+    # Previously vs Never delivered (ever had a delivered order in any PO).
+    delivered = g("delivered")
+    if delivered == "previously":
+        qs = qs.filter(has_been_delivered=True)
+    elif delivered == "never":
+        qs = qs.filter(has_been_delivered=False)
 
     # Internal Service case filter (+ open/closed sub-filter), mirroring the
     # Members list. The read model's case_* fields describe the governing
