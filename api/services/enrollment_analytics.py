@@ -232,8 +232,9 @@ def _company_status(enrollment, case, parity, in_any_po, has_medicaid, has_socia
             or stage == "on_hold"):
         return "paused"
     # Active = who we're ACTUALLY serving: in any PO (being delivered), OR
-    # assigned to a kitchen, OR ready to be assigned (Kitchen Assignment stage).
-    if in_any_po or kitchen_id or stage == "kitchen_assignment":
+    # already at Service Active, OR assigned to a kitchen, OR ready to be assigned
+    # (Kitchen Assignment stage).
+    if in_any_po or kitchen_id or stage in ("service_active", "kitchen_assignment"):
         return "active"
     # Pending = open + unblocked + not yet serving, held up by ANY (OR) of:
     #   Verification pending  (not verified)
