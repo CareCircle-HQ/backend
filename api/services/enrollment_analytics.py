@@ -160,6 +160,12 @@ def _parity_fields(client):
 
     return {
         "eligibility": row.get("eligibility") or "",
+        # Coverage gates (NOT stored as columns -- popped in build_row and used
+        # for the Company Status "not eligible" test = no valid Medicaid OR no
+        # valid social care). Default True so a serializer miss doesn't wrongly
+        # flag someone Unable.
+        "_has_valid_medicaid": bool(row.get("has_valid_medicaid", True)),
+        "_has_valid_social_care": bool(row.get("has_valid_social_care", True)),
         "verification_state": row.get("verification_state") or "",
         "program_status": row.get("program_status_label") or "",
         "lead_source": row.get("lead_source") or "",
@@ -189,18 +195,19 @@ def _parity_fields(client):
 #               (in any PO, or assigned / ready to be assigned to a kitchen)
 
 
-def _company_status(enrollment, case, parity, in_any_po):
+def _company_status(enrollment, case, parity, in_any_po, has_medicaid, has_social):
     if case is None or getattr(case, "case_type", "") != _INTERNAL_SERVICE:
         return "no_case"
     if (getattr(case, "case_status", "") or "").lower() in ("closed", "cancelled"):
         return "closed"
     # --- governing case is OPEN below ---
     # Unable = cannot be delivered though the case is open: out of orbit/range,
-    # ineligible, OR a DENIED authorization (a terminal block, so NOT Pending --
-    # Pending's auth state is "not approved AND not denied").
+    # NOT ELIGIBLE (no valid Medicaid -- expired/nonexistent -- OR no valid social
+    # care coverage), OR a DENIED authorization (terminal block, so NOT Pending).
     auth = (getattr(case, "service_authorization_status", "") or "").lower()
+    not_eligible = (not has_medicaid) or (not has_social)
     if (parity.get("out_of_orbit") or parity.get("out_of_range")
-            or parity.get("eligibility") == "ineligible" or auth == "denied"):
+            or not_eligible or auth == "denied"):
         return "unable"
     if parity.get("paused") or (enrollment.stage or "") == "on_hold":
         return "paused"
@@ -237,6 +244,10 @@ def build_row(enrollment):
     menu_type, allergies, conditions, meds = _dietary(enrollment.pk, cid)
     has_scr, scr_at, has_asm, asm_at, eligible = _screening_assessment(cid)
     parity = _parity_fields(client)
+    # Coverage gates for the Company Status "not eligible" test -- pop so they
+    # aren't written as (nonexistent) columns.
+    has_medicaid = parity.pop("_has_valid_medicaid", True)
+    has_social = parity.pop("_has_valid_social_care", True)
 
     # Governing internal-service case: the enrollment's own case when it's
     # internal-service, else the client's most-recent internal-service case.
@@ -304,7 +315,9 @@ def build_row(enrollment):
         **parity,
         # Data-team roll-up bucket (independent: raw verification/auth/nutrition
         # + block flags + case state).
-        "company_status": _company_status(enrollment, case, parity, in_any_po),
+        "company_status": _company_status(
+            enrollment, case, parity, in_any_po, has_medicaid, has_social
+        ),
         # Nutrition-review status + delivery company on latest order.
         "nutritionist_status": _nutritionist_status(enrollment),
         "delivery_company": delivery_company,
