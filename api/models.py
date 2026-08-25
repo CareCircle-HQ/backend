@@ -2233,12 +2233,11 @@ class EnrollmentVerification(models.Model):
         indexes = [
             models.Index(fields=["client", "stage"]),
             models.Index(fields=["household", "stage"]),
-            # Kitchen filter on the Members/Data list.
-            models.Index(fields=["kitchen"]),
             # Verification-requested date filter (requested_from/to -> opened_at).
             models.Index(fields=["opened_at"]),
-            # "Verified by" filter on the Members + Verification lists.
-            models.Index(fields=["verified_by"]),
+            # NOTE: kitchen + verified_by are ForeignKeys and are ALREADY indexed
+            # by Django's automatic FK index -- no explicit index needed (see
+            # migration that drops the earlier redundant duplicates).
         ]
         constraints = [
             # At most one LIVE verification per (navigation) case. Renewals reuse
