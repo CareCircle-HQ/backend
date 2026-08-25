@@ -195,10 +195,12 @@ def _company_status(enrollment, case, parity, in_any_po):
     if (getattr(case, "case_status", "") or "").lower() in ("closed", "cancelled"):
         return "closed"
     # --- governing case is OPEN below ---
-    # Anyone blocked (paused / out of orbit / out of range / ineligible) is NOT
-    # active -- they belong in Unable / Paused, so those are checked first.
+    # Unable = cannot be delivered though the case is open: out of orbit/range,
+    # ineligible, OR a DENIED authorization (a terminal block, so NOT Pending --
+    # Pending's auth state is "not approved AND not denied").
+    auth = (getattr(case, "service_authorization_status", "") or "").lower()
     if (parity.get("out_of_orbit") or parity.get("out_of_range")
-            or parity.get("eligibility") == "ineligible"):
+            or parity.get("eligibility") == "ineligible" or auth == "denied"):
         return "unable"
     if parity.get("paused") or (enrollment.stage or "") == "on_hold":
         return "paused"
@@ -207,8 +209,8 @@ def _company_status(enrollment, case, parity, in_any_po):
     if (in_any_po or enrollment.kitchen_id
             or (enrollment.stage or "") == "kitchen_assignment"):
         return "active"
-    # Otherwise still held up in the funnel (verification / authorization /
-    # nutritional approval) -- Pending.
+    # Pending = open, unblocked, not yet serving -- held up by verification,
+    # service authorization (pending, not denied), or nutritional approval.
     return "pending"
 
 
