@@ -2785,6 +2785,7 @@ class DataSummaryView(PortalAPIView):
             "by_eligibility": breakdown("eligibility"),
             "by_service_type": breakdown("service_type"),
             "by_program_status": breakdown("program_status"),
+            "by_company_status": breakdown("company_status"),
         })
 
 

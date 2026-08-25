@@ -4853,6 +4853,9 @@ class EnrollmentAnalytics(models.Model):
     eligibility = models.CharField(max_length=20, blank=True, db_index=True)
     verification_state = models.CharField(max_length=40, blank=True, db_index=True)
     program_status = models.CharField(max_length=40, blank=True, db_index=True)
+    # Data-team roll-up: one bucket per member (active / pending / unable / paused
+    # / closed / no_case). Derived in the builder; see _company_status.
+    company_status = models.CharField(max_length=20, blank=True, db_index=True)
     lead_source = models.CharField(max_length=120, blank=True, db_index=True)
     team = models.CharField(max_length=120, blank=True, db_index=True)
     service_type = models.CharField(max_length=20, blank=True, db_index=True)

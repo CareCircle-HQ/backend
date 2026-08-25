@@ -160,6 +160,39 @@ def _parity_fields(client):
     }
 
 
+# Company Status: one bucket per member for the data team. PRIORITY ORDER (first
+# match wins) -- tell me to reorder if the business wants a different precedence:
+#   no_case  -> no governing internal-service (food) case ever
+#   closed   -> governing case is closed/cancelled
+#   unable   -> case OPEN but cannot be delivered (out of orbit / out of range /
+#               ineligible)
+#   paused   -> case OPEN, member/program service paused (Paused or On Hold)
+#   pending  -> case OPEN but held up in the funnel (verification / service
+#               authorization / nutritional approval not yet cleared)
+#   active   -> being delivered OR ready to be assigned to a kitchen
+_PENDING_PROGRAM_STATUSES = {
+    "Pending Verification", "Waiting Authorization", "Authorized",
+    "Reauthorization", "Authorization Expired", "Denied",
+}
+
+
+def _company_status(case, parity):
+    if case is None or getattr(case, "case_type", "") != _INTERNAL_SERVICE:
+        return "no_case"
+    if (getattr(case, "case_status", "") or "").lower() in ("closed", "cancelled"):
+        return "closed"
+    # --- governing case is OPEN below ---
+    if (parity.get("out_of_orbit") or parity.get("out_of_range")
+            or parity.get("eligibility") == "ineligible"):
+        return "unable"
+    if parity.get("paused") or parity.get("program_status") == "On Hold":
+        return "paused"
+    if (parity.get("program_status") in _PENDING_PROGRAM_STATUSES
+            or parity.get("verification_state") != "Verified"):
+        return "pending"
+    return "active"
+
+
 def build_row(enrollment):
     """Compute the EnrollmentAnalytics field dict for one enrollment."""
     client = enrollment.client
@@ -170,6 +203,7 @@ def build_row(enrollment):
     ins_status, ins_exp, soc_status, soc_exp = _coverage(cid)
     menu_type, allergies, conditions, meds = _dietary(enrollment.pk, cid)
     has_scr, scr_at, has_asm, asm_at, eligible = _screening_assessment(cid)
+    parity = _parity_fields(client)
 
     # Governing internal-service case: the enrollment's own case when it's
     # internal-service, else the client's most-recent internal-service case.
@@ -233,7 +267,9 @@ def build_row(enrollment):
         "requested_at": enrollment.requested_at or enrollment.opened_at,
         "case_closed_at": (case.case_closed_at if case else None),
         # Members-parity criteria (eligibility / status / flags / tags / ...).
-        **_parity_fields(client),
+        **parity,
+        # Data-team roll-up bucket (depends on the parity fields + case above).
+        "company_status": _company_status(case, parity),
     }
 
 
@@ -350,6 +386,7 @@ def filter_analytics(params):
         "attestation_status": "attestation_status", "stage": "stage",
         "case_type": "case_type", "case_status": "case_status",
         "auth_status": "auth_status", "program": "program_name",
+        "company_status": "company_status",
         # Members-parity criteria.
         "eligibility": "eligibility", "verification_state": "verification_state",
         "program_status": "program_status", "lead_source": "lead_source",
