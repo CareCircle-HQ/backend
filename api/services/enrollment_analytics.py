@@ -106,10 +106,11 @@ def _dietary(enrollment_id, client_id):
     prof = (MemberDietaryProfile.objects
             .filter(enrollment_id=enrollment_id, client_id=client_id).first())
     if prof is None:
-        return "", [], [], []
+        return "", [], [], [], ""
     return (
         prof.menu_type or "",
         _clean(prof.food_allergies), _clean(prof.conditions), _clean(prof.medications),
+        prof.status or "",
     )
 
 
@@ -195,7 +196,8 @@ def _parity_fields(client):
 #               (in any PO, or assigned / ready to be assigned to a kitchen)
 
 
-def _company_status(enrollment, case, parity, in_any_po, has_medicaid, has_social):
+def _company_status(enrollment, case, parity, in_any_po, has_medicaid, has_social,
+                    member_status=""):
     if case is None or getattr(case, "case_type", "") != _INTERNAL_SERVICE:
         return "no_case"
     if (getattr(case, "case_status", "") or "").lower() in ("closed", "cancelled"):
@@ -209,7 +211,12 @@ def _company_status(enrollment, case, parity, in_any_po, has_medicaid, has_socia
     if (parity.get("out_of_orbit") or parity.get("out_of_range")
             or not_eligible or auth == "denied"):
         return "unable"
-    if parity.get("paused") or (enrollment.stage or "") == "on_hold":
+    # Paused = made it through but service paused, case still open -- by an AGENT
+    # (member status Paused) OR by a NUTRITIONIST (member status Nutritionist
+    # Paused), OR the program is On Hold. (Eligibility pauses lack coverage, so
+    # they were already caught above as Unable.)
+    if (parity.get("paused") or member_status == "nutritionist_paused"
+            or (enrollment.stage or "") == "on_hold"):
         return "paused"
     # Active = who we're ACTUALLY serving: in any PO (being delivered), OR
     # assigned to a kitchen, OR ready to be assigned (Kitchen Assignment stage).
@@ -250,7 +257,7 @@ def build_row(enrollment):
     cur_del, last_po_del, last_delivered, delivery_company = _derive_delivery(cid)
     in_any_po = _in_any_po(cid)
     ins_status, ins_exp, soc_status, soc_exp = _coverage(cid)
-    menu_type, allergies, conditions, meds = _dietary(enrollment.pk, cid)
+    menu_type, allergies, conditions, meds, member_status = _dietary(enrollment.pk, cid)
     has_scr, scr_at, has_asm, asm_at, eligible = _screening_assessment(cid)
     parity = _parity_fields(client)
     # Coverage gates for the Company Status "not eligible" test -- pop so they
@@ -325,7 +332,8 @@ def build_row(enrollment):
         # Data-team roll-up bucket (independent: raw verification/auth/nutrition
         # + block flags + case state).
         "company_status": _company_status(
-            enrollment, case, parity, in_any_po, has_medicaid, has_social
+            enrollment, case, parity, in_any_po, has_medicaid, has_social,
+            member_status,
         ),
         # Nutrition-review status + delivery company on latest order.
         "nutritionist_status": _nutritionist_status(enrollment),
