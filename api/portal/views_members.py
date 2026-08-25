@@ -2758,6 +2758,9 @@ class DataSummaryView(PortalAPIView):
             "by_insurance_status": breakdown("insurance_status"),
             "by_menu_type": breakdown("menu_type"),
             "by_auth_status": breakdown("auth_status"),
+            "by_eligibility": breakdown("eligibility"),
+            "by_service_type": breakdown("service_type"),
+            "by_program_status": breakdown("program_status"),
         })
 
 

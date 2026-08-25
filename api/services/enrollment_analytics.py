@@ -99,6 +99,54 @@ def _screening_assessment(client_id):
     )
 
 
+def _parity_fields(client):
+    """Fields mirrored EXACTLY from the Members list (via MemberListSerializer +
+    the same view helpers), so the Data page numbers match the Members page.
+    Best-effort per field: never let one lookup fail the whole row."""
+    from api.models import Ticket, TicketStatus
+    from api.portal.serializers import MemberListSerializer
+
+    try:
+        row = MemberListSerializer(client).data
+    except Exception:  # noqa: BLE001
+        row = {}
+
+    try:
+        from api.portal.views_members import _service_type_for_client
+        service_type = _service_type_for_client(client) or ""
+    except Exception:  # noqa: BLE001
+        service_type = ""
+    try:
+        from api.portal.views_members import _case_team_map
+        team = (_case_team_map([client.pk]) or {}).get(str(client.pk), "") or ""
+    except Exception:  # noqa: BLE001
+        team = ""
+    try:
+        ticket_types = [
+            c for c in Ticket.objects.filter(
+                client_id=client.pk,
+                status__in=[TicketStatus.OPEN, TicketStatus.IN_PROGRESS],
+            ).values_list("type__code", flat=True).distinct() if c
+        ]
+    except Exception:  # noqa: BLE001
+        ticket_types = []
+
+    return {
+        "eligibility": row.get("eligibility") or "",
+        "verification_state": row.get("verification_state") or "",
+        "program_status": row.get("program_status_label") or "",
+        "lead_source": row.get("lead_source") or "",
+        "out_of_orbit": bool(row.get("out_of_orbit")),
+        "out_of_range": bool(row.get("out_of_range")),
+        "paused": bool(row.get("paused")),
+        "pause_type": row.get("pause_type") or "",
+        "tags": [t["name"] for t in (row.get("tags") or []) if t.get("name")],
+        "service_type": service_type,
+        "team": team,
+        "ticket_types": ticket_types,
+    }
+
+
 def build_row(enrollment):
     """Compute the EnrollmentAnalytics field dict for one enrollment."""
     client = enrollment.client
@@ -167,12 +215,27 @@ def build_row(enrollment):
         "medical_conditions": conditions,
         "medications": meds,
         "eligible_services": eligible,
+        # Data-team criteria straight off the enrollment/case.
+        "verified_by_id_str": str(enrollment.verified_by_id) if enrollment.verified_by_id else "",
+        "requested_at": enrollment.requested_at or enrollment.opened_at,
+        "case_closed_at": (case.case_closed_at if case else None),
+        # Members-parity criteria (eligibility / status / flags / tags / ...).
+        **_parity_fields(client),
     }
 
 
 def _base_qs(enrollment_ids=None):
     qs = EnrollmentVerification.objects.select_related(
-        "client", "case", "kitchen", "client__household_membership",
+        "client", "case", "kitchen", "verified_by",
+        "client__household_membership",
+    ).prefetch_related(
+        # Feed MemberListSerializer + its helpers without N+1 (same shape as the
+        # Members list's MEMBER_LIST_PREFETCH, reached via the client).
+        "client__insurances", "client__tags", "client__addresses",
+        "client__social_care_coverages", "client__military_profile",
+        "client__enrollments", "client__member_profiles", "client__cases",
+        "client__household_membership__household__members",
+        "client__household_membership__household__enrollment_verifications",
     )
     if enrollment_ids is not None:
         qs = qs.filter(pk__in=enrollment_ids)
@@ -263,13 +326,21 @@ def filter_analytics(params):
         "attestation_status": "attestation_status", "stage": "stage",
         "case_type": "case_type", "case_status": "case_status",
         "auth_status": "auth_status",
+        # Members-parity criteria.
+        "eligibility": "eligibility", "verification_state": "verification_state",
+        "program_status": "program_status", "lead_source": "lead_source",
+        "team": "team", "service_type": "service_type",
+        "program_type": "program_type", "pause_type": "pause_type",
+        "verified_by": "verified_by_id_str",
     }.items():
         if g(param):
             qs = qs.filter(**{col: g(param)})
 
     # Boolean filters.
     for param, col in {"has_screening": "has_screening",
-                       "has_eligibility_assessment": "has_eligibility_assessment"}.items():
+                       "has_eligibility_assessment": "has_eligibility_assessment",
+                       "out_of_orbit": "out_of_orbit", "out_of_range": "out_of_range",
+                       "paused": "paused"}.items():
         if g(param) in ("1", "true", "yes"):
             qs = qs.filter(**{col: True})
         elif g(param) in ("0", "false", "no"):
@@ -280,7 +351,8 @@ def filter_analytics(params):
         "created": "member_created_at", "delivered": "last_delivered_at",
         "insurance_exp": "insurance_expires_at", "social_exp": "social_expires_at",
         "screening": "screening_at", "assessment": "eligibility_assessment_at",
-        "case_opened": "case_opened_at",
+        "case_opened": "case_opened_at", "requested": "requested_at",
+        "closed": "case_closed_at",
     }.items():
         if g(f"{prefix}_from"):
             qs = qs.filter(**{f"{col}__date__gte": g(f"{prefix}_from")})
@@ -289,7 +361,8 @@ def filter_analytics(params):
 
     # Multi-select array filters (GIN __overlap = "matches ANY of").
     for param, col in {"allergies": "allergies", "medical_conditions": "medical_conditions",
-                       "medications": "medications", "eligible_services": "eligible_services"}.items():
+                       "medications": "medications", "eligible_services": "eligible_services",
+                       "tags": "tags", "ticket_types": "ticket_types"}.items():
         vals = [v.strip() for v in g(param).split(",") if v.strip()]
         if vals:
             qs = qs.filter(**{f"{col}__overlap": vals})

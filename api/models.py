@@ -4848,11 +4848,30 @@ class EnrollmentAnalytics(models.Model):
     case_opened_at = models.DateTimeField(null=True, blank=True, db_index=True)
     program_name = models.CharField(max_length=255, blank=True)
 
+    # --- Members-parity criteria (populated from MemberListSerializer output so
+    # the Data page numbers match the Members page exactly). ---
+    eligibility = models.CharField(max_length=20, blank=True, db_index=True)
+    verification_state = models.CharField(max_length=40, blank=True, db_index=True)
+    program_status = models.CharField(max_length=40, blank=True, db_index=True)
+    lead_source = models.CharField(max_length=120, blank=True, db_index=True)
+    team = models.CharField(max_length=120, blank=True, db_index=True)
+    service_type = models.CharField(max_length=20, blank=True, db_index=True)
+    program_type = models.CharField(max_length=20, blank=True, db_index=True)
+    out_of_orbit = models.BooleanField(default=False, db_index=True)
+    out_of_range = models.BooleanField(default=False, db_index=True)
+    paused = models.BooleanField(default=False, db_index=True)
+    pause_type = models.CharField(max_length=20, blank=True)
+    verified_by_id_str = models.CharField(max_length=64, blank=True, db_index=True)
+    requested_at = models.DateTimeField(null=True, blank=True, db_index=True)
+    case_closed_at = models.DateTimeField(null=True, blank=True, db_index=True)
+
     # --- multi-valued (array + GIN) ---
     allergies = ArrayField(models.CharField(max_length=64), default=list, blank=True)
     medical_conditions = ArrayField(models.CharField(max_length=128), default=list, blank=True)
     medications = ArrayField(models.CharField(max_length=128), default=list, blank=True)
     eligible_services = ArrayField(models.CharField(max_length=64), default=list, blank=True)
+    tags = ArrayField(models.CharField(max_length=64), default=list, blank=True)
+    ticket_types = ArrayField(models.CharField(max_length=64), default=list, blank=True)
 
     # When this row was last rebuilt (freshness watermark).
     refreshed_at = models.DateTimeField(auto_now=True, db_index=True)
@@ -4863,6 +4882,8 @@ class EnrollmentAnalytics(models.Model):
             GinIndex(fields=["medical_conditions"], name="ea_conditions_gin"),
             GinIndex(fields=["medications"], name="ea_medications_gin"),
             GinIndex(fields=["eligible_services"], name="ea_elig_services_gin"),
+            GinIndex(fields=["tags"], name="ea_tags_gin"),
+            GinIndex(fields=["ticket_types"], name="ea_ticket_types_gin"),
         ]
 
     def __str__(self):
