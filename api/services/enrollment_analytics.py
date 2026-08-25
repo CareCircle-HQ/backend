@@ -216,8 +216,17 @@ def _company_status(enrollment, case, parity, in_any_po, has_medicaid, has_socia
     if (in_any_po or enrollment.kitchen_id
             or (enrollment.stage or "") == "kitchen_assignment"):
         return "active"
-    # Pending = open, unblocked, not yet serving -- held up by verification,
-    # service authorization (pending, not denied), or nutritional approval.
+    # Pending = open + unblocked + not yet serving, held up by ANY (OR) of:
+    #   Verification pending  (not verified)
+    #   Authorization pending (not approved AND not denied -> pending/never/blank)
+    #   Nutrition pending      (not nutritionist-approved)
+    verification_pending = enrollment.verified_at is None
+    authorization_pending = auth not in ("approved", "not_required", "denied")
+    nutrition_pending = enrollment.nutritionist_approved_at is None
+    if verification_pending or authorization_pending or nutrition_pending:
+        return "pending"
+    # Cleared all gates but not yet serving (rare/anomalous) -- still not being
+    # served, so surface as Pending rather than Active.
     return "pending"
 
 
