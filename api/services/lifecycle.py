@@ -5465,8 +5465,19 @@ def reconcile_internal_service_authorization(client, *, actor=None, actor_label=
         client.ineligible_reasons = []
         client.save(update_fields=["ineligible_reasons"])
     reactivated = (was_service_inactive and bool(open_cases)) or lift_case_ineligible
+    # Always lift the sticky SERVICE_INACTIVE / case-INELIGIBLE off-ramp so the
+    # member re-derives from live data (a new open case may move them back to
+    # navigation / pending / service).
     recompute_client_stage(client, actor=actor, ignore_sticky=reactivated)
-    if reactivated and client.lifecycle_stage != ClientStage.SERVICE_INACTIVE:
+    # ...but only ANNOUNCE a "Service Reactivated" when they actually had service
+    # to resume -- i.e. their verification was completed. A NEVER-VERIFIED member
+    # (verified_at never set: no kitchen/cadence, never served) merely returns to
+    # navigation/pending, so emitting "Service Reactivated" for them is wrong.
+    if (
+        reactivated
+        and client.lifecycle_stage != ClientStage.SERVICE_INACTIVE
+        and verification_completed(client)
+    ):
         from api.services import timeline
 
         author = actor_label or _actor_name(actor)
