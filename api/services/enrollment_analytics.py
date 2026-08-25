@@ -206,37 +206,40 @@ def _company_status(enrollment, case, parity, in_any_po, has_medicaid, has_socia
     if (getattr(case, "case_status", "") or "").lower() in ("closed", "cancelled"):
         return "closed"
     # --- governing case is OPEN below ---
-    # Unable = cannot be delivered though the case is open: out of orbit/range,
-    # NOT ELIGIBLE (no valid Medicaid -- expired/nonexistent -- OR no valid social
-    # care coverage, OR the member is on the hard lifecycle INELIGIBLE off-ramp),
-    # OR a DENIED authorization (terminal block, so NOT Pending).
+    # enrollment may be None (an open internal-service case but the member never
+    # started verification -- navigation). Read enrollment fields defensively.
     auth = (getattr(case, "service_authorization_status", "") or "").lower()
+    stage = (getattr(enrollment, "stage", "") or "") if enrollment else ""
+    verified = (getattr(enrollment, "verified_at", None) is not None) if enrollment else False
+    nutrition_ok = (getattr(enrollment, "nutritionist_approved_at", None) is not None) if enrollment else False
+    prog = parity.get("program_status") or ""
+    # Unable = cannot be delivered though the case is open: out of orbit/range,
+    # NOT ELIGIBLE (no valid Medicaid/social OR the hard lifecycle INELIGIBLE
+    # off-ramp), a DENIED authorization, an EXPIRED authorization (approval window
+    # lapsed -> needs reauthorization; raw status can still read "approved", so we
+    # key off the computed program_status), OR the program is ON HOLD.
     not_eligible = (
         (not has_medicaid) or (not has_social)
         or parity.get("eligibility") == "ineligible"
     )
     if (parity.get("out_of_orbit") or parity.get("out_of_range")
-            or not_eligible or auth == "denied"):
+            or not_eligible or auth == "denied"
+            or prog == "Authorization Expired"
+            or stage == "on_hold" or prog == "On Hold"):
         return "unable"
-    # enrollment may be None (an open internal-service case but the member never
-    # started verification -- navigation). Read enrollment fields defensively.
-    stage = (getattr(enrollment, "stage", "") or "") if enrollment else ""
-    kitchen_id = getattr(enrollment, "kitchen_id", None) if enrollment else None
-    verified = (getattr(enrollment, "verified_at", None) is not None) if enrollment else False
-    nutrition_ok = (getattr(enrollment, "nutritionist_approved_at", None) is not None) if enrollment else False
     # Paused = made it through but service paused, case still open -- by an AGENT
     # (member status Paused) OR by a NUTRITIONIST (member status Nutritionist
-    # Paused), OR the program is On Hold. (Eligibility pauses lack coverage, so
-    # they were already caught above as Unable.)
-    if (parity.get("paused") or member_status == "nutritionist_paused"
-            or stage == "on_hold"):
+    # Paused). Program On Hold is Unable (above); eligibility pauses lack coverage
+    # and were also caught above as Unable.
+    if parity.get("paused") or member_status == "nutritionist_paused":
         return "paused"
     # Active = who we're ACTUALLY serving RIGHT NOW: at Service Active (being
-    # delivered) or Kitchen Assignment (ready to be assigned a kitchen). NOTE:
-    # deliberately NOT `in_any_po` (that's "EVER in a PO" -- a closed/expired
-    # member who was once delivered must not count) nor a stale `kitchen_id` on a
-    # terminal/pending enrollment.
-    if stage in ("service_active", "kitchen_assignment"):
+    # delivered) or Kitchen Assignment (ready to be assigned a kitchen) AND with a
+    # currently-VALID authorization (approved / not-required). An EXPIRED auth
+    # means service should have stopped (needs reauthorization) -> not Active; it
+    # falls through to Pending below. NOTE: deliberately NOT `in_any_po` ("EVER in
+    # a PO") nor a stale `kitchen_id` on a terminal/pending enrollment.
+    if stage in ("service_active", "kitchen_assignment") and auth in ("approved", "not_required"):
         return "active"
     # Pending = open + unblocked + not yet serving, held up by ANY (OR) of:
     #   Verification pending  (not verified)
