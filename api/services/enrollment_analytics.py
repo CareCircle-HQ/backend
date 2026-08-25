@@ -1,17 +1,20 @@
 """Build/refresh the EnrollmentAnalytics read model (Administration > Data page).
 
-One row per EnrollmentVerification, flattening every Data-page filter field from
-the live tables (incl. derived delivery status + multi-valued dietary/eligibility
-arrays). Rebuilt on a schedule (~hourly) -- see tasks.rebuild_enrollment_analytics
-and docs/analytics-architecture.md. Not the source of truth.
+One row per MEMBER (Client) -- every member, including those with no enrollment /
+no internal-service case -- flattening every Data-page filter field for the
+member's active/governing enrollment (incl. derived delivery status + multi-valued
+dietary/eligibility arrays). Rebuilt on a schedule (~hourly) -- see
+tasks.rebuild_enrollment_analytics and docs/analytics-architecture.md. Not the
+source of truth.
 """
 
 import logging
 
+from django.db.models import Prefetch
 from django.utils import timezone
 
 from ..models import (
-    Assessment, DeliveryOrder, EnrollmentAnalytics, EnrollmentVerification,
+    Assessment, Client, DeliveryOrder, EnrollmentAnalytics, EnrollmentVerification,
     Insurance, MemberDietaryProfile, Screening, SocialCareCoverage,
 )
 
@@ -211,26 +214,28 @@ def _company_status(enrollment, case, parity, in_any_po, has_medicaid, has_socia
     if (parity.get("out_of_orbit") or parity.get("out_of_range")
             or not_eligible or auth == "denied"):
         return "unable"
+    # enrollment may be None (an open internal-service case but the member never
+    # started verification -- navigation). Read enrollment fields defensively.
+    stage = (getattr(enrollment, "stage", "") or "") if enrollment else ""
+    kitchen_id = getattr(enrollment, "kitchen_id", None) if enrollment else None
+    verified = (getattr(enrollment, "verified_at", None) is not None) if enrollment else False
+    nutrition_ok = (getattr(enrollment, "nutritionist_approved_at", None) is not None) if enrollment else False
     # Paused = made it through but service paused, case still open -- by an AGENT
     # (member status Paused) OR by a NUTRITIONIST (member status Nutritionist
     # Paused), OR the program is On Hold. (Eligibility pauses lack coverage, so
     # they were already caught above as Unable.)
     if (parity.get("paused") or member_status == "nutritionist_paused"
-            or (enrollment.stage or "") == "on_hold"):
+            or stage == "on_hold"):
         return "paused"
     # Active = who we're ACTUALLY serving: in any PO (being delivered), OR
     # assigned to a kitchen, OR ready to be assigned (Kitchen Assignment stage).
-    if (in_any_po or enrollment.kitchen_id
-            or (enrollment.stage or "") == "kitchen_assignment"):
+    if in_any_po or kitchen_id or stage == "kitchen_assignment":
         return "active"
     # Pending = open + unblocked + not yet serving, held up by ANY (OR) of:
     #   Verification pending  (not verified)
     #   Authorization pending (not approved AND not denied -> pending/never/blank)
     #   Nutrition pending      (not nutritionist-approved)
-    verification_pending = enrollment.verified_at is None
-    authorization_pending = auth not in ("approved", "not_required", "denied")
-    nutrition_pending = enrollment.nutritionist_approved_at is None
-    if verification_pending or authorization_pending or nutrition_pending:
+    if (not verified) or (auth not in ("approved", "not_required", "denied")) or (not nutrition_ok):
         return "pending"
     # Cleared all gates but not yet serving (rare/anomalous) -- still not being
     # served, so surface as Pending rather than Active.
@@ -240,7 +245,9 @@ def _company_status(enrollment, case, parity, in_any_po, has_medicaid, has_socia
 def _nutritionist_status(enrollment):
     """Nutrition-review status: 'approved' once a nutritionist has signed off,
     else 'pending' for a verified member awaiting sign-off, else '' (not yet in
-    the nutrition queue)."""
+    the nutrition queue / no enrollment)."""
+    if enrollment is None:
+        return ""
     if enrollment.nutritionist_approved_at is not None:
         return "approved"
     if enrollment.verified_at is not None:
@@ -248,16 +255,31 @@ def _nutritionist_status(enrollment):
     return ""
 
 
-def build_row(enrollment):
-    """Compute the EnrollmentAnalytics field dict for one enrollment."""
-    client = enrollment.client
-    cid = enrollment.client_id
+def _active_enrollment(client):
+    """The member's active/governing enrollment (own or household), or None --
+    reuses the same helper the Members list uses for parity."""
+    from api.portal import serializers as s
+    try:
+        return s.active_enrollment(client)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def build_row(client):
+    """Compute the EnrollmentAnalytics field dict for one MEMBER (client). The
+    member may have no enrollment / no internal-service case (company_status =
+    no_case); enrollment-specific fields are then blank."""
+    cid = client.client_id
     membership = getattr(client, "household_membership", None)
+    enr = _active_enrollment(client)  # may be None
 
     cur_del, last_po_del, last_delivered, delivery_company = _derive_delivery(cid)
     in_any_po = _in_any_po(cid)
     ins_status, ins_exp, soc_status, soc_exp = _coverage(cid)
-    menu_type, allergies, conditions, meds, member_status = _dietary(enrollment.pk, cid)
+    if enr is not None:
+        menu_type, allergies, conditions, meds, member_status = _dietary(enr.pk, cid)
+    else:
+        menu_type, allergies, conditions, meds, member_status = "", [], [], [], ""
     has_scr, scr_at, has_asm, asm_at, eligible = _screening_assessment(cid)
     parity = _parity_fields(client)
     # Coverage gates for the Company Status "not eligible" test -- pop so they
@@ -265,27 +287,31 @@ def build_row(enrollment):
     has_medicaid = parity.pop("_has_valid_medicaid", True)
     has_social = parity.pop("_has_valid_social_care", True)
 
-    # Governing internal-service case: the enrollment's own case when it's
+    # Governing internal-service case: the active enrollment's own case when it's
     # internal-service, else the client's most-recent internal-service case.
-    case = enrollment.case if getattr(enrollment.case, "case_type", "") == _INTERNAL_SERVICE else None
+    case = enr.case if (enr is not None and getattr(enr.case, "case_type", "") == _INTERNAL_SERVICE) else None
     if case is None:
         case = (client.cases.filter(case_type=_INTERNAL_SERVICE)
                 .order_by("-date_opened").first())
 
     # Verified-by, mirroring the page fallback: "System" when verified with no agent.
+    verified_at = enr.verified_at if enr is not None else None
     verified_by_name = ""
-    if enrollment.verified_at is not None:
-        vb = enrollment.verified_by
+    if verified_at is not None:
+        vb = enr.verified_by
         verified_by_name = (
             (vb.name or "").strip() or (vb.agent_code or "") if vb else ""
         ) or "System"
 
     return {
-        "client_id": cid,
-        "household_id": enrollment.household_id,
+        "enrollment_id": (enr.pk if enr is not None else None),
+        "household_id": (
+            enr.household_id if enr is not None
+            else (membership.household_id if membership else None)
+        ),
         "case_id": (case.case_id if case else None),
         "is_primary": bool(membership.is_primary) if membership else False,
-        "stage": enrollment.stage or "",
+        "stage": (enr.stage or "") if enr is not None else "",
         "first_name": client.first_name or "",
         "last_name": client.last_name or "",
         "medicaid_id": getattr(client, "medicaid_id", "") or "",
@@ -293,9 +319,9 @@ def build_row(enrollment):
         "member_created_at": client.created_at,
         "care_coordinator": client.care_coordinator or "",
         "primary_care_coordinator": (case.primary_worker_name if case else "") or "",
-        "cadence": _cadence_from_weekdays(enrollment.delivery_weekdays),
-        "kitchen_id": enrollment.kitchen_id,
-        "kitchen_name": (enrollment.kitchen.name if enrollment.kitchen_id else ""),
+        "cadence": _cadence_from_weekdays(enr.delivery_weekdays if enr is not None else []),
+        "kitchen_id": (enr.kitchen_id if enr is not None else None),
+        "kitchen_name": (enr.kitchen.name if (enr is not None and enr.kitchen_id) else ""),
         "menu_type": menu_type,
         "current_delivery_status": cur_del,
         "last_po_delivery_status": last_po_del,
@@ -312,7 +338,7 @@ def build_row(enrollment):
         "screening_at": scr_at,
         "has_eligibility_assessment": has_asm,
         "eligibility_assessment_at": asm_at,
-        "verified_at": enrollment.verified_at,
+        "verified_at": verified_at,
         "verified_by_name": verified_by_name,
         "case_type": (case.case_type if case else ""),
         "case_status": (case.case_status if case else ""),
@@ -324,38 +350,44 @@ def build_row(enrollment):
         "medications": meds,
         "eligible_services": eligible,
         # Data-team criteria straight off the enrollment/case.
-        "verified_by_id_str": str(enrollment.verified_by_id) if enrollment.verified_by_id else "",
-        "requested_at": enrollment.requested_at or enrollment.opened_at,
+        "verified_by_id_str": (
+            str(enr.verified_by_id) if (enr is not None and enr.verified_by_id) else ""
+        ),
+        "requested_at": (
+            (enr.requested_at or enr.opened_at) if enr is not None else None
+        ),
         "case_closed_at": (case.case_closed_at if case else None),
         # Members-parity criteria (eligibility / status / flags / tags / ...).
         **parity,
         # Data-team roll-up bucket (independent: raw verification/auth/nutrition
         # + block flags + case state).
         "company_status": _company_status(
-            enrollment, case, parity, in_any_po, has_medicaid, has_social,
-            member_status,
+            enr, case, parity, in_any_po, has_medicaid, has_social, member_status,
         ),
         # Nutrition-review status + delivery company on latest order.
-        "nutritionist_status": _nutritionist_status(enrollment),
+        "nutritionist_status": _nutritionist_status(enr),
         "delivery_company": delivery_company,
     }
 
 
-def _base_qs(enrollment_ids=None):
-    qs = EnrollmentVerification.objects.select_related(
-        "client", "case", "kitchen", "verified_by",
-        "client__household_membership",
-    ).prefetch_related(
-        # Feed MemberListSerializer + its helpers without N+1 (same shape as the
-        # Members list's MEMBER_LIST_PREFETCH, reached via the client).
-        "client__insurances", "client__tags", "client__addresses",
-        "client__social_care_coverages", "client__military_profile",
-        "client__enrollments", "client__member_profiles", "client__cases",
-        "client__household_membership__household__members",
-        "client__household_membership__household__enrollment_verifications",
+def _base_qs(client_ids=None):
+    qs = Client.objects.select_related("household_membership").prefetch_related(
+        # Feed MemberListSerializer + its helpers (+ active_enrollment / dietary /
+        # case resolution) without N+1 -- same shape as the Members list's
+        # MEMBER_LIST_PREFETCH.
+        "insurances", "tags", "addresses", "social_care_coverages",
+        "military_profile", "member_profiles", "cases",
+        Prefetch(
+            "enrollments",
+            queryset=EnrollmentVerification.objects.select_related(
+                "kitchen", "verified_by", "case",
+            ),
+        ),
+        "household_membership__household__members",
+        "household_membership__household__enrollment_verifications",
     )
-    if enrollment_ids is not None:
-        qs = qs.filter(pk__in=enrollment_ids)
+    if client_ids is not None:
+        qs = qs.filter(pk__in=client_ids)
     return qs
 
 
@@ -364,28 +396,29 @@ def _base_qs(enrollment_ids=None):
 _PRIMARY = "default"
 
 
-def upsert_enrollment(enrollment):
-    """Build + write one enrollment's analytics row (on the primary)."""
+def upsert_client(client):
+    """Build + write one member's analytics row (on the primary)."""
     EnrollmentAnalytics.objects.using(_PRIMARY).update_or_create(
-        enrollment=enrollment, defaults=build_row(enrollment),
+        client=client, defaults=build_row(client),
     )
 
 
-def rebuild(enrollment_ids=None, *, chunk=500, progress=None):
-    """(Re)build analytics rows. Full rebuild when ``enrollment_ids`` is None.
+def rebuild(client_ids=None, *, chunk=500, progress=None):
+    """(Re)build analytics rows -- ONE PER MEMBER. Full rebuild when ``client_ids``
+    is None.
 
     ``progress(done, total)`` is an optional callback for live progress.
     Returns the number of rows written.
     """
-    qs = _base_qs(enrollment_ids)
+    qs = _base_qs(client_ids)
     total = qs.count()
     done = 0
-    for enr in qs.iterator(chunk_size=chunk):
+    for client in qs.iterator(chunk_size=chunk):
         try:
-            upsert_enrollment(enr)
+            upsert_client(client)
         except Exception as exc:  # noqa: BLE001 - never let one row kill the run
-            logger.warning("enrollment_analytics: row %s failed: %s", enr.pk, exc,
-                           exc_info=True)
+            logger.warning("enrollment_analytics: client %s failed: %s",
+                           client.pk, exc, exc_info=True)
         done += 1
         if progress and done % chunk == 0:
             progress(done, total)
@@ -517,16 +550,16 @@ def filter_analytics(params):
 
 
 def prune_orphans():
-    """Delete analytics rows whose enrollment no longer exists (CASCADE already
-    handles hard deletes; this is a safety net for the nightly reconcile)."""
-    live = set(EnrollmentVerification.objects.values_list("pk", flat=True))
+    """Delete analytics rows whose member (Client) no longer exists (CASCADE
+    already handles hard deletes; this is a safety net for the nightly reconcile)."""
+    live = set(Client.objects.values_list("pk", flat=True))
     stale = [
         pk for pk in EnrollmentAnalytics.objects.using(_PRIMARY)
-        .values_list("enrollment_id", flat=True)
+        .values_list("client_id", flat=True)
         if pk not in live
     ]
     if stale:
         EnrollmentAnalytics.objects.using(_PRIMARY).filter(
-            enrollment_id__in=stale
+            client_id__in=stale
         ).delete()
     return len(stale)

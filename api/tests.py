@@ -5162,8 +5162,10 @@ class EnrollmentAnalyticsTest(TestCase):
         )
 
         ea.rebuild()
-        row = EnrollmentAnalytics.objects.get(enrollment=enr)
+        # One row per MEMBER (client); the active enrollment feeds its fields.
+        row = EnrollmentAnalytics.objects.get(client=c)
         self.assertEqual(str(row.client_id), str(c.client_id))
+        self.assertEqual(row.enrollment_id, enr.pk)
         self.assertTrue(row.is_primary)
         self.assertEqual(row.menu_type, "Standard")
         self.assertEqual(sorted(row.allergies), ["fish", "peanuts"])

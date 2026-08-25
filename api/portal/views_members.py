@@ -2782,12 +2782,13 @@ class DataSummaryView(PortalAPIView):
         def breakdown(field):
             return {
                 (row[field] or "—"): row["n"]
-                for row in qs.values(field).annotate(n=Count("enrollment_id")).order_by("-n")
+                for row in qs.values(field).annotate(n=Count("client_id")).order_by("-n")
             }
 
         return Response({
+            # One row per MEMBER, so total == members.
             "total": qs.count(),
-            "members": qs.values("client_id").distinct().count(),
+            "members": qs.count(),
             "households": qs.exclude(household_id=None).values("household_id").distinct().count(),
             "with_screening": qs.filter(has_screening=True).count(),
             "with_eligibility_assessment": qs.filter(has_eligibility_assessment=True).count(),

@@ -4777,11 +4777,13 @@ class LeadNote(models.Model):
 
 
 class EnrollmentAnalytics(models.Model):
-    """Denormalized, per-enrollment read model powering the Administration > Data
+    """Denormalized, per-MEMBER read model powering the Administration > Data
     page (arbitrary-field filtering + exports for the data team).
 
-    One row per :class:`EnrollmentVerification`, flattening every Data-page filter
-    field -- including DERIVED values (delivery statuses, last-delivered) and
+    One row per :class:`Client` (every member, including those with no enrollment
+    / no internal-service case), flattening every Data-page filter field for the
+    member's active/governing enrollment -- including DERIVED values (delivery
+    statuses, last-delivered) and
     MULTI-VALUED ones (allergies/conditions/medications/eligible-services, stored
     as arrays with GIN indexes) -- so the Data page never joins the live 12-table
     graph. Rebuilt on a schedule (~hourly); see services/enrollment_analytics.py
@@ -4789,12 +4791,15 @@ class EnrollmentAnalytics(models.Model):
     reproducible from the operational tables.
     """
 
-    # Identity / joins (enrollment is the grain + primary link).
-    enrollment = models.OneToOneField(
-        "EnrollmentVerification", on_delete=models.CASCADE,
+    # Identity / joins. Grain = MEMBER (one row per Client), so EVERY member is
+    # represented -- including those with no enrollment / no internal-service case
+    # (company_status = no_case). enrollment_id references the member's active/
+    # governing enrollment when they have one (else null).
+    client = models.OneToOneField(
+        "Client", on_delete=models.CASCADE,
         related_name="analytics", primary_key=True,
     )
-    client_id = models.UUIDField(db_index=True)
+    enrollment_id = models.BigIntegerField(null=True, blank=True, db_index=True)
     household_id = models.UUIDField(null=True, blank=True, db_index=True)
     case_id = models.UUIDField(null=True, blank=True)
     is_primary = models.BooleanField(default=False)
@@ -4897,4 +4902,4 @@ class EnrollmentAnalytics(models.Model):
         ]
 
     def __str__(self):
-        return f"EnrollmentAnalytics({self.enrollment_id})"
+        return f"EnrollmentAnalytics(client={self.client_id})"
