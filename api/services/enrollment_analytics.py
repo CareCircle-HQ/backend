@@ -48,11 +48,11 @@ def _derive_delivery(client_id):
     member, from their delivery orders (latest by expected date)."""
     orders = list(
         DeliveryOrder.objects.filter(member_id=client_id)
-        .select_related("purchase_order")
+        .select_related("purchase_order", "delivery_company")
         .order_by("-expected_delivery_date", "-created_at")[:50]
     )
     if not orders:
-        return "", "", None
+        return "", "", None, ""
     latest = orders[0]
     current = latest.status or ""
     last_po = (latest.purchase_order.delivery_status
@@ -61,7 +61,10 @@ def _derive_delivery(client_id):
         (o.delivered_at or o.expected_delivery_date
          for o in orders if o.status == "delivered"), None
     )
-    return current, last_po, _as_aware(delivered)
+    company = next(
+        (o.delivery_company.name for o in orders if o.delivery_company_id), ""
+    )
+    return current, last_po, _as_aware(delivered), company
 
 
 def _as_aware(value):
@@ -201,7 +204,7 @@ def build_row(enrollment):
     cid = enrollment.client_id
     membership = getattr(client, "household_membership", None)
 
-    cur_del, last_po_del, last_delivered = _derive_delivery(cid)
+    cur_del, last_po_del, last_delivered, delivery_company = _derive_delivery(cid)
     ins_status, ins_exp, soc_status, soc_exp = _coverage(cid)
     menu_type, allergies, conditions, meds = _dietary(enrollment.pk, cid)
     has_scr, scr_at, has_asm, asm_at, eligible = _screening_assessment(cid)
@@ -273,12 +276,18 @@ def build_row(enrollment):
         # Data-team roll-up bucket (independent: raw verification/auth/nutrition
         # + block flags + case state).
         "company_status": _company_status(enrollment, case, parity),
+        # Nutritionist who approved (name) + delivery company on latest order.
+        "nutritionist": (
+            (enrollment.nutritionist_approved_by.name if enrollment.nutritionist_approved_by_id else "")
+            or (enrollment.nutritionist_signature or "")
+        ),
+        "delivery_company": delivery_company,
     }
 
 
 def _base_qs(enrollment_ids=None):
     qs = EnrollmentVerification.objects.select_related(
-        "client", "case", "kitchen", "verified_by",
+        "client", "case", "kitchen", "verified_by", "nutritionist_approved_by",
         "client__household_membership",
     ).prefetch_related(
         # Feed MemberListSerializer + its helpers without N+1 (same shape as the
@@ -390,6 +399,7 @@ def filter_analytics(params):
         "case_type": "case_type", "case_status": "case_status",
         "auth_status": "auth_status", "program": "program_name",
         "company_status": "company_status",
+        "nutritionist": "nutritionist", "delivery_company": "delivery_company",
         # Members-parity criteria.
         "eligibility": "eligibility", "verification_state": "verification_state",
         "program_status": "program_status", "lead_source": "lead_source",

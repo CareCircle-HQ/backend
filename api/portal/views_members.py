@@ -2753,6 +2753,34 @@ class DataProgramsView(PortalAPIView):
         return Response([{"value": n, "label": n} for n in names])
 
 
+class DataNutritionistsView(PortalAPIView):
+    """Administration > Data: nutritionist filter options (Agents in the
+    Nutritionist group). Values are names -- matching EnrollmentAnalytics.nutritionist."""
+
+    def get(self, request):
+        from ..models import Agent
+
+        names = sorted({
+            n for n in Agent.objects.filter(group="Nutritionist")
+            .values_list("name", flat=True) if n
+        })
+        return Response([{"value": n, "label": n} for n in names])
+
+
+class DataDeliveryCompaniesView(PortalAPIView):
+    """Administration > Data: delivery-company filter options. Values are names --
+    matching EnrollmentAnalytics.delivery_company (the company on a member's
+    latest delivery order)."""
+
+    def get(self, request):
+        from ..models import DeliveryCompany
+
+        names = sorted({
+            n for n in DeliveryCompany.objects.values_list("name", flat=True) if n
+        })
+        return Response([{"value": n, "label": n} for n in names])
+
+
 class DataSummaryView(PortalAPIView):
     """Administration > Data: aggregate counts for the current filter set -- the
     'general numbers that meet the criteria' the data team works from. Same
