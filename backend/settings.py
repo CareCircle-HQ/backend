@@ -202,6 +202,32 @@ if os.getenv('DB_SSLMODE'):
         'connect_timeout': int(os.getenv('DB_CONNECT_TIMEOUT', '10')),
     }
 
+# Optional read replica for analytics (Phase 2). When REPLICA_DB_HOST is set, a
+# 'replica' alias is added and AnalyticsRouter routes read-only analytics queries
+# (the Data page's EnrollmentAnalytics) to it, keeping heavy reads off the primary.
+# Inherits the default's engine/name/creds unless overridden by REPLICA_DB_*.
+# Unset (local/CI) -> no replica, and the router is a no-op (reads hit default).
+if os.getenv('REPLICA_DB_HOST'):
+    DATABASES['replica'] = {
+        'ENGINE': os.getenv('DB_ENGINE', 'django.db.backends.postgresql'),
+        'NAME': os.getenv('REPLICA_DB_NAME', DATABASES['default']['NAME']),
+        'USER': os.getenv('REPLICA_DB_USER', DATABASES['default']['USER']),
+        'PASSWORD': os.getenv('REPLICA_DB_PASSWORD', DATABASES['default']['PASSWORD']),
+        'HOST': os.getenv('REPLICA_DB_HOST'),
+        'PORT': os.getenv('REPLICA_DB_PORT', DATABASES['default']['PORT']),
+        'CONN_MAX_AGE': int(os.getenv('DB_CONN_MAX_AGE', '60')),
+        'CONN_HEALTH_CHECKS': os.getenv('DB_CONN_HEALTH_CHECKS', 'true').lower() == 'true',
+        # A physical replica is read-only; never route writes/migrations here.
+        'TEST': {'MIRROR': 'default'},
+    }
+    if os.getenv('DB_SSLMODE'):
+        DATABASES['replica']['OPTIONS'] = {
+            'sslmode': os.getenv('DB_SSLMODE'),
+            'connect_timeout': int(os.getenv('DB_CONNECT_TIMEOUT', '10')),
+        }
+
+DATABASE_ROUTERS = ['api.db_routers.AnalyticsRouter']
+
 # Optional read-only comparison database (a PRIOR snapshot restored locally),
 # exposed as the ``old`` alias for ``.using('old')`` diff queries. Only added
 # when OLD_DB_NAME is set (local dev), so prod/CI are unaffected. Inherits the
@@ -414,6 +440,14 @@ CELERY_BEAT_SCHEDULE = {
     "import-uniteus-assessment-results": {
         "task": "api.tasks.import_uniteus_assessment_results",
         "schedule": crontab(minute=30, hour=3),
+    },
+    # Hourly rebuild of the EnrollmentAnalytics read model backing the
+    # Administration > Data page (1-hour freshness SLA). Full rebuild + orphan
+    # prune; safe to run any time. Runs at :20 past each hour to avoid the
+    # top-of-hour crunch with the export poller. See docs/analytics-architecture.md.
+    "rebuild-enrollment-analytics": {
+        "task": "api.tasks.rebuild_enrollment_analytics",
+        "schedule": crontab(minute=20),
     },
 }
 

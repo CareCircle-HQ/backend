@@ -5089,6 +5089,66 @@ class AgentAccountabilityDashboardTest(TestCase):
         self.assertEqual(rows["Kemmil Mendoza"]["assessments"], 1)
 
 
+class EnrollmentAnalyticsTest(TestCase):
+    """Phase 1 read model: builder correctness + Phase 2 router no-op."""
+
+    def test_build_row_and_rebuild(self):
+        import datetime
+        from .models import (
+            Client, EnrollmentAnalytics, EnrollmentVerification, EnrollmentStage,
+            Household, HouseholdMember, Insurance, InsurancePlanType,
+            MemberDietaryProfile, RecordStatus,
+        )
+        from .services import enrollment_analytics as ea
+
+        hh = Household.objects.create()
+        c = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="ANA", last_name="LEE",
+            date_of_birth=datetime.date(1980, 5, 1), care_coordinator="CC One",
+        )
+        HouseholdMember.objects.create(household=hh, client=c, is_primary=True)
+        enr = EnrollmentVerification.objects.create(
+            client=c, household=hh, stage=EnrollmentStage.SERVICE_ACTIVE,
+            verified_at=timezone.now(), delivery_weekdays=["mon", "thu"],
+        )
+        MemberDietaryProfile.objects.create(
+            enrollment=enr, client=c, menu_type="Standard",
+            food_allergies=["peanuts", "fish"], conditions=["Diabetic"],
+        )
+        Insurance.objects.create(
+            client=c, plan_type=InsurancePlanType.MEDICAID, status=RecordStatus.ACTIVE,
+        )
+
+        ea.rebuild()
+        row = EnrollmentAnalytics.objects.get(enrollment=enr)
+        self.assertEqual(str(row.client_id), str(c.client_id))
+        self.assertTrue(row.is_primary)
+        self.assertEqual(row.menu_type, "Standard")
+        self.assertEqual(sorted(row.allergies), ["fish", "peanuts"])
+        self.assertEqual(row.medical_conditions, ["Diabetic"])
+        self.assertEqual(row.cadence, "mon_thu")
+        self.assertEqual(row.insurance_status, "active")
+        self.assertEqual(row.care_coordinator, "CC One")
+        # Verified with no agent -> "System" (mirrors the page fallback).
+        self.assertEqual(row.verified_by_name, "System")
+
+        # GIN array containment filter works (multi-select semantics).
+        self.assertTrue(
+            EnrollmentAnalytics.objects.filter(allergies__contains=["fish"]).exists()
+        )
+
+    def test_router_is_noop_without_replica(self):
+        from django.conf import settings
+        from .db_routers import AnalyticsRouter
+        from .models import EnrollmentAnalytics
+
+        self.assertNotIn("replica", settings.DATABASES)  # not configured in tests
+        r = AnalyticsRouter()
+        self.assertIsNone(r.db_for_read(EnrollmentAnalytics))   # -> default
+        self.assertIsNone(r.db_for_write(EnrollmentAnalytics))  # -> default
+        self.assertFalse(r.allow_migrate("replica", "api"))
+
+
 class PodImportTest(TestCase):
     """Proof-of-Delivery ingestion: pure parsers + the apply/dedupe path."""
 

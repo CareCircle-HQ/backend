@@ -32,6 +32,7 @@ from ..models import (
     CaseStatus,
     CaseType,
     Client,
+    EnrollmentAnalytics,
     CommunicationChannel,
     CommunicationTimeOfDay,
     DeliveryCompany,
@@ -1016,8 +1017,14 @@ class MemberListSerializer(serializers.Serializer):
 
     def get_verification_completed_by(self, obj):
         # Agent who completed the verification pop-up (set alongside verified_at).
+        # Only the pop-up wizard attributes a verifier; verifications carried over
+        # from a CRM/import/backfill have verified_at set but no agent -- show
+        # "System" for those (rather than a blank that looks like missing data).
+        # Null only when the household isn't verified at all (no verified_at).
         enr = active_enrollment(obj)
-        return _agent_name(enr.verified_by) if enr else None
+        if enr is None or enr.verified_at is None:
+            return None
+        return _agent_name(enr.verified_by) or "System"
 
 
 def _household_context(client):
@@ -2603,3 +2610,42 @@ class VerificationCreateSerializer(serializers.Serializer):
     auth_status = serializers.ChoiceField(
         choices=["Draft", "Pending", "Accepted", "Denied"], default="Pending"
     )
+
+
+class EnrollmentAnalyticsSerializer(serializers.ModelSerializer):
+    """Flat per-enrollment row for the Administration > Data page (served from
+    the EnrollmentAnalytics read model)."""
+
+    id = serializers.CharField(source="enrollment_id", read_only=True)
+    client_id = serializers.CharField(read_only=True)
+    name = serializers.SerializerMethodField()
+    age = serializers.SerializerMethodField()
+
+    class Meta:
+        model = EnrollmentAnalytics
+        fields = [
+            "id", "client_id", "name", "first_name", "last_name", "medicaid_id",
+            "dob", "age", "member_created_at", "stage", "is_primary",
+            "care_coordinator", "primary_care_coordinator", "cadence",
+            "kitchen_name", "menu_type",
+            "current_delivery_status", "last_po_delivery_status", "last_delivered_at",
+            "insurance_status", "insurance_expires_at",
+            "social_status", "social_expires_at",
+            "attestation_status", "attestation_requested_at", "attestation_completed_at",
+            "has_screening", "screening_at",
+            "has_eligibility_assessment", "eligibility_assessment_at",
+            "verified_at", "verified_by_name",
+            "case_type", "case_status", "auth_status", "case_opened_at", "program_name",
+            "allergies", "medical_conditions", "medications", "eligible_services",
+            "refreshed_at",
+        ]
+
+    def get_name(self, obj):
+        return f"{obj.first_name} {obj.last_name}".strip()
+
+    def get_age(self, obj):
+        if not obj.dob:
+            return None
+        import datetime
+        t = datetime.date.today()
+        return t.year - obj.dob.year - ((t.month, t.day) < (obj.dob.month, obj.dob.day))

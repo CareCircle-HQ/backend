@@ -2712,30 +2712,61 @@ class MembersExportView(MembersListView):
         )
 
 
-class DataListView(MembersListView):
-    """Administration > Data list.
-
-    A separate endpoint that starts as an exact clone of the Members list, so the
-    two can be optimized independently: the Members list is tuned for Verifiers /
-    CS working recent (day/week/month) queries, while Data serves Admin / the data
-    team working the full picture over wide date ranges. Behaviour is identical
-    today; override :meth:`get_queryset` here to diverge without touching the
-    Members list agents rely on daily.
+class DataListView(PortalGenericAPIView):
+    """Administration > Data list: a flat, per-enrollment view served from the
+    EnrollmentAnalytics read model (denormalized + indexed, incl. GIN arrays for
+    the multi-select filters), so the data team can filter on almost any field
+    fast. Reads route to the read replica when configured (AnalyticsRouter).
     """
 
-
-class DataExportView(MembersExportView):
-    """CSV export for the Administration > Data list (clone of the Members
-    export; kept separate so the Data list can diverge)."""
+    serializer_class = s.EnrollmentAnalyticsSerializer
 
     def get(self, request):
-        resp = super().get(request)
-        # Only rename the download when the export actually streamed (a 403 from
-        # the management gate is a DRF Response, not the CSV stream).
-        cd = resp.get("Content-Disposition") if hasattr(resp, "get") else None
-        if cd and "members_" in cd:
-            resp["Content-Disposition"] = cd.replace("members_", "data_")
-        return resp
+        from ..services.enrollment_analytics import filter_analytics
+
+        qs = filter_analytics(request.query_params)
+        page = self.paginate_queryset(qs)
+        return self.get_paginated_response(self.get_serializer(page, many=True).data)
+
+
+class DataExportView(PortalAPIView):
+    """CSV export of the Data list (same read model + filters). Management-only;
+    streams with a bounded-memory iterator."""
+
+    def get(self, request):
+        agent = current_agent(request)
+        if not (agent and (getattr(agent, "is_manager", False) or agent.group == "Management")):
+            return Response(
+                {"detail": "Management access required."}, status=http.HTTP_403_FORBIDDEN
+            )
+        from ..services.enrollment_analytics import filter_analytics
+        from .report_exports import stream_csv_response
+
+        qs = filter_analytics(request.query_params)
+        fields = [
+            "enrollment_id", "client_id", "first_name", "last_name", "medicaid_id",
+            "dob", "stage", "is_primary", "care_coordinator", "primary_care_coordinator",
+            "cadence", "kitchen_name", "menu_type", "current_delivery_status",
+            "last_po_delivery_status", "last_delivered_at", "insurance_status",
+            "insurance_expires_at", "social_status", "social_expires_at",
+            "attestation_status", "has_screening", "screening_at",
+            "has_eligibility_assessment", "eligibility_assessment_at", "verified_at",
+            "verified_by_name", "case_type", "case_status", "auth_status",
+            "case_opened_at", "program_name", "allergies", "medical_conditions",
+            "medications", "eligible_services",
+        ]
+
+        def rows():
+            yield fields
+            for r in qs.values_list(*fields).iterator(chunk_size=1000):
+                yield [
+                    ",".join(v) if isinstance(v, list) else ("" if v is None else str(v))
+                    for v in r
+                ]
+
+        return stream_csv_response(
+            rows(), f"data_{timezone.localdate().isoformat()}.csv",
+        )
 
 
 class UnlinkedMembersListView(PortalGenericAPIView):

@@ -6,6 +6,8 @@ from django.conf import settings
 from django.contrib.auth.hashers import check_password, make_password
 from django.contrib.contenttypes.fields import GenericForeignKey
 from django.contrib.contenttypes.models import ContentType
+from django.contrib.postgres.fields import ArrayField
+from django.contrib.postgres.indexes import GinIndex
 from django.db import models
 from django.utils import timezone
 
@@ -495,6 +497,8 @@ class Client(models.Model):
         indexes = [
             models.Index(fields=["last_name", "first_name"]),
             models.Index(fields=["date_of_birth"]),
+            # Members/Data list "Lead source" filter (exact match).
+            models.Index(fields=["lead_source"]),
         ]
 
     def save(self, *args, **kwargs):
@@ -681,6 +685,8 @@ class Insurance(models.Model):
         indexes = [
             models.Index(fields=["client", "status"]),
             models.Index(fields=["insurance_id"]),
+            # Expiring-insurance filter/warnings (expired_at date range).
+            models.Index(fields=["expired_at"]),
         ]
 
     def __str__(self):
@@ -722,6 +728,8 @@ class SocialCareCoverage(models.Model):
         indexes = [
             models.Index(fields=["client", "status"]),
             models.Index(fields=["external_member_id"]),
+            # Expiring social-care-coverage filter/warnings (expired_at range).
+            models.Index(fields=["expired_at"]),
         ]
 
     def __str__(self):
@@ -1500,6 +1508,18 @@ class Case(models.Model):
                 fields=["client", "case_type", "-date_opened"],
                 name="api_case_client_type_dopen_idx",
             ),
+            # Members/Data list default filter: internal-service cases opened in a
+            # date window (created_from/created_to -> case_type + date_opened,
+            # across ALL cases before the client join). Index the global predicate.
+            models.Index(
+                fields=["case_type", "date_opened"],
+                name="api_case_type_dopen_idx",
+            ),
+            # Closed-date filter (closed_from/closed_to -> case_closed_at).
+            models.Index(
+                fields=["case_type", "case_closed_at"],
+                name="api_case_type_closed_idx",
+            ),
         ]
 
     def __str__(self):
@@ -2213,6 +2233,10 @@ class EnrollmentVerification(models.Model):
         indexes = [
             models.Index(fields=["client", "stage"]),
             models.Index(fields=["household", "stage"]),
+            # Kitchen filter on the Members/Data list.
+            models.Index(fields=["kitchen"]),
+            # Verification-requested date filter (requested_from/to -> opened_at).
+            models.Index(fields=["opened_at"]),
         ]
         constraints = [
             # At most one LIVE verification per (navigation) case. Renewals reuse
@@ -4481,6 +4505,8 @@ class DeliveryOrder(models.Model):
             models.Index(fields=["status"]),
             models.Index(fields=["member"]),
             models.Index(fields=["expected_delivery_date"]),
+            # "Last delivered" lookups (latest delivered_at per member).
+            models.Index(fields=["member", "delivered_at"]),
         ]
 
     def __str__(self):
@@ -4747,3 +4773,96 @@ class LeadNote(models.Model):
 
     def __str__(self):
         return f"Note on {self.lead_id} by {self.author_name or 'agent'}"
+
+
+class EnrollmentAnalytics(models.Model):
+    """Denormalized, per-enrollment read model powering the Administration > Data
+    page (arbitrary-field filtering + exports for the data team).
+
+    One row per :class:`EnrollmentVerification`, flattening every Data-page filter
+    field -- including DERIVED values (delivery statuses, last-delivered) and
+    MULTI-VALUED ones (allergies/conditions/medications/eligible-services, stored
+    as arrays with GIN indexes) -- so the Data page never joins the live 12-table
+    graph. Rebuilt on a schedule (~hourly); see services/enrollment_analytics.py
+    and docs/analytics-architecture.md. NOT the source of truth -- always
+    reproducible from the operational tables.
+    """
+
+    # Identity / joins (enrollment is the grain + primary link).
+    enrollment = models.OneToOneField(
+        "EnrollmentVerification", on_delete=models.CASCADE,
+        related_name="analytics", primary_key=True,
+    )
+    client_id = models.UUIDField(db_index=True)
+    household_id = models.UUIDField(null=True, blank=True, db_index=True)
+    case_id = models.UUIDField(null=True, blank=True)
+    is_primary = models.BooleanField(default=False)
+    stage = models.CharField(max_length=25, blank=True, db_index=True)
+
+    # Display / export identity.
+    first_name = models.CharField(max_length=255, blank=True)
+    last_name = models.CharField(max_length=255, blank=True)
+    medicaid_id = models.CharField(max_length=64, blank=True)
+
+    # --- scalar filter columns (btree via db_index) ---
+    dob = models.DateField(null=True, blank=True, db_index=True)
+    member_created_at = models.DateTimeField(null=True, blank=True, db_index=True)
+    care_coordinator = models.CharField(max_length=255, blank=True, db_index=True)
+    primary_care_coordinator = models.CharField(max_length=255, blank=True)
+    cadence = models.CharField(max_length=40, blank=True, db_index=True)
+    kitchen_id = models.UUIDField(null=True, blank=True, db_index=True)
+    kitchen_name = models.CharField(max_length=255, blank=True)
+    menu_type = models.CharField(max_length=120, blank=True, db_index=True)
+
+    # Derived delivery fields.
+    current_delivery_status = models.CharField(max_length=30, blank=True, db_index=True)
+    last_po_delivery_status = models.CharField(max_length=30, blank=True)
+    last_delivered_at = models.DateTimeField(null=True, blank=True, db_index=True)
+
+    # Coverage.
+    insurance_status = models.CharField(max_length=20, blank=True, db_index=True)
+    insurance_expires_at = models.DateTimeField(null=True, blank=True, db_index=True)
+    social_status = models.CharField(max_length=20, blank=True, db_index=True)
+    social_expires_at = models.DateTimeField(null=True, blank=True, db_index=True)
+
+    # Attestation (dates nullable -- backfilled from CRM later).
+    attestation_status = models.CharField(max_length=20, blank=True, db_index=True)
+    attestation_requested_at = models.DateTimeField(null=True, blank=True)
+    attestation_completed_at = models.DateTimeField(null=True, blank=True)
+
+    # Screening / eligibility assessment.
+    has_screening = models.BooleanField(default=False, db_index=True)
+    screening_at = models.DateTimeField(null=True, blank=True)
+    has_eligibility_assessment = models.BooleanField(default=False, db_index=True)
+    eligibility_assessment_at = models.DateTimeField(null=True, blank=True)
+
+    # Verification provenance (mirrors the "System" fallback used on the pages).
+    verified_at = models.DateTimeField(null=True, blank=True, db_index=True)
+    verified_by_name = models.CharField(max_length=255, blank=True)
+
+    # Governing internal-service case snapshot.
+    case_type = models.CharField(max_length=20, blank=True, db_index=True)
+    case_status = models.CharField(max_length=25, blank=True, db_index=True)
+    auth_status = models.CharField(max_length=20, blank=True, db_index=True)
+    case_opened_at = models.DateTimeField(null=True, blank=True, db_index=True)
+    program_name = models.CharField(max_length=255, blank=True)
+
+    # --- multi-valued (array + GIN) ---
+    allergies = ArrayField(models.CharField(max_length=64), default=list, blank=True)
+    medical_conditions = ArrayField(models.CharField(max_length=128), default=list, blank=True)
+    medications = ArrayField(models.CharField(max_length=128), default=list, blank=True)
+    eligible_services = ArrayField(models.CharField(max_length=64), default=list, blank=True)
+
+    # When this row was last rebuilt (freshness watermark).
+    refreshed_at = models.DateTimeField(auto_now=True, db_index=True)
+
+    class Meta:
+        indexes = [
+            GinIndex(fields=["allergies"], name="ea_allergies_gin"),
+            GinIndex(fields=["medical_conditions"], name="ea_conditions_gin"),
+            GinIndex(fields=["medications"], name="ea_medications_gin"),
+            GinIndex(fields=["eligible_services"], name="ea_elig_services_gin"),
+        ]
+
+    def __str__(self):
+        return f"EnrollmentAnalytics({self.enrollment_id})"
