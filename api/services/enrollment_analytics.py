@@ -201,9 +201,13 @@ def _parity_fields(client):
 
 
 def _company_status(enrollment, case, parity, in_any_po, has_medicaid, has_social,
-                    member_status=""):
+                    member_status="", in_household=False):
     if case is None or getattr(case, "case_type", "") != _INTERNAL_SERVICE:
-        return "no_case"
+        # No internal-service case (own OR household -- the household fallback
+        # already ran). A member who is part of a household but has no food case
+        # is a household relative, NOT a standalone "No Case Created" member, so
+        # leave them uncounted (blank). Only a SOLO caseless member is No Case.
+        return "" if in_household else "no_case"
     if (getattr(case, "case_status", "") or "").lower() in ("closed", "cancelled"):
         return "closed"
     # --- governing case is OPEN below ---
@@ -381,6 +385,7 @@ def build_row(client):
         # + block flags + case state).
         "company_status": _company_status(
             enr, case, parity, in_any_po, has_medicaid, has_social, member_status,
+            in_household=membership is not None,
         ),
         # Nutrition-review status + delivery company on latest order.
         "nutritionist_status": _nutritionist_status(enr),
