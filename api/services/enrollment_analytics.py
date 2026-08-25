@@ -14,8 +14,9 @@ from django.db.models import Prefetch
 from django.utils import timezone
 
 from ..models import (
-    Assessment, Client, DeliveryOrder, EnrollmentAnalytics, EnrollmentVerification,
-    Insurance, MemberDietaryProfile, Screening, SocialCareCoverage,
+    Assessment, Case, Client, DeliveryOrder, EnrollmentAnalytics,
+    EnrollmentVerification, Insurance, MemberDietaryProfile, Screening,
+    SocialCareCoverage,
 )
 
 logger = logging.getLogger(__name__)
@@ -298,10 +299,17 @@ def build_row(client):
     has_social = parity.pop("_has_valid_social_care", True)
 
     # Governing internal-service case: the active enrollment's own case when it's
-    # internal-service, else the client's most-recent internal-service case.
+    # internal-service, else the client's most-recent internal-service case, else
+    # (for a DEPENDENT with no own case) the HOUSEHOLD's most-recent internal-
+    # service case -- a dependent inherits the household's case, so they aren't
+    # mislabeled "No Case Created" while their household holds the food case.
     case = enr.case if (enr is not None and getattr(enr.case, "case_type", "") == _INTERNAL_SERVICE) else None
     if case is None:
         case = (client.cases.filter(case_type=_INTERNAL_SERVICE)
+                .order_by("-date_opened").first())
+    if case is None and membership is not None:
+        hh_ids = [m.client_id for m in membership.household.members.all()]
+        case = (Case.objects.filter(client_id__in=hh_ids, case_type=_INTERNAL_SERVICE)
                 .order_by("-date_opened").first())
 
     # Verified-by, mirroring the page fallback: "System" when verified with no agent.
