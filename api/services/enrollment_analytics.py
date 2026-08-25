@@ -231,10 +231,12 @@ def _company_status(enrollment, case, parity, in_any_po, has_medicaid, has_socia
     if (parity.get("paused") or member_status == "nutritionist_paused"
             or stage == "on_hold"):
         return "paused"
-    # Active = who we're ACTUALLY serving: in any PO (being delivered), OR
-    # already at Service Active, OR assigned to a kitchen, OR ready to be assigned
-    # (Kitchen Assignment stage).
-    if in_any_po or kitchen_id or stage in ("service_active", "kitchen_assignment"):
+    # Active = who we're ACTUALLY serving RIGHT NOW: at Service Active (being
+    # delivered) or Kitchen Assignment (ready to be assigned a kitchen). NOTE:
+    # deliberately NOT `in_any_po` (that's "EVER in a PO" -- a closed/expired
+    # member who was once delivered must not count) nor a stale `kitchen_id` on a
+    # terminal/pending enrollment.
+    if stage in ("service_active", "kitchen_assignment"):
         return "active"
     # Pending = open + unblocked + not yet serving, held up by ANY (OR) of:
     #   Verification pending  (not verified)
