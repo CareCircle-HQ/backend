@@ -325,7 +325,7 @@ def filter_analytics(params):
         "insurance_status": "insurance_status", "social_status": "social_status",
         "attestation_status": "attestation_status", "stage": "stage",
         "case_type": "case_type", "case_status": "case_status",
-        "auth_status": "auth_status",
+        "auth_status": "auth_status", "program": "program_name",
         # Members-parity criteria.
         "eligibility": "eligibility", "verification_state": "verification_state",
         "program_status": "program_status", "lead_source": "lead_source",

@@ -2729,6 +2729,30 @@ class DataListView(PortalGenericAPIView):
         return self.get_paginated_response(self.get_serializer(page, many=True).data)
 
 
+class DataProgramsView(PortalAPIView):
+    """Administration > Data: the Program filter options -- internal-service
+    program names from Settings > Programs (ActiveProgram), i.e. rows whose
+    case_category classifies as Internal Service (incl. Reauthorization). These
+    match EnrollmentAnalytics.program_name (the governing internal-service case's
+    program)."""
+
+    def get(self, request):
+        from ..models import ActiveProgram, CaseType
+        from ..serializers import _CATEGORY_TO_CASE_TYPE
+
+        internal_cats = {
+            k for k, v in _CATEGORY_TO_CASE_TYPE.items()
+            if v == CaseType.INTERNAL_SERVICE
+        }
+        names = sorted({
+            row.program_name
+            for row in ActiveProgram.objects.only("program_name", "case_category")
+            if row.program_name
+            and (row.case_category or "").strip().casefold() in internal_cats
+        })
+        return Response([{"value": n, "label": n} for n in names])
+
+
 class DataSummaryView(PortalAPIView):
     """Administration > Data: aggregate counts for the current filter set -- the
     'general numbers that meet the criteria' the data team works from. Same

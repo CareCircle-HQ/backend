@@ -4846,7 +4846,7 @@ class EnrollmentAnalytics(models.Model):
     case_status = models.CharField(max_length=25, blank=True, db_index=True)
     auth_status = models.CharField(max_length=20, blank=True, db_index=True)
     case_opened_at = models.DateTimeField(null=True, blank=True, db_index=True)
-    program_name = models.CharField(max_length=255, blank=True)
+    program_name = models.CharField(max_length=255, blank=True, db_index=True)
 
     # --- Members-parity criteria (populated from MemberListSerializer output so
     # the Data page numbers match the Members page exactly). ---

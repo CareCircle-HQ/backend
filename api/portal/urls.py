@@ -99,6 +99,7 @@ from .views_members import (
     MembersExportView,
     DataListView,
     DataSummaryView,
+    DataProgramsView,
     DataExportView,
     MembersStatsView,
     NeedAttestationMembersListView,
@@ -237,6 +238,7 @@ urlpatterns = [
     # two can be optimized independently (see DataListView).
     path("data/", DataListView.as_view(), name="portal-data"),
     path("data/summary/", DataSummaryView.as_view(), name="portal-data-summary"),
+    path("data/programs/", DataProgramsView.as_view(), name="portal-data-programs"),
     path("data/export/", DataExportView.as_view(), name="portal-data-export"),
     path("members/stats/", MembersStatsView.as_view(), name="portal-members-stats"),
     path("care-management/tabs/", CareManagementTabCountsView.as_view(), name="portal-care-management-tabs"),
