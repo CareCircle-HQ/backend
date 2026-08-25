@@ -128,6 +128,33 @@ def process_pod_import(self, run_id):
 
 
 @shared_task(bind=True, ignore_result=True)
+def warm_dashboard_cache(self):
+    """Precompute the management Dashboard payload for each preset period and
+    store it in the shared cache, so those (common) views are always served
+    warm/instant instead of paying the ~2-3s recompute. Custom ranges still
+    compute on demand (and cache for DASHBOARD_CACHE_TTL). Scheduled on beat a
+    bit more often than the TTL. See views_dashboard."""
+    from django.conf import settings
+
+    from .portal.views_dashboard import (
+        DashboardView, dashboard_cache_key, period_window,
+    )
+
+    view = DashboardView()
+    # Keep warm entries a little longer than the TTL so a skipped run never
+    # leaves a cold cache between beats.
+    warm_ttl = settings.DASHBOARD_CACHE_TTL * 2
+    for period in ("today", "week", "month", "last_month", "year", "all"):
+        start, end = period_window(period)
+        try:
+            payload = view._compute(start, end, period=period, custom=False)
+            from django.core.cache import cache
+            cache.set(dashboard_cache_key(period, False, start, end), payload, warm_ttl)
+        except Exception:  # noqa: BLE001 - one period failing must not kill the rest
+            logger.warning("warm_dashboard_cache: period %s failed", period, exc_info=True)
+
+
+@shared_task(bind=True, ignore_result=True)
 def rebuild_enrollment_analytics(self):
     """Rebuild the EnrollmentAnalytics read model for the Data page. Scheduled
     ~hourly on Celery beat (1-hour freshness SLA); also safe to call ad-hoc.
