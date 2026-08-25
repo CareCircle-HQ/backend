@@ -61,7 +61,20 @@ def _derive_delivery(client_id):
         (o.delivered_at or o.expected_delivery_date
          for o in orders if o.status == "delivered"), None
     )
-    return current, last_po, delivered
+    return current, last_po, _as_aware(delivered)
+
+
+def _as_aware(value):
+    """Coerce a date/naive-datetime into an aware datetime (expected_delivery_date
+    is a DateField), so storing it in a DateTimeField doesn't warn or shift days."""
+    if value is None:
+        return None
+    import datetime as _dt
+    if isinstance(value, _dt.datetime):
+        return timezone.make_aware(value) if timezone.is_naive(value) else value
+    if isinstance(value, _dt.date):
+        return timezone.make_aware(_dt.datetime(value.year, value.month, value.day))
+    return value
 
 
 def _coverage(client_id):
@@ -307,6 +320,17 @@ def filter_analytics(params):
         except (ValueError, AttributeError):
             pass
         qs = qs.filter(cond)
+
+    # Internal Service case filter (+ open/closed sub-filter), mirroring the
+    # Members list. The read model's case_* fields describe the governing
+    # internal-service case.
+    if g("has_internal_service") in ("1", "true", "yes"):
+        qs = qs.filter(case_type="internal_service")
+        istatus = g("internal_status")
+        if istatus == "open":
+            qs = qs.filter(case_status="open")
+        elif istatus == "closed":
+            qs = qs.filter(case_status__in=["closed", "cancelled"])
 
     # Age range -> DOB bounds.
     today = datetime.date.today()
