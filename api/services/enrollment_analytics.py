@@ -160,23 +160,23 @@ def _parity_fields(client):
     }
 
 
-# Company Status: one bucket per member for the data team. PRIORITY ORDER (first
-# match wins) -- tell me to reorder if the business wants a different precedence:
+# Company Status: an INDEPENDENT per-member roll-up for the data team -- derived
+# from the raw facts (verification, service authorization, nutrition approval,
+# block flags, case open/closed), NOT from the service/program status. PRIORITY
+# ORDER (first match wins); tell me to reorder if the business wants otherwise:
 #   no_case  -> no governing internal-service (food) case ever
 #   closed   -> governing case is closed/cancelled
 #   unable   -> case OPEN but cannot be delivered (out of orbit / out of range /
 #               ineligible)
-#   paused   -> case OPEN, member/program service paused (Paused or On Hold)
-#   pending  -> case OPEN but held up in the funnel (verification / service
-#               authorization / nutritional approval not yet cleared)
+#   paused   -> case OPEN, service paused (member Paused or enrollment On Hold)
+#   pending  -> case OPEN but not yet cleared through verification / service
+#               authorization / nutritional approval
 #   active   -> being delivered OR ready to be assigned to a kitchen
-_PENDING_PROGRAM_STATUSES = {
-    "Pending Verification", "Waiting Authorization", "Authorized",
-    "Reauthorization", "Authorization Expired", "Denied",
-}
+#               (verified + authorized + nutrition approved, unblocked)
+_AUTHORIZED = {"approved", "not_required"}
 
 
-def _company_status(case, parity):
+def _company_status(enrollment, case, parity):
     if case is None or getattr(case, "case_type", "") != _INTERNAL_SERVICE:
         return "no_case"
     if (getattr(case, "case_status", "") or "").lower() in ("closed", "cancelled"):
@@ -185,10 +185,12 @@ def _company_status(case, parity):
     if (parity.get("out_of_orbit") or parity.get("out_of_range")
             or parity.get("eligibility") == "ineligible"):
         return "unable"
-    if parity.get("paused") or parity.get("program_status") == "On Hold":
+    if parity.get("paused") or (enrollment.stage or "") == "on_hold":
         return "paused"
-    if (parity.get("program_status") in _PENDING_PROGRAM_STATUSES
-            or parity.get("verification_state") != "Verified"):
+    verified = enrollment.verified_at is not None
+    authorized = (getattr(case, "service_authorization_status", "") or "") in _AUTHORIZED
+    nutrition_ok = getattr(enrollment, "nutritionist_approved_at", None) is not None
+    if not (verified and authorized and nutrition_ok):
         return "pending"
     return "active"
 
@@ -268,8 +270,9 @@ def build_row(enrollment):
         "case_closed_at": (case.case_closed_at if case else None),
         # Members-parity criteria (eligibility / status / flags / tags / ...).
         **parity,
-        # Data-team roll-up bucket (depends on the parity fields + case above).
-        "company_status": _company_status(case, parity),
+        # Data-team roll-up bucket (independent: raw verification/auth/nutrition
+        # + block flags + case state).
+        "company_status": _company_status(enrollment, case, parity),
     }
 
 
