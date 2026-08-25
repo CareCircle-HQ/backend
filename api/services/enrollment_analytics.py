@@ -186,27 +186,30 @@ def _parity_fields(client):
 #   pending  -> case OPEN but not yet cleared through verification / service
 #               authorization / nutritional approval
 #   active   -> being delivered OR ready to be assigned to a kitchen
-#               (verified + authorized + nutrition approved, unblocked)
-_AUTHORIZED = {"approved", "not_required"}
+#               (in any PO, or assigned / ready to be assigned to a kitchen)
 
 
-def _company_status(enrollment, case, parity):
+def _company_status(enrollment, case, parity, in_any_po):
     if case is None or getattr(case, "case_type", "") != _INTERNAL_SERVICE:
         return "no_case"
     if (getattr(case, "case_status", "") or "").lower() in ("closed", "cancelled"):
         return "closed"
     # --- governing case is OPEN below ---
+    # Anyone blocked (paused / out of orbit / out of range / ineligible) is NOT
+    # active -- they belong in Unable / Paused, so those are checked first.
     if (parity.get("out_of_orbit") or parity.get("out_of_range")
             or parity.get("eligibility") == "ineligible"):
         return "unable"
     if parity.get("paused") or (enrollment.stage or "") == "on_hold":
         return "paused"
-    verified = enrollment.verified_at is not None
-    authorized = (getattr(case, "service_authorization_status", "") or "") in _AUTHORIZED
-    nutrition_ok = getattr(enrollment, "nutritionist_approved_at", None) is not None
-    if not (verified and authorized and nutrition_ok):
-        return "pending"
-    return "active"
+    # Active = who we're ACTUALLY serving: in any PO (being delivered), OR
+    # assigned to a kitchen, OR ready to be assigned (Kitchen Assignment stage).
+    if (in_any_po or enrollment.kitchen_id
+            or (enrollment.stage or "") == "kitchen_assignment"):
+        return "active"
+    # Otherwise still held up in the funnel (verification / authorization /
+    # nutritional approval) -- Pending.
+    return "pending"
 
 
 def _nutritionist_status(enrollment):
@@ -299,7 +302,7 @@ def build_row(enrollment):
         **parity,
         # Data-team roll-up bucket (independent: raw verification/auth/nutrition
         # + block flags + case state).
-        "company_status": _company_status(enrollment, case, parity),
+        "company_status": _company_status(enrollment, case, parity, in_any_po),
         # Nutrition-review status + delivery company on latest order.
         "nutritionist_status": _nutritionist_status(enrollment),
         "delivery_company": delivery_company,
