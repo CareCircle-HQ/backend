@@ -112,13 +112,13 @@ def _parity_fields(client):
         row = {}
 
     try:
-        from api.portal.views_members import _service_type_for_client
-        service_type = _service_type_for_client(client) or ""
+        from api.portal.views_members import MembersListView
+        service_type = MembersListView._service_type_for_client(client) or ""
     except Exception:  # noqa: BLE001
         service_type = ""
     try:
-        from api.portal.views_members import _case_team_map
-        team = (_case_team_map([client.pk]) or {}).get(str(client.pk), "") or ""
+        from api.portal.views_members import MembersListView
+        team = (MembersListView()._case_team_map([client]) or {}).get(str(client.client_id), "") or ""
     except Exception:  # noqa: BLE001
         team = ""
     try:
