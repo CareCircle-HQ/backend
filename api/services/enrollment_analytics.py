@@ -208,9 +208,13 @@ def _company_status(enrollment, case, parity, in_any_po, has_medicaid, has_socia
     # --- governing case is OPEN below ---
     # Unable = cannot be delivered though the case is open: out of orbit/range,
     # NOT ELIGIBLE (no valid Medicaid -- expired/nonexistent -- OR no valid social
-    # care coverage), OR a DENIED authorization (terminal block, so NOT Pending).
+    # care coverage, OR the member is on the hard lifecycle INELIGIBLE off-ramp),
+    # OR a DENIED authorization (terminal block, so NOT Pending).
     auth = (getattr(case, "service_authorization_status", "") or "").lower()
-    not_eligible = (not has_medicaid) or (not has_social)
+    not_eligible = (
+        (not has_medicaid) or (not has_social)
+        or parity.get("eligibility") == "ineligible"
+    )
     if (parity.get("out_of_orbit") or parity.get("out_of_range")
             or not_eligible or auth == "denied"):
         return "unable"
