@@ -2329,6 +2329,48 @@ class InternalServiceClosureFullStopTest(TestCase):
         self.assertEqual(new.supersedes_id, enr.pk)
         self.assertNotEqual(client.lifecycle_stage, ClientStage.SERVICE_INACTIVE)
 
+    def test_never_verified_reopen_does_not_reactivate_service(self):
+        # A NEVER-verified member (pending verification, no kitchen/cadence) who
+        # is parked at SERVICE_INACTIVE and then gets a new open internal-service
+        # case must NOT emit a "Service Reactivated" event -- they never had
+        # service to resume; they just re-derive to navigation/pending.
+        from .models import (
+            ClientStage, EnrollmentStage, EnrollmentVerification, Household,
+            HouseholdMember, TimelineEvent, TimelineEventType,
+        )
+
+        client = self._client()
+        hh = Household.objects.create(name="HH")
+        HouseholdMember.objects.create(household=hh, client=client, is_primary=True)
+        # NEVER verified: verified_at stays None.
+        EnrollmentVerification.objects.create(
+            client=client, household=hh,
+            stage=EnrollmentStage.PENDING_VERIFICATION,
+        )
+        case_id = str(uuid.uuid4())
+        self._save_case(client, case_id, auth="approved", case_status="open")
+        self._save_case(client, case_id, auth="approved", case_status="closed",
+                        closed_at=timezone.now())
+        # Force the sticky SERVICE_INACTIVE off-ramp, then clear prior events.
+        client.lifecycle_stage = ClientStage.SERVICE_INACTIVE
+        client.save(update_fields=["lifecycle_stage"])
+        TimelineEvent.objects.filter(client=client).delete()
+
+        # New open, approved internal-service case -> reconcile runs.
+        self._save_case(client, str(uuid.uuid4()), auth="approved",
+                        case_status="open")
+
+        client.refresh_from_db()
+        self.assertFalse(
+            TimelineEvent.objects.filter(
+                client=client,
+                event_type=TimelineEventType.MEMBER_SERVICE_REACTIVATED,
+            ).exists(),
+            "never-verified member should not get a Service Reactivated event",
+        )
+        # The off-ramp is still lifted (re-derived away from SERVICE_INACTIVE).
+        self.assertNotEqual(client.lifecycle_stage, ClientStage.SERVICE_INACTIVE)
+
     def test_close_out_is_idempotent(self):
         from .models import EnrollmentStage, Note, NoteSource
 
@@ -5107,8 +5149,16 @@ class EnrollmentAnalyticsTest(TestCase):
             date_of_birth=datetime.date(1980, 5, 1), care_coordinator="CC One",
         )
         HouseholdMember.objects.create(household=hh, client=c, is_primary=True)
+        # An OPEN internal-service case -> a real "cased" member (without one the
+        # member is No Case Created and the food-program fields are blanked).
+        from .models import Case, CaseType, CaseStatus
+        case = Case.objects.create(
+            case_id=str(uuid.uuid4()), client=c, case_type=CaseType.INTERNAL_SERVICE,
+            case_status=CaseStatus.OPEN, service_authorization_status="approved",
+            date_opened=timezone.now(),
+        )
         enr = EnrollmentVerification.objects.create(
-            client=c, household=hh, stage=EnrollmentStage.SERVICE_ACTIVE,
+            client=c, household=hh, case=case, stage=EnrollmentStage.SERVICE_ACTIVE,
             verified_at=timezone.now(), delivery_weekdays=["mon", "thu"],
         )
         MemberDietaryProfile.objects.create(
@@ -5120,8 +5170,10 @@ class EnrollmentAnalyticsTest(TestCase):
         )
 
         ea.rebuild()
-        row = EnrollmentAnalytics.objects.get(enrollment=enr)
+        # One row per MEMBER (client); the active enrollment feeds its fields.
+        row = EnrollmentAnalytics.objects.get(client=c)
         self.assertEqual(str(row.client_id), str(c.client_id))
+        self.assertEqual(row.enrollment_id, enr.pk)
         self.assertTrue(row.is_primary)
         self.assertEqual(row.menu_type, "Standard")
         self.assertEqual(sorted(row.allergies), ["fish", "peanuts"])

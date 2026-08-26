@@ -42,6 +42,37 @@ from ..models import (
 from ..services.catalog import product_type_kind_for_name
 from .base import PortalAPIView, current_agent
 
+import logging
+
+from django.conf import settings
+from django.core.cache import cache
+
+logger = logging.getLogger(__name__)
+
+
+def dashboard_cache_key(period, custom, start, end):
+    """Stable cache key for a dashboard payload. Keyed by the resolved window so
+    the view and the warm task (api.tasks.warm_dashboard_cache) agree."""
+    label = "custom" if custom else (period or "all")
+    s = start.isoformat() if start else "none"
+    e = end.isoformat() if end else "none"
+    return f"dashboard:v1:{label}:{s}:{e}"
+
+
+def _cache_get(key):
+    try:
+        return cache.get(key)
+    except Exception:  # noqa: BLE001 - cache is best-effort; fall back to live
+        logger.warning("dashboard cache get failed (%s)", key, exc_info=True)
+        return None
+
+
+def _cache_set(key, payload, ttl=None):
+    try:
+        cache.set(key, payload, ttl if ttl is not None else settings.DASHBOARD_CACHE_TTL)
+    except Exception:  # noqa: BLE001
+        logger.warning("dashboard cache set failed (%s)", key, exc_info=True)
+
 # Case statuses that mean the case is no longer open/serviceable.
 _TERMINAL_CASE_STATUSES = [CaseStatus.CLOSED, CaseStatus.CANCELLED]
 
@@ -708,6 +739,19 @@ class DashboardView(PortalAPIView):
         )
         start, end = resolve_window(request)
 
+        # ~10-min response cache (best-effort). The dashboard is management-only,
+        # tolerant of minor staleness, and ~2-3s to compute -- so serve a cached
+        # payload when present and recompute on miss. Preset windows are kept warm
+        # by api.tasks.warm_dashboard_cache. A cache outage falls back to live.
+        key = dashboard_cache_key(period, custom, start, end)
+        cached = _cache_get(key)
+        if cached is not None:
+            return Response(cached)
+        payload = self._compute(start, end, period=period, custom=custom)
+        _cache_set(key, payload)
+        return Response(payload)
+
+    def _compute(self, start, end, *, period, custom):
         # Every case metric below is restricted to each client's GOVERNING
         # internal-service case, so a superseded / parallel NON-governing case is
         # never counted or considered anywhere on the dashboard.
@@ -1080,30 +1124,28 @@ class DashboardView(PortalAPIView):
             "total": kitchen_assignment + pending_verified_auth,
         }
 
-        return Response(
-            {
-                "period": "custom" if custom else period,
-                "range": (
-                    {"start": start.isoformat(), "end": end.isoformat()}
-                    if start is not None
-                    else None
-                ),
-                "open_cases": open_cases_payload,
-                "members": members_payload,
-                "total_enrolled": total_enrolled,
-                "active_delivery_members": active_delivery_members,
-                "meals_boxes": meals_boxes,
-                "cancel_rate": cancel_rate,
-                "serving": serving,
-                "enrolled": enrolled,
-                "receiving": receiving_meals,
-                "pending": pending,
-                # CS tab Section 3 -- member status (priority-ordered, one bucket).
-                "member_status": {
-                    t: len(s) for t, s in cs_member_status(start, end)[0].items()
-                },  # [1] = tag sets (never_requested / closure_ticket)
-            }
-        )
+        return {
+            "period": "custom" if custom else period,
+            "range": (
+                {"start": start.isoformat(), "end": end.isoformat()}
+                if start is not None
+                else None
+            ),
+            "open_cases": open_cases_payload,
+            "members": members_payload,
+            "total_enrolled": total_enrolled,
+            "active_delivery_members": active_delivery_members,
+            "meals_boxes": meals_boxes,
+            "cancel_rate": cancel_rate,
+            "serving": serving,
+            "enrolled": enrolled,
+            "receiving": receiving_meals,
+            "pending": pending,
+            # CS tab Section 3 -- member status (priority-ordered, one bucket).
+            "member_status": {
+                t: len(s) for t, s in cs_member_status(start, end)[0].items()
+            },  # [1] = tag sets (never_requested / closure_ticket)
+        }
 
     @staticmethod
     def _household_member_count(case_client_ids):

@@ -2613,10 +2613,10 @@ class VerificationCreateSerializer(serializers.Serializer):
 
 
 class EnrollmentAnalyticsSerializer(serializers.ModelSerializer):
-    """Flat per-enrollment row for the Administration > Data page (served from
-    the EnrollmentAnalytics read model)."""
+    """Flat per-member row for the Administration > Data page (served from the
+    EnrollmentAnalytics read model, one row per member)."""
 
-    id = serializers.CharField(source="enrollment_id", read_only=True)
+    id = serializers.CharField(source="client_id", read_only=True)
     client_id = serializers.CharField(read_only=True)
     name = serializers.SerializerMethodField()
     age = serializers.SerializerMethodField()

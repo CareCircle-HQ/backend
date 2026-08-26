@@ -2233,10 +2233,11 @@ class EnrollmentVerification(models.Model):
         indexes = [
             models.Index(fields=["client", "stage"]),
             models.Index(fields=["household", "stage"]),
-            # Kitchen filter on the Members/Data list.
-            models.Index(fields=["kitchen"]),
             # Verification-requested date filter (requested_from/to -> opened_at).
             models.Index(fields=["opened_at"]),
+            # NOTE: kitchen + verified_by are ForeignKeys and are ALREADY indexed
+            # by Django's automatic FK index -- no explicit index needed (see
+            # migration that drops the earlier redundant duplicates).
         ]
         constraints = [
             # At most one LIVE verification per (navigation) case. Renewals reuse
@@ -4776,11 +4777,13 @@ class LeadNote(models.Model):
 
 
 class EnrollmentAnalytics(models.Model):
-    """Denormalized, per-enrollment read model powering the Administration > Data
+    """Denormalized, per-MEMBER read model powering the Administration > Data
     page (arbitrary-field filtering + exports for the data team).
 
-    One row per :class:`EnrollmentVerification`, flattening every Data-page filter
-    field -- including DERIVED values (delivery statuses, last-delivered) and
+    One row per :class:`Client` (every member, including those with no enrollment
+    / no internal-service case), flattening every Data-page filter field for the
+    member's active/governing enrollment -- including DERIVED values (delivery
+    statuses, last-delivered) and
     MULTI-VALUED ones (allergies/conditions/medications/eligible-services, stored
     as arrays with GIN indexes) -- so the Data page never joins the live 12-table
     graph. Rebuilt on a schedule (~hourly); see services/enrollment_analytics.py
@@ -4788,12 +4791,15 @@ class EnrollmentAnalytics(models.Model):
     reproducible from the operational tables.
     """
 
-    # Identity / joins (enrollment is the grain + primary link).
-    enrollment = models.OneToOneField(
-        "EnrollmentVerification", on_delete=models.CASCADE,
+    # Identity / joins. Grain = MEMBER (one row per Client), so EVERY member is
+    # represented -- including those with no enrollment / no internal-service case
+    # (company_status = no_case). enrollment_id references the member's active/
+    # governing enrollment when they have one (else null).
+    client = models.OneToOneField(
+        "Client", on_delete=models.CASCADE,
         related_name="analytics", primary_key=True,
     )
-    client_id = models.UUIDField(db_index=True)
+    enrollment_id = models.BigIntegerField(null=True, blank=True, db_index=True)
     household_id = models.UUIDField(null=True, blank=True, db_index=True)
     case_id = models.UUIDField(null=True, blank=True)
     is_primary = models.BooleanField(default=False)
@@ -4818,6 +4824,9 @@ class EnrollmentAnalytics(models.Model):
     current_delivery_status = models.CharField(max_length=30, blank=True, db_index=True)
     last_po_delivery_status = models.CharField(max_length=30, blank=True)
     last_delivered_at = models.DateTimeField(null=True, blank=True, db_index=True)
+    # True when the member has EVER been included in a generated Purchase Order
+    # (has a DeliveryOrder line tied to a PO) -- regardless of delivery status.
+    in_any_po = models.BooleanField(default=False, db_index=True)
 
     # Coverage.
     insurance_status = models.CharField(max_length=20, blank=True, db_index=True)
@@ -4845,13 +4854,39 @@ class EnrollmentAnalytics(models.Model):
     case_status = models.CharField(max_length=25, blank=True, db_index=True)
     auth_status = models.CharField(max_length=20, blank=True, db_index=True)
     case_opened_at = models.DateTimeField(null=True, blank=True, db_index=True)
-    program_name = models.CharField(max_length=255, blank=True)
+    program_name = models.CharField(max_length=255, blank=True, db_index=True)
+
+    # --- Members-parity criteria (populated from MemberListSerializer output so
+    # the Data page numbers match the Members page exactly). ---
+    eligibility = models.CharField(max_length=20, blank=True, db_index=True)
+    verification_state = models.CharField(max_length=40, blank=True, db_index=True)
+    program_status = models.CharField(max_length=40, blank=True, db_index=True)
+    # Data-team roll-up: one bucket per member (active / pending / unable / paused
+    # / closed / no_case). Derived in the builder; see _company_status.
+    company_status = models.CharField(max_length=20, blank=True, db_index=True)
+    # Nutritionist review status (pending / approved) and the delivery company on
+    # the member's latest delivery order.
+    nutritionist_status = models.CharField(max_length=20, blank=True, db_index=True)
+    delivery_company = models.CharField(max_length=255, blank=True, db_index=True)
+    lead_source = models.CharField(max_length=120, blank=True, db_index=True)
+    team = models.CharField(max_length=120, blank=True, db_index=True)
+    service_type = models.CharField(max_length=20, blank=True, db_index=True)
+    program_type = models.CharField(max_length=20, blank=True, db_index=True)
+    out_of_orbit = models.BooleanField(default=False, db_index=True)
+    out_of_range = models.BooleanField(default=False, db_index=True)
+    paused = models.BooleanField(default=False, db_index=True)
+    pause_type = models.CharField(max_length=20, blank=True)
+    verified_by_id_str = models.CharField(max_length=64, blank=True, db_index=True)
+    requested_at = models.DateTimeField(null=True, blank=True, db_index=True)
+    case_closed_at = models.DateTimeField(null=True, blank=True, db_index=True)
 
     # --- multi-valued (array + GIN) ---
     allergies = ArrayField(models.CharField(max_length=64), default=list, blank=True)
     medical_conditions = ArrayField(models.CharField(max_length=128), default=list, blank=True)
     medications = ArrayField(models.CharField(max_length=128), default=list, blank=True)
     eligible_services = ArrayField(models.CharField(max_length=64), default=list, blank=True)
+    tags = ArrayField(models.CharField(max_length=64), default=list, blank=True)
+    ticket_types = ArrayField(models.CharField(max_length=64), default=list, blank=True)
 
     # When this row was last rebuilt (freshness watermark).
     refreshed_at = models.DateTimeField(auto_now=True, db_index=True)
@@ -4862,7 +4897,9 @@ class EnrollmentAnalytics(models.Model):
             GinIndex(fields=["medical_conditions"], name="ea_conditions_gin"),
             GinIndex(fields=["medications"], name="ea_medications_gin"),
             GinIndex(fields=["eligible_services"], name="ea_elig_services_gin"),
+            GinIndex(fields=["tags"], name="ea_tags_gin"),
+            GinIndex(fields=["ticket_types"], name="ea_ticket_types_gin"),
         ]
 
     def __str__(self):
-        return f"EnrollmentAnalytics({self.enrollment_id})"
+        return f"EnrollmentAnalytics(client={self.client_id})"

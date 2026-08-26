@@ -384,6 +384,28 @@ CELERY_WORKER_PREFETCH_MULTIPLIER = 1
 CELERY_WORKER_MAX_TASKS_PER_CHILD = 100
 CELERY_TASK_TRACK_STARTED = True
 CELERY_BROKER_CONNECTION_RETRY_ON_STARTUP = True
+
+# Shared cache (same local Redis, separate db) so the management Dashboard's
+# ~10-min response cache is visible across ALL gunicorn workers AND is warmable
+# by the Celery beat job (see api.tasks.warm_dashboard_cache). Django's built-in
+# Redis backend -- no extra dependency. Dashboard cache reads/writes are
+# best-effort (wrapped in try/except), so a Redis outage just falls back to
+# computing live rather than erroring.
+import sys as _sys
+
+if "test" in _sys.argv:
+    # Tests must not share the real Redis cache (stale dashboard payloads leak
+    # across runs/tests); compute live via a no-op cache.
+    CACHES = {"default": {"BACKEND": "django.core.cache.backends.dummy.DummyCache"}}
+else:
+    CACHES = {
+        "default": {
+            "BACKEND": "django.core.cache.backends.redis.RedisCache",
+            "LOCATION": os.getenv("CACHE_URL", "redis://127.0.0.1:6379/2"),
+        }
+    }
+# Dashboard response cache TTL (seconds); the warm job runs a bit more often.
+DASHBOARD_CACHE_TTL = int(os.getenv("DASHBOARD_CACHE_TTL", "600"))
 # The daily warning-snapshot sweep is scheduled by wall-clock time, so anchor
 # Beat to the program's operating calendar (America/New_York). Interval-based
 # entries (e.g. the export poller) are unaffected; only crontab entries follow
@@ -448,6 +470,12 @@ CELERY_BEAT_SCHEDULE = {
     "rebuild-enrollment-analytics": {
         "task": "api.tasks.rebuild_enrollment_analytics",
         "schedule": crontab(minute=20),
+    },
+    # Keep the management Dashboard's preset windows warm in the shared cache so
+    # those views load instantly. Every 8 min (< DASHBOARD_CACHE_TTL=10 min).
+    "warm-dashboard-cache": {
+        "task": "api.tasks.warm_dashboard_cache",
+        "schedule": 480.0,
     },
 }
 

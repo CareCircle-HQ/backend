@@ -2729,6 +2729,81 @@ class DataListView(PortalGenericAPIView):
         return self.get_paginated_response(self.get_serializer(page, many=True).data)
 
 
+class DataProgramsView(PortalAPIView):
+    """Administration > Data: the Program filter options -- internal-service
+    program names from Settings > Programs (ActiveProgram), i.e. rows whose
+    case_category classifies as Internal Service (incl. Reauthorization). These
+    match EnrollmentAnalytics.program_name (the governing internal-service case's
+    program)."""
+
+    def get(self, request):
+        from ..models import ActiveProgram, CaseType
+        from ..serializers import _CATEGORY_TO_CASE_TYPE
+
+        internal_cats = {
+            k for k, v in _CATEGORY_TO_CASE_TYPE.items()
+            if v == CaseType.INTERNAL_SERVICE
+        }
+        names = sorted({
+            row.program_name
+            for row in ActiveProgram.objects.only("program_name", "case_category")
+            if row.program_name
+            and (row.case_category or "").strip().casefold() in internal_cats
+        })
+        return Response([{"value": n, "label": n} for n in names])
+
+
+class DataDeliveryCompaniesView(PortalAPIView):
+    """Administration > Data: delivery-company filter options. Values are names --
+    matching EnrollmentAnalytics.delivery_company (the company on a member's
+    latest delivery order)."""
+
+    def get(self, request):
+        from ..models import DeliveryCompany
+
+        names = sorted({
+            n for n in DeliveryCompany.objects.values_list("name", flat=True) if n
+        })
+        return Response([{"value": n, "label": n} for n in names])
+
+
+class DataSummaryView(PortalAPIView):
+    """Administration > Data: aggregate counts for the current filter set -- the
+    'general numbers that meet the criteria' the data team works from. Same
+    filters as the list/export, served from the EnrollmentAnalytics read model
+    (fast COUNT/GROUP BY on indexed columns; routes to the replica)."""
+
+    def get(self, request):
+        from django.db.models import Count
+        from ..services.enrollment_analytics import filter_analytics
+
+        qs = filter_analytics(request.query_params)
+
+        def breakdown(field):
+            return {
+                (row[field] or "—"): row["n"]
+                for row in qs.values(field).annotate(n=Count("client_id")).order_by("-n")
+            }
+
+        return Response({
+            # One row per MEMBER, so total == members.
+            "total": qs.count(),
+            "members": qs.count(),
+            "households": qs.exclude(household_id=None).values("household_id").distinct().count(),
+            "with_screening": qs.filter(has_screening=True).count(),
+            "with_eligibility_assessment": qs.filter(has_eligibility_assessment=True).count(),
+            "by_stage": breakdown("stage"),
+            "by_current_delivery_status": breakdown("current_delivery_status"),
+            "by_insurance_status": breakdown("insurance_status"),
+            "by_menu_type": breakdown("menu_type"),
+            "by_auth_status": breakdown("auth_status"),
+            "by_eligibility": breakdown("eligibility"),
+            "by_service_type": breakdown("service_type"),
+            "by_program_status": breakdown("program_status"),
+            "by_company_status": breakdown("company_status"),
+        })
+
+
 class DataExportView(PortalAPIView):
     """CSV export of the Data list (same read model + filters). Management-only;
     streams with a bounded-memory iterator."""
