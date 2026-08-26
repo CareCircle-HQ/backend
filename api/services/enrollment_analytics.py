@@ -548,6 +548,15 @@ def filter_analytics(params):
             case_status__in=["closed", "cancelled"]
         ).filter(in_any_po=(delivered == "previously"))
 
+    # Nutritionist filter. "none" is the sentinel for the blank bucket -- members
+    # not (yet) at the nutritionist step (still pre-verification) or closed -- so
+    # the three options (approved / pending / not-at-step) partition the set.
+    ns = g("nutritionist_status")
+    if ns == "none":
+        qs = qs.filter(nutritionist_status="")
+    elif ns:
+        qs = qs.filter(nutritionist_status=ns)
+
     # Verification filter -- matches the VERIFICATION PAGE queue (enrollment-grain,
     # across own + household enrollments), NOT the per-member governing-enrollment
     # scalar. "Pending Verification" = has an enrollment at that stage; "Verified"
@@ -588,7 +597,6 @@ def filter_analytics(params):
         "case_type": "case_type", "case_status": "case_status",
         "auth_status": "auth_status", "program": "program_name",
         "company_status": "company_status",
-        "nutritionist_status": "nutritionist_status",
         "delivery_company": "delivery_company",
         # Members-parity criteria.
         "eligibility": "eligibility",
