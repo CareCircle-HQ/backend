@@ -887,6 +887,58 @@ def evaluate_is_new_flag(client):
 
 
 @transaction.atomic
+def reopen_for_verification(enrollment, *, actor=None, actor_label="", note="",
+                           trigger="verification_requested"):
+    """Force a NEVER-verified enrollment back to PENDING_VERIFICATION so it can be
+    (re-)verified -- a deliberate REGRESSION the normal transition map disallows
+    (e.g. a reauthorization activated an unverified enrollment to Service Active,
+    or a reconcile advanced it past verification). Only valid when the enrollment
+    was never really verified (``verified_at`` IS NULL) -- a real verification is
+    left untouched. Truncates future deliveries + clears the serving fields
+    (kitchen / delivery days) and records a StageEvent. No-op if already Pending
+    Verification or if it was actually verified."""
+    if enrollment.verified_at is not None:
+        return enrollment
+    from_stage = EnrollmentStage(enrollment.stage)
+    if from_stage == EnrollmentStage.PENDING_VERIFICATION:
+        return enrollment
+    try:
+        from api.services.orders import truncate_future_deliveries
+
+        truncate_future_deliveries(enrollment)
+    except Exception:  # pragma: no cover - defensive
+        logging.getLogger(__name__).warning(
+            "truncate on reopen_for_verification failed for %s", enrollment.pk,
+            exc_info=True,
+        )
+    now = timezone.now()
+    enrollment.stage = EnrollmentStage.PENDING_VERIFICATION
+    enrollment.stage_at = now
+    enrollment.kitchen = None
+    enrollment.delivery_weekdays = []
+    enrollment.closed_at = None
+    enrollment.save(update_fields=[
+        "stage", "stage_at", "kitchen", "delivery_weekdays", "closed_at",
+    ])
+    is_system = actor is None and (
+        not actor_label or actor_label.strip().lower().startswith("system:")
+    )
+    meta = {"trigger": trigger}
+    if actor_label:
+        meta["actor_label"] = actor_label
+    StageEvent.objects.create(
+        entity_type=StageEntityType.ENROLLMENT,
+        enrollment=enrollment, client=enrollment.client,
+        from_stage=from_stage, to_stage=EnrollmentStage.PENDING_VERIFICATION,
+        source=StageEventSource.AUTO if is_system else StageEventSource.MANUAL,
+        actor=stage_event_actor(actor),
+        note=note or "Verification requested: returned to Pending Verification.",
+        metadata=meta,
+    )
+    return enrollment
+
+
+@transaction.atomic
 def advance_enrollment(enrollment, to_stage, *, actor=None, actor_label="", note="",
                        force=False, trigger=""):
     """Move an enrollment to ``to_stage`` with guard checks. Logs a StageEvent.

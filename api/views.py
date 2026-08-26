@@ -723,6 +723,15 @@ _REQUESTABLE_STAGES = (
     EnrollmentStage.PENDING_VERIFICATION,
     EnrollmentStage.VALIDATED,
     EnrollmentStage.PENDING_VALIDATION,
+    # Advanced stages are requestable ONLY when never verified (the caller also
+    # checks verified_at is None): a member wrongly advanced to a serving stage
+    # without a real verification (e.g. a reauthorization activated an unverified
+    # enrollment) can still be (re-)requested -- reopen_for_verification regresses
+    # it back to Pending Verification. A genuinely-verified enrollment has
+    # verified_at set, so it's never renewable.
+    EnrollmentStage.VERIFIED,
+    EnrollmentStage.KITCHEN_ASSIGNMENT,
+    EnrollmentStage.SERVICE_ACTIVE,
 )
 
 
@@ -815,11 +824,14 @@ class EnrollmentVerificationViewSet(viewsets.ModelViewSet):
             enrollment.verified_at is None
             and enrollment.stage != EnrollmentStage.PENDING_VERIFICATION
         ):
-            advance_enrollment(
-                enrollment, EnrollmentStage.PENDING_VERIFICATION, force=True,
-                actor=getattr(request, "user", None),
-                note="Verification requested: returned to Pending Verification.",
-                trigger="verification_requested",
+            # Regress a never-verified enrollment back to Pending Verification --
+            # handles pre-service (Validated) AND wrongly-advanced serving stages
+            # (Service Active / Kitchen Assignment), which the transition map
+            # won't let advance_enrollment do directly.
+            from .services.lifecycle import reopen_for_verification
+
+            reopen_for_verification(
+                enrollment, actor=getattr(request, "user", None),
             )
         agent_id = getattr(getattr(request, "user", None), "agent_id", None)
         enrollment.requested_at = timezone.now()

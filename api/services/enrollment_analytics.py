@@ -15,8 +15,8 @@ from django.utils import timezone
 
 from ..models import (
     Assessment, Case, Client, DeliveryOrder, EnrollmentAnalytics,
-    EnrollmentVerification, Insurance, MemberDietaryProfile, Screening,
-    SocialCareCoverage,
+    EnrollmentVerification, Insurance, MemberDietaryProfile, OrderSchedule,
+    OrderStatus, Screening, SocialCareCoverage,
 )
 
 logger = logging.getLogger(__name__)
@@ -83,10 +83,23 @@ def _in_any_po(client_id):
 
 
 def _has_active_delivery(client_id):
-    """True when the member has an ACTIVE delivery calendar -- a non-cancelled
-    DeliveryOrder tied to a PO (a real scheduled/live/delivered order). Distinct
-    from ``_in_any_po`` (EVER in a PO, incl. all-cancelled): this is the "being
-    delivered right now" signal used by the Active company status."""
+    """True when the member has an ACTIVE delivery calendar -- used by the Active
+    company status. The calendar is the SCHEDULE (upcoming ``OrderSchedule``
+    occurrences), NOT generated Purchase-Order lines: a freshly-activated member
+    has a full future schedule long before any PO/DeliveryOrder is cut (POs are
+    generated close to the delivery date). So count either:
+      * an upcoming SCHEDULED delivery occurrence (anticipated date today or
+        later), or
+      * a live (non-cancelled) DeliveryOrder already in a PO.
+    Distinct from ``_in_any_po`` (EVER in a PO, incl. all-cancelled)."""
+    from django.utils import timezone
+
+    today = timezone.localdate()
+    if OrderSchedule.objects.filter(
+        member__client_id=client_id, status=OrderStatus.SCHEDULED,
+        anticipated_delivery_date__gte=today,
+    ).exists():
+        return True
     return DeliveryOrder.objects.filter(
         member_id=client_id, purchase_order__isnull=False,
     ).exclude(status="cancelled").exists()
