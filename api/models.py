@@ -392,6 +392,14 @@ class Client(models.Model):
     # + backfill_client_case_sort. Indexed for fast range filters.
     governing_verification_requested_at = models.DateTimeField(null=True, blank=True, db_index=True)
     governing_verification_completed_at = models.DateTimeField(null=True, blank=True, db_index=True)
+    # Denormalized GOVERNING internal-service case attributes, so the Members list's
+    # Internal-Service (open/closed), Closed-date, and Authorized-date filters key
+    # off the SAME governing case the Data page reports (not ANY internal-service
+    # case). Blank/NULL when there is no governing internal-service case.
+    # Maintained by refresh_internal_case_sort + backfill_client_case_sort.
+    governing_internal_case_status = models.CharField(max_length=32, blank=True, default="", db_index=True)
+    governing_internal_case_closed_at = models.DateTimeField(null=True, blank=True, db_index=True)
+    governing_internal_case_authorized_at = models.DateTimeField(null=True, blank=True, db_index=True)
     # Why the member is on the hard INELIGIBLE off-ramp: the human-readable gate
     # reasons (expired/missing Medicaid, wrong Medicaid type, out-of-range
     # ZIP/state, or a Kitchen-Assignment closure/denial). Written wherever the

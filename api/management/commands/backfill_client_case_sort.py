@@ -86,6 +86,9 @@ class Command(BaseCommand):
             "governing_internal_case_opened_at",
             "governing_verification_requested_at",
             "governing_verification_completed_at",
+            "governing_internal_case_status",
+            "governing_internal_case_closed_at",
+            "governing_internal_case_authorized_at",
         ]
         qs = Client.objects.prefetch_related(
             "cases",
@@ -101,7 +104,7 @@ class Command(BaseCommand):
             # case/enrollment dates (mirrors the Data page's no-case blanking, so
             # a caseless enrollment doesn't leak a requested/completed date).
             if gov is None:
-                vals = {col: None for col in cols}
+                vals = {col: ("" if col == "governing_internal_case_status" else None) for col in cols}
             else:
                 enr = active_enrollment(c)
                 vals = {
@@ -110,6 +113,9 @@ class Command(BaseCommand):
                         (enr.requested_at or enr.opened_at) if enr is not None else None
                     ),
                     "governing_verification_completed_at": enr.verified_at if enr is not None else None,
+                    "governing_internal_case_status": gov.case_status or "",
+                    "governing_internal_case_closed_at": gov.case_closed_at,
+                    "governing_internal_case_authorized_at": gov.service_authorization_approval_starts_at,
                 }
             if any(getattr(c, col) != vals[col] for col in cols):
                 for col in cols:

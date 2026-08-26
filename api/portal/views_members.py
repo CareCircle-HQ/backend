@@ -1112,26 +1112,20 @@ def apply_enrollment_date_filter(qs, field, start, end):
 
 def apply_authorization_date_filter(qs, start, end):
     """Restrict ``qs`` to clients whose GOVERNING internal-service case has an
-    authorization approval-start date (``service_authorization_approval_starts_at``
-    -- i.e. when the case was authorized) within the inclusive [start, end]
-    window. Either bound may be None (open-ended); no-op when both are None.
+    authorization approval-start date (when the case was authorized) within the
+    inclusive [start, end] window. Either bound may be None (open-ended); no-op
+    when both are None.
 
-    Uses ``Exists`` on the internal-service case (mirroring
-    ``apply_authorization_filter``), so it introduces no join duplicates and
-    needs no ``.distinct()`` of its own. As with the authorization status
-    filter, the case is held by the household primary, so a matching primary
-    brings its household into the grouped result."""
+    Keys off the denormalized ``governing_internal_case_authorized_at`` (the same
+    governing case the Data page reports), NOT any internal-service case. No join,
+    so no ``.distinct()`` is required."""
     if not start and not end:
         return qs
-    cases = Case.objects.filter(
-        client=OuterRef("pk"),
-        case_type=CaseType.INTERNAL_SERVICE,
-    )
     if start:
-        cases = cases.filter(service_authorization_approval_starts_at__date__gte=start)
+        qs = qs.filter(governing_internal_case_authorized_at__date__gte=start)
     if end:
-        cases = cases.filter(service_authorization_approval_starts_at__date__lte=end)
-    return qs.filter(Exists(cases))
+        qs = qs.filter(governing_internal_case_authorized_at__date__lte=end)
+    return qs
 
 
 def apply_case_created_date_filter(qs, start, end):
@@ -1675,24 +1669,22 @@ class MembersListView(PortalGenericAPIView):
         if (params.get("has_internal_service") or "").strip().lower() in (
             "1", "true", "yes",
         ):
-            qs = qs.filter(cases__case_type=CaseType.INTERNAL_SERVICE)
-            # Open/closed sub-filter: ONLY active when Internal Service is on
-            # (it narrows that set). Mirrors the "current case" the Created column
-            # shows: a member is OPEN if they have any non-terminal internal-
-            # service case (actively serviced), else CLOSED. So "closed" means the
-            # member has NO open internal-service case (all done) -- NOT merely
-            # "has a closed case", since members with an open case also usually
-            # have older closed ones and would otherwise wrongly show as closed.
+            # Keyed off the GOVERNING internal-service case (denormalized on
+            # Client, favorability/deferral aware) so this matches the Data page:
+            # "has a governing IS case" = status set; open/closed = that governing
+            # case's status. NOT "any IS case" -- a member with an open pending
+            # case whose governing (favored) case is a closed approved one counts
+            # as CLOSED here, exactly as the Data page reports.
+            qs = qs.exclude(governing_internal_case_status="")
             internal_status = (params.get("internal_status") or "").strip().lower()
-            if internal_status in ("open", "closed"):
-                terminal = (CaseStatus.CLOSED, CaseStatus.CANCELLED)
-                open_case = Case.objects.filter(
-                    client=OuterRef("pk"), case_type=CaseType.INTERNAL_SERVICE,
-                ).exclude(case_status__in=terminal)
-                if internal_status == "open":
-                    qs = qs.filter(Exists(open_case))
-                else:
-                    qs = qs.exclude(Exists(open_case))
+            if internal_status == "open":
+                qs = qs.exclude(
+                    governing_internal_case_status__in=[CaseStatus.CLOSED, CaseStatus.CANCELLED]
+                )
+            elif internal_status == "closed":
+                qs = qs.filter(
+                    governing_internal_case_status__in=[CaseStatus.CLOSED, CaseStatus.CANCELLED]
+                )
 
         # Product-kind filter (Meals vs Boxes), keyed off the household's program
         # name. A household is always one kind, so meals/boxes never mix.
@@ -1951,22 +1943,16 @@ class MembersListView(PortalGenericAPIView):
             qs = qs.filter(governing_internal_case_opened_at__date__lte=created_to)
 
         # Closed-date range filter (Members page): filters on the date the
-        # member's INTERNAL-SERVICE case was CLOSED (its ``case_closed_at``, the
-        # C: date shown in the "Created" column). Mirrors the created-date filter
-        # above but on the close date, so an ops user can pull members whose
-        # service case was closed within a window (e.g. "closed today") and then
-        # cross-check paused/active status via the status filter. Both bounds
-        # apply to the SAME internal-service case row; .distinct() dedupes the
-        # join. Inclusive [from, to]; either bound may be omitted.
+        # member's GOVERNING internal-service case was CLOSED
+        # (``governing_internal_case_closed_at``, denormalized + indexed) -- the
+        # same governing case the Data page reports, NOT any internal-service
+        # case. Inclusive [from, to]; either bound may be omitted. No join.
         closed_from = _parse_date(params.get("closed_from"))
         closed_to = _parse_date(params.get("closed_to"))
-        if closed_from or closed_to:
-            case_closed_q = Q(cases__case_type=CaseType.INTERNAL_SERVICE)
-            if closed_from:
-                case_closed_q &= Q(cases__case_closed_at__date__gte=closed_from)
-            if closed_to:
-                case_closed_q &= Q(cases__case_closed_at__date__lte=closed_to)
-            qs = qs.filter(case_closed_q)
+        if closed_from:
+            qs = qs.filter(governing_internal_case_closed_at__date__gte=closed_from)
+        if closed_to:
+            qs = qs.filter(governing_internal_case_closed_at__date__lte=closed_to)
 
         # Date-period filter (Verification page dropdown): narrow to households
         # whose enrollment record was OPENED within the selected window. Skipped
