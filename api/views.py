@@ -712,6 +712,20 @@ def _choices(enum):
     return [{"value": v, "label": l} for v, l in enum.choices]
 
 
+# Pre-verification stages a (never-verified) enrollment can be REQUESTED from:
+# the agent can (re-)request verification and the wizard/popup opens. Includes
+# VALIDATED so a member whose enrollment was regressed there (e.g. a reconcile
+# dropped it to Validated when no open case existed yet) isn't stranded behind a
+# "Pending Verification" label with no way to act -- requesting returns them to
+# PENDING_VERIFICATION. Excludes VERIFIED/KITCHEN_ASSIGNMENT/SERVICE_ACTIVE (real
+# progress we never reset) and terminals.
+_REQUESTABLE_STAGES = (
+    EnrollmentStage.PENDING_VERIFICATION,
+    EnrollmentStage.VALIDATED,
+    EnrollmentStage.PENDING_VALIDATION,
+)
+
+
 class EnrollmentVerificationViewSet(viewsets.ModelViewSet):
     """CRUD for household verification enrollments + the wizard data.
 
@@ -762,7 +776,7 @@ class EnrollmentVerificationViewSet(viewsets.ModelViewSet):
                 .first()
                 or client_qs.filter(
                     verified_at__isnull=True,
-                    stage=EnrollmentStage.PENDING_VERIFICATION,
+                    stage__in=_REQUESTABLE_STAGES,
                 )
                 .order_by("-opened_at")
                 .first()
@@ -770,7 +784,7 @@ class EnrollmentVerificationViewSet(viewsets.ModelViewSet):
         if existing is not None:
             renewable = (
                 existing.verified_at is None
-                and existing.stage == EnrollmentStage.PENDING_VERIFICATION
+                and existing.stage in _REQUESTABLE_STAGES
             )
             if not renewable:
                 return Response(
@@ -792,6 +806,21 @@ class EnrollmentVerificationViewSet(viewsets.ModelViewSet):
         history keeps every renewal), link the governing case if it was missing
         (e.g. a bulk-imported enrollment), and re-drive the household. Returns the
         renewed enrollment (200)."""
+        # A never-verified enrollment sitting BELOW Pending Verification (e.g.
+        # regressed to Validated) is put back INTO the verification queue so the
+        # wizard/popup appears -- otherwise the member is stranded behind a
+        # "Pending Verification" label with no way to act. Real progress
+        # (verified/kitchen/active) never reaches here (guarded by the caller).
+        if (
+            enrollment.verified_at is None
+            and enrollment.stage != EnrollmentStage.PENDING_VERIFICATION
+        ):
+            advance_enrollment(
+                enrollment, EnrollmentStage.PENDING_VERIFICATION, force=True,
+                actor=getattr(request, "user", None),
+                note="Verification requested: returned to Pending Verification.",
+                trigger="verification_requested",
+            )
         agent_id = getattr(getattr(request, "user", None), "agent_id", None)
         enrollment.requested_at = timezone.now()
         update_fields = ["requested_at"]
@@ -829,7 +858,7 @@ class EnrollmentVerificationViewSet(viewsets.ModelViewSet):
         enrollment = self.get_object()
         if (
             enrollment.verified_at is not None
-            or enrollment.stage != EnrollmentStage.PENDING_VERIFICATION
+            or enrollment.stage not in _REQUESTABLE_STAGES
         ):
             return Response(
                 {"detail": "Only a pending (unverified) verification can be renewed."},

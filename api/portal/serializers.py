@@ -226,6 +226,45 @@ def can_request_dependent_split(client):
     return has_internal and has_nav and has_elig
 
 
+def can_request_primary_verification(client):
+    """CRM member-profile "Request Verification" gate for a PRIMARY (or
+    household-less) member who is ELIGIBLE for verification but has no actionable
+    pending verification -- e.g. their enrollment was regressed to Validated, or
+    no enrollment exists at all. Requesting (re-)creates a Pending Verification
+    enrollment so the wizard opens, instead of leaving the member stranded behind
+    a "Pending Verification" label with no way to act.
+
+    True when: primary/household-less, an OPEN internal-service case, valid
+    Medicaid + social care, NOT already verified, and NOT already sitting at a
+    live Pending Verification enrollment (that one already shows the wizard).
+    Dependents use can_request_dependent_split instead."""
+    from ..models import EnrollmentStage, EnrollmentVerification
+    from ..services.lifecycle import (
+        has_open_internal_service_case,
+        has_valid_medicaid,
+        has_valid_social_care,
+        verification_completed,
+    )
+
+    membership = getattr(client, "household_membership", None)
+    if membership is not None and not membership.is_primary:
+        return False
+    if not has_open_internal_service_case(client):
+        return False
+    if verification_completed(client):
+        return False
+    if not (has_valid_medicaid(client) and has_valid_social_care(client)):
+        return False
+    # An actionable pending enrollment already drives the wizard -> no button.
+    if EnrollmentVerification.objects.filter(
+        client=client,
+        stage=EnrollmentStage.PENDING_VERIFICATION,
+        verified_at__isnull=True,
+    ).exists():
+        return False
+    return True
+
+
 # Coarse pipeline PHASE for the Verification list's "Stage" column. Both
 # pending_verification and verified (awaiting authorization) are still in the
 # "Verification" phase; the case being approved advances to Kitchen Assignment,
@@ -1128,6 +1167,11 @@ class MemberDetailSerializer(serializers.Serializer):
                 # service + care-management + eligibility cases and no verification
                 # yet). Requesting splits them into their own case server-side.
                 "can_request_dependent_split": can_request_dependent_split(client),
+                # Drives the member-profile "Request Verification" button for a
+                # PRIMARY / household-less member who is eligible but stuck (no
+                # actionable pending verification -- e.g. enrollment regressed to
+                # Validated, or missing). Requesting (re-)opens the verification.
+                "can_request_verification": can_request_primary_verification(client),
                 # Williamsburg exception (lead source == "Williamsburg"): the
                 # verification wizard forces the Kosher menu and the save
                 # auto-assigns the Williamsburg kitchen + activates directly.

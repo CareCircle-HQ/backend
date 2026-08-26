@@ -5428,6 +5428,65 @@ class ClosedCaseEnrollmentTerminalizedTest(TestCase):
         )
 
 
+class RequestVerificationFromValidatedTest(TestCase):
+    """A never-verified enrollment regressed to VALIDATED must be re-requestable:
+    the ext re-request returns it to Pending Verification (so the wizard opens),
+    instead of 409'ing as "already requested". A real (verified) enrollment is
+    still protected (409)."""
+
+    def setUp(self):
+        self.agent = Agent.objects.create(name="RV Agent", agent_code="930", group="CS")
+        access = AccessToken()
+        access["agent_id"] = str(self.agent.id)
+        access["agent_code"] = self.agent.agent_code
+        access["agent_name"] = self.agent.name
+        access["agent_group"] = self.agent.group
+        self.api = APIClient()
+        self.api.credentials(HTTP_AUTHORIZATION=f"Bearer {access}")
+
+    def _validated_member(self):
+        from .models import (
+            Case, CaseStatus, CaseType, Client, EnrollmentStage,
+            EnrollmentVerification, Household, HouseholdMember,
+            ServiceAuthorizationStatus,
+        )
+        c = Client.objects.create(client_id=str(uuid.uuid4()), first_name="Val", last_name="Idated")
+        hh = Household.objects.create(name="HH")
+        HouseholdMember.objects.create(household=hh, client=c, is_primary=True)
+        case = Case.objects.create(
+            case_id=str(uuid.uuid4()), client=c, case_type=CaseType.INTERNAL_SERVICE,
+            case_status=CaseStatus.OPEN,
+            service_authorization_status=ServiceAuthorizationStatus.APPROVED,
+            program_name="Medically Tailored Meals (MTM)",
+        )
+        enr = EnrollmentVerification.objects.create(
+            client=c, household=hh, case=case, stage=EnrollmentStage.VALIDATED,
+            program_name="Medically Tailored Meals (MTM)",
+        )
+        return c, enr
+
+    def test_re_request_from_validated_returns_to_pending(self):
+        from .models import EnrollmentStage
+        c, enr = self._validated_member()
+        resp = self.api.post(f"/api/enrollment-verifications/{enr.pk}/re-request/")
+        self.assertEqual(resp.status_code, 200, resp.content)
+        enr.refresh_from_db()
+        self.assertEqual(EnrollmentStage(enr.stage), EnrollmentStage.PENDING_VERIFICATION)
+        self.assertIsNotNone(enr.requested_at)
+
+    def test_verified_enrollment_is_not_reset(self):
+        from django.utils import timezone
+        from .models import EnrollmentStage
+        c, enr = self._validated_member()
+        enr.verified_at = timezone.now()
+        enr.stage = EnrollmentStage.VERIFIED
+        enr.save(update_fields=["verified_at", "stage"])
+        resp = self.api.post(f"/api/enrollment-verifications/{enr.pk}/re-request/")
+        self.assertEqual(resp.status_code, 409, resp.content)
+        enr.refresh_from_db()
+        self.assertEqual(EnrollmentStage(enr.stage), EnrollmentStage.VERIFIED)
+
+
 class TimelineReasonDetailTest(TestCase):
     """Out-of-Orbit / Out-of-Range timeline rows surface WHY (reason / ZIP), not
     just the member name, so the History tab shows the detail directly."""

@@ -6516,6 +6516,41 @@ class MemberRequestVerificationView(PortalAPIView):
                 {"error": "Can't request verification: " + ", ".join(missing) + "."},
                 status=http.HTTP_400_BAD_REQUEST,
             )
+        # RENEW an existing pre-verification enrollment (never verified, sitting at
+        # Validated / Pending Validation -- e.g. regressed there by a reconcile
+        # when no open case existed yet) back into the queue, instead of rejecting
+        # as "already requested". Without this the member is stranded behind a
+        # "Pending Verification" label with no wizard/popup to act on.
+        renewable = (
+            EnrollmentVerification.objects.filter(
+                client=client, verified_at__isnull=True,
+                stage__in=(EnrollmentStage.VALIDATED, EnrollmentStage.PENDING_VALIDATION),
+            )
+            .order_by("-opened_at")
+            .first()
+        )
+        if renewable is not None:
+            agent = current_agent(request)
+            actor = _agent_actor(agent)
+            with transaction.atomic():
+                advance_enrollment(
+                    renewable, EnrollmentStage.PENDING_VERIFICATION, force=True,
+                    actor=actor,
+                    note="Verification requested: returned to Pending Verification.",
+                    trigger="verification_requested",
+                )
+                renewable.requested_by = agent
+                renewable.requested_at = timezone.now()
+                renewable.save(update_fields=["requested_by", "requested_at"])
+                reconcile_enrollment_authorization(renewable, actor=actor)
+                recompute_enrollment_household(renewable)
+                clear_new_flag_on_verification_request(renewable)
+                try:
+                    timeline.event_for_verification(renewable, actor=actor)
+                except Exception:  # never let history-logging break the request
+                    logger.warning("request-verification timeline emit failed", exc_info=True)
+            client.refresh_from_db()
+            return Response(s.MemberDetailSerializer(client).data)
         # Already requested/handled (own or household enrollment) -- nothing to do.
         if not is_urgent_care_candidate(client):
             return Response(
