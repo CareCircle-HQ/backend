@@ -494,11 +494,17 @@ def refresh_internal_case_sort(client, *, save=True):
         client=client, case_type=CaseType.INTERNAL_SERVICE,
     ).aggregate(m=Max("date_opened"))["m"]
     gov = governing_service_case_for_display(client)
-    gov_opened = gov.date_opened if gov is not None else None
-    # Governing enrollment dates (mirrors the Data page's active_enrollment).
-    enr = active_enrollment(client)
-    gov_requested = (enr.requested_at or enr.opened_at) if enr is not None else None
-    gov_completed = enr.verified_at if enr is not None else None
+    # Mirror the Data page: when there is NO governing internal-service case the
+    # member is "No Case" and all case/enrollment-derived dates are blank (a
+    # caseless enrollment must not leak a requested/completed date). Only populate
+    # the governing enrollment dates when a governing case exists.
+    if gov is None:
+        gov_opened = gov_requested = gov_completed = None
+    else:
+        gov_opened = gov.date_opened
+        enr = active_enrollment(client)
+        gov_requested = (enr.requested_at or enr.opened_at) if enr is not None else None
+        gov_completed = enr.verified_at if enr is not None else None
 
     updates = {
         "internal_case_opened_at": latest,

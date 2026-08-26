@@ -97,14 +97,20 @@ class Command(BaseCommand):
         batch = []
         for c in qs.iterator(chunk_size=500):
             gov = governing_service_case_for_display(c)
-            enr = active_enrollment(c)
-            vals = {
-                "governing_internal_case_opened_at": gov.date_opened if gov is not None else None,
-                "governing_verification_requested_at": (
-                    (enr.requested_at or enr.opened_at) if enr is not None else None
-                ),
-                "governing_verification_completed_at": enr.verified_at if enr is not None else None,
-            }
+            # No governing internal-service case -> "No Case": blank all
+            # case/enrollment dates (mirrors the Data page's no-case blanking, so
+            # a caseless enrollment doesn't leak a requested/completed date).
+            if gov is None:
+                vals = {col: None for col in cols}
+            else:
+                enr = active_enrollment(c)
+                vals = {
+                    "governing_internal_case_opened_at": gov.date_opened,
+                    "governing_verification_requested_at": (
+                        (enr.requested_at or enr.opened_at) if enr is not None else None
+                    ),
+                    "governing_verification_completed_at": enr.verified_at if enr is not None else None,
+                }
             if any(getattr(c, col) != vals[col] for col in cols):
                 for col in cols:
                     setattr(c, col, vals[col])
