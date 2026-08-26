@@ -383,6 +383,15 @@ class Client(models.Model):
     # matching ANY internal-service case. Maintained by reconcile +
     # backfill_client_case_sort. Indexed for a fast range filter.
     governing_internal_case_opened_at = models.DateTimeField(null=True, blank=True, db_index=True)
+    # Denormalized "Verification Requested / Completed" FILTER keys, taken from the
+    # member's GOVERNING enrollment (active_enrollment) -- so the Members /
+    # Verification page's requested/completed date filters match the Data page
+    # (which reports the same governing enrollment) instead of matching ANY
+    # own/household enrollment. requested = enrollment ``requested_at or opened_at``;
+    # completed = enrollment ``verified_at``. Maintained by refresh_internal_case_sort
+    # + backfill_client_case_sort. Indexed for fast range filters.
+    governing_verification_requested_at = models.DateTimeField(null=True, blank=True, db_index=True)
+    governing_verification_completed_at = models.DateTimeField(null=True, blank=True, db_index=True)
     # Why the member is on the hard INELIGIBLE off-ramp: the human-readable gate
     # reasons (expired/missing Medicaid, wrong Medicaid type, out-of-range
     # ZIP/state, or a Kitchen-Assignment closure/denial). Written wherever the

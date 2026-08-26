@@ -77,8 +77,16 @@ class Command(BaseCommand):
 
     def _backfill_governing(self, apply):
         from api.models import Client
-        from api.portal.serializers import governing_service_case_for_display
+        from api.portal.serializers import (
+            active_enrollment,
+            governing_service_case_for_display,
+        )
 
+        cols = [
+            "governing_internal_case_opened_at",
+            "governing_verification_requested_at",
+            "governing_verification_completed_at",
+        ]
         qs = Client.objects.prefetch_related(
             "cases",
             "enrollments",
@@ -89,21 +97,29 @@ class Command(BaseCommand):
         batch = []
         for c in qs.iterator(chunk_size=500):
             gov = governing_service_case_for_display(c)
-            val = gov.date_opened if gov is not None else None
-            if c.governing_internal_case_opened_at != val:
-                c.governing_internal_case_opened_at = val
+            enr = active_enrollment(c)
+            vals = {
+                "governing_internal_case_opened_at": gov.date_opened if gov is not None else None,
+                "governing_verification_requested_at": (
+                    (enr.requested_at or enr.opened_at) if enr is not None else None
+                ),
+                "governing_verification_completed_at": enr.verified_at if enr is not None else None,
+            }
+            if any(getattr(c, col) != vals[col] for col in cols):
+                for col in cols:
+                    setattr(c, col, vals[col])
                 batch.append(c)
             checked += 1
             if len(batch) >= 500:
                 changed += len(batch)
                 if apply:
-                    Client.objects.bulk_update(batch, ["governing_internal_case_opened_at"])
+                    Client.objects.bulk_update(batch, cols)
                 batch = []
         if batch:
             changed += len(batch)
             if apply:
-                Client.objects.bulk_update(batch, ["governing_internal_case_opened_at"])
+                Client.objects.bulk_update(batch, cols)
         verb = "APPLIED: updated" if apply else "would update"
         self.stdout.write(self.style.SUCCESS(
-            f"[governing key] {verb} {changed} of {checked} client(s)."
+            f"[governing keys] {verb} {changed} of {checked} client(s)."
         ))

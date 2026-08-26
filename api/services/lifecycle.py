@@ -485,21 +485,30 @@ def refresh_internal_case_sort(client, *, save=True):
     from django.db.models import Max
 
     from api.models import Case, CaseType
-    from api.portal.serializers import governing_service_case_for_display
+    from api.portal.serializers import (
+        active_enrollment,
+        governing_service_case_for_display,
+    )
 
     latest = Case.objects.filter(
         client=client, case_type=CaseType.INTERNAL_SERVICE,
     ).aggregate(m=Max("date_opened"))["m"]
     gov = governing_service_case_for_display(client)
     gov_opened = gov.date_opened if gov is not None else None
+    # Governing enrollment dates (mirrors the Data page's active_enrollment).
+    enr = active_enrollment(client)
+    gov_requested = (enr.requested_at or enr.opened_at) if enr is not None else None
+    gov_completed = enr.verified_at if enr is not None else None
 
-    fields = []
-    if client.internal_case_opened_at != latest:
-        client.internal_case_opened_at = latest
-        fields.append("internal_case_opened_at")
-    if client.governing_internal_case_opened_at != gov_opened:
-        client.governing_internal_case_opened_at = gov_opened
-        fields.append("governing_internal_case_opened_at")
+    updates = {
+        "internal_case_opened_at": latest,
+        "governing_internal_case_opened_at": gov_opened,
+        "governing_verification_requested_at": gov_requested,
+        "governing_verification_completed_at": gov_completed,
+    }
+    fields = [f for f, val in updates.items() if getattr(client, f) != val]
+    for f in fields:
+        setattr(client, f, updates[f])
     if fields and save:
         client.save(update_fields=fields)
     return latest

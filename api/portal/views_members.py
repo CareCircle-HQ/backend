@@ -1175,14 +1175,19 @@ def apply_verification_date_filters(qs, params, *, skip_enrollment_bounds=False)
         qs = apply_case_created_date_filter(qs, case_from, case_to)
         # Exists-based, so no distinct is required for this bound alone.
     if not skip_enrollment_bounds:
+        # Requested/completed key off the GOVERNING enrollment (denormalized,
+        # indexed on Client), so these match the Data page household-for-household
+        # instead of matching ANY own/household enrollment. No join -> no distinct.
         req_from, req_to = _parse_date(params.get("requested_from")), _parse_date(params.get("requested_to"))
-        if req_from or req_to:
-            qs = apply_enrollment_date_filter(qs, "opened_at", req_from, req_to)
-            changed = True
+        if req_from:
+            qs = qs.filter(governing_verification_requested_at__date__gte=req_from)
+        if req_to:
+            qs = qs.filter(governing_verification_requested_at__date__lte=req_to)
         comp_from, comp_to = _parse_date(params.get("completed_from")), _parse_date(params.get("completed_to"))
-        if comp_from or comp_to:
-            qs = apply_enrollment_date_filter(qs, "verified_at", comp_from, comp_to)
-            changed = True
+        if comp_from:
+            qs = qs.filter(governing_verification_completed_at__date__gte=comp_from)
+        if comp_to:
+            qs = qs.filter(governing_verification_completed_at__date__lte=comp_to)
     auth_from, auth_to = _parse_date(params.get("authorized_from")), _parse_date(params.get("authorized_to"))
     if auth_from or auth_to:
         qs = apply_authorization_date_filter(qs, auth_from, auth_to)
