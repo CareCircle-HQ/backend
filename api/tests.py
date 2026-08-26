@@ -5569,9 +5569,11 @@ class CompanyStatusActiveRuleTest(TestCase):
         enr = self._enr("service_active", verified=True, nutrition=False)
         self.assertEqual(self._status(enr, has_active_delivery=True), "active")
 
-    def test_service_active_without_live_delivery_is_pending(self):
+    def test_service_active_without_live_delivery_is_review(self):
+        # Activated but not delivering -> quarantined in 'review' (not Pending,
+        # which is strictly pre-service). See the review doc.
         enr = self._enr("service_active", verified=True, nutrition=True)
-        self.assertEqual(self._status(enr, has_active_delivery=False), "pending")
+        self.assertEqual(self._status(enr, has_active_delivery=False), "review")
 
     def test_kitchen_assignment_with_nutrition_is_active(self):
         enr = self._enr("kitchen_assignment", verified=True, nutrition=True)
@@ -5581,9 +5583,50 @@ class CompanyStatusActiveRuleTest(TestCase):
         enr = self._enr("kitchen_assignment", verified=True, nutrition=False)
         self.assertEqual(self._status(enr, has_active_delivery=False), "pending")
 
-    def test_unverified_is_pending_even_if_being_delivered(self):
+    def test_unverified_being_delivered_is_not_active(self):
+        # Verification is required for Active: an unverified member is never
+        # Active. At service_active with a live calendar but unverified they're a
+        # data anomaly -> 'review' (not Active). A pre-service unverified member
+        # is Pending (see test_pending_verification_is_pending).
         enr = self._enr("service_active", verified=False, nutrition=True)
-        self.assertEqual(self._status(enr, has_active_delivery=True), "pending")
+        result = self._status(enr, has_active_delivery=True)
+        self.assertNotEqual(result, "active")
+        self.assertEqual(result, "review")
+
+    def _status_auth(self, enr, *, auth, has_active_delivery):
+        from types import SimpleNamespace
+        from .models import CaseType
+        from .services.enrollment_analytics import _company_status
+        case = SimpleNamespace(
+            case_type=CaseType.INTERNAL_SERVICE, case_status="open",
+            service_authorization_status=auth,
+        )
+        return _company_status(
+            enr, case, {}, False, True, True, "",
+            in_household=False, has_active_delivery=has_active_delivery,
+        )
+
+    def test_pending_verification_is_pending(self):
+        enr = self._enr("pending_verification", verified=False, nutrition=False)
+        self.assertEqual(self._status_auth(enr, auth="approved", has_active_delivery=False), "pending")
+
+    def test_verified_awaiting_with_pending_auth_is_pending(self):
+        enr = self._enr("verified", verified=True, nutrition=False)
+        self.assertEqual(self._status_auth(enr, auth="pending", has_active_delivery=False), "pending")
+
+    def test_kitchen_without_nutrition_is_pending(self):
+        enr = self._enr("kitchen_assignment", verified=True, nutrition=False)
+        self.assertEqual(self._status_auth(enr, auth="approved", has_active_delivery=False), "pending")
+
+    def test_service_active_no_delivery_is_review(self):
+        # Activated (service_active) but no live delivery calendar -> quarantined
+        # in the temporary 'review' bucket (excluded from Pending).
+        enr = self._enr("service_active", verified=True, nutrition=True)
+        self.assertEqual(self._status_auth(enr, auth="approved", has_active_delivery=False), "review")
+
+    def test_never_requested_auth_is_review(self):
+        enr = self._enr("pending_verification", verified=False, nutrition=False)
+        self.assertEqual(self._status_auth(enr, auth="never_requested", has_active_delivery=False), "review")
 
 
 class GhlFinalVerificationStatusTest(TestCase):

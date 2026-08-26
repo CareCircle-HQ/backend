@@ -110,8 +110,36 @@ Verification check itself: cheap + correct, adopt regardless (catches the 2).
 
 ---
 
-## 2. PENDING — TODO (re-check)
-## 3. UNABLE TO BE SERVICED — TODO (re-check)
+## 2. PENDING — ✅ IMPLEMENTED
+
+**Definition:** governing case **open** AND authorization ∈ (**approved**, **pending/requested**) AND the member is still **before being served** — a PRE-service enrollment (pending verification / verified-awaiting / pending nutritionist), i.e. NOT yet `service_active`.
+
+```python
+if auth in ("approved", "pending") and stage not in ("service_active", "service_complete"):
+    return "pending"
+return "review"   # temporary quarantine (see below)
+```
+
+Two groups are deliberately **excluded** from Pending into a temporary
+**`review`** bucket (NOT surfaced in the Data-page dropdown; tracked in
+`docs/company-status-review-activated-no-delivery.md`, root cause TBD):
+- **Activated but not delivering** — `service_active`/`service_complete` with no
+  live delivery calendar (not Active, and past kitchen so not Pending).
+- **Non-actionable auth** — e.g. `never_requested`.
+
+Impact (clone rebuild): Pending 256 → **214**; `review` = **42**. Unit tests in
+`CompanyStatusActiveRuleTest`.
+
+## 3. UNABLE TO BE SERVICED — ✅ VERIFIED (no code change)
+
+**Definition (matches implementation):** governing case **open** AND (auth
+**denied** OR **out of orbit** OR **out of range** OR **not eligible** [no valid
+Medicaid / no valid social care / hard lifecycle-ineligible off-ramp incl.
+out-of-range ZIP / unsupported Medicaid plan] OR **Authorization Expired**).
+Authorization Expired is kept (confirmed): approval window lapsed → no current
+service, same spirit as denied. Clone: 1,946 (denied 1,018, out-of-orbit 455,
+ineligible 532, expired 4).
+
 ## 4. PAUSED — TODO (re-check)
 ## 5. CLOSED — TODO (re-check)
 ## 6. NO CASE CREATED — TODO (re-check)

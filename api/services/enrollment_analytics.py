@@ -266,11 +266,20 @@ def _company_status(enrollment, case, parity, in_any_po, has_medicaid, has_socia
             return "active"
         if stage == "kitchen_assignment" and nutrition_ok:
             return "active"
-    # Pending = open + unblocked but not (yet) actively served: verification
-    # incomplete, authorization not yet approved, nutrition pending, or the
-    # serving data isn't in place (no active delivery calendar / kitchen not
-    # assigned). Pending is the catch-all once Active's gates aren't all met.
-    return "pending"
+    # Pending = open case + a LIVE authorization (approved OR pending/requested)
+    # + still PROGRESSING toward service, i.e. a PRE-service enrollment: pending
+    # verification / verified (awaiting) / pending nutritionist -- everything
+    # BEFORE actually being served. Deliberately NOT service_active/complete.
+    if auth in ("approved", "pending") and stage not in (
+        "service_active", "service_complete",
+    ):
+        return "pending"
+    # REVIEW (temporary bucket, excluded from Pending -- to be resolved, see
+    # docs/company-status-review-activated-no-delivery.md):
+    #   * "activated but not delivering": a service_active/complete enrollment
+    #     with NO live delivery calendar (Active requires an active calendar), and
+    #   * authorizations that aren't approved/pending (e.g. never_requested).
+    return "review"
 
 
 def _nutritionist_status(enrollment):
