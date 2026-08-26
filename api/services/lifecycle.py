@@ -471,23 +471,37 @@ def derive_client_stage(client, *, ignore_sticky=False):
 
 
 def refresh_internal_case_sort(client, *, save=True):
-    """Refresh ``Client.internal_case_opened_at`` = the most recent
-    internal-service case ``date_opened`` (the Members-list "Created" sort key).
+    """Refresh the two denormalized Members-list case-date keys:
 
-    Denormalized so the list can ORDER BY an indexed column (index scan + LIMIT)
-    instead of computing a correlated subquery for every client and sorting the
-    whole table. No-op when the value is already current."""
+    * ``internal_case_opened_at``           = MOST RECENT internal-service case
+      ``date_opened`` (the "Created" SORT key), and
+    * ``governing_internal_case_opened_at`` = the GOVERNING internal-service
+      case's ``date_opened`` (the "Created" FILTER key -- favorability/deferral
+      aware, matching the Data page's governing-case semantics).
+
+    Denormalized so the list can ORDER BY / range-filter an indexed column
+    (index scan + LIMIT) instead of a correlated subquery per client. No-op when
+    both values are already current."""
     from django.db.models import Max
 
     from api.models import Case, CaseType
+    from api.portal.serializers import governing_service_case_for_display
 
     latest = Case.objects.filter(
         client=client, case_type=CaseType.INTERNAL_SERVICE,
     ).aggregate(m=Max("date_opened"))["m"]
+    gov = governing_service_case_for_display(client)
+    gov_opened = gov.date_opened if gov is not None else None
+
+    fields = []
     if client.internal_case_opened_at != latest:
         client.internal_case_opened_at = latest
-        if save:
-            client.save(update_fields=["internal_case_opened_at"])
+        fields.append("internal_case_opened_at")
+    if client.governing_internal_case_opened_at != gov_opened:
+        client.governing_internal_case_opened_at = gov_opened
+        fields.append("governing_internal_case_opened_at")
+    if fields and save:
+        client.save(update_fields=fields)
     return latest
 
 

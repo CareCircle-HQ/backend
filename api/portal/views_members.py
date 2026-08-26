@@ -1931,22 +1931,19 @@ class MembersListView(PortalGenericAPIView):
             qs = qs.filter(enr_q)
 
         # Created-date range filter (Members page): filters on the date the
-        # member's INTERNAL-SERVICE case was created (its ``date_opened``) --
-        # NOT the Client record's own ``created_at``. Mirrors the Urgent Care
-        # triage filter above and the ``case_created_at`` column, so the range
-        # searches the internal-service case creation date. Both bounds are
-        # applied to the SAME internal-service case row (one .filter() over the
-        # multi-valued relation); the trailing .distinct() dedupes the join.
-        # Inclusive [from, to]; either bound may be omitted.
+        # member's GOVERNING internal-service case was created (its
+        # ``date_opened``) -- NOT any internal-service case, and NOT the Client
+        # record's own ``created_at``. Keys off the denormalized, indexed
+        # ``governing_internal_case_opened_at`` (favorability/deferral aware, kept
+        # fresh by reconcile) so it matches the Data page's governing-case
+        # "Case Created" filter household-for-household. Inclusive [from, to];
+        # either bound may be omitted. No join -> no extra .distinct() needed.
         created_from = _parse_date(params.get("created_from"))
         created_to = _parse_date(params.get("created_to"))
-        if created_from or created_to:
-            case_date_q = Q(cases__case_type=CaseType.INTERNAL_SERVICE)
-            if created_from:
-                case_date_q &= Q(cases__date_opened__date__gte=created_from)
-            if created_to:
-                case_date_q &= Q(cases__date_opened__date__lte=created_to)
-            qs = qs.filter(case_date_q)
+        if created_from:
+            qs = qs.filter(governing_internal_case_opened_at__date__gte=created_from)
+        if created_to:
+            qs = qs.filter(governing_internal_case_opened_at__date__lte=created_to)
 
         # Closed-date range filter (Members page): filters on the date the
         # member's INTERNAL-SERVICE case was CLOSED (its ``case_closed_at``, the

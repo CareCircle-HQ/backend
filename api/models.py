@@ -376,6 +376,13 @@ class Client(models.Model):
     # backfill_client_case_sort command; indexed so the list orders via an index
     # scan + LIMIT instead of computing + sorting that value for all ~60k clients.
     internal_case_opened_at = models.DateTimeField(null=True, blank=True, db_index=True)
+    # Denormalized "Case Created" FILTER key: the GOVERNING internal-service
+    # case's date_opened (favorability/deferral aware, via
+    # governing_service_case_for_display) -- so the Members list's Created filter
+    # matches the Data page (which keys off the same governing case), instead of
+    # matching ANY internal-service case. Maintained by reconcile +
+    # backfill_client_case_sort. Indexed for a fast range filter.
+    governing_internal_case_opened_at = models.DateTimeField(null=True, blank=True, db_index=True)
     # Why the member is on the hard INELIGIBLE off-ramp: the human-readable gate
     # reasons (expired/missing Medicaid, wrong Medicaid type, out-of-range
     # ZIP/state, or a Kitchen-Assignment closure/denial). Written wherever the
