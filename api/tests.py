@@ -5487,6 +5487,53 @@ class RequestVerificationFromValidatedTest(TestCase):
         self.assertEqual(EnrollmentStage(enr.stage), EnrollmentStage.VERIFIED)
 
 
+class GhlFinalVerificationStatusTest(TestCase):
+    """The GHL 'Final Verification Status' the extension reads must reflect the
+    real verification (verified_at), NOT a completed eligibility screening --
+    otherwise a screened-but-unverified member shows "already completed" and the
+    ext blocks the request."""
+
+    def test_screened_but_unverified_is_pending(self):
+        from .models import (
+            Case, CaseStatus, CaseType, Client, EnrollmentStage,
+            EnrollmentVerification, Household, HouseholdMember, Screening,
+            ServiceAuthorizationStatus,
+        )
+        from .integrations.ghl.custom_fields_updated import _final_verification_status
+
+        c = Client.objects.create(client_id=str(uuid.uuid4()), first_name="Scr", last_name="Eened")
+        Screening.objects.create(
+            enhanced_screen_id=str(uuid.uuid4()), client=c, subject_id=c.pk,
+            screen_status="complete",
+        )
+        hh = Household.objects.create(name="HH")
+        HouseholdMember.objects.create(household=hh, client=c, is_primary=True)
+        case = Case.objects.create(
+            case_id=str(uuid.uuid4()), client=c, case_type=CaseType.INTERNAL_SERVICE,
+            case_status=CaseStatus.OPEN,
+            service_authorization_status=ServiceAuthorizationStatus.APPROVED,
+        )
+        EnrollmentVerification.objects.create(
+            client=c, household=hh, case=case, stage=EnrollmentStage.VALIDATED,
+        )
+        self.assertEqual(_final_verification_status(c), "Pending")
+
+    def test_verified_is_complete(self):
+        from django.utils import timezone
+        from .models import (
+            Client, EnrollmentStage, EnrollmentVerification, Household, HouseholdMember,
+        )
+        from .integrations.ghl.custom_fields_updated import _final_verification_status
+
+        c = Client.objects.create(client_id=str(uuid.uuid4()), first_name="Ver", last_name="Ified")
+        hh = Household.objects.create(name="HH")
+        HouseholdMember.objects.create(household=hh, client=c, is_primary=True)
+        EnrollmentVerification.objects.create(
+            client=c, household=hh, stage=EnrollmentStage.VERIFIED, verified_at=timezone.now(),
+        )
+        self.assertEqual(_final_verification_status(c), "Complete")
+
+
 class TimelineReasonDetailTest(TestCase):
     """Out-of-Orbit / Out-of-Range timeline rows surface WHY (reason / ZIP), not
     just the member name, so the History tab shows the detail directly."""

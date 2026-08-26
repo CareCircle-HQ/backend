@@ -215,12 +215,18 @@ def _member_status(client):
 
 
 def _final_verification_status(client):
-    """Overall verification status based on screenings."""
-    # Aggregate from related screenings (verified_at was removed; use status)
-    verified_screenings = client.screenings.filter(
-        screen_status__iexact="complete"
-    ).exists()
-    return "Complete" if verified_screenings else "Pending"
+    """Overall VERIFICATION status pushed to GHL (read by the extension to decide
+    whether verification can still be requested).
+
+    "Complete" ONLY once the verification POP-UP was actually completed -- i.e. a
+    governing enrollment carries ``verified_at``. A completed eligibility
+    SCREENING is NOT a verification (it's an early-funnel step): keying off
+    screenings reported "Complete" for screened-but-unverified members, so the
+    extension showed "verification already completed" and blocked the request.
+    """
+    from api.services.lifecycle import verification_completed
+
+    return "Complete" if verification_completed(client) else "Pending"
 
 
 # =============================================================================
