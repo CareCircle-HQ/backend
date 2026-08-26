@@ -416,6 +416,11 @@ def build_row(client):
         "auth_status": (case.service_authorization_status if case else ""),
         "case_opened_at": (case.date_opened if case else None),
         "program_name": (case.program_name if case else ""),
+        # Program TYPE = the governing case's household_type (household /
+        # individual) -- drives the Data page's "Program (Household/Individual)"
+        # filter. Was never populated (always blank), so that filter matched
+        # nothing; keyed off the governing internal-service case like the rest.
+        "program_type": (case.household_type if case else ""),
         "allergies": allergies,
         "medical_conditions": conditions,
         "medications": meds,

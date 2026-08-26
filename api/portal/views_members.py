@@ -1789,22 +1789,12 @@ class MembersListView(PortalGenericAPIView):
         # household's program.
         program_type = (params.get("program_type") or "").strip().lower()
         if program_type in ("household", "individual"):
-            household_prog = (
-                Q(enrollments__program_name__icontains="household")
-                | Q(
-                    household_membership__household__enrollment_verifications__program_name__icontains="household"
-                )
-            )
-            has_prog = (
-                Q(enrollments__isnull=False)
-                | Q(
-                    household_membership__household__enrollment_verifications__isnull=False
-                )
-            )
-            if program_type == "household":
-                qs = qs.filter(household_prog)
-            else:  # individual: has a program, but none of household scope
-                qs = qs.filter(has_prog).exclude(household_prog)
+            # Keyed off the GOVERNING internal-service case's household_type
+            # (denormalized, indexed on Client), matching the Data page -- NOT a
+            # "household" program name on ANY (incl. closed/disregarded)
+            # enrollment. A member whose current governing program is Individual
+            # but who has an OLD closed Household program is Individual here.
+            qs = qs.filter(governing_program_type=program_type)
 
         # Menu-type filter (Members page): the member's assigned catalog menu
         # type. MemberDietaryProfile.menu_type stores the catalog NAME, so match

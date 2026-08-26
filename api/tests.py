@@ -2811,6 +2811,9 @@ class MemberListGroupedStatusFilterTest(TestCase):
             MemberDietaryProfile, MemberStatus,
         )
 
+        from .serializers import derive_household_type
+        from .services.lifecycle import refresh_internal_case_sort
+
         client = Client.objects.create(
             client_id=str(uuid.uuid4()), first_name=first, last_name="Member",
             lifecycle_stage=lifecycle or ClientStage.ACTIVE,
@@ -2823,6 +2826,8 @@ class MemberListGroupedStatusFilterTest(TestCase):
             case_status=case_status or CaseStatus.OPEN,
             service_authorization_status=auth or "",
             program_name=program_name,
+            # Derived at case save in prod; set it here since we bypass the serializer.
+            household_type=derive_household_type(None, program_name),
         )
         enr = EnrollmentVerification.objects.create(
             client=client, household=hh,
@@ -2834,6 +2839,9 @@ class MemberListGroupedStatusFilterTest(TestCase):
             enrollment=enr, client=client,
             status=member_status or MemberStatus.ACTIVE,
         )
+        # Populate the denormalized governing-case keys (governing_program_type,
+        # etc.) as the case-save reconcile does in production.
+        refresh_internal_case_sort(client)
         return client
 
     def _ids(self, **params):

@@ -503,11 +503,13 @@ def refresh_internal_case_sort(client, *, save=True):
         gov_opened = gov_requested = gov_completed = None
         gov_status, gov_closed, gov_authorized = "", None, None
         gov_kitchen = None
+        gov_program_type = ""
     else:
         gov_opened = gov.date_opened
         gov_status = gov.case_status or ""
         gov_closed = gov.case_closed_at
         gov_authorized = gov.service_authorization_approval_starts_at
+        gov_program_type = gov.household_type or ""
         enr = active_enrollment(client)
         gov_requested = (enr.requested_at or enr.opened_at) if enr is not None else None
         gov_completed = enr.verified_at if enr is not None else None
@@ -522,6 +524,7 @@ def refresh_internal_case_sort(client, *, save=True):
         "governing_internal_case_closed_at": gov_closed,
         "governing_internal_case_authorized_at": gov_authorized,
         "governing_kitchen_id": gov_kitchen,
+        "governing_program_type": gov_program_type,
     }
     fields = [f for f, val in updates.items() if getattr(client, f) != val]
     for f in fields:

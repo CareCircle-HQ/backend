@@ -407,6 +407,12 @@ class Client(models.Model):
         "Kitchen", null=True, blank=True, on_delete=models.SET_NULL,
         related_name="+", db_index=True,
     )
+    # Denormalized GOVERNING internal-service case's program TYPE
+    # (household / individual, from its household_type), so the Members list's
+    # Program (Household/Individual) filter keys off the governing case -- like
+    # the Data page -- instead of matching a household program name on ANY
+    # (incl. closed/disregarded) enrollment. "" when no governing case.
+    governing_program_type = models.CharField(max_length=16, blank=True, default="", db_index=True)
     # Why the member is on the hard INELIGIBLE off-ramp: the human-readable gate
     # reasons (expired/missing Medicaid, wrong Medicaid type, out-of-range
     # ZIP/state, or a Kitchen-Assignment closure/denial). Written wherever the
