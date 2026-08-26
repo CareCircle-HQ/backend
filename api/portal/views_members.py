@@ -123,6 +123,7 @@ from ..services.lifecycle import (
     recompute_client_stage,
     recompute_enrollment_household,
     reconcile_enrollment_authorization,
+    reopen_for_verification,
     split_dependent_into_own_enrollment,
 )
 from ..services import timeline
@@ -6510,29 +6511,24 @@ class MemberRequestVerificationView(PortalAPIView):
                 {"error": "Can't request verification: " + ", ".join(missing) + "."},
                 status=http.HTTP_400_BAD_REQUEST,
             )
-        # RENEW an existing pre-verification enrollment (never verified, sitting at
-        # Validated / Pending Validation -- e.g. regressed there by a reconcile
-        # when no open case existed yet) back into the queue, instead of rejecting
-        # as "already requested". Without this the member is stranded behind a
-        # "Pending Verification" label with no wizard/popup to act on.
-        renewable = (
-            EnrollmentVerification.objects.filter(
-                client=client, verified_at__isnull=True,
-                stage__in=(EnrollmentStage.VALIDATED, EnrollmentStage.PENDING_VALIDATION),
-            )
-            .order_by("-opened_at")
-            .first()
-        )
-        if renewable is not None:
+        # RENEW a NEVER-verified governing enrollment back into the verification
+        # queue, instead of rejecting as "already requested". Covers a member
+        # wrongly advanced to a serving stage (e.g. a reauthorization activated an
+        # unverified enrollment to Service Active) OR regressed to Validated --
+        # ANY non-terminal enrollment that was never verified. reopen_for_
+        # verification force-regresses it to Pending Verification (a hop the
+        # normal transition map disallows) so the wizard opens; it's a no-op for a
+        # genuinely-verified enrollment.
+        renewable = s.active_enrollment(client)
+        if (
+            renewable is not None
+            and renewable.verified_at is None
+            and EnrollmentStage(renewable.stage) != EnrollmentStage.PENDING_VERIFICATION
+        ):
             agent = current_agent(request)
             actor = _agent_actor(agent)
             with transaction.atomic():
-                advance_enrollment(
-                    renewable, EnrollmentStage.PENDING_VERIFICATION, force=True,
-                    actor=actor,
-                    note="Verification requested: returned to Pending Verification.",
-                    trigger="verification_requested",
-                )
+                reopen_for_verification(renewable, actor_label=actor)
                 renewable.requested_by = agent
                 renewable.requested_at = timezone.now()
                 renewable.save(update_fields=["requested_by", "requested_at"])

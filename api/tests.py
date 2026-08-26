@@ -5494,6 +5494,55 @@ class RequestVerificationFromValidatedTest(TestCase):
         enr.refresh_from_db()
         self.assertEqual(EnrollmentStage(enr.stage), EnrollmentStage.VERIFIED)
 
+    def test_re_request_from_service_active_unverified_regresses(self):
+        # A member wrongly advanced to service_active but NEVER verified (e.g. a
+        # reauthorization activated an unverified enrollment) can still be
+        # (re-)requested: it regresses back to Pending Verification.
+        from .models import EnrollmentStage
+        c, enr = self._validated_member()
+        enr.stage = EnrollmentStage.SERVICE_ACTIVE
+        enr.save(update_fields=["stage"])
+        resp = self.api.post(f"/api/enrollment-verifications/{enr.pk}/re-request/")
+        self.assertEqual(resp.status_code, 200, resp.content)
+        enr.refresh_from_db()
+        self.assertEqual(EnrollmentStage(enr.stage), EnrollmentStage.PENDING_VERIFICATION)
+        self.assertIsNone(enr.verified_at)
+
+
+class ReopenForVerificationTest(TestCase):
+    """reopen_for_verification force-regresses a NEVER-verified enrollment back to
+    Pending Verification (a hop the transition map disallows), but never touches a
+    genuinely-verified one."""
+
+    def _enr(self, stage, *, verified):
+        from django.utils import timezone
+        from .models import (
+            Client, EnrollmentStage, EnrollmentVerification, Household, HouseholdMember,
+        )
+        c = Client.objects.create(client_id=str(uuid.uuid4()), first_name="R", last_name="V")
+        hh = Household.objects.create(name="HH")
+        HouseholdMember.objects.create(household=hh, client=c, is_primary=True)
+        return EnrollmentVerification.objects.create(
+            client=c, household=hh, stage=stage,
+            verified_at=(timezone.now() if verified else None),
+        )
+
+    def test_service_active_unverified_regresses(self):
+        from .models import EnrollmentStage
+        from .services.lifecycle import reopen_for_verification
+        enr = self._enr(EnrollmentStage.SERVICE_ACTIVE, verified=False)
+        reopen_for_verification(enr, actor_label="Agent X")
+        enr.refresh_from_db()
+        self.assertEqual(EnrollmentStage(enr.stage), EnrollmentStage.PENDING_VERIFICATION)
+
+    def test_verified_enrollment_untouched(self):
+        from .models import EnrollmentStage
+        from .services.lifecycle import reopen_for_verification
+        enr = self._enr(EnrollmentStage.SERVICE_ACTIVE, verified=True)
+        reopen_for_verification(enr, actor_label="Agent X")
+        enr.refresh_from_db()
+        self.assertEqual(EnrollmentStage(enr.stage), EnrollmentStage.SERVICE_ACTIVE)
+
 
 class DataSummaryHouseholdByPrimaryTest(TestCase):
     """Data-page household count is by the GOVERNING (primary) member, so each
