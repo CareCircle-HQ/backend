@@ -140,9 +140,31 @@ Authorization Expired is kept (confirmed): approval window lapsed → no current
 service, same spirit as denied. Clone: 1,946 (denied 1,018, out-of-orbit 455,
 ineligible 532, expired 4).
 
-## 4. PAUSED — TODO (re-check)
-## 5. CLOSED — TODO (re-check)
-## 6. NO CASE CREATED — TODO (re-check)
+## 4. PAUSED — ✅ VERIFIED (no code change)
+Governing case **open** AND (explicit **Pause** flag OR **nutritionist paused**
+OR **On Hold** [stage `on_hold` / program "On Hold"]). Clone: **1,975**
+(on-hold 1,912, explicit pause 190, + nutritionist-paused). Matches definition.
 
-(Left to review together, same format: intended algorithm vs. implemented, impact,
-open questions.)
+## 5. CLOSED — ✅ VERIFIED (no code change)
+Governing internal-service case status ∈ (**closed**, cancelled). Clone:
+**3,057** (all `closed`). Matches definition.
+
+## 6. NO CASE (CREATED) — ✅ VERIFIED (no code change)
+Member has **no** governing internal-service case **AND** is **not** part of a
+household (`in_household` False). A household member (dependent) with no own case
+is blank `""` (excluded), NOT No Case — this is the "exclude individual members
+tied to the primary case" rule. Clone: **39,003** no_case (sample: 0 with an IS
+case, 0 in a household); **6,354** blank (household relatives). Matches definition.
+
+---
+
+## Priority note
+Buckets are first-match in order `No Case → Closed → Unable → Paused → Active →
+Pending → review`. So when two apply, the earlier wins — e.g. a member who is
+BOTH On Hold and Out of Orbit is **Unable**, not Paused. This is intentional
+(more-severe state wins); revisit if a different precedence is wanted.
+
+## Status: all six buckets reviewed
+Active ✅ / Pending ✅ (+ `review` quarantine) / Unable ✅ / Paused ✅ / Closed ✅ /
+No Case ✅. Open follow-up: root-cause the `review` (activated-but-not-delivering)
+group — see docs/company-status-review-activated-no-delivery.md.
