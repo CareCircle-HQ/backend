@@ -5372,6 +5372,62 @@ class HoldPreservedThroughCaseChangeTest(TestCase):
         self.assertEqual(EnrollmentStage(live[0].stage), EnrollmentStage.ON_HOLD)
 
 
+class ClosedCaseEnrollmentTerminalizedTest(TestCase):
+    """Per-enrollment invariant: when a case closes but a newer OPEN case keeps
+    the client active, the stale NON-active enrollment left on the closed case is
+    terminalized (not left lingering). The active/serving enrollment is untouched."""
+
+    def test_stale_closed_case_enrollment_is_terminalized(self):
+        from django.utils import timezone
+
+        from .models import (
+            Case, CaseStatus, CaseType, Client, EnrollmentStage,
+            EnrollmentVerification, Household, HouseholdMember,
+            ServiceAuthorizationStatus,
+        )
+        from .services.lifecycle import reconcile_internal_service_authorization
+
+        c = Client.objects.create(client_id=str(uuid.uuid4()), first_name="C", last_name="C")
+        hh = Household.objects.create(name="HH")
+        HouseholdMember.objects.create(household=hh, client=c, is_primary=True)
+        now = timezone.now()
+        open_case = Case.objects.create(
+            case_id=str(uuid.uuid4()), client=c, case_type=CaseType.INTERNAL_SERVICE,
+            case_status=CaseStatus.OPEN,
+            service_authorization_status=ServiceAuthorizationStatus.APPROVED,
+            program_name="Medically Tailored Meals (MTM)", case_created_at=now,
+        )
+        closed_case = Case.objects.create(
+            case_id=str(uuid.uuid4()), client=c, case_type=CaseType.INTERNAL_SERVICE,
+            case_status=CaseStatus.CLOSED,
+            service_authorization_status=ServiceAuthorizationStatus.APPROVED,
+            program_name="Medically Tailored Meals (MTM)", case_created_at=now,
+        )
+        active = EnrollmentVerification.objects.create(
+            client=c, household=hh, case=open_case,
+            stage=EnrollmentStage.SERVICE_ACTIVE, verified_at=now,
+            program_name="Medically Tailored Meals (MTM)",
+        )
+        stale = EnrollmentVerification.objects.create(
+            client=c, household=hh, case=closed_case,
+            stage=EnrollmentStage.KITCHEN_ASSIGNMENT, verified_at=now,
+            program_name="Medically Tailored Meals (MTM)",
+        )
+        reconcile_internal_service_authorization(c)
+        stale.refresh_from_db()
+        active.refresh_from_db()
+        self.assertIn(
+            EnrollmentStage(stale.stage),
+            (EnrollmentStage.CLOSED, EnrollmentStage.CANCELLED),
+            "stale enrollment on the closed case must be terminalized",
+        )
+        self.assertNotIn(
+            EnrollmentStage(active.stage),
+            (EnrollmentStage.CLOSED, EnrollmentStage.CANCELLED),
+            "the active/serving enrollment (open case) must be preserved",
+        )
+
+
 class TimelineReasonDetailTest(TestCase):
     """Out-of-Orbit / Out-of-Range timeline rows surface WHY (reason / ZIP), not
     just the member name, so the History tab shows the detail directly."""

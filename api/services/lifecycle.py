@@ -12,6 +12,7 @@ source of truth for funnel-conversion and time-in-stage reporting.
 """
 
 import contextvars
+import logging
 from contextlib import contextmanager
 from datetime import datetime, timezone as dt_timezone
 
@@ -5252,6 +5253,76 @@ def process_scheduled_extensions(
     return result
 
 
+def _terminalize_closed_case_enrollments(client, *, actor=None, actor_label=""):
+    """Per-enrollment invariant: an enrollment whose OWN internal-service case is
+    closed/cancelled must itself be terminal (each case is tied to one
+    enrollment). Closes any non-terminal enrollment still sitting on a
+    closed/cancelled case.
+
+    Only runs on a PARTIAL close -- i.e. the client still has at least one OPEN
+    internal-service case. A FULL stop (every case closed) is handled reversibly
+    by ``_full_stop_close_out`` (pause -> SERVICE_INACTIVE), so we must not
+    hard-close there. Runs AFTER the governing-case switch has carried the
+    verification onto the new enrollment, so closing the old (superseded /
+    parallel) one loses nothing. Idempotent. Returns the number closed.
+    """
+    from api.models import EnrollmentVerification
+
+    if not open_internal_service_cases(client):
+        return 0
+    # The ACTIVE (governing/serving) enrollment is the survivor -- its ``case``
+    # field can legitimately still point at an old closed case while the member is
+    # served via a different open governing case (case-switch repoint is lazy).
+    # Never terminalize it; only stale/parallel NON-active enrollments.
+    from api.portal.serializers import active_enrollment
+    active = active_enrollment(client)
+    active_pk = active.pk if active is not None else None
+    closed = {CaseStatus.CLOSED, CaseStatus.CANCELLED}
+    # Already-done / handled-elsewhere stages we never re-terminalize: the true
+    # terminals, plus DISREGARDED (dismissed request), SERVICE_COMPLETE (finished
+    # serving), and SCHEDULED_EXTENSION (parked reauth -- cleaned by
+    # _close_orphaned_scheduled_extensions).
+    _skip_stages = set(_TERMINAL_STAGES) | {
+        EnrollmentStage.DISREGARDED,
+        EnrollmentStage.SERVICE_COMPLETE,
+        EnrollmentStage.SCHEDULED_EXTENSION,
+    }
+    n = 0
+    stale = (
+        EnrollmentVerification.objects.filter(client=client)
+        .select_related("case")
+        .exclude(stage__in=[s.value for s in _skip_stages])
+    )
+    for enr in stale:
+        if enr.pk == active_pk:
+            continue
+        if not (enr.case_id and enr.case and enr.case.case_status in closed):
+            continue
+        # CLOSED (service ended) when the transition map allows it -- i.e. from a
+        # serving stage; a PRE-service enrollment (validated / pending / kitchen
+        # assignment) never served, so it terminalizes as CANCELLED instead. Both
+        # are terminal. force bypasses gates but NOT the map, so pick the allowed
+        # terminal per the current stage.
+        cur = EnrollmentStage(enr.stage)
+        to_stage = (
+            EnrollmentStage.CLOSED
+            if EnrollmentStage.CLOSED in ENROLLMENT_TRANSITIONS.get(cur, set())
+            else EnrollmentStage.CANCELLED
+        )
+        try:
+            advance_enrollment(
+                enr, to_stage, force=True, actor=actor, actor_label=actor_label,
+                note="Internal-service case closed; enrollment terminalized.",
+                trigger="case_closed",
+            )
+            n += 1
+        except Exception:  # noqa: BLE001 - never let one enrollment abort the pass
+            logging.getLogger(__name__).exception(
+                "terminalize closed-case enrollment %s failed", enr.pk
+            )
+    return n
+
+
 def reconcile_internal_service_authorization(client, *, actor=None, actor_label=""):
     """React to a change in the client's internal-service case authorization.
 
@@ -5474,6 +5545,16 @@ def reconcile_internal_service_authorization(client, *, actor=None, actor_label=
                     enr, actor=actor, actor_label=actor_label,
                 )
                 result["downgraded"] = True
+
+    # Per-enrollment invariant, LAST (after the governing switch/carry above has
+    # moved verification onto the surviving enrollment): terminalize any
+    # enrollment still non-terminal on a CLOSED case. Only on a partial close (an
+    # open case remains) -- a full stop is handled reversibly above. This closes
+    # the stale/parallel enrollment a closed case leaves behind when a newer case
+    # keeps the client open, WITHOUT disturbing the carried survivor (now on the
+    # open case). Not flagged as ``closed_out`` so the governing enrollment's
+    # delivery reconcile below still runs.
+    _terminalize_closed_case_enrollments(client, actor=actor, actor_label=actor_label)
 
     # Keep the delivery calendar in step with the (possibly changed) governing
     # authorization: auto-heal a same-kind window extension, or truncate future
