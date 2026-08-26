@@ -14369,6 +14369,11 @@ class MembersPendingVerificationReportTest(TestCase):
         enr = EnrollmentVerification.objects.create(
             client=client, household=hh, case=case, stage=stage,
         )
+        # Populate the denormalized governing-case keys (as the case-save
+        # reconcile does in production), so the governing case-created filter has
+        # something to match.
+        from .services.lifecycle import refresh_internal_case_sort
+        refresh_internal_case_sort(client)
         return client, hh, enr
 
     def test_excludes_already_verified_and_adds_case_created(self):

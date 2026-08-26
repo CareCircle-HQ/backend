@@ -1130,23 +1130,21 @@ def apply_authorization_date_filter(qs, start, end):
 
 def apply_case_created_date_filter(qs, start, end):
     """Restrict ``qs`` to clients whose GOVERNING internal-service case was
-    CREATED/opened (``Case.date_opened``) within the inclusive [start, end]
-    window. Either bound may be None (open-ended); no-op when both are None.
+    CREATED/opened within the inclusive [start, end] window. Either bound may be
+    None (open-ended); no-op when both are None.
 
-    Uses ``Exists`` on the internal-service case (mirroring
-    ``apply_authorization_date_filter``), so it introduces no join duplicates
-    and needs no ``.distinct()`` of its own."""
+    Keys off the denormalized ``governing_internal_case_opened_at`` (the same
+    governing case the Members-list "Created" filter and the Data page report) --
+    NOT any internal-service case -- so the Verification page's case-created
+    filter matches the Members page instead of drifting on multi-case members.
+    No join, so no ``.distinct()`` is required."""
     if not start and not end:
         return qs
-    cases = Case.objects.filter(
-        client=OuterRef("pk"),
-        case_type=CaseType.INTERNAL_SERVICE,
-    )
     if start:
-        cases = cases.filter(date_opened__date__gte=start)
+        qs = qs.filter(governing_internal_case_opened_at__date__gte=start)
     if end:
-        cases = cases.filter(date_opened__date__lte=end)
-    return qs.filter(Exists(cases))
+        qs = qs.filter(governing_internal_case_opened_at__date__lte=end)
+    return qs
 
 
 def apply_verification_date_filters(qs, params, *, skip_enrollment_bounds=False):
