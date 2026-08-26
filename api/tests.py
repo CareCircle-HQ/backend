@@ -5487,6 +5487,57 @@ class RequestVerificationFromValidatedTest(TestCase):
         self.assertEqual(EnrollmentStage(enr.stage), EnrollmentStage.VERIFIED)
 
 
+class CompanyStatusActiveRuleTest(TestCase):
+    """The Data-page 'Active' company status: a REAL verification + valid auth,
+    and either an active delivery calendar (being delivered -- nutrition not
+    re-checked) OR pending Kitchen Assignment WITH nutritionist sign-off."""
+
+    def _case(self, auth="approved", status="open"):
+        from types import SimpleNamespace
+        from .models import CaseType
+        return SimpleNamespace(
+            case_type=CaseType.INTERNAL_SERVICE, case_status=status,
+            service_authorization_status=auth,
+        )
+
+    def _enr(self, stage, *, verified=True, nutrition=True):
+        from types import SimpleNamespace
+        from django.utils import timezone
+        now = timezone.now()
+        return SimpleNamespace(
+            stage=stage,
+            verified_at=(now if verified else None),
+            nutritionist_approved_at=(now if nutrition else None),
+        )
+
+    def _status(self, enr, *, has_active_delivery):
+        from .services.enrollment_analytics import _company_status
+        return _company_status(
+            enr, self._case(), {}, False, True, True, "",
+            in_household=False, has_active_delivery=has_active_delivery,
+        )
+
+    def test_being_delivered_is_active_even_without_nutrition(self):
+        enr = self._enr("service_active", verified=True, nutrition=False)
+        self.assertEqual(self._status(enr, has_active_delivery=True), "active")
+
+    def test_service_active_without_live_delivery_is_pending(self):
+        enr = self._enr("service_active", verified=True, nutrition=True)
+        self.assertEqual(self._status(enr, has_active_delivery=False), "pending")
+
+    def test_kitchen_assignment_with_nutrition_is_active(self):
+        enr = self._enr("kitchen_assignment", verified=True, nutrition=True)
+        self.assertEqual(self._status(enr, has_active_delivery=False), "active")
+
+    def test_kitchen_assignment_without_nutrition_is_pending(self):
+        enr = self._enr("kitchen_assignment", verified=True, nutrition=False)
+        self.assertEqual(self._status(enr, has_active_delivery=False), "pending")
+
+    def test_unverified_is_pending_even_if_being_delivered(self):
+        enr = self._enr("service_active", verified=False, nutrition=True)
+        self.assertEqual(self._status(enr, has_active_delivery=True), "pending")
+
+
 class GhlFinalVerificationStatusTest(TestCase):
     """The GHL 'Final Verification Status' the extension reads must reflect the
     real verification (verified_at), NOT a completed eligibility screening --

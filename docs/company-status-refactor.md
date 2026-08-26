@@ -10,7 +10,36 @@ Implementation lives in `api/services/enrollment_analytics.py::_company_status`.
 
 ---
 
-## 1. ACTIVE  — reviewed (NOT yet implemented)
+## 1. ACTIVE  — ✅ IMPLEMENTED (Option B + active delivery calendar + verification)
+
+**Decisions made & shipped:**
+- Nutrition: **Option B** — a member on an **active delivery calendar** is Active
+  regardless of nutrition (already being served; the nutrition gap still shows in
+  the nutritionist filter). Only the **pending Kitchen Assignment** branch requires
+  nutritionist sign-off.
+- "Being delivered" = **active delivery calendar** (`_has_active_delivery`: a
+  non-cancelled DeliveryOrder in a PO), NOT the `service_active` stage.
+- **Verification required**: Active needs a real `verified_at`, not just the stage.
+
+**New rule (`_company_status`, after Unable/Paused excluded):**
+```python
+if verified and auth in ("approved", "not_required"):
+    if has_active_delivery:                                   # being delivered
+        return "active"
+    if stage == "kitchen_assignment" and nutrition_ok:        # pre-service + nutrition
+        return "active"
+# else -> pending
+```
+
+**Impact on the 2026-08-25 clone (after full rebuild):** Active 12,853 → **12,675**
+(−178: 2 unverified, ~75 service_active with no live delivery, ~74 kitchen w/o
+nutrition, a few reclassified); Pending 75 → 256. All 12,675 Active satisfy the
+rule (12,184 being delivered + 491 kitchen+nutrition); other buckets unchanged.
+Unit tests: `CompanyStatusActiveRuleTest`.
+
+---
+
+## 1b. ACTIVE — original review notes (kept for history)
 
 > Note: this is the **company** "Active" rollup, distinct from the system's
 > enrollment `service_active` stage.

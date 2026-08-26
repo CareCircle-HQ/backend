@@ -82,6 +82,16 @@ def _in_any_po(client_id):
     ).exists()
 
 
+def _has_active_delivery(client_id):
+    """True when the member has an ACTIVE delivery calendar -- a non-cancelled
+    DeliveryOrder tied to a PO (a real scheduled/live/delivered order). Distinct
+    from ``_in_any_po`` (EVER in a PO, incl. all-cancelled): this is the "being
+    delivered right now" signal used by the Active company status."""
+    return DeliveryOrder.objects.filter(
+        member_id=client_id, purchase_order__isnull=False,
+    ).exclude(status="cancelled").exists()
+
+
 def _as_aware(value):
     """Coerce a date/naive-datetime into an aware datetime (expected_delivery_date
     is a DateField), so storing it in a DateTimeField doesn't warn or shift days."""
@@ -201,7 +211,7 @@ def _parity_fields(client):
 
 
 def _company_status(enrollment, case, parity, in_any_po, has_medicaid, has_social,
-                    member_status="", in_household=False):
+                    member_status="", in_household=False, has_active_delivery=False):
     if case is None or getattr(case, "case_type", "") != _INTERNAL_SERVICE:
         # No internal-service case (own OR household -- the household fallback
         # already ran). A member who is part of a household but has no food case
@@ -238,22 +248,28 @@ def _company_status(enrollment, case, parity, in_any_po, has_medicaid, has_socia
     if (parity.get("paused") or member_status == "nutritionist_paused"
             or stage == "on_hold" or prog == "On Hold"):
         return "paused"
-    # Active = who we're ACTUALLY serving RIGHT NOW: at Service Active (being
-    # delivered) or Kitchen Assignment (ready to be assigned a kitchen) AND with a
-    # currently-VALID authorization (approved / not-required). An EXPIRED auth
-    # means service should have stopped (needs reauthorization) -> not Active; it
-    # falls through to Pending below. NOTE: deliberately NOT `in_any_po` ("EVER in
-    # a PO") nor a stale `kitchen_id` on a terminal/pending enrollment.
-    if stage in ("service_active", "kitchen_assignment") and auth in ("approved", "not_required"):
-        return "active"
-    # Pending = open + unblocked + not yet serving, held up by ANY (OR) of:
-    #   Verification pending  (not verified)
-    #   Authorization pending (not approved AND not denied -> pending/never/blank)
-    #   Nutrition pending      (not nutritionist-approved)
-    if (not verified) or (auth not in ("approved", "not_required", "denied")) or (not nutrition_ok):
-        return "pending"
-    # Cleared all gates but not yet serving (rare/anomalous) -- still not being
-    # served, so surface as Pending rather than Active.
+    # Active = who we're ACTUALLY serving RIGHT NOW, and ONLY on a REAL completed
+    # verification (verified_at -- NOT merely inferred from the stage, which the
+    # reconcile incident proved can be false) AND a currently-VALID authorization
+    # (approved / not-required; an EXPIRED auth already fell into Unable above).
+    # Two ways to be Active:
+    #   * BEING DELIVERED -- an active delivery calendar (a non-cancelled
+    #     DeliveryOrder in a PO). Nutrition need NOT be re-checked here: the
+    #     member is already being served, and any nutrition gap still surfaces in
+    #     the nutritionist filter. (This is deliberately the delivery calendar,
+    #     NOT the `service_active` stage -- an activated member with no live
+    #     deliveries is not actually being served.)
+    #   * PENDING KITCHEN ASSIGNMENT -- not yet delivered, so require the
+    #     nutritionist sign-off before counting them Active.
+    if verified and auth in ("approved", "not_required"):
+        if has_active_delivery:
+            return "active"
+        if stage == "kitchen_assignment" and nutrition_ok:
+            return "active"
+    # Pending = open + unblocked but not (yet) actively served: verification
+    # incomplete, authorization not yet approved, nutrition pending, or the
+    # serving data isn't in place (no active delivery calendar / kitchen not
+    # assigned). Pending is the catch-all once Active's gates aren't all met.
     return "pending"
 
 
@@ -290,6 +306,7 @@ def build_row(client):
 
     cur_del, last_po_del, last_delivered, delivery_company = _derive_delivery(cid)
     in_any_po = _in_any_po(cid)
+    has_active_delivery = _has_active_delivery(cid)
     ins_status, ins_exp, soc_status, soc_exp = _coverage(cid)
     if enr is not None:
         menu_type, allergies, conditions, meds, member_status = _dietary(enr.pk, cid)
@@ -417,7 +434,7 @@ def build_row(client):
         # + block flags + case state).
         "company_status": _company_status(
             enr, case, parity, in_any_po, has_medicaid, has_social, member_status,
-            in_household=membership is not None,
+            in_household=membership is not None, has_active_delivery=has_active_delivery,
         ),
         # Nutrition-review status + delivery company on latest order.
         "nutritionist_status": _nutritionist_status(enr),
