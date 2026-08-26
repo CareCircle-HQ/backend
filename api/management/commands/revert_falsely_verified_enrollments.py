@@ -1,29 +1,30 @@
-"""Revert enrollments FALSELY marked verified by the case-replacement carry.
+"""Revert enrollments FALSELY marked verified (system-only "verification").
 
-When the import replaces a governing case, ``_carry_service_and_activate`` carries
-the prior enrollment's verification forward and ladders the new enrollment
-``pending_verification -> verified -> kitchen_assignment``. The carry only checks
-that ``verified_at`` is NON-NULL -- not that the verification was REAL -- so a
-member whose "verification" is only a system stamp (``verified_by`` NULL, never a
-real wizard verification, ``nutritionist_approved_at`` NULL) gets propagated into
-Kitchen Assignment on every case replacement, skipping the verification wizard AND
-the nutritionist step. A large batch of case replacements in one import (e.g.
-2026-08-21) mass-advances these never-really-verified members.
+Several paths stamp ``verified_at`` WITHOUT a real verification -- most notably
+``reconcile_member_stages`` (which inferred verification from an APPROVED
+authorization: note "Reconcile: approved but delivery data incomplete."), and the
+bulk file imports (Meal Inputs / LIST2 / LIST3 / Active Members). Such a row has
+``verified_at`` set but NO verifier (``verified_by`` NULL) and NO nutritionist
+sign-off (``nutritionist_approved_at`` NULL), and was advanced to Verified /
+Kitchen Assignment / Service Active -- skipping the verification wizard AND the
+nutritionist step. The case-replacement carry then propagates it across imports.
 
 This reverts such rows to PENDING_VERIFICATION: clears the false verification
-fact, drops the carried kitchen/cadence, pulls future deliveries off the calendar,
-and recomputes the client's lifecycle stage.
+fact, drops the imported/carried kitchen/cadence, pulls future deliveries off the
+calendar, and recomputes the client's lifecycle stage.
 
 SIGNATURE (all required, so a REAL or grandfathered-nutritionist verification is
 never clobbered):
-  * a StageEvent with metadata trigger == "case_replaced"
-  * ``verified_by`` IS NULL        (no real verifier -- carry copies verified_by,
-                                    so NULL here means the source was never real)
-  * ``nutritionist_approved_at`` IS NULL   (nutritionist step never happened)
+  * ``verified_by`` IS NULL               (no real verifier)
+  * ``nutritionist_approved_at`` IS NULL  (nutritionist step never happened)
+  * stage advanced past verification (see below)
 
-SERVING rows (SERVICE_ACTIVE / ON_HOLD / SERVICE_COMPLETE) are only REPORTED, not
-reverted, unless ``--include-serving``. Dry-run by default; ``--apply`` commits.
-``--since YYYY-MM-DD`` limits to rows verified on/after that date (Friday's batch).
+IMPORTANT: without ``--since`` this also matches historical bulk-import
+verifications (e.g. the 6/29 Meal Inputs batch) that may have been intentional.
+ALWAYS scope with ``--since`` (e.g. the incident date) unless you truly mean to
+revert every system-only verification. SERVING rows (SERVICE_ACTIVE / ON_HOLD /
+SERVICE_COMPLETE) are only REPORTED unless ``--include-serving``. Dry-run by
+default; ``--apply`` commits.
 """
 from collections import Counter
 from datetime import datetime
@@ -35,7 +36,6 @@ from django.utils import timezone
 from api.models import Client, EnrollmentStage, EnrollmentVerification
 from api.services.lifecycle import recompute_client_stage
 
-_TRIGGER = "case_replaced"
 _PRE_SERVICE = [EnrollmentStage.VERIFIED, EnrollmentStage.KITCHEN_ASSIGNMENT]
 _SERVING = [
     EnrollmentStage.SERVICE_ACTIVE,
@@ -66,10 +66,9 @@ class Command(BaseCommand):
 
     def _base_qs(self, since):
         qs = EnrollmentVerification.objects.filter(
-            stage_events__metadata__trigger=_TRIGGER,
             verified_by__isnull=True,
             nutritionist_approved_at__isnull=True,
-        ).distinct()
+        )
         if since:
             try:
                 d = datetime.strptime(since, "%Y-%m-%d").date()
@@ -103,9 +102,9 @@ class Command(BaseCommand):
         by_stage = Counter(qs.values_list("stage", flat=True))
 
         self.stdout.write(self.style.MIGRATE_HEADING(
-            "\n=== Revert falsely-verified (case_replaced carry) enrollments -> Pending Verification ==="
+            "\n=== Revert falsely-verified (system-only) enrollments -> Pending Verification ==="
         ))
-        self.stdout.write(f"  signature matches (verified_by=System, no nutritionist, case_replaced): {all_sig.count()}")
+        self.stdout.write(f"  signature matches (verified_by=System, no nutritionist): {all_sig.count()}")
         if since:
             self.stdout.write(f"  (limited to verified_at >= {since})")
         self.stdout.write(f"  to revert: {total}")
