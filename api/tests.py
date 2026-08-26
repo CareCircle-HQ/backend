@@ -5487,6 +5487,46 @@ class RequestVerificationFromValidatedTest(TestCase):
         self.assertEqual(EnrollmentStage(enr.stage), EnrollmentStage.VERIFIED)
 
 
+class DataSummaryHouseholdByPrimaryTest(TestCase):
+    """Data-page household count is by the GOVERNING (primary) member, so each
+    household maps to one status and buckets partition cleanly -- a mixed
+    household (e.g. paused primary + active dependent) is NOT double-counted."""
+
+    def setUp(self):
+        self.agent = Agent.objects.create(name="DS Agent", agent_code="940", group="CS")
+        access = AccessToken()
+        access["agent_id"] = str(self.agent.id)
+        access["agent_code"] = self.agent.agent_code
+        access["agent_name"] = self.agent.name
+        access["agent_group"] = self.agent.group
+        self.api = APIClient()
+        self.api.credentials(HTTP_AUTHORIZATION=f"Bearer {access}")
+
+    def _ea(self, household_id, *, is_primary, status):
+        from .models import Client, EnrollmentAnalytics
+        c = Client.objects.create(client_id=str(uuid.uuid4()), first_name="a", last_name="b")
+        return EnrollmentAnalytics.objects.create(
+            client=c, household_id=household_id, is_primary=is_primary,
+            company_status=status,
+        )
+
+    def test_household_counted_by_primary_status(self):
+        hh_a = uuid.uuid4()  # uniform active
+        hh_b = uuid.uuid4()  # mixed: paused primary, active dependent
+        self._ea(hh_a, is_primary=True, status="active")
+        self._ea(hh_a, is_primary=False, status="active")
+        self._ea(hh_b, is_primary=True, status="paused")
+        self._ea(hh_b, is_primary=False, status="active")
+
+        r_active = self.api.get(reverse("portal-data-summary"), {"company_status": "active"})
+        self.assertEqual(r_active.status_code, 200, r_active.content)
+        # Only hh_a (primary active); hh_b's active DEPENDENT does NOT pull hh_b in.
+        self.assertEqual(r_active.json()["households"], 1)
+
+        r_paused = self.api.get(reverse("portal-data-summary"), {"company_status": "paused"})
+        self.assertEqual(r_paused.json()["households"], 1)  # hh_b (primary paused)
+
+
 class CompanyStatusActiveRuleTest(TestCase):
     """The Data-page 'Active' company status: a REAL verification + valid auth,
     and either an active delivery calendar (being delivered -- nutrition not

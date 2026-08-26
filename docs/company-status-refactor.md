@@ -8,6 +8,13 @@ Buckets are evaluated in priority order (first match wins):
 `No Case → Closed → Unable → Paused → Active → Pending`.
 Implementation lives in `api/services/enrollment_analytics.py::_company_status`.
 
+**Household counting (Data page):** counted by the GOVERNING (primary) member
+(`is_primary=True`), so each household maps to exactly ONE status and the
+per-status household counts partition cleanly (sum to the total). Counting
+distinct `household_id` across ALL members double-counted a household whose
+members span statuses (measured: 165 mixed households, ~169 overlap). Changed in
+`DataSummaryView` (`views_members.py`); test `DataSummaryHouseholdByPrimaryTest`.
+
 ---
 
 ## 1. ACTIVE  — ✅ IMPLEMENTED (Option B + active delivery calendar + verification)

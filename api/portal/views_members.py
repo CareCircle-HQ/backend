@@ -2777,7 +2777,13 @@ class DataSummaryView(PortalAPIView):
             # One row per MEMBER, so total == members.
             "total": qs.count(),
             "members": qs.count(),
-            "households": qs.exclude(household_id=None).values("household_id").distinct().count(),
+            # Households counted by their GOVERNING (primary) member, so each
+            # household maps to exactly ONE status and the per-status household
+            # counts partition cleanly (sum to the total). Counting distinct
+            # household_id across ALL members double-counts a household whose
+            # members span different statuses -- e.g. an active primary with a
+            # paused dependent would land in both the Active and Paused buckets.
+            "households": qs.filter(is_primary=True).exclude(household_id=None).values("household_id").distinct().count(),
             "with_screening": qs.filter(has_screening=True).count(),
             "with_eligibility_assessment": qs.filter(has_eligibility_assessment=True).count(),
             "by_stage": breakdown("stage"),
