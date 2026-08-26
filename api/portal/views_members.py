@@ -1698,15 +1698,12 @@ class MembersListView(PortalGenericAPIView):
                 )
             )
 
-        # Kitchen filter: the member's (or their household's) enrollment kitchen.
+        # Kitchen filter: the member's GOVERNING enrollment kitchen (denormalized
+        # + indexed on Client), matching the Data page -- NOT any own/household
+        # enrollment's kitchen. No join.
         kitchen_id = (params.get("kitchen") or "").strip()
         if kitchen_id:
-            qs = qs.filter(
-                Q(enrollments__kitchen_id=kitchen_id)
-                | Q(
-                    household_membership__household__enrollment_verifications__kitchen_id=kitchen_id
-                )
-            )
+            qs = qs.filter(governing_kitchen_id=kitchen_id)
 
         # Lead-source filter (Members page): the client's stored lead source
         # (a CallTools queue id, or legacy free-text such as "Williamsburg").

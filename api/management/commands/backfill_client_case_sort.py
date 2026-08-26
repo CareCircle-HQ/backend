@@ -89,6 +89,7 @@ class Command(BaseCommand):
             "governing_internal_case_status",
             "governing_internal_case_closed_at",
             "governing_internal_case_authorized_at",
+            "governing_kitchen_id",
         ]
         qs = Client.objects.prefetch_related(
             "cases",
@@ -116,6 +117,7 @@ class Command(BaseCommand):
                     "governing_internal_case_status": gov.case_status or "",
                     "governing_internal_case_closed_at": gov.case_closed_at,
                     "governing_internal_case_authorized_at": gov.service_authorization_approval_starts_at,
+                    "governing_kitchen_id": enr.kitchen_id if enr is not None else None,
                 }
             if any(getattr(c, col) != vals[col] for col in cols):
                 for col in cols:

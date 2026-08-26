@@ -400,6 +400,13 @@ class Client(models.Model):
     governing_internal_case_status = models.CharField(max_length=32, blank=True, default="", db_index=True)
     governing_internal_case_closed_at = models.DateTimeField(null=True, blank=True, db_index=True)
     governing_internal_case_authorized_at = models.DateTimeField(null=True, blank=True, db_index=True)
+    # Denormalized GOVERNING enrollment's kitchen, so the Members list's Kitchen
+    # filter keys off the same governing enrollment the Data page reports (not ANY
+    # own/household enrollment's kitchen). NULL when no governing case/kitchen.
+    governing_kitchen = models.ForeignKey(
+        "Kitchen", null=True, blank=True, on_delete=models.SET_NULL,
+        related_name="+", db_index=True,
+    )
     # Why the member is on the hard INELIGIBLE off-ramp: the human-readable gate
     # reasons (expired/missing Medicaid, wrong Medicaid type, out-of-range
     # ZIP/state, or a Kitchen-Assignment closure/denial). Written wherever the
