@@ -616,7 +616,7 @@ def filter_analytics(params):
         "insurance_exp": "insurance_expires_at", "social_exp": "social_expires_at",
         "screening": "screening_at", "assessment": "eligibility_assessment_at",
         "case_opened": "case_opened_at", "requested": "requested_at",
-        "closed": "case_closed_at",
+        "verified": "verified_at", "closed": "case_closed_at",
     }.items():
         if g(f"{prefix}_from"):
             qs = qs.filter(**{f"{col}__date__gte": g(f"{prefix}_from")})
