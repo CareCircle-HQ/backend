@@ -63,12 +63,20 @@ class Command(BaseCommand):
         parser.add_argument(
             "--list", action="store_true", help="Print each affected member.",
         )
+        parser.add_argument(
+            "--clients-file", default="",
+            help="Restrict to the client UUIDs in this file (one per line). Scopes "
+                 "the revert to an explicit curated list (still requires the "
+                 "system-only signature).",
+        )
 
-    def _base_qs(self, since):
+    def _base_qs(self, since, client_ids=None):
         qs = EnrollmentVerification.objects.filter(
             verified_by__isnull=True,
             nutritionist_approved_at__isnull=True,
         )
+        if client_ids is not None:
+            qs = qs.filter(client_id__in=client_ids)
         if since:
             try:
                 d = datetime.strptime(since, "%Y-%m-%d").date()
@@ -93,7 +101,14 @@ class Command(BaseCommand):
         include_serving = opts["include_serving"]
         since = (opts["since"] or "").strip()
 
-        all_sig = self._base_qs(since)
+        client_ids = None
+        cf = (opts.get("clients_file") or "").strip()
+        if cf:
+            with open(cf) as fh:
+                client_ids = [line.strip() for line in fh if line.strip()]
+            self.stdout.write(f"  scoped to {len(client_ids)} client id(s) from {cf}")
+
+        all_sig = self._base_qs(since, client_ids)
         revert_stages = list(_PRE_SERVICE) + (list(_SERVING) if include_serving else [])
         qs = all_sig.filter(stage__in=[s.value for s in revert_stages])
         serving_qs = all_sig.filter(stage__in=[s.value for s in _SERVING])
