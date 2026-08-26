@@ -302,19 +302,49 @@ def build_row(client):
     has_medicaid = parity.pop("_has_valid_medicaid", True)
     has_social = parity.pop("_has_valid_social_care", True)
 
-    # Governing internal-service case: the active enrollment's own case when it's
-    # internal-service, else the client's most-recent internal-service case, else
-    # (for a DEPENDENT with no own case) the HOUSEHOLD's most-recent internal-
-    # service case -- a dependent inherits the household's case, so they aren't
-    # mislabeled "No Case Created" while their household holds the food case.
-    case = enr.case if (enr is not None and getattr(enr.case, "case_type", "") == _INTERNAL_SERVICE) else None
-    if case is None:
-        case = (client.cases.filter(case_type=_INTERNAL_SERVICE)
-                .order_by("-date_opened").first())
-    if case is None and membership is not None:
-        hh_ids = [m.client_id for m in membership.household.members.all()]
-        case = (Case.objects.filter(client_id__in=hh_ids, case_type=_INTERNAL_SERVICE)
-                .order_by("-date_opened").first())
+    # Governing internal-service case -- the SAME canonical resolution the
+    # Members/Verification pages use: the client's own governing IS case
+    # (favorability + deferral aware), else their household's. Keeps auth_status /
+    # case_status / company_status in agreement with those pages for members with
+    # multiple internal-service cases.
+    from api.portal.serializers import governing_service_case_for_display
+    case = governing_service_case_for_display(client)
+
+    # Verification-page parity flags. These reproduce the Verification page's
+    # EXACT Pending / Verified buckets so the Data page's verification filter
+    # matches it household-for-household. Both require the page's scope
+    # (require_internal_service_primary: the member's household PRIMARY holds an
+    # OPEN internal-service case):
+    #   has_verified_enrollment  = scope AND any own/household enrollment verified
+    #                              (== verification_completed_q)
+    #   has_pending_verification_enrollment = scope AND has an own/household
+    #     enrollment at pending_verification AND lifecycle_stage in the verify
+    #     window AND NOT verified.
+    _VWINDOW = ("pending_verification", "verified", "kitchen_assignment")
+    funnel_enr = list(client.enrollments.all())
+    if membership is not None:
+        funnel_enr += list(membership.household.enrollment_verifications.all())
+    verified_completed = any(e.verified_at is not None for e in funnel_enr)
+    has_pending_enr = any((e.stage or "") == "pending_verification" for e in funnel_enr)
+    lifecycle_in_window = (getattr(client, "lifecycle_stage", "") or "") in _VWINDOW
+    # Scope: the household PRIMARY holds an OPEN internal-service case.
+    primary_open_is = False
+    if membership is not None:
+        primary_m = next(
+            (m for m in membership.household.members.all() if m.is_primary and m.client_id),
+            None,
+        )
+        if primary_m is not None:
+            primary_open_is = any(
+                c.case_type == _INTERNAL_SERVICE
+                and (c.case_status or "").lower() not in ("closed", "cancelled")
+                for c in primary_m.client.cases.all()
+            )
+    has_verified_enr = primary_open_is and verified_completed
+    has_pending_verif = (
+        primary_open_is and has_pending_enr and lifecycle_in_window
+        and not verified_completed
+    )
 
     # Verified-by, mirroring the page fallback: "System" when verified with no agent.
     verified_at = enr.verified_at if enr is not None else None
@@ -349,6 +379,8 @@ def build_row(client):
         "last_po_delivery_status": last_po_del,
         "last_delivered_at": last_delivered,
         "in_any_po": in_any_po,
+        "has_pending_verification_enrollment": has_pending_verif,
+        "has_verified_enrollment": has_verified_enr,
         "insurance_status": ins_status or "",
         "insurance_expires_at": ins_exp,
         "social_status": soc_status or "",
@@ -431,6 +463,9 @@ def _base_qs(client_ids=None):
         ),
         "household_membership__household__members",
         "household_membership__household__enrollment_verifications",
+        # Household primary's cases -> the require_internal_service_primary scope
+        # (primary holds an OPEN internal-service case) used by the verification flags.
+        "household_membership__household__members__client__cases",
     )
     if client_ids is not None:
         qs = qs.filter(pk__in=client_ids)
@@ -513,6 +548,16 @@ def filter_analytics(params):
             case_status__in=["closed", "cancelled"]
         ).filter(in_any_po=(delivered == "previously"))
 
+    # Verification filter -- matches the VERIFICATION PAGE queue (enrollment-grain,
+    # across own + household enrollments), NOT the per-member governing-enrollment
+    # scalar. "Pending Verification" = has an enrollment at that stage; "Verified"
+    # = has a verified governing enrollment.
+    vstate = g("verification_state")
+    if vstate == "Pending Verification":
+        qs = qs.filter(has_pending_verification_enrollment=True)
+    elif vstate == "Verified":
+        qs = qs.filter(has_verified_enrollment=True)
+
     # Internal Service case filter (+ open/closed sub-filter), mirroring the
     # Members list. The read model's case_* fields describe the governing
     # internal-service case.
@@ -546,7 +591,7 @@ def filter_analytics(params):
         "nutritionist_status": "nutritionist_status",
         "delivery_company": "delivery_company",
         # Members-parity criteria.
-        "eligibility": "eligibility", "verification_state": "verification_state",
+        "eligibility": "eligibility",
         "program_status": "program_status", "lead_source": "lead_source",
         "team": "team", "service_type": "service_type",
         "program_type": "program_type", "pause_type": "pause_type",

@@ -4827,6 +4827,14 @@ class EnrollmentAnalytics(models.Model):
     # True when the member has EVER been included in a generated Purchase Order
     # (has a DeliveryOrder line tied to a PO) -- regardless of delivery status.
     in_any_po = models.BooleanField(default=False, db_index=True)
+    # Enrollment-grain verification flags (own OR household enrollment), so the
+    # Data page can match the Verification page's operational queue exactly:
+    #   has_pending_verification_enrollment -> ANY enrollment at pending_verification
+    #   has_verified_enrollment             -> ANY governing enrollment verified
+    # (the scalar verification_state below stays the member's GOVERNING-enrollment
+    # fact, for display/analytics).
+    has_pending_verification_enrollment = models.BooleanField(default=False, db_index=True)
+    has_verified_enrollment = models.BooleanField(default=False, db_index=True)
 
     # Coverage.
     insurance_status = models.CharField(max_length=20, blank=True, db_index=True)

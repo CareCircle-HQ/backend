@@ -2774,10 +2774,14 @@ class DataSummaryView(PortalAPIView):
     (fast COUNT/GROUP BY on indexed columns; routes to the replica)."""
 
     def get(self, request):
-        from django.db.models import Count
+        from django.db.models import Count, Max
+        from ..models import EnrollmentAnalytics
         from ..services.enrollment_analytics import filter_analytics
 
         qs = filter_analytics(request.query_params)
+        # Read-model freshness watermark (drives the Data page "Updated N ago" +
+        # Rebuild control). Global, not filtered.
+        last_refreshed = EnrollmentAnalytics.objects.aggregate(m=Max("refreshed_at"))["m"]
 
         def breakdown(field):
             return {
@@ -2786,6 +2790,7 @@ class DataSummaryView(PortalAPIView):
             }
 
         return Response({
+            "last_refreshed_at": last_refreshed.isoformat() if last_refreshed else None,
             # One row per MEMBER, so total == members.
             "total": qs.count(),
             "members": qs.count(),
@@ -2841,6 +2846,47 @@ class DataExportView(PortalAPIView):
 
         return stream_csv_response(
             rows(), f"data_{timezone.localdate().isoformat()}.csv",
+        )
+
+
+class DataRebuildView(PortalAPIView):
+    """Administration > Data: manually trigger a read-model rebuild. Management-
+    only. Enqueues the Celery ``rebuild_enrollment_analytics`` task (a full 65k+
+    rebuild takes minutes, so it must run async -- never inline in the request).
+    Returns the current freshness watermark so the UI can show progress."""
+
+    def post(self, request):
+        from django.db.models import Max
+        from ..models import EnrollmentAnalytics
+        from ..tasks import rebuild_enrollment_analytics
+
+        agent = current_agent(request)
+        if not (agent and (getattr(agent, "is_manager", False) or agent.group == "Management")):
+            return Response(
+                {"detail": "Management access required."}, status=http.HTTP_403_FORBIDDEN
+            )
+        # Best-effort enqueue; if the broker is unreachable (e.g. local dev with no
+        # Celery worker) say so rather than 500, so the UI can hint "run the
+        # command / start a worker".
+        try:
+            rebuild_enrollment_analytics.delay()
+            enqueued = True
+        except Exception:  # noqa: BLE001
+            enqueued = False
+        last = EnrollmentAnalytics.objects.aggregate(m=Max("refreshed_at"))["m"]
+        return Response(
+            {
+                "enqueued": enqueued,
+                "last_refreshed_at": last.isoformat() if last else None,
+                "detail": (
+                    "Rebuild started; the Data page refreshes when it completes "
+                    "(a few minutes)." if enqueued else
+                    "Could not reach the task queue. Run "
+                    "`python manage.py rebuild_enrollment_analytics --prune` or "
+                    "start a Celery worker."
+                ),
+            },
+            status=(http.HTTP_202_ACCEPTED if enqueued else http.HTTP_503_SERVICE_UNAVAILABLE),
         )
 
 
