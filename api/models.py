@@ -376,6 +376,43 @@ class Client(models.Model):
     # backfill_client_case_sort command; indexed so the list orders via an index
     # scan + LIMIT instead of computing + sorting that value for all ~60k clients.
     internal_case_opened_at = models.DateTimeField(null=True, blank=True, db_index=True)
+    # Denormalized "Case Created" FILTER key: the GOVERNING internal-service
+    # case's date_opened (favorability/deferral aware, via
+    # governing_service_case_for_display) -- so the Members list's Created filter
+    # matches the Data page (which keys off the same governing case), instead of
+    # matching ANY internal-service case. Maintained by reconcile +
+    # backfill_client_case_sort. Indexed for a fast range filter.
+    governing_internal_case_opened_at = models.DateTimeField(null=True, blank=True, db_index=True)
+    # Denormalized "Verification Requested / Completed" FILTER keys, taken from the
+    # member's GOVERNING enrollment (active_enrollment) -- so the Members /
+    # Verification page's requested/completed date filters match the Data page
+    # (which reports the same governing enrollment) instead of matching ANY
+    # own/household enrollment. requested = enrollment ``requested_at or opened_at``;
+    # completed = enrollment ``verified_at``. Maintained by refresh_internal_case_sort
+    # + backfill_client_case_sort. Indexed for fast range filters.
+    governing_verification_requested_at = models.DateTimeField(null=True, blank=True, db_index=True)
+    governing_verification_completed_at = models.DateTimeField(null=True, blank=True, db_index=True)
+    # Denormalized GOVERNING internal-service case attributes, so the Members list's
+    # Internal-Service (open/closed), Closed-date, and Authorized-date filters key
+    # off the SAME governing case the Data page reports (not ANY internal-service
+    # case). Blank/NULL when there is no governing internal-service case.
+    # Maintained by refresh_internal_case_sort + backfill_client_case_sort.
+    governing_internal_case_status = models.CharField(max_length=32, blank=True, default="", db_index=True)
+    governing_internal_case_closed_at = models.DateTimeField(null=True, blank=True, db_index=True)
+    governing_internal_case_authorized_at = models.DateTimeField(null=True, blank=True, db_index=True)
+    # Denormalized GOVERNING enrollment's kitchen, so the Members list's Kitchen
+    # filter keys off the same governing enrollment the Data page reports (not ANY
+    # own/household enrollment's kitchen). NULL when no governing case/kitchen.
+    governing_kitchen = models.ForeignKey(
+        "Kitchen", null=True, blank=True, on_delete=models.SET_NULL,
+        related_name="+", db_index=True,
+    )
+    # Denormalized GOVERNING internal-service case's program TYPE
+    # (household / individual, from its household_type), so the Members list's
+    # Program (Household/Individual) filter keys off the governing case -- like
+    # the Data page -- instead of matching a household program name on ANY
+    # (incl. closed/disregarded) enrollment. "" when no governing case.
+    governing_program_type = models.CharField(max_length=16, blank=True, default="", db_index=True)
     # Why the member is on the hard INELIGIBLE off-ramp: the human-readable gate
     # reasons (expired/missing Medicaid, wrong Medicaid type, out-of-range
     # ZIP/state, or a Kitchen-Assignment closure/denial). Written wherever the
@@ -4827,6 +4864,14 @@ class EnrollmentAnalytics(models.Model):
     # True when the member has EVER been included in a generated Purchase Order
     # (has a DeliveryOrder line tied to a PO) -- regardless of delivery status.
     in_any_po = models.BooleanField(default=False, db_index=True)
+    # Enrollment-grain verification flags (own OR household enrollment), so the
+    # Data page can match the Verification page's operational queue exactly:
+    #   has_pending_verification_enrollment -> ANY enrollment at pending_verification
+    #   has_verified_enrollment             -> ANY governing enrollment verified
+    # (the scalar verification_state below stays the member's GOVERNING-enrollment
+    # fact, for display/analytics).
+    has_pending_verification_enrollment = models.BooleanField(default=False, db_index=True)
+    has_verified_enrollment = models.BooleanField(default=False, db_index=True)
 
     # Coverage.
     insurance_status = models.CharField(max_length=20, blank=True, db_index=True)

@@ -1112,47 +1112,39 @@ def apply_enrollment_date_filter(qs, field, start, end):
 
 def apply_authorization_date_filter(qs, start, end):
     """Restrict ``qs`` to clients whose GOVERNING internal-service case has an
-    authorization approval-start date (``service_authorization_approval_starts_at``
-    -- i.e. when the case was authorized) within the inclusive [start, end]
-    window. Either bound may be None (open-ended); no-op when both are None.
+    authorization approval-start date (when the case was authorized) within the
+    inclusive [start, end] window. Either bound may be None (open-ended); no-op
+    when both are None.
 
-    Uses ``Exists`` on the internal-service case (mirroring
-    ``apply_authorization_filter``), so it introduces no join duplicates and
-    needs no ``.distinct()`` of its own. As with the authorization status
-    filter, the case is held by the household primary, so a matching primary
-    brings its household into the grouped result."""
+    Keys off the denormalized ``governing_internal_case_authorized_at`` (the same
+    governing case the Data page reports), NOT any internal-service case. No join,
+    so no ``.distinct()`` is required."""
     if not start and not end:
         return qs
-    cases = Case.objects.filter(
-        client=OuterRef("pk"),
-        case_type=CaseType.INTERNAL_SERVICE,
-    )
     if start:
-        cases = cases.filter(service_authorization_approval_starts_at__date__gte=start)
+        qs = qs.filter(governing_internal_case_authorized_at__date__gte=start)
     if end:
-        cases = cases.filter(service_authorization_approval_starts_at__date__lte=end)
-    return qs.filter(Exists(cases))
+        qs = qs.filter(governing_internal_case_authorized_at__date__lte=end)
+    return qs
 
 
 def apply_case_created_date_filter(qs, start, end):
     """Restrict ``qs`` to clients whose GOVERNING internal-service case was
-    CREATED/opened (``Case.date_opened``) within the inclusive [start, end]
-    window. Either bound may be None (open-ended); no-op when both are None.
+    CREATED/opened within the inclusive [start, end] window. Either bound may be
+    None (open-ended); no-op when both are None.
 
-    Uses ``Exists`` on the internal-service case (mirroring
-    ``apply_authorization_date_filter``), so it introduces no join duplicates
-    and needs no ``.distinct()`` of its own."""
+    Keys off the denormalized ``governing_internal_case_opened_at`` (the same
+    governing case the Members-list "Created" filter and the Data page report) --
+    NOT any internal-service case -- so the Verification page's case-created
+    filter matches the Members page instead of drifting on multi-case members.
+    No join, so no ``.distinct()`` is required."""
     if not start and not end:
         return qs
-    cases = Case.objects.filter(
-        client=OuterRef("pk"),
-        case_type=CaseType.INTERNAL_SERVICE,
-    )
     if start:
-        cases = cases.filter(date_opened__date__gte=start)
+        qs = qs.filter(governing_internal_case_opened_at__date__gte=start)
     if end:
-        cases = cases.filter(date_opened__date__lte=end)
-    return qs.filter(Exists(cases))
+        qs = qs.filter(governing_internal_case_opened_at__date__lte=end)
+    return qs
 
 
 def apply_verification_date_filters(qs, params, *, skip_enrollment_bounds=False):
@@ -1175,14 +1167,19 @@ def apply_verification_date_filters(qs, params, *, skip_enrollment_bounds=False)
         qs = apply_case_created_date_filter(qs, case_from, case_to)
         # Exists-based, so no distinct is required for this bound alone.
     if not skip_enrollment_bounds:
+        # Requested/completed key off the GOVERNING enrollment (denormalized,
+        # indexed on Client), so these match the Data page household-for-household
+        # instead of matching ANY own/household enrollment. No join -> no distinct.
         req_from, req_to = _parse_date(params.get("requested_from")), _parse_date(params.get("requested_to"))
-        if req_from or req_to:
-            qs = apply_enrollment_date_filter(qs, "opened_at", req_from, req_to)
-            changed = True
+        if req_from:
+            qs = qs.filter(governing_verification_requested_at__date__gte=req_from)
+        if req_to:
+            qs = qs.filter(governing_verification_requested_at__date__lte=req_to)
         comp_from, comp_to = _parse_date(params.get("completed_from")), _parse_date(params.get("completed_to"))
-        if comp_from or comp_to:
-            qs = apply_enrollment_date_filter(qs, "verified_at", comp_from, comp_to)
-            changed = True
+        if comp_from:
+            qs = qs.filter(governing_verification_completed_at__date__gte=comp_from)
+        if comp_to:
+            qs = qs.filter(governing_verification_completed_at__date__lte=comp_to)
     auth_from, auth_to = _parse_date(params.get("authorized_from")), _parse_date(params.get("authorized_to"))
     if auth_from or auth_to:
         qs = apply_authorization_date_filter(qs, auth_from, auth_to)
@@ -1670,24 +1667,22 @@ class MembersListView(PortalGenericAPIView):
         if (params.get("has_internal_service") or "").strip().lower() in (
             "1", "true", "yes",
         ):
-            qs = qs.filter(cases__case_type=CaseType.INTERNAL_SERVICE)
-            # Open/closed sub-filter: ONLY active when Internal Service is on
-            # (it narrows that set). Mirrors the "current case" the Created column
-            # shows: a member is OPEN if they have any non-terminal internal-
-            # service case (actively serviced), else CLOSED. So "closed" means the
-            # member has NO open internal-service case (all done) -- NOT merely
-            # "has a closed case", since members with an open case also usually
-            # have older closed ones and would otherwise wrongly show as closed.
+            # Keyed off the GOVERNING internal-service case (denormalized on
+            # Client, favorability/deferral aware) so this matches the Data page:
+            # "has a governing IS case" = status set; open/closed = that governing
+            # case's status. NOT "any IS case" -- a member with an open pending
+            # case whose governing (favored) case is a closed approved one counts
+            # as CLOSED here, exactly as the Data page reports.
+            qs = qs.exclude(governing_internal_case_status="")
             internal_status = (params.get("internal_status") or "").strip().lower()
-            if internal_status in ("open", "closed"):
-                terminal = (CaseStatus.CLOSED, CaseStatus.CANCELLED)
-                open_case = Case.objects.filter(
-                    client=OuterRef("pk"), case_type=CaseType.INTERNAL_SERVICE,
-                ).exclude(case_status__in=terminal)
-                if internal_status == "open":
-                    qs = qs.filter(Exists(open_case))
-                else:
-                    qs = qs.exclude(Exists(open_case))
+            if internal_status == "open":
+                qs = qs.exclude(
+                    governing_internal_case_status__in=[CaseStatus.CLOSED, CaseStatus.CANCELLED]
+                )
+            elif internal_status == "closed":
+                qs = qs.filter(
+                    governing_internal_case_status__in=[CaseStatus.CLOSED, CaseStatus.CANCELLED]
+                )
 
         # Product-kind filter (Meals vs Boxes), keyed off the household's program
         # name. A household is always one kind, so meals/boxes never mix.
@@ -1701,15 +1696,12 @@ class MembersListView(PortalGenericAPIView):
                 )
             )
 
-        # Kitchen filter: the member's (or their household's) enrollment kitchen.
+        # Kitchen filter: the member's GOVERNING enrollment kitchen (denormalized
+        # + indexed on Client), matching the Data page -- NOT any own/household
+        # enrollment's kitchen. No join.
         kitchen_id = (params.get("kitchen") or "").strip()
         if kitchen_id:
-            qs = qs.filter(
-                Q(enrollments__kitchen_id=kitchen_id)
-                | Q(
-                    household_membership__household__enrollment_verifications__kitchen_id=kitchen_id
-                )
-            )
+            qs = qs.filter(governing_kitchen_id=kitchen_id)
 
         # Lead-source filter (Members page): the client's stored lead source
         # (a CallTools queue id, or legacy free-text such as "Williamsburg").
@@ -1797,22 +1789,12 @@ class MembersListView(PortalGenericAPIView):
         # household's program.
         program_type = (params.get("program_type") or "").strip().lower()
         if program_type in ("household", "individual"):
-            household_prog = (
-                Q(enrollments__program_name__icontains="household")
-                | Q(
-                    household_membership__household__enrollment_verifications__program_name__icontains="household"
-                )
-            )
-            has_prog = (
-                Q(enrollments__isnull=False)
-                | Q(
-                    household_membership__household__enrollment_verifications__isnull=False
-                )
-            )
-            if program_type == "household":
-                qs = qs.filter(household_prog)
-            else:  # individual: has a program, but none of household scope
-                qs = qs.filter(has_prog).exclude(household_prog)
+            # Keyed off the GOVERNING internal-service case's household_type
+            # (denormalized, indexed on Client), matching the Data page -- NOT a
+            # "household" program name on ANY (incl. closed/disregarded)
+            # enrollment. A member whose current governing program is Individual
+            # but who has an OLD closed Household program is Individual here.
+            qs = qs.filter(governing_program_type=program_type)
 
         # Menu-type filter (Members page): the member's assigned catalog menu
         # type. MemberDietaryProfile.menu_type stores the catalog NAME, so match
@@ -1931,40 +1913,31 @@ class MembersListView(PortalGenericAPIView):
             qs = qs.filter(enr_q)
 
         # Created-date range filter (Members page): filters on the date the
-        # member's INTERNAL-SERVICE case was created (its ``date_opened``) --
-        # NOT the Client record's own ``created_at``. Mirrors the Urgent Care
-        # triage filter above and the ``case_created_at`` column, so the range
-        # searches the internal-service case creation date. Both bounds are
-        # applied to the SAME internal-service case row (one .filter() over the
-        # multi-valued relation); the trailing .distinct() dedupes the join.
-        # Inclusive [from, to]; either bound may be omitted.
+        # member's GOVERNING internal-service case was created (its
+        # ``date_opened``) -- NOT any internal-service case, and NOT the Client
+        # record's own ``created_at``. Keys off the denormalized, indexed
+        # ``governing_internal_case_opened_at`` (favorability/deferral aware, kept
+        # fresh by reconcile) so it matches the Data page's governing-case
+        # "Case Created" filter household-for-household. Inclusive [from, to];
+        # either bound may be omitted. No join -> no extra .distinct() needed.
         created_from = _parse_date(params.get("created_from"))
         created_to = _parse_date(params.get("created_to"))
-        if created_from or created_to:
-            case_date_q = Q(cases__case_type=CaseType.INTERNAL_SERVICE)
-            if created_from:
-                case_date_q &= Q(cases__date_opened__date__gte=created_from)
-            if created_to:
-                case_date_q &= Q(cases__date_opened__date__lte=created_to)
-            qs = qs.filter(case_date_q)
+        if created_from:
+            qs = qs.filter(governing_internal_case_opened_at__date__gte=created_from)
+        if created_to:
+            qs = qs.filter(governing_internal_case_opened_at__date__lte=created_to)
 
         # Closed-date range filter (Members page): filters on the date the
-        # member's INTERNAL-SERVICE case was CLOSED (its ``case_closed_at``, the
-        # C: date shown in the "Created" column). Mirrors the created-date filter
-        # above but on the close date, so an ops user can pull members whose
-        # service case was closed within a window (e.g. "closed today") and then
-        # cross-check paused/active status via the status filter. Both bounds
-        # apply to the SAME internal-service case row; .distinct() dedupes the
-        # join. Inclusive [from, to]; either bound may be omitted.
+        # member's GOVERNING internal-service case was CLOSED
+        # (``governing_internal_case_closed_at``, denormalized + indexed) -- the
+        # same governing case the Data page reports, NOT any internal-service
+        # case. Inclusive [from, to]; either bound may be omitted. No join.
         closed_from = _parse_date(params.get("closed_from"))
         closed_to = _parse_date(params.get("closed_to"))
-        if closed_from or closed_to:
-            case_closed_q = Q(cases__case_type=CaseType.INTERNAL_SERVICE)
-            if closed_from:
-                case_closed_q &= Q(cases__case_closed_at__date__gte=closed_from)
-            if closed_to:
-                case_closed_q &= Q(cases__case_closed_at__date__lte=closed_to)
-            qs = qs.filter(case_closed_q)
+        if closed_from:
+            qs = qs.filter(governing_internal_case_closed_at__date__gte=closed_from)
+        if closed_to:
+            qs = qs.filter(governing_internal_case_closed_at__date__lte=closed_to)
 
         # Date-period filter (Verification page dropdown): narrow to households
         # whose enrollment record was OPENED within the selected window. Skipped
@@ -2774,10 +2747,14 @@ class DataSummaryView(PortalAPIView):
     (fast COUNT/GROUP BY on indexed columns; routes to the replica)."""
 
     def get(self, request):
-        from django.db.models import Count
+        from django.db.models import Count, Max
+        from ..models import EnrollmentAnalytics
         from ..services.enrollment_analytics import filter_analytics
 
         qs = filter_analytics(request.query_params)
+        # Read-model freshness watermark (drives the Data page "Updated N ago" +
+        # Rebuild control). Global, not filtered.
+        last_refreshed = EnrollmentAnalytics.objects.aggregate(m=Max("refreshed_at"))["m"]
 
         def breakdown(field):
             return {
@@ -2786,10 +2763,17 @@ class DataSummaryView(PortalAPIView):
             }
 
         return Response({
+            "last_refreshed_at": last_refreshed.isoformat() if last_refreshed else None,
             # One row per MEMBER, so total == members.
             "total": qs.count(),
             "members": qs.count(),
-            "households": qs.exclude(household_id=None).values("household_id").distinct().count(),
+            # Households counted by their GOVERNING (primary) member, so each
+            # household maps to exactly ONE status and the per-status household
+            # counts partition cleanly (sum to the total). Counting distinct
+            # household_id across ALL members double-counts a household whose
+            # members span different statuses -- e.g. an active primary with a
+            # paused dependent would land in both the Active and Paused buckets.
+            "households": qs.filter(is_primary=True).exclude(household_id=None).values("household_id").distinct().count(),
             "with_screening": qs.filter(has_screening=True).count(),
             "with_eligibility_assessment": qs.filter(has_eligibility_assessment=True).count(),
             "by_stage": breakdown("stage"),
@@ -2841,6 +2825,47 @@ class DataExportView(PortalAPIView):
 
         return stream_csv_response(
             rows(), f"data_{timezone.localdate().isoformat()}.csv",
+        )
+
+
+class DataRebuildView(PortalAPIView):
+    """Administration > Data: manually trigger a read-model rebuild. Management-
+    only. Enqueues the Celery ``rebuild_enrollment_analytics`` task (a full 65k+
+    rebuild takes minutes, so it must run async -- never inline in the request).
+    Returns the current freshness watermark so the UI can show progress."""
+
+    def post(self, request):
+        from django.db.models import Max
+        from ..models import EnrollmentAnalytics
+        from ..tasks import rebuild_enrollment_analytics
+
+        agent = current_agent(request)
+        if not (agent and (getattr(agent, "is_manager", False) or agent.group == "Management")):
+            return Response(
+                {"detail": "Management access required."}, status=http.HTTP_403_FORBIDDEN
+            )
+        # Best-effort enqueue; if the broker is unreachable (e.g. local dev with no
+        # Celery worker) say so rather than 500, so the UI can hint "run the
+        # command / start a worker".
+        try:
+            rebuild_enrollment_analytics.delay()
+            enqueued = True
+        except Exception:  # noqa: BLE001
+            enqueued = False
+        last = EnrollmentAnalytics.objects.aggregate(m=Max("refreshed_at"))["m"]
+        return Response(
+            {
+                "enqueued": enqueued,
+                "last_refreshed_at": last.isoformat() if last else None,
+                "detail": (
+                    "Rebuild started; the Data page refreshes when it completes "
+                    "(a few minutes)." if enqueued else
+                    "Could not reach the task queue. Run "
+                    "`python manage.py rebuild_enrollment_analytics --prune` or "
+                    "start a Celery worker."
+                ),
+            },
+            status=(http.HTTP_202_ACCEPTED if enqueued else http.HTTP_503_SERVICE_UNAVAILABLE),
         )
 
 
@@ -6485,6 +6510,41 @@ class MemberRequestVerificationView(PortalAPIView):
                 {"error": "Can't request verification: " + ", ".join(missing) + "."},
                 status=http.HTTP_400_BAD_REQUEST,
             )
+        # RENEW an existing pre-verification enrollment (never verified, sitting at
+        # Validated / Pending Validation -- e.g. regressed there by a reconcile
+        # when no open case existed yet) back into the queue, instead of rejecting
+        # as "already requested". Without this the member is stranded behind a
+        # "Pending Verification" label with no wizard/popup to act on.
+        renewable = (
+            EnrollmentVerification.objects.filter(
+                client=client, verified_at__isnull=True,
+                stage__in=(EnrollmentStage.VALIDATED, EnrollmentStage.PENDING_VALIDATION),
+            )
+            .order_by("-opened_at")
+            .first()
+        )
+        if renewable is not None:
+            agent = current_agent(request)
+            actor = _agent_actor(agent)
+            with transaction.atomic():
+                advance_enrollment(
+                    renewable, EnrollmentStage.PENDING_VERIFICATION, force=True,
+                    actor=actor,
+                    note="Verification requested: returned to Pending Verification.",
+                    trigger="verification_requested",
+                )
+                renewable.requested_by = agent
+                renewable.requested_at = timezone.now()
+                renewable.save(update_fields=["requested_by", "requested_at"])
+                reconcile_enrollment_authorization(renewable, actor=actor)
+                recompute_enrollment_household(renewable)
+                clear_new_flag_on_verification_request(renewable)
+                try:
+                    timeline.event_for_verification(renewable, actor=actor)
+                except Exception:  # never let history-logging break the request
+                    logger.warning("request-verification timeline emit failed", exc_info=True)
+            client.refresh_from_db()
+            return Response(s.MemberDetailSerializer(client).data)
         # Already requested/handled (own or household enrollment) -- nothing to do.
         if not is_urgent_care_candidate(client):
             return Response(

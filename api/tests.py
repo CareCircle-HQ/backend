@@ -2811,6 +2811,9 @@ class MemberListGroupedStatusFilterTest(TestCase):
             MemberDietaryProfile, MemberStatus,
         )
 
+        from .serializers import derive_household_type
+        from .services.lifecycle import refresh_internal_case_sort
+
         client = Client.objects.create(
             client_id=str(uuid.uuid4()), first_name=first, last_name="Member",
             lifecycle_stage=lifecycle or ClientStage.ACTIVE,
@@ -2823,6 +2826,8 @@ class MemberListGroupedStatusFilterTest(TestCase):
             case_status=case_status or CaseStatus.OPEN,
             service_authorization_status=auth or "",
             program_name=program_name,
+            # Derived at case save in prod; set it here since we bypass the serializer.
+            household_type=derive_household_type(None, program_name),
         )
         enr = EnrollmentVerification.objects.create(
             client=client, household=hh,
@@ -2834,6 +2839,9 @@ class MemberListGroupedStatusFilterTest(TestCase):
             enrollment=enr, client=client,
             status=member_status or MemberStatus.ACTIVE,
         )
+        # Populate the denormalized governing-case keys (governing_program_type,
+        # etc.) as the case-save reconcile does in production.
+        refresh_internal_case_sort(client)
         return client
 
     def _ids(self, **params):
@@ -5370,6 +5378,302 @@ class HoldPreservedThroughCaseChangeTest(TestCase):
         ))
         self.assertEqual(len(live), 1)
         self.assertEqual(EnrollmentStage(live[0].stage), EnrollmentStage.ON_HOLD)
+
+
+class ClosedCaseEnrollmentTerminalizedTest(TestCase):
+    """Per-enrollment invariant: when a case closes but a newer OPEN case keeps
+    the client active, the stale NON-active enrollment left on the closed case is
+    terminalized (not left lingering). The active/serving enrollment is untouched."""
+
+    def test_stale_closed_case_enrollment_is_terminalized(self):
+        from django.utils import timezone
+
+        from .models import (
+            Case, CaseStatus, CaseType, Client, EnrollmentStage,
+            EnrollmentVerification, Household, HouseholdMember,
+            ServiceAuthorizationStatus,
+        )
+        from .services.lifecycle import reconcile_internal_service_authorization
+
+        c = Client.objects.create(client_id=str(uuid.uuid4()), first_name="C", last_name="C")
+        hh = Household.objects.create(name="HH")
+        HouseholdMember.objects.create(household=hh, client=c, is_primary=True)
+        now = timezone.now()
+        open_case = Case.objects.create(
+            case_id=str(uuid.uuid4()), client=c, case_type=CaseType.INTERNAL_SERVICE,
+            case_status=CaseStatus.OPEN,
+            service_authorization_status=ServiceAuthorizationStatus.APPROVED,
+            program_name="Medically Tailored Meals (MTM)", case_created_at=now,
+        )
+        closed_case = Case.objects.create(
+            case_id=str(uuid.uuid4()), client=c, case_type=CaseType.INTERNAL_SERVICE,
+            case_status=CaseStatus.CLOSED,
+            service_authorization_status=ServiceAuthorizationStatus.APPROVED,
+            program_name="Medically Tailored Meals (MTM)", case_created_at=now,
+        )
+        active = EnrollmentVerification.objects.create(
+            client=c, household=hh, case=open_case,
+            stage=EnrollmentStage.SERVICE_ACTIVE, verified_at=now,
+            program_name="Medically Tailored Meals (MTM)",
+        )
+        stale = EnrollmentVerification.objects.create(
+            client=c, household=hh, case=closed_case,
+            stage=EnrollmentStage.KITCHEN_ASSIGNMENT, verified_at=now,
+            program_name="Medically Tailored Meals (MTM)",
+        )
+        reconcile_internal_service_authorization(c)
+        stale.refresh_from_db()
+        active.refresh_from_db()
+        self.assertIn(
+            EnrollmentStage(stale.stage),
+            (EnrollmentStage.CLOSED, EnrollmentStage.CANCELLED),
+            "stale enrollment on the closed case must be terminalized",
+        )
+        self.assertNotIn(
+            EnrollmentStage(active.stage),
+            (EnrollmentStage.CLOSED, EnrollmentStage.CANCELLED),
+            "the active/serving enrollment (open case) must be preserved",
+        )
+
+
+class RequestVerificationFromValidatedTest(TestCase):
+    """A never-verified enrollment regressed to VALIDATED must be re-requestable:
+    the ext re-request returns it to Pending Verification (so the wizard opens),
+    instead of 409'ing as "already requested". A real (verified) enrollment is
+    still protected (409)."""
+
+    def setUp(self):
+        self.agent = Agent.objects.create(name="RV Agent", agent_code="930", group="CS")
+        access = AccessToken()
+        access["agent_id"] = str(self.agent.id)
+        access["agent_code"] = self.agent.agent_code
+        access["agent_name"] = self.agent.name
+        access["agent_group"] = self.agent.group
+        self.api = APIClient()
+        self.api.credentials(HTTP_AUTHORIZATION=f"Bearer {access}")
+
+    def _validated_member(self):
+        from .models import (
+            Case, CaseStatus, CaseType, Client, EnrollmentStage,
+            EnrollmentVerification, Household, HouseholdMember,
+            ServiceAuthorizationStatus,
+        )
+        c = Client.objects.create(client_id=str(uuid.uuid4()), first_name="Val", last_name="Idated")
+        hh = Household.objects.create(name="HH")
+        HouseholdMember.objects.create(household=hh, client=c, is_primary=True)
+        case = Case.objects.create(
+            case_id=str(uuid.uuid4()), client=c, case_type=CaseType.INTERNAL_SERVICE,
+            case_status=CaseStatus.OPEN,
+            service_authorization_status=ServiceAuthorizationStatus.APPROVED,
+            program_name="Medically Tailored Meals (MTM)",
+        )
+        enr = EnrollmentVerification.objects.create(
+            client=c, household=hh, case=case, stage=EnrollmentStage.VALIDATED,
+            program_name="Medically Tailored Meals (MTM)",
+        )
+        return c, enr
+
+    def test_re_request_from_validated_returns_to_pending(self):
+        from .models import EnrollmentStage
+        c, enr = self._validated_member()
+        resp = self.api.post(f"/api/enrollment-verifications/{enr.pk}/re-request/")
+        self.assertEqual(resp.status_code, 200, resp.content)
+        enr.refresh_from_db()
+        self.assertEqual(EnrollmentStage(enr.stage), EnrollmentStage.PENDING_VERIFICATION)
+        self.assertIsNotNone(enr.requested_at)
+
+    def test_verified_enrollment_is_not_reset(self):
+        from django.utils import timezone
+        from .models import EnrollmentStage
+        c, enr = self._validated_member()
+        enr.verified_at = timezone.now()
+        enr.stage = EnrollmentStage.VERIFIED
+        enr.save(update_fields=["verified_at", "stage"])
+        resp = self.api.post(f"/api/enrollment-verifications/{enr.pk}/re-request/")
+        self.assertEqual(resp.status_code, 409, resp.content)
+        enr.refresh_from_db()
+        self.assertEqual(EnrollmentStage(enr.stage), EnrollmentStage.VERIFIED)
+
+
+class DataSummaryHouseholdByPrimaryTest(TestCase):
+    """Data-page household count is by the GOVERNING (primary) member, so each
+    household maps to one status and buckets partition cleanly -- a mixed
+    household (e.g. paused primary + active dependent) is NOT double-counted."""
+
+    def setUp(self):
+        self.agent = Agent.objects.create(name="DS Agent", agent_code="940", group="CS")
+        access = AccessToken()
+        access["agent_id"] = str(self.agent.id)
+        access["agent_code"] = self.agent.agent_code
+        access["agent_name"] = self.agent.name
+        access["agent_group"] = self.agent.group
+        self.api = APIClient()
+        self.api.credentials(HTTP_AUTHORIZATION=f"Bearer {access}")
+
+    def _ea(self, household_id, *, is_primary, status):
+        from .models import Client, EnrollmentAnalytics
+        c = Client.objects.create(client_id=str(uuid.uuid4()), first_name="a", last_name="b")
+        return EnrollmentAnalytics.objects.create(
+            client=c, household_id=household_id, is_primary=is_primary,
+            company_status=status,
+        )
+
+    def test_household_counted_by_primary_status(self):
+        hh_a = uuid.uuid4()  # uniform active
+        hh_b = uuid.uuid4()  # mixed: paused primary, active dependent
+        self._ea(hh_a, is_primary=True, status="active")
+        self._ea(hh_a, is_primary=False, status="active")
+        self._ea(hh_b, is_primary=True, status="paused")
+        self._ea(hh_b, is_primary=False, status="active")
+
+        r_active = self.api.get(reverse("portal-data-summary"), {"company_status": "active"})
+        self.assertEqual(r_active.status_code, 200, r_active.content)
+        # Only hh_a (primary active); hh_b's active DEPENDENT does NOT pull hh_b in.
+        self.assertEqual(r_active.json()["households"], 1)
+
+        r_paused = self.api.get(reverse("portal-data-summary"), {"company_status": "paused"})
+        self.assertEqual(r_paused.json()["households"], 1)  # hh_b (primary paused)
+
+
+class CompanyStatusActiveRuleTest(TestCase):
+    """The Data-page 'Active' company status: a REAL verification + valid auth,
+    and either an active delivery calendar (being delivered -- nutrition not
+    re-checked) OR pending Kitchen Assignment WITH nutritionist sign-off."""
+
+    def _case(self, auth="approved", status="open"):
+        from types import SimpleNamespace
+        from .models import CaseType
+        return SimpleNamespace(
+            case_type=CaseType.INTERNAL_SERVICE, case_status=status,
+            service_authorization_status=auth,
+        )
+
+    def _enr(self, stage, *, verified=True, nutrition=True):
+        from types import SimpleNamespace
+        from django.utils import timezone
+        now = timezone.now()
+        return SimpleNamespace(
+            stage=stage,
+            verified_at=(now if verified else None),
+            nutritionist_approved_at=(now if nutrition else None),
+        )
+
+    def _status(self, enr, *, has_active_delivery):
+        from .services.enrollment_analytics import _company_status
+        return _company_status(
+            enr, self._case(), {}, False, True, True, "",
+            in_household=False, has_active_delivery=has_active_delivery,
+        )
+
+    def test_being_delivered_is_active_even_without_nutrition(self):
+        enr = self._enr("service_active", verified=True, nutrition=False)
+        self.assertEqual(self._status(enr, has_active_delivery=True), "active")
+
+    def test_service_active_without_live_delivery_is_review(self):
+        # Activated but not delivering -> quarantined in 'review' (not Pending,
+        # which is strictly pre-service). See the review doc.
+        enr = self._enr("service_active", verified=True, nutrition=True)
+        self.assertEqual(self._status(enr, has_active_delivery=False), "review")
+
+    def test_kitchen_assignment_with_nutrition_is_active(self):
+        enr = self._enr("kitchen_assignment", verified=True, nutrition=True)
+        self.assertEqual(self._status(enr, has_active_delivery=False), "active")
+
+    def test_kitchen_assignment_without_nutrition_is_pending(self):
+        enr = self._enr("kitchen_assignment", verified=True, nutrition=False)
+        self.assertEqual(self._status(enr, has_active_delivery=False), "pending")
+
+    def test_unverified_being_delivered_is_not_active(self):
+        # Verification is required for Active: an unverified member is never
+        # Active. At service_active with a live calendar but unverified they're a
+        # data anomaly -> 'review' (not Active). A pre-service unverified member
+        # is Pending (see test_pending_verification_is_pending).
+        enr = self._enr("service_active", verified=False, nutrition=True)
+        result = self._status(enr, has_active_delivery=True)
+        self.assertNotEqual(result, "active")
+        self.assertEqual(result, "review")
+
+    def _status_auth(self, enr, *, auth, has_active_delivery):
+        from types import SimpleNamespace
+        from .models import CaseType
+        from .services.enrollment_analytics import _company_status
+        case = SimpleNamespace(
+            case_type=CaseType.INTERNAL_SERVICE, case_status="open",
+            service_authorization_status=auth,
+        )
+        return _company_status(
+            enr, case, {}, False, True, True, "",
+            in_household=False, has_active_delivery=has_active_delivery,
+        )
+
+    def test_pending_verification_is_pending(self):
+        enr = self._enr("pending_verification", verified=False, nutrition=False)
+        self.assertEqual(self._status_auth(enr, auth="approved", has_active_delivery=False), "pending")
+
+    def test_verified_awaiting_with_pending_auth_is_pending(self):
+        enr = self._enr("verified", verified=True, nutrition=False)
+        self.assertEqual(self._status_auth(enr, auth="pending", has_active_delivery=False), "pending")
+
+    def test_kitchen_without_nutrition_is_pending(self):
+        enr = self._enr("kitchen_assignment", verified=True, nutrition=False)
+        self.assertEqual(self._status_auth(enr, auth="approved", has_active_delivery=False), "pending")
+
+    def test_service_active_no_delivery_is_review(self):
+        # Activated (service_active) but no live delivery calendar -> quarantined
+        # in the temporary 'review' bucket (excluded from Pending).
+        enr = self._enr("service_active", verified=True, nutrition=True)
+        self.assertEqual(self._status_auth(enr, auth="approved", has_active_delivery=False), "review")
+
+    def test_never_requested_auth_is_review(self):
+        enr = self._enr("pending_verification", verified=False, nutrition=False)
+        self.assertEqual(self._status_auth(enr, auth="never_requested", has_active_delivery=False), "review")
+
+
+class GhlFinalVerificationStatusTest(TestCase):
+    """The GHL 'Final Verification Status' the extension reads must reflect the
+    real verification (verified_at), NOT a completed eligibility screening --
+    otherwise a screened-but-unverified member shows "already completed" and the
+    ext blocks the request."""
+
+    def test_screened_but_unverified_is_pending(self):
+        from .models import (
+            Case, CaseStatus, CaseType, Client, EnrollmentStage,
+            EnrollmentVerification, Household, HouseholdMember, Screening,
+            ServiceAuthorizationStatus,
+        )
+        from .integrations.ghl.custom_fields_updated import _final_verification_status
+
+        c = Client.objects.create(client_id=str(uuid.uuid4()), first_name="Scr", last_name="Eened")
+        Screening.objects.create(
+            enhanced_screen_id=str(uuid.uuid4()), client=c, subject_id=c.pk,
+            screen_status="complete",
+        )
+        hh = Household.objects.create(name="HH")
+        HouseholdMember.objects.create(household=hh, client=c, is_primary=True)
+        case = Case.objects.create(
+            case_id=str(uuid.uuid4()), client=c, case_type=CaseType.INTERNAL_SERVICE,
+            case_status=CaseStatus.OPEN,
+            service_authorization_status=ServiceAuthorizationStatus.APPROVED,
+        )
+        EnrollmentVerification.objects.create(
+            client=c, household=hh, case=case, stage=EnrollmentStage.VALIDATED,
+        )
+        self.assertEqual(_final_verification_status(c), "Pending")
+
+    def test_verified_is_complete(self):
+        from django.utils import timezone
+        from .models import (
+            Client, EnrollmentStage, EnrollmentVerification, Household, HouseholdMember,
+        )
+        from .integrations.ghl.custom_fields_updated import _final_verification_status
+
+        c = Client.objects.create(client_id=str(uuid.uuid4()), first_name="Ver", last_name="Ified")
+        hh = Household.objects.create(name="HH")
+        HouseholdMember.objects.create(household=hh, client=c, is_primary=True)
+        EnrollmentVerification.objects.create(
+            client=c, household=hh, stage=EnrollmentStage.VERIFIED, verified_at=timezone.now(),
+        )
+        self.assertEqual(_final_verification_status(c), "Complete")
 
 
 class TimelineReasonDetailTest(TestCase):
@@ -14207,6 +14511,11 @@ class MembersPendingVerificationReportTest(TestCase):
         enr = EnrollmentVerification.objects.create(
             client=client, household=hh, case=case, stage=stage,
         )
+        # Populate the denormalized governing-case keys (as the case-save
+        # reconcile does in production), so the governing case-created filter has
+        # something to match.
+        from .services.lifecycle import refresh_internal_case_sort
+        refresh_internal_case_sort(client)
         return client, hh, enr
 
     def test_excludes_already_verified_and_adds_case_created(self):

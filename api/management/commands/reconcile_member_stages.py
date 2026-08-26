@@ -186,6 +186,17 @@ class Command(BaseCommand):
             ServiceAuthorizationStatus.DENIED,
             ServiceAuthorizationStatus.PENDING,
         ):
+            # AUTHORIZATION IS NOT VERIFICATION -- a REAL verification (verified_by
+            # set) must NEVER be destroyed here. The verification fact is
+            # independent of the case's authorization state; regressing a genuinely
+            # verified household to Validated + clearing verified_at wiped real
+            # agent verifications whenever the case auth happened to be
+            # non-actionable at reconcile time (see DESTINY THOMPSON). Leave a
+            # really-verified enrollment untouched; only regress one that was NOT
+            # really verified (verified_by null: no verification, or a false
+            # system stamp), which also clears any stray false verified_at.
+            if enr.verified_by_id is not None:
+                return ("no_change",)
             self._set_verified_at(enr, EnrollmentStage.VALIDATED)
             changed = self._move(
                 enr, EnrollmentStage.VALIDATED,
