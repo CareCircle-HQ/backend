@@ -196,29 +196,44 @@ class Command(BaseCommand):
             )
             return ("validated", reason) if changed else ("no_change",)
 
+        # AUTHORIZATION IS NOT VERIFICATION. A household that has NOT completed a
+        # real verification stays at Pending Verification even when its case is
+        # APPROVED. This pass must NOT infer a verification from the authorization
+        # (that mass-created "System" verifications -- verified_at with no
+        # verifier and no nutritionist sign-off -- and pushed members into Kitchen
+        # Assignment / Service Active, skipping the verification wizard AND the
+        # nutritionist step). Only an ALREADY-verified enrollment is advanced by
+        # this reconcile; an unverified one waits for the real verification.
+        already_verified = enr.verified_at is not None
+        if not already_verified:
+            changed = self._move(
+                enr, EnrollmentStage.PENDING_VERIFICATION,
+                note=f"Reconcile: {auth} authorization, not verified yet.",
+            )
+            return ("pending_verification", f"{auth}, unverified") if changed else ("no_change",)
+
+        # --- already verified below: advance per auth + completeness (no NEW
+        # verification is ever stamped here; verified_at is already set). ---
         # Approved + complete -> activate (kitchen output + delivery plan).
         if auth == ServiceAuthorizationStatus.APPROVED and complete:
             return self._activate(enr, case, cadence, product_kind)
 
-        # Approved + incomplete -> verified, waiting for kitchen assignment.
+        # Approved + incomplete -> waiting for kitchen assignment.
         if auth == ServiceAuthorizationStatus.APPROVED:
-            self._set_verified_at(enr, EnrollmentStage.KITCHEN_ASSIGNMENT)
             self._move(
                 enr, EnrollmentStage.KITCHEN_ASSIGNMENT,
                 note="Reconcile: approved but delivery data incomplete.",
             )
             return ("kitchen_assignment",)
 
-        # Denied / Requested (pending): verified when complete, else pending.
+        # Denied / Requested (pending): stay Verified when complete, else pending.
         if complete:
-            self._set_verified_at(enr, EnrollmentStage.VERIFIED)
             self._move(
                 enr, EnrollmentStage.VERIFIED,
                 note=f"Reconcile: {auth} authorization, verified (no delivery).",
             )
             return ("verified",)
 
-        self._set_verified_at(enr, EnrollmentStage.PENDING_VERIFICATION)
         changed = self._move(
             enr, EnrollmentStage.PENDING_VERIFICATION,
             note=f"Reconcile: {auth} authorization, data incomplete.",
