@@ -4878,6 +4878,10 @@ class EnrollmentAnalytics(models.Model):
     # fact, for display/analytics).
     has_pending_verification_enrollment = models.BooleanField(default=False, db_index=True)
     has_verified_enrollment = models.BooleanField(default=False, db_index=True)
+    #   has_never_requested_verification -> open governing IS case (primary scope)
+    #     but the member never entered verification (not verified, no pending
+    #     enrollment, never requested). Powers the Data page's "Never Requested".
+    has_never_requested_verification = models.BooleanField(default=False, db_index=True)
 
     # Coverage.
     insurance_status = models.CharField(max_length=20, blank=True, db_index=True)

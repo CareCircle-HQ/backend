@@ -5587,6 +5587,20 @@ class VerificationNeverRequestedScopeTest(TestCase):
         self.assertNotIn(str(pending.client_id), ids)    # in the pending queue
         self.assertNotIn(str(verified.client_id), ids)   # verified
 
+    def test_read_model_flag_matches_query(self):
+        # The Data-page read-model flag (build_row) mirrors the Verification-page
+        # 'Never Requested' query exactly, so the two pages agree.
+        from .models import EnrollmentStage
+        from .services.enrollment_analytics import build_row
+        no_enr = self._member("NoEnr2")
+        validated = self._member("Val2", enr_stage=EnrollmentStage.VALIDATED)
+        pending = self._member("Pend2", enr_stage=EnrollmentStage.PENDING_VERIFICATION, requested=True)
+        verified = self._member("Ver2", enr_stage=EnrollmentStage.VERIFIED, verified=True)
+        self.assertTrue(build_row(no_enr)["has_never_requested_verification"])
+        self.assertTrue(build_row(validated)["has_never_requested_verification"])
+        self.assertFalse(build_row(pending)["has_never_requested_verification"])
+        self.assertFalse(build_row(verified)["has_never_requested_verification"])
+
 
 class ReopenForVerificationTest(TestCase):
     """reopen_for_verification force-regresses a NEVER-verified enrollment back to
