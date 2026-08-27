@@ -1980,6 +1980,23 @@ class MembersListView(PortalGenericAPIView):
         if closed_to:
             qs = qs.filter(governing_internal_case_closed_at__date__lte=closed_to)
 
+        # Added-to-CRM date range (Members page): members with an INTERNAL-SERVICE
+        # case first SAVED INTO OUR DB within [from, to] -- the actual intake date
+        # (Case.added_to_system_at), independent of the Unite Us opened date AND of
+        # whether it's the member's GOVERNING case. Unlike the governing-based
+        # "Created" filter, this matches on ANY internal-service case, so a case we
+        # added today surfaces even when the member's favored/governing case is
+        # older (e.g. a renewal). Join over cases -> needs .distinct().
+        added_from = _parse_date(params.get("added_from"))
+        added_to = _parse_date(params.get("added_to"))
+        if added_from or added_to:
+            adq = Q(cases__case_type=CaseType.INTERNAL_SERVICE)
+            if added_from:
+                adq &= Q(cases__added_to_system_at__date__gte=added_from)
+            if added_to:
+                adq &= Q(cases__added_to_system_at__date__lte=added_to)
+            qs = qs.filter(adq).distinct()
+
         # Date-period filter (Verification page dropdown): narrow to households
         # whose enrollment record was OPENED within the selected window. Skipped
         # when a "verified by" filter is active -- the period window is already
