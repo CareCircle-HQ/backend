@@ -10955,6 +10955,20 @@ class RequestVerificationEndpointTest(TestCase):
         resp = self.api.post(self._url(client))
         self.assertEqual(resp.status_code, 400, resp.content)
 
+    def test_request_sets_governing_verification_requested_at(self):
+        # Regression: requesting verification the SAME day the case was created
+        # must refresh the denormalized governing_verification_requested_at, or the
+        # Members-list "Verification Requested" date filter won't match same-day.
+        from .services.lifecycle import refresh_internal_case_sort
+        client = self._candidate()
+        refresh_internal_case_sort(client)
+        client.refresh_from_db()
+        self.assertIsNone(client.governing_verification_requested_at)  # no enrollment yet
+        resp = self.api.post(self._url(client))
+        self.assertEqual(resp.status_code, 200, resp.content)
+        client.refresh_from_db()
+        self.assertIsNotNone(client.governing_verification_requested_at)
+
     def test_ineligible_member_rejected(self):
         # A Not Eligible member can't be verified: the button is hidden AND the
         # endpoint rejects a stale/direct call.

@@ -123,6 +123,7 @@ from ..services.lifecycle import (
     recompute_client_stage,
     recompute_enrollment_household,
     reconcile_enrollment_authorization,
+    refresh_internal_case_sort,
     reopen_for_verification,
     split_dependent_into_own_enrollment,
 )
@@ -6573,6 +6574,10 @@ class MemberRequestVerificationView(PortalAPIView):
                 renewable.save(update_fields=["requested_by", "requested_at"])
                 reconcile_enrollment_authorization(renewable, actor=actor)
                 recompute_enrollment_household(renewable)
+                # Keep the Members-list "Verification Requested" date filter fresh
+                # same-day (denormalized key otherwise only refreshes on the case
+                # reconcile).
+                refresh_internal_case_sort(client)
                 clear_new_flag_on_verification_request(renewable)
                 try:
                     timeline.event_for_verification(renewable, actor=actor)
@@ -6620,6 +6625,8 @@ class MemberRequestVerificationView(PortalAPIView):
             # Drives the whole household to Pending Verification and drops the
             # primary off the Urgent Care list (clears is_new).
             recompute_enrollment_household(enr)
+            # Refresh the denormalized "Verification Requested" key same-day.
+            refresh_internal_case_sort(client)
             clear_new_flag_on_verification_request(enr)
             try:
                 timeline.event_for_verification(enr, actor=actor)

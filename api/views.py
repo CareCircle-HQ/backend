@@ -108,6 +108,32 @@ def _safe_recompute_household(enrollment):
         logger.exception(
             "recompute_enrollment_household failed for %s", getattr(enrollment, "pk", None)
         )
+    _safe_refresh_case_sort(enrollment)
+
+
+def _safe_refresh_case_sort(enrollment):
+    """Refresh the denormalized governing-case keys (Members-list date filters)
+    for an enrollment's whole household. A verification REQUEST/COMPLETE changes
+    the active enrollment's requested_at/verified_at, but those keys otherwise
+    only refresh on the CASE reconcile -- so without this, a member verified the
+    same day their case was created wouldn't match the "Verification Requested /
+    Completed" date filters until the next case reconcile. Best-effort; used on
+    the agent API-write paths only (NOT the bulk reconcile, which refreshes at
+    its own end)."""
+    try:
+        from .services.lifecycle import refresh_internal_case_sort
+
+        clients = [enrollment.client] if enrollment.client_id else []
+        hh = getattr(enrollment, "household", None)
+        if hh is not None:
+            clients += [m.client for m in hh.members.all() if m.client_id]
+        for c in {c.pk: c for c in clients if c is not None}.values():
+            refresh_internal_case_sort(c)
+    except Exception:  # noqa: BLE001
+        logger.exception(
+            "refresh_internal_case_sort failed for enrollment %s",
+            getattr(enrollment, "pk", None),
+        )
 
 
 class RegisterView(generics.CreateAPIView):
@@ -1050,6 +1076,10 @@ class EnrollmentVerificationViewSet(viewsets.ModelViewSet):
                 )
         except InvalidTransition as exc:
             return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        # Completion sets verified_at -> refresh the denormalized keys so the
+        # Members-list "Verification Completed/Requested" date filters match same-day
+        # (advance_enrollment already recomputed the household stages).
+        _safe_refresh_case_sort(enrollment)
         enrollment.refresh_from_db()
         return Response(self.get_serializer(enrollment).data)
 
