@@ -5617,6 +5617,41 @@ class HistoryNotNullStringGuardTest(TestCase):
         self.assertIn(h.governing_program_type, ("", None))
 
 
+class CaseAddedToSystemTest(TestCase):
+    """Case.added_to_system_at is stamped on first insert (the date we saved it to
+    our DB) and never overwritten by later updates; the Members "Created" column
+    exposes it as the A: row via case_dates."""
+
+    def _case(self, client):
+        from django.utils import timezone
+        from .models import Case, CaseStatus, CaseType
+        return Case.objects.create(
+            case_id=str(uuid.uuid4()), client=client, case_type=CaseType.INTERNAL_SERVICE,
+            case_status=CaseStatus.OPEN, date_opened=timezone.now(),
+        )
+
+    def test_stamped_on_insert_and_stable(self):
+        from .models import CaseStatus, Client
+        c = Client.objects.create(client_id=str(uuid.uuid4()), first_name="a", last_name="b")
+        case = self._case(c)
+        self.assertIsNotNone(case.added_to_system_at)
+        first = case.added_to_system_at
+        case.case_status = CaseStatus.CLOSED
+        case.save()
+        case.refresh_from_db()
+        self.assertEqual(case.added_to_system_at, first)  # not overwritten on update
+
+    def test_case_dates_exposes_added(self):
+        from .models import Client
+        from .portal.serializers import MemberListSerializer
+        from .services.enrollment_analytics import _base_qs
+        c = Client.objects.create(client_id=str(uuid.uuid4()), first_name="a", last_name="b")
+        self._case(c)
+        data = MemberListSerializer(_base_qs([c.client_id]).get(pk=c.client_id)).data
+        self.assertTrue(data["case_dates"])
+        self.assertIsNotNone(data["case_dates"][0]["added"])
+
+
 class DeliveryHistoryFilterTest(TestCase):
     """Previously/Never Delivered = purely whether the member appears on at least
     one NON-CANCELLED PO. No case/governing scoping; cancelled POs don't count."""
