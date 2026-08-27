@@ -203,10 +203,13 @@ def can_request_dependent_split(client):
     their own internal-service case (the split runs server-side on request,
     mirroring the Urgent Care action). Returns False for a primary / household-
     less client, or once a verification exists."""
-    from ..models import EnrollmentStage, EnrollmentVerification
+    from ..models import ClientStage, EnrollmentStage, EnrollmentVerification
 
     membership = getattr(client, "household_membership", None)
     if membership is None or membership.is_primary:
+        return False
+    # Not Eligible: no verification for an ineligible member -- hide the button.
+    if (client.lifecycle_stage or "") in (ClientStage.NOT_ELIGIBLE, ClientStage.INELIGIBLE):
         return False
     # "No verification requested yet" for a DEPENDENT means they hold no
     # enrollment of their OWN. A dependent served through the household has no
@@ -238,7 +241,7 @@ def can_request_primary_verification(client):
     Medicaid + social care, NOT already verified, and NOT already sitting at a
     live Pending Verification enrollment (that one already shows the wizard).
     Dependents use can_request_dependent_split instead."""
-    from ..models import EnrollmentStage, EnrollmentVerification
+    from ..models import ClientStage, EnrollmentStage, EnrollmentVerification
     from ..services.lifecycle import (
         has_open_internal_service_case,
         has_valid_medicaid,
@@ -248,6 +251,10 @@ def can_request_primary_verification(client):
 
     membership = getattr(client, "household_membership", None)
     if membership is not None and not membership.is_primary:
+        return False
+    # Not Eligible: a member on the hard-ineligible off-ramp (or the legacy
+    # not_eligible denial) can't be verified -- hide the button entirely.
+    if (client.lifecycle_stage or "") in (ClientStage.NOT_ELIGIBLE, ClientStage.INELIGIBLE):
         return False
     if not has_open_internal_service_case(client):
         return False

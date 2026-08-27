@@ -6535,6 +6535,10 @@ class MemberRequestVerificationView(PortalAPIView):
         # Gate: reject with the specific missing prerequisite(s) so the UI can
         # explain why. Mirrors is_urgent_care_candidate but itemized.
         missing = []
+        # Not Eligible: an ineligible member can't be verified. Guards direct/
+        # stale calls even though the button is hidden (can_request_*_verification).
+        if (client.lifecycle_stage or "") in (ClientStage.NOT_ELIGIBLE, ClientStage.INELIGIBLE):
+            missing.append("member is Not Eligible")
         if not has_open_internal_service_case(client):
             missing.append("no open Internal Service case")
         if not has_valid_medicaid(client):

@@ -10876,6 +10876,20 @@ class RequestVerificationEndpointTest(TestCase):
         resp = self.api.post(self._url(client))
         self.assertEqual(resp.status_code, 400, resp.content)
 
+    def test_ineligible_member_rejected(self):
+        # A Not Eligible member can't be verified: the button is hidden AND the
+        # endpoint rejects a stale/direct call.
+        from .models import ClientStage
+        from .portal.serializers import can_request_primary_verification
+        for stage in (ClientStage.INELIGIBLE, ClientStage.NOT_ELIGIBLE):
+            client = self._candidate()
+            client.lifecycle_stage = stage
+            client.save(update_fields=["lifecycle_stage"])
+            self.assertFalse(can_request_primary_verification(client))  # button hidden
+            resp = self.api.post(self._url(client))
+            self.assertEqual(resp.status_code, 400, resp.content)
+            self.assertIn("Not Eligible", resp.json()["error"])
+
 
 class WorkQueueVipTest(TestCase):
     """The Work Queue VIP flag: created via the ticket POST (default False),
