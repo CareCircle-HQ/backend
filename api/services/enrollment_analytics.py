@@ -384,6 +384,17 @@ def build_row(client):
         primary_open_is and has_pending_enr and lifecycle_in_window
         and not verified_completed
     )
+    #   has_never_requested_verification = scope AND the member never entered the
+    #     verification funnel: not verified, no pending_verification enrollment,
+    #     and no own/household enrollment was ever requested (requested_at).
+    #     Mirrors the Verification page's "Never Requested" filter
+    #     (require_internal_service_primary EXCLUDE verification_scope_q |
+    #     verification_ever_started_q).
+    ever_requested = any(e.requested_at is not None for e in funnel_enr)
+    has_never_requested_verif = (
+        primary_open_is and not verified_completed
+        and not has_pending_enr and not ever_requested
+    )
 
     # Verified-by, mirroring the page fallback: "System" when verified with no agent.
     verified_at = enr.verified_at if enr is not None else None
@@ -420,6 +431,7 @@ def build_row(client):
         "in_any_po": in_any_po,
         "has_pending_verification_enrollment": has_pending_verif,
         "has_verified_enrollment": has_verified_enr,
+        "has_never_requested_verification": has_never_requested_verif,
         "insurance_status": ins_status or "",
         "insurance_expires_at": ins_exp,
         "social_status": soc_status or "",
@@ -610,6 +622,8 @@ def filter_analytics(params):
         qs = qs.filter(has_pending_verification_enrollment=True)
     elif vstate == "Verified":
         qs = qs.filter(has_verified_enrollment=True)
+    elif vstate == "Never Requested":
+        qs = qs.filter(has_never_requested_verification=True)
 
     # Internal Service case filter (+ open/closed sub-filter), mirroring the
     # Members list. The read model's case_* fields describe the governing

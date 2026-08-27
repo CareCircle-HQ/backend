@@ -407,6 +407,14 @@ class ClientSerializer(serializers.ModelSerializer):
         # instead of resurrecting the retired id (which would recreate the
         # duplicate we just merged).
         survivor = Client.objects.filter(migrated_from_id=str(client_id)).first()
+        # Capture prior consent on the EXISTING record so we can detect a
+        # WITHDRAWAL (was accepted -> now revoked) after the save. None => the
+        # client didn't exist yet (a brand-new record, never any prior consent).
+        _prior = survivor or Client.objects.filter(client_id=client_id).first()
+        _was_consented = None if _prior is None else bool(
+            _prior.consent_accepted
+            or (_prior.consent_status or "").lower() == "accepted"
+        )
         if survivor is not None:
             for k, v in validated_data.items():
                 setattr(survivor, k, v)
@@ -416,6 +424,22 @@ class ClientSerializer(serializers.ModelSerializer):
             client, _ = Client.objects.update_or_create(
                 client_id=client_id, defaults=validated_data
             )
+
+        # Consent WITHDRAWAL: an already-consented client whose consent is now
+        # revoked. Record it + place an actively-served household On Hold with a
+        # dated reason. (A brand-new no-consent record -> _was_consented is None,
+        # so this never fires; that ingestion is still blocked at the extension.)
+        if _was_consented:
+            now_consented = bool(
+                client.consent_accepted
+                or (client.consent_status or "").lower() == "accepted"
+            )
+            if not now_consented:
+                from api.services.lifecycle import apply_consent_withdrawal
+                try:
+                    apply_consent_withdrawal(client)
+                except Exception:  # never break the client save on a side effect
+                    pass
 
         # Mirror the ext's single Client.client_phone_number into the ClientPhone
         # table (what the member-profile "Phone Numbers" widget + caller-ID read),

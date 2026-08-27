@@ -5509,6 +5509,85 @@ class RequestVerificationFromValidatedTest(TestCase):
         self.assertIsNone(enr.verified_at)
 
 
+class ConsentWithdrawalTest(TestCase):
+    """A previously-consented client whose consent is revoked: record a
+    CONSENT_WITHDRAWN timeline event, and place an actively-served household On
+    Hold with a dated reason. A pre-service household records only (nothing to
+    hold). A brand-new no-consent record never triggers it."""
+
+    def _client(self, *, stage, consent=True):
+        from django.utils import timezone
+        from .models import (
+            Client, EnrollmentStage, EnrollmentVerification, Household, HouseholdMember,
+        )
+        c = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="C", last_name="W",
+            consent_accepted=consent, consent_status="accepted" if consent else "",
+        )
+        hh = Household.objects.create(name="CW")
+        HouseholdMember.objects.create(household=hh, client=c, is_primary=True)
+        EnrollmentVerification.objects.create(
+            client=c, household=hh, stage=stage,
+            verified_at=timezone.now() if stage != EnrollmentStage.PENDING_VERIFICATION else None,
+        )
+        return c
+
+    def _revoke(self, c):
+        from .serializers import ClientSerializer
+        ser = ClientSerializer(data={
+            "client_id": str(c.client_id), "first_name": c.first_name,
+            "last_name": c.last_name, "consent_accepted": False,
+            "consent_status": "declined",
+        })
+        ser.is_valid(raise_exception=True)
+        return ser.save()
+
+    def test_withdrawal_holds_active_household(self):
+        from .models import (
+            EnrollmentStage, EnrollmentVerification, TimelineEvent, TimelineEventType,
+        )
+        c = self._client(stage=EnrollmentStage.SERVICE_ACTIVE)
+        self._revoke(c)
+        enr = EnrollmentVerification.objects.get(client=c)
+        self.assertEqual(EnrollmentStage(enr.stage), EnrollmentStage.ON_HOLD)
+        self.assertTrue(
+            TimelineEvent.objects.filter(
+                client=c, event_type=TimelineEventType.CONSENT_WITHDRAWN
+            ).exists()
+        )
+
+    def test_withdrawal_pre_service_records_only(self):
+        from .models import (
+            EnrollmentStage, EnrollmentVerification, TimelineEvent, TimelineEventType,
+        )
+        c = self._client(stage=EnrollmentStage.PENDING_VERIFICATION)
+        self._revoke(c)
+        enr = EnrollmentVerification.objects.get(client=c)
+        # Nothing being served -> no hold, but the withdrawal is still recorded.
+        self.assertEqual(EnrollmentStage(enr.stage), EnrollmentStage.PENDING_VERIFICATION)
+        self.assertTrue(
+            TimelineEvent.objects.filter(
+                client=c, event_type=TimelineEventType.CONSENT_WITHDRAWN
+            ).exists()
+        )
+
+    def test_new_no_consent_client_no_withdrawal(self):
+        from .models import Client, TimelineEvent, TimelineEventType
+        from .serializers import ClientSerializer
+        cid = str(uuid.uuid4())
+        ser = ClientSerializer(data={
+            "client_id": cid, "first_name": "N", "last_name": "C",
+            "consent_accepted": False, "consent_status": "declined",
+        })
+        ser.is_valid(raise_exception=True)
+        ser.save()
+        self.assertFalse(
+            TimelineEvent.objects.filter(
+                client_id=cid, event_type=TimelineEventType.CONSENT_WITHDRAWN
+            ).exists()
+        )
+
+
 class HistoryNotNullStringGuardTest(TestCase):
     """A save(update_fields=[...]) on a partially-hydrated instance can leave a
     NOT-NULL string column None in memory; simple-history copies the whole
@@ -5586,6 +5665,20 @@ class VerificationNeverRequestedScopeTest(TestCase):
         self.assertIn(str(validated.client_id), ids)     # pre-request, never requested
         self.assertNotIn(str(pending.client_id), ids)    # in the pending queue
         self.assertNotIn(str(verified.client_id), ids)   # verified
+
+    def test_read_model_flag_matches_query(self):
+        # The Data-page read-model flag (build_row) mirrors the Verification-page
+        # 'Never Requested' query exactly, so the two pages agree.
+        from .models import EnrollmentStage
+        from .services.enrollment_analytics import build_row
+        no_enr = self._member("NoEnr2")
+        validated = self._member("Val2", enr_stage=EnrollmentStage.VALIDATED)
+        pending = self._member("Pend2", enr_stage=EnrollmentStage.PENDING_VERIFICATION, requested=True)
+        verified = self._member("Ver2", enr_stage=EnrollmentStage.VERIFIED, verified=True)
+        self.assertTrue(build_row(no_enr)["has_never_requested_verification"])
+        self.assertTrue(build_row(validated)["has_never_requested_verification"])
+        self.assertFalse(build_row(pending)["has_never_requested_verification"])
+        self.assertFalse(build_row(verified)["has_never_requested_verification"])
 
 
 class ReopenForVerificationTest(TestCase):
@@ -10861,6 +10954,34 @@ class RequestVerificationEndpointTest(TestCase):
         )
         resp = self.api.post(self._url(client))
         self.assertEqual(resp.status_code, 400, resp.content)
+
+    def test_request_sets_governing_verification_requested_at(self):
+        # Regression: requesting verification the SAME day the case was created
+        # must refresh the denormalized governing_verification_requested_at, or the
+        # Members-list "Verification Requested" date filter won't match same-day.
+        from .services.lifecycle import refresh_internal_case_sort
+        client = self._candidate()
+        refresh_internal_case_sort(client)
+        client.refresh_from_db()
+        self.assertIsNone(client.governing_verification_requested_at)  # no enrollment yet
+        resp = self.api.post(self._url(client))
+        self.assertEqual(resp.status_code, 200, resp.content)
+        client.refresh_from_db()
+        self.assertIsNotNone(client.governing_verification_requested_at)
+
+    def test_ineligible_member_rejected(self):
+        # A Not Eligible member can't be verified: the button is hidden AND the
+        # endpoint rejects a stale/direct call.
+        from .models import ClientStage
+        from .portal.serializers import can_request_primary_verification
+        for stage in (ClientStage.INELIGIBLE, ClientStage.NOT_ELIGIBLE):
+            client = self._candidate()
+            client.lifecycle_stage = stage
+            client.save(update_fields=["lifecycle_stage"])
+            self.assertFalse(can_request_primary_verification(client))  # button hidden
+            resp = self.api.post(self._url(client))
+            self.assertEqual(resp.status_code, 400, resp.content)
+            self.assertIn("Not Eligible", resp.json()["error"])
 
 
 class WorkQueueVipTest(TestCase):

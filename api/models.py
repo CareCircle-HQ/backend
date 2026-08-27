@@ -3656,6 +3656,7 @@ class Ticket(models.Model):
 # ===========================================================================
 class TimelineEventType(models.TextChoices):
     CONSENT_GRANTED = "consent_granted", "Consent Granted"
+    CONSENT_WITHDRAWN = "consent_withdrawn", "Consent Withdrawn"
     INSURANCE = "insurance", "Insurance"
     SOCIAL_CARE_COVERAGE = "social_care_coverage", "Social Care Coverage"
     SCREENING = "screening", "Screening"
@@ -4878,6 +4879,10 @@ class EnrollmentAnalytics(models.Model):
     # fact, for display/analytics).
     has_pending_verification_enrollment = models.BooleanField(default=False, db_index=True)
     has_verified_enrollment = models.BooleanField(default=False, db_index=True)
+    #   has_never_requested_verification -> open governing IS case (primary scope)
+    #     but the member never entered verification (not verified, no pending
+    #     enrollment, never requested). Powers the Data page's "Never Requested".
+    has_never_requested_verification = models.BooleanField(default=False, db_index=True)
 
     # Coverage.
     insurance_status = models.CharField(max_length=20, blank=True, db_index=True)

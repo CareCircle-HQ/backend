@@ -123,6 +123,7 @@ from ..services.lifecycle import (
     recompute_client_stage,
     recompute_enrollment_household,
     reconcile_enrollment_authorization,
+    refresh_internal_case_sort,
     reopen_for_verification,
     split_dependent_into_own_enrollment,
 )
@@ -1163,11 +1164,15 @@ def apply_case_created_date_filter(qs, start, end):
 
 def apply_verification_date_filters(qs, params, *, skip_enrollment_bounds=False):
     """Apply the Verification-page case-created/requested/completed/authorized
-    date-range filters from query params (``case_from``/``case_to`` ->
-    internal-service case ``date_opened``; ``requested_from``/``requested_to``
-    -> enrollment ``opened_at``; ``completed_from``/``completed_to`` ->
-    enrollment ``verified_at``; ``authorized_from``/``authorized_to`` ->
-    internal-service case ``service_authorization_approval_starts_at``). Returns
+    date-range filters from query params. All key off the GOVERNING internal-
+    service case/enrollment via denormalized, indexed Client columns (kept fresh
+    by refresh_internal_case_sort on the case reconcile AND the verification
+    request/completion write paths -- see _safe_refresh_case_sort):
+      ``case_from``/``case_to``           -> governing_internal_case_opened_at
+      ``requested_from``/``requested_to`` -> governing_verification_requested_at
+      ``completed_from``/``completed_to`` -> governing_verification_completed_at
+      ``authorized_from``/``authorized_to`` -> governing_internal_case_authorized_at
+    So they match the Data/Members pages household-for-household. Returns
     (qs, changed) where ``changed`` signals the caller to ``.distinct()``.
 
     ``skip_enrollment_bounds`` omits the enrollment-level requested/completed
@@ -6535,6 +6540,10 @@ class MemberRequestVerificationView(PortalAPIView):
         # Gate: reject with the specific missing prerequisite(s) so the UI can
         # explain why. Mirrors is_urgent_care_candidate but itemized.
         missing = []
+        # Not Eligible: an ineligible member can't be verified. Guards direct/
+        # stale calls even though the button is hidden (can_request_*_verification).
+        if (client.lifecycle_stage or "") in (ClientStage.NOT_ELIGIBLE, ClientStage.INELIGIBLE):
+            missing.append("member is Not Eligible")
         if not has_open_internal_service_case(client):
             missing.append("no open Internal Service case")
         if not has_valid_medicaid(client):
@@ -6569,6 +6578,10 @@ class MemberRequestVerificationView(PortalAPIView):
                 renewable.save(update_fields=["requested_by", "requested_at"])
                 reconcile_enrollment_authorization(renewable, actor=actor)
                 recompute_enrollment_household(renewable)
+                # Keep the Members-list "Verification Requested" date filter fresh
+                # same-day (denormalized key otherwise only refreshes on the case
+                # reconcile).
+                refresh_internal_case_sort(client)
                 clear_new_flag_on_verification_request(renewable)
                 try:
                     timeline.event_for_verification(renewable, actor=actor)
@@ -6616,6 +6629,8 @@ class MemberRequestVerificationView(PortalAPIView):
             # Drives the whole household to Pending Verification and drops the
             # primary off the Urgent Care list (clears is_new).
             recompute_enrollment_household(enr)
+            # Refresh the denormalized "Verification Requested" key same-day.
+            refresh_internal_case_sort(client)
             clear_new_flag_on_verification_request(enr)
             try:
                 timeline.event_for_verification(enr, actor=actor)
