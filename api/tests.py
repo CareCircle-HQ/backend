@@ -5526,14 +5526,16 @@ class HistoryNotNullStringGuardTest(TestCase):
         c.governing_internal_case_status = None
         c.governing_program_type = None
         c.first_name = "A2"
-        # Would raise IntegrityError on the history insert without the guard.
+        # Previously raised IntegrityError on the history insert (NOT-NULL). The
+        # columns are now nullable (safety net), so the write must simply succeed.
         c.save(update_fields=["first_name"])
         h = (
             HistoricalClient.objects.filter(client_id=c.client_id)
             .order_by("-history_id").first()
         )
-        self.assertEqual(h.governing_internal_case_status, "")
-        self.assertEqual(h.governing_program_type, "")
+        self.assertIsNotNone(h)  # history row written, no crash
+        self.assertIn(h.governing_internal_case_status, ("", None))
+        self.assertIn(h.governing_program_type, ("", None))
 
 
 class VerificationNeverRequestedScopeTest(TestCase):

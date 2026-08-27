@@ -1704,7 +1704,12 @@ class MembersListView(PortalGenericAPIView):
             # case's status. NOT "any IS case" -- a member with an open pending
             # case whose governing (favored) case is a closed approved one counts
             # as CLOSED here, exactly as the Data page reports.
-            qs = qs.exclude(governing_internal_case_status="")
+            # "has a governing IS case" = status set to a real value. Coalesce
+            # NULL to "" (the column is nullable as a history-write safety net, but
+            # a null means "no governing case" just like "").
+            qs = qs.exclude(governing_internal_case_status="").exclude(
+                governing_internal_case_status__isnull=True
+            )
             internal_status = (params.get("internal_status") or "").strip().lower()
             if internal_status == "open":
                 qs = qs.exclude(
