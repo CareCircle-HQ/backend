@@ -397,7 +397,12 @@ class Client(models.Model):
     # off the SAME governing case the Data page reports (not ANY internal-service
     # case). Blank/NULL when there is no governing internal-service case.
     # Maintained by refresh_internal_case_sort + backfill_client_case_sort.
-    governing_internal_case_status = models.CharField(max_length=32, blank=True, default="", db_index=True)
+    # null=True is a SAFETY NET: a save(update_fields=[...]) on a partially
+    # hydrated instance can leave this unset (None), and simple-history copies the
+    # whole instance into the history row -- a NOT-NULL column there aborted CSV
+    # imports. Treated as "" everywhere (refresh/backfill write ""; filters below
+    # coalesce null to empty), so a stray null is harmless, never a crash.
+    governing_internal_case_status = models.CharField(max_length=32, blank=True, null=True, default="", db_index=True)
     governing_internal_case_closed_at = models.DateTimeField(null=True, blank=True, db_index=True)
     governing_internal_case_authorized_at = models.DateTimeField(null=True, blank=True, db_index=True)
     # Denormalized GOVERNING enrollment's kitchen, so the Members list's Kitchen
@@ -412,7 +417,8 @@ class Client(models.Model):
     # Program (Household/Individual) filter keys off the governing case -- like
     # the Data page -- instead of matching a household program name on ANY
     # (incl. closed/disregarded) enrollment. "" when no governing case.
-    governing_program_type = models.CharField(max_length=16, blank=True, default="", db_index=True)
+    # null=True as a safety net (see governing_internal_case_status above).
+    governing_program_type = models.CharField(max_length=16, blank=True, null=True, default="", db_index=True)
     # Why the member is on the hard INELIGIBLE off-ramp: the human-readable gate
     # reasons (expired/missing Medicaid, wrong Medicaid type, out-of-range
     # ZIP/state, or a Kitchen-Assignment closure/denial). Written wherever the
