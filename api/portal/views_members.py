@@ -1164,11 +1164,15 @@ def apply_case_created_date_filter(qs, start, end):
 
 def apply_verification_date_filters(qs, params, *, skip_enrollment_bounds=False):
     """Apply the Verification-page case-created/requested/completed/authorized
-    date-range filters from query params (``case_from``/``case_to`` ->
-    internal-service case ``date_opened``; ``requested_from``/``requested_to``
-    -> enrollment ``opened_at``; ``completed_from``/``completed_to`` ->
-    enrollment ``verified_at``; ``authorized_from``/``authorized_to`` ->
-    internal-service case ``service_authorization_approval_starts_at``). Returns
+    date-range filters from query params. All key off the GOVERNING internal-
+    service case/enrollment via denormalized, indexed Client columns (kept fresh
+    by refresh_internal_case_sort on the case reconcile AND the verification
+    request/completion write paths -- see _safe_refresh_case_sort):
+      ``case_from``/``case_to``           -> governing_internal_case_opened_at
+      ``requested_from``/``requested_to`` -> governing_verification_requested_at
+      ``completed_from``/``completed_to`` -> governing_verification_completed_at
+      ``authorized_from``/``authorized_to`` -> governing_internal_case_authorized_at
+    So they match the Data/Members pages household-for-household. Returns
     (qs, changed) where ``changed`` signals the caller to ``.distinct()``.
 
     ``skip_enrollment_bounds`` omits the enrollment-level requested/completed
