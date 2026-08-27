@@ -938,6 +938,55 @@ def reopen_for_verification(enrollment, *, actor=None, actor_label="", note="",
     return enrollment
 
 
+# A household is "active in the program" (worth holding on a consent withdrawal)
+# once it's verified or beyond and still non-terminal. Pre-verification households
+# have nothing being served to stop.
+_CONSENT_HOLD_STAGES = frozenset({
+    EnrollmentStage.VERIFIED,
+    EnrollmentStage.KITCHEN_ASSIGNMENT,
+    EnrollmentStage.SERVICE_ACTIVE,
+})
+
+
+def apply_consent_withdrawal(client, *, actor=None, actor_label=""):
+    """A previously-consented client had consent REVOKED (in Unite Us). Record it
+    on the timeline and -- when the household is actively in the program (verified
+    / kitchen assignment / being served) -- place it On Hold with a dated,
+    explained reason so deliveries stop pending re-consent. Best-effort: a hiccup
+    never breaks the client save that triggered it."""
+    from api.history import ChangeSource
+    from api.portal.serializers import active_enrollment
+    from api.services import timeline
+
+    log = logging.getLogger(__name__)
+    reason = (
+        f"Consent withdrawn (revoked in Unite Us) on "
+        f"{timezone.localdate():%Y-%m-%d}. Household placed on hold pending "
+        f"re-consent."
+    )
+    try:
+        timeline.event_for_consent_withdrawn(
+            client, reason=reason, source=ChangeSource.EXTENSION,
+            actor=actor_label or "",
+        )
+    except Exception:  # pragma: no cover - defensive
+        log.warning("consent-withdrawn timeline failed for %s", client.pk, exc_info=True)
+
+    enr = active_enrollment(client)
+    if enr is None or EnrollmentStage(enr.stage) not in _CONSENT_HOLD_STAGES:
+        return  # not actively in the program -> record only, nothing to hold
+    try:
+        advance_enrollment(
+            enr, EnrollmentStage.ON_HOLD, actor=actor, actor_label=actor_label,
+            note=reason, trigger="consent_withdrawn",
+        )
+        recompute_enrollment_household(enr, actor=actor)
+    except InvalidTransition:
+        pass
+    except Exception:  # pragma: no cover - defensive
+        log.warning("consent-withdrawn hold failed for %s", client.pk, exc_info=True)
+
+
 @transaction.atomic
 def advance_enrollment(enrollment, to_stage, *, actor=None, actor_label="", note="",
                        force=False, trigger=""):

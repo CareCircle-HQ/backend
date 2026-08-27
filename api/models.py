@@ -3656,6 +3656,7 @@ class Ticket(models.Model):
 # ===========================================================================
 class TimelineEventType(models.TextChoices):
     CONSENT_GRANTED = "consent_granted", "Consent Granted"
+    CONSENT_WITHDRAWN = "consent_withdrawn", "Consent Withdrawn"
     INSURANCE = "insurance", "Insurance"
     SOCIAL_CARE_COVERAGE = "social_care_coverage", "Social Care Coverage"
     SCREENING = "screening", "Screening"

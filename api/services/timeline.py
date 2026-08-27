@@ -299,6 +299,28 @@ def event_for_consent(client, *, source=ChangeSource.EXTENSION, actor=""):
     )
 
 
+def event_for_consent_withdrawn(client, *, reason="", occurred_at=None,
+                                source=ChangeSource.EXTENSION, actor=""):
+    """Emit a 'Consent Withdrawn' event when a previously-consented client's
+    consent is revoked. Unlike the grant (create-once), a withdrawal is a real,
+    dated occurrence -- keyed by its timestamp so a later re-consent/re-withdraw
+    each records distinctly."""
+    if client is None:
+        return None
+    occurred = occurred_at or timezone.now()
+    return emit_timeline_event(
+        client=client,
+        event_type=TimelineEventType.CONSENT_WITHDRAWN,
+        occurred_at=occurred,
+        title="Consent Withdrawn",
+        subtitle=reason or "Consent revoked in Unite Us.",
+        source=source,
+        actor=actor,
+        entity=client,
+        dedupe_key=f"consent_withdrawn:{client.pk}:{occurred.isoformat()}",
+    )
+
+
 def event_for_screening(screening, *, source=ChangeSource.EXTENSION, actor="", resync=False):
     client = screening.client
     if client is None:

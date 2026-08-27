@@ -5509,6 +5509,85 @@ class RequestVerificationFromValidatedTest(TestCase):
         self.assertIsNone(enr.verified_at)
 
 
+class ConsentWithdrawalTest(TestCase):
+    """A previously-consented client whose consent is revoked: record a
+    CONSENT_WITHDRAWN timeline event, and place an actively-served household On
+    Hold with a dated reason. A pre-service household records only (nothing to
+    hold). A brand-new no-consent record never triggers it."""
+
+    def _client(self, *, stage, consent=True):
+        from django.utils import timezone
+        from .models import (
+            Client, EnrollmentStage, EnrollmentVerification, Household, HouseholdMember,
+        )
+        c = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="C", last_name="W",
+            consent_accepted=consent, consent_status="accepted" if consent else "",
+        )
+        hh = Household.objects.create(name="CW")
+        HouseholdMember.objects.create(household=hh, client=c, is_primary=True)
+        EnrollmentVerification.objects.create(
+            client=c, household=hh, stage=stage,
+            verified_at=timezone.now() if stage != EnrollmentStage.PENDING_VERIFICATION else None,
+        )
+        return c
+
+    def _revoke(self, c):
+        from .serializers import ClientSerializer
+        ser = ClientSerializer(data={
+            "client_id": str(c.client_id), "first_name": c.first_name,
+            "last_name": c.last_name, "consent_accepted": False,
+            "consent_status": "declined",
+        })
+        ser.is_valid(raise_exception=True)
+        return ser.save()
+
+    def test_withdrawal_holds_active_household(self):
+        from .models import (
+            EnrollmentStage, EnrollmentVerification, TimelineEvent, TimelineEventType,
+        )
+        c = self._client(stage=EnrollmentStage.SERVICE_ACTIVE)
+        self._revoke(c)
+        enr = EnrollmentVerification.objects.get(client=c)
+        self.assertEqual(EnrollmentStage(enr.stage), EnrollmentStage.ON_HOLD)
+        self.assertTrue(
+            TimelineEvent.objects.filter(
+                client=c, event_type=TimelineEventType.CONSENT_WITHDRAWN
+            ).exists()
+        )
+
+    def test_withdrawal_pre_service_records_only(self):
+        from .models import (
+            EnrollmentStage, EnrollmentVerification, TimelineEvent, TimelineEventType,
+        )
+        c = self._client(stage=EnrollmentStage.PENDING_VERIFICATION)
+        self._revoke(c)
+        enr = EnrollmentVerification.objects.get(client=c)
+        # Nothing being served -> no hold, but the withdrawal is still recorded.
+        self.assertEqual(EnrollmentStage(enr.stage), EnrollmentStage.PENDING_VERIFICATION)
+        self.assertTrue(
+            TimelineEvent.objects.filter(
+                client=c, event_type=TimelineEventType.CONSENT_WITHDRAWN
+            ).exists()
+        )
+
+    def test_new_no_consent_client_no_withdrawal(self):
+        from .models import Client, TimelineEvent, TimelineEventType
+        from .serializers import ClientSerializer
+        cid = str(uuid.uuid4())
+        ser = ClientSerializer(data={
+            "client_id": cid, "first_name": "N", "last_name": "C",
+            "consent_accepted": False, "consent_status": "declined",
+        })
+        ser.is_valid(raise_exception=True)
+        ser.save()
+        self.assertFalse(
+            TimelineEvent.objects.filter(
+                client_id=cid, event_type=TimelineEventType.CONSENT_WITHDRAWN
+            ).exists()
+        )
+
+
 class HistoryNotNullStringGuardTest(TestCase):
     """A save(update_fields=[...]) on a partially-hydrated instance can leave a
     NOT-NULL string column None in memory; simple-history copies the whole
