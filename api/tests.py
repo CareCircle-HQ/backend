@@ -5617,6 +5617,57 @@ class HistoryNotNullStringGuardTest(TestCase):
         self.assertIn(h.governing_program_type, ("", None))
 
 
+class CompanyStatusCaselessTest(TestCase):
+    """A caseless member is No Case Created UNLESS they're covered by their
+    household's case (held by the primary), in which case they INHERIT the
+    household's status. A solo / fully-caseless household is No Case."""
+
+    def _row(self, client):
+        from .services.enrollment_analytics import _base_qs, build_row
+        return build_row(_base_qs([client.client_id]).get(pk=client.client_id))
+
+    def test_solo_caseless_is_no_case(self):
+        from .models import Client, Household, HouseholdMember
+        c = Client.objects.create(client_id=str(uuid.uuid4()), first_name="s", last_name="o")
+        hh = Household.objects.create(name="solo")
+        HouseholdMember.objects.create(household=hh, client=c, is_primary=True)
+        # A 1-person household with no case must still be No Case (not blank).
+        self.assertEqual(self._row(c)["company_status"], "no_case")
+
+    def test_caseless_household_no_case(self):
+        # Multiple members, but NO member holds a case -> everyone No Case.
+        from .models import Client, Household, HouseholdMember
+        hh = Household.objects.create(name="caseless")
+        p = Client.objects.create(client_id=str(uuid.uuid4()), first_name="p", last_name="r")
+        d = Client.objects.create(client_id=str(uuid.uuid4()), first_name="d", last_name="e")
+        HouseholdMember.objects.create(household=hh, client=p, is_primary=True)
+        HouseholdMember.objects.create(household=hh, client=d, is_primary=False)
+        self.assertEqual(self._row(d)["company_status"], "no_case")
+
+    def test_caseless_dependent_inherits_household_case(self):
+        from django.utils import timezone
+        from .models import (
+            Case, CaseStatus, CaseType, Client, Household, HouseholdMember,
+            ServiceAuthorizationStatus,
+        )
+        hh = Household.objects.create(name="covered")
+        p = Client.objects.create(client_id=str(uuid.uuid4()), first_name="p", last_name="r")
+        d = Client.objects.create(client_id=str(uuid.uuid4()), first_name="d", last_name="e")
+        HouseholdMember.objects.create(household=hh, client=p, is_primary=True)
+        HouseholdMember.objects.create(household=hh, client=d, is_primary=False)
+        now = timezone.now()
+        Case.objects.create(
+            case_id=str(uuid.uuid4()), client=p, case_type=CaseType.INTERNAL_SERVICE,
+            case_status=CaseStatus.OPEN,
+            service_authorization_status=ServiceAuthorizationStatus.APPROVED,
+            date_opened=now, case_created_at=now,
+        )
+        # The caseless dependent inherits the household case -> NOT No Case / blank.
+        row = self._row(d)
+        self.assertNotIn(row["company_status"], ("no_case", ""))
+        self.assertEqual(row["case_type"], "internal_service")
+
+
 class VerificationNotApplicableFilterTest(TestCase):
     """Data-page verification filter "Not Applicable" = the gap: an open governing
     internal-service case but none of pending/verified/never-requested. Derived
@@ -5647,18 +5698,6 @@ class VerificationNotApplicableFilterTest(TestCase):
         self.assertIn(str(gap.client_id), na)
         for other in (pending, verified, never, closed):
             self.assertNotIn(str(other.client_id), na)
-
-    def test_company_status_not_applicable_is_complement(self):
-        from .services.enrollment_analytics import filter_analytics
-        blank = self._ea(company_status="")            # household relative -> NA
-        active = self._ea(company_status="active")
-        review = self._ea(company_status="review")
-        na = {str(x) for x in filter_analytics(
-            {"company_status": "not_applicable"}
-        ).values_list("client_id", flat=True)}
-        self.assertIn(str(blank.client_id), na)        # in none of the named buckets
-        self.assertNotIn(str(active.client_id), na)
-        self.assertNotIn(str(review.client_id), na)    # review IS a named bucket
 
 
 class VerificationNeverRequestedScopeTest(TestCase):

@@ -226,11 +226,13 @@ def _parity_fields(client):
 def _company_status(enrollment, case, parity, in_any_po, has_medicaid, has_social,
                     member_status="", in_household=False, has_active_delivery=False):
     if case is None or getattr(case, "case_type", "") != _INTERNAL_SERVICE:
-        # No internal-service case (own OR household -- the household fallback
-        # already ran). A member who is part of a household but has no food case
-        # is a household relative, NOT a standalone "No Case Created" member, so
-        # leave them uncounted (blank). Only a SOLO caseless member is No Case.
-        return "" if in_household else "no_case"
+        # No governing internal-service case they hold OR are covered by -- both
+        # the enrollment fallback and the household-PRIMARY fallback (build_row)
+        # already ran. So this member has no case AND is not a relative on a
+        # household case: No Case Created, regardless of any (often 1-person)
+        # household row. A covered relative resolves to the household case above,
+        # so it never reaches here (it inherits the household's status instead).
+        return "no_case"
     if (getattr(case, "case_status", "") or "").lower() in ("closed", "cancelled"):
         return "closed"
     # --- governing case is OPEN below ---
@@ -348,6 +350,21 @@ def build_row(client):
     # multiple internal-service cases.
     from api.portal.serializers import governing_service_case_for_display
     case = governing_service_case_for_display(client)
+    # Caseless member: fall back to the household's governing case (held by the
+    # PRIMARY) so a covered relative INHERITS the household's status instead of
+    # dropping into No Case. The resolver above only inherits via a live
+    # enrollment; this also covers a household that has a case but no enrollment.
+    # A solo / fully-caseless household finds nothing -> stays None -> No Case.
+    # (Uses the prefetched members/cases -- no extra query.)
+    if case is None and membership is not None:
+        from api.portal.serializers import internal_service_case
+        _primary = next(
+            (m for m in membership.household.members.all()
+             if m.is_primary and m.client_id and m.client_id != cid),
+            None,
+        )
+        if _primary is not None:
+            case = internal_service_case(_primary.client)
 
     # Verification-page parity flags. These reproduce the Verification page's
     # EXACT Pending / Verified buckets so the Data page's verification filter
@@ -572,15 +589,6 @@ def _shift_years(d, years):
         return d.replace(month=2, day=28, year=d.year - years)
 
 
-# The NAMED company-status buckets (each a Data-page dropdown option). The
-# "Not Applicable" filter is their complement -- everything in none of them
-# (chiefly the blank "" household-relative bucket). Keep in sync with
-# _company_status + the frontend COMPANY_STATUSES.
-_COMPANY_STATUS_BUCKETS = [
-    "active", "pending", "unable", "paused", "closed", "no_case", "review",
-]
-
-
 def filter_analytics(params):
     """Build the filtered/sorted EnrollmentAnalytics queryset for the Data page
     from request query params. Every filter maps to an indexed column (btree) or
@@ -646,16 +654,6 @@ def filter_analytics(params):
             has_never_requested_verification=False,
         )
 
-    # Company-status filter. "not_applicable" = the COMPLEMENT of the named
-    # buckets: every member in NONE of them (the blank "" household-relative
-    # bucket -- a member in a household with no own food case -- plus any stray
-    # value), so the dropdown's buckets + this one cover the whole population.
-    cstatus = g("company_status")
-    if cstatus == "not_applicable":
-        qs = qs.exclude(company_status__in=_COMPANY_STATUS_BUCKETS)
-    elif cstatus:
-        qs = qs.filter(company_status=cstatus)
-
     # Internal Service case filter (+ open/closed sub-filter), mirroring the
     # Members list. The read model's case_* fields describe the governing
     # internal-service case.
@@ -685,7 +683,7 @@ def filter_analytics(params):
         "attestation_status": "attestation_status", "stage": "stage",
         "case_type": "case_type", "case_status": "case_status",
         "auth_status": "auth_status", "program": "program_name",
-        # company_status handled above ("not_applicable" = complement bucket).
+        "company_status": "company_status",
         "delivery_company": "delivery_company",
         # Members-parity criteria.
         "eligibility": "eligibility",
