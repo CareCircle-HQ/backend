@@ -491,9 +491,11 @@ def refresh_internal_case_sort(client, *, save=True):
         governing_service_case_for_display,
     )
 
-    latest = Case.objects.filter(
+    _agg = Case.objects.filter(
         client=client, case_type=CaseType.INTERNAL_SERVICE,
-    ).aggregate(m=Max("date_opened"))["m"]
+    ).aggregate(m=Max("date_opened"), a=Max("added_to_system_at"))
+    latest = _agg["m"]
+    latest_added = _agg["a"]
     gov = governing_service_case_for_display(client)
     # Mirror the Data page: when there is NO governing internal-service case the
     # member is "No Case" and all case/enrollment-derived dates are blank (a
@@ -517,6 +519,7 @@ def refresh_internal_case_sort(client, *, save=True):
 
     updates = {
         "internal_case_opened_at": latest,
+        "internal_case_added_at": latest_added,
         "governing_internal_case_opened_at": gov_opened,
         "governing_verification_requested_at": gov_requested,
         "governing_verification_completed_at": gov_completed,

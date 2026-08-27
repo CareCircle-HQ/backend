@@ -376,6 +376,11 @@ class Client(models.Model):
     # backfill_client_case_sort command; indexed so the list orders via an index
     # scan + LIMIT instead of computing + sorting that value for all ~60k clients.
     internal_case_opened_at = models.DateTimeField(null=True, blank=True, db_index=True)
+    # Denormalized "Added to CRM" SORT key: the MOST RECENT internal-service case
+    # added_to_system_at (the A: date -- when we first saved a case for this
+    # member into our DB). Maintained by reconcile + backfill_case_added_at;
+    # indexed so the Members "Created" column can sort by it via an index scan.
+    internal_case_added_at = models.DateTimeField(null=True, blank=True, db_index=True)
     # Denormalized "Case Created" FILTER key: the GOVERNING internal-service
     # case's date_opened (favorability/deferral aware, via
     # governing_service_case_for_display) -- so the Members list's Created filter
@@ -1572,6 +1577,12 @@ class Case(models.Model):
             models.Index(
                 fields=["case_type", "date_opened"],
                 name="api_case_type_dopen_idx",
+            ),
+            # "Added to CRM" filter (added_from/added_to -> case_type +
+            # added_to_system_at, across ALL cases before the client join).
+            models.Index(
+                fields=["case_type", "added_to_system_at"],
+                name="api_case_type_added_idx",
             ),
             # Closed-date filter (closed_from/closed_to -> case_closed_at).
             models.Index(

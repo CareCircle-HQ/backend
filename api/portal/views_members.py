@@ -2622,10 +2622,12 @@ class MembersListView(PortalGenericAPIView):
             if sort_key == "updated":
                 col = F("updated_at")
             else:
-                # Denormalized latest internal-service case date_opened (kept fresh
-                # by reconcile). Indexed, so the default list orders via an index
+                # "created" now orders by the ADDED-to-system date (the A: row):
+                # the most-recent internal-service case added_to_system_at,
+                # denormalized on the Client (kept fresh by reconcile +
+                # backfill_case_added_at). Indexed, so the list orders via an index
                 # scan rather than a per-row correlated subquery + full sort.
-                col = F("internal_case_opened_at")
+                col = F("internal_case_added_at")
             primary = col.desc(nulls_last=True) if descending else col.asc(nulls_last=True)
             qs = qs.order_by(
                 primary,

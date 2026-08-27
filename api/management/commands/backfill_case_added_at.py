@@ -39,4 +39,21 @@ class Command(BaseCommand):
                 WHERE c.case_id = h.case_id AND c.added_to_system_at IS NULL
                 """
             )
-            self.stdout.write(self.style.SUCCESS(f"APPLIED: filled {cur.rowcount} row(s)."))
+            self.stdout.write(self.style.SUCCESS(f"APPLIED: filled {cur.rowcount} case row(s)."))
+            # Refresh the denormalized Members-list SORT key (most-recent
+            # internal-service case added date) so the "Created" column can order
+            # by it. Reconcile maintains it going forward; this seeds existing rows.
+            cur.execute(
+                """
+                UPDATE api_client cl
+                SET internal_case_added_at = s.max_added
+                FROM (
+                    SELECT client_id, max(added_to_system_at) AS max_added
+                    FROM api_case WHERE case_type='internal_service'
+                    GROUP BY client_id
+                ) s
+                WHERE cl.client_id = s.client_id
+                  AND cl.internal_case_added_at IS DISTINCT FROM s.max_added
+                """
+            )
+            self.stdout.write(self.style.SUCCESS(f"APPLIED: set sort key on {cur.rowcount} client(s)."))
