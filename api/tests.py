@@ -5648,6 +5648,18 @@ class VerificationNotApplicableFilterTest(TestCase):
         for other in (pending, verified, never, closed):
             self.assertNotIn(str(other.client_id), na)
 
+    def test_company_status_not_applicable_is_complement(self):
+        from .services.enrollment_analytics import filter_analytics
+        blank = self._ea(company_status="")            # household relative -> NA
+        active = self._ea(company_status="active")
+        review = self._ea(company_status="review")
+        na = {str(x) for x in filter_analytics(
+            {"company_status": "not_applicable"}
+        ).values_list("client_id", flat=True)}
+        self.assertIn(str(blank.client_id), na)        # in none of the named buckets
+        self.assertNotIn(str(active.client_id), na)
+        self.assertNotIn(str(review.client_id), na)    # review IS a named bucket
+
 
 class VerificationNeverRequestedScopeTest(TestCase):
     """The Verification page's 'Never Requested' filter: members whose primary

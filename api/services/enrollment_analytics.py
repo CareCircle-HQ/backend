@@ -572,6 +572,15 @@ def _shift_years(d, years):
         return d.replace(month=2, day=28, year=d.year - years)
 
 
+# The NAMED company-status buckets (each a Data-page dropdown option). The
+# "Not Applicable" filter is their complement -- everything in none of them
+# (chiefly the blank "" household-relative bucket). Keep in sync with
+# _company_status + the frontend COMPANY_STATUSES.
+_COMPANY_STATUS_BUCKETS = [
+    "active", "pending", "unable", "paused", "closed", "no_case", "review",
+]
+
+
 def filter_analytics(params):
     """Build the filtered/sorted EnrollmentAnalytics queryset for the Data page
     from request query params. Every filter maps to an indexed column (btree) or
@@ -637,6 +646,16 @@ def filter_analytics(params):
             has_never_requested_verification=False,
         )
 
+    # Company-status filter. "not_applicable" = the COMPLEMENT of the named
+    # buckets: every member in NONE of them (the blank "" household-relative
+    # bucket -- a member in a household with no own food case -- plus any stray
+    # value), so the dropdown's buckets + this one cover the whole population.
+    cstatus = g("company_status")
+    if cstatus == "not_applicable":
+        qs = qs.exclude(company_status__in=_COMPANY_STATUS_BUCKETS)
+    elif cstatus:
+        qs = qs.filter(company_status=cstatus)
+
     # Internal Service case filter (+ open/closed sub-filter), mirroring the
     # Members list. The read model's case_* fields describe the governing
     # internal-service case.
@@ -666,7 +685,7 @@ def filter_analytics(params):
         "attestation_status": "attestation_status", "stage": "stage",
         "case_type": "case_type", "case_status": "case_status",
         "auth_status": "auth_status", "program": "program_name",
-        "company_status": "company_status",
+        # company_status handled above ("not_applicable" = complement bucket).
         "delivery_company": "delivery_company",
         # Members-parity criteria.
         "eligibility": "eligibility",
