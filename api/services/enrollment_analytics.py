@@ -72,14 +72,19 @@ def _derive_delivery(client_id):
 
 
 def _in_any_po(client_id):
-    """True when the member has ever been included in a generated Purchase Order
-    (a DeliveryOrder line tied to a PO), regardless of delivery status. POs carry
-    a DeliveryOrder line PER MEMBER (dependents included -- confirmed in the
-    data: nearly every member of a delivered household has their own line), so
-    this is a per-member check."""
-    return DeliveryOrder.objects.filter(
-        member_id=client_id, purchase_order__isnull=False
-    ).exists()
+    """True when the member appears on at least one NON-CANCELLED Purchase Order
+    (a DeliveryOrder line tied to a PO whose status isn't 'cancelled'). Cancelled
+    POs don't count. POs carry a DeliveryOrder line PER MEMBER (dependents
+    included -- confirmed in the data: nearly every member of a delivered
+    household has their own line), so this is a per-member check. Drives the Data
+    page's Previously/Never Delivered filter."""
+    return (
+        DeliveryOrder.objects.filter(
+            member_id=client_id, purchase_order__isnull=False
+        )
+        .exclude(purchase_order__status="cancelled")  # PurchaseOrderStatus.CANCELLED
+        .exists()
+    )
 
 
 def _has_active_delivery(client_id):
@@ -612,14 +617,12 @@ def filter_analytics(params):
             pass
         qs = qs.filter(cond)
 
-    # Previously vs Never delivered: whether the member (with an OPEN governing
-    # internal-service case) has ever been included in a generated PO. Both
-    # options are scoped to an open governing case.
+    # Previously vs Never delivered: purely whether the member appears on at least
+    # one non-cancelled PO (in_any_po). NOT scoped to a case/governing status --
+    # "was or wasn't on a PO", full stop.
     delivered = g("delivered")
     if delivered in ("previously", "never"):
-        qs = qs.filter(case_type="internal_service").exclude(
-            case_status__in=["closed", "cancelled"]
-        ).filter(in_any_po=(delivered == "previously"))
+        qs = qs.filter(in_any_po=(delivered == "previously"))
 
     # Nutritionist filter. "none" is the sentinel for the blank bucket -- members
     # not (yet) at the nutritionist step (still pre-verification) or closed -- so
