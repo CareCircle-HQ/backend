@@ -140,3 +140,18 @@ def _stamp_change_context(sender, history_instance, **kwargs):
         source, actor = _attribution_from_request()
     history_instance.change_source = source
     history_instance.change_actor = actor
+    # A ``save(update_fields=[...])`` on a partially-hydrated instance can leave a
+    # NOT-NULL string column unset (None) on the in-memory object -- e.g. the
+    # denormalized ``governing_internal_case_status`` when only
+    # ``governing_internal_case_id`` was touched. The main table is shielded by
+    # ``update_fields``, but simple-history copies the WHOLE instance into the
+    # history row, so that None would violate the history table's NOT-NULL
+    # constraint and crash the save. Coerce such Nones to "" (the fields' intended
+    # empty value) so a history write can never break a legitimate save.
+    for f in history_instance._meta.fields:
+        if (
+            getattr(f, "empty_strings_allowed", False)
+            and not f.null
+            and getattr(history_instance, f.attname, "") is None
+        ):
+            setattr(history_instance, f.attname, "")
