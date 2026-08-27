@@ -5617,6 +5617,38 @@ class HistoryNotNullStringGuardTest(TestCase):
         self.assertIn(h.governing_program_type, ("", None))
 
 
+class VerificationNotApplicableFilterTest(TestCase):
+    """Data-page verification filter "Not Applicable" = the gap: an open governing
+    internal-service case but none of pending/verified/never-requested. Derived
+    from existing read-model columns; the four options partition IS+open."""
+
+    def _ea(self, **kw):
+        from .models import Client, EnrollmentAnalytics
+        c = Client.objects.create(client_id=str(uuid.uuid4()), first_name="a", last_name="b")
+        defaults = dict(
+            client=c, case_type="internal_service", case_status="open",
+            has_pending_verification_enrollment=False,
+            has_verified_enrollment=False,
+            has_never_requested_verification=False,
+        )
+        defaults.update(kw)
+        return Client.objects.get(pk=EnrollmentAnalytics.objects.create(**defaults).client_id)
+
+    def test_not_applicable_is_the_gap(self):
+        from .services.enrollment_analytics import filter_analytics
+        gap = self._ea()                                              # open IS, none -> NA
+        pending = self._ea(has_pending_verification_enrollment=True)
+        verified = self._ea(has_verified_enrollment=True)
+        never = self._ea(has_never_requested_verification=True)
+        closed = self._ea(case_status="closed")                       # not open -> not NA
+        na = {str(x) for x in filter_analytics(
+            {"verification_state": "Not Applicable"}
+        ).values_list("client_id", flat=True)}
+        self.assertIn(str(gap.client_id), na)
+        for other in (pending, verified, never, closed):
+            self.assertNotIn(str(other.client_id), na)
+
+
 class VerificationNeverRequestedScopeTest(TestCase):
     """The Verification page's 'Never Requested' filter: members whose primary
     holds an open Internal Service case but who never entered the verification

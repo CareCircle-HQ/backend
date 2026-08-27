@@ -624,6 +624,18 @@ def filter_analytics(params):
         qs = qs.filter(has_verified_enrollment=True)
     elif vstate == "Never Requested":
         qs = qs.filter(has_never_requested_verification=True)
+    elif vstate == "Not Applicable":
+        # The GAP: an open governing internal-service case but NONE of the three
+        # verification states apply -- requested-but-stalled/blocked (on hold /
+        # unable), or household-primary-scope edges. Derived from existing columns
+        # (no stored flag): open IS case AND not pending/verified/never-requested.
+        qs = qs.filter(
+            case_type="internal_service", case_status="open",
+        ).filter(
+            has_pending_verification_enrollment=False,
+            has_verified_enrollment=False,
+            has_never_requested_verification=False,
+        )
 
     # Internal Service case filter (+ open/closed sub-filter), mirroring the
     # Members list. The read model's case_* fields describe the governing
