@@ -1169,6 +1169,13 @@ class MemberDetailSerializer(serializers.Serializer):
                     and active_enrollment(client).nutritionist_approved_at
                     and active_enrollment(client).nutritionist_approved_by_id
                 ),
+                # On the hard-ineligible off-ramp (or the legacy not_eligible
+                # denial) -- an ineligible member can't be verified or run through
+                # nutritionist intake, so the frontend hides both buttons.
+                # (ClientStage.NOT_ELIGIBLE / INELIGIBLE values.)
+                "not_eligible": (client.lifecycle_stage or "") in (
+                    "not_eligible", "ineligible",
+                ),
                 # Drives the member-profile "Request Verification" button for a
                 # household DEPENDENT (non-primary member with their own internal-
                 # service + care-management + eligibility cases and no verification
