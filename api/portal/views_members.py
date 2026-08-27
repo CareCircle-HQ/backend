@@ -911,6 +911,19 @@ def verification_scope_q():
     return enrollment_stage_q(EnrollmentStage.PENDING_VERIFICATION) | verification_completed_q()
 
 
+def verification_ever_started_q():
+    """A member who has EVER started verification: an own OR household enrollment
+    carries a ``requested_at`` stamp, or a governing enrollment is verified. The
+    INVERSE (``.exclude(verification_ever_started_q())``) is "verification never
+    requested" -- a member with a case who never entered the funnel. Multi-valued
+    joins -> caller must ``.distinct()``."""
+    return (
+        Q(enrollments__requested_at__isnull=False)
+        | Q(household_membership__household__enrollment_verifications__requested_at__isnull=False)
+        | verification_completed_q()
+    )
+
+
 def enrollment_stage_q(*stages):
     """Match a client whose OWN enrollment OR their household's governing
     enrollment sits at any of the given stage(s). Mirrors the On Hold pattern so
@@ -1444,11 +1457,23 @@ class MembersListView(PortalGenericAPIView):
         # ever shown, before the per-status filter chips are applied.
         scope = (params.get("scope") or "").strip()
         if scope == "verification":
-            # Full verification history: the pending queue + anything ever
-            # verified, regardless of the stage it later advanced to. Also
-            # restrict to members whose household primary holds an Internal
-            # Service case (see require_internal_service_primary).
-            qs = require_internal_service_primary(qs.filter(verification_scope_q()))
+            if (params.get("status") or "").strip().lower() == "never_requested":
+                # NEVER REQUESTED: members whose household primary holds an open
+                # Internal Service case but who never entered the verification
+                # funnel -- NOT in the pending/verified queue AND no own/household
+                # enrollment was ever requested/verified. Exclude the UNION so a
+                # stray pending_verification enrollment with no requested_at stamp
+                # (still "in the queue") doesn't leak in. OUTSIDE the normal scope,
+                # so we DON'T apply verification_scope_q here.
+                qs = require_internal_service_primary(qs).exclude(
+                    verification_scope_q() | verification_ever_started_q()
+                )
+            else:
+                # Full verification history: the pending queue + anything ever
+                # verified, regardless of the stage it later advanced to. Also
+                # restrict to members whose household primary holds an Internal
+                # Service case (see require_internal_service_primary).
+                qs = require_internal_service_primary(qs.filter(verification_scope_q()))
         elif scope == "need_attention":
             # "Need Attention" (Urgent Care): brand-new members whose first
             # internal-service case was created by the ext (Client.is_new) and who
@@ -1586,6 +1611,11 @@ class MembersListView(PortalGenericAPIView):
                         "pending_verification", "verified", "kitchen_assignment",
                     ]
                 ).exclude(verification_completed_q())
+            elif sv == "never_requested":
+                # Verification never requested -- already applied at the scope
+                # block above (the base qs was replaced with the never-requested
+                # set). Nothing further to filter here.
+                pass
             # ── Nutritionist axis (gate between Verified and Kitchen Assignment) ──
             elif sv == "pending_nutritionist":
                 # Governing enrollment is Verified but NOT yet Nutritionist-approved.

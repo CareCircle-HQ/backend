@@ -5509,6 +5509,56 @@ class RequestVerificationFromValidatedTest(TestCase):
         self.assertIsNone(enr.verified_at)
 
 
+class VerificationNeverRequestedScopeTest(TestCase):
+    """The Verification page's 'Never Requested' filter: members whose primary
+    holds an open Internal Service case but who never entered the verification
+    funnel -- NOT in the pending/verified queue and never requested/verified."""
+
+    def _member(self, first, *, enr_stage=None, requested=False, verified=False):
+        from django.utils import timezone
+        from .models import (
+            Case, CaseStatus, CaseType, Client, EnrollmentVerification,
+            Household, HouseholdMember,
+        )
+        c = Client.objects.create(client_id=str(uuid.uuid4()), first_name=first, last_name="X")
+        hh = Household.objects.create(name=first)
+        HouseholdMember.objects.create(household=hh, client=c, is_primary=True)
+        Case.objects.create(
+            case_id=uuid.uuid4(), client=c, case_type=CaseType.INTERNAL_SERVICE,
+            case_status=CaseStatus.OPEN,
+        )
+        if enr_stage is not None:
+            EnrollmentVerification.objects.create(
+                client=c, household=hh, stage=enr_stage,
+                requested_at=(timezone.now() if requested else None),
+                verified_at=(timezone.now() if verified else None),
+            )
+        return c
+
+    def _never_requested_ids(self):
+        from .portal.views_members import (
+            require_internal_service_primary, verification_ever_started_q,
+            verification_scope_q,
+        )
+        qs = require_internal_service_primary(Client.objects.all()).exclude(
+            verification_scope_q() | verification_ever_started_q()
+        ).distinct()
+        return {str(pk) for pk in qs.values_list("pk", flat=True)}
+
+    def test_partitions_correctly(self):
+        from .models import EnrollmentStage
+        no_enr = self._member("NoEnr")  # case, never any enrollment
+        validated = self._member("Val", enr_stage=EnrollmentStage.VALIDATED)  # not requested
+        pending = self._member("Pend", enr_stage=EnrollmentStage.PENDING_VERIFICATION, requested=True)
+        verified = self._member("Ver", enr_stage=EnrollmentStage.VERIFIED, verified=True)
+
+        ids = self._never_requested_ids()
+        self.assertIn(str(no_enr.client_id), ids)       # never entered funnel
+        self.assertIn(str(validated.client_id), ids)     # pre-request, never requested
+        self.assertNotIn(str(pending.client_id), ids)    # in the pending queue
+        self.assertNotIn(str(verified.client_id), ids)   # verified
+
+
 class ReopenForVerificationTest(TestCase):
     """reopen_for_verification force-regresses a NEVER-verified enrollment back to
     Pending Verification (a hop the transition map disallows), but never touches a
