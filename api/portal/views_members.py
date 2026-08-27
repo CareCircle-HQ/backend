@@ -2705,6 +2705,9 @@ class MembersListView(PortalGenericAPIView):
             self._stamp_added_via(groups)
             self._stamp_case_teams(groups)
         elif scope == "verification":
+            # Verification page's Team column now also shows the Source
+            # (Extension / Import) badge, so stamp added_via too.
+            self._stamp_added_via(groups)
             self._stamp_case_teams(groups)
         return self.get_paginated_response(groups)
 
