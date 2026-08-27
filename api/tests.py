@@ -5509,6 +5509,33 @@ class RequestVerificationFromValidatedTest(TestCase):
         self.assertIsNone(enr.verified_at)
 
 
+class HistoryNotNullStringGuardTest(TestCase):
+    """A save(update_fields=[...]) on a partially-hydrated instance can leave a
+    NOT-NULL string column None in memory; simple-history copies the whole
+    instance into the history row. The history handler must coerce those Nones to
+    "" so the write can't violate the history table's NOT-NULL constraint (the
+    real cause of the CSV-import 'governing_internal_case_status' crash)."""
+
+    def test_partial_instance_save_does_not_crash_history(self):
+        from .models import Client, HistoricalClient
+        c = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="A", last_name="B",
+        )
+        self.assertEqual(c.governing_internal_case_status, "")
+        # Simulate the partial/None state a bulk update_fields save can produce.
+        c.governing_internal_case_status = None
+        c.governing_program_type = None
+        c.first_name = "A2"
+        # Would raise IntegrityError on the history insert without the guard.
+        c.save(update_fields=["first_name"])
+        h = (
+            HistoricalClient.objects.filter(client_id=c.client_id)
+            .order_by("-history_id").first()
+        )
+        self.assertEqual(h.governing_internal_case_status, "")
+        self.assertEqual(h.governing_program_type, "")
+
+
 class VerificationNeverRequestedScopeTest(TestCase):
     """The Verification page's 'Never Requested' filter: members whose primary
     holds an open Internal Service case but who never entered the verification
