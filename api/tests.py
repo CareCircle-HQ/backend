@@ -5617,6 +5617,163 @@ class HistoryNotNullStringGuardTest(TestCase):
         self.assertIn(h.governing_program_type, ("", None))
 
 
+class CaseAddedToSystemTest(TestCase):
+    """Case.added_to_system_at is stamped on first insert (the date we saved it to
+    our DB) and never overwritten by later updates; the Members "Created" column
+    exposes it as the A: row via case_dates."""
+
+    def _case(self, client):
+        from django.utils import timezone
+        from .models import Case, CaseStatus, CaseType
+        return Case.objects.create(
+            case_id=str(uuid.uuid4()), client=client, case_type=CaseType.INTERNAL_SERVICE,
+            case_status=CaseStatus.OPEN, date_opened=timezone.now(),
+        )
+
+    def test_stamped_on_insert_and_stable(self):
+        from .models import CaseStatus, Client
+        c = Client.objects.create(client_id=str(uuid.uuid4()), first_name="a", last_name="b")
+        case = self._case(c)
+        self.assertIsNotNone(case.added_to_system_at)
+        first = case.added_to_system_at
+        case.case_status = CaseStatus.CLOSED
+        case.save()
+        case.refresh_from_db()
+        self.assertEqual(case.added_to_system_at, first)  # not overwritten on update
+
+    def test_case_dates_exposes_added(self):
+        from .models import Client
+        from .portal.serializers import MemberListSerializer
+        from .services.enrollment_analytics import _base_qs
+        c = Client.objects.create(client_id=str(uuid.uuid4()), first_name="a", last_name="b")
+        self._case(c)
+        data = MemberListSerializer(_base_qs([c.client_id]).get(pk=c.client_id)).data
+        self.assertTrue(data["case_dates"])
+        self.assertIsNotNone(data["case_dates"][0]["added"])
+
+
+class DeliveryHistoryFilterTest(TestCase):
+    """Previously/Never Delivered = purely whether the member appears on at least
+    one NON-CANCELLED PO. No case/governing scoping; cancelled POs don't count."""
+
+    def test_in_any_po_excludes_cancelled(self):
+        from .models import (
+            Client, DeliveryOrder, PurchaseOrder, PurchaseOrderStatus,
+        )
+        from .services.enrollment_analytics import _in_any_po
+        on_live = Client.objects.create(client_id=str(uuid.uuid4()), first_name="a", last_name="b")
+        on_cancelled = Client.objects.create(client_id=str(uuid.uuid4()), first_name="c", last_name="d")
+        never = Client.objects.create(client_id=str(uuid.uuid4()), first_name="e", last_name="f")
+        live = PurchaseOrder.objects.create(status=PurchaseOrderStatus.CONFIRMED)
+        canc = PurchaseOrder.objects.create(status=PurchaseOrderStatus.CANCELLED)
+        DeliveryOrder.objects.create(purchase_order=live, member=on_live)
+        DeliveryOrder.objects.create(purchase_order=canc, member=on_cancelled)
+        self.assertTrue(_in_any_po(on_live.client_id))
+        self.assertFalse(_in_any_po(on_cancelled.client_id))  # only a cancelled PO
+        self.assertFalse(_in_any_po(never.client_id))
+
+    def test_delivered_filter_ignores_case(self):
+        from .models import Client, EnrollmentAnalytics
+        from .services.enrollment_analytics import filter_analytics
+        # In a PO but NO internal-service case -> still "Previously" (no scoping).
+        c1 = Client.objects.create(client_id=str(uuid.uuid4()), first_name="p", last_name="1")
+        EnrollmentAnalytics.objects.create(client=c1, in_any_po=True, case_type="", case_status="")
+        # Not in a PO though the case is open -> "Never".
+        c2 = Client.objects.create(client_id=str(uuid.uuid4()), first_name="n", last_name="2")
+        EnrollmentAnalytics.objects.create(
+            client=c2, in_any_po=False, case_type="internal_service", case_status="open"
+        )
+        prev = {str(x) for x in filter_analytics({"delivered": "previously"}).values_list("client_id", flat=True)}
+        never = {str(x) for x in filter_analytics({"delivered": "never"}).values_list("client_id", flat=True)}
+        self.assertIn(str(c1.client_id), prev)
+        self.assertNotIn(str(c1.client_id), never)
+        self.assertIn(str(c2.client_id), never)
+        self.assertNotIn(str(c2.client_id), prev)
+
+
+class CompanyStatusCaselessTest(TestCase):
+    """A caseless member is No Case Created UNLESS they're covered by their
+    household's case (held by the primary), in which case they INHERIT the
+    household's status. A solo / fully-caseless household is No Case."""
+
+    def _row(self, client):
+        from .services.enrollment_analytics import _base_qs, build_row
+        return build_row(_base_qs([client.client_id]).get(pk=client.client_id))
+
+    def test_solo_caseless_is_no_case(self):
+        from .models import Client, Household, HouseholdMember
+        c = Client.objects.create(client_id=str(uuid.uuid4()), first_name="s", last_name="o")
+        hh = Household.objects.create(name="solo")
+        HouseholdMember.objects.create(household=hh, client=c, is_primary=True)
+        # A 1-person household with no case must still be No Case (not blank).
+        self.assertEqual(self._row(c)["company_status"], "no_case")
+
+    def test_caseless_household_no_case(self):
+        # Multiple members, but NO member holds a case -> everyone No Case.
+        from .models import Client, Household, HouseholdMember
+        hh = Household.objects.create(name="caseless")
+        p = Client.objects.create(client_id=str(uuid.uuid4()), first_name="p", last_name="r")
+        d = Client.objects.create(client_id=str(uuid.uuid4()), first_name="d", last_name="e")
+        HouseholdMember.objects.create(household=hh, client=p, is_primary=True)
+        HouseholdMember.objects.create(household=hh, client=d, is_primary=False)
+        self.assertEqual(self._row(d)["company_status"], "no_case")
+
+    def test_caseless_dependent_inherits_household_case(self):
+        from django.utils import timezone
+        from .models import (
+            Case, CaseStatus, CaseType, Client, Household, HouseholdMember,
+            ServiceAuthorizationStatus,
+        )
+        hh = Household.objects.create(name="covered")
+        p = Client.objects.create(client_id=str(uuid.uuid4()), first_name="p", last_name="r")
+        d = Client.objects.create(client_id=str(uuid.uuid4()), first_name="d", last_name="e")
+        HouseholdMember.objects.create(household=hh, client=p, is_primary=True)
+        HouseholdMember.objects.create(household=hh, client=d, is_primary=False)
+        now = timezone.now()
+        Case.objects.create(
+            case_id=str(uuid.uuid4()), client=p, case_type=CaseType.INTERNAL_SERVICE,
+            case_status=CaseStatus.OPEN,
+            service_authorization_status=ServiceAuthorizationStatus.APPROVED,
+            date_opened=now, case_created_at=now,
+        )
+        # The caseless dependent inherits the household case -> NOT No Case / blank.
+        row = self._row(d)
+        self.assertNotIn(row["company_status"], ("no_case", ""))
+        self.assertEqual(row["case_type"], "internal_service")
+
+
+class VerificationNotApplicableFilterTest(TestCase):
+    """Data-page verification filter "Not Applicable" = the gap: an open governing
+    internal-service case but none of pending/verified/never-requested. Derived
+    from existing read-model columns; the four options partition IS+open."""
+
+    def _ea(self, **kw):
+        from .models import Client, EnrollmentAnalytics
+        c = Client.objects.create(client_id=str(uuid.uuid4()), first_name="a", last_name="b")
+        defaults = dict(
+            client=c, case_type="internal_service", case_status="open",
+            has_pending_verification_enrollment=False,
+            has_verified_enrollment=False,
+            has_never_requested_verification=False,
+        )
+        defaults.update(kw)
+        return Client.objects.get(pk=EnrollmentAnalytics.objects.create(**defaults).client_id)
+
+    def test_not_applicable_is_the_gap(self):
+        from .services.enrollment_analytics import filter_analytics
+        gap = self._ea()                                              # open IS, none -> NA
+        pending = self._ea(has_pending_verification_enrollment=True)
+        verified = self._ea(has_verified_enrollment=True)
+        never = self._ea(has_never_requested_verification=True)
+        closed = self._ea(case_status="closed")                       # not open -> not NA
+        na = {str(x) for x in filter_analytics(
+            {"verification_state": "Not Applicable"}
+        ).values_list("client_id", flat=True)}
+        self.assertIn(str(gap.client_id), na)
+        for other in (pending, verified, never, closed):
+            self.assertNotIn(str(other.client_id), na)
+
+
 class VerificationNeverRequestedScopeTest(TestCase):
     """The Verification page's 'Never Requested' filter: members whose primary
     holds an open Internal Service case but who never entered the verification

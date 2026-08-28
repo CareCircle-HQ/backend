@@ -72,14 +72,19 @@ def _derive_delivery(client_id):
 
 
 def _in_any_po(client_id):
-    """True when the member has ever been included in a generated Purchase Order
-    (a DeliveryOrder line tied to a PO), regardless of delivery status. POs carry
-    a DeliveryOrder line PER MEMBER (dependents included -- confirmed in the
-    data: nearly every member of a delivered household has their own line), so
-    this is a per-member check."""
-    return DeliveryOrder.objects.filter(
-        member_id=client_id, purchase_order__isnull=False
-    ).exists()
+    """True when the member appears on at least one NON-CANCELLED Purchase Order
+    (a DeliveryOrder line tied to a PO whose status isn't 'cancelled'). Cancelled
+    POs don't count. POs carry a DeliveryOrder line PER MEMBER (dependents
+    included -- confirmed in the data: nearly every member of a delivered
+    household has their own line), so this is a per-member check. Drives the Data
+    page's Previously/Never Delivered filter."""
+    return (
+        DeliveryOrder.objects.filter(
+            member_id=client_id, purchase_order__isnull=False
+        )
+        .exclude(purchase_order__status="cancelled")  # PurchaseOrderStatus.CANCELLED
+        .exists()
+    )
 
 
 def _has_active_delivery(client_id):
@@ -226,11 +231,13 @@ def _parity_fields(client):
 def _company_status(enrollment, case, parity, in_any_po, has_medicaid, has_social,
                     member_status="", in_household=False, has_active_delivery=False):
     if case is None or getattr(case, "case_type", "") != _INTERNAL_SERVICE:
-        # No internal-service case (own OR household -- the household fallback
-        # already ran). A member who is part of a household but has no food case
-        # is a household relative, NOT a standalone "No Case Created" member, so
-        # leave them uncounted (blank). Only a SOLO caseless member is No Case.
-        return "" if in_household else "no_case"
+        # No governing internal-service case they hold OR are covered by -- both
+        # the enrollment fallback and the household-PRIMARY fallback (build_row)
+        # already ran. So this member has no case AND is not a relative on a
+        # household case: No Case Created, regardless of any (often 1-person)
+        # household row. A covered relative resolves to the household case above,
+        # so it never reaches here (it inherits the household's status instead).
+        return "no_case"
     if (getattr(case, "case_status", "") or "").lower() in ("closed", "cancelled"):
         return "closed"
     # --- governing case is OPEN below ---
@@ -348,6 +355,21 @@ def build_row(client):
     # multiple internal-service cases.
     from api.portal.serializers import governing_service_case_for_display
     case = governing_service_case_for_display(client)
+    # Caseless member: fall back to the household's governing case (held by the
+    # PRIMARY) so a covered relative INHERITS the household's status instead of
+    # dropping into No Case. The resolver above only inherits via a live
+    # enrollment; this also covers a household that has a case but no enrollment.
+    # A solo / fully-caseless household finds nothing -> stays None -> No Case.
+    # (Uses the prefetched members/cases -- no extra query.)
+    if case is None and membership is not None:
+        from api.portal.serializers import internal_service_case
+        _primary = next(
+            (m for m in membership.household.members.all()
+             if m.is_primary and m.client_id and m.client_id != cid),
+            None,
+        )
+        if _primary is not None:
+            case = internal_service_case(_primary.client)
 
     # Verification-page parity flags. These reproduce the Verification page's
     # EXACT Pending / Verified buckets so the Data page's verification filter
@@ -363,7 +385,13 @@ def build_row(client):
     funnel_enr = list(client.enrollments.all())
     if membership is not None:
         funnel_enr += list(membership.household.enrollment_verifications.all())
-    verified_completed = any(e.verified_at is not None for e in funnel_enr)
+    # A verified_at on a DISREGARDED (dismissed) or SCHEDULED_EXTENSION (parked)
+    # enrollment doesn't count -- it's a stale prior-cycle fact, not the current
+    # verification. Matches verification_completed_q + lifecycle._governing_enrollments.
+    _NONGOV = ("disregarded", "scheduled_extension")
+    verified_completed = any(
+        e.verified_at is not None and (e.stage or "") not in _NONGOV for e in funnel_enr
+    )
     has_pending_enr = any((e.stage or "") == "pending_verification" for e in funnel_enr)
     lifecycle_in_window = (getattr(client, "lifecycle_stage", "") or "") in _VWINDOW
     # Scope: the household PRIMARY holds an OPEN internal-service case.
@@ -595,14 +623,12 @@ def filter_analytics(params):
             pass
         qs = qs.filter(cond)
 
-    # Previously vs Never delivered: whether the member (with an OPEN governing
-    # internal-service case) has ever been included in a generated PO. Both
-    # options are scoped to an open governing case.
+    # Previously vs Never delivered: purely whether the member appears on at least
+    # one non-cancelled PO (in_any_po). NOT scoped to a case/governing status --
+    # "was or wasn't on a PO", full stop.
     delivered = g("delivered")
     if delivered in ("previously", "never"):
-        qs = qs.filter(case_type="internal_service").exclude(
-            case_status__in=["closed", "cancelled"]
-        ).filter(in_any_po=(delivered == "previously"))
+        qs = qs.filter(in_any_po=(delivered == "previously"))
 
     # Nutritionist filter. "none" is the sentinel for the blank bucket -- members
     # not (yet) at the nutritionist step (still pre-verification) or closed -- so
@@ -624,6 +650,18 @@ def filter_analytics(params):
         qs = qs.filter(has_verified_enrollment=True)
     elif vstate == "Never Requested":
         qs = qs.filter(has_never_requested_verification=True)
+    elif vstate == "Not Applicable":
+        # The GAP: an open governing internal-service case but NONE of the three
+        # verification states apply -- requested-but-stalled/blocked (on hold /
+        # unable), or household-primary-scope edges. Derived from existing columns
+        # (no stored flag): open IS case AND not pending/verified/never-requested.
+        qs = qs.filter(
+            case_type="internal_service", case_status="open",
+        ).filter(
+            has_pending_verification_enrollment=False,
+            has_verified_enrollment=False,
+            has_never_requested_verification=False,
+        )
 
     # Internal Service case filter (+ open/closed sub-filter), mirroring the
     # Members list. The read model's case_* fields describe the governing

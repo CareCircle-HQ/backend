@@ -892,10 +892,25 @@ def verification_completed_q():
     client's lifecycle_stage. The case authorization status (a separate
     dimension) never affects this.
 
+    EXCLUDES ``disregarded`` (dismissed request) and ``scheduled_extension``
+    (parked reauthorization) enrollments -- matching lifecycle._governing_
+    enrollments -- so a stale ``verified_at`` on a disregarded PRIOR-cycle
+    enrollment no longer labels the member Verified (their current governing
+    enrollment drives the status instead). ``closed``/``cancelled`` verified
+    enrollments still count (the member was genuinely verified).
+
     Caller is responsible for ``.distinct()`` (this adds multi-valued joins)."""
-    return Q(enrollments__verified_at__isnull=False) | Q(
-        household_membership__household__enrollment_verifications__verified_at__isnull=False
-    )
+    from django.db.models import Exists, OuterRef
+
+    from ..models import EnrollmentStage, EnrollmentVerification
+    _nongov = [EnrollmentStage.DISREGARDED, EnrollmentStage.SCHEDULED_EXTENSION]
+    own = EnrollmentVerification.objects.filter(
+        client=OuterRef("pk"), verified_at__isnull=False
+    ).exclude(stage__in=_nongov)
+    hh = EnrollmentVerification.objects.filter(
+        household__members__client=OuterRef("pk"), verified_at__isnull=False
+    ).exclude(stage__in=_nongov)
+    return Exists(own) | Exists(hh)
 
 
 def verification_scope_q():
@@ -1980,6 +1995,23 @@ class MembersListView(PortalGenericAPIView):
         if closed_to:
             qs = qs.filter(governing_internal_case_closed_at__date__lte=closed_to)
 
+        # Added-to-CRM date range (Members page): members with an INTERNAL-SERVICE
+        # case first SAVED INTO OUR DB within [from, to] -- the actual intake date
+        # (Case.added_to_system_at), independent of the Unite Us opened date AND of
+        # whether it's the member's GOVERNING case. Unlike the governing-based
+        # "Created" filter, this matches on ANY internal-service case, so a case we
+        # added today surfaces even when the member's favored/governing case is
+        # older (e.g. a renewal). Join over cases -> needs .distinct().
+        added_from = _parse_date(params.get("added_from"))
+        added_to = _parse_date(params.get("added_to"))
+        if added_from or added_to:
+            adq = Q(cases__case_type=CaseType.INTERNAL_SERVICE)
+            if added_from:
+                adq &= Q(cases__added_to_system_at__date__gte=added_from)
+            if added_to:
+                adq &= Q(cases__added_to_system_at__date__lte=added_to)
+            qs = qs.filter(adq).distinct()
+
         # Date-period filter (Verification page dropdown): narrow to households
         # whose enrollment record was OPENED within the selected window. Skipped
         # when a "verified by" filter is active -- the period window is already
@@ -2605,10 +2637,12 @@ class MembersListView(PortalGenericAPIView):
             if sort_key == "updated":
                 col = F("updated_at")
             else:
-                # Denormalized latest internal-service case date_opened (kept fresh
-                # by reconcile). Indexed, so the default list orders via an index
+                # "created" now orders by the ADDED-to-system date (the A: row):
+                # the most-recent internal-service case added_to_system_at,
+                # denormalized on the Client (kept fresh by reconcile +
+                # backfill_case_added_at). Indexed, so the list orders via an index
                 # scan rather than a per-row correlated subquery + full sort.
-                col = F("internal_case_opened_at")
+                col = F("internal_case_added_at")
             primary = col.desc(nulls_last=True) if descending else col.asc(nulls_last=True)
             qs = qs.order_by(
                 primary,
@@ -2686,6 +2720,9 @@ class MembersListView(PortalGenericAPIView):
             self._stamp_added_via(groups)
             self._stamp_case_teams(groups)
         elif scope == "verification":
+            # Verification page's Team column now also shows the Source
+            # (Extension / Import) badge, so stamp added_via too.
+            self._stamp_added_via(groups)
             self._stamp_case_teams(groups)
         return self.get_paginated_response(groups)
 

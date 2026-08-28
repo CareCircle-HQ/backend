@@ -376,6 +376,11 @@ class Client(models.Model):
     # backfill_client_case_sort command; indexed so the list orders via an index
     # scan + LIMIT instead of computing + sorting that value for all ~60k clients.
     internal_case_opened_at = models.DateTimeField(null=True, blank=True, db_index=True)
+    # Denormalized "Added to CRM" SORT key: the MOST RECENT internal-service case
+    # added_to_system_at (the A: date -- when we first saved a case for this
+    # member into our DB). Maintained by reconcile + backfill_case_added_at;
+    # indexed so the Members "Created" column can sort by it via an index scan.
+    internal_case_added_at = models.DateTimeField(null=True, blank=True, db_index=True)
     # Denormalized "Case Created" FILTER key: the GOVERNING internal-service
     # case's date_opened (favorability/deferral aware, via
     # governing_service_case_for_display) -- so the Members list's Created filter
@@ -1360,6 +1365,13 @@ class Case(models.Model):
     # agent-edited), so it is NOT reliable for this ordering.
     case_created_at = models.DateTimeField(null=True, blank=True, db_index=True)
     updated_at = models.DateTimeField(null=True, blank=True)  # source last update
+    # When this case row was FIRST saved into OUR system -- distinct from the
+    # Unite Us source dates above (date_opened / case_created_at), which can
+    # predate the import that actually added it. Stamped on first insert (see
+    # save); backfilled for existing rows from the earliest HistoricalCase
+    # history_date. Powers the Members "Created" column A: row + the "how many
+    # cases did we ADD on date X" reporting (independent of the UU date's import lag).
+    added_to_system_at = models.DateTimeField(null=True, blank=True, db_index=True)
 
     # Product (model to be defined later) - placeholder reference for now.
     product_id = models.UUIDField(null=True, blank=True)
@@ -1533,6 +1545,14 @@ class Case(models.Model):
 
     history = tracked_history()
 
+    def save(self, *args, **kwargs):
+        # Stamp the date we FIRST saved this case into our DB (first insert only),
+        # so it survives later source-driven updates. Historical rows are
+        # backfilled from the earliest HistoricalCase.history_date.
+        if self._state.adding and self.added_to_system_at is None:
+            self.added_to_system_at = timezone.now()
+        super().save(*args, **kwargs)
+
     class Meta:
         ordering = ["-date_opened"]
         indexes = [
@@ -1557,6 +1577,12 @@ class Case(models.Model):
             models.Index(
                 fields=["case_type", "date_opened"],
                 name="api_case_type_dopen_idx",
+            ),
+            # "Added to CRM" filter (added_from/added_to -> case_type +
+            # added_to_system_at, across ALL cases before the client join).
+            models.Index(
+                fields=["case_type", "added_to_system_at"],
+                name="api_case_type_added_idx",
             ),
             # Closed-date filter (closed_from/closed_to -> case_closed_at).
             models.Index(

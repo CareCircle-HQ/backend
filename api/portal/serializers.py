@@ -838,9 +838,15 @@ class MemberListSerializer(serializers.Serializer):
             )
         opened = chosen.date_opened.isoformat() if chosen.date_opened else None
         closed = chosen.case_closed_at.isoformat() if chosen.case_closed_at else None
-        if not (opened or closed):
+        # A: the date WE added this case to the system (first insert), distinct
+        # from the Unite Us opened date -- shown under O: in the Created column.
+        added = (
+            chosen.added_to_system_at.isoformat()
+            if getattr(chosen, "added_to_system_at", None) else None
+        )
+        if not (opened or closed or added):
             return []
-        return [{"opened": opened, "closed": closed}]
+        return [{"opened": opened, "closed": closed, "added": added}]
 
     def get_household_primary_id(self, obj):
         # client_id of the household's PRIMARY member, used by the Members list
