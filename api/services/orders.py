@@ -878,6 +878,39 @@ def truncate_future_deliveries(enrollment, on_or_after=None):
     return sync_delivery_calendar(enrollment, from_date=cutoff)
 
 
+# DeliveryOrder statuses that a delivery has already reached and must not be
+# retroactively cancelled (already delivered / terminal). Mirrors CancelPurchaseOrderView.
+_DELIVERY_ORDER_TERMINAL = (
+    DeliveryOrderStatus.DELIVERED,
+    DeliveryOrderStatus.CANCELLED,
+    DeliveryOrderStatus.RETURNED,
+    DeliveryOrderStatus.FAILED,
+)
+
+
+def cancel_future_delivery_orders(client, from_date=None):
+    """Cancel a member's NOT-YET-DELIVERED DeliveryOrders on/after ``from_date``
+    (default today).
+
+    Called when a member is pulled OUT of service (paused / out of orbit / out of
+    range / scope-switch pause) so a delivery ALREADY committed to a cut Purchase
+    Order doesn't still ship -- and get billed -- after the member stopped serving.
+    PO generation already excludes these members going forward; this closes the
+    gap for orders cut BEFORE the status change. Terminal orders (delivered/
+    cancelled/returned/failed) are left intact. Returns the count cancelled.
+    """
+    if client is None:
+        return 0
+    cutoff = from_date or timezone.localdate()
+    return (
+        DeliveryOrder.objects.filter(
+            member=client, expected_delivery_date__gte=cutoff,
+        )
+        .exclude(status__in=_DELIVERY_ORDER_TERMINAL)
+        .update(status=DeliveryOrderStatus.CANCELLED, updated_at=timezone.now())
+    )
+
+
 @transaction.atomic
 def close_duplicate_enrollment(enrollment, from_date=None):
     """Close a spurious DUPLICATE enrollment (a second enrollment for a client

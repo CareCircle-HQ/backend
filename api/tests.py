@@ -15205,6 +15205,53 @@ class DedupePoDeliveryOrdersCommandTest(TestCase):
         self.assertEqual(stale.status, DeliveryOrderStatus.CANCELLED)  # cancelled
 
 
+class CancelFutureDeliveryOrdersTest(TestCase):
+    """Pausing / pulling a member out of service must retract deliveries ALREADY
+    committed to a cut PO (future, not-yet-delivered) so they don't still ship +
+    bill -- the gap that let paused additional members exceed the meal cap."""
+
+    def test_cancels_future_nonterminal_keeps_past_and_delivered(self):
+        from datetime import timedelta
+
+        from django.utils import timezone
+
+        from .models import (
+            Client, DeliveryOrder, DeliveryOrderStatus, PurchaseOrder,
+        )
+        from .services.orders import cancel_future_delivery_orders
+
+        c = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Pause", last_name="Bill",
+        )
+        po = PurchaseOrder.objects.create()
+        today = timezone.localdate()
+        fut = DeliveryOrder.objects.create(
+            purchase_order=po, member=c,
+            expected_delivery_date=today + timedelta(days=3),
+            status=DeliveryOrderStatus.READY_FOR_DELIVERY,
+        )
+        past = DeliveryOrder.objects.create(
+            purchase_order=po, member=c,
+            expected_delivery_date=today - timedelta(days=3),
+            status=DeliveryOrderStatus.READY_FOR_DELIVERY,
+        )
+        fut_delivered = DeliveryOrder.objects.create(
+            purchase_order=po, member=c,
+            expected_delivery_date=today + timedelta(days=3),
+            status=DeliveryOrderStatus.DELIVERED,
+        )
+
+        n = cancel_future_delivery_orders(c)
+
+        fut.refresh_from_db()
+        past.refresh_from_db()
+        fut_delivered.refresh_from_db()
+        self.assertEqual(n, 1)
+        self.assertEqual(fut.status, DeliveryOrderStatus.CANCELLED)  # future retracted
+        self.assertEqual(past.status, DeliveryOrderStatus.READY_FOR_DELIVERY)  # past kept
+        self.assertEqual(fut_delivered.status, DeliveryOrderStatus.DELIVERED)  # delivered kept
+
+
 class TerminalCloseClearsScheduledOccurrencesTest(TestCase):
     """A CLOSED/CANCELLED enrollment must retain NO future SCHEDULED delivery
     occurrence -- a lingering one seeds a duplicate PO line (with no wizard-

@@ -2700,7 +2700,9 @@ def _pause_lock_additional_members(client, primary, *, actor=None, actor_label="
     """
     from api.models import MemberStatus, Note, NoteSource
     from api.services import timeline
-    from api.services.orders import resync_scheduled_orders
+    from api.services.orders import (
+        cancel_future_delivery_orders, resync_scheduled_orders,
+    )
 
     primary_id = getattr(primary, "pk", None)
     pinned = 0
@@ -2723,6 +2725,14 @@ def _pause_lock_additional_members(client, primary, *, actor=None, actor_label="
                 continue
             pinned += 1
             touched_enrollments.add(enr.pk)
+            # Retract any delivery ALREADY committed to a cut PO for this now-paused
+            # member, so a scope switch stops upcoming shipments (+ billing), not
+            # just future PO generation.
+            if mv.client_id:
+                try:
+                    cancel_future_delivery_orders(mv.client)
+                except Exception:  # pragma: no cover - defensive
+                    pass
             try:
                 timeline.event_for_member_paused(
                     mv, enrollment=enr,
@@ -2780,7 +2790,9 @@ def _pause_additional_members_manual(client, primary, *, actor=None, actor_label
     """
     from api.models import MemberStatus, Note, NoteSource
     from api.services import timeline
-    from api.services.orders import resync_scheduled_orders
+    from api.services.orders import (
+        cancel_future_delivery_orders, resync_scheduled_orders,
+    )
 
     primary_id = getattr(primary, "pk", None)
     paused = 0
@@ -2802,6 +2814,13 @@ def _pause_additional_members_manual(client, primary, *, actor=None, actor_label
                 continue
             paused += 1
             touched.add(enr.pk)
+            # Retract any already-committed upcoming delivery so the pause stops
+            # shipments (+ billing) now, not just future PO generation.
+            if mv.client_id:
+                try:
+                    cancel_future_delivery_orders(mv.client)
+                except Exception:  # pragma: no cover - defensive
+                    pass
             try:
                 timeline.event_for_member_paused(
                     mv, enrollment=enr,
