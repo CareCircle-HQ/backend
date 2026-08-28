@@ -2059,6 +2059,71 @@ class EffectiveAuthorizationWindowTest(TestCase):
         self.assertEqual(case.effective_authorization_window(), (None, None))
 
 
+class ImportScopeSwitchPausesMembersTest(TestCase):
+    """Regression: when the governing internal-service case switches Household ->
+    Individual via the IMPORT reconcile (not the manual Household-tab action), the
+    non-primary household members must be auto-paused + pause_locked, leaving only
+    the primary active. Previously the auto handler was never wired into the
+    reconcile, so an import-driven switch left every member active."""
+
+    def test_reconcile_pauses_non_primary_on_household_to_individual(self):
+        from django.utils import timezone
+        from .models import (
+            Case, CaseHouseholdType, CaseStatus, CaseType, Client,
+            EnrollmentStage, EnrollmentVerification, Household, HouseholdMember,
+            MemberDietaryProfile, MemberStatus, ServiceAuthorizationStatus,
+        )
+        from .services.lifecycle import reconcile_internal_service_authorization
+
+        hh = Household.objects.create(name="Switchers")
+        primary = Client.objects.create(client_id=str(uuid.uuid4()), first_name="P", last_name="R")
+        dep = Client.objects.create(client_id=str(uuid.uuid4()), first_name="D", last_name="E")
+        HouseholdMember.objects.create(household=hh, client=primary, is_primary=True)
+        HouseholdMember.objects.create(household=hh, client=dep, is_primary=False)
+        now = timezone.now()
+        # OLD household case (closed) + its enrollment (household scope).
+        old_case = Case.objects.create(
+            case_id=str(uuid.uuid4()), client=primary, case_type=CaseType.INTERNAL_SERVICE,
+            case_status=CaseStatus.CLOSED, household_type=CaseHouseholdType.HOUSEHOLD,
+            program_name="MTM - (Household) Program", date_opened=now, case_created_at=now,
+        )
+        old_enr = EnrollmentVerification.objects.create(
+            client=primary, household=hh, case=old_case, stage=EnrollmentStage.CLOSED,
+            verified_at=now, household_type_override="household",
+        )
+        # NEW individual case (open, approved) + its enrollment (individual scope),
+        # with BOTH members copied as active (the state the import leaves).
+        new_case = Case.objects.create(
+            case_id=str(uuid.uuid4()), client=primary, case_type=CaseType.INTERNAL_SERVICE,
+            case_status=CaseStatus.OPEN, household_type=CaseHouseholdType.INDIVIDUAL,
+            program_name="MTM", date_opened=now, case_created_at=now,
+            service_authorization_status=ServiceAuthorizationStatus.APPROVED,
+        )
+        new_enr = EnrollmentVerification.objects.create(
+            client=primary, household=hh, case=new_case, stage=EnrollmentStage.SERVICE_ACTIVE,
+            verified_at=now, household_type_override="individual",
+        )
+        for c in (primary, dep):
+            MemberDietaryProfile.objects.create(
+                client=c, enrollment=new_enr, status=MemberStatus.ACTIVE,
+            )
+
+        reconcile_internal_service_authorization(primary)
+
+        # On the OPEN individual enrollment, the dependent is paused + locked and
+        # the primary stays active. (Query per-client so the assertion is robust to
+        # any enrollment reshuffle the reconcile performs.)
+        dep_open = MemberDietaryProfile.objects.filter(
+            client=dep, enrollment__household=hh,
+        ).exclude(enrollment__stage__in=[EnrollmentStage.CLOSED, EnrollmentStage.CANCELLED])
+        self.assertTrue(dep_open.filter(status=MemberStatus.PAUSED, pause_locked=True).exists())
+        self.assertFalse(dep_open.filter(status=MemberStatus.ACTIVE).exists())
+        prim_open = MemberDietaryProfile.objects.filter(
+            client=primary, enrollment__household=hh,
+        ).exclude(enrollment__stage__in=[EnrollmentStage.CLOSED, EnrollmentStage.CANCELLED])
+        self.assertTrue(prim_open.filter(status=MemberStatus.ACTIVE).exists())
+
+
 class TimelineDedupeKeyClampTest(TestCase):
     """Regression: the ``TimelineEvent.dedupe_key`` column is varchar(128). The
     governing-case-changed key concatenates the client id + previous + new case
