@@ -15205,6 +15205,49 @@ class DedupePoDeliveryOrdersCommandTest(TestCase):
         self.assertEqual(stale.status, DeliveryOrderStatus.CANCELLED)  # cancelled
 
 
+class TagHhCloseCommandTest(TestCase):
+    """tag_hh_close tags the WHOLE household of each client_id in the CSV (not
+    just the listed row), is idempotent, and skips unknown ids."""
+
+    def test_tags_whole_household_from_csv(self):
+        import csv as _csv
+        import tempfile
+        from io import StringIO
+
+        from django.core.management import call_command
+
+        from .models import (
+            Client, ClientTag, ClientTagColor, Household, HouseholdMember,
+        )
+
+        ClientTag.objects.get_or_create(
+            name="9/1 HH CLOSE", defaults={"color": ClientTagColor.YELLOW}
+        )
+        hh = Household.objects.create(name="Closers")
+        primary = Client.objects.create(client_id=str(uuid.uuid4()), first_name="P", last_name="R")
+        dep = Client.objects.create(client_id=str(uuid.uuid4()), first_name="D", last_name="E")
+        HouseholdMember.objects.create(household=hh, client=primary, is_primary=True)
+        HouseholdMember.objects.create(household=hh, client=dep, is_primary=False)
+
+        with tempfile.NamedTemporaryFile("w", suffix=".csv", delete=False, newline="") as f:
+            w = _csv.writer(f)
+            w.writerow(["client_id"])
+            w.writerow([str(primary.client_id)])   # only the PRIMARY is listed
+            w.writerow([str(uuid.uuid4())])        # an unknown id (skipped)
+            path = f.name
+
+        call_command("tag_hh_close", "--file", path, "--apply", stdout=StringIO())
+
+        tag = ClientTag.objects.get(name="9/1 HH CLOSE")
+        self.assertTrue(Client.objects.filter(pk=primary.pk, tags=tag).exists())
+        self.assertTrue(  # the dependent is tagged too (whole household)
+            Client.objects.filter(pk=dep.pk, tags=tag).exists()
+        )
+        # Idempotent: a second run adds nothing / doesn't error.
+        call_command("tag_hh_close", "--file", path, "--apply", stdout=StringIO())
+        self.assertEqual(Client.objects.filter(tags=tag).count(), 2)
+
+
 class CancelFutureDeliveryOrdersTest(TestCase):
     """Pausing / pulling a member out of service must retract deliveries ALREADY
     committed to a cut PO (future, not-yet-delivered) so they don't still ship +
