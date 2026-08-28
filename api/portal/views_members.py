@@ -1474,6 +1474,26 @@ class MembersListView(PortalGenericAPIView):
                 )
             qs = qs.filter(cond)
 
+        # Cases page: search by CASE ID (full or partial) -- returns the household/
+        # members owning a matching case. case_id is a UUID column, so cast to text
+        # for an icontains partial match; a full UUID still matches exactly.
+        case_id_q = (params.get("case_id") or "").strip()
+        if case_id_q:
+            from django.db.models import TextField
+            from django.db.models.functions import Cast
+
+            qs = qs.annotate(
+                _case_id_text=Cast("cases__case_id", output_field=TextField())
+            ).filter(_case_id_text__icontains=case_id_q).distinct()
+
+        # Cases page: restrict to households that hold a case of the selected TYPE
+        # (default internal_service, sent by the page). The date filters below stay
+        # keyed on the governing INTERNAL-SERVICE case (the denormalized governing_*
+        # fields), so switching type narrows the household set, not those keys.
+        case_type_q = (params.get("case_type") or "").strip()
+        if case_type_q:
+            qs = qs.filter(cases__case_type=case_type_q).distinct()
+
         # Page-level scope (Verification / Logistics) restricts which members are
         # ever shown, before the per-status filter chips are applied.
         scope = (params.get("scope") or "").strip()

@@ -15244,6 +15244,41 @@ class CaseDatesFollowGoverningCaseTest(TestCase):
         self.assertEqual(data[0]["opened"], gov.date_opened.isoformat())
 
 
+class CasesPageFiltersTest(TestCase):
+    """The Cases page reuses the members grouped endpoint with new params:
+    case_id (full/partial case-ID search) and case_type (default internal_service)."""
+
+    def _queryset(self, **params):
+        from rest_framework.request import Request
+        from rest_framework.test import APIRequestFactory
+
+        from .portal.views_members import MembersListView
+        v = MembersListView()
+        v.request = Request(APIRequestFactory().get("/members/", params))
+        v.format_kwarg = None
+        return v.get_queryset()
+
+    def test_case_id_and_case_type_filters(self):
+        from .models import Case, CaseStatus, CaseType, Client
+
+        c = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Case", last_name="Search",
+        )
+        case = Case.objects.create(
+            case_id=str(uuid.uuid4()), client=c, case_type=CaseType.INTERNAL_SERVICE,
+            case_status=CaseStatus.OPEN,
+        )
+        cid = str(case.case_id)
+
+        def ids(**p):
+            return {str(x) for x in self._queryset(**p).values_list("client_id", flat=True)}
+
+        self.assertIn(str(c.client_id), ids(case_id=cid))          # full case-ID
+        self.assertIn(str(c.client_id), ids(case_id=cid[:8]))      # partial case-ID
+        self.assertIn(str(c.client_id), ids(case_type="internal_service"))
+        self.assertNotIn(str(c.client_id), ids(case_type="eligibility"))  # type mismatch excludes
+
+
 class TagHhCloseCommandTest(TestCase):
     """tag_hh_close tags the WHOLE household of each client_id in the CSV (not
     just the listed row), is idempotent, and skips unknown ids."""
