@@ -97,6 +97,7 @@ from ..services.delivery import (
 from ..services.client_diagnostic import diagnose_client
 from ..services.orders import (
     _format_address,
+    cancel_future_delivery_orders,
     generate_delivery_calendar,
     rebuild_delivery_calendar,
     reconcile_enrollment_calendar,
@@ -4243,6 +4244,13 @@ class HouseholdMemberEditView(PortalAPIView):
             mv.kitchen_meal_type = ""
             mv.kitchen_food_notes = ""
             mv.save()
+            # Retract any already-committed upcoming delivery so the pause stops
+            # shipments (+ billing) now, not just future PO generation.
+            if mv.client_id:
+                try:
+                    cancel_future_delivery_orders(mv.client)
+                except Exception:  # never let order cleanup break the edit
+                    pass
             agent = current_agent(request)
             actor = _agent_actor(agent)
             try:
@@ -4299,6 +4307,13 @@ class HouseholdMemberEditView(PortalAPIView):
             mv.kitchen_meal_type = ""
             mv.kitchen_food_notes = ""
             mv.save()
+            # Retract any already-committed upcoming delivery for the now-excluded
+            # member (same reason as the pause path).
+            if mv.client_id:
+                try:
+                    cancel_future_delivery_orders(mv.client)
+                except Exception:  # never let order cleanup break the edit
+                    pass
             agent = current_agent(request)
             actor = _agent_actor(agent)
             try:

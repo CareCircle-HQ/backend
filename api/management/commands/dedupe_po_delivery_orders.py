@@ -11,12 +11,17 @@ Review-only by default:
 Apply the fix:
     python manage.py dedupe_po_delivery_orders --apply
 """
+import datetime
+
 from django.core.management.base import BaseCommand
 from django.db import transaction
 from django.db.models import Count
 from django.utils import timezone
 
 from api.models import DeliveryOrder, DeliveryOrderStatus, PurchaseOrder
+
+# Fallback sort key for a (theoretically) null created_at, so it sorts oldest.
+_EPOCH = datetime.datetime.min.replace(tzinfo=datetime.timezone.utc)
 
 
 class Command(BaseCommand):
@@ -53,6 +58,20 @@ class Command(BaseCommand):
                 continue  # all-cancelled history, or a single live order: fine
             harmful += 1
             po = PurchaseOrder.objects.filter(pk=pair["purchase_order_id"]).first()
+            # Keep the most SERVICE-REPRESENTATIVE order, not just the earliest: a
+            # duplicate line from a superseded/stale enrollment typically has no
+            # kitchen and/or a zero quantity, while the real line (the member's
+            # current, case-linked service) carries a kitchen + real quantity.
+            # Prefer kitchen-assigned, then positive quantity, then most recent;
+            # cancel the rest.
+            live.sort(
+                key=lambda d: (
+                    1 if d.kitchen_id else 0,
+                    1 if (d.quantity or 0) > 0 else 0,
+                    d.created_at or _EPOCH,
+                ),
+                reverse=True,
+            )
             keep, extras = live[0], live[1:]
             self.stdout.write(
                 f"PO {getattr(po, 'po_number', pair['purchase_order_id'])} | "

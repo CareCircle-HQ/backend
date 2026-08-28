@@ -1067,6 +1067,22 @@ def advance_enrollment(enrollment, to_stage, *, actor=None, actor_label="", note
                 "terminal calendar cleanup failed for enrollment %s",
                 enrollment.pk, exc_info=True,
             )
+        # Belt-and-suspenders: directly cancel any future not-yet-ordered
+        # (SCHEDULED) occurrence the plan-window truncate/sync left behind, so a
+        # terminal enrollment NEVER keeps a scheduled delivery. A lingering
+        # occurrence on a superseded/closed enrollment is exactly what puts a
+        # member on a SECOND (duplicate) PO line -- the one with no wizard-verified
+        # address. Occurrences already committed to a delivery (advanced past
+        # SCHEDULED) are left untouched.
+        try:
+            from api.models import OrderStatus
+
+            enrollment.orders.filter(
+                status=OrderStatus.SCHEDULED,
+                anticipated_delivery_date__gte=timezone.localdate(),
+            ).update(status=OrderStatus.CANCELLED)
+        except Exception:  # pragma: no cover - defensive
+            pass
 
     # Verification complete -> clear the "new client needs attention" flag. The
     # flag was set when the client's first internal-service case was created
@@ -2684,7 +2700,9 @@ def _pause_lock_additional_members(client, primary, *, actor=None, actor_label="
     """
     from api.models import MemberStatus, Note, NoteSource
     from api.services import timeline
-    from api.services.orders import resync_scheduled_orders
+    from api.services.orders import (
+        cancel_future_delivery_orders, resync_scheduled_orders,
+    )
 
     primary_id = getattr(primary, "pk", None)
     pinned = 0
@@ -2707,6 +2725,14 @@ def _pause_lock_additional_members(client, primary, *, actor=None, actor_label="
                 continue
             pinned += 1
             touched_enrollments.add(enr.pk)
+            # Retract any delivery ALREADY committed to a cut PO for this now-paused
+            # member, so a scope switch stops upcoming shipments (+ billing), not
+            # just future PO generation.
+            if mv.client_id:
+                try:
+                    cancel_future_delivery_orders(mv.client)
+                except Exception:  # pragma: no cover - defensive
+                    pass
             try:
                 timeline.event_for_member_paused(
                     mv, enrollment=enr,
@@ -2764,7 +2790,9 @@ def _pause_additional_members_manual(client, primary, *, actor=None, actor_label
     """
     from api.models import MemberStatus, Note, NoteSource
     from api.services import timeline
-    from api.services.orders import resync_scheduled_orders
+    from api.services.orders import (
+        cancel_future_delivery_orders, resync_scheduled_orders,
+    )
 
     primary_id = getattr(primary, "pk", None)
     paused = 0
@@ -2786,6 +2814,13 @@ def _pause_additional_members_manual(client, primary, *, actor=None, actor_label
                 continue
             paused += 1
             touched.add(enr.pk)
+            # Retract any already-committed upcoming delivery so the pause stops
+            # shipments (+ billing) now, not just future PO generation.
+            if mv.client_id:
+                try:
+                    cancel_future_delivery_orders(mv.client)
+                except Exception:  # pragma: no cover - defensive
+                    pass
             try:
                 timeline.event_for_member_paused(
                     mv, enrollment=enr,

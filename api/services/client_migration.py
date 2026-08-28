@@ -103,6 +103,12 @@ def merge_migrated_client(old_client, new_client, *, actor_label="", dry_run=Fal
             enr.save(update_fields=["client", "household"])
         # Member dietary profiles (SET_NULL FK) -> new client.
         MemberDietaryProfile.objects.filter(client=old_client).update(client=new_client)
+        # Delivery orders (member is SET_NULL) -> new client. Without this,
+        # deleting the old client below would orphan its orders (member=None) --
+        # an unfulfillable member-less "ghost" line on the PO.
+        from api.models import DeliveryOrder
+
+        DeliveryOrder.objects.filter(member=old_client).update(member=new_client)
         # Append-only history + agent items -> new client.
         old_client.stage_events.all().update(client=new_client)
         old_client.timeline_events.all().update(client=new_client)

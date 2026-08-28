@@ -15168,6 +15168,253 @@ class DedupePoDeliveryOrdersCommandTest(TestCase):
         solo.refresh_from_db()
         self.assertEqual(solo.status, DeliveryOrderStatus.PENDING)  # untouched
 
+    def test_keeps_the_serviceable_line_not_the_stale_blank(self):
+        """When a member is duplicated, keep the line with a kitchen + real
+        quantity (their current service) and cancel the stale/blank one -- not
+        just whichever was created first."""
+        from io import StringIO
+
+        from django.core.management import call_command
+
+        from .models import (
+            Client, DeliveryOrder, DeliveryOrderStatus, Kitchen, PurchaseOrder,
+            PurchaseOrderStatus,
+        )
+
+        client = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Dup", last_name="Keep",
+        )
+        k = Kitchen.objects.create(name="K-keep")
+        po = PurchaseOrder.objects.create(status=PurchaseOrderStatus.DRAFT)
+        # Created FIRST: the stale/blank line (no kitchen, zero quantity).
+        stale = DeliveryOrder.objects.create(
+            purchase_order=po, member=client, status=DeliveryOrderStatus.PENDING,
+            quantity=0,
+        )
+        # Created LATER: the real serviceable line (kitchen + quantity).
+        good = DeliveryOrder.objects.create(
+            purchase_order=po, member=client, status=DeliveryOrderStatus.PENDING,
+            kitchen=k, quantity=14,
+        )
+
+        call_command("dedupe_po_delivery_orders", "--apply", stdout=StringIO())
+
+        stale.refresh_from_db()
+        good.refresh_from_db()
+        self.assertEqual(good.status, DeliveryOrderStatus.PENDING)  # kept
+        self.assertEqual(stale.status, DeliveryOrderStatus.CANCELLED)  # cancelled
+
+
+class CaseDatesFollowGoverningCaseTest(TestCase):
+    """The Members/Verification O: date (get_case_dates) must reflect the ACTIVE
+    GOVERNING case -- the same one the 'Case Created' filter
+    (governing_internal_case_opened_at) keys off -- so a date you SEE is a date you
+    can filter by. Regression: it used to show the most-recently-opened case, so a
+    parked future reauthorization (opened later) leaked into O: while the filter
+    kept pointing at the older serving case -> the two disagreed."""
+
+    def test_o_date_matches_governing_case_not_latest(self):
+        from datetime import timedelta
+
+        from django.utils import timezone
+
+        from .models import Case, CaseStatus, CaseType, Client
+        from .portal.serializers import (
+            MemberListSerializer, governing_service_case_for_display,
+        )
+
+        c = Client.objects.create(client_id=str(uuid.uuid4()), first_name="Re", last_name="Auth")
+        now = timezone.now()
+        # Currently-serving case (older) + a later-opened case.
+        Case.objects.create(
+            case_id=str(uuid.uuid4()), client=c, case_type=CaseType.INTERNAL_SERVICE,
+            case_status=CaseStatus.OPEN, date_opened=now - timedelta(days=150),
+            program_name="Medically Tailored Meals (MTM)",
+        )
+        Case.objects.create(
+            case_id=str(uuid.uuid4()), client=c, case_type=CaseType.INTERNAL_SERVICE,
+            case_status=CaseStatus.OPEN, date_opened=now - timedelta(days=1),
+            program_name="Medically Tailored Meals (MTM)",
+        )
+
+        gov = governing_service_case_for_display(c)
+        data = MemberListSerializer(c).data["case_dates"]
+        self.assertTrue(data)
+        # The O: date is exactly the governing case's date_opened (the filter key).
+        self.assertEqual(data[0]["opened"], gov.date_opened.isoformat())
+
+
+class TagHhCloseCommandTest(TestCase):
+    """tag_hh_close tags the WHOLE household of each client_id in the CSV (not
+    just the listed row), is idempotent, and skips unknown ids."""
+
+    def test_tags_whole_household_from_csv(self):
+        import csv as _csv
+        import tempfile
+        from io import StringIO
+
+        from django.core.management import call_command
+
+        from .models import (
+            Client, ClientTag, ClientTagColor, Household, HouseholdMember,
+        )
+
+        ClientTag.objects.get_or_create(
+            name="9/1 HH CLOSE", defaults={"color": ClientTagColor.YELLOW}
+        )
+        hh = Household.objects.create(name="Closers")
+        primary = Client.objects.create(client_id=str(uuid.uuid4()), first_name="P", last_name="R")
+        dep = Client.objects.create(client_id=str(uuid.uuid4()), first_name="D", last_name="E")
+        HouseholdMember.objects.create(household=hh, client=primary, is_primary=True)
+        HouseholdMember.objects.create(household=hh, client=dep, is_primary=False)
+
+        with tempfile.NamedTemporaryFile("w", suffix=".csv", delete=False, newline="") as f:
+            w = _csv.writer(f)
+            w.writerow(["client_id"])
+            w.writerow([str(primary.client_id)])   # only the PRIMARY is listed
+            w.writerow([str(uuid.uuid4())])        # an unknown id (skipped)
+            path = f.name
+
+        call_command("tag_hh_close", "--file", path, "--apply", stdout=StringIO())
+
+        tag = ClientTag.objects.get(name="9/1 HH CLOSE")
+        self.assertTrue(Client.objects.filter(pk=primary.pk, tags=tag).exists())
+        self.assertTrue(  # the dependent is tagged too (whole household)
+            Client.objects.filter(pk=dep.pk, tags=tag).exists()
+        )
+        # Idempotent: a second run adds nothing / doesn't error.
+        call_command("tag_hh_close", "--file", path, "--apply", stdout=StringIO())
+        self.assertEqual(Client.objects.filter(tags=tag).count(), 2)
+
+
+class CancelFutureDeliveryOrdersTest(TestCase):
+    """Pausing / pulling a member out of service must retract deliveries ALREADY
+    committed to a cut PO (future, not-yet-delivered) so they don't still ship +
+    bill -- the gap that let paused additional members exceed the meal cap."""
+
+    def test_cancels_future_nonterminal_keeps_past_and_delivered(self):
+        from datetime import timedelta
+
+        from django.utils import timezone
+
+        from .models import (
+            Client, DeliveryOrder, DeliveryOrderStatus, PurchaseOrder,
+        )
+        from .services.orders import cancel_future_delivery_orders
+
+        c = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Pause", last_name="Bill",
+        )
+        po = PurchaseOrder.objects.create()
+        today = timezone.localdate()
+        fut = DeliveryOrder.objects.create(
+            purchase_order=po, member=c,
+            expected_delivery_date=today + timedelta(days=3),
+            status=DeliveryOrderStatus.READY_FOR_DELIVERY,
+        )
+        past = DeliveryOrder.objects.create(
+            purchase_order=po, member=c,
+            expected_delivery_date=today - timedelta(days=3),
+            status=DeliveryOrderStatus.READY_FOR_DELIVERY,
+        )
+        fut_delivered = DeliveryOrder.objects.create(
+            purchase_order=po, member=c,
+            expected_delivery_date=today + timedelta(days=3),
+            status=DeliveryOrderStatus.DELIVERED,
+        )
+
+        n = cancel_future_delivery_orders(c)
+
+        fut.refresh_from_db()
+        past.refresh_from_db()
+        fut_delivered.refresh_from_db()
+        self.assertEqual(n, 1)
+        self.assertEqual(fut.status, DeliveryOrderStatus.CANCELLED)  # future retracted
+        self.assertEqual(past.status, DeliveryOrderStatus.READY_FOR_DELIVERY)  # past kept
+        self.assertEqual(fut_delivered.status, DeliveryOrderStatus.DELIVERED)  # delivered kept
+
+
+class CancelExcludedMemberOrdersOrphanTest(TestCase):
+    """cancel_excluded_member_orders also cancels ORPHANED member-less (member=None)
+    ghost orders -- the unfulfillable line that showed only the household on a PO --
+    while leaving a genuinely-serving member's order alone."""
+
+    def test_cancels_ghost_order_keeps_serving(self):
+        from datetime import timedelta
+        from io import StringIO
+
+        from django.core.management import call_command
+        from django.utils import timezone
+
+        from .models import (
+            Client, DeliveryOrder, DeliveryOrderStatus, EnrollmentStage,
+            EnrollmentVerification, MemberDietaryProfile, MemberStatus,
+            PurchaseOrder,
+        )
+
+        po = PurchaseOrder.objects.create()
+        ghost = DeliveryOrder.objects.create(
+            purchase_order=po, member=None,
+            status=DeliveryOrderStatus.READY_FOR_DELIVERY,
+        )
+        c = Client.objects.create(client_id=str(uuid.uuid4()), first_name="S", last_name="V")
+        enr = EnrollmentVerification.objects.create(client=c, stage=EnrollmentStage.SERVICE_ACTIVE)
+        MemberDietaryProfile.objects.create(client=c, enrollment=enr, status=MemberStatus.ACTIVE)
+        keep = DeliveryOrder.objects.create(
+            purchase_order=po, member=c, status=DeliveryOrderStatus.PENDING,
+            expected_delivery_date=timezone.localdate() + timedelta(days=3),
+        )
+
+        call_command("cancel_excluded_member_orders", "--apply", stdout=StringIO())
+
+        ghost.refresh_from_db()
+        keep.refresh_from_db()
+        self.assertEqual(ghost.status, DeliveryOrderStatus.CANCELLED)   # ghost cancelled
+        self.assertEqual(keep.status, DeliveryOrderStatus.PENDING)      # serving kept
+
+
+class TerminalCloseClearsScheduledOccurrencesTest(TestCase):
+    """A CLOSED/CANCELLED enrollment must retain NO future SCHEDULED delivery
+    occurrence -- a lingering one seeds a duplicate PO line (with no wizard-
+    verified address) when the member's replacement enrollment also schedules
+    that date. advance_enrollment clears them on the terminal transition."""
+
+    def test_closing_clears_future_scheduled_occurrence(self):
+        from datetime import timedelta
+
+        from django.utils import timezone
+
+        from .models import (
+            Client, EnrollmentStage, EnrollmentVerification, MemberDietaryProfile,
+            MemberStatus, OrderSchedule, OrderStatus,
+        )
+        from .services.lifecycle import advance_enrollment
+
+        c = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Term", last_name="Close",
+        )
+        enr = EnrollmentVerification.objects.create(
+            client=c, stage=EnrollmentStage.SERVICE_ACTIVE,
+        )
+        mp = MemberDietaryProfile.objects.create(
+            client=c, enrollment=enr, status=MemberStatus.ACTIVE,
+        )
+        fut = timezone.localdate() + timedelta(days=7)
+        OrderSchedule.objects.create(
+            enrollment=enr, member=mp, anticipated_delivery_date=fut,
+            status=OrderStatus.SCHEDULED,
+        )
+
+        advance_enrollment(enr, EnrollmentStage.CLOSED, force=True)
+
+        # No live (non-cancelled) future SCHEDULED occurrence survives the close.
+        self.assertFalse(
+            OrderSchedule.objects.filter(
+                enrollment=enr, status=OrderStatus.SCHEDULED,
+                anticipated_delivery_date__gte=timezone.localdate(),
+            ).exists()
+        )
+
 
 class DeliveryCalendarNoDuplicateTest(TestCase):
     """_dedupe_calendar_occurrences never lets the same client land on the same
@@ -18981,6 +19228,38 @@ class CaseReplacementReanchorsDependentTest(TestCase):
         c.refresh_from_db()
         # Already primary -> stays in the same household (no-op re-anchor).
         self.assertEqual(c.household_membership.household_id, hh.pk)
+
+
+class MergeReassignsDeliveryOrdersTest(TestCase):
+    """merge_migrated_client must move the old client's DeliveryOrders onto the
+    survivor -- else deleting the old client orphans them (member=None), the
+    member-less ghost line on the PO."""
+
+    def test_merge_moves_delivery_orders_to_survivor(self):
+        from datetime import date
+
+        from .models import (
+            Client, DeliveryOrder, DeliveryOrderStatus, PurchaseOrder,
+        )
+        from .services.client_migration import merge_migrated_client
+
+        dob = date(1990, 1, 1)
+        old = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Mig", last_name="Old", date_of_birth=dob,
+        )
+        new = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Mig", last_name="Old", date_of_birth=dob,
+        )
+        po = PurchaseOrder.objects.create()
+        do = DeliveryOrder.objects.create(
+            purchase_order=po, member=old, status=DeliveryOrderStatus.READY_FOR_DELIVERY,
+        )
+
+        summary = merge_migrated_client(old, new)
+        self.assertTrue(summary["merged"])
+
+        do.refresh_from_db()
+        self.assertEqual(str(do.member_id), str(new.client_id))  # moved, not orphaned
 
 
 class ListUnmergedMigrationsCommandTest(TestCase):
