@@ -15244,6 +15244,49 @@ class CaseDatesFollowGoverningCaseTest(TestCase):
         self.assertEqual(data[0]["opened"], gov.date_opened.isoformat())
 
 
+class CarriedProfilesStayInHouseholdTest(TestCase):
+    """_create_missing_carried_profiles must carry ONLY the target household's
+    members (owner + HouseholdMembers) -- never a stale cross-household client
+    lingering on the source. Regression: a split-out member (RACHEL) was carried
+    onto another household's (CHAYA's) enrollments and paused there as a phantom."""
+
+    def test_cross_household_member_not_carried(self):
+        from .models import (
+            Client, EnrollmentStage, EnrollmentVerification, Household,
+            HouseholdMember, MemberDietaryProfile, MemberStatus,
+        )
+        from .services.lifecycle import _create_missing_carried_profiles
+
+        hh = Household.objects.create()
+        chaya = Client.objects.create(client_id=str(uuid.uuid4()), first_name="Chaya", last_name="F")
+        kid = Client.objects.create(client_id=str(uuid.uuid4()), first_name="Kid", last_name="F")
+        rachel = Client.objects.create(client_id=str(uuid.uuid4()), first_name="Rachel", last_name="S")
+        HouseholdMember.objects.create(household=hh, client=chaya, is_primary=True)
+        # A genuine dependent with NO HouseholdMember row (stranded) must still carry.
+        # rachel belongs to her OWN separate household -> she is "foreign" to hh and
+        # must NOT be carried.
+        rachel_hh = Household.objects.create()
+        HouseholdMember.objects.create(household=rachel_hh, client=rachel, is_primary=True)
+
+        target = EnrollmentVerification.objects.create(
+            client=chaya, household=hh, stage=EnrollmentStage.PENDING_VERIFICATION,
+        )
+        source = EnrollmentVerification.objects.create(
+            client=chaya, household=hh, stage=EnrollmentStage.CLOSED,
+        )
+        for c in (chaya, kid, rachel):
+            MemberDietaryProfile.objects.create(
+                enrollment=source, client=c, status=MemberStatus.ACTIVE,
+            )
+
+        _create_missing_carried_profiles(target, source)
+
+        carried = {str(x) for x in target.member_profiles.values_list("client_id", flat=True)}
+        self.assertIn(str(chaya.client_id), carried)   # owner carried
+        self.assertIn(str(kid.client_id), carried)     # real dependent carried
+        self.assertNotIn(str(rachel.client_id), carried)  # cross-household NOT carried
+
+
 class CasesPageFiltersTest(TestCase):
     """The Cases page reuses the members grouped endpoint with new params:
     case_id (full/partial case-ID search) and case_type (default internal_service)."""
