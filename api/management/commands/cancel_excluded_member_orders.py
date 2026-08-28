@@ -12,6 +12,11 @@ A member is "in service" when they have at least one ACTIVE member profile on a
 non-excluded (live) enrollment. Anyone else with a future, not-yet-delivered
 order has that order cancelled here.
 
+Also cancels ORPHANED "ghost" orders with no linked member at all (member=None) --
+e.g. a profile-only dependent later re-keyed into their own case, or a member
+whose Client was deleted -- which can never ship yet show as a member-less line
+on the PO.
+
 Review-only by default:
     python manage.py cancel_excluded_member_orders
 Apply the fix:
@@ -64,6 +69,17 @@ class Command(BaseCommand):
         )
         offenders = [do for do in future if do.member_id not in serving_ids]
 
+        # Orphaned "ghost" orders: no linked member at all (member=None) -- e.g. a
+        # profile-only dependent later re-keyed into their own case, or a member
+        # whose Client was deleted (member is SET_NULL). They can never ship (no
+        # recipient) yet appear on the PO as a member-less household line. Cancel
+        # every LIVE one, any date.
+        orphans = list(
+            DeliveryOrder.objects.filter(member__isnull=True)
+            .exclude(status__in=_TERMINAL)
+            .select_related("purchase_order")
+        )
+
         for do in offenders:
             po = do.purchase_order
             self.stdout.write(
@@ -71,15 +87,22 @@ class Command(BaseCommand):
                 f"{str(do.member_id)[:8]} | {do.expected_delivery_date} | "
                 f"{do.status} -> cancel"
             )
+        for do in orphans:
+            po = do.purchase_order
+            self.stdout.write(
+                f"PO {getattr(po, 'po_number', '') or '-'} | member <none/ghost> "
+                f"| {do.expected_delivery_date} | {do.status} -> cancel"
+            )
         self.stdout.write("")
         self.stdout.write(f"Future orders for out-of-service members: {len(offenders)}")
+        self.stdout.write(f"Orphaned member-less (ghost) orders       : {len(orphans)}")
 
         if not apply:
             self.stdout.write("Review only. Re-run with --apply to cancel them.")
             return
         with transaction.atomic():
             n = 0
-            for do in offenders:
+            for do in offenders + orphans:
                 do.status = DeliveryOrderStatus.CANCELLED
                 do.save(update_fields=["status", "updated_at"])
                 n += 1

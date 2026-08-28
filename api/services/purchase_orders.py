@@ -746,6 +746,12 @@ def generate_purchase_order(kind, delivery_date, kitchen, schedule_ids, split_se
             )
             .exclude(enrollment__stage__in=SERVICE_EXCLUDED_ENROLLMENT_STAGES)
             .exclude(member__status__in=SERVICE_EXCLUDED_MEMBER_STATUSES)
+            # A schedule whose member profile has no linked Client (a profile-only
+            # placeholder, e.g. a dependent later re-keyed into their own case)
+            # would create a DeliveryOrder with member=None -- an unfulfillable
+            # "ghost" line that shows only the household on the PO. Never order it.
+            .exclude(member__isnull=True)
+            .exclude(member__client__isnull=True)
         )
         .annotate(_has_open_isc=open_internal_service_case_exists())
         .filter(_has_open_isc=True)

@@ -15334,6 +15334,45 @@ class CancelFutureDeliveryOrdersTest(TestCase):
         self.assertEqual(fut_delivered.status, DeliveryOrderStatus.DELIVERED)  # delivered kept
 
 
+class CancelExcludedMemberOrdersOrphanTest(TestCase):
+    """cancel_excluded_member_orders also cancels ORPHANED member-less (member=None)
+    ghost orders -- the unfulfillable line that showed only the household on a PO --
+    while leaving a genuinely-serving member's order alone."""
+
+    def test_cancels_ghost_order_keeps_serving(self):
+        from datetime import timedelta
+        from io import StringIO
+
+        from django.core.management import call_command
+        from django.utils import timezone
+
+        from .models import (
+            Client, DeliveryOrder, DeliveryOrderStatus, EnrollmentStage,
+            EnrollmentVerification, MemberDietaryProfile, MemberStatus,
+            PurchaseOrder,
+        )
+
+        po = PurchaseOrder.objects.create()
+        ghost = DeliveryOrder.objects.create(
+            purchase_order=po, member=None,
+            status=DeliveryOrderStatus.READY_FOR_DELIVERY,
+        )
+        c = Client.objects.create(client_id=str(uuid.uuid4()), first_name="S", last_name="V")
+        enr = EnrollmentVerification.objects.create(client=c, stage=EnrollmentStage.SERVICE_ACTIVE)
+        MemberDietaryProfile.objects.create(client=c, enrollment=enr, status=MemberStatus.ACTIVE)
+        keep = DeliveryOrder.objects.create(
+            purchase_order=po, member=c, status=DeliveryOrderStatus.PENDING,
+            expected_delivery_date=timezone.localdate() + timedelta(days=3),
+        )
+
+        call_command("cancel_excluded_member_orders", "--apply", stdout=StringIO())
+
+        ghost.refresh_from_db()
+        keep.refresh_from_db()
+        self.assertEqual(ghost.status, DeliveryOrderStatus.CANCELLED)   # ghost cancelled
+        self.assertEqual(keep.status, DeliveryOrderStatus.PENDING)      # serving kept
+
+
 class TerminalCloseClearsScheduledOccurrencesTest(TestCase):
     """A CLOSED/CANCELLED enrollment must retain NO future SCHEDULED delivery
     occurrence -- a lingering one seeds a duplicate PO line (with no wizard-
