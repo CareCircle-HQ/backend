@@ -5501,9 +5501,26 @@ def reconcile_internal_service_authorization(client, *, actor=None, actor_label=
         set_reauth_attention(client, False)
     # Record an old -> new governing-case switch (timeline event + primary note)
     # before acting on it, so the history captures WHY service state changed.
+    # Capture the PREVIOUS governing pointer first -- _record_governing_case_change
+    # overwrites it -- so the scope-switch handler below can name the old case.
+    _prev_governing_id = client.governing_internal_case_id or ""
     _record_governing_case_change(
         client, governing, actor=actor, actor_label=actor_label,
     )
+    # Auto-reconcile a Household<->Individual SCOPE switch that arrived via import
+    # (not just the manual Household-tab action / enrollment replacement): when the
+    # governing case is now Individual, pause + lock every non-primary household
+    # member (only the primary keeps service); when it returns to Household, resume
+    # them. Data-driven + idempotent, so it no-ops once the scope already matches.
+    try:
+        _handle_household_scope_switch(
+            client, _prev_governing_id, governing,
+            actor=actor, actor_label=actor_label,
+        )
+    except Exception:  # pragma: no cover - never break the reconcile
+        logger.warning(
+            "household scope-switch reconcile failed for %s", client.pk, exc_info=True
+        )
     gov_status = governing.service_authorization_status
     # SERVICE_INACTIVE is sticky: remember it here so the tail can RE-DERIVE past
     # it (ignore_sticky) + emit the reactivation event once an open case reopens
