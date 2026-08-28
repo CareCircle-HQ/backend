@@ -19230,6 +19230,38 @@ class CaseReplacementReanchorsDependentTest(TestCase):
         self.assertEqual(c.household_membership.household_id, hh.pk)
 
 
+class MergeReassignsDeliveryOrdersTest(TestCase):
+    """merge_migrated_client must move the old client's DeliveryOrders onto the
+    survivor -- else deleting the old client orphans them (member=None), the
+    member-less ghost line on the PO."""
+
+    def test_merge_moves_delivery_orders_to_survivor(self):
+        from datetime import date
+
+        from .models import (
+            Client, DeliveryOrder, DeliveryOrderStatus, PurchaseOrder,
+        )
+        from .services.client_migration import merge_migrated_client
+
+        dob = date(1990, 1, 1)
+        old = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Mig", last_name="Old", date_of_birth=dob,
+        )
+        new = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Mig", last_name="Old", date_of_birth=dob,
+        )
+        po = PurchaseOrder.objects.create()
+        do = DeliveryOrder.objects.create(
+            purchase_order=po, member=old, status=DeliveryOrderStatus.READY_FOR_DELIVERY,
+        )
+
+        summary = merge_migrated_client(old, new)
+        self.assertTrue(summary["merged"])
+
+        do.refresh_from_db()
+        self.assertEqual(str(do.member_id), str(new.client_id))  # moved, not orphaned
+
+
 class ListUnmergedMigrationsCommandTest(TestCase):
     """list_unmerged_migrations: a torn enrollment.client != case.client with a
     MATCHING dob is a migration; a DIFFERENT dob is REVIEW (not a migration)."""
