@@ -15168,6 +15168,85 @@ class DedupePoDeliveryOrdersCommandTest(TestCase):
         solo.refresh_from_db()
         self.assertEqual(solo.status, DeliveryOrderStatus.PENDING)  # untouched
 
+    def test_keeps_the_serviceable_line_not_the_stale_blank(self):
+        """When a member is duplicated, keep the line with a kitchen + real
+        quantity (their current service) and cancel the stale/blank one -- not
+        just whichever was created first."""
+        from io import StringIO
+
+        from django.core.management import call_command
+
+        from .models import (
+            Client, DeliveryOrder, DeliveryOrderStatus, Kitchen, PurchaseOrder,
+            PurchaseOrderStatus,
+        )
+
+        client = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Dup", last_name="Keep",
+        )
+        k = Kitchen.objects.create(name="K-keep")
+        po = PurchaseOrder.objects.create(status=PurchaseOrderStatus.DRAFT)
+        # Created FIRST: the stale/blank line (no kitchen, zero quantity).
+        stale = DeliveryOrder.objects.create(
+            purchase_order=po, member=client, status=DeliveryOrderStatus.PENDING,
+            quantity=0,
+        )
+        # Created LATER: the real serviceable line (kitchen + quantity).
+        good = DeliveryOrder.objects.create(
+            purchase_order=po, member=client, status=DeliveryOrderStatus.PENDING,
+            kitchen=k, quantity=14,
+        )
+
+        call_command("dedupe_po_delivery_orders", "--apply", stdout=StringIO())
+
+        stale.refresh_from_db()
+        good.refresh_from_db()
+        self.assertEqual(good.status, DeliveryOrderStatus.PENDING)  # kept
+        self.assertEqual(stale.status, DeliveryOrderStatus.CANCELLED)  # cancelled
+
+
+class TerminalCloseClearsScheduledOccurrencesTest(TestCase):
+    """A CLOSED/CANCELLED enrollment must retain NO future SCHEDULED delivery
+    occurrence -- a lingering one seeds a duplicate PO line (with no wizard-
+    verified address) when the member's replacement enrollment also schedules
+    that date. advance_enrollment clears them on the terminal transition."""
+
+    def test_closing_clears_future_scheduled_occurrence(self):
+        from datetime import timedelta
+
+        from django.utils import timezone
+
+        from .models import (
+            Client, EnrollmentStage, EnrollmentVerification, MemberDietaryProfile,
+            MemberStatus, OrderSchedule, OrderStatus,
+        )
+        from .services.lifecycle import advance_enrollment
+
+        c = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Term", last_name="Close",
+        )
+        enr = EnrollmentVerification.objects.create(
+            client=c, stage=EnrollmentStage.SERVICE_ACTIVE,
+        )
+        mp = MemberDietaryProfile.objects.create(
+            client=c, enrollment=enr, status=MemberStatus.ACTIVE,
+        )
+        fut = timezone.localdate() + timedelta(days=7)
+        OrderSchedule.objects.create(
+            enrollment=enr, member=mp, anticipated_delivery_date=fut,
+            status=OrderStatus.SCHEDULED,
+        )
+
+        advance_enrollment(enr, EnrollmentStage.CLOSED, force=True)
+
+        # No live (non-cancelled) future SCHEDULED occurrence survives the close.
+        self.assertFalse(
+            OrderSchedule.objects.filter(
+                enrollment=enr, status=OrderStatus.SCHEDULED,
+                anticipated_delivery_date__gte=timezone.localdate(),
+            ).exists()
+        )
+
 
 class DeliveryCalendarNoDuplicateTest(TestCase):
     """_dedupe_calendar_occurrences never lets the same client land on the same
