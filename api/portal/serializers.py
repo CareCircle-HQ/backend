@@ -807,35 +807,21 @@ class MemberListSerializer(serializers.Serializer):
         )
 
     def get_case_dates(self, obj):
-        # Open/close dates for the member's CURRENT internal-service case only --
-        # the one we're actively servicing. That's the OPEN case (not
-        # Closed/Cancelled); if none is open, the most-recently-opened case (the
-        # last one we serviced). Other/older cases are intentionally omitted so
-        # the Members "Created" column shows a single O:/C: block. ``closed`` is
-        # null for an open case, so its C: row is dropped. Returned as a one-item
-        # list to keep the column's rendering (it maps over case_dates).
-        cases = internal_service_cases(obj)
-        if not cases:
+        # O:/A:/C: for the member's ACTIVE GOVERNING internal-service case -- the
+        # SAME case the "Case Created" filter (governing_internal_case_opened_at),
+        # the authorization/verification columns, and the current enrollment all
+        # key off, via governing_service_case_for_display. That resolver is:
+        #   * deferral-aware -- a future-dated REAUTHORIZATION extension does NOT
+        #     supplant the currently-serving case, so O: shows the serving case's
+        #     open date, not the parked reauth's; and
+        #   * household-aware -- a dependent inherits the household's governing case.
+        # Using it (instead of the most-recently-opened case) keeps the O: date
+        # shown consistent with what the Case Created filter searches, so a date
+        # you can SEE is a date you can filter by. One-item list for the column's
+        # renderer; ``closed`` is null for an open case (its C: row is dropped).
+        chosen = governing_service_case_for_display(obj)
+        if chosen is None:
             return []
-        terminal = (CaseStatus.CLOSED, CaseStatus.CANCELLED)
-        open_cases = [c for c in cases if c.case_status not in terminal]
-        if open_cases:
-            # Actively servicing: show the most-recently-opened open case.
-            chosen = max(
-                open_cases,
-                key=lambda c: (c.date_opened is not None, c.date_opened),
-            )
-        else:
-            # No open case -> show the LAST case we serviced: the one closed most
-            # recently (latest close date), so its close date is what's shown.
-            # date_opened breaks ties / covers any missing close date.
-            chosen = max(
-                cases,
-                key=lambda c: (
-                    c.case_closed_at is not None, c.case_closed_at,
-                    c.date_opened is not None, c.date_opened,
-                ),
-            )
         opened = chosen.date_opened.isoformat() if chosen.date_opened else None
         closed = chosen.case_closed_at.isoformat() if chosen.case_closed_at else None
         # A: the date WE added this case to the system (first insert), distinct

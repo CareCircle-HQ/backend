@@ -15205,6 +15205,45 @@ class DedupePoDeliveryOrdersCommandTest(TestCase):
         self.assertEqual(stale.status, DeliveryOrderStatus.CANCELLED)  # cancelled
 
 
+class CaseDatesFollowGoverningCaseTest(TestCase):
+    """The Members/Verification O: date (get_case_dates) must reflect the ACTIVE
+    GOVERNING case -- the same one the 'Case Created' filter
+    (governing_internal_case_opened_at) keys off -- so a date you SEE is a date you
+    can filter by. Regression: it used to show the most-recently-opened case, so a
+    parked future reauthorization (opened later) leaked into O: while the filter
+    kept pointing at the older serving case -> the two disagreed."""
+
+    def test_o_date_matches_governing_case_not_latest(self):
+        from datetime import timedelta
+
+        from django.utils import timezone
+
+        from .models import Case, CaseStatus, CaseType, Client
+        from .portal.serializers import (
+            MemberListSerializer, governing_service_case_for_display,
+        )
+
+        c = Client.objects.create(client_id=str(uuid.uuid4()), first_name="Re", last_name="Auth")
+        now = timezone.now()
+        # Currently-serving case (older) + a later-opened case.
+        Case.objects.create(
+            case_id=str(uuid.uuid4()), client=c, case_type=CaseType.INTERNAL_SERVICE,
+            case_status=CaseStatus.OPEN, date_opened=now - timedelta(days=150),
+            program_name="Medically Tailored Meals (MTM)",
+        )
+        Case.objects.create(
+            case_id=str(uuid.uuid4()), client=c, case_type=CaseType.INTERNAL_SERVICE,
+            case_status=CaseStatus.OPEN, date_opened=now - timedelta(days=1),
+            program_name="Medically Tailored Meals (MTM)",
+        )
+
+        gov = governing_service_case_for_display(c)
+        data = MemberListSerializer(c).data["case_dates"]
+        self.assertTrue(data)
+        # The O: date is exactly the governing case's date_opened (the filter key).
+        self.assertEqual(data[0]["opened"], gov.date_opened.isoformat())
+
+
 class TagHhCloseCommandTest(TestCase):
     """tag_hh_close tags the WHOLE household of each client_id in the CSV (not
     just the listed row), is idempotent, and skips unknown ids."""
