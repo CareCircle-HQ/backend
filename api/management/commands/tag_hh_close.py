@@ -14,6 +14,7 @@ Custom file:
     python manage.py tag_hh_close --file path/to/file.csv --apply
 """
 import csv
+import io
 
 from django.core.management.base import BaseCommand
 
@@ -23,11 +24,29 @@ TAG_NAME = "9/1 HH CLOSE"
 DEFAULT_FILE = "tmp/import/OpenHouseholdMemberstotag.csv"
 
 
+def _read_csv_rows(path):
+    """Read the CSV from a local path OR an ``s3://bucket/key`` URI (via the app's
+    boto3 client -- so on the server you can point straight at the uploaded S3
+    object with no manual copy). ``utf-8-sig`` strips an Excel BOM."""
+    if path.startswith("s3://"):
+        from api.services import import_storage
+
+        bucket, _, key = path[len("s3://"):].partition("/")
+        obj = import_storage._client().get_object(Bucket=bucket, Key=key)
+        text = obj["Body"].read().decode("utf-8-sig")
+        return list(csv.DictReader(io.StringIO(text)))
+    with open(path, newline="", encoding="utf-8-sig") as f:
+        return list(csv.DictReader(f))
+
+
 class Command(BaseCommand):
     help = f"Tag whole households from a CSV with the {TAG_NAME!r} tag."
 
     def add_arguments(self, parser):
-        parser.add_argument("--file", default=DEFAULT_FILE)
+        parser.add_argument(
+            "--file", default=DEFAULT_FILE,
+            help="Local path OR s3://bucket/key of the CSV (needs a client_id column).",
+        )
         parser.add_argument("--apply", action="store_true", help="Commit (default: review only).")
 
     def handle(self, *args, **options):
@@ -36,13 +55,12 @@ class Command(BaseCommand):
             self.stderr.write(self.style.ERROR(f"Tag {TAG_NAME!r} not found -- create it first."))
             return
 
-        # 1) Read the seed client_ids from the CSV.
-        seed_ids = []
-        with open(options["file"], newline="") as f:
-            for row in csv.DictReader(f):
-                cid = (row.get("client_id") or "").strip()
-                if cid:
-                    seed_ids.append(cid)
+        # 1) Read the seed client_ids from the CSV (local path or s3:// URI).
+        seed_ids = [
+            (row.get("client_id") or "").strip()
+            for row in _read_csv_rows(options["file"])
+        ]
+        seed_ids = [c for c in seed_ids if c]
         unique_seed = set(seed_ids)
 
         # 2) Which seeds actually exist as clients.
