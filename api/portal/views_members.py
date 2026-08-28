@@ -892,10 +892,25 @@ def verification_completed_q():
     client's lifecycle_stage. The case authorization status (a separate
     dimension) never affects this.
 
+    EXCLUDES ``disregarded`` (dismissed request) and ``scheduled_extension``
+    (parked reauthorization) enrollments -- matching lifecycle._governing_
+    enrollments -- so a stale ``verified_at`` on a disregarded PRIOR-cycle
+    enrollment no longer labels the member Verified (their current governing
+    enrollment drives the status instead). ``closed``/``cancelled`` verified
+    enrollments still count (the member was genuinely verified).
+
     Caller is responsible for ``.distinct()`` (this adds multi-valued joins)."""
-    return Q(enrollments__verified_at__isnull=False) | Q(
-        household_membership__household__enrollment_verifications__verified_at__isnull=False
-    )
+    from django.db.models import Exists, OuterRef
+
+    from ..models import EnrollmentStage, EnrollmentVerification
+    _nongov = [EnrollmentStage.DISREGARDED, EnrollmentStage.SCHEDULED_EXTENSION]
+    own = EnrollmentVerification.objects.filter(
+        client=OuterRef("pk"), verified_at__isnull=False
+    ).exclude(stage__in=_nongov)
+    hh = EnrollmentVerification.objects.filter(
+        household__members__client=OuterRef("pk"), verified_at__isnull=False
+    ).exclude(stage__in=_nongov)
+    return Exists(own) | Exists(hh)
 
 
 def verification_scope_q():

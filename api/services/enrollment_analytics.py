@@ -385,7 +385,13 @@ def build_row(client):
     funnel_enr = list(client.enrollments.all())
     if membership is not None:
         funnel_enr += list(membership.household.enrollment_verifications.all())
-    verified_completed = any(e.verified_at is not None for e in funnel_enr)
+    # A verified_at on a DISREGARDED (dismissed) or SCHEDULED_EXTENSION (parked)
+    # enrollment doesn't count -- it's a stale prior-cycle fact, not the current
+    # verification. Matches verification_completed_q + lifecycle._governing_enrollments.
+    _NONGOV = ("disregarded", "scheduled_extension")
+    verified_completed = any(
+        e.verified_at is not None and (e.stage or "") not in _NONGOV for e in funnel_enr
+    )
     has_pending_enr = any((e.stage or "") == "pending_verification" for e in funnel_enr)
     lifecycle_in_window = (getattr(client, "lifecycle_stage", "") or "") in _VWINDOW
     # Scope: the household PRIMARY holds an OPEN internal-service case.
