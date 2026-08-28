@@ -15244,6 +15244,46 @@ class CaseDatesFollowGoverningCaseTest(TestCase):
         self.assertEqual(data[0]["opened"], gov.date_opened.isoformat())
 
 
+class CleanupCrossHouseholdProfilesCommandTest(TestCase):
+    """cleanup_cross_household_profiles marks a phantom profile (a household PRIMARY
+    appearing on someone else's household enrollment) REMOVED, and leaves genuine
+    members (the owner + real dependents) alone."""
+
+    def test_marks_foreign_primary_removed_keeps_legit(self):
+        from io import StringIO
+
+        from django.core.management import call_command
+
+        from .models import (
+            Client, EnrollmentStage, EnrollmentVerification, Household,
+            HouseholdMember, MemberDietaryProfile, MemberStatus,
+        )
+
+        hh = Household.objects.create()
+        darrien = Client.objects.create(client_id=str(uuid.uuid4()), first_name="Darrien", last_name="H")
+        kid = Client.objects.create(client_id=str(uuid.uuid4()), first_name="Kid", last_name="H")
+        HouseholdMember.objects.create(household=hh, client=darrien, is_primary=True)
+        HouseholdMember.objects.create(household=hh, client=kid, is_primary=False)
+
+        kayla_hh = Household.objects.create()
+        kayla = Client.objects.create(client_id=str(uuid.uuid4()), first_name="Kayla", last_name="F")
+        HouseholdMember.objects.create(household=kayla_hh, client=kayla, is_primary=True)
+
+        enr = EnrollmentVerification.objects.create(
+            client=darrien, household=hh, stage=EnrollmentStage.SERVICE_ACTIVE,
+        )
+        d = MemberDietaryProfile.objects.create(enrollment=enr, client=darrien, status=MemberStatus.ACTIVE)
+        k = MemberDietaryProfile.objects.create(enrollment=enr, client=kid, status=MemberStatus.ACTIVE)
+        ph = MemberDietaryProfile.objects.create(enrollment=enr, client=kayla, status=MemberStatus.ACTIVE)
+
+        call_command("cleanup_cross_household_profiles", "--apply", stdout=StringIO())
+
+        d.refresh_from_db(); k.refresh_from_db(); ph.refresh_from_db()
+        self.assertEqual(ph.status, MemberStatus.REMOVED)   # phantom neutralized
+        self.assertEqual(d.status, MemberStatus.ACTIVE)     # owner untouched
+        self.assertEqual(k.status, MemberStatus.ACTIVE)     # real dependent untouched
+
+
 class CarriedProfilesStayInHouseholdTest(TestCase):
     """_create_missing_carried_profiles must carry ONLY the target household's
     members (owner + HouseholdMembers) -- never a stale cross-household client
