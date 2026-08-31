@@ -106,10 +106,24 @@ _ALL_MEMBERS_HEADER = [
 ]
 
 
-def all_members_header():
+def all_members_header(max_phones=0):
     """The All-Members export column headers (shared with the filtered Members
-    export, so both stay in lockstep)."""
-    return list(_ALL_MEMBERS_HEADER)
+    export, so both stay in lockstep). Appends a "Screening Agent" column and one
+    "Phone N" column per phone the widest member in the set carries."""
+    return (
+        list(_ALL_MEMBERS_HEADER)
+        + ["Screening Agent"]
+        + [f"Phone {i}" for i in range(1, max_phones + 1)]
+    )
+
+
+def max_phone_count(qs):
+    """The largest number of phone numbers any client in ``qs`` has, so the export
+    can size its per-number Phone columns. Capped to keep the CSV bounded."""
+    from django.db.models import Count, Max
+
+    n = qs.annotate(_np=Count("phones", distinct=True)).aggregate(m=Max("_np"))["m"]
+    return min(n or 0, 15)
 
 
 def all_members_prefetch(qs):
@@ -127,25 +141,33 @@ def all_members_prefetch(qs):
     )
 
 
-def all_members_row_context():
+def all_members_row_context(max_phones=0):
     """Precompute the request-independent lookups (excluded zips, allowed states,
-    lead-source labels, team map) once per export -- passed to every row."""
+    lead-source labels, team map, screening-agent map) once per export -- passed to
+    every row. ``max_phones`` sizes the per-number Phone columns."""
     from ..models import UniteUsAgent
     from ..services.service_area import excluded_zips
     from ..services.state_area import allowed_state_codes
     from .views_reports import _lead_source_label_map
+    agents = list(UniteUsAgent.objects.all())
     return {
         "zips": excluded_zips(),
         "states": allowed_state_codes(),
         "lead_labels": _lead_source_label_map(),
         "team_map": {
-            str(u.user_id): (u.originating_team or "")
-            for u in UniteUsAgent.objects.all()
+            str(u.user_id): (u.originating_team or "") for u in agents
         },
+        # Screening facilitator (Screening.facilitator_id -> employee_id) -> name.
+        "screen_agent_map": {
+            str(u.employee_id): (u.name or f"{u.first_name} {u.last_name}".strip())
+            for u in agents if u.employee_id
+        },
+        "max_phones": max_phones,
     }
 
 
-def all_members_row(client, *, zips, states, lead_labels, team_map):
+def all_members_row(client, *, zips, states, lead_labels, team_map,
+                    screen_agent_map=None, max_phones=0):
     """Build ONE All-Members export row for a client (see _ALL_MEMBERS_HEADER)."""
     from ..models import CaseType
     from ..services.eligibility import evaluate_client
@@ -155,8 +177,8 @@ def all_members_row(client, *, zips, states, lead_labels, team_map):
         member_out_of_range,
     )
     from .views_reports import (
-        _cadence_label, _client_phone_numbers, _currently_servicing,
-        _current_address, _date_str, _dietary_restrictions,
+        _cadence_label, _client_phone_list, _client_phone_numbers,
+        _currently_servicing, _current_address, _date_str, _dietary_restrictions,
         _household_member_count, _household_primary_member_id,
         _medicaid_insurance, _medicaid_type_label,
         _out_of_orbit_reason, _social_care_coverage, _SCC_STATUS_LABELS, _yn,
@@ -185,6 +207,15 @@ def all_members_row(client, *, zips, states, lead_labels, team_map):
     if enr is not None and enr.kitchen_id:
         facility = enr.kitchen.name or ""
     raw_source = (client.lead_source or "").strip()
+
+    # Screening agent = the latest screening's facilitator name (resolved via the
+    # employee_id map); phones spread one-per-column ("Phone 1".."Phone N").
+    screenings = list(client.screenings.all())  # model orders -screen_created_at
+    latest_scr = screenings[0] if screenings else None
+    screen_agent = ""
+    if latest_scr is not None and latest_scr.facilitator_id and screen_agent_map:
+        screen_agent = screen_agent_map.get(str(latest_scr.facilitator_id), "")
+    phones = _client_phone_list(client)
 
     return [
         _household_primary_member_id(client),
@@ -232,6 +263,9 @@ def all_members_row(client, *, zips, states, lead_labels, team_map):
         _date_str(scc.expired_at if scc else None),
         (profile.menu_type if profile else ""),
         _dietary_restrictions(profile),
+        # Appended columns: Screening Agent, then one column per phone number.
+        screen_agent,
+        *[phones[i] if i < len(phones) else "" for i in range(max_phones)],
     ]
 
 
@@ -251,8 +285,9 @@ def all_members_rows(params):
     if created_to:
         qs = qs.filter(created_at__date__lte=created_to)
 
-    ctx = all_members_row_context()
-    yield all_members_header()
+    max_phones = max_phone_count(qs)
+    ctx = all_members_row_context(max_phones)
+    yield all_members_header(max_phones)
     for client in qs.iterator(chunk_size=2000):
         yield all_members_row(client, **ctx)
 

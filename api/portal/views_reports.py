@@ -143,18 +143,23 @@ def _enrollment_member_clients(enrollment):
     return list(clients.values())
 
 
-def _client_phone_numbers(client):
-    """All phone numbers on file for a client (primary first), '; '-joined.
-    Falls back to the single ``client_phone_number`` field when none are on
-    the related phones table."""
+def _client_phone_list(client):
+    """The client's phone numbers as a LIST -- primary first, then oldest,
+    de-duped. Falls back to the single ``client_phone_number`` field when none are
+    on the related phones table."""
     numbers = []
-    for p in client.phones.all():
+    for p in sorted(client.phones.all(), key=lambda x: (not x.is_primary, x.created_at)):
         raw = (p.raw or p.normalized or "").strip()
         if raw and raw not in numbers:
             numbers.append(raw)
     if not numbers and (client.client_phone_number or "").strip():
         numbers.append(client.client_phone_number.strip())
-    return "; ".join(numbers)
+    return numbers
+
+
+def _client_phone_numbers(client):
+    """All phone numbers on file for a client (primary first), '; '-joined."""
+    return "; ".join(_client_phone_list(client))
 
 
 class MembersPendingVerificationReportView(PortalAPIView):

@@ -2811,14 +2811,15 @@ class MembersExportView(MembersListView):
             )
         from .report_exports import (
             all_members_header, all_members_prefetch, all_members_row,
-            all_members_row_context, stream_csv_response,
+            all_members_row_context, max_phone_count, stream_csv_response,
         )
 
         qs = all_members_prefetch(self.get_queryset())
-        ctx = all_members_row_context()
+        max_phones = max_phone_count(qs)
+        ctx = all_members_row_context(max_phones)
 
         def rows():
-            yield all_members_header()
+            yield all_members_header(max_phones)
             seen = set()  # the filter joins can repeat a client; emit each once
             for client in qs.iterator(chunk_size=1000):
                 if client.pk in seen:

@@ -15278,6 +15278,40 @@ class DataScreeningAgentFilterTest(TestCase):
         self.assertNotIn(str(c.client_id), miss)
 
 
+class AllMembersReportScreeningPhonesTest(TestCase):
+    """The All-Members report export gains a Screening Agent column and one column
+    per phone number ("Phone 1", "Phone 2", ...)."""
+
+    def test_report_has_screening_agent_and_phone_columns(self):
+        import uuid as _uuid
+
+        from django.utils import timezone
+
+        from .models import Client, ClientPhone, Screening, UniteUsAgent
+        from .portal.report_exports import all_members_rows
+
+        emp = _uuid.uuid4()
+        UniteUsAgent.objects.create(user_id=_uuid.uuid4(), employee_id=emp, name="Deborah Delgado")
+        c = Client.objects.create(client_id=str(_uuid.uuid4()), first_name="Rep", last_name="Ort")
+        ClientPhone.objects.create(client=c, raw="(212) 111-1111", normalized="2121111111", is_primary=True)
+        ClientPhone.objects.create(client=c, raw="(917) 222-2222", normalized="9172222222", is_primary=False)
+        Screening.objects.create(
+            enhanced_screen_id=_uuid.uuid4(), subject_id=c.client_id, client=c,
+            screen_created_at=timezone.now(), facilitator_id=emp,
+        )
+
+        gen = all_members_rows({})
+        header = next(gen)
+        rows = list(gen)
+        self.assertIn("Screening Agent", header)
+        self.assertIn("Phone 1", header)
+        self.assertIn("Phone 2", header)
+        row = next(r for r in rows if r[header.index("Member ID")] == str(c.client_id))
+        self.assertEqual(row[header.index("Screening Agent")], "Deborah Delgado")
+        self.assertEqual(row[header.index("Phone 1")], "(212) 111-1111")
+        self.assertEqual(row[header.index("Phone 2")], "(917) 222-2222")
+
+
 class DataPhoneNumbersReadModelTest(TestCase):
     """build_row collects the member's phone numbers (primary first, de-duped) into
     EnrollmentAnalytics.phone_numbers -- spread one-per-column on the Data export."""
