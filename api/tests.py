@@ -15244,6 +15244,29 @@ class CaseDatesFollowGoverningCaseTest(TestCase):
         self.assertEqual(data[0]["opened"], gov.date_opened.isoformat())
 
 
+class DataTeamUnassignedFilterTest(TestCase):
+    """The Data page team filter's '__unassigned__' sentinel matches the blank-team
+    bucket, so Unassigned + named teams reconcile to All Teams."""
+
+    def test_unassigned_sentinel_matches_blank_team(self):
+        import uuid as _uuid
+
+        from .models import Client, EnrollmentAnalytics
+        from .services.enrollment_analytics import filter_analytics
+
+        a = Client.objects.create(client_id=str(_uuid.uuid4()), first_name="A", last_name="A")
+        b = Client.objects.create(client_id=str(_uuid.uuid4()), first_name="B", last_name="B")
+        EnrollmentAnalytics.objects.create(client=a, team="")
+        EnrollmentAnalytics.objects.create(client=b, team="CareCircle Call Center")
+
+        un = {str(x) for x in filter_analytics({"team": "__unassigned__"}).values_list("client_id", flat=True)}
+        self.assertIn(str(a.client_id), un)
+        self.assertNotIn(str(b.client_id), un)
+        cc = {str(x) for x in filter_analytics({"team": "CareCircle Call Center"}).values_list("client_id", flat=True)}
+        self.assertIn(str(b.client_id), cc)
+        self.assertNotIn(str(a.client_id), cc)
+
+
 class DataTeamFallbackNoISCaseTest(TestCase):
     """A member with NO internal-service case still gets a Data-page team, from the
     creator of their most-recent case of any type (nav/eligibility/screening)."""

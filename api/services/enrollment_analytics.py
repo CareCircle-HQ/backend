@@ -24,6 +24,10 @@ logger = logging.getLogger(__name__)
 
 _INTERNAL_SERVICE = "internal_service"
 
+# Data page Team filter sentinel for the "No Team / Unassigned" bucket (blank
+# team). The frontend sends this value; filter_analytics maps it to team="".
+UNASSIGNED_TEAM = "__unassigned__"
+
 
 def _cadence_from_weekdays(weekdays):
     """Normalize delivery weekdays -> a DeliveryCadence-style code for filtering."""
@@ -763,13 +767,21 @@ def filter_analytics(params):
         # Members-parity criteria.
         "eligibility": "eligibility",
         "program_status": "program_status", "lead_source": "lead_source",
-        "team": "team", "service_type": "service_type",
+        "service_type": "service_type",
         "program_type": "program_type", "pause_type": "pause_type",
         "verified_by": "verified_by_id_str",
         "screening_agent": "screening_agent",
     }.items():
         if g(param):
             qs = qs.filter(**{col: g(param)})
+
+    # Team (exact) with an "Unassigned / No team" sentinel that matches the blank
+    # team bucket, so the Data page's team chips reconcile to All Teams.
+    team_val = g("team")
+    if team_val == UNASSIGNED_TEAM:
+        qs = qs.filter(team="")
+    elif team_val:
+        qs = qs.filter(team=team_val)
 
     # Boolean filters.
     for param, col in {"has_screening": "has_screening",

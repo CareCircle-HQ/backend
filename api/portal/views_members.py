@@ -1373,10 +1373,10 @@ class TeamsListView(PortalAPIView):
     ``UniteUsAgent.originating_team`` string the filter matches
     (``team__iexact=value``)."""
 
-    # "Met Council Team" is the default originating_team assigned to everyone
-    # not on the CareCircle roster (i.e. non-US staff), so it isn't a real
-    # filterable CareCircle team -- hide it from the Team filter dropdown.
-    _EXCLUDED_TEAMS = {"met council team"}
+    # "Met Council Team" is the default originating_team for staff not on the
+    # CareCircle roster. It IS a real, filterable bucket (cases created by Met
+    # Council staff), so it's offered in the dropdown. Nothing is excluded.
+    _EXCLUDED_TEAMS = set()
 
     def get(self, request):
         teams = (
