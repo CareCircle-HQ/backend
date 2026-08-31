@@ -6307,6 +6307,17 @@ class MemberVerificationCreateView(PortalAPIView):
             actor_label=actor_label,
             note="Verification completed via support portal.",
         )
+        # Refresh the denormalized governing_verification_completed_at NOW (it's
+        # derived from the enrollment's verified_at) so the Verification/Data
+        # completed-date FILTER immediately matches the Verified status we just
+        # set. Otherwise the denorm stays null until the next case reconcile
+        # happens to run -- the cause of "Verified but not in the completed-date
+        # filter". Maintained elsewhere on case reconcile; this closes the gap for
+        # the verification-completion path itself.
+        try:
+            refresh_internal_case_sort(enrollment.client)
+        except Exception:  # never let denorm upkeep break the verification
+            pass
 
         # Summary event capturing WHAT was verified -- the household roster + each
         # member's resolved menu, the delivery address/days, and which checkboxes

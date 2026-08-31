@@ -15244,6 +15244,42 @@ class CaseDatesFollowGoverningCaseTest(TestCase):
         self.assertEqual(data[0]["opened"], gov.date_opened.isoformat())
 
 
+class VerificationCompletedDenormTest(TestCase):
+    """governing_verification_completed_at (the completed-date FILTER key) must
+    track the governing enrollment's verified_at, so a Verified household is also
+    matchable by the completed-date filter. Regression: it went stale (null) when a
+    verification completed without a following case reconcile."""
+
+    def test_refresh_sets_completed_from_enrollment_verified_at(self):
+        from django.utils import timezone
+
+        from .models import (
+            Client, EnrollmentStage, EnrollmentVerification, Household,
+            HouseholdMember,
+        )
+        from .services.lifecycle import refresh_internal_case_sort
+
+        hh = Household.objects.create()
+        c = Client.objects.create(client_id=str(uuid.uuid4()), first_name="V", last_name="Done")
+        HouseholdMember.objects.create(household=hh, client=c, is_primary=True)
+        # A governing internal-service case is required for the denorm to populate.
+        from .models import Case, CaseStatus, CaseType
+        case = Case.objects.create(
+            case_id=str(uuid.uuid4()), client=c, case_type=CaseType.INTERNAL_SERVICE,
+            case_status=CaseStatus.OPEN,
+        )
+        vat = timezone.now()
+        EnrollmentVerification.objects.create(
+            client=c, household=hh, case=case, stage=EnrollmentStage.VERIFIED,
+            verified_at=vat,
+        )
+        # Simulate the stale state, then the refresh the verify path now runs.
+        Client.objects.filter(pk=c.pk).update(governing_verification_completed_at=None)
+        refresh_internal_case_sort(c)
+        c.refresh_from_db()
+        self.assertEqual(c.governing_verification_completed_at, vat)
+
+
 class CleanupCrossHouseholdProfilesCommandTest(TestCase):
     """cleanup_cross_household_profiles marks a phantom profile (a household PRIMARY
     appearing on someone else's household enrollment) REMOVED, and leaves genuine
