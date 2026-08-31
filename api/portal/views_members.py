@@ -1374,9 +1374,11 @@ class TeamsListView(PortalAPIView):
     (``team__iexact=value``)."""
 
     # "Met Council Team" is the default originating_team for staff not on the
-    # CareCircle roster. It IS a real, filterable bucket (cases created by Met
-    # Council staff), so it's offered in the dropdown. Nothing is excluded.
-    _EXCLUDED_TEAMS = set()
+    # CareCircle roster. Their cases are blocked at import and the legacy ones were
+    # purged (see purge_non_carecircle_cases), so no member resolves to that team
+    # -- hide it from the dropdown. (Members with no resolvable creator surface via
+    # the Data page's "No Team / Unassigned" option instead.)
+    _EXCLUDED_TEAMS = {"met council team"}
 
     def get(self, request):
         teams = (
