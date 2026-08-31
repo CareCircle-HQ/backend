@@ -15244,6 +15244,31 @@ class CaseDatesFollowGoverningCaseTest(TestCase):
         self.assertEqual(data[0]["opened"], gov.date_opened.isoformat())
 
 
+class CsvImportCreatorAllowlistTest(TestCase):
+    """CSV import lets in cases whose creator is on a CareCircle team (Call Center
+    or Street) and blocks Met Council. Regression: the Street team is stored as
+    'CareCircle Street' (no 'Team' suffix), so it must be in the allowlist -- it
+    was previously excluded, wrongly skipping Street-created cases."""
+
+    def test_carecircle_street_allowlisted_metcouncil_blocked(self):
+        import uuid as _uuid
+
+        from .models import UniteUsAgent
+        from .services.csv_import import CARECIRCLE_ALLOWLIST_TEAMS
+
+        street = UniteUsAgent.objects.create(user_id=_uuid.uuid4(), name="St", originating_team="CareCircle Street")
+        cc = UniteUsAgent.objects.create(user_id=_uuid.uuid4(), name="Cc", originating_team="CareCircle Call Center")
+        mc = UniteUsAgent.objects.create(user_id=_uuid.uuid4(), name="Mc", originating_team="Met Council Team")
+
+        allowed = set(
+            UniteUsAgent.objects.filter(originating_team__in=CARECIRCLE_ALLOWLIST_TEAMS)
+            .values_list("user_id", flat=True)
+        )
+        self.assertIn(street.user_id, allowed)     # Street allowed (was wrongly skipped)
+        self.assertIn(cc.user_id, allowed)         # Call Center allowed
+        self.assertNotIn(mc.user_id, allowed)      # Met Council blocked
+
+
 class DataTeamUnassignedFilterTest(TestCase):
     """The Data page team filter's '__unassigned__' sentinel matches the blank-team
     bucket, so Unassigned + named teams reconcile to All Teams."""

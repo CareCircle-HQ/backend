@@ -73,7 +73,13 @@ TIMELINE_ACTOR = "system:csv-import"
 # (matched on originating_team, sourced from the CareCircle roster). Everyone
 # else -- notably Met Council Team -- is excluded. An EMPTY match set means no
 # gate (accept all), so imports keep working until the roster is populated.
-CARECIRCLE_ALLOWLIST_TEAMS = ("CareCircle Call Center", "CareCircle Street Team")
+# NB: the roster stores the Street team as "CareCircle Street" (no "Team" suffix).
+# Both spellings are listed so a case created by a CareCircle Street agent is
+# ALLOWED in regardless of which form the roster carries -- otherwise those cases
+# were wrongly skipped (only Call Center matched).
+CARECIRCLE_ALLOWLIST_TEAMS = (
+    "CareCircle Call Center", "CareCircle Street", "CareCircle Street Team",
+)
 
 # Export types exposed in the Settings > Import web UI.
 SUPPORTED_EXPORT_TYPES = ("clients", "screening", "assessments", "cases", "notes")
