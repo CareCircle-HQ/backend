@@ -15244,6 +15244,41 @@ class CaseDatesFollowGoverningCaseTest(TestCase):
         self.assertEqual(data[0]["opened"], gov.date_opened.isoformat())
 
 
+class PurgeNonCareCircleCasesTest(TestCase):
+    """purge_non_carecircle_cases deletes only cases whose creator is a KNOWN
+    Unite Us agent on a non-CareCircle team (Met Council); it never touches
+    CareCircle-created, extension/unknown-creator, or no-creator cases."""
+
+    def test_deletes_only_metcouncil(self):
+        import uuid as _uuid
+        from io import StringIO
+
+        from django.core.management import call_command
+
+        from .models import Case, CaseStatus, CaseType, Client, UniteUsAgent
+
+        cc = UniteUsAgent.objects.create(user_id=_uuid.uuid4(), name="Cc", originating_team="CareCircle Call Center")
+        mc = UniteUsAgent.objects.create(user_id=_uuid.uuid4(), name="Mc", originating_team="Met Council Team")
+        client = Client.objects.create(client_id=str(_uuid.uuid4()), first_name="P", last_name="Q")
+
+        def mk(creator):
+            return Case.objects.create(
+                case_id=_uuid.uuid4(), client=client, case_type=CaseType.NAVIGATION,
+                case_status=CaseStatus.OPEN, created_by_id=creator,
+            )
+        cc_case = mk(cc.user_id)
+        mc_case = mk(mc.user_id)
+        ext_case = mk(_uuid.uuid4())   # unknown creator (extension-stamped agent id)
+        none_case = mk(None)           # no creator
+
+        call_command("purge_non_carecircle_cases", "--apply", stdout=StringIO())
+
+        self.assertFalse(Case.objects.filter(pk=mc_case.pk).exists())   # deleted
+        self.assertTrue(Case.objects.filter(pk=cc_case.pk).exists())    # kept
+        self.assertTrue(Case.objects.filter(pk=ext_case.pk).exists())   # kept (ext/unknown)
+        self.assertTrue(Case.objects.filter(pk=none_case.pk).exists())  # kept (no creator)
+
+
 class CsvImportCreatorAllowlistTest(TestCase):
     """CSV import lets in cases whose creator is on a CareCircle team (Call Center
     or Street) and blocks Met Council. Regression: the Street team is stored as
