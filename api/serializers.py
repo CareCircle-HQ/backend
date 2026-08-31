@@ -59,10 +59,37 @@ from .models import (
     SocialCareCoverage,
     SocialCareCoverageStatus,
     TimelineEvent,
+    UniteUsAgent,
+    UniteUsCredential,
     VerifiedSocialNeed,
 )
 
 User = get_user_model()
+
+
+def _uniteus_user_id_for_agent_id(agent_pk):
+    """The Unite Us ``user_id`` for a portal Agent (== ``UniteUsAgent.user_id`` and
+    the canonical ``Case.created_by_id``), resolved via the agent's captured Unite
+    Us credential: ``UniteUsCredential.employee_id`` -> ``UniteUsAgent.employee_id``
+    -> ``user_id``. Returns None when the agent has no linked Unite Us identity, so
+    the caller leaves created_by_id blank rather than stamping the (unresolvable)
+    portal Agent PK -- which would never map to a team."""
+    if not agent_pk:
+        return None
+    emp_ids = list(
+        UniteUsCredential.objects.filter(agent_id=agent_pk)
+        .exclude(employee_id="")
+        .values_list("employee_id", flat=True)
+    )
+    for emp in emp_ids:
+        uid = (
+            UniteUsAgent.objects.filter(employee_id=emp)
+            .values_list("user_id", flat=True)
+            .first()
+        )
+        if uid:
+            return uid
+    return None
 
 
 class RegisterSerializer(serializers.ModelSerializer):
@@ -1616,25 +1643,29 @@ class CaseSerializer(serializers.ModelSerializer):
         case._prev_auth = _prev_auth
         # Extension attribution: stamp the AUTHENTICATED agent as the case
         # creator the FIRST time a case is saved (``_prev is None``). Unite Us
-        # imports carry their own source ``created_by`` in the payload, so the
-        # "only when blank" guard preserves it; Django-admin / CRM writes have no
-        # ``agent_code`` and are skipped. This is what fills the Urgent Care
-        # "Created By" column for cases logged through the extension.
+        # imports carry their own source ``created_by`` in the payload (and have no
+        # request in context), so the "only when blank" guard preserves it.
+        #
+        # Keyed on ``agent_id`` (the AgentUser principal's PK) -- present for every
+        # authenticated agent -- NOT ``agent_code`` (null for agents without a
+        # dialer extension, which previously silently skipped their attribution).
+        # ``created_by_id`` is canonically the Unite Us ``user_id`` (== UniteUsAgent
+        # .user_id) that team resolution keys on, so we resolve the agent's Unite Us
+        # identity and stamp THAT -- never the portal Agent PK, which maps to no team.
         try:
             request = self.context.get("request")
             agent = getattr(request, "user", None) if request is not None else None
-            if (
-                _prev is None
-                and getattr(agent, "agent_code", None)
-                and not case.created_by_name
-            ):
+            agent_pk = getattr(agent, "agent_id", None)
+            if _prev is None and agent_pk:
                 stamped = []
-                if getattr(agent, "name", None):
+                if getattr(agent, "name", None) and not case.created_by_name:
                     case.created_by_name = agent.name
                     stamped.append("created_by_name")
-                if getattr(agent, "agent_id", None) and case.created_by_id is None:
-                    case.created_by_id = agent.agent_id
-                    stamped.append("created_by_id")
+                if case.created_by_id is None:
+                    uid = _uniteus_user_id_for_agent_id(agent_pk)
+                    if uid:
+                        case.created_by_id = uid
+                        stamped.append("created_by_id")
                 if stamped:
                     case.save(update_fields=stamped)
         except Exception:

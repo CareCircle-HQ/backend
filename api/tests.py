@@ -11038,19 +11038,48 @@ class IsNewFlagTest(TestCase):
         self.assertFalse(client.is_new)
 
     def test_extension_write_stamps_created_by(self):
-        # An extension write (AgentUser with name + agent_id) stamps the acting
-        # agent as the case creator, filling the Urgent Care "Created By" column.
+        # An extension write stamps the acting agent as creator: created_by_name
+        # from the agent, and created_by_id RESOLVED to the agent's Unite Us
+        # user_id (credential.employee_id -> UniteUsAgent) so team resolution works
+        # -- NOT the (unresolvable) portal Agent PK.
         import uuid as _uuid
 
+        from .models import Agent, UniteUsAgent, UniteUsCredential
+
         client = self._client()
-        agent_id = _uuid.uuid4()
+        agent = Agent.objects.create(name="Ada Agent")
+        emp = _uuid.uuid4()
+        UniteUsCredential.objects.create(provider_id="p1", employee_id=str(emp), agent=agent)
+        uua = UniteUsAgent.objects.create(
+            user_id=_uuid.uuid4(), employee_id=emp, name="Ada Agent",
+            originating_team="CareCircle Call Center",
+        )
         request = SimpleNamespace(
-            user=SimpleNamespace(agent_code="123", name="Ada Agent", agent_id=agent_id)
+            user=SimpleNamespace(agent_code="123", name="Ada Agent", agent_id=agent.id)
         )
         case = self._save_internal_case(client, context={"request": request})
         case.refresh_from_db()
         self.assertEqual(case.created_by_name, "Ada Agent")
-        self.assertEqual(case.created_by_id, agent_id)
+        self.assertEqual(case.created_by_id, uua.user_id)
+
+    def test_extension_write_stamps_dialerless_agent(self):
+        # An agent WITHOUT an agent_code (no dialer extension) is still attributed
+        # -- previously the agent_code guard silently skipped them, leaving cases
+        # with no creator at all. created_by_id stays blank when unresolvable
+        # (no Unite Us credential), but the name is stamped.
+        import uuid as _uuid
+
+        from .models import Agent
+
+        client = self._client()
+        agent = Agent.objects.create(name="Bea Agent")  # no credential -> unresolvable id
+        request = SimpleNamespace(
+            user=SimpleNamespace(agent_code=None, name="Bea Agent", agent_id=agent.id)
+        )
+        case = self._save_internal_case(client, context={"request": request})
+        case.refresh_from_db()
+        self.assertEqual(case.created_by_name, "Bea Agent")
+        self.assertIsNone(case.created_by_id)  # left blank, never the Agent PK
 
     def test_extension_write_preserves_existing_created_by(self):
         # A payload that already carries created_by (e.g. a Unite Us import row)
