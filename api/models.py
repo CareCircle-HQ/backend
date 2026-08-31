@@ -4971,6 +4971,9 @@ class EnrollmentAnalytics(models.Model):
     medical_conditions = ArrayField(models.CharField(max_length=128), default=list, blank=True)
     medications = ArrayField(models.CharField(max_length=128), default=list, blank=True)
     eligible_services = ArrayField(models.CharField(max_length=64), default=list, blank=True)
+    # The member's phone numbers (primary first). Exported one-per-column on the
+    # Data page CSV ("Phone 1", "Phone 2", ...).
+    phone_numbers = ArrayField(models.CharField(max_length=40), default=list, blank=True)
     tags = ArrayField(models.CharField(max_length=64), default=list, blank=True)
     ticket_types = ArrayField(models.CharField(max_length=64), default=list, blank=True)
 

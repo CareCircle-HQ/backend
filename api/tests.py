@@ -15278,6 +15278,27 @@ class DataScreeningAgentFilterTest(TestCase):
         self.assertNotIn(str(c.client_id), miss)
 
 
+class DataPhoneNumbersReadModelTest(TestCase):
+    """build_row collects the member's phone numbers (primary first, de-duped) into
+    EnrollmentAnalytics.phone_numbers -- spread one-per-column on the Data export."""
+
+    def test_phones_primary_first_deduped(self):
+        import uuid as _uuid
+
+        from .models import Client, ClientPhone, EnrollmentAnalytics
+        from .services.enrollment_analytics import upsert_client
+
+        c = Client.objects.create(client_id=str(_uuid.uuid4()), first_name="Ph", last_name="One")
+        # Non-primary added first, primary second -- primary must sort first.
+        ClientPhone.objects.create(client=c, raw="(212) 111-1111", normalized="2121111111", is_primary=False)
+        ClientPhone.objects.create(client=c, raw="(917) 222-2222", normalized="9172222222", is_primary=True)
+
+        upsert_client(c)
+        ea = EnrollmentAnalytics.objects.get(client=c)
+        # Primary first, then the other.
+        self.assertEqual(ea.phone_numbers, ["(917) 222-2222", "(212) 111-1111"])
+
+
 class VerificationCompletedDenormTest(TestCase):
     """governing_verification_completed_at (the completed-date FILTER key) must
     track the governing enrollment's verified_at, so a Verified household is also

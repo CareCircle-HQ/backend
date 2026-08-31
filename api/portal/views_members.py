@@ -2972,20 +2972,39 @@ class DataExportView(PortalAPIView):
             "cadence", "kitchen_name", "menu_type", "current_delivery_status",
             "last_po_delivery_status", "last_delivered_at", "insurance_status",
             "insurance_expires_at", "social_status", "social_expires_at",
-            "attestation_status", "has_screening", "screening_at",
+            "attestation_status", "has_screening", "screening_at", "screening_agent",
             "has_eligibility_assessment", "eligibility_assessment_at", "verified_at",
             "verified_by_name", "case_type", "case_status", "auth_status",
             "case_opened_at", "program_name", "allergies", "medical_conditions",
             "medications", "eligible_services",
         ]
+        # A member can have several phone numbers -- export each in its OWN column
+        # ("Phone 1", "Phone 2", ...). Size the columns to the widest member in the
+        # filtered set (defensively capped), then spread phone_numbers across them.
+        from django.db.models import F, IntegerField, Max, Value, Func
+        from django.db.models.functions import Coalesce
+
+        max_phones = (
+            qs.annotate(_np=Coalesce(
+                Func(F("phone_numbers"), Value(1), function="array_length"),
+                Value(0), output_field=IntegerField(),
+            )).aggregate(m=Max("_np"))["m"] or 0
+        )
+        max_phones = min(max_phones, 15)
+        fetch_fields = fields + ["phone_numbers"]
+        header = fields + [f"Phone {i}" for i in range(1, max_phones + 1)]
 
         def rows():
-            yield fields
-            for r in qs.values_list(*fields).iterator(chunk_size=1000):
-                yield [
+            yield header
+            for r in qs.values_list(*fetch_fields).iterator(chunk_size=1000):
+                *scalars, phones = r
+                line = [
                     ",".join(v) if isinstance(v, list) else ("" if v is None else str(v))
-                    for v in r
+                    for v in scalars
                 ]
+                phones = phones or []
+                line += [phones[i] if i < len(phones) else "" for i in range(max_phones)]
+                yield line
 
         return stream_csv_response(
             rows(), f"data_{timezone.localdate().isoformat()}.csv",

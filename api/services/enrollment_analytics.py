@@ -180,6 +180,19 @@ def _screening_assessment(client_id):
     )
 
 
+def _phones(client):
+    """The client's phone numbers, primary first then oldest, de-duped. Uses the
+    human-readable ``raw`` (falls back to the normalized last-10). Prefetched, so
+    sorted in Python (no extra query)."""
+    out, seen = [], set()
+    for p in sorted(client.phones.all(), key=lambda x: (not x.is_primary, x.created_at)):
+        num = (p.raw or p.normalized or "").strip()
+        if num and num not in seen:
+            seen.add(num)
+            out.append(num)
+    return out
+
+
 def _parity_fields(client):
     """Fields mirrored EXACTLY from the Members list (via MemberListSerializer +
     the same view helpers), so the Data page numbers match the Members page.
@@ -491,6 +504,7 @@ def build_row(client):
         "has_screening": has_scr,
         "screening_at": scr_at,
         "screening_agent": scr_agent,
+        "phone_numbers": _phones(client),
         "has_eligibility_assessment": has_asm,
         "eligibility_assessment_at": asm_at,
         "verified_at": verified_at,
@@ -560,7 +574,7 @@ def _base_qs(client_ids=None):
         # case resolution) without N+1 -- same shape as the Members list's
         # MEMBER_LIST_PREFETCH.
         "insurances", "tags", "addresses", "social_care_coverages",
-        "military_profile", "member_profiles", "cases",
+        "military_profile", "member_profiles", "cases", "phones",
         Prefetch(
             "enrollments",
             queryset=EnrollmentVerification.objects.select_related(
