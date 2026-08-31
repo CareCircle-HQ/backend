@@ -2915,13 +2915,21 @@ class DataSummaryView(PortalAPIView):
 
     def get(self, request):
         from django.db.models import Count, Max
-        from ..models import EnrollmentAnalytics
+        from ..models import AnalyticsRebuildRun, EnrollmentAnalytics
         from ..services.enrollment_analytics import filter_analytics
 
         qs = filter_analytics(request.query_params)
         # Read-model freshness watermark (drives the Data page "Updated N ago" +
         # Rebuild control). Global, not filtered.
         last_refreshed = EnrollmentAnalytics.objects.aggregate(m=Max("refreshed_at"))["m"]
+        # When the rebuild TASK last completed (scheduled job or manual button) --
+        # the figure the "Data updated" label shows. Distinct from refreshed_at,
+        # which a single live member upsert bumps.
+        last_run = (
+            AnalyticsRebuildRun.objects.filter(completed_at__isnull=False)
+            .order_by("-completed_at").first()
+        )
+        last_rebuilt = last_run.completed_at if last_run else None
 
         def breakdown(field):
             return {
@@ -2931,6 +2939,12 @@ class DataSummaryView(PortalAPIView):
 
         return Response({
             "last_refreshed_at": last_refreshed.isoformat() if last_refreshed else None,
+            # Last completed rebuild-task run (falls back to the row watermark until
+            # the first tracked run exists).
+            "last_rebuilt_at": (
+                last_rebuilt.isoformat() if last_rebuilt
+                else (last_refreshed.isoformat() if last_refreshed else None)
+            ),
             # One row per MEMBER, so total == members.
             "total": qs.count(),
             "members": qs.count(),
@@ -3034,7 +3048,7 @@ class DataRebuildView(PortalAPIView):
         # Celery worker) say so rather than 500, so the UI can hint "run the
         # command / start a worker".
         try:
-            rebuild_enrollment_analytics.delay()
+            rebuild_enrollment_analytics.delay(trigger="manual")
             enqueued = True
         except Exception:  # noqa: BLE001
             enqueued = False

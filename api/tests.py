@@ -15308,6 +15308,24 @@ class PurgeNonCareCircleCasesTest(TestCase):
         self.assertTrue(Case.objects.filter(pk=none_case.pk).exists())  # kept (no creator)
 
 
+class AnalyticsRebuildRunTest(TestCase):
+    """The rebuild command records each run (started/completed/trigger) so the Data
+    page can show when the refresh TASK last ran (not the per-row watermark)."""
+
+    def test_rebuild_command_records_completed_run(self):
+        from io import StringIO
+
+        from django.core.management import call_command
+
+        from .models import AnalyticsRebuildRun
+
+        call_command("rebuild_enrollment_analytics", "--trigger=manual", stdout=StringIO())
+        run = AnalyticsRebuildRun.objects.order_by("-started_at").first()
+        self.assertIsNotNone(run)
+        self.assertIsNotNone(run.completed_at)      # stamped on completion
+        self.assertEqual(run.trigger, "manual")
+
+
 class CsvImportCreatorAllowlistTest(TestCase):
     """CSV import lets in cases whose creator is on a CareCircle team (Call Center
     or Street) and blocks Met Council. Regression: the Street team is stored as
