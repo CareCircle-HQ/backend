@@ -4924,6 +4924,10 @@ class EnrollmentAnalytics(models.Model):
     # Screening / eligibility assessment.
     has_screening = models.BooleanField(default=False, db_index=True)
     screening_at = models.DateTimeField(null=True, blank=True)
+    # Name of the Unite Us facilitator who performed the latest screening
+    # (Screening.facilitator_id -> UniteUsAgent.employee_id -> name). Powers the
+    # Data page "Screening Agent" filter. Blank when no screening / unresolved.
+    screening_agent = models.CharField(max_length=255, blank=True, db_index=True)
     has_eligibility_assessment = models.BooleanField(default=False, db_index=True)
     eligibility_assessment_at = models.DateTimeField(null=True, blank=True)
 

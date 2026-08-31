@@ -2886,6 +2886,24 @@ class DataDeliveryCompaniesView(PortalAPIView):
         return Response([{"value": n, "label": n} for n in names])
 
 
+class DataScreeningAgentsView(PortalAPIView):
+    """Administration > Data: Screening Agent filter options -- the distinct
+    screening_agent values in the read model (the Unite Us facilitator who
+    performed each member's latest screening, resolved from facilitator_id)."""
+
+    def get(self, request):
+        from ..models import EnrollmentAnalytics
+
+        names = sorted({
+            n for n in EnrollmentAnalytics.objects
+            .exclude(screening_agent="")
+            .values_list("screening_agent", flat=True)
+            .distinct()
+            if n
+        })
+        return Response([{"value": n, "label": n} for n in names])
+
+
 class DataSummaryView(PortalAPIView):
     """Administration > Data: aggregate counts for the current filter set -- the
     'general numbers that meet the criteria' the data team works from. Same

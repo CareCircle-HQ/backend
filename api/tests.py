@@ -15244,6 +15244,40 @@ class CaseDatesFollowGoverningCaseTest(TestCase):
         self.assertEqual(data[0]["opened"], gov.date_opened.isoformat())
 
 
+class DataScreeningAgentFilterTest(TestCase):
+    """Data page Screening Agent: build_row resolves the screening facilitator
+    (Screening.facilitator_id -> UniteUsAgent.employee_id -> name) into
+    EnrollmentAnalytics.screening_agent, and filter_analytics filters on it."""
+
+    def test_resolves_and_filters_by_screening_agent(self):
+        import uuid as _uuid
+
+        from django.utils import timezone
+
+        from .models import Client, EnrollmentAnalytics, Screening, UniteUsAgent
+        from .services.enrollment_analytics import (
+            _reset_screening_agent_cache, filter_analytics, upsert_client,
+        )
+
+        emp = _uuid.uuid4()
+        UniteUsAgent.objects.create(user_id=_uuid.uuid4(), employee_id=emp, name="Michelle Ramirez")
+        c = Client.objects.create(client_id=str(_uuid.uuid4()), first_name="Scr", last_name="Ee")
+        Screening.objects.create(
+            enhanced_screen_id=_uuid.uuid4(), subject_id=c.client_id, client=c,
+            screen_created_at=timezone.now(), facilitator_id=emp,
+        )
+        _reset_screening_agent_cache()
+        upsert_client(c)
+
+        ea = EnrollmentAnalytics.objects.get(client=c)
+        self.assertEqual(ea.screening_agent, "Michelle Ramirez")
+        # The filter matches on the resolved name.
+        got = {str(x) for x in filter_analytics({"screening_agent": "Michelle Ramirez"}).values_list("client_id", flat=True)}
+        self.assertIn(str(c.client_id), got)
+        miss = {str(x) for x in filter_analytics({"screening_agent": "Someone Else"}).values_list("client_id", flat=True)}
+        self.assertNotIn(str(c.client_id), miss)
+
+
 class VerificationCompletedDenormTest(TestCase):
     """governing_verification_completed_at (the completed-date FILTER key) must
     track the governing enrollment's verified_at, so a Verified household is also

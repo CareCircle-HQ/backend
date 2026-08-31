@@ -2708,7 +2708,7 @@ class EnrollmentAnalyticsSerializer(serializers.ModelSerializer):
             "insurance_status", "insurance_expires_at",
             "social_status", "social_expires_at",
             "attestation_status", "attestation_requested_at", "attestation_completed_at",
-            "has_screening", "screening_at",
+            "has_screening", "screening_at", "screening_agent",
             "has_eligibility_assessment", "eligibility_assessment_at",
             "verified_at", "verified_by_name",
             "case_type", "case_status", "auth_status", "case_opened_at", "program_name",

@@ -9,6 +9,7 @@ source of truth.
 """
 
 import logging
+from functools import lru_cache
 
 from django.db.models import Prefetch
 from django.utils import timezone
@@ -146,16 +147,36 @@ def _dietary(enrollment_id, client_id):
     )
 
 
+@lru_cache(maxsize=4096)
+def _agent_name_by_employee_id(employee_id):
+    """Screening facilitator name from a Unite Us employee_id. Cached across the
+    build (facilitators repeat heavily); the cache is cleared at the start of each
+    full rebuild via _reset_screening_agent_cache. Blank when unresolved."""
+    if employee_id is None:
+        return ""
+    from api.models import UniteUsAgent
+    ag = UniteUsAgent.objects.filter(employee_id=employee_id).first()
+    if ag is None:
+        return ""
+    return (ag.name or f"{ag.first_name} {ag.last_name}".strip() or "")
+
+
+def _reset_screening_agent_cache():
+    """Drop the facilitator-name cache so a rebuild picks up renamed agents."""
+    _agent_name_by_employee_id.cache_clear()
+
+
 def _screening_assessment(client_id):
     scr = (Screening.objects.filter(client_id=client_id)
            .order_by("-screen_created_at").first())
     asm = (Assessment.objects.filter(client_id=client_id)
            .order_by("-screen_created_at").first())
     eligible = _clean(asm.eligible_services) if asm else []
+    scr_agent = _agent_name_by_employee_id(scr.facilitator_id) if scr else ""
     return (
         scr is not None, (scr.screen_created_at if scr else None),
         asm is not None, (asm.screen_created_at if asm else None),
-        eligible,
+        eligible, scr_agent,
     )
 
 
@@ -341,7 +362,7 @@ def build_row(client):
         menu_type, allergies, conditions, meds, member_status = _dietary(enr.pk, cid)
     else:
         menu_type, allergies, conditions, meds, member_status = "", [], [], [], ""
-    has_scr, scr_at, has_asm, asm_at, eligible = _screening_assessment(cid)
+    has_scr, scr_at, has_asm, asm_at, eligible, scr_agent = _screening_assessment(cid)
     parity = _parity_fields(client)
     # Coverage gates for the Company Status "not eligible" test -- pop so they
     # aren't written as (nonexistent) columns.
@@ -469,6 +490,7 @@ def build_row(client):
         "attestation_completed_at": None,
         "has_screening": has_scr,
         "screening_at": scr_at,
+        "screening_agent": scr_agent,
         "has_eligibility_assessment": has_asm,
         "eligibility_assessment_at": asm_at,
         "verified_at": verified_at,
@@ -575,6 +597,8 @@ def rebuild(client_ids=None, *, chunk=500, progress=None):
     ``progress(done, total)`` is an optional callback for live progress.
     Returns the number of rows written.
     """
+    # Drop the facilitator-name cache so a rebuild reflects any renamed agents.
+    _reset_screening_agent_cache()
     qs = _base_qs(client_ids)
     total = qs.count()
     done = 0
@@ -700,6 +724,7 @@ def filter_analytics(params):
         "team": "team", "service_type": "service_type",
         "program_type": "program_type", "pause_type": "pause_type",
         "verified_by": "verified_by_id_str",
+        "screening_agent": "screening_agent",
     }.items():
         if g(param):
             qs = qs.filter(**{col: g(param)})
