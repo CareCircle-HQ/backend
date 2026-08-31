@@ -1256,14 +1256,41 @@ class CasesSummaryView(PortalAPIView):
     def get(self, request):
         from api.models import Case, CaseType
 
-        base = Case.objects.all()
+        p = request.query_params
+        qs = Case.objects.all()
+        # Apply the same date windows as the Cases page, at the CASE level so the
+        # chip totals reflect the current filter: Created=date_opened,
+        # Added=added_to_system_at, Closed=case_closed_at, Verified=an enrollment
+        # verified in range.
+        for field, frm, to in (
+            ("date_opened", "created_from", "created_to"),
+            ("added_to_system_at", "added_from", "added_to"),
+            ("case_closed_at", "closed_from", "closed_to"),
+            ("enrollments__verified_at", "completed_from", "completed_to"),
+        ):
+            d1 = _parse_date((p.get(frm) or "").strip())
+            d2 = _parse_date((p.get(to) or "").strip())
+            if d1:
+                qs = qs.filter(**{f"{field}__date__gte": d1})
+            if d2:
+                qs = qs.filter(**{f"{field}__date__lte": d2})
+        case_id_q = (p.get("case_id") or "").strip()
+        if case_id_q:
+            from django.db.models import TextField
+            from django.db.models.functions import Cast
+
+            qs = qs.annotate(
+                _case_id_text=Cast("case_id", output_field=TextField())
+            ).filter(_case_id_text__icontains=case_id_q)
+
+        def n(**extra):
+            return qs.filter(**extra).values("case_id").distinct().count()
+
         return Response({
-            "internal_service": base.filter(case_type=CaseType.INTERNAL_SERVICE).count(),
-            "care_management": base.filter(case_type=CaseType.NAVIGATION).count(),
-            "eligibility": base.filter(case_type=CaseType.ELIGIBILITY).count(),
-            "reauthorizations": base.filter(
-                case_type=CaseType.INTERNAL_SERVICE, is_extension=True,
-            ).count(),
+            "internal_service": n(case_type=CaseType.INTERNAL_SERVICE),
+            "care_management": n(case_type=CaseType.NAVIGATION),
+            "eligibility": n(case_type=CaseType.ELIGIBILITY),
+            "reauthorizations": n(case_type=CaseType.INTERNAL_SERVICE, is_extension=True),
         })
 
 
