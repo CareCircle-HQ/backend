@@ -15308,6 +15308,54 @@ class PurgeNonCareCircleCasesTest(TestCase):
         self.assertTrue(Case.objects.filter(pk=none_case.pk).exists())  # kept (no creator)
 
 
+class TicketAssigneeListTest(TestCase):
+    """Work Queue: the assignee list returns ALL active CareCircle users (any
+    group), and any active agent is assignable to a ticket -- not just CS."""
+
+    def _auth(self):
+        from .models import Agent
+
+        mgr = Agent.objects.create(name="Mgr", agent_code="990", group="Management", is_manager=True)
+        access = AccessToken()
+        access["agent_id"] = str(mgr.id)
+        access["agent_code"] = mgr.agent_code
+        access["agent_name"] = mgr.name
+        access["agent_group"] = mgr.group
+        access["agent_is_manager"] = True
+        api = APIClient()
+        api.credentials(HTTP_AUTHORIZATION=f"Bearer {access}")
+        return mgr, api
+
+    def test_agents_list_includes_all_active_groups(self):
+        from .models import Agent
+
+        _, api = self._auth()
+        Agent.objects.create(name="Screener One", agent_code="991", group="Screeners")
+        Agent.objects.create(name="Nutri One", agent_code="992", group="Nutritionist")
+        Agent.objects.create(name="Inactive One", agent_code="993", group="CS", status="Inactive")
+        resp = api.get(reverse("portal-agents"))
+        self.assertEqual(resp.status_code, 200, resp.content)
+        names = {a["name"] for a in resp.json()}
+        self.assertIn("Screener One", names)     # non-CS group now listed
+        self.assertIn("Nutri One", names)
+        self.assertNotIn("Inactive One", names)  # inactive still excluded
+
+    def test_assign_ticket_to_non_cs_agent(self):
+        from .models import Agent, Ticket, TicketType
+
+        _, api = self._auth()
+        screener = Agent.objects.create(name="Screener Two", agent_code="994", group="Screeners")
+        tt, _ = TicketType.objects.get_or_create(code="verification", defaults={"label": "Verification"})
+        ticket = Ticket.objects.create(type=tt, reason="r")
+        resp = api.patch(
+            reverse("portal-ticket-detail", args=[ticket.id]),
+            {"assignee_id": str(screener.id)}, format="json",
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        ticket.refresh_from_db()
+        self.assertEqual(ticket.assigned_to_id, screener.id)
+
+
 class AnalyticsRebuildRunTest(TestCase):
     """The rebuild command records each run (started/completed/trigger) so the Data
     page can show when the refresh TASK last ran (not the per-row watermark)."""

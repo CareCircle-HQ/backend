@@ -199,12 +199,11 @@ class TicketDetailView(PortalAPIView):
         if "assignee_id" in request.data:
             aid = request.data.get("assignee_id") or None
             if aid:
-                agent = Agent.objects.filter(
-                    pk=aid, status="Active", group__in=ASSIGNABLE_GROUPS
-                ).first()
+                # Any ACTIVE CareCircle user is assignable (not just CS/Management).
+                agent = Agent.objects.filter(pk=aid, status="Active").first()
                 if agent is None:
                     return Response(
-                        {"error": "Unknown or non-assignable agent."},
+                        {"error": "Unknown or inactive agent."},
                         status=http.HTTP_400_BAD_REQUEST,
                     )
                 ticket.assigned_to = agent
@@ -325,18 +324,22 @@ class TicketTypesListView(PortalAPIView):
         return Response(s.PortalTicketTypeSerializer(types, many=True).data)
 
 
-# Groups assignable to a ticket, in display order (CS first, then Management).
-ASSIGNABLE_GROUPS = ["CS", "Management"]
+# Groups surfaced FIRST in the assignee list (primary triage), then everyone else.
+PRIORITY_GROUPS = ["CS", "Management"]
 
 
 class AgentsListView(PortalAPIView):
+    """Assignable agents for the Work Queue: ALL active CareCircle users (any
+    group), with the primary triage groups (CS, then Management) listed first."""
+
     def get(self, request):
         agents = (
-            Agent.objects.filter(status="Active", group__in=ASSIGNABLE_GROUPS)
+            Agent.objects.filter(status="Active")
             .order_by(
                 DBCase(
                     When(group="CS", then=0),
-                    default=1,
+                    When(group="Management", then=1),
+                    default=2,
                     output_field=IntegerField(),
                 ),
                 "name",
