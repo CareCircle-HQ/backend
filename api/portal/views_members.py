@@ -2945,6 +2945,9 @@ class DataSummaryView(PortalAPIView):
                 last_rebuilt.isoformat() if last_rebuilt
                 else (last_refreshed.isoformat() if last_refreshed else None)
             ),
+            # How that last run was launched: "scheduled" (background job) or
+            # "manual" (Data page button) / "cli". Blank until a run is tracked.
+            "last_rebuilt_trigger": (last_run.trigger or "") if last_run else "",
             # One row per MEMBER, so total == members.
             "total": qs.count(),
             "members": qs.count(),
