@@ -1247,6 +1247,26 @@ class FoodAllergiesListView(PortalAPIView):
         ])
 
 
+class CasesSummaryView(PortalAPIView):
+    """Case-type totals for the Cases-page summary chips: internal-service, care
+    management (stored ``navigation``), eligibility, and how many internal-service
+    cases are REAUTHORIZATIONS (``is_extension``). Counts are over ALL cases so the
+    chips read as running totals regardless of the page's case-type dropdown."""
+
+    def get(self, request):
+        from api.models import Case, CaseType
+
+        base = Case.objects.all()
+        return Response({
+            "internal_service": base.filter(case_type=CaseType.INTERNAL_SERVICE).count(),
+            "care_management": base.filter(case_type=CaseType.NAVIGATION).count(),
+            "eligibility": base.filter(case_type=CaseType.ELIGIBILITY).count(),
+            "reauthorizations": base.filter(
+                case_type=CaseType.INTERNAL_SERVICE, is_extension=True,
+            ).count(),
+        })
+
+
 class LeadSourcesListView(PortalAPIView):
     """Lead-source options for the Members-page filter dropdown.
 

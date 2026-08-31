@@ -44,6 +44,7 @@ from .views_leads import (
 from .views_members import (
     BulkAssignBoxesView,
     BulkAssignMealsView,
+    CasesSummaryView,
     FoodAllergiesListView,
     HouseholdMemberEditView,
     LeadSourcesListView,
@@ -245,6 +246,7 @@ urlpatterns = [
     path("data/export/", DataExportView.as_view(), name="portal-data-export"),
     path("data/rebuild/", DataRebuildView.as_view(), name="portal-data-rebuild"),
     path("members/stats/", MembersStatsView.as_view(), name="portal-members-stats"),
+    path("cases/summary/", CasesSummaryView.as_view(), name="portal-cases-summary"),
     path("care-management/tabs/", CareManagementTabCountsView.as_view(), name="portal-care-management-tabs"),
     path("members/unlinked/", UnlinkedMembersListView.as_view(), name="portal-members-unlinked"),
     path("members/no-navigation/", NoNavigationMembersListView.as_view(), name="portal-members-no-navigation"),
