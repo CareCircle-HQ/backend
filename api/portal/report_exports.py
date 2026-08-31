@@ -103,6 +103,7 @@ _ALL_MEMBERS_HEADER = [
     # Extras
     "Menu Type",
     "Dietary Restrictions",
+    "Food Notes",
 ]
 
 
@@ -263,6 +264,7 @@ def all_members_row(client, *, zips, states, lead_labels, team_map,
         _date_str(scc.expired_at if scc else None),
         (profile.menu_type if profile else ""),
         _dietary_restrictions(profile),
+        (profile.kitchen_food_notes if profile else ""),
         # Appended columns: Screening Agent, then one column per phone number.
         screen_agent,
         *[phones[i] if i < len(phones) else "" for i in range(max_phones)],
