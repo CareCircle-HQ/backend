@@ -161,9 +161,32 @@ def _agent_name_by_employee_id(employee_id):
     return (ag.name or f"{ag.first_name} {ag.last_name}".strip() or "")
 
 
+@lru_cache(maxsize=4096)
+def _team_by_user_id(user_id):
+    """CareCircle originating team of the Unite Us agent (case creator) with this
+    user_id. Cached across the build; cleared per rebuild. Blank when unresolved."""
+    if user_id is None:
+        return ""
+    from api.models import UniteUsAgent
+    ag = UniteUsAgent.objects.filter(user_id=user_id).first()
+    return (ag.originating_team or "") if ag else ""
+
+
+def _fallback_case_team(client):
+    """Team for a member with NO internal-service case: the CareCircle team of the
+    agent who created the member's MOST-RECENT case of ANY type. Blank when none of
+    their cases has a resolvable creator (so a truly caseless member stays blank)."""
+    cand = [ca for ca in client.cases.all() if ca.created_by_id]
+    if not cand:
+        return ""
+    ca = max(cand, key=lambda c: (c.date_opened is not None, c.date_opened))
+    return _team_by_user_id(ca.created_by_id)
+
+
 def _reset_screening_agent_cache():
-    """Drop the facilitator-name cache so a rebuild picks up renamed agents."""
+    """Drop the per-build lookup caches so a rebuild picks up renamed agents/teams."""
     _agent_name_by_employee_id.cache_clear()
+    _team_by_user_id.cache_clear()
 
 
 def _screening_assessment(client_id):
@@ -213,6 +236,11 @@ def _parity_fields(client):
     try:
         from api.portal.views_members import MembersListView
         team = (MembersListView()._case_team_map([client]) or {}).get(str(client.client_id), "") or ""
+        # No internal-service case (or its creator didn't resolve)? Attribute the
+        # member to the team that created their most-recent case of ANY type, so
+        # nav/eligibility/screening-only members aren't left blank on the Data page.
+        if not team:
+            team = _fallback_case_team(client)
     except Exception:  # noqa: BLE001
         team = ""
     try:

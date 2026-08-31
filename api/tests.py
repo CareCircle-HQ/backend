@@ -15244,6 +15244,38 @@ class CaseDatesFollowGoverningCaseTest(TestCase):
         self.assertEqual(data[0]["opened"], gov.date_opened.isoformat())
 
 
+class DataTeamFallbackNoISCaseTest(TestCase):
+    """A member with NO internal-service case still gets a Data-page team, from the
+    creator of their most-recent case of any type (nav/eligibility/screening)."""
+
+    def test_no_is_case_member_gets_team_from_any_case_creator(self):
+        import uuid as _uuid
+
+        from django.utils import timezone
+
+        from .models import (
+            Case, CaseStatus, CaseType, Client, EnrollmentAnalytics, UniteUsAgent,
+        )
+        from .services.enrollment_analytics import (
+            _reset_screening_agent_cache, upsert_client,
+        )
+
+        uid = _uuid.uuid4()
+        UniteUsAgent.objects.create(user_id=uid, name="Agent Z", originating_team="CareCircle Call Center")
+        c = Client.objects.create(client_id=str(_uuid.uuid4()), first_name="No", last_name="Isc")
+        # A Care Management (navigation) case -- NOT internal service.
+        Case.objects.create(
+            case_id=_uuid.uuid4(), client=c, case_type=CaseType.NAVIGATION,
+            case_status=CaseStatus.OPEN, created_by_id=uid, date_opened=timezone.now(),
+        )
+        _reset_screening_agent_cache()
+        upsert_client(c)
+
+        ea = EnrollmentAnalytics.objects.get(client=c)
+        self.assertEqual(ea.case_type, "")  # no governing internal-service case
+        self.assertEqual(ea.team, "CareCircle Call Center")  # team from the nav case creator
+
+
 class DataScreeningAgentFilterTest(TestCase):
     """Data page Screening Agent: build_row resolves the screening facilitator
     (Screening.facilitator_id -> UniteUsAgent.employee_id -> name) into
