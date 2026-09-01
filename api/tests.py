@@ -5241,6 +5241,76 @@ class EnrollmentCaseBindingGateTest(TestCase):
         self.assertEqual(EnrollmentVerification.objects.filter(client=c).count(), 1)
 
 
+class ResolveDoubleServingCommandTest(TestCase):
+    """resolve_double_serving_enrollments retires the stray navigation-case
+    enrollment and keeps the governing internal-service one; it SKIPS a stray with
+    no live internal-service survivor (unsafe to auto-retire)."""
+
+    def _member(self, *, with_is_survivor):
+        from django.utils import timezone
+
+        from .models import (
+            Case, CaseStatus, CaseType, Client, EnrollmentStage,
+            EnrollmentVerification, Household, HouseholdMember,
+        )
+        c = Client.objects.create(client_id=str(uuid.uuid4()), first_name="Dbl", last_name="Serve")
+        hh = Household.objects.create(name="HH")
+        HouseholdMember.objects.create(household=hh, client=c, is_primary=True)
+        nav = Case.objects.create(
+            case_id=str(uuid.uuid4()), client=c, case_type=CaseType.NAVIGATION,
+            case_status=CaseStatus.OPEN,
+        )
+        stray = EnrollmentVerification.objects.create(
+            client=c, household=hh, case=nav,
+            stage=EnrollmentStage.SERVICE_ACTIVE, verified_at=timezone.now(),
+        )
+        survivor = None
+        if with_is_survivor:
+            isc = Case.objects.create(
+                case_id=str(uuid.uuid4()), client=c, case_type=CaseType.INTERNAL_SERVICE,
+                case_status=CaseStatus.OPEN,
+            )
+            survivor = EnrollmentVerification.objects.create(
+                client=c, household=hh, case=isc,
+                stage=EnrollmentStage.SERVICE_ACTIVE, verified_at=timezone.now(),
+            )
+        return c, stray, survivor
+
+    def test_retires_stray_when_is_survivor_exists(self):
+        from io import StringIO
+
+        from django.core.management import call_command
+
+        from .models import EnrollmentStage
+
+        c, stray, survivor = self._member(with_is_survivor=True)
+        call_command(
+            "resolve_double_serving_enrollments", "--client", str(c.client_id),
+            "--apply", stdout=StringIO(),
+        )
+        survivor.refresh_from_db()
+        stray.refresh_from_db()
+        self.assertEqual(EnrollmentStage(survivor.stage), EnrollmentStage.SERVICE_ACTIVE)
+        self.assertEqual(EnrollmentStage(stray.stage), EnrollmentStage.DISREGARDED)
+        self.assertIsNone(stray.case_id)
+
+    def test_skips_when_no_is_survivor(self):
+        from io import StringIO
+
+        from django.core.management import call_command
+
+        from .models import EnrollmentStage
+
+        c, stray, _ = self._member(with_is_survivor=False)
+        call_command(
+            "resolve_double_serving_enrollments", "--client", str(c.client_id),
+            "--apply", stdout=StringIO(),
+        )
+        stray.refresh_from_db()
+        # Untouched -- the stray may be the only thing serving them.
+        self.assertEqual(EnrollmentStage(stray.stage), EnrollmentStage.SERVICE_ACTIVE)
+
+
 class WorkQueueResolvedDateFilterTest(TestCase):
     """Work Queue resolved-date filter: resolved_from/resolved_to bound tickets by
     their resolved_at (local calendar day); unresolved tickets are excluded."""
