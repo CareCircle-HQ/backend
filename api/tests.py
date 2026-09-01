@@ -5310,6 +5310,48 @@ class ResolveDoubleServingCommandTest(TestCase):
         # Untouched -- the stray may be the only thing serving them.
         self.assertEqual(EnrollmentStage(stray.stage), EnrollmentStage.SERVICE_ACTIVE)
 
+    def test_prefers_delivery_type_address(self):
+        # Survivor holds a 'temporary' (no-unit) address; the stray holds the
+        # proper 'delivery' address (with apt) -> carry the delivery-type one.
+        from io import StringIO
+
+        from django.core.management import call_command
+        from django.utils import timezone
+
+        from .models import (
+            Address, Case, CaseStatus, CaseType, Client, EnrollmentStage,
+            EnrollmentVerification, Household, HouseholdMember,
+        )
+        c = Client.objects.create(client_id=str(uuid.uuid4()), first_name="Addr", last_name="Pref")
+        hh = Household.objects.create(name="HH")
+        HouseholdMember.objects.create(household=hh, client=c, is_primary=True)
+        isc = Case.objects.create(
+            case_id=str(uuid.uuid4()), client=c, case_type=CaseType.INTERNAL_SERVICE,
+            case_status=CaseStatus.OPEN,
+        )
+        nav = Case.objects.create(
+            case_id=str(uuid.uuid4()), client=c, case_type=CaseType.NAVIGATION,
+            case_status=CaseStatus.OPEN,
+        )
+        temp = Address.objects.create(client=c, type="temporary", street="1 Main St", zip="11111")
+        deliv = Address.objects.create(client=c, type="delivery", street="1 Main St Apt 5", zip="11111")
+        survivor = EnrollmentVerification.objects.create(
+            client=c, household=hh, case=isc, stage=EnrollmentStage.SERVICE_ACTIVE,
+            verified_at=timezone.now(), delivery_address=temp,
+        )
+        stray = EnrollmentVerification.objects.create(
+            client=c, household=hh, case=nav, stage=EnrollmentStage.SERVICE_ACTIVE,
+            verified_at=timezone.now(), delivery_address=deliv,
+        )
+        call_command(
+            "resolve_double_serving_enrollments", "--client", str(c.client_id),
+            "--apply", stdout=StringIO(),
+        )
+        survivor.refresh_from_db()
+        stray.refresh_from_db()
+        self.assertEqual(survivor.delivery_address_id, deliv.pk)  # carried delivery-type
+        self.assertEqual(EnrollmentStage(stray.stage), EnrollmentStage.DISREGARDED)
+
 
 class WorkQueueResolvedDateFilterTest(TestCase):
     """Work Queue resolved-date filter: resolved_from/resolved_to bound tickets by

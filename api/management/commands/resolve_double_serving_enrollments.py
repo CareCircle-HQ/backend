@@ -92,22 +92,42 @@ class Command(BaseCommand):
                 f"kitchen={stray.kitchen.name if stray.kitchen_id else None}, "
                 f"addr={stray.delivery_address_id})"
             )
-            # Address handling.
-            carry_addr = (
-                survivor.delivery_address_id is None
-                and stray.delivery_address_id is not None
-            )
-            if (
-                not carry_addr
-                and survivor.delivery_address_id
-                and stray.delivery_address_id
-                and survivor.delivery_address_id != stray.delivery_address_id
-            ):
-                self.stdout.write(
-                    f"    ADDRESS MISMATCH -- survivor addr {survivor.delivery_address_id} "
-                    f"vs stray addr {stray.delivery_address_id}: NOT overwritten, "
-                    "reconcile manually (stray may hold the apt/unit)."
-                )
+            # Address handling -- PREFER the type='delivery' address. The survivor
+            # sometimes carries only a 'temporary' (no-unit) capture while the stray
+            # holds the proper 'delivery' address (with apt), or vice versa. Newest
+            # is NOT a reliable signal here.
+            from api.models import Address
+
+            surv_a = (Address.objects.filter(pk=survivor.delivery_address_id).first()
+                      if survivor.delivery_address_id else None)
+            stray_a = (Address.objects.filter(pk=stray.delivery_address_id).first()
+                       if stray.delivery_address_id else None)
+
+            def _is_delivery(a):
+                return bool(a) and (a.type or "").lower() == "delivery"
+
+            carry_addr = False
+            if surv_a is None and stray_a is not None:
+                carry_addr = True  # survivor blank -> take the stray's
+            elif surv_a and stray_a and surv_a.pk != stray_a.pk:
+                if _is_delivery(stray_a) and not _is_delivery(surv_a):
+                    carry_addr = True
+                    self.stdout.write(
+                        f"    carry delivery-type addr {stray_a.pk} "
+                        f"('{stray_a.street}') over survivor's {surv_a.type} "
+                        f"addr {surv_a.pk} ('{surv_a.street}')"
+                    )
+                elif _is_delivery(surv_a):
+                    self.stdout.write(
+                        f"    survivor already has the delivery-type addr {surv_a.pk} "
+                        f"('{surv_a.street}'); keeping it."
+                    )
+                else:
+                    self.stdout.write(
+                        f"    ADDRESS MISMATCH (no clear delivery-type) -- survivor "
+                        f"{surv_a.pk}/{surv_a.type} vs stray {stray_a.pk}/{stray_a.type}: "
+                        "NOT overwritten, reconcile manually."
+                    )
             # Report imminent duplicate POs on the stray's kitchen.
             dup_pos = DeliveryOrder.objects.filter(
                 member_id=c.client_id, kitchen=stray.kitchen,
