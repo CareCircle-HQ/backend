@@ -608,7 +608,10 @@ def build_row(client):
         "menu_type": menu_type,
         "current_delivery_status": cur_del,
         "last_po_delivery_status": last_po_del,
-        "last_delivered_at": last_delivered,
+        # Coerce at the storage boundary too (belt-and-suspenders): last_delivered
+        # is derived from a DateField, so guarantee it lands aware regardless of
+        # the source, silencing the naive-datetime warning on save.
+        "last_delivered_at": _as_aware(last_delivered),
         "in_any_po": in_any_po,
         "has_pending_verification_enrollment": has_pending_verif,
         "has_verified_enrollment": has_verified_enr,

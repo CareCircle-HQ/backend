@@ -5126,6 +5126,28 @@ class MembersListSortDenormTest(TestCase):
         self.assertTrue(M._flat_needs_distinct({"status": "verified"}))
 
 
+class AsAwareCoercionTest(TestCase):
+    """_as_aware coerces a date or a naive datetime into a timezone-AWARE datetime
+    so the Data page's last_delivered_at never triggers the naive-datetime warning
+    (or shifts days) when stored in a DateTimeField."""
+
+    def test_coerces_date_and_naive_datetime(self):
+        import datetime
+
+        from django.utils import timezone
+
+        from .services.enrollment_analytics import _as_aware
+
+        for v in (datetime.date(2026, 8, 17), datetime.datetime(2026, 8, 17, 0, 0, 0)):
+            r = _as_aware(v)
+            self.assertIsNotNone(r)
+            self.assertFalse(timezone.is_naive(r))
+        self.assertIsNone(_as_aware(None))
+        # An already-aware datetime is returned unchanged.
+        aware = timezone.now()
+        self.assertEqual(_as_aware(aware), aware)
+
+
 class CompanyStatusNotEligibleTest(TestCase):
     """A member parked on the not_eligible/ineligible lifecycle off-ramp (closed
     enrollment, but a lingering open case -- e.g. after a Household->Individual
