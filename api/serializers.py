@@ -1197,7 +1197,13 @@ class EnrollmentVerificationSerializer(serializers.ModelSerializer):
         if existing is not None:
             if hid:
                 existing.household = Household.objects.filter(pk=hid).first()
-            if case is not None:
+            # Bind ONLY an internal-service case. A navigation / eligibility case must
+            # never attach to a verification enrollment -- doing so stranded the
+            # verified delivery address on a nav-case row while the real
+            # internal-service enrollment stayed blank. Reusing the existing (IS)
+            # enrollment and ignoring the non-IS case lands the address/data on the
+            # right row instead.
+            if case is not None and case.case_type == CaseType.INTERNAL_SERVICE:
                 existing.case = case
             if aid:
                 existing.delivery_address = Address.objects.filter(pk=aid).first()
@@ -1213,7 +1219,9 @@ class EnrollmentVerificationSerializer(serializers.ModelSerializer):
         enrollment = EnrollmentVerification.objects.create(
             client=client,
             household=Household.objects.filter(pk=hid).first() if hid else None,
-            case=case,
+            # Only an internal-service case may govern a verification enrollment;
+            # a navigation/eligibility case is left off (never bound).
+            case=case if (case is not None and case.case_type == CaseType.INTERNAL_SERVICE) else None,
             delivery_address=Address.objects.filter(pk=aid).first() if aid else None,
             **validated_data,
         )
@@ -1246,7 +1254,11 @@ class EnrollmentVerificationSerializer(serializers.ModelSerializer):
         if hid is not _UNSET:
             instance.household = Household.objects.filter(pk=hid).first() if hid else None
         if case_id is not _UNSET:
-            instance.case = Case.objects.filter(pk=case_id).first() if case_id else None
+            _c = Case.objects.filter(pk=case_id).first() if case_id else None
+            # Bind only an internal-service case; a non-IS case is ignored (enrollments
+            # never attach to navigation/eligibility). An explicit empty case_id clears.
+            if _c is None or _c.case_type == CaseType.INTERNAL_SERVICE:
+                instance.case = _c
         if aid is not _UNSET:
             instance.delivery_address = (
                 Address.objects.filter(pk=aid).first() if aid else None

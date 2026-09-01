@@ -33,7 +33,9 @@ NOT_ASSIGNED = "__none__"
 
 
 def _cadence_from_weekdays(weekdays):
-    """Normalize delivery weekdays -> a DeliveryCadence-style code for filtering."""
+    """Normalize delivery weekdays -> a DeliveryCadence-style code for filtering.
+    Lossy fallback only (see _cadence_for_client) -- it collapses distinct single-
+    day cadences to 'once_a_week' and can't name arbitrary day-sets."""
     s = {(w or "").strip().lower()[:3] for w in (weekdays or []) if w}
     if s == {"mon", "thu"}:
         return "mon_thu"
@@ -42,6 +44,28 @@ def _cadence_from_weekdays(weekdays):
     if len(s) == 1:
         return "once_a_week"
     return ""
+
+
+def _cadence_for_client(client, enr):
+    """The member's ACTUAL delivery cadence code -- MemberDeliverySchedule.
+    delivery_days_cadence (a DeliveryCadence code), the same field the Members-list
+    cadence filter matches. Preferred over deriving it from weekdays, which
+    collapsed distinct cadences (mon_only/tue_only -> once_a_week) and dropped
+    unrecognized day-sets, making the Data page cadence filter inaccurate. Falls
+    back to the weekday derivation only when the member has no schedule cadence."""
+    from api.models import MemberDeliverySchedule
+
+    qs = MemberDeliverySchedule.objects.filter(member_profile__client=client)
+    if enr is not None:
+        qs = qs.filter(enrollment=enr)
+    code = (
+        qs.exclude(delivery_days_cadence="")
+        .values_list("delivery_days_cadence", flat=True)
+        .first()
+    )
+    if code:
+        return code
+    return _cadence_from_weekdays(enr.delivery_weekdays if enr is not None else [])
 
 
 def _clean(seq):
@@ -169,6 +193,23 @@ def _agent_name_by_employee_id(employee_id):
 
 
 @lru_cache(maxsize=4096)
+def _team_by_creator_name(name):
+    """CareCircle originating team of the Unite Us agent with this NAME. Fallback
+    for EXTENSION-created cases whose ``created_by_id`` isn't the agent's Unite Us
+    user_id (so the id lookup misses) but whose ``created_by_name`` matches a real
+    Unite Us agent. Cached per build. Blank when unresolved."""
+    name = (name or "").strip()
+    if not name:
+        return ""
+    from api.models import UniteUsAgent
+    ag = (
+        UniteUsAgent.objects.filter(name__iexact=name)
+        .exclude(originating_team="").first()
+    )
+    return (ag.originating_team or "") if ag else ""
+
+
+@lru_cache(maxsize=4096)
 def _team_by_user_id(user_id):
     """CareCircle originating team of the Unite Us agent (case creator) with this
     user_id. Cached across the build; cleared per rebuild. Blank when unresolved."""
@@ -183,17 +224,22 @@ def _fallback_case_team(client):
     """Team for a member with NO internal-service case: the CareCircle team of the
     agent who created the member's MOST-RECENT case of ANY type. Blank when none of
     their cases has a resolvable creator (so a truly caseless member stays blank)."""
-    cand = [ca for ca in client.cases.all() if ca.created_by_id]
+    cand = [
+        ca for ca in client.cases.all()
+        if ca.created_by_id or (ca.created_by_name or "").strip()
+    ]
     if not cand:
         return ""
     ca = max(cand, key=lambda c: (c.date_opened is not None, c.date_opened))
-    return _team_by_user_id(ca.created_by_id)
+    # id first, then the creator-name fallback (ext-created cases).
+    return _team_by_user_id(ca.created_by_id) or _team_by_creator_name(ca.created_by_name)
 
 
 def _reset_screening_agent_cache():
     """Drop the per-build lookup caches so a rebuild picks up renamed agents/teams."""
     _agent_name_by_employee_id.cache_clear()
     _team_by_user_id.cache_clear()
+    _team_by_creator_name.cache_clear()
 
 
 def _screening_assessment(client_id):
@@ -241,11 +287,20 @@ def _parity_fields(client):
     except Exception:  # noqa: BLE001
         service_type = ""
     try:
-        from api.portal.views_members import MembersListView
-        team = (MembersListView()._case_team_map([client]) or {}).get(str(client.client_id), "") or ""
-        # No internal-service case (or its creator didn't resolve)? Attribute the
-        # member to the team that created their most-recent case of ANY type, so
-        # nav/eligibility/screening-only members aren't left blank on the Data page.
+        from api.portal.serializers import governing_service_case_for_display
+        # Resolve the team from the SAME governing case the read model uses for
+        # case_type/case_status/etc. (governing_service_case_for_display) -- NOT a
+        # separate internal_service_case lookup, which disagreed and left members
+        # the Data page tags "IS" with no team. Match by created_by_id -> Unite Us
+        # user_id, then fall back to created_by_name (ext-created cases store a
+        # created_by_id that isn't the agent's Unite Us user_id).
+        gov = governing_service_case_for_display(client)
+        team = ""
+        if gov is not None:
+            team = _team_by_user_id(gov.created_by_id) or _team_by_creator_name(gov.created_by_name)
+        # Still blank (no governing case, or its creator didn't resolve)? Attribute
+        # the member to the team that created their most-recent case of ANY type,
+        # so nav/eligibility/screening-only members aren't left blank.
         if not team:
             team = _fallback_case_team(client)
     except Exception:  # noqa: BLE001
@@ -298,7 +353,8 @@ def _parity_fields(client):
 
 
 def _company_status(enrollment, case, parity, in_any_po, has_medicaid, has_social,
-                    member_status="", in_household=False, has_active_delivery=False):
+                    member_status="", in_household=False, has_active_delivery=False,
+                    lifecycle_stage=""):
     if case is None or getattr(case, "case_type", "") != _INTERNAL_SERVICE:
         # No governing internal-service case they hold OR are covered by -- both
         # the enrollment fallback and the household-PRIMARY fallback (build_row)
@@ -325,6 +381,12 @@ def _company_status(enrollment, case, parity, in_any_po, has_medicaid, has_socia
     not_eligible = (
         (not has_medicaid) or (not has_social)
         or parity.get("eligibility") == "ineligible"
+        # The member is parked on the not-eligible / ineligible lifecycle off-ramp
+        # (e.g. denied, or off-ramped after a Household->Individual scope change).
+        # Their enrollment is closed and they aren't being served, so they belong
+        # in Unable -- NOT Pending, which their lingering open case would otherwise
+        # imply. (Raw Medicaid can still read active, so key off the stage too.)
+        or (lifecycle_stage or "").lower() in ("not_eligible", "ineligible")
     )
     if (parity.get("out_of_orbit") or parity.get("out_of_range")
             or not_eligible or auth == "denied"
@@ -540,13 +602,16 @@ def build_row(client):
         "member_created_at": client.created_at,
         "care_coordinator": client.care_coordinator or "",
         "primary_care_coordinator": (case.primary_worker_name if case else "") or "",
-        "cadence": _cadence_from_weekdays(enr.delivery_weekdays if enr is not None else []),
+        "cadence": _cadence_for_client(client, enr),
         "kitchen_id": (enr.kitchen_id if enr is not None else None),
         "kitchen_name": (enr.kitchen.name if (enr is not None and enr.kitchen_id) else ""),
         "menu_type": menu_type,
         "current_delivery_status": cur_del,
         "last_po_delivery_status": last_po_del,
-        "last_delivered_at": last_delivered,
+        # Coerce at the storage boundary too (belt-and-suspenders): last_delivered
+        # is derived from a DateField, so guarantee it lands aware regardless of
+        # the source, silencing the naive-datetime warning on save.
+        "last_delivered_at": _as_aware(last_delivered),
         "in_any_po": in_any_po,
         "has_pending_verification_enrollment": has_pending_verif,
         "has_verified_enrollment": has_verified_enr,
@@ -595,6 +660,7 @@ def build_row(client):
         "company_status": _company_status(
             enr, case, parity, in_any_po, has_medicaid, has_social, member_status,
             in_household=membership is not None, has_active_delivery=has_active_delivery,
+            lifecycle_stage=(getattr(client, "lifecycle_stage", "") or ""),
         ),
         # Nutrition-review status + delivery company on latest order.
         "nutritionist_status": _nutritionist_status(enr, parity.get("tags") or []),
@@ -708,8 +774,19 @@ def filter_analytics(params):
 
     search = g("search")
     if search:
+        # Single-field matches: a first/last-name substring or the medicaid id.
         cond = Q(first_name__icontains=search) | Q(last_name__icontains=search) \
             | Q(medicaid_id__icontains=search)
+        # Full-name search: "First Last" (or "Last First", or a middle name) is
+        # matched by requiring EACH token to appear in the first OR last name --
+        # neither field alone contains the whole string, which is why a full name
+        # returned nothing before.
+        terms = search.split()
+        if len(terms) > 1:
+            name_q = Q()
+            for term in terms:
+                name_q &= (Q(first_name__icontains=term) | Q(last_name__icontains=term))
+            cond |= name_q
         try:
             import uuid as _uuid
             cond |= Q(client_id=_uuid.UUID(search)) | Q(enrollment_id=int(search)) \

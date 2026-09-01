@@ -125,6 +125,8 @@ from ..services.lifecycle import (
     recompute_enrollment_household,
     reconcile_enrollment_authorization,
     refresh_internal_case_sort,
+    valid_medicaid_exists,
+    valid_social_care_exists,
     reopen_for_verification,
     split_dependent_into_own_enrollment,
 )
@@ -1583,10 +1585,24 @@ class MembersListView(PortalGenericAPIView):
             open_internal_case = Case.objects.filter(
                 client=OuterRef("pk"), case_type=CaseType.INTERNAL_SERVICE,
             ).exclude(case_status__in=[CaseStatus.CLOSED, CaseStatus.CANCELLED])
-            qs = qs.filter(is_new=True).filter(Exists(open_internal_case)).exclude(
+            # Every ELIGIBLE member with an open internal-service case who has NOT
+            # entered verification yet -- NOT just the brand-new (is_new) ones. The
+            # rule:
+            #   * an OPEN internal-service (meal/box) case, and
+            #   * NO enrollment yet (own OR household -- an enrollment means
+            #     verification was already requested/handled), and
+            #   * ELIGIBLE: valid Medicaid + valid social care, and NOT on the
+            #     not_eligible/ineligible lifecycle off-ramp, and
+            #   * NOT manually dismissed from the list (urgent_care_dismissed).
+            # is_new is no longer a gate here, so dismissal keys off its own flag.
+            qs = qs.filter(Exists(open_internal_case)).filter(
+                valid_medicaid_exists(), valid_social_care_exists(),
+            ).exclude(
                 Q(enrollments__isnull=False)
                 | Q(household_membership__household__enrollment_verifications__isnull=False)
-            ).distinct()
+            ).exclude(
+                lifecycle_stage__in=[ClientStage.NOT_ELIGIBLE, ClientStage.INELIGIBLE]
+            ).exclude(urgent_care_dismissed=True).distinct()
             # Optional case-created date-range filter (Urgent Care triage): keep
             # only members whose governing internal-service case was OPENED within
             # [case_from, case_to]. Matched against the internal-service case's
@@ -2157,17 +2173,30 @@ class MembersListView(PortalGenericAPIView):
     def _case_team_map(self, page):
         """{client_id(str): originating_team} for the page -- the CareCircle team
         of the Unite Us agent who CREATED each member's governing internal-service
-        case (Case.created_by_id == UniteUsAgent.user_id). Batched into ONE
-        UniteUsAgent query over the page's distinct creator ids to avoid an N+1.
-        Blank when the case has no known creator or the creator isn't a known
-        Unite Us agent."""
-        creator_by_client = {}
-        creator_ids = set()
+        case.
+
+        Primary match: Case.created_by_id == UniteUsAgent.user_id. FALLBACK: the
+        creator's NAME (Case.created_by_name == UniteUsAgent.name) -- an
+        EXTENSION-created case stores a created_by_id that ISN'T the agent's Unite
+        Us user_id, so the id lookup misses even though the name maps to a real
+        team; without this those members wrongly show as 'No Team / Unassigned'.
+        Both lookups are batched to avoid an N+1. Blank only when neither the id
+        nor the name resolves to a Unite Us agent."""
+        creator_by_client = {}  # cid -> (uid_lower, name)
+        creator_ids, names = set(), set()
         for c in page:
             case = s.internal_service_case(c)
-            if case is not None and case.created_by_id:
-                creator_by_client[str(c.client_id)] = str(case.created_by_id).lower()
+            if case is None:
+                continue
+            uid = str(case.created_by_id).lower() if case.created_by_id else ""
+            name = (case.created_by_name or "").strip()
+            if not uid and not name:
+                continue
+            creator_by_client[str(c.client_id)] = (uid, name)
+            if case.created_by_id:
                 creator_ids.add(case.created_by_id)
+            if name:
+                names.add(name)
         team_by_uid = {}
         if creator_ids:
             team_by_uid = {
@@ -2176,9 +2205,19 @@ class MembersListView(PortalGenericAPIView):
                     user_id__in=creator_ids
                 ).values_list("user_id", "originating_team")
             }
+        # Name fallback -- only for creators whose id didn't resolve to a team.
+        unresolved = {n for (u, n) in creator_by_client.values() if n and not team_by_uid.get(u)}
+        team_by_name = {}
+        if unresolved:
+            for nm, team in UniteUsAgent.objects.filter(
+                name__in=unresolved
+            ).values_list("name", "originating_team"):
+                key = (nm or "").strip()
+                if team and key not in team_by_name:
+                    team_by_name[key] = team
         return {
-            cid: team_by_uid.get(uid, "")
-            for cid, uid in creator_by_client.items()
+            cid: (team_by_uid.get(uid, "") or team_by_name.get(name, ""))
+            for cid, (uid, name) in creator_by_client.items()
         }
 
     def _stamp_added_via(self, groups):
@@ -6651,18 +6690,17 @@ class MemberVerificationDisregardView(PortalAPIView):
 class MemberDismissAttentionView(PortalAPIView):
     """POST: dismiss a client from the Urgent Care ("Need Attention") list.
 
-    Clears the ``is_new`` flag so a client that no longer needs verification
-    attention (e.g. verified through another path, or flagged in error) drops
-    off the list. Normally ``is_new`` clears automatically when a verification
-    completes; this is the manual escape hatch for the stragglers that aren't
-    pending verification. Idempotent (a no-op when already clear). Records an
-    audit Note."""
+    Sets the ``urgent_care_dismissed`` flag so the client drops off the list.
+    The list no longer keys off ``is_new`` (it shows every eligible member with
+    an open internal-service case and no enrollment yet), so dismissal needs its
+    own flag -- clearing ``is_new`` alone would no longer remove them. Idempotent
+    (a no-op when already dismissed). Records an audit Note."""
 
     def post(self, request, client_id):
         client = get_object_or_404(Client, pk=client_id)
-        if client.is_new:
-            client.is_new = False
-            client.save(update_fields=["is_new"])
+        if not client.urgent_care_dismissed:
+            client.urgent_care_dismissed = True
+            client.save(update_fields=["urgent_care_dismissed"])
             agent = current_agent(request)
             author = agent.name if agent else ""
             Note.objects.create(
@@ -7363,11 +7401,22 @@ class BulkAssignBoxesView(PortalAPIView):
                     if enrollment_ready_for_assignment(e, kitchens_ctx)
                 ]
             enrollments = _bulk_filter_enrollments(enrollments, request.data)
+            # Only households the SELECTED box kitchen can fully serve are
+            # assignable; the rest are surfaced but not assignable (same hard
+            # rule as the meals flow).
+            offered = kitchen_offered_menu_index(kitchen)
+            servable, excluded = [], []
+            for enr in enrollments:
+                prev = _preview_household_for_kitchen(enr, kitchen, offered)
+                (servable if prev["fully_covered"] else excluded).append((enr, prev))
             return Response({
                 "kitchen_id": str(kitchen.pk),
                 "kitchen_name": kitchen.name,
                 "total": len(enrollments),
-                "candidates": [_bulk_candidate_row(e) for e in enrollments],
+                "fully_covered": len(servable),
+                "with_exclusions": len(excluded),
+                "households": [p for _, p in excluded],
+                "candidates": [_bulk_candidate_row(e) for e, _ in servable],
             })
 
         # The cadence (and thus the delivery weekday) comes from the SELECTED
@@ -7413,8 +7462,14 @@ class BulkAssignBoxesView(PortalAPIView):
         # matching the preview so the applied set equals the reviewed set.
         enrollments = _bulk_filter_enrollments(enrollments, request.data)
 
-        assigned, out_of_orbit, failed, errors = 0, 0, 0, []
+        # HARD RULE (same as meals): never bulk-assign a household the selected
+        # kitchen can't fully serve -- skip it for individual assignment instead.
+        offered = kitchen_offered_menu_index(kitchen)
+        assigned, skipped, out_of_orbit, failed, errors = 0, 0, 0, 0, []
         for enr in enrollments:
+            if not _preview_household_for_kitchen(enr, kitchen, offered)["fully_covered"]:
+                skipped += 1
+                continue
             try:
                 with transaction.atomic():
                     result = assign_kitchen_to_household(
@@ -7436,6 +7491,7 @@ class BulkAssignBoxesView(PortalAPIView):
             "kitchen_name": kitchen.name,
             "total": len(enrollments),
             "assigned": assigned,
+            "skipped": skipped,
             "out_of_orbit": out_of_orbit,
             "failed": failed,
             "errors": errors,
@@ -7663,36 +7719,34 @@ class BulkAssignMealsView(PortalAPIView):
         # Preview: dry-run only, report the matched households (the filtered set
         # the agent is about to assign) plus which of them would have exclusions.
         if request.data.get("preview"):
-            fully_covered, with_exclusions, households = 0, 0, []
+            servable, excluded = [], []
             for enr in enrollments:
                 prev = _preview_household_for_kitchen(enr, kitchen, offered)
-                if prev["fully_covered"]:
-                    fully_covered += 1
-                else:
-                    with_exclusions += 1
-                    households.append(prev)
+                (servable if prev["fully_covered"] else excluded).append((enr, prev))
             return Response({
                 "kitchen_id": str(kitchen.pk),
                 "kitchen_name": kitchen.name,
                 "total": len(enrollments),
-                "fully_covered": fully_covered,
-                "with_exclusions": with_exclusions,
-                # Only the households needing attention (keeps the payload bounded).
-                "households": households,
-                # The full matched set (result of the filters) for the preview list.
-                "candidates": [_bulk_candidate_row(e) for e in enrollments],
+                "fully_covered": len(servable),
+                "with_exclusions": len(excluded),
+                # Households this kitchen CAN'T fully serve -- NOT assignable here
+                # (shown so the agent can assign them to a capable kitchen).
+                "households": [p for _, p in excluded],
+                # Only the servable set is assignable to this kitchen.
+                "candidates": [_bulk_candidate_row(e) for e, _ in servable],
             })
 
-        # Apply.
-        only_covered = request.data.get("only_covered", True)
+        # Apply. HARD RULE: a household the SELECTED kitchen can't fully serve is
+        # NEVER bulk-assigned -- a member with a blocker for this kitchen (menu it
+        # doesn't offer / an allergy it can't handle) must not be routed here (it
+        # would just be set Out of Orbit). Those households are skipped and left
+        # for individual assignment to a kitchen that CAN serve them.
         agent = current_agent(request)
         assigned, skipped, out_of_orbit, failed, errors = 0, 0, 0, 0, []
         for enr in enrollments:
-            if only_covered:
-                prev = _preview_household_for_kitchen(enr, kitchen, offered)
-                if not prev["fully_covered"]:
-                    skipped += 1
-                    continue
+            if not _preview_household_for_kitchen(enr, kitchen, offered)["fully_covered"]:
+                skipped += 1
+                continue
             try:
                 with transaction.atomic():
                     result = assign_kitchen_to_household(

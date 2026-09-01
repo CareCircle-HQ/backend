@@ -4931,6 +4931,79 @@ class ReopenEnrollmentForNewCaseTest(TestCase):
         self.assertIsNone(new.verified_at)                         # verification dropped
         self.assertEqual(new.member_profiles.count(), 1)           # roster still carried
 
+    def _setup_unverified(self, *, menu="Standard", nutrition=False, address=True):
+        """Prior CLOSED enrollment whose ``verified_at`` was CLEARED (verification
+        reverted on an auth denial) but whose intake may still be complete."""
+        from django.utils import timezone
+
+        from .models import (
+            Address, Case, CaseStatus, CaseType, Client, EnrollmentStage,
+            EnrollmentVerification, Household, HouseholdMember,
+            MemberDietaryProfile, MemberStatus, ServiceAuthorizationStatus,
+        )
+        now = timezone.now()
+        c = Client.objects.create(client_id=str(uuid.uuid4()), first_name="Un", last_name="Verified")
+        hh = Household.objects.create(name="HH")
+        HouseholdMember.objects.create(household=hh, client=c, is_primary=True)
+        old_case = Case.objects.create(
+            case_id=str(uuid.uuid4()), client=c, case_type=CaseType.INTERNAL_SERVICE,
+            case_status=CaseStatus.CLOSED,
+            service_authorization_status=ServiceAuthorizationStatus.DENIED,
+            program_name="Clinically Appropriate Meals",
+        )
+        addr = Address.objects.create(client=c, type="temporary", zip="11201") if address else None
+        prior = EnrollmentVerification.objects.create(
+            client=c, household=hh, case=old_case, stage=EnrollmentStage.CLOSED,
+            program_name="Clinically Appropriate Meals",
+            verified_at=None,  # cleared on the denial revert
+            delivery_address=addr,
+            nutritionist_approved_at=(now if nutrition else None),
+            closed_at=now,
+        )
+        MemberDietaryProfile.objects.create(
+            enrollment=prior, client=c, member_name="Un", menu_type=menu,
+            status=MemberStatus.ACTIVE,
+        )
+        new_case = Case.objects.create(
+            case_id=str(uuid.uuid4()), client=c, case_type=CaseType.INTERNAL_SERVICE,
+            case_status=CaseStatus.OPEN,
+            service_authorization_status=ServiceAuthorizationStatus.APPROVED,
+            program_name="Clinically Appropriate Meals",
+        )
+        return c, prior, new_case
+
+    def test_unverified_complete_with_nutrition_reopens_to_kitchen_assignment(self):
+        # verified_at cleared, but complete intake + nutrition approved -> resume
+        # straight to Kitchen Assignment (only a kitchen is missing).
+        from .models import EnrollmentStage
+        from .services.lifecycle import reopen_enrollment_for_new_case
+        c, prior, new_case = self._setup_unverified(nutrition=True)
+        new = reopen_enrollment_for_new_case(c, new_case)
+        self.assertIsNotNone(new)
+        self.assertEqual(EnrollmentStage(new.stage), EnrollmentStage.KITCHEN_ASSIGNMENT)
+        self.assertIsNotNone(new.verified_at)  # verification fact restored
+
+    def test_unverified_complete_without_nutrition_reopens_to_verified(self):
+        # Complete intake but NO nutrition sign-off -> Verified / Pending
+        # Nutritionist (must not skip the nutrition gate to Kitchen Assignment).
+        from .models import EnrollmentStage
+        from .services.lifecycle import reopen_enrollment_for_new_case
+        c, prior, new_case = self._setup_unverified(nutrition=False)
+        new = reopen_enrollment_for_new_case(c, new_case)
+        self.assertIsNotNone(new)
+        self.assertEqual(EnrollmentStage(new.stage), EnrollmentStage.VERIFIED)
+        self.assertIsNotNone(new.verified_at)
+
+    def test_unverified_incomplete_requires_reverification(self):
+        # Missing menu type -> intake incomplete -> genuine re-verification.
+        from .models import EnrollmentStage
+        from .services.lifecycle import reopen_enrollment_for_new_case
+        c, prior, new_case = self._setup_unverified(menu="")
+        new = reopen_enrollment_for_new_case(c, new_case)
+        self.assertIsNotNone(new)
+        self.assertEqual(EnrollmentStage(new.stage), EnrollmentStage.PENDING_VERIFICATION)
+        self.assertIsNone(new.verified_at)
+
     def test_skips_when_case_held_by_another_live_enrollment(self):
         # Cross-client/shared case (e.g. a relative): the new case is already held
         # by ANOTHER client's LIVE enrollment. Reopen must SKIP -- no crash, no
@@ -5051,6 +5124,427 @@ class MembersListSortDenormTest(TestCase):
         self.assertTrue(M._flat_needs_distinct({"kitchen": "1"}))
         self.assertTrue(M._flat_needs_distinct({"allergy": "milk"}))
         self.assertTrue(M._flat_needs_distinct({"status": "verified"}))
+
+
+class AsAwareCoercionTest(TestCase):
+    """_as_aware coerces a date or a naive datetime into a timezone-AWARE datetime
+    so the Data page's last_delivered_at never triggers the naive-datetime warning
+    (or shifts days) when stored in a DateTimeField."""
+
+    def test_coerces_date_and_naive_datetime(self):
+        import datetime
+
+        from django.utils import timezone
+
+        from .services.enrollment_analytics import _as_aware
+
+        for v in (datetime.date(2026, 8, 17), datetime.datetime(2026, 8, 17, 0, 0, 0)):
+            r = _as_aware(v)
+            self.assertIsNotNone(r)
+            self.assertFalse(timezone.is_naive(r))
+        self.assertIsNone(_as_aware(None))
+        # An already-aware datetime is returned unchanged.
+        aware = timezone.now()
+        self.assertEqual(_as_aware(aware), aware)
+
+
+class DataPageFullNameSearchTest(TestCase):
+    """Data page search matches a FULL name ('First Last' / 'Last First'), not
+    only a single name -- each token must appear in the first or last name."""
+
+    def test_full_name_search(self):
+        from .models import Client, EnrollmentAnalytics
+        from .services.enrollment_analytics import filter_analytics
+
+        c = Client.objects.create(client_id=str(uuid.uuid4()), first_name="Jane", last_name="Doe")
+        EnrollmentAnalytics.objects.create(
+            client=c, first_name="Jane", last_name="Doe", case_type="", case_status="",
+        )
+
+        def hit(term):
+            return filter_analytics({"search": term}).filter(client_id=c.client_id).exists()
+
+        self.assertTrue(hit("Jane"))          # first name only
+        self.assertTrue(hit("Doe"))           # last name only
+        self.assertTrue(hit("Jane Doe"))      # full name (was broken)
+        self.assertTrue(hit("Doe Jane"))      # reversed order
+        self.assertTrue(hit("jane doe"))      # case-insensitive
+        self.assertFalse(hit("Jane Smith"))   # wrong last name -> no match
+
+
+class EnrollmentCaseBindingGateTest(TestCase):
+    """EnrollmentVerificationSerializer binds ONLY internal-service cases -- a
+    navigation/eligibility case must never attach to a verification enrollment
+    (that stranded the verified delivery address on a nav-case sibling row)."""
+
+    def _case(self, client, case_type):
+        from .models import Case, CaseStatus
+
+        return Case.objects.create(
+            case_id=str(uuid.uuid4()), client=client, case_type=case_type,
+            case_status=CaseStatus.OPEN,
+        )
+
+    def test_navigation_case_not_bound_on_create(self):
+        from .models import CaseType, Client
+        from .serializers import EnrollmentVerificationSerializer
+
+        c = Client.objects.create(client_id=str(uuid.uuid4()), first_name="Nav", last_name="Only")
+        nav = self._case(c, CaseType.NAVIGATION)
+        ser = EnrollmentVerificationSerializer(data={
+            "client_id": str(c.client_id), "case_id": str(nav.case_id),
+            "members": [{"member_name": "Nav Only"}],
+        })
+        ser.is_valid(raise_exception=True)
+        enr = ser.save()
+        self.assertIsNone(enr.case_id)  # nav case NOT bound
+
+    def test_internal_service_case_is_bound(self):
+        from .models import CaseType, Client
+        from .serializers import EnrollmentVerificationSerializer
+
+        c = Client.objects.create(client_id=str(uuid.uuid4()), first_name="IS", last_name="Case")
+        isc = self._case(c, CaseType.INTERNAL_SERVICE)
+        ser = EnrollmentVerificationSerializer(data={
+            "client_id": str(c.client_id), "case_id": str(isc.case_id),
+            "members": [{"member_name": "IS Case"}],
+        })
+        ser.is_valid(raise_exception=True)
+        enr = ser.save()
+        self.assertEqual(str(enr.case_id), str(isc.case_id))
+
+    def test_nav_case_reuses_is_enrollment_without_clobbering(self):
+        # A nav case sent while the client has a pre-verify IS enrollment: REUSE the
+        # IS enrollment (keep its IS case) and land the address there -- don't fork a
+        # nav-bound row and don't strand the address.
+        from .models import (
+            Address, CaseType, Client, EnrollmentStage, EnrollmentVerification,
+        )
+        from .serializers import EnrollmentVerificationSerializer
+
+        c = Client.objects.create(client_id=str(uuid.uuid4()), first_name="Reuse", last_name="IS")
+        isc = self._case(c, CaseType.INTERNAL_SERVICE)
+        nav = self._case(c, CaseType.NAVIGATION)
+        existing = EnrollmentVerification.objects.create(
+            client=c, case=isc, stage=EnrollmentStage.PENDING_VERIFICATION,
+        )
+        addr = Address.objects.create(client=c, type="delivery", street="1 Main St", zip="11111")
+        ser = EnrollmentVerificationSerializer(data={
+            "client_id": str(c.client_id), "case_id": str(nav.case_id),
+            "delivery_address_id": str(addr.pk), "members": [{"member_name": "Reuse IS"}],
+        })
+        ser.is_valid(raise_exception=True)
+        enr = ser.save()
+        self.assertEqual(enr.pk, existing.pk)                 # reused, not forked
+        self.assertEqual(str(enr.case_id), str(isc.case_id))  # kept IS case, not nav
+        self.assertEqual(enr.delivery_address_id, addr.pk)    # address landed here
+        self.assertEqual(EnrollmentVerification.objects.filter(client=c).count(), 1)
+
+
+class ResolveDoubleServingCommandTest(TestCase):
+    """resolve_double_serving_enrollments retires the stray navigation-case
+    enrollment and keeps the governing internal-service one; it SKIPS a stray with
+    no live internal-service survivor (unsafe to auto-retire)."""
+
+    def _member(self, *, with_is_survivor):
+        from django.utils import timezone
+
+        from .models import (
+            Case, CaseStatus, CaseType, Client, EnrollmentStage,
+            EnrollmentVerification, Household, HouseholdMember,
+        )
+        c = Client.objects.create(client_id=str(uuid.uuid4()), first_name="Dbl", last_name="Serve")
+        hh = Household.objects.create(name="HH")
+        HouseholdMember.objects.create(household=hh, client=c, is_primary=True)
+        nav = Case.objects.create(
+            case_id=str(uuid.uuid4()), client=c, case_type=CaseType.NAVIGATION,
+            case_status=CaseStatus.OPEN,
+        )
+        stray = EnrollmentVerification.objects.create(
+            client=c, household=hh, case=nav,
+            stage=EnrollmentStage.SERVICE_ACTIVE, verified_at=timezone.now(),
+        )
+        survivor = None
+        if with_is_survivor:
+            isc = Case.objects.create(
+                case_id=str(uuid.uuid4()), client=c, case_type=CaseType.INTERNAL_SERVICE,
+                case_status=CaseStatus.OPEN,
+            )
+            survivor = EnrollmentVerification.objects.create(
+                client=c, household=hh, case=isc,
+                stage=EnrollmentStage.SERVICE_ACTIVE, verified_at=timezone.now(),
+            )
+        return c, stray, survivor
+
+    def test_retires_stray_when_is_survivor_exists(self):
+        from io import StringIO
+
+        from django.core.management import call_command
+
+        from .models import EnrollmentStage
+
+        c, stray, survivor = self._member(with_is_survivor=True)
+        call_command(
+            "resolve_double_serving_enrollments", "--client", str(c.client_id),
+            "--apply", stdout=StringIO(),
+        )
+        survivor.refresh_from_db()
+        stray.refresh_from_db()
+        self.assertEqual(EnrollmentStage(survivor.stage), EnrollmentStage.SERVICE_ACTIVE)
+        self.assertEqual(EnrollmentStage(stray.stage), EnrollmentStage.DISREGARDED)
+        self.assertIsNone(stray.case_id)
+
+    def test_skips_when_no_is_survivor(self):
+        from io import StringIO
+
+        from django.core.management import call_command
+
+        from .models import EnrollmentStage
+
+        c, stray, _ = self._member(with_is_survivor=False)
+        call_command(
+            "resolve_double_serving_enrollments", "--client", str(c.client_id),
+            "--apply", stdout=StringIO(),
+        )
+        stray.refresh_from_db()
+        # Untouched -- the stray may be the only thing serving them.
+        self.assertEqual(EnrollmentStage(stray.stage), EnrollmentStage.SERVICE_ACTIVE)
+
+    def test_prefers_delivery_type_address(self):
+        # Survivor holds a 'temporary' (no-unit) address; the stray holds the
+        # proper 'delivery' address (with apt) -> carry the delivery-type one.
+        from io import StringIO
+
+        from django.core.management import call_command
+        from django.utils import timezone
+
+        from .models import (
+            Address, Case, CaseStatus, CaseType, Client, EnrollmentStage,
+            EnrollmentVerification, Household, HouseholdMember,
+        )
+        c = Client.objects.create(client_id=str(uuid.uuid4()), first_name="Addr", last_name="Pref")
+        hh = Household.objects.create(name="HH")
+        HouseholdMember.objects.create(household=hh, client=c, is_primary=True)
+        isc = Case.objects.create(
+            case_id=str(uuid.uuid4()), client=c, case_type=CaseType.INTERNAL_SERVICE,
+            case_status=CaseStatus.OPEN,
+        )
+        nav = Case.objects.create(
+            case_id=str(uuid.uuid4()), client=c, case_type=CaseType.NAVIGATION,
+            case_status=CaseStatus.OPEN,
+        )
+        temp = Address.objects.create(client=c, type="temporary", street="1 Main St", zip="11111")
+        deliv = Address.objects.create(client=c, type="delivery", street="1 Main St Apt 5", zip="11111")
+        survivor = EnrollmentVerification.objects.create(
+            client=c, household=hh, case=isc, stage=EnrollmentStage.SERVICE_ACTIVE,
+            verified_at=timezone.now(), delivery_address=temp,
+        )
+        stray = EnrollmentVerification.objects.create(
+            client=c, household=hh, case=nav, stage=EnrollmentStage.SERVICE_ACTIVE,
+            verified_at=timezone.now(), delivery_address=deliv,
+        )
+        call_command(
+            "resolve_double_serving_enrollments", "--client", str(c.client_id),
+            "--apply", stdout=StringIO(),
+        )
+        survivor.refresh_from_db()
+        stray.refresh_from_db()
+        self.assertEqual(survivor.delivery_address_id, deliv.pk)  # carried delivery-type
+        self.assertEqual(EnrollmentStage(stray.stage), EnrollmentStage.DISREGARDED)
+
+    def test_skips_when_stray_holds_the_only_delivery_plan(self):
+        # Survivor (IS) is a hollow shell with NO delivery plan; the stray holds the
+        # live plan -> retiring it would strip service, so it is SKIPPED.
+        from io import StringIO
+
+        from django.core.management import call_command
+        from django.utils import timezone
+
+        from .models import (
+            Case, CaseStatus, CaseType, Client, DeliveryCadence, EnrollmentStage,
+            EnrollmentVerification, Household, HouseholdMember,
+            MemberDeliverySchedule, ScheduleStatus,
+        )
+        c = Client.objects.create(client_id=str(uuid.uuid4()), first_name="Holl", last_name="Ow")
+        hh = Household.objects.create(name="HH")
+        HouseholdMember.objects.create(household=hh, client=c, is_primary=True)
+        isc = Case.objects.create(
+            case_id=str(uuid.uuid4()), client=c, case_type=CaseType.INTERNAL_SERVICE,
+            case_status=CaseStatus.OPEN,
+        )
+        nav = Case.objects.create(
+            case_id=str(uuid.uuid4()), client=c, case_type=CaseType.NAVIGATION,
+            case_status=CaseStatus.OPEN,
+        )
+        survivor = EnrollmentVerification.objects.create(
+            client=c, household=hh, case=isc, stage=EnrollmentStage.SERVICE_ACTIVE,
+            verified_at=timezone.now(),  # NO delivery plan
+        )
+        stray = EnrollmentVerification.objects.create(
+            client=c, household=hh, case=nav, stage=EnrollmentStage.SERVICE_ACTIVE,
+            verified_at=timezone.now(),
+        )
+        MemberDeliverySchedule.objects.create(
+            enrollment=stray, member_name="Holl Ow",
+            delivery_days_cadence=DeliveryCadence.ONCE_A_WEEK,
+            status=ScheduleStatus.SCHEDULED,  # ends_on None -> live plan on the stray
+        )
+        call_command(
+            "resolve_double_serving_enrollments", "--client", str(c.client_id),
+            "--apply", stdout=StringIO(),
+        )
+        stray.refresh_from_db()
+        # NOT retired -- the survivor couldn't take over.
+        self.assertEqual(EnrollmentStage(stray.stage), EnrollmentStage.SERVICE_ACTIVE)
+
+    def test_excluded_client_is_skipped(self):
+        # A client on the bespoke-handling exclusion list is never auto-retired,
+        # even when it otherwise looks resolvable.
+        from io import StringIO
+
+        from django.core.management import call_command
+        from django.utils import timezone
+
+        from .management.commands.resolve_double_serving_enrollments import Command
+        from .models import (
+            Case, CaseStatus, CaseType, Client, EnrollmentStage,
+            EnrollmentVerification, Household, HouseholdMember,
+        )
+        excluded_id = next(iter(Command.EXCLUDED_CLIENTS))
+        c = Client.objects.create(client_id=excluded_id, first_name="Excl", last_name="Uded")
+        hh = Household.objects.create(name="HH")
+        HouseholdMember.objects.create(household=hh, client=c, is_primary=True)
+        isc = Case.objects.create(
+            case_id=str(uuid.uuid4()), client=c, case_type=CaseType.INTERNAL_SERVICE,
+            case_status=CaseStatus.OPEN,
+        )
+        nav = Case.objects.create(
+            case_id=str(uuid.uuid4()), client=c, case_type=CaseType.NAVIGATION,
+            case_status=CaseStatus.OPEN,
+        )
+        EnrollmentVerification.objects.create(
+            client=c, household=hh, case=isc, stage=EnrollmentStage.SERVICE_ACTIVE,
+            verified_at=timezone.now(),
+        )
+        stray = EnrollmentVerification.objects.create(
+            client=c, household=hh, case=nav, stage=EnrollmentStage.SERVICE_ACTIVE,
+            verified_at=timezone.now(),
+        )
+        call_command(
+            "resolve_double_serving_enrollments", "--client", str(c.client_id),
+            "--apply", stdout=StringIO(),
+        )
+        stray.refresh_from_db()
+        self.assertEqual(EnrollmentStage(stray.stage), EnrollmentStage.SERVICE_ACTIVE)
+
+
+class WorkQueueResolvedDateFilterTest(TestCase):
+    """Work Queue resolved-date filter: resolved_from/resolved_to bound tickets by
+    their resolved_at (local calendar day); unresolved tickets are excluded."""
+
+    def _ids(self, **params):
+        from rest_framework.request import Request
+        from rest_framework.test import APIRequestFactory
+
+        from .portal.views_tickets import WorkQueueView
+
+        v = WorkQueueView()
+        v.request = Request(APIRequestFactory().get("/x", params))
+        return set(v.get_queryset().values_list("pk", flat=True))
+
+    def test_filters_by_resolved_date(self):
+        import datetime
+
+        from django.utils import timezone
+
+        from .models import Ticket, TicketStatus, TicketType
+
+        tt, _ = TicketType.objects.get_or_create(
+            code="verification", defaults={"label": "Verification"}
+        )
+        early = Ticket.objects.create(
+            type=tt, status=TicketStatus.RESOLVED,
+            resolved_at=timezone.make_aware(datetime.datetime(2026, 8, 10, 12, 0)),
+        )
+        late = Ticket.objects.create(
+            type=tt, status=TicketStatus.RESOLVED,
+            resolved_at=timezone.make_aware(datetime.datetime(2026, 8, 20, 12, 0)),
+        )
+        unresolved = Ticket.objects.create(type=tt, status=TicketStatus.OPEN)
+
+        window = self._ids(resolved_from="2026-08-01", resolved_to="2026-08-15")
+        self.assertIn(early.pk, window)
+        self.assertNotIn(late.pk, window)
+        self.assertNotIn(unresolved.pk, window)  # no resolved_at -> excluded
+
+        from_only = self._ids(resolved_from="2026-08-16")
+        self.assertIn(late.pk, from_only)
+        self.assertNotIn(early.pk, from_only)
+
+
+class CompanyStatusNotEligibleTest(TestCase):
+    """A member parked on the not_eligible/ineligible lifecycle off-ramp (closed
+    enrollment, but a lingering open case -- e.g. after a Household->Individual
+    scope change) is Unable, not Pending, on the Data page."""
+
+    def test_not_eligible_lifecycle_is_unable(self):
+        from types import SimpleNamespace
+
+        from .services.enrollment_analytics import _INTERNAL_SERVICE, _company_status
+
+        case = SimpleNamespace(
+            case_type=_INTERNAL_SERVICE, case_status="open",
+            service_authorization_status="approved",
+        )
+        enr = SimpleNamespace(stage="closed", verified_at=None, nutritionist_approved_at=None)
+        parity = {
+            "eligibility": "eligible", "program_status": "",
+            "out_of_orbit": False, "out_of_range": False, "paused": False,
+        }
+        # Coverage reads active, but the member is on the not-eligible off-ramp.
+        self.assertEqual(
+            _company_status(enr, case, parity, False, True, True, lifecycle_stage="not_eligible"),
+            "unable",
+        )
+        # Without the off-ramp the same inputs would be Pending (regression guard).
+        self.assertEqual(
+            _company_status(enr, case, parity, False, True, True, lifecycle_stage="verified"),
+            "pending",
+        )
+
+
+class CaseTeamNameFallbackTest(TestCase):
+    """A member's team resolves from the case creator's NAME when the case's
+    created_by_id doesn't match a Unite Us agent (extension-created cases store a
+    created_by_id that isn't the agent's Unite Us user_id) -- so they don't wrongly
+    show as 'No Team / Unassigned' on the Members + Data pages."""
+
+    def test_team_resolves_by_creator_name(self):
+        from django.utils import timezone
+
+        from .models import (
+            Case, CaseStatus, CaseType, Client, UniteUsAgent,
+        )
+        from .portal.views_members import MembersListView
+        from .services.enrollment_analytics import build_row
+
+        UniteUsAgent.objects.create(
+            user_id=uuid.uuid4(), name="Rafael Del Valle",
+            originating_team="CareCircle Call Center",
+        )
+        c = Client.objects.create(client_id=str(uuid.uuid4()), first_name="Y", last_name="M")
+        Case.objects.create(
+            case_id=str(uuid.uuid4()), client=c, case_type=CaseType.INTERNAL_SERVICE,
+            case_status=CaseStatus.OPEN,
+            created_by_id=uuid.uuid4(),  # NOT the agent's Unite Us user_id
+            created_by_name="Rafael Del Valle",
+            date_opened=timezone.now(), case_created_at=timezone.now(),
+        )
+        self.assertEqual(
+            MembersListView()._case_team_map([c]).get(str(c.client_id)),
+            "CareCircle Call Center",
+        )
+        self.assertEqual(build_row(c).get("team"), "CareCircle Call Center")
 
 
 class MembersExportTest(TestCase):
@@ -13888,6 +14382,44 @@ class NeedAttentionScopeCaseRuleTest(TestCase):
         ids = self._ids()
         self.assertIn(str(internal.client_id), ids)
         self.assertNotIn(str(elig_only.client_id), ids)
+
+    def test_not_eligible_members_hidden(self):
+        # Not-eligible members are removed from the Urgent Care tab: missing the
+        # coverage gate, or on the not_eligible/ineligible lifecycle off-ramp.
+        from .models import CaseType, ClientStage
+
+        eligible = self._member(case_type=CaseType.INTERNAL_SERVICE)
+        no_social = self._member(case_type=CaseType.INTERNAL_SERVICE)
+        no_social.social_care_coverages.all().delete()
+        no_medicaid = self._member(case_type=CaseType.INTERNAL_SERVICE)
+        no_medicaid.insurances.all().delete()
+        offramp = self._member(case_type=CaseType.INTERNAL_SERVICE)
+        offramp.lifecycle_stage = ClientStage.NOT_ELIGIBLE
+        offramp.save(update_fields=["lifecycle_stage"])
+
+        ids = self._ids()
+        self.assertIn(str(eligible.client_id), ids)
+        self.assertNotIn(str(no_social.client_id), ids)      # no social care
+        self.assertNotIn(str(no_medicaid.client_id), ids)    # no Medicaid
+        self.assertNotIn(str(offramp.client_id), ids)        # not_eligible off-ramp
+
+    def test_shows_even_when_not_flagged_is_new(self):
+        # The list no longer gates on is_new: an eligible member with an open IS
+        # case and no enrollment appears even if is_new was never set.
+        from .models import CaseType
+
+        not_flagged = self._member(case_type=CaseType.INTERNAL_SERVICE, is_new=False)
+        self.assertIn(str(not_flagged.client_id), self._ids())
+
+    def test_dismissed_member_hidden(self):
+        # Dismissal keys off urgent_care_dismissed (not is_new) now.
+        from .models import CaseType
+
+        m = self._member(case_type=CaseType.INTERNAL_SERVICE)
+        self.assertIn(str(m.client_id), self._ids())
+        m.urgent_care_dismissed = True
+        m.save(update_fields=["urgent_care_dismissed"])
+        self.assertNotIn(str(m.client_id), self._ids())
 
 
 class KitchenAbbreviationPoNumberTest(TestCase):

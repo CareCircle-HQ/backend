@@ -454,9 +454,13 @@ def urgent_care_no_verification_rows(params):
     (``date_opened``) date.
 
     ``params``: created_from / created_to (inclusive)."""
-    from ..models import Client
+    from django.db.models import Exists, OuterRef, Q
+
+    from ..models import Case, CaseStatus, CaseType, Client, ClientStage
     from ..services.lifecycle import (
-        has_open_internal_service_case, has_verification_request,
+        has_open_internal_service_case, has_valid_medicaid,
+        has_valid_social_care, has_verification_request,
+        valid_medicaid_exists, valid_social_care_exists,
     )
     from .views_members import _parse_date, apply_case_created_date_filter
     from .views_reports import _client_phone_numbers, _date_str
@@ -464,7 +468,23 @@ def urgent_care_no_verification_rows(params):
     created_from = _parse_date(params.get("created_from"))
     created_to = _parse_date(params.get("created_to"))
 
-    qs = Client.objects.filter(is_new=True)
+    # Mirror the Urgent Care (need_attention) list: every ELIGIBLE member with an
+    # OPEN internal-service case and NO enrollment yet, not on the not_eligible/
+    # ineligible off-ramp and not manually dismissed. No longer gated on is_new.
+    open_ic = Case.objects.filter(
+        client=OuterRef("pk"), case_type=CaseType.INTERNAL_SERVICE,
+    ).exclude(case_status__in=[CaseStatus.CLOSED, CaseStatus.CANCELLED])
+    qs = (
+        Client.objects
+        .filter(Exists(open_ic))
+        .filter(valid_medicaid_exists(), valid_social_care_exists())
+        .exclude(
+            Q(enrollments__isnull=False)
+            | Q(household_membership__household__enrollment_verifications__isnull=False)
+        )
+        .exclude(lifecycle_stage__in=[ClientStage.NOT_ELIGIBLE, ClientStage.INELIGIBLE])
+        .exclude(urgent_care_dismissed=True)
+    )
     # Same case-created window as the Urgent Care tab: an internal-service case
     # opened within [from, to], via the localized ``__date`` lookup (NOT a naive
     # UTC .date()), so the export lines up with the tab across the day boundary.
@@ -488,6 +508,12 @@ def urgent_care_no_verification_rows(params):
         if not has_open_internal_service_case(client):
             continue
         if has_verification_request(client):
+            continue
+        # NOT ELIGIBLE members are excluded from the tab (and this export): missing
+        # the coverage gate, or on the not_eligible/ineligible lifecycle off-ramp.
+        if not (has_valid_medicaid(client) and has_valid_social_care(client)):
+            continue
+        if client.lifecycle_stage in (ClientStage.NOT_ELIGIBLE, ClientStage.INELIGIBLE):
             continue
 
         gc = _governing_internal_case(client)
