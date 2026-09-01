@@ -368,16 +368,38 @@ def _company_status(enrollment, case, parity, in_any_po, has_medicaid, has_socia
     return "review"
 
 
-def _nutritionist_status(enrollment):
-    """Nutrition-review status: 'approved' once a nutritionist has signed off,
-    else 'pending' for a verified member awaiting sign-off, else '' (not yet in
-    the nutrition queue / no enrollment)."""
+# Enrollment stages that are terminal (no longer progressing toward service).
+_NUTRI_TERMINAL_STAGES = ("closed", "cancelled", "disregarded")
+# Mirrors api.services.lifecycle.PENDING_NUTRITIONIST_TAG_NAME (the purple tag set
+# on split members who still need a Nutritionist review -- the Pending Review page).
+_PENDING_NUTRITIONIST_TAG = "Pending Nutritionist"
+
+
+def _nutritionist_status(enrollment, tags=()):
+    """Where the member sits in the NUTRITION-APPROVAL lifecycle. Priority-ordered
+    so every member lands in exactly ONE bucket:
+
+      approved          -- a Nutritionist signed off (nutritionist_approved_at set;
+                           a signed PDF exists).
+      waiting_approval  -- governing enrollment at VERIFIED awaiting sign-off: the
+                           same query as the Nutritionist page.
+      at_review         -- flagged "Pending Nutritionist" (a split member on the
+                           Nutritionist Pending Review page).
+      pending_questions -- verified but not approved, not in either queue, and not
+                           terminal: still needs the nutrition questions/sign-off
+                           before they can be approved.
+      "" (not at step)  -- no enrollment, pre-verification, or closed-never-approved.
+    """
     if enrollment is None:
         return ""
     if enrollment.nutritionist_approved_at is not None:
         return "approved"
-    if enrollment.verified_at is not None:
-        return "pending"
+    if enrollment.stage == "verified":
+        return "waiting_approval"
+    if _PENDING_NUTRITIONIST_TAG in (tags or ()):
+        return "at_review"
+    if enrollment.verified_at is not None and enrollment.stage not in _NUTRI_TERMINAL_STAGES:
+        return "pending_questions"
     return ""
 
 
@@ -572,7 +594,7 @@ def build_row(client):
             in_household=membership is not None, has_active_delivery=has_active_delivery,
         ),
         # Nutrition-review status + delivery company on latest order.
-        "nutritionist_status": _nutritionist_status(enr),
+        "nutritionist_status": _nutritionist_status(enr, parity.get("tags") or []),
         "delivery_company": delivery_company,
     }
 

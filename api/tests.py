@@ -15356,6 +15356,41 @@ class TicketAssigneeListTest(TestCase):
         self.assertEqual(ticket.assigned_to_id, screener.id)
 
 
+class NutritionistStatusPartitionTest(TestCase):
+    """_nutritionist_status assigns each member to exactly one lifecycle bucket,
+    priority-ordered: approved > waiting_approval > at_review > pending_questions >
+    "" (not at step)."""
+
+    def _enr(self, **kw):
+        from types import SimpleNamespace
+
+        d = dict(nutritionist_approved_at=None, stage="", verified_at=None)
+        d.update(kw)
+        return SimpleNamespace(**d)
+
+    def test_buckets_and_priority(self):
+        from datetime import datetime
+
+        from .services.enrollment_analytics import _nutritionist_status
+
+        now = datetime(2026, 1, 1)
+        f = _nutritionist_status
+        TAG = ["Pending Nutritionist"]
+
+        # approved (outranks everything, any stage)
+        self.assertEqual(f(self._enr(nutritionist_approved_at=now, stage="active", verified_at=now), TAG), "approved")
+        # waiting approval: governing enrollment at VERIFIED, not approved
+        self.assertEqual(f(self._enr(stage="verified", verified_at=now)), "waiting_approval")
+        # at review: Pending Nutritionist tag, already past VERIFIED
+        self.assertEqual(f(self._enr(stage="active", verified_at=now), TAG), "at_review")
+        # pending questions: verified, not approved, no tag, not terminal
+        self.assertEqual(f(self._enr(stage="active", verified_at=now)), "pending_questions")
+        # not at step: no enrollment / pre-verification / closed-never-approved
+        self.assertEqual(f(None), "")
+        self.assertEqual(f(self._enr(stage="pending_verification")), "")
+        self.assertEqual(f(self._enr(stage="closed", verified_at=now)), "")
+
+
 class AnalyticsRebuildRunTest(TestCase):
     """The rebuild command records each run (started/completed/trigger) so the Data
     page can show when the refresh TASK last ran (not the per-row watermark)."""
