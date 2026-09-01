@@ -3872,18 +3872,40 @@ def reopen_enrollment_for_new_case(client, new_governing_case, *, actor=None, ac
     # A live enrollment (funnel/serving) means the normal path handles it.
     if any(EnrollmentStage(e.stage) in _LIVE_ENROLLMENT_STAGES for e in all_enr):
         return None
-    # Clone source: the most-recent VERIFIED terminal enrollment (has data).
-    priors = [
-        e for e in all_enr
-        if e.verified_at and EnrollmentStage(e.stage) in _REOPEN_SOURCE_STAGES
-    ]
+    # Clone source: the most-recent terminal enrollment with data to resume from.
+    # Prefer a VERIFIED prior; else fall back to a terminal prior that still carries
+    # a roster -- an enrollment whose ``verified_at`` was cleared UPSTREAM
+    # (verification reverted on an authorization denial) but whose intake is intact.
+    # Without this fallback such members are stranded on a closed enrollment when a
+    # new open+approved case arrives (the not_eligible + open-approved-case anomaly).
+    def _is_source(e):
+        return EnrollmentStage(e.stage) in _REOPEN_SOURCE_STAGES
+
+    verified_priors = [e for e in all_enr if e.verified_at and _is_source(e)]
+    data_priors = [e for e in all_enr if _is_source(e) and e.member_profiles.exists()]
+    priors = verified_priors or data_priors
     if not priors:
         return None
     prior = max(priors, key=lambda e: (e.closed_at or e.stage_at or e.opened_at))
 
     prior_close = prior.closed_at or prior.stage_at
     gap_days = (timezone.now() - prior_close).days if prior_close else 0
-    reverify = gap_days > _REOPEN_REVERIFY_GAP_DAYS
+    if prior.verified_at:
+        # A real verification survives: the 60-day rule decides resume vs re-verify.
+        reverify = gap_days > _REOPEN_REVERIFY_GAP_DAYS
+        prior_was_serving = True
+    else:
+        # verified_at was cleared upstream. Treat the member as verified only when
+        # the carried intake is COMPLETE (delivery address + every member has a menu
+        # type) -- then restore the verification fact and let the NUTRITION gate in
+        # _carry_service_and_activate pick Kitchen Assignment (nutrition approved) vs
+        # Pending Nutritionist. Incomplete intake -> genuine re-verification.
+        _profs = list(prior.member_profiles.all())
+        _data_complete = bool(prior.delivery_address_id) and bool(_profs) and all(
+            (p.menu_type or "").strip() for p in _profs
+        )
+        reverify = not _data_complete
+        prior_was_serving = bool(prior.kitchen_id)
 
     # GLOBAL safety: the per-case unique index covers every NON-terminal row
     # across ALL clients. If the governing case is already held by a live
@@ -3932,10 +3954,12 @@ def reopen_enrollment_for_new_case(client, new_governing_case, *, actor=None, ac
             "stage": EnrollmentStage.PENDING_VERIFICATION.value,
         }
         if not reverify:
-            # Within 60 days: carry the verification + nutritionist sign-off so
-            # _carry_service_and_activate can resume service without re-review.
+            # Carry the verification + nutritionist sign-off so
+            # _carry_service_and_activate can resume without re-review. RESTORE the
+            # verified fact when it was cleared upstream (data-complete fallback) so
+            # the nutrition gate can advance the enrollment.
             fields.update(
-                verified_at=prior.verified_at,
+                verified_at=prior.verified_at or timezone.now(),
                 verified_by=prior.verified_by,
                 nutritionist_approved_at=prior.nutritionist_approved_at,
                 nutritionist_approved_by=prior.nutritionist_approved_by,
@@ -3972,21 +3996,21 @@ def reopen_enrollment_for_new_case(client, new_governing_case, *, actor=None, ac
         short = str(new_governing_case.case_id)[:8]
         if reverify:
             note = (
-                f"Reopened on {day} for new open case {short}: the household went "
-                f"{gap_days} days (> {_REOPEN_REVERIFY_GAP_DAYS}) with no open "
-                "internal-service case, so re-verification is required. Roster + "
-                "dietary data carried; service stays paused until re-verified."
+                f"Reopened on {day} for new open case {short}: re-verification "
+                "required (prior verification lapsed >"
+                f"{_REOPEN_REVERIFY_GAP_DAYS}d, or the carried intake is incomplete). "
+                "Roster + dietary data carried; service stays paused until re-verified."
             )
         else:
             _carry_service_and_activate(
                 new_enr, prior, new_governing_case, new_kind,
-                prior_was_serving=True, actor=actor, actor_label=actor_label,
+                prior_was_serving=prior_was_serving, actor=actor, actor_label=actor_label,
             )
             note = (
-                f"Reopened on {day} for new open case {short}: within "
-                f"{_REOPEN_REVERIFY_GAP_DAYS} days ({gap_days}d) of the prior "
-                "enrollment closing, so service resumed from the previous "
-                "enrollment (no re-verification)."
+                f"Reopened on {day} for new open case {short}: verification + intake "
+                "carried from the prior enrollment; advanced to the appropriate stage "
+                "(kitchen assignment if nutrition-approved, else pending nutritionist) "
+                "for the new governing case."
             )
         _write_primary_system_note(client, note, author_name=author)
 

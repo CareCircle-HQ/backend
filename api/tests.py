@@ -4931,6 +4931,79 @@ class ReopenEnrollmentForNewCaseTest(TestCase):
         self.assertIsNone(new.verified_at)                         # verification dropped
         self.assertEqual(new.member_profiles.count(), 1)           # roster still carried
 
+    def _setup_unverified(self, *, menu="Standard", nutrition=False, address=True):
+        """Prior CLOSED enrollment whose ``verified_at`` was CLEARED (verification
+        reverted on an auth denial) but whose intake may still be complete."""
+        from django.utils import timezone
+
+        from .models import (
+            Address, Case, CaseStatus, CaseType, Client, EnrollmentStage,
+            EnrollmentVerification, Household, HouseholdMember,
+            MemberDietaryProfile, MemberStatus, ServiceAuthorizationStatus,
+        )
+        now = timezone.now()
+        c = Client.objects.create(client_id=str(uuid.uuid4()), first_name="Un", last_name="Verified")
+        hh = Household.objects.create(name="HH")
+        HouseholdMember.objects.create(household=hh, client=c, is_primary=True)
+        old_case = Case.objects.create(
+            case_id=str(uuid.uuid4()), client=c, case_type=CaseType.INTERNAL_SERVICE,
+            case_status=CaseStatus.CLOSED,
+            service_authorization_status=ServiceAuthorizationStatus.DENIED,
+            program_name="Clinically Appropriate Meals",
+        )
+        addr = Address.objects.create(client=c, type="temporary", zip="11201") if address else None
+        prior = EnrollmentVerification.objects.create(
+            client=c, household=hh, case=old_case, stage=EnrollmentStage.CLOSED,
+            program_name="Clinically Appropriate Meals",
+            verified_at=None,  # cleared on the denial revert
+            delivery_address=addr,
+            nutritionist_approved_at=(now if nutrition else None),
+            closed_at=now,
+        )
+        MemberDietaryProfile.objects.create(
+            enrollment=prior, client=c, member_name="Un", menu_type=menu,
+            status=MemberStatus.ACTIVE,
+        )
+        new_case = Case.objects.create(
+            case_id=str(uuid.uuid4()), client=c, case_type=CaseType.INTERNAL_SERVICE,
+            case_status=CaseStatus.OPEN,
+            service_authorization_status=ServiceAuthorizationStatus.APPROVED,
+            program_name="Clinically Appropriate Meals",
+        )
+        return c, prior, new_case
+
+    def test_unverified_complete_with_nutrition_reopens_to_kitchen_assignment(self):
+        # verified_at cleared, but complete intake + nutrition approved -> resume
+        # straight to Kitchen Assignment (only a kitchen is missing).
+        from .models import EnrollmentStage
+        from .services.lifecycle import reopen_enrollment_for_new_case
+        c, prior, new_case = self._setup_unverified(nutrition=True)
+        new = reopen_enrollment_for_new_case(c, new_case)
+        self.assertIsNotNone(new)
+        self.assertEqual(EnrollmentStage(new.stage), EnrollmentStage.KITCHEN_ASSIGNMENT)
+        self.assertIsNotNone(new.verified_at)  # verification fact restored
+
+    def test_unverified_complete_without_nutrition_reopens_to_verified(self):
+        # Complete intake but NO nutrition sign-off -> Verified / Pending
+        # Nutritionist (must not skip the nutrition gate to Kitchen Assignment).
+        from .models import EnrollmentStage
+        from .services.lifecycle import reopen_enrollment_for_new_case
+        c, prior, new_case = self._setup_unverified(nutrition=False)
+        new = reopen_enrollment_for_new_case(c, new_case)
+        self.assertIsNotNone(new)
+        self.assertEqual(EnrollmentStage(new.stage), EnrollmentStage.VERIFIED)
+        self.assertIsNotNone(new.verified_at)
+
+    def test_unverified_incomplete_requires_reverification(self):
+        # Missing menu type -> intake incomplete -> genuine re-verification.
+        from .models import EnrollmentStage
+        from .services.lifecycle import reopen_enrollment_for_new_case
+        c, prior, new_case = self._setup_unverified(menu="")
+        new = reopen_enrollment_for_new_case(c, new_case)
+        self.assertIsNotNone(new)
+        self.assertEqual(EnrollmentStage(new.stage), EnrollmentStage.PENDING_VERIFICATION)
+        self.assertIsNone(new.verified_at)
+
     def test_skips_when_case_held_by_another_live_enrollment(self):
         # Cross-client/shared case (e.g. a relative): the new case is already held
         # by ANOTHER client's LIVE enrollment. Reopen must SKIP -- no crash, no
