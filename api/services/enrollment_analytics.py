@@ -263,11 +263,20 @@ def _parity_fields(client):
     except Exception:  # noqa: BLE001
         service_type = ""
     try:
-        from api.portal.views_members import MembersListView
-        team = (MembersListView()._case_team_map([client]) or {}).get(str(client.client_id), "") or ""
-        # No internal-service case (or its creator didn't resolve)? Attribute the
-        # member to the team that created their most-recent case of ANY type, so
-        # nav/eligibility/screening-only members aren't left blank on the Data page.
+        from api.portal.serializers import governing_service_case_for_display
+        # Resolve the team from the SAME governing case the read model uses for
+        # case_type/case_status/etc. (governing_service_case_for_display) -- NOT a
+        # separate internal_service_case lookup, which disagreed and left members
+        # the Data page tags "IS" with no team. Match by created_by_id -> Unite Us
+        # user_id, then fall back to created_by_name (ext-created cases store a
+        # created_by_id that isn't the agent's Unite Us user_id).
+        gov = governing_service_case_for_display(client)
+        team = ""
+        if gov is not None:
+            team = _team_by_user_id(gov.created_by_id) or _team_by_creator_name(gov.created_by_name)
+        # Still blank (no governing case, or its creator didn't resolve)? Attribute
+        # the member to the team that created their most-recent case of ANY type,
+        # so nav/eligibility/screening-only members aren't left blank.
         if not team:
             team = _fallback_case_team(client)
     except Exception:  # noqa: BLE001
