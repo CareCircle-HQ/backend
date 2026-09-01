@@ -2157,17 +2157,30 @@ class MembersListView(PortalGenericAPIView):
     def _case_team_map(self, page):
         """{client_id(str): originating_team} for the page -- the CareCircle team
         of the Unite Us agent who CREATED each member's governing internal-service
-        case (Case.created_by_id == UniteUsAgent.user_id). Batched into ONE
-        UniteUsAgent query over the page's distinct creator ids to avoid an N+1.
-        Blank when the case has no known creator or the creator isn't a known
-        Unite Us agent."""
-        creator_by_client = {}
-        creator_ids = set()
+        case.
+
+        Primary match: Case.created_by_id == UniteUsAgent.user_id. FALLBACK: the
+        creator's NAME (Case.created_by_name == UniteUsAgent.name) -- an
+        EXTENSION-created case stores a created_by_id that ISN'T the agent's Unite
+        Us user_id, so the id lookup misses even though the name maps to a real
+        team; without this those members wrongly show as 'No Team / Unassigned'.
+        Both lookups are batched to avoid an N+1. Blank only when neither the id
+        nor the name resolves to a Unite Us agent."""
+        creator_by_client = {}  # cid -> (uid_lower, name)
+        creator_ids, names = set(), set()
         for c in page:
             case = s.internal_service_case(c)
-            if case is not None and case.created_by_id:
-                creator_by_client[str(c.client_id)] = str(case.created_by_id).lower()
+            if case is None:
+                continue
+            uid = str(case.created_by_id).lower() if case.created_by_id else ""
+            name = (case.created_by_name or "").strip()
+            if not uid and not name:
+                continue
+            creator_by_client[str(c.client_id)] = (uid, name)
+            if case.created_by_id:
                 creator_ids.add(case.created_by_id)
+            if name:
+                names.add(name)
         team_by_uid = {}
         if creator_ids:
             team_by_uid = {
@@ -2176,9 +2189,19 @@ class MembersListView(PortalGenericAPIView):
                     user_id__in=creator_ids
                 ).values_list("user_id", "originating_team")
             }
+        # Name fallback -- only for creators whose id didn't resolve to a team.
+        unresolved = {n for (u, n) in creator_by_client.values() if n and not team_by_uid.get(u)}
+        team_by_name = {}
+        if unresolved:
+            for nm, team in UniteUsAgent.objects.filter(
+                name__in=unresolved
+            ).values_list("name", "originating_team"):
+                key = (nm or "").strip()
+                if team and key not in team_by_name:
+                    team_by_name[key] = team
         return {
-            cid: team_by_uid.get(uid, "")
-            for cid, uid in creator_by_client.items()
+            cid: (team_by_uid.get(uid, "") or team_by_name.get(name, ""))
+            for cid, (uid, name) in creator_by_client.items()
         }
 
     def _stamp_added_via(self, groups):

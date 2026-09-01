@@ -5053,6 +5053,40 @@ class MembersListSortDenormTest(TestCase):
         self.assertTrue(M._flat_needs_distinct({"status": "verified"}))
 
 
+class CaseTeamNameFallbackTest(TestCase):
+    """A member's team resolves from the case creator's NAME when the case's
+    created_by_id doesn't match a Unite Us agent (extension-created cases store a
+    created_by_id that isn't the agent's Unite Us user_id) -- so they don't wrongly
+    show as 'No Team / Unassigned' on the Members + Data pages."""
+
+    def test_team_resolves_by_creator_name(self):
+        from django.utils import timezone
+
+        from .models import (
+            Case, CaseStatus, CaseType, Client, UniteUsAgent,
+        )
+        from .portal.views_members import MembersListView
+        from .services.enrollment_analytics import build_row
+
+        UniteUsAgent.objects.create(
+            user_id=uuid.uuid4(), name="Rafael Del Valle",
+            originating_team="CareCircle Call Center",
+        )
+        c = Client.objects.create(client_id=str(uuid.uuid4()), first_name="Y", last_name="M")
+        Case.objects.create(
+            case_id=str(uuid.uuid4()), client=c, case_type=CaseType.INTERNAL_SERVICE,
+            case_status=CaseStatus.OPEN,
+            created_by_id=uuid.uuid4(),  # NOT the agent's Unite Us user_id
+            created_by_name="Rafael Del Valle",
+            date_opened=timezone.now(), case_created_at=timezone.now(),
+        )
+        self.assertEqual(
+            MembersListView()._case_team_map([c]).get(str(c.client_id)),
+            "CareCircle Call Center",
+        )
+        self.assertEqual(build_row(c).get("team"), "CareCircle Call Center")
+
+
 class MembersExportTest(TestCase):
     """Filtered Members export: management-only; streams CSV using the All-Members
     columns for the members matching the list filters."""
