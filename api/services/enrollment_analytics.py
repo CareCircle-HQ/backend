@@ -27,6 +27,9 @@ _INTERNAL_SERVICE = "internal_service"
 # Data page Team filter sentinel for the "No Team / Unassigned" bucket (blank
 # team). The frontend sends this value; filter_analytics maps it to team="".
 UNASSIGNED_TEAM = "__unassigned__"
+# Data page sentinel for "Not Assigned" on the Kitchen / Cadence filters (no
+# kitchen assigned / blank delivery cadence).
+NOT_ASSIGNED = "__none__"
 
 
 def _cadence_from_weekdays(weekdays):
@@ -777,7 +780,7 @@ def filter_analytics(params):
     for param, col in {
         "care_coordinator": "care_coordinator__icontains",
         "primary_care_coordinator": "primary_care_coordinator__icontains",
-        "cadence": "cadence", "kitchen": "kitchen_id", "menu_type": "menu_type",
+        "menu_type": "menu_type",
         "current_delivery_status": "current_delivery_status",
         "last_po_delivery_status": "last_po_delivery_status",
         "insurance_status": "insurance_status", "social_status": "social_status",
@@ -804,6 +807,20 @@ def filter_analytics(params):
         qs = qs.filter(team="")
     elif team_val:
         qs = qs.filter(team=team_val)
+
+    # Kitchen (exact kitchen_id) with a "Not Assigned" sentinel = no kitchen yet.
+    kitchen_val = g("kitchen")
+    if kitchen_val == NOT_ASSIGNED:
+        qs = qs.filter(kitchen_id__isnull=True)
+    elif kitchen_val:
+        qs = qs.filter(kitchen_id=kitchen_val)
+
+    # Cadence (exact) with a "Not Assigned" sentinel = no delivery cadence yet.
+    cadence_val = g("cadence")
+    if cadence_val == NOT_ASSIGNED:
+        qs = qs.filter(cadence="")
+    elif cadence_val:
+        qs = qs.filter(cadence=cadence_val)
 
     # Boolean filters.
     for param, col in {"has_screening": "has_screening",

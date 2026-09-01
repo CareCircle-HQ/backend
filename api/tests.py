@@ -15409,6 +15409,36 @@ class AnalyticsRebuildRunTest(TestCase):
         self.assertEqual(run.trigger, "manual")
 
 
+class DataKitchenCadenceNotAssignedFilterTest(TestCase):
+    """Data page Kitchen/Cadence filters expose a '__none__' (Not Assigned)
+    sentinel matching no-kitchen / blank-cadence members; exact values still work."""
+
+    def test_not_assigned_sentinel(self):
+        import uuid as _uuid
+
+        from .models import Client, EnrollmentAnalytics
+        from .services.enrollment_analytics import filter_analytics
+
+        kid = _uuid.uuid4()
+        a = Client.objects.create(client_id=str(_uuid.uuid4()), first_name="A", last_name="A")
+        b = Client.objects.create(client_id=str(_uuid.uuid4()), first_name="B", last_name="B")
+        EnrollmentAnalytics.objects.create(client=a, kitchen_id=None, cadence="")
+        EnrollmentAnalytics.objects.create(client=b, kitchen_id=kid, cadence="mon_thu")
+
+        def ids(params):
+            return {str(x) for x in filter_analytics(params).values_list("client_id", flat=True)}
+
+        k = ids({"kitchen": "__none__"})
+        self.assertIn(str(a.client_id), k)
+        self.assertNotIn(str(b.client_id), k)
+        c = ids({"cadence": "__none__"})
+        self.assertIn(str(a.client_id), c)
+        self.assertNotIn(str(b.client_id), c)
+        # Exact selections still work.
+        self.assertEqual(ids({"kitchen": str(kid)}), {str(b.client_id)})
+        self.assertEqual(ids({"cadence": "mon_thu"}), {str(b.client_id)})
+
+
 class CsvImportCreatorAllowlistTest(TestCase):
     """CSV import lets in cases whose creator is on a CareCircle team (Call Center
     or Street) and blocks Met Council. Regression: the Street team is stored as
