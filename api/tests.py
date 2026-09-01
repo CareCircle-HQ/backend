@@ -14049,6 +14049,26 @@ class NeedAttentionScopeCaseRuleTest(TestCase):
         self.assertIn(str(internal.client_id), ids)
         self.assertNotIn(str(elig_only.client_id), ids)
 
+    def test_not_eligible_members_hidden(self):
+        # Not-eligible members are removed from the Urgent Care tab: missing the
+        # coverage gate, or on the not_eligible/ineligible lifecycle off-ramp.
+        from .models import CaseType, ClientStage
+
+        eligible = self._member(case_type=CaseType.INTERNAL_SERVICE)
+        no_social = self._member(case_type=CaseType.INTERNAL_SERVICE)
+        no_social.social_care_coverages.all().delete()
+        no_medicaid = self._member(case_type=CaseType.INTERNAL_SERVICE)
+        no_medicaid.insurances.all().delete()
+        offramp = self._member(case_type=CaseType.INTERNAL_SERVICE)
+        offramp.lifecycle_stage = ClientStage.NOT_ELIGIBLE
+        offramp.save(update_fields=["lifecycle_stage"])
+
+        ids = self._ids()
+        self.assertIn(str(eligible.client_id), ids)
+        self.assertNotIn(str(no_social.client_id), ids)      # no social care
+        self.assertNotIn(str(no_medicaid.client_id), ids)    # no Medicaid
+        self.assertNotIn(str(offramp.client_id), ids)        # not_eligible off-ramp
+
 
 class KitchenAbbreviationPoNumberTest(TestCase):
     """The PO number uses the kitchen's configured abbreviation when set, and

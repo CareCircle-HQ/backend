@@ -454,9 +454,10 @@ def urgent_care_no_verification_rows(params):
     (``date_opened``) date.
 
     ``params``: created_from / created_to (inclusive)."""
-    from ..models import Client
+    from ..models import Client, ClientStage
     from ..services.lifecycle import (
-        has_open_internal_service_case, has_verification_request,
+        has_open_internal_service_case, has_valid_medicaid,
+        has_valid_social_care, has_verification_request,
     )
     from .views_members import _parse_date, apply_case_created_date_filter
     from .views_reports import _client_phone_numbers, _date_str
@@ -488,6 +489,12 @@ def urgent_care_no_verification_rows(params):
         if not has_open_internal_service_case(client):
             continue
         if has_verification_request(client):
+            continue
+        # NOT ELIGIBLE members are excluded from the tab (and this export): missing
+        # the coverage gate, or on the not_eligible/ineligible lifecycle off-ramp.
+        if not (has_valid_medicaid(client) and has_valid_social_care(client)):
+            continue
+        if client.lifecycle_stage in (ClientStage.NOT_ELIGIBLE, ClientStage.INELIGIBLE):
             continue
 
         gc = _governing_internal_case(client)

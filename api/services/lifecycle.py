@@ -826,6 +826,35 @@ def has_valid_social_care(client):
     )
 
 
+def valid_medicaid_exists():
+    """``Exists`` form of :func:`has_valid_medicaid` for filtering a Client
+    queryset -- a member with at least one ACTIVE Medicaid/Dual insurance."""
+    from django.db.models import Exists, OuterRef
+
+    from api.models import Insurance
+
+    return Exists(
+        Insurance.objects.filter(
+            client=OuterRef("pk"), plan_type__in=MEDICAID_PLAN_TYPES,
+            status=RecordStatus.ACTIVE,
+        )
+    )
+
+
+def valid_social_care_exists():
+    """``Exists`` form of :func:`has_valid_social_care` -- a member with at least
+    one ENROLLED social care coverage."""
+    from django.db.models import Exists, OuterRef
+
+    from api.models import SocialCareCoverage
+
+    return Exists(
+        SocialCareCoverage.objects.filter(
+            client=OuterRef("pk"), status=SocialCareCoverageStatus.ENROLLED,
+        )
+    )
+
+
 def has_open_internal_service_case(client):
     """True when the client holds an internal-service (meal/box) case that is
     not closed/cancelled -- the case the verification + delivery attach to."""

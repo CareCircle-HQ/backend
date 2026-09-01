@@ -125,6 +125,8 @@ from ..services.lifecycle import (
     recompute_enrollment_household,
     reconcile_enrollment_authorization,
     refresh_internal_case_sort,
+    valid_medicaid_exists,
+    valid_social_care_exists,
     reopen_for_verification,
     split_dependent_into_own_enrollment,
 )
@@ -1583,9 +1585,19 @@ class MembersListView(PortalGenericAPIView):
             open_internal_case = Case.objects.filter(
                 client=OuterRef("pk"), case_type=CaseType.INTERNAL_SERVICE,
             ).exclude(case_status__in=[CaseStatus.CLOSED, CaseStatus.CANCELLED])
-            qs = qs.filter(is_new=True).filter(Exists(open_internal_case)).exclude(
+            # NOT ELIGIBLE members are dropped from the tab -- they can't be
+            # verified, so they don't belong in the actionable Urgent Care queue.
+            # "Not eligible" = missing the coverage gate (no valid Medicaid OR no
+            # valid social care), OR parked on the not_eligible/ineligible lifecycle
+            # off-ramp. (is_new is set-only, so a member whose coverage lapsed after
+            # being flagged would otherwise linger here.)
+            qs = qs.filter(is_new=True).filter(Exists(open_internal_case)).filter(
+                valid_medicaid_exists(), valid_social_care_exists(),
+            ).exclude(
                 Q(enrollments__isnull=False)
                 | Q(household_membership__household__enrollment_verifications__isnull=False)
+            ).exclude(
+                lifecycle_stage__in=[ClientStage.NOT_ELIGIBLE, ClientStage.INELIGIBLE]
             ).distinct()
             # Optional case-created date-range filter (Urgent Care triage): keep
             # only members whose governing internal-service case was OPENED within
