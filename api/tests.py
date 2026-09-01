@@ -5053,6 +5053,37 @@ class MembersListSortDenormTest(TestCase):
         self.assertTrue(M._flat_needs_distinct({"status": "verified"}))
 
 
+class CompanyStatusNotEligibleTest(TestCase):
+    """A member parked on the not_eligible/ineligible lifecycle off-ramp (closed
+    enrollment, but a lingering open case -- e.g. after a Household->Individual
+    scope change) is Unable, not Pending, on the Data page."""
+
+    def test_not_eligible_lifecycle_is_unable(self):
+        from types import SimpleNamespace
+
+        from .services.enrollment_analytics import _INTERNAL_SERVICE, _company_status
+
+        case = SimpleNamespace(
+            case_type=_INTERNAL_SERVICE, case_status="open",
+            service_authorization_status="approved",
+        )
+        enr = SimpleNamespace(stage="closed", verified_at=None, nutritionist_approved_at=None)
+        parity = {
+            "eligibility": "eligible", "program_status": "",
+            "out_of_orbit": False, "out_of_range": False, "paused": False,
+        }
+        # Coverage reads active, but the member is on the not-eligible off-ramp.
+        self.assertEqual(
+            _company_status(enr, case, parity, False, True, True, lifecycle_stage="not_eligible"),
+            "unable",
+        )
+        # Without the off-ramp the same inputs would be Pending (regression guard).
+        self.assertEqual(
+            _company_status(enr, case, parity, False, True, True, lifecycle_stage="verified"),
+            "pending",
+        )
+
+
 class CaseTeamNameFallbackTest(TestCase):
     """A member's team resolves from the case creator's NAME when the case's
     created_by_id doesn't match a Unite Us agent (extension-created cases store a

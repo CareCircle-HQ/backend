@@ -353,7 +353,8 @@ def _parity_fields(client):
 
 
 def _company_status(enrollment, case, parity, in_any_po, has_medicaid, has_social,
-                    member_status="", in_household=False, has_active_delivery=False):
+                    member_status="", in_household=False, has_active_delivery=False,
+                    lifecycle_stage=""):
     if case is None or getattr(case, "case_type", "") != _INTERNAL_SERVICE:
         # No governing internal-service case they hold OR are covered by -- both
         # the enrollment fallback and the household-PRIMARY fallback (build_row)
@@ -380,6 +381,12 @@ def _company_status(enrollment, case, parity, in_any_po, has_medicaid, has_socia
     not_eligible = (
         (not has_medicaid) or (not has_social)
         or parity.get("eligibility") == "ineligible"
+        # The member is parked on the not-eligible / ineligible lifecycle off-ramp
+        # (e.g. denied, or off-ramped after a Household->Individual scope change).
+        # Their enrollment is closed and they aren't being served, so they belong
+        # in Unable -- NOT Pending, which their lingering open case would otherwise
+        # imply. (Raw Medicaid can still read active, so key off the stage too.)
+        or (lifecycle_stage or "").lower() in ("not_eligible", "ineligible")
     )
     if (parity.get("out_of_orbit") or parity.get("out_of_range")
             or not_eligible or auth == "denied"
@@ -650,6 +657,7 @@ def build_row(client):
         "company_status": _company_status(
             enr, case, parity, in_any_po, has_medicaid, has_social, member_status,
             in_household=membership is not None, has_active_delivery=has_active_delivery,
+            lifecycle_stage=(getattr(client, "lifecycle_stage", "") or ""),
         ),
         # Nutrition-review status + delivery company on latest order.
         "nutritionist_status": _nutritionist_status(enr, parity.get("tags") or []),
