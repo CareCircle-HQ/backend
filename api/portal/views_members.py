@@ -7363,11 +7363,22 @@ class BulkAssignBoxesView(PortalAPIView):
                     if enrollment_ready_for_assignment(e, kitchens_ctx)
                 ]
             enrollments = _bulk_filter_enrollments(enrollments, request.data)
+            # Only households the SELECTED box kitchen can fully serve are
+            # assignable; the rest are surfaced but not assignable (same hard
+            # rule as the meals flow).
+            offered = kitchen_offered_menu_index(kitchen)
+            servable, excluded = [], []
+            for enr in enrollments:
+                prev = _preview_household_for_kitchen(enr, kitchen, offered)
+                (servable if prev["fully_covered"] else excluded).append((enr, prev))
             return Response({
                 "kitchen_id": str(kitchen.pk),
                 "kitchen_name": kitchen.name,
                 "total": len(enrollments),
-                "candidates": [_bulk_candidate_row(e) for e in enrollments],
+                "fully_covered": len(servable),
+                "with_exclusions": len(excluded),
+                "households": [p for _, p in excluded],
+                "candidates": [_bulk_candidate_row(e) for e, _ in servable],
             })
 
         # The cadence (and thus the delivery weekday) comes from the SELECTED
@@ -7413,8 +7424,14 @@ class BulkAssignBoxesView(PortalAPIView):
         # matching the preview so the applied set equals the reviewed set.
         enrollments = _bulk_filter_enrollments(enrollments, request.data)
 
-        assigned, out_of_orbit, failed, errors = 0, 0, 0, []
+        # HARD RULE (same as meals): never bulk-assign a household the selected
+        # kitchen can't fully serve -- skip it for individual assignment instead.
+        offered = kitchen_offered_menu_index(kitchen)
+        assigned, skipped, out_of_orbit, failed, errors = 0, 0, 0, 0, []
         for enr in enrollments:
+            if not _preview_household_for_kitchen(enr, kitchen, offered)["fully_covered"]:
+                skipped += 1
+                continue
             try:
                 with transaction.atomic():
                     result = assign_kitchen_to_household(
@@ -7436,6 +7453,7 @@ class BulkAssignBoxesView(PortalAPIView):
             "kitchen_name": kitchen.name,
             "total": len(enrollments),
             "assigned": assigned,
+            "skipped": skipped,
             "out_of_orbit": out_of_orbit,
             "failed": failed,
             "errors": errors,
@@ -7663,36 +7681,34 @@ class BulkAssignMealsView(PortalAPIView):
         # Preview: dry-run only, report the matched households (the filtered set
         # the agent is about to assign) plus which of them would have exclusions.
         if request.data.get("preview"):
-            fully_covered, with_exclusions, households = 0, 0, []
+            servable, excluded = [], []
             for enr in enrollments:
                 prev = _preview_household_for_kitchen(enr, kitchen, offered)
-                if prev["fully_covered"]:
-                    fully_covered += 1
-                else:
-                    with_exclusions += 1
-                    households.append(prev)
+                (servable if prev["fully_covered"] else excluded).append((enr, prev))
             return Response({
                 "kitchen_id": str(kitchen.pk),
                 "kitchen_name": kitchen.name,
                 "total": len(enrollments),
-                "fully_covered": fully_covered,
-                "with_exclusions": with_exclusions,
-                # Only the households needing attention (keeps the payload bounded).
-                "households": households,
-                # The full matched set (result of the filters) for the preview list.
-                "candidates": [_bulk_candidate_row(e) for e in enrollments],
+                "fully_covered": len(servable),
+                "with_exclusions": len(excluded),
+                # Households this kitchen CAN'T fully serve -- NOT assignable here
+                # (shown so the agent can assign them to a capable kitchen).
+                "households": [p for _, p in excluded],
+                # Only the servable set is assignable to this kitchen.
+                "candidates": [_bulk_candidate_row(e) for e, _ in servable],
             })
 
-        # Apply.
-        only_covered = request.data.get("only_covered", True)
+        # Apply. HARD RULE: a household the SELECTED kitchen can't fully serve is
+        # NEVER bulk-assigned -- a member with a blocker for this kitchen (menu it
+        # doesn't offer / an allergy it can't handle) must not be routed here (it
+        # would just be set Out of Orbit). Those households are skipped and left
+        # for individual assignment to a kitchen that CAN serve them.
         agent = current_agent(request)
         assigned, skipped, out_of_orbit, failed, errors = 0, 0, 0, 0, []
         for enr in enrollments:
-            if only_covered:
-                prev = _preview_household_for_kitchen(enr, kitchen, offered)
-                if not prev["fully_covered"]:
-                    skipped += 1
-                    continue
+            if not _preview_household_for_kitchen(enr, kitchen, offered)["fully_covered"]:
+                skipped += 1
+                continue
             try:
                 with transaction.atomic():
                     result = assign_kitchen_to_household(
