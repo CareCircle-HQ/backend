@@ -83,6 +83,32 @@ class Command(BaseCommand):
                 )
                 continue
 
+            # SERVICE-SAFETY GUARD: only retire the stray when the SURVIVOR can
+            # take over -- i.e. the survivor holds a live delivery plan too. When
+            # the STRAY holds the live plan and the survivor is a hollow shell (no
+            # delivery_schedules -- e.g. an IS enrollment that never got a calendar),
+            # retiring the stray would strip the member's only deliveries. Skip for
+            # manual re-homing (move the plan/kitchen onto the IS enrollment first).
+            from django.utils import timezone
+
+            today = timezone.localdate()
+
+            def _serves(e):
+                return any(
+                    (p.ends_on is None or p.ends_on >= today)
+                    for p in e.delivery_schedules.all()
+                )
+
+            if _serves(stray) and not _serves(survivor):
+                skipped += 1
+                self.stdout.write(
+                    f"  SKIP {c.client_id}: the STRAY enr {stray.pk} holds the live "
+                    f"delivery plan; survivor enr {survivor.pk} has none -- retiring "
+                    "would strip service. Re-home the plan/kitchen onto the "
+                    "internal-service enrollment first, then retry."
+                )
+                continue
+
             self.stdout.write(f"--- {c.client_id} {c.first_name} {c.last_name}")
             self.stdout.write(
                 f"    survivor IS enr {survivor.pk} ({survivor.stage}, "

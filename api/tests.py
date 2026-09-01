@@ -5352,6 +5352,51 @@ class ResolveDoubleServingCommandTest(TestCase):
         self.assertEqual(survivor.delivery_address_id, deliv.pk)  # carried delivery-type
         self.assertEqual(EnrollmentStage(stray.stage), EnrollmentStage.DISREGARDED)
 
+    def test_skips_when_stray_holds_the_only_delivery_plan(self):
+        # Survivor (IS) is a hollow shell with NO delivery plan; the stray holds the
+        # live plan -> retiring it would strip service, so it is SKIPPED.
+        from io import StringIO
+
+        from django.core.management import call_command
+        from django.utils import timezone
+
+        from .models import (
+            Case, CaseStatus, CaseType, Client, DeliveryCadence, EnrollmentStage,
+            EnrollmentVerification, Household, HouseholdMember,
+            MemberDeliverySchedule, ScheduleStatus,
+        )
+        c = Client.objects.create(client_id=str(uuid.uuid4()), first_name="Holl", last_name="Ow")
+        hh = Household.objects.create(name="HH")
+        HouseholdMember.objects.create(household=hh, client=c, is_primary=True)
+        isc = Case.objects.create(
+            case_id=str(uuid.uuid4()), client=c, case_type=CaseType.INTERNAL_SERVICE,
+            case_status=CaseStatus.OPEN,
+        )
+        nav = Case.objects.create(
+            case_id=str(uuid.uuid4()), client=c, case_type=CaseType.NAVIGATION,
+            case_status=CaseStatus.OPEN,
+        )
+        survivor = EnrollmentVerification.objects.create(
+            client=c, household=hh, case=isc, stage=EnrollmentStage.SERVICE_ACTIVE,
+            verified_at=timezone.now(),  # NO delivery plan
+        )
+        stray = EnrollmentVerification.objects.create(
+            client=c, household=hh, case=nav, stage=EnrollmentStage.SERVICE_ACTIVE,
+            verified_at=timezone.now(),
+        )
+        MemberDeliverySchedule.objects.create(
+            enrollment=stray, member_name="Holl Ow",
+            delivery_days_cadence=DeliveryCadence.ONCE_A_WEEK,
+            status=ScheduleStatus.SCHEDULED,  # ends_on None -> live plan on the stray
+        )
+        call_command(
+            "resolve_double_serving_enrollments", "--client", str(c.client_id),
+            "--apply", stdout=StringIO(),
+        )
+        stray.refresh_from_db()
+        # NOT retired -- the survivor couldn't take over.
+        self.assertEqual(EnrollmentStage(stray.stage), EnrollmentStage.SERVICE_ACTIVE)
+
 
 class WorkQueueResolvedDateFilterTest(TestCase):
     """Work Queue resolved-date filter: resolved_from/resolved_to bound tickets by
