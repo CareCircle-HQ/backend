@@ -15439,6 +15439,36 @@ class DataKitchenCadenceNotAssignedFilterTest(TestCase):
         self.assertEqual(ids({"cadence": "mon_thu"}), {str(b.client_id)})
 
 
+class DataCoverageStatusFilterTest(TestCase):
+    """Data page Insurance/Social-care filters match the real stored values
+    (incl. non_enrolled) and expose a '__none__' bucket for no coverage, so the
+    buckets sum to all members."""
+
+    def test_social_and_insurance_buckets(self):
+        import uuid as _uuid
+
+        from .models import Client, EnrollmentAnalytics
+        from .services.enrollment_analytics import filter_analytics
+
+        def mk(social, ins):
+            c = Client.objects.create(client_id=str(_uuid.uuid4()), first_name="A", last_name="B")
+            EnrollmentAnalytics.objects.create(client=c, social_status=social, insurance_status=ins)
+            return c
+
+        enr = mk("enrolled", "active")
+        non = mk("non_enrolled", "inactive")
+        none_ = mk("", "")
+
+        def ids(params):
+            return {str(x) for x in filter_analytics(params).values_list("client_id", flat=True)}
+
+        self.assertEqual(ids({"social_status": "non_enrolled"}), {str(non.client_id)})
+        self.assertEqual(ids({"social_status": "__none__"}), {str(none_.client_id)})
+        self.assertEqual(ids({"social_status": "enrolled"}), {str(enr.client_id)})
+        self.assertEqual(ids({"insurance_status": "__none__"}), {str(none_.client_id)})
+        self.assertEqual(ids({"insurance_status": "inactive"}), {str(non.client_id)})
+
+
 class CsvImportCreatorAllowlistTest(TestCase):
     """CSV import lets in cases whose creator is on a CareCircle team (Call Center
     or Street) and blocks Met Council. Regression: the Street team is stored as

@@ -783,7 +783,6 @@ def filter_analytics(params):
         "menu_type": "menu_type",
         "current_delivery_status": "current_delivery_status",
         "last_po_delivery_status": "last_po_delivery_status",
-        "insurance_status": "insurance_status", "social_status": "social_status",
         "attestation_status": "attestation_status", "stage": "stage",
         "case_type": "case_type", "case_status": "case_status",
         "auth_status": "auth_status", "program": "program_name",
@@ -821,6 +820,17 @@ def filter_analytics(params):
         qs = qs.filter(cadence="")
     elif cadence_val:
         qs = qs.filter(cadence=cadence_val)
+
+    # Insurance / Social care status (exact) with a NOT_ASSIGNED sentinel for the
+    # blank "no coverage on file" bucket, so every member is reachable and the
+    # buckets sum to the total.
+    for param, col in (("insurance_status", "insurance_status"),
+                       ("social_status", "social_status")):
+        val = g(param)
+        if val == NOT_ASSIGNED:
+            qs = qs.filter(**{col: ""})
+        elif val:
+            qs = qs.filter(**{col: val})
 
     # Boolean filters.
     for param, col in {"has_screening": "has_screening",
