@@ -791,7 +791,6 @@ def filter_analytics(params):
         # Members-parity criteria.
         "eligibility": "eligibility",
         "program_status": "program_status", "lead_source": "lead_source",
-        "service_type": "service_type",
         "program_type": "program_type", "pause_type": "pause_type",
         "verified_by": "verified_by_id_str",
         "screening_agent": "screening_agent",
@@ -824,8 +823,11 @@ def filter_analytics(params):
     # Insurance / Social care status (exact) with a NOT_ASSIGNED sentinel for the
     # blank "no coverage on file" bucket, so every member is reachable and the
     # buckets sum to the total.
+    # service_type ("meals"/"boxes") is blank for members with no enrollment /
+    # unrecognized program, so it gets the same NOT_ASSIGNED bucket.
     for param, col in (("insurance_status", "insurance_status"),
-                       ("social_status", "social_status")):
+                       ("social_status", "social_status"),
+                       ("service_type", "service_type")):
         val = g(param)
         if val == NOT_ASSIGNED:
             qs = qs.filter(**{col: ""})

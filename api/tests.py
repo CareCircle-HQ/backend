@@ -15450,14 +15450,16 @@ class DataCoverageStatusFilterTest(TestCase):
         from .models import Client, EnrollmentAnalytics
         from .services.enrollment_analytics import filter_analytics
 
-        def mk(social, ins):
+        def mk(social, ins, svc=""):
             c = Client.objects.create(client_id=str(_uuid.uuid4()), first_name="A", last_name="B")
-            EnrollmentAnalytics.objects.create(client=c, social_status=social, insurance_status=ins)
+            EnrollmentAnalytics.objects.create(
+                client=c, social_status=social, insurance_status=ins, service_type=svc,
+            )
             return c
 
-        enr = mk("enrolled", "active")
-        non = mk("non_enrolled", "inactive")
-        none_ = mk("", "")
+        enr = mk("enrolled", "active", "meals")
+        non = mk("non_enrolled", "inactive", "boxes")
+        none_ = mk("", "", "")
 
         def ids(params):
             return {str(x) for x in filter_analytics(params).values_list("client_id", flat=True)}
@@ -15467,6 +15469,9 @@ class DataCoverageStatusFilterTest(TestCase):
         self.assertEqual(ids({"social_status": "enrolled"}), {str(enr.client_id)})
         self.assertEqual(ids({"insurance_status": "__none__"}), {str(none_.client_id)})
         self.assertEqual(ids({"insurance_status": "inactive"}), {str(non.client_id)})
+        self.assertEqual(ids({"service_type": "meals"}), {str(enr.client_id)})
+        self.assertEqual(ids({"service_type": "boxes"}), {str(non.client_id)})
+        self.assertEqual(ids({"service_type": "__none__"}), {str(none_.client_id)})
 
 
 class CsvImportCreatorAllowlistTest(TestCase):
