@@ -515,6 +515,11 @@ class Client(models.Model):
     # warnings. See api.services.lifecycle.advance_enrollment (clear) and
     # api.serializers.CaseSerializer (set).
     is_new = models.BooleanField(default=False, db_index=True)
+    # Manually dismissed from the Urgent Care ("Need Attention") list. Independent
+    # of is_new: the list no longer keys off is_new, so dismissing must set its own
+    # flag (else the member would immediately reappear). Set by the Dismiss action
+    # / bulk command; excluded from the need_attention scope.
+    urgent_care_dismissed = models.BooleanField(default=False, db_index=True)
     is_a_family = models.BooleanField(default=False)
     total_family_members = models.PositiveSmallIntegerField(null=True, blank=True)
     attestation_needed = models.BooleanField(default=False)

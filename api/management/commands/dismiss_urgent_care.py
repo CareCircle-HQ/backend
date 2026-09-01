@@ -1,104 +1,68 @@
 """Bulk-dismiss clients from the Urgent Care ("Need Attention") list.
 
-The Urgent Care list is exactly the clients flagged ``Client.is_new=True`` who
-have NOT yet entered the verification pipeline -- i.e. no enrollment of their
-own AND none on their household (mirrors the ``scope=need_attention`` query in
-``api.portal.views_members.MembersListView``). "Dismissing" a client just
-clears ``is_new`` so they drop off the list.
-
-Two selection modes (both write ONLY the flag -- no audit Note and no timeline
-event, unlike the per-member dismiss endpoint):
-
-  * default    -- is_new clients on the list who have NO internal-service case.
-  * --verified -- is_new clients whose verification is already COMPLETE (a
-                  governing enrollment, their own or their household's, has
-                  ``verified_at`` set). These are stale flags that should have
-                  cleared on verification; this sweeps them off the list.
+The list shows every ELIGIBLE member with an OPEN internal-service (meal/box)
+case and NO enrollment yet -- valid Medicaid + social care, not on the
+not_eligible/ineligible off-ramp (mirrors ``scope=need_attention`` in
+``api.portal.views_members.MembersListView``). "Dismissing" sets
+``Client.urgent_care_dismissed=True`` so they drop off the list (independent of
+``is_new``, which no longer gates the list).
 
 Preview first (default), then commit:
 
-    python manage.py dismiss_urgent_care                     # dry run (no-case mode)
-    python manage.py dismiss_urgent_care --apply             # commit no-case mode
-    python manage.py dismiss_urgent_care --verified          # dry run (verified mode)
-    python manage.py dismiss_urgent_care --verified --apply  # commit verified mode
+    python manage.py dismiss_urgent_care            # dry run
+    python manage.py dismiss_urgent_care --apply    # commit
 """
 from django.core.management.base import BaseCommand
-from django.db.models import Q
+from django.db.models import Exists, OuterRef, Q
 
-from api.models import CaseType, Client
+from api.models import Case, CaseStatus, CaseType, Client, ClientStage
+from api.services.lifecycle import valid_medicaid_exists, valid_social_care_exists
 
 
 class Command(BaseCommand):
     help = (
-        "Clear is_new for Urgent Care ('Need Attention') clients that have no "
-        "internal-service case. Dry-run by default; pass --apply to commit."
+        "Dismiss every member currently on the Urgent Care list "
+        "(sets urgent_care_dismissed). Dry-run by default; --apply to commit."
     )
 
     def add_arguments(self, parser):
         parser.add_argument(
-            "--verified", action="store_true",
-            help="Target is_new clients whose verification is already complete "
-                 "(instead of the default: list members with no internal-service case).",
-        )
-        parser.add_argument(
-            "--all", action="store_true", dest="all_flagged",
-            help="Target EVERY client with is_new=True, no conditions "
-                 "(ignores verification and case status). Wipes the whole flag.",
-        )
-        parser.add_argument(
             "--apply", action="store_true",
-            help="Actually clear is_new. Without this the command only previews.",
+            help="Actually dismiss. Without this the command only previews.",
         )
         parser.add_argument(
             "--limit", type=int, default=50,
-            help="Max rows to print in the preview (default 50). Counts are always full.",
+            help="Max rows to print in the preview (default 50). Counts are full.",
         )
 
-    def _queryset(self, verified, all_flagged):
-        if all_flagged:
-            # Every flagged client, no conditions.
-            return Client.objects.filter(is_new=True)
-        if verified:
-            # is_new clients already verified: a governing enrollment (own or
-            # household) has verified_at set. The flag should have cleared on
-            # verification; this sweeps the stragglers.
-            verified_q = (
-                Q(enrollments__verified_at__isnull=False)
-                | Q(household_membership__household__enrollment_verifications__verified_at__isnull=False)
-            )
-            return Client.objects.filter(is_new=True).filter(verified_q).distinct()
-        # Mirror the Need Attention list: is_new AND no enrollment (own or
-        # household), then narrow to those with no internal-service case.
+    def _list_queryset(self):
+        """The current Urgent Care list -- mirrors the need_attention scope."""
+        open_ic = Case.objects.filter(
+            client=OuterRef("pk"), case_type=CaseType.INTERNAL_SERVICE,
+        ).exclude(case_status__in=[CaseStatus.CLOSED, CaseStatus.CANCELLED])
         return (
-            Client.objects.filter(is_new=True)
+            Client.objects.filter(Exists(open_ic))
+            .filter(valid_medicaid_exists(), valid_social_care_exists())
             .exclude(
                 Q(enrollments__isnull=False)
                 | Q(household_membership__household__enrollment_verifications__isnull=False)
             )
-            .exclude(cases__case_type=CaseType.INTERNAL_SERVICE)
+            .exclude(lifecycle_stage__in=[ClientStage.NOT_ELIGIBLE, ClientStage.INELIGIBLE])
+            .exclude(urgent_care_dismissed=True)
             .distinct()
         )
 
     def handle(self, *args, **opts):
-        verified = opts["verified"]
-        all_flagged = opts["all_flagged"]
-        if all_flagged:
-            cohort = "client(s) flagged is_new (all, unconditional)"
-        elif verified:
-            cohort = "is_new client(s) already verified"
-        else:
-            cohort = "Urgent Care client(s) with no internal-service case"
-        qs = self._queryset(verified, all_flagged)
+        qs = self._list_queryset()
         total = qs.count()
-
         if total == 0:
             self.stdout.write(self.style.SUCCESS(
-                f"No {cohort}. Nothing to do."
+                "Urgent Care list is empty. Nothing to dismiss."
             ))
             return
 
         limit = opts["limit"]
-        self.stdout.write(f"{total} {cohort}:")
+        self.stdout.write(f"{total} member(s) currently on the Urgent Care list:")
         for cid, first, last in qs.values_list(
             "client_id", "first_name", "last_name"
         )[:limit]:
@@ -108,14 +72,13 @@ class Command(BaseCommand):
 
         if not opts["apply"]:
             self.stdout.write(self.style.WARNING(
-                "Dry run -- no changes made. Re-run with --apply to clear is_new."
+                "Dry run -- no changes made. Re-run with --apply to dismiss."
             ))
             return
 
-        # Bulk flag-only write: no Note, no timeline event.
         updated = Client.objects.filter(
             pk__in=list(qs.values_list("pk", flat=True))
-        ).update(is_new=False)
+        ).update(urgent_care_dismissed=True)
         self.stdout.write(self.style.SUCCESS(
-            f"Dismissed {updated} client(s) from the Urgent Care list (is_new cleared)."
+            f"Dismissed {updated} client(s) from the Urgent Care list."
         ))

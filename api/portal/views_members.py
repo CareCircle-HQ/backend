@@ -1585,20 +1585,24 @@ class MembersListView(PortalGenericAPIView):
             open_internal_case = Case.objects.filter(
                 client=OuterRef("pk"), case_type=CaseType.INTERNAL_SERVICE,
             ).exclude(case_status__in=[CaseStatus.CLOSED, CaseStatus.CANCELLED])
-            # NOT ELIGIBLE members are dropped from the tab -- they can't be
-            # verified, so they don't belong in the actionable Urgent Care queue.
-            # "Not eligible" = missing the coverage gate (no valid Medicaid OR no
-            # valid social care), OR parked on the not_eligible/ineligible lifecycle
-            # off-ramp. (is_new is set-only, so a member whose coverage lapsed after
-            # being flagged would otherwise linger here.)
-            qs = qs.filter(is_new=True).filter(Exists(open_internal_case)).filter(
+            # Every ELIGIBLE member with an open internal-service case who has NOT
+            # entered verification yet -- NOT just the brand-new (is_new) ones. The
+            # rule:
+            #   * an OPEN internal-service (meal/box) case, and
+            #   * NO enrollment yet (own OR household -- an enrollment means
+            #     verification was already requested/handled), and
+            #   * ELIGIBLE: valid Medicaid + valid social care, and NOT on the
+            #     not_eligible/ineligible lifecycle off-ramp, and
+            #   * NOT manually dismissed from the list (urgent_care_dismissed).
+            # is_new is no longer a gate here, so dismissal keys off its own flag.
+            qs = qs.filter(Exists(open_internal_case)).filter(
                 valid_medicaid_exists(), valid_social_care_exists(),
             ).exclude(
                 Q(enrollments__isnull=False)
                 | Q(household_membership__household__enrollment_verifications__isnull=False)
             ).exclude(
                 lifecycle_stage__in=[ClientStage.NOT_ELIGIBLE, ClientStage.INELIGIBLE]
-            ).distinct()
+            ).exclude(urgent_care_dismissed=True).distinct()
             # Optional case-created date-range filter (Urgent Care triage): keep
             # only members whose governing internal-service case was OPENED within
             # [case_from, case_to]. Matched against the internal-service case's
@@ -6686,18 +6690,17 @@ class MemberVerificationDisregardView(PortalAPIView):
 class MemberDismissAttentionView(PortalAPIView):
     """POST: dismiss a client from the Urgent Care ("Need Attention") list.
 
-    Clears the ``is_new`` flag so a client that no longer needs verification
-    attention (e.g. verified through another path, or flagged in error) drops
-    off the list. Normally ``is_new`` clears automatically when a verification
-    completes; this is the manual escape hatch for the stragglers that aren't
-    pending verification. Idempotent (a no-op when already clear). Records an
-    audit Note."""
+    Sets the ``urgent_care_dismissed`` flag so the client drops off the list.
+    The list no longer keys off ``is_new`` (it shows every eligible member with
+    an open internal-service case and no enrollment yet), so dismissal needs its
+    own flag -- clearing ``is_new`` alone would no longer remove them. Idempotent
+    (a no-op when already dismissed). Records an audit Note."""
 
     def post(self, request, client_id):
         client = get_object_or_404(Client, pk=client_id)
-        if client.is_new:
-            client.is_new = False
-            client.save(update_fields=["is_new"])
+        if not client.urgent_care_dismissed:
+            client.urgent_care_dismissed = True
+            client.save(update_fields=["urgent_care_dismissed"])
             agent = current_agent(request)
             author = agent.name if agent else ""
             Note.objects.create(

@@ -14069,6 +14069,24 @@ class NeedAttentionScopeCaseRuleTest(TestCase):
         self.assertNotIn(str(no_medicaid.client_id), ids)    # no Medicaid
         self.assertNotIn(str(offramp.client_id), ids)        # not_eligible off-ramp
 
+    def test_shows_even_when_not_flagged_is_new(self):
+        # The list no longer gates on is_new: an eligible member with an open IS
+        # case and no enrollment appears even if is_new was never set.
+        from .models import CaseType
+
+        not_flagged = self._member(case_type=CaseType.INTERNAL_SERVICE, is_new=False)
+        self.assertIn(str(not_flagged.client_id), self._ids())
+
+    def test_dismissed_member_hidden(self):
+        # Dismissal keys off urgent_care_dismissed (not is_new) now.
+        from .models import CaseType
+
+        m = self._member(case_type=CaseType.INTERNAL_SERVICE)
+        self.assertIn(str(m.client_id), self._ids())
+        m.urgent_care_dismissed = True
+        m.save(update_fields=["urgent_care_dismissed"])
+        self.assertNotIn(str(m.client_id), self._ids())
+
 
 class KitchenAbbreviationPoNumberTest(TestCase):
     """The PO number uses the kitchen's configured abbreviation when set, and
