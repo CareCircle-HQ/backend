@@ -5172,6 +5172,75 @@ class DataPageFullNameSearchTest(TestCase):
         self.assertFalse(hit("Jane Smith"))   # wrong last name -> no match
 
 
+class EnrollmentCaseBindingGateTest(TestCase):
+    """EnrollmentVerificationSerializer binds ONLY internal-service cases -- a
+    navigation/eligibility case must never attach to a verification enrollment
+    (that stranded the verified delivery address on a nav-case sibling row)."""
+
+    def _case(self, client, case_type):
+        from .models import Case, CaseStatus
+
+        return Case.objects.create(
+            case_id=str(uuid.uuid4()), client=client, case_type=case_type,
+            case_status=CaseStatus.OPEN,
+        )
+
+    def test_navigation_case_not_bound_on_create(self):
+        from .models import CaseType, Client
+        from .serializers import EnrollmentVerificationSerializer
+
+        c = Client.objects.create(client_id=str(uuid.uuid4()), first_name="Nav", last_name="Only")
+        nav = self._case(c, CaseType.NAVIGATION)
+        ser = EnrollmentVerificationSerializer(data={
+            "client_id": str(c.client_id), "case_id": str(nav.case_id),
+            "members": [{"member_name": "Nav Only"}],
+        })
+        ser.is_valid(raise_exception=True)
+        enr = ser.save()
+        self.assertIsNone(enr.case_id)  # nav case NOT bound
+
+    def test_internal_service_case_is_bound(self):
+        from .models import CaseType, Client
+        from .serializers import EnrollmentVerificationSerializer
+
+        c = Client.objects.create(client_id=str(uuid.uuid4()), first_name="IS", last_name="Case")
+        isc = self._case(c, CaseType.INTERNAL_SERVICE)
+        ser = EnrollmentVerificationSerializer(data={
+            "client_id": str(c.client_id), "case_id": str(isc.case_id),
+            "members": [{"member_name": "IS Case"}],
+        })
+        ser.is_valid(raise_exception=True)
+        enr = ser.save()
+        self.assertEqual(str(enr.case_id), str(isc.case_id))
+
+    def test_nav_case_reuses_is_enrollment_without_clobbering(self):
+        # A nav case sent while the client has a pre-verify IS enrollment: REUSE the
+        # IS enrollment (keep its IS case) and land the address there -- don't fork a
+        # nav-bound row and don't strand the address.
+        from .models import (
+            Address, CaseType, Client, EnrollmentStage, EnrollmentVerification,
+        )
+        from .serializers import EnrollmentVerificationSerializer
+
+        c = Client.objects.create(client_id=str(uuid.uuid4()), first_name="Reuse", last_name="IS")
+        isc = self._case(c, CaseType.INTERNAL_SERVICE)
+        nav = self._case(c, CaseType.NAVIGATION)
+        existing = EnrollmentVerification.objects.create(
+            client=c, case=isc, stage=EnrollmentStage.PENDING_VERIFICATION,
+        )
+        addr = Address.objects.create(client=c, type="delivery", street="1 Main St", zip="11111")
+        ser = EnrollmentVerificationSerializer(data={
+            "client_id": str(c.client_id), "case_id": str(nav.case_id),
+            "delivery_address_id": str(addr.pk), "members": [{"member_name": "Reuse IS"}],
+        })
+        ser.is_valid(raise_exception=True)
+        enr = ser.save()
+        self.assertEqual(enr.pk, existing.pk)                 # reused, not forked
+        self.assertEqual(str(enr.case_id), str(isc.case_id))  # kept IS case, not nav
+        self.assertEqual(enr.delivery_address_id, addr.pk)    # address landed here
+        self.assertEqual(EnrollmentVerification.objects.filter(client=c).count(), 1)
+
+
 class WorkQueueResolvedDateFilterTest(TestCase):
     """Work Queue resolved-date filter: resolved_from/resolved_to bound tickets by
     their resolved_at (local calendar day); unresolved tickets are excluded."""
