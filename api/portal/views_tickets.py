@@ -93,6 +93,17 @@ class WorkQueueView(PortalGenericAPIView):
         created_to = _parse_date(p.get("created_to"))
         if created_to:
             qs = qs.filter(created_at__date__lte=created_to)
+        # Date-resolved range (inclusive) on ``resolved_at`` -- filter tickets by
+        # WHEN they were resolved. ``__date`` uses the active timezone
+        # (America/New_York) so the window matches the local calendar day. Only
+        # resolved tickets carry a resolved_at, so a resolved-date filter
+        # naturally scopes to resolved tickets.
+        resolved_from = _parse_date(p.get("resolved_from"))
+        if resolved_from:
+            qs = qs.filter(resolved_at__date__gte=resolved_from)
+        resolved_to = _parse_date(p.get("resolved_to"))
+        if resolved_to:
+            qs = qs.filter(resolved_at__date__lte=resolved_to)
         # Stable ordering is REQUIRED for correct pagination (without an ORDER BY
         # the page contents are arbitrary and can repeat/skip across pages).
         # Default newest-first; honor the list's recent/oldest sort toggle.

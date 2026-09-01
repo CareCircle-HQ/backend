@@ -5172,6 +5172,50 @@ class DataPageFullNameSearchTest(TestCase):
         self.assertFalse(hit("Jane Smith"))   # wrong last name -> no match
 
 
+class WorkQueueResolvedDateFilterTest(TestCase):
+    """Work Queue resolved-date filter: resolved_from/resolved_to bound tickets by
+    their resolved_at (local calendar day); unresolved tickets are excluded."""
+
+    def _ids(self, **params):
+        from rest_framework.request import Request
+        from rest_framework.test import APIRequestFactory
+
+        from .portal.views_tickets import WorkQueueView
+
+        v = WorkQueueView()
+        v.request = Request(APIRequestFactory().get("/x", params))
+        return set(v.get_queryset().values_list("pk", flat=True))
+
+    def test_filters_by_resolved_date(self):
+        import datetime
+
+        from django.utils import timezone
+
+        from .models import Ticket, TicketStatus, TicketType
+
+        tt, _ = TicketType.objects.get_or_create(
+            code="verification", defaults={"label": "Verification"}
+        )
+        early = Ticket.objects.create(
+            type=tt, status=TicketStatus.RESOLVED,
+            resolved_at=timezone.make_aware(datetime.datetime(2026, 8, 10, 12, 0)),
+        )
+        late = Ticket.objects.create(
+            type=tt, status=TicketStatus.RESOLVED,
+            resolved_at=timezone.make_aware(datetime.datetime(2026, 8, 20, 12, 0)),
+        )
+        unresolved = Ticket.objects.create(type=tt, status=TicketStatus.OPEN)
+
+        window = self._ids(resolved_from="2026-08-01", resolved_to="2026-08-15")
+        self.assertIn(early.pk, window)
+        self.assertNotIn(late.pk, window)
+        self.assertNotIn(unresolved.pk, window)  # no resolved_at -> excluded
+
+        from_only = self._ids(resolved_from="2026-08-16")
+        self.assertIn(late.pk, from_only)
+        self.assertNotIn(early.pk, from_only)
+
+
 class CompanyStatusNotEligibleTest(TestCase):
     """A member parked on the not_eligible/ineligible lifecycle off-ramp (closed
     enrollment, but a lingering open case -- e.g. after a Household->Individual
