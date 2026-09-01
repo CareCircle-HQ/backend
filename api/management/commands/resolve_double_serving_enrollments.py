@@ -29,6 +29,15 @@ from django.core.management.base import BaseCommand
 class Command(BaseCommand):
     help = "Retire the stray navigation-case enrollment for double-serving members."
 
+    # Clients needing BESPOKE handling -- excluded so an --apply never touches them.
+    # These are the INVERSE of this command's fix: the internal-service enrollment is
+    # the hollow / out-of-orbit one and the NAV enrollment holds the real service
+    # (active profile + plan). They must be fixed by rebinding the nav enrollment
+    # onto the IS case + retiring the hollow IS row, NOT by retiring the nav one.
+    EXCLUDED_CLIENTS = frozenset({
+        "4732505c-fa45-48b4-93ab-a520c03fde0c",  # FLORANGEL DIAZ -- handle manually
+    })
+
     def add_arguments(self, parser):
         parser.add_argument("--apply", action="store_true",
                             help="Persist changes (default: dry run).")
@@ -63,6 +72,13 @@ class Command(BaseCommand):
         for stray in stray_qs:
             c = stray.client
             if c is None:
+                continue
+            if str(c.client_id) in self.EXCLUDED_CLIENTS:
+                skipped += 1
+                self.stdout.write(
+                    f"  SKIP {c.client_id}: excluded (bespoke manual handling -- "
+                    "nav enrollment holds the real service)."
+                )
                 continue
             gov_case = s.internal_service_case(c)
             survivor = None

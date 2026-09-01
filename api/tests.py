@@ -5397,6 +5397,46 @@ class ResolveDoubleServingCommandTest(TestCase):
         # NOT retired -- the survivor couldn't take over.
         self.assertEqual(EnrollmentStage(stray.stage), EnrollmentStage.SERVICE_ACTIVE)
 
+    def test_excluded_client_is_skipped(self):
+        # A client on the bespoke-handling exclusion list is never auto-retired,
+        # even when it otherwise looks resolvable.
+        from io import StringIO
+
+        from django.core.management import call_command
+        from django.utils import timezone
+
+        from .management.commands.resolve_double_serving_enrollments import Command
+        from .models import (
+            Case, CaseStatus, CaseType, Client, EnrollmentStage,
+            EnrollmentVerification, Household, HouseholdMember,
+        )
+        excluded_id = next(iter(Command.EXCLUDED_CLIENTS))
+        c = Client.objects.create(client_id=excluded_id, first_name="Excl", last_name="Uded")
+        hh = Household.objects.create(name="HH")
+        HouseholdMember.objects.create(household=hh, client=c, is_primary=True)
+        isc = Case.objects.create(
+            case_id=str(uuid.uuid4()), client=c, case_type=CaseType.INTERNAL_SERVICE,
+            case_status=CaseStatus.OPEN,
+        )
+        nav = Case.objects.create(
+            case_id=str(uuid.uuid4()), client=c, case_type=CaseType.NAVIGATION,
+            case_status=CaseStatus.OPEN,
+        )
+        EnrollmentVerification.objects.create(
+            client=c, household=hh, case=isc, stage=EnrollmentStage.SERVICE_ACTIVE,
+            verified_at=timezone.now(),
+        )
+        stray = EnrollmentVerification.objects.create(
+            client=c, household=hh, case=nav, stage=EnrollmentStage.SERVICE_ACTIVE,
+            verified_at=timezone.now(),
+        )
+        call_command(
+            "resolve_double_serving_enrollments", "--client", str(c.client_id),
+            "--apply", stdout=StringIO(),
+        )
+        stray.refresh_from_db()
+        self.assertEqual(EnrollmentStage(stray.stage), EnrollmentStage.SERVICE_ACTIVE)
+
 
 class WorkQueueResolvedDateFilterTest(TestCase):
     """Work Queue resolved-date filter: resolved_from/resolved_to bound tickets by
