@@ -5148,6 +5148,30 @@ class AsAwareCoercionTest(TestCase):
         self.assertEqual(_as_aware(aware), aware)
 
 
+class DataPageFullNameSearchTest(TestCase):
+    """Data page search matches a FULL name ('First Last' / 'Last First'), not
+    only a single name -- each token must appear in the first or last name."""
+
+    def test_full_name_search(self):
+        from .models import Client, EnrollmentAnalytics
+        from .services.enrollment_analytics import filter_analytics
+
+        c = Client.objects.create(client_id=str(uuid.uuid4()), first_name="Jane", last_name="Doe")
+        EnrollmentAnalytics.objects.create(
+            client=c, first_name="Jane", last_name="Doe", case_type="", case_status="",
+        )
+
+        def hit(term):
+            return filter_analytics({"search": term}).filter(client_id=c.client_id).exists()
+
+        self.assertTrue(hit("Jane"))          # first name only
+        self.assertTrue(hit("Doe"))           # last name only
+        self.assertTrue(hit("Jane Doe"))      # full name (was broken)
+        self.assertTrue(hit("Doe Jane"))      # reversed order
+        self.assertTrue(hit("jane doe"))      # case-insensitive
+        self.assertFalse(hit("Jane Smith"))   # wrong last name -> no match
+
+
 class CompanyStatusNotEligibleTest(TestCase):
     """A member parked on the not_eligible/ineligible lifecycle off-ramp (closed
     enrollment, but a lingering open case -- e.g. after a Household->Individual

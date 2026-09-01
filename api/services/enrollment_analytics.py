@@ -774,8 +774,19 @@ def filter_analytics(params):
 
     search = g("search")
     if search:
+        # Single-field matches: a first/last-name substring or the medicaid id.
         cond = Q(first_name__icontains=search) | Q(last_name__icontains=search) \
             | Q(medicaid_id__icontains=search)
+        # Full-name search: "First Last" (or "Last First", or a middle name) is
+        # matched by requiring EACH token to appear in the first OR last name --
+        # neither field alone contains the whole string, which is why a full name
+        # returned nothing before.
+        terms = search.split()
+        if len(terms) > 1:
+            name_q = Q()
+            for term in terms:
+                name_q &= (Q(first_name__icontains=term) | Q(last_name__icontains=term))
+            cond |= name_q
         try:
             import uuid as _uuid
             cond |= Q(client_id=_uuid.UUID(search)) | Q(enrollment_id=int(search)) \
