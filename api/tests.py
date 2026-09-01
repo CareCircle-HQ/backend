@@ -5438,6 +5438,62 @@ class ResolveDoubleServingCommandTest(TestCase):
         self.assertEqual(EnrollmentStage(stray.stage), EnrollmentStage.SERVICE_ACTIVE)
 
 
+class RehomeServingNavCommandTest(TestCase):
+    """rehome_serving_nav_enrollment rebinds the SERVING nav enrollment onto the
+    governing IS case (carrying address + nutri approval) and retires the hollow
+    IS enrollment -- the inverse of resolve_double_serving."""
+
+    def test_rebinds_nav_to_is_and_retires_hollow(self):
+        from io import StringIO
+
+        from django.core.management import call_command
+        from django.utils import timezone
+
+        from .models import (
+            Address, Case, CaseStatus, CaseType, Client, DeliveryCadence,
+            EnrollmentStage, EnrollmentVerification, Household, HouseholdMember,
+            MemberDeliverySchedule, ScheduleStatus,
+        )
+        c = Client.objects.create(client_id=str(uuid.uuid4()), first_name="Re", last_name="Home")
+        hh = Household.objects.create(name="HH")
+        HouseholdMember.objects.create(household=hh, client=c, is_primary=True)
+        isc = Case.objects.create(
+            case_id=str(uuid.uuid4()), client=c, case_type=CaseType.INTERNAL_SERVICE,
+            case_status=CaseStatus.OPEN, program_name="MTM",
+        )
+        nav = Case.objects.create(
+            case_id=str(uuid.uuid4()), client=c, case_type=CaseType.NAVIGATION,
+            case_status=CaseStatus.OPEN,
+        )
+        deliv = Address.objects.create(client=c, type="delivery", street="1 Main St Apt 5", zip="11111")
+        temp = Address.objects.create(client=c, type="temporary", street="1 Main St", zip="11111")
+        hollow = EnrollmentVerification.objects.create(
+            client=c, household=hh, case=isc, stage=EnrollmentStage.SERVICE_ACTIVE,
+            verified_at=timezone.now(), nutritionist_approved_at=timezone.now(),
+            delivery_address=deliv,  # holds the delivery-type apt address + nutri
+        )
+        serving = EnrollmentVerification.objects.create(
+            client=c, household=hh, case=nav, stage=EnrollmentStage.SERVICE_ACTIVE,
+            verified_at=timezone.now(), delivery_address=temp,
+        )
+        MemberDeliverySchedule.objects.create(
+            enrollment=serving, member_name="Re Home",
+            delivery_days_cadence=DeliveryCadence.ONCE_A_WEEK,
+            status=ScheduleStatus.SCHEDULED,  # live plan -> serving
+        )
+        call_command(
+            "rehome_serving_nav_enrollment", "--client", str(c.client_id),
+            "--apply", stdout=StringIO(),
+        )
+        hollow.refresh_from_db()
+        serving.refresh_from_db()
+        self.assertEqual(EnrollmentStage(hollow.stage), EnrollmentStage.DISREGARDED)
+        self.assertEqual(EnrollmentStage(serving.stage), EnrollmentStage.SERVICE_ACTIVE)
+        self.assertEqual(str(serving.case_id), str(isc.case_id))   # rebound to IS case
+        self.assertEqual(serving.delivery_address_id, deliv.pk)     # apt address carried
+        self.assertIsNotNone(serving.nutritionist_approved_at)      # nutri carried
+
+
 class WorkQueueResolvedDateFilterTest(TestCase):
     """Work Queue resolved-date filter: resolved_from/resolved_to bound tickets by
     their resolved_at (local calendar day); unresolved tickets are excluded."""
