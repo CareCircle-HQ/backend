@@ -785,7 +785,7 @@ def filter_analytics(params):
         "last_po_delivery_status": "last_po_delivery_status",
         "attestation_status": "attestation_status", "stage": "stage",
         "case_type": "case_type", "case_status": "case_status",
-        "auth_status": "auth_status", "program": "program_name",
+        "program": "program_name",
         "company_status": "company_status",
         "delivery_company": "delivery_company",
         # Members-parity criteria.
@@ -827,7 +827,8 @@ def filter_analytics(params):
     # unrecognized program, so it gets the same NOT_ASSIGNED bucket.
     for param, col in (("insurance_status", "insurance_status"),
                        ("social_status", "social_status"),
-                       ("service_type", "service_type")):
+                       ("service_type", "service_type"),
+                       ("auth_status", "auth_status")):
         val = g(param)
         if val == NOT_ASSIGNED:
             qs = qs.filter(**{col: ""})
