@@ -3397,18 +3397,40 @@ def _create_missing_carried_profiles(target, source):
     downstream kitchen reconcile can plan them; a Paused / Inactive / Out-of-Range
     member carries that status verbatim and is not revived). Returns the number
     of profiles created. Best-effort."""
-    from api.models import MemberDietaryProfile, MemberStatus
+    from api.models import HouseholdMember, MemberDietaryProfile, MemberStatus
 
     if target is None or source is None:
         return 0
+    source_profiles = list(source.member_profiles.all())
+    # Never carry a client who DEFINITIVELY belongs to a DIFFERENT household (they
+    # hold their own HouseholdMember row elsewhere -- e.g. a member who has since
+    # split into their own household). Such a stale cross-household profile would
+    # otherwise be copied onto THIS household's enrollments, where the scope
+    # reconcile then pauses/locks them as a phantom "additional member" -- reading
+    # as paused while they are primary/active in their own household. (Root cause of
+    # RACHEL STEINBERG being carried onto CHAYA FISCHER's household after the 08/19
+    # split.) A genuine dependent (member of THIS household, or not yet assigned to
+    # any household) is unaffected, so stranded-dependent carry still works.
+    foreign = set()
+    if target.household_id is not None:
+        src_ids = [p.client_id for p in source_profiles if p.client_id]
+        if src_ids:
+            foreign = set(
+                HouseholdMember.objects.filter(client_id__in=src_ids)
+                .exclude(household_id=target.household_id)
+                .values_list("client_id", flat=True)
+            )
     existing = {p.client_id for p in target.member_profiles.all() if p.client_id}
     created = 0
-    for sp in source.member_profiles.all():
+    for sp in source_profiles:
         if not sp.client_id or sp.client_id in existing:
             continue
         # A REMOVED profile is a split-out dependent kept only as history; never
         # copy them forward (e.g. onto a reauthorization enrollment).
         if sp.status == MemberStatus.REMOVED:
+            continue
+        # Belongs to a different household -- never carry them onto this one.
+        if sp.client_id in foreign:
             continue
         carried = {f: getattr(sp, f) for f in _CARRY_PROFILE_FIELDS}
         try:

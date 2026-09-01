@@ -155,13 +155,14 @@ def warm_dashboard_cache(self):
 
 
 @shared_task(bind=True, ignore_result=True)
-def rebuild_enrollment_analytics(self):
+def rebuild_enrollment_analytics(self, trigger="scheduled"):
     """Rebuild the EnrollmentAnalytics read model for the Data page. Scheduled
     ~hourly on Celery beat (1-hour freshness SLA); also safe to call ad-hoc.
-    Full rebuild today (small table); switch to watermark-incremental at scale."""
+    Full rebuild today (small table); switch to watermark-incremental at scale.
+    ``trigger`` labels the run (scheduled beat vs the Data page's manual button)."""
     from django.core.management import call_command
 
-    call_command("rebuild_enrollment_analytics", "--prune")
+    call_command("rebuild_enrollment_analytics", "--prune", f"--trigger={trigger}")
 
 
 @shared_task(bind=True, ignore_result=True)

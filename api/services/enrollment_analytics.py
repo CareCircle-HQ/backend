@@ -9,6 +9,7 @@ source of truth.
 """
 
 import logging
+from functools import lru_cache
 
 from django.db.models import Prefetch
 from django.utils import timezone
@@ -22,6 +23,13 @@ from ..models import (
 logger = logging.getLogger(__name__)
 
 _INTERNAL_SERVICE = "internal_service"
+
+# Data page Team filter sentinel for the "No Team / Unassigned" bucket (blank
+# team). The frontend sends this value; filter_analytics maps it to team="".
+UNASSIGNED_TEAM = "__unassigned__"
+# Data page sentinel for "Not Assigned" on the Kitchen / Cadence filters (no
+# kitchen assigned / blank delivery cadence).
+NOT_ASSIGNED = "__none__"
 
 
 def _cadence_from_weekdays(weekdays):
@@ -146,17 +154,73 @@ def _dietary(enrollment_id, client_id):
     )
 
 
+@lru_cache(maxsize=4096)
+def _agent_name_by_employee_id(employee_id):
+    """Screening facilitator name from a Unite Us employee_id. Cached across the
+    build (facilitators repeat heavily); the cache is cleared at the start of each
+    full rebuild via _reset_screening_agent_cache. Blank when unresolved."""
+    if employee_id is None:
+        return ""
+    from api.models import UniteUsAgent
+    ag = UniteUsAgent.objects.filter(employee_id=employee_id).first()
+    if ag is None:
+        return ""
+    return (ag.name or f"{ag.first_name} {ag.last_name}".strip() or "")
+
+
+@lru_cache(maxsize=4096)
+def _team_by_user_id(user_id):
+    """CareCircle originating team of the Unite Us agent (case creator) with this
+    user_id. Cached across the build; cleared per rebuild. Blank when unresolved."""
+    if user_id is None:
+        return ""
+    from api.models import UniteUsAgent
+    ag = UniteUsAgent.objects.filter(user_id=user_id).first()
+    return (ag.originating_team or "") if ag else ""
+
+
+def _fallback_case_team(client):
+    """Team for a member with NO internal-service case: the CareCircle team of the
+    agent who created the member's MOST-RECENT case of ANY type. Blank when none of
+    their cases has a resolvable creator (so a truly caseless member stays blank)."""
+    cand = [ca for ca in client.cases.all() if ca.created_by_id]
+    if not cand:
+        return ""
+    ca = max(cand, key=lambda c: (c.date_opened is not None, c.date_opened))
+    return _team_by_user_id(ca.created_by_id)
+
+
+def _reset_screening_agent_cache():
+    """Drop the per-build lookup caches so a rebuild picks up renamed agents/teams."""
+    _agent_name_by_employee_id.cache_clear()
+    _team_by_user_id.cache_clear()
+
+
 def _screening_assessment(client_id):
     scr = (Screening.objects.filter(client_id=client_id)
            .order_by("-screen_created_at").first())
     asm = (Assessment.objects.filter(client_id=client_id)
            .order_by("-screen_created_at").first())
     eligible = _clean(asm.eligible_services) if asm else []
+    scr_agent = _agent_name_by_employee_id(scr.facilitator_id) if scr else ""
     return (
         scr is not None, (scr.screen_created_at if scr else None),
         asm is not None, (asm.screen_created_at if asm else None),
-        eligible,
+        eligible, scr_agent,
     )
+
+
+def _phones(client):
+    """The client's phone numbers, primary first then oldest, de-duped. Uses the
+    human-readable ``raw`` (falls back to the normalized last-10). Prefetched, so
+    sorted in Python (no extra query)."""
+    out, seen = [], set()
+    for p in sorted(client.phones.all(), key=lambda x: (not x.is_primary, x.created_at)):
+        num = (p.raw or p.normalized or "").strip()
+        if num and num not in seen:
+            seen.add(num)
+            out.append(num)
+    return out
 
 
 def _parity_fields(client):
@@ -179,6 +243,11 @@ def _parity_fields(client):
     try:
         from api.portal.views_members import MembersListView
         team = (MembersListView()._case_team_map([client]) or {}).get(str(client.client_id), "") or ""
+        # No internal-service case (or its creator didn't resolve)? Attribute the
+        # member to the team that created their most-recent case of ANY type, so
+        # nav/eligibility/screening-only members aren't left blank on the Data page.
+        if not team:
+            team = _fallback_case_team(client)
     except Exception:  # noqa: BLE001
         team = ""
     try:
@@ -302,16 +371,38 @@ def _company_status(enrollment, case, parity, in_any_po, has_medicaid, has_socia
     return "review"
 
 
-def _nutritionist_status(enrollment):
-    """Nutrition-review status: 'approved' once a nutritionist has signed off,
-    else 'pending' for a verified member awaiting sign-off, else '' (not yet in
-    the nutrition queue / no enrollment)."""
+# Enrollment stages that are terminal (no longer progressing toward service).
+_NUTRI_TERMINAL_STAGES = ("closed", "cancelled", "disregarded")
+# Mirrors api.services.lifecycle.PENDING_NUTRITIONIST_TAG_NAME (the purple tag set
+# on split members who still need a Nutritionist review -- the Pending Review page).
+_PENDING_NUTRITIONIST_TAG = "Pending Nutritionist"
+
+
+def _nutritionist_status(enrollment, tags=()):
+    """Where the member sits in the NUTRITION-APPROVAL lifecycle. Priority-ordered
+    so every member lands in exactly ONE bucket:
+
+      approved          -- a Nutritionist signed off (nutritionist_approved_at set;
+                           a signed PDF exists).
+      waiting_approval  -- governing enrollment at VERIFIED awaiting sign-off: the
+                           same query as the Nutritionist page.
+      at_review         -- flagged "Pending Nutritionist" (a split member on the
+                           Nutritionist Pending Review page).
+      pending_questions -- verified but not approved, not in either queue, and not
+                           terminal: still needs the nutrition questions/sign-off
+                           before they can be approved.
+      "" (not at step)  -- no enrollment, pre-verification, or closed-never-approved.
+    """
     if enrollment is None:
         return ""
     if enrollment.nutritionist_approved_at is not None:
         return "approved"
-    if enrollment.verified_at is not None:
-        return "pending"
+    if enrollment.stage == "verified":
+        return "waiting_approval"
+    if _PENDING_NUTRITIONIST_TAG in (tags or ()):
+        return "at_review"
+    if enrollment.verified_at is not None and enrollment.stage not in _NUTRI_TERMINAL_STAGES:
+        return "pending_questions"
     return ""
 
 
@@ -341,7 +432,7 @@ def build_row(client):
         menu_type, allergies, conditions, meds, member_status = _dietary(enr.pk, cid)
     else:
         menu_type, allergies, conditions, meds, member_status = "", [], [], [], ""
-    has_scr, scr_at, has_asm, asm_at, eligible = _screening_assessment(cid)
+    has_scr, scr_at, has_asm, asm_at, eligible, scr_agent = _screening_assessment(cid)
     parity = _parity_fields(client)
     # Coverage gates for the Company Status "not eligible" test -- pop so they
     # aren't written as (nonexistent) columns.
@@ -469,6 +560,8 @@ def build_row(client):
         "attestation_completed_at": None,
         "has_screening": has_scr,
         "screening_at": scr_at,
+        "screening_agent": scr_agent,
+        "phone_numbers": _phones(client),
         "has_eligibility_assessment": has_asm,
         "eligibility_assessment_at": asm_at,
         "verified_at": verified_at,
@@ -504,7 +597,7 @@ def build_row(client):
             in_household=membership is not None, has_active_delivery=has_active_delivery,
         ),
         # Nutrition-review status + delivery company on latest order.
-        "nutritionist_status": _nutritionist_status(enr),
+        "nutritionist_status": _nutritionist_status(enr, parity.get("tags") or []),
         "delivery_company": delivery_company,
     }
 
@@ -538,7 +631,7 @@ def _base_qs(client_ids=None):
         # case resolution) without N+1 -- same shape as the Members list's
         # MEMBER_LIST_PREFETCH.
         "insurances", "tags", "addresses", "social_care_coverages",
-        "military_profile", "member_profiles", "cases",
+        "military_profile", "member_profiles", "cases", "phones",
         Prefetch(
             "enrollments",
             queryset=EnrollmentVerification.objects.select_related(
@@ -575,6 +668,8 @@ def rebuild(client_ids=None, *, chunk=500, progress=None):
     ``progress(done, total)`` is an optional callback for live progress.
     Returns the number of rows written.
     """
+    # Drop the facilitator-name cache so a rebuild reflects any renamed agents.
+    _reset_screening_agent_cache()
     qs = _base_qs(client_ids)
     total = qs.count()
     done = 0
@@ -685,10 +780,9 @@ def filter_analytics(params):
     for param, col in {
         "care_coordinator": "care_coordinator__icontains",
         "primary_care_coordinator": "primary_care_coordinator__icontains",
-        "cadence": "cadence", "kitchen": "kitchen_id", "menu_type": "menu_type",
+        "menu_type": "menu_type",
         "current_delivery_status": "current_delivery_status",
         "last_po_delivery_status": "last_po_delivery_status",
-        "insurance_status": "insurance_status", "social_status": "social_status",
         "attestation_status": "attestation_status", "stage": "stage",
         "case_type": "case_type", "case_status": "case_status",
         "auth_status": "auth_status", "program": "program_name",
@@ -697,12 +791,48 @@ def filter_analytics(params):
         # Members-parity criteria.
         "eligibility": "eligibility",
         "program_status": "program_status", "lead_source": "lead_source",
-        "team": "team", "service_type": "service_type",
         "program_type": "program_type", "pause_type": "pause_type",
         "verified_by": "verified_by_id_str",
+        "screening_agent": "screening_agent",
     }.items():
         if g(param):
             qs = qs.filter(**{col: g(param)})
+
+    # Team (exact) with an "Unassigned / No team" sentinel that matches the blank
+    # team bucket, so the Data page's team chips reconcile to All Teams.
+    team_val = g("team")
+    if team_val == UNASSIGNED_TEAM:
+        qs = qs.filter(team="")
+    elif team_val:
+        qs = qs.filter(team=team_val)
+
+    # Kitchen (exact kitchen_id) with a "Not Assigned" sentinel = no kitchen yet.
+    kitchen_val = g("kitchen")
+    if kitchen_val == NOT_ASSIGNED:
+        qs = qs.filter(kitchen_id__isnull=True)
+    elif kitchen_val:
+        qs = qs.filter(kitchen_id=kitchen_val)
+
+    # Cadence (exact) with a "Not Assigned" sentinel = no delivery cadence yet.
+    cadence_val = g("cadence")
+    if cadence_val == NOT_ASSIGNED:
+        qs = qs.filter(cadence="")
+    elif cadence_val:
+        qs = qs.filter(cadence=cadence_val)
+
+    # Insurance / Social care status (exact) with a NOT_ASSIGNED sentinel for the
+    # blank "no coverage on file" bucket, so every member is reachable and the
+    # buckets sum to the total.
+    # service_type ("meals"/"boxes") is blank for members with no enrollment /
+    # unrecognized program, so it gets the same NOT_ASSIGNED bucket.
+    for param, col in (("insurance_status", "insurance_status"),
+                       ("social_status", "social_status"),
+                       ("service_type", "service_type")):
+        val = g(param)
+        if val == NOT_ASSIGNED:
+            qs = qs.filter(**{col: ""})
+        elif val:
+            qs = qs.filter(**{col: val})
 
     # Boolean filters.
     for param, col in {"has_screening": "has_screening",

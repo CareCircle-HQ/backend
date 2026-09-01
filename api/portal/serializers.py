@@ -741,6 +741,9 @@ class MemberListSerializer(serializers.Serializer):
     # first). ``closed`` is null while a case is still open, so the column omits
     # the C: line for open cases.
     case_dates = serializers.SerializerMethodField()
+    # The client's cases (any type), GOVERNING internal-service case first then the
+    # rest (most-recently-opened first) -- powers the Cases page "Case ID" column.
+    case_list = serializers.SerializerMethodField()
     household_primary_id = serializers.SerializerMethodField()
     last_updated = serializers.DateTimeField(source="updated_at")
     created_at = serializers.DateTimeField()
@@ -833,6 +836,29 @@ class MemberListSerializer(serializers.Serializer):
         if not (opened or closed or added):
             return []
         return [{"opened": opened, "closed": closed, "added": added}]
+
+    def get_case_list(self, obj):
+        # The client's cases for the Cases page "Case ID" column: the GOVERNING
+        # internal-service case first (governing_service_case_for_display -- the
+        # same case the date columns/filters key off), then the client's other
+        # cases, most-recently-opened first. Each entry carries the id, its type
+        # label, and whether it's the governing case.
+        gov = governing_service_case_for_display(obj)
+        gov_id = gov.case_id if gov is not None else None
+        others = [c for c in obj.cases.all() if c.case_id != gov_id]
+        others.sort(
+            key=lambda c: (c.date_opened is not None, c.date_opened), reverse=True,
+        )
+        ordered = ([gov] if gov is not None else []) + others
+        return [
+            {
+                "id": str(c.case_id),
+                "type": c.case_type,
+                "type_label": CaseType(c.case_type).label if c.case_type else "",
+                "governing": c.case_id == gov_id,
+            }
+            for c in ordered
+        ]
 
     def get_household_primary_id(self, obj):
         # client_id of the household's PRIMARY member, used by the Members list
@@ -2682,7 +2708,7 @@ class EnrollmentAnalyticsSerializer(serializers.ModelSerializer):
             "insurance_status", "insurance_expires_at",
             "social_status", "social_expires_at",
             "attestation_status", "attestation_requested_at", "attestation_completed_at",
-            "has_screening", "screening_at",
+            "has_screening", "screening_at", "screening_agent",
             "has_eligibility_assessment", "eligibility_assessment_at",
             "verified_at", "verified_by_name",
             "case_type", "case_status", "auth_status", "case_opened_at", "program_name",

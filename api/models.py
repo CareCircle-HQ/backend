@@ -4924,6 +4924,10 @@ class EnrollmentAnalytics(models.Model):
     # Screening / eligibility assessment.
     has_screening = models.BooleanField(default=False, db_index=True)
     screening_at = models.DateTimeField(null=True, blank=True)
+    # Name of the Unite Us facilitator who performed the latest screening
+    # (Screening.facilitator_id -> UniteUsAgent.employee_id -> name). Powers the
+    # Data page "Screening Agent" filter. Blank when no screening / unresolved.
+    screening_agent = models.CharField(max_length=255, blank=True, db_index=True)
     has_eligibility_assessment = models.BooleanField(default=False, db_index=True)
     eligibility_assessment_at = models.DateTimeField(null=True, blank=True)
 
@@ -4967,6 +4971,9 @@ class EnrollmentAnalytics(models.Model):
     medical_conditions = ArrayField(models.CharField(max_length=128), default=list, blank=True)
     medications = ArrayField(models.CharField(max_length=128), default=list, blank=True)
     eligible_services = ArrayField(models.CharField(max_length=64), default=list, blank=True)
+    # The member's phone numbers (primary first). Exported one-per-column on the
+    # Data page CSV ("Phone 1", "Phone 2", ...).
+    phone_numbers = ArrayField(models.CharField(max_length=40), default=list, blank=True)
     tags = ArrayField(models.CharField(max_length=64), default=list, blank=True)
     ticket_types = ArrayField(models.CharField(max_length=64), default=list, blank=True)
 
@@ -4985,3 +4992,24 @@ class EnrollmentAnalytics(models.Model):
 
     def __str__(self):
         return f"EnrollmentAnalytics(client={self.client_id})"
+
+
+class AnalyticsRebuildRun(models.Model):
+    """One execution of the EnrollmentAnalytics rebuild task/command. Lets the Data
+    page show when the read model was last REBUILT by the job (scheduled or the
+    manual button) -- distinct from EnrollmentAnalytics.refreshed_at, which any
+    single-row live upsert (a member edit) bumps and so isn't the task's run time."""
+
+    started_at = models.DateTimeField(auto_now_add=True, db_index=True)
+    completed_at = models.DateTimeField(null=True, blank=True, db_index=True)
+    rows = models.IntegerField(default=0)
+    pruned = models.IntegerField(default=0)
+    # How the rebuild was launched: "scheduled" (Celery beat), "manual" (Data page
+    # button / ad-hoc task) or "cli" (management command). Free text; informational.
+    trigger = models.CharField(max_length=20, blank=True)
+
+    class Meta:
+        ordering = ["-started_at"]
+
+    def __str__(self):
+        return f"AnalyticsRebuildRun({self.started_at:%Y-%m-%d %H:%M} {self.trigger})"

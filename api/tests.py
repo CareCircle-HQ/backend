@@ -11038,19 +11038,48 @@ class IsNewFlagTest(TestCase):
         self.assertFalse(client.is_new)
 
     def test_extension_write_stamps_created_by(self):
-        # An extension write (AgentUser with name + agent_id) stamps the acting
-        # agent as the case creator, filling the Urgent Care "Created By" column.
+        # An extension write stamps the acting agent as creator: created_by_name
+        # from the agent, and created_by_id RESOLVED to the agent's Unite Us
+        # user_id (credential.employee_id -> UniteUsAgent) so team resolution works
+        # -- NOT the (unresolvable) portal Agent PK.
         import uuid as _uuid
 
+        from .models import Agent, UniteUsAgent, UniteUsCredential
+
         client = self._client()
-        agent_id = _uuid.uuid4()
+        agent = Agent.objects.create(name="Ada Agent")
+        emp = _uuid.uuid4()
+        UniteUsCredential.objects.create(provider_id="p1", employee_id=str(emp), agent=agent)
+        uua = UniteUsAgent.objects.create(
+            user_id=_uuid.uuid4(), employee_id=emp, name="Ada Agent",
+            originating_team="CareCircle Call Center",
+        )
         request = SimpleNamespace(
-            user=SimpleNamespace(agent_code="123", name="Ada Agent", agent_id=agent_id)
+            user=SimpleNamespace(agent_code="123", name="Ada Agent", agent_id=agent.id)
         )
         case = self._save_internal_case(client, context={"request": request})
         case.refresh_from_db()
         self.assertEqual(case.created_by_name, "Ada Agent")
-        self.assertEqual(case.created_by_id, agent_id)
+        self.assertEqual(case.created_by_id, uua.user_id)
+
+    def test_extension_write_stamps_dialerless_agent(self):
+        # An agent WITHOUT an agent_code (no dialer extension) is still attributed
+        # -- previously the agent_code guard silently skipped them, leaving cases
+        # with no creator at all. created_by_id stays blank when unresolvable
+        # (no Unite Us credential), but the name is stamped.
+        import uuid as _uuid
+
+        from .models import Agent
+
+        client = self._client()
+        agent = Agent.objects.create(name="Bea Agent")  # no credential -> unresolvable id
+        request = SimpleNamespace(
+            user=SimpleNamespace(agent_code=None, name="Bea Agent", agent_id=agent.id)
+        )
+        case = self._save_internal_case(client, context={"request": request})
+        case.refresh_from_db()
+        self.assertEqual(case.created_by_name, "Bea Agent")
+        self.assertIsNone(case.created_by_id)  # left blank, never the Agent PK
 
     def test_extension_write_preserves_existing_created_by(self):
         # A payload that already carries created_by (e.g. a Unite Us import row)
@@ -15242,6 +15271,530 @@ class CaseDatesFollowGoverningCaseTest(TestCase):
         self.assertTrue(data)
         # The O: date is exactly the governing case's date_opened (the filter key).
         self.assertEqual(data[0]["opened"], gov.date_opened.isoformat())
+
+
+class PurgeNonCareCircleCasesTest(TestCase):
+    """purge_non_carecircle_cases deletes only cases whose creator is a KNOWN
+    Unite Us agent on a non-CareCircle team (Met Council); it never touches
+    CareCircle-created, extension/unknown-creator, or no-creator cases."""
+
+    def test_deletes_only_metcouncil(self):
+        import uuid as _uuid
+        from io import StringIO
+
+        from django.core.management import call_command
+
+        from .models import Case, CaseStatus, CaseType, Client, UniteUsAgent
+
+        cc = UniteUsAgent.objects.create(user_id=_uuid.uuid4(), name="Cc", originating_team="CareCircle Call Center")
+        mc = UniteUsAgent.objects.create(user_id=_uuid.uuid4(), name="Mc", originating_team="Met Council Team")
+        client = Client.objects.create(client_id=str(_uuid.uuid4()), first_name="P", last_name="Q")
+
+        def mk(creator):
+            return Case.objects.create(
+                case_id=_uuid.uuid4(), client=client, case_type=CaseType.NAVIGATION,
+                case_status=CaseStatus.OPEN, created_by_id=creator,
+            )
+        cc_case = mk(cc.user_id)
+        mc_case = mk(mc.user_id)
+        ext_case = mk(_uuid.uuid4())   # unknown creator (extension-stamped agent id)
+        none_case = mk(None)           # no creator
+
+        call_command("purge_non_carecircle_cases", "--apply", stdout=StringIO())
+
+        self.assertFalse(Case.objects.filter(pk=mc_case.pk).exists())   # deleted
+        self.assertTrue(Case.objects.filter(pk=cc_case.pk).exists())    # kept
+        self.assertTrue(Case.objects.filter(pk=ext_case.pk).exists())   # kept (ext/unknown)
+        self.assertTrue(Case.objects.filter(pk=none_case.pk).exists())  # kept (no creator)
+
+
+class TicketAssigneeListTest(TestCase):
+    """Work Queue: the assignee list returns ALL active CareCircle users (any
+    group), and any active agent is assignable to a ticket -- not just CS."""
+
+    def _auth(self):
+        from .models import Agent
+
+        mgr = Agent.objects.create(name="Mgr", agent_code="990", group="Management", is_manager=True)
+        access = AccessToken()
+        access["agent_id"] = str(mgr.id)
+        access["agent_code"] = mgr.agent_code
+        access["agent_name"] = mgr.name
+        access["agent_group"] = mgr.group
+        access["agent_is_manager"] = True
+        api = APIClient()
+        api.credentials(HTTP_AUTHORIZATION=f"Bearer {access}")
+        return mgr, api
+
+    def test_agents_list_includes_all_active_groups(self):
+        from .models import Agent
+
+        _, api = self._auth()
+        Agent.objects.create(name="Screener One", agent_code="991", group="Screeners")
+        Agent.objects.create(name="Nutri One", agent_code="992", group="Nutritionist")
+        Agent.objects.create(name="Inactive One", agent_code="993", group="CS", status="Inactive")
+        resp = api.get(reverse("portal-agents"))
+        self.assertEqual(resp.status_code, 200, resp.content)
+        names = {a["name"] for a in resp.json()}
+        self.assertIn("Screener One", names)     # non-CS group now listed
+        self.assertIn("Nutri One", names)
+        self.assertNotIn("Inactive One", names)  # inactive still excluded
+
+    def test_assign_ticket_to_non_cs_agent(self):
+        from .models import Agent, Ticket, TicketType
+
+        _, api = self._auth()
+        screener = Agent.objects.create(name="Screener Two", agent_code="994", group="Screeners")
+        tt, _ = TicketType.objects.get_or_create(code="verification", defaults={"label": "Verification"})
+        ticket = Ticket.objects.create(type=tt, reason="r")
+        resp = api.patch(
+            reverse("portal-ticket-detail", args=[ticket.id]),
+            {"assignee_id": str(screener.id)}, format="json",
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        ticket.refresh_from_db()
+        self.assertEqual(ticket.assigned_to_id, screener.id)
+
+
+class NutritionistStatusPartitionTest(TestCase):
+    """_nutritionist_status assigns each member to exactly one lifecycle bucket,
+    priority-ordered: approved > waiting_approval > at_review > pending_questions >
+    "" (not at step)."""
+
+    def _enr(self, **kw):
+        from types import SimpleNamespace
+
+        d = dict(nutritionist_approved_at=None, stage="", verified_at=None)
+        d.update(kw)
+        return SimpleNamespace(**d)
+
+    def test_buckets_and_priority(self):
+        from datetime import datetime
+
+        from .services.enrollment_analytics import _nutritionist_status
+
+        now = datetime(2026, 1, 1)
+        f = _nutritionist_status
+        TAG = ["Pending Nutritionist"]
+
+        # approved (outranks everything, any stage)
+        self.assertEqual(f(self._enr(nutritionist_approved_at=now, stage="active", verified_at=now), TAG), "approved")
+        # waiting approval: governing enrollment at VERIFIED, not approved
+        self.assertEqual(f(self._enr(stage="verified", verified_at=now)), "waiting_approval")
+        # at review: Pending Nutritionist tag, already past VERIFIED
+        self.assertEqual(f(self._enr(stage="active", verified_at=now), TAG), "at_review")
+        # pending questions: verified, not approved, no tag, not terminal
+        self.assertEqual(f(self._enr(stage="active", verified_at=now)), "pending_questions")
+        # not at step: no enrollment / pre-verification / closed-never-approved
+        self.assertEqual(f(None), "")
+        self.assertEqual(f(self._enr(stage="pending_verification")), "")
+        self.assertEqual(f(self._enr(stage="closed", verified_at=now)), "")
+
+
+class AnalyticsRebuildRunTest(TestCase):
+    """The rebuild command records each run (started/completed/trigger) so the Data
+    page can show when the refresh TASK last ran (not the per-row watermark)."""
+
+    def test_rebuild_command_records_completed_run(self):
+        from io import StringIO
+
+        from django.core.management import call_command
+
+        from .models import AnalyticsRebuildRun
+
+        call_command("rebuild_enrollment_analytics", "--trigger=manual", stdout=StringIO())
+        run = AnalyticsRebuildRun.objects.order_by("-started_at").first()
+        self.assertIsNotNone(run)
+        self.assertIsNotNone(run.completed_at)      # stamped on completion
+        self.assertEqual(run.trigger, "manual")
+
+
+class DataKitchenCadenceNotAssignedFilterTest(TestCase):
+    """Data page Kitchen/Cadence filters expose a '__none__' (Not Assigned)
+    sentinel matching no-kitchen / blank-cadence members; exact values still work."""
+
+    def test_not_assigned_sentinel(self):
+        import uuid as _uuid
+
+        from .models import Client, EnrollmentAnalytics
+        from .services.enrollment_analytics import filter_analytics
+
+        kid = _uuid.uuid4()
+        a = Client.objects.create(client_id=str(_uuid.uuid4()), first_name="A", last_name="A")
+        b = Client.objects.create(client_id=str(_uuid.uuid4()), first_name="B", last_name="B")
+        EnrollmentAnalytics.objects.create(client=a, kitchen_id=None, cadence="")
+        EnrollmentAnalytics.objects.create(client=b, kitchen_id=kid, cadence="mon_thu")
+
+        def ids(params):
+            return {str(x) for x in filter_analytics(params).values_list("client_id", flat=True)}
+
+        k = ids({"kitchen": "__none__"})
+        self.assertIn(str(a.client_id), k)
+        self.assertNotIn(str(b.client_id), k)
+        c = ids({"cadence": "__none__"})
+        self.assertIn(str(a.client_id), c)
+        self.assertNotIn(str(b.client_id), c)
+        # Exact selections still work.
+        self.assertEqual(ids({"kitchen": str(kid)}), {str(b.client_id)})
+        self.assertEqual(ids({"cadence": "mon_thu"}), {str(b.client_id)})
+
+
+class DataCoverageStatusFilterTest(TestCase):
+    """Data page Insurance/Social-care filters match the real stored values
+    (incl. non_enrolled) and expose a '__none__' bucket for no coverage, so the
+    buckets sum to all members."""
+
+    def test_social_and_insurance_buckets(self):
+        import uuid as _uuid
+
+        from .models import Client, EnrollmentAnalytics
+        from .services.enrollment_analytics import filter_analytics
+
+        def mk(social, ins, svc=""):
+            c = Client.objects.create(client_id=str(_uuid.uuid4()), first_name="A", last_name="B")
+            EnrollmentAnalytics.objects.create(
+                client=c, social_status=social, insurance_status=ins, service_type=svc,
+            )
+            return c
+
+        enr = mk("enrolled", "active", "meals")
+        non = mk("non_enrolled", "inactive", "boxes")
+        none_ = mk("", "", "")
+
+        def ids(params):
+            return {str(x) for x in filter_analytics(params).values_list("client_id", flat=True)}
+
+        self.assertEqual(ids({"social_status": "non_enrolled"}), {str(non.client_id)})
+        self.assertEqual(ids({"social_status": "__none__"}), {str(none_.client_id)})
+        self.assertEqual(ids({"social_status": "enrolled"}), {str(enr.client_id)})
+        self.assertEqual(ids({"insurance_status": "__none__"}), {str(none_.client_id)})
+        self.assertEqual(ids({"insurance_status": "inactive"}), {str(non.client_id)})
+        self.assertEqual(ids({"service_type": "meals"}), {str(enr.client_id)})
+        self.assertEqual(ids({"service_type": "boxes"}), {str(non.client_id)})
+        self.assertEqual(ids({"service_type": "__none__"}), {str(none_.client_id)})
+
+
+class CsvImportCreatorAllowlistTest(TestCase):
+    """CSV import lets in cases whose creator is on a CareCircle team (Call Center
+    or Street) and blocks Met Council. Regression: the Street team is stored as
+    'CareCircle Street' (no 'Team' suffix), so it must be in the allowlist -- it
+    was previously excluded, wrongly skipping Street-created cases."""
+
+    def test_carecircle_street_allowlisted_metcouncil_blocked(self):
+        import uuid as _uuid
+
+        from .models import UniteUsAgent
+        from .services.csv_import import CARECIRCLE_ALLOWLIST_TEAMS
+
+        street = UniteUsAgent.objects.create(user_id=_uuid.uuid4(), name="St", originating_team="CareCircle Street")
+        cc = UniteUsAgent.objects.create(user_id=_uuid.uuid4(), name="Cc", originating_team="CareCircle Call Center")
+        mc = UniteUsAgent.objects.create(user_id=_uuid.uuid4(), name="Mc", originating_team="Met Council Team")
+
+        allowed = set(
+            UniteUsAgent.objects.filter(originating_team__in=CARECIRCLE_ALLOWLIST_TEAMS)
+            .values_list("user_id", flat=True)
+        )
+        self.assertIn(street.user_id, allowed)     # Street allowed (was wrongly skipped)
+        self.assertIn(cc.user_id, allowed)         # Call Center allowed
+        self.assertNotIn(mc.user_id, allowed)      # Met Council blocked
+
+
+class DataTeamUnassignedFilterTest(TestCase):
+    """The Data page team filter's '__unassigned__' sentinel matches the blank-team
+    bucket, so Unassigned + named teams reconcile to All Teams."""
+
+    def test_unassigned_sentinel_matches_blank_team(self):
+        import uuid as _uuid
+
+        from .models import Client, EnrollmentAnalytics
+        from .services.enrollment_analytics import filter_analytics
+
+        a = Client.objects.create(client_id=str(_uuid.uuid4()), first_name="A", last_name="A")
+        b = Client.objects.create(client_id=str(_uuid.uuid4()), first_name="B", last_name="B")
+        EnrollmentAnalytics.objects.create(client=a, team="")
+        EnrollmentAnalytics.objects.create(client=b, team="CareCircle Call Center")
+
+        un = {str(x) for x in filter_analytics({"team": "__unassigned__"}).values_list("client_id", flat=True)}
+        self.assertIn(str(a.client_id), un)
+        self.assertNotIn(str(b.client_id), un)
+        cc = {str(x) for x in filter_analytics({"team": "CareCircle Call Center"}).values_list("client_id", flat=True)}
+        self.assertIn(str(b.client_id), cc)
+        self.assertNotIn(str(a.client_id), cc)
+
+
+class DataTeamFallbackNoISCaseTest(TestCase):
+    """A member with NO internal-service case still gets a Data-page team, from the
+    creator of their most-recent case of any type (nav/eligibility/screening)."""
+
+    def test_no_is_case_member_gets_team_from_any_case_creator(self):
+        import uuid as _uuid
+
+        from django.utils import timezone
+
+        from .models import (
+            Case, CaseStatus, CaseType, Client, EnrollmentAnalytics, UniteUsAgent,
+        )
+        from .services.enrollment_analytics import (
+            _reset_screening_agent_cache, upsert_client,
+        )
+
+        uid = _uuid.uuid4()
+        UniteUsAgent.objects.create(user_id=uid, name="Agent Z", originating_team="CareCircle Call Center")
+        c = Client.objects.create(client_id=str(_uuid.uuid4()), first_name="No", last_name="Isc")
+        # A Care Management (navigation) case -- NOT internal service.
+        Case.objects.create(
+            case_id=_uuid.uuid4(), client=c, case_type=CaseType.NAVIGATION,
+            case_status=CaseStatus.OPEN, created_by_id=uid, date_opened=timezone.now(),
+        )
+        _reset_screening_agent_cache()
+        upsert_client(c)
+
+        ea = EnrollmentAnalytics.objects.get(client=c)
+        self.assertEqual(ea.case_type, "")  # no governing internal-service case
+        self.assertEqual(ea.team, "CareCircle Call Center")  # team from the nav case creator
+
+
+class DataScreeningAgentFilterTest(TestCase):
+    """Data page Screening Agent: build_row resolves the screening facilitator
+    (Screening.facilitator_id -> UniteUsAgent.employee_id -> name) into
+    EnrollmentAnalytics.screening_agent, and filter_analytics filters on it."""
+
+    def test_resolves_and_filters_by_screening_agent(self):
+        import uuid as _uuid
+
+        from django.utils import timezone
+
+        from .models import Client, EnrollmentAnalytics, Screening, UniteUsAgent
+        from .services.enrollment_analytics import (
+            _reset_screening_agent_cache, filter_analytics, upsert_client,
+        )
+
+        emp = _uuid.uuid4()
+        UniteUsAgent.objects.create(user_id=_uuid.uuid4(), employee_id=emp, name="Michelle Ramirez")
+        c = Client.objects.create(client_id=str(_uuid.uuid4()), first_name="Scr", last_name="Ee")
+        Screening.objects.create(
+            enhanced_screen_id=_uuid.uuid4(), subject_id=c.client_id, client=c,
+            screen_created_at=timezone.now(), facilitator_id=emp,
+        )
+        _reset_screening_agent_cache()
+        upsert_client(c)
+
+        ea = EnrollmentAnalytics.objects.get(client=c)
+        self.assertEqual(ea.screening_agent, "Michelle Ramirez")
+        # The filter matches on the resolved name.
+        got = {str(x) for x in filter_analytics({"screening_agent": "Michelle Ramirez"}).values_list("client_id", flat=True)}
+        self.assertIn(str(c.client_id), got)
+        miss = {str(x) for x in filter_analytics({"screening_agent": "Someone Else"}).values_list("client_id", flat=True)}
+        self.assertNotIn(str(c.client_id), miss)
+
+
+class AllMembersReportScreeningPhonesTest(TestCase):
+    """The All-Members report export gains a Screening Agent column and one column
+    per phone number ("Phone 1", "Phone 2", ...)."""
+
+    def test_report_has_screening_agent_and_phone_columns(self):
+        import uuid as _uuid
+
+        from django.utils import timezone
+
+        from .models import Client, ClientPhone, Screening, UniteUsAgent
+        from .portal.report_exports import all_members_rows
+
+        emp = _uuid.uuid4()
+        UniteUsAgent.objects.create(user_id=_uuid.uuid4(), employee_id=emp, name="Deborah Delgado")
+        c = Client.objects.create(client_id=str(_uuid.uuid4()), first_name="Rep", last_name="Ort")
+        ClientPhone.objects.create(client=c, raw="(212) 111-1111", normalized="2121111111", is_primary=True)
+        ClientPhone.objects.create(client=c, raw="(917) 222-2222", normalized="9172222222", is_primary=False)
+        Screening.objects.create(
+            enhanced_screen_id=_uuid.uuid4(), subject_id=c.client_id, client=c,
+            screen_created_at=timezone.now(), facilitator_id=emp,
+        )
+
+        gen = all_members_rows({})
+        header = next(gen)
+        rows = list(gen)
+        self.assertIn("Screening Agent", header)
+        self.assertIn("Phone 1", header)
+        self.assertIn("Phone 2", header)
+        row = next(r for r in rows if r[header.index("Member ID")] == str(c.client_id))
+        self.assertEqual(row[header.index("Screening Agent")], "Deborah Delgado")
+        self.assertEqual(row[header.index("Phone 1")], "(212) 111-1111")
+        self.assertEqual(row[header.index("Phone 2")], "(917) 222-2222")
+
+
+class DataPhoneNumbersReadModelTest(TestCase):
+    """build_row collects the member's phone numbers (primary first, de-duped) into
+    EnrollmentAnalytics.phone_numbers -- spread one-per-column on the Data export."""
+
+    def test_phones_primary_first_deduped(self):
+        import uuid as _uuid
+
+        from .models import Client, ClientPhone, EnrollmentAnalytics
+        from .services.enrollment_analytics import upsert_client
+
+        c = Client.objects.create(client_id=str(_uuid.uuid4()), first_name="Ph", last_name="One")
+        # Non-primary added first, primary second -- primary must sort first.
+        ClientPhone.objects.create(client=c, raw="(212) 111-1111", normalized="2121111111", is_primary=False)
+        ClientPhone.objects.create(client=c, raw="(917) 222-2222", normalized="9172222222", is_primary=True)
+
+        upsert_client(c)
+        ea = EnrollmentAnalytics.objects.get(client=c)
+        # Primary first, then the other.
+        self.assertEqual(ea.phone_numbers, ["(917) 222-2222", "(212) 111-1111"])
+
+
+class VerificationCompletedDenormTest(TestCase):
+    """governing_verification_completed_at (the completed-date FILTER key) must
+    track the governing enrollment's verified_at, so a Verified household is also
+    matchable by the completed-date filter. Regression: it went stale (null) when a
+    verification completed without a following case reconcile."""
+
+    def test_refresh_sets_completed_from_enrollment_verified_at(self):
+        from django.utils import timezone
+
+        from .models import (
+            Client, EnrollmentStage, EnrollmentVerification, Household,
+            HouseholdMember,
+        )
+        from .services.lifecycle import refresh_internal_case_sort
+
+        hh = Household.objects.create()
+        c = Client.objects.create(client_id=str(uuid.uuid4()), first_name="V", last_name="Done")
+        HouseholdMember.objects.create(household=hh, client=c, is_primary=True)
+        # A governing internal-service case is required for the denorm to populate.
+        from .models import Case, CaseStatus, CaseType
+        case = Case.objects.create(
+            case_id=str(uuid.uuid4()), client=c, case_type=CaseType.INTERNAL_SERVICE,
+            case_status=CaseStatus.OPEN,
+        )
+        vat = timezone.now()
+        EnrollmentVerification.objects.create(
+            client=c, household=hh, case=case, stage=EnrollmentStage.VERIFIED,
+            verified_at=vat,
+        )
+        # Simulate the stale state, then the refresh the verify path now runs.
+        Client.objects.filter(pk=c.pk).update(governing_verification_completed_at=None)
+        refresh_internal_case_sort(c)
+        c.refresh_from_db()
+        self.assertEqual(c.governing_verification_completed_at, vat)
+
+
+class CleanupCrossHouseholdProfilesCommandTest(TestCase):
+    """cleanup_cross_household_profiles marks a phantom profile (a household PRIMARY
+    appearing on someone else's household enrollment) REMOVED, and leaves genuine
+    members (the owner + real dependents) alone."""
+
+    def test_marks_foreign_primary_removed_keeps_legit(self):
+        from io import StringIO
+
+        from django.core.management import call_command
+
+        from .models import (
+            Client, EnrollmentStage, EnrollmentVerification, Household,
+            HouseholdMember, MemberDietaryProfile, MemberStatus,
+        )
+
+        hh = Household.objects.create()
+        darrien = Client.objects.create(client_id=str(uuid.uuid4()), first_name="Darrien", last_name="H")
+        kid = Client.objects.create(client_id=str(uuid.uuid4()), first_name="Kid", last_name="H")
+        HouseholdMember.objects.create(household=hh, client=darrien, is_primary=True)
+        HouseholdMember.objects.create(household=hh, client=kid, is_primary=False)
+
+        kayla_hh = Household.objects.create()
+        kayla = Client.objects.create(client_id=str(uuid.uuid4()), first_name="Kayla", last_name="F")
+        HouseholdMember.objects.create(household=kayla_hh, client=kayla, is_primary=True)
+
+        enr = EnrollmentVerification.objects.create(
+            client=darrien, household=hh, stage=EnrollmentStage.SERVICE_ACTIVE,
+        )
+        d = MemberDietaryProfile.objects.create(enrollment=enr, client=darrien, status=MemberStatus.ACTIVE)
+        k = MemberDietaryProfile.objects.create(enrollment=enr, client=kid, status=MemberStatus.ACTIVE)
+        ph = MemberDietaryProfile.objects.create(enrollment=enr, client=kayla, status=MemberStatus.ACTIVE)
+
+        call_command("cleanup_cross_household_profiles", "--apply", stdout=StringIO())
+
+        d.refresh_from_db(); k.refresh_from_db(); ph.refresh_from_db()
+        self.assertEqual(ph.status, MemberStatus.REMOVED)   # phantom neutralized
+        self.assertEqual(d.status, MemberStatus.ACTIVE)     # owner untouched
+        self.assertEqual(k.status, MemberStatus.ACTIVE)     # real dependent untouched
+
+
+class CarriedProfilesStayInHouseholdTest(TestCase):
+    """_create_missing_carried_profiles must carry ONLY the target household's
+    members (owner + HouseholdMembers) -- never a stale cross-household client
+    lingering on the source. Regression: a split-out member (RACHEL) was carried
+    onto another household's (CHAYA's) enrollments and paused there as a phantom."""
+
+    def test_cross_household_member_not_carried(self):
+        from .models import (
+            Client, EnrollmentStage, EnrollmentVerification, Household,
+            HouseholdMember, MemberDietaryProfile, MemberStatus,
+        )
+        from .services.lifecycle import _create_missing_carried_profiles
+
+        hh = Household.objects.create()
+        chaya = Client.objects.create(client_id=str(uuid.uuid4()), first_name="Chaya", last_name="F")
+        kid = Client.objects.create(client_id=str(uuid.uuid4()), first_name="Kid", last_name="F")
+        rachel = Client.objects.create(client_id=str(uuid.uuid4()), first_name="Rachel", last_name="S")
+        HouseholdMember.objects.create(household=hh, client=chaya, is_primary=True)
+        # A genuine dependent with NO HouseholdMember row (stranded) must still carry.
+        # rachel belongs to her OWN separate household -> she is "foreign" to hh and
+        # must NOT be carried.
+        rachel_hh = Household.objects.create()
+        HouseholdMember.objects.create(household=rachel_hh, client=rachel, is_primary=True)
+
+        target = EnrollmentVerification.objects.create(
+            client=chaya, household=hh, stage=EnrollmentStage.PENDING_VERIFICATION,
+        )
+        source = EnrollmentVerification.objects.create(
+            client=chaya, household=hh, stage=EnrollmentStage.CLOSED,
+        )
+        for c in (chaya, kid, rachel):
+            MemberDietaryProfile.objects.create(
+                enrollment=source, client=c, status=MemberStatus.ACTIVE,
+            )
+
+        _create_missing_carried_profiles(target, source)
+
+        carried = {str(x) for x in target.member_profiles.values_list("client_id", flat=True)}
+        self.assertIn(str(chaya.client_id), carried)   # owner carried
+        self.assertIn(str(kid.client_id), carried)     # real dependent carried
+        self.assertNotIn(str(rachel.client_id), carried)  # cross-household NOT carried
+
+
+class CasesPageFiltersTest(TestCase):
+    """The Cases page reuses the members grouped endpoint with new params:
+    case_id (full/partial case-ID search) and case_type (default internal_service)."""
+
+    def _queryset(self, **params):
+        from rest_framework.request import Request
+        from rest_framework.test import APIRequestFactory
+
+        from .portal.views_members import MembersListView
+        v = MembersListView()
+        v.request = Request(APIRequestFactory().get("/members/", params))
+        v.format_kwarg = None
+        return v.get_queryset()
+
+    def test_case_id_and_case_type_filters(self):
+        from .models import Case, CaseStatus, CaseType, Client
+
+        c = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Case", last_name="Search",
+        )
+        case = Case.objects.create(
+            case_id=str(uuid.uuid4()), client=c, case_type=CaseType.INTERNAL_SERVICE,
+            case_status=CaseStatus.OPEN,
+        )
+        cid = str(case.case_id)
+
+        def ids(**p):
+            return {str(x) for x in self._queryset(**p).values_list("client_id", flat=True)}
+
+        self.assertIn(str(c.client_id), ids(case_id=cid))          # full case-ID
+        self.assertIn(str(c.client_id), ids(case_id=cid[:8]))      # partial case-ID
+        self.assertIn(str(c.client_id), ids(case_type="internal_service"))
+        self.assertNotIn(str(c.client_id), ids(case_type="eligibility"))  # type mismatch excludes
 
 
 class TagHhCloseCommandTest(TestCase):

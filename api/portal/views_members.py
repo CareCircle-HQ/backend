@@ -1247,6 +1247,53 @@ class FoodAllergiesListView(PortalAPIView):
         ])
 
 
+class CasesSummaryView(PortalAPIView):
+    """Case-type totals for the Cases-page summary chips: internal-service, care
+    management (stored ``navigation``), eligibility, and how many internal-service
+    cases are REAUTHORIZATIONS (``is_extension``). Counts are over ALL cases so the
+    chips read as running totals regardless of the page's case-type dropdown."""
+
+    def get(self, request):
+        from api.models import Case, CaseType
+
+        p = request.query_params
+        qs = Case.objects.all()
+        # Apply the same date windows as the Cases page, at the CASE level so the
+        # chip totals reflect the current filter: Created=date_opened,
+        # Added=added_to_system_at, Closed=case_closed_at, Verified=an enrollment
+        # verified in range.
+        for field, frm, to in (
+            ("date_opened", "created_from", "created_to"),
+            ("added_to_system_at", "added_from", "added_to"),
+            ("case_closed_at", "closed_from", "closed_to"),
+            ("enrollments__verified_at", "completed_from", "completed_to"),
+        ):
+            d1 = _parse_date((p.get(frm) or "").strip())
+            d2 = _parse_date((p.get(to) or "").strip())
+            if d1:
+                qs = qs.filter(**{f"{field}__date__gte": d1})
+            if d2:
+                qs = qs.filter(**{f"{field}__date__lte": d2})
+        case_id_q = (p.get("case_id") or "").strip()
+        if case_id_q:
+            from django.db.models import TextField
+            from django.db.models.functions import Cast
+
+            qs = qs.annotate(
+                _case_id_text=Cast("case_id", output_field=TextField())
+            ).filter(_case_id_text__icontains=case_id_q)
+
+        def n(**extra):
+            return qs.filter(**extra).values("case_id").distinct().count()
+
+        return Response({
+            "internal_service": n(case_type=CaseType.INTERNAL_SERVICE),
+            "care_management": n(case_type=CaseType.NAVIGATION),
+            "eligibility": n(case_type=CaseType.ELIGIBILITY),
+            "reauthorizations": n(case_type=CaseType.INTERNAL_SERVICE, is_extension=True),
+        })
+
+
 class LeadSourcesListView(PortalAPIView):
     """Lead-source options for the Members-page filter dropdown.
 
@@ -1326,9 +1373,11 @@ class TeamsListView(PortalAPIView):
     ``UniteUsAgent.originating_team`` string the filter matches
     (``team__iexact=value``)."""
 
-    # "Met Council Team" is the default originating_team assigned to everyone
-    # not on the CareCircle roster (i.e. non-US staff), so it isn't a real
-    # filterable CareCircle team -- hide it from the Team filter dropdown.
+    # "Met Council Team" is the default originating_team for staff not on the
+    # CareCircle roster. Their cases are blocked at import and the legacy ones were
+    # purged (see purge_non_carecircle_cases), so no member resolves to that team
+    # -- hide it from the dropdown. (Members with no resolvable creator surface via
+    # the Data page's "No Team / Unassigned" option instead.)
     _EXCLUDED_TEAMS = {"met council team"}
 
     def get(self, request):
@@ -1473,6 +1522,26 @@ class MembersListView(PortalGenericAPIView):
                     | Q(client_phone_number__icontains=digits)
                 )
             qs = qs.filter(cond)
+
+        # Cases page: search by CASE ID (full or partial) -- returns the household/
+        # members owning a matching case. case_id is a UUID column, so cast to text
+        # for an icontains partial match; a full UUID still matches exactly.
+        case_id_q = (params.get("case_id") or "").strip()
+        if case_id_q:
+            from django.db.models import TextField
+            from django.db.models.functions import Cast
+
+            qs = qs.annotate(
+                _case_id_text=Cast("cases__case_id", output_field=TextField())
+            ).filter(_case_id_text__icontains=case_id_q).distinct()
+
+        # Cases page: restrict to households that hold a case of the selected TYPE
+        # (default internal_service, sent by the page). The date filters below stay
+        # keyed on the governing INTERNAL-SERVICE case (the denormalized governing_*
+        # fields), so switching type narrows the household set, not those keys.
+        case_type_q = (params.get("case_type") or "").strip()
+        if case_type_q:
+            qs = qs.filter(cases__case_type=case_type_q).distinct()
 
         # Page-level scope (Verification / Logistics) restricts which members are
         # ever shown, before the per-status filter chips are applied.
@@ -2744,14 +2813,15 @@ class MembersExportView(MembersListView):
             )
         from .report_exports import (
             all_members_header, all_members_prefetch, all_members_row,
-            all_members_row_context, stream_csv_response,
+            all_members_row_context, max_phone_count, stream_csv_response,
         )
 
         qs = all_members_prefetch(self.get_queryset())
-        ctx = all_members_row_context()
+        max_phones = max_phone_count(qs)
+        ctx = all_members_row_context(max_phones)
 
         def rows():
-            yield all_members_header()
+            yield all_members_header(max_phones)
             seen = set()  # the filter joins can repeat a client; emit each once
             for client in qs.iterator(chunk_size=1000):
                 if client.pk in seen:
@@ -2819,6 +2889,24 @@ class DataDeliveryCompaniesView(PortalAPIView):
         return Response([{"value": n, "label": n} for n in names])
 
 
+class DataScreeningAgentsView(PortalAPIView):
+    """Administration > Data: Screening Agent filter options -- the distinct
+    screening_agent values in the read model (the Unite Us facilitator who
+    performed each member's latest screening, resolved from facilitator_id)."""
+
+    def get(self, request):
+        from ..models import EnrollmentAnalytics
+
+        names = sorted({
+            n for n in EnrollmentAnalytics.objects
+            .exclude(screening_agent="")
+            .values_list("screening_agent", flat=True)
+            .distinct()
+            if n
+        })
+        return Response([{"value": n, "label": n} for n in names])
+
+
 class DataSummaryView(PortalAPIView):
     """Administration > Data: aggregate counts for the current filter set -- the
     'general numbers that meet the criteria' the data team works from. Same
@@ -2827,13 +2915,21 @@ class DataSummaryView(PortalAPIView):
 
     def get(self, request):
         from django.db.models import Count, Max
-        from ..models import EnrollmentAnalytics
+        from ..models import AnalyticsRebuildRun, EnrollmentAnalytics
         from ..services.enrollment_analytics import filter_analytics
 
         qs = filter_analytics(request.query_params)
         # Read-model freshness watermark (drives the Data page "Updated N ago" +
         # Rebuild control). Global, not filtered.
         last_refreshed = EnrollmentAnalytics.objects.aggregate(m=Max("refreshed_at"))["m"]
+        # When the rebuild TASK last completed (scheduled job or manual button) --
+        # the figure the "Data updated" label shows. Distinct from refreshed_at,
+        # which a single live member upsert bumps.
+        last_run = (
+            AnalyticsRebuildRun.objects.filter(completed_at__isnull=False)
+            .order_by("-completed_at").first()
+        )
+        last_rebuilt = last_run.completed_at if last_run else None
 
         def breakdown(field):
             return {
@@ -2843,6 +2939,15 @@ class DataSummaryView(PortalAPIView):
 
         return Response({
             "last_refreshed_at": last_refreshed.isoformat() if last_refreshed else None,
+            # Last completed rebuild-task run (falls back to the row watermark until
+            # the first tracked run exists).
+            "last_rebuilt_at": (
+                last_rebuilt.isoformat() if last_rebuilt
+                else (last_refreshed.isoformat() if last_refreshed else None)
+            ),
+            # How that last run was launched: "scheduled" (background job) or
+            # "manual" (Data page button) / "cli". Blank until a run is tracked.
+            "last_rebuilt_trigger": (last_run.trigger or "") if last_run else "",
             # One row per MEMBER, so total == members.
             "total": qs.count(),
             "members": qs.count(),
@@ -2887,20 +2992,39 @@ class DataExportView(PortalAPIView):
             "cadence", "kitchen_name", "menu_type", "current_delivery_status",
             "last_po_delivery_status", "last_delivered_at", "insurance_status",
             "insurance_expires_at", "social_status", "social_expires_at",
-            "attestation_status", "has_screening", "screening_at",
+            "attestation_status", "has_screening", "screening_at", "screening_agent",
             "has_eligibility_assessment", "eligibility_assessment_at", "verified_at",
             "verified_by_name", "case_type", "case_status", "auth_status",
             "case_opened_at", "program_name", "allergies", "medical_conditions",
             "medications", "eligible_services",
         ]
+        # A member can have several phone numbers -- export each in its OWN column
+        # ("Phone 1", "Phone 2", ...). Size the columns to the widest member in the
+        # filtered set (defensively capped), then spread phone_numbers across them.
+        from django.db.models import F, IntegerField, Max, Value, Func
+        from django.db.models.functions import Coalesce
+
+        max_phones = (
+            qs.annotate(_np=Coalesce(
+                Func(F("phone_numbers"), Value(1), function="array_length"),
+                Value(0), output_field=IntegerField(),
+            )).aggregate(m=Max("_np"))["m"] or 0
+        )
+        max_phones = min(max_phones, 15)
+        fetch_fields = fields + ["phone_numbers"]
+        header = fields + [f"Phone {i}" for i in range(1, max_phones + 1)]
 
         def rows():
-            yield fields
-            for r in qs.values_list(*fields).iterator(chunk_size=1000):
-                yield [
+            yield header
+            for r in qs.values_list(*fetch_fields).iterator(chunk_size=1000):
+                *scalars, phones = r
+                line = [
                     ",".join(v) if isinstance(v, list) else ("" if v is None else str(v))
-                    for v in r
+                    for v in scalars
                 ]
+                phones = phones or []
+                line += [phones[i] if i < len(phones) else "" for i in range(max_phones)]
+                yield line
 
         return stream_csv_response(
             rows(), f"data_{timezone.localdate().isoformat()}.csv",
@@ -2927,7 +3051,7 @@ class DataRebuildView(PortalAPIView):
         # Celery worker) say so rather than 500, so the UI can hint "run the
         # command / start a worker".
         try:
-            rebuild_enrollment_analytics.delay()
+            rebuild_enrollment_analytics.delay(trigger="manual")
             enqueued = True
         except Exception:  # noqa: BLE001
             enqueued = False
@@ -6240,6 +6364,17 @@ class MemberVerificationCreateView(PortalAPIView):
             actor_label=actor_label,
             note="Verification completed via support portal.",
         )
+        # Refresh the denormalized governing_verification_completed_at NOW (it's
+        # derived from the enrollment's verified_at) so the Verification/Data
+        # completed-date FILTER immediately matches the Verified status we just
+        # set. Otherwise the denorm stays null until the next case reconcile
+        # happens to run -- the cause of "Verified but not in the completed-date
+        # filter". Maintained elsewhere on case reconcile; this closes the gap for
+        # the verification-completion path itself.
+        try:
+            refresh_internal_case_sort(enrollment.client)
+        except Exception:  # never let denorm upkeep break the verification
+            pass
 
         # Summary event capturing WHAT was verified -- the household roster + each
         # member's resolved menu, the delivery address/days, and which checkboxes
