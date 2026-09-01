@@ -746,13 +746,14 @@ def filter_analytics(params):
     elif vstate == "Never Requested":
         qs = qs.filter(has_never_requested_verification=True)
     elif vstate == "Not Applicable":
-        # The GAP: an open governing internal-service case but NONE of the three
-        # verification states apply -- requested-but-stalled/blocked (on hold /
-        # unable), or household-primary-scope edges. Derived from existing columns
-        # (no stored flag): open IS case AND not pending/verified/never-requested.
-        qs = qs.filter(
-            case_type="internal_service", case_status="open",
-        ).filter(
+        # Everything with an internal-service case that NONE of the three
+        # verification states cover: open-but-stalled/blocked (on hold / unable /
+        # household-primary-scope edges) AND closed/cancelled IS cases (where
+        # verification no longer applies). Derived from existing columns (no stored
+        # flag). Dropping the earlier open-only restriction makes the four
+        # verification states EXHAUSTIVE over the internal-service set -- and since
+        # they're already mutually exclusive, they now sum to the IS total.
+        qs = qs.filter(case_type="internal_service").filter(
             has_pending_verification_enrollment=False,
             has_verified_enrollment=False,
             has_never_requested_verification=False,
