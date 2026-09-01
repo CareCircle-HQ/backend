@@ -5808,9 +5808,11 @@ class CompanyStatusCaselessTest(TestCase):
 
 
 class VerificationNotApplicableFilterTest(TestCase):
-    """Data-page verification filter "Not Applicable" = the gap: an open governing
-    internal-service case but none of pending/verified/never-requested. Derived
-    from existing read-model columns; the four options partition IS+open."""
+    """Data-page verification filter "Not Applicable" = any internal-service case
+    (open OR closed) with none of pending/verified/never-requested. Derived from
+    existing read-model columns; the four verification options PARTITION the whole
+    internal-service set (mutually exclusive + exhaustive), so they sum to the IS
+    total -- including the closed-case members that used to fall through the gap."""
 
     def _ea(self, **kw):
         from .models import Client, EnrollmentAnalytics
@@ -5824,19 +5826,37 @@ class VerificationNotApplicableFilterTest(TestCase):
         defaults.update(kw)
         return Client.objects.get(pk=EnrollmentAnalytics.objects.create(**defaults).client_id)
 
-    def test_not_applicable_is_the_gap(self):
+    def test_not_applicable_covers_open_gap_and_closed(self):
         from .services.enrollment_analytics import filter_analytics
         gap = self._ea()                                              # open IS, none -> NA
+        closed = self._ea(case_status="closed")                       # closed IS, none -> NA (now)
         pending = self._ea(has_pending_verification_enrollment=True)
         verified = self._ea(has_verified_enrollment=True)
         never = self._ea(has_never_requested_verification=True)
-        closed = self._ea(case_status="closed")                       # not open -> not NA
         na = {str(x) for x in filter_analytics(
             {"verification_state": "Not Applicable"}
         ).values_list("client_id", flat=True)}
         self.assertIn(str(gap.client_id), na)
-        for other in (pending, verified, never, closed):
+        self.assertIn(str(closed.client_id), na)          # closed IS case now included
+        for other in (pending, verified, never):
             self.assertNotIn(str(other.client_id), na)
+
+    def test_four_states_partition_the_is_total(self):
+        from .services.enrollment_analytics import filter_analytics
+        self._ea(); self._ea(case_status="closed")
+        self._ea(has_pending_verification_enrollment=True)
+        self._ea(has_verified_enrollment=True)
+        self._ea(has_never_requested_verification=True)
+
+        def cnt(state):
+            return filter_analytics({
+                "has_internal_service": "1", "verification_state": state,
+            }).count()
+
+        total = filter_analytics({"has_internal_service": "1"}).count()
+        summed = (cnt("Pending Verification") + cnt("Verified")
+                  + cnt("Never Requested") + cnt("Not Applicable"))
+        self.assertEqual(summed, total)
 
 
 class VerificationNeverRequestedScopeTest(TestCase):
