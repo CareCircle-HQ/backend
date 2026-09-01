@@ -33,7 +33,9 @@ NOT_ASSIGNED = "__none__"
 
 
 def _cadence_from_weekdays(weekdays):
-    """Normalize delivery weekdays -> a DeliveryCadence-style code for filtering."""
+    """Normalize delivery weekdays -> a DeliveryCadence-style code for filtering.
+    Lossy fallback only (see _cadence_for_client) -- it collapses distinct single-
+    day cadences to 'once_a_week' and can't name arbitrary day-sets."""
     s = {(w or "").strip().lower()[:3] for w in (weekdays or []) if w}
     if s == {"mon", "thu"}:
         return "mon_thu"
@@ -42,6 +44,28 @@ def _cadence_from_weekdays(weekdays):
     if len(s) == 1:
         return "once_a_week"
     return ""
+
+
+def _cadence_for_client(client, enr):
+    """The member's ACTUAL delivery cadence code -- MemberDeliverySchedule.
+    delivery_days_cadence (a DeliveryCadence code), the same field the Members-list
+    cadence filter matches. Preferred over deriving it from weekdays, which
+    collapsed distinct cadences (mon_only/tue_only -> once_a_week) and dropped
+    unrecognized day-sets, making the Data page cadence filter inaccurate. Falls
+    back to the weekday derivation only when the member has no schedule cadence."""
+    from api.models import MemberDeliverySchedule
+
+    qs = MemberDeliverySchedule.objects.filter(member_profile__client=client)
+    if enr is not None:
+        qs = qs.filter(enrollment=enr)
+    code = (
+        qs.exclude(delivery_days_cadence="")
+        .values_list("delivery_days_cadence", flat=True)
+        .first()
+    )
+    if code:
+        return code
+    return _cadence_from_weekdays(enr.delivery_weekdays if enr is not None else [])
 
 
 def _clean(seq):
@@ -571,7 +595,7 @@ def build_row(client):
         "member_created_at": client.created_at,
         "care_coordinator": client.care_coordinator or "",
         "primary_care_coordinator": (case.primary_worker_name if case else "") or "",
-        "cadence": _cadence_from_weekdays(enr.delivery_weekdays if enr is not None else []),
+        "cadence": _cadence_for_client(client, enr),
         "kitchen_id": (enr.kitchen_id if enr is not None else None),
         "kitchen_name": (enr.kitchen.name if (enr is not None and enr.kitchen_id) else ""),
         "menu_type": menu_type,
