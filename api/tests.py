@@ -5544,25 +5544,32 @@ class SplitDependentVerifiedDateTest(TestCase):
     profile -- so verified-DATE filters include them (not just the status)."""
 
     def test_dependent_gets_verified_at_on_split(self):
+        from datetime import timedelta
+
         from django.utils import timezone
 
         from .models import (
-            Client, EnrollmentStage, EnrollmentVerification, Household,
+            Agent, Client, EnrollmentStage, EnrollmentVerification, Household,
             HouseholdMember,
         )
         from .services.lifecycle import split_dependent_into_own_enrollment
 
         vat = timezone.now()
+        rat = vat - timedelta(days=3)  # requested earlier than verified
+        requester = Agent.objects.create(name="Req Agent", agent_code="701", group="Verifiers")
+        verifier = Agent.objects.create(name="Ver Agent", agent_code="702", group="Verifiers")
         hh = Household.objects.create(name="HH")
         primary = Client.objects.create(client_id=str(uuid.uuid4()), first_name="Prim", last_name="Ary")
         dep = Client.objects.create(client_id=str(uuid.uuid4()), first_name="Dep", last_name="Endent")
         HouseholdMember.objects.create(household=hh, client=primary, is_primary=True)
         HouseholdMember.objects.create(household=hh, client=dep, is_primary=False)
-        # Verified household enrollment (on the primary). The dependent has NO
-        # per-member profile -- governed by household membership alone.
+        # Verified household enrollment (on the primary), with the full request +
+        # verification audit trail. The dependent has NO per-member profile.
         EnrollmentVerification.objects.create(
             client=primary, household=hh, stage=EnrollmentStage.SERVICE_ACTIVE,
-            verified_at=vat,
+            verified_at=vat, verified_by=verifier,
+            requested_at=rat, requested_by=requester,
+            is_family_verified=True, medicaid_type_verified=True,
         )
         # The dependent's freshly-created (unverified) enrollment being split out.
         new_enr = EnrollmentVerification.objects.create(
@@ -5570,8 +5577,15 @@ class SplitDependentVerifiedDateTest(TestCase):
         )
         split_dependent_into_own_enrollment(dep, new_enr)
         new_enr.refresh_from_db()
-        self.assertIsNotNone(new_enr.verified_at)  # carried from the household
+        # Verified date + verifying agent preserved.
         self.assertEqual(new_enr.verified_at, vat)
+        self.assertEqual(new_enr.verified_by_id, verifier.id)
+        # Requested date + requesting agent preserved.
+        self.assertEqual(new_enr.requested_at, rat)
+        self.assertEqual(new_enr.requested_by_id, requester.id)
+        # Other verification fields preserved.
+        self.assertTrue(new_enr.is_family_verified)
+        self.assertTrue(new_enr.medicaid_type_verified)
 
 
 class ScreeningImportMultiPassTest(TestCase):
