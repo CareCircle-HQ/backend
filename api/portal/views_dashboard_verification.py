@@ -380,6 +380,14 @@ class VerificationDashboardView(PortalAPIView):
                 .order_by("-n")
             )
         ]
+        # Chip totals tied to the leaderboards so they ALWAYS reconcile:
+        #  * verified_in_range  = verifications COMPLETED in range (by verified_at),
+        #    deduped per household -> equals the sum of all Top Verifiers bars.
+        #  * requested_in_range = requests RAISED in range -> equals the sum of all
+        #    Top Requesters bars. (Distinct from the funnel's request-cohort
+        #    "Verified" step, which counts requests-in-range that later verified.)
+        verified_in_range = sum(r["count"] for r in verifiers)
+        requested_in_range = sum(r["count"] for r in requesters)
 
         # --- Quality & bottlenecks (over verifications COMPLETED in range) ----
         # Scoped to the selected date window via ``completed_qs`` (verified_at in
@@ -444,6 +452,8 @@ class VerificationDashboardView(PortalAPIView):
 
         return Response({
             "missing_cases": missing_cases,
+            "verified_in_range": verified_in_range,
+            "requested_in_range": requested_in_range,
             "period": period,
             "range": (
                 {"start": start.isoformat(), "end": end.isoformat()}
