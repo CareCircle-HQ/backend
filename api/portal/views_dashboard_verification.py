@@ -337,9 +337,12 @@ class VerificationDashboardView(PortalAPIView):
         # agent when a household holds several verified enrollments (a superseded /
         # carried row from a governing-case switch, or a split-out dependent), so
         # dedupe by household before tallying by verified_by.
+        # Show ALL agents (no top-N cap) and attribute EVERY row -- verifications
+        # with no agent fall into an "Unassigned / System" bucket -- so the bars
+        # sum to the section total with nothing dropped.
         _nongov = [EnrollmentStage.DISREGARDED, EnrollmentStage.SCHEDULED_EXTENSION]
         seen_hh = set()
-        v_tally = {}  # verified_by id -> [name, count]
+        v_tally = {}  # verified_by id ("" == unassigned) -> [name, count]
         for hh_id, cli_id, vby, vname in (
             completed_qs.exclude(stage__in=_nongov)
             .order_by("-verified_at", "-opened_at")
@@ -352,31 +355,29 @@ class VerificationDashboardView(PortalAPIView):
             if key in seen_hh:
                 continue
             seen_hh.add(key)
-            if vby is None:
-                continue  # verified with no attributable agent -> don't credit
-            t = v_tally.get(vby)
+            gid = str(vby) if vby else ""
+            t = v_tally.get(gid)
             if t is None:
-                t = v_tally[vby] = [vname or "Unknown", 0]
+                t = v_tally[gid] = [vname or "Unassigned / System", 0]
             t[1] += 1
         verifiers = sorted(
             (
-                {"id": str(vby), "name": t[0], "count": t[1]}
-                for vby, t in v_tally.items()
+                {"id": gid, "name": t[0], "count": t[1]}
+                for gid, t in v_tally.items()
             ),
             key=lambda r: r["count"],
             reverse=True,
-        )[:8]
+        )
         requesters = [
             {
-                "id": str(r["requested_by"]),
-                "name": r["requested_by__name"] or "Unknown",
+                "id": str(r["requested_by"]) if r["requested_by"] else "",
+                "name": r["requested_by__name"] or "Unassigned / System",
                 "count": r["n"],
             }
             for r in (
-                cohort.filter(requested_by__isnull=False)
-                .values("requested_by", "requested_by__name")
+                cohort.values("requested_by", "requested_by__name")
                 .annotate(n=Count("id"))
-                .order_by("-n")[:8]
+                .order_by("-n")
             )
         ]
 
