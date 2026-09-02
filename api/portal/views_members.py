@@ -6431,6 +6431,12 @@ class MemberVerificationCreateView(PortalAPIView):
         # records a StageEvent + timeline event and recomputes the client's
         # lifecycle stage to "Verified".
         agent = current_agent(request)
+        if agent is None:
+            logger.warning(
+                "verification completed with no resolvable agent -> verified_by "
+                "left null (enrollment %s). Check the portal auth token.",
+                enrollment.pk,
+            )
         enrollment.verified_at = timezone.now()
         enrollment.verified_by = agent
         enrollment.save(update_fields=["verified_at", "verified_by"])

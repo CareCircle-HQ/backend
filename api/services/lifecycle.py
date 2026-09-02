@@ -3228,6 +3228,25 @@ def _handle_household_scope_switch(
     return True
 
 
+def _agent_from_chain(enrollment, field_id):
+    """First non-null agent id for ``field_id`` ('requested_by_id' /
+    'verified_by_id'), walking the ``supersedes`` chain back to the ORIGINAL
+    enrollment. Lets a case switch / reauthorization / household split copy the
+    acting agent from the previous (or original) enrollment instead of dropping
+    it -- and NEVER invents the agent performing the current action."""
+    if enrollment is None:
+        return None
+    seen = set()
+    cur = enrollment
+    while cur is not None and cur.pk not in seen:
+        seen.add(cur.pk)
+        val = getattr(cur, field_id, None)
+        if val:
+            return val
+        cur = getattr(cur, "supersedes", None)
+    return None
+
+
 def _carry_verification_fields(target, source):
     """Carry the verified capture from ``source`` onto ``target`` after a
     governing-case replacement reused a pre-existing enrollment.
@@ -3278,18 +3297,43 @@ def _carry_verification_fields(target, source):
         except Exception:  # pragma: no cover - defensive
             pass
 
+    # (1c) Attribution back-fill: recover a MISSING requested_by / verified_by on
+    # the survivor from the SOURCE's chain (previous -> original enrollment) --
+    # even when it's already verified. Copies from the original/previous
+    # enrollment, never the acting agent. requested_by is safe to fill anytime;
+    # verified_by only once the row is actually verified (no half-verified state).
+    attr = []
+    if target.requested_by_id is None:
+        rb = source.requested_by_id or _agent_from_chain(source, "requested_by_id")
+        if rb:
+            target.requested_by_id = rb
+            attr.append("requested_by")
+    if target.verified_at is not None and target.verified_by_id is None:
+        vb = source.verified_by_id or _agent_from_chain(source, "verified_by_id")
+        if vb:
+            target.verified_by_id = vb
+            attr.append("verified_by")
+    if attr:
+        try:
+            target.save(update_fields=attr)
+        except Exception:  # pragma: no cover - defensive
+            attr = []
+
     # (2) Verification fact -- only when the survivor isn't already verified.
     if target.verified_at is not None or source.verified_at is None:
-        return len(addr_fields)
+        return len(addr_fields) + len(attr)
     fields = ["verified_at", "verified_by"]
     target.verified_at = source.verified_at
-    target.verified_by = source.verified_by
+    # Attribute to the source (or, if it lost it, the original in its chain).
+    target.verified_by_id = source.verified_by_id or _agent_from_chain(source, "verified_by_id")
     if target.requested_at is None and source.requested_at is not None:
         target.requested_at = source.requested_at
         fields.append("requested_at")
-    if target.requested_by_id is None and source.requested_by_id is not None:
-        target.requested_by = source.requested_by
-        fields.append("requested_by")
+    if target.requested_by_id is None:
+        rb = source.requested_by_id or _agent_from_chain(source, "requested_by_id")
+        if rb:
+            target.requested_by_id = rb
+            fields.append("requested_by")
     for flag in ("delivery_address_verified", "is_family_verified", "medicaid_type_verified"):
         if not getattr(target, flag, False) and getattr(source, flag, False):
             setattr(target, flag, True)
@@ -3298,7 +3342,7 @@ def _carry_verification_fields(target, source):
         target.save(update_fields=fields)
     except Exception:  # pragma: no cover - defensive
         fields = []
-    return len(addr_fields) + len(fields)
+    return len(addr_fields) + len(attr) + len(fields)
 
 
 _COND_SENTINEL = ["No Restriction"]
@@ -3977,7 +4021,9 @@ def reopen_enrollment_for_new_case(client, new_governing_case, *, actor=None, ac
             "is_family_verified": prior.is_family_verified,
             "medicaid_type_verified": prior.medicaid_type_verified,
             "delivery_address_verified": prior.delivery_address_verified,
-            "requested_by": prior.requested_by,
+            # Copy the requester from the previous (or original) enrollment, not
+            # the acting agent -- a reauth/reopen is not a new agent request.
+            "requested_by_id": _agent_from_chain(prior, "requested_by_id"),
             "requested_at": timezone.now() if reverify else prior.requested_at,
             "supersedes": prior,
             "stage": EnrollmentStage.PENDING_VERIFICATION.value,
@@ -3989,7 +4035,7 @@ def reopen_enrollment_for_new_case(client, new_governing_case, *, actor=None, ac
             # the nutrition gate can advance the enrollment.
             fields.update(
                 verified_at=prior.verified_at or timezone.now(),
-                verified_by=prior.verified_by,
+                verified_by_id=_agent_from_chain(prior, "verified_by_id"),
                 nutritionist_approved_at=prior.nutritionist_approved_at,
                 nutritionist_approved_by=prior.nutritionist_approved_by,
                 nutritionist_signature=prior.nutritionist_signature,
@@ -4233,8 +4279,11 @@ def replace_enrollment_for_case_change(
             "medicaid_type_verified": live.medicaid_type_verified,
             "delivery_address_verified": live.delivery_address_verified,
             "verified_at": live.verified_at,
-            "verified_by": live.verified_by,
-            "requested_by": live.requested_by,
+            # Copy the verifier/requester from the previous (or original)
+            # enrollment -- a governing-case switch is not a re-verification and
+            # must not attribute to the switching agent.
+            "verified_by_id": _agent_from_chain(live, "verified_by_id"),
+            "requested_by_id": _agent_from_chain(live, "requested_by_id"),
             "requested_at": live.requested_at,
             # Carry the Nutritionist legal sign-off forward: a governing-case
             # switch doesn't change the member's clinical picture, so it must not
@@ -5226,8 +5275,10 @@ def _park_deferred_extensions(client, cases, *, actor=None, actor_label=""):
             medicaid_type_verified=live.medicaid_type_verified,
             delivery_address_verified=live.delivery_address_verified,
             verified_at=live.verified_at,
-            verified_by=live.verified_by,
-            requested_by=live.requested_by,
+            # Carry the verifier/requester from the live (or original) enrollment
+            # -- parking a reauthorization is not a new agent action.
+            verified_by_id=_agent_from_chain(live, "verified_by_id"),
+            requested_by_id=_agent_from_chain(live, "requested_by_id"),
             requested_at=live.requested_at,
             nutritionist_approved_at=live.nutritionist_approved_at,
             nutritionist_approved_by=live.nutritionist_approved_by,

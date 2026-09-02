@@ -985,6 +985,12 @@ class EnrollmentVerificationViewSet(viewsets.ModelViewSet):
         # null (so the requested DATE fell back to opened_at). agent NULL for
         # bulk/system writes.
         agent_id = getattr(getattr(self.request, "user", None), "agent_id", None)
+        if not agent_id:
+            logger.warning(
+                "ext verification request with no resolvable agent -> requested_by "
+                "left null (enrollment %s). Check the caller's auth token.",
+                enrollment.pk,
+            )
         fields = []
         if enrollment.requested_at is None:
             enrollment.requested_at = timezone.now()
@@ -1093,9 +1099,27 @@ class EnrollmentVerificationViewSet(viewsets.ModelViewSet):
                 note=request.data.get("note", "") or "",
                 force=bool(request.data.get("force")),
             )
-            # Once verification completes, immediately project the case's
-            # authorization outcome (it may already be Accepted -> orders).
+            # Once verification completes, capture the verification FACT (who +
+            # when) -- set-stage is a live agent completion, so it must stamp
+            # verified_at/verified_by (advance_enrollment only moves the stage).
+            # Then project the case's authorization outcome (it may already be
+            # Accepted -> orders).
             if enrollment.stage == EnrollmentStage.VERIFIED:
+                agent_id = getattr(getattr(request, "user", None), "agent_id", None)
+                vfields = []
+                if enrollment.verified_at is None:
+                    enrollment.verified_at = timezone.now()
+                    vfields.append("verified_at")
+                if agent_id and enrollment.verified_by_id is None:
+                    enrollment.verified_by_id = agent_id
+                    vfields.append("verified_by")
+                if vfields:
+                    enrollment.save(update_fields=vfields)
+                if not agent_id and enrollment.verified_by_id is None:
+                    logger.warning(
+                        "set-stage VERIFIED with no acting agent -> verified_by "
+                        "left null (enrollment %s)", enrollment.pk,
+                    )
                 reconcile_enrollment_authorization(
                     enrollment, actor=getattr(request, "user", None)
                 )

@@ -5710,6 +5710,66 @@ class VerificationDashboardMissingCaseTest(TestCase):
         self.assertNotIn(str(c1.client_id), ids)
 
 
+class VerificationAgentCaptureTest(TestCase):
+    """Fix: never lose the acting agent. set-stage completion stamps verified_by;
+    carry/propagation recovers a missing agent from the original/previous
+    enrollment chain (never the acting agent)."""
+
+    def test_set_stage_verified_stamps_verified_by(self):
+        from rest_framework.test import APIClient
+        from django.urls import reverse
+
+        from .models import (
+            Agent, Client, EnrollmentStage, EnrollmentVerification, Household,
+        )
+        ag = Agent.objects.create(name="Ver", agent_code="921", group="Verifiers")
+        hh = Household.objects.create(name="HH")
+        c = Client.objects.create(client_id=str(uuid.uuid4()), first_name="A", last_name="B")
+        enr = EnrollmentVerification.objects.create(
+            client=c, household=hh, stage=EnrollmentStage.PENDING_VERIFICATION)
+
+        class U:
+            is_authenticated = True
+            agent_id = ag.id
+            agent_code = ag.agent_code
+        api = APIClient(); api.force_authenticate(user=U())
+        resp = api.post(
+            reverse("enrollment-verification-set-stage", args=[enr.pk]),
+            {"stage": "verified", "force": True}, format="json",
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        enr.refresh_from_db()
+        self.assertIsNotNone(enr.verified_at)          # verification fact stamped
+        self.assertEqual(enr.verified_by_id, ag.id)    # acting agent captured
+
+    def test_carry_recovers_agent_from_chain(self):
+        from django.utils import timezone
+
+        from .models import (
+            Agent, Client, EnrollmentStage, EnrollmentVerification, Household,
+        )
+        from .services.lifecycle import _carry_verification_fields
+        ag = Agent.objects.create(name="Orig", agent_code="922", group="Verifiers")
+        hh = Household.objects.create(name="HH")
+        c = Client.objects.create(client_id=str(uuid.uuid4()), first_name="A", last_name="B")
+        now = timezone.now()
+        original = EnrollmentVerification.objects.create(
+            client=c, household=hh, stage=EnrollmentStage.CLOSED,
+            verified_at=now, verified_by=ag, requested_by=ag)
+        # An intermediate that LOST the agent (e.g. a prior bad carry/import).
+        source = EnrollmentVerification.objects.create(
+            client=c, household=hh, stage=EnrollmentStage.CLOSED,
+            verified_at=now, verified_by=None, requested_by=None, supersedes=original)
+        # A verified survivor missing the agent -> should recover from the chain.
+        target = EnrollmentVerification.objects.create(
+            client=c, household=hh, stage=EnrollmentStage.VERIFIED,
+            verified_at=now, verified_by=None, requested_by=None)
+        _carry_verification_fields(target, source)
+        target.refresh_from_db()
+        self.assertEqual(target.verified_by_id, ag.id)   # from original in the chain
+        self.assertEqual(target.requested_by_id, ag.id)
+
+
 class ExtRequestVerificationTimelineTest(TestCase):
     """Requesting a verification FROM THE EXTENSION now records a timeline event
     (mirroring the CRM button): the acting agent + the request time, on both the
