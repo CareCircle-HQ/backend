@@ -99,13 +99,22 @@ def _base_ev():
     )
 
 
-def verification_enrollments(reason):
+def verification_enrollments(reason, start=None, end=None):
     """Return the EnrollmentVerification queryset behind one drill-down
     ``reason``. The dashboard counts are derived from the SAME querysets, so a
-    count can never disagree with its list. Snapshot (all-time) by design --
-    these are 'right now' operational lists."""
+    count can never disagree with its list.
+
+    The VERIFIED-population reasons (``stuck_*``, ``missing_*``,
+    ``step4_incomplete``) honor the dashboard's date window on ``verified_at``
+    (all-time when ``start`` is None). The pending-queue reasons (``pending`` /
+    ``aging_*``) are a live snapshot -- 'right now' operational lists."""
     ev = _base_ev()
     today = timezone.localdate()
+
+    def _in_window(qs):
+        if start is None:
+            return qs
+        return qs.filter(verified_at__date__gte=start, verified_at__date__lte=end)
 
     if reason == "pending" or reason.startswith("aging_"):
         pending = _with_req_date(
@@ -131,9 +140,9 @@ def verification_enrollments(reason):
             return pending.filter(req__date__lte=today - timedelta(days=15))
 
     if reason.startswith("stuck_"):
-        stuck = ev.filter(
+        stuck = _in_window(ev.filter(
             stage=EnrollmentStage.VERIFIED, verified_at__isnull=False
-        )
+        ))
         if reason == "stuck_pending":
             return stuck.filter(
                 case__service_authorization_status=ServiceAuthorizationStatus.PENDING
@@ -149,7 +158,7 @@ def verification_enrollments(reason):
         if reason == "stuck_no_case":
             return stuck.filter(case__isnull=True)
 
-    verified = ev.filter(verified_at__isnull=False)
+    verified = _in_window(ev.filter(verified_at__isnull=False))
     if reason == "step4_incomplete":
         return verified.exclude(_STEP4_ALL)
     if reason == "missing_address":
@@ -336,22 +345,15 @@ class VerificationDashboardView(PortalAPIView):
             )
         ]
 
-        # --- Quality & bottlenecks (SNAPSHOT over verified population) ----
-        verified_all = ev.filter(verified_at__isnull=False)
+        # --- Quality & bottlenecks (over verifications COMPLETED in range) ----
+        # Scoped to the selected date window via ``completed_qs`` (verified_at in
+        # range; all-time when no range) so the Verified-but-Stuck + Missing-Data
+        # cards move with the picker -- and match their drill-down lists, which
+        # apply the SAME window (see verification_enrollments).
+        verified_all = completed_qs
         verified_total = verified_all.count()
-        step4_complete = verified_all.filter(_STEP4_ALL).count()
-        step4_none = verified_all.exclude(
-            Q(is_family_verified=True)
-            | Q(medicaid_type_verified=True)
-            | Q(delivery_address_verified=True)
-        ).count()
-        step4 = {
-            "complete": step4_complete,
-            "partial": verified_total - step4_complete - step4_none,
-            "none": step4_none,
-        }
 
-        stuck = ev.filter(stage=EnrollmentStage.VERIFIED, verified_at__isnull=False)
+        stuck = verified_all.filter(stage=EnrollmentStage.VERIFIED)
         stuck_total = stuck.count()
         stuck_pending = stuck.filter(
             case__service_authorization_status=ServiceAuthorizationStatus.PENDING
@@ -399,7 +401,6 @@ class VerificationDashboardView(PortalAPIView):
             "agents": {"verifiers": verifiers, "requesters": requesters},
             "quality": {
                 "verified_total": verified_total,
-                "step4": step4,
                 "stuck": stuck_payload,
                 "missing": missing,
             },
@@ -421,7 +422,11 @@ class VerificationDashboardListView(PortalAPIView):
             return Response({"detail": "Unknown reason."}, status=404)
 
         today = timezone.localdate()
-        qs = verification_enrollments(reason).order_by("req" if (
+        # Honor the dashboard's date window for the verified-population reasons
+        # (stuck_* / missing_* / step4_incomplete) so a card's count matches its
+        # expanded list. Pending/aging reasons ignore it (live snapshot).
+        start, end = resolve_window(request)
+        qs = verification_enrollments(reason, start, end).order_by("req" if (
             reason == "pending" or reason.startswith("aging_")
         ) else "-verified_at")[:200]
 
