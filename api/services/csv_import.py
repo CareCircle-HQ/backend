@@ -1653,10 +1653,17 @@ def run_csv_import(*, export_type, file_obj, triggered_by="manual", emit_side_ef
                 importer.reconcile_touched_cases()
             elif export_type == "notes":
                 importer.import_notes(reader)
-            # Always reconcile the funnel stage for every touched client, so the
+            # Reconcile the funnel stage + warnings for every touched client so the
             # upload self-heals lifecycle_stage even when per-record side effects
             # are off (bulk load) or the client file was imported before cases.
-            importer.recompute_touched()
+            # ONLY the datasets that can actually move the funnel pay for this
+            # (expensive) per-client recompute: stage + warnings derive from
+            # cases / enrollments / eligibility, NOT from screenings or notes. A
+            # screening/notes upload is append-only and leaves the funnel untouched,
+            # so running recompute_touched there is a pure no-op that ground large
+            # screening imports for hours after the rows were already written.
+            if export_type in ("clients", "cases", "assessments"):
+                importer.recompute_touched()
         run.status = ImportRunStatus.COMPLETED
     except Exception as exc:  # fatal: bad file / decode error
         run.status = ImportRunStatus.FAILED
