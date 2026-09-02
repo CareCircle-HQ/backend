@@ -5598,6 +5598,57 @@ class SplitDependentVerifiedDateTest(TestCase):
         self.assertEqual(new_enr.nutritionist_approval_pdf_key, "s3://nutrition/approval.pdf")
 
 
+class ExtRequestVerificationTimelineTest(TestCase):
+    """Requesting a verification FROM THE EXTENSION now records a timeline event
+    (mirroring the CRM button): the acting agent + the request time, on both the
+    fresh-create and re-request paths."""
+
+    def _api(self, agent):
+        from rest_framework.test import APIClient
+
+        class U:
+            is_authenticated = True
+            agent_id = agent.id
+            agent_code = agent.agent_code
+            is_manager = False
+            group = agent.group
+
+        api = APIClient()
+        api.force_authenticate(user=U())
+        return api
+
+    def test_ext_request_logs_timeline_with_agent_and_time(self):
+        from django.urls import reverse
+
+        from .models import (
+            Agent, Case, CaseStatus, CaseType, Client, EnrollmentVerification,
+            TimelineEvent, TimelineEventType,
+        )
+        agent = Agent.objects.create(name="Ext Agent", agent_code="705", group="Verifiers")
+        c = Client.objects.create(client_id=str(uuid.uuid4()), first_name="Ext", last_name="Req")
+        case = Case.objects.create(
+            case_id=str(uuid.uuid4()), client=c, case_type=CaseType.INTERNAL_SERVICE,
+            case_status=CaseStatus.OPEN,
+        )
+        resp = self._api(agent).post(
+            reverse("enrollment-verification-list"),
+            {"client_id": str(c.client_id), "case_id": str(case.case_id),
+             "members": [{"member_name": "Ext Req"}]},
+            format="json",
+        )
+        self.assertIn(resp.status_code, (200, 201), resp.content)
+        enr = EnrollmentVerification.objects.get(client=c)
+        # Requested time + requesting agent stamped.
+        self.assertIsNotNone(enr.requested_at)
+        self.assertEqual(enr.requested_by_id, agent.id)
+        # Timeline event created, attributed to the acting agent.
+        ev = TimelineEvent.objects.filter(
+            client=c, event_type=TimelineEventType.VERIFICATION_REQUESTED,
+        ).first()
+        self.assertIsNotNone(ev)
+        self.assertIn("705", ev.actor or "")
+
+
 class ScreeningImportMultiPassTest(TestCase):
     """The screening import buffers a bounded bucket of screens per pass (so a
     multi-GB, non-contiguous export doesn't OOM). All of a screen's scattered
