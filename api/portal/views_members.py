@@ -3025,8 +3025,21 @@ class DataExportView(PortalAPIView):
         from .report_exports import stream_csv_response
 
         qs = filter_analytics(request.query_params)
+        # Household PRIMARY member's client_id -- annotated via subquery so no
+        # read-model rebuild is needed. For a primary member this equals their own
+        # client_id; for a dependent it's the household's primary. Blank when the
+        # member has no household.
+        from django.db.models import OuterRef, Subquery
+
+        from ..models import HouseholdMember
+
+        qs = qs.annotate(primary_client_id=Subquery(
+            HouseholdMember.objects.filter(
+                household_id=OuterRef("household_id"), is_primary=True,
+            ).values("client_id")[:1]
+        ))
         fields = [
-            "enrollment_id", "client_id", "first_name", "last_name", "medicaid_id",
+            "enrollment_id", "client_id", "primary_client_id", "first_name", "last_name", "medicaid_id",
             "dob", "stage", "is_primary", "care_coordinator", "primary_care_coordinator",
             "cadence", "kitchen_name", "menu_type", "current_delivery_status",
             "last_po_delivery_status", "last_delivered_at", "insurance_status",

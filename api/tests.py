@@ -5538,6 +5538,52 @@ class WorkQueueResolvedDateFilterTest(TestCase):
         self.assertNotIn(early.pk, from_only)
 
 
+class DataExportPrimaryMemberTest(TestCase):
+    """The Data page CSV export includes a primary_client_id column: a primary
+    member's own id, and a dependent's household-primary id."""
+
+    def _mgr_api(self):
+        from rest_framework.test import APIClient
+        from rest_framework_simplejwt.tokens import AccessToken
+
+        from .models import Agent
+        agent = Agent.objects.create(name="Mgr", agent_code="988", group="Management", is_manager=True)
+        access = AccessToken()
+        access["agent_id"] = str(agent.id)
+        access["agent_code"] = agent.agent_code
+        access["agent_name"] = agent.name
+        access["agent_group"] = agent.group
+        access["agent_is_manager"] = agent.is_manager
+        api = APIClient()
+        api.credentials(HTTP_AUTHORIZATION=f"Bearer {access}")
+        return api
+
+    def test_export_includes_primary_member_id(self):
+        from django.urls import reverse
+
+        from .models import Client, EnrollmentAnalytics, Household, HouseholdMember
+        hh = Household.objects.create(name="HH")
+        prim = Client.objects.create(client_id=str(uuid.uuid4()), first_name="Prim", last_name="Ary")
+        dep = Client.objects.create(client_id=str(uuid.uuid4()), first_name="Dep", last_name="Endent")
+        HouseholdMember.objects.create(household=hh, client=prim, is_primary=True)
+        HouseholdMember.objects.create(household=hh, client=dep, is_primary=False)
+        for c, isp in ((prim, True), (dep, False)):
+            EnrollmentAnalytics.objects.create(
+                client_id=c.client_id, household_id=hh.household_id, is_primary=isp,
+                first_name=c.first_name, last_name=c.last_name, case_type="", case_status="",
+            )
+
+        resp = self._mgr_api().get(reverse("portal-data-export"))
+        self.assertEqual(resp.status_code, 200, getattr(resp, "content", b""))
+        body = b"".join(resp.streaming_content).decode()
+        lines = [l for l in body.splitlines() if l.strip()]
+        header = lines[0].split(",")
+        self.assertIn("primary_client_id", header)
+        idx = header.index("primary_client_id")
+        dep_line = next(l for l in lines if str(dep.client_id) in l)
+        self.assertEqual(dep_line.split(",")[idx], str(prim.client_id))  # dependent -> primary
+
+
 class CompanyStatusNotEligibleTest(TestCase):
     """A member parked on the not_eligible/ineligible lifecycle off-ramp (closed
     enrollment, but a lingering open case -- e.g. after a Household->Individual
