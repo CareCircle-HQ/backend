@@ -248,12 +248,20 @@ class VerificationDashboardView(PortalAPIView):
         cohort = _scope_requests(ev.all(), start, end)
         requested = cohort.count()
         verified = cohort.filter(verified_at__isnull=False).count()
+        # Nutritionist sign-off gate: sits between Verified and Kitchen Assignment.
+        # A verified household is "Pending Nutritionist" until nutritionist_approved_at
+        # is set; kitchen-or-beyond implies it cleared the gate (kept in the OR so the
+        # funnel stays monotonic even where the timestamp wasn't backfilled).
+        nutritionist = cohort.filter(
+            Q(nutritionist_approved_at__isnull=False) | Q(stage__in=_KITCHEN_OR_BEYOND)
+        ).count()
         kitchen = cohort.filter(stage__in=_KITCHEN_OR_BEYOND).count()
         active = cohort.filter(stage__in=_SERVICE_OR_BEYOND).count()
 
         steps = [
             ("requested", "Requested", requested),
             ("verified", "Verified", verified),
+            ("nutritionist", "Pending Nutritionist", nutritionist),
             ("kitchen", "Kitchen Assignment", kitchen),
             ("service", "Service Active", active),
         ]
