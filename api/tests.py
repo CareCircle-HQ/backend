@@ -5598,6 +5598,61 @@ class SplitDependentVerifiedDateTest(TestCase):
         self.assertEqual(new_enr.nutritionist_approval_pdf_key, "s3://nutrition/approval.pdf")
 
 
+class VerificationDashboardVerifiersTest(TestCase):
+    """The verification dashboard's per-agent 'Top Verifiers' count must match the
+    All-Verifications report: ONE per household, excluding dismissed rows -- not one
+    per enrollment (which over-credits agents for carried/superseded/split rows)."""
+
+    def _api(self, group="Management"):
+        from rest_framework.test import APIClient
+        from rest_framework_simplejwt.tokens import AccessToken
+
+        from .models import Agent
+        a = Agent.objects.create(name="Mgr", agent_code=str(uuid.uuid4())[:8], group=group)
+        acc = AccessToken()
+        acc["agent_id"] = str(a.id); acc["agent_code"] = a.agent_code
+        acc["agent_name"] = a.name; acc["agent_group"] = a.group
+        api = APIClient(); api.credentials(HTTP_AUTHORIZATION=f"Bearer {acc}")
+        return api
+
+    def test_verifiers_dedupe_by_household_and_exclude_disregarded(self):
+        from django.utils import timezone
+
+        from .models import (
+            Agent, Client, EnrollmentStage, EnrollmentVerification, Household,
+        )
+        now = timezone.now()
+        v = Agent.objects.create(name="Val Verifier", agent_code="810", group="Verifiers")
+        # Household H1: TWO verified enrollments by the same agent -> counts ONCE.
+        h1 = Household.objects.create(name="H1")
+        c1 = Client.objects.create(client_id=str(uuid.uuid4()), first_name="A", last_name="One")
+        EnrollmentVerification.objects.create(
+            client=c1, household=h1, stage=EnrollmentStage.SERVICE_ACTIVE,
+            verified_at=now, verified_by=v)
+        EnrollmentVerification.objects.create(  # superseded/carried duplicate
+            client=c1, household=h1, stage=EnrollmentStage.CLOSED,
+            verified_at=now, verified_by=v)
+        # Household H2: one verified enrollment -> counts once.
+        h2 = Household.objects.create(name="H2")
+        c2 = Client.objects.create(client_id=str(uuid.uuid4()), first_name="B", last_name="Two")
+        EnrollmentVerification.objects.create(
+            client=c2, household=h2, stage=EnrollmentStage.VERIFIED,
+            verified_at=now, verified_by=v)
+        # DISREGARDED with a stale verified_at -> excluded.
+        h3 = Household.objects.create(name="H3")
+        c3 = Client.objects.create(client_id=str(uuid.uuid4()), first_name="C", last_name="Three")
+        EnrollmentVerification.objects.create(
+            client=c3, household=h3, stage=EnrollmentStage.DISREGARDED,
+            verified_at=now, verified_by=v)
+
+        resp = self._api().get("/api/portal/dashboard/verification/?period=all")
+        self.assertEqual(resp.status_code, 200, resp.content)
+        verifiers = {r["id"]: r for r in resp.json()["agents"]["verifiers"]}
+        self.assertIn(str(v.id), verifiers)
+        # H1 (deduped to 1) + H2 (1); H3 disregarded excluded. Raw rows would be 4.
+        self.assertEqual(verifiers[str(v.id)]["count"], 2)
+
+
 class ExtRequestVerificationTimelineTest(TestCase):
     """Requesting a verification FROM THE EXTENSION now records a timeline event
     (mirroring the CRM button): the acting agent + the request time, on both the

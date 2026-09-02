@@ -283,19 +283,43 @@ class VerificationDashboardView(PortalAPIView):
         }
 
         # --- Agents (EVENT scoped by range) -------------------------------
-        verifiers = [
-            {
-                "id": str(r["verified_by"]),
-                "name": r["verified_by__name"] or "Unknown",
-                "count": r["n"],
-            }
-            for r in (
-                completed_qs.filter(verified_by__isnull=False)
-                .values("verified_by", "verified_by__name")
-                .annotate(n=Count("id"))
-                .order_by("-n")[:8]
+        # Accurate per-agent count mirrors the "All Verifications" report / the
+        # Verification page: ONE verification per household (else per solo client)
+        # -- the most-recent verified enrollment -- excluding dismissed
+        # (Disregarded) + parked (Scheduled Extension) rows whose verified_at is a
+        # stale prior-cycle fact. Counting raw enrollment rows over-credits an
+        # agent when a household holds several verified enrollments (a superseded /
+        # carried row from a governing-case switch, or a split-out dependent), so
+        # dedupe by household before tallying by verified_by.
+        _nongov = [EnrollmentStage.DISREGARDED, EnrollmentStage.SCHEDULED_EXTENSION]
+        seen_hh = set()
+        v_tally = {}  # verified_by id -> [name, count]
+        for hh_id, cli_id, vby, vname in (
+            completed_qs.exclude(stage__in=_nongov)
+            .order_by("-verified_at", "-opened_at")
+            .values_list(
+                "household_id", "client_id", "verified_by", "verified_by__name"
             )
-        ]
+            .iterator(chunk_size=2000)
+        ):
+            key = ("hh", hh_id) if hh_id else ("c", cli_id)
+            if key in seen_hh:
+                continue
+            seen_hh.add(key)
+            if vby is None:
+                continue  # verified with no attributable agent -> don't credit
+            t = v_tally.get(vby)
+            if t is None:
+                t = v_tally[vby] = [vname or "Unknown", 0]
+            t[1] += 1
+        verifiers = sorted(
+            (
+                {"id": str(vby), "name": t[0], "count": t[1]}
+                for vby, t in v_tally.items()
+            ),
+            key=lambda r: r["count"],
+            reverse=True,
+        )[:8]
         requesters = [
             {
                 "id": str(r["requested_by"]),
