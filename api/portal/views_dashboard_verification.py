@@ -35,7 +35,7 @@ from ..models import (
     ServiceAuthorizationStatus,
 )
 from .base import PortalAPIView, current_agent
-from .views_dashboard import period_window
+from .views_dashboard import resolve_window
 
 # Stages that mean the household reached (or passed) active meal service.
 _KITCHEN_OR_BEYOND = [
@@ -201,7 +201,9 @@ class VerificationDashboardView(PortalAPIView):
             )
 
         period = (request.query_params.get("period") or "all").lower()
-        start, end = period_window(period)
+        # Accept an explicit custom range (?start=&end=, ISO YYYY-MM-DD) -- wins
+        # over the named period preset -- so the dashboard's From/To pickers work.
+        start, end = resolve_window(request)
         today = timezone.localdate()
 
         ev = EnrollmentVerification.objects
