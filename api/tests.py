@@ -5558,6 +5558,7 @@ class SplitDependentVerifiedDateTest(TestCase):
         rat = vat - timedelta(days=3)  # requested earlier than verified
         requester = Agent.objects.create(name="Req Agent", agent_code="701", group="Verifiers")
         verifier = Agent.objects.create(name="Ver Agent", agent_code="702", group="Verifiers")
+        nutri = Agent.objects.create(name="RD Jane", agent_code="703", group="Nutritionist")
         hh = Household.objects.create(name="HH")
         primary = Client.objects.create(client_id=str(uuid.uuid4()), first_name="Prim", last_name="Ary")
         dep = Client.objects.create(client_id=str(uuid.uuid4()), first_name="Dep", last_name="Endent")
@@ -5570,6 +5571,10 @@ class SplitDependentVerifiedDateTest(TestCase):
             verified_at=vat, verified_by=verifier,
             requested_at=rat, requested_by=requester,
             is_family_verified=True, medicaid_type_verified=True,
+            # Nutritionist sign-off (+ typed signature + approval PDF).
+            nutritionist_approved_at=vat, nutritionist_approved_by=nutri,
+            nutritionist_signature="RD Jane, MS RD",
+            nutritionist_approval_pdf_key="s3://nutrition/approval.pdf",
         )
         # The dependent's freshly-created (unverified) enrollment being split out.
         new_enr = EnrollmentVerification.objects.create(
@@ -5586,6 +5591,11 @@ class SplitDependentVerifiedDateTest(TestCase):
         # Other verification fields preserved.
         self.assertTrue(new_enr.is_family_verified)
         self.assertTrue(new_enr.medicaid_type_verified)
+        # Nutritionist sign-off + signature + approval PDF preserved.
+        self.assertEqual(new_enr.nutritionist_approved_at, vat)
+        self.assertEqual(new_enr.nutritionist_approved_by_id, nutri.id)
+        self.assertEqual(new_enr.nutritionist_signature, "RD Jane, MS RD")
+        self.assertEqual(new_enr.nutritionist_approval_pdf_key, "s3://nutrition/approval.pdf")
 
 
 class ScreeningImportMultiPassTest(TestCase):
