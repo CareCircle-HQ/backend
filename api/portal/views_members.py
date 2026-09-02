@@ -1478,28 +1478,15 @@ class MembersListView(PortalGenericAPIView):
         if search:
             import re
 
+            # Direct Client-column matches (no join) -- one scan of the client
+            # table, no row multiplication.
             cond = (
                 Q(first_name__icontains=search)
                 | Q(last_name__icontains=search)
-                | Q(insurances__external_member_id__icontains=search)  # Medicaid ID
                 | Q(client_email_address__icontains=search)            # email
                 # Old (migrated-from) Unite Us id: find a merged client by the
                 # prior person id it was migrated from (partial or full).
                 | Q(migrated_from_id__icontains=search)
-                # Member address (any type stored on the client profile) ...
-                | Q(addresses__street__icontains=search)
-                | Q(addresses__city__icontains=search)
-                | Q(addresses__zip__icontains=search)
-                # ... and the TRUE delivery address, which lives on the ENROLLMENT
-                # (the profile copy can be stale). Match the member's own
-                # enrollment AND -- for a dependent with no own enrollment -- their
-                # household's enrollment, so every member is findable by it.
-                | Q(enrollments__delivery_address__street__icontains=search)
-                | Q(enrollments__delivery_address__city__icontains=search)
-                | Q(enrollments__delivery_address__zip__icontains=search)
-                | Q(household_membership__household__enrollment_verifications__delivery_address__street__icontains=search)
-                | Q(household_membership__household__enrollment_verifications__delivery_address__city__icontains=search)
-                | Q(household_membership__household__enrollment_verifications__delivery_address__zip__icontains=search)
             )
             # Multi-word "first last" search.
             parts = search.split()
@@ -1514,14 +1501,53 @@ class MembersListView(PortalGenericAPIView):
                 cond |= Q(client_id=uuid.UUID(search))
             except (ValueError, TypeError, AttributeError):
                 pass
+            # Joined-table matches as CORRELATED EXISTS subqueries instead of a big
+            # OR across multi-valued joins. The old join-OR produced a cartesian
+            # row explosion (insurances x addresses x enrollments x household
+            # enrollments x phones) + DISTINCT + ORDER BY, which made a miss like
+            # "garcia rodriguez" take ~50s on prod-sized data. Exists is evaluated
+            # per candidate and never multiplies rows.
+            cond |= Exists(
+                Insurance.objects.filter(  # Medicaid ID
+                    client=OuterRef("pk"), external_member_id__icontains=search,
+                )
+            )
+            addr_match = (
+                Q(street__icontains=search)
+                | Q(city__icontains=search)
+                | Q(zip__icontains=search)
+            )
+            # Member address (any type stored on the client profile) ...
+            cond |= Exists(Address.objects.filter(addr_match, client=OuterRef("pk")))
+            # ... and the TRUE delivery address, which lives on the ENROLLMENT (the
+            # profile copy can be stale): the member's own enrollment AND -- for a
+            # dependent with no own enrollment -- their household's enrollment, so
+            # every member is findable by it.
+            enr_addr_match = (
+                Q(delivery_address__street__icontains=search)
+                | Q(delivery_address__city__icontains=search)
+                | Q(delivery_address__zip__icontains=search)
+            )
+            cond |= Exists(
+                EnrollmentVerification.objects.filter(
+                    enr_addr_match, client=OuterRef("pk"),
+                )
+            )
+            cond |= Exists(
+                EnrollmentVerification.objects.filter(
+                    enr_addr_match, household__members__client=OuterRef("pk"),
+                )
+            )
             # Phone: match the indexed last-10-digit normalized column (and the
             # raw field) once the query carries enough digits to be a phone
             # fragment -- so formatting in the query "(716) 555-..." still hits.
             digits = re.sub(r"\D", "", search)
             if len(digits) >= 7:
-                cond |= (
-                    Q(phones__normalized__icontains=digits)
-                    | Q(client_phone_number__icontains=digits)
+                cond |= Q(client_phone_number__icontains=digits)
+                cond |= Exists(
+                    ClientPhone.objects.filter(
+                        client=OuterRef("pk"), normalized__icontains=digits,
+                    )
                 )
             qs = qs.filter(cond)
 
