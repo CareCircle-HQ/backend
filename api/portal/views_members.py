@@ -1475,7 +1475,20 @@ class MembersListView(PortalGenericAPIView):
         params = self.request.query_params
 
         search = (params.get("search") or "").strip()
-        if search:
+        # Full UUID -> pure id lookup: skip the whole text/relation search. A UUID
+        # never appears in a name / address / phone / Medicaid id, so the only
+        # meaningful matches are the client's OWN id (indexed point lookup) or the
+        # id it was migrated FROM. This makes "search by client id" instant instead
+        # of running icontains + 5 Exists subqueries with a 36-char needle.
+        try:
+            search_uuid = uuid.UUID(search) if search else None
+        except (ValueError, TypeError, AttributeError):
+            search_uuid = None
+        if search_uuid is not None:
+            qs = qs.filter(
+                Q(client_id=search_uuid) | Q(migrated_from_id__icontains=search)
+            )
+        elif search:
             import re
 
             # Direct Client-column matches (no join) -- one scan of the client
@@ -1497,10 +1510,6 @@ class MembersListView(PortalGenericAPIView):
             dob = _parse_date(search)
             if dob:
                 cond |= Q(date_of_birth=dob)
-            try:
-                cond |= Q(client_id=uuid.UUID(search))
-            except (ValueError, TypeError, AttributeError):
-                pass
             # Joined-table matches as CORRELATED EXISTS subqueries instead of a big
             # OR across multi-valued joins. The old join-OR produced a cartesian
             # row explosion (insurances x addresses x enrollments x household
