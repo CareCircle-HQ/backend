@@ -23,12 +23,14 @@ creation time.
 import statistics
 from datetime import timedelta
 
-from django.db.models import Count, Q
+from django.db.models import Count, Exists, OuterRef, Q
 from django.db.models.functions import Coalesce
 from django.utils import timezone
 from rest_framework.response import Response
 
 from ..models import (
+    Case,
+    CaseType,
     Client,
     EnrollmentStage,
     EnrollmentVerification,
@@ -56,7 +58,8 @@ VERIFICATION_REASONS = frozenset({
     "pending",
     "aging_0_2", "aging_3_7", "aging_8_14", "aging_15_plus",
     "stuck_pending", "stuck_denied", "stuck_expired", "stuck_no_case",
-    "step4_incomplete", "missing_address", "missing_case",
+    "step4_incomplete", "missing_address",
+    "missing_internal_service", "missing_care_management", "missing_eligibility",
 })
 
 # All-three Step-4 validation checks completed.
@@ -65,6 +68,26 @@ _STEP4_ALL = (
     & Q(medicaid_type_verified=True)
     & Q(delivery_address_verified=True)
 )
+
+# The 3 "members missing a case" dashboard sections: reason -> CaseType. Note
+# NAVIGATION is labeled "Care Management" in the product.
+_MISSING_CASE_REASON = {
+    "missing_internal_service": CaseType.INTERNAL_SERVICE,
+    "missing_care_management": CaseType.NAVIGATION,
+    "missing_eligibility": CaseType.ELIGIBILITY,
+}
+
+
+def _missing_case_qs(verified, case_type):
+    """Rows in ``verified`` whose HOUSEHOLD (else the client, for a solo member)
+    holds NO case of ``case_type`` -- i.e. a verified member missing that case.
+    Correlated Exists so there's no multi-join row blow-up."""
+    hh = Case.objects.filter(
+        case_type=case_type,
+        client__household_membership__household_id=OuterRef("household_id"),
+    )
+    cli = Case.objects.filter(case_type=case_type, client_id=OuterRef("client_id"))
+    return verified.exclude(Exists(hh)).exclude(Exists(cli))
 
 
 def _is_privileged(agent):
@@ -163,8 +186,8 @@ def verification_enrollments(reason, start=None, end=None):
         return verified.exclude(_STEP4_ALL)
     if reason == "missing_address":
         return verified.filter(delivery_address__isnull=True)
-    if reason == "missing_case":
-        return verified.filter(case__isnull=True)
+    if reason in _MISSING_CASE_REASON:
+        return _missing_case_qs(verified, _MISSING_CASE_REASON[reason])
 
     return ev.none()
 
@@ -194,8 +217,12 @@ def _row_detail(reason, ev, today):
         return "Unchecked: " + ", ".join(missing) if missing else "Incomplete checks"
     if reason == "missing_address":
         return "No delivery address on file"
-    if reason == "missing_case":
-        return "No linked internal-service case"
+    if reason in _MISSING_CASE_REASON:
+        return {
+            "missing_internal_service": "No internal-service case",
+            "missing_care_management": "No care-management case",
+            "missing_eligibility": "No eligibility case",
+        }[reason]
     return ""
 
 
@@ -381,10 +408,33 @@ class VerificationDashboardView(PortalAPIView):
 
         missing = {
             "address": verified_all.filter(delivery_address__isnull=True).count(),
-            "case": verified_all.filter(case__isnull=True).count(),
+        }
+
+        # Verified members (in range) missing a case of each type, DEDUPED per
+        # household / individual (a household with several verified rows --
+        # superseded/carried or split dependents -- counts once).
+        def _dedup_count(qs):
+            seen = set()
+            for hh_id, cli_id in (
+                qs.values_list("household_id", "client_id").iterator(chunk_size=2000)
+            ):
+                seen.add(("hh", hh_id) if hh_id else ("c", cli_id))
+            return len(seen)
+
+        missing_cases = {
+            "internal_service": _dedup_count(
+                _missing_case_qs(verified_all, CaseType.INTERNAL_SERVICE)
+            ),
+            "care_management": _dedup_count(
+                _missing_case_qs(verified_all, CaseType.NAVIGATION)
+            ),
+            "eligibility": _dedup_count(
+                _missing_case_qs(verified_all, CaseType.ELIGIBILITY)
+            ),
         }
 
         return Response({
+            "missing_cases": missing_cases,
             "period": period,
             "range": (
                 {"start": start.isoformat(), "end": end.isoformat()}
@@ -426,14 +476,25 @@ class VerificationDashboardListView(PortalAPIView):
         # (stuck_* / missing_* / step4_incomplete) so a card's count matches its
         # expanded list. Pending/aging reasons ignore it (live snapshot).
         start, end = resolve_window(request)
-        qs = verification_enrollments(reason, start, end).order_by("req" if (
+        base = verification_enrollments(reason, start, end).order_by("req" if (
             reason == "pending" or reason.startswith("aging_")
-        ) else "-verified_at")[:200]
+        ) else "-verified_at")
+
+        # The "missing case" reasons are deduped per household / individual (one
+        # row per member, matching the card count); every other reason lists per
+        # enrollment. Cap the preview at 200 rows either way.
+        dedup = reason in _MISSING_CASE_REASON
+        source = base.iterator(chunk_size=500) if dedup else base[:200]
 
         # Names for enrollments whose client row didn't come back via
         # select_related (defensive; client is normally joined).
-        results = []
-        for e in qs:
+        results, seen = [], set()
+        for e in source:
+            if dedup:
+                key = ("hh", e.household_id) if e.household_id else ("c", e.client_id)
+                if key in seen:
+                    continue
+                seen.add(key)
             client = e.client
             cid = str(e.client_id) if e.client_id else str(e.pk)
             name = (
@@ -447,6 +508,8 @@ class VerificationDashboardListView(PortalAPIView):
                 "stage": e.stage,
                 "detail": _row_detail(reason, e, today),
             })
+            if len(results) >= 200:
+                break
 
         return Response({
             "reason": reason,

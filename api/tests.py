@@ -5653,6 +5653,63 @@ class VerificationDashboardVerifiersTest(TestCase):
         self.assertEqual(verifiers[str(v.id)]["count"], 2)
 
 
+class VerificationDashboardMissingCaseTest(TestCase):
+    """The 3 'Verified Members Missing a Case' sections count verified members (in
+    range, deduped per household) whose household has NO case of the given type."""
+
+    def _api(self):
+        from rest_framework.test import APIClient
+        from rest_framework_simplejwt.tokens import AccessToken
+
+        from .models import Agent
+        a = Agent.objects.create(name="Mgr", agent_code=str(uuid.uuid4())[:8], group="Management")
+        acc = AccessToken()
+        acc["agent_id"] = str(a.id); acc["agent_code"] = a.agent_code
+        acc["agent_name"] = a.name; acc["agent_group"] = a.group
+        api = APIClient(); api.credentials(HTTP_AUTHORIZATION=f"Bearer {acc}")
+        return api
+
+    def _verified(self, hh_name):
+        from django.utils import timezone
+
+        from .models import (
+            Client, EnrollmentStage, EnrollmentVerification, Household,
+            HouseholdMember,
+        )
+        hh = Household.objects.create(name=hh_name)
+        c = Client.objects.create(client_id=str(uuid.uuid4()), first_name=hh_name, last_name="X")
+        HouseholdMember.objects.create(household=hh, client=c, is_primary=True)
+        EnrollmentVerification.objects.create(
+            client=c, household=hh, stage=EnrollmentStage.VERIFIED,
+            verified_at=timezone.now())
+        return hh, c
+
+    def test_missing_case_counts_and_drilldown(self):
+        from .models import Case, CaseStatus, CaseType
+
+        # H1: has an internal-service case -> NOT missing internal_service.
+        _, c1 = self._verified("H1")
+        Case.objects.create(
+            case_id=str(uuid.uuid4()), client=c1, case_type=CaseType.INTERNAL_SERVICE,
+            case_status=CaseStatus.OPEN)
+        # H2: no cases at all -> missing all three.
+        _, c2 = self._verified("H2")
+
+        data = self._api().get("/api/portal/dashboard/verification/?period=all").json()
+        mc = data["missing_cases"]
+        self.assertEqual(mc["internal_service"], 1)   # only H2
+        self.assertEqual(mc["care_management"], 2)    # H1 + H2 (neither has navigation)
+        self.assertEqual(mc["eligibility"], 2)        # H1 + H2
+
+        # Drill-down: missing_internal_service lists H2's member only.
+        lst = self._api().get(
+            "/api/portal/dashboard/verification/missing_internal_service/?period=all"
+        ).json()
+        ids = {r["id"] for r in lst["results"]}
+        self.assertIn(str(c2.client_id), ids)
+        self.assertNotIn(str(c1.client_id), ids)
+
+
 class ExtRequestVerificationTimelineTest(TestCase):
     """Requesting a verification FROM THE EXTENSION now records a timeline event
     (mirroring the CRM button): the acting agent + the request time, on both the
