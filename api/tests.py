@@ -5538,6 +5538,42 @@ class WorkQueueResolvedDateFilterTest(TestCase):
         self.assertNotIn(early.pk, from_only)
 
 
+class SplitDependentVerifiedDateTest(TestCase):
+    """Splitting a household-verified dependent into their own enrollment must
+    carry the household's verified_at -- even when the dependent had no per-member
+    profile -- so verified-DATE filters include them (not just the status)."""
+
+    def test_dependent_gets_verified_at_on_split(self):
+        from django.utils import timezone
+
+        from .models import (
+            Client, EnrollmentStage, EnrollmentVerification, Household,
+            HouseholdMember,
+        )
+        from .services.lifecycle import split_dependent_into_own_enrollment
+
+        vat = timezone.now()
+        hh = Household.objects.create(name="HH")
+        primary = Client.objects.create(client_id=str(uuid.uuid4()), first_name="Prim", last_name="Ary")
+        dep = Client.objects.create(client_id=str(uuid.uuid4()), first_name="Dep", last_name="Endent")
+        HouseholdMember.objects.create(household=hh, client=primary, is_primary=True)
+        HouseholdMember.objects.create(household=hh, client=dep, is_primary=False)
+        # Verified household enrollment (on the primary). The dependent has NO
+        # per-member profile -- governed by household membership alone.
+        EnrollmentVerification.objects.create(
+            client=primary, household=hh, stage=EnrollmentStage.SERVICE_ACTIVE,
+            verified_at=vat,
+        )
+        # The dependent's freshly-created (unverified) enrollment being split out.
+        new_enr = EnrollmentVerification.objects.create(
+            client=dep, household=hh, stage=EnrollmentStage.VERIFIED,
+        )
+        split_dependent_into_own_enrollment(dep, new_enr)
+        new_enr.refresh_from_db()
+        self.assertIsNotNone(new_enr.verified_at)  # carried from the household
+        self.assertEqual(new_enr.verified_at, vat)
+
+
 class ScreeningImportMultiPassTest(TestCase):
     """The screening import buffers a bounded bucket of screens per pass (so a
     multi-GB, non-contiguous export doesn't OOM). All of a screen's scattered

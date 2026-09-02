@@ -4904,6 +4904,24 @@ def split_dependent_into_own_enrollment(client, new_enrollment, *, actor=None, a
             if copied:
                 new_profile.save(update_fields=copied)
 
+    # The verification applies to the WHOLE household, so a household-verified
+    # dependent must carry the household's verified_at onto their OWN new
+    # enrollment -- even when they had no per-member profile row (old_enr is None)
+    # or their old profile's enrollment wasn't the verified one. Without this the
+    # split leaves them on a Verified stage with a NULL verified_at, so a
+    # verified-DATE filter excludes them. Fall back to ANY verified enrollment on
+    # the shared household; a no-op when the household isn't verified (no date to
+    # invent) or the dependent's own enrollment is already verified.
+    if new_enrollment.verified_at is None:
+        verified_source = (
+            shared_household.enrollment_verifications
+            .filter(verified_at__isnull=False)
+            .order_by("-verified_at")
+            .first()
+        )
+        if verified_source is not None:
+            _carry_verification_fields(new_enrollment, verified_source)
+
     # (2) Detach from the shared household; KEEP the old profile as REMOVED.
     if old_profile is not None:
         old_profile.status = MemberStatus.REMOVED
