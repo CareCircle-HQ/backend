@@ -5710,6 +5710,41 @@ class VerificationDashboardMissingCaseTest(TestCase):
         self.assertNotIn(str(c1.client_id), ids)
 
 
+class BackfillEnrollmentAgentsTest(TestCase):
+    """backfill_enrollment_agents copies verified_by/requested_by from the SAME
+    client's attributed enrollment; leaves clients with no agent anywhere alone."""
+
+    def test_backfills_only_from_same_client(self):
+        from django.core.management import call_command
+        from django.utils import timezone
+
+        from .models import (
+            Agent, Client, EnrollmentStage, EnrollmentVerification,
+        )
+        ag = Agent.objects.create(name="Ver", agent_code="930", group="Verifiers")
+        now = timezone.now()
+        # Client A: one attributed enrollment + one missing the agent -> recovered.
+        a = Client.objects.create(client_id=str(uuid.uuid4()), first_name="A", last_name="A")
+        EnrollmentVerification.objects.create(
+            client=a, stage=EnrollmentStage.CLOSED, verified_at=now,
+            verified_by=ag, requested_by=ag)
+        tgt = EnrollmentVerification.objects.create(
+            client=a, stage=EnrollmentStage.VERIFIED, verified_at=now,
+            verified_by=None, requested_by=None)
+        # Client B: no agent anywhere (import root) -> left untouched.
+        b = Client.objects.create(client_id=str(uuid.uuid4()), first_name="B", last_name="B")
+        bnull = EnrollmentVerification.objects.create(
+            client=b, stage=EnrollmentStage.VERIFIED, verified_at=now,
+            verified_by=None, requested_by=None)
+
+        call_command("backfill_enrollment_agents", "--apply")
+        tgt.refresh_from_db(); bnull.refresh_from_db()
+        self.assertEqual(tgt.verified_by_id, ag.id)
+        self.assertEqual(tgt.requested_by_id, ag.id)
+        self.assertIsNone(bnull.verified_by_id)   # no source -> untouched
+        self.assertIsNone(bnull.requested_by_id)
+
+
 class VerificationAgentCaptureTest(TestCase):
     """Fix: never lose the acting agent. set-stage completion stamps verified_by;
     carry/propagation recovers a missing agent from the original/previous
