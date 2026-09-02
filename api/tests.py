@@ -5538,6 +5538,51 @@ class WorkQueueResolvedDateFilterTest(TestCase):
         self.assertNotIn(early.pk, from_only)
 
 
+class ScreeningImportMultiPassTest(TestCase):
+    """The screening import buffers a bounded bucket of screens per pass (so a
+    multi-GB, non-contiguous export doesn't OOM). All of a screen's scattered
+    rows must still be collected across passes."""
+
+    def test_non_contiguous_screens_survive_multi_pass(self):
+        import io
+        from unittest import mock
+
+        from .models import Client, ImportRun, ImportRunStatus, Screening
+        from .services import csv_import
+
+        s1 = str(uuid.uuid4())
+        s2 = str(uuid.uuid4())
+        c1 = Client.objects.create(client_id=s1, first_name="A", last_name="One")
+        Client.objects.create(client_id=s2, first_name="B", last_name="Two")
+        header = ("enhanced_screen_id,subject_id,screen_created_at,screen_status,"
+                  "facilitator_id,provider_name,question_primary_text,answer_id,"
+                  "question_option_text\n")
+
+        def row(sid, q, aid, ans):
+            return f"{sid},{sid},2026-08-01,complete,,Prov,{q},{aid},{ans}\n"
+
+        # Interleaved (screen1, screen2, screen1, screen2) -- non-contiguous.
+        body = header + row(s1, "Q1", "a1", "Yes") + row(s2, "Q1", "b1", "No") \
+            + row(s1, "Q2", "a2", "Maybe") + row(s2, "Q2", "b2", "Never")
+        run = ImportRun.objects.create(
+            source="csv", status=ImportRunStatus.RUNNING,
+            export_type="screening", triggered_by="test",
+        )
+        # Force several passes (rows/pass = 1) to exercise the bucketing.
+        with mock.patch.object(csv_import, "_SCREENING_ROWS_PER_PASS", 1):
+            csv_import.run_csv_import(
+                export_type="screening", file_obj=io.BytesIO(body.encode()),
+                run=run, emit_side_effects=False, emit_timeline=False,
+            )
+        run.refresh_from_db()
+        self.assertEqual(run.status, ImportRunStatus.COMPLETED)
+        self.assertEqual(Screening.objects.count(), 2)
+        sc1 = Screening.objects.get(pk=s1)
+        self.assertEqual(str(sc1.client_id), str(c1.client_id))
+        # Both scattered answers were collected despite the multi-pass bucketing.
+        self.assertEqual(len(sc1.questions_answers or []), 2)
+
+
 class DataExportPrimaryMemberTest(TestCase):
     """The Data page CSV export includes a primary_client_id column: a primary
     member's own id, and a dependent's household-primary id."""
