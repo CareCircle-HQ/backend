@@ -51,6 +51,7 @@ from .views_members import (
     MemberAssignKitchenView,
     MemberCadenceView,
     MemberCaseAuditView,
+    MemberCaseCloseView,
     MemberCaseDetailView,
     MemberCaseHistoryView,
     MemberCasesView,
@@ -320,6 +321,11 @@ urlpatterns = [
     path(
         "members/<uuid:client_id>/cases/<uuid:case_id>/",
         MemberCaseDetailView.as_view(),
+    ),
+    path(
+        "members/<uuid:client_id>/cases/<uuid:case_id>/close/",
+        MemberCaseCloseView.as_view(),
+        name="portal-member-case-close",
     ),
     path(
         "members/<uuid:client_id>/refresh-uniteus/",

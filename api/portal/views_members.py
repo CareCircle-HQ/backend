@@ -5342,6 +5342,70 @@ class MemberCaseDetailView(PortalAPIView):
         return Response(status=204)
 
 
+class MemberCaseCloseView(PortalAPIView):
+    """POST /members/<client_id>/cases/<case_id>/close/ -- a MANAGER closes an
+    INTERNAL-SERVICE case whose service authorization was never requested (or is
+    blank). Sets the case closed + closed_at, then reconciles the member's
+    enrollments + funnel stage (a closed governing IS case with no authorization
+    terminalizes the enrollment). Refused for non-managers, non-internal-service
+    cases, already-closed cases, or cases that carry a real authorization."""
+
+    @transaction.atomic
+    def post(self, request, client_id, case_id):
+        agent = current_agent(request)
+        if not (agent and (is_management_group(agent.group) or getattr(agent, "is_manager", False))):
+            return Response(
+                {"detail": "Management access required."},
+                status=http.HTTP_403_FORBIDDEN,
+            )
+        client = get_object_or_404(Client, pk=client_id)
+        case = get_object_or_404(Case, pk=case_id, client_id=client_id)
+        if case.case_type != CaseType.INTERNAL_SERVICE:
+            return Response(
+                {"detail": "Only internal-service cases can be closed here."},
+                status=http.HTTP_400_BAD_REQUEST,
+            )
+        if case.case_status in (CaseStatus.CLOSED, CaseStatus.CANCELLED):
+            return Response(
+                {"detail": "This case is already closed."},
+                status=http.HTTP_400_BAD_REQUEST,
+            )
+        if (case.service_authorization_status or "") not in (
+            "", ServiceAuthorizationStatus.NEVER_REQUESTED,
+        ):
+            return Response(
+                {"detail": "Only cases whose authorization was never requested "
+                           "(or is blank) can be closed here."},
+                status=http.HTTP_400_BAD_REQUEST,
+            )
+
+        case.case_status = CaseStatus.CLOSED
+        case.case_closed_at = timezone.now()
+        case.save(update_fields=["case_status", "case_closed_at"])
+
+        # React to the governing IS case closing: terminalize the now-caseless
+        # enrollment + recompute the member's funnel stage. Best-effort so the
+        # close itself never fails on a downstream reconcile hiccup.
+        actor_label = agent.name or "Manager"
+        try:
+            from api.services.lifecycle import (
+                reconcile_internal_service_authorization, recompute_client_stage,
+            )
+            reconcile_internal_service_authorization(client, actor_label=actor_label)
+            recompute_client_stage(client)
+        except Exception:  # pragma: no cover - defensive
+            logger.exception("post-close reconcile failed for client %s", client_id)
+
+        Note.objects.create(
+            client=client, source=NoteSource.AGENT, author_name=agent.name or "",
+            body=(f"Internal-service case {case_id} closed by {agent.name} "
+                  "(authorization never requested)."),
+        )
+        return Response({
+            "ok": True, "client_id": str(client.client_id), "case_id": str(case_id),
+        })
+
+
 class MemberCaseHistoryView(PortalGenericAPIView):
     """The client timeline scoped to a single case -- the 'Case history' shown on
     the profile's Cases tab. Same event rows as the client history (with the same

@@ -5710,6 +5710,66 @@ class VerificationDashboardMissingCaseTest(TestCase):
         self.assertNotIn(str(c1.client_id), ids)
 
 
+class MemberCaseCloseTest(TestCase):
+    """Manager-only close of an internal-service case whose authorization was
+    never requested / blank."""
+
+    def _api(self, group="Management"):
+        from rest_framework.test import APIClient
+        from rest_framework_simplejwt.tokens import AccessToken
+
+        from .models import Agent
+        a = Agent.objects.create(name="Mgr", agent_code=str(uuid.uuid4())[:8], group=group)
+        acc = AccessToken()
+        acc["agent_id"] = str(a.id); acc["agent_code"] = a.agent_code
+        acc["agent_name"] = a.name; acc["agent_group"] = a.group
+        api = APIClient(); api.credentials(HTTP_AUTHORIZATION=f"Bearer {acc}")
+        return api
+
+    def _case(self, **kw):
+        from .models import Case, CaseType, Client, CaseStatus
+        c = Client.objects.create(client_id=str(uuid.uuid4()), first_name="A", last_name="B")
+        defaults = dict(
+            client=c, case_type=CaseType.INTERNAL_SERVICE,
+            case_status=CaseStatus.OPEN, service_authorization_status="",
+        )
+        defaults.update(kw)
+        return c, Case.objects.create(case_id=str(uuid.uuid4()), **defaults)
+
+    def _url(self, c, case):
+        return f"/api/portal/members/{c.client_id}/cases/{case.case_id}/close/"
+
+    def test_manager_closes_blank_auth_internal_case(self):
+        from .models import CaseStatus
+        c, case = self._case()
+        resp = self._api().post(self._url(c, case))
+        self.assertEqual(resp.status_code, 200, resp.content)
+        case.refresh_from_db()
+        self.assertEqual(case.case_status, CaseStatus.CLOSED)
+        self.assertIsNotNone(case.case_closed_at)
+
+    def test_never_requested_is_closable(self):
+        from .models import CaseStatus, ServiceAuthorizationStatus
+        c, case = self._case(service_authorization_status=ServiceAuthorizationStatus.NEVER_REQUESTED)
+        self.assertEqual(self._api().post(self._url(c, case)).status_code, 200)
+        case.refresh_from_db()
+        self.assertEqual(case.case_status, CaseStatus.CLOSED)
+
+    def test_non_manager_forbidden(self):
+        c, case = self._case()
+        self.assertEqual(self._api(group="CS").post(self._url(c, case)).status_code, 403)
+
+    def test_real_auth_refused(self):
+        from .models import ServiceAuthorizationStatus
+        c, case = self._case(service_authorization_status=ServiceAuthorizationStatus.APPROVED)
+        self.assertEqual(self._api().post(self._url(c, case)).status_code, 400)
+
+    def test_non_internal_service_refused(self):
+        from .models import CaseType
+        c, case = self._case(case_type=CaseType.NAVIGATION)
+        self.assertEqual(self._api().post(self._url(c, case)).status_code, 400)
+
+
 class CareTeamAgentWriteOnceTest(TestCase):
     """The Care Team agent (Client.agent_code/agent_name) is write-once: the first
     value assigned stays permanently; later writes never overwrite it. A record
