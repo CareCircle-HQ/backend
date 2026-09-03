@@ -53,6 +53,7 @@ from ..models import (
     Note,
     ProgramMainCategory,
     PurchaseOrder,
+    PurchaseOrderNote,
     ServiceAuthorizationStatus,
     SocialCareCoverage,
     StageEvent,
@@ -2124,7 +2125,16 @@ class PortalPurchaseOrderSerializer(serializers.ModelSerializer):
             "total": len(orders),
             "delivered": sum(1 for o in orders if o.status == "delivered"),
             "failed": sum(1 for o in orders if o.status in ("failed", "returned")),
+            "notes": len(list(obj.notes.all())),
         }
+
+
+class PortalPurchaseOrderNoteSerializer(serializers.ModelSerializer):
+    """A single agent note in a PO's note history."""
+
+    class Meta:
+        model = PurchaseOrderNote
+        fields = ["id", "author_name", "body", "created_at"]
 
 
 class PortalMemberOrderSerializer(PortalPurchaseOrderSerializer):

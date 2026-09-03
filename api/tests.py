@@ -5710,6 +5710,47 @@ class VerificationDashboardMissingCaseTest(TestCase):
         self.assertNotIn(str(c1.client_id), ids)
 
 
+class PurchaseOrderNotesTest(TestCase):
+    """Per-PO note history: POST adds a note stamped with the author agent +
+    created_at; GET lists newest-first; empty body is rejected."""
+
+    def _api(self):
+        from rest_framework.test import APIClient
+        from rest_framework_simplejwt.tokens import AccessToken
+
+        from .models import Agent
+        a = Agent.objects.create(name="Loggy Logistics", agent_code=str(uuid.uuid4())[:8], group="Logistics")
+        acc = AccessToken()
+        acc["agent_id"] = str(a.id); acc["agent_code"] = a.agent_code
+        acc["agent_name"] = a.name; acc["agent_group"] = a.group
+        api = APIClient(); api.credentials(HTTP_AUTHORIZATION=f"Bearer {acc}")
+        return api, a
+
+    def _po(self):
+        from .models import PurchaseOrder
+        return PurchaseOrder.objects.create(status="draft")
+
+    def test_add_and_list_note(self):
+        po = self._po()
+        api, agent = self._api()
+        url = f"/api/portal/purchase-orders/{po.pk}/notes/"
+        resp = api.post(url, {"body": "Called the kitchen about the delay."}, format="json")
+        self.assertEqual(resp.status_code, 201, resp.content)
+        self.assertEqual(resp.data["author_name"], agent.name)
+        self.assertTrue(resp.data["created_at"])
+        # GET returns it.
+        listed = api.get(url)
+        self.assertEqual(listed.status_code, 200)
+        self.assertEqual(len(listed.data), 1)
+        self.assertEqual(listed.data[0]["body"], "Called the kitchen about the delay.")
+
+    def test_empty_body_rejected(self):
+        po = self._po()
+        api, _ = self._api()
+        resp = api.post(f"/api/portal/purchase-orders/{po.pk}/notes/", {"body": "  "}, format="json")
+        self.assertEqual(resp.status_code, 400)
+
+
 class MemberCaseCloseTest(TestCase):
     """Manager-only close of an internal-service case whose authorization was
     never requested / blank."""

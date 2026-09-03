@@ -4672,6 +4672,31 @@ class TicketNote(models.Model):
         return f"Note on ticket {self.ticket_id} by {self.author_name or 'system'}"
 
 
+class PurchaseOrderNote(models.Model):
+    """An agent note on a Purchase Order (Orders page). Note history: each row is
+    an immutable entry stamped with the author agent + when it was written."""
+
+    purchase_order = models.ForeignKey(
+        "PurchaseOrder", on_delete=models.CASCADE, related_name="notes"
+    )
+    # The agent who wrote the note; ``author_name`` is a snapshot so the row
+    # stays readable even if the agent record changes/clears.
+    author_agent = models.ForeignKey(
+        "Agent", on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="purchase_order_notes",
+    )
+    author_name = models.CharField(max_length=255, blank=True)
+    body = models.TextField()
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        indexes = [models.Index(fields=["purchase_order", "created_at"])]
+
+    def __str__(self):
+        return f"Note on PO {self.purchase_order_id} by {self.author_name or 'system'}"
+
+
 class TicketActivityAction(models.TextChoices):
     """What happened to a ticket, for the ticket activity/history feed."""
 
