@@ -1580,18 +1580,24 @@ class MembersListView(PortalGenericAPIView):
         if case_type_q:
             qs = qs.filter(cases__case_type=case_type_q).distinct()
 
-        # Cases page: "Authorization never requested / blank" checkbox -- keep
-        # households holding a case (of the selected type, if any) whose service
-        # authorization was NEVER_REQUESTED or is blank. Correlated Exists so the
-        # TYPE + AUTH conditions land on the SAME case (not two different ones).
-        if (params.get("auth_never_requested") or "").strip().lower() in ("1", "true", "yes"):
-            auth_case = Case.objects.filter(
-                client=OuterRef("pk"),
-                service_authorization_status__in=["never_requested", ""],
-            )
+        # Cases page: case-level filters that must ALL hold on the SAME case --
+        # "Authorization never requested / blank" checkbox + Open/Closed status.
+        # Correlated Exists (scoped to the selected type, if any) so the AUTH +
+        # STATUS conditions can't be satisfied by two different cases.
+        auth_flag = (params.get("auth_never_requested") or "").strip().lower() in ("1", "true", "yes")
+        case_status_q = (params.get("case_status") or "").strip().lower()
+        case_cond = Q()
+        if auth_flag:
+            case_cond &= Q(service_authorization_status__in=["never_requested", ""])
+        if case_status_q == "open":
+            case_cond &= Q(case_status="open")
+        elif case_status_q == "closed":
+            case_cond &= Q(case_status__in=["closed", "cancelled"])
+        if case_cond:
+            sub = Case.objects.filter(client=OuterRef("pk"))
             if case_type_q:
-                auth_case = auth_case.filter(case_type=case_type_q)
-            qs = qs.filter(Exists(auth_case))
+                sub = sub.filter(case_type=case_type_q)
+            qs = qs.filter(Exists(sub.filter(case_cond)))
 
         # Page-level scope (Verification / Logistics) restricts which members are
         # ever shown, before the per-status filter chips are applied.
