@@ -5710,6 +5710,41 @@ class VerificationDashboardMissingCaseTest(TestCase):
         self.assertNotIn(str(c1.client_id), ids)
 
 
+class CareTeamAgentWriteOnceTest(TestCase):
+    """The Care Team agent (Client.agent_code/agent_name) is write-once: the first
+    value assigned stays permanently; later writes never overwrite it. A record
+    that has none yet accepts the first write."""
+
+    def _save(self, client, data):
+        from .serializers import ClientSerializer
+        s = ClientSerializer(instance=client, data=data, partial=True)
+        s.is_valid(raise_exception=True)
+        s.save()
+        client.refresh_from_db()
+
+    def test_first_agent_is_permanent(self):
+        from .models import Client
+        c = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="A", last_name="B",
+            agent_code="100", agent_name="First Agent")
+        # A later write with a different agent must NOT change it.
+        self._save(c, {"agent_code": "200", "agent_name": "Second Agent"})
+        self.assertEqual(c.agent_code, "100")
+        self.assertEqual(c.agent_name, "First Agent")
+
+    def test_blank_record_accepts_first_write(self):
+        from .models import Client
+        c = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="C", last_name="D")  # no agent
+        self._save(c, {"agent_code": "300", "agent_name": "New Agent"})
+        self.assertEqual(c.agent_code, "300")
+        self.assertEqual(c.agent_name, "New Agent")
+        # ...and now it's locked.
+        self._save(c, {"agent_code": "400", "agent_name": "Later Agent"})
+        self.assertEqual(c.agent_code, "300")
+        self.assertEqual(c.agent_name, "New Agent")
+
+
 class BackfillEnrollmentAgentsTest(TestCase):
     """backfill_enrollment_agents copies verified_by/requested_by from the SAME
     client's attributed enrollment; leaves clients with no agent anywhere alone."""

@@ -442,6 +442,16 @@ class ClientSerializer(serializers.ModelSerializer):
             _prior.consent_accepted
             or (_prior.consent_status or "").lower() == "accepted"
         )
+        # Care Team agent is WRITE-ONCE: once ``agent_code`` / ``agent_name`` is
+        # set, it stays for good -- later writes never overwrite it (the first
+        # care-team agent assigned to the member is permanent). Guarded per field;
+        # the import never sends these, so the first EXTENSION write that carries
+        # them wins. A brand-new record (_prior is None) is unaffected.
+        if _prior is not None:
+            for f in ("agent_code", "agent_name"):
+                if f in validated_data and (getattr(_prior, f, "") or "").strip():
+                    validated_data.pop(f)
+
         if survivor is not None:
             for k, v in validated_data.items():
                 setattr(survivor, k, v)
