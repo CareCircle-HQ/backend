@@ -23,19 +23,21 @@ creation time.
 import statistics
 from datetime import timedelta
 
-from django.db.models import Count, Q
+from django.db.models import Count, Exists, OuterRef, Q
 from django.db.models.functions import Coalesce
 from django.utils import timezone
 from rest_framework.response import Response
 
 from ..models import (
+    Case,
+    CaseType,
     Client,
     EnrollmentStage,
     EnrollmentVerification,
     ServiceAuthorizationStatus,
 )
 from .base import PortalAPIView, current_agent
-from .views_dashboard import period_window
+from .views_dashboard import resolve_window
 
 # Stages that mean the household reached (or passed) active meal service.
 _KITCHEN_OR_BEYOND = [
@@ -56,7 +58,8 @@ VERIFICATION_REASONS = frozenset({
     "pending",
     "aging_0_2", "aging_3_7", "aging_8_14", "aging_15_plus",
     "stuck_pending", "stuck_denied", "stuck_expired", "stuck_no_case",
-    "step4_incomplete", "missing_address", "missing_case",
+    "step4_incomplete", "missing_address",
+    "missing_internal_service", "missing_care_management", "missing_eligibility",
 })
 
 # All-three Step-4 validation checks completed.
@@ -65,6 +68,26 @@ _STEP4_ALL = (
     & Q(medicaid_type_verified=True)
     & Q(delivery_address_verified=True)
 )
+
+# The 3 "members missing a case" dashboard sections: reason -> CaseType. Note
+# NAVIGATION is labeled "Care Management" in the product.
+_MISSING_CASE_REASON = {
+    "missing_internal_service": CaseType.INTERNAL_SERVICE,
+    "missing_care_management": CaseType.NAVIGATION,
+    "missing_eligibility": CaseType.ELIGIBILITY,
+}
+
+
+def _missing_case_qs(verified, case_type):
+    """Rows in ``verified`` whose HOUSEHOLD (else the client, for a solo member)
+    holds NO case of ``case_type`` -- i.e. a verified member missing that case.
+    Correlated Exists so there's no multi-join row blow-up."""
+    hh = Case.objects.filter(
+        case_type=case_type,
+        client__household_membership__household_id=OuterRef("household_id"),
+    )
+    cli = Case.objects.filter(case_type=case_type, client_id=OuterRef("client_id"))
+    return verified.exclude(Exists(hh)).exclude(Exists(cli))
 
 
 def _is_privileged(agent):
@@ -99,13 +122,22 @@ def _base_ev():
     )
 
 
-def verification_enrollments(reason):
+def verification_enrollments(reason, start=None, end=None):
     """Return the EnrollmentVerification queryset behind one drill-down
     ``reason``. The dashboard counts are derived from the SAME querysets, so a
-    count can never disagree with its list. Snapshot (all-time) by design --
-    these are 'right now' operational lists."""
+    count can never disagree with its list.
+
+    The VERIFIED-population reasons (``stuck_*``, ``missing_*``,
+    ``step4_incomplete``) honor the dashboard's date window on ``verified_at``
+    (all-time when ``start`` is None). The pending-queue reasons (``pending`` /
+    ``aging_*``) are a live snapshot -- 'right now' operational lists."""
     ev = _base_ev()
     today = timezone.localdate()
+
+    def _in_window(qs):
+        if start is None:
+            return qs
+        return qs.filter(verified_at__date__gte=start, verified_at__date__lte=end)
 
     if reason == "pending" or reason.startswith("aging_"):
         pending = _with_req_date(
@@ -131,9 +163,9 @@ def verification_enrollments(reason):
             return pending.filter(req__date__lte=today - timedelta(days=15))
 
     if reason.startswith("stuck_"):
-        stuck = ev.filter(
+        stuck = _in_window(ev.filter(
             stage=EnrollmentStage.VERIFIED, verified_at__isnull=False
-        )
+        ))
         if reason == "stuck_pending":
             return stuck.filter(
                 case__service_authorization_status=ServiceAuthorizationStatus.PENDING
@@ -149,13 +181,13 @@ def verification_enrollments(reason):
         if reason == "stuck_no_case":
             return stuck.filter(case__isnull=True)
 
-    verified = ev.filter(verified_at__isnull=False)
+    verified = _in_window(ev.filter(verified_at__isnull=False))
     if reason == "step4_incomplete":
         return verified.exclude(_STEP4_ALL)
     if reason == "missing_address":
         return verified.filter(delivery_address__isnull=True)
-    if reason == "missing_case":
-        return verified.filter(case__isnull=True)
+    if reason in _MISSING_CASE_REASON:
+        return _missing_case_qs(verified, _MISSING_CASE_REASON[reason])
 
     return ev.none()
 
@@ -185,8 +217,12 @@ def _row_detail(reason, ev, today):
         return "Unchecked: " + ", ".join(missing) if missing else "Incomplete checks"
     if reason == "missing_address":
         return "No delivery address on file"
-    if reason == "missing_case":
-        return "No linked internal-service case"
+    if reason in _MISSING_CASE_REASON:
+        return {
+            "missing_internal_service": "No internal-service case",
+            "missing_care_management": "No care-management case",
+            "missing_eligibility": "No eligibility case",
+        }[reason]
     return ""
 
 
@@ -201,7 +237,9 @@ class VerificationDashboardView(PortalAPIView):
             )
 
         period = (request.query_params.get("period") or "all").lower()
-        start, end = period_window(period)
+        # Accept an explicit custom range (?start=&end=, ISO YYYY-MM-DD) -- wins
+        # over the named period preset -- so the dashboard's From/To pickers work.
+        start, end = resolve_window(request)
         today = timezone.localdate()
 
         ev = EnrollmentVerification.objects
@@ -210,12 +248,20 @@ class VerificationDashboardView(PortalAPIView):
         cohort = _scope_requests(ev.all(), start, end)
         requested = cohort.count()
         verified = cohort.filter(verified_at__isnull=False).count()
+        # Nutritionist sign-off gate: sits between Verified and Kitchen Assignment.
+        # A verified household is "Pending Nutritionist" until nutritionist_approved_at
+        # is set; kitchen-or-beyond implies it cleared the gate (kept in the OR so the
+        # funnel stays monotonic even where the timestamp wasn't backfilled).
+        nutritionist = cohort.filter(
+            Q(nutritionist_approved_at__isnull=False) | Q(stage__in=_KITCHEN_OR_BEYOND)
+        ).count()
         kitchen = cohort.filter(stage__in=_KITCHEN_OR_BEYOND).count()
         active = cohort.filter(stage__in=_SERVICE_OR_BEYOND).count()
 
         steps = [
             ("requested", "Requested", requested),
             ("verified", "Verified", verified),
+            ("nutritionist", "Pending Nutritionist", nutritionist),
             ("kitchen", "Kitchen Assignment", kitchen),
             ("service", "Service Active", active),
         ]
@@ -283,49 +329,75 @@ class VerificationDashboardView(PortalAPIView):
         }
 
         # --- Agents (EVENT scoped by range) -------------------------------
-        verifiers = [
-            {
-                "id": str(r["verified_by"]),
-                "name": r["verified_by__name"] or "Unknown",
-                "count": r["n"],
-            }
-            for r in (
-                completed_qs.filter(verified_by__isnull=False)
-                .values("verified_by", "verified_by__name")
-                .annotate(n=Count("id"))
-                .order_by("-n")[:8]
+        # Accurate per-agent count mirrors the "All Verifications" report / the
+        # Verification page: ONE verification per household (else per solo client)
+        # -- the most-recent verified enrollment -- excluding dismissed
+        # (Disregarded) + parked (Scheduled Extension) rows whose verified_at is a
+        # stale prior-cycle fact. Counting raw enrollment rows over-credits an
+        # agent when a household holds several verified enrollments (a superseded /
+        # carried row from a governing-case switch, or a split-out dependent), so
+        # dedupe by household before tallying by verified_by.
+        # Show ALL agents (no top-N cap) and attribute EVERY row -- verifications
+        # with no agent fall into an "Unassigned / System" bucket -- so the bars
+        # sum to the section total with nothing dropped.
+        _nongov = [EnrollmentStage.DISREGARDED, EnrollmentStage.SCHEDULED_EXTENSION]
+        seen_hh = set()
+        v_tally = {}  # verified_by id ("" == unassigned) -> [name, count]
+        for hh_id, cli_id, vby, vname in (
+            completed_qs.exclude(stage__in=_nongov)
+            .order_by("-verified_at", "-opened_at")
+            .values_list(
+                "household_id", "client_id", "verified_by", "verified_by__name"
             )
-        ]
+            .iterator(chunk_size=2000)
+        ):
+            key = ("hh", hh_id) if hh_id else ("c", cli_id)
+            if key in seen_hh:
+                continue
+            seen_hh.add(key)
+            gid = str(vby) if vby else ""
+            t = v_tally.get(gid)
+            if t is None:
+                t = v_tally[gid] = [vname or "Unassigned / System", 0]
+            t[1] += 1
+        verifiers = sorted(
+            (
+                {"id": gid, "name": t[0], "count": t[1]}
+                for gid, t in v_tally.items()
+            ),
+            key=lambda r: r["count"],
+            reverse=True,
+        )
         requesters = [
             {
-                "id": str(r["requested_by"]),
-                "name": r["requested_by__name"] or "Unknown",
+                "id": str(r["requested_by"]) if r["requested_by"] else "",
+                "name": r["requested_by__name"] or "Unassigned / System",
                 "count": r["n"],
             }
             for r in (
-                cohort.filter(requested_by__isnull=False)
-                .values("requested_by", "requested_by__name")
+                cohort.values("requested_by", "requested_by__name")
                 .annotate(n=Count("id"))
-                .order_by("-n")[:8]
+                .order_by("-n")
             )
         ]
+        # Chip totals tied to the leaderboards so they ALWAYS reconcile:
+        #  * verified_in_range  = verifications COMPLETED in range (by verified_at),
+        #    deduped per household -> equals the sum of all Top Verifiers bars.
+        #  * requested_in_range = requests RAISED in range -> equals the sum of all
+        #    Top Requesters bars. (Distinct from the funnel's request-cohort
+        #    "Verified" step, which counts requests-in-range that later verified.)
+        verified_in_range = sum(r["count"] for r in verifiers)
+        requested_in_range = sum(r["count"] for r in requesters)
 
-        # --- Quality & bottlenecks (SNAPSHOT over verified population) ----
-        verified_all = ev.filter(verified_at__isnull=False)
+        # --- Quality & bottlenecks (over verifications COMPLETED in range) ----
+        # Scoped to the selected date window via ``completed_qs`` (verified_at in
+        # range; all-time when no range) so the Verified-but-Stuck + Missing-Data
+        # cards move with the picker -- and match their drill-down lists, which
+        # apply the SAME window (see verification_enrollments).
+        verified_all = completed_qs
         verified_total = verified_all.count()
-        step4_complete = verified_all.filter(_STEP4_ALL).count()
-        step4_none = verified_all.exclude(
-            Q(is_family_verified=True)
-            | Q(medicaid_type_verified=True)
-            | Q(delivery_address_verified=True)
-        ).count()
-        step4 = {
-            "complete": step4_complete,
-            "partial": verified_total - step4_complete - step4_none,
-            "none": step4_none,
-        }
 
-        stuck = ev.filter(stage=EnrollmentStage.VERIFIED, verified_at__isnull=False)
+        stuck = verified_all.filter(stage=EnrollmentStage.VERIFIED)
         stuck_total = stuck.count()
         stuck_pending = stuck.filter(
             case__service_authorization_status=ServiceAuthorizationStatus.PENDING
@@ -353,10 +425,35 @@ class VerificationDashboardView(PortalAPIView):
 
         missing = {
             "address": verified_all.filter(delivery_address__isnull=True).count(),
-            "case": verified_all.filter(case__isnull=True).count(),
+        }
+
+        # Verified members (in range) missing a case of each type, DEDUPED per
+        # household / individual (a household with several verified rows --
+        # superseded/carried or split dependents -- counts once).
+        def _dedup_count(qs):
+            seen = set()
+            for hh_id, cli_id in (
+                qs.values_list("household_id", "client_id").iterator(chunk_size=2000)
+            ):
+                seen.add(("hh", hh_id) if hh_id else ("c", cli_id))
+            return len(seen)
+
+        missing_cases = {
+            "internal_service": _dedup_count(
+                _missing_case_qs(verified_all, CaseType.INTERNAL_SERVICE)
+            ),
+            "care_management": _dedup_count(
+                _missing_case_qs(verified_all, CaseType.NAVIGATION)
+            ),
+            "eligibility": _dedup_count(
+                _missing_case_qs(verified_all, CaseType.ELIGIBILITY)
+            ),
         }
 
         return Response({
+            "missing_cases": missing_cases,
+            "verified_in_range": verified_in_range,
+            "requested_in_range": requested_in_range,
             "period": period,
             "range": (
                 {"start": start.isoformat(), "end": end.isoformat()}
@@ -373,7 +470,6 @@ class VerificationDashboardView(PortalAPIView):
             "agents": {"verifiers": verifiers, "requesters": requesters},
             "quality": {
                 "verified_total": verified_total,
-                "step4": step4,
                 "stuck": stuck_payload,
                 "missing": missing,
             },
@@ -395,14 +491,29 @@ class VerificationDashboardListView(PortalAPIView):
             return Response({"detail": "Unknown reason."}, status=404)
 
         today = timezone.localdate()
-        qs = verification_enrollments(reason).order_by("req" if (
+        # Honor the dashboard's date window for the verified-population reasons
+        # (stuck_* / missing_* / step4_incomplete) so a card's count matches its
+        # expanded list. Pending/aging reasons ignore it (live snapshot).
+        start, end = resolve_window(request)
+        base = verification_enrollments(reason, start, end).order_by("req" if (
             reason == "pending" or reason.startswith("aging_")
-        ) else "-verified_at")[:200]
+        ) else "-verified_at")
+
+        # The "missing case" reasons are deduped per household / individual (one
+        # row per member, matching the card count); every other reason lists per
+        # enrollment. Cap the preview at 200 rows either way.
+        dedup = reason in _MISSING_CASE_REASON
+        source = base.iterator(chunk_size=500) if dedup else base[:200]
 
         # Names for enrollments whose client row didn't come back via
         # select_related (defensive; client is normally joined).
-        results = []
-        for e in qs:
+        results, seen = [], set()
+        for e in source:
+            if dedup:
+                key = ("hh", e.household_id) if e.household_id else ("c", e.client_id)
+                if key in seen:
+                    continue
+                seen.add(key)
             client = e.client
             cid = str(e.client_id) if e.client_id else str(e.pk)
             name = (
@@ -416,6 +527,8 @@ class VerificationDashboardListView(PortalAPIView):
                 "stage": e.stage,
                 "detail": _row_detail(reason, e, today),
             })
+            if len(results) >= 200:
+                break
 
         return Response({
             "reason": reason,

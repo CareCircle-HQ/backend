@@ -882,6 +882,14 @@ class EnrollmentVerificationViewSet(viewsets.ModelViewSet):
         # Re-requesting means the household is being handled again -> drop it off
         # the Urgent Care list.
         clear_new_flag_on_verification_request(enrollment)
+        # Log the (re-)request on the member's timeline: WHO + WHEN, mirroring the
+        # CRM button. occurred_at=requested_at so a re-request shows the fresh time.
+        try:
+            timeline.event_for_verification(
+                enrollment, actor=_agent_actor(request), occurred_at=enrollment.requested_at,
+            )
+        except Exception:  # never let history-logging break the re-request
+            logger.warning("ext re-request timeline emit failed", exc_info=True)
         # A re-request for a splittable dependent still splits them into their own
         # case (heals a pending enrollment created before the split was wired in).
         if not self._maybe_split_dependent(enrollment):
@@ -969,15 +977,38 @@ class EnrollmentVerificationViewSet(viewsets.ModelViewSet):
 
     def perform_create(self, serializer):
         serializer.save()
-        # Attribute the verification REQUEST to the authenticated ext agent (the
-        # one who submitted the E-Form). NULL when the request has no resolvable
-        # agent (e.g. bulk/system writes).
+        enrollment = serializer.instance
+        # Attribute the verification REQUEST to the authenticated ext agent (WHO,
+        # via requested_by) and stamp WHEN it was requested (requested_at) --
+        # mirroring the CRM "Request Verification" button, which sets both. The
+        # plain create path previously set only requested_by, leaving requested_at
+        # null (so the requested DATE fell back to opened_at). agent NULL for
+        # bulk/system writes.
         agent_id = getattr(getattr(self.request, "user", None), "agent_id", None)
+        if not agent_id:
+            logger.warning(
+                "ext verification request with no resolvable agent -> requested_by "
+                "left null (enrollment %s). Check the caller's auth token.",
+                enrollment.pk,
+            )
+        fields = []
+        if enrollment.requested_at is None:
+            enrollment.requested_at = timezone.now()
+            fields.append("requested_at")
         if agent_id:
-            enrollment = serializer.instance
             enrollment.requested_by_id = agent_id
-            enrollment.save(update_fields=["requested_by"])
-        _safe_timeline(timeline.event_for_verification, serializer.instance, self.request)
+            fields.append("requested_by")
+        if fields:
+            enrollment.save(update_fields=fields)
+        # Log the request on the member's timeline: WHO (actor) + WHEN
+        # (occurred_at = the request time), so it reads as an explicit request.
+        try:
+            timeline.event_for_verification(
+                enrollment, actor=_agent_actor(self.request),
+                occurred_at=enrollment.requested_at,
+            )
+        except Exception:  # never let history-logging break the request
+            logger.warning("ext request-verification timeline emit failed", exc_info=True)
         # Requesting a verification means the household is now being handled, so
         # clear the primary's is_new flag -> drop it off the Urgent Care list.
         clear_new_flag_on_verification_request(serializer.instance)
@@ -1068,9 +1099,27 @@ class EnrollmentVerificationViewSet(viewsets.ModelViewSet):
                 note=request.data.get("note", "") or "",
                 force=bool(request.data.get("force")),
             )
-            # Once verification completes, immediately project the case's
-            # authorization outcome (it may already be Accepted -> orders).
+            # Once verification completes, capture the verification FACT (who +
+            # when) -- set-stage is a live agent completion, so it must stamp
+            # verified_at/verified_by (advance_enrollment only moves the stage).
+            # Then project the case's authorization outcome (it may already be
+            # Accepted -> orders).
             if enrollment.stage == EnrollmentStage.VERIFIED:
+                agent_id = getattr(getattr(request, "user", None), "agent_id", None)
+                vfields = []
+                if enrollment.verified_at is None:
+                    enrollment.verified_at = timezone.now()
+                    vfields.append("verified_at")
+                if agent_id and enrollment.verified_by_id is None:
+                    enrollment.verified_by_id = agent_id
+                    vfields.append("verified_by")
+                if vfields:
+                    enrollment.save(update_fields=vfields)
+                if not agent_id and enrollment.verified_by_id is None:
+                    logger.warning(
+                        "set-stage VERIFIED with no acting agent -> verified_by "
+                        "left null (enrollment %s)", enrollment.pk,
+                    )
                 reconcile_enrollment_authorization(
                     enrollment, actor=getattr(request, "user", None)
                 )

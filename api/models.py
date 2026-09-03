@@ -3531,6 +3531,7 @@ class TicketTypeCode(models.TextChoices):
     MISSING_WRONG_ORDER = "missing_wrong_order", "Missing / Wrong Order"
     NUTRITIONAL_COUNSELING = "nutritional_counseling", "Nutritional Counseling"
     KITCHEN_SWITCH = "kitchen_switch", "Kitchen Switch"
+    CADENCE_SWITCH = "cadence_switch", "Cadence Switch"
     # Agent-facing categories added in the 2026 ticket-category refresh.
     INELIGIBLE_FOR_SERVICE = "ineligible_for_service", "Ineligible for Service"
     MEAL_TYPE_UPDATE = "meal_type_update", "Meal Type Update"

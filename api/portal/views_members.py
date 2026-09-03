@@ -1475,31 +1475,31 @@ class MembersListView(PortalGenericAPIView):
         params = self.request.query_params
 
         search = (params.get("search") or "").strip()
-        if search:
+        # Full UUID -> pure id lookup: skip the whole text/relation search. A UUID
+        # never appears in a name / address / phone / Medicaid id, so the only
+        # meaningful matches are the client's OWN id (indexed point lookup) or the
+        # id it was migrated FROM. This makes "search by client id" instant instead
+        # of running icontains + 5 Exists subqueries with a 36-char needle.
+        try:
+            search_uuid = uuid.UUID(search) if search else None
+        except (ValueError, TypeError, AttributeError):
+            search_uuid = None
+        if search_uuid is not None:
+            qs = qs.filter(
+                Q(client_id=search_uuid) | Q(migrated_from_id__icontains=search)
+            )
+        elif search:
             import re
 
+            # Direct Client-column matches (no join) -- one scan of the client
+            # table, no row multiplication.
             cond = (
                 Q(first_name__icontains=search)
                 | Q(last_name__icontains=search)
-                | Q(insurances__external_member_id__icontains=search)  # Medicaid ID
                 | Q(client_email_address__icontains=search)            # email
                 # Old (migrated-from) Unite Us id: find a merged client by the
                 # prior person id it was migrated from (partial or full).
                 | Q(migrated_from_id__icontains=search)
-                # Member address (any type stored on the client profile) ...
-                | Q(addresses__street__icontains=search)
-                | Q(addresses__city__icontains=search)
-                | Q(addresses__zip__icontains=search)
-                # ... and the TRUE delivery address, which lives on the ENROLLMENT
-                # (the profile copy can be stale). Match the member's own
-                # enrollment AND -- for a dependent with no own enrollment -- their
-                # household's enrollment, so every member is findable by it.
-                | Q(enrollments__delivery_address__street__icontains=search)
-                | Q(enrollments__delivery_address__city__icontains=search)
-                | Q(enrollments__delivery_address__zip__icontains=search)
-                | Q(household_membership__household__enrollment_verifications__delivery_address__street__icontains=search)
-                | Q(household_membership__household__enrollment_verifications__delivery_address__city__icontains=search)
-                | Q(household_membership__household__enrollment_verifications__delivery_address__zip__icontains=search)
             )
             # Multi-word "first last" search.
             parts = search.split()
@@ -1510,18 +1510,53 @@ class MembersListView(PortalGenericAPIView):
             dob = _parse_date(search)
             if dob:
                 cond |= Q(date_of_birth=dob)
-            try:
-                cond |= Q(client_id=uuid.UUID(search))
-            except (ValueError, TypeError, AttributeError):
-                pass
+            # Joined-table matches as CORRELATED EXISTS subqueries instead of a big
+            # OR across multi-valued joins. The old join-OR produced a cartesian
+            # row explosion (insurances x addresses x enrollments x household
+            # enrollments x phones) + DISTINCT + ORDER BY, which made a miss like
+            # "garcia rodriguez" take ~50s on prod-sized data. Exists is evaluated
+            # per candidate and never multiplies rows.
+            cond |= Exists(
+                Insurance.objects.filter(  # Medicaid ID
+                    client=OuterRef("pk"), external_member_id__icontains=search,
+                )
+            )
+            addr_match = (
+                Q(street__icontains=search)
+                | Q(city__icontains=search)
+                | Q(zip__icontains=search)
+            )
+            # Member address (any type stored on the client profile) ...
+            cond |= Exists(Address.objects.filter(addr_match, client=OuterRef("pk")))
+            # ... and the TRUE delivery address, which lives on the ENROLLMENT (the
+            # profile copy can be stale): the member's own enrollment AND -- for a
+            # dependent with no own enrollment -- their household's enrollment, so
+            # every member is findable by it.
+            enr_addr_match = (
+                Q(delivery_address__street__icontains=search)
+                | Q(delivery_address__city__icontains=search)
+                | Q(delivery_address__zip__icontains=search)
+            )
+            cond |= Exists(
+                EnrollmentVerification.objects.filter(
+                    enr_addr_match, client=OuterRef("pk"),
+                )
+            )
+            cond |= Exists(
+                EnrollmentVerification.objects.filter(
+                    enr_addr_match, household__members__client=OuterRef("pk"),
+                )
+            )
             # Phone: match the indexed last-10-digit normalized column (and the
             # raw field) once the query carries enough digits to be a phone
             # fragment -- so formatting in the query "(716) 555-..." still hits.
             digits = re.sub(r"\D", "", search)
             if len(digits) >= 7:
-                cond |= (
-                    Q(phones__normalized__icontains=digits)
-                    | Q(client_phone_number__icontains=digits)
+                cond |= Q(client_phone_number__icontains=digits)
+                cond |= Exists(
+                    ClientPhone.objects.filter(
+                        client=OuterRef("pk"), normalized__icontains=digits,
+                    )
                 )
             qs = qs.filter(cond)
 
@@ -3025,8 +3060,21 @@ class DataExportView(PortalAPIView):
         from .report_exports import stream_csv_response
 
         qs = filter_analytics(request.query_params)
+        # Household PRIMARY member's client_id -- annotated via subquery so no
+        # read-model rebuild is needed. For a primary member this equals their own
+        # client_id; for a dependent it's the household's primary. Blank when the
+        # member has no household.
+        from django.db.models import OuterRef, Subquery
+
+        from ..models import HouseholdMember
+
+        qs = qs.annotate(primary_client_id=Subquery(
+            HouseholdMember.objects.filter(
+                household_id=OuterRef("household_id"), is_primary=True,
+            ).values("client_id")[:1]
+        ))
         fields = [
-            "enrollment_id", "client_id", "first_name", "last_name", "medicaid_id",
+            "enrollment_id", "client_id", "primary_client_id", "first_name", "last_name", "medicaid_id",
             "dob", "stage", "is_primary", "care_coordinator", "primary_care_coordinator",
             "cadence", "kitchen_name", "menu_type", "current_delivery_status",
             "last_po_delivery_status", "last_delivered_at", "insurance_status",
@@ -6383,6 +6431,12 @@ class MemberVerificationCreateView(PortalAPIView):
         # records a StageEvent + timeline event and recomputes the client's
         # lifecycle stage to "Verified".
         agent = current_agent(request)
+        if agent is None:
+            logger.warning(
+                "verification completed with no resolvable agent -> verified_by "
+                "left null (enrollment %s). Check the portal auth token.",
+                enrollment.pk,
+            )
         enrollment.verified_at = timezone.now()
         enrollment.verified_by = agent
         enrollment.save(update_fields=["verified_at", "verified_by"])

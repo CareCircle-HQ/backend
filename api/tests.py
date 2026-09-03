@@ -5538,6 +5538,415 @@ class WorkQueueResolvedDateFilterTest(TestCase):
         self.assertNotIn(early.pk, from_only)
 
 
+class SplitDependentVerifiedDateTest(TestCase):
+    """Splitting a household-verified dependent into their own enrollment must
+    carry the household's verified_at -- even when the dependent had no per-member
+    profile -- so verified-DATE filters include them (not just the status)."""
+
+    def test_dependent_gets_verified_at_on_split(self):
+        from datetime import timedelta
+
+        from django.utils import timezone
+
+        from .models import (
+            Agent, Client, EnrollmentStage, EnrollmentVerification, Household,
+            HouseholdMember,
+        )
+        from .services.lifecycle import split_dependent_into_own_enrollment
+
+        vat = timezone.now()
+        rat = vat - timedelta(days=3)  # requested earlier than verified
+        requester = Agent.objects.create(name="Req Agent", agent_code="701", group="Verifiers")
+        verifier = Agent.objects.create(name="Ver Agent", agent_code="702", group="Verifiers")
+        nutri = Agent.objects.create(name="RD Jane", agent_code="703", group="Nutritionist")
+        hh = Household.objects.create(name="HH")
+        primary = Client.objects.create(client_id=str(uuid.uuid4()), first_name="Prim", last_name="Ary")
+        dep = Client.objects.create(client_id=str(uuid.uuid4()), first_name="Dep", last_name="Endent")
+        HouseholdMember.objects.create(household=hh, client=primary, is_primary=True)
+        HouseholdMember.objects.create(household=hh, client=dep, is_primary=False)
+        # Verified household enrollment (on the primary), with the full request +
+        # verification audit trail. The dependent has NO per-member profile.
+        EnrollmentVerification.objects.create(
+            client=primary, household=hh, stage=EnrollmentStage.SERVICE_ACTIVE,
+            verified_at=vat, verified_by=verifier,
+            requested_at=rat, requested_by=requester,
+            is_family_verified=True, medicaid_type_verified=True,
+            # Nutritionist sign-off (+ typed signature + approval PDF).
+            nutritionist_approved_at=vat, nutritionist_approved_by=nutri,
+            nutritionist_signature="RD Jane, MS RD",
+            nutritionist_approval_pdf_key="s3://nutrition/approval.pdf",
+        )
+        # The dependent's freshly-created (unverified) enrollment being split out.
+        new_enr = EnrollmentVerification.objects.create(
+            client=dep, household=hh, stage=EnrollmentStage.VERIFIED,
+        )
+        split_dependent_into_own_enrollment(dep, new_enr)
+        new_enr.refresh_from_db()
+        # Verified date + verifying agent preserved.
+        self.assertEqual(new_enr.verified_at, vat)
+        self.assertEqual(new_enr.verified_by_id, verifier.id)
+        # Requested date + requesting agent preserved.
+        self.assertEqual(new_enr.requested_at, rat)
+        self.assertEqual(new_enr.requested_by_id, requester.id)
+        # Other verification fields preserved.
+        self.assertTrue(new_enr.is_family_verified)
+        self.assertTrue(new_enr.medicaid_type_verified)
+        # Nutritionist sign-off + signature + approval PDF preserved.
+        self.assertEqual(new_enr.nutritionist_approved_at, vat)
+        self.assertEqual(new_enr.nutritionist_approved_by_id, nutri.id)
+        self.assertEqual(new_enr.nutritionist_signature, "RD Jane, MS RD")
+        self.assertEqual(new_enr.nutritionist_approval_pdf_key, "s3://nutrition/approval.pdf")
+
+
+class VerificationDashboardVerifiersTest(TestCase):
+    """The verification dashboard's per-agent 'Top Verifiers' count must match the
+    All-Verifications report: ONE per household, excluding dismissed rows -- not one
+    per enrollment (which over-credits agents for carried/superseded/split rows)."""
+
+    def _api(self, group="Management"):
+        from rest_framework.test import APIClient
+        from rest_framework_simplejwt.tokens import AccessToken
+
+        from .models import Agent
+        a = Agent.objects.create(name="Mgr", agent_code=str(uuid.uuid4())[:8], group=group)
+        acc = AccessToken()
+        acc["agent_id"] = str(a.id); acc["agent_code"] = a.agent_code
+        acc["agent_name"] = a.name; acc["agent_group"] = a.group
+        api = APIClient(); api.credentials(HTTP_AUTHORIZATION=f"Bearer {acc}")
+        return api
+
+    def test_verifiers_dedupe_by_household_and_exclude_disregarded(self):
+        from django.utils import timezone
+
+        from .models import (
+            Agent, Client, EnrollmentStage, EnrollmentVerification, Household,
+        )
+        now = timezone.now()
+        v = Agent.objects.create(name="Val Verifier", agent_code="810", group="Verifiers")
+        # Household H1: TWO verified enrollments by the same agent -> counts ONCE.
+        h1 = Household.objects.create(name="H1")
+        c1 = Client.objects.create(client_id=str(uuid.uuid4()), first_name="A", last_name="One")
+        EnrollmentVerification.objects.create(
+            client=c1, household=h1, stage=EnrollmentStage.SERVICE_ACTIVE,
+            verified_at=now, verified_by=v)
+        EnrollmentVerification.objects.create(  # superseded/carried duplicate
+            client=c1, household=h1, stage=EnrollmentStage.CLOSED,
+            verified_at=now, verified_by=v)
+        # Household H2: one verified enrollment -> counts once.
+        h2 = Household.objects.create(name="H2")
+        c2 = Client.objects.create(client_id=str(uuid.uuid4()), first_name="B", last_name="Two")
+        EnrollmentVerification.objects.create(
+            client=c2, household=h2, stage=EnrollmentStage.VERIFIED,
+            verified_at=now, verified_by=v)
+        # DISREGARDED with a stale verified_at -> excluded.
+        h3 = Household.objects.create(name="H3")
+        c3 = Client.objects.create(client_id=str(uuid.uuid4()), first_name="C", last_name="Three")
+        EnrollmentVerification.objects.create(
+            client=c3, household=h3, stage=EnrollmentStage.DISREGARDED,
+            verified_at=now, verified_by=v)
+
+        resp = self._api().get("/api/portal/dashboard/verification/?period=all")
+        self.assertEqual(resp.status_code, 200, resp.content)
+        verifiers = {r["id"]: r for r in resp.json()["agents"]["verifiers"]}
+        self.assertIn(str(v.id), verifiers)
+        # H1 (deduped to 1) + H2 (1); H3 disregarded excluded. Raw rows would be 4.
+        self.assertEqual(verifiers[str(v.id)]["count"], 2)
+
+
+class VerificationDashboardMissingCaseTest(TestCase):
+    """The 3 'Verified Members Missing a Case' sections count verified members (in
+    range, deduped per household) whose household has NO case of the given type."""
+
+    def _api(self):
+        from rest_framework.test import APIClient
+        from rest_framework_simplejwt.tokens import AccessToken
+
+        from .models import Agent
+        a = Agent.objects.create(name="Mgr", agent_code=str(uuid.uuid4())[:8], group="Management")
+        acc = AccessToken()
+        acc["agent_id"] = str(a.id); acc["agent_code"] = a.agent_code
+        acc["agent_name"] = a.name; acc["agent_group"] = a.group
+        api = APIClient(); api.credentials(HTTP_AUTHORIZATION=f"Bearer {acc}")
+        return api
+
+    def _verified(self, hh_name):
+        from django.utils import timezone
+
+        from .models import (
+            Client, EnrollmentStage, EnrollmentVerification, Household,
+            HouseholdMember,
+        )
+        hh = Household.objects.create(name=hh_name)
+        c = Client.objects.create(client_id=str(uuid.uuid4()), first_name=hh_name, last_name="X")
+        HouseholdMember.objects.create(household=hh, client=c, is_primary=True)
+        EnrollmentVerification.objects.create(
+            client=c, household=hh, stage=EnrollmentStage.VERIFIED,
+            verified_at=timezone.now())
+        return hh, c
+
+    def test_missing_case_counts_and_drilldown(self):
+        from .models import Case, CaseStatus, CaseType
+
+        # H1: has an internal-service case -> NOT missing internal_service.
+        _, c1 = self._verified("H1")
+        Case.objects.create(
+            case_id=str(uuid.uuid4()), client=c1, case_type=CaseType.INTERNAL_SERVICE,
+            case_status=CaseStatus.OPEN)
+        # H2: no cases at all -> missing all three.
+        _, c2 = self._verified("H2")
+
+        data = self._api().get("/api/portal/dashboard/verification/?period=all").json()
+        mc = data["missing_cases"]
+        self.assertEqual(mc["internal_service"], 1)   # only H2
+        self.assertEqual(mc["care_management"], 2)    # H1 + H2 (neither has navigation)
+        self.assertEqual(mc["eligibility"], 2)        # H1 + H2
+
+        # Drill-down: missing_internal_service lists H2's member only.
+        lst = self._api().get(
+            "/api/portal/dashboard/verification/missing_internal_service/?period=all"
+        ).json()
+        ids = {r["id"] for r in lst["results"]}
+        self.assertIn(str(c2.client_id), ids)
+        self.assertNotIn(str(c1.client_id), ids)
+
+
+class BackfillEnrollmentAgentsTest(TestCase):
+    """backfill_enrollment_agents copies verified_by/requested_by from the SAME
+    client's attributed enrollment; leaves clients with no agent anywhere alone."""
+
+    def test_backfills_only_from_same_client(self):
+        from django.core.management import call_command
+        from django.utils import timezone
+
+        from .models import (
+            Agent, Client, EnrollmentStage, EnrollmentVerification,
+        )
+        ag = Agent.objects.create(name="Ver", agent_code="930", group="Verifiers")
+        now = timezone.now()
+        # Client A: one attributed enrollment + one missing the agent -> recovered.
+        a = Client.objects.create(client_id=str(uuid.uuid4()), first_name="A", last_name="A")
+        EnrollmentVerification.objects.create(
+            client=a, stage=EnrollmentStage.CLOSED, verified_at=now,
+            verified_by=ag, requested_by=ag)
+        tgt = EnrollmentVerification.objects.create(
+            client=a, stage=EnrollmentStage.VERIFIED, verified_at=now,
+            verified_by=None, requested_by=None)
+        # Client B: no agent anywhere (import root) -> left untouched.
+        b = Client.objects.create(client_id=str(uuid.uuid4()), first_name="B", last_name="B")
+        bnull = EnrollmentVerification.objects.create(
+            client=b, stage=EnrollmentStage.VERIFIED, verified_at=now,
+            verified_by=None, requested_by=None)
+
+        call_command("backfill_enrollment_agents", "--apply")
+        tgt.refresh_from_db(); bnull.refresh_from_db()
+        self.assertEqual(tgt.verified_by_id, ag.id)
+        self.assertEqual(tgt.requested_by_id, ag.id)
+        self.assertIsNone(bnull.verified_by_id)   # no source -> untouched
+        self.assertIsNone(bnull.requested_by_id)
+
+
+class VerificationAgentCaptureTest(TestCase):
+    """Fix: never lose the acting agent. set-stage completion stamps verified_by;
+    carry/propagation recovers a missing agent from the original/previous
+    enrollment chain (never the acting agent)."""
+
+    def test_set_stage_verified_stamps_verified_by(self):
+        from rest_framework.test import APIClient
+        from django.urls import reverse
+
+        from .models import (
+            Agent, Client, EnrollmentStage, EnrollmentVerification, Household,
+        )
+        ag = Agent.objects.create(name="Ver", agent_code="921", group="Verifiers")
+        hh = Household.objects.create(name="HH")
+        c = Client.objects.create(client_id=str(uuid.uuid4()), first_name="A", last_name="B")
+        enr = EnrollmentVerification.objects.create(
+            client=c, household=hh, stage=EnrollmentStage.PENDING_VERIFICATION)
+
+        class U:
+            is_authenticated = True
+            agent_id = ag.id
+            agent_code = ag.agent_code
+        api = APIClient(); api.force_authenticate(user=U())
+        resp = api.post(
+            reverse("enrollment-verification-set-stage", args=[enr.pk]),
+            {"stage": "verified", "force": True}, format="json",
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        enr.refresh_from_db()
+        self.assertIsNotNone(enr.verified_at)          # verification fact stamped
+        self.assertEqual(enr.verified_by_id, ag.id)    # acting agent captured
+
+    def test_carry_recovers_agent_from_chain(self):
+        from django.utils import timezone
+
+        from .models import (
+            Agent, Client, EnrollmentStage, EnrollmentVerification, Household,
+        )
+        from .services.lifecycle import _carry_verification_fields
+        ag = Agent.objects.create(name="Orig", agent_code="922", group="Verifiers")
+        hh = Household.objects.create(name="HH")
+        c = Client.objects.create(client_id=str(uuid.uuid4()), first_name="A", last_name="B")
+        now = timezone.now()
+        original = EnrollmentVerification.objects.create(
+            client=c, household=hh, stage=EnrollmentStage.CLOSED,
+            verified_at=now, verified_by=ag, requested_by=ag)
+        # An intermediate that LOST the agent (e.g. a prior bad carry/import).
+        source = EnrollmentVerification.objects.create(
+            client=c, household=hh, stage=EnrollmentStage.CLOSED,
+            verified_at=now, verified_by=None, requested_by=None, supersedes=original)
+        # A verified survivor missing the agent -> should recover from the chain.
+        target = EnrollmentVerification.objects.create(
+            client=c, household=hh, stage=EnrollmentStage.VERIFIED,
+            verified_at=now, verified_by=None, requested_by=None)
+        _carry_verification_fields(target, source)
+        target.refresh_from_db()
+        self.assertEqual(target.verified_by_id, ag.id)   # from original in the chain
+        self.assertEqual(target.requested_by_id, ag.id)
+
+
+class ExtRequestVerificationTimelineTest(TestCase):
+    """Requesting a verification FROM THE EXTENSION now records a timeline event
+    (mirroring the CRM button): the acting agent + the request time, on both the
+    fresh-create and re-request paths."""
+
+    def _api(self, agent):
+        from rest_framework.test import APIClient
+
+        class U:
+            is_authenticated = True
+            agent_id = agent.id
+            agent_code = agent.agent_code
+            is_manager = False
+            group = agent.group
+
+        api = APIClient()
+        api.force_authenticate(user=U())
+        return api
+
+    def test_ext_request_logs_timeline_with_agent_and_time(self):
+        from django.urls import reverse
+
+        from .models import (
+            Agent, Case, CaseStatus, CaseType, Client, EnrollmentVerification,
+            TimelineEvent, TimelineEventType,
+        )
+        agent = Agent.objects.create(name="Ext Agent", agent_code="705", group="Verifiers")
+        c = Client.objects.create(client_id=str(uuid.uuid4()), first_name="Ext", last_name="Req")
+        case = Case.objects.create(
+            case_id=str(uuid.uuid4()), client=c, case_type=CaseType.INTERNAL_SERVICE,
+            case_status=CaseStatus.OPEN,
+        )
+        resp = self._api(agent).post(
+            reverse("enrollment-verification-list"),
+            {"client_id": str(c.client_id), "case_id": str(case.case_id),
+             "members": [{"member_name": "Ext Req"}]},
+            format="json",
+        )
+        self.assertIn(resp.status_code, (200, 201), resp.content)
+        enr = EnrollmentVerification.objects.get(client=c)
+        # Requested time + requesting agent stamped.
+        self.assertIsNotNone(enr.requested_at)
+        self.assertEqual(enr.requested_by_id, agent.id)
+        # Timeline event created, attributed to the acting agent.
+        ev = TimelineEvent.objects.filter(
+            client=c, event_type=TimelineEventType.VERIFICATION_REQUESTED,
+        ).first()
+        self.assertIsNotNone(ev)
+        self.assertIn("705", ev.actor or "")
+
+
+class ScreeningImportMultiPassTest(TestCase):
+    """The screening import buffers a bounded bucket of screens per pass (so a
+    multi-GB, non-contiguous export doesn't OOM). All of a screen's scattered
+    rows must still be collected across passes."""
+
+    def test_non_contiguous_screens_survive_multi_pass(self):
+        import io
+        from unittest import mock
+
+        from .models import Client, ImportRun, ImportRunStatus, Screening
+        from .services import csv_import
+
+        s1 = str(uuid.uuid4())
+        s2 = str(uuid.uuid4())
+        c1 = Client.objects.create(client_id=s1, first_name="A", last_name="One")
+        Client.objects.create(client_id=s2, first_name="B", last_name="Two")
+        header = ("enhanced_screen_id,subject_id,screen_created_at,screen_status,"
+                  "facilitator_id,provider_name,question_primary_text,answer_id,"
+                  "question_option_text\n")
+
+        def row(sid, q, aid, ans):
+            return f"{sid},{sid},2026-08-01,complete,,Prov,{q},{aid},{ans}\n"
+
+        # Interleaved (screen1, screen2, screen1, screen2) -- non-contiguous.
+        body = header + row(s1, "Q1", "a1", "Yes") + row(s2, "Q1", "b1", "No") \
+            + row(s1, "Q2", "a2", "Maybe") + row(s2, "Q2", "b2", "Never")
+        run = ImportRun.objects.create(
+            source="csv", status=ImportRunStatus.RUNNING,
+            export_type="screening", triggered_by="test",
+        )
+        # Force several passes (rows/pass = 1) to exercise the bucketing.
+        with mock.patch.object(csv_import, "_SCREENING_ROWS_PER_PASS", 1):
+            csv_import.run_csv_import(
+                export_type="screening", file_obj=io.BytesIO(body.encode()),
+                run=run, emit_side_effects=False, emit_timeline=False,
+            )
+        run.refresh_from_db()
+        self.assertEqual(run.status, ImportRunStatus.COMPLETED)
+        self.assertEqual(Screening.objects.count(), 2)
+        sc1 = Screening.objects.get(pk=s1)
+        self.assertEqual(str(sc1.client_id), str(c1.client_id))
+        # Both scattered answers were collected despite the multi-pass bucketing.
+        self.assertEqual(len(sc1.questions_answers or []), 2)
+
+
+class DataExportPrimaryMemberTest(TestCase):
+    """The Data page CSV export includes a primary_client_id column: a primary
+    member's own id, and a dependent's household-primary id."""
+
+    def _mgr_api(self):
+        from rest_framework.test import APIClient
+        from rest_framework_simplejwt.tokens import AccessToken
+
+        from .models import Agent
+        agent = Agent.objects.create(name="Mgr", agent_code="988", group="Management", is_manager=True)
+        access = AccessToken()
+        access["agent_id"] = str(agent.id)
+        access["agent_code"] = agent.agent_code
+        access["agent_name"] = agent.name
+        access["agent_group"] = agent.group
+        access["agent_is_manager"] = agent.is_manager
+        api = APIClient()
+        api.credentials(HTTP_AUTHORIZATION=f"Bearer {access}")
+        return api
+
+    def test_export_includes_primary_member_id(self):
+        from django.urls import reverse
+
+        from .models import Client, EnrollmentAnalytics, Household, HouseholdMember
+        hh = Household.objects.create(name="HH")
+        prim = Client.objects.create(client_id=str(uuid.uuid4()), first_name="Prim", last_name="Ary")
+        dep = Client.objects.create(client_id=str(uuid.uuid4()), first_name="Dep", last_name="Endent")
+        HouseholdMember.objects.create(household=hh, client=prim, is_primary=True)
+        HouseholdMember.objects.create(household=hh, client=dep, is_primary=False)
+        for c, isp in ((prim, True), (dep, False)):
+            EnrollmentAnalytics.objects.create(
+                client_id=c.client_id, household_id=hh.household_id, is_primary=isp,
+                first_name=c.first_name, last_name=c.last_name, case_type="", case_status="",
+            )
+
+        resp = self._mgr_api().get(reverse("portal-data-export"))
+        self.assertEqual(resp.status_code, 200, getattr(resp, "content", b""))
+        body = b"".join(resp.streaming_content).decode()
+        lines = [l for l in body.splitlines() if l.strip()]
+        header = lines[0].split(",")
+        self.assertIn("primary_client_id", header)
+        idx = header.index("primary_client_id")
+        dep_line = next(l for l in lines if str(dep.client_id) in l)
+        self.assertEqual(dep_line.split(",")[idx], str(prim.client_id))  # dependent -> primary
+
+
 class CompanyStatusNotEligibleTest(TestCase):
     """A member parked on the not_eligible/ineligible lifecycle off-ramp (closed
     enrollment, but a lingering open case -- e.g. after a Household->Individual

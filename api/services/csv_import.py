@@ -89,6 +89,14 @@ SUPPORTED_EXPORT_TYPES = ("clients", "screening", "assessments", "cases", "notes
 # the rest), not just via ``manage.py import_csv``.
 CLI_EXPORT_TYPES = SUPPORTED_EXPORT_TYPES
 
+# The screening (v2) export is large (>1 GB) and its rows are NOT grouped by
+# screen -- a screen's answer rows are scattered across the whole file -- so the
+# importer must buffer a screen's rows before it can build it. Buffering the
+# ENTIRE file at once OOMs/swaps the box, so screenings are processed in several
+# passes, each buffering only the screens in one hash bucket. This caps the
+# buffered working set to ~this many rows per pass regardless of file size.
+_SCREENING_ROWS_PER_PASS = 150_000
+
 
 # --- streaming helpers -----------------------------------------------------
 def _text_stream(file_obj):
@@ -906,7 +914,27 @@ class CsvImporter:
                 self.errors.append(f"client {cid}: {exc}")
                 logger.warning("csv_import client %s failed: %s", cid, exc)
 
-    def import_screenings(self, reader, provider_id=None, provider_name=None):
+    def _iter_rows(self, file_obj):
+        """Yield CSV rows from the START of ``file_obj``, rewinding first and
+        detaching the text wrapper afterwards so the SAME file can be re-read on
+        the next pass without closing the underlying descriptor. Handles quoted
+        fields with embedded newlines (the v2 screening export has them)."""
+        raw = getattr(file_obj, "file", file_obj)
+        raw.seek(0)
+        wrapper = _text_stream(file_obj)
+        try:
+            for row in csv.DictReader(wrapper):
+                yield row
+        finally:
+            try:
+                wrapper.detach()
+            except Exception:  # noqa: BLE001 - StringIO fallback has no detach()
+                pass
+
+    def import_screenings(self, file_obj, provider_id=None, provider_name=None):
+        import hashlib
+        import math
+
         self.dataset = "screenings"
         # Optional provider scope: import only screens performed by the given
         # provider (id OR name, case-insensitive/trimmed). Non-matching screens
@@ -930,23 +958,46 @@ class CsvImporter:
                 employee_id__isnull=False,
             ).values_list("employee_id", flat=True)
         }
-        # Group the denormalized (one-row-per-answer) export by screen. The Unite
-        # Us export does NOT guarantee a screen's rows are contiguous -- they can
-        # be scattered across the file -- so collect ALL rows per screen id before
-        # building the payload. (A contiguous-only pass would create each screen
-        # from just the first fragment of its answers and skip the rest as
-        # "already exists".) Holds the file in memory; fine for the
-        # few-hundred-MB exports we import.
-        groups = OrderedDict()
-        for row in reader:
+
+        # --- sizing pass (bounded memory) -----------------------------------
+        # The export's rows are NOT grouped by screen and it's >1 GB, so we can't
+        # stream contiguously and can't buffer the whole file. First pass: only
+        # SIZE the job -- count distinct screens (a set of tens of thousands of
+        # ids, cheap) + blank-key skips -- to set the progress denominator and
+        # decide how many bounded passes to split the screens across.
+        screen_ids = set()
+        total_rows = 0
+        for row in self._iter_rows(file_obj):
             sid = (row.get("enhanced_screen_id") or "").strip()
             if not sid:
                 self._count("skipped")
                 continue
-            groups.setdefault(sid, []).append(row)
+            total_rows += 1
+            screen_ids.add(sid)
+        self._set_total(self.processed + len(screen_ids))
 
-        # Denominator = blank-key rows already skipped + one item per screen.
-        self._set_total(self.processed + len(groups))
+        n_passes = max(1, math.ceil(total_rows / _SCREENING_ROWS_PER_PASS))
+
+        def _bucket(s):
+            return int(hashlib.md5(s.encode("utf-8")).hexdigest(), 16) % n_passes
+
+        # --- bounded passes: buffer + process one hash bucket of screens each --
+        for p in range(n_passes):
+            groups = OrderedDict()
+            for row in self._iter_rows(file_obj):
+                sid = (row.get("enhanced_screen_id") or "").strip()
+                if not sid:
+                    continue  # already counted in the sizing pass
+                if n_passes > 1 and _bucket(sid) != p:
+                    continue
+                groups.setdefault(sid, []).append(row)
+            self._import_screening_groups(
+                groups, allow_facilitator_ids, provider_filter, want_id, want_name,
+            )
+
+    def _import_screening_groups(
+        self, groups, allow_facilitator_ids, provider_filter, want_id, want_name,
+    ):
         for sid, rows in groups.items():
             head = rows[0]
             # Facilitator allowlist (only enforced when the list is non-empty).
@@ -1624,19 +1675,22 @@ def run_csv_import(*, export_type, file_obj, triggered_by="manual", emit_side_ef
             if total is not None:
                 importer._set_total(total)
         # Stream the file as text (tolerating a UTF-8 BOM from spreadsheet
-        # exports) rather than reading it all into memory -- the screening
-        # export runs to several GB.
-        reader = csv.DictReader(_text_stream(file_obj))
+        # exports) rather than reading it all into memory -- the screening export
+        # runs to several GB. Single-pass importers get a fresh reader from the
+        # top of the (already header-checked, rewound) file; screenings re-read
+        # the file themselves across multiple bounded-memory passes.
+        def _reader():
+            return csv.DictReader(_text_stream(file_obj))
         with change_context(ChangeSource.IMPORT, f"csv:{triggered_by}"):
             if export_type == "clients":
-                importer.import_clients(reader)
+                importer.import_clients(_reader())
             elif export_type == "screening":
                 importer.import_screenings(
-                    reader, provider_id=provider_id, provider_name=provider_name,
+                    file_obj, provider_id=provider_id, provider_name=provider_name,
                 )
             elif export_type == "assessments":
                 importer.import_assessments(
-                    reader, provider_id=provider_id, provider_name=provider_name,
+                    _reader(), provider_id=provider_id, provider_name=provider_name,
                 )
             elif export_type == "cases":
                 # Defer the per-save client-wide reconcile: with one case per row,
@@ -1648,15 +1702,22 @@ def run_csv_import(*, export_type, file_obj, triggered_by="manual", emit_side_ef
 
                 with deferred_internal_service_reconcile():
                     importer.import_cases(
-                        reader, provider_id=provider_id, provider_name=provider_name,
+                        _reader(), provider_id=provider_id, provider_name=provider_name,
                     )
                 importer.reconcile_touched_cases()
             elif export_type == "notes":
-                importer.import_notes(reader)
-            # Always reconcile the funnel stage for every touched client, so the
+                importer.import_notes(_reader())
+            # Reconcile the funnel stage + warnings for every touched client so the
             # upload self-heals lifecycle_stage even when per-record side effects
             # are off (bulk load) or the client file was imported before cases.
-            importer.recompute_touched()
+            # ONLY the datasets that can actually move the funnel pay for this
+            # (expensive) per-client recompute: stage + warnings derive from
+            # cases / enrollments / eligibility, NOT from screenings or notes. A
+            # screening/notes upload is append-only and leaves the funnel untouched,
+            # so running recompute_touched there is a pure no-op that ground large
+            # screening imports for hours after the rows were already written.
+            if export_type in ("clients", "cases", "assessments"):
+                importer.recompute_touched()
         run.status = ImportRunStatus.COMPLETED
     except Exception as exc:  # fatal: bad file / decode error
         run.status = ImportRunStatus.FAILED

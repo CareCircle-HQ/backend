@@ -762,7 +762,7 @@ def _governing_case_id_for(enrollment):
 
 
 def event_for_verification(enrollment, *, stage_event=None, source=ChangeSource.SYSTEM,
-                           actor="", trigger=""):
+                           actor="", trigger="", occurred_at=None):
     """Emit a timeline event for an enrollment stage change.
 
     Called from :func:`api.services.lifecycle.advance_enrollment` after a
@@ -784,7 +784,10 @@ def event_for_verification(enrollment, *, stage_event=None, source=ChangeSource.
     # it no longer produces a history event.
     if enrollment.stage == EnrollmentStage.DISREGARDED:
         return None
-    occurred = enrollment.stage_at or timezone.now()
+    # ``occurred_at`` lets a caller pin the event to the request time (e.g. the
+    # extension/CRM "Request Verification", where requested_at is the truth) --
+    # important for a re-request whose stage_at may still be the original entry.
+    occurred = occurred_at or enrollment.stage_at or timezone.now()
     try:
         label = EnrollmentStage(enrollment.stage).label
     except ValueError:
