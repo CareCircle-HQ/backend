@@ -146,6 +146,14 @@ MIDDLEWARE = [
 # Max DB statement time (ms) for web requests; 0 disables the middleware.
 WEB_STATEMENT_TIMEOUT_MS = int(os.getenv('WEB_STATEMENT_TIMEOUT_MS', '30000') or 0)
 
+# Hyros lead-tracking integration. When a Meta Ads member gains an internal-service
+# case they're pushed to Hyros tagged "Enrolled". Empty API key = integration OFF
+# (nothing is sent), so it stays dormant until the secret is configured.
+HYROS_API_KEY = os.getenv('HYROS_API_KEY', '')
+HYROS_LEADS_URL = os.getenv(
+    'HYROS_LEADS_URL', 'https://api.hyros.com/v1/api/v1.0/leads'
+)
+
 ROOT_URLCONF = 'backend.urls'
 
 TEMPLATES = [

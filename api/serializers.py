@@ -603,6 +603,10 @@ class ClientSerializer(serializers.ModelSerializer):
         # an Internal Service case is saved (see CaseSerializer), since a
         # household only matters once the client has an internal service to be
         # verified/delivered for.
+        # Meta Ads lead-tracking: push to Hyros as "Enrolled" once the member has
+        # an internal-service case (no-op unless configured + qualifying).
+        from api.services.hyros import maybe_enqueue_enrollment
+        maybe_enqueue_enrollment(client)
         return client
 
 
@@ -1792,6 +1796,15 @@ class CaseSerializer(serializers.ModelSerializer):
             logger.exception(
                 "internal-service authorization reconcile failed for case %s", case_id
             )
+        # Meta Ads lead-tracking: saving an internal-service case may make a Meta
+        # Ads member newly "enrolled" -> push to Hyros (no-op unless configured
+        # + qualifying + not already pushed).
+        try:
+            if case.case_type == CaseType.INTERNAL_SERVICE and case.client_id:
+                from api.services.hyros import maybe_enqueue_enrollment
+                maybe_enqueue_enrollment(case.client)
+        except Exception:
+            logger.exception("Hyros enqueue (case save) failed for case %s", case_id)
         return case
 
 

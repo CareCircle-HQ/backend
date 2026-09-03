@@ -363,6 +363,9 @@ class Client(models.Model):
     consent_status = models.CharField(max_length=20, blank=True)  # E-form: accepted/declined
     consented_at = models.DateTimeField(null=True, blank=True)
     consent_doc_url = models.URLField(blank=True)
+    # Set once we've pushed this member to Hyros as "Enrolled" (Meta Ads leads
+    # with an internal-service case). Guards the once-per-member push.
+    hyros_enrolled_pushed_at = models.DateTimeField(null=True, blank=True)
 
     # --- Lifecycle funnel (maintained by api.services.lifecycle) ---
     lifecycle_stage = models.CharField(

@@ -2,6 +2,8 @@ import uuid
 from datetime import timedelta
 from types import SimpleNamespace
 
+from unittest import mock
+
 from django.test import SimpleTestCase, TestCase, override_settings
 from django.urls import reverse
 from django.utils import timezone
@@ -5708,6 +5710,89 @@ class VerificationDashboardMissingCaseTest(TestCase):
         ids = {r["id"] for r in lst["results"]}
         self.assertIn(str(c2.client_id), ids)
         self.assertNotIn(str(c1.client_id), ids)
+
+
+class HyrosEnrollmentPushTest(TestCase):
+    """Meta Ads members with an internal-service case are pushed to Hyros as
+    'Enrolled', once per member, only when the integration is configured."""
+
+    def _meta_client(self, lead_source="META ADS", consent=True, with_case=True):
+        from .models import Case, CaseStatus, CaseType, Client
+        c = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="John", last_name="Doe",
+            client_email_address="john@doe.com", lead_source=lead_source,
+            consent_accepted=consent,
+        )
+        if with_case:
+            Case.objects.create(
+                case_id=str(uuid.uuid4()), client=c,
+                case_type=CaseType.INTERNAL_SERVICE, case_status=CaseStatus.OPEN,
+            )
+        return c
+
+    @override_settings(HYROS_API_KEY="test-key")
+    @mock.patch("api.services.hyros.requests.post")
+    def test_push_success_stamps_and_sends_payload(self, mock_post):
+        mock_post.return_value = mock.Mock(status_code=200, text="ok")
+        c = self._meta_client()
+        from .services.hyros import push_enrollment
+        push_enrollment(str(c.client_id))
+        c.refresh_from_db()
+        self.assertIsNotNone(c.hyros_enrolled_pushed_at)
+        _, kwargs = mock_post.call_args
+        body = kwargs["json"]
+        self.assertEqual(body["email"], "john@doe.com")
+        self.assertEqual(body["firstName"], "John")
+        self.assertEqual(body["lastName"], "Doe")
+        self.assertEqual(body["tags"], ["!enrolled"])
+        self.assertEqual(body["stage"], "Enrolled")
+        self.assertEqual(body["adOptimizationConsent"], "GRANTED")
+        self.assertEqual(kwargs["headers"]["API-Key"], "test-key")
+
+    @override_settings(HYROS_API_KEY="test-key")
+    @mock.patch("api.services.hyros.requests.post")
+    def test_consent_denied_when_not_consented(self, mock_post):
+        mock_post.return_value = mock.Mock(status_code=200, text="ok")
+        c = self._meta_client(consent=False)
+        from .services.hyros import push_enrollment
+        push_enrollment(str(c.client_id))
+        self.assertEqual(mock_post.call_args.kwargs["json"]["adOptimizationConsent"], "DENIED")
+
+    @override_settings(HYROS_API_KEY="test-key")
+    @mock.patch("api.services.hyros.requests.post")
+    def test_no_internal_case_is_skipped(self, mock_post):
+        c = self._meta_client(with_case=False)
+        from .services.hyros import push_enrollment
+        push_enrollment(str(c.client_id))
+        mock_post.assert_not_called()
+        c.refresh_from_db(); self.assertIsNone(c.hyros_enrolled_pushed_at)
+
+    @override_settings(HYROS_API_KEY="test-key")
+    @mock.patch("api.services.hyros.requests.post")
+    def test_non_meta_ads_is_skipped(self, mock_post):
+        c = self._meta_client(lead_source="Brooklyn-01")
+        from .services.hyros import push_enrollment
+        push_enrollment(str(c.client_id))
+        mock_post.assert_not_called()
+
+    @override_settings(HYROS_API_KEY="")
+    @mock.patch("api.services.hyros.requests.post")
+    def test_integration_off_without_key(self, mock_post):
+        c = self._meta_client()
+        from .services.hyros import push_enrollment
+        push_enrollment(str(c.client_id))
+        mock_post.assert_not_called()
+
+    @override_settings(HYROS_API_KEY="test-key")
+    @mock.patch("api.services.hyros.requests.post")
+    def test_already_pushed_not_repushed(self, mock_post):
+        from django.utils import timezone
+        c = self._meta_client()
+        c.hyros_enrolled_pushed_at = timezone.now()
+        c.save(update_fields=["hyros_enrolled_pushed_at"])
+        from .services.hyros import push_enrollment
+        push_enrollment(str(c.client_id))
+        mock_post.assert_not_called()
 
 
 class PurchaseOrderNotesTest(TestCase):

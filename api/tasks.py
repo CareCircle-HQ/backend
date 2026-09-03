@@ -20,6 +20,14 @@ logger = logging.getLogger(__name__)
 
 
 @shared_task(bind=True, ignore_result=True)
+def push_hyros_enrollment(self, client_id):
+    """Push a Meta Ads member to Hyros tagged 'Enrolled' (once per member)."""
+    from .services.hyros import push_enrollment
+
+    push_enrollment(client_id)
+
+
+@shared_task(bind=True, ignore_result=True)
 def process_import(self, run_id):
     """Download the uploaded CSV from S3 and run the import for ``run_id``."""
     run = ImportRun.objects.filter(pk=run_id).first()
