@@ -115,8 +115,10 @@ def address_range_reason(client, *, zips=None, states=None):
         states = allowed_state_codes()
     for a in _range_addresses(client):
         label = (a.type or "address").replace("_", " ")
-        if a.zip and is_zip_out_of_range(a.zip, service=zips):
-            return f"{label} ZIP {(a.zip or '').strip()[:5]} is outside the coverage area"
+        # A present address with a blank/malformed ZIP is out of range too.
+        if is_zip_out_of_range(a.zip, service=zips):
+            z = (a.zip or "").strip()[:5] or "(blank)"
+            return f"{label} ZIP {z} is outside the coverage area"
         if a.state and not is_state_allowed(a.state, allowed=states):
             return f"{label} state {a.state} is not served"
     return ""

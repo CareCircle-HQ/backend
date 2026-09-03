@@ -4419,6 +4419,20 @@ class DeliveryCoverageEligibilityTest(TestCase):
         self.assertIsNotNone(note)
         self.assertIn("11209", note.body)
 
+    def test_blank_zip_is_out_of_range(self):
+        # A present delivery address with a blank ZIP is out of range (fail-closed)
+        # once the whitelist is configured.
+        from .models import MemberStatus
+        from .services.meal_rules import reconcile_member_kitchen_output
+        from .services.service_area import SERVICE_AREA_REASON
+
+        mv = self._profile("")
+        out, _became, reason = reconcile_member_kitchen_output(mv, None, save=True)
+        self.assertTrue(out)
+        self.assertEqual(reason, SERVICE_AREA_REASON)
+        mv.refresh_from_db()
+        self.assertEqual(mv.status, MemberStatus.OUT_OF_RANGE)
+
     def test_reconcile_active_for_serviceable_zip(self):
         from .models import MemberStatus
         from .services.meal_rules import reconcile_member_kitchen_output

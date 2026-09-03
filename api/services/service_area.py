@@ -9,10 +9,10 @@ Orders. Out of Range additionally opens a Case Closure ticket and holds the
 whole household (see api.portal.views_members._enforce_delivery_coverage).
 
 The whitelist is admin-editable from Settings (Service ZIP Codes), so this reads
-it from the DB. Matching is on the first 5 digits of the ZIP. Fail-open: an
-unconfigured (empty) whitelist or a blank/unparseable ZIP is treated as IN range,
-so the feature stays inert until seeded and never flags on missing data (mirrors
-the served-states allow-list in ``state_area``).
+it from the DB. Matching is on the first 5 digits of the ZIP. An UNCONFIGURED
+(empty) whitelist is inert (everyone in range) so the feature stays off until
+seeded. Once configured, an address with a blank or malformed ZIP is treated as
+OUT of range (fail-closed) -- a member with NO address at all is still skipped.
 """
 
 # Standardized reason label for this process (shown in the note body + timeline
@@ -37,26 +37,26 @@ def service_zips():
 def is_zip_out_of_range(zip_value, *, service=None):
     """True when ``zip_value`` is NOT in the active service-area whitelist.
 
-    Fail-open: an empty whitelist (unconfigured) or a blank/unparseable ZIP is
-    treated as IN range (returns False), so the feature is inert until seeded and
-    never flags a member on missing/bad ZIP data.
+    An empty whitelist (unconfigured) is inert (returns False). Otherwise a blank
+    or malformed ZIP is OUT of range (returns True) -- only the empty-whitelist
+    case fails open.
     """
     if service is None:
         service = service_zips()
     if not service:
         return False
-    z = _zip5(zip_value)
-    if not z:
-        return False
-    return z not in service
+    return _zip5(zip_value) not in service
 
 
 def _addr_zip_out_of_range(addr, service):
-    """The out-of-range 5-digit ZIP of ``addr`` if it's outside coverage, else ""."""
-    if addr is None:
+    """The offending ZIP label if ``addr`` is outside coverage, else "". A present
+    address with a blank/malformed ZIP is out of range (labelled "(blank)"); a
+    missing address (``None``) is skipped."""
+    if addr is None or not service:
         return ""
-    z = _zip5(addr.zip)
-    return z if (z and is_zip_out_of_range(z, service=service)) else ""
+    if not is_zip_out_of_range(addr.zip, service=service):
+        return ""
+    return _zip5(addr.zip) or "(blank)"
 
 
 def enrollment_out_of_range_zip(enrollment, *, service=None):
