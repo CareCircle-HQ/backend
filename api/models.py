@@ -4900,6 +4900,11 @@ class EnrollmentAnalytics(models.Model):
     current_delivery_status = models.CharField(max_length=30, blank=True, db_index=True)
     last_po_delivery_status = models.CharField(max_length=30, blank=True)
     last_delivered_at = models.DateTimeField(null=True, blank=True, db_index=True)
+    # Delivery date of the member's most-recent PO-backed delivery order,
+    # REGARDLESS of delivered status (distinct from last_delivered_at, which is
+    # only the last order marked delivered). Powers the "Last PO Delivery Date"
+    # filter.
+    last_po_delivery_date = models.DateTimeField(null=True, blank=True, db_index=True)
     # True when the member has EVER been included in a generated Purchase Order
     # (has a DeliveryOrder line tied to a PO) -- regardless of delivery status.
     in_any_po = models.BooleanField(default=False, db_index=True)
@@ -4945,6 +4950,9 @@ class EnrollmentAnalytics(models.Model):
     case_type = models.CharField(max_length=20, blank=True, db_index=True)
     case_status = models.CharField(max_length=25, blank=True, db_index=True)
     auth_status = models.CharField(max_length=20, blank=True, db_index=True)
+    # Governing case's authorization window (approved window, else requested).
+    auth_start_date = models.DateTimeField(null=True, blank=True, db_index=True)
+    auth_end_date = models.DateTimeField(null=True, blank=True, db_index=True)
     case_opened_at = models.DateTimeField(null=True, blank=True, db_index=True)
     program_name = models.CharField(max_length=255, blank=True, db_index=True)
 
@@ -4968,6 +4976,10 @@ class EnrollmentAnalytics(models.Model):
     out_of_range = models.BooleanField(default=False, db_index=True)
     paused = models.BooleanField(default=False, db_index=True)
     pause_type = models.CharField(max_length=20, blank=True)
+    # When the member entered their current paused state -- member-status pause
+    # (MemberDietaryProfile.status_changed_at) or, for an On-Hold enrollment, the
+    # enrollment's stage_at. Null when not paused. Powers the "Pause Date" filter.
+    pause_date = models.DateTimeField(null=True, blank=True, db_index=True)
     verified_by_id_str = models.CharField(max_length=64, blank=True, db_index=True)
     requested_at = models.DateTimeField(null=True, blank=True, db_index=True)
     case_closed_at = models.DateTimeField(null=True, blank=True, db_index=True)

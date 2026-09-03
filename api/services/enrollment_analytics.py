@@ -88,7 +88,7 @@ def _derive_delivery(client_id):
         .order_by("-expected_delivery_date", "-created_at")[:50]
     )
     if not orders:
-        return "", "", None, ""
+        return "", "", None, "", None
     latest = orders[0]
     current = latest.status or ""
     last_po = (latest.purchase_order.delivery_status
@@ -97,10 +97,18 @@ def _derive_delivery(client_id):
         (o.delivered_at or o.expected_delivery_date
          for o in orders if o.status == "delivered"), None
     )
+    # Most-recent PO-backed delivery date, regardless of delivered status (skips
+    # cancelled POs). ``orders`` is already newest-first by expected date.
+    last_po_date = next(
+        (o.expected_delivery_date for o in orders
+         if o.purchase_order_id
+         and (o.purchase_order.status if o.purchase_order else "") != "cancelled"),
+        None,
+    )
     company = next(
         (o.delivery_company.name for o in orders if o.delivery_company_id), ""
     )
-    return current, last_po, _as_aware(delivered), company
+    return current, last_po, _as_aware(delivered), company, _as_aware(last_po_date)
 
 
 def _in_any_po(client_id):
@@ -167,14 +175,19 @@ def _coverage(client_id):
 
 
 def _dietary(enrollment_id, client_id):
+    from ..models import MEMBER_PAUSED_STATUSES
+
     prof = (MemberDietaryProfile.objects
             .filter(enrollment_id=enrollment_id, client_id=client_id).first())
     if prof is None:
-        return "", [], [], [], ""
+        return "", [], [], [], "", None
+    # Pause date = when a paused member entered their paused status.
+    pause_at = prof.status_changed_at if prof.status in MEMBER_PAUSED_STATUSES else None
     return (
         prof.menu_type or "",
         _clean(prof.food_allergies), _clean(prof.conditions), _clean(prof.medications),
         prof.status or "",
+        pause_at,
     )
 
 
@@ -486,16 +499,23 @@ def build_row(client):
     membership = getattr(client, "household_membership", None)
     enr = _active_enrollment(client)  # may be None
 
-    cur_del, last_po_del, last_delivered, delivery_company = _derive_delivery(cid)
+    cur_del, last_po_del, last_delivered, delivery_company, last_po_date = _derive_delivery(cid)
     in_any_po = _in_any_po(cid)
     has_active_delivery = _has_active_delivery(cid)
     ins_status, ins_exp, soc_status, soc_exp = _coverage(cid)
     if enr is not None:
-        menu_type, allergies, conditions, meds, member_status = _dietary(enr.pk, cid)
+        menu_type, allergies, conditions, meds, member_status, pause_at = _dietary(enr.pk, cid)
     else:
-        menu_type, allergies, conditions, meds, member_status = "", [], [], [], ""
+        menu_type, allergies, conditions, meds, member_status, pause_at = "", [], [], [], "", None
     has_scr, scr_at, has_asm, asm_at, eligible, scr_agent = _screening_assessment(cid)
     parity = _parity_fields(client)
+    # Pause date: only when the member reads as paused -- the member-status pause
+    # time (from _dietary) or, for an On-Hold enrollment, when it went on hold.
+    pause_date = None
+    if parity.get("paused"):
+        pause_date = pause_at or (
+            enr.stage_at if (enr is not None and (enr.stage or "") == "on_hold") else None
+        )
     # Coverage gates for the Company Status "not eligible" test -- pop so they
     # aren't written as (nonexistent) columns.
     has_medicaid = parity.pop("_has_valid_medicaid", True)
@@ -612,6 +632,7 @@ def build_row(client):
         # is derived from a DateField, so guarantee it lands aware regardless of
         # the source, silencing the naive-datetime warning on save.
         "last_delivered_at": _as_aware(last_delivered),
+        "last_po_delivery_date": last_po_date,
         "in_any_po": in_any_po,
         "has_pending_verification_enrollment": has_pending_verif,
         "has_verified_enrollment": has_verified_enr,
@@ -634,6 +655,14 @@ def build_row(client):
         "case_type": (case.case_type if case else ""),
         "case_status": (case.case_status if case else ""),
         "auth_status": (case.service_authorization_status if case else ""),
+        "auth_start_date": (
+            (case.service_authorization_approval_starts_at
+             or case.service_authorization_request_starts_at) if case else None
+        ),
+        "auth_end_date": (
+            (case.service_authorization_approval_ends_at
+             or case.service_authorization_request_ends_at) if case else None
+        ),
         "case_opened_at": (case.date_opened if case else None),
         "program_name": (case.program_name if case else ""),
         # Program TYPE = the governing case's household_type (household /
@@ -665,6 +694,7 @@ def build_row(client):
         # Nutrition-review status + delivery company on latest order.
         "nutritionist_status": _nutritionist_status(enr, parity.get("tags") or []),
         "delivery_company": delivery_company,
+        "pause_date": pause_date,
     }
 
     # NO internal-service case (No Case Created) -> the member has no food-program
@@ -678,14 +708,16 @@ def build_row(client):
             "enrollment_id": None, "stage": "", "cadence": "",
             "kitchen_id": None, "kitchen_name": "", "menu_type": "",
             "current_delivery_status": "", "last_po_delivery_status": "",
-            "last_delivered_at": None, "in_any_po": False, "delivery_company": "",
+            "last_delivered_at": None, "last_po_delivery_date": None,
+            "in_any_po": False, "delivery_company": "",
             "verified_at": None, "verified_by_name": "", "verified_by_id_str": "",
             "requested_at": None, "nutritionist_status": "",
             "case_type": "", "case_status": "", "auth_status": "",
+            "auth_start_date": None, "auth_end_date": None,
             "case_opened_at": None, "case_closed_at": None, "program_name": "",
             "service_type": "", "program_type": "", "program_status": "",
             "verification_state": "", "out_of_orbit": False, "out_of_range": False,
-            "paused": False, "pause_type": "",
+            "paused": False, "pause_type": "", "pause_date": None,
             "allergies": [], "medical_conditions": [], "medications": [],
         })
     return row
@@ -847,6 +879,14 @@ def filter_analytics(params):
         elif istatus == "closed":
             qs = qs.filter(case_status__in=["closed", "cancelled"])
 
+    # Primary Member dropdown: all (no filter) / primary / additional household
+    # member (non-primary).
+    pm = (g("primary_member") or "").strip().lower()
+    if pm == "primary":
+        qs = qs.filter(is_primary=True)
+    elif pm == "additional":
+        qs = qs.filter(is_primary=False)
+
     # Age range -> DOB bounds.
     today = datetime.date.today()
     if g("age_min"):
@@ -930,6 +970,8 @@ def filter_analytics(params):
         "screening": "screening_at", "assessment": "eligibility_assessment_at",
         "case_opened": "case_opened_at", "requested": "requested_at",
         "verified": "verified_at", "closed": "case_closed_at",
+        "auth_start": "auth_start_date", "auth_end": "auth_end_date",
+        "pause": "pause_date", "last_po_delivered": "last_po_delivery_date",
     }.items():
         if g(f"{prefix}_from"):
             qs = qs.filter(**{f"{col}__date__gte": g(f"{prefix}_from")})
