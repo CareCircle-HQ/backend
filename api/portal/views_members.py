@@ -3100,7 +3100,8 @@ class DataExportView(PortalAPIView):
             "insurance_expires_at", "social_status", "social_expires_at",
             "attestation_status", "has_screening", "screening_at", "screening_agent",
             "has_eligibility_assessment", "eligibility_assessment_at", "verified_at",
-            "verified_by_name", "case_type", "case_status", "auth_status",
+            "verified_by_name", "case_id", "case_type", "case_status",
+            "company_status", "auth_status", "auth_start_date", "auth_end_date",
             "case_opened_at", "program_name", "allergies", "medical_conditions",
             "medications", "eligible_services",
         ]
