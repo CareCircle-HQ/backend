@@ -793,8 +793,8 @@ def sync_household_members(client, enrollment=None, agent=None):
         # outside the coverage area — the same block that already put the
         # existing members Out of Range — the new member inherits Out of Range
         # too, since a menu type can't fix a geographic block.
-        from .services.service_area import member_excluded_info, service_area_note_body
-        oor_zip, oor_source = member_excluded_info(profile)
+        from .services.service_area import member_out_of_range_info, service_area_note_body
+        oor_zip, oor_source = member_out_of_range_info(profile)
         # Attribute the acting agent (who added the member) so the note author
         # and the timeline actor show WHO performed the action instead of blank.
         agent_author = (agent.name if agent else "") or ""

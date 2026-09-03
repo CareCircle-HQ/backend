@@ -38,7 +38,7 @@ from api.models import (
     TicketStatus,
     TicketTypeCode,
 )
-from api.services.service_area import excluded_zips, member_excluded_info
+from api.services.service_area import service_zips, member_out_of_range_info
 
 # Terminal stages: service already ended, so nothing to enforce/hold.
 _TERMINAL_STAGES = (
@@ -64,17 +64,20 @@ class Command(BaseCommand):
         from api.portal.views_members import _enforce_delivery_coverage
 
         apply = options["apply"]
-        excluded = excluded_zips()
+        service = service_zips()
         self.stdout.write(self.style.MIGRATE_HEADING(
-            f"\nExcluded ZIPs configured: {len(excluded)} -> {sorted(excluded)}"
+            f"\nService-area ZIPs configured: {len(service)}"
         ))
-        if not excluded:
-            self.stdout.write(self.style.WARNING("No excluded ZIPs configured -- nothing to do."))
+        if not service:
+            self.stdout.write(self.style.WARNING(
+                "No service-area ZIPs configured -- whitelist inert, nothing to do."
+            ))
             return
 
         # Candidate enrollments: any non-terminal enrollment with >=1 member whose
-        # delivery/primary ZIP is excluded. member_excluded_info checks the
-        # enrollment delivery address + the member's primary address.
+        # delivery/primary ZIP is OUTSIDE the service-area whitelist.
+        # member_out_of_range_info checks the enrollment delivery address + the
+        # member's primary address.
         profiles = (
             MemberDietaryProfile.objects
             .exclude(enrollment__stage__in=_TERMINAL_STAGES)
@@ -84,7 +87,7 @@ class Command(BaseCommand):
         enr_ids = set()
         affected_members = 0
         for mv in profiles.iterator(chunk_size=1000):
-            zip_code, _src = member_excluded_info(mv, excluded=excluded)
+            zip_code, _src = member_out_of_range_info(mv, service=service)
             if zip_code:
                 affected_members += 1
                 if mv.enrollment_id:

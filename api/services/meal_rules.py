@@ -141,7 +141,7 @@ def apply_to_member(profile, *, save=True):
     True only on an ACTIVE -> OUT_OF_ORBIT transition (so the caller can emit a
     single timeline event)."""
     # Local import avoids an import cycle between services modules.
-    from api.services.service_area import profile_excluded_zip
+    from api.services.service_area import profile_out_of_range_zip
 
     result = resolve_kitchen_meal(profile.menu_type, profile.food_allergies)
     # Preserve a member the automatic rule must never reactivate: a manual PAUSE,
@@ -157,7 +157,7 @@ def apply_to_member(profile, *, save=True):
     # the member out of service even when the meal rule alone could fulfill them.
     # A ZIP outside coverage is Out of Range (a distinct status); a dietary/kitchen
     # fulfillment failure is Out of Orbit.
-    zip_excluded = bool(profile_excluded_zip(profile))
+    zip_excluded = bool(profile_out_of_range_zip(profile))
     out = zip_excluded or result.out_of_orbit
     if out:
         profile.status = (
@@ -234,7 +234,7 @@ def reconcile_member_kitchen_output(
         member_coverage_for_kitchen,
         serving_kitchens_for_member,
     )
-    from api.services.service_area import SERVICE_AREA_REASON, profile_excluded_zip
+    from api.services.service_area import SERVICE_AREA_REASON, profile_out_of_range_zip
 
     was_out = profile.status in (MemberStatus.OUT_OF_ORBIT, MemberStatus.OUT_OF_RANGE)
     out, reason, meal_type, notes = False, "", "", ""
@@ -245,7 +245,7 @@ def reconcile_member_kitchen_output(
     # Delivery Coverage Eligibility Check (highest priority): a member whose
     # delivery/primary ZIP is outside the coverage area is Out of Range regardless
     # of their menu/allergy fulfillment, and stays that way across re-runs.
-    if profile_excluded_zip(profile):
+    if profile_out_of_range_zip(profile):
         out, reason, out_of_range = True, SERVICE_AREA_REASON, True
     elif not (profile.menu_type or "").strip():
         out, reason = True, "No menu type assigned yet."

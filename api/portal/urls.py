@@ -160,8 +160,6 @@ from .views_activity import ActivityFiltersView, ActivityLogView
 from .views_service_area import (
     AllowedStateDetailView,
     AllowedStatesView,
-    ExcludedZipCodeDetailView,
-    ExcludedZipCodesView,
     ServiceZipCodeDetailView,
     ServiceZipCodesView,
 )
@@ -445,17 +443,6 @@ urlpatterns = [
         "settings/unite-us-agents/<uuid:agent_id>/",
         UniteUsAgentDetailView.as_view(),
         name="portal-unite-us-agent-detail",
-    ),
-    # Settings > Excluded ZIP Codes: delivery-coverage exclusion list
-    path(
-        "settings/excluded-zip-codes/",
-        ExcludedZipCodesView.as_view(),
-        name="portal-excluded-zip-codes",
-    ),
-    path(
-        "settings/excluded-zip-codes/<int:zip_id>/",
-        ExcludedZipCodeDetailView.as_view(),
-        name="portal-excluded-zip-code-detail",
     ),
     # Settings > Service ZIP Codes: PHS service-area whitelist (add/remove/toggle)
     path(

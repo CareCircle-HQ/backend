@@ -36,7 +36,7 @@ class Command(BaseCommand):
     def handle(self, *args, **opts):
         from api.models import EnrollmentStage, MemberDietaryProfile, MemberStatus
         from api.services.eligibility import apply_out_of_range_ineligibility
-        from api.services.service_area import excluded_zips, member_excluded_info
+        from api.services.service_area import service_zips, member_out_of_range_info
 
         dry_run = not opts["apply"]
         limit = opts["limit"]
@@ -51,7 +51,7 @@ class Command(BaseCommand):
             .select_related("client", "enrollment")
             .order_by("client_id")
         )
-        excluded = excluded_zips()
+        service = service_zips()
 
         # Dedupe to one entry per client (apply_out_of_range_ineligibility pauses
         # ALL of a client's live profiles + sets the client Not Eligible once).
@@ -61,7 +61,7 @@ class Command(BaseCommand):
             if not mv.client_id or mv.client_id in seen:
                 continue
             seen.add(mv.client_id)
-            zip_code, source = member_excluded_info(mv, excluded=excluded)
+            zip_code, source = member_out_of_range_info(mv, service=service)
             targets.append((mv, zip_code, source))
         if limit:
             targets = targets[:limit]

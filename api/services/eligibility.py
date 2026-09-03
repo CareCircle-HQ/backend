@@ -106,16 +106,16 @@ def address_range_reason(client, *, zips=None, states=None):
     """Ineligibility reason when a primary/delivery address is Out of Range
     (ZIP or State), or "". Checks the ZIP against the excluded-ZIP list and the
     state against the served-states allow-list."""
-    from api.services.service_area import excluded_zips, is_zip_excluded
+    from api.services.service_area import service_zips, is_zip_out_of_range
     from api.services.state_area import allowed_state_codes, is_state_allowed
 
     if zips is None:
-        zips = excluded_zips()
+        zips = service_zips()
     if states is None:
         states = allowed_state_codes()
     for a in _range_addresses(client):
         label = (a.type or "address").replace("_", " ")
-        if a.zip and is_zip_excluded(a.zip, excluded=zips):
+        if a.zip and is_zip_out_of_range(a.zip, service=zips):
             return f"{label} ZIP {(a.zip or '').strip()[:5]} is outside the coverage area"
         if a.state and not is_state_allowed(a.state, allowed=states):
             return f"{label} state {a.state} is not served"

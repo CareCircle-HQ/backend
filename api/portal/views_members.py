@@ -510,12 +510,12 @@ def _enforce_delivery_coverage(enrollment, agent):
     """
     from ..services.eligibility import apply_out_of_range_ineligibility
     from ..services.service_area import (
-        excluded_zips,
-        member_excluded_info,
+        service_zips,
+        member_out_of_range_info,
         out_of_range_ticket_reason,
     )
 
-    excluded = excluded_zips()
+    service = service_zips()
     # Portal agents are Agents, not Django Users, so there is no StageEvent.actor
     # User to attribute -- pass the agent NAME as the string label used on the
     # note / timeline (StageEvent is logged as an automatic system transition).
@@ -530,7 +530,7 @@ def _enforce_delivery_coverage(enrollment, agent):
         return name or (str(c.pk) if c else "Member")
 
     for mv in enrollment.member_profiles.select_related("client").all():
-        offending_zip, source = member_excluded_info(mv, excluded=excluded)
+        offending_zip, source = member_out_of_range_info(mv, service=service)
         if not offending_zip:
             continue
         # Skip terminal off-boarded members; everyone else in the household shares
@@ -4160,9 +4160,9 @@ class MemberHouseholdView(PortalAPIView):
         # (Paused members + a Case Closure ticket). This is a sticky off-ramp --
         # editing the address back to a serviceable ZIP does NOT auto-restore
         # service; an agent must resolve the Not-Eligible state.
-        from ..services.service_area import is_zip_excluded
+        from ..services.service_area import is_zip_out_of_range
         coverage = None
-        if is_zip_excluded(addr.zip):
+        if is_zip_out_of_range(addr.zip):
             coverage = _enforce_delivery_coverage(enr, agent)
         resp = {
             "street": addr.street, "unit": addr.unit, "city": addr.city,

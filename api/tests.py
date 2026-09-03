@@ -3891,16 +3891,17 @@ class RemovalAndVerificationGuardsTest(TestCase):
         from rest_framework.test import APIRequestFactory
 
         from .models import (
-            Address, AddressType, ClientStage, ExcludedZipCode, Insurance,
+            Address, AddressType, ClientStage, Insurance, ServiceZipCode,
         )
         from .portal.views_members import MemberVerificationCreateView
 
         client = self._client("Ora", "Range")
         self._internal_case(client)
         # Valid medical insurance (blank expiry => active) so the ONLY hard gate
-        # that can fire is the out-of-range address.
+        # that can fire is the out-of-range address. Whitelist is non-empty (10001)
+        # but ZIP 11209 is absent -> out of range.
+        ServiceZipCode.objects.get_or_create(zip="10001", defaults={"is_active": True})
         Insurance.objects.create(client=client, plan_name="P", external_member_id="1")
-        ExcludedZipCode.objects.create(zip="11209")
         Address.objects.create(
             client=client, type=AddressType.CURRENT, zip="11209", street="1 St",
         )
@@ -4338,9 +4339,9 @@ class DeliveryCoverageEligibilityTest(TestCase):
     (only if the meal rule also passes)."""
 
     def setUp(self):
-        from .models import ExcludedZipCode
-
-        ExcludedZipCode.objects.get_or_create(zip="11209")
+        from .models import ServiceZipCode
+        # Whitelist: 10001 is served; 11209 is intentionally absent -> out of range.
+        ServiceZipCode.objects.get_or_create(zip="10001", defaults={"is_active": True})
 
     def _profile(self, zip_code, *, primary_zip=None, status=None, menu_type="Standard"):
         from .models import (
@@ -7764,8 +7765,8 @@ class KitchenAwareMealRuleTest(TestCase):
         self.assertEqual(mv.kitchen_meal_type, "Kosher")
 
 
-class ExcludedZipSettingsTest(TestCase):
-    """Settings CRUD for the excluded-ZIP list."""
+class ServiceZipSettingsTest(TestCase):
+    """Settings CRUD for the service-area ZIP whitelist."""
 
     def setUp(self):
         self.agent = Agent.objects.create(
@@ -7780,13 +7781,13 @@ class ExcludedZipSettingsTest(TestCase):
         self.api.credentials(HTTP_AUTHORIZATION=f"Bearer {access}")
 
     def test_add_reject_duplicate_and_delete(self):
-        from .models import ExcludedZipCode
+        from .models import ServiceZipCode
 
-        url = reverse("portal-excluded-zip-codes")
+        url = "/api/portal/settings/service-zip-codes/"
         # Invalid ZIP.
         self.assertEqual(self.api.post(url, {"zip": "abc"}, format="json").status_code, 400)
         # Add valid.
-        resp = self.api.post(url, {"zip": "11250", "label": "Test"}, format="json")
+        resp = self.api.post(url, {"zip": "11250", "borough": "Brooklyn"}, format="json")
         self.assertEqual(resp.status_code, 201, resp.content)
         zid = resp.json()["id"]
         # Duplicate rejected.
@@ -7794,9 +7795,8 @@ class ExcludedZipSettingsTest(TestCase):
         # Listed.
         self.assertTrue(any(z["zip"] == "11250" for z in self.api.get(url).json()["results"]))
         # Delete.
-        det = reverse("portal-excluded-zip-code-detail", kwargs={"zip_id": zid})
-        self.assertEqual(self.api.delete(det).status_code, 204)
-        self.assertFalse(ExcludedZipCode.objects.filter(zip="11250").exists())
+        self.assertEqual(self.api.delete(f"{url}{zid}/").status_code, 204)
+        self.assertFalse(ServiceZipCode.objects.filter(zip="11250").exists())
 
 
 class RestoreOutOfRangeMemberTest(TestCase):
@@ -7805,9 +7805,9 @@ class RestoreOutOfRangeMemberTest(TestCase):
     is now serviceable, otherwise refuses."""
 
     def setUp(self):
-        from .models import ExcludedZipCode
-
-        ExcludedZipCode.objects.get_or_create(zip="11209")
+        from .models import ServiceZipCode
+        # Whitelist non-empty (10001 served); 11209 absent -> out of range.
+        ServiceZipCode.objects.get_or_create(zip="10001", defaults={"is_active": True})
         self.agent = Agent.objects.create(
             name="R Agent", agent_code="911", group="CS"
         )
@@ -10809,12 +10809,13 @@ class MemberEligibilityTest(TestCase):
 
     def test_zip_out_of_range_is_ineligible(self):
         from .models import (
-            Address, AddressType, ClientStage, ExcludedZipCode, Insurance,
+            Address, AddressType, ClientStage, Insurance, ServiceZipCode,
         )
 
         c = self._client()
         Insurance.objects.create(client=c, plan_name="P", external_member_id="1")
-        ExcludedZipCode.objects.create(zip="11209")
+        # Whitelist non-empty (10001); ZIP 11209 absent -> out of range.
+        ServiceZipCode.objects.get_or_create(zip="10001", defaults={"is_active": True})
         Address.objects.create(
             client=c, type=AddressType.CURRENT, zip="11209", state="NY"
         )
