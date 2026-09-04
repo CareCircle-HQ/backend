@@ -1155,6 +1155,16 @@ class MemberDetailSerializer(serializers.Serializer):
             (a for a in client.addresses.all() if a.type == "current"),
             next(iter(client.addresses.all()), None),
         )
+        # Which addresses the eligibility gate judges + whether each is out of
+        # range, so the UI can flag the exact row that blocks the member.
+        from api.services.service_area import is_zip_out_of_range, service_zips
+
+        _svc_zips = service_zips()
+        _gate_addr_types = {"current", "home", "delivery"}
+        _addr_out_of_range = lambda a: (
+            (a.type or "").lower() in _gate_addr_types
+            and is_zip_out_of_range(a.zip, service=_svc_zips)
+        )
         return {
             "core": {
                 "id": str(client.client_id),
@@ -1325,6 +1335,24 @@ class MemberDetailSerializer(serializers.Serializer):
             }
             if current_addr
             else None,
+            # Every address on file (home / delivery / mailing / current / work),
+            # so the Overview tab can show them all -- a stale out-of-range row
+            # here is exactly what the eligibility gate judges.
+            "addresses": [
+                {
+                    "type": a.type or "",
+                    "type_label": (a.type or "").replace("_", " ").title(),
+                    "street": a.street or "",
+                    "unit": a.unit or "",
+                    "city": a.city or "",
+                    "county": a.county or "",
+                    "state": a.state or "",
+                    "zip": a.zip or "",
+                    "notes": a.notes or "",
+                    "out_of_range": _addr_out_of_range(a),
+                }
+                for a in client.addresses.all()
+            ],
             "flags": member_flags(client),
             "care_team": {
                 "case_manager": client.agent_name,
