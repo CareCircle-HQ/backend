@@ -5727,6 +5727,56 @@ class VerificationDashboardMissingCaseTest(TestCase):
         self.assertNotIn(str(c1.client_id), ids)
 
 
+class ClientEligibilityWarningsViewTest(TestCase):
+    """Extension Profile-tab eligibility warnings endpoint: out-of-range ZIP,
+    invalid Medicaid type, no active insurance, no social care coverage."""
+
+    def _api(self):
+        from rest_framework.test import APIClient
+        from rest_framework_simplejwt.tokens import AccessToken
+
+        from .models import Agent
+        a = Agent.objects.create(name="Ext", agent_code=str(uuid.uuid4())[:8], group="CS")
+        acc = AccessToken(); acc["agent_id"] = str(a.id); acc["agent_code"] = a.agent_code
+        api = APIClient(); api.credentials(HTTP_AUTHORIZATION=f"Bearer {acc}")
+        return api
+
+    def _codes(self, client_id):
+        resp = self._api().get(f"/api/clients/{client_id}/eligibility-warnings/")
+        self.assertEqual(resp.status_code, 200, resp.content)
+        return {w["code"] for w in resp.data["warnings"]}
+
+    def test_clean_client_no_warnings(self):
+        from .models import Address, AddressType, Client, Insurance, ServiceZipCode
+        ServiceZipCode.objects.get_or_create(zip="10001", defaults={"is_active": True})
+        c = Client.objects.create(client_id=str(uuid.uuid4()), first_name="A", last_name="B")
+        Insurance.objects.create(client=c, plan_name="Fidelis Medicaid", external_member_id="1")
+        Address.objects.create(client=c, type=AddressType.CURRENT, zip="10001")
+        from .models import SocialCareCoverage
+        SocialCareCoverage.objects.create(client=c, plan_name="SCC")
+        codes = self._codes(c.client_id)
+        self.assertNotIn("out_of_range_zip", codes)
+        self.assertNotIn("no_active_insurance", codes)
+        self.assertNotIn("no_social_care_coverage", codes)
+
+    def test_flags_out_of_range_and_missing_coverage(self):
+        from .models import Address, AddressType, Client, ServiceZipCode
+        ServiceZipCode.objects.get_or_create(zip="10001", defaults={"is_active": True})
+        c = Client.objects.create(client_id=str(uuid.uuid4()), first_name="A", last_name="B")
+        Address.objects.create(client=c, type=AddressType.CURRENT, zip="11209")  # not served
+        codes = self._codes(c.client_id)
+        self.assertIn("out_of_range_zip", codes)
+        self.assertIn("no_active_insurance", codes)       # no insurance on file
+        self.assertIn("no_social_care_coverage", codes)   # none on file
+
+    def test_flags_invalid_medicaid_type(self):
+        from .models import Client, Insurance, ServiceZipCode
+        ServiceZipCode.objects.get_or_create(zip="10001", defaults={"is_active": True})
+        c = Client.objects.create(client_id=str(uuid.uuid4()), first_name="A", last_name="B")
+        Insurance.objects.create(client=c, plan_name="Senior Health MLTC", external_member_id="1")
+        self.assertIn("invalid_medicaid_type", self._codes(c.client_id))
+
+
 class HyrosEnrollmentPushTest(TestCase):
     """Meta Ads members with an internal-service case are pushed to Hyros as
     'Enrolled', once per member, only when the integration is configured."""

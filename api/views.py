@@ -240,6 +240,74 @@ class StateCheckView(APIView):
         })
 
 
+class ClientEligibilityWarningsView(APIView):
+    """Non-blocking eligibility heads-up warnings for the extension Profile tab.
+
+    GET /api/clients/<client_id>/eligibility-warnings/ ->
+        {"warnings": [{"code": ..., "title": ..., "detail": ...}, ...]}
+
+    Runs the authoritative eligibility checks so the extension never re-implements
+    (and drifts from) the Medicaid-type / insurance / coverage / service-area
+    rules. Only the conditions that apply are returned; an empty list = all clear.
+    These are warnings only -- they never block saving.
+    """
+
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request, client_id):
+        from .models import Client
+        from .services.eligibility import (
+            _range_addresses,
+            medicaid_type_reason,
+            medical_insurance_reason,
+            social_coverage_reason,
+        )
+        from .services.service_area import is_zip_out_of_range, service_zips
+
+        client = Client.objects.filter(pk=client_id).first()
+        if client is None:
+            return Response({"warnings": []})
+
+        warnings = []
+
+        # Out-of-range ZIP: any primary/delivery address ZIP not in the active
+        # ServiceZipCode whitelist (blank/malformed also counts once configured).
+        service = service_zips()
+        for a in _range_addresses(client):
+            if is_zip_out_of_range(a.zip, service=service):
+                z = (a.zip or "").strip()[:5] or "(blank)"
+                warnings.append({
+                    "code": "out_of_range_zip",
+                    "title": "Out of Range ZIP Code",
+                    "detail": f"The {(a.type or 'address').replace('_', ' ')} ZIP "
+                              f"{z} is outside the delivery coverage area.",
+                })
+                break
+
+        mt = medicaid_type_reason(client)
+        if mt:
+            warnings.append({
+                "code": "invalid_medicaid_type",
+                "title": "Invalid Medicaid Type", "detail": mt,
+            })
+
+        ins = medical_insurance_reason(client)
+        if ins:
+            warnings.append({
+                "code": "no_active_insurance",
+                "title": "No Active Insurance", "detail": ins,
+            })
+
+        scc = social_coverage_reason(client)
+        if scc:
+            warnings.append({
+                "code": "no_social_care_coverage",
+                "title": "No Social Care Coverage", "detail": scc,
+            })
+
+        return Response({"warnings": warnings})
+
+
 class BulkUpsertMixin:
     """Adds a /bulk/ action accepting a list of records for batch upsert.
 

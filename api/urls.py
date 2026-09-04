@@ -18,6 +18,7 @@ from .views import (
     ProgramViewSet,
     ProviderViewSet,
     RegisterView,
+    ClientEligibilityWarningsView,
     ScreeningViewSet,
     StateCheckView,
     ZipCodeCheckView,
@@ -135,6 +136,11 @@ urlpatterns = [
     path("health/", HealthView.as_view(), name="health"),
     path("zipcodes/check/", ZipCodeCheckView.as_view(), name="zipcode-check"),
     path("states/check/", StateCheckView.as_view(), name="state-check"),
+    path(
+        "clients/<uuid:client_id>/eligibility-warnings/",
+        ClientEligibilityWarningsView.as_view(),
+        name="client-eligibility-warnings",
+    ),
     # Program eligibilities available for a household member
     # (?member=<id>, optional ?program=&is_eligible=&model_version=)
     path(
