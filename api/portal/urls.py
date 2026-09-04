@@ -51,6 +51,7 @@ from .views_members import (
     MemberAssignKitchenView,
     MemberCadenceView,
     MemberCaseAuditView,
+    MemberCaseCloseView,
     MemberCaseDetailView,
     MemberCaseHistoryView,
     MemberCasesView,
@@ -127,6 +128,7 @@ from .views_orders import (
     KitchensListView,
     PrepareMembersForPOView,
     PurchaseOrderDeliveryOrdersView,
+    PurchaseOrderNotesView,
     PurchaseOrderGenerateView,
     PurchaseOrderPreviewLateView,
     PurchaseOrderPreviewRefreshView,
@@ -158,8 +160,6 @@ from .views_activity import ActivityFiltersView, ActivityLogView
 from .views_service_area import (
     AllowedStateDetailView,
     AllowedStatesView,
-    ExcludedZipCodeDetailView,
-    ExcludedZipCodesView,
     ServiceZipCodeDetailView,
     ServiceZipCodesView,
 )
@@ -322,6 +322,11 @@ urlpatterns = [
         MemberCaseDetailView.as_view(),
     ),
     path(
+        "members/<uuid:client_id>/cases/<uuid:case_id>/close/",
+        MemberCaseCloseView.as_view(),
+        name="portal-member-case-close",
+    ),
+    path(
         "members/<uuid:client_id>/refresh-uniteus/",
         MemberUniteUsRefreshView.as_view(),
         name="portal-member-refresh-uniteus",
@@ -388,6 +393,7 @@ urlpatterns = [
     path("purchase-orders/generate/", PurchaseOrderGenerateView.as_view()),
     path("purchase-orders/<uuid:po_id>/split/", PurchaseOrderSplitView.as_view()),
     path("purchase-orders/<uuid:po_id>/delivery-orders/", PurchaseOrderDeliveryOrdersView.as_view()),
+    path("purchase-orders/<uuid:po_id>/notes/", PurchaseOrderNotesView.as_view()),
     path("purchase-orders/<uuid:po_id>/cancel/", CancelPurchaseOrderView.as_view()),
     path("purchase-orders/<uuid:po_id>/send-to-kitchen/", SendToKitchenView.as_view()),
     path("purchase-orders/<uuid:po_id>/kitchen-export/", KitchenExportView.as_view()),
@@ -437,17 +443,6 @@ urlpatterns = [
         "settings/unite-us-agents/<uuid:agent_id>/",
         UniteUsAgentDetailView.as_view(),
         name="portal-unite-us-agent-detail",
-    ),
-    # Settings > Excluded ZIP Codes: delivery-coverage exclusion list
-    path(
-        "settings/excluded-zip-codes/",
-        ExcludedZipCodesView.as_view(),
-        name="portal-excluded-zip-codes",
-    ),
-    path(
-        "settings/excluded-zip-codes/<int:zip_id>/",
-        ExcludedZipCodeDetailView.as_view(),
-        name="portal-excluded-zip-code-detail",
     ),
     # Settings > Service ZIP Codes: PHS service-area whitelist (add/remove/toggle)
     path(

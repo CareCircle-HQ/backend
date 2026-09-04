@@ -147,12 +147,12 @@ def all_members_row_context(max_phones=0):
     lead-source labels, team map, screening-agent map) once per export -- passed to
     every row. ``max_phones`` sizes the per-number Phone columns."""
     from ..models import UniteUsAgent
-    from ..services.service_area import excluded_zips
+    from ..services.service_area import service_zips
     from ..services.state_area import allowed_state_codes
     from .views_reports import _lead_source_label_map
     agents = list(UniteUsAgent.objects.all())
     return {
-        "zips": excluded_zips(),
+        "zips": service_zips(),
         "states": allowed_state_codes(),
         "lead_labels": _lead_source_label_map(),
         "team_map": {

@@ -2,6 +2,8 @@ import uuid
 from datetime import timedelta
 from types import SimpleNamespace
 
+from unittest import mock
+
 from django.test import SimpleTestCase, TestCase, override_settings
 from django.urls import reverse
 from django.utils import timezone
@@ -3889,16 +3891,17 @@ class RemovalAndVerificationGuardsTest(TestCase):
         from rest_framework.test import APIRequestFactory
 
         from .models import (
-            Address, AddressType, ClientStage, ExcludedZipCode, Insurance,
+            Address, AddressType, ClientStage, Insurance, ServiceZipCode,
         )
         from .portal.views_members import MemberVerificationCreateView
 
         client = self._client("Ora", "Range")
         self._internal_case(client)
         # Valid medical insurance (blank expiry => active) so the ONLY hard gate
-        # that can fire is the out-of-range address.
+        # that can fire is the out-of-range address. Whitelist is non-empty (10001)
+        # but ZIP 11209 is absent -> out of range.
+        ServiceZipCode.objects.get_or_create(zip="10001", defaults={"is_active": True})
         Insurance.objects.create(client=client, plan_name="P", external_member_id="1")
-        ExcludedZipCode.objects.create(zip="11209")
         Address.objects.create(
             client=client, type=AddressType.CURRENT, zip="11209", street="1 St",
         )
@@ -4336,9 +4339,9 @@ class DeliveryCoverageEligibilityTest(TestCase):
     (only if the meal rule also passes)."""
 
     def setUp(self):
-        from .models import ExcludedZipCode
-
-        ExcludedZipCode.objects.get_or_create(zip="11209")
+        from .models import ServiceZipCode
+        # Whitelist: 10001 is served; 11209 is intentionally absent -> out of range.
+        ServiceZipCode.objects.get_or_create(zip="10001", defaults={"is_active": True})
 
     def _profile(self, zip_code, *, primary_zip=None, status=None, menu_type="Standard"):
         from .models import (
@@ -4415,6 +4418,20 @@ class DeliveryCoverageEligibilityTest(TestCase):
         note = Note.objects.filter(client=dep, source=NoteSource.SYSTEM).first()
         self.assertIsNotNone(note)
         self.assertIn("11209", note.body)
+
+    def test_blank_zip_is_out_of_range(self):
+        # A present delivery address with a blank ZIP is out of range (fail-closed)
+        # once the whitelist is configured.
+        from .models import MemberStatus
+        from .services.meal_rules import reconcile_member_kitchen_output
+        from .services.service_area import SERVICE_AREA_REASON
+
+        mv = self._profile("")
+        out, _became, reason = reconcile_member_kitchen_output(mv, None, save=True)
+        self.assertTrue(out)
+        self.assertEqual(reason, SERVICE_AREA_REASON)
+        mv.refresh_from_db()
+        self.assertEqual(mv.status, MemberStatus.OUT_OF_RANGE)
 
     def test_reconcile_active_for_serviceable_zip(self):
         from .models import MemberStatus
@@ -5708,6 +5725,225 @@ class VerificationDashboardMissingCaseTest(TestCase):
         ids = {r["id"] for r in lst["results"]}
         self.assertIn(str(c2.client_id), ids)
         self.assertNotIn(str(c1.client_id), ids)
+
+
+class HyrosEnrollmentPushTest(TestCase):
+    """Meta Ads members with an internal-service case are pushed to Hyros as
+    'Enrolled', once per member, only when the integration is configured."""
+
+    def _meta_client(self, lead_source="META ADS", consent=True, with_case=True):
+        from .models import Case, CaseStatus, CaseType, Client
+        c = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="John", last_name="Doe",
+            client_email_address="john@doe.com", lead_source=lead_source,
+            consent_accepted=consent,
+        )
+        if with_case:
+            Case.objects.create(
+                case_id=str(uuid.uuid4()), client=c,
+                case_type=CaseType.INTERNAL_SERVICE, case_status=CaseStatus.OPEN,
+            )
+        return c
+
+    @override_settings(HYROS_API_KEY="test-key")
+    @mock.patch("api.services.hyros.requests.post")
+    def test_push_success_stamps_and_sends_payload(self, mock_post):
+        mock_post.return_value = mock.Mock(status_code=200, text="ok")
+        c = self._meta_client()
+        from .services.hyros import push_enrollment
+        push_enrollment(str(c.client_id))
+        c.refresh_from_db()
+        self.assertIsNotNone(c.hyros_enrolled_pushed_at)
+        _, kwargs = mock_post.call_args
+        body = kwargs["json"]
+        self.assertEqual(body["email"], "john@doe.com")
+        self.assertEqual(body["firstName"], "John")
+        self.assertEqual(body["lastName"], "Doe")
+        self.assertEqual(body["tags"], ["!enrolled"])
+        self.assertEqual(body["stage"], "Enrolled")
+        self.assertEqual(body["adOptimizationConsent"], "GRANTED")
+        self.assertEqual(kwargs["headers"]["API-Key"], "test-key")
+
+    @override_settings(HYROS_API_KEY="test-key")
+    @mock.patch("api.services.hyros.requests.post")
+    def test_consent_denied_when_not_consented(self, mock_post):
+        mock_post.return_value = mock.Mock(status_code=200, text="ok")
+        c = self._meta_client(consent=False)
+        from .services.hyros import push_enrollment
+        push_enrollment(str(c.client_id))
+        self.assertEqual(mock_post.call_args.kwargs["json"]["adOptimizationConsent"], "DENIED")
+
+    @override_settings(HYROS_API_KEY="test-key")
+    @mock.patch("api.services.hyros.requests.post")
+    def test_no_internal_case_is_skipped(self, mock_post):
+        c = self._meta_client(with_case=False)
+        from .services.hyros import push_enrollment
+        push_enrollment(str(c.client_id))
+        mock_post.assert_not_called()
+        c.refresh_from_db(); self.assertIsNone(c.hyros_enrolled_pushed_at)
+
+    @override_settings(HYROS_API_KEY="test-key")
+    @mock.patch("api.services.hyros.requests.post")
+    def test_non_meta_ads_is_skipped(self, mock_post):
+        c = self._meta_client(lead_source="Brooklyn-01")
+        from .services.hyros import push_enrollment
+        push_enrollment(str(c.client_id))
+        mock_post.assert_not_called()
+
+    @override_settings(HYROS_API_KEY="")
+    @mock.patch("api.services.hyros.requests.post")
+    def test_integration_off_without_key(self, mock_post):
+        c = self._meta_client()
+        from .services.hyros import push_enrollment
+        push_enrollment(str(c.client_id))
+        mock_post.assert_not_called()
+
+    @override_settings(HYROS_API_KEY="test-key")
+    @mock.patch("api.services.hyros.requests.post")
+    def test_already_pushed_not_repushed(self, mock_post):
+        from django.utils import timezone
+        c = self._meta_client()
+        c.hyros_enrolled_pushed_at = timezone.now()
+        c.save(update_fields=["hyros_enrolled_pushed_at"])
+        from .services.hyros import push_enrollment
+        push_enrollment(str(c.client_id))
+        mock_post.assert_not_called()
+
+
+class PurchaseOrderNotesTest(TestCase):
+    """Per-PO note history: POST adds a note stamped with the author agent +
+    created_at; GET lists newest-first; empty body is rejected."""
+
+    def _api(self):
+        from rest_framework.test import APIClient
+        from rest_framework_simplejwt.tokens import AccessToken
+
+        from .models import Agent
+        a = Agent.objects.create(name="Loggy Logistics", agent_code=str(uuid.uuid4())[:8], group="Logistics")
+        acc = AccessToken()
+        acc["agent_id"] = str(a.id); acc["agent_code"] = a.agent_code
+        acc["agent_name"] = a.name; acc["agent_group"] = a.group
+        api = APIClient(); api.credentials(HTTP_AUTHORIZATION=f"Bearer {acc}")
+        return api, a
+
+    def _po(self):
+        from .models import PurchaseOrder
+        return PurchaseOrder.objects.create(status="draft")
+
+    def test_add_and_list_note(self):
+        po = self._po()
+        api, agent = self._api()
+        url = f"/api/portal/purchase-orders/{po.pk}/notes/"
+        resp = api.post(url, {"body": "Called the kitchen about the delay."}, format="json")
+        self.assertEqual(resp.status_code, 201, resp.content)
+        self.assertEqual(resp.data["author_name"], agent.name)
+        self.assertTrue(resp.data["created_at"])
+        # GET returns it.
+        listed = api.get(url)
+        self.assertEqual(listed.status_code, 200)
+        self.assertEqual(len(listed.data), 1)
+        self.assertEqual(listed.data[0]["body"], "Called the kitchen about the delay.")
+
+    def test_empty_body_rejected(self):
+        po = self._po()
+        api, _ = self._api()
+        resp = api.post(f"/api/portal/purchase-orders/{po.pk}/notes/", {"body": "  "}, format="json")
+        self.assertEqual(resp.status_code, 400)
+
+
+class MemberCaseCloseTest(TestCase):
+    """Manager-only close of an internal-service case whose authorization was
+    never requested / blank."""
+
+    def _api(self, group="Management"):
+        from rest_framework.test import APIClient
+        from rest_framework_simplejwt.tokens import AccessToken
+
+        from .models import Agent
+        a = Agent.objects.create(name="Mgr", agent_code=str(uuid.uuid4())[:8], group=group)
+        acc = AccessToken()
+        acc["agent_id"] = str(a.id); acc["agent_code"] = a.agent_code
+        acc["agent_name"] = a.name; acc["agent_group"] = a.group
+        api = APIClient(); api.credentials(HTTP_AUTHORIZATION=f"Bearer {acc}")
+        return api
+
+    def _case(self, **kw):
+        from .models import Case, CaseType, Client, CaseStatus
+        c = Client.objects.create(client_id=str(uuid.uuid4()), first_name="A", last_name="B")
+        defaults = dict(
+            client=c, case_type=CaseType.INTERNAL_SERVICE,
+            case_status=CaseStatus.OPEN, service_authorization_status="",
+        )
+        defaults.update(kw)
+        return c, Case.objects.create(case_id=str(uuid.uuid4()), **defaults)
+
+    def _url(self, c, case):
+        return f"/api/portal/members/{c.client_id}/cases/{case.case_id}/close/"
+
+    def test_manager_closes_blank_auth_internal_case(self):
+        from .models import CaseStatus
+        c, case = self._case()
+        resp = self._api().post(self._url(c, case))
+        self.assertEqual(resp.status_code, 200, resp.content)
+        case.refresh_from_db()
+        self.assertEqual(case.case_status, CaseStatus.CLOSED)
+        self.assertIsNotNone(case.case_closed_at)
+
+    def test_never_requested_is_closable(self):
+        from .models import CaseStatus, ServiceAuthorizationStatus
+        c, case = self._case(service_authorization_status=ServiceAuthorizationStatus.NEVER_REQUESTED)
+        self.assertEqual(self._api().post(self._url(c, case)).status_code, 200)
+        case.refresh_from_db()
+        self.assertEqual(case.case_status, CaseStatus.CLOSED)
+
+    def test_non_manager_forbidden(self):
+        c, case = self._case()
+        self.assertEqual(self._api(group="CS").post(self._url(c, case)).status_code, 403)
+
+    def test_real_auth_refused(self):
+        from .models import ServiceAuthorizationStatus
+        c, case = self._case(service_authorization_status=ServiceAuthorizationStatus.APPROVED)
+        self.assertEqual(self._api().post(self._url(c, case)).status_code, 400)
+
+    def test_non_internal_service_refused(self):
+        from .models import CaseType
+        c, case = self._case(case_type=CaseType.NAVIGATION)
+        self.assertEqual(self._api().post(self._url(c, case)).status_code, 400)
+
+
+class CareTeamAgentWriteOnceTest(TestCase):
+    """The Care Team agent (Client.agent_code/agent_name) is write-once: the first
+    value assigned stays permanently; later writes never overwrite it. A record
+    that has none yet accepts the first write."""
+
+    def _save(self, client, data):
+        from .serializers import ClientSerializer
+        s = ClientSerializer(instance=client, data=data, partial=True)
+        s.is_valid(raise_exception=True)
+        s.save()
+        client.refresh_from_db()
+
+    def test_first_agent_is_permanent(self):
+        from .models import Client
+        c = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="A", last_name="B",
+            agent_code="100", agent_name="First Agent")
+        # A later write with a different agent must NOT change it.
+        self._save(c, {"agent_code": "200", "agent_name": "Second Agent"})
+        self.assertEqual(c.agent_code, "100")
+        self.assertEqual(c.agent_name, "First Agent")
+
+    def test_blank_record_accepts_first_write(self):
+        from .models import Client
+        c = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="C", last_name="D")  # no agent
+        self._save(c, {"agent_code": "300", "agent_name": "New Agent"})
+        self.assertEqual(c.agent_code, "300")
+        self.assertEqual(c.agent_name, "New Agent")
+        # ...and now it's locked.
+        self._save(c, {"agent_code": "400", "agent_name": "Later Agent"})
+        self.assertEqual(c.agent_code, "300")
+        self.assertEqual(c.agent_name, "New Agent")
 
 
 class BackfillEnrollmentAgentsTest(TestCase):
@@ -7543,8 +7779,8 @@ class KitchenAwareMealRuleTest(TestCase):
         self.assertEqual(mv.kitchen_meal_type, "Kosher")
 
 
-class ExcludedZipSettingsTest(TestCase):
-    """Settings CRUD for the excluded-ZIP list."""
+class ServiceZipSettingsTest(TestCase):
+    """Settings CRUD for the service-area ZIP whitelist."""
 
     def setUp(self):
         self.agent = Agent.objects.create(
@@ -7559,13 +7795,13 @@ class ExcludedZipSettingsTest(TestCase):
         self.api.credentials(HTTP_AUTHORIZATION=f"Bearer {access}")
 
     def test_add_reject_duplicate_and_delete(self):
-        from .models import ExcludedZipCode
+        from .models import ServiceZipCode
 
-        url = reverse("portal-excluded-zip-codes")
+        url = "/api/portal/settings/service-zip-codes/"
         # Invalid ZIP.
         self.assertEqual(self.api.post(url, {"zip": "abc"}, format="json").status_code, 400)
         # Add valid.
-        resp = self.api.post(url, {"zip": "11250", "label": "Test"}, format="json")
+        resp = self.api.post(url, {"zip": "11250", "borough": "Brooklyn"}, format="json")
         self.assertEqual(resp.status_code, 201, resp.content)
         zid = resp.json()["id"]
         # Duplicate rejected.
@@ -7573,9 +7809,8 @@ class ExcludedZipSettingsTest(TestCase):
         # Listed.
         self.assertTrue(any(z["zip"] == "11250" for z in self.api.get(url).json()["results"]))
         # Delete.
-        det = reverse("portal-excluded-zip-code-detail", kwargs={"zip_id": zid})
-        self.assertEqual(self.api.delete(det).status_code, 204)
-        self.assertFalse(ExcludedZipCode.objects.filter(zip="11250").exists())
+        self.assertEqual(self.api.delete(f"{url}{zid}/").status_code, 204)
+        self.assertFalse(ServiceZipCode.objects.filter(zip="11250").exists())
 
 
 class RestoreOutOfRangeMemberTest(TestCase):
@@ -7584,9 +7819,9 @@ class RestoreOutOfRangeMemberTest(TestCase):
     is now serviceable, otherwise refuses."""
 
     def setUp(self):
-        from .models import ExcludedZipCode
-
-        ExcludedZipCode.objects.get_or_create(zip="11209")
+        from .models import ServiceZipCode
+        # Whitelist non-empty (10001 served); 11209 absent -> out of range.
+        ServiceZipCode.objects.get_or_create(zip="10001", defaults={"is_active": True})
         self.agent = Agent.objects.create(
             name="R Agent", agent_code="911", group="CS"
         )
@@ -10588,12 +10823,13 @@ class MemberEligibilityTest(TestCase):
 
     def test_zip_out_of_range_is_ineligible(self):
         from .models import (
-            Address, AddressType, ClientStage, ExcludedZipCode, Insurance,
+            Address, AddressType, ClientStage, Insurance, ServiceZipCode,
         )
 
         c = self._client()
         Insurance.objects.create(client=c, plan_name="P", external_member_id="1")
-        ExcludedZipCode.objects.create(zip="11209")
+        # Whitelist non-empty (10001); ZIP 11209 absent -> out of range.
+        ServiceZipCode.objects.get_or_create(zip="10001", defaults={"is_active": True})
         Address.objects.create(
             client=c, type=AddressType.CURRENT, zip="11209", state="NY"
         )

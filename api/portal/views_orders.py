@@ -55,7 +55,7 @@ def _parse_uuid(value):
     except (TypeError, ValueError, AttributeError):
         return None
 
-PO_PREFETCH = ("delivery_orders", "kitchen", "delivery_company")
+PO_PREFETCH = ("delivery_orders", "kitchen", "delivery_company", "notes")
 
 
 class PurchaseOrdersView(PortalGenericAPIView):
@@ -178,6 +178,41 @@ class PurchaseOrderDeliveryOrdersView(PortalGenericAPIView):
             qs = qs.filter(cond)
         page = self.paginate_queryset(qs)
         return self.get_paginated_response(self.get_serializer(page, many=True).data)
+
+
+class PurchaseOrderNotesView(PortalAPIView):
+    """GET the note history for a PO (newest first) + POST to add a note. Each
+    note records the author agent + a timestamp."""
+
+    def get(self, request, po_id):
+        get_object_or_404(PurchaseOrder, pk=po_id)
+        from ..models import PurchaseOrderNote
+
+        notes = PurchaseOrderNote.objects.filter(
+            purchase_order_id=po_id
+        ).order_by("-created_at")
+        return Response(s.PortalPurchaseOrderNoteSerializer(notes, many=True).data)
+
+    def post(self, request, po_id):
+        from .base import current_agent
+        from ..models import PurchaseOrderNote
+
+        po = get_object_or_404(PurchaseOrder, pk=po_id)
+        body = (request.data.get("body") or "").strip()
+        if not body:
+            return Response(
+                {"error": "Note body is required."}, status=http.HTTP_400_BAD_REQUEST
+            )
+        agent = current_agent(request)
+        note = PurchaseOrderNote.objects.create(
+            purchase_order=po,
+            author_agent=agent,
+            author_name=agent.name if agent else "",
+            body=body,
+        )
+        return Response(
+            s.PortalPurchaseOrderNoteSerializer(note).data, status=http.HTTP_201_CREATED
+        )
 
 
 class SendToKitchenView(PortalAPIView):

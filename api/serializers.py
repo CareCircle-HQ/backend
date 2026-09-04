@@ -442,6 +442,16 @@ class ClientSerializer(serializers.ModelSerializer):
             _prior.consent_accepted
             or (_prior.consent_status or "").lower() == "accepted"
         )
+        # Care Team agent is WRITE-ONCE: once ``agent_code`` / ``agent_name`` is
+        # set, it stays for good -- later writes never overwrite it (the first
+        # care-team agent assigned to the member is permanent). Guarded per field;
+        # the import never sends these, so the first EXTENSION write that carries
+        # them wins. A brand-new record (_prior is None) is unaffected.
+        if _prior is not None:
+            for f in ("agent_code", "agent_name"):
+                if f in validated_data and (getattr(_prior, f, "") or "").strip():
+                    validated_data.pop(f)
+
         if survivor is not None:
             for k, v in validated_data.items():
                 setattr(survivor, k, v)
@@ -593,6 +603,10 @@ class ClientSerializer(serializers.ModelSerializer):
         # an Internal Service case is saved (see CaseSerializer), since a
         # household only matters once the client has an internal service to be
         # verified/delivered for.
+        # Meta Ads lead-tracking: push to Hyros as "Enrolled" once the member has
+        # an internal-service case (no-op unless configured + qualifying).
+        from api.services.hyros import maybe_enqueue_enrollment
+        maybe_enqueue_enrollment(client)
         return client
 
 
@@ -779,8 +793,8 @@ def sync_household_members(client, enrollment=None, agent=None):
         # outside the coverage area — the same block that already put the
         # existing members Out of Range — the new member inherits Out of Range
         # too, since a menu type can't fix a geographic block.
-        from .services.service_area import member_excluded_info, service_area_note_body
-        oor_zip, oor_source = member_excluded_info(profile)
+        from .services.service_area import member_out_of_range_info, service_area_note_body
+        oor_zip, oor_source = member_out_of_range_info(profile)
         # Attribute the acting agent (who added the member) so the note author
         # and the timeline actor show WHO performed the action instead of blank.
         agent_author = (agent.name if agent else "") or ""
@@ -1782,6 +1796,15 @@ class CaseSerializer(serializers.ModelSerializer):
             logger.exception(
                 "internal-service authorization reconcile failed for case %s", case_id
             )
+        # Meta Ads lead-tracking: saving an internal-service case may make a Meta
+        # Ads member newly "enrolled" -> push to Hyros (no-op unless configured
+        # + qualifying + not already pushed).
+        try:
+            if case.case_type == CaseType.INTERNAL_SERVICE and case.client_id:
+                from api.services.hyros import maybe_enqueue_enrollment
+                maybe_enqueue_enrollment(case.client)
+        except Exception:
+            logger.exception("Hyros enqueue (case save) failed for case %s", case_id)
         return case
 
 

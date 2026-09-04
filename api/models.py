@@ -363,6 +363,9 @@ class Client(models.Model):
     consent_status = models.CharField(max_length=20, blank=True)  # E-form: accepted/declined
     consented_at = models.DateTimeField(null=True, blank=True)
     consent_doc_url = models.URLField(blank=True)
+    # Set once we've pushed this member to Hyros as "Enrolled" (Meta Ads leads
+    # with an internal-service case). Guards the once-per-member push.
+    hyros_enrolled_pushed_at = models.DateTimeField(null=True, blank=True)
 
     # --- Lifecycle funnel (maintained by api.services.lifecycle) ---
     lifecycle_stage = models.CharField(
@@ -1995,7 +1998,8 @@ class MemberStatus(models.TextChoices):
     ACTIVE = "active", "Active"
     OUT_OF_ORBIT = "out_of_orbit", "Out of Orbit"
     # Set automatically when the member's DELIVERY or PRIMARY address ZIP is
-    # outside the service coverage area (the editable ExcludedZipCode list). Like
+    # outside the service coverage area (not in the active ServiceZipCode
+    # whitelist). Like
     # OUT_OF_ORBIT, out-of-range members are excluded from all delivery schedules
     # and Purchase Orders. Unlike Out of Orbit (a dietary/kitchen fulfillment
     # block), Out of Range also opens a Case Closure ticket and holds the whole
@@ -2939,30 +2943,6 @@ class UniteUsAgent(models.Model):
 
     def __str__(self):
         return f"{self.name or self.email or self.user_id}"
-
-
-class ExcludedZipCode(models.Model):
-    """A delivery ZIP code outside our service coverage area.
-
-    Editable from Settings (add/remove) so the service area can change without a
-    code change. Used by the Delivery Coverage Eligibility Check: a member whose
-    delivery-address ZIP is in this list is set Out of Orbit (reason
-    "Delivery Address Outside Coverage Area") and excluded from all delivery
-    schedules / Purchase Orders. Matched on the first 5 digits of the ZIP.
-    """
-
-    zip = models.CharField(max_length=5, unique=True, db_index=True)
-    # Optional free-text label (e.g. a neighborhood name) shown in Settings.
-    label = models.CharField(max_length=120, blank=True)
-    created_at = models.DateTimeField(auto_now_add=True)
-
-    class Meta:
-        ordering = ["zip"]
-        verbose_name = "Excluded ZIP code"
-        verbose_name_plural = "Excluded ZIP codes"
-
-    def __str__(self):
-        return self.zip
 
 
 class ServiceZipCode(models.Model):
@@ -4672,6 +4652,31 @@ class TicketNote(models.Model):
         return f"Note on ticket {self.ticket_id} by {self.author_name or 'system'}"
 
 
+class PurchaseOrderNote(models.Model):
+    """An agent note on a Purchase Order (Orders page). Note history: each row is
+    an immutable entry stamped with the author agent + when it was written."""
+
+    purchase_order = models.ForeignKey(
+        "PurchaseOrder", on_delete=models.CASCADE, related_name="notes"
+    )
+    # The agent who wrote the note; ``author_name`` is a snapshot so the row
+    # stays readable even if the agent record changes/clears.
+    author_agent = models.ForeignKey(
+        "Agent", on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="purchase_order_notes",
+    )
+    author_name = models.CharField(max_length=255, blank=True)
+    body = models.TextField()
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        indexes = [models.Index(fields=["purchase_order", "created_at"])]
+
+    def __str__(self):
+        return f"Note on PO {self.purchase_order_id} by {self.author_name or 'system'}"
+
+
 class TicketActivityAction(models.TextChoices):
     """What happened to a ticket, for the ticket activity/history feed."""
 
@@ -4900,6 +4905,11 @@ class EnrollmentAnalytics(models.Model):
     current_delivery_status = models.CharField(max_length=30, blank=True, db_index=True)
     last_po_delivery_status = models.CharField(max_length=30, blank=True)
     last_delivered_at = models.DateTimeField(null=True, blank=True, db_index=True)
+    # Delivery date of the member's most-recent PO-backed delivery order,
+    # REGARDLESS of delivered status (distinct from last_delivered_at, which is
+    # only the last order marked delivered). Powers the "Last PO Delivery Date"
+    # filter.
+    last_po_delivery_date = models.DateTimeField(null=True, blank=True, db_index=True)
     # True when the member has EVER been included in a generated Purchase Order
     # (has a DeliveryOrder line tied to a PO) -- regardless of delivery status.
     in_any_po = models.BooleanField(default=False, db_index=True)
@@ -4945,6 +4955,9 @@ class EnrollmentAnalytics(models.Model):
     case_type = models.CharField(max_length=20, blank=True, db_index=True)
     case_status = models.CharField(max_length=25, blank=True, db_index=True)
     auth_status = models.CharField(max_length=20, blank=True, db_index=True)
+    # Governing case's authorization window (approved window, else requested).
+    auth_start_date = models.DateTimeField(null=True, blank=True, db_index=True)
+    auth_end_date = models.DateTimeField(null=True, blank=True, db_index=True)
     case_opened_at = models.DateTimeField(null=True, blank=True, db_index=True)
     program_name = models.CharField(max_length=255, blank=True, db_index=True)
 
@@ -4968,6 +4981,10 @@ class EnrollmentAnalytics(models.Model):
     out_of_range = models.BooleanField(default=False, db_index=True)
     paused = models.BooleanField(default=False, db_index=True)
     pause_type = models.CharField(max_length=20, blank=True)
+    # When the member entered their current paused state -- member-status pause
+    # (MemberDietaryProfile.status_changed_at) or, for an On-Hold enrollment, the
+    # enrollment's stage_at. Null when not paused. Powers the "Pause Date" filter.
+    pause_date = models.DateTimeField(null=True, blank=True, db_index=True)
     verified_by_id_str = models.CharField(max_length=64, blank=True, db_index=True)
     requested_at = models.DateTimeField(null=True, blank=True, db_index=True)
     case_closed_at = models.DateTimeField(null=True, blank=True, db_index=True)

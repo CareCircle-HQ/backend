@@ -1,15 +1,18 @@
-"""Delivery Coverage Eligibility Check.
+"""Delivery Coverage Eligibility Check (service-area WHITELIST).
 
 Second eligibility process (alongside the Service Fulfillment / meal rules):
-verify a member's addresses are inside the service coverage area. A member
-whose DELIVERY address OR PRIMARY (Current/Home) address ZIP is in the editable
-:class:`ExcludedZipCode` list is set Out of Range (reason "Delivery Address
+verify a member's addresses are inside the service coverage area. A member whose
+DELIVERY address OR PRIMARY (Current/Home) address ZIP is NOT in the editable
+:class:`ServiceZipCode` whitelist is set Out of Range (reason "Delivery Address
 Outside Coverage Area") and excluded from all delivery schedules / Purchase
 Orders. Out of Range additionally opens a Case Closure ticket and holds the
 whole household (see api.portal.views_members._enforce_delivery_coverage).
 
-The excluded-ZIP list is admin-editable from Settings (no code change), so this
-reads it from the DB. Matching is on the first 5 digits of the ZIP.
+The whitelist is admin-editable from Settings (Service ZIP Codes), so this reads
+it from the DB. Matching is on the first 5 digits of the ZIP. An UNCONFIGURED
+(empty) whitelist is inert (everyone in range) so the feature stays off until
+seeded. Once configured, an address with a blank or malformed ZIP is treated as
+OUT of range (fail-closed) -- a member with NO address at all is still skipped.
 """
 
 # Standardized reason label for this process (shown in the note body + timeline
@@ -23,43 +26,46 @@ def _zip5(value):
     return (value or "").strip()[:5]
 
 
-def excluded_zips():
-    """The set of excluded 5-digit ZIP codes (empty when none configured)."""
-    from api.models import ExcludedZipCode
+def service_zips():
+    """The set of ACTIVE service-area 5-digit ZIP codes (the whitelist). Empty
+    when none are configured."""
+    from api.models import ServiceZipCode
 
-    return {z.zip for z in ExcludedZipCode.objects.all()}
+    return {z.zip for z in ServiceZipCode.objects.filter(is_active=True)}
 
 
-def is_zip_excluded(zip_value, *, excluded=None):
-    """True when ``zip_value`` (raw) is in the excluded list."""
-    z = _zip5(zip_value)
-    if not z:
+def is_zip_out_of_range(zip_value, *, service=None):
+    """True when ``zip_value`` is NOT in the active service-area whitelist.
+
+    An empty whitelist (unconfigured) is inert (returns False). Otherwise a blank
+    or malformed ZIP is OUT of range (returns True) -- only the empty-whitelist
+    case fails open.
+    """
+    if service is None:
+        service = service_zips()
+    if not service:
         return False
-    if excluded is None:
-        excluded = excluded_zips()
-    return z in excluded
+    return _zip5(zip_value) not in service
 
 
-def enrollment_excluded_zip(enrollment, *, excluded=None):
+def _addr_zip_out_of_range(addr, service):
+    """The offending ZIP label if ``addr`` is outside coverage, else "". A present
+    address with a blank/malformed ZIP is out of range (labelled "(blank)"); a
+    missing address (``None``) is skipped."""
+    if addr is None or not service:
+        return ""
+    if not is_zip_out_of_range(addr.zip, service=service):
+        return ""
+    return _zip5(addr.zip) or "(blank)"
+
+
+def enrollment_out_of_range_zip(enrollment, *, service=None):
     """The offending 5-digit ZIP if the enrollment's DELIVERY address is outside
     the coverage area, else "". Only the delivery address is checked."""
     if enrollment is None:
         return ""
     addr = getattr(enrollment, "delivery_address", None)
-    if addr is None:
-        return ""
-    z = _zip5(addr.zip)
-    if z and is_zip_excluded(z, excluded=excluded):
-        return z
-    return ""
-
-
-def _addr_zip_excluded(addr, excluded):
-    """The offending 5-digit ZIP of ``addr`` if excluded, else ""."""
-    if addr is None:
-        return ""
-    z = _zip5(addr.zip)
-    return z if (z and is_zip_excluded(z, excluded=excluded)) else ""
+    return _addr_zip_out_of_range(addr, service if service is not None else service_zips())
 
 
 def primary_address(client):
@@ -79,29 +85,30 @@ def primary_address(client):
     return None
 
 
-def member_excluded_info(profile, *, excluded=None):
+def member_out_of_range_info(profile, *, service=None):
     """Delivery Coverage check for a member. Returns ``(zip, source)`` where the
-    member's DELIVERY address or PRIMARY (Current/Home) address ZIP is in the
-    excluded list, else ``("", "")``. The delivery address takes precedence."""
+    member's DELIVERY address or PRIMARY (Current/Home) address ZIP is outside the
+    service-area whitelist, else ``("", "")``. The delivery address takes
+    precedence."""
     if profile is None:
         return "", ""
-    if excluded is None:
-        excluded = excluded_zips()
+    if service is None:
+        service = service_zips()
     enr = getattr(profile, "enrollment", None)
     delivery = getattr(enr, "delivery_address", None) if enr is not None else None
-    z = _addr_zip_excluded(delivery, excluded)
+    z = _addr_zip_out_of_range(delivery, service)
     if z:
         return z, "delivery address"
-    z = _addr_zip_excluded(primary_address(getattr(profile, "client", None)), excluded)
+    z = _addr_zip_out_of_range(primary_address(getattr(profile, "client", None)), service)
     if z:
         return z, "primary address"
     return "", ""
 
 
-def profile_excluded_zip(profile, *, excluded=None):
+def profile_out_of_range_zip(profile, *, service=None):
     """The offending delivery-or-primary ZIP for a member, or "". Used by the
     meal rules to force Out of Orbit durably."""
-    return member_excluded_info(profile, excluded=excluded)[0]
+    return member_out_of_range_info(profile, service=service)[0]
 
 
 def service_area_note_body(zip_code, source="delivery address"):

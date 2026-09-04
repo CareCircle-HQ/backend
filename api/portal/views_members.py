@@ -510,12 +510,12 @@ def _enforce_delivery_coverage(enrollment, agent):
     """
     from ..services.eligibility import apply_out_of_range_ineligibility
     from ..services.service_area import (
-        excluded_zips,
-        member_excluded_info,
+        service_zips,
+        member_out_of_range_info,
         out_of_range_ticket_reason,
     )
 
-    excluded = excluded_zips()
+    service = service_zips()
     # Portal agents are Agents, not Django Users, so there is no StageEvent.actor
     # User to attribute -- pass the agent NAME as the string label used on the
     # note / timeline (StageEvent is logged as an automatic system transition).
@@ -530,7 +530,7 @@ def _enforce_delivery_coverage(enrollment, agent):
         return name or (str(c.pk) if c else "Member")
 
     for mv in enrollment.member_profiles.select_related("client").all():
-        offending_zip, source = member_excluded_info(mv, excluded=excluded)
+        offending_zip, source = member_out_of_range_info(mv, service=service)
         if not offending_zip:
             continue
         # Skip terminal off-boarded members; everyone else in the household shares
@@ -1579,6 +1579,25 @@ class MembersListView(PortalGenericAPIView):
         case_type_q = (params.get("case_type") or "").strip()
         if case_type_q:
             qs = qs.filter(cases__case_type=case_type_q).distinct()
+
+        # Cases page: case-level filters that must ALL hold on the SAME case --
+        # "Authorization never requested / blank" checkbox + Open/Closed status.
+        # Correlated Exists (scoped to the selected type, if any) so the AUTH +
+        # STATUS conditions can't be satisfied by two different cases.
+        auth_flag = (params.get("auth_never_requested") or "").strip().lower() in ("1", "true", "yes")
+        case_status_q = (params.get("case_status") or "").strip().lower()
+        case_cond = Q()
+        if auth_flag:
+            case_cond &= Q(service_authorization_status__in=["never_requested", ""])
+        if case_status_q == "open":
+            case_cond &= Q(case_status="open")
+        elif case_status_q == "closed":
+            case_cond &= Q(case_status__in=["closed", "cancelled"])
+        if case_cond:
+            sub = Case.objects.filter(client=OuterRef("pk"))
+            if case_type_q:
+                sub = sub.filter(case_type=case_type_q)
+            qs = qs.filter(Exists(sub.filter(case_cond)))
 
         # Page-level scope (Verification / Logistics) restricts which members are
         # ever shown, before the per-status filter chips are applied.
@@ -3081,7 +3100,8 @@ class DataExportView(PortalAPIView):
             "insurance_expires_at", "social_status", "social_expires_at",
             "attestation_status", "has_screening", "screening_at", "screening_agent",
             "has_eligibility_assessment", "eligibility_assessment_at", "verified_at",
-            "verified_by_name", "case_type", "case_status", "auth_status",
+            "verified_by_name", "case_id", "case_type", "case_status",
+            "company_status", "auth_status", "auth_start_date", "auth_end_date",
             "case_opened_at", "program_name", "allergies", "medical_conditions",
             "medications", "eligible_services",
         ]
@@ -4140,9 +4160,9 @@ class MemberHouseholdView(PortalAPIView):
         # (Paused members + a Case Closure ticket). This is a sticky off-ramp --
         # editing the address back to a serviceable ZIP does NOT auto-restore
         # service; an agent must resolve the Not-Eligible state.
-        from ..services.service_area import is_zip_excluded
+        from ..services.service_area import is_zip_out_of_range
         coverage = None
-        if is_zip_excluded(addr.zip):
+        if is_zip_out_of_range(addr.zip):
             coverage = _enforce_delivery_coverage(enr, agent)
         resp = {
             "street": addr.street, "unit": addr.unit, "city": addr.city,
@@ -5321,6 +5341,70 @@ class MemberCaseDetailView(PortalAPIView):
             )
         case.delete()
         return Response(status=204)
+
+
+class MemberCaseCloseView(PortalAPIView):
+    """POST /members/<client_id>/cases/<case_id>/close/ -- a MANAGER closes an
+    INTERNAL-SERVICE case whose service authorization was never requested (or is
+    blank). Sets the case closed + closed_at, then reconciles the member's
+    enrollments + funnel stage (a closed governing IS case with no authorization
+    terminalizes the enrollment). Refused for non-managers, non-internal-service
+    cases, already-closed cases, or cases that carry a real authorization."""
+
+    @transaction.atomic
+    def post(self, request, client_id, case_id):
+        agent = current_agent(request)
+        if not (agent and (is_management_group(agent.group) or getattr(agent, "is_manager", False))):
+            return Response(
+                {"detail": "Management access required."},
+                status=http.HTTP_403_FORBIDDEN,
+            )
+        client = get_object_or_404(Client, pk=client_id)
+        case = get_object_or_404(Case, pk=case_id, client_id=client_id)
+        if case.case_type != CaseType.INTERNAL_SERVICE:
+            return Response(
+                {"detail": "Only internal-service cases can be closed here."},
+                status=http.HTTP_400_BAD_REQUEST,
+            )
+        if case.case_status in (CaseStatus.CLOSED, CaseStatus.CANCELLED):
+            return Response(
+                {"detail": "This case is already closed."},
+                status=http.HTTP_400_BAD_REQUEST,
+            )
+        if (case.service_authorization_status or "") not in (
+            "", ServiceAuthorizationStatus.NEVER_REQUESTED,
+        ):
+            return Response(
+                {"detail": "Only cases whose authorization was never requested "
+                           "(or is blank) can be closed here."},
+                status=http.HTTP_400_BAD_REQUEST,
+            )
+
+        case.case_status = CaseStatus.CLOSED
+        case.case_closed_at = timezone.now()
+        case.save(update_fields=["case_status", "case_closed_at"])
+
+        # React to the governing IS case closing: terminalize the now-caseless
+        # enrollment + recompute the member's funnel stage. Best-effort so the
+        # close itself never fails on a downstream reconcile hiccup.
+        actor_label = agent.name or "Manager"
+        try:
+            from api.services.lifecycle import (
+                reconcile_internal_service_authorization, recompute_client_stage,
+            )
+            reconcile_internal_service_authorization(client, actor_label=actor_label)
+            recompute_client_stage(client)
+        except Exception:  # pragma: no cover - defensive
+            logger.exception("post-close reconcile failed for client %s", client_id)
+
+        Note.objects.create(
+            client=client, source=NoteSource.AGENT, author_name=agent.name or "",
+            body=(f"Internal-service case {case_id} closed by {agent.name} "
+                  "(authorization never requested)."),
+        )
+        return Response({
+            "ok": True, "client_id": str(client.client_id), "case_id": str(case_id),
+        })
 
 
 class MemberCaseHistoryView(PortalGenericAPIView):

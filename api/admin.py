@@ -8,7 +8,6 @@ from .models import (
     AllowedState,
     AllowedZipCode,
     Assessment,
-    ExcludedZipCode,
     ServiceZipCode,
     CadenceRule,
     Case,
@@ -463,13 +462,6 @@ class AllowedStateAdmin(admin.ModelAdmin):
     list_display = ("code", "name", "created_at")
     search_fields = ("code", "name")
     ordering = ("code",)
-
-
-@admin.register(ExcludedZipCode)
-class ExcludedZipCodeAdmin(admin.ModelAdmin):
-    list_display = ("zip", "label", "created_at")
-    search_fields = ("zip", "label")
-    ordering = ("zip",)
 
 
 @admin.register(ServiceZipCode)
