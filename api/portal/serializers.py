@@ -334,6 +334,33 @@ def authorization_status(client):
     return case_authorization(governing_service_case_for_display(client))
 
 
+def _delivery_address_payload(client, service_zips):
+    """The household's delivery address as captured by the verification pop-up.
+
+    Sourced from the governing enrollment's ``delivery_address`` (Step 2 of the
+    pop-up), so it is ``None`` until the household is verified -- there is no
+    delivery address to judge before then. ``out_of_range`` is computed for ANY
+    address type (the enrollment address is frequently typed "temporary", which
+    the client-level eligibility gate deliberately ignores).
+    """
+    from api.services.service_area import is_zip_out_of_range
+
+    enr = active_enrollment(client)
+    addr = getattr(enr, "delivery_address", None) if enr is not None else None
+    if addr is None:
+        return None
+    return {
+        "type": addr.type or "",
+        "street": addr.street or "",
+        "unit": addr.unit or "",
+        "city": addr.city or "",
+        "state": addr.state or "",
+        "zip": addr.zip or "",
+        "out_of_range": is_zip_out_of_range(addr.zip, service=service_zips),
+        "verified": enr.delivery_address_verified,
+    }
+
+
 def active_enrollment(client):
     """Most recent non-closed enrollment governing the client (drives status /
     household / dates).
@@ -1335,6 +1362,13 @@ class MemberDetailSerializer(serializers.Serializer):
             }
             if current_addr
             else None,
+            # The DELIVERY address, which is captured by the verification pop-up
+            # (Step 2) and therefore lives on the governing enrollment -- NOT as a
+            # client address of a particular type (it is often typed "temporary").
+            # None until the household is verified. ``out_of_range`` is evaluated
+            # here for ANY address type, since this row is the one deliveries
+            # actually go to.
+            "delivery_address": _delivery_address_payload(client, _svc_zips),
             # Every address on file (home / delivery / mailing / current / work),
             # so the Overview tab can show them all -- a stale out-of-range row
             # here is exactly what the eligibility gate judges.
@@ -1972,6 +2006,9 @@ class PortalActiveProgramSerializer(serializers.ModelSerializer):
     case_type_label = serializers.CharField(
         source="get_case_type_display", read_only=True
     )
+    service_type_label = serializers.CharField(
+        source="get_service_type_display", read_only=True
+    )
 
     class Meta:
         model = ActiveProgram
@@ -1983,11 +2020,16 @@ class PortalActiveProgramSerializer(serializers.ModelSerializer):
             "services_category",
             "case_type",
             "case_type_label",
+            "service_type",
+            "service_type_label",
             "is_for_household",
             "to_extend",
             "updated_at",
         ]
-        read_only_fields = ["id", "case_type_label", "is_for_household", "updated_at"]
+        read_only_fields = [
+            "id", "case_type_label", "service_type_label", "is_for_household",
+            "updated_at",
+        ]
 
 
 # ---------------------------------------------------------------------------
