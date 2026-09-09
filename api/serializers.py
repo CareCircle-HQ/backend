@@ -22,6 +22,7 @@ from .models import (
     CaseStatus,
     CaseType,
     Client,
+    ClientSource,
     ClientLevel,
     ClientPhone,
     ClientPhoneSource,
@@ -451,6 +452,18 @@ class ClientSerializer(serializers.ModelSerializer):
             for f in ("agent_code", "agent_name"):
                 if f in validated_data and (getattr(_prior, f, "") or "").strip():
                     validated_data.pop(f)
+
+        # ``client_added_at`` is OURS to stamp (model.save, first insert only) --
+        # never accept it from a payload, or a re-sync could move it.
+        validated_data.pop("client_added_at", None)
+        # ``source`` is WRITE-ONCE: it records how the member first reached us, so
+        # a later write from another channel must not rewrite it. The CSV import
+        # sends it explicitly; the extension does not, so an API write that
+        # creates the member defaults to EXTENSION.
+        if _prior is not None and (_prior.source or "").strip():
+            validated_data.pop("source", None)
+        elif not (validated_data.get("source") or "").strip():
+            validated_data["source"] = ClientSource.EXTENSION
 
         if survivor is not None:
             for k, v in validated_data.items():
