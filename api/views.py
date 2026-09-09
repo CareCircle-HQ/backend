@@ -240,6 +240,107 @@ class StateCheckView(APIView):
         })
 
 
+class ProgramServiceTypeView(APIView):
+    """Resolve a source PROGRAM NAME to the service type we classified it as.
+
+    GET /api/programs/service-type/?program_name=<exact name> ->
+        {"program_name": ..., "matched": true,
+         "service_type": "medically_tailored_meals",
+         "service_type_label": "Medically Tailored Meals (MTM)"}
+
+    Reads the ``ActiveProgram`` classification table (Settings > Programs). Kept
+    OUTSIDE the portal so screener agents -- who have no portal access -- can
+    still resolve a case's service type. ``matched`` is false when the program
+    name isn't in the table; ``service_type`` is blank when it's there but not
+    classified yet.
+    """
+
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        from .models import ActiveProgram
+
+        name = (request.query_params.get("program_name") or "").strip()
+        if not name:
+            return Response({"detail": "program_name is required."}, status=400)
+        row = ActiveProgram.objects.filter(program_name__iexact=name).first()
+        return Response({
+            "program_name": name,
+            "matched": row is not None,
+            "service_type": (row.service_type if row else ""),
+            "service_type_label": (
+                row.get_service_type_display() if row and row.service_type else ""
+            ),
+            "case_category": (row.case_category if row else ""),
+        })
+
+
+class ClientScreeningEligibilityView(APIView):
+    """Does the member's SCREENING identify a need we actually serve?
+
+    GET /api/clients/<client_id>/screening-eligibility/ ->
+        {"is_eligible": true,
+         "active_categories": ["Food", ...],
+         "identified_needs": ["Housing", "Food"],
+         "matched": ["Food"]}
+
+    Delegates the verdict to ``lifecycle._is_eligible`` -- the SAME rule that
+    drives the Eligible / Not Eligible lifecycle stage -- so the extension and
+    the v2 agent can surface it without re-implementing (and drifting from) the
+    active-ProgramMainCategory matching. ``is_eligible`` is False while no
+    category is active (the opt-in default).
+    """
+
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request, client_id):
+        from .models import Client, ProgramMainCategory
+        from .services.lifecycle import _active_main_category_names, _is_eligible
+
+        client = Client.objects.filter(pk=client_id).first()
+        if client is None:
+            return Response(
+                {
+                    "is_eligible": False,
+                    "active_categories": [],
+                    "identified_needs": [],
+                    "matched": [],
+                },
+                status=404,
+            )
+
+        active_lower = _active_main_category_names()
+        active_names = sorted(
+            (c.name or "").strip()
+            for c in ProgramMainCategory.objects.filter(is_active=True)
+            if (c.name or "").strip()
+        )
+
+        # Flatten the member's screening needs (entries may be plain strings or
+        # dicts with a ``name`` key -- mirrors lifecycle._is_eligible).
+        needs: list[str] = []
+        for s in client.screenings.all():
+            for need in s.identified_social_needs or []:
+                if isinstance(need, str):
+                    name = need
+                elif isinstance(need, dict):
+                    name = need.get("name") or ""
+                else:
+                    name = ""
+                name = (name or "").strip()
+                if name and name not in needs:
+                    needs.append(name)
+
+        matched = [n for n in needs if n.casefold() in active_lower]
+
+        return Response({
+            "is_eligible": _is_eligible(client),
+            "active_categories": active_names,
+            "identified_needs": needs,
+            "matched": matched,
+        })
+
+
 class ClientEligibilityWarningsView(APIView):
     """Non-blocking eligibility heads-up warnings for the extension Profile tab.
 

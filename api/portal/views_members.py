@@ -1399,22 +1399,48 @@ class TeamsListView(PortalAPIView):
 
 
 class VerifiersListView(PortalAPIView):
-    """Verifier-group agents for the Members-page 'Verified by' filter dropdown.
+    """Agents for the 'Verified by' filter dropdown (Members + Verification).
 
-    ``value`` == the Agent id (matched against
-    ``EnrollmentVerification.verified_by`` by the members list ``verified_by``
-    filter); ``label`` == the agent's name. Only ACTIVE agents in the Verifiers
-    group are offered."""
+    Derived from the DATA, not the agent roster: every agent who has actually
+    COMPLETED a verification (``EnrollmentVerification.verified_by`` with a
+    ``verified_at``), excluding disregarded enrollments so the options match what
+    the ``verified_by`` filter can actually return.
+
+    This matters because verifications are not done by the Verifiers group alone
+    -- CS and Management complete them too, and a roster-based list both hid
+    those agents and offered ones who never verified. Inactive agents are kept:
+    their past verifications are still filterable history.
+
+    The predicate mirrors the members-list ``verified_by`` filter EXACTLY
+    (``verified_by`` stamped, excluding disregarded enrollments) so every option
+    offered can actually return rows, and ``count`` is a DISTINCT MEMBER count --
+    the number of members selecting that agent yields, not the number of
+    verification records (a member re-verified twice must not inflate it).
+
+    ``value`` == the Agent id (matched against ``verified_by``);
+    ``label`` == "<agent name> (<members>)"; ``count`` carries the raw number."""
 
     def get(self, request):
-        agents = (
-            Agent.objects.filter(status="Active", group="Verifiers")
-            .order_by("name")
-            .values_list("id", "name")
+        rows = (
+            EnrollmentVerification.objects.filter(verified_by__isnull=False)
+            .exclude(stage=EnrollmentStage.DISREGARDED)
+            # Clear the model's default ordering: it would otherwise be added to
+            # the SELECT and defeat the grouping (one row per enrollment).
+            .order_by()
+            .values("verified_by_id", "verified_by__name")
+            .annotate(count=Count("client_id", distinct=True))
         )
-        return Response(
-            [{"value": str(aid), "label": name or str(aid)} for aid, name in agents]
-        )
+        options = []
+        for r in rows:
+            name = r["verified_by__name"] or str(r["verified_by_id"])
+            options.append({
+                "value": str(r["verified_by_id"]),
+                "label": f"{name} ({r['count']})",
+                "name": name,
+                "count": r["count"],
+            })
+        options.sort(key=lambda o: (o["name"] or "").lower())
+        return Response(options)
 
 
 class TicketTypesListView(PortalAPIView):
@@ -2087,26 +2113,35 @@ class MembersListView(PortalGenericAPIView):
         # verified_at, period -> opened_at, all on the verifier's own enrollment.
         verified_by_val = (params.get("verified_by") or "").strip()
         if verified_by_val:
-            enr_q = (
-                Q(enrollments__verified_by_id=verified_by_val)
-                & ~Q(enrollments__stage=EnrollmentStage.DISREGARDED)
-            )
+            # A correlated EXISTS, not a join: the page scope
+            # (verification_scope_q) already joins ``enrollments``, and chaining a
+            # second enrollments filter made Django reuse/promote that join so a
+            # SINGLE enrollment row had to satisfy BOTH the scope's
+            # ``stage=pending_verification`` AND ``verified_by`` -- which silently
+            # dropped every member whose verified enrollment had since advanced
+            # (Service Active / closed), returning far too few rows (and zero for
+            # an agent all of whose members moved on). Exists is evaluated per
+            # candidate client, so it is immune to join order/promotion and keeps
+            # every bound below ANDed onto the SAME enrollment row.
+            sub = EnrollmentVerification.objects.filter(
+                client=OuterRef("pk"), verified_by_id=verified_by_val
+            ).exclude(stage=EnrollmentStage.DISREGARDED)
             rng = period_date_range(params.get("period"))
             if rng:
-                enr_q &= Q(enrollments__opened_at__date__gte=rng[0]) & Q(
-                    enrollments__opened_at__date__lte=rng[1]
+                sub = sub.filter(
+                    opened_at__date__gte=rng[0], opened_at__date__lte=rng[1]
                 )
             vreq_from, vreq_to = _parse_date(params.get("requested_from")), _parse_date(params.get("requested_to"))
             if vreq_from:
-                enr_q &= Q(enrollments__opened_at__date__gte=vreq_from)
+                sub = sub.filter(opened_at__date__gte=vreq_from)
             if vreq_to:
-                enr_q &= Q(enrollments__opened_at__date__lte=vreq_to)
+                sub = sub.filter(opened_at__date__lte=vreq_to)
             vcomp_from, vcomp_to = _parse_date(params.get("completed_from")), _parse_date(params.get("completed_to"))
             if vcomp_from:
-                enr_q &= Q(enrollments__verified_at__date__gte=vcomp_from)
+                sub = sub.filter(verified_at__date__gte=vcomp_from)
             if vcomp_to:
-                enr_q &= Q(enrollments__verified_at__date__lte=vcomp_to)
-            qs = qs.filter(enr_q)
+                sub = sub.filter(verified_at__date__lte=vcomp_to)
+            qs = qs.filter(Exists(sub))
 
         # Created-date range filter (Members page): filters on the date the
         # member's GOVERNING internal-service case was created (its

@@ -3142,6 +3142,23 @@ class ActiveProgram(models.Model):
         FOOD = "food", "Food"
         TRANSPORTATION = "transportation", "Transportation"
 
+    class ServiceType(models.TextChoices):
+        """The service a program delivers, independent of the population /
+        borough / reauthorization variants encoded in ``program_name``."""
+
+        CLINICALLY_APPROPRIATE_MEALS = (
+            "clinically_appropriate_meals", "Clinically Appropriate Meals",
+        )
+        MEDICALLY_TAILORED_MEALS = (
+            "medically_tailored_meals", "Medically Tailored Meals (MTM)",
+        )
+        FOOD_PRESCRIPTIONS = (
+            "food_prescriptions", "Food Prescriptions (Voucher / Boxes)",
+        )
+        SOCIAL_SERVICE_CASE_MANAGEMENT = (
+            "social_service_case_management", "Social Service Case Management",
+        )
+
     program_name = models.CharField(max_length=255, unique=True, db_index=True)
     main_category = models.CharField(max_length=120, blank=True)
     # ELIGIBILITY / NAVIGATION / Internal Services / External Services, etc.
@@ -3154,6 +3171,14 @@ class ActiveProgram(models.Model):
     # program today is food); set to Transportation for transport programs.
     case_type = models.CharField(
         max_length=20, choices=CaseType.choices, default=CaseType.FOOD
+    )
+    # The service this program delivers (Settings > Programs). Seeded from the
+    # program name by data migration; blank when the program isn't one of the
+    # services we deliver. ``db_default`` guards against an omitted-column
+    # insert during a deploy window (see ``to_extend`` below).
+    service_type = models.CharField(
+        max_length=40, choices=ServiceType.choices, blank=True,
+        default="", db_default="",
     )
     # Opt-in flag (managed from Settings > Programs): this program should be
     # treated as an extension/reauthorization of an existing service. Seeded True
@@ -3512,6 +3537,7 @@ class TicketTypeCode(models.TextChoices):
     NUTRITIONAL_COUNSELING = "nutritional_counseling", "Nutritional Counseling"
     KITCHEN_SWITCH = "kitchen_switch", "Kitchen Switch"
     CADENCE_SWITCH = "cadence_switch", "Cadence Switch"
+    HYBRID_SWITCH = "hybrid_switch", "Hybrid Switch"
     # Agent-facing categories added in the 2026 ticket-category refresh.
     INELIGIBLE_FOR_SERVICE = "ineligible_for_service", "Ineligible for Service"
     MEAL_TYPE_UPDATE = "meal_type_update", "Meal Type Update"

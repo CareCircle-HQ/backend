@@ -21,10 +21,17 @@ The date window is a named ``period`` (today/week/month/last_month/year/all) or 
 custom ``start``/``end`` range -- see ``resolve_window``.
 """
 
-from django.db.models import Count
+from django.db.models import Count, Max
 from rest_framework.response import Response
 
-from ..models import Assessment, Case, CaseType, Screening, UniteUsAgent
+from ..models import (
+    Assessment,
+    Case,
+    CaseType,
+    EnrollmentVerification,
+    Screening,
+    UniteUsAgent,
+)
 from .base import PortalAPIView, current_agent
 from .views_dashboard import resolve_window
 
@@ -178,6 +185,54 @@ class AgentAccountabilityView(PortalAPIView):
         )
         return Response({
             "screeners": rows,
+            "start": start.isoformat() if start else None,
+            "end": end.isoformat() if end else None,
+        })
+
+
+class VerificationAccountabilityView(PortalAPIView):
+    """Per-agent VERIFICATION submissions over a date window.
+
+    Counts the enrollment verifications COMPLETED (``verified_at``) inside the
+    window, grouped by the agent who submitted them (``verified_by``). Rows with
+    no acting agent (imports / backfills) bucket under "System".
+
+    The window is a named ``period`` or a custom ``start``/``end`` range -- see
+    ``resolve_window``. Available to the verification team (any portal group),
+    matching where it sits in the nav.
+    """
+
+    def get(self, request):
+        start, end = resolve_window(request)
+
+        qs = EnrollmentVerification.objects.filter(verified_at__isnull=False)
+        if start is not None:
+            qs = qs.filter(verified_at__date__gte=start, verified_at__date__lte=end)
+
+        rows = []
+        for r in (
+            qs.values(
+                "verified_by_id",
+                "verified_by__name",
+                "verified_by__agent_code",
+                "verified_by__group",
+            )
+            .annotate(n=Count("pk"), last=Max("verified_at"))
+        ):
+            aid = r["verified_by_id"]
+            rows.append({
+                "key": f"agent:{aid}" if aid else "system",
+                "agent": r["verified_by__name"] or ("System" if not aid else f"Agent {aid}"),
+                "agent_code": r["verified_by__agent_code"] or "",
+                "team": r["verified_by__group"] or "",
+                "verifications": r["n"],
+                "last_submitted": r["last"].isoformat() if r["last"] else None,
+            })
+        rows.sort(key=lambda x: (x["verifications"], x["agent"]), reverse=True)
+
+        return Response({
+            "verifiers": rows,
+            "total": sum(x["verifications"] for x in rows),
             "start": start.isoformat() if start else None,
             "end": end.isoformat() if end else None,
         })

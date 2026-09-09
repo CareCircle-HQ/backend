@@ -356,8 +356,8 @@ class ActiveProgramViewSet(viewsets.ModelViewSet):
     Agents can add / edit / delete rows and set each program's ``case_category``
     and ``case_type`` (Food/Transportation). ``is_for_household`` is auto-derived
     from the name on save. Full list (no pagination for client-side search) with
-    optional ``?search=`` (program name), ``?category=`` (case_category) and
-    ``?case_type=food|transportation``.
+    optional ``?search=`` (program name), ``?category=`` (case_category),
+    ``?case_type=food|transportation`` and ``?service_type=<code>|none``.
     """
 
     permission_classes = [IsPortalAgent]
@@ -377,6 +377,13 @@ class ActiveProgramViewSet(viewsets.ModelViewSet):
         case_type = (params.get("case_type") or "").strip().lower()
         if case_type in ActiveProgram.CaseType.values:
             qs = qs.filter(case_type=case_type)
+        # Service type: a valid code, or "none" for the programs with none set
+        # (so the unclassified ones are reachable from the UI too).
+        service_type = (params.get("service_type") or "").strip().lower()
+        if service_type == "none":
+            qs = qs.filter(service_type="")
+        elif service_type in ActiveProgram.ServiceType.values:
+            qs = qs.filter(service_type=service_type)
         return qs
 
     def list(self, request, *args, **kwargs):
@@ -397,6 +404,12 @@ class ActiveProgramViewSet(viewsets.ModelViewSet):
                 "case_types": [
                     {"value": v, "label": label}
                     for v, label in ActiveProgram.CaseType.choices
+                ],
+                # Service the program delivers; blank ("—") is a valid choice for
+                # programs that aren't one of the services we deliver.
+                "service_types": [
+                    {"value": v, "label": label}
+                    for v, label in ActiveProgram.ServiceType.choices
                 ],
                 "results": data,
             }

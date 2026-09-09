@@ -17695,8 +17695,9 @@ class TicketHouseholdPrimaryIdSerializerTest(TestCase):
 
 
 class MembersVerifiedByFilterTest(TestCase):
-    """/verifiers/ lists Verifier-group agents; the members list ?verified_by=
-    filter keeps only members verified by that agent."""
+    """/verifiers/ lists the agents who ACTUALLY verified (any group, with a
+    member count); the members list ?verified_by= filter keeps only members
+    verified by that agent."""
 
     def _api(self):
         from rest_framework.test import APIClient
@@ -17716,14 +17717,12 @@ class MembersVerifiedByFilterTest(TestCase):
         )
 
         verifier = Agent.objects.create(name="Vera Verifier", group="Verifiers", status="Active")
+        # Never verified anything -> must NOT be offered as a filter option.
         Agent.objects.create(name="Cassie CS", group="CS", status="Active")
+        # A CS agent who DID verify: verification is not a Verifiers-only job, so
+        # she must be offered even though she's outside the Verifiers group.
+        cs_verifier = Agent.objects.create(name="Carla CS", group="CS", status="Active")
         api = self._api()
-
-        # /verifiers/ returns only the Verifier-group agent.
-        vs = api.get("/api/portal/verifiers/").json()
-        labels = {v["label"] for v in vs}
-        self.assertIn("Vera Verifier", labels)
-        self.assertNotIn("Cassie CS", labels)
 
         from datetime import timedelta
 
@@ -17759,6 +17758,24 @@ class MembersVerifiedByFilterTest(TestCase):
             client=bob_client, stage=EnrollmentStage.VERIFIED, verified_by=other_agent,
             opened_at=now,
         )
+        cs_client = Client.objects.create(client_id=str(uuid.uuid4()), first_name="Cee", last_name="Ess")
+        EnrollmentVerification.objects.create(
+            client=cs_client, stage=EnrollmentStage.VERIFIED, verified_by=cs_verifier,
+            opened_at=now,
+        )
+
+        # /verifiers/ is derived from the DATA, not the agent roster: every agent
+        # who actually verified (any group), with a DISTINCT MEMBER count so the
+        # number matches the rows the filter returns. Vera verified two members
+        # (one of them via a since-closed enrollment).
+        vs = api.get("/api/portal/verifiers/").json()
+        by_name = {v["name"]: v for v in vs}
+        self.assertIn("Vera Verifier", by_name)
+        self.assertEqual(by_name["Vera Verifier"]["count"], 2)
+        self.assertEqual(by_name["Vera Verifier"]["label"], "Vera Verifier (2)")
+        # A CS agent who verified IS offered; an agent who never verified is not.
+        self.assertIn("Carla CS", by_name)
+        self.assertNotIn("Cassie CS", by_name)
 
         def ids(resp):
             out = set()
