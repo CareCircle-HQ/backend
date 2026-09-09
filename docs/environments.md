@@ -77,6 +77,40 @@ The Chrome extension must also point at production: set `backendUrl` to
 `https://www.carecircleinternal.com/*` is listed in `extension/manifest.json`
 `host_permissions`.
 
+### Delivery-partner API host (proof-of-delivery ingestion)
+
+Delivery companies push proof of delivery on a SEPARATE hostname that exposes
+nothing else — no CRM or extension route exists there. Off until configured:
+
+```bash
+PARTNER_API_HOST=partners.carecircleinternal.com
+# ...and add that host to DJANGO_ALLOWED_HOSTS.
+```
+
+Do NOT add it to `CORS_ALLOWED_ORIGINS` or `DJANGO_CSRF_TRUSTED_ORIGINS`: it is
+server-to-server only and must not be callable from a browser.
+
+One-time server setup (outside the normal `git pull` deploy, so repeat it if the
+box is rebuilt):
+
+1. DNS for `partners.carecircleinternal.com` pointing at the same place as `www`.
+2. Add the hostname to whatever terminates TLS in front of nginx (the vhosts
+   `listen 80` and read `X-Forwarded-Proto`, so the certificate is NOT managed by
+   certbot on the box).
+3. Install [`deploy/nginx-partners-api.conf`](../deploy/nginx-partners-api.conf),
+   which proxies **only** `/v1/` and returns a JSON 404 for everything else.
+
+Verify after setup:
+
+```bash
+curl -s -o /dev/null -w '%{http_code}\n' https://partners.carecircleinternal.com/api/clients/  # want 404
+curl -X POST https://partners.carecircleinternal.com/v1/token/ \
+  -H 'Content-Type: application/json' -d '{"client_id":"...","client_secret":"..."}'
+```
+
+Credentials are issued from **Settings → Delivery Company → POD API access**
+(Management only).
+
 ## Verifying the live environment
 
 Hit the health endpoint to confirm which backend is actually responding:

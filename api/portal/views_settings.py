@@ -208,8 +208,18 @@ class DeliveryCompanyViewSet(viewsets.ModelViewSet):
     def integrations(self, request, pk=None):
         company = self.get_object()
         method = request.data.get("method")
-        if method not in ("email", "api"):
-            return Response({"error": "method must be 'email' or 'api'."}, status=http.HTTP_400_BAD_REQUEST)
+        # Delivery companies no longer RECEIVE orders from us by email -- the
+        # outbound integration was never wired up (zero rows in production) and
+        # has been retired. The only integration is now INBOUND: they push proof
+        # of delivery to the partner API, whose credential lives on
+        # DeliveryCompanyApiClient (see views_partner_credentials). Kitchens keep
+        # their own email/api integration; that is a separate model.
+        if method != "api":
+            return Response(
+                {"error": "method must be 'api'. Email delivery integrations have "
+                          "been retired; use POD API access instead."},
+                status=http.HTTP_400_BAD_REQUEST,
+            )
         if company.integrations.filter(method=method).exists():
             return Response(
                 {"error": f"This company already has a {method} integration."},
