@@ -1,9 +1,12 @@
+import base64
 import uuid
 from datetime import timedelta
 from types import SimpleNamespace
 
 from unittest import mock
+from unittest.mock import patch
 
+from django.core.files.uploadedfile import SimpleUploadedFile
 from django.test import SimpleTestCase, TestCase, override_settings
 from django.urls import reverse
 from django.utils import timezone
@@ -21590,3 +21593,391 @@ class MenuCarryRegressionAuditGuardTest(TestCase):
         text = out.getvalue()
         self.assertIn(str(a.client_id), text)      # genuine regression is flagged
         self.assertNotIn(str(b.client_id), text)   # disregarded placeholder is NOT
+
+
+@override_settings(
+    PARTNER_API_HOST="partners.test",
+    ALLOWED_HOSTS=["testserver", "partners.test", "127.0.0.1", "localhost"],
+)
+class DeliveryPartnerApiTest(TestCase):
+    """The delivery-partner POD API.
+
+    The security properties matter more than the happy path here: the partner
+    surface must be invisible from the CRM host (and vice versa), a partner
+    credential must be useless against the CRM, and a company must never reach
+    another company's delivery order.
+    """
+
+    PARTNER = {"HTTP_HOST": "partners.test"}
+    CRM = {"HTTP_HOST": "testserver"}
+    # 1x1 PNG.
+    PNG = base64.b64decode(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFAAH/"
+        "q842iQAAAABJRU5ErkJggg=="
+    )
+
+    def setUp(self):
+        from .models import (
+            Client, DeliveryCompany, DeliveryCompanyApiClient, DeliveryOrder,
+            DeliveryOrderStatus, PurchaseOrder,
+        )
+        from .partner import auth as partner_auth
+
+        self.company = DeliveryCompany.objects.create(name="QARI Test")
+        self.other_company = DeliveryCompany.objects.create(name="Rival Courier")
+        member = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="P", last_name="O"
+        )
+        po = PurchaseOrder.objects.create()
+        self.order = DeliveryOrder.objects.create(
+            purchase_order=po, member=member, delivery_company=self.company,
+            status=DeliveryOrderStatus.READY_FOR_DELIVERY,
+        )
+        self.other_order = DeliveryOrder.objects.create(
+            purchase_order=po, member=member, delivery_company=self.other_company,
+            status=DeliveryOrderStatus.READY_FOR_DELIVERY,
+        )
+        self.secret = partner_auth.generate_secret()
+        self.client_row = DeliveryCompanyApiClient.objects.create(
+            delivery_company=self.company,
+            client_id=partner_auth.generate_client_id(self.company.name),
+            secret_hash=partner_auth.hash_secret(self.secret),
+        )
+        self.api = APIClient()
+
+    # -- helpers ------------------------------------------------------------
+    def _token(self, secret=None):
+        r = self.api.post(
+            "/v1/token/",
+            {"client_id": self.client_row.client_id, "client_secret": secret or self.secret},
+            format="json", **self.PARTNER,
+        )
+        return r
+
+    def _bearer(self):
+        return {"HTTP_AUTHORIZATION": f"Bearer {self._token().json()['access_token']}", **self.PARTNER}
+
+    def _upload_patch(self):
+        """Storage is not configured in tests: capture the upload instead."""
+        return patch(
+            "api.services.pod_ingest.import_storage.upload_bytes",
+            side_effect=lambda key, data, **kw: key,
+        )
+
+    # -- isolation ----------------------------------------------------------
+    def test_crm_routes_do_not_exist_on_the_partner_host(self):
+        for path in ("/api/clients/", "/api/portal/members/", "/api/health/"):
+            self.assertEqual(
+                self.api.get(path, **self.PARTNER).status_code, 404,
+                f"{path} must not be routable on the partner host",
+            )
+
+    def test_partner_routes_do_not_exist_on_the_crm_host(self):
+        self.assertEqual(self.api.get("/v1/whoami/", **self.CRM).status_code, 404)
+        self.assertEqual(
+            self.api.post("/v1/token/", {}, format="json", **self.CRM).status_code, 404
+        )
+
+    def test_partner_token_is_useless_against_the_crm(self):
+        token = self._token().json()["access_token"]
+        r = self.api.get(
+            "/api/clients/", HTTP_AUTHORIZATION=f"Bearer {token}", **self.CRM
+        )
+        self.assertEqual(r.status_code, 401)
+
+    def test_agent_jwt_is_rejected_by_the_partner_api(self):
+        agent = Agent.objects.create(
+            name="Mgr", agent_code="MGR-P1", email="mgr-p1@example.com",
+            group="Management", status="Active",
+        )
+        access = AccessToken()
+        access["agent_id"] = str(agent.id)
+        access["agent_code"] = agent.agent_code
+        access["agent_name"] = agent.name
+        access["agent_group"] = agent.group
+        r = self.api.get(
+            "/v1/whoami/", HTTP_AUTHORIZATION=f"Bearer {access}", **self.PARTNER
+        )
+        self.assertEqual(r.status_code, 401)
+
+    # -- credentials --------------------------------------------------------
+    def test_token_exchange_and_whoami(self):
+        r = self._token()
+        self.assertEqual(r.status_code, 200)
+        body = r.json()
+        self.assertEqual(body["token_type"], "Bearer")
+        self.assertTrue(body["access_token"].startswith("ccat_"))
+        self.assertGreater(body["expires_in"], 0)
+
+        who = self.api.get("/v1/whoami/", **self._bearer())
+        self.assertEqual(who.status_code, 200)
+        self.assertEqual(who.json()["delivery_company"], "QARI Test")
+        self.assertEqual(who.json()["client_id"], self.client_row.client_id)
+
+    def test_bad_secret_and_missing_credentials_are_401_and_400(self):
+        self.assertEqual(self._token(secret="wrong").status_code, 401)
+        self.assertEqual(
+            self.api.post("/v1/token/", {}, format="json", **self.PARTNER).status_code, 400
+        )
+
+    def test_no_token_is_401(self):
+        self.assertEqual(self.api.get("/v1/whoami/", **self.PARTNER).status_code, 401)
+
+    def test_rotation_keeps_the_previous_secret_working_then_stops(self):
+        from .partner import auth as partner_auth
+
+        old = self.secret
+        new = partner_auth.generate_secret()
+        self.client_row.previous_secret_hash = self.client_row.secret_hash
+        self.client_row.previous_secret_expires_at = timezone.now() + timedelta(days=7)
+        self.client_row.secret_hash = partner_auth.hash_secret(new)
+        self.client_row.save()
+
+        self.assertEqual(self._token(secret=new).status_code, 200)
+        self.assertEqual(self._token(secret=old).status_code, 200)  # overlap window
+
+        # Once the window closes the old secret stops working.
+        self.client_row.previous_secret_expires_at = timezone.now() - timedelta(minutes=1)
+        self.client_row.save(update_fields=["previous_secret_expires_at"])
+        self.assertEqual(self._token(secret=old).status_code, 401)
+        self.assertEqual(self._token(secret=new).status_code, 200)
+
+    def test_revoking_the_credential_kills_live_tokens(self):
+        headers = self._bearer()
+        self.assertEqual(self.api.get("/v1/whoami/", **headers).status_code, 200)
+        self.client_row.revoked_at = timezone.now()
+        self.client_row.save(update_fields=["revoked_at"])
+        self.assertEqual(self.api.get("/v1/whoami/", **headers).status_code, 401)
+        self.assertEqual(self._token().status_code, 401)
+
+    def test_expired_token_is_rejected(self):
+        from .models import PartnerAccessToken
+
+        headers = self._bearer()
+        PartnerAccessToken.objects.update(expires_at=timezone.now() - timedelta(seconds=1))
+        self.assertEqual(self.api.get("/v1/whoami/", **headers).status_code, 401)
+
+    def test_missing_scope_is_403(self):
+        from .models import PartnerScope
+
+        self.client_row.scopes = [PartnerScope.POD_STATUS]  # no pod:photo
+        self.client_row.save(update_fields=["scopes"])
+        headers = self._bearer()
+        r = self.api.post(
+            f"/v1/deliveries/{self.order.pk}/proofs/base64/",
+            {"photos": [base64.b64encode(self.PNG).decode()]}, format="json", **headers,
+        )
+        self.assertEqual(r.status_code, 403)
+        # ...but the status endpoint still works.
+        ok = self.api.post(
+            f"/v1/deliveries/{self.order.pk}/status/",
+            {"status": "delivered"}, format="json", **headers,
+        )
+        self.assertEqual(ok.status_code, 200)
+
+    # -- scoping ------------------------------------------------------------
+    def test_another_companys_order_is_404_not_403(self):
+        """404, so a partner cannot even confirm the order id exists."""
+        headers = self._bearer()
+        for path in ("status/", "proofs/base64/"):
+            r = self.api.post(
+                f"/v1/deliveries/{self.other_order.pk}/{path}",
+                {"status": "delivered", "photos": [base64.b64encode(self.PNG).decode()]},
+                format="json", **headers,
+            )
+            self.assertEqual(r.status_code, 404, path)
+            self.assertEqual(r.json()["error"], "order_not_found")
+
+    # -- status -------------------------------------------------------------
+    def test_status_update_applies_and_rejects_non_partner_statuses(self):
+        from .models import DeliveryOrderStatus
+
+        headers = self._bearer()
+        r = self.api.post(
+            f"/v1/deliveries/{self.order.pk}/status/",
+            {"status": "delivered", "delivered_at": "2026-09-08T14:30:00Z", "driver": "D-77"},
+            format="json", **headers,
+        )
+        self.assertEqual(r.status_code, 200)
+        self.order.refresh_from_db()
+        self.assertEqual(self.order.status, DeliveryOrderStatus.DELIVERED)
+        self.assertIsNotNone(self.order.delivered_at)
+
+        # A partner may not move an order back into our own workflow states.
+        bad = self.api.post(
+            f"/v1/deliveries/{self.order.pk}/status/",
+            {"status": "pending"}, format="json", **headers,
+        )
+        self.assertEqual(bad.status_code, 400)
+        self.assertEqual(bad.json()["error"], "invalid_status")
+
+    # -- proofs -------------------------------------------------------------
+    def test_multipart_upload_creates_a_proof_and_dedupes_on_retry(self):
+        from .models import DeliveryOrderProof
+
+        headers = self._bearer()
+        with self._upload_patch():
+            first = self.api.post(
+                f"/v1/deliveries/{self.order.pk}/proofs/",
+                {
+                    "file": SimpleUploadedFile("pod.png", self.PNG, content_type="image/png"),
+                    "status": "delivered", "driver": "D-77", "route_id": "RT-7",
+                    "note": "left with doorman",
+                },
+                format="multipart", **headers,
+            )
+            self.assertEqual(first.status_code, 201)
+            self.assertEqual(first.json()["stored"], 1)
+
+            # Same bytes again -> no second row (safe retries).
+            again = self.api.post(
+                f"/v1/deliveries/{self.order.pk}/proofs/",
+                {"file": SimpleUploadedFile("other-name.png", self.PNG, content_type="image/png")},
+                format="multipart", **headers,
+            )
+        self.assertEqual(again.json()["stored"], 0)
+        self.assertEqual(again.json()["duplicates"], 1)
+
+        proofs = DeliveryOrderProof.objects.filter(delivery_order=self.order)
+        self.assertEqual(proofs.count(), 1)
+        proof = proofs.get()
+        self.assertEqual(proof.driver, "D-77")
+        self.assertEqual(proof.route_id, "RT-7")
+        self.assertEqual(proof.delivery_company_id, self.company.pk)
+        # Tagged as API-sourced so it is distinguishable from a CSV import.
+        self.assertIn("api:", proof.source_report)
+        self.order.refresh_from_db()
+        self.assertEqual(self.order.status, "delivered")
+
+    def test_base64_upload_matches_multipart_for_the_same_image(self):
+        from .models import DeliveryOrderProof
+
+        headers = self._bearer()
+        with self._upload_patch():
+            self.api.post(
+                f"/v1/deliveries/{self.order.pk}/proofs/",
+                {"file": SimpleUploadedFile("a.png", self.PNG, content_type="image/png")},
+                format="multipart", **headers,
+            )
+            # The SAME image via the other transport must de-duplicate, proving
+            # both paths hash identically.
+            r = self.api.post(
+                f"/v1/deliveries/{self.order.pk}/proofs/base64/",
+                {"photos": [{"filename": "a.png", "content_type": "image/png",
+                             "data": base64.b64encode(self.PNG).decode()}]},
+                format="json", **headers,
+            )
+        self.assertEqual(r.json()["duplicates"], 1)
+        self.assertEqual(DeliveryOrderProof.objects.filter(delivery_order=self.order).count(), 1)
+
+    def test_base64_rejects_invalid_payloads(self):
+        headers = self._bearer()
+        r = self.api.post(
+            f"/v1/deliveries/{self.order.pk}/proofs/base64/",
+            {"photos": ["!!! not base64 !!!"]}, format="json", **headers,
+        )
+        self.assertEqual(r.status_code, 400)
+        self.assertEqual(r.json()["error"], "no_proof_stored")
+        empty = self.api.post(
+            f"/v1/deliveries/{self.order.pk}/proofs/base64/",
+            {"photos": []}, format="json", **headers,
+        )
+        self.assertEqual(empty.json()["error"], "no_file")
+
+    def test_presign_confirm_only_accepts_keys_issued_for_that_order(self):
+        headers = self._bearer()
+        # A key naming someone else's folder must be refused even if it exists.
+        r = self.api.post(
+            f"/v1/deliveries/{self.order.pk}/proofs/confirm/",
+            {"s3_keys": ["pod-inbox/some-other-company/whatever.png"]},
+            format="json", **headers,
+        )
+        self.assertEqual(r.status_code, 400)
+        self.assertIn("failures", r.json())
+
+
+@override_settings(ALLOWED_HOSTS=["testserver", "partners.test"])
+class DeliveryPartnerCredentialSettingsTest(TestCase):
+    """Settings > Delivery Company > POD API access is MANAGEMENT ONLY, and the
+    secret is shown exactly once."""
+
+    def setUp(self):
+        from .models import DeliveryCompany
+
+        self.company = DeliveryCompany.objects.create(name="QARI Test")
+        self.url = f"/api/portal/settings/delivery-companies/{self.company.pk}/api-client/"
+
+    def _client_for(self, group):
+        agent = Agent.objects.create(
+            name=f"A {group}", agent_code=f"AC-{group[:3].upper()}",
+            email=f"{group.lower()}@example.com", group=group, status="Active",
+        )
+        access = AccessToken()
+        access["agent_id"] = str(agent.id)
+        access["agent_code"] = agent.agent_code
+        access["agent_name"] = agent.name
+        access["agent_group"] = agent.group
+        api = APIClient()
+        api.credentials(HTTP_AUTHORIZATION=f"Bearer {access}")
+        return api
+
+    def test_only_management_may_manage_credentials(self):
+        for group in ("CS", "Verifiers", "Logistics", "Nutritionist"):
+            api = self._client_for(group)
+            self.assertEqual(api.get(self.url).status_code, 403, group)
+            self.assertEqual(api.post(self.url, {}, format="json").status_code, 403, group)
+        self.assertEqual(self._client_for("Management").get(self.url).status_code, 200)
+
+    def test_create_then_rotate_and_the_secret_is_only_returned_once(self):
+        api = self._client_for("Management")
+        created = api.post(self.url, {}, format="json")
+        self.assertEqual(created.status_code, 201)
+        secret = created.json()["client_secret"]
+        self.assertTrue(secret.startswith("ccsk_"))
+
+        # A second create without rotate=true is a conflict, not a silent reissue.
+        self.assertEqual(api.post(self.url, {}, format="json").status_code, 409)
+
+        # Reading it back never exposes the secret.
+        fetched = api.get(self.url).json()
+        self.assertNotIn("client_secret", fetched)
+        self.assertTrue(fetched["exists"])
+
+        rotated = api.post(self.url, {"rotate": True}, format="json")
+        self.assertEqual(rotated.status_code, 200)
+        self.assertNotEqual(rotated.json()["client_secret"], secret)
+        self.assertIsNotNone(rotated.json()["previous_secret_expires_at"])
+
+    def test_revoke_deactivates_the_credential(self):
+        api = self._client_for("Management")
+        api.post(self.url, {}, format="json")
+        self.assertTrue(api.delete(self.url).json()["revoked"])
+        self.assertFalse(api.get(self.url).json()["is_active"])
+
+    @override_settings(PARTNER_API_HOST="partners.test")
+    def test_docs_export_in_all_three_formats_and_secret_handling(self):
+        api = self._client_for("Management")
+        secret = api.post(self.url, {}, format="json").json()["client_secret"]
+        docs = self.url + "docs/"
+
+        md = api.get(docs + "?fmt=md")
+        self.assertEqual(md.status_code, 200)
+        body = md.content.decode()
+        self.assertIn("partners.test", body)
+        # Without ?secret= the guide must NOT contain the real secret.
+        self.assertNotIn(secret, body)
+        self.assertIn("<your client_secret>", body)
+
+        # The one-time integration pack embeds it.
+        with_secret = api.get(f"{docs}?fmt=md&secret={secret}").content.decode()
+        self.assertIn(secret, with_secret)
+
+        pdf = api.get(docs + "?fmt=pdf")
+        self.assertEqual(pdf.status_code, 200)
+        self.assertTrue(pdf.content.startswith(b"%PDF"))
+
+        spec = api.get(docs + "?fmt=openapi").json()
+        self.assertEqual(spec["openapi"], "3.0.3")
+        self.assertIn("/v1/token/", spec["paths"])
+        # The spec must describe ONLY the partner surface.
+        self.assertTrue(all(p.startswith("/v1/") for p in spec["paths"]))

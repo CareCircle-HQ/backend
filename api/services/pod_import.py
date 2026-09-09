@@ -32,7 +32,7 @@ from django.utils import timezone
 from ..models import (
     DeliveryOrder, DeliveryOrderProof, DeliveryOrderStatus,
 )
-from . import import_storage
+from . import import_storage, pod_ingest
 
 logger = logging.getLogger(__name__)
 
@@ -264,15 +264,12 @@ class PodImporter:
             note = (idx.get("note") and row.get(idx["note"]) or "").strip()
 
             if self.apply:
-                fields = []
-                if status and order.status != status:
-                    order.status = status; fields.append("status")
-                if delivered_at and order.delivered_at != delivered_at:
-                    order.delivered_at = delivered_at; fields.append("delivered_at")
-                if self.company and order.delivery_company_id != self.company.pk:
-                    order.delivery_company = self.company; fields.append("delivery_company")
-                if fields:
-                    order.save(update_fields=fields)
+                # Shared with the partner API (services.pod_ingest) so both
+                # entry points may change exactly the same order fields.
+                if pod_ingest.apply_delivery_outcome(
+                    order, status=status, delivered_at=delivered_at,
+                    company=self.company or None,
+                ):
                     self.stats["orders_updated"] += 1
 
             if not self.apply or not self.fetch:
@@ -314,37 +311,28 @@ class PodImporter:
 
     # -- phase 3: dedup + upload + create (DB, main) ------------------------
     def _store(self, task, data, content_type):
+        """Delegates to services.pod_ingest so the CSV importer and the partner
+        API store proofs identically (same key layout, same hash de-dup)."""
         order, url = task["order"], task["url"]
-        digest = hashlib.sha256(data).hexdigest()
-        if DeliveryOrderProof.objects.filter(
-            delivery_order=order, content_hash=digest
-        ).exists():
+        outcome, _proof, error = pod_ingest.store_proof(
+            order,
+            data,
+            content_type=content_type,
+            company=self.company,
+            driver=task["driver"],
+            route_id=task.get("route") or "",
+            note=task["note"],
+            delivered_at=task["delivered_at"],
+            source_url=url,
+            source_report=self.source_report,
+        )
+        if outcome == pod_ingest.CREATED:
+            self.stats["proofs_created"] += 1
+        elif outcome == pod_ingest.DUPLICATE:
             self.stats["proofs_deduped"] += 1
-            return
-        ext = _guess_ext(content_type, url)
-        key = f"pod/{order.pk}/{digest[:16]}.{ext}"
-        try:
-            import_storage.upload_bytes(
-                key, data, content_type=content_type or "application/octet-stream"
-            )
-        except Exception as exc:  # noqa: BLE001
+        else:
             self.stats["images_failed"] += 1
-            self.errors.append(f"order {order.pk}: S3 upload failed ({exc})")
-            return
-        try:
-            with transaction.atomic():
-                DeliveryOrderProof.objects.create(
-                    delivery_order=order, s3_key=key, content_type=content_type,
-                    content_hash=digest, source_url=url[:2000],
-                    delivery_company=self.company, source_report=self.source_report,
-                    driver=(task["driver"] or "")[:255],
-                    route_id=(task.get("route") or "")[:255], note=task["note"] or "",
-                    delivered_at=task["delivered_at"],
-                )
-        except IntegrityError:
-            self.stats["proofs_deduped"] += 1
-            return
-        self.stats["proofs_created"] += 1
+            self.errors.append(f"order {order.pk}: {error}")
 
     def run(self, reader):
         idx = build_header_index(reader.fieldnames)

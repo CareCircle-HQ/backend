@@ -166,6 +166,10 @@ from .views_service_area import (
     ServiceZipCodeDetailView,
     ServiceZipCodesView,
 )
+from .views_partner_credentials import (
+    DeliveryCompanyApiClientView,
+    DeliveryCompanyApiDocsView,
+)
 from .views_pod import (
     PodImportPresignView,
     PodImportRunDetailView,
@@ -482,6 +486,20 @@ urlpatterns = [
     path(
         "settings/delivery-company-integrations/<uuid:integration_id>/set-primary/",
         DeliveryCompanyIntegrationSetPrimaryView.as_view(),
+    ),
+
+    # Settings > Delivery Company > POD API access (MANAGEMENT ONLY): the
+    # credential a delivery company uses to push proof of delivery, plus the
+    # integration guide for their developers.
+    path(
+        "settings/delivery-companies/<uuid:company_id>/api-client/",
+        DeliveryCompanyApiClientView.as_view(),
+        name="portal-delivery-company-api-client",
+    ),
+    path(
+        "settings/delivery-companies/<uuid:company_id>/api-client/docs/",
+        DeliveryCompanyApiDocsView.as_view(),
+        name="portal-delivery-company-api-docs",
     ),
 
     # Google Places proxy — delivery-address autocomplete (mirrors the

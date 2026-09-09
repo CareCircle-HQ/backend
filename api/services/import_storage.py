@@ -126,6 +126,19 @@ def download_to_temp(key):
     return tmp
 
 
+def read_bytes(key):
+    """Read a (small) object fully into memory: ``(bytes, content_type)``.
+
+    Used to re-read a partner's direct upload so it goes through the same
+    hashing / de-duplication as every other proof-of-delivery path. Only for
+    objects known to be small (single images) -- use ``download_to_temp`` for
+    anything large. Raises on a missing object so the caller can report it.
+    """
+    obj = _client().get_object(Bucket=_bucket(), Key=key)
+    body = obj["Body"].read()
+    return body, (obj.get("ContentType") or "")
+
+
 def delete_object(key):
     """Best-effort delete of an object under the imports/ prefix. Returns True
     when a delete request was issued, False when skipped (no key / no bucket) or

@@ -4380,6 +4380,103 @@ class DeliveryCompanyIntegration(models.Model):
         return f"{self.delivery_company} ({self.get_method_display()})"
 
 
+class PartnerScope(models.TextChoices):
+    """What a delivery partner's credential is allowed to do. Kept coarse: the
+    partner API only ever ingests proof of delivery."""
+
+    POD_STATUS = "pod:status", "Update delivery status"
+    POD_PHOTO = "pod:photo", "Upload proof-of-delivery photos"
+
+
+def default_partner_scopes():
+    return [PartnerScope.POD_STATUS, PartnerScope.POD_PHOTO]
+
+
+class DeliveryCompanyApiClient(models.Model):
+    """INBOUND API credential for a delivery company, so their backend can push
+    proof of delivery to us (see docs/delivery_partner_api_plan.md).
+
+    One credential per company. ``client_id`` is public and identifies them;
+    the secret is only ever stored HASHED and is shown once at creation. A
+    rotation keeps the previous secret working until
+    ``previous_secret_expires_at`` so the vendor can redeploy without an outage.
+
+    This is deliberately NOT ``DeliveryCompanyIntegration``: that modelled the
+    (now removed) outbound "how they receive orders" direction.
+    """
+
+    delivery_company = models.OneToOneField(
+        DeliveryCompany, on_delete=models.CASCADE, related_name="api_client"
+    )
+    # Public identifier, e.g. "ccpod_qari_a1b2c3d4" -- greppable in logs and by
+    # secret scanners, and safe to show in the UI.
+    client_id = models.CharField(max_length=64, unique=True, db_index=True)
+    secret_hash = models.CharField(max_length=128)
+    # Rotation overlap: the superseded secret stays valid until it lapses.
+    previous_secret_hash = models.CharField(max_length=128, blank=True)
+    previous_secret_expires_at = models.DateTimeField(null=True, blank=True)
+    scopes = models.JSONField(default=default_partner_scopes, blank=True)
+    created_by = models.ForeignKey(
+        "Agent", on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="created_delivery_api_clients",
+    )
+    # Optional hardening: when set, only these IPs/CIDRs may authenticate.
+    allowed_ips = models.JSONField(default=list, blank=True)
+    expires_at = models.DateTimeField(null=True, blank=True)
+    revoked_at = models.DateTimeField(null=True, blank=True)
+    last_used_at = models.DateTimeField(null=True, blank=True)
+    last_used_ip = models.CharField(max_length=64, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["delivery_company__name"]
+
+    def __str__(self):
+        return f"{self.delivery_company} ({self.client_id})"
+
+    @property
+    def is_active(self):
+        now = timezone.now()
+        if self.revoked_at is not None:
+            return False
+        return not (self.expires_at and self.expires_at <= now)
+
+
+class PartnerAccessToken(models.Model):
+    """A short-lived OPAQUE bearer token issued from a client_id/secret exchange.
+
+    Opaque (random, stored hashed) rather than a JWT on purpose: the project's
+    DEFAULT_AUTHENTICATION_CLASSES include JWT authenticators, so a partner JWT
+    signed with the shared key would authenticate against the whole CRM. An
+    opaque token is meaningless to those authenticators, and revoking it is a
+    single row update.
+    """
+
+    client = models.ForeignKey(
+        DeliveryCompanyApiClient, on_delete=models.CASCADE, related_name="tokens"
+    )
+    # sha256 of the token; the raw value is returned once and never stored.
+    token_hash = models.CharField(max_length=64, unique=True, db_index=True)
+    scopes = models.JSONField(default=list, blank=True)
+    expires_at = models.DateTimeField(db_index=True)
+    revoked_at = models.DateTimeField(null=True, blank=True)
+    created_ip = models.CharField(max_length=64, blank=True)
+    last_used_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        indexes = [models.Index(fields=["client", "expires_at"])]
+
+    def __str__(self):
+        return f"Partner token for {self.client_id} (exp {self.expires_at:%Y-%m-%d %H:%M})"
+
+    @property
+    def is_valid(self):
+        return self.revoked_at is None and self.expires_at > timezone.now()
+
+
 # ---------------------------------------------------------------------------
 # Purchase orders & delivery orders
 # ---------------------------------------------------------------------------

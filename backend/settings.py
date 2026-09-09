@@ -126,6 +126,9 @@ INSTALLED_APPS = [
 
 MIDDLEWARE = [
     'django.middleware.security.SecurityMiddleware',
+    # Swaps in the delivery-partner URLConf on PARTNER_API_HOST so no CRM route
+    # exists on that hostname. Must precede URL resolution.
+    'api.middleware.PartnerHostMiddleware',
     'whitenoise.middleware.WhiteNoiseMiddleware',
     'corsheaders.middleware.CorsMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
@@ -152,6 +155,20 @@ WEB_STATEMENT_TIMEOUT_MS = int(os.getenv('WEB_STATEMENT_TIMEOUT_MS', '30000') or
 HYROS_API_KEY = os.getenv('HYROS_API_KEY', '')
 HYROS_LEADS_URL = os.getenv(
     'HYROS_LEADS_URL', 'https://api.hyros.com/v1/api/v1.0/leads'
+)
+
+# Delivery-partner API hostname (e.g. partners.carecircleinternal.com). When set,
+# requests to this host are served ONLY by api.partner.urls -- see
+# api.middleware.PartnerHostMiddleware and docs/delivery_partner_api_plan.md.
+# Must also appear in DJANGO_ALLOWED_HOSTS. Deliberately NOT added to
+# CORS_ALLOWED_ORIGINS or CSRF_TRUSTED_ORIGINS: it is server-to-server only.
+PARTNER_API_HOST = os.getenv('PARTNER_API_HOST', '').strip()
+
+# Partner access-token lifetime, and how long a rotated-away client secret keeps
+# working so a vendor can redeploy without an outage.
+PARTNER_TOKEN_TTL_SECONDS = int(os.getenv('PARTNER_TOKEN_TTL_SECONDS', '3600'))
+PARTNER_ROTATION_GRACE_SECONDS = int(
+    os.getenv('PARTNER_ROTATION_GRACE_SECONDS', str(7 * 24 * 3600))
 )
 
 ROOT_URLCONF = 'backend.urls'
@@ -503,6 +520,13 @@ REST_FRAMEWORK = {
         'rest_framework.renderers.JSONRenderer',
         'rest_framework.renderers.BrowsableAPIRenderer',
     ),
+    # Only the partner (vendor-facing) endpoints are throttled: they are the
+    # publicly reachable surface. Agent/extension traffic is unaffected.
+    'DEFAULT_THROTTLE_RATES': {
+        'partner': os.getenv('PARTNER_THROTTLE_RATE', '600/min'),
+        # Credential exchange is deliberately much tighter (brute-force guard).
+        'partner_token': os.getenv('PARTNER_TOKEN_THROTTLE_RATE', '20/min'),
+    },
 }
 
 # Simple JWT
