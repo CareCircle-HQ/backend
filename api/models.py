@@ -490,9 +490,12 @@ class Client(models.Model):
     # reflects when the member actually reached us.
     client_added_at = models.DateTimeField(null=True, blank=True, db_index=True)
     # Which channel first created the member (extension vs import). Write-once,
-    # enforced in ClientSerializer._upsert.
+    # enforced in ClientSerializer._upsert. ``db_default`` so an insert that omits
+    # the column (a not-yet-restarted process running older code mid-deploy) gets
+    # "" instead of a NOT-NULL violation on api_client / api_historicalclient.
     source = models.CharField(
-        max_length=20, choices=ClientSource.choices, blank=True, db_index=True
+        max_length=20, choices=ClientSource.choices, blank=True, db_index=True,
+        db_default="",
     )
 
     # --- Demographics ---
@@ -5053,8 +5056,9 @@ class EnrollmentAnalytics(models.Model):
     # When the member first reached OUR system (Client.client_added_at). This is
     # what the Data page's Member-Created range filters on.
     member_added_at = models.DateTimeField(null=True, blank=True, db_index=True)
-    # How the member first reached us (extension vs import).
-    source = models.CharField(max_length=20, blank=True, db_index=True)
+    # How the member first reached us (extension vs import). ``db_default`` for the
+    # same omitted-column reason as Client.source.
+    source = models.CharField(max_length=20, blank=True, db_index=True, db_default="")
     care_coordinator = models.CharField(max_length=255, blank=True, db_index=True)
     primary_care_coordinator = models.CharField(max_length=255, blank=True)
     cadence = models.CharField(max_length=40, blank=True, db_index=True)
