@@ -620,6 +620,10 @@ def build_row(client):
         "medicaid_id": getattr(client, "medicaid_id", "") or "",
         "dob": client.date_of_birth,
         "member_created_at": client.created_at,
+        # OUR added date + the channel that created the member: what the Data
+        # page's "Member Created" range filters on (see Client.client_added_at).
+        "member_added_at": client.client_added_at,
+        "source": client.source or "",
         "care_coordinator": client.care_coordinator or "",
         "primary_care_coordinator": (case.primary_worker_name if case else "") or "",
         "cadence": _cadence_for_client(client, enr),
@@ -965,7 +969,9 @@ def filter_analytics(params):
 
     # Date-range filters: param prefix -> column.
     for prefix, col in {
-        "created": "member_created_at", "delivered": "last_delivered_at",
+        # "Member Created" now means when the member reached US
+        # (Client.client_added_at), not Unite Us's clustered created_at.
+        "created": "member_added_at", "delivered": "last_delivered_at",
         "insurance_exp": "insurance_expires_at", "social_exp": "social_expires_at",
         "screening": "screening_at", "assessment": "eligibility_assessment_at",
         "case_opened": "case_opened_at", "requested": "requested_at",
@@ -987,9 +993,11 @@ def filter_analytics(params):
             qs = qs.filter(**{f"{col}__overlap": vals})
 
     # Sort.
-    sort_map = {"created": "member_created_at", "delivered": "last_delivered_at",
+    # "created" sorts by the same column it FILTERS on (member_added_at), so a
+    # date range and the ordering agree.
+    sort_map = {"created": "member_added_at", "delivered": "last_delivered_at",
                 "name": "last_name", "verified": "verified_at"}
-    col = sort_map.get(g("sort"), "member_created_at")
+    col = sort_map.get(g("sort"), "member_added_at")
     if (params.get("dir") or "desc").lower() != "asc":
         col = "-" + col
     return qs.order_by(col, "last_name", "first_name")

@@ -39,6 +39,7 @@ from api.models import (
     CaseStatus,
     CaseType,
     Client,
+    ClientSource,
     IdentifiedSocialNeed,
     ImportRun,
     ImportRunStatus,
@@ -431,6 +432,10 @@ def map_client_group(client_id, rows):
         "care_coordinator_status": _s(profile, "care_coordinator_status"),
         "created_at": _dt(profile, "client_created_at"),
         "updated_at": _dt(profile, "client_updated_at"),
+        # How this member first reached us. Write-once (see
+        # ClientSerializer._upsert), so re-importing an existing member never
+        # relabels one the extension created.
+        "source": ClientSource.IMPORT,
         # Authoritative: deactivate stored records absent from this export.
         "reconcile_insurances": True,
         "reconcile_social_care_coverages": True,

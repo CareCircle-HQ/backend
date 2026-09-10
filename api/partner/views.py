@@ -16,6 +16,7 @@ import base64
 import binascii
 import logging
 
+from django.db.models import Q
 from django.utils import timezone
 from rest_framework import exceptions, status as http
 from rest_framework.parsers import FormParser, JSONParser, MultiPartParser
@@ -68,15 +69,36 @@ class PartnerAPIView(APIView):
 
 
 def _order_for(request, order_id):
-    """The partner's own delivery order, or ``None``.
+    """A delivery order this partner may submit proof for, or ``None``.
 
-    A company must never see another company's order, so an order that exists
-    but belongs to someone else is reported as NOT FOUND rather than forbidden:
-    a 403 would confirm the id is real.
+    The delivery company is NOT known in advance -- it is established when proof
+    of delivery arrives (the same rule the CSV importer follows, where the
+    company is stamped onto the orders at import time). So an order is claimable
+    while it has no company, and the first successful submission stamps the
+    caller's company onto it via ``pod_ingest.apply_delivery_outcome``.
+
+    After that the order is locked to that company: another partner asking for it
+    gets NOT FOUND rather than forbidden, because a 403 would confirm the id is
+    real.
     """
-    return DeliveryOrder.objects.filter(
-        pk=order_id, delivery_company=request.user.delivery_company
-    ).select_related("member").first()
+    order = (
+        DeliveryOrder.objects
+        .filter(pk=order_id)
+        .filter(
+            Q(delivery_company__isnull=True)
+            | Q(delivery_company=request.user.delivery_company)
+        )
+        .select_related("member")
+        .first()
+    )
+    if order is not None and order.delivery_company_id is None:
+        # Worth an audit line: this is the moment an order becomes attributed to
+        # a delivery company, and nothing before it recorded who delivers what.
+        logger.info(
+            "partner %s claiming unassigned delivery order %s",
+            request.user.client.client_id, order_id,
+        )
+    return order
 
 
 def _proof_payload(proof, created):

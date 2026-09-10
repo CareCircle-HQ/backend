@@ -21788,6 +21788,70 @@ class DeliveryPartnerApiTest(TestCase):
             self.assertEqual(r.status_code, 404, path)
             self.assertEqual(r.json()["error"], "order_not_found")
 
+    def test_unassigned_order_is_claimed_by_the_partner_that_reports_it(self):
+        """The delivery company is not known until proof arrives: an order with
+        no company is claimable, and reporting it stamps the caller's company on
+        (mirrors the CSV importer, which stamps the company at import time)."""
+        from .models import DeliveryOrder, DeliveryOrderStatus, PurchaseOrder
+
+        unassigned = DeliveryOrder.objects.create(
+            purchase_order=PurchaseOrder.objects.first(),
+            member=self.order.member,
+            status=DeliveryOrderStatus.READY_FOR_DELIVERY,
+        )
+        self.assertIsNone(unassigned.delivery_company_id)
+
+        r = self.api.post(
+            f"/v1/deliveries/{unassigned.pk}/status/",
+            {"status": "delivered"}, format="json", **self._bearer(),
+        )
+        self.assertEqual(r.status_code, 200)
+        unassigned.refresh_from_db()
+        self.assertEqual(unassigned.delivery_company_id, self.company.pk)
+        self.assertIn("delivery_company", r.json()["updated_fields"])
+
+    def test_once_claimed_another_company_cannot_touch_the_order(self):
+        """First report wins: the claim locks the order to that company."""
+        from .models import (
+            DeliveryCompanyApiClient, DeliveryOrder, DeliveryOrderStatus,
+            PurchaseOrder,
+        )
+        from .partner import auth as partner_auth
+
+        unassigned = DeliveryOrder.objects.create(
+            purchase_order=PurchaseOrder.objects.first(),
+            member=self.order.member,
+            status=DeliveryOrderStatus.READY_FOR_DELIVERY,
+        )
+        # Our partner claims it.
+        self.api.post(
+            f"/v1/deliveries/{unassigned.pk}/status/",
+            {"status": "delivered"}, format="json", **self._bearer(),
+        )
+
+        # A DIFFERENT company now asks for the same order -> not found.
+        rival_secret = partner_auth.generate_secret()
+        DeliveryCompanyApiClient.objects.create(
+            delivery_company=self.other_company,
+            client_id=partner_auth.generate_client_id(self.other_company.name),
+            secret_hash=partner_auth.hash_secret(rival_secret),
+        )
+        rival_token = self.api.post(
+            "/v1/token/",
+            {"client_id": DeliveryCompanyApiClient.objects.get(
+                delivery_company=self.other_company).client_id,
+             "client_secret": rival_secret},
+            format="json", **self.PARTNER,
+        ).json()["access_token"]
+
+        r = self.api.post(
+            f"/v1/deliveries/{unassigned.pk}/status/",
+            {"status": "delivered"}, format="json",
+            HTTP_AUTHORIZATION=f"Bearer {rival_token}", **self.PARTNER,
+        )
+        self.assertEqual(r.status_code, 404)
+        self.assertEqual(r.json()["error"], "order_not_found")
+
     # -- status -------------------------------------------------------------
     def test_status_update_applies_and_rejects_non_partner_statuses(self):
         from .models import DeliveryOrderStatus
@@ -21948,6 +22012,24 @@ class DeliveryPartnerCredentialSettingsTest(TestCase):
         self.assertNotEqual(rotated.json()["client_secret"], secret)
         self.assertIsNotNone(rotated.json()["previous_secret_expires_at"])
 
+    def test_compromised_rotation_kills_the_old_secret_immediately(self):
+        """A leaked secret must not survive the grace window, and tokens already
+        minted from it must stop working."""
+        api = self._client_for("Management")
+        leaked = api.post(self.url, {}, format="json").json()["client_secret"]
+
+        # A NORMAL rotation deliberately keeps the old secret alive...
+        api.post(self.url, {"rotate": True}, format="json")
+        got = api.get(self.url).json()
+        self.assertIsNotNone(got["previous_secret_expires_at"])
+
+        # ...whereas a compromised rotation does not.
+        r = api.post(self.url, {"rotate": True, "compromised": True}, format="json")
+        self.assertEqual(r.status_code, 200)
+        self.assertIsNone(r.json()["previous_secret_expires_at"])
+        self.assertEqual(api.get(self.url).json()["active_tokens"], 0)
+        self.assertNotEqual(r.json()["client_secret"], leaked)
+
     def test_revoke_deactivates_the_credential(self):
         api = self._client_for("Management")
         api.post(self.url, {}, format="json")
@@ -21981,3 +22063,109 @@ class DeliveryPartnerCredentialSettingsTest(TestCase):
         self.assertIn("/v1/token/", spec["paths"])
         # The spec must describe ONLY the partner surface.
         self.assertTrue(all(p.startswith("/v1/") for p in spec["paths"]))
+
+
+class ClientAddedAtAndSourceTest(TestCase):
+    """``client_added_at`` (when the member reached US) and ``source`` (which
+    channel created them).
+
+    Both are write-once: ``created_at`` already carries Unite Us's own date, and
+    ~80% of that population shares a handful of days from a Unite Us migration,
+    which is why the Data page's Member-Created range needs its own column.
+    """
+
+    def _payload(self, **over):
+        data = {
+            "client_id": str(uuid.uuid4()),
+            "first_name": "Ada", "last_name": "Lovelace",
+        }
+        data.update(over)
+        return data
+
+    def test_added_at_is_stamped_on_insert_and_never_moved(self):
+        from .models import ClientSource
+
+        ser = ClientSerializer(data=self._payload())
+        ser.is_valid(raise_exception=True)
+        client = ser.save()
+        self.assertIsNotNone(client.client_added_at)
+        self.assertEqual(client.source, ClientSource.EXTENSION)
+        first = client.client_added_at
+
+        # A later write must not move it, even if the payload tries.
+        ser2 = ClientSerializer(
+            instance=client,
+            data={"client_id": str(client.client_id), "first_name": "Ada2",
+                  "client_added_at": "2001-01-01T00:00:00Z"},
+            partial=True,
+        )
+        ser2.is_valid(raise_exception=True)
+        client = ser2.save()
+        client.refresh_from_db()
+        self.assertEqual(client.client_added_at, first)
+        self.assertEqual(client.first_name, "Ada2")  # the rest of the write applied
+
+    def test_source_defaults_to_extension_and_import_can_set_its_own(self):
+        from .models import ClientSource
+
+        ext = ClientSerializer(data=self._payload())
+        ext.is_valid(raise_exception=True)
+        self.assertEqual(ext.save().source, ClientSource.EXTENSION)
+
+        imp = ClientSerializer(data=self._payload(source=ClientSource.IMPORT))
+        imp.is_valid(raise_exception=True)
+        self.assertEqual(imp.save().source, ClientSource.IMPORT)
+
+    def test_source_is_write_once(self):
+        """A re-import must not relabel a member the extension created (or vice
+        versa) -- source records how they FIRST reached us."""
+        from .models import ClientSource
+
+        ser = ClientSerializer(data=self._payload())
+        ser.is_valid(raise_exception=True)
+        client = ser.save()
+        self.assertEqual(client.source, ClientSource.EXTENSION)
+
+        again = ClientSerializer(
+            instance=client,
+            data={"client_id": str(client.client_id), "source": ClientSource.IMPORT},
+            partial=True,
+        )
+        again.is_valid(raise_exception=True)
+        client = again.save()
+        client.refresh_from_db()
+        self.assertEqual(client.source, ClientSource.EXTENSION)
+
+    def test_created_at_still_honours_the_unite_us_date(self):
+        """The source date must keep flowing into created_at -- client_added_at is
+        an addition, not a replacement."""
+        ser = ClientSerializer(data=self._payload(created_at="2019-05-05T12:00:00Z"))
+        ser.is_valid(raise_exception=True)
+        client = ser.save()
+        self.assertEqual(client.created_at.year, 2019)
+        # ...while OUR stamp is now-ish, not 2019.
+        self.assertGreater(client.client_added_at.year, 2019)
+
+    def test_data_page_member_created_filter_uses_the_added_date(self):
+        """The Data page range must key off member_added_at, so a member imported
+        today is findable today even when Unite Us says they were created in 2019."""
+        from .models import EnrollmentAnalytics
+        from .services.enrollment_analytics import filter_analytics
+
+        member = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Grace", last_name="Hopper",
+        )
+        EnrollmentAnalytics.objects.create(
+            client_id=member.pk,
+            member_created_at=timezone.now() - timedelta(days=3000),  # Unite Us date
+            member_added_at=timezone.now(),                            # ours
+        )
+        today = timezone.now().date().isoformat()
+        self.assertEqual(
+            filter_analytics({"created_from": today, "created_to": today}).count(), 1
+        )
+        # ...and the stale Unite Us date must NOT match.
+        old = (timezone.now() - timedelta(days=3000)).date().isoformat()
+        self.assertEqual(
+            filter_analytics({"created_from": old, "created_to": old}).count(), 0
+        )

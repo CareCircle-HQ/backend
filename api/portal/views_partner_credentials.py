@@ -94,6 +94,10 @@ class DeliveryCompanyApiClientView(APIView):
     def post(self, request, company_id):
         company = get_object_or_404(DeliveryCompany, pk=company_id)
         rotate = bool(request.data.get("rotate"))
+        # A LEAKED secret must die now, not after the grace window. "Rotate" is
+        # the button people reach for in that situation, so it takes a flag that
+        # skips the overlap and kills tokens already minted from the old secret.
+        compromised = bool(request.data.get("compromised"))
         client = DeliveryCompanyApiClient.objects.filter(
             delivery_company=company
         ).select_related("delivery_company").first()
@@ -115,18 +119,28 @@ class DeliveryCompanyApiClientView(APIView):
                               "to issue a new secret."},
                     status=http.HTTP_409_CONFLICT,
                 )
-            # Keep the old secret alive briefly so the vendor can redeploy
-            # without an outage, then reactivate a revoked credential.
-            client.previous_secret_hash = client.secret_hash
-            client.previous_secret_expires_at = timezone.now() + timezone.timedelta(
-                seconds=partner_auth.ROTATION_GRACE_SECONDS
-            )
+            if compromised:
+                # No overlap: the old secret stops working immediately, and any
+                # access token already issued from it is revoked.
+                client.previous_secret_hash = ""
+                client.previous_secret_expires_at = None
+            else:
+                # Keep the old secret alive briefly so the vendor can redeploy
+                # without an outage.
+                client.previous_secret_hash = client.secret_hash
+                client.previous_secret_expires_at = timezone.now() + timezone.timedelta(
+                    seconds=partner_auth.ROTATION_GRACE_SECONDS
+                )
             client.secret_hash = partner_auth.hash_secret(secret)
-            client.revoked_at = None
+            client.revoked_at = None  # rotating reactivates a revoked credential
             client.save(update_fields=[
                 "previous_secret_hash", "previous_secret_expires_at",
                 "secret_hash", "revoked_at", "updated_at",
             ])
+            if compromised:
+                PartnerAccessToken.objects.filter(
+                    client=client, revoked_at__isnull=True
+                ).update(revoked_at=timezone.now())
             created = False
 
         client.refresh_from_db()

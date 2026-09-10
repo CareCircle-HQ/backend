@@ -56,6 +56,11 @@ clickable HTML explorer of the surface.
 **Rotation is zero-downtime:** issuing a new secret keeps the old one valid until
 the grace window closes, so the vendor can redeploy without an outage.
 
+**A LEAKED secret needs `compromised: true`** on the rotate call ("Rotate now
+(leaked)" in Settings). A normal rotation deliberately keeps the old secret
+working for the overlap, which is the opposite of what a leak needs, so this
+variant skips the overlap and revokes every access token already minted from it.
+
 ### Why opaque access tokens, not JWTs
 
 `DEFAULT_AUTHENTICATION_CLASSES` contains two JWT authenticators. A partner JWT
@@ -83,11 +88,25 @@ already receive on the manifest, so there is no new identifier for them.
 **Deliberately absent:** any endpoint that lists our data. Partners submit; they
 do not read.
 
-### Scoping
+### Scoping — claim on POD
 
-Every order is resolved through `_order_for()`, which filters by the caller's
-company. An order that exists but belongs to someone else returns **404, not
-403** — a 403 would confirm the id is real.
+The delivery company is **not known before delivery**: it is established when
+proof arrives. (The CSV importer works the same way -- the company is stamped
+onto the orders at import time.) In production **no order has a company set**
+(0 of 320k), so requiring one up front would make the API unusable.
+
+So `_order_for()` accepts an order that either has **no company** (claimable) or
+**already belongs to the caller**. The first successful submission stamps the
+caller's company on via `pod_ingest.apply_delivery_outcome`, and from then on the
+order is locked to them: another partner asking for it gets **404, not 403** — a
+403 would confirm the id is real. Claims are logged, since that is the moment an
+order becomes attributed to a carrier.
+
+Trade-off to be aware of: any partner can claim any *unclaimed* order. That is
+inherent to deciding the carrier at POD time, and it is the same exposure the CSV
+flow has -- except there a staff member chooses the company. If it ever matters,
+the guard is to populate `delivery_company` earlier (both `DeliveryOrder` and
+`PurchaseOrder` already have the field) and tighten this filter.
 
 `/confirm/` additionally refuses any S3 key that wasn't issued for that company
 *and* that order, so a partner cannot name an arbitrary object in our bucket.

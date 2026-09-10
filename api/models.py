@@ -344,6 +344,18 @@ def default_communication_time_of_day():
     return {day: [] for day in WEEKDAYS}
 
 
+class ClientSource(models.TextChoices):
+    """Which channel first created the member in OUR system.
+
+    Write-once: set when the row is first inserted and never rewritten, so it
+    always answers "how did this member get here?". Blank on rows that predate
+    the field.
+    """
+
+    EXTENSION = "extension", "Extension"
+    IMPORT = "import", "Import"
+
+
 # ---------------------------------------------------------------------------
 # Core model
 # ---------------------------------------------------------------------------
@@ -466,8 +478,22 @@ class Client(models.Model):
     crm_synced_at = models.DateTimeField(null=True, blank=True)
 
     # --- Metadata ---
+    # SOURCE timestamps: Unite Us's own created/updated dates for the person,
+    # carried through by the extension and the CSV import. NOT when we first saved
+    # the member: Unite Us migrated most of this population in at the end of 2024,
+    # so ~80% of rows share a handful of days in Dec-2024/Jan-2025.
     created_at = models.DateTimeField(null=True, blank=True)
     updated_at = models.DateTimeField(null=True, blank=True)
+    # OUR date: when this member was first inserted into the CRM, stamped on the
+    # first insert (see ``save``) and never rewritten. This is what the Data
+    # page's "Member Created" range filters, because unlike ``created_at`` it
+    # reflects when the member actually reached us.
+    client_added_at = models.DateTimeField(null=True, blank=True, db_index=True)
+    # Which channel first created the member (extension vs import). Write-once,
+    # enforced in ClientSerializer._upsert.
+    source = models.CharField(
+        max_length=20, choices=ClientSource.choices, blank=True, db_index=True
+    )
 
     # --- Demographics ---
     gender = models.CharField(max_length=20, blank=True)  # male/female/other/unknown
@@ -565,6 +591,10 @@ class Client(models.Model):
         # page created-date filter (and show a blank "Created" column).
         if self._state.adding and self.created_at is None:
             self.created_at = timezone.now()
+        # OUR "added to the CRM" stamp: first insert only, so it is never moved by
+        # a later sync. Kept separate from ``created_at`` (the Unite Us date).
+        if self._state.adding and self.client_added_at is None:
+            self.client_added_at = timezone.now()
         super().save(*args, **kwargs)
 
     def __str__(self):
@@ -5016,7 +5046,15 @@ class EnrollmentAnalytics(models.Model):
 
     # --- scalar filter columns (btree via db_index) ---
     dob = models.DateField(null=True, blank=True, db_index=True)
+    # Unite Us's own created date for the person. Kept for reference/export, but
+    # NOT what "Member Created" filters -- Unite Us migrated ~80% of this
+    # population in over a few days, so it clusters uselessly. See Client.
     member_created_at = models.DateTimeField(null=True, blank=True, db_index=True)
+    # When the member first reached OUR system (Client.client_added_at). This is
+    # what the Data page's Member-Created range filters on.
+    member_added_at = models.DateTimeField(null=True, blank=True, db_index=True)
+    # How the member first reached us (extension vs import).
+    source = models.CharField(max_length=20, blank=True, db_index=True)
     care_coordinator = models.CharField(max_length=255, blank=True, db_index=True)
     primary_care_coordinator = models.CharField(max_length=255, blank=True)
     cadence = models.CharField(max_length=40, blank=True, db_index=True)
