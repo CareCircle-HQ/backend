@@ -20666,6 +20666,112 @@ class WilliamsburgKitchenGuardTest(TestCase):
             self.assertNotIn(c.client_id, ids)
 
 
+class CadenceFilterIgnoresFinishedPlansTest(TestCase):
+    """The Members-list cadence filter must describe the CURRENT plan.
+
+    It matched any schedule row on any enrollment, so a member whose old
+    household closed on Mon/Thu kept answering that filter for good: the list
+    showed them under Mon/Thu while opening the member -- which reads the current
+    enrollment -- showed Wed-Only.
+    """
+
+    def _agent_api(self):
+        agent = Agent.objects.create(
+            name="Ops", agent_code="OPS-1", email="ops-1@example.com",
+            group="Logistics", status="Active",
+        )
+        access = AccessToken()
+        access["agent_id"] = str(agent.id)
+        access["agent_code"] = agent.agent_code
+        access["agent_name"] = agent.name
+        access["agent_group"] = agent.group
+        api = APIClient()
+        api.credentials(HTTP_AUTHORIZATION=f"Bearer {access}")
+        return api
+
+    def test_a_closed_households_cadence_no_longer_matches(self):
+        from .models import (
+            Client, DeliveryCadence, EnrollmentStage, EnrollmentVerification,
+            MemberDeliverySchedule, MemberDietaryProfile, MemberStatus,
+            ScheduleStatus,
+        )
+
+        client = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Sara", last_name="Fisher",
+        )
+        # The household they LEFT: closed, and still recorded on Mon/Thu.
+        closed = EnrollmentVerification.objects.create(
+            client=client, stage=EnrollmentStage.CLOSED,
+        )
+        old_profile = MemberDietaryProfile.objects.create(
+            enrollment=closed, client=client, member_name="Sara Fisher",
+            status=MemberStatus.INACTIVE,
+        )
+        MemberDeliverySchedule.objects.create(
+            enrollment=closed, member_profile=old_profile,
+            delivery_days_cadence=DeliveryCadence.MON_THU,
+            status=ScheduleStatus.SCHEDULED,
+        )
+        # Their CURRENT household, moved to Wed-Only.
+        live = EnrollmentVerification.objects.create(
+            client=client, stage=EnrollmentStage.SERVICE_ACTIVE,
+        )
+        live_profile = MemberDietaryProfile.objects.create(
+            enrollment=live, client=client, member_name="Sara Fisher",
+            status=MemberStatus.ACTIVE,
+        )
+        MemberDeliverySchedule.objects.create(
+            enrollment=live, member_profile=live_profile,
+            delivery_days_cadence=DeliveryCadence.ONCE_A_WEEK,
+            status=ScheduleStatus.SCHEDULED,
+        )
+
+        api = self._agent_api()
+
+        def ids_for(cadence):
+            r = api.get(f"/api/portal/members/?cadence={cadence}")
+            self.assertEqual(r.status_code, 200)
+            body = r.json()
+            rows = body if isinstance(body, list) else body.get("results", [])
+            return {str(row.get("client_id") or row.get("id")) for row in rows}
+
+        self.assertNotIn(str(client.client_id), ids_for("mon_thu"))
+        self.assertIn(str(client.client_id), ids_for("once_a_week"))
+
+    def test_a_cancelled_plan_does_not_answer_the_filter(self):
+        """A cancelled row on a LIVE enrollment is history too."""
+        from .models import (
+            Client, DeliveryCadence, EnrollmentStage, EnrollmentVerification,
+            MemberDeliverySchedule, MemberDietaryProfile, MemberStatus,
+            ScheduleStatus,
+        )
+
+        client = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Cancel", last_name="Row",
+        )
+        enr = EnrollmentVerification.objects.create(
+            client=client, stage=EnrollmentStage.SERVICE_ACTIVE,
+        )
+        profile = MemberDietaryProfile.objects.create(
+            enrollment=enr, client=client, member_name="Cancel Row",
+            status=MemberStatus.ACTIVE,
+        )
+        MemberDeliverySchedule.objects.create(
+            enrollment=enr, member_profile=profile,
+            delivery_days_cadence=DeliveryCadence.MON_THU,
+            status=ScheduleStatus.CANCELLED,
+        )
+
+        api = self._agent_api()
+        r = api.get("/api/portal/members/?cadence=mon_thu")
+        body = r.json()
+        rows = body if isinstance(body, list) else body.get("results", [])
+        self.assertNotIn(
+            str(client.client_id),
+            {str(row.get("client_id") or row.get("id")) for row in rows},
+        )
+
+
 class UnservableHouseholdAssignmentTest(TestCase):
     """Assigning a kitchen/cadence to a household with nobody servable must FAIL
     LOUDLY.

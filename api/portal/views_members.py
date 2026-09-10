@@ -52,6 +52,7 @@ from ..models import (
     InsurancePlanType,
     Kitchen,
     MemberDeliverySchedule,
+    ScheduleStatus,
     MemberDietaryProfile,
     KitchenProductType,
     MemberStatus,
@@ -2074,9 +2075,24 @@ class MembersListView(PortalGenericAPIView):
                 Q(code__iexact=cadence_val) | Q(label__iexact=cadence_val)
             ).first()
             cadence_code = row.code if row else cadence_val
-            qs = qs.filter(
-                member_profiles__delivery_schedules__delivery_days_cadence=cadence_code
+            # Only a LIVE plan counts. Matching any schedule row meant a member
+            # whose OLD household closed on Mon/Thu kept matching that filter for
+            # good -- the list showed them under Mon/Thu while opening the member
+            # (which reads the current enrollment) showed Wed-Only. Both a
+            # cancelled row and a finished enrollment are history.
+            #
+            # Expressed as EXISTS so all three conditions apply to the SAME
+            # schedule row: a plain .exclude() on the join would drop any client
+            # who merely HAS a closed enrollment somewhere.
+            live_cadence = MemberDeliverySchedule.objects.filter(
+                member_profile__client_id=OuterRef("pk"),
+                delivery_days_cadence=cadence_code,
+            ).exclude(
+                status__in=(ScheduleStatus.CANCELLED, ScheduleStatus.COMPLETED),
+            ).exclude(
+                enrollment__stage__in=FINISHED_ENROLLMENT_STAGES,
             )
+            qs = qs.filter(Exists(live_cadence))
 
         # Team filter (Members page): keep members whose INTERNAL-SERVICE case
         # was CREATED by a Unite Us agent on the selected CareCircle originating
@@ -7088,6 +7104,19 @@ def _logistics_enrollment(client_id):
             status=http.HTTP_404_NOT_FOUND,
         )
     return client, enr, None
+
+
+# Enrollment stages whose delivery plan is HISTORY: their cadence describes a
+# household we no longer serve, so it must not answer a "current cadence" filter.
+# Deliberately NOT the same as SERVICE_EXCLUDED_ENROLLMENT_STAGES, which also
+# covers On Hold and Kitchen Assignment -- those are live households an agent
+# still expects to find.
+FINISHED_ENROLLMENT_STAGES = (
+    EnrollmentStage.CLOSED,
+    EnrollmentStage.CANCELLED,
+    EnrollmentStage.DISREGARDED,
+    EnrollmentStage.SERVICE_COMPLETE,
+)
 
 
 def assign_kitchen_to_household(
