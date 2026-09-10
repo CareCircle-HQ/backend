@@ -223,6 +223,69 @@ def _open_out_of_range_ticket(enrollment, reason):
     return True
 
 
+def _recover_delivery_coverage(enrollment, agent):
+    """Re-run eligibility for a household whose delivery ZIP is now serviceable.
+
+    The mirror of :func:`_enforce_delivery_coverage`. That off-ramp is sticky --
+    it is never auto-reversed by the ZIP becoming serviceable -- and the intent
+    was that "an agent must resolve it". But the only code that CAN resolve it
+    (``reconcile_client_eligibility``) runs on the extension save and the CSV
+    import; nothing in the CRM did. So the CRM could put a household into Not
+    Eligible and never take it out: the agent entered the corrected in-range
+    address, and nothing happened.
+
+    An agent typing a verified new address IS that resolution, so it re-runs the
+    gates here. Nobody is restored blindly: ``reconcile_client_eligibility``
+    re-evaluates EVERY gate, so a member who is also ineligible for insurance /
+    Medicaid type / coverage reasons stays ineligible. Only households actually
+    off-ramped for the coverage area are touched.
+
+    Returns the names of the members restored.
+    """
+    from api.history import ChangeSource
+    from ..models import ClientStage
+    from ..services.eligibility import reconcile_client_eligibility
+    from ..services.service_area import SERVICE_AREA_REASON
+
+    actor_label = getattr(agent, "name", "") or ""
+    candidates, seen = [], set()
+    for member in [enrollment.client] + [
+        mp.client for mp in enrollment.member_profiles.select_related("client").all()
+    ]:
+        if member is None or member.pk in seen:
+            continue
+        seen.add(member.pk)
+        # Only a coverage-area off-ramp is ours to reverse here.
+        if member.lifecycle_stage != ClientStage.INELIGIBLE:
+            continue
+        if SERVICE_AREA_REASON not in list(member.ineligible_reasons or []):
+            continue
+        candidates.append(member)
+
+    restored = []
+    for member in candidates:
+        try:
+            stage = reconcile_client_eligibility(
+                member, actor_label=actor_label, source=ChangeSource.CRM,
+            )
+        except Exception:  # never let a recovery attempt break the address save
+            logger.exception("coverage recovery failed for client %s", member.pk)
+            continue
+        if stage != ClientStage.INELIGIBLE:
+            restored.append(
+                f"{member.first_name} {member.last_name}".strip() or str(member.pk)
+            )
+    if restored:
+        # The off-ramp opened a Case Closure ticket for review; the review is done.
+        try:
+            _resolve_out_of_range_tickets(enrollment, actor=actor_label)
+        except Exception:  # never let ticket cleanup break the address save
+            logger.exception(
+                "out-of-range ticket cleanup failed for enrollment %s", enrollment.pk
+            )
+    return restored
+
+
 def _resolve_out_of_range_tickets(enrollment, actor=""):
     """Mark this household's open Out-of-Range Case Closure ticket(s) resolved
     (called when the ZIP becomes serviceable again). Returns the count resolved."""
@@ -4213,12 +4276,23 @@ class MemberHouseholdView(PortalAPIView):
         # service; an agent must resolve the Not-Eligible state.
         from ..services.service_area import is_zip_out_of_range
         coverage = None
+        restored = []
         if is_zip_out_of_range(addr.zip):
             coverage = _enforce_delivery_coverage(enr, agent)
+        else:
+            # ...and the mirror: a corrected, in-range address re-runs the gates,
+            # so the CRM can take a household OUT of the coverage off-ramp it put
+            # them in. Without this the agent fixed the address and nothing moved.
+            restored = _recover_delivery_coverage(enr, agent)
         resp = {
             "street": addr.street, "unit": addr.unit, "city": addr.city,
             "state": addr.state, "zip": addr.zip, "notes": addr.notes,
         }
+        if restored:
+            resp["coverage_restored"] = (
+                f"ZIP {addr.zip} is within the coverage area — "
+                f"{', '.join(restored)} returned to service."
+            )
         if coverage and coverage.get("out_of_range"):
             names = coverage["out_of_range"]
             resp["coverage_warning"] = (

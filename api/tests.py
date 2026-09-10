@@ -20666,6 +20666,120 @@ class WilliamsburgKitchenGuardTest(TestCase):
             self.assertNotIn(c.client_id, ids)
 
 
+class DeliveryCoverageRecoveryTest(TestCase):
+    """Correcting an out-of-range delivery address must return the household to
+    service.
+
+    The coverage off-ramp is sticky on purpose -- "an agent must resolve it" --
+    but the only code that CAN resolve it (reconcile_client_eligibility) ran on
+    the extension save and the CSV import, never in the CRM. So the CRM could
+    push a household to Not Eligible and had no way back: the agent typed the
+    corrected in-range address and nothing happened.
+
+    Real case: ZIP 11219 (not in the service list) corrected to 11212 (Brooklyn,
+    active).
+    """
+
+    def _setup(self):
+        from .models import (
+            Address, AddressType, Client, EnrollmentStage, EnrollmentVerification,
+            Household, HouseholdMember, Insurance, MemberDietaryProfile,
+            MemberStatus, ServiceZipCode,
+        )
+
+        ServiceZipCode.objects.create(zip="11212", borough="Brooklyn", is_active=True)
+        client = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Out", last_name="Ofrange",
+        )
+        # A live insurance policy, so the ZIP is the ONLY failing gate and the
+        # test is actually about coverage recovery.
+        Insurance.objects.create(
+            client=client, plan_name="Fidelis Medicaid",
+            expired_at=timezone.now() + timedelta(days=365),
+        )
+        addr = Address.objects.create(
+            client=client, type=AddressType.DELIVERY,
+            street="5001 10th Ave", city="Brooklyn", state="NY", zip="11219",
+        )
+        household = Household.objects.create(name="HH")
+        HouseholdMember.objects.create(household=household, client=client, is_primary=True)
+        enr = EnrollmentVerification.objects.create(
+            client=client, household=household, delivery_address=addr,
+            stage=EnrollmentStage.SERVICE_ACTIVE,
+        )
+        MemberDietaryProfile.objects.create(
+            enrollment=enr, client=client, member_name="Out Ofrange",
+            status=MemberStatus.ACTIVE, menu_type="Regular",
+        )
+        return client, enr, addr
+
+    def _api(self):
+        agent = Agent.objects.create(
+            name="CS One", agent_code="CS-1", email="cs-1@example.com",
+            group="CS", status="Active",
+        )
+        access = AccessToken()
+        access["agent_id"] = str(agent.id)
+        access["agent_code"] = agent.agent_code
+        access["agent_name"] = agent.name
+        access["agent_group"] = agent.group
+        api = APIClient()
+        api.credentials(HTTP_AUTHORIZATION=f"Bearer {access}")
+        return api
+
+    def test_correcting_the_zip_restores_the_household(self):
+        from .models import ClientStage
+        from .services.service_area import SERVICE_AREA_REASON, is_zip_out_of_range
+
+        client, enr, addr = self._setup()
+        self.assertTrue(is_zip_out_of_range("11219"))
+        self.assertFalse(is_zip_out_of_range("11212"))
+
+        api = self._api()
+        url = f"/api/portal/members/{client.client_id}/household/"
+
+        # 1. The bad ZIP off-ramps the household.
+        r = api.patch(url, {"street": "5001 10th Ave", "city": "Brooklyn",
+                            "state": "NY", "zip": "11219"}, format="json")
+        self.assertEqual(r.status_code, 200)
+        client.refresh_from_db()
+        self.assertEqual(client.lifecycle_stage, ClientStage.INELIGIBLE)
+        self.assertIn(SERVICE_AREA_REASON, list(client.ineligible_reasons or []))
+
+        # 2. The corrected ZIP brings them back -- and says so.
+        r2 = api.patch(url, {"street": "300 Dumont Avenue", "unit": "15G",
+                             "city": "Brooklyn", "state": "NY", "zip": "11212"},
+                       format="json")
+        self.assertEqual(r2.status_code, 200)
+        client.refresh_from_db()
+        self.assertNotEqual(client.lifecycle_stage, ClientStage.INELIGIBLE)
+        self.assertEqual(list(client.ineligible_reasons or []), [])
+        self.assertIn("coverage_restored", r2.json())
+
+    def test_a_member_ineligible_for_another_reason_is_not_restored(self):
+        """Recovery re-runs EVERY gate, so a coverage fix must not paper over an
+        unrelated ineligibility."""
+        from .models import ClientStage, Insurance
+        from .services.eligibility import evaluate_client
+
+        client, enr, addr = self._setup()
+        api = self._api()
+        url = f"/api/portal/members/{client.client_id}/household/"
+        api.patch(url, {"street": "5001 10th Ave", "city": "Brooklyn",
+                        "state": "NY", "zip": "11219"}, format="json")
+        client.refresh_from_db()
+        self.assertEqual(client.lifecycle_stage, ClientStage.INELIGIBLE)
+
+        # A second, unrelated gate now fails as well.
+        Insurance.objects.filter(client=client).delete()
+        self.assertTrue(evaluate_client(client).ineligible)
+
+        api.patch(url, {"street": "300 Dumont Avenue", "city": "Brooklyn",
+                        "state": "NY", "zip": "11212"}, format="json")
+        client.refresh_from_db()
+        self.assertEqual(client.lifecycle_stage, ClientStage.INELIGIBLE)
+
+
 class CadenceFilterIgnoresFinishedPlansTest(TestCase):
     """The Members-list cadence filter must describe the CURRENT plan.
 
