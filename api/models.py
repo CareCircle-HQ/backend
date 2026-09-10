@@ -2369,17 +2369,33 @@ class EnrollmentVerification(models.Model):
         return f"{self.client_id} ({self.stage})"
 
 
-# Canonical medical Conditions offered in the verification wizard (Step 2).
-# Stored as labels on MemberDietaryProfile.conditions. "No Restriction" is the
-# default / nothing-selected sentinel.
-MEMBER_CONDITIONS = [
-    "Cancer", "Cardiometabolic", "Crohn’s Disease", "Diabetic",
+# Medical Conditions OFFERED in the verification wizard (Step 2) and the
+# nutritionist intake. Stored as labels on MemberDietaryProfile.conditions;
+# "No Restriction" is the default / nothing-selected sentinel.
+SELECTABLE_MEMBER_CONDITIONS = [
+    "Cancer", "Congestive Heart Failure", "Crohn’s Disease", "Diabetic",
     "Gestational Diabetes", "Heart disease", "High blood pressure",
     "High cholesterol", "Hypothyroidism", "Hyperthyroidism", "IBS",
-    "Kidney Disease", "Liver Disease", "Overweight (determined by BMI)",
+    "Kidney Disease Non-Dialysis", "Kidney Disease ON Dialysis",
+    "Liver Disease", "Overweight (determined by BMI)",
     "Obesity (determined by BMI)", "Pre-Diabetes", "Postpartum", "Pregnant",
     "Ulcerative Colitis", "No Restriction",
 ]
+
+# RETIRED conditions: no longer offered, but NOT removed from members who
+# already carry one. Deleting a clinical value someone recorded deliberately
+# would destroy history, so these stay valid stored labels -- they still render
+# on the nutritionist pages and remain searchable in the Data page's free-text
+# conditions filter. "Kidney Disease" was split into the Non-Dialysis / ON
+# Dialysis pair above; "Cardiometabolic" was replaced by Congestive Heart
+# Failure.
+RETIRED_MEMBER_CONDITIONS = [
+    "Cardiometabolic",
+    "Kidney Disease",
+]
+
+# Every label that may legitimately appear on a stored profile.
+MEMBER_CONDITIONS = SELECTABLE_MEMBER_CONDITIONS + RETIRED_MEMBER_CONDITIONS
 
 
 def default_member_conditions():
