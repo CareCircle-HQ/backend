@@ -20666,6 +20666,226 @@ class WilliamsburgKitchenGuardTest(TestCase):
             self.assertNotIn(c.client_id, ids)
 
 
+class DeliveryCoverageRecoveryTest(TestCase):
+    """Correcting an out-of-range delivery address must return the household to
+    service.
+
+    The coverage off-ramp is sticky on purpose -- "an agent must resolve it" --
+    but the only code that CAN resolve it (reconcile_client_eligibility) ran on
+    the extension save and the CSV import, never in the CRM. So the CRM could
+    push a household to Not Eligible and had no way back: the agent typed the
+    corrected in-range address and nothing happened.
+
+    Real case: ZIP 11219 (not in the service list) corrected to 11212 (Brooklyn,
+    active).
+    """
+
+    def _setup(self):
+        from .models import (
+            Address, AddressType, Client, EnrollmentStage, EnrollmentVerification,
+            Household, HouseholdMember, Insurance, MemberDietaryProfile,
+            MemberStatus, ServiceZipCode,
+        )
+
+        ServiceZipCode.objects.create(zip="11212", borough="Brooklyn", is_active=True)
+        client = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Out", last_name="Ofrange",
+        )
+        # A live insurance policy, so the ZIP is the ONLY failing gate and the
+        # test is actually about coverage recovery.
+        Insurance.objects.create(
+            client=client, plan_name="Fidelis Medicaid",
+            expired_at=timezone.now() + timedelta(days=365),
+        )
+        addr = Address.objects.create(
+            client=client, type=AddressType.DELIVERY,
+            street="5001 10th Ave", city="Brooklyn", state="NY", zip="11219",
+        )
+        household = Household.objects.create(name="HH")
+        HouseholdMember.objects.create(household=household, client=client, is_primary=True)
+        enr = EnrollmentVerification.objects.create(
+            client=client, household=household, delivery_address=addr,
+            stage=EnrollmentStage.SERVICE_ACTIVE,
+        )
+        MemberDietaryProfile.objects.create(
+            enrollment=enr, client=client, member_name="Out Ofrange",
+            status=MemberStatus.ACTIVE, menu_type="Regular",
+        )
+        return client, enr, addr
+
+    def _api(self):
+        agent = Agent.objects.create(
+            name="CS One", agent_code="CS-1", email="cs-1@example.com",
+            group="CS", status="Active",
+        )
+        access = AccessToken()
+        access["agent_id"] = str(agent.id)
+        access["agent_code"] = agent.agent_code
+        access["agent_name"] = agent.name
+        access["agent_group"] = agent.group
+        api = APIClient()
+        api.credentials(HTTP_AUTHORIZATION=f"Bearer {access}")
+        return api
+
+    def test_correcting_the_zip_restores_the_household(self):
+        from .models import ClientStage
+        from .services.service_area import SERVICE_AREA_REASON, is_zip_out_of_range
+
+        client, enr, addr = self._setup()
+        self.assertTrue(is_zip_out_of_range("11219"))
+        self.assertFalse(is_zip_out_of_range("11212"))
+
+        api = self._api()
+        url = f"/api/portal/members/{client.client_id}/household/"
+
+        # 1. The bad ZIP off-ramps the household.
+        r = api.patch(url, {"street": "5001 10th Ave", "city": "Brooklyn",
+                            "state": "NY", "zip": "11219"}, format="json")
+        self.assertEqual(r.status_code, 200)
+        client.refresh_from_db()
+        self.assertEqual(client.lifecycle_stage, ClientStage.INELIGIBLE)
+        self.assertIn(SERVICE_AREA_REASON, list(client.ineligible_reasons or []))
+
+        # 2. The corrected ZIP brings them back -- and says so.
+        r2 = api.patch(url, {"street": "300 Dumont Avenue", "unit": "15G",
+                             "city": "Brooklyn", "state": "NY", "zip": "11212"},
+                       format="json")
+        self.assertEqual(r2.status_code, 200)
+        client.refresh_from_db()
+        self.assertNotEqual(client.lifecycle_stage, ClientStage.INELIGIBLE)
+        self.assertEqual(list(client.ineligible_reasons or []), [])
+        self.assertIn("coverage_restored", r2.json())
+
+    def test_a_member_ineligible_for_another_reason_is_not_restored(self):
+        """Recovery re-runs EVERY gate, so a coverage fix must not paper over an
+        unrelated ineligibility."""
+        from .models import ClientStage, Insurance
+        from .services.eligibility import evaluate_client
+
+        client, enr, addr = self._setup()
+        api = self._api()
+        url = f"/api/portal/members/{client.client_id}/household/"
+        api.patch(url, {"street": "5001 10th Ave", "city": "Brooklyn",
+                        "state": "NY", "zip": "11219"}, format="json")
+        client.refresh_from_db()
+        self.assertEqual(client.lifecycle_stage, ClientStage.INELIGIBLE)
+
+        # A second, unrelated gate now fails as well.
+        Insurance.objects.filter(client=client).delete()
+        self.assertTrue(evaluate_client(client).ineligible)
+
+        api.patch(url, {"street": "300 Dumont Avenue", "city": "Brooklyn",
+                        "state": "NY", "zip": "11212"}, format="json")
+        client.refresh_from_db()
+        self.assertEqual(client.lifecycle_stage, ClientStage.INELIGIBLE)
+
+
+class CadenceFilterIgnoresFinishedPlansTest(TestCase):
+    """The Members-list cadence filter must describe the CURRENT plan.
+
+    It matched any schedule row on any enrollment, so a member whose old
+    household closed on Mon/Thu kept answering that filter for good: the list
+    showed them under Mon/Thu while opening the member -- which reads the current
+    enrollment -- showed Wed-Only.
+    """
+
+    def _agent_api(self):
+        agent = Agent.objects.create(
+            name="Ops", agent_code="OPS-1", email="ops-1@example.com",
+            group="Logistics", status="Active",
+        )
+        access = AccessToken()
+        access["agent_id"] = str(agent.id)
+        access["agent_code"] = agent.agent_code
+        access["agent_name"] = agent.name
+        access["agent_group"] = agent.group
+        api = APIClient()
+        api.credentials(HTTP_AUTHORIZATION=f"Bearer {access}")
+        return api
+
+    def test_a_closed_households_cadence_no_longer_matches(self):
+        from .models import (
+            Client, DeliveryCadence, EnrollmentStage, EnrollmentVerification,
+            MemberDeliverySchedule, MemberDietaryProfile, MemberStatus,
+            ScheduleStatus,
+        )
+
+        client = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Sara", last_name="Fisher",
+        )
+        # The household they LEFT: closed, and still recorded on Mon/Thu.
+        closed = EnrollmentVerification.objects.create(
+            client=client, stage=EnrollmentStage.CLOSED,
+        )
+        old_profile = MemberDietaryProfile.objects.create(
+            enrollment=closed, client=client, member_name="Sara Fisher",
+            status=MemberStatus.INACTIVE,
+        )
+        MemberDeliverySchedule.objects.create(
+            enrollment=closed, member_profile=old_profile,
+            delivery_days_cadence=DeliveryCadence.MON_THU,
+            status=ScheduleStatus.SCHEDULED,
+        )
+        # Their CURRENT household, moved to Wed-Only.
+        live = EnrollmentVerification.objects.create(
+            client=client, stage=EnrollmentStage.SERVICE_ACTIVE,
+        )
+        live_profile = MemberDietaryProfile.objects.create(
+            enrollment=live, client=client, member_name="Sara Fisher",
+            status=MemberStatus.ACTIVE,
+        )
+        MemberDeliverySchedule.objects.create(
+            enrollment=live, member_profile=live_profile,
+            delivery_days_cadence=DeliveryCadence.ONCE_A_WEEK,
+            status=ScheduleStatus.SCHEDULED,
+        )
+
+        api = self._agent_api()
+
+        def ids_for(cadence):
+            r = api.get(f"/api/portal/members/?cadence={cadence}")
+            self.assertEqual(r.status_code, 200)
+            body = r.json()
+            rows = body if isinstance(body, list) else body.get("results", [])
+            return {str(row.get("client_id") or row.get("id")) for row in rows}
+
+        self.assertNotIn(str(client.client_id), ids_for("mon_thu"))
+        self.assertIn(str(client.client_id), ids_for("once_a_week"))
+
+    def test_a_cancelled_plan_does_not_answer_the_filter(self):
+        """A cancelled row on a LIVE enrollment is history too."""
+        from .models import (
+            Client, DeliveryCadence, EnrollmentStage, EnrollmentVerification,
+            MemberDeliverySchedule, MemberDietaryProfile, MemberStatus,
+            ScheduleStatus,
+        )
+
+        client = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Cancel", last_name="Row",
+        )
+        enr = EnrollmentVerification.objects.create(
+            client=client, stage=EnrollmentStage.SERVICE_ACTIVE,
+        )
+        profile = MemberDietaryProfile.objects.create(
+            enrollment=enr, client=client, member_name="Cancel Row",
+            status=MemberStatus.ACTIVE,
+        )
+        MemberDeliverySchedule.objects.create(
+            enrollment=enr, member_profile=profile,
+            delivery_days_cadence=DeliveryCadence.MON_THU,
+            status=ScheduleStatus.CANCELLED,
+        )
+
+        api = self._agent_api()
+        r = api.get("/api/portal/members/?cadence=mon_thu")
+        body = r.json()
+        rows = body if isinstance(body, list) else body.get("results", [])
+        self.assertNotIn(
+            str(client.client_id),
+            {str(row.get("client_id") or row.get("id")) for row in rows},
+        )
+
+
 class UnservableHouseholdAssignmentTest(TestCase):
     """Assigning a kitchen/cadence to a household with nobody servable must FAIL
     LOUDLY.
@@ -20717,7 +20937,13 @@ class UnservableHouseholdAssignmentTest(TestCase):
         enr, client, kitchen = self._household(MemberStatus.INACTIVE)
         with self.assertRaises(ValueError) as ctx:
             assign_kitchen_to_household(enr, client, kitchen, cadence="mon_thu")
-        self.assertIn("no member that can be served", str(ctx.exception))
+        msg = str(ctx.exception)
+        # Names WHO is blocking and says "member profile status" -- the client
+        # header shows Active (a different field), so a vague message reads as
+        # simply untrue to the agent looking at it.
+        self.assertIn("Solo Member", msg)
+        self.assertIn("Inactive", msg)
+        self.assertIn("member profile", msg)
         # ...and the household is left untouched rather than half-assigned.
         self.assertEqual(current_household_cadence(enr), "")
         self.assertEqual(enr.delivery_schedules.count(), 0)

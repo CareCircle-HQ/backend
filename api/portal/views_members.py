@@ -52,6 +52,7 @@ from ..models import (
     InsurancePlanType,
     Kitchen,
     MemberDeliverySchedule,
+    ScheduleStatus,
     MemberDietaryProfile,
     KitchenProductType,
     MemberStatus,
@@ -220,6 +221,69 @@ def _open_out_of_range_ticket(enrollment, reason):
         detail="Out-of-range ticket opened by the system.",
     )
     return True
+
+
+def _recover_delivery_coverage(enrollment, agent):
+    """Re-run eligibility for a household whose delivery ZIP is now serviceable.
+
+    The mirror of :func:`_enforce_delivery_coverage`. That off-ramp is sticky --
+    it is never auto-reversed by the ZIP becoming serviceable -- and the intent
+    was that "an agent must resolve it". But the only code that CAN resolve it
+    (``reconcile_client_eligibility``) runs on the extension save and the CSV
+    import; nothing in the CRM did. So the CRM could put a household into Not
+    Eligible and never take it out: the agent entered the corrected in-range
+    address, and nothing happened.
+
+    An agent typing a verified new address IS that resolution, so it re-runs the
+    gates here. Nobody is restored blindly: ``reconcile_client_eligibility``
+    re-evaluates EVERY gate, so a member who is also ineligible for insurance /
+    Medicaid type / coverage reasons stays ineligible. Only households actually
+    off-ramped for the coverage area are touched.
+
+    Returns the names of the members restored.
+    """
+    from api.history import ChangeSource
+    from ..models import ClientStage
+    from ..services.eligibility import reconcile_client_eligibility
+    from ..services.service_area import SERVICE_AREA_REASON
+
+    actor_label = getattr(agent, "name", "") or ""
+    candidates, seen = [], set()
+    for member in [enrollment.client] + [
+        mp.client for mp in enrollment.member_profiles.select_related("client").all()
+    ]:
+        if member is None or member.pk in seen:
+            continue
+        seen.add(member.pk)
+        # Only a coverage-area off-ramp is ours to reverse here.
+        if member.lifecycle_stage != ClientStage.INELIGIBLE:
+            continue
+        if SERVICE_AREA_REASON not in list(member.ineligible_reasons or []):
+            continue
+        candidates.append(member)
+
+    restored = []
+    for member in candidates:
+        try:
+            stage = reconcile_client_eligibility(
+                member, actor_label=actor_label, source=ChangeSource.CRM,
+            )
+        except Exception:  # never let a recovery attempt break the address save
+            logger.exception("coverage recovery failed for client %s", member.pk)
+            continue
+        if stage != ClientStage.INELIGIBLE:
+            restored.append(
+                f"{member.first_name} {member.last_name}".strip() or str(member.pk)
+            )
+    if restored:
+        # The off-ramp opened a Case Closure ticket for review; the review is done.
+        try:
+            _resolve_out_of_range_tickets(enrollment, actor=actor_label)
+        except Exception:  # never let ticket cleanup break the address save
+            logger.exception(
+                "out-of-range ticket cleanup failed for enrollment %s", enrollment.pk
+            )
+    return restored
 
 
 def _resolve_out_of_range_tickets(enrollment, actor=""):
@@ -2074,9 +2138,24 @@ class MembersListView(PortalGenericAPIView):
                 Q(code__iexact=cadence_val) | Q(label__iexact=cadence_val)
             ).first()
             cadence_code = row.code if row else cadence_val
-            qs = qs.filter(
-                member_profiles__delivery_schedules__delivery_days_cadence=cadence_code
+            # Only a LIVE plan counts. Matching any schedule row meant a member
+            # whose OLD household closed on Mon/Thu kept matching that filter for
+            # good -- the list showed them under Mon/Thu while opening the member
+            # (which reads the current enrollment) showed Wed-Only. Both a
+            # cancelled row and a finished enrollment are history.
+            #
+            # Expressed as EXISTS so all three conditions apply to the SAME
+            # schedule row: a plain .exclude() on the join would drop any client
+            # who merely HAS a closed enrollment somewhere.
+            live_cadence = MemberDeliverySchedule.objects.filter(
+                member_profile__client_id=OuterRef("pk"),
+                delivery_days_cadence=cadence_code,
+            ).exclude(
+                status__in=(ScheduleStatus.CANCELLED, ScheduleStatus.COMPLETED),
+            ).exclude(
+                enrollment__stage__in=FINISHED_ENROLLMENT_STAGES,
             )
+            qs = qs.filter(Exists(live_cadence))
 
         # Team filter (Members page): keep members whose INTERNAL-SERVICE case
         # was CREATED by a Unite Us agent on the selected CareCircle originating
@@ -4197,12 +4276,23 @@ class MemberHouseholdView(PortalAPIView):
         # service; an agent must resolve the Not-Eligible state.
         from ..services.service_area import is_zip_out_of_range
         coverage = None
+        restored = []
         if is_zip_out_of_range(addr.zip):
             coverage = _enforce_delivery_coverage(enr, agent)
+        else:
+            # ...and the mirror: a corrected, in-range address re-runs the gates,
+            # so the CRM can take a household OUT of the coverage off-ramp it put
+            # them in. Without this the agent fixed the address and nothing moved.
+            restored = _recover_delivery_coverage(enr, agent)
         resp = {
             "street": addr.street, "unit": addr.unit, "city": addr.city,
             "state": addr.state, "zip": addr.zip, "notes": addr.notes,
         }
+        if restored:
+            resp["coverage_restored"] = (
+                f"ZIP {addr.zip} is within the coverage area — "
+                f"{', '.join(restored)} returned to service."
+            )
         if coverage and coverage.get("out_of_range"):
             names = coverage["out_of_range"]
             resp["coverage_warning"] = (
@@ -7090,6 +7180,19 @@ def _logistics_enrollment(client_id):
     return client, enr, None
 
 
+# Enrollment stages whose delivery plan is HISTORY: their cadence describes a
+# household we no longer serve, so it must not answer a "current cadence" filter.
+# Deliberately NOT the same as SERVICE_EXCLUDED_ENROLLMENT_STAGES, which also
+# covers On Hold and Kitchen Assignment -- those are live households an agent
+# still expects to find.
+FINISHED_ENROLLMENT_STAGES = (
+    EnrollmentStage.CLOSED,
+    EnrollmentStage.CANCELLED,
+    EnrollmentStage.DISREGARDED,
+    EnrollmentStage.SERVICE_COMPLETE,
+)
+
+
 def assign_kitchen_to_household(
     enr, client, kitchen, *, cadence, once_weekday=None,
     member_quantities=None, exclude_notes=None, agent=None,
@@ -7138,11 +7241,24 @@ def assign_kitchen_to_household(
         status__in=(MemberStatus.ACTIVE, MemberStatus.PENDING, MemberStatus.OUT_OF_ORBIT)
     )
     if not assignable.exists():
-        blocking = sorted({p.get_status_display() for p in enr.member_profiles.all()})
+        # Name WHO is blocking and which status, because the client header can
+        # read "Active" (Client.lifecycle_stage) while the member PROFILE inside
+        # the enrollment is not -- two different fields, and a message about
+        # "members" being inactive reads as plainly wrong next to that header.
+        blocking = [
+            f"{(p.member_name or 'This member').strip()} ({p.get_status_display()})"
+            for p in enr.member_profiles.all()
+        ]
+        if not blocking:
+            raise ValueError(
+                "This household has no member profiles, so there is nobody to "
+                "build a delivery plan for. Add a household member first."
+            )
         raise ValueError(
-            "This household has no member that can be served"
-            + (f" (every member is {', '.join(blocking)})" if blocking else "")
-            + ". Reactivate a member before assigning a kitchen or cadence."
+            "Nobody in this household can be served yet -- member profile "
+            f"status: {', '.join(blocking)}. Return a member to service on the "
+            "Household tab (edit the member, then \"Return this member to "
+            "service\") before assigning a kitchen or cadence."
         )
 
     # Capture the pre-assignment kitchen + cadence so a RE-assignment (the
