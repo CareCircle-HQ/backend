@@ -15,8 +15,12 @@ whole assignment in one shot:
   * assign the Williamsburg kitchen,
   * default the delivery address to the primary's current address when none is
     set (shared by the whole household),
-  * stamp the verification facts, build the delivery schedule + calendar on a
-    Mon/Thu cadence, and advance the enrollment to SERVICE_ACTIVE.
+  * stamp the verification facts, build the delivery schedule + calendar on the
+    Williamsburg cadence, and advance the enrollment to SERVICE_ACTIVE.
+
+The cadence is WED-ONLY. Williamsburg launched on Mon/Thu because that was the
+only cadence we had; the Wed-Only cadence was added later and is when these
+households are actually delivered.
 
 Purchase Orders remain a separate manual step (same as the normal flow).
 """
@@ -30,6 +34,10 @@ logger = logging.getLogger(__name__)
 # The exception's fixed assignment values.
 WILLIAMSBURG_KITCHEN_NAME = "Williamsburg"
 WILLIAMSBURG_MENU_TYPE = "Kosher"
+# Wed-Only = the once-a-week cadence delivered on Wednesday. Kept as constants so
+# the fast-track and the one-off migration command cannot drift apart.
+WILLIAMSBURG_ONCE_WEEKDAY = "wed"
+WILLIAMSBURG_DELIVERY_WEEKDAYS = [WILLIAMSBURG_ONCE_WEEKDAY]
 # The verification fields are explicitly empty -- these clients have no real
 # dietary restrictions or food allergies. The Kosher pork/shellfish exclusion
 # is NOT an allergy; it is carried to the kitchen via the meal type + notes.
@@ -93,7 +101,7 @@ def fast_track_williamsburg_enrollment(enrollment, *, actor=None, agent=None):
         if addr is not None:
             enrollment.delivery_address = addr
 
-    # 3. Williamsburg kitchen + verification facts + Mon/Thu cadence.
+    # 3. Williamsburg kitchen + verification facts + Wed-Only cadence.
     kitchen = Kitchen.objects.filter(name__iexact=WILLIAMSBURG_KITCHEN_NAME).first()
     enrollment.kitchen = kitchen
     enrollment.is_family_verified = True
@@ -103,7 +111,7 @@ def fast_track_williamsburg_enrollment(enrollment, *, actor=None, agent=None):
     if agent is not None:
         enrollment.verified_by = agent
     if not enrollment.delivery_weekdays:
-        enrollment.delivery_weekdays = ["mon", "thu"]
+        enrollment.delivery_weekdays = list(WILLIAMSBURG_DELIVERY_WEEKDAYS)
     enrollment.save()
 
     # 4. Per-member dietary: rebuild from the household so every member gets the
@@ -142,7 +150,8 @@ def fast_track_williamsburg_enrollment(enrollment, *, actor=None, agent=None):
             note="Williamsburg exception: auto-verified on extension request.",
         )
     create_member_delivery_schedules(
-        enrollment, case=case, cadence=DeliveryCadence.MON_THU, kitchen=kitchen,
+        enrollment, case=case, cadence=DeliveryCadence.ONCE_A_WEEK,
+        once_a_week_weekday=WILLIAMSBURG_ONCE_WEEKDAY, kitchen=kitchen,
     )
     generate_delivery_calendar(enrollment)
     # Activate through the MANDATORY Kitchen Assignment step -- no enrollment may

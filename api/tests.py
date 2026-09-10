@@ -20656,6 +20656,96 @@ class WilliamsburgKitchenGuardTest(TestCase):
             self.assertNotIn(c.client_id, ids)
 
 
+class WilliamsburgWedOnlyCadenceTest(TestCase):
+    """Williamsburg delivers WED-ONLY.
+
+    It launched on Mon/Thu only because that was the sole cadence we had; the
+    once-a-week Wednesday cadence came later and is when these households are
+    actually delivered.
+    """
+
+    def test_fast_track_builds_a_wednesday_plan(self):
+        from .models import (
+            Case, CaseStatus, CaseType, Client, DeliveryCadence, EnrollmentStage,
+            EnrollmentVerification, Household, HouseholdMember, Kitchen,
+            KitchenStatus,
+        )
+        from .services.delivery import current_household_cadence
+        from .services.williamsburg import (
+            WILLIAMSBURG_KITCHEN_NAME, WILLIAMSBURG_ONCE_WEEKDAY,
+            fast_track_williamsburg_enrollment,
+        )
+
+        Kitchen.objects.create(
+            name=WILLIAMSBURG_KITCHEN_NAME, status=KitchenStatus.ACTIVE,
+        )
+        client = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Willy", last_name="Burg",
+            is_williamsburg=True,
+        )
+        household = Household.objects.create(name="HH")
+        HouseholdMember.objects.create(household=household, client=client, is_primary=True)
+        case = Case.objects.create(
+            case_id=str(uuid.uuid4()), client=client,
+            case_type=CaseType.INTERNAL_SERVICE, case_status=CaseStatus.MANAGED,
+            program_name="Medically Tailored Meals (MTM)",
+        )
+        enr = EnrollmentVerification.objects.create(
+            client=client, household=household, case=case,
+            stage=EnrollmentStage.PENDING_VERIFICATION,
+        )
+
+        enr = fast_track_williamsburg_enrollment(enr)
+
+        self.assertEqual(enr.delivery_weekdays, [WILLIAMSBURG_ONCE_WEEKDAY])
+        self.assertEqual(current_household_cadence(enr), DeliveryCadence.ONCE_A_WEEK)
+        self.assertNotEqual(current_household_cadence(enr), DeliveryCadence.MON_THU)
+
+    def test_every_generated_occurrence_falls_on_a_wednesday(self):
+        """The plan is only right if the DATED calendar lands on Wednesdays --
+        the cadence code alone would not catch a wrong weekday."""
+        from .models import (
+            Case, CaseStatus, CaseType, Client, EnrollmentStage,
+            EnrollmentVerification, Household, HouseholdMember, Kitchen,
+            KitchenStatus, OrderSchedule, ServiceAuthorizationStatus,
+        )
+        from .services.williamsburg import (
+            WILLIAMSBURG_KITCHEN_NAME, fast_track_williamsburg_enrollment,
+        )
+
+        Kitchen.objects.create(
+            name=WILLIAMSBURG_KITCHEN_NAME, status=KitchenStatus.ACTIVE,
+        )
+        client = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Wanda", last_name="Burg",
+            is_williamsburg=True,
+        )
+        household = Household.objects.create(name="HH2")
+        HouseholdMember.objects.create(household=household, client=client, is_primary=True)
+        case = Case.objects.create(
+            case_id=str(uuid.uuid4()), client=client,
+            case_type=CaseType.INTERNAL_SERVICE, case_status=CaseStatus.MANAGED,
+            program_name="Medically Tailored Meals (MTM)",
+            service_authorization_status=ServiceAuthorizationStatus.APPROVED,
+            service_authorization_approval_starts_at=timezone.now(),
+            service_authorization_approval_ends_at=timezone.now() + timedelta(days=60),
+        )
+        enr = EnrollmentVerification.objects.create(
+            client=client, household=household, case=case,
+            stage=EnrollmentStage.PENDING_VERIFICATION,
+        )
+
+        enr = fast_track_williamsburg_enrollment(enr)
+
+        dates = list(
+            OrderSchedule.objects.filter(enrollment=enr)
+            .values_list("anticipated_delivery_date", flat=True)
+        )
+        self.assertTrue(dates, "the fast-track should build a dated calendar")
+        offenders = [d for d in dates if d.weekday() != 2]  # 2 == Wednesday
+        self.assertEqual(offenders, [], f"non-Wednesday deliveries: {offenders}")
+
+
 class PausedHouseholdGoverningCaseSwitchTest(TestCase):
     """A new governing case must NOT auto-resume a PAUSED (On Hold) household:
     it stays On Hold and the client is flagged 'Need Review'."""
