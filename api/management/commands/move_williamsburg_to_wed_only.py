@@ -33,6 +33,7 @@ from django.db import transaction
 
 from api.models import DeliveryCadence, EnrollmentStage, EnrollmentVerification, Kitchen
 from api.services.delivery import current_household_cadence, update_household_cadence
+from api.portal.views_members import product_kind_for_enrollment
 from api.services.orders import reconcile_enrollment_calendar, resync_scheduled_orders
 from api.services.williamsburg import (
     WILLIAMSBURG_KITCHEN_NAME,
@@ -56,6 +57,13 @@ class Command(BaseCommand):
             help="Also re-plan closed/disregarded enrollments (normally skipped).",
         )
         parser.add_argument(
+            "--force", action="store_true",
+            help=(
+                "Also re-apply to households ALREADY on Wed-Only -- repairs plans "
+                "written before the meals/once-a-week ProductType existed."
+            ),
+        )
+        parser.add_argument(
             "--limit", type=int, default=0,
             help="Process at most N households (useful for a first pass).",
         )
@@ -63,6 +71,7 @@ class Command(BaseCommand):
     def handle(self, *args, **opts):
         dry = opts["dry_run"]
         include_closed = opts["include_closed"]
+        force = opts["force"]
         limit = opts["limit"] or 0
 
         kitchen = Kitchen.objects.filter(
@@ -85,7 +94,9 @@ class Command(BaseCommand):
         targets, skipped = [], Counter()
         for enr in enrollments:
             cadence = current_household_cadence(enr)
-            if cadence != DeliveryCadence.MON_THU:
+            if force and cadence == DeliveryCadence.ONCE_A_WEEK:
+                pass  # re-apply to repair an earlier partial move
+            elif cadence != DeliveryCadence.MON_THU:
                 # Anything already on another cadence is left alone: a Wed-Only
                 # household is done, and a Tue/Fri one was a deliberate choice
                 # this command has no business overriding.
@@ -126,6 +137,12 @@ class Command(BaseCommand):
                         cadence=DeliveryCadence.ONCE_A_WEEK,
                         once_a_week_weekday=WILLIAMSBURG_ONCE_WEEKDAY,
                         case=enr.case,
+                        # MUST be passed: the program-name keyword detection this
+                        # falls back on returns None for a case whose program is
+                        # e.g. "Enhanced Care Management ...", which resolves NO
+                        # ProductType and leaves meals_per_day=0 -- a plan
+                        # plan_built_kind then reads as "not meals".
+                        product_kind=product_kind_for_enrollment(enr),
                     )
                     # Rebuild the dated calendar exactly like the batch job, then
                     # refresh the still-scheduled snapshots PO generation reads.

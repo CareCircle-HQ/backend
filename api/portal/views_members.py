@@ -7084,6 +7084,28 @@ def assign_kitchen_to_household(
             "Williamsburg households can only be assigned the Williamsburg kitchen."
         )
 
+    # Nobody left to serve? Every plan-building path filters out non-servable
+    # members, so such a household silently produces ZERO schedules: the
+    # assignment returns success while the cadence stays empty and no delivery is
+    # ever scheduled -- an agent sees a button that does nothing.
+    #
+    # Judged on the state BEFORE the meal rules, and only on statuses this
+    # assignment could never rescue. ACTIVE and PENDING are fine (the rules
+    # promote PENDING), and so is OUT_OF_ORBIT -- a kitchen that CAN serve them
+    # reactivates it. Choosing a kitchen that happens to fulfil nobody is a
+    # different, recoverable case, already reported through the out-of-orbit
+    # banner, so it must not be blocked here.
+    assignable = enr.member_profiles.filter(
+        status__in=(MemberStatus.ACTIVE, MemberStatus.PENDING, MemberStatus.OUT_OF_ORBIT)
+    )
+    if not assignable.exists():
+        blocking = sorted({p.get_status_display() for p in enr.member_profiles.all()})
+        raise ValueError(
+            "This household has no member that can be served"
+            + (f" (every member is {', '.join(blocking)})" if blocking else "")
+            + ". Reactivate a member before assigning a kitchen or cadence."
+        )
+
     # Capture the pre-assignment kitchen + cadence so a RE-assignment (the
     # household already had a kitchen) logs a precise 'Kitchen Changed' diff,
     # while a first-time assignment logs a 'Kitchen Assigned' event (emitted
@@ -7406,11 +7428,17 @@ class MemberAssignKitchenView(PortalAPIView):
             except (TypeError, ValueError, AttributeError):
                 continue
 
-        summary = assign_kitchen_to_household(
-            enr, client, kitchen, cadence=cadence, once_weekday=once_weekday,
-            member_quantities=member_quantities, exclude_notes=exclude_notes,
-            agent=current_agent(request),
-        )
+        try:
+            summary = assign_kitchen_to_household(
+                enr, client, kitchen, cadence=cadence, once_weekday=once_weekday,
+                member_quantities=member_quantities, exclude_notes=exclude_notes,
+                agent=current_agent(request),
+            )
+        except ValueError as exc:
+            # The central guards (Williamsburg kitchen, no servable member) reject
+            # an assignment that cannot work. Without this they surfaced as a 500
+            # and the agent saw a button that simply did nothing.
+            return Response({"detail": str(exc)}, status=http.HTTP_400_BAD_REQUEST)
         resp = {
             "id": enr.pk,
             "stage": enr.stage,
