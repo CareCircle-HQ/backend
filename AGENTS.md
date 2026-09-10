@@ -21,6 +21,11 @@ python manage.py makemigrations --check --dry-run
 python manage.py test api.tests --parallel 4
 ```
 
+**Migrations are DISABLED under `manage.py test`** (`_DisableMigrations` in
+settings builds tables straight from model state). So data migrations never run
+in the suite: a test can never assert on rows a migration seeds, and must create
+them itself. Verify a data migration by running it against the local clone.
+
 The frontend has **no TypeScript installed** (`node_modules/.bin/tsc` does not
 exist), so `tsc --noEmit` silently does nothing. Verify it with `npm run build`
 instead -- esbuild will surface syntax/JSX errors.

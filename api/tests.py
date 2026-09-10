@@ -1371,7 +1371,7 @@ class AssignKitchenFromVerifiedTest(TestCase):
 
         from .models import (
             Client, DeliveryCadence, EnrollmentStage, EnrollmentVerification,
-            Kitchen, KitchenStatus,
+            Kitchen, KitchenStatus, MemberDietaryProfile, MemberStatus,
         )
         from .portal import views_members as vm
 
@@ -1381,10 +1381,14 @@ class AssignKitchenFromVerifiedTest(TestCase):
         kitchen = Kitchen.objects.create(
             name="Williamsburg", status=KitchenStatus.ACTIVE,
         )
-        # No member profiles -> the per-member meal-rule loop is skipped, so the
-        # test isolates the stage-transition behavior (the actual bug).
+        # One ACTIVE member: the assignment refuses a household with nobody to
+        # serve, and this test is about the stage transition, not that guard.
         enr = EnrollmentVerification.objects.create(
             client=client, stage=EnrollmentStage.VERIFIED,
+        )
+        MemberDietaryProfile.objects.create(
+            enrollment=enr, client=client, member_name="Will Burg",
+            status=MemberStatus.ACTIVE,
         )
 
         # Stub the delivery-plan side effects: this test only asserts the stage
@@ -19467,7 +19471,7 @@ class ReassignRunsFullCalendarReconcileTest(TestCase):
 
         from .models import (
             Client, DeliveryCadence, EnrollmentStage, EnrollmentVerification,
-            Kitchen, KitchenStatus,
+            Kitchen, KitchenStatus, MemberDietaryProfile, MemberStatus,
         )
         from .portal import views_members as vm
 
@@ -19477,6 +19481,12 @@ class ReassignRunsFullCalendarReconcileTest(TestCase):
         kitchen = Kitchen.objects.create(name="K", status=KitchenStatus.ACTIVE)
         enr = EnrollmentVerification.objects.create(
             client=client, stage=EnrollmentStage.SERVICE_ACTIVE,
+        )
+        # One ACTIVE member: assignment refuses an unservable household, and this
+        # test is about which calendar path runs.
+        MemberDietaryProfile.objects.create(
+            enrollment=enr, client=client, member_name="Re Assign",
+            status=MemberStatus.ACTIVE,
         )
         with patch.object(vm, "create_member_delivery_schedules", return_value=created), \
                 patch.object(vm, "update_household_cadence"), \
@@ -20654,6 +20664,227 @@ class WilliamsburgKitchenGuardTest(TestCase):
         for kind in (ProductTypeKind.MEALS, ProductTypeKind.BOXES):
             ids = {e.client_id for e in _awaiting_enrollments(kind)}
             self.assertNotIn(c.client_id, ids)
+
+
+class UnservableHouseholdAssignmentTest(TestCase):
+    """Assigning a kitchen/cadence to a household with nobody servable must FAIL
+    LOUDLY.
+
+    Every plan-building path filters out non-servable members, so such a
+    household silently produced zero schedules: the call returned success, the
+    cadence stayed empty and no delivery was ever scheduled -- the agent saw a
+    button that did nothing. (Found on a Williamsburg member whose only profile
+    was left Inactive by a household split.)
+    """
+
+    def _household(self, member_status):
+        from .models import (
+            Case, CaseStatus, CaseType, Client, EnrollmentStage,
+            EnrollmentVerification, Household, HouseholdMember, Kitchen,
+            KitchenMenuType, KitchenStatus, MemberDietaryProfile, MenuType,
+        )
+
+        # A kitchen that genuinely OFFERS the member's menu, so the meal rules
+        # can promote a Pending member instead of pushing them Out of Orbit.
+        menu = MenuType.objects.create(name="Regular")
+        kitchen = Kitchen.objects.create(name="K1", status=KitchenStatus.ACTIVE)
+        KitchenMenuType.objects.create(kitchen=kitchen, menu_type=menu)
+        client = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Solo", last_name="Member",
+        )
+        household = Household.objects.create(name="HH")
+        HouseholdMember.objects.create(household=household, client=client, is_primary=True)
+        case = Case.objects.create(
+            case_id=str(uuid.uuid4()), client=client,
+            case_type=CaseType.INTERNAL_SERVICE, case_status=CaseStatus.MANAGED,
+            program_name="Medically Tailored Meals (MTM)",
+        )
+        enr = EnrollmentVerification.objects.create(
+            client=client, household=household, case=case,
+            stage=EnrollmentStage.KITCHEN_ASSIGNMENT, kitchen=kitchen,
+        )
+        MemberDietaryProfile.objects.create(
+            enrollment=enr, client=client, member_name="Solo Member",
+            status=member_status, menu_type="Regular", food_allergies=["none"],
+        )
+        return enr, client, kitchen
+
+    def test_inactive_only_household_is_rejected_not_silently_ignored(self):
+        from .models import MemberStatus
+        from .portal.views_members import assign_kitchen_to_household
+        from .services.delivery import current_household_cadence
+
+        enr, client, kitchen = self._household(MemberStatus.INACTIVE)
+        with self.assertRaises(ValueError) as ctx:
+            assign_kitchen_to_household(enr, client, kitchen, cadence="mon_thu")
+        self.assertIn("no member that can be served", str(ctx.exception))
+        # ...and the household is left untouched rather than half-assigned.
+        self.assertEqual(current_household_cadence(enr), "")
+        self.assertEqual(enr.delivery_schedules.count(), 0)
+
+    def test_out_of_orbit_is_not_blocked(self):
+        """Out of Orbit is recoverable -- a kitchen that CAN fulfil the member
+        reactivates them -- so it must not be treated like a terminal status."""
+        from .models import MemberStatus
+        from .portal.views_members import assign_kitchen_to_household
+        from .services.delivery import current_household_cadence
+
+        enr, client, kitchen = self._household(MemberStatus.OUT_OF_ORBIT)
+        assign_kitchen_to_household(enr, client, kitchen, cadence="mon_thu")
+        self.assertEqual(current_household_cadence(enr), "mon_thu")
+
+    def test_a_normal_pending_household_still_assigns(self):
+        """PENDING is the pre-kitchen state, and the meal rules promote it during
+        assignment -- the guard must not break the ordinary first-time flow."""
+        from .models import MemberStatus
+        from .portal.views_members import assign_kitchen_to_household
+        from .services.delivery import current_household_cadence
+
+        enr, client, kitchen = self._household(MemberStatus.PENDING)
+        assign_kitchen_to_household(enr, client, kitchen, cadence="mon_thu")
+        self.assertEqual(current_household_cadence(enr), "mon_thu")
+        self.assertGreater(enr.delivery_schedules.count(), 0)
+
+
+class WilliamsburgWedOnlyCadenceTest(TestCase):
+    """Williamsburg delivers WED-ONLY.
+
+    It launched on Mon/Thu only because that was the sole cadence we had; the
+    once-a-week Wednesday cadence came later and is when these households are
+    actually delivered.
+    """
+
+    def test_fast_track_builds_a_wednesday_plan(self):
+        from .models import (
+            Case, CaseStatus, CaseType, Client, DeliveryCadence, EnrollmentStage,
+            EnrollmentVerification, Household, HouseholdMember, Kitchen,
+            KitchenStatus,
+        )
+        from .services.delivery import current_household_cadence
+        from .services.williamsburg import (
+            WILLIAMSBURG_KITCHEN_NAME, WILLIAMSBURG_ONCE_WEEKDAY,
+            fast_track_williamsburg_enrollment,
+        )
+
+        Kitchen.objects.create(
+            name=WILLIAMSBURG_KITCHEN_NAME, status=KitchenStatus.ACTIVE,
+        )
+        client = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Willy", last_name="Burg",
+            is_williamsburg=True,
+        )
+        household = Household.objects.create(name="HH")
+        HouseholdMember.objects.create(household=household, client=client, is_primary=True)
+        case = Case.objects.create(
+            case_id=str(uuid.uuid4()), client=client,
+            case_type=CaseType.INTERNAL_SERVICE, case_status=CaseStatus.MANAGED,
+            program_name="Medically Tailored Meals (MTM)",
+        )
+        enr = EnrollmentVerification.objects.create(
+            client=client, household=household, case=case,
+            stage=EnrollmentStage.PENDING_VERIFICATION,
+        )
+
+        enr = fast_track_williamsburg_enrollment(enr)
+
+        self.assertEqual(enr.delivery_weekdays, [WILLIAMSBURG_ONCE_WEEKDAY])
+        self.assertEqual(current_household_cadence(enr), DeliveryCadence.ONCE_A_WEEK)
+        self.assertNotEqual(current_household_cadence(enr), DeliveryCadence.MON_THU)
+
+    def test_wed_only_meals_resolve_their_own_product_type(self):
+        """Once-a-week was configured for BOXES only, so a Wed-Only MEALS plan fell
+        back to the Mon/Thu row -- and to NOTHING when the program name carries no
+        meal/box keyword, leaving meals_per_day=0 (which plan_built_kind reads as
+        "not meals") and raising the "Cadence doesn't match product type" warning.
+        Migration 0258 seeds the pairing; this guards the resolution behaviour.
+
+        (Data migrations are not exercised by the suite -- settings disable
+        migrations under `manage.py test` -- so the rows are built here.)
+        """
+        from .models import DeliveryCadence, ProductType, ProductTypeKind
+        from .services.delivery import _resolve_product_type
+
+        ProductType.objects.create(
+            type=ProductTypeKind.MEALS, delivery_days_cadence=DeliveryCadence.MON_THU,
+            prod_per_delivery=3, meals_per_day=3,
+        )
+        once = ProductType.objects.create(
+            type=ProductTypeKind.MEALS,
+            delivery_days_cadence=DeliveryCadence.ONCE_A_WEEK,
+            prod_per_delivery=3, meals_per_day=3,
+        )
+        # Exact cadence match, not the Mon/Thu fallback...
+        self.assertEqual(
+            _resolve_product_type("Medically Tailored Meals (MTM)", "once_a_week"),
+            once,
+        )
+        # ...including when the program name has no meal/box keyword, which is why
+        # the caller must pass an explicit kind.
+        self.assertEqual(
+            _resolve_product_type(
+                "Enhanced Care Management - Level 2 Only", "once_a_week",
+                kind=ProductTypeKind.MEALS,
+            ),
+            once,
+        )
+        # Non-zero on BOTH fields: meals_per_day identifies the kind, and a zero
+        # prod_per_delivery would make plan_built_kind return None.
+        self.assertEqual(once.meals_per_day, 3)
+        self.assertTrue(once.prod_per_delivery)
+
+    def test_wed_only_delivers_a_full_week_of_meals(self):
+        from .services.orders import _weekday_ints, meals_for_delivery
+
+        wed = _weekday_ints(["wed"])
+        mon_thu = _weekday_ints(["mon", "thu"])
+        self.assertEqual(meals_for_delivery(2, wed, 3), 21)
+        self.assertEqual(
+            meals_for_delivery(0, mon_thu, 3) + meals_for_delivery(3, mon_thu, 3), 21,
+        )
+
+    def test_every_generated_occurrence_falls_on_a_wednesday(self):
+        """The plan is only right if the DATED calendar lands on Wednesdays --
+        the cadence code alone would not catch a wrong weekday."""
+        from .models import (
+            Case, CaseStatus, CaseType, Client, EnrollmentStage,
+            EnrollmentVerification, Household, HouseholdMember, Kitchen,
+            KitchenStatus, OrderSchedule, ServiceAuthorizationStatus,
+        )
+        from .services.williamsburg import (
+            WILLIAMSBURG_KITCHEN_NAME, fast_track_williamsburg_enrollment,
+        )
+
+        Kitchen.objects.create(
+            name=WILLIAMSBURG_KITCHEN_NAME, status=KitchenStatus.ACTIVE,
+        )
+        client = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Wanda", last_name="Burg",
+            is_williamsburg=True,
+        )
+        household = Household.objects.create(name="HH2")
+        HouseholdMember.objects.create(household=household, client=client, is_primary=True)
+        case = Case.objects.create(
+            case_id=str(uuid.uuid4()), client=client,
+            case_type=CaseType.INTERNAL_SERVICE, case_status=CaseStatus.MANAGED,
+            program_name="Medically Tailored Meals (MTM)",
+            service_authorization_status=ServiceAuthorizationStatus.APPROVED,
+            service_authorization_approval_starts_at=timezone.now(),
+            service_authorization_approval_ends_at=timezone.now() + timedelta(days=60),
+        )
+        enr = EnrollmentVerification.objects.create(
+            client=client, household=household, case=case,
+            stage=EnrollmentStage.PENDING_VERIFICATION,
+        )
+
+        enr = fast_track_williamsburg_enrollment(enr)
+
+        dates = list(
+            OrderSchedule.objects.filter(enrollment=enr)
+            .values_list("anticipated_delivery_date", flat=True)
+        )
+        self.assertTrue(dates, "the fast-track should build a dated calendar")
+        offenders = [d for d in dates if d.weekday() != 2]  # 2 == Wednesday
+        self.assertEqual(offenders, [], f"non-Wednesday deliveries: {offenders}")
 
 
 class PausedHouseholdGoverningCaseSwitchTest(TestCase):
