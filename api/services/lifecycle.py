@@ -4894,6 +4894,18 @@ def split_dependent_into_own_enrollment(client, new_enrollment, *, actor=None, a
             member_name=old_profile.member_name or "",
         )
     prior_status = old_profile.status if old_profile else MemberStatus.ACTIVE
+    # A TERMINAL status describes the household being LEFT, not the new case.
+    # INACTIVE means "was in service there and no longer is" -- carrying it onto a
+    # brand-new enrollment produced a household whose only member could never be
+    # served: the automatic meal rule refuses to lift INACTIVE, so verification
+    # activated the enrollment while the member stayed excluded, leaving no
+    # cadence, no delivery plan, and a kitchen assignment that had to refuse.
+    # PENDING is the correct initial state -- "not activated yet" -- and the meal
+    # rule DOES promote it at kitchen assignment. Deliberate holds (a manual or
+    # nutritionist pause, an out-of-range ZIP) still follow the member, because
+    # those describe the PERSON rather than the old household's service.
+    if prior_status in (MemberStatus.INACTIVE, MemberStatus.REMOVED):
+        prior_status = MemberStatus.PENDING
     # Per-MEMBER nutritionist review: a dependent can live in a household that is
     # nutritionist-approved at the ENROLLMENT level while never having been
     # individually reviewed. Base the decision on THEIR own nutrition data (meal
