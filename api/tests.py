@@ -22791,6 +22791,43 @@ class RetiredMedicalConditionsTest(TestCase):
         for row in rows:
             self.assertEqual(row["value"], row["label"])
 
+    def test_the_medications_endpoint_serves_the_same_shape(self):
+        """Medications were duplicated in both pickers too -- 39 entries, still
+        identical when this was written, i.e. caught before they drifted."""
+        from .models import (
+            RETIRED_MEMBER_MEDICATIONS, SELECTABLE_MEMBER_MEDICATIONS,
+        )
+
+        agent = Agent.objects.create(
+            name="Verif2", agent_code="VER-2", email="ver-2@example.com",
+            group="Verifiers", status="Active",
+        )
+        access = AccessToken()
+        access["agent_id"] = str(agent.id)
+        access["agent_code"] = agent.agent_code
+        access["agent_name"] = agent.name
+        access["agent_group"] = agent.group
+        api = APIClient()
+        api.credentials(HTTP_AUTHORIZATION=f"Bearer {access}")
+
+        r = api.get("/api/portal/medications/")
+        self.assertEqual(r.status_code, 200)
+        rows = r.json()
+        self.assertEqual(
+            [row["value"] for row in rows if not row["retired"]],
+            SELECTABLE_MEMBER_MEDICATIONS,
+        )
+        self.assertEqual(
+            [row["value"] for row in rows if row["retired"]],
+            RETIRED_MEMBER_MEDICATIONS,
+        )
+        # A few anchors, so a careless edit to the list is noticed.
+        for expected in ("Insulin", "Metformin", "Levothyroxine"):
+            self.assertIn(expected, SELECTABLE_MEMBER_MEDICATIONS)
+        # The sentinels belong to the picker, not the served list.
+        self.assertNotIn("No Medications", SELECTABLE_MEMBER_MEDICATIONS)
+        self.assertNotIn("Other", SELECTABLE_MEMBER_MEDICATIONS)
+
     def test_a_stored_retired_condition_survives_a_profile_save(self):
         """The nutritionist intake re-saves a member's conditions. A retired label
         already on file must come back unchanged rather than being dropped or

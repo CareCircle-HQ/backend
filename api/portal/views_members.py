@@ -53,7 +53,9 @@ from ..models import (
     Kitchen,
     MemberDeliverySchedule,
     RETIRED_MEMBER_CONDITIONS,
+    RETIRED_MEMBER_MEDICATIONS,
     SELECTABLE_MEMBER_CONDITIONS,
+    SELECTABLE_MEMBER_MEDICATIONS,
     ScheduleStatus,
     MemberDietaryProfile,
     KitchenProductType,
@@ -1340,6 +1342,28 @@ class MedicalConditionsListView(PortalAPIView):
             + [
                 {"value": name, "label": name, "retired": True}
                 for name in RETIRED_MEMBER_CONDITIONS
+            ]
+        )
+
+
+class MedicationsListView(PortalAPIView):
+    """Medication options for the verification wizard + the nutritionist intake.
+
+    Same reasoning as MedicalConditionsListView: the list was duplicated in both
+    pickers (39 entries, still identical -- caught before they drifted) and is now
+    served from one place. Retired medications are flagged, not omitted, so a
+    label a member already carries stays a checked entry.
+    """
+
+    def get(self, request):
+        return Response(
+            [
+                {"value": name, "label": name, "retired": False}
+                for name in SELECTABLE_MEMBER_MEDICATIONS
+            ]
+            + [
+                {"value": name, "label": name, "retired": True}
+                for name in RETIRED_MEMBER_MEDICATIONS
             ]
         )
 
