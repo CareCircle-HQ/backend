@@ -4601,19 +4601,49 @@ class HouseholdMemberEditView(PortalAPIView):
                 except Exception:  # never let note-writing break the edit
                     pass
         elif reactivate and mv.status in (
-            MemberStatus.OUT_OF_ORBIT, MemberStatus.PENDING,
+            MemberStatus.OUT_OF_ORBIT, MemberStatus.PENDING, MemberStatus.INACTIVE,
         ):
             # Re-run the kitchen-aware rules against the edited menu type /
             # allergies. Only return the member to Active if the new combination
             # can actually be fulfilled by the household's assigned kitchen;
             # otherwise the agent must pick a different menu type. Also promotes a
             # still-PENDING member (pre-kitchen add) once they have a menu.
+            #
+            # INACTIVE (service ended) is terminal, and the AUTOMATIC meal rule
+            # refuses to lift it -- only an explicit flow may, via allow_resume.
+            # Until it was accepted here the only code that could clear INACTIVE
+            # was the household resume flow, which needs the enrollment to be
+            # coming back from a hold: a member who reached an already-active
+            # household another way (carried by a household split, then verified)
+            # had NO route back, leaving the household with nobody servable -- no
+            # cadence, no plan, and a kitchen assignment that refused. Requested
+            # only for INACTIVE, so Out of Orbit / Pending keep the stricter rule.
+            resuming = mv.status == MemberStatus.INACTIVE
+            if resuming and mv.eligibility_paused:
+                # An import-driven eligibility pause is not ours to lift; the meal
+                # rule silently declines it, which would look like success here.
+                return Response(
+                    {"error": (
+                        "This member is paused on eligibility grounds, which has "
+                        "to be resolved in Unite Us before they return to service."
+                    )},
+                    status=http.HTTP_400_BAD_REQUEST,
+                )
             out, _became, reason = reconcile_member_kitchen_output(
-                mv, enr.kitchen, save=False,
+                mv, enr.kitchen, save=False, allow_resume=resuming,
             )
             if out:
                 return Response(
                     {"error": reason or "This menu type can't be fulfilled for this member."},
+                    status=http.HTTP_400_BAD_REQUEST,
+                )
+            if mv.status != MemberStatus.ACTIVE:
+                # Never report success while the member stays excluded.
+                return Response(
+                    {"error": (
+                        "This member could not be returned to service "
+                        f"(still {mv.get_status_display()})."
+                    )},
                     status=http.HTTP_400_BAD_REQUEST,
                 )
             mv.save()
@@ -4625,6 +4655,15 @@ class HouseholdMemberEditView(PortalAPIView):
                 )
             except Exception:  # never let history-logging break the edit
                 pass
+            if resuming and enr.stage == EnrollmentStage.SERVICE_ACTIVE and enr.kitchen_id:
+                # The household may have had NO servable member, so no delivery
+                # plan and no calendar exist yet -- not just missing occurrences.
+                try:
+                    rebuild_delivery_calendar(enr)
+                except Exception:  # never let the rebuild break the edit
+                    logger.exception(
+                        "reactivate: calendar rebuild failed for enrollment %s", enr.pk
+                    )
         elif restore_range and mv.status == MemberStatus.OUT_OF_RANGE:
             # Return an Out-of-Range member to service. Re-check delivery coverage
             # AND the meal rule (reconcile_member_kitchen_output is ZIP-aware): the

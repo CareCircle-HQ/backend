@@ -20722,6 +20722,100 @@ class UnservableHouseholdAssignmentTest(TestCase):
         self.assertEqual(current_household_cadence(enr), "")
         self.assertEqual(enr.delivery_schedules.count(), 0)
 
+    def test_an_inactive_member_can_be_returned_to_service(self):
+        """The "reactivate" action accepted only Out of Orbit / Pending, and the
+        automatic meal rule refuses to lift a terminal INACTIVE. The only code that
+        could was the household RESUME flow, which needs the enrollment to be
+        coming back from a hold -- so a member who reached an already-active
+        household another way had no route back and left it unservable."""
+        from .models import MemberStatus
+        from .portal.views_members import assign_kitchen_to_household
+        from .services.delivery import current_household_cadence
+
+        enr, client, kitchen = self._household(MemberStatus.INACTIVE)
+        agent = Agent.objects.create(
+            name="Logi", agent_code="LOGI-1", email="logi-1@example.com",
+            group="Logistics", status="Active",
+        )
+        access = AccessToken()
+        access["agent_id"] = str(agent.id)
+        access["agent_code"] = agent.agent_code
+        access["agent_name"] = agent.name
+        access["agent_group"] = agent.group
+        api = APIClient()
+        api.credentials(HTTP_AUTHORIZATION=f"Bearer {access}")
+
+        profile = enr.member_profiles.get()
+        url = (
+            f"/api/portal/members/{client.client_id}/household/members/{profile.pk}/"
+        )
+        r = api.patch(url, {"reactivate": True}, format="json")
+        self.assertEqual(r.status_code, 200)
+        profile.refresh_from_db()
+        self.assertEqual(profile.status, MemberStatus.ACTIVE)
+
+        # ...and the assignment that used to refuse now works.
+        assign_kitchen_to_household(enr, client, kitchen, cadence="mon_thu")
+        self.assertEqual(current_household_cadence(enr), "mon_thu")
+
+    def test_reactivating_an_eligibility_paused_member_is_refused(self):
+        """An import-driven eligibility pause is not ours to lift -- and the meal
+        rule declines it SILENTLY, which would otherwise read as success."""
+        from .models import MemberStatus
+
+        enr, client, kitchen = self._household(MemberStatus.INACTIVE)
+        profile = enr.member_profiles.get()
+        profile.eligibility_paused = True
+        profile.save(update_fields=["eligibility_paused"])
+
+        agent = Agent.objects.create(
+            name="Logi2", agent_code="LOGI-2", email="logi-2@example.com",
+            group="Logistics", status="Active",
+        )
+        access = AccessToken()
+        access["agent_id"] = str(agent.id)
+        access["agent_code"] = agent.agent_code
+        access["agent_name"] = agent.name
+        access["agent_group"] = agent.group
+        api = APIClient()
+        api.credentials(HTTP_AUTHORIZATION=f"Bearer {access}")
+
+        url = (
+            f"/api/portal/members/{client.client_id}/household/members/{profile.pk}/"
+        )
+        r = api.patch(url, {"reactivate": True}, format="json")
+        self.assertEqual(r.status_code, 400)
+        self.assertIn("eligibility", str(r.data).lower())
+        profile.refresh_from_db()
+        self.assertEqual(profile.status, MemberStatus.INACTIVE)
+
+    def test_split_does_not_carry_a_terminal_status_onto_the_new_case(self):
+        """A household split must not stamp the OLD household's terminal INACTIVE
+        onto the member's brand-new enrollment.
+
+        Real case: a member's household closed, so he was Inactive there. Weeks
+        later his own meal case opened, the split carried the Inactive across, and
+        verification then activated an enrollment whose only member could never be
+        served -- no cadence, no plan, and an assignment that had to refuse. He was
+        an active client with the Kosher menu Williamsburg requires; the status
+        described a household he had left.
+        """
+        from .models import MemberStatus
+        from .models import MEMBER_PAUSED_STATUSES
+
+        # PENDING is "not activated yet", which the meal rules DO promote, unlike
+        # the terminal INACTIVE the split used to carry.
+        self.assertNotIn(MemberStatus.PENDING, MEMBER_PAUSED_STATUSES)
+        self.assertIn(MemberStatus.INACTIVE, MEMBER_PAUSED_STATUSES)
+
+        enr, client, kitchen = self._household(MemberStatus.PENDING)
+        from .portal.views_members import assign_kitchen_to_household
+        from .services.delivery import current_household_cadence
+
+        assign_kitchen_to_household(enr, client, kitchen, cadence="mon_thu")
+        self.assertEqual(enr.member_profiles.get().status, MemberStatus.ACTIVE)
+        self.assertEqual(current_household_cadence(enr), "mon_thu")
+
     def test_out_of_orbit_is_not_blocked(self):
         """Out of Orbit is recoverable -- a kitchen that CAN fulfil the member
         reactivates them -- so it must not be treated like a terminal status."""
