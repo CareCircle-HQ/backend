@@ -7138,11 +7138,24 @@ def assign_kitchen_to_household(
         status__in=(MemberStatus.ACTIVE, MemberStatus.PENDING, MemberStatus.OUT_OF_ORBIT)
     )
     if not assignable.exists():
-        blocking = sorted({p.get_status_display() for p in enr.member_profiles.all()})
+        # Name WHO is blocking and which status, because the client header can
+        # read "Active" (Client.lifecycle_stage) while the member PROFILE inside
+        # the enrollment is not -- two different fields, and a message about
+        # "members" being inactive reads as plainly wrong next to that header.
+        blocking = [
+            f"{(p.member_name or 'This member').strip()} ({p.get_status_display()})"
+            for p in enr.member_profiles.all()
+        ]
+        if not blocking:
+            raise ValueError(
+                "This household has no member profiles, so there is nobody to "
+                "build a delivery plan for. Add a household member first."
+            )
         raise ValueError(
-            "This household has no member that can be served"
-            + (f" (every member is {', '.join(blocking)})" if blocking else "")
-            + ". Reactivate a member before assigning a kitchen or cadence."
+            "Nobody in this household can be served yet -- member profile "
+            f"status: {', '.join(blocking)}. Return a member to service on the "
+            "Household tab (edit the member, then \"Return this member to "
+            "service\") before assigning a kitchen or cadence."
         )
 
     # Capture the pre-assignment kitchen + cadence so a RE-assignment (the

@@ -20717,7 +20717,13 @@ class UnservableHouseholdAssignmentTest(TestCase):
         enr, client, kitchen = self._household(MemberStatus.INACTIVE)
         with self.assertRaises(ValueError) as ctx:
             assign_kitchen_to_household(enr, client, kitchen, cadence="mon_thu")
-        self.assertIn("no member that can be served", str(ctx.exception))
+        msg = str(ctx.exception)
+        # Names WHO is blocking and says "member profile status" -- the client
+        # header shows Active (a different field), so a vague message reads as
+        # simply untrue to the agent looking at it.
+        self.assertIn("Solo Member", msg)
+        self.assertIn("Inactive", msg)
+        self.assertIn("member profile", msg)
         # ...and the household is left untouched rather than half-assigned.
         self.assertEqual(current_household_cadence(enr), "")
         self.assertEqual(enr.delivery_schedules.count(), 0)
