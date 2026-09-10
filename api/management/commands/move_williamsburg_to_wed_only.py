@@ -91,20 +91,23 @@ class Command(BaseCommand):
         )
         self.stdout.write(f"Williamsburg enrollments: {enrollments.count()}")
 
-        targets, skipped = [], Counter()
+        targets, skipped, from_cadence = [], Counter(), Counter()
         for enr in enrollments:
             cadence = current_household_cadence(enr)
-            if force and cadence == DeliveryCadence.ONCE_A_WEEK:
-                pass  # re-apply to repair an earlier partial move
-            elif cadence != DeliveryCadence.MON_THU:
-                # Anything already on another cadence is left alone: a Wed-Only
-                # household is done, and a Tue/Fri one was a deliberate choice
-                # this command has no business overriding.
-                skipped[f"cadence={cadence or '(no schedule)'}"] += 1
+            if not cadence:
+                # No delivery plan at all, so there are no schedule rows to
+                # re-point. These need a kitchen/cadence ASSIGNMENT instead (and
+                # often a member returned to service first) -- reported, not
+                # silently counted as done.
+                skipped["no delivery plan (needs assignment)"] += 1
+                continue
+            if cadence == DeliveryCadence.ONCE_A_WEEK and not force:
+                skipped["already Wed-Only"] += 1
                 continue
             if enr.stage in TERMINAL_STAGES and not include_closed:
                 skipped[f"stage={enr.stage}"] += 1
                 continue
+            from_cadence[cadence] += 1
             targets.append(enr)
             if limit and len(targets) >= limit:
                 break
@@ -114,11 +117,15 @@ class Command(BaseCommand):
         for reason, n in skipped.most_common():
             self.stdout.write(f"  {reason:<28} {n:>5}")
         self.stdout.write("")
-        self.stdout.write(f"On Mon/Thu and eligible to move: {len(targets)}")
+        self.stdout.write(f"Eligible to move to Wed-Only: {len(targets)}")
 
         by_stage = Counter(e.stage for e in targets)
         for stage, n in by_stage.most_common():
             self.stdout.write(f"  {stage:<28} {n:>5}")
+        self.stdout.write("")
+        self.stdout.write(self.style.MIGRATE_HEADING("Moving FROM cadence"))
+        for cad, n in from_cadence.most_common():
+            self.stdout.write(f"  {cad:<28} {n:>5}")
 
         if dry:
             self.stdout.write("")
@@ -144,10 +151,14 @@ class Command(BaseCommand):
                         # plan_built_kind then reads as "not meals".
                         product_kind=product_kind_for_enrollment(enr),
                     )
-                    # Rebuild the dated calendar exactly like the batch job, then
-                    # refresh the still-scheduled snapshots PO generation reads.
-                    reconcile_enrollment_calendar(enr)
-                    resync_scheduled_orders(enrollment=enr)
+                    # A CLOSED/disregarded household must not have its calendar
+                    # rebuilt -- that could resurrect future occurrences for a
+                    # household we stopped serving. Record the cadence only.
+                    if enr.stage not in TERMINAL_STAGES:
+                        # Rebuild the dated calendar exactly like the batch job,
+                        # then refresh the snapshots PO generation reads.
+                        reconcile_enrollment_calendar(enr)
+                        resync_scheduled_orders(enrollment=enr)
                 moved += 1
                 if moved % 25 == 0:
                     self.stdout.write(f"  {moved}/{len(targets)} moved…")
