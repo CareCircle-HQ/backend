@@ -75,6 +75,27 @@ def cadence_delivery_weekdays(cadence):
     return list(CADENCE_WEEKDAYS.get(cadence, []))
 
 
+def cadence_matching_weekdays(weekdays):
+    """The ACTIVE cadence whose configured delivery days are exactly
+    ``weekdays``, or "" when none is.
+
+    The inverse of :func:`cadence_delivery_weekdays`, used to recover a
+    household's cadence from ``EnrollmentVerification.delivery_weekdays`` when no
+    delivery plan exists to read it from. Deliberately an EXACT set match and
+    never a guess: an unrecognized day-set returns "" so the household waits for
+    an agent instead of being planned onto days nobody chose.
+    """
+    wanted = sorted({w for w in (weekdays or []) if w in _WEEKDAY_CODES})
+    if not wanted:
+        return ""
+    from api.models import Cadence
+
+    for row in Cadence.objects.filter(is_active=True):
+        if sorted(set(cadence_delivery_weekdays(row.code))) == wanted:
+            return row.code
+    return ""
+
+
 def cadence_options_for_kind(kind):
     """The delivery cadences a household of this product ``kind`` (meals/boxes)
     can be assigned, each with its delivery weekdays and the predefined

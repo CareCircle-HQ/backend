@@ -720,6 +720,7 @@ def rebuild_delivery_calendar(enrollment, from_date=None):
     ``{added, removed, updated}`` plus ``plans_created``.
     """
     from api.services.delivery import (
+        cadence_matching_weekdays,
         create_member_delivery_schedules,
         current_household_cadence,
         ensure_member_delivery_schedules,
@@ -760,6 +761,20 @@ def rebuild_delivery_calendar(enrollment, from_date=None):
             # has NO plan yet -- bootstrap the first plan from the prior's cadence.
             prior = enrollment.supersedes
             cadence = current_household_cadence(prior) if prior else ""
+            if not cadence:
+                # No predecessor to copy from, but the enrollment may already
+                # KNOW its delivery days: create_member_delivery_schedules saves
+                # delivery_weekdays BEFORE writing the plan rows, so an assignment
+                # that aborted (its only member not servable at that moment) left
+                # the kitchen and the weekdays behind with no plan -- and both
+                # heal paths asked the missing PLAN for the cadence, so nothing
+                # ever repaired it. The household then sat Service Active,
+                # undeliverable, showing a cadence on the Data page (which derives
+                # it from these weekdays) and none on the member page.
+                #
+                # An exact cadence match only: an unrecognized day-set is left for
+                # an agent rather than planned onto days nobody chose.
+                cadence = cadence_matching_weekdays(enrollment.delivery_weekdays)
             if cadence:
                 from api.models import DeliveryCadence
                 from api.services.catalog import product_kind_for_enrollment

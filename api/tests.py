@@ -23190,3 +23190,142 @@ class HouseholdCaseInheritanceTest(TestCase):
         row = self._row_for(primary)
         self.assertEqual(row["case_id"], case.case_id)
         self.assertEqual(row["enrollment_id"], enr.pk)
+
+
+class PlanlessKitchenHealTest(TestCase):
+    """A household with a kitchen and delivery weekdays but NO plan must heal.
+
+    Found from the Data page: members under Company Status = `review` showing a
+    kitchen and (on the member page) no cadence. create_member_delivery_schedules
+    saves ``delivery_weekdays`` BEFORE it writes the plan rows, so an assignment
+    that aborted -- its only member not servable at that moment -- left the
+    kitchen and the weekdays behind with no plan. Both heal paths then asked the
+    missing PLAN for the cadence (``current_household_cadence``), so nothing ever
+    repaired it: the household sat Service Active and undeliverable, which is what
+    dropped it into the `review` quarantine.
+    """
+
+    def _cadences(self):
+        """The Cadence rows the weekday->cadence match reads. Created explicitly:
+        migrations are disabled under `manage.py test`, so the settings table a
+        data migration seeds is EMPTY here."""
+        from .models import Cadence
+
+        for code, label, weekdays in (
+            ("mon_thu", "Mon/Thu", ["mon", "thu"]),
+            ("tue_fri", "Tue/Fri", ["tue", "fri"]),
+            ("tue_only", "Tue-Only", ["tue"]),
+            ("once_a_week", "Wed-Only", ["wed"]),
+        ):
+            Cadence.objects.create(
+                code=code, label=label, weekdays=weekdays, is_active=True,
+            )
+
+    def _planless(self, *, weekdays, member_status=None):
+        from .models import (
+            Case, CaseType, Client, EnrollmentStage, EnrollmentVerification,
+            Household, HouseholdMember, Kitchen, MemberDietaryProfile,
+            MemberStatus, ProductType, ProductTypeKind, DeliveryCadence,
+        )
+
+        ProductType.objects.get_or_create(
+            type=ProductTypeKind.MEALS,
+            delivery_days_cadence=DeliveryCadence.MON_THU,
+            defaults={"prod_per_delivery": 3, "meals_per_day": 3},
+        )
+        for code in ("tue_fri", "tue_only", "once_a_week"):
+            ProductType.objects.get_or_create(
+                type=ProductTypeKind.MEALS, delivery_days_cadence=code,
+                defaults={"prod_per_delivery": 3, "meals_per_day": 3},
+            )
+        kitchen = Kitchen.objects.create(name="Heal Kitchen", status="active")
+        client = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Plan", last_name="Less",
+            client_added_at=timezone.now(),
+        )
+        household = Household.objects.create(name="HH")
+        HouseholdMember.objects.create(household=household, client=client, is_primary=True)
+        case = Case.objects.create(
+            case_id=uuid.uuid4(), client=client, case_type=CaseType.INTERNAL_SERVICE,
+            case_status="open", service_authorization_status="approved",
+            program_name="Medically Tailored Meals (MTM)",
+            # The approval WINDOW: create_member_delivery_schedules plans dates
+            # inside it, so without one there is nothing to schedule.
+            service_authorization_approval_starts_at=timezone.localdate() - timedelta(days=7),
+            service_authorization_approval_ends_at=timezone.localdate() + timedelta(days=90),
+        )
+        enr = EnrollmentVerification.objects.create(
+            client=client, household=household, case=case, kitchen=kitchen,
+            stage=EnrollmentStage.SERVICE_ACTIVE, verified_at=timezone.now(),
+            delivery_weekdays=weekdays, program_name="Medically Tailored Meals (MTM)",
+        )
+        MemberDietaryProfile.objects.create(
+            enrollment=enr, client=client, member_name="Plan Less",
+            status=member_status or MemberStatus.ACTIVE, menu_type="Regular",
+        )
+        return enr
+
+    def test_the_enrollments_own_weekdays_bootstrap_the_missing_plan(self):
+        # rebuild_delivery_calendar is the unit that bootstraps the plan.
+        # reconcile_enrollment_calendar wraps it behind a meals<->boxes switch
+        # remediation that can early-return before this code is reached.
+        from .services.orders import rebuild_delivery_calendar
+
+        self._cadences()
+        enr = self._planless(weekdays=["mon", "thu"])
+        self.assertEqual(enr.delivery_schedules.count(), 0, "starts with no plan")
+        self.assertIsNone(enr.supersedes, "and with no predecessor to copy from")
+
+        rebuild_delivery_calendar(enr)
+        self.assertEqual(enr.delivery_schedules.count(), 1)
+        sched = enr.delivery_schedules.get()
+        self.assertEqual(sched.delivery_days_cadence, "mon_thu")
+
+    def test_a_single_delivery_day_is_matched_too(self):
+        """Tue-Only is a real cadence; the old weekday derivation collapsed
+        single-day sets into once_a_week, which would have planned the wrong day."""
+        from .services.orders import rebuild_delivery_calendar
+
+        self._cadences()
+        enr = self._planless(weekdays=["tue"])
+        rebuild_delivery_calendar(enr)
+        self.assertEqual(
+            enr.delivery_schedules.get().delivery_days_cadence, "tue_only",
+        )
+
+    def test_an_unrecognized_day_set_is_left_for_an_agent(self):
+        """No cadence matches, so no plan is invented -- delivery_days_cadence is
+        NOT NULL and a guess would schedule days nobody chose."""
+        from .services.orders import rebuild_delivery_calendar
+
+        self._cadences()
+        for weekdays in ([], ["sat"], ["mon", "wed", "fri"]):
+            enr = self._planless(weekdays=weekdays)
+            rebuild_delivery_calendar(enr)
+            self.assertEqual(
+                enr.delivery_schedules.count(), 0, f"weekdays={weekdays}",
+            )
+
+    def test_a_household_with_nobody_servable_still_gets_no_plan(self):
+        """The abort that caused this is still correct: an Inactive-only household
+        has nobody to deliver to, and must be reactivated first."""
+        from .models import MemberStatus
+        from .services.orders import rebuild_delivery_calendar
+
+        self._cadences()
+        enr = self._planless(weekdays=["mon", "thu"], member_status=MemberStatus.INACTIVE)
+        rebuild_delivery_calendar(enr)
+        self.assertEqual(enr.delivery_schedules.count(), 0)
+
+    def test_cadence_matching_weekdays_is_an_exact_set_match(self):
+        from .services.delivery import cadence_matching_weekdays
+
+        self._cadences()
+        self.assertEqual(cadence_matching_weekdays(["thu", "mon"]), "mon_thu")
+        self.assertEqual(cadence_matching_weekdays(["tue"]), "tue_only")
+        self.assertEqual(cadence_matching_weekdays(["wed"]), "once_a_week")
+        # Not a subset / superset match, and never a guess.
+        self.assertEqual(cadence_matching_weekdays(["mon"]), "")
+        self.assertEqual(cadence_matching_weekdays(["mon", "tue", "thu"]), "")
+        self.assertEqual(cadence_matching_weekdays([]), "")
+        self.assertEqual(cadence_matching_weekdays(None), "")
