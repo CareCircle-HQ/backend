@@ -2254,7 +2254,8 @@ class PortalHouseholdMemberSerializer(serializers.ModelSerializer):
             "has_nutrition_pdf", "nutrition_review_status",
             "meal_category", "menu_type", "general_verification_notes",
             "status", "status_label", "kitchen_meal_type", "kitchen_food_notes",
-            "is_primary", "pause_locked", "not_eligible", "not_eligible_reason",
+            "is_primary", "pause_locked", "pause_prior_status",
+            "not_eligible", "not_eligible_reason",
         ]
 
     def get_client_id(self, obj):

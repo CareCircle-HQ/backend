@@ -2060,6 +2060,19 @@ class MemberStatus(models.TextChoices):
     REMOVED = "removed", "Removed"
 
 
+# Statuses an agent may PAUSE from. ACTIVE is the original case; PENDING and
+# INACTIVE were added because they had no pause action at all, leaving an agent
+# no way to record that a member is on hold before service ever started (or after
+# it ended). Deliberately NOT out-of-orbit / out-of-range, which have their own
+# remedies (fix the menu, fix the ZIP), nor an eligibility pause, which is not
+# ours to lift.
+PAUSABLE_MEMBER_STATUSES = (
+    MemberStatus.ACTIVE,
+    MemberStatus.PENDING,
+    MemberStatus.INACTIVE,
+)
+
+
 # Member statuses that exclude a member from every delivery schedule / order /
 # Purchase Order: PENDING (pre-kitchen, not activated yet), OUT_OF_ORBIT (meal
 # rule can't fulfill them), OUT_OF_RANGE (delivery/primary ZIP outside coverage),
@@ -2526,6 +2539,17 @@ class MemberDietaryProfile(models.Model):
     # matching CaseMismatchFlag (never auto-cleared on a switch back to
     # household). See api.services.lifecycle governing-case switch handling.
     pause_locked = models.BooleanField(default=False)
+    # The status this member held BEFORE an agent paused them, so an unpause puts
+    # them back where they were. Without it, unpause re-runs the meal rule and
+    # lands everyone on ACTIVE -- which would make pause+unpause a way to
+    # activate a PENDING member without kitchen assignment or the nutritionist
+    # sign-off, and to revive a terminal INACTIVE without the explicit "Return
+    # this member to service" flow (which re-checks the kitchen and requires a
+    # menu type). Blank for a member paused while ACTIVE -- they keep the old
+    # behaviour of being re-evaluated by the meal rule on unpause.
+    pause_prior_status = models.CharField(
+        max_length=32, blank=True, choices=MemberStatus.choices,
+    )
     # The member's mobile number, collected during verification. Stored on the
     # enrollment (not just the client) so it is part of the verification record
     # and CARRIES ACROSS a governing-case replacement -- like the delivery

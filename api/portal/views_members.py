@@ -60,6 +60,7 @@ from ..models import (
     MemberDietaryProfile,
     KitchenProductType,
     MemberStatus,
+    PAUSABLE_MEMBER_STATUSES,
     MEMBER_PAUSED_STATUSES,
     SERVICE_EXCLUDED_MEMBER_STATUSES,
     MenuType,
@@ -4648,9 +4649,20 @@ class HouseholdMemberEditView(PortalAPIView):
                 status=http.HTTP_400_BAD_REQUEST,
             )
 
-        if pause and mv.status == MemberStatus.ACTIVE:
+        if pause and mv.status in PAUSABLE_MEMBER_STATUSES:
             # Manual agent pause (requires a reason). Excludes the member from
             # every delivery schedule / Purchase Order until unpaused.
+            #
+            # PENDING and INACTIVE are pausable too: an agent needs to record
+            # that a member is on hold whether or not service ever started (e.g.
+            # the member asks to pause before their first delivery), and those
+            # statuses previously had no pause action at all.
+            #
+            # Remember where they came from, so the unpause below can put them
+            # BACK rather than activating them -- see pause_prior_status.
+            mv.pause_prior_status = (
+                mv.status if mv.status != MemberStatus.ACTIVE else ""
+            )
             mv.status = MemberStatus.PAUSED
             mv.kitchen_meal_type = ""
             mv.kitchen_food_notes = ""
@@ -4681,15 +4693,29 @@ class HouseholdMemberEditView(PortalAPIView):
                 except Exception:  # never let note-writing break the edit
                     pass
         elif unpause and mv.status == MemberStatus.PAUSED:
-            # Lift the manual pause: re-run the kitchen-aware meal rule so the
-            # member returns to Active, or falls to Out of Orbit if the current
-            # menu/allergies can't be fulfilled by the assigned kitchen. This is
-            # the explicit resume flow, so allow_resume=True lets the meal rule
-            # move the member OFF the manual PAUSED status.
-            reconcile_member_kitchen_output(
-                mv, enr.kitchen, save=False, allow_resume=True,
-            )
-            mv.save()
+            # Lift the manual pause. A member paused from PENDING or INACTIVE
+            # goes back to exactly that status: they were never in service, so
+            # re-running the meal rule would ACTIVATE them and skip the gates
+            # that status represents (kitchen assignment + nutritionist sign-off
+            # for Pending; the explicit "Return this member to service" flow,
+            # which re-checks the kitchen, for Inactive).
+            prior = mv.pause_prior_status
+            if prior in (MemberStatus.PENDING, MemberStatus.INACTIVE):
+                mv.status = prior
+                mv.pause_prior_status = ""
+                mv.save(update_fields=["status", "pause_prior_status"])
+            else:
+                # Paused from ACTIVE (or a legacy row with nothing recorded):
+                # re-run the kitchen-aware meal rule so the member returns to
+                # Active, or falls to Out of Orbit if the current menu/allergies
+                # can't be fulfilled by the assigned kitchen. This is the explicit
+                # resume flow, so allow_resume=True lets the meal rule move the
+                # member OFF the manual PAUSED status.
+                reconcile_member_kitchen_output(
+                    mv, enr.kitchen, save=False, allow_resume=True,
+                )
+                mv.pause_prior_status = ""
+                mv.save()
             agent = current_agent(request)
             actor = _agent_actor(agent)
             try:

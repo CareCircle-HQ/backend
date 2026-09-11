@@ -23452,3 +23452,131 @@ class CarryLeavesMemberBehindTest(TestCase):
         self.assertEqual(profile.status, MemberStatus.ACTIVE,
                          "allow_resume should have returned them")
         self.assertEqual(self._events(profile).count(), 0)
+
+
+class PauseFromPendingOrInactiveTest(TestCase):
+    """An agent can pause a PENDING or INACTIVE member, and unpausing puts them
+    back where they were.
+
+    Those statuses had no pause action at all, so there was no way to record that
+    a member is on hold before service ever started (or after it ended). The
+    catch: unpause re-runs the meal rule with allow_resume=True, which lands on
+    ACTIVE -- so without remembering the prior status, pause+unpause would be a
+    way to activate a Pending member with no kitchen assignment or nutritionist
+    sign-off, and to revive a terminal Inactive without the explicit "Return this
+    member to service" flow.
+    """
+
+    def _member(self, status):
+        from .models import (
+            Client, EnrollmentStage, EnrollmentVerification, Kitchen,
+            KitchenMenuType, MemberDietaryProfile, MenuType,
+        )
+
+        client = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Pause", last_name="Target",
+            client_added_at=timezone.now(),
+        )
+        kitchen = Kitchen.objects.create(name="Pause Kitchen", status="active")
+        KitchenMenuType.objects.create(
+            kitchen=kitchen, menu_type=MenuType.objects.create(name="Regular"),
+        )
+        enr = EnrollmentVerification.objects.create(
+            client=client, kitchen=kitchen, stage=EnrollmentStage.SERVICE_ACTIVE,
+            verified_at=timezone.now(),
+        )
+        profile = MemberDietaryProfile.objects.create(
+            enrollment=enr, client=client, member_name="Pause Target",
+            status=status, menu_type="Regular",
+        )
+        return client, profile
+
+    def _api(self):
+        agent = Agent.objects.get_or_create(
+            agent_code="PAU-1",
+            defaults={"name": "Pauser", "email": "pau1@example.com",
+                      "group": "CS", "status": "Active"},
+        )[0]
+        access = AccessToken()
+        access["agent_id"] = str(agent.id)
+        access["agent_code"] = agent.agent_code
+        access["agent_name"] = agent.name
+        access["agent_group"] = agent.group
+        api = APIClient()
+        api.credentials(HTTP_AUTHORIZATION=f"Bearer {access}")
+        return api
+
+    def _patch(self, client, profile, body):
+        return self._api().patch(
+            f"/api/portal/members/{client.client_id}/household/members/{profile.pk}/",
+            body, format="json",
+        )
+
+    def test_a_pending_member_can_be_paused_and_returns_to_pending(self):
+        from .models import MemberStatus
+
+        client, profile = self._member(MemberStatus.PENDING)
+        r = self._patch(client, profile, {"pause": True, "pause_reason": "member asked to wait"})
+        self.assertEqual(r.status_code, 200)
+        profile.refresh_from_db()
+        self.assertEqual(profile.status, MemberStatus.PAUSED)
+        self.assertEqual(profile.pause_prior_status, MemberStatus.PENDING)
+
+        r = self._patch(client, profile, {"unpause": True})
+        self.assertEqual(r.status_code, 200)
+        profile.refresh_from_db()
+        self.assertEqual(
+            profile.status, MemberStatus.PENDING,
+            "a pending member must NOT be activated by an unpause -- that would "
+            "skip kitchen assignment and the nutritionist sign-off",
+        )
+        self.assertEqual(profile.pause_prior_status, "")
+
+    def test_an_inactive_member_can_be_paused_and_returns_to_inactive(self):
+        from .models import MemberStatus
+
+        client, profile = self._member(MemberStatus.INACTIVE)
+        self._patch(client, profile, {"pause": True, "pause_reason": "on hold"})
+        profile.refresh_from_db()
+        self.assertEqual(profile.status, MemberStatus.PAUSED)
+        self.assertEqual(profile.pause_prior_status, MemberStatus.INACTIVE)
+
+        self._patch(client, profile, {"unpause": True})
+        profile.refresh_from_db()
+        self.assertEqual(
+            profile.status, MemberStatus.INACTIVE,
+            "unpause must not become a backdoor around Return-this-member-to-service",
+        )
+
+    def test_an_active_member_still_re_runs_the_meal_rule_on_unpause(self):
+        """The original behaviour must be untouched: nothing is recorded for an
+        ACTIVE pause, so unpause re-evaluates them against the kitchen."""
+        from .models import MemberStatus
+
+        client, profile = self._member(MemberStatus.ACTIVE)
+        self._patch(client, profile, {"pause": True, "pause_reason": "holiday"})
+        profile.refresh_from_db()
+        self.assertEqual(profile.status, MemberStatus.PAUSED)
+        self.assertEqual(profile.pause_prior_status, "")
+
+        self._patch(client, profile, {"unpause": True})
+        profile.refresh_from_db()
+        self.assertEqual(profile.status, MemberStatus.ACTIVE)
+
+    def test_a_pause_still_requires_a_reason(self):
+        from .models import MemberStatus
+
+        client, profile = self._member(MemberStatus.PENDING)
+        r = self._patch(client, profile, {"pause": True, "pause_reason": ""})
+        self.assertEqual(r.status_code, 400)
+        profile.refresh_from_db()
+        self.assertEqual(profile.status, MemberStatus.PENDING, "unchanged")
+
+    def test_out_of_orbit_is_not_pausable(self):
+        """It has its own remedy (fix the menu), and pausing would hide it."""
+        from .models import MemberStatus
+
+        client, profile = self._member(MemberStatus.OUT_OF_ORBIT)
+        self._patch(client, profile, {"pause": True, "pause_reason": "nope"})
+        profile.refresh_from_db()
+        self.assertEqual(profile.status, MemberStatus.OUT_OF_ORBIT)
