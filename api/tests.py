@@ -22872,3 +22872,460 @@ class RetiredMedicalConditionsTest(TestCase):
         profile.refresh_from_db()
         for kept in ("Kidney Disease", "Cardiometabolic", "IBS"):
             self.assertIn(kept, profile.conditions)
+
+
+class ExecutiveDashboardTest(TestCase):
+    """The Executive dashboard: every tile is a Data-page filter combination.
+
+    The point of these is that the dashboard cannot drift from the Data page --
+    both run filter_analytics -- and that the sections reconcile, which is what
+    makes the page trustworthy to someone who will not go and check.
+    """
+
+    def _row(self, *, added, status, **fields):
+        """A read-model row. EnrollmentAnalytics is a READ MODEL, so writing rows
+        directly is legitimate and keeps these tests about the dashboard rather
+        than about the (separately tested) builder."""
+        from .models import Client, EnrollmentAnalytics
+
+        client = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Exec", last_name="Row",
+            client_added_at=added,
+        )
+        return EnrollmentAnalytics.objects.create(
+            client=client, member_added_at=added, company_status=status, **fields,
+        )
+
+    def _api(self, group="Management"):
+        # get_or_create: a test may build a client twice for the same group, and
+        # agent_code is unique.
+        agent, _ = Agent.objects.get_or_create(
+            agent_code=f"{group[:3].upper()}-70",
+            defaults={
+                "name": f"{group} One",
+                "email": f"{group.lower()}70@example.com",
+                "group": group, "status": "Active",
+            },
+        )
+        access = AccessToken()
+        access["agent_id"] = str(agent.id)
+        access["agent_code"] = agent.agent_code
+        access["agent_name"] = agent.name
+        access["agent_group"] = agent.group
+        api = APIClient()
+        api.credentials(HTTP_AUTHORIZATION=f"Bearer {access}")
+        return api
+
+    def test_only_management_may_read_it(self):
+        self._row(added=timezone.now(), status="active")
+        self.assertEqual(
+            self._api("Management").get("/api/portal/dashboard/executive/").status_code,
+            200,
+        )
+        for group in ("CS", "Logistics", "Verifiers", "Nutritionist"):
+            self.assertEqual(
+                self._api(group).get("/api/portal/dashboard/executive/").status_code,
+                403,
+                f"{group} must not read the executive dashboard",
+            )
+        self.assertEqual(
+            APIClient().get("/api/portal/dashboard/executive/").status_code, 401,
+        )
+
+    def test_the_four_header_cards_account_for_every_member(self):
+        """Active + Inactive(case) + Inactive(no case) must equal Total Members,
+        which is why `review` is counted in the case-exists card (it is a
+        quarantine for members who DO have a case and are not being served) even
+        though it also gets its own row below."""
+        now = timezone.now()
+        self._row(added=now, status="active")
+        self._row(added=now, status="pending")
+        self._row(added=now, status="unable")
+        self._row(added=now, status="paused")
+        self._row(added=now, status="closed")
+        self._row(added=now, status="review")
+        self._row(added=now, status="no_case")
+
+        totals = self._api().get("/api/portal/dashboard/executive/").json()["totals"]
+        self.assertEqual(totals["total_members"], 7)
+        self.assertEqual(totals["active_members"], 1)
+        self.assertEqual(totals["inactive_with_case"], 5)  # incl. review
+        self.assertEqual(totals["inactive_no_case"], 1)
+        self.assertEqual(
+            totals["active_members"]
+            + totals["inactive_with_case"]
+            + totals["inactive_no_case"],
+            totals["total_members"],
+        )
+        # Percentages are of members WITH a case, not of the total -- against the
+        # total they would be swamped by the imported no-case backlog.
+        self.assertEqual(totals["with_case"], 6)
+        self.assertEqual(totals["active_pct"], round(100 / 6, 1))
+
+    def test_the_range_filters_when_WE_added_the_member(self):
+        """Not Unite Us's created_at, which clusters on the days they migrated --
+        the whole reason Client.client_added_at exists."""
+        from .models import Client
+
+        inside = timezone.now() - timedelta(days=2)
+        outside = timezone.now() - timedelta(days=90)
+        self._row(added=inside, status="active")
+        old = self._row(added=outside, status="active")
+        # Unite Us thinks the OLD member is brand new; the filter must not care.
+        Client.objects.filter(pk=old.client_id).update(created_at=timezone.now())
+
+        frm = (timezone.now() - timedelta(days=7)).date().isoformat()
+        body = self._api().get(
+            f"/api/portal/dashboard/executive/?created_from={frm}"
+        ).json()
+        self.assertEqual(body["totals"]["total_members"], 1)
+        self.assertEqual(body["totals"]["active_members"], 1)
+        # ...and with no range, both are counted.
+        allbody = self._api().get("/api/portal/dashboard/executive/").json()
+        self.assertEqual(allbody["totals"]["total_members"], 2)
+
+    def test_active_rows_partition_each_service(self):
+        """being delivered + assigned + not assigned must equal the service total,
+        which is what the ANY_ASSIGNED kitchen sentinel exists for."""
+        from .models import Kitchen
+
+        kitchen = Kitchen.objects.create(name="K1", status="active")
+        now = timezone.now()
+        self._row(added=now, status="active", service_type="meals", in_any_po=True)
+        self._row(added=now, status="active", service_type="meals", in_any_po=False,
+                  kitchen_id=kitchen.pk)
+        self._row(added=now, status="active", service_type="meals", in_any_po=False)
+
+        meals = self._api().get(
+            "/api/portal/dashboard/executive/"
+        ).json()["members"]["active"]["meals"]
+        self.assertEqual(meals["being_delivered"], 1)
+        self.assertEqual(meals["assigned_for_delivery"], 1)
+        self.assertEqual(meals["not_assigned_for_delivery"], 1)
+        self.assertEqual(
+            meals["being_delivered"]
+            + meals["assigned_for_delivery"]
+            + meals["not_assigned_for_delivery"],
+            meals["total"],
+        )
+
+    def test_unable_header_matches_the_data_page_not_the_sum_of_reasons(self):
+        """The reasons OVERLAP (one member can be out of range AND uninsured), so
+        summing them reported 2,935 against a real 1,844 -- the dashboard
+        disagreeing with the Data page an agent opens to check it. The header is
+        the distinct count; the sum is reported separately so the overlap can be
+        explained rather than looking like a bug."""
+        now = timezone.now()
+        # One member matching TWO reasons.
+        self._row(added=now, status="unable", eligibility="ineligible",
+                  out_of_range=True, insurance_status="active",
+                  social_status="enrolled")
+
+        unable = self._api().get(
+            "/api/portal/dashboard/executive/"
+        ).json()["members"]["unable"]
+        self.assertEqual(unable["rejected_case_open"], 1)
+        self.assertEqual(unable["out_of_range"], 1)
+        self.assertEqual(unable["rows_sum"], 2, "the reasons overlap")
+        # ...and the header is what Company Status = Unable returns on the Data page.
+        from .services.enrollment_analytics import filter_analytics
+        self.assertEqual(unable["total"], 1)
+        self.assertEqual(
+            unable["total"], filter_analytics({"company_status": "unable"}).count(),
+        )
+
+    def test_member_type_sections_reconcile_to_active(self):
+        """Individual + primary-of-household + members-of-household partitions
+        Active. The spec omitted the primary/non-primary split on the household
+        rows; only this reading makes the design's arithmetic work."""
+        now = timezone.now()
+        self._row(added=now, status="active", program_type="individual",
+                  service_type="meals", is_primary=True)
+        self._row(added=now, status="active", program_type="household",
+                  service_type="meals", is_primary=True)
+        self._row(added=now, status="active", program_type="household",
+                  service_type="boxes", is_primary=False)
+
+        body = self._api().get("/api/portal/dashboard/executive/").json()
+        types = body["by_member_type"]
+        self.assertEqual(types["primary_members"]["individual"]["total"], 1)
+        self.assertEqual(types["primary_members"]["primary_household_members"]["total"], 1)
+        self.assertEqual(types["primary_members"]["total"], 2)
+        self.assertEqual(types["members_of_household"]["total"], 1)
+        self.assertEqual(
+            types["primary_members"]["total"] + types["members_of_household"]["total"],
+            body["totals"]["active_members"],
+        )
+
+    def test_cases_count_cases_not_members(self):
+        """Several members on ONE governing case is ONE case. Non-governing is
+        every other case of those members, whatever the pipeline."""
+        from .models import Case, CaseType, Client
+
+        now = timezone.now()
+        case_id = uuid.uuid4()
+        for _ in range(3):
+            self._row(added=now, status="active", case_id=case_id,
+                      case_status="open", auth_status="approved",
+                      service_type="meals")
+        holder = Client.objects.first()
+        Case.objects.create(
+            case_id=case_id, client=holder, case_type=CaseType.INTERNAL_SERVICE,
+            case_status="open",
+        )
+        # A second, NON-governing case on the same member (another pipeline).
+        Case.objects.create(
+            case_id=uuid.uuid4(), client=holder, case_type=CaseType.NAVIGATION,
+            case_status="open",
+        )
+
+        cases = self._api().get("/api/portal/dashboard/executive/").json()["cases"]
+        self.assertEqual(cases["total"]["governing"], 1, "3 members, 1 case")
+        self.assertEqual(cases["total"]["non_governing"], 1)
+        self.assertEqual(cases["by_authorization"]["approved"], 1)
+        self.assertEqual(cases["by_status"]["open"], 1)
+        self.assertEqual(cases["by_service_type"]["meals"], 1)
+
+
+class HouseholdCaseInheritanceTest(TestCase):
+    """A household relative may only inherit the primary's case when the
+    household verification actually COVERED them.
+
+    Reported from the Data page: a member appeared under Company Status =
+    `review` who had no case at all. She was a relative of someone holding an
+    INDIVIDUAL-scope case -- which by definition serves only its holder -- and the
+    read model handed her his enrollment wholesale, so she read as verified +
+    approved + service_active while having no delivery calendar of her own. That
+    satisfies neither Active (no calendar) nor Pending (past pre-service), so she
+    fell through to the `review` quarantine.
+    """
+
+    def _household(self, *, case_scope, cover_relative):
+        """A primary with a case + verified active enrollment, and one relative.
+        ``cover_relative`` decides whether the relative is a member profile on the
+        primary's enrollment -- i.e. whether the verification covered them."""
+        from .models import (
+            Case, CaseType, Client, EnrollmentStage, EnrollmentVerification,
+            Household, HouseholdMember, MemberDietaryProfile, MemberStatus,
+        )
+
+        primary = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Prim", last_name="Holder",
+            client_added_at=timezone.now(),
+        )
+        relative = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Rel", last_name="Ative",
+            client_added_at=timezone.now(),
+        )
+        household = Household.objects.create(name="HH")
+        HouseholdMember.objects.create(household=household, client=primary, is_primary=True)
+        HouseholdMember.objects.create(household=household, client=relative, is_primary=False)
+
+        case = Case.objects.create(
+            case_id=uuid.uuid4(), client=primary,
+            case_type=CaseType.INTERNAL_SERVICE, case_status="open",
+            household_type=case_scope, service_authorization_status="approved",
+        )
+        enr = EnrollmentVerification.objects.create(
+            client=primary, household=household, case=case,
+            stage=EnrollmentStage.SERVICE_ACTIVE, verified_at=timezone.now(),
+        )
+        MemberDietaryProfile.objects.create(
+            enrollment=enr, client=primary, member_name="Prim Holder",
+            status=MemberStatus.ACTIVE,
+        )
+        if cover_relative:
+            MemberDietaryProfile.objects.create(
+                enrollment=enr, client=relative, member_name="Rel Ative",
+                status=MemberStatus.ACTIVE,
+            )
+        return primary, relative, enr, case
+
+    def _row_for(self, client):
+        from .models import Client
+        from .services.enrollment_analytics import build_row
+
+        fresh = (
+            Client.objects.filter(pk=client.pk)
+            .select_related("household_membership")
+            .prefetch_related("military_profile", "member_profiles", "cases", "phones")
+            .first()
+        )
+        return build_row(fresh)
+
+    def test_an_uncovered_relative_does_not_inherit_the_case(self):
+        """The reported bug: no profile on the enrollment means the verification
+        never covered them, so the primary's case is not theirs to inherit. Their
+        honest status is No Case -- not `review`, which merely records that they
+        matched neither Active nor Pending."""
+        _primary, relative, _enr, _case = self._household(
+            case_scope="individual", cover_relative=False,
+        )
+        row = self._row_for(relative)
+        self.assertEqual(row["company_status"], "no_case")
+        self.assertIsNone(row["case_id"])
+        self.assertIsNone(row["enrollment_id"])
+        # ...and nothing of the primary's leaks onto them.
+        self.assertEqual(row["stage"], "")
+        self.assertEqual(row["auth_status"], "")
+        self.assertEqual(row["verification_state"], "")
+
+    def test_a_covered_relative_still_inherits(self):
+        """The household fallback exists for a reason: a relative the verification
+        DID cover must keep inheriting, or every dependent drops to No Case."""
+        _primary, relative, enr, case = self._household(
+            case_scope="household", cover_relative=True,
+        )
+        row = self._row_for(relative)
+        self.assertEqual(row["case_id"], case.case_id)
+        self.assertEqual(row["enrollment_id"], enr.pk)
+        self.assertNotEqual(row["company_status"], "no_case")
+
+    def test_the_primary_is_never_affected(self):
+        """The guard keys off "this enrollment is not mine"; a case holder must
+        never be caught by it, even when nobody has a member profile."""
+        primary, _relative, enr, case = self._household(
+            case_scope="individual", cover_relative=False,
+        )
+        row = self._row_for(primary)
+        self.assertEqual(row["case_id"], case.case_id)
+        self.assertEqual(row["enrollment_id"], enr.pk)
+
+
+class PlanlessKitchenHealTest(TestCase):
+    """A household with a kitchen and delivery weekdays but NO plan must heal.
+
+    Found from the Data page: members under Company Status = `review` showing a
+    kitchen and (on the member page) no cadence. create_member_delivery_schedules
+    saves ``delivery_weekdays`` BEFORE it writes the plan rows, so an assignment
+    that aborted -- its only member not servable at that moment -- left the
+    kitchen and the weekdays behind with no plan. Both heal paths then asked the
+    missing PLAN for the cadence (``current_household_cadence``), so nothing ever
+    repaired it: the household sat Service Active and undeliverable, which is what
+    dropped it into the `review` quarantine.
+    """
+
+    def _cadences(self):
+        """The Cadence rows the weekday->cadence match reads. Created explicitly:
+        migrations are disabled under `manage.py test`, so the settings table a
+        data migration seeds is EMPTY here."""
+        from .models import Cadence
+
+        for code, label, weekdays in (
+            ("mon_thu", "Mon/Thu", ["mon", "thu"]),
+            ("tue_fri", "Tue/Fri", ["tue", "fri"]),
+            ("tue_only", "Tue-Only", ["tue"]),
+            ("once_a_week", "Wed-Only", ["wed"]),
+        ):
+            Cadence.objects.create(
+                code=code, label=label, weekdays=weekdays, is_active=True,
+            )
+
+    def _planless(self, *, weekdays, member_status=None):
+        from .models import (
+            Case, CaseType, Client, EnrollmentStage, EnrollmentVerification,
+            Household, HouseholdMember, Kitchen, MemberDietaryProfile,
+            MemberStatus, ProductType, ProductTypeKind, DeliveryCadence,
+        )
+
+        ProductType.objects.get_or_create(
+            type=ProductTypeKind.MEALS,
+            delivery_days_cadence=DeliveryCadence.MON_THU,
+            defaults={"prod_per_delivery": 3, "meals_per_day": 3},
+        )
+        for code in ("tue_fri", "tue_only", "once_a_week"):
+            ProductType.objects.get_or_create(
+                type=ProductTypeKind.MEALS, delivery_days_cadence=code,
+                defaults={"prod_per_delivery": 3, "meals_per_day": 3},
+            )
+        kitchen = Kitchen.objects.create(name="Heal Kitchen", status="active")
+        client = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Plan", last_name="Less",
+            client_added_at=timezone.now(),
+        )
+        household = Household.objects.create(name="HH")
+        HouseholdMember.objects.create(household=household, client=client, is_primary=True)
+        case = Case.objects.create(
+            case_id=uuid.uuid4(), client=client, case_type=CaseType.INTERNAL_SERVICE,
+            case_status="open", service_authorization_status="approved",
+            program_name="Medically Tailored Meals (MTM)",
+            # The approval WINDOW: create_member_delivery_schedules plans dates
+            # inside it, so without one there is nothing to schedule.
+            service_authorization_approval_starts_at=timezone.localdate() - timedelta(days=7),
+            service_authorization_approval_ends_at=timezone.localdate() + timedelta(days=90),
+        )
+        enr = EnrollmentVerification.objects.create(
+            client=client, household=household, case=case, kitchen=kitchen,
+            stage=EnrollmentStage.SERVICE_ACTIVE, verified_at=timezone.now(),
+            delivery_weekdays=weekdays, program_name="Medically Tailored Meals (MTM)",
+        )
+        MemberDietaryProfile.objects.create(
+            enrollment=enr, client=client, member_name="Plan Less",
+            status=member_status or MemberStatus.ACTIVE, menu_type="Regular",
+        )
+        return enr
+
+    def test_the_enrollments_own_weekdays_bootstrap_the_missing_plan(self):
+        # rebuild_delivery_calendar is the unit that bootstraps the plan.
+        # reconcile_enrollment_calendar wraps it behind a meals<->boxes switch
+        # remediation that can early-return before this code is reached.
+        from .services.orders import rebuild_delivery_calendar
+
+        self._cadences()
+        enr = self._planless(weekdays=["mon", "thu"])
+        self.assertEqual(enr.delivery_schedules.count(), 0, "starts with no plan")
+        self.assertIsNone(enr.supersedes, "and with no predecessor to copy from")
+
+        rebuild_delivery_calendar(enr)
+        self.assertEqual(enr.delivery_schedules.count(), 1)
+        sched = enr.delivery_schedules.get()
+        self.assertEqual(sched.delivery_days_cadence, "mon_thu")
+
+    def test_a_single_delivery_day_is_matched_too(self):
+        """Tue-Only is a real cadence; the old weekday derivation collapsed
+        single-day sets into once_a_week, which would have planned the wrong day."""
+        from .services.orders import rebuild_delivery_calendar
+
+        self._cadences()
+        enr = self._planless(weekdays=["tue"])
+        rebuild_delivery_calendar(enr)
+        self.assertEqual(
+            enr.delivery_schedules.get().delivery_days_cadence, "tue_only",
+        )
+
+    def test_an_unrecognized_day_set_is_left_for_an_agent(self):
+        """No cadence matches, so no plan is invented -- delivery_days_cadence is
+        NOT NULL and a guess would schedule days nobody chose."""
+        from .services.orders import rebuild_delivery_calendar
+
+        self._cadences()
+        for weekdays in ([], ["sat"], ["mon", "wed", "fri"]):
+            enr = self._planless(weekdays=weekdays)
+            rebuild_delivery_calendar(enr)
+            self.assertEqual(
+                enr.delivery_schedules.count(), 0, f"weekdays={weekdays}",
+            )
+
+    def test_a_household_with_nobody_servable_still_gets_no_plan(self):
+        """The abort that caused this is still correct: an Inactive-only household
+        has nobody to deliver to, and must be reactivated first."""
+        from .models import MemberStatus
+        from .services.orders import rebuild_delivery_calendar
+
+        self._cadences()
+        enr = self._planless(weekdays=["mon", "thu"], member_status=MemberStatus.INACTIVE)
+        rebuild_delivery_calendar(enr)
+        self.assertEqual(enr.delivery_schedules.count(), 0)
+
+    def test_cadence_matching_weekdays_is_an_exact_set_match(self):
+        from .services.delivery import cadence_matching_weekdays
+
+        self._cadences()
+        self.assertEqual(cadence_matching_weekdays(["thu", "mon"]), "mon_thu")
+        self.assertEqual(cadence_matching_weekdays(["tue"]), "tue_only")
+        self.assertEqual(cadence_matching_weekdays(["wed"]), "once_a_week")
+        # Not a subset / superset match, and never a guess.
+        self.assertEqual(cadence_matching_weekdays(["mon"]), "")
+        self.assertEqual(cadence_matching_weekdays(["mon", "tue", "thu"]), "")
+        self.assertEqual(cadence_matching_weekdays([]), "")
+        self.assertEqual(cadence_matching_weekdays(None), "")

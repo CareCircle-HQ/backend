@@ -20,6 +20,7 @@ from .views_dashboard import (
     DashboardMemberStatusListView,
     DashboardServingListView,
     DashboardView,
+    ExecutiveDashboardView,
 )
 from .views_dashboard_verification import (
     VerificationDashboardListView,
@@ -610,6 +611,11 @@ urlpatterns = [
     ),
 
     # Dashboard
+    path(
+        "dashboard/executive/",
+        ExecutiveDashboardView.as_view(),
+        name="portal-dashboard-executive",
+    ),
     path("dashboard/", DashboardView.as_view(), name="portal-dashboard"),
     path(
         "dashboard/serving/<str:reason>/",

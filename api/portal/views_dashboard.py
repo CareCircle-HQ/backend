@@ -17,6 +17,7 @@ from django.db.models import Q
 from django.utils import timezone
 from django.utils.dateparse import parse_date
 from rest_framework.response import Response
+from .permissions import IsManagementAgent
 
 from ..models import (
     Case,
@@ -683,6 +684,23 @@ def _serving_details(reason, client_ids, *, start, end, governing_ids=None):
             out.setdefault(cid, prefix)
         return out
     return {}
+
+
+class ExecutiveDashboardView(PortalAPIView):
+    """Management-only Member & Case dashboard (the Executive tab).
+
+    Every number is a DATA PAGE filter combination, run through
+    ``filter_analytics`` -- see api/services/executive_dashboard.py for why that
+    matters and for each tile's definition. Accepts the Data page's own
+    ``created_from`` / ``created_to`` (Member Created = Client.client_added_at).
+    """
+
+    permission_classes = [IsManagementAgent]
+
+    def get(self, request):
+        from api.services.executive_dashboard import build_executive_dashboard
+
+        return Response(build_executive_dashboard(request.query_params))
 
 
 class DashboardView(PortalAPIView):

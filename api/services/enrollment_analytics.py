@@ -30,6 +30,11 @@ UNASSIGNED_TEAM = "__unassigned__"
 # Data page sentinel for "Not Assigned" on the Kitchen / Cadence filters (no
 # kitchen assigned / blank delivery cadence).
 NOT_ASSIGNED = "__none__"
+# "Any kitchen" -- assigned to SOME kitchen, whichever one. The executive
+# dashboard needs "assigned for delivery" (a kitchen, but not delivered yet),
+# which NOT_ASSIGNED alone cannot express and a specific kitchen_id would narrow
+# too far.
+ANY_ASSIGNED = "__any__"
 
 
 def _cadence_from_weekdays(weekdays):
@@ -498,6 +503,29 @@ def build_row(client):
     cid = client.client_id
     membership = getattr(client, "household_membership", None)
     enr = _active_enrollment(client)  # may be None
+    # A household relative may only INHERIT the primary's enrollment/case when
+    # they are actually ON that enrollment -- i.e. they have a member profile on
+    # it, meaning the household verification covered them. Without this check a
+    # relative of someone holding an INDIVIDUAL-scope case (which by definition
+    # serves only its holder) picked up the primary's stage/authorization/
+    # verification wholesale. Such a member is then verified + approved +
+    # service_active on paper while having no delivery calendar of their own, so
+    # they satisfy neither Active (no calendar) nor Pending (already past
+    # pre-service) and fell through to the `review` quarantine -- for a member who
+    # simply has no case of their own. Their honest status is No Case.
+    #
+    # Blocks ONLY the borrowed-enrollment case: a relative inheriting a household
+    # case with NO enrollment anywhere is untouched (they legitimately show the
+    # household's status), and every genuinely covered relative IS a profile on
+    # the enrollment, so the normal household path is unaffected.
+    inherit_blocked = False
+    if (
+        enr is not None
+        and str(enr.client_id) != str(cid)
+        and not any(p.enrollment_id == enr.pk for p in client.member_profiles.all())
+    ):
+        enr = None
+        inherit_blocked = True
 
     cur_del, last_po_del, last_delivered, delivery_company, last_po_date = _derive_delivery(cid)
     in_any_po = _in_any_po(cid)
@@ -543,6 +571,9 @@ def build_row(client):
         )
         if _primary is not None:
             case = internal_service_case(_primary.client)
+    # ...and the case that came with that borrowed enrollment is not theirs either.
+    if inherit_blocked and case is not None and str(case.client_id) != str(cid):
+        case = None
 
     # Verification-page parity flags. These reproduce the Verification page's
     # EXACT Pending / Verified buckets so the Data page's verification filter
@@ -932,6 +963,8 @@ def filter_analytics(params):
     kitchen_val = g("kitchen")
     if kitchen_val == NOT_ASSIGNED:
         qs = qs.filter(kitchen_id__isnull=True)
+    elif kitchen_val == ANY_ASSIGNED:
+        qs = qs.filter(kitchen_id__isnull=False)
     elif kitchen_val:
         qs = qs.filter(kitchen_id=kitchen_val)
 
