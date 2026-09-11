@@ -30,6 +30,11 @@ UNASSIGNED_TEAM = "__unassigned__"
 # Data page sentinel for "Not Assigned" on the Kitchen / Cadence filters (no
 # kitchen assigned / blank delivery cadence).
 NOT_ASSIGNED = "__none__"
+# "Any kitchen" -- assigned to SOME kitchen, whichever one. The executive
+# dashboard needs "assigned for delivery" (a kitchen, but not delivered yet),
+# which NOT_ASSIGNED alone cannot express and a specific kitchen_id would narrow
+# too far.
+ANY_ASSIGNED = "__any__"
 
 
 def _cadence_from_weekdays(weekdays):
@@ -932,6 +937,8 @@ def filter_analytics(params):
     kitchen_val = g("kitchen")
     if kitchen_val == NOT_ASSIGNED:
         qs = qs.filter(kitchen_id__isnull=True)
+    elif kitchen_val == ANY_ASSIGNED:
+        qs = qs.filter(kitchen_id__isnull=False)
     elif kitchen_val:
         qs = qs.filter(kitchen_id=kitchen_val)
 
