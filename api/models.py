@@ -3838,6 +3838,14 @@ class TimelineEventType(models.TextChoices):
     # Customer Service review via a CaseMismatchFlag; recorded once per switch by
     # the case reconcile (api.services.lifecycle).
     MEMBER_CASE_MISMATCH = "member_case_mismatch", "Case Mismatch"
+    # A new governing case carried the household back into service, but this
+    # member could NOT be returned with it (see
+    # timeline.event_for_member_service_carry_blocked). Previously this failed
+    # silently, leaving the household Service Active with a kitchen, no cadence
+    # and no deliveries, discoverable only by auditing the Data page.
+    MEMBER_SERVICE_CARRY_BLOCKED = (
+        "member_service_carry_blocked", "Not Returned To Service",
+    )
     HOUSEHOLD_MEMBER_ADDED = "household_member_added", "Household Member Added"
     HOUSEHOLD_MEMBER_REMOVED = "household_member_removed", "Household Member Removed"
     PRODUCT_TYPE_CHANGED = "product_type_changed", "Product Type Changed"

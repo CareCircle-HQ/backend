@@ -20944,6 +20944,9 @@ class UnservableHouseholdAssignmentTest(TestCase):
         self.assertIn("Solo Member", msg)
         self.assertIn("Inactive", msg)
         self.assertIn("member profile", msg)
+        # Names the tab LABEL agents see ("Programs"), not the component name.
+        self.assertIn("Programs tab", msg)
+        self.assertNotIn("Household tab", msg)
         # ...and the household is left untouched rather than half-assigned.
         self.assertEqual(current_household_cadence(enr), "")
         self.assertEqual(enr.delivery_schedules.count(), 0)
@@ -23329,3 +23332,123 @@ class PlanlessKitchenHealTest(TestCase):
         self.assertEqual(cadence_matching_weekdays(["mon", "tue", "thu"]), "")
         self.assertEqual(cadence_matching_weekdays([]), "")
         self.assertEqual(cadence_matching_weekdays(None), "")
+
+
+class CarryLeavesMemberBehindTest(TestCase):
+    """A governing-case replacement that cannot bring a member back must SAY so.
+
+    A member whose service previously ended keeps a terminal status, and the
+    replacement copies their profile verbatim onto the new enrollment.
+    _carry_service_and_activate then asks the meal rule to return them
+    (allow_resume=True) -- but that call was wrapped in a bare `except: pass` and
+    its OUTCOME was never checked. A member left unservable gets no delivery
+    plan, so the household sat Service Active with a kitchen, no cadence and no
+    deliveries, with nothing anywhere saying why. It surfaced weeks later as a
+    stranded household on the Data page.
+    """
+
+    def _carry(self, *, member_status, kitchen_serves=True):
+        from .models import (
+            Case, CaseStatus, CaseType, Client, DeliveryCadence, EnrollmentStage,
+            EnrollmentVerification, Kitchen, KitchenMenuType,
+            MemberDeliverySchedule, MemberDietaryProfile, MemberStatus, MenuType,
+            ProductType, ProductTypeKind, ScheduleStatus,
+            ServiceAuthorizationStatus,
+        )
+        from .services.lifecycle import _carry_service_and_activate
+
+        client = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Carry", last_name="Case",
+            client_added_at=timezone.now(),
+        )
+        kitchen = Kitchen.objects.create(name="Carry Kitchen", status="active")
+        # The kitchen must actually OFFER the menu, or the meal rule pushes the
+        # member Out of Orbit and both branches of this test look the same.
+        KitchenMenuType.objects.create(
+            kitchen=kitchen, menu_type=MenuType.objects.create(name="Regular"),
+        )
+        ProductType.objects.get_or_create(
+            type=ProductTypeKind.MEALS,
+            delivery_days_cadence=DeliveryCadence.MON_THU,
+            defaults={"prod_per_delivery": 3, "meals_per_day": 3},
+        )
+        prior = EnrollmentVerification.objects.create(
+            client=client, stage=EnrollmentStage.SERVICE_ACTIVE, kitchen=kitchen,
+            program_name="MTM Meals", verified_at=timezone.now(),
+            delivery_weekdays=["mon", "thu"],
+        )
+        # The carry only runs when the prior household's kitchen AND cadence are
+        # known -- and the cadence is read from its PLAN, so the prior enrollment
+        # needs one or _carry_service_and_activate declines before reaching the
+        # member loop this test is about.
+        prior_profile = MemberDietaryProfile.objects.create(
+            enrollment=prior, client=client, member_name="Carry Case",
+            status=MemberStatus.ACTIVE, menu_type="Regular",
+        )
+        MemberDeliverySchedule.objects.create(
+            enrollment=prior, member_profile=prior_profile, kitchen=kitchen,
+            delivery_days_cadence=DeliveryCadence.MON_THU,
+            status=ScheduleStatus.SCHEDULED,
+        )
+        new_case = Case.objects.create(
+            case_id=uuid.uuid4(), client=client, case_type=CaseType.INTERNAL_SERVICE,
+            case_status=CaseStatus.MANAGED, program_name="MTM Meals",
+            service_authorization_status=ServiceAuthorizationStatus.APPROVED,
+        )
+        now = timezone.now()
+        new_enr = EnrollmentVerification.objects.create(
+            client=client, case=new_case, kitchen=kitchen,
+            stage=EnrollmentStage.PENDING_VERIFICATION, program_name="MTM Meals",
+            verified_at=now, nutritionist_approved_at=now,
+        )
+        # The member profile the replacement COPIED, terminal status and all.
+        profile = MemberDietaryProfile.objects.create(
+            enrollment=new_enr, client=client, member_name="Carry Case",
+            status=member_status,
+            # A menu the kitchen cannot handle is how the meal rule declines.
+            menu_type="Regular" if kitchen_serves else "Kosher",
+        )
+        _carry_service_and_activate(
+            new_enr, prior, new_case, ProductTypeKind.MEALS,
+            prior_was_serving=True, actor=None, actor_label="",
+        )
+        profile.refresh_from_db()
+        return profile, new_enr
+
+    def _events(self, profile):
+        from .models import TimelineEvent, TimelineEventType
+
+        return TimelineEvent.objects.filter(
+            client_id=profile.client_id,
+            event_type=TimelineEventType.MEMBER_SERVICE_CARRY_BLOCKED,
+        )
+
+    def test_a_member_left_unservable_is_recorded_on_the_timeline(self):
+        """The whole situation, where an agent will actually see it."""
+        from .models import MemberStatus, SERVICE_EXCLUDED_MEMBER_STATUSES
+
+        profile, new_enr = self._carry(member_status=MemberStatus.INACTIVE,
+                                       kitchen_serves=False)
+        self.assertIn(profile.status, SERVICE_EXCLUDED_MEMBER_STATUSES)
+
+        event = self._events(profile).first()
+        self.assertIsNotNone(event, "a member left behind must be recorded")
+        self.assertEqual(event.badge_text, "Needs Review")
+        # It must explain WHAT happened, to WHOM, and the way out.
+        self.assertIn("Carry Case", event.subtitle)
+        self.assertIn("no deliveries", event.subtitle)
+        self.assertIn("Return this member to service", event.subtitle)
+        self.assertIn("Programs tab", event.subtitle)
+        self.assertEqual(event.metadata["prior_status"], MemberStatus.INACTIVE)
+        self.assertEqual(event.metadata["kitchen"], "Carry Kitchen")
+
+    def test_nothing_is_logged_when_the_member_comes_back(self):
+        """The happy path must stay quiet -- the event means "needs review", so
+        emitting it for a member who WAS returned would be noise."""
+        from .models import MemberStatus
+
+        profile, _new_enr = self._carry(member_status=MemberStatus.INACTIVE,
+                                        kitchen_serves=True)
+        self.assertEqual(profile.status, MemberStatus.ACTIVE,
+                         "allow_resume should have returned them")
+        self.assertEqual(self._events(profile).count(), 0)

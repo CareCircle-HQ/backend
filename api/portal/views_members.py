@@ -7312,8 +7312,12 @@ def assign_kitchen_to_household(
         raise ValueError(
             "Nobody in this household can be served yet -- member profile "
             f"status: {', '.join(blocking)}. Return a member to service on the "
-            "Household tab (edit the member, then \"Return this member to "
-            "service\") before assigning a kitchen or cadence."
+            # "Programs" is the LABEL agents see for the tab whose component is
+            # HouseholdTab (see MemberDetailPage's tab list). Naming it "Household"
+            # sent an agent hunting for a tab that does not exist, while they were
+            # already on the right one.
+            "Programs tab (expand the member, Edit, then tick \"Return this "
+            "member to service\") before assigning a kitchen or cadence."
         )
 
     # Capture the pre-assignment kitchen + cadence so a RE-assignment (the

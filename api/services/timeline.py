@@ -1497,6 +1497,74 @@ def event_for_member_case_mismatch(
     )
 
 
+def event_for_member_service_carry_blocked(
+    profile, *, enrollment=None, prior_status="", case=None, reason="",
+    source=ChangeSource.SYSTEM, actor="",
+):
+    """Emit "Not Returned To Service" when a governing-case replacement carried
+    the household back INTO service but this member could not come with it.
+
+    Why this exists: a member whose service previously ended keeps a terminal
+    status (e.g. Inactive), and the replacement copies their profile verbatim
+    onto the new enrollment. ``_carry_service_and_activate`` then asks the meal
+    rule to return them (allow_resume=True) -- but that attempt was wrapped in a
+    bare ``except: pass`` and its OUTCOME was never checked, so a member who
+    stayed unservable left the household Service Active with a kitchen, no
+    cadence and no deliveries, and NOTHING said so. It surfaced weeks later as a
+    stranded household on the Data page.
+
+    So the whole situation is recorded where an agent looks: what the member's
+    status was, which case brought them back, why the automatic attempt did not
+    return them, and the one action that fixes it. Not de-duped -- each
+    replacement that leaves a member behind is its own occurrence.
+    """
+    client = getattr(profile, "client", None)
+    if client is None:
+        return None
+    enrollment = enrollment or getattr(profile, "enrollment", None)
+    status_label = (prior_status or profile.status or "").replace("_", " ").title()
+    detail = (
+        f"A new approved case returned this household to service, but "
+        f"{profile.member_name or 'this member'} stayed {status_label} and gets "
+        f"no deliveries. "
+    )
+    detail += (
+        f"The automatic check could not return them: {reason} " if reason
+        else "The automatic check did not return them to service. "
+    )
+    detail += (
+        "Until they are, the household has a kitchen but no delivery plan. "
+        "Fix it on the Programs tab: expand the member, Edit, then tick "
+        "\"Return this member to service\"."
+    )
+    return emit_timeline_event(
+        client=client,
+        event_type=TimelineEventType.MEMBER_SERVICE_CARRY_BLOCKED,
+        occurred_at=timezone.now(),
+        title="Not returned to service",
+        subtitle=detail,
+        badge_text="Needs Review",
+        badge_tone=TimelineBadgeTone.WARNING,
+        source=source,
+        actor=actor,
+        entity=profile,
+        enrollment=enrollment,
+        case=case,
+        metadata={
+            "member_name": profile.member_name or "",
+            "member_status": profile.status or "",
+            "prior_status": str(prior_status or ""),
+            "reason": reason or "",
+            "new_case_id": str(getattr(case, "case_id", "") or ""),
+            "kitchen": (
+                enrollment.kitchen.name
+                if (enrollment is not None and enrollment.kitchen_id) else ""
+            ),
+            "remedy": "Programs tab -> member -> Edit -> Return this member to service",
+        },
+    )
+
+
 def event_for_household_member_added(
     primary_client, member_client, *, enrollment=None, source=ChangeSource.CRM,
     actor="", added_from="",

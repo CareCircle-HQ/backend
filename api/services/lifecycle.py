@@ -3739,9 +3739,12 @@ def _carry_service_and_activate(
         create_member_delivery_schedules,
         current_household_cadence,
     )
+    from api.models import SERVICE_EXCLUDED_MEMBER_STATUSES
+    from api.services import timeline
     from api.services.meal_rules import reconcile_member_kitchen_output
     from api.services.orders import rebuild_delivery_calendar
 
+    logger = logging.getLogger(__name__)
     prior_kind = product_type_kind_for_name(prior_enr.program_name or "") or \
         product_type_kind_for_name(prior_enr.service_type or "")
     same_kind = (
@@ -3835,10 +3838,37 @@ def _carry_service_and_activate(
         if mv.status == MemberStatus.PENDING:
             mv.status = MemberStatus.ACTIVE
             mv.save(update_fields=["status"])
+        prior_status = mv.status
+        failure = ""
         try:
-            reconcile_member_kitchen_output(mv, kitchen=kitchen, allow_resume=True, save=True)
-        except Exception:  # pragma: no cover - defensive
-            pass
+            out, _became, why = reconcile_member_kitchen_output(
+                mv, kitchen=kitchen, allow_resume=True, save=True,
+            )
+            if out:
+                failure = why or "the assigned kitchen cannot fulfil their menu."
+        except Exception as exc:  # pragma: no cover - defensive
+            # Still must not break the replacement -- but no longer silently.
+            logger.exception(
+                "carry: returning member %s to service failed", mv.pk,
+            )
+            failure = f"the check errored ({type(exc).__name__})."
+        # The OUTCOME is what matters, not just whether the call raised: a member
+        # left in any non-servable status gets no delivery plan, which is what
+        # strands the household (Service Active + a kitchen, no cadence, no
+        # deliveries). Record it on the timeline so the household is not
+        # discovered weeks later by auditing the Data page.
+        mv.refresh_from_db(fields=["status"])
+        if mv.status in SERVICE_EXCLUDED_MEMBER_STATUSES:
+            try:
+                timeline.event_for_member_service_carry_blocked(
+                    mv, enrollment=new_enr, prior_status=prior_status,
+                    case=getattr(new_enr, "case", None), reason=failure,
+                    actor=actor_label or "",
+                )
+            except Exception:  # pragma: no cover - never break the carry
+                logger.exception(
+                    "carry: timeline event failed for member %s", mv.pk,
+                )
 
     _step_stage_forward(
         new_enr, EnrollmentStage.SERVICE_ACTIVE, actor=actor,
