@@ -22720,3 +22720,155 @@ class ClientAddedAtAndSourceTest(TestCase):
         self.assertEqual(
             filter_analytics({"created_from": old, "created_to": old}).count(), 0
         )
+
+
+class RetiredMedicalConditionsTest(TestCase):
+    """Kidney Disease and Cardiometabolic are no longer OFFERED, but a member who
+    already carries one must keep it.
+
+    Kidney Disease was split into a Non-Dialysis / ON Dialysis pair and
+    Cardiometabolic replaced by Congestive Heart Failure. Deleting a clinical
+    value someone recorded deliberately would destroy history, so the retired
+    labels stay valid stored values -- they still render on the nutritionist
+    pages and remain searchable in the Data page's free-text conditions filter.
+    """
+
+    def test_the_offered_list_changed_but_retired_labels_stay_valid(self):
+        from .models import (
+            MEMBER_CONDITIONS, RETIRED_MEMBER_CONDITIONS,
+            SELECTABLE_MEMBER_CONDITIONS,
+        )
+
+        for added in (
+            "Kidney Disease Non-Dialysis",
+            "Kidney Disease ON Dialysis",
+            "Congestive Heart Failure",
+        ):
+            self.assertIn(added, SELECTABLE_MEMBER_CONDITIONS)
+
+        for retired in ("Kidney Disease", "Cardiometabolic"):
+            self.assertNotIn(retired, SELECTABLE_MEMBER_CONDITIONS)
+            self.assertIn(retired, RETIRED_MEMBER_CONDITIONS)
+            # ...still a legitimate stored label.
+            self.assertIn(retired, MEMBER_CONDITIONS)
+
+        # The sentinel must stay in the offered list, or "nothing selected" breaks.
+        self.assertIn("No Restriction", SELECTABLE_MEMBER_CONDITIONS)
+
+    def test_the_endpoint_serves_one_list_and_flags_the_retired_ones(self):
+        """The clinical list was hardcoded in three places and drifted by hand on
+        every change. It is served from one endpoint now; retired labels are
+        included but FLAGGED, because the picker still has to show one a member
+        already carries."""
+        from .models import RETIRED_MEMBER_CONDITIONS, SELECTABLE_MEMBER_CONDITIONS
+
+        agent = Agent.objects.create(
+            name="Verif", agent_code="VER-1", email="ver-1@example.com",
+            group="Verifiers", status="Active",
+        )
+        access = AccessToken()
+        access["agent_id"] = str(agent.id)
+        access["agent_code"] = agent.agent_code
+        access["agent_name"] = agent.name
+        access["agent_group"] = agent.group
+        api = APIClient()
+        api.credentials(HTTP_AUTHORIZATION=f"Bearer {access}")
+
+        r = api.get("/api/portal/medical-conditions/")
+        self.assertEqual(r.status_code, 200)
+        rows = r.json()
+        offered = [row["value"] for row in rows if not row["retired"]]
+        retired = [row["value"] for row in rows if row["retired"]]
+
+        self.assertEqual(offered, SELECTABLE_MEMBER_CONDITIONS)
+        self.assertEqual(retired, RETIRED_MEMBER_CONDITIONS)
+        self.assertIn("Kidney Disease Non-Dialysis", offered)
+        self.assertIn("Kidney Disease ON Dialysis", offered)
+        self.assertIn("Congestive Heart Failure", offered)
+        self.assertNotIn("Kidney Disease", offered)
+        self.assertNotIn("Cardiometabolic", offered)
+        # value == label: the label IS what gets stored on the profile.
+        for row in rows:
+            self.assertEqual(row["value"], row["label"])
+
+    def test_the_medications_endpoint_serves_the_same_shape(self):
+        """Medications were duplicated in both pickers too -- 39 entries, still
+        identical when this was written, i.e. caught before they drifted."""
+        from .models import (
+            RETIRED_MEMBER_MEDICATIONS, SELECTABLE_MEMBER_MEDICATIONS,
+        )
+
+        agent = Agent.objects.create(
+            name="Verif2", agent_code="VER-2", email="ver-2@example.com",
+            group="Verifiers", status="Active",
+        )
+        access = AccessToken()
+        access["agent_id"] = str(agent.id)
+        access["agent_code"] = agent.agent_code
+        access["agent_name"] = agent.name
+        access["agent_group"] = agent.group
+        api = APIClient()
+        api.credentials(HTTP_AUTHORIZATION=f"Bearer {access}")
+
+        r = api.get("/api/portal/medications/")
+        self.assertEqual(r.status_code, 200)
+        rows = r.json()
+        self.assertEqual(
+            [row["value"] for row in rows if not row["retired"]],
+            SELECTABLE_MEMBER_MEDICATIONS,
+        )
+        self.assertEqual(
+            [row["value"] for row in rows if row["retired"]],
+            RETIRED_MEMBER_MEDICATIONS,
+        )
+        # A few anchors, so a careless edit to the list is noticed.
+        for expected in ("Insulin", "Metformin", "Levothyroxine"):
+            self.assertIn(expected, SELECTABLE_MEMBER_MEDICATIONS)
+        # The sentinels belong to the picker, not the served list.
+        self.assertNotIn("No Medications", SELECTABLE_MEMBER_MEDICATIONS)
+        self.assertNotIn("Other", SELECTABLE_MEMBER_MEDICATIONS)
+
+    def test_a_stored_retired_condition_survives_a_profile_save(self):
+        """The nutritionist intake re-saves a member's conditions. A retired label
+        already on file must come back unchanged rather than being dropped or
+        rewritten as free text."""
+        from .models import (
+            Client, EnrollmentStage, EnrollmentVerification, MemberDietaryProfile,
+            MemberStatus,
+        )
+
+        client = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Legacy", last_name="Condition",
+        )
+        enr = EnrollmentVerification.objects.create(
+            client=client, stage=EnrollmentStage.SERVICE_ACTIVE,
+        )
+        profile = MemberDietaryProfile.objects.create(
+            enrollment=enr, client=client, member_name="Legacy Condition",
+            status=MemberStatus.ACTIVE,
+            conditions=["Kidney Disease", "Cardiometabolic", "IBS"],
+        )
+
+        agent = Agent.objects.create(
+            name="Nut", agent_code="NUT-1", email="nut-1@example.com",
+            group="Nutritionist", status="Active",
+        )
+        access = AccessToken()
+        access["agent_id"] = str(agent.id)
+        access["agent_code"] = agent.agent_code
+        access["agent_name"] = agent.name
+        access["agent_group"] = agent.group
+        api = APIClient()
+        api.credentials(HTTP_AUTHORIZATION=f"Bearer {access}")
+
+        # A save that carries the values back (what the picker now sends, because
+        # a retired label stays a checked entry instead of collapsing into "Other").
+        r = api.patch(
+            f"/api/portal/members/{client.client_id}/household/members/{profile.pk}/",
+            {"conditions": ["Kidney Disease", "Cardiometabolic", "IBS"]},
+            format="json",
+        )
+        self.assertEqual(r.status_code, 200)
+        profile.refresh_from_db()
+        for kept in ("Kidney Disease", "Cardiometabolic", "IBS"):
+            self.assertIn(kept, profile.conditions)

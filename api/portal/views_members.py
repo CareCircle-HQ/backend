@@ -52,6 +52,10 @@ from ..models import (
     InsurancePlanType,
     Kitchen,
     MemberDeliverySchedule,
+    RETIRED_MEMBER_CONDITIONS,
+    RETIRED_MEMBER_MEDICATIONS,
+    SELECTABLE_MEMBER_CONDITIONS,
+    SELECTABLE_MEMBER_MEDICATIONS,
     ScheduleStatus,
     MemberDietaryProfile,
     KitchenProductType,
@@ -1311,6 +1315,57 @@ class FoodAllergiesListView(PortalAPIView):
             for code, label in FoodAllergy.choices
             if code != "none"
         ])
+
+
+class MedicalConditionsListView(PortalAPIView):
+    """Medical Condition options for the verification wizard + the nutritionist
+    intake.
+
+    The list used to be hardcoded in THREE places (this module's models plus both
+    pickers), so every clinical change meant editing all three by hand and they
+    drifted. Served from one place now, with the frontend keeping only a fallback
+    for when the request fails.
+
+    RETIRED conditions are returned too, flagged rather than omitted: they must
+    not be OFFERED, but a member who already carries one keeps it, and the picker
+    needs to know the difference -- an unrecognised label gets folded into the
+    free-text "Other" box, where it looks like something an agent typed and can be
+    dropped without a word.
+    """
+
+    def get(self, request):
+        return Response(
+            [
+                {"value": name, "label": name, "retired": False}
+                for name in SELECTABLE_MEMBER_CONDITIONS
+            ]
+            + [
+                {"value": name, "label": name, "retired": True}
+                for name in RETIRED_MEMBER_CONDITIONS
+            ]
+        )
+
+
+class MedicationsListView(PortalAPIView):
+    """Medication options for the verification wizard + the nutritionist intake.
+
+    Same reasoning as MedicalConditionsListView: the list was duplicated in both
+    pickers (39 entries, still identical -- caught before they drifted) and is now
+    served from one place. Retired medications are flagged, not omitted, so a
+    label a member already carries stays a checked entry.
+    """
+
+    def get(self, request):
+        return Response(
+            [
+                {"value": name, "label": name, "retired": False}
+                for name in SELECTABLE_MEMBER_MEDICATIONS
+            ]
+            + [
+                {"value": name, "label": name, "retired": True}
+                for name in RETIRED_MEMBER_MEDICATIONS
+            ]
+        )
 
 
 class CasesSummaryView(PortalAPIView):
