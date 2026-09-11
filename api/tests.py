@@ -23085,3 +23085,108 @@ class ExecutiveDashboardTest(TestCase):
         self.assertEqual(cases["by_authorization"]["approved"], 1)
         self.assertEqual(cases["by_status"]["open"], 1)
         self.assertEqual(cases["by_service_type"]["meals"], 1)
+
+
+class HouseholdCaseInheritanceTest(TestCase):
+    """A household relative may only inherit the primary's case when the
+    household verification actually COVERED them.
+
+    Reported from the Data page: a member appeared under Company Status =
+    `review` who had no case at all. She was a relative of someone holding an
+    INDIVIDUAL-scope case -- which by definition serves only its holder -- and the
+    read model handed her his enrollment wholesale, so she read as verified +
+    approved + service_active while having no delivery calendar of her own. That
+    satisfies neither Active (no calendar) nor Pending (past pre-service), so she
+    fell through to the `review` quarantine.
+    """
+
+    def _household(self, *, case_scope, cover_relative):
+        """A primary with a case + verified active enrollment, and one relative.
+        ``cover_relative`` decides whether the relative is a member profile on the
+        primary's enrollment -- i.e. whether the verification covered them."""
+        from .models import (
+            Case, CaseType, Client, EnrollmentStage, EnrollmentVerification,
+            Household, HouseholdMember, MemberDietaryProfile, MemberStatus,
+        )
+
+        primary = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Prim", last_name="Holder",
+            client_added_at=timezone.now(),
+        )
+        relative = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Rel", last_name="Ative",
+            client_added_at=timezone.now(),
+        )
+        household = Household.objects.create(name="HH")
+        HouseholdMember.objects.create(household=household, client=primary, is_primary=True)
+        HouseholdMember.objects.create(household=household, client=relative, is_primary=False)
+
+        case = Case.objects.create(
+            case_id=uuid.uuid4(), client=primary,
+            case_type=CaseType.INTERNAL_SERVICE, case_status="open",
+            household_type=case_scope, service_authorization_status="approved",
+        )
+        enr = EnrollmentVerification.objects.create(
+            client=primary, household=household, case=case,
+            stage=EnrollmentStage.SERVICE_ACTIVE, verified_at=timezone.now(),
+        )
+        MemberDietaryProfile.objects.create(
+            enrollment=enr, client=primary, member_name="Prim Holder",
+            status=MemberStatus.ACTIVE,
+        )
+        if cover_relative:
+            MemberDietaryProfile.objects.create(
+                enrollment=enr, client=relative, member_name="Rel Ative",
+                status=MemberStatus.ACTIVE,
+            )
+        return primary, relative, enr, case
+
+    def _row_for(self, client):
+        from .models import Client
+        from .services.enrollment_analytics import build_row
+
+        fresh = (
+            Client.objects.filter(pk=client.pk)
+            .select_related("household_membership")
+            .prefetch_related("military_profile", "member_profiles", "cases", "phones")
+            .first()
+        )
+        return build_row(fresh)
+
+    def test_an_uncovered_relative_does_not_inherit_the_case(self):
+        """The reported bug: no profile on the enrollment means the verification
+        never covered them, so the primary's case is not theirs to inherit. Their
+        honest status is No Case -- not `review`, which merely records that they
+        matched neither Active nor Pending."""
+        _primary, relative, _enr, _case = self._household(
+            case_scope="individual", cover_relative=False,
+        )
+        row = self._row_for(relative)
+        self.assertEqual(row["company_status"], "no_case")
+        self.assertIsNone(row["case_id"])
+        self.assertIsNone(row["enrollment_id"])
+        # ...and nothing of the primary's leaks onto them.
+        self.assertEqual(row["stage"], "")
+        self.assertEqual(row["auth_status"], "")
+        self.assertEqual(row["verification_state"], "")
+
+    def test_a_covered_relative_still_inherits(self):
+        """The household fallback exists for a reason: a relative the verification
+        DID cover must keep inheriting, or every dependent drops to No Case."""
+        _primary, relative, enr, case = self._household(
+            case_scope="household", cover_relative=True,
+        )
+        row = self._row_for(relative)
+        self.assertEqual(row["case_id"], case.case_id)
+        self.assertEqual(row["enrollment_id"], enr.pk)
+        self.assertNotEqual(row["company_status"], "no_case")
+
+    def test_the_primary_is_never_affected(self):
+        """The guard keys off "this enrollment is not mine"; a case holder must
+        never be caught by it, even when nobody has a member profile."""
+        primary, _relative, enr, case = self._household(
+            case_scope="individual", cover_relative=False,
+        )
+        row = self._row_for(primary)
+        self.assertEqual(row["case_id"], case.case_id)
+        self.assertEqual(row["enrollment_id"], enr.pk)
