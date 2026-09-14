@@ -23678,3 +23678,94 @@ class UniteUsOnDemandSingleCredentialTest(TestCase):
                     api.core_get("/people/x")
             cred.refresh_from_db()
             self.assertEqual(cred.status, expected, f"HTTP {code}")
+
+
+class TimelineDedupeRaceTest(TestCase):
+    """Losing the dedupe_key race must adopt the winner's row, not 500.
+
+    Production: `IntegrityError: duplicate key value violates unique constraint
+    "unique_timeline_dedupe_key"` (consent_granted:<person>) raised out of the
+    Unite Us pull and aborted that member's import. emit_timeline_event looked up
+    the key and then INSERTed -- so two workers processing the same person could
+    both find nothing and both insert. The Unite Us credential fan-out made that
+    window wide, since it reprocessed the same person repeatedly.
+    """
+
+    def _client(self):
+        from .models import Client
+
+        return Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Race", last_name="Case",
+            client_added_at=timezone.now(),
+        )
+
+    def _emit(self, client, **kw):
+        from .models import TimelineEventType
+        from .services.timeline import emit_timeline_event
+
+        return emit_timeline_event(
+            client=client, event_type=TimelineEventType.MEMBER_REACTIVATED,
+            occurred_at=timezone.now(), title="Consent",
+            dedupe_key=f"consent_granted:{client.pk}", **kw,
+        )
+
+    def test_the_same_key_twice_returns_one_row(self):
+        from .models import TimelineEvent
+
+        client = self._client()
+        first = self._emit(client)
+        second = self._emit(client)
+        self.assertEqual(first.pk, second.pk)
+        self.assertEqual(TimelineEvent.objects.filter(client=client).count(), 1)
+
+    def test_losing_the_race_adopts_the_existing_row(self):
+        """Simulates the real interleaving: our pre-check finds nothing, another
+        worker inserts, then our INSERT violates the constraint."""
+        from unittest.mock import patch
+
+        from django.db import IntegrityError
+
+        from .models import TimelineEvent
+
+        client = self._client()
+        # The winner's row really exists (as it would, committed by the other
+        # worker), so our INSERT hits the REAL constraint -- not a faked error.
+        winner = self._emit(client)
+
+        # ...and our pre-check misses it, which is the race window itself. Only
+        # the FIRST lookup misses; the recovery lookup after the IntegrityError
+        # must find the winner.
+        real_filter = TimelineEvent.objects.filter
+        calls = {"n": 0}
+
+        def flaky_filter(*args, **kwargs):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return TimelineEvent.objects.none()
+            return real_filter(*args, **kwargs)
+
+        with patch.object(TimelineEvent.objects, "filter", side_effect=flaky_filter):
+            event = self._emit(client)
+
+        self.assertEqual(event.pk, winner.pk, "must adopt the winner's row")
+
+        self.assertEqual(
+            TimelineEvent.objects.filter(client=client).count(), 1,
+            "and must not leave a duplicate behind",
+        )
+
+    def test_an_unrelated_integrity_error_is_not_swallowed(self):
+        """Only the dedupe race is recoverable; anything else must surface."""
+        from unittest.mock import patch
+
+        from django.db import IntegrityError
+
+        from .models import TimelineEvent
+
+        client = self._client()
+        with patch.object(
+            TimelineEvent.objects, "create",
+            side_effect=IntegrityError("some other constraint"),
+        ):
+            with self.assertRaises(IntegrityError):
+                self._emit(client)
