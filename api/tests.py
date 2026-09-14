@@ -23769,3 +23769,139 @@ class TimelineDedupeRaceTest(TestCase):
         ):
             with self.assertRaises(IntegrityError):
                 self._emit(client)
+
+
+class SlowRequestLoggingTest(TestCase):
+    """Slow requests must name themselves, with the agent, in the log.
+
+    The 2026-09-14 incident was reported by a human: a single endpoint held
+    gunicorn workers for up to 15 minutes and nothing in the logs said which
+    request, how long, or who made it. nginx timing covers "what and how long";
+    only Django knows WHICH AGENT.
+    """
+
+    def _run(self, view, threshold=3000):
+        from django.core.exceptions import MiddlewareNotUsed
+        from django.test import RequestFactory
+
+        from .middleware import SlowRequestMiddleware
+
+        with override_settings(SLOW_REQUEST_MS=threshold):
+            try:
+                mw = SlowRequestMiddleware(view)
+            except MiddlewareNotUsed:
+                return None, None
+            request = RequestFactory().get("/api/portal/members/?search=Jane%20Doe")
+            with self.assertLogs("api.middleware", level="WARNING") as caught:
+                mw(request)
+            return mw, caught.output
+
+    def test_a_slow_request_is_logged_with_duration_and_agent(self):
+        from unittest.mock import patch
+
+        from django.http import HttpResponse
+
+        def view(_request):
+            return HttpResponse(status=200)
+
+        # Simulate elapsed time rather than sleeping: a real 3s sleep would make
+        # the suite slower for no extra confidence.
+        with patch("api.middleware.time.monotonic", side_effect=[0.0, 9.5]):
+            _mw, output = self._run(view)
+
+        self.assertEqual(len(output), 1)
+        line = output[0]
+        self.assertIn("SLOW REQUEST", line, "the prefix a metric filter counts on")
+        self.assertIn("9500ms", line)
+        self.assertIn("/api/portal/members/", line)
+        self.assertIn("200", line)
+
+    def test_the_query_string_is_never_logged(self):
+        """Members-list search puts MEMBER NAMES in the query string."""
+        from unittest.mock import patch
+
+        from django.http import HttpResponse
+
+        with patch("api.middleware.time.monotonic", side_effect=[0.0, 9.5]):
+            _mw, output = self._run(lambda _r: HttpResponse(status=200))
+
+        self.assertNotIn("Jane", output[0])
+        self.assertNotIn("search=", output[0])
+
+    def test_a_fast_request_logs_nothing(self):
+        from unittest.mock import patch
+
+        from django.core.exceptions import MiddlewareNotUsed
+        from django.http import HttpResponse
+        from django.test import RequestFactory
+
+        from .middleware import SlowRequestMiddleware
+
+        with override_settings(SLOW_REQUEST_MS=3000):
+            mw = SlowRequestMiddleware(lambda _r: HttpResponse(status=200))
+            request = RequestFactory().get("/api/portal/members/")
+            with patch("api.middleware.time.monotonic", side_effect=[0.0, 0.2]):
+                with self.assertNoLogs("api.middleware", level="WARNING"):
+                    mw(request)
+
+    def test_zero_disables_the_middleware_entirely(self):
+        from django.core.exceptions import MiddlewareNotUsed
+        from django.http import HttpResponse
+
+        from .middleware import SlowRequestMiddleware
+
+        with override_settings(SLOW_REQUEST_MS=0):
+            with self.assertRaises(MiddlewareNotUsed):
+                SlowRequestMiddleware(lambda _r: HttpResponse())
+
+    def test_the_response_is_returned_unchanged(self):
+        """Observability must never alter behaviour."""
+        from unittest.mock import patch
+
+        from django.http import HttpResponse
+        from django.test import RequestFactory
+
+        from .middleware import SlowRequestMiddleware
+
+        sentinel = HttpResponse("body", status=201)
+        with override_settings(SLOW_REQUEST_MS=3000):
+            mw = SlowRequestMiddleware(lambda _r: sentinel)
+            with patch("api.middleware.time.monotonic", side_effect=[0.0, 9.9]):
+                with self.assertLogs("api.middleware", level="WARNING"):
+                    out = mw(RequestFactory().get("/x/"))
+        self.assertIs(out, sentinel)
+
+
+class DiagnoseCommandTest(TestCase):
+    """`manage.py diagnose` must run clean and surface stuck import runs.
+
+    Its purpose is to replace a dozen ad-hoc shell queries during an incident with
+    one pasteable snapshot -- so it has to survive an empty/odd database rather
+    than raise in the middle of an outage.
+    """
+
+    def test_it_runs_and_reports_a_stuck_import_run(self):
+        from datetime import timedelta
+        from io import StringIO
+
+        from django.core.management import call_command
+
+        from .models import ImportRun, ImportRunStatus
+
+        run = ImportRun.objects.create(source="uniteus", status=ImportRunStatus.RUNNING)
+        # A row abandoned by a killed process: RUNNING for ever, because the
+        # status is only resolved in finalize().
+        ImportRun.objects.filter(pk=run.pk).update(
+            started_at=timezone.now() - timedelta(days=3),
+        )
+
+        out = StringIO()
+        call_command("diagnose", "--hours", "6", stdout=out)
+        text = out.getvalue()
+
+        self.assertIn("Import runs", text)
+        self.assertIn("RUNNING > 2h", text)
+        self.assertIn("block features", text)
+        self.assertIn("Delivery gaps", text)
+        self.assertIn("Read model", text)
+        self.assertNotIn("ERROR in", text, "no section may blow up")

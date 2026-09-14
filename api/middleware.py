@@ -1,7 +1,12 @@
 """Request-scoped middleware."""
 
+import logging
+import time
+
 from django.conf import settings
 from django.db import connection
+
+logger = logging.getLogger(__name__)
 
 
 class PartnerHostMiddleware:
@@ -72,3 +77,61 @@ class StatementTimeoutMiddleware:
         except Exception:  # pragma: no cover - never block a request on this
             pass
         return self.get_response(request)
+
+
+class SlowRequestMiddleware:
+    """Log any request slower than ``SLOW_REQUEST_MS`` with WHO and WHAT.
+
+    Written after the 2026-09-14 incident, where a single endpoint held gunicorn
+    workers for up to 15 minutes and the logs never said so: the duration had to
+    be reconstructed afterwards from ImportRun rows, and the endpoint found by
+    reading source code. nginx timing (``$request_time``) covers the "what and how
+    long" half, but it cannot see WHICH AGENT made the call -- and "an agent says
+    it's slow" is how these arrive.
+
+    Deliberately logged at WARNING with a fixed ``SLOW REQUEST`` prefix so a
+    CloudWatch metric filter can count it (see docs/observability-plan.md).
+
+    The QUERY STRING is never logged: members-list search puts member names in it,
+    and there is no operational reason to accumulate those. The path alone
+    identifies the endpoint.
+
+    Placed LAST in MIDDLEWARE so it measures the whole stack beneath it. Inert
+    (and dropped) when SLOW_REQUEST_MS is 0.
+    """
+
+    def __init__(self, get_response):
+        self.get_response = get_response
+        self.threshold_ms = int(getattr(settings, "SLOW_REQUEST_MS", 0) or 0)
+        if self.threshold_ms <= 0:
+            from django.core.exceptions import MiddlewareNotUsed
+
+            raise MiddlewareNotUsed()
+
+    def __call__(self, request):
+        started = time.monotonic()
+        response = self.get_response(request)
+        elapsed_ms = (time.monotonic() - started) * 1000
+        if elapsed_ms >= self.threshold_ms:
+            logger.warning(
+                "SLOW REQUEST %s %s -> %s in %.0fms (agent=%s)",
+                request.method,
+                # request.path, never get_full_path(): no query string.
+                request.path,
+                getattr(response, "status_code", "?"),
+                elapsed_ms,
+                self._actor(request),
+            )
+        return response
+
+    @staticmethod
+    def _actor(request):
+        """The acting agent, best-effort. Never raises and never touches the DB:
+        this runs on every slow request, including ones that are slow BECAUSE the
+        database is struggling."""
+        user = getattr(request, "user", None)
+        code = getattr(user, "agent_code", "") or ""
+        if code:
+            return code
+        agent_id = getattr(user, "agent_id", "") or ""
+        return str(agent_id) if agent_id else "anonymous"
