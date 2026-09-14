@@ -64,6 +64,12 @@ def _mark_expired(cred):
     cred.save(update_fields=["status", "updated_at"])
 
 
+# Public alias: the API layer retires a credential on a 401 (dead session) so it
+# leaves the active pool instead of being retried on every run for ever.
+def mark_expired(cred):
+    _mark_expired(cred)
+
+
 def refresh_credential(cred):
     """Refresh ``cred`` in place. Returns True on success; marks it EXPIRED and
     returns False on a token rejection. Raises UniteUsAuthError on config/transport

@@ -188,6 +188,10 @@ class UniteUsRunUpdateView(views.APIView):
             triggered_by=f"extension:agent:{agent_code}",
             provider_id=cred.provider_id,
             client_ids=client_ids,
+            # The credential was already resolved above -- use exactly it. Passing
+            # only provider_id made this walk EVERY active credential of that
+            # provider inline (see DailyPull.execute).
+            credential_id=cred.pk,
         )
 
         return Response(

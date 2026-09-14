@@ -479,11 +479,25 @@ class DailyPull:
             logger.warning("evaluate_is_new_flag failed for %s", client_id, exc_info=True)
 
     # -- entry -------------------------------------------------------------
-    def execute(self, client_limit=None, provider_id=None, client_ids=None):
+    def execute(self, client_limit=None, provider_id=None, client_ids=None,
+                credential_id=None):
         creds = UniteUsCredential.objects.filter(
             status=UniteUsCredentialStatus.ACTIVE
         ).defer("access_token", "refresh_token")  # decrypt lazily, per-credential
-        if provider_id:
+        if credential_id:
+            # ON-DEMAND (agent clicked Refresh): use EXACTLY this credential.
+            #
+            # The fan-out below is a NIGHTLY-only strategy: different agents'
+            # sessions can see different people, so the cron tries them all. In a
+            # web request it is a denial of service -- every dead credential costs
+            # a 30s-timeout round trip (and a failed token refresh), so one click
+            # could hold a gunicorn worker for minutes. With ~114 active
+            # credentials, a few concurrent clicks exhausted every worker and the
+            # whole site stalled; the ALB health check then flapped the target.
+            # Failing fast with "reconnect" is the correct answer here -- the UI
+            # already renders it.
+            creds = creds.filter(pk=credential_id)
+        elif provider_id:
             creds = creds.filter(provider_id=provider_id)
         creds = list(creds)
         if not creds:
@@ -558,8 +572,12 @@ class DailyPull:
 
 
 def run_daily_pull(*, triggered_by="cron", client_limit=None, provider_id=None,
-                   client_ids=None):
-    """Execute one daily pull and return the persisted ImportRun."""
+                   client_ids=None, credential_id=None):
+    """Execute one daily pull and return the persisted ImportRun.
+
+    ``credential_id`` restricts the run to a SINGLE credential and must be used
+    by anything running inside a web request -- see DailyPull.execute.
+    """
     run = ImportRun.objects.create(
         source="uniteus", status=ImportRunStatus.RUNNING, triggered_by=triggered_by
     )
@@ -568,7 +586,7 @@ def run_daily_pull(*, triggered_by="cron", client_limit=None, provider_id=None,
         with change_context(ChangeSource.IMPORT, "system:unite-us-import"):
             puller.execute(
                 client_limit=client_limit, provider_id=provider_id,
-                client_ids=client_ids,
+                client_ids=client_ids, credential_id=credential_id,
             )
         run.status = ImportRunStatus.COMPLETED
     except Exception as exc:  # noqa: BLE001
@@ -701,9 +719,22 @@ def refresh_from_uniteus(client_id, *, case_id=None, provider_id=None,
     client_id = str(client_id)
 
     if not case_id:
+        # Pick ONE credential, exactly as the case-scoped path below already
+        # does. This ran through the nightly fan-out before, so refreshing a
+        # whole member from the member page walked every active credential
+        # inline and could pin a worker for minutes.
+        cred = _select_active_credential(provider_id=provider_id)
+        if cred is None:
+            run = ImportRun.objects.create(
+                source="uniteus", status=ImportRunStatus.FAILED,
+                triggered_by=triggered_by,
+                error_log="No active Unite Us credentials; nothing to pull.",
+                finished_at=timezone.now(),
+            )
+            return _summarize_refresh(run, scope="member")
         run = run_daily_pull(
             triggered_by=triggered_by, provider_id=provider_id,
-            client_ids=[client_id],
+            client_ids=[client_id], credential_id=cred.pk,
         )
         return _summarize_refresh(run, scope="member")
 

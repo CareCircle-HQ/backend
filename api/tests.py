@@ -23580,3 +23580,192 @@ class PauseFromPendingOrInactiveTest(TestCase):
         self._patch(client, profile, {"pause": True, "pause_reason": "nope"})
         profile.refresh_from_db()
         self.assertEqual(profile.status, MemberStatus.OUT_OF_ORBIT)
+
+
+class UniteUsOnDemandSingleCredentialTest(TestCase):
+    """An on-demand refresh must use ONE credential, never the nightly fan-out.
+
+    Production incident: `refresh_from_uniteus` (the member page's "Refresh from
+    Unite Us") ran the whole daily pull inline, and DailyPull.execute walks EVERY
+    active credential of the provider, retrying the same person on each. With ~114
+    active credentials -- each dead one costing a 30s-timeout round trip plus a
+    failed token refresh -- one click could hold a gunicorn worker for minutes. A
+    few concurrent clicks exhausted every worker and the site stalled for
+    everyone, which is how it showed up: agents reported slow saves from the
+    extension AND a slow members list, neither of which touches Unite Us.
+    """
+
+    def _cred(self, **kw):
+        from .models import UniteUsCredential, UniteUsCredentialStatus
+
+        # One credential per (provider, employee) -- so the ~114 active ones in
+        # production are 114 distinct agent sessions on the SAME provider, which
+        # is why filtering by provider_id narrowed nothing.
+        base = dict(
+            provider_id="p", employee_id=f"e{uuid.uuid4()}", access_token="tok",
+            refresh_token="r", status=UniteUsCredentialStatus.ACTIVE,
+        )
+        base.update(kw)
+        return UniteUsCredential.objects.create(**base)
+
+    def test_execute_with_a_credential_id_uses_only_that_credential(self):
+        from .models import ImportRun, ImportRunStatus
+        from .services.uniteus_import import DailyPull
+
+        creds = [self._cred() for _ in range(5)]
+        run = ImportRun.objects.create(source="uniteus", status=ImportRunStatus.RUNNING)
+        puller = DailyPull(run)
+        seen = []
+        puller._process_person = lambda cid: seen.append(cid)
+
+        puller.execute(client_ids=["person-1"], credential_id=creds[2].pk)
+        self.assertEqual(
+            len(seen), 1,
+            "the person must be fetched ONCE, not once per active credential",
+        )
+
+    def test_without_a_credential_id_the_nightly_still_fans_out(self):
+        """The cron relies on it: different sessions can see different people."""
+        from .models import ImportRun, ImportRunStatus
+        from .services.uniteus_import import DailyPull
+
+        for _ in range(5):
+            self._cred()
+        run = ImportRun.objects.create(source="uniteus", status=ImportRunStatus.RUNNING)
+        puller = DailyPull(run)
+        seen = []
+        puller._process_person = lambda cid: seen.append(cid)
+
+        puller.execute(client_ids=["person-1"])
+        self.assertEqual(len(seen), 5)
+
+    def test_member_refresh_does_not_fan_out(self):
+        from unittest.mock import patch
+
+        from .services import uniteus_import
+
+        for _ in range(4):
+            self._cred()
+        with patch.object(uniteus_import, "run_daily_pull") as pull:
+            pull.return_value = type(
+                "R", (), {"pk": 1, "status": "completed", "created_count": 0,
+                          "updated_count": 0, "skipped_count": 0, "error_count": 0,
+                          "stats": {}, "error_log": ""},
+            )()
+            uniteus_import.refresh_from_uniteus("client-1")
+        self.assertIsNotNone(
+            pull.call_args.kwargs.get("credential_id"),
+            "the member-scoped refresh must pin itself to one credential",
+        )
+
+    def test_a_401_retires_the_credential_but_a_403_does_not(self):
+        """401 = the session is dead, so it must leave the active pool -- that is
+        why the pool grew to ~114. 403 = this session cannot see THAT record,
+        which says nothing about the session, so it must stay."""
+        from unittest.mock import Mock, patch
+
+        from .integrations.uniteus import api as uu_api
+        from .models import UniteUsCredentialStatus
+
+        for code, expected in (
+            (401, UniteUsCredentialStatus.EXPIRED),
+            (403, UniteUsCredentialStatus.ACTIVE),
+        ):
+            cred = self._cred(last_captured_at=timezone.now())
+            api = uu_api.UniteUsClient(cred)
+            with patch.object(api._session, "get", return_value=Mock(status_code=code)):
+                with self.assertRaises(uu_api.UniteUsAuthExpired):
+                    api.core_get("/people/x")
+            cred.refresh_from_db()
+            self.assertEqual(cred.status, expected, f"HTTP {code}")
+
+
+class TimelineDedupeRaceTest(TestCase):
+    """Losing the dedupe_key race must adopt the winner's row, not 500.
+
+    Production: `IntegrityError: duplicate key value violates unique constraint
+    "unique_timeline_dedupe_key"` (consent_granted:<person>) raised out of the
+    Unite Us pull and aborted that member's import. emit_timeline_event looked up
+    the key and then INSERTed -- so two workers processing the same person could
+    both find nothing and both insert. The Unite Us credential fan-out made that
+    window wide, since it reprocessed the same person repeatedly.
+    """
+
+    def _client(self):
+        from .models import Client
+
+        return Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Race", last_name="Case",
+            client_added_at=timezone.now(),
+        )
+
+    def _emit(self, client, **kw):
+        from .models import TimelineEventType
+        from .services.timeline import emit_timeline_event
+
+        return emit_timeline_event(
+            client=client, event_type=TimelineEventType.MEMBER_REACTIVATED,
+            occurred_at=timezone.now(), title="Consent",
+            dedupe_key=f"consent_granted:{client.pk}", **kw,
+        )
+
+    def test_the_same_key_twice_returns_one_row(self):
+        from .models import TimelineEvent
+
+        client = self._client()
+        first = self._emit(client)
+        second = self._emit(client)
+        self.assertEqual(first.pk, second.pk)
+        self.assertEqual(TimelineEvent.objects.filter(client=client).count(), 1)
+
+    def test_losing_the_race_adopts_the_existing_row(self):
+        """Simulates the real interleaving: our pre-check finds nothing, another
+        worker inserts, then our INSERT violates the constraint."""
+        from unittest.mock import patch
+
+        from django.db import IntegrityError
+
+        from .models import TimelineEvent
+
+        client = self._client()
+        # The winner's row really exists (as it would, committed by the other
+        # worker), so our INSERT hits the REAL constraint -- not a faked error.
+        winner = self._emit(client)
+
+        # ...and our pre-check misses it, which is the race window itself. Only
+        # the FIRST lookup misses; the recovery lookup after the IntegrityError
+        # must find the winner.
+        real_filter = TimelineEvent.objects.filter
+        calls = {"n": 0}
+
+        def flaky_filter(*args, **kwargs):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return TimelineEvent.objects.none()
+            return real_filter(*args, **kwargs)
+
+        with patch.object(TimelineEvent.objects, "filter", side_effect=flaky_filter):
+            event = self._emit(client)
+
+        self.assertEqual(event.pk, winner.pk, "must adopt the winner's row")
+
+        self.assertEqual(
+            TimelineEvent.objects.filter(client=client).count(), 1,
+            "and must not leave a duplicate behind",
+        )
+
+    def test_an_unrelated_integrity_error_is_not_swallowed(self):
+        """Only the dedupe race is recoverable; anything else must surface."""
+        from unittest.mock import patch
+
+        from django.db import IntegrityError
+
+        from .models import TimelineEvent
+
+        client = self._client()
+        with patch.object(
+            TimelineEvent.objects, "create",
+            side_effect=IntegrityError("some other constraint"),
+        ):
+            with self.assertRaises(IntegrityError):
+                self._emit(client)

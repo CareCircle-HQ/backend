@@ -77,6 +77,20 @@ class UniteUsClient:
         except requests.RequestException as exc:
             raise UniteUsApiError(f"GET {path} failed: {exc}")
         if resp.status_code in (401, 403):
+            # A 401 means the SESSION is dead -- mark the credential EXPIRED so it
+            # leaves the active pool. Without this it stayed ACTIVE for ever:
+            # _mark_expired was only reached from the token-REFRESH path, so a
+            # credential whose token still looked fresh but was revoked
+            # server-side failed on every run and was retried indefinitely. That
+            # is how the active pool grew to ~114, which is what made the nightly
+            # fan-out expensive enough to stall the site.
+            #
+            # A 403 is deliberately NOT treated this way: Unite Us returns it for
+            # a record this session may not see, which says nothing about the
+            # session's validity -- marking it expired would kill working
+            # credentials.
+            if resp.status_code == 401:
+                creds_client.mark_expired(self.cred)
             raise UniteUsAuthExpired(f"GET {path} -> {resp.status_code}")
         if resp.status_code >= 400:
             raise UniteUsApiError(f"GET {path} -> {resp.status_code}: {resp.text[:300]}")
@@ -107,6 +121,8 @@ class UniteUsClient:
         except requests.RequestException as exc:
             raise UniteUsApiError(f"POST {path} failed: {exc}")
         if resp.status_code in (401, 403):
+            if resp.status_code == 401:  # dead session -- see core_get
+                creds_client.mark_expired(self.cred)
             raise UniteUsAuthExpired(f"POST {path} -> {resp.status_code}")
         if resp.status_code >= 400:
             raise UniteUsApiError(f"POST {path} -> {resp.status_code}: {resp.text[:500]}")

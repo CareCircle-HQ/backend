@@ -24,6 +24,7 @@ import hashlib
 import logging
 
 from django.contrib.contenttypes.models import ContentType
+from django.db import IntegrityError, transaction
 from django.utils import timezone
 
 from api.history import ChangeSource
@@ -132,15 +133,38 @@ def emit_timeline_event(
 
     if dedupe_key:
         dedupe_key = _clamp_dedupe_key(dedupe_key)
-        existing = TimelineEvent.objects.filter(dedupe_key=dedupe_key).first()
-        if existing is not None:
+
+        def _merge_into(existing):
             if update_metadata and metadata:
                 merged = {**(existing.metadata or {}), **metadata}
                 if merged != existing.metadata:
                     existing.metadata = merged
                     existing.save(update_fields=["metadata"])
             return existing  # create-once: row identity is left untouched
-        return TimelineEvent.objects.create(dedupe_key=dedupe_key, **defaults)
+
+        existing = TimelineEvent.objects.filter(dedupe_key=dedupe_key).first()
+        if existing is not None:
+            return _merge_into(existing)
+        # The lookup above is a CHECK-THEN-ACT: two workers can both find nothing
+        # and both INSERT, and the loser hits unique_timeline_dedupe_key. That
+        # surfaced in production as a 500 out of the Unite Us pull
+        # (consent_granted:<person>), which ABORTED that member's import -- the
+        # same person being processed concurrently is exactly the collision
+        # window. Losing the race is not an error: the row we wanted now exists,
+        # so adopt it.
+        #
+        # The savepoint is required, not decorative: on Postgres an IntegrityError
+        # poisons the surrounding transaction, so without it every later query in
+        # the caller's atomic block would fail with "current transaction is
+        # aborted" -- turning a harmless race into the very crash we are removing.
+        try:
+            with transaction.atomic():
+                return TimelineEvent.objects.create(dedupe_key=dedupe_key, **defaults)
+        except IntegrityError:
+            existing = TimelineEvent.objects.filter(dedupe_key=dedupe_key).first()
+            if existing is None:
+                raise  # a DIFFERENT constraint -- do not swallow it
+            return _merge_into(existing)
     return TimelineEvent.objects.create(dedupe_key="", **defaults)
 
 
