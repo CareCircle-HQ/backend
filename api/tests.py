@@ -20944,6 +20944,9 @@ class UnservableHouseholdAssignmentTest(TestCase):
         self.assertIn("Solo Member", msg)
         self.assertIn("Inactive", msg)
         self.assertIn("member profile", msg)
+        # Names the tab LABEL agents see ("Programs"), not the component name.
+        self.assertIn("Programs tab", msg)
+        self.assertNotIn("Household tab", msg)
         # ...and the household is left untouched rather than half-assigned.
         self.assertEqual(current_household_cadence(enr), "")
         self.assertEqual(enr.delivery_schedules.count(), 0)
@@ -23329,3 +23332,251 @@ class PlanlessKitchenHealTest(TestCase):
         self.assertEqual(cadence_matching_weekdays(["mon", "tue", "thu"]), "")
         self.assertEqual(cadence_matching_weekdays([]), "")
         self.assertEqual(cadence_matching_weekdays(None), "")
+
+
+class CarryLeavesMemberBehindTest(TestCase):
+    """A governing-case replacement that cannot bring a member back must SAY so.
+
+    A member whose service previously ended keeps a terminal status, and the
+    replacement copies their profile verbatim onto the new enrollment.
+    _carry_service_and_activate then asks the meal rule to return them
+    (allow_resume=True) -- but that call was wrapped in a bare `except: pass` and
+    its OUTCOME was never checked. A member left unservable gets no delivery
+    plan, so the household sat Service Active with a kitchen, no cadence and no
+    deliveries, with nothing anywhere saying why. It surfaced weeks later as a
+    stranded household on the Data page.
+    """
+
+    def _carry(self, *, member_status, kitchen_serves=True):
+        from .models import (
+            Case, CaseStatus, CaseType, Client, DeliveryCadence, EnrollmentStage,
+            EnrollmentVerification, Kitchen, KitchenMenuType,
+            MemberDeliverySchedule, MemberDietaryProfile, MemberStatus, MenuType,
+            ProductType, ProductTypeKind, ScheduleStatus,
+            ServiceAuthorizationStatus,
+        )
+        from .services.lifecycle import _carry_service_and_activate
+
+        client = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Carry", last_name="Case",
+            client_added_at=timezone.now(),
+        )
+        kitchen = Kitchen.objects.create(name="Carry Kitchen", status="active")
+        # The kitchen must actually OFFER the menu, or the meal rule pushes the
+        # member Out of Orbit and both branches of this test look the same.
+        KitchenMenuType.objects.create(
+            kitchen=kitchen, menu_type=MenuType.objects.create(name="Regular"),
+        )
+        ProductType.objects.get_or_create(
+            type=ProductTypeKind.MEALS,
+            delivery_days_cadence=DeliveryCadence.MON_THU,
+            defaults={"prod_per_delivery": 3, "meals_per_day": 3},
+        )
+        prior = EnrollmentVerification.objects.create(
+            client=client, stage=EnrollmentStage.SERVICE_ACTIVE, kitchen=kitchen,
+            program_name="MTM Meals", verified_at=timezone.now(),
+            delivery_weekdays=["mon", "thu"],
+        )
+        # The carry only runs when the prior household's kitchen AND cadence are
+        # known -- and the cadence is read from its PLAN, so the prior enrollment
+        # needs one or _carry_service_and_activate declines before reaching the
+        # member loop this test is about.
+        prior_profile = MemberDietaryProfile.objects.create(
+            enrollment=prior, client=client, member_name="Carry Case",
+            status=MemberStatus.ACTIVE, menu_type="Regular",
+        )
+        MemberDeliverySchedule.objects.create(
+            enrollment=prior, member_profile=prior_profile, kitchen=kitchen,
+            delivery_days_cadence=DeliveryCadence.MON_THU,
+            status=ScheduleStatus.SCHEDULED,
+        )
+        new_case = Case.objects.create(
+            case_id=uuid.uuid4(), client=client, case_type=CaseType.INTERNAL_SERVICE,
+            case_status=CaseStatus.MANAGED, program_name="MTM Meals",
+            service_authorization_status=ServiceAuthorizationStatus.APPROVED,
+        )
+        now = timezone.now()
+        new_enr = EnrollmentVerification.objects.create(
+            client=client, case=new_case, kitchen=kitchen,
+            stage=EnrollmentStage.PENDING_VERIFICATION, program_name="MTM Meals",
+            verified_at=now, nutritionist_approved_at=now,
+        )
+        # The member profile the replacement COPIED, terminal status and all.
+        profile = MemberDietaryProfile.objects.create(
+            enrollment=new_enr, client=client, member_name="Carry Case",
+            status=member_status,
+            # A menu the kitchen cannot handle is how the meal rule declines.
+            menu_type="Regular" if kitchen_serves else "Kosher",
+        )
+        _carry_service_and_activate(
+            new_enr, prior, new_case, ProductTypeKind.MEALS,
+            prior_was_serving=True, actor=None, actor_label="",
+        )
+        profile.refresh_from_db()
+        return profile, new_enr
+
+    def _events(self, profile):
+        from .models import TimelineEvent, TimelineEventType
+
+        return TimelineEvent.objects.filter(
+            client_id=profile.client_id,
+            event_type=TimelineEventType.MEMBER_SERVICE_CARRY_BLOCKED,
+        )
+
+    def test_a_member_left_unservable_is_recorded_on_the_timeline(self):
+        """The whole situation, where an agent will actually see it."""
+        from .models import MemberStatus, SERVICE_EXCLUDED_MEMBER_STATUSES
+
+        profile, new_enr = self._carry(member_status=MemberStatus.INACTIVE,
+                                       kitchen_serves=False)
+        self.assertIn(profile.status, SERVICE_EXCLUDED_MEMBER_STATUSES)
+
+        event = self._events(profile).first()
+        self.assertIsNotNone(event, "a member left behind must be recorded")
+        self.assertEqual(event.badge_text, "Needs Review")
+        # It must explain WHAT happened, to WHOM, and the way out.
+        self.assertIn("Carry Case", event.subtitle)
+        self.assertIn("no deliveries", event.subtitle)
+        self.assertIn("Return this member to service", event.subtitle)
+        self.assertIn("Programs tab", event.subtitle)
+        self.assertEqual(event.metadata["prior_status"], MemberStatus.INACTIVE)
+        self.assertEqual(event.metadata["kitchen"], "Carry Kitchen")
+
+    def test_nothing_is_logged_when_the_member_comes_back(self):
+        """The happy path must stay quiet -- the event means "needs review", so
+        emitting it for a member who WAS returned would be noise."""
+        from .models import MemberStatus
+
+        profile, _new_enr = self._carry(member_status=MemberStatus.INACTIVE,
+                                        kitchen_serves=True)
+        self.assertEqual(profile.status, MemberStatus.ACTIVE,
+                         "allow_resume should have returned them")
+        self.assertEqual(self._events(profile).count(), 0)
+
+
+class PauseFromPendingOrInactiveTest(TestCase):
+    """An agent can pause a PENDING or INACTIVE member, and unpausing puts them
+    back where they were.
+
+    Those statuses had no pause action at all, so there was no way to record that
+    a member is on hold before service ever started (or after it ended). The
+    catch: unpause re-runs the meal rule with allow_resume=True, which lands on
+    ACTIVE -- so without remembering the prior status, pause+unpause would be a
+    way to activate a Pending member with no kitchen assignment or nutritionist
+    sign-off, and to revive a terminal Inactive without the explicit "Return this
+    member to service" flow.
+    """
+
+    def _member(self, status):
+        from .models import (
+            Client, EnrollmentStage, EnrollmentVerification, Kitchen,
+            KitchenMenuType, MemberDietaryProfile, MenuType,
+        )
+
+        client = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Pause", last_name="Target",
+            client_added_at=timezone.now(),
+        )
+        kitchen = Kitchen.objects.create(name="Pause Kitchen", status="active")
+        KitchenMenuType.objects.create(
+            kitchen=kitchen, menu_type=MenuType.objects.create(name="Regular"),
+        )
+        enr = EnrollmentVerification.objects.create(
+            client=client, kitchen=kitchen, stage=EnrollmentStage.SERVICE_ACTIVE,
+            verified_at=timezone.now(),
+        )
+        profile = MemberDietaryProfile.objects.create(
+            enrollment=enr, client=client, member_name="Pause Target",
+            status=status, menu_type="Regular",
+        )
+        return client, profile
+
+    def _api(self):
+        agent = Agent.objects.get_or_create(
+            agent_code="PAU-1",
+            defaults={"name": "Pauser", "email": "pau1@example.com",
+                      "group": "CS", "status": "Active"},
+        )[0]
+        access = AccessToken()
+        access["agent_id"] = str(agent.id)
+        access["agent_code"] = agent.agent_code
+        access["agent_name"] = agent.name
+        access["agent_group"] = agent.group
+        api = APIClient()
+        api.credentials(HTTP_AUTHORIZATION=f"Bearer {access}")
+        return api
+
+    def _patch(self, client, profile, body):
+        return self._api().patch(
+            f"/api/portal/members/{client.client_id}/household/members/{profile.pk}/",
+            body, format="json",
+        )
+
+    def test_a_pending_member_can_be_paused_and_returns_to_pending(self):
+        from .models import MemberStatus
+
+        client, profile = self._member(MemberStatus.PENDING)
+        r = self._patch(client, profile, {"pause": True, "pause_reason": "member asked to wait"})
+        self.assertEqual(r.status_code, 200)
+        profile.refresh_from_db()
+        self.assertEqual(profile.status, MemberStatus.PAUSED)
+        self.assertEqual(profile.pause_prior_status, MemberStatus.PENDING)
+
+        r = self._patch(client, profile, {"unpause": True})
+        self.assertEqual(r.status_code, 200)
+        profile.refresh_from_db()
+        self.assertEqual(
+            profile.status, MemberStatus.PENDING,
+            "a pending member must NOT be activated by an unpause -- that would "
+            "skip kitchen assignment and the nutritionist sign-off",
+        )
+        self.assertEqual(profile.pause_prior_status, "")
+
+    def test_an_inactive_member_can_be_paused_and_returns_to_inactive(self):
+        from .models import MemberStatus
+
+        client, profile = self._member(MemberStatus.INACTIVE)
+        self._patch(client, profile, {"pause": True, "pause_reason": "on hold"})
+        profile.refresh_from_db()
+        self.assertEqual(profile.status, MemberStatus.PAUSED)
+        self.assertEqual(profile.pause_prior_status, MemberStatus.INACTIVE)
+
+        self._patch(client, profile, {"unpause": True})
+        profile.refresh_from_db()
+        self.assertEqual(
+            profile.status, MemberStatus.INACTIVE,
+            "unpause must not become a backdoor around Return-this-member-to-service",
+        )
+
+    def test_an_active_member_still_re_runs_the_meal_rule_on_unpause(self):
+        """The original behaviour must be untouched: nothing is recorded for an
+        ACTIVE pause, so unpause re-evaluates them against the kitchen."""
+        from .models import MemberStatus
+
+        client, profile = self._member(MemberStatus.ACTIVE)
+        self._patch(client, profile, {"pause": True, "pause_reason": "holiday"})
+        profile.refresh_from_db()
+        self.assertEqual(profile.status, MemberStatus.PAUSED)
+        self.assertEqual(profile.pause_prior_status, "")
+
+        self._patch(client, profile, {"unpause": True})
+        profile.refresh_from_db()
+        self.assertEqual(profile.status, MemberStatus.ACTIVE)
+
+    def test_a_pause_still_requires_a_reason(self):
+        from .models import MemberStatus
+
+        client, profile = self._member(MemberStatus.PENDING)
+        r = self._patch(client, profile, {"pause": True, "pause_reason": ""})
+        self.assertEqual(r.status_code, 400)
+        profile.refresh_from_db()
+        self.assertEqual(profile.status, MemberStatus.PENDING, "unchanged")
+
+    def test_out_of_orbit_is_not_pausable(self):
+        """It has its own remedy (fix the menu), and pausing would hide it."""
+        from .models import MemberStatus
+
+        client, profile = self._member(MemberStatus.OUT_OF_ORBIT)
+        self._patch(client, profile, {"pause": True, "pause_reason": "nope"})
+        profile.refresh_from_db()
+        self.assertEqual(profile.status, MemberStatus.OUT_OF_ORBIT)
