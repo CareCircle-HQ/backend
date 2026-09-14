@@ -24483,3 +24483,137 @@ class ActiveEnrollmentFallsBackToTheServingEnrollmentTest(TestCase):
             enrollment=dead, client=evan, member_name="Evan Akalloo",
         )
         self.assertEqual(active_enrollment(evan).pk, own_closed.pk)
+
+
+class SharedEnrollmentCaseForkLoopTest(TestCase):
+    """Two members who each hold their own case must not fork a SHARED enrollment
+    back and forth for ever.
+
+    Production root cause. _primary_enrollment deliberately includes any
+    enrollment the client is a MEMBER PROFILE on, so a family served together
+    resolves to the SAME enrollment for every member. When two of them each held
+    an open approved case, replace_enrollment_for_case_change had no ownership
+    check: each reconcile pass forked the shared enrollment onto its own client's
+    case, undoing the other, so neither ever reached the "same case, nothing to do"
+    exit. One member accumulated 119 enrollments alternating 60/59 between two
+    cases -- six of them inside a single minute.
+    """
+
+    def _client(self, name):
+        from .models import Client
+
+        return Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name=name, last_name="Akalloo",
+            client_added_at=timezone.now(),
+        )
+
+    def _household(self, client):
+        from .models import Household, HouseholdMember
+
+        hh = Household.objects.create(name=f"{client.first_name} HH")
+        HouseholdMember.objects.create(household=hh, client=client, is_primary=True)
+        return hh
+
+    def _case(self, client):
+        from .models import Case, CaseStatus, CaseType, ServiceAuthorizationStatus
+
+        return Case.objects.create(
+            case_id=uuid.uuid4(), client=client, case_type=CaseType.INTERNAL_SERVICE,
+            case_status=CaseStatus.MANAGED, program_name="MTM Meals",
+            household_type="individual",
+            service_authorization_status=ServiceAuthorizationStatus.APPROVED,
+            case_created_at=timezone.now(),
+        )
+
+    def _setup(self):
+        """Owner with a live enrollment; a relative served on it via a profile,
+        each holding their own open approved case."""
+        from .models import (
+            EnrollmentStage, EnrollmentVerification, MemberDietaryProfile,
+        )
+
+        owner = self._client("Liam")
+        relative = self._client("Evan")
+        owner_hh = self._household(owner)
+        self._household(relative)          # separate household record
+        owner_case = self._case(owner)
+        relative_case = self._case(relative)
+        enr = EnrollmentVerification.objects.create(
+            client=owner, household=owner_hh, case=owner_case,
+            stage=EnrollmentStage.SERVICE_ACTIVE, verified_at=timezone.now(),
+        )
+        for c, n in ((owner, "Liam Akalloo"), (relative, "Evan Akalloo")):
+            MemberDietaryProfile.objects.create(
+                enrollment=enr, client=c, member_name=n,
+            )
+        return owner, relative, owner_case, relative_case, enr
+
+    def test_a_relatives_case_cannot_fork_the_owners_enrollment(self):
+        from .models import EnrollmentVerification
+        from .services.lifecycle import replace_enrollment_for_case_change
+
+        owner, relative, _oc, relative_case, enr = self._setup()
+        before = EnrollmentVerification.objects.count()
+
+        result = replace_enrollment_for_case_change(relative, relative_case)
+
+        self.assertFalse(result, "a non-owner must not fork someone else's enrollment")
+        self.assertEqual(EnrollmentVerification.objects.count(), before)
+        enr.refresh_from_db()
+        self.assertEqual(enr.case_id, _oc.case_id, "the owner's case still governs")
+
+    def test_the_owner_can_still_switch_their_own_enrollment(self):
+        """The feature must keep working: a genuine case change still forks."""
+        from .services.lifecycle import replace_enrollment_for_case_change
+
+        owner, _rel, _oc, _rc, enr = self._setup()
+        new_case = self._case(owner)
+
+        self.assertTrue(replace_enrollment_for_case_change(owner, new_case))
+        enr.refresh_from_db()
+        self.assertIn(enr.stage, ("closed", "cancelled"), "old one closed")
+
+    def test_repeated_reconciles_converge_instead_of_looping(self):
+        from .models import EnrollmentVerification
+        from .services.lifecycle import replace_enrollment_for_case_change
+
+        owner, relative, owner_case, relative_case, _enr = self._setup()
+        start = EnrollmentVerification.objects.count()
+        for _ in range(5):
+            replace_enrollment_for_case_change(relative, relative_case)
+            replace_enrollment_for_case_change(owner, owner_case)
+        self.assertEqual(
+            EnrollmentVerification.objects.count(), start,
+            "five reconcile passes must not create a single new enrollment",
+        )
+
+    def test_a_member_served_on_a_relatives_enrollment_gets_no_second_one(self):
+        """reopen_enrollment_for_new_case guarded on the client's OWN enrollments,
+        so a member served on a relative's live enrollment would have had a SECOND
+        enrollment opened -- duplicating their service (22 already-scheduled
+        deliveries in the production case)."""
+        from .models import EnrollmentVerification
+        from .services.lifecycle import reopen_enrollment_for_new_case
+
+        _owner, relative, _oc, relative_case, _enr = self._setup()
+        before = EnrollmentVerification.objects.count()
+
+        self.assertIsNone(reopen_enrollment_for_new_case(relative, relative_case))
+        self.assertEqual(EnrollmentVerification.objects.count(), before)
+
+    def test_a_household_primary_may_still_act_for_the_household(self):
+        from .models import (
+            EnrollmentStage, EnrollmentVerification, HouseholdMember,
+            MemberDietaryProfile,
+        )
+        from .services.lifecycle import _may_replace_enrollment
+
+        owner = self._client("Liam")
+        hh = self._household(owner)
+        dependent = self._client("Evan")
+        HouseholdMember.objects.create(household=hh, client=dependent, is_primary=False)
+        enr = EnrollmentVerification.objects.create(
+            client=owner, household=hh, stage=EnrollmentStage.SERVICE_ACTIVE,
+        )
+        self.assertTrue(_may_replace_enrollment(owner, enr), "owner may")
+        self.assertFalse(_may_replace_enrollment(dependent, enr), "dependent may not")
