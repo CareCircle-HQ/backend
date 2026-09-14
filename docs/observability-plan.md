@@ -124,17 +124,76 @@ nobody complained). That endpoint went from 152 queries to 9 -- see commit
 3a6362e. Neither nginx timing nor an ALB metric could have found it, because only
 Django knows WHICH AGENT and which endpoint.
 
-## Phase 2 -- Ship logs to CloudWatch (~2h, ~$3-8/mo)
+## Phase 2 -- Ship logs to CloudWatch (~1h, ~$3-8/mo)
 
-Unified CloudWatch agent on the EC2 box:
+Config lives in `deploy/cloudwatch-agent-config.json` (version-controlled so the
+deployed agent config is reviewable). Log groups, each with **90-day retention**
+set in the config itself -- the CloudWatch default is "never expire", which is both
+an unbounded cost and, with PHI in the picture, a compliance liability:
 
-- log groups: `/carecircle/nginx/access`, `/carecircle/nginx/error`,
-  `/carecircle/gunicorn`
-- **retention 90 days on each** (set at creation; the default is never-expire)
-- instance role needs `logs:CreateLogStream`, `logs:PutLogEvents`,
-  `logs:DescribeLogStreams`
-- **Standard** log class, NOT Infrequent Access: IA is half price but does not
-  support metric filters, which Phase 3 depends on
+```
+/carecircle/nginx/access   request timing (rt / urt)
+/carecircle/nginx/error
+/carecircle/gunicorn       journald unit=gunicorn.service -- Django logs, incl.
+                           SLOW REQUEST lines and 5xx tracebacks
+/carecircle/celery         journald unit=celery-worker.service (drop if not installed)
+```
+
+**journald is read natively** -- AWS added this to the agent in August 2026, so
+gunicorn does NOT need reconfiguring to write log files. That matters: the Django
+logs (including the slow-request warnings) currently go to stdout -> journald, and
+the alternative would have meant `--error-logfile` + `--capture-output` and a
+gunicorn restart. Requires a RECENT agent version; install the latest.
+
+**Standard** log class, NOT Infrequent Access: IA is half price but does not
+support metric filters, which Phase 3 depends on.
+
+### Steps
+
+1. **IAM** -- attach `CloudWatchAgentServerPolicy` to `carecircle-ec2-role`. This
+   is the one instance-role permission that IS legitimate (the box writes its own
+   logs), unlike `cloudwatch:PutMetricAlarm`, which belongs to humans. Do it from
+   the console or CloudShell; the instance cannot grant itself IAM.
+
+2. **Install the agent** (Ubuntu):
+   ```
+   wget https://amazoncloudwatch-agent.s3.amazonaws.com/ubuntu/amd64/latest/amazon-cloudwatch-agent.deb
+   sudo dpkg -i -E ./amazon-cloudwatch-agent.deb
+   ```
+
+3. **Install the config** from the repo:
+   ```
+   sudo cp ~/backend/deploy/cloudwatch-agent-config.json /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json
+   ```
+
+4. **Start it:**
+   ```
+   sudo /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a fetch-config -m ec2 -s -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json
+   ```
+
+5. **Verify:**
+   ```
+   sudo /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a status
+   sudo tail -20 /opt/aws/amazon-cloudwatch-agent/logs/amazon-cloudwatch-agent.log
+   aws logs describe-log-groups --region us-east-2 --log-group-name-prefix /carecircle --query 'logGroups[].[logGroupName,retentionInDays]' --output table
+   ```
+   Retention must read 90 on every group. If a group already existed without
+   retention, the agent will not change it -- set it explicitly:
+   ```
+   aws logs put-retention-policy --region us-east-2 --log-group-name /carecircle/nginx/access --retention-in-days 90
+   ```
+
+### Watch the cost for the first week
+
+Ingestion is the driver ($0.50/GB; storage is $0.03/GB-month). nginx access is the
+chatty one. Check actual volume before assuming the estimate:
+
+```
+aws logs describe-log-groups --region us-east-2 --log-group-name-prefix /carecircle --query 'logGroups[].[logGroupName,storedBytes]' --output table
+```
+
+If it runs hot, the lever is fewer lines rather than shorter retention -- the
+health check is already `access_log off`, and static asset requests could be too.
 
 Then Logs Insights, e.g. the 20 slowest requests today:
 
