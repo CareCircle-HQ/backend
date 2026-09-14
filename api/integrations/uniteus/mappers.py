@@ -402,6 +402,11 @@ def map_provided_service(ps, *, case_id, sole_auth=None, invoice=None, program_n
 
 
 def _provided_description(a):
+    """Always a STRING. Unite Us metadata values are free-form and can arrive as
+    numbers (a quantity typed into a text field), which used to crash the caller's
+    ``[:255]`` with "TypeError: 'int' object is not subscriptable" -- aborting that
+    person's whole import, so their contracted services silently never synced.
+    Found in production the day CloudWatch log shipping was switched on."""
     md = a.get("metadata")
     if isinstance(md, list):
         pref = next(
@@ -410,10 +415,10 @@ def _provided_description(a):
             None,
         )
         if pref:
-            return pref
+            return str(pref)
         any_v = next((m.get("value") for m in md if m.get("value")), None)
         if any_v:
-            return any_v
+            return str(any_v)
     return ""
 
 

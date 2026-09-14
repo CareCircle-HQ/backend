@@ -24167,6 +24167,29 @@ class MemberOrdersEndpointEfficiencyTest(TestCase):
         self.assertEqual(counts["failed"], 2)
         self.assertEqual(counts["delivered"], 1)
 
+    def test_the_page_is_explicitly_ordered(self):
+        """The Count() annotations add a GROUP BY, and Django reports a grouped
+        queryset as UNORDERED even though PurchaseOrder has Meta.ordering. Without
+        an explicit order_by, page boundaries can shift between requests -- the
+        same PO twice, or one skipped. DRF warns about exactly this."""
+        import warnings
+
+        mine = self._client("Mine")
+        for _ in range(3):
+            self._po_with(mine, others=1)
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            r = self._api().get(self.URL.format(mine.pk))
+
+        self.assertEqual(r.status_code, 200)
+        self.assertFalse(
+            [w for w in caught if "UnorderedObjectList" in str(w.category)],
+            "pagination must not warn about an unordered queryset",
+        )
+        stamps = [row["created_at"] for row in r.json()["results"] if row.get("created_at")]
+        self.assertEqual(stamps, sorted(stamps, reverse=True), "newest first")
+
     def test_the_query_count_does_not_grow_with_more_purchase_orders(self):
         """The N+1 guard -- the actual defect. Serialising a second PO must not
         cost more queries than the first."""
@@ -24192,3 +24215,46 @@ class MemberOrdersEndpointEfficiencyTest(TestCase):
             len(fourth), len(first) + 2,
             f"4 POs took {len(fourth)} queries vs {len(first)} for 1 -- N+1",
         )
+
+
+class UniteUsProvidedDescriptionTest(SimpleTestCase):
+    """Unite Us metadata values are free-form and are not always strings.
+
+    Production, found the day CloudWatch log shipping was switched on:
+
+        File "api/integrations/uniteus/mappers.py", line 347, in map_provided_service
+            "name": _provided_description(a)[:255],
+        TypeError: 'int' object is not subscriptable
+
+    The caller slices the result to fit ContractedService.name (255 chars), so a
+    numeric value -- a quantity typed into a free-text field -- crashed the import
+    for that person, and their contracted services silently never synced.
+    """
+
+    def _desc(self, metadata):
+        from .integrations.uniteus.mappers import _provided_description
+
+        return _provided_description({"metadata": metadata})
+
+    def test_a_numeric_value_is_returned_as_a_string(self):
+        out = self._desc([{"field": "specific_support_provided", "value": 12}])
+        self.assertEqual(out, "12")
+        self.assertEqual(out[:255], "12", "the caller slices it")
+
+    def test_a_numeric_fallback_value_is_also_a_string(self):
+        """The second branch (any value, no preferred field) had the same flaw."""
+        out = self._desc([{"field": "something_else", "value": 7}])
+        self.assertEqual(out, "7")
+        self.assertEqual(out[:255], "7")
+
+    def test_normal_text_is_unchanged(self):
+        out = self._desc(
+            [{"field": "specific_support_provided", "value": "Home delivered meals"}],
+        )
+        self.assertEqual(out, "Home delivered meals")
+
+    def test_missing_or_odd_metadata_gives_an_empty_string(self):
+        self.assertEqual(self._desc(None), "")
+        self.assertEqual(self._desc([]), "")
+        self.assertEqual(self._desc("not-a-list"), "")
+        self.assertEqual(self._desc([{"field": "x", "value": ""}]), "")

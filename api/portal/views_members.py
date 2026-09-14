@@ -4097,6 +4097,11 @@ class MemberOrdersView(PortalGenericAPIView):
                 # than one per PO.
                 "notes",
             )
+            # Explicit, because the annotations below add a GROUP BY and Django
+            # reports a grouped queryset as UNORDERED even when the model has
+            # Meta.ordering -- DRF then warns and page boundaries can shift
+            # between requests (the same PO twice, or one skipped).
+            .order_by("-created_at")
             # The PO-wide counts the serializer used to derive by loading every
             # line into Python. Aggregated in the database instead.
             .annotate(
