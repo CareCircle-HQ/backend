@@ -23950,3 +23950,126 @@ class DiagnoseCommandTest(TestCase):
         call_command("diagnose", stdout=out)
         self.assertIn("member_prep latest", out.getvalue())
         self.assertNotIn("BLOCKS", out.getvalue())
+
+
+class MemberPrepStaleRunTakeoverTest(TestCase):
+    """An abandoned prep run must not disable the feature for ever.
+
+    "Prepare Members for PO" refuses to start while its own latest ImportRun is
+    PENDING or RUNNING. That row is set up front and resolved only when the task
+    finishes, so a Celery worker killed mid-run -- which any deploy does -- leaves
+    it in flight permanently and every later click is silently ignored.
+
+    Production 2026-09-10: run #1449 died at 8,000 of ~15,100 members (reported as
+    "stuck at 53%") and had to be resolved by hand before the button worked again.
+    """
+
+    URL = "/api/portal/purchase-orders/prepare-members/"
+
+    def _api(self):
+        agent = Agent.objects.get_or_create(
+            agent_code="PREP-1",
+            defaults={"name": "Prep", "email": "prep@example.com",
+                      "group": "Logistics", "status": "Active"},
+        )[0]
+        access = AccessToken()
+        access["agent_id"] = str(agent.id)
+        access["agent_code"] = agent.agent_code
+        access["agent_name"] = agent.name
+        access["agent_group"] = agent.group
+        api = APIClient()
+        api.credentials(HTTP_AUTHORIZATION=f"Bearer {access}")
+        return api
+
+    def _run(self, *, status, age_minutes):
+        from datetime import timedelta
+
+        from .models import ImportRun
+        from .tasks import MEMBER_PREP_SOURCE
+
+        run = ImportRun.objects.create(source=MEMBER_PREP_SOURCE, status=status)
+        ImportRun.objects.filter(pk=run.pk).update(
+            started_at=timezone.now() - timedelta(minutes=age_minutes),
+        )
+        run.refresh_from_db()
+        return run
+
+    def test_a_live_run_still_blocks_a_second_one(self):
+        """The idempotency guard must survive: two concurrent full-calendar
+        passes are exactly what it exists to prevent."""
+        from unittest.mock import patch
+
+        from .models import ImportRun, ImportRunStatus
+        from .tasks import MEMBER_PREP_SOURCE
+
+        live = self._run(status=ImportRunStatus.RUNNING, age_minutes=5)
+        with patch("api.tasks.prepare_members_for_po.delay") as enqueued:
+            r = self._api().post(self.URL, {}, format="json")
+        self.assertEqual(r.status_code, 202)
+        enqueued.assert_not_called()
+        self.assertEqual(
+            ImportRun.objects.filter(source=MEMBER_PREP_SOURCE).count(), 1,
+        )
+        live.refresh_from_db()
+        self.assertEqual(live.status, ImportRunStatus.RUNNING, "left alone")
+
+    def test_an_abandoned_run_is_taken_over(self):
+        from unittest.mock import patch
+
+        from .models import ImportRun, ImportRunStatus
+        from .tasks import MEMBER_PREP_SOURCE
+
+        dead = self._run(status=ImportRunStatus.RUNNING, age_minutes=180)
+        with patch("api.tasks.prepare_members_for_po.delay") as enqueued:
+            r = self._api().post(self.URL, {}, format="json")
+        self.assertEqual(r.status_code, 202)
+        enqueued.assert_called_once()
+
+        dead.refresh_from_db()
+        self.assertEqual(dead.status, ImportRunStatus.FAILED)
+        self.assertIsNotNone(dead.finished_at)
+        self.assertIn("Abandoned", dead.error_log)
+        self.assertIn("running", dead.error_log, "records what it WAS, not FAILED")
+        self.assertEqual(
+            ImportRun.objects.filter(source=MEMBER_PREP_SOURCE).count(), 2,
+            "a fresh run is started",
+        )
+
+    def test_a_pending_run_can_be_abandoned_too(self):
+        """A task Celery never picked up never reaches RUNNING at all."""
+        from unittest.mock import patch
+
+        from .models import ImportRunStatus
+
+        dead = self._run(status=ImportRunStatus.PENDING, age_minutes=180)
+        with patch("api.tasks.prepare_members_for_po.delay") as enqueued:
+            self._api().post(self.URL, {}, format="json")
+        enqueued.assert_called_once()
+        dead.refresh_from_db()
+        self.assertEqual(dead.status, ImportRunStatus.FAILED)
+
+    def test_the_threshold_is_configurable(self):
+        from unittest.mock import patch
+
+        from .models import ImportRunStatus
+
+        self._run(status=ImportRunStatus.RUNNING, age_minutes=20)
+        # Default is 60 minutes, so 20 minutes old is still considered alive...
+        with patch("api.tasks.prepare_members_for_po.delay") as enqueued:
+            self._api().post(self.URL, {}, format="json")
+        enqueued.assert_not_called()
+        # ...but not under a tighter threshold.
+        with override_settings(MEMBER_PREP_STALE_MINUTES=10):
+            with patch("api.tasks.prepare_members_for_po.delay") as enqueued:
+                self._api().post(self.URL, {}, format="json")
+        enqueued.assert_called_once()
+
+    def test_a_finished_run_never_blocks(self):
+        from unittest.mock import patch
+
+        from .models import ImportRunStatus
+
+        self._run(status=ImportRunStatus.COMPLETED, age_minutes=5)
+        with patch("api.tasks.prepare_members_for_po.delay") as enqueued:
+            self._api().post(self.URL, {}, format="json")
+        enqueued.assert_called_once()

@@ -435,6 +435,34 @@ class PrepareMembersForPOView(PortalAPIView):
             .first()
         )
 
+    @staticmethod
+    def _stale_after():
+        """How long an in-flight run may go without finishing before it is
+        presumed dead. A healthy pass over ~15k members takes about 10 minutes, so
+        the default hour is six times the real runtime -- deliberately generous,
+        because taking over a run that is genuinely alive would start a second
+        heavy full-calendar pass alongside the first."""
+        from datetime import timedelta
+
+        from django.conf import settings
+
+        return timedelta(minutes=int(
+            getattr(settings, "MEMBER_PREP_STALE_MINUTES", 60) or 60
+        ))
+
+    @classmethod
+    def _is_abandoned(cls, run):
+        """Age-based, because there is no heartbeat to read: ImportRun has no
+        updated_at, and the task writes progress with queryset.update(), which
+        does NOT touch auto_now fields. Age alone is a blunter signal than
+        "progress has stopped", but with a 6x margin the failure mode is bounded
+        (at worst one duplicate run) whereas the alternative -- trusting the row
+        for ever -- disables the feature completely."""
+        started = getattr(run, "started_at", None)
+        if started is None:
+            return True
+        return (timezone.now() - started) > cls._stale_after()
+
     def get(self, request):
         from .views_imports import _run_summary
 
@@ -451,11 +479,33 @@ class PrepareMembersForPOView(PortalAPIView):
 
         # Idempotent: if a prep job is already in flight, return it instead of
         # spawning a second heavy full-calendar pass.
+        #
+        # ...but only while it is plausibly ALIVE. A row is set PENDING/RUNNING up
+        # front and resolved only when the task finishes, so a Celery worker
+        # killed mid-run (a deploy restarts it) leaves the row in flight for ever
+        # and this guard then refuses every future run -- the feature is silently
+        # dead until somebody works out why the button does nothing. That happened
+        # on 2026-09-10: run #1449 died at 8,000 of ~15,100 members (the "stuck at
+        # 53%") and had to be resolved by hand. So an abandoned run is taken over
+        # rather than obeyed.
         existing = self._latest()
         if existing is not None and existing.status in (
             ImportRunStatus.PENDING, ImportRunStatus.RUNNING,
         ):
-            return Response(_run_summary(existing), status=http.HTTP_202_ACCEPTED)
+            if not self._is_abandoned(existing):
+                return Response(_run_summary(existing), status=http.HTTP_202_ACCEPTED)
+            was = existing.status
+            existing.status = ImportRunStatus.FAILED
+            existing.finished_at = timezone.now()
+            existing.error_log = (
+                (existing.error_log or "")
+                + f"\nAbandoned: still {was} after "
+                  f"{self._stale_after()} with no completion (worker most likely "
+                  f"restarted). Superseded by a new run."
+            ).strip()
+            existing.save(
+                update_fields=["status", "finished_at", "error_log"],
+            )
 
         agent = current_agent(request)
         triggered_by = (
