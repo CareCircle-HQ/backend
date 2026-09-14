@@ -124,7 +124,7 @@ nobody complained). That endpoint went from 152 queries to 9 -- see commit
 3a6362e. Neither nginx timing nor an ALB metric could have found it, because only
 Django knows WHICH AGENT and which endpoint.
 
-## Phase 2 -- Ship logs to CloudWatch (~1h, ~$3-8/mo)
+## Phase 2 -- Ship logs to CloudWatch -- DONE 2026-09-14 (~$3-8/mo)
 
 Config lives in `deploy/cloudwatch-agent-config.json` (version-controlled so the
 deployed agent config is reviewable). Log groups, each with **90-day retention**
@@ -182,6 +182,30 @@ support metric filters, which Phase 3 depends on.
    ```
    aws logs put-retention-policy --region us-east-2 --log-group-name /carecircle/nginx/access --retention-in-days 90
    ```
+
+### As built -- and two things that cost time
+
+All four groups exist with 90-day retention and are ingesting, including
+`/carecircle/gunicorn`, which confirms **journald collection works** (the one part
+that could not be verified in advance).
+
+1. **IAM propagation looks like a failure.** For ~2 minutes after attaching the
+   policy the agent logged a wall of `AccessDenied ... logs:PutLogEvents`, while
+   `CreateLogGroup` and `PutRetentionPolicy` had already succeeded (the groups
+   existed, with retention set). The agent backs off up to ~60s between retries,
+   so it looks stuck. `sudo systemctl restart amazon-cloudwatch-agent` clears the
+   cached credential session; after that the log ends with "Everything is ready."
+   Do not go adding permissions in response to those errors.
+
+2. **`aws logs tail` fails ON THE BOX, and should.**
+   `CloudWatchAgentServerPolicy` is write-only (Create / Put / Describe); reading
+   contents needs `logs:FilterLogEvents`, which the instance role does not have.
+   That is correct least privilege -- a web server has no reason to read its logs
+   back. **Read from CloudShell**, which runs as the console user.
+
+   The wider rule this session kept re-learning: anything that CHANGES AWS
+   configuration (IAM, alarms, log groups) or READS log contents -> CloudShell.
+   Anything that runs the app (agent install, systemctl, Django) -> the EC2 box.
 
 ### Watch the cost for the first week
 
