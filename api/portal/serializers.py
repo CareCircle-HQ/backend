@@ -2314,9 +2314,31 @@ class PortalHouseholdMemberSerializer(serializers.ModelSerializer):
             return "Not eligible for the program"
 
     def get_is_primary(self, obj):
-        # The primary household member can't be removed from the Household tab.
-        membership = getattr(obj.client, "household_membership", None) if obj.client_id else None
-        return bool(getattr(membership, "is_primary", False))
+        """Primary OF THIS ENROLLMENT'S HOUSEHOLD -- not "primary of some household".
+
+        This used to read the member's own household_membership flag and stop
+        there, so anyone who heads their OWN household record showed a Primary
+        badge on somebody else's household tab. A family served on one enrollment
+        while each person still has a separate household record therefore rendered
+        as several primaries at once (seen in production: one enrollment showing
+        four, each primary of a different household).
+
+        Not cosmetic: the frontend hides the Remove control for a primary, so a
+        wrongly badged member could not be removed from the household at all.
+        """
+        if not obj.client_id:
+            return False
+        membership = getattr(obj.client, "household_membership", None)
+        if membership is None or not getattr(membership, "is_primary", False):
+            return False
+        enrollment = getattr(obj, "enrollment", None)
+        household_id = getattr(enrollment, "household_id", None)
+        if household_id:
+            return str(membership.household_id) == str(household_id)
+        # No household on the enrollment (a bare/individual one): its owner is the
+        # only sensible primary.
+        owner_id = getattr(enrollment, "client_id", None)
+        return bool(owner_id) and str(owner_id) == str(obj.client_id)
 
     def get_has_nutrition_pdf(self, obj):
         return bool(obj.nutritionist_pdf_key)

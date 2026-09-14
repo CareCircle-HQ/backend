@@ -24258,3 +24258,103 @@ class UniteUsProvidedDescriptionTest(SimpleTestCase):
         self.assertEqual(self._desc([]), "")
         self.assertEqual(self._desc("not-a-list"), "")
         self.assertEqual(self._desc([{"field": "x", "value": ""}]), "")
+
+
+class HouseholdPrimaryBadgeTest(TestCase):
+    """"Primary" must mean primary OF THIS ENROLLMENT'S HOUSEHOLD.
+
+    Production: a member tab showed FOUR members badged Primary. No household
+    actually had more than one primary -- the AKALLOO family was served on ONE
+    enrollment while each person still had a SEPARATE household record, and the
+    serializer read each member's own household_membership flag without checking
+    which household it belonged to.
+
+    Not cosmetic: the frontend hides the Remove control for a primary
+    (`!member.isPrimary && <Remove/>`), so wrongly badged members could not be
+    removed from the household at all.
+    """
+
+    def _client(self, name):
+        from .models import Client
+
+        return Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name=name, last_name="Akalloo",
+            client_added_at=timezone.now(),
+        )
+
+    def _own_household(self, client, primary=True):
+        """Give the client their own household, where they are the primary."""
+        from .models import Household, HouseholdMember
+
+        hh = Household.objects.create(name=f"{client.first_name} HH")
+        HouseholdMember.objects.create(household=hh, client=client, is_primary=primary)
+        return hh
+
+    def _serialize(self, enrollment):
+        from .portal import serializers as s
+
+        return {
+            row["name"]: row["is_primary"]
+            for row in s.PortalHouseholdMemberSerializer(
+                enrollment.member_profiles.select_related("client", "enrollment"),
+                many=True,
+            ).data
+        }
+
+    def test_only_the_primary_of_this_household_is_badged(self):
+        from .models import EnrollmentStage, EnrollmentVerification, MemberDietaryProfile
+
+        owner = self._client("Liam")
+        household = self._own_household(owner)
+        enr = EnrollmentVerification.objects.create(
+            client=owner, household=household, stage=EnrollmentStage.SERVICE_ACTIVE,
+        )
+        MemberDietaryProfile.objects.create(
+            enrollment=enr, client=owner, member_name="Liam Akalloo",
+        )
+        # Three relatives served on THIS enrollment while each still heads their
+        # own separate household record -- the exact production shape.
+        for name in ("Evan", "Navita", "Skylar"):
+            relative = self._client(name)
+            self._own_household(relative)
+            MemberDietaryProfile.objects.create(
+                enrollment=enr, client=relative, member_name=f"{name} Akalloo",
+            )
+
+        badges = self._serialize(enr)
+        self.assertEqual(
+            sum(1 for v in badges.values() if v), 1, f"exactly one primary: {badges}",
+        )
+        self.assertTrue(badges["Liam Akalloo"])
+        self.assertFalse(badges["Evan Akalloo"])
+
+    def test_a_non_primary_of_their_own_household_is_never_badged(self):
+        from .models import EnrollmentStage, EnrollmentVerification, MemberDietaryProfile
+
+        owner = self._client("Liam")
+        household = self._own_household(owner)
+        dependent = self._client("Evan")
+        self._own_household(dependent, primary=False)
+        enr = EnrollmentVerification.objects.create(
+            client=owner, household=household, stage=EnrollmentStage.SERVICE_ACTIVE,
+        )
+        for c, n in ((owner, "Liam Akalloo"), (dependent, "Evan Akalloo")):
+            MemberDietaryProfile.objects.create(enrollment=enr, client=c, member_name=n)
+
+        badges = self._serialize(enr)
+        self.assertEqual(badges, {"Liam Akalloo": True, "Evan Akalloo": False})
+
+    def test_an_enrollment_without_a_household_badges_its_owner(self):
+        """A bare/individual enrollment has no household to compare against; its
+        owner is the only sensible primary."""
+        from .models import EnrollmentStage, EnrollmentVerification, MemberDietaryProfile
+
+        owner = self._client("Solo")
+        self._own_household(owner)
+        enr = EnrollmentVerification.objects.create(
+            client=owner, stage=EnrollmentStage.SERVICE_ACTIVE,
+        )
+        MemberDietaryProfile.objects.create(
+            enrollment=enr, client=owner, member_name="Solo Akalloo",
+        )
+        self.assertEqual(self._serialize(enr), {"Solo Akalloo": True})
