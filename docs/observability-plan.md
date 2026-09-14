@@ -83,7 +83,7 @@ Lessons worth keeping:
   to SNS itself, using the topic's access policy.
 - `put-metric-alarm` is idempotent (same name = update), so re-running is safe.
 
-## Phase 1 -- Make the logs answer questions (code + config)
+## Phase 1 -- Make the logs answer questions -- DONE 2026-09-14
 
 1. **Slow-request middleware** (`api.middleware.SlowRequestMiddleware`) -- logs any
    request over `SLOW_REQUEST_MS` (default 3000ms) with method, path, status,
@@ -99,6 +99,30 @@ Lessons worth keeping:
 4. **Silence `django.security.DisallowedHost`** -- scanner noise that buried the
    real errors during triage. The nginx `default_server` (already deployed) stops
    most of it at the edge.
+
+### As built
+
+nginx is live (`log_format timed` beside the `map`, `access_log ... timed` in the
+CRM vhost) and the catch-all default_server answers the ALB health check. Sample:
+
+```
+172.31.6.69 www.carecircleinternal.com "GET /api/portal/members/<uuid>/" 403 73
+    rt=0.002 urt=0.002 "Mozilla/5.0 ..."
+```
+
+`rt` is total time, `urt` is time waiting on gunicorn -- when rt >> urt the delay
+is nginx/network (slow client, large upload), not the app. Slowest requests:
+
+```
+awk '{for(i=1;i<=NF;i++) if($i ~ /^rt=/) print substr($i,4), $0}' \
+    /var/log/nginx/access.log | sort -rn | head -20
+```
+
+The Django half paid for itself within an hour of deploying: it named
+`GET /members/<id>/orders/` at 4-7s, which nobody had measured (it returns 200 and
+nobody complained). That endpoint went from 152 queries to 9 -- see commit
+3a6362e. Neither nginx timing nor an ALB metric could have found it, because only
+Django knows WHICH AGENT and which endpoint.
 
 ## Phase 2 -- Ship logs to CloudWatch (~2h, ~$3-8/mo)
 
