@@ -35,7 +35,7 @@ commonly applied to those, not to operational logs.
 
 ---
 
-## Phase 0 -- Alerting, no installation (~30 min, ~$0.50/mo)
+## Phase 0 -- Alerting, no installation -- DONE 2026-09-14 (~$0.40/mo)
 
 The ALB already publishes these metrics; nothing to deploy. Console work.
 
@@ -56,6 +56,32 @@ which is exactly how this incident stayed invisible.
 
 **This is the highest value-per-effort item in the whole plan**: it is the
 difference between an agent telling you and a system telling you.
+
+### As built
+
+```
+SNS topic  arn:aws:sns:us-east-2:235665523206:Carecircle-alerts  -> alexis@carecirclecs.com
+LB         app/Lb-Development/b8946aa01528d29d      (NOTE: serves PRODUCTION despite the name)
+TG         targetgroup/G-Prod/fb66bfd251e98163
+alarms     alb-unhealthy-host  alb-p99-latency  alb-target-5xx  alb-rejected-connections
+```
+
+Each alarm notifies the topic on BOTH `In alarm` and `OK`, so a recovery is
+reported as well as a failure.
+
+`alb-rejected-connections` sits in INSUFFICIENT_DATA and that is correct: the
+metric has never emitted (the ALB has never rejected a connection), which is also
+why it cannot be found in the console metric browser -- CloudWatch only lists
+metrics that have published data. The CLI can still alarm on it.
+
+Lessons worth keeping:
+- Run this from **CloudShell**, not the EC2 box. The instance role
+  (`carecircle-ec2-role`) deliberately lacks `cloudwatch:PutMetricAlarm` and
+  `sns:Publish`, which is correct least privilege -- a web server should not
+  manage its own monitoring. CloudShell runs as the console user.
+- The alarms themselves need no instance permissions at all: CloudWatch publishes
+  to SNS itself, using the topic's access policy.
+- `put-metric-alarm` is idempotent (same name = update), so re-running is safe.
 
 ## Phase 1 -- Make the logs answer questions (code + config)
 
