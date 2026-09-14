@@ -144,10 +144,17 @@ MIDDLEWARE = [
     # unaffected), so a pathological query fails fast instead of saturating
     # every worker. Disabled when WEB_STATEMENT_TIMEOUT_MS is 0.
     'api.middleware.StatementTimeoutMiddleware',
+    # LAST so it times the whole stack beneath it: logs any request slower than
+    # SLOW_REQUEST_MS, with the acting agent (which nginx cannot know).
+    'api.middleware.SlowRequestMiddleware',
 ]
 
 # Max DB statement time (ms) for web requests; 0 disables the middleware.
 WEB_STATEMENT_TIMEOUT_MS = int(os.getenv('WEB_STATEMENT_TIMEOUT_MS', '30000') or 0)
+
+# Requests at/over this many ms are logged at WARNING with the acting agent.
+# 0 disables the middleware entirely.
+SLOW_REQUEST_MS = int(os.getenv('SLOW_REQUEST_MS', '3000') or 0)
 
 # Hyros lead-tracking integration. When a Meta Ads member gains an internal-service
 # case they're pushed to Hyros tagged "Enrolled". Empty API key = integration OFF
@@ -713,6 +720,19 @@ LOGGING = {
         'django.request': {
             'handlers': ['console'],
             'level': 'ERROR',
+            'propagate': False,
+        },
+        # An unknown Host is NOT an application error: Django answers it with a
+        # 400 (DisallowedHost subclasses SuspiciousOperation) and the worker is
+        # unharmed. It is logged at ERROR with a full traceback that names our
+        # PartnerHostMiddleware -- purely because that is the first caller of
+        # get_host() -- so internet background noise reads like our code
+        # crashing. During the 2026-09-14 incident this buried the real errors.
+        # nginx now drops unknown-Host traffic at the edge (default_server ->
+        # 444); this silences whatever still reaches Django.
+        'django.security.DisallowedHost': {
+            'handlers': ['console'],
+            'level': 'CRITICAL',
             'propagate': False,
         },
     },
