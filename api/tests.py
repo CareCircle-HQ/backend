@@ -23900,8 +23900,295 @@ class DiagnoseCommandTest(TestCase):
         text = out.getvalue()
 
         self.assertIn("Import runs", text)
-        self.assertIn("RUNNING > 2h", text)
+        self.assertIn("in flight > 2h", text)
         self.assertIn("block features", text)
         self.assertIn("Delivery gaps", text)
         self.assertIn("Read model", text)
         self.assertNotIn("ERROR in", text, "no section may blow up")
+
+    def test_a_pending_member_prep_row_is_named_as_the_blocker(self):
+        """"Prepare Members for PO" refuses to start while its own latest row is
+        PENDING **or** RUNNING, so one abandoned row disables the feature. PENDING
+        is the easy one to miss -- a task Celery never picked up never reaches
+        RUNNING at all."""
+        from datetime import timedelta
+        from io import StringIO
+
+        from django.core.management import call_command
+
+        from .models import ImportRun, ImportRunStatus
+        from .tasks import MEMBER_PREP_SOURCE
+
+        run = ImportRun.objects.create(
+            source=MEMBER_PREP_SOURCE, status=ImportRunStatus.PENDING,
+        )
+        ImportRun.objects.filter(pk=run.pk).update(
+            started_at=timezone.now() - timedelta(days=1),
+        )
+
+        out = StringIO()
+        call_command("diagnose", stdout=out)
+        text = out.getvalue()
+
+        self.assertIn("member_prep latest", text)
+        self.assertIn("BLOCKS", text)
+        self.assertIn("Prepare Members for PO", text)
+
+    def test_a_completed_member_prep_row_is_not_flagged(self):
+        from io import StringIO
+
+        from django.core.management import call_command
+
+        from .models import ImportRun, ImportRunStatus
+        from .tasks import MEMBER_PREP_SOURCE
+
+        ImportRun.objects.create(
+            source=MEMBER_PREP_SOURCE, status=ImportRunStatus.COMPLETED,
+            finished_at=timezone.now(),
+        )
+        out = StringIO()
+        call_command("diagnose", stdout=out)
+        self.assertIn("member_prep latest", out.getvalue())
+        self.assertNotIn("BLOCKS", out.getvalue())
+
+
+class MemberPrepStaleRunTakeoverTest(TestCase):
+    """An abandoned prep run must not disable the feature for ever.
+
+    "Prepare Members for PO" refuses to start while its own latest ImportRun is
+    PENDING or RUNNING. That row is set up front and resolved only when the task
+    finishes, so a Celery worker killed mid-run -- which any deploy does -- leaves
+    it in flight permanently and every later click is silently ignored.
+
+    Production 2026-09-10: run #1449 died at 8,000 of ~15,100 members (reported as
+    "stuck at 53%") and had to be resolved by hand before the button worked again.
+    """
+
+    URL = "/api/portal/purchase-orders/prepare-members/"
+
+    def _api(self):
+        agent = Agent.objects.get_or_create(
+            agent_code="PREP-1",
+            defaults={"name": "Prep", "email": "prep@example.com",
+                      "group": "Logistics", "status": "Active"},
+        )[0]
+        access = AccessToken()
+        access["agent_id"] = str(agent.id)
+        access["agent_code"] = agent.agent_code
+        access["agent_name"] = agent.name
+        access["agent_group"] = agent.group
+        api = APIClient()
+        api.credentials(HTTP_AUTHORIZATION=f"Bearer {access}")
+        return api
+
+    def _run(self, *, status, age_minutes):
+        from datetime import timedelta
+
+        from .models import ImportRun
+        from .tasks import MEMBER_PREP_SOURCE
+
+        run = ImportRun.objects.create(source=MEMBER_PREP_SOURCE, status=status)
+        ImportRun.objects.filter(pk=run.pk).update(
+            started_at=timezone.now() - timedelta(minutes=age_minutes),
+        )
+        run.refresh_from_db()
+        return run
+
+    def test_a_live_run_still_blocks_a_second_one(self):
+        """The idempotency guard must survive: two concurrent full-calendar
+        passes are exactly what it exists to prevent."""
+        from unittest.mock import patch
+
+        from .models import ImportRun, ImportRunStatus
+        from .tasks import MEMBER_PREP_SOURCE
+
+        live = self._run(status=ImportRunStatus.RUNNING, age_minutes=5)
+        with patch("api.tasks.prepare_members_for_po.delay") as enqueued:
+            r = self._api().post(self.URL, {}, format="json")
+        self.assertEqual(r.status_code, 202)
+        enqueued.assert_not_called()
+        self.assertEqual(
+            ImportRun.objects.filter(source=MEMBER_PREP_SOURCE).count(), 1,
+        )
+        live.refresh_from_db()
+        self.assertEqual(live.status, ImportRunStatus.RUNNING, "left alone")
+
+    def test_an_abandoned_run_is_taken_over(self):
+        from unittest.mock import patch
+
+        from .models import ImportRun, ImportRunStatus
+        from .tasks import MEMBER_PREP_SOURCE
+
+        dead = self._run(status=ImportRunStatus.RUNNING, age_minutes=180)
+        with patch("api.tasks.prepare_members_for_po.delay") as enqueued:
+            r = self._api().post(self.URL, {}, format="json")
+        self.assertEqual(r.status_code, 202)
+        enqueued.assert_called_once()
+
+        dead.refresh_from_db()
+        self.assertEqual(dead.status, ImportRunStatus.FAILED)
+        self.assertIsNotNone(dead.finished_at)
+        self.assertIn("Abandoned", dead.error_log)
+        self.assertIn("running", dead.error_log, "records what it WAS, not FAILED")
+        self.assertEqual(
+            ImportRun.objects.filter(source=MEMBER_PREP_SOURCE).count(), 2,
+            "a fresh run is started",
+        )
+
+    def test_a_pending_run_can_be_abandoned_too(self):
+        """A task Celery never picked up never reaches RUNNING at all."""
+        from unittest.mock import patch
+
+        from .models import ImportRunStatus
+
+        dead = self._run(status=ImportRunStatus.PENDING, age_minutes=180)
+        with patch("api.tasks.prepare_members_for_po.delay") as enqueued:
+            self._api().post(self.URL, {}, format="json")
+        enqueued.assert_called_once()
+        dead.refresh_from_db()
+        self.assertEqual(dead.status, ImportRunStatus.FAILED)
+
+    def test_the_threshold_is_configurable(self):
+        from unittest.mock import patch
+
+        from .models import ImportRunStatus
+
+        self._run(status=ImportRunStatus.RUNNING, age_minutes=20)
+        # Default is 60 minutes, so 20 minutes old is still considered alive...
+        with patch("api.tasks.prepare_members_for_po.delay") as enqueued:
+            self._api().post(self.URL, {}, format="json")
+        enqueued.assert_not_called()
+        # ...but not under a tighter threshold.
+        with override_settings(MEMBER_PREP_STALE_MINUTES=10):
+            with patch("api.tasks.prepare_members_for_po.delay") as enqueued:
+                self._api().post(self.URL, {}, format="json")
+        enqueued.assert_called_once()
+
+    def test_a_finished_run_never_blocks(self):
+        from unittest.mock import patch
+
+        from .models import ImportRunStatus
+
+        self._run(status=ImportRunStatus.COMPLETED, age_minutes=5)
+        with patch("api.tasks.prepare_members_for_po.delay") as enqueued:
+            self._api().post(self.URL, {}, format="json")
+        enqueued.assert_called_once()
+
+
+class MemberOrdersEndpointEfficiencyTest(TestCase):
+    """The member Orders tab must load only THIS member's delivery lines.
+
+    Found by SlowRequestMiddleware within an hour of deploying it:
+    GET /members/<id>/orders/ was taking 4-7s in production. The view prefetched
+    `delivery_orders__proofs` -- every delivery line of every PO on the page, i.e.
+    a whole kitchen's delivery day (averaging ~1,900 rows, peaking near 5,000) --
+    and then discarded all but this member's IN PYTHON. Measured on a production
+    clone: 108,245 rows loaded to render 25.
+
+    The subtle part is `counts`, which must stay PO-WIDE. Filtering the prefetch
+    naively would have quietly turned it into the member's own totals, so the
+    number an agent reads would silently change meaning.
+    """
+
+    URL = "/api/portal/members/{}/orders/"
+
+    def _api(self):
+        agent = Agent.objects.get_or_create(
+            agent_code="ORD-1",
+            defaults={"name": "Ord", "email": "ord@example.com",
+                      "group": "Logistics", "status": "Active"},
+        )[0]
+        access = AccessToken()
+        access["agent_id"] = str(agent.id)
+        access["agent_code"] = agent.agent_code
+        access["agent_name"] = agent.name
+        access["agent_group"] = agent.group
+        api = APIClient()
+        api.credentials(HTTP_AUTHORIZATION=f"Bearer {access}")
+        return api
+
+    def _client(self, name):
+        from .models import Client
+
+        return Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name=name, last_name="Test",
+            client_added_at=timezone.now(),
+        )
+
+    def _po_with(self, mine, others=5, status="delivered"):
+        """One PO carrying our member's line plus `others` lines for other
+        members -- the shape that made this slow."""
+        from .models import DeliveryOrder, PurchaseOrder
+
+        po = PurchaseOrder.objects.create(status="draft")
+        DeliveryOrder.objects.create(purchase_order=po, member=mine, status=status)
+        for i in range(others):
+            DeliveryOrder.objects.create(
+                purchase_order=po, member=self._client(f"Other{i}"), status=status,
+            )
+        return po
+
+    def test_only_the_members_own_lines_are_returned(self):
+        mine = self._client("Mine")
+        self._po_with(mine, others=5)
+
+        r = self._api().get(self.URL.format(mine.pk))
+        self.assertEqual(r.status_code, 200)
+        results = r.json()["results"]
+        self.assertEqual(len(results), 1)
+        lines = results[0]["delivery_orders"]
+        self.assertEqual(len(lines), 1, "not the other five members' lines")
+        self.assertEqual(lines[0]["member_id"], str(mine.pk))
+
+    def test_counts_stay_po_wide(self):
+        """The regression this refactor could easily have introduced."""
+        mine = self._client("Mine")
+        self._po_with(mine, others=5, status="delivered")
+
+        counts = self._api().get(self.URL.format(mine.pk)).json()["results"][0]["counts"]
+        self.assertEqual(counts["total"], 6, "all six lines on the PO, not just mine")
+        self.assertEqual(counts["delivered"], 6)
+
+    def test_failed_and_returned_both_count_as_failed(self):
+        from .models import DeliveryOrder, PurchaseOrder
+
+        mine = self._client("Mine")
+        po = PurchaseOrder.objects.create(status="draft")
+        DeliveryOrder.objects.create(purchase_order=po, member=mine, status="failed")
+        DeliveryOrder.objects.create(
+            purchase_order=po, member=self._client("Other"), status="returned",
+        )
+        DeliveryOrder.objects.create(
+            purchase_order=po, member=self._client("Other2"), status="delivered",
+        )
+
+        counts = self._api().get(self.URL.format(mine.pk)).json()["results"][0]["counts"]
+        self.assertEqual(counts["total"], 3)
+        self.assertEqual(counts["failed"], 2)
+        self.assertEqual(counts["delivered"], 1)
+
+    def test_the_query_count_does_not_grow_with_more_purchase_orders(self):
+        """The N+1 guard -- the actual defect. Serialising a second PO must not
+        cost more queries than the first."""
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+
+        mine = self._client("Mine")
+        self._po_with(mine, others=4)
+        api = self._api()
+        api.get(self.URL.format(mine.pk))  # warm any one-off lookups
+
+        with CaptureQueriesContext(connection) as first:
+            api.get(self.URL.format(mine.pk))
+
+        for _ in range(3):
+            self._po_with(mine, others=4)
+
+        with CaptureQueriesContext(connection) as fourth:
+            r = api.get(self.URL.format(mine.pk))
+
+        self.assertEqual(len(r.json()["results"]), 4)
+        self.assertLessEqual(
+            len(fourth), len(first) + 2,
+            f"4 POs took {len(fourth)} queries vs {len(first)} for 1 -- N+1",
+        )

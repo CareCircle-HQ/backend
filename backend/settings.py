@@ -156,6 +156,12 @@ WEB_STATEMENT_TIMEOUT_MS = int(os.getenv('WEB_STATEMENT_TIMEOUT_MS', '30000') or
 # 0 disables the middleware entirely.
 SLOW_REQUEST_MS = int(os.getenv('SLOW_REQUEST_MS', '3000') or 0)
 
+# How long a "Prepare Members for PO" run may sit in flight before a new request
+# presumes it dead and takes over. A healthy pass over ~15k members takes ~10
+# minutes; the default is 6x that, because a Celery worker killed mid-run (any
+# deploy) would otherwise block the feature for ever.
+MEMBER_PREP_STALE_MINUTES = int(os.getenv('MEMBER_PREP_STALE_MINUTES', '60') or 60)
+
 # Hyros lead-tracking integration. When a Meta Ads member gains an internal-service
 # case they're pushed to Hyros tagged "Enrolled". Empty API key = integration OFF
 # (nothing is sent), so it stays dormant until the secret is configured.

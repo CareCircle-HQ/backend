@@ -45,25 +45,34 @@ class Command(BaseCommand):
 
     # -- sections ----------------------------------------------------------
     def _imports(self, since):
-        """Import runs, and specifically ones stuck RUNNING.
+        """Import runs, and specifically ones stuck in flight.
 
-        A run is set RUNNING up front and only resolved in `finalize()`, so a
-        killed process leaves the row RUNNING for ever -- which is how a stale row
-        can permanently block a feature (the "Prepare Members for PO" job).
+        A run is set PENDING/RUNNING up front and only resolved in `finalize()`,
+        so a killed process (or a task Celery never picked up) leaves the row in
+        flight for ever.
+
+        PENDING counts as stuck too: PurchaseOrderMemberPrepView refuses to start
+        a new job while its latest row is PENDING **or** RUNNING, so a single
+        abandoned row blocks "Prepare Members for PO" permanently. An earlier
+        version of this command only looked at RUNNING, which is exactly how that
+        went unnoticed.
         """
         from api.models import ImportRun, ImportRunStatus
 
         self.stdout.write("\n-- Import runs --")
-        stuck = ImportRun.objects.filter(status=ImportRunStatus.RUNNING)
+        self._blocking_prep()
+        stuck = ImportRun.objects.filter(
+            status__in=(ImportRunStatus.PENDING, ImportRunStatus.RUNNING),
+        )
         old_stuck = stuck.filter(started_at__lt=timezone.now() - timedelta(hours=2))
-        self.stdout.write(f"  RUNNING now              : {stuck.count()}")
+        self.stdout.write(f"  in flight now (PENDING+RUNNING): {stuck.count()}")
         self.stdout.write(
-            f"  RUNNING > 2h (likely dead): {old_stuck.count()}"
+            f"  in flight > 2h (likely dead)   : {old_stuck.count()}"
             + ("   <-- these block features until closed" if old_stuck else "")
         )
         for r in old_stuck.order_by("started_at")[:5]:
             self.stdout.write(
-                f"      #{r.pk} {r.source} started {r.started_at:%m-%d %H:%M} "
+                f"      #{r.pk} {r.source} {r.status} since {r.started_at:%m-%d %H:%M} "
                 f"by {r.triggered_by}"
             )
         recent = ImportRun.objects.filter(started_at__gte=since).order_by("-started_at")
@@ -75,6 +84,34 @@ class Command(BaseCommand):
                 f"      {r.started_at:%H:%M:%S} {str(round(secs) if secs else '-'):>6}s "
                 f"{r.status:10} {r.triggered_by}{flag}"
             )
+
+    def _blocking_prep(self):
+        """"Prepare Members for PO" is gated on its OWN latest row: while that is
+        PENDING or RUNNING the endpoint returns the existing run instead of
+        starting a new one. So one abandoned row disables the feature until it is
+        resolved -- worth calling out by name rather than leaving in a count."""
+        from api.models import ImportRun, ImportRunStatus
+        from api.tasks import MEMBER_PREP_SOURCE
+
+        latest = (
+            ImportRun.objects.filter(source=MEMBER_PREP_SOURCE)
+            .order_by("-started_at").first()
+        )
+        if latest is None:
+            self.stdout.write("  member_prep: no runs on record")
+            return
+        blocked = latest.status in (ImportRunStatus.PENDING, ImportRunStatus.RUNNING)
+        age_h = (timezone.now() - latest.started_at).total_seconds() / 3600
+        line = (
+            f"  member_prep latest: #{latest.pk} {latest.status} "
+            f"({age_h:.1f}h old, {latest.processed_count} processed)"
+        )
+        if blocked:
+            line += (
+                "  <-- BLOCKS 'Prepare Members for PO' until resolved"
+                if age_h > 2 else "  (in flight)"
+            )
+        self.stdout.write(line)
 
     def _uniteus(self, since):
         """Credential pool. A large ACTIVE pool used to be a performance problem:
