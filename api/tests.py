@@ -23580,3 +23580,101 @@ class PauseFromPendingOrInactiveTest(TestCase):
         self._patch(client, profile, {"pause": True, "pause_reason": "nope"})
         profile.refresh_from_db()
         self.assertEqual(profile.status, MemberStatus.OUT_OF_ORBIT)
+
+
+class UniteUsOnDemandSingleCredentialTest(TestCase):
+    """An on-demand refresh must use ONE credential, never the nightly fan-out.
+
+    Production incident: `refresh_from_uniteus` (the member page's "Refresh from
+    Unite Us") ran the whole daily pull inline, and DailyPull.execute walks EVERY
+    active credential of the provider, retrying the same person on each. With ~114
+    active credentials -- each dead one costing a 30s-timeout round trip plus a
+    failed token refresh -- one click could hold a gunicorn worker for minutes. A
+    few concurrent clicks exhausted every worker and the site stalled for
+    everyone, which is how it showed up: agents reported slow saves from the
+    extension AND a slow members list, neither of which touches Unite Us.
+    """
+
+    def _cred(self, **kw):
+        from .models import UniteUsCredential, UniteUsCredentialStatus
+
+        # One credential per (provider, employee) -- so the ~114 active ones in
+        # production are 114 distinct agent sessions on the SAME provider, which
+        # is why filtering by provider_id narrowed nothing.
+        base = dict(
+            provider_id="p", employee_id=f"e{uuid.uuid4()}", access_token="tok",
+            refresh_token="r", status=UniteUsCredentialStatus.ACTIVE,
+        )
+        base.update(kw)
+        return UniteUsCredential.objects.create(**base)
+
+    def test_execute_with_a_credential_id_uses_only_that_credential(self):
+        from .models import ImportRun, ImportRunStatus
+        from .services.uniteus_import import DailyPull
+
+        creds = [self._cred() for _ in range(5)]
+        run = ImportRun.objects.create(source="uniteus", status=ImportRunStatus.RUNNING)
+        puller = DailyPull(run)
+        seen = []
+        puller._process_person = lambda cid: seen.append(cid)
+
+        puller.execute(client_ids=["person-1"], credential_id=creds[2].pk)
+        self.assertEqual(
+            len(seen), 1,
+            "the person must be fetched ONCE, not once per active credential",
+        )
+
+    def test_without_a_credential_id_the_nightly_still_fans_out(self):
+        """The cron relies on it: different sessions can see different people."""
+        from .models import ImportRun, ImportRunStatus
+        from .services.uniteus_import import DailyPull
+
+        for _ in range(5):
+            self._cred()
+        run = ImportRun.objects.create(source="uniteus", status=ImportRunStatus.RUNNING)
+        puller = DailyPull(run)
+        seen = []
+        puller._process_person = lambda cid: seen.append(cid)
+
+        puller.execute(client_ids=["person-1"])
+        self.assertEqual(len(seen), 5)
+
+    def test_member_refresh_does_not_fan_out(self):
+        from unittest.mock import patch
+
+        from .services import uniteus_import
+
+        for _ in range(4):
+            self._cred()
+        with patch.object(uniteus_import, "run_daily_pull") as pull:
+            pull.return_value = type(
+                "R", (), {"pk": 1, "status": "completed", "created_count": 0,
+                          "updated_count": 0, "skipped_count": 0, "error_count": 0,
+                          "stats": {}, "error_log": ""},
+            )()
+            uniteus_import.refresh_from_uniteus("client-1")
+        self.assertIsNotNone(
+            pull.call_args.kwargs.get("credential_id"),
+            "the member-scoped refresh must pin itself to one credential",
+        )
+
+    def test_a_401_retires_the_credential_but_a_403_does_not(self):
+        """401 = the session is dead, so it must leave the active pool -- that is
+        why the pool grew to ~114. 403 = this session cannot see THAT record,
+        which says nothing about the session, so it must stay."""
+        from unittest.mock import Mock, patch
+
+        from .integrations.uniteus import api as uu_api
+        from .models import UniteUsCredentialStatus
+
+        for code, expected in (
+            (401, UniteUsCredentialStatus.EXPIRED),
+            (403, UniteUsCredentialStatus.ACTIVE),
+        ):
+            cred = self._cred(last_captured_at=timezone.now())
+            api = uu_api.UniteUsClient(cred)
+            with patch.object(api._session, "get", return_value=Mock(status_code=code)):
+                with self.assertRaises(uu_api.UniteUsAuthExpired):
+                    api.core_get("/people/x")
+            cred.refresh_from_db()
+            self.assertEqual(cred.status, expected, f"HTTP {code}")
