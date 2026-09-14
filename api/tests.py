@@ -24073,3 +24073,122 @@ class MemberPrepStaleRunTakeoverTest(TestCase):
         with patch("api.tasks.prepare_members_for_po.delay") as enqueued:
             self._api().post(self.URL, {}, format="json")
         enqueued.assert_called_once()
+
+
+class MemberOrdersEndpointEfficiencyTest(TestCase):
+    """The member Orders tab must load only THIS member's delivery lines.
+
+    Found by SlowRequestMiddleware within an hour of deploying it:
+    GET /members/<id>/orders/ was taking 4-7s in production. The view prefetched
+    `delivery_orders__proofs` -- every delivery line of every PO on the page, i.e.
+    a whole kitchen's delivery day (averaging ~1,900 rows, peaking near 5,000) --
+    and then discarded all but this member's IN PYTHON. Measured on a production
+    clone: 108,245 rows loaded to render 25.
+
+    The subtle part is `counts`, which must stay PO-WIDE. Filtering the prefetch
+    naively would have quietly turned it into the member's own totals, so the
+    number an agent reads would silently change meaning.
+    """
+
+    URL = "/api/portal/members/{}/orders/"
+
+    def _api(self):
+        agent = Agent.objects.get_or_create(
+            agent_code="ORD-1",
+            defaults={"name": "Ord", "email": "ord@example.com",
+                      "group": "Logistics", "status": "Active"},
+        )[0]
+        access = AccessToken()
+        access["agent_id"] = str(agent.id)
+        access["agent_code"] = agent.agent_code
+        access["agent_name"] = agent.name
+        access["agent_group"] = agent.group
+        api = APIClient()
+        api.credentials(HTTP_AUTHORIZATION=f"Bearer {access}")
+        return api
+
+    def _client(self, name):
+        from .models import Client
+
+        return Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name=name, last_name="Test",
+            client_added_at=timezone.now(),
+        )
+
+    def _po_with(self, mine, others=5, status="delivered"):
+        """One PO carrying our member's line plus `others` lines for other
+        members -- the shape that made this slow."""
+        from .models import DeliveryOrder, PurchaseOrder
+
+        po = PurchaseOrder.objects.create(status="draft")
+        DeliveryOrder.objects.create(purchase_order=po, member=mine, status=status)
+        for i in range(others):
+            DeliveryOrder.objects.create(
+                purchase_order=po, member=self._client(f"Other{i}"), status=status,
+            )
+        return po
+
+    def test_only_the_members_own_lines_are_returned(self):
+        mine = self._client("Mine")
+        self._po_with(mine, others=5)
+
+        r = self._api().get(self.URL.format(mine.pk))
+        self.assertEqual(r.status_code, 200)
+        results = r.json()["results"]
+        self.assertEqual(len(results), 1)
+        lines = results[0]["delivery_orders"]
+        self.assertEqual(len(lines), 1, "not the other five members' lines")
+        self.assertEqual(lines[0]["member_id"], str(mine.pk))
+
+    def test_counts_stay_po_wide(self):
+        """The regression this refactor could easily have introduced."""
+        mine = self._client("Mine")
+        self._po_with(mine, others=5, status="delivered")
+
+        counts = self._api().get(self.URL.format(mine.pk)).json()["results"][0]["counts"]
+        self.assertEqual(counts["total"], 6, "all six lines on the PO, not just mine")
+        self.assertEqual(counts["delivered"], 6)
+
+    def test_failed_and_returned_both_count_as_failed(self):
+        from .models import DeliveryOrder, PurchaseOrder
+
+        mine = self._client("Mine")
+        po = PurchaseOrder.objects.create(status="draft")
+        DeliveryOrder.objects.create(purchase_order=po, member=mine, status="failed")
+        DeliveryOrder.objects.create(
+            purchase_order=po, member=self._client("Other"), status="returned",
+        )
+        DeliveryOrder.objects.create(
+            purchase_order=po, member=self._client("Other2"), status="delivered",
+        )
+
+        counts = self._api().get(self.URL.format(mine.pk)).json()["results"][0]["counts"]
+        self.assertEqual(counts["total"], 3)
+        self.assertEqual(counts["failed"], 2)
+        self.assertEqual(counts["delivered"], 1)
+
+    def test_the_query_count_does_not_grow_with_more_purchase_orders(self):
+        """The N+1 guard -- the actual defect. Serialising a second PO must not
+        cost more queries than the first."""
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+
+        mine = self._client("Mine")
+        self._po_with(mine, others=4)
+        api = self._api()
+        api.get(self.URL.format(mine.pk))  # warm any one-off lookups
+
+        with CaptureQueriesContext(connection) as first:
+            api.get(self.URL.format(mine.pk))
+
+        for _ in range(3):
+            self._po_with(mine, others=4)
+
+        with CaptureQueriesContext(connection) as fourth:
+            r = api.get(self.URL.format(mine.pk))
+
+        self.assertEqual(len(r.json()["results"]), 4)
+        self.assertLessEqual(
+            len(fourth), len(first) + 2,
+            f"4 POs took {len(fourth)} queries vs {len(first)} for 1 -- N+1",
+        )

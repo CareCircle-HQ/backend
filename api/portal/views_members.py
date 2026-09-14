@@ -69,6 +69,7 @@ from ..models import (
     NoteSource,
     ProductType,
     ProductTypeKind,
+    DeliveryOrder,
     PurchaseOrder,
     ServiceAuthorizationStatus,
     StageEvent,
@@ -4034,27 +4035,86 @@ class MemberOrdersView(PortalGenericAPIView):
 
     def get(self, request, client_id):
         get_object_or_404(Client, pk=client_id)
-        qs = (
-            PurchaseOrder.objects.filter(delivery_orders__member_id=client_id)
-            .distinct()
-            .prefetch_related("delivery_orders__proofs", "kitchen", "delivery_company")
-        )
+
+        # Select the POs via a SUBQUERY on this member's delivery lines rather
+        # than a join, for two reasons:
+        #   1. it drops the .distinct() over a join that fans out to thousands of
+        #      rows per PO, and
+        #   2. a join here would silently corrupt the count annotations below --
+        #      Django applies Count() over the FILTERED relation, so the PO's
+        #      "total" would collapse to just this member's lines.
+        # It also fixes a real bug: chained .filter() calls on a multi-valued
+        # relation create SEPARATE joins, so the old window filter matched a PO
+        # where SOME line was this member's and SOME (possibly different) line was
+        # in the window. Both conditions now apply to the SAME line.
+        member_lines = DeliveryOrder.objects.filter(member_id=client_id)
+
         # Optional ?enrollment=<id> scopes orders to a SPECIFIC (superseded)
         # enrollment. DeliveryOrders aren't enrollment-linked, so scope by that
         # enrollment's delivery window (its plan's start/end dates) -- the orders
         # delivered while that enrollment was the active program.
         override = (request.query_params.get("enrollment") or "").strip()
+        empty = False
         if override:
             window = MemberDeliverySchedule.objects.filter(
                 enrollment_id=override
             ).aggregate(start=Min("starts_on"), end=Max("ends_on"))
             start, end = window.get("start"), window.get("end")
             if start:
-                qs = qs.filter(delivery_orders__expected_delivery_date__gte=start)
+                member_lines = member_lines.filter(
+                    expected_delivery_date__gte=start
+                )
             if end:
-                qs = qs.filter(delivery_orders__expected_delivery_date__lte=end)
+                member_lines = member_lines.filter(expected_delivery_date__lte=end)
             if not start and not end:
-                qs = qs.none()
+                empty = True
+
+        qs = (
+            PurchaseOrder.objects
+            .filter(pk__in=member_lines.values("purchase_order_id"))
+            # FKs: a join, not two extra queries.
+            .select_related("kitchen", "delivery_company")
+            .prefetch_related(
+                # ONLY this member's lines. The page previously prefetched every
+                # delivery line of every PO -- a whole kitchen's delivery day,
+                # averaging ~1,900 rows and peaking near 5,000 -- plus all their
+                # proofs, then discarded all but this member's IN PYTHON. At a
+                # page size of 25 that is ~46,000 rows loaded to render at most
+                # 25, which is why this endpoint took 4-7 seconds in production.
+                Prefetch(
+                    "delivery_orders",
+                    queryset=DeliveryOrder.objects.filter(member_id=client_id)
+                    # Everything PortalDeliveryOrderSerializer touches, or it
+                    # issues five lookups PER LINE (client, kitchen, menu type,
+                    # dietary tags, delivery company).
+                    .select_related(
+                        "member", "kitchen", "menu_type", "delivery_company",
+                    )
+                    .prefetch_related("proofs", "custom_dietary_tags"),
+                    to_attr="member_delivery_orders",
+                ),
+                # Counted by the serializer; prefetched so it is one query rather
+                # than one per PO.
+                "notes",
+            )
+            # The PO-wide counts the serializer used to derive by loading every
+            # line into Python. Aggregated in the database instead.
+            .annotate(
+                dlv_total=Count("delivery_orders", distinct=True),
+                dlv_delivered=Count(
+                    "delivery_orders",
+                    filter=Q(delivery_orders__status="delivered"),
+                    distinct=True,
+                ),
+                dlv_failed=Count(
+                    "delivery_orders",
+                    filter=Q(delivery_orders__status__in=("failed", "returned")),
+                    distinct=True,
+                ),
+            )
+        )
+        if empty:
+            qs = qs.none()
         status_val = (request.query_params.get("status") or "").strip()
         if status_val and status_val.lower() != "all":
             qs = qs.filter(status=status_val)

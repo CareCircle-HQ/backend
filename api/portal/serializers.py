@@ -2156,7 +2156,17 @@ class PortalDeliveryOrderSerializer(serializers.ModelSerializer):
         return obj.delivery_company.name if obj.delivery_company else ""
 
     def get_delivery_address(self, obj):
-        return _delivery_address_str(obj.member)
+        # Resolving the address walks member profile -> enrollment -> household,
+        # three queries PER LINE. On the member Orders tab every line belongs to
+        # the SAME member, so it is the identical lookup repeated once per row.
+        # Memoised on the serializer context, which lives exactly one request --
+        # a module-level cache would go stale after an address edit.
+        if obj.member_id is None:
+            return _delivery_address_str(obj.member)
+        cache = self.context.setdefault("_delivery_address_cache", {})
+        if obj.member_id not in cache:
+            cache[obj.member_id] = _delivery_address_str(obj.member)
+        return cache[obj.member_id]
 
 
 class PortalPurchaseOrderSerializer(serializers.ModelSerializer):
@@ -2190,6 +2200,18 @@ class PortalPurchaseOrderSerializer(serializers.ModelSerializer):
         return obj.delivery_company.name if obj.delivery_company else ""
 
     def get_counts(self, obj):
+        # Prefer database-side counts when the view annotated them. Deriving these
+        # in Python means loading every delivery line of the PO -- averaging ~1,900
+        # rows, peaking near 5,000 -- which is affordable on the PO list (one PO)
+        # but not on the member tab (25 POs a page). The fallback keeps every other
+        # caller working unchanged.
+        if hasattr(obj, "dlv_total"):
+            return {
+                "total": obj.dlv_total,
+                "delivered": obj.dlv_delivered,
+                "failed": obj.dlv_failed,
+                "notes": len(list(obj.notes.all())),
+            }
         orders = list(obj.delivery_orders.all())
         return {
             "total": len(orders),
@@ -2216,8 +2238,16 @@ class PortalMemberOrderSerializer(PortalPurchaseOrderSerializer):
         fields = PortalPurchaseOrderSerializer.Meta.fields + ["delivery_orders"]
 
     def get_delivery_orders(self, obj):
-        member_id = self.context.get("member_id")
-        orders = [o for o in obj.delivery_orders.all() if str(o.member_id) == str(member_id)]
+        # `member_delivery_orders` is a Prefetch(to_attr=...) already narrowed to
+        # this member by the view, so nothing else is loaded. Falling back to
+        # filtering in Python keeps the serializer usable without that prefetch.
+        orders = getattr(obj, "member_delivery_orders", None)
+        if orders is None:
+            member_id = self.context.get("member_id")
+            orders = [
+                o for o in obj.delivery_orders.all()
+                if str(o.member_id) == str(member_id)
+            ]
         return PortalDeliveryOrderSerializer(orders, many=True, context=self.context).data
 
 
