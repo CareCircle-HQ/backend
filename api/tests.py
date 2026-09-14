@@ -24617,3 +24617,86 @@ class SharedEnrollmentCaseForkLoopTest(TestCase):
         )
         self.assertTrue(_may_replace_enrollment(owner, enr), "owner may")
         self.assertFalse(_may_replace_enrollment(dependent, enr), "dependent may not")
+
+
+class RemoveMemberPrimaryGuardTest(TestCase):
+    """The "primary cannot be removed" guard must be scoped to THIS household.
+
+    Reported while splitting the AKALLOO family: removing EVAN from LIAM's
+    enrollment failed with "The primary member cannot be removed" -- because the
+    guard asked whether EVAN is the primary of ANY household. He is: his OWN,
+    single-member one. He is only a member PROFILE on LIAM's enrollment, and he is
+    precisely the member who needs removing so the family can be split into
+    per-member enrollments. Same flaw as the Primary badge (see
+    HouseholdPrimaryBadgeTest).
+    """
+
+    def _client(self, name):
+        from .models import Client
+
+        return Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name=name, last_name="Akalloo",
+            client_added_at=timezone.now(),
+        )
+
+    def _household(self, client, primary=True):
+        from .models import Household, HouseholdMember
+
+        hh = Household.objects.create(name=f"{client.first_name} HH")
+        HouseholdMember.objects.create(household=hh, client=client, is_primary=primary)
+        return hh
+
+    def _enrollment(self, owner, household):
+        from .models import EnrollmentStage, EnrollmentVerification
+
+        return EnrollmentVerification.objects.create(
+            client=owner, household=household, stage=EnrollmentStage.SERVICE_ACTIVE,
+        )
+
+    def test_a_relative_who_heads_their_own_household_can_be_removed(self):
+        from .portal.views_members import _is_primary_of_enrollment_household
+
+        owner = self._client("Liam")
+        relative = self._client("Evan")
+        household = self._household(owner)
+        self._household(relative)          # his own, where he IS primary
+        enr = self._enrollment(owner, household)
+
+        self.assertFalse(
+            _is_primary_of_enrollment_household(relative, enr),
+            "primary of his OWN household must not block removal from this one",
+        )
+
+    def test_this_households_primary_is_still_protected(self):
+        from .portal.views_members import _is_primary_of_enrollment_household
+
+        owner = self._client("Liam")
+        household = self._household(owner)
+        enr = self._enrollment(owner, household)
+        self.assertTrue(_is_primary_of_enrollment_household(owner, enr))
+
+    def test_a_dependent_of_this_household_can_be_removed(self):
+        from .models import HouseholdMember
+        from .portal.views_members import _is_primary_of_enrollment_household
+
+        owner = self._client("Liam")
+        household = self._household(owner)
+        dependent = self._client("Evan")
+        HouseholdMember.objects.create(
+            household=household, client=dependent, is_primary=False,
+        )
+        enr = self._enrollment(owner, household)
+        self.assertFalse(_is_primary_of_enrollment_household(dependent, enr))
+
+    def test_an_enrollment_without_a_household_protects_its_owner(self):
+        from .models import EnrollmentStage, EnrollmentVerification
+        from .portal.views_members import _is_primary_of_enrollment_household
+
+        owner = self._client("Solo")
+        other = self._client("Guest")
+        self._household(owner)
+        enr = EnrollmentVerification.objects.create(
+            client=owner, stage=EnrollmentStage.SERVICE_ACTIVE,
+        )
+        self.assertTrue(_is_primary_of_enrollment_household(owner, enr))
+        self.assertFalse(_is_primary_of_enrollment_household(other, enr))

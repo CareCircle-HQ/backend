@@ -4576,6 +4576,24 @@ class MemberMobileNumberView(PortalAPIView):
         return Response(s.MemberDetailSerializer(client).data)
 
 
+def _is_primary_of_enrollment_household(client, enrollment):
+    """Is ``client`` the primary of the household that owns ``enrollment``?
+
+    Deliberately household-scoped: being the primary of some OTHER household says
+    nothing about this enrollment, and treating it as though it did blocked the
+    removal of exactly the members who need removing (a relative served on
+    somebody else's enrollment while heading their own household).
+    """
+    household_id = getattr(enrollment, "household_id", None)
+    if household_id:
+        return HouseholdMember.objects.filter(
+            client=client, household_id=household_id, is_primary=True,
+        ).exists()
+    # No household on the enrollment: its owner is the only sensible primary.
+    owner_id = getattr(enrollment, "client_id", None)
+    return bool(owner_id) and str(owner_id) == str(client.pk)
+
+
 def _promote_removed_member_to_own_household(
     member_client, active_case, *, diet_snapshot, member_name, agent, actor,
 ):
@@ -5094,15 +5112,20 @@ class HouseholdMemberEditView(PortalAPIView):
             household = membership.household if membership else None
 
         member_client = mv.client
-        # Never remove a primary member -- enforced here for EVERY removal
-        # surface routed through this endpoint (the program tab, the Household
-        # tab and the verification pop-up). A primary owns their household's
-        # timeline + enrollment, so they can't be dropped. Checked directly
-        # against the HouseholdMember roster so it holds regardless of which
-        # household context the enrollment resolves to.
-        if member_client is not None and HouseholdMember.objects.filter(
-            client=member_client, is_primary=True
-        ).exists():
+        # Never remove THIS HOUSEHOLD'S primary -- enforced here for EVERY removal
+        # surface routed through this endpoint (the program tab, the Household tab
+        # and the verification pop-up). A primary owns their household's timeline +
+        # enrollment, so they can't be dropped.
+        #
+        # Scoped to the ENROLLMENT's household, not "primary of any household".
+        # The unscoped check blocked removing a member who is the primary of their
+        # OWN household while merely being a profile on a relative's enrollment --
+        # which is precisely the member who needs removing, so the family can be
+        # split into per-member enrollments. Same flaw as the Primary badge
+        # (PortalHouseholdMemberSerializer.get_is_primary).
+        if member_client is not None and _is_primary_of_enrollment_household(
+            member_client, mv.enrollment,
+        ):
             return Response(
                 {"error": "The primary member cannot be removed."},
                 status=http.HTTP_400_BAD_REQUEST,
