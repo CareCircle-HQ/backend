@@ -379,14 +379,38 @@ def active_enrollment(client):
     enrollments = [
         e for e in client.enrollments.all() if e.stage not in _INERT
     ]
-    if not enrollments:
+    if not any(e.closed_at is None for e in enrollments):
+        # No LIVE enrollment of their own -- so find the one that actually serves
+        # them. Widened from "no enrollments AT ALL": a member whose own enrollment
+        # is CLOSED used to stop here, and every program action (address, dietary,
+        # kitchen + cadence, hold, member changes, /assign-kitchen/) resolves
+        # through this function, so agents were editing a dead row and nothing
+        # took effect -- reported as "we cannot service this member".
+        #
+        # Two sources, in order of authority:
+        #   1. the household's enrollments (the verification covers the household),
+        #   2. any enrollment where the client is a MEMBER PROFILE -- the ground
+        #      truth of who is being served, and the only link when a family is
+        #      served on ONE enrollment while each person still has a SEPARATE
+        #      household record (production: the AKALLOO family).
+        #
+        # Strictly additive: applied only when it yields a LIVE enrollment, so a
+        # client with nothing live still resolves to their own closed row exactly
+        # as before (1,126 such clients on a production clone, none affected).
+        candidates = []
         membership = getattr(client, "household_membership", None)
         if membership is not None:
-            enrollments = [
-                e
-                for e in membership.household.enrollment_verifications.all()
-                if e.stage not in _INERT
-            ]
+            candidates += list(membership.household.enrollment_verifications.all())
+        candidates += [
+            p.enrollment for p in client.member_profiles.all()
+            if p.enrollment_id
+        ]
+        live = [
+            e for e in candidates
+            if e.stage not in _INERT and e.closed_at is None
+        ]
+        if live:
+            enrollments = live
     if not enrollments:
         return None
     open_ones = [e for e in enrollments if e.closed_at is None]
@@ -2314,9 +2338,31 @@ class PortalHouseholdMemberSerializer(serializers.ModelSerializer):
             return "Not eligible for the program"
 
     def get_is_primary(self, obj):
-        # The primary household member can't be removed from the Household tab.
-        membership = getattr(obj.client, "household_membership", None) if obj.client_id else None
-        return bool(getattr(membership, "is_primary", False))
+        """Primary OF THIS ENROLLMENT'S HOUSEHOLD -- not "primary of some household".
+
+        This used to read the member's own household_membership flag and stop
+        there, so anyone who heads their OWN household record showed a Primary
+        badge on somebody else's household tab. A family served on one enrollment
+        while each person still has a separate household record therefore rendered
+        as several primaries at once (seen in production: one enrollment showing
+        four, each primary of a different household).
+
+        Not cosmetic: the frontend hides the Remove control for a primary, so a
+        wrongly badged member could not be removed from the household at all.
+        """
+        if not obj.client_id:
+            return False
+        membership = getattr(obj.client, "household_membership", None)
+        if membership is None or not getattr(membership, "is_primary", False):
+            return False
+        enrollment = getattr(obj, "enrollment", None)
+        household_id = getattr(enrollment, "household_id", None)
+        if household_id:
+            return str(membership.household_id) == str(household_id)
+        # No household on the enrollment (a bare/individual one): its owner is the
+        # only sensible primary.
+        owner_id = getattr(enrollment, "client_id", None)
+        return bool(owner_id) and str(owner_id) == str(obj.client_id)
 
     def get_has_nutrition_pdf(self, obj):
         return bool(obj.nutritionist_pdf_key)

@@ -340,6 +340,27 @@ def _primary_enrollment(client):
     return max(enrollments, key=sort_key)
 
 
+def _may_replace_enrollment(client, enrollment):
+    """May ``client``'s governing case replace ``enrollment``?
+
+    Only its OWNER, or the primary of its household, may. A non-primary member --
+    linked only by a MemberDietaryProfile -- may not: their case rewriting the
+    owner's enrollment is what produced unbounded enrollment forking (see
+    replace_enrollment_for_case_change).
+    """
+    if str(getattr(enrollment, "client_id", "")) == str(client.pk):
+        return True
+    household_id = getattr(enrollment, "household_id", None)
+    if not household_id:
+        return False
+    membership = getattr(client, "household_membership", None)
+    return bool(
+        membership is not None
+        and membership.is_primary
+        and str(membership.household_id) == str(household_id)
+    )
+
+
 def _held_from_stage(enrollment):
     """The enrollment stage an On Hold enrollment was paused FROM, read off the
     most recent 'to On Hold' StageEvent. None when no such event exists."""
@@ -3973,7 +3994,15 @@ def reopen_enrollment_for_new_case(client, new_governing_case, *, actor=None, ac
 
     all_enr = list(EnrollmentVerification.objects.filter(client=client))
     # A live enrollment (funnel/serving) means the normal path handles it.
-    if any(EnrollmentStage(e.stage) in _LIVE_ENROLLMENT_STAGES for e in all_enr):
+    #
+    # _governing_enrollments, not just the client's OWN rows: a member served on a
+    # relative's live enrollment (linked by a MemberDietaryProfile) is already
+    # covered, and opening a second enrollment for them would duplicate their
+    # service -- in the case that prompted this, 22 already-scheduled deliveries.
+    if any(
+        EnrollmentStage(e.stage) in _LIVE_ENROLLMENT_STAGES
+        for e in _governing_enrollments(client)
+    ):
         return None
     # Clone source: the most-recent terminal enrollment with data to resume from.
     # Prefer a VERIFIED prior; else fall back to a terminal prior that still carries
@@ -4167,6 +4196,23 @@ def replace_enrollment_for_case_change(
 
     terminal = {EnrollmentStage.CLOSED, EnrollmentStage.CANCELLED}
     live = _primary_enrollment(client)
+    if live is not None and not _may_replace_enrollment(client, live):
+        # A case may only replace an enrollment it can legitimately govern.
+        #
+        # _primary_enrollment deliberately includes any enrollment the client is a
+        # MEMBER PROFILE on, so a family served together resolves to the SAME
+        # enrollment for every member. Without this check, two members who each
+        # hold their own open approved case both "own" that shared enrollment, and
+        # each reconcile pass forks it onto its own client's case -- undoing the
+        # other. Neither ever reaches the "same case, nothing to do" exit, so the
+        # forking is UNBOUNDED: production shows one member with 119 enrollments
+        # alternating 60/59 between two cases, six of them inside one minute.
+        #
+        # Returning False makes a non-owner's reconcile a no-op on somebody else's
+        # enrollment. Deciding which of two competing individual-scope cases should
+        # govern a shared enrollment is a Customer Service judgement, not something
+        # to churn the database over.
+        return False
     if live is None:
         return None
     if EnrollmentStage(live.stage) in terminal:

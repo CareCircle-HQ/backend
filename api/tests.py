@@ -24167,6 +24167,29 @@ class MemberOrdersEndpointEfficiencyTest(TestCase):
         self.assertEqual(counts["failed"], 2)
         self.assertEqual(counts["delivered"], 1)
 
+    def test_the_page_is_explicitly_ordered(self):
+        """The Count() annotations add a GROUP BY, and Django reports a grouped
+        queryset as UNORDERED even though PurchaseOrder has Meta.ordering. Without
+        an explicit order_by, page boundaries can shift between requests -- the
+        same PO twice, or one skipped. DRF warns about exactly this."""
+        import warnings
+
+        mine = self._client("Mine")
+        for _ in range(3):
+            self._po_with(mine, others=1)
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            r = self._api().get(self.URL.format(mine.pk))
+
+        self.assertEqual(r.status_code, 200)
+        self.assertFalse(
+            [w for w in caught if "UnorderedObjectList" in str(w.category)],
+            "pagination must not warn about an unordered queryset",
+        )
+        stamps = [row["created_at"] for row in r.json()["results"] if row.get("created_at")]
+        self.assertEqual(stamps, sorted(stamps, reverse=True), "newest first")
+
     def test_the_query_count_does_not_grow_with_more_purchase_orders(self):
         """The N+1 guard -- the actual defect. Serialising a second PO must not
         cost more queries than the first."""
@@ -24192,3 +24215,488 @@ class MemberOrdersEndpointEfficiencyTest(TestCase):
             len(fourth), len(first) + 2,
             f"4 POs took {len(fourth)} queries vs {len(first)} for 1 -- N+1",
         )
+
+
+class UniteUsProvidedDescriptionTest(SimpleTestCase):
+    """Unite Us metadata values are free-form and are not always strings.
+
+    Production, found the day CloudWatch log shipping was switched on:
+
+        File "api/integrations/uniteus/mappers.py", line 347, in map_provided_service
+            "name": _provided_description(a)[:255],
+        TypeError: 'int' object is not subscriptable
+
+    The caller slices the result to fit ContractedService.name (255 chars), so a
+    numeric value -- a quantity typed into a free-text field -- crashed the import
+    for that person, and their contracted services silently never synced.
+    """
+
+    def _desc(self, metadata):
+        from .integrations.uniteus.mappers import _provided_description
+
+        return _provided_description({"metadata": metadata})
+
+    def test_a_numeric_value_is_returned_as_a_string(self):
+        out = self._desc([{"field": "specific_support_provided", "value": 12}])
+        self.assertEqual(out, "12")
+        self.assertEqual(out[:255], "12", "the caller slices it")
+
+    def test_a_numeric_fallback_value_is_also_a_string(self):
+        """The second branch (any value, no preferred field) had the same flaw."""
+        out = self._desc([{"field": "something_else", "value": 7}])
+        self.assertEqual(out, "7")
+        self.assertEqual(out[:255], "7")
+
+    def test_normal_text_is_unchanged(self):
+        out = self._desc(
+            [{"field": "specific_support_provided", "value": "Home delivered meals"}],
+        )
+        self.assertEqual(out, "Home delivered meals")
+
+    def test_missing_or_odd_metadata_gives_an_empty_string(self):
+        self.assertEqual(self._desc(None), "")
+        self.assertEqual(self._desc([]), "")
+        self.assertEqual(self._desc("not-a-list"), "")
+        self.assertEqual(self._desc([{"field": "x", "value": ""}]), "")
+
+
+class HouseholdPrimaryBadgeTest(TestCase):
+    """"Primary" must mean primary OF THIS ENROLLMENT'S HOUSEHOLD.
+
+    Production: a member tab showed FOUR members badged Primary. No household
+    actually had more than one primary -- the AKALLOO family was served on ONE
+    enrollment while each person still had a SEPARATE household record, and the
+    serializer read each member's own household_membership flag without checking
+    which household it belonged to.
+
+    Not cosmetic: the frontend hides the Remove control for a primary
+    (`!member.isPrimary && <Remove/>`), so wrongly badged members could not be
+    removed from the household at all.
+    """
+
+    def _client(self, name):
+        from .models import Client
+
+        return Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name=name, last_name="Akalloo",
+            client_added_at=timezone.now(),
+        )
+
+    def _own_household(self, client, primary=True):
+        """Give the client their own household, where they are the primary."""
+        from .models import Household, HouseholdMember
+
+        hh = Household.objects.create(name=f"{client.first_name} HH")
+        HouseholdMember.objects.create(household=hh, client=client, is_primary=primary)
+        return hh
+
+    def _serialize(self, enrollment):
+        from .portal import serializers as s
+
+        return {
+            row["name"]: row["is_primary"]
+            for row in s.PortalHouseholdMemberSerializer(
+                enrollment.member_profiles.select_related("client", "enrollment"),
+                many=True,
+            ).data
+        }
+
+    def test_only_the_primary_of_this_household_is_badged(self):
+        from .models import EnrollmentStage, EnrollmentVerification, MemberDietaryProfile
+
+        owner = self._client("Liam")
+        household = self._own_household(owner)
+        enr = EnrollmentVerification.objects.create(
+            client=owner, household=household, stage=EnrollmentStage.SERVICE_ACTIVE,
+        )
+        MemberDietaryProfile.objects.create(
+            enrollment=enr, client=owner, member_name="Liam Akalloo",
+        )
+        # Three relatives served on THIS enrollment while each still heads their
+        # own separate household record -- the exact production shape.
+        for name in ("Evan", "Navita", "Skylar"):
+            relative = self._client(name)
+            self._own_household(relative)
+            MemberDietaryProfile.objects.create(
+                enrollment=enr, client=relative, member_name=f"{name} Akalloo",
+            )
+
+        badges = self._serialize(enr)
+        self.assertEqual(
+            sum(1 for v in badges.values() if v), 1, f"exactly one primary: {badges}",
+        )
+        self.assertTrue(badges["Liam Akalloo"])
+        self.assertFalse(badges["Evan Akalloo"])
+
+    def test_a_non_primary_of_their_own_household_is_never_badged(self):
+        from .models import EnrollmentStage, EnrollmentVerification, MemberDietaryProfile
+
+        owner = self._client("Liam")
+        household = self._own_household(owner)
+        dependent = self._client("Evan")
+        self._own_household(dependent, primary=False)
+        enr = EnrollmentVerification.objects.create(
+            client=owner, household=household, stage=EnrollmentStage.SERVICE_ACTIVE,
+        )
+        for c, n in ((owner, "Liam Akalloo"), (dependent, "Evan Akalloo")):
+            MemberDietaryProfile.objects.create(enrollment=enr, client=c, member_name=n)
+
+        badges = self._serialize(enr)
+        self.assertEqual(badges, {"Liam Akalloo": True, "Evan Akalloo": False})
+
+    def test_an_enrollment_without_a_household_badges_its_owner(self):
+        """A bare/individual enrollment has no household to compare against; its
+        owner is the only sensible primary."""
+        from .models import EnrollmentStage, EnrollmentVerification, MemberDietaryProfile
+
+        owner = self._client("Solo")
+        self._own_household(owner)
+        enr = EnrollmentVerification.objects.create(
+            client=owner, stage=EnrollmentStage.SERVICE_ACTIVE,
+        )
+        MemberDietaryProfile.objects.create(
+            enrollment=enr, client=owner, member_name="Solo Akalloo",
+        )
+        self.assertEqual(self._serialize(enr), {"Solo Akalloo": True})
+
+
+class ActiveEnrollmentFallsBackToTheServingEnrollmentTest(TestCase):
+    """A member whose own enrollment is CLOSED must resolve to the live one that
+    actually serves them.
+
+    Production (EVAN AKALLOO): his governing case had moved Household ->
+    Individual, and the new open case was already attached to a LIVE enrollment
+    owned by a relative, with EVAN an active member profile on it and 22 upcoming
+    deliveries. But he also owned one CLOSED enrollment of his own, and
+    active_enrollment stopped there -- the household fallback only ran for clients
+    with NO enrollment at all. So the Cases tab showed the new case while the
+    Programs tab showed the old one, and because every program action (address,
+    dietary, kitchen + cadence, hold, member changes, /assign-kitchen/) resolves
+    through this function, agents were editing a dead row: "we cannot service this
+    member".
+
+    Measured on a production clone: of 1,126 clients whose own enrollments are all
+    closed, this changes exactly ONE -- the widening only applies when it finds a
+    genuinely LIVE enrollment.
+    """
+
+    def _client(self, name):
+        from .models import Client
+
+        return Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name=name, last_name="Akalloo",
+            client_added_at=timezone.now(),
+        )
+
+    def _household(self, client):
+        from .models import Household, HouseholdMember
+
+        hh = Household.objects.create(name=f"{client.first_name} HH")
+        HouseholdMember.objects.create(household=hh, client=client, is_primary=True)
+        return hh
+
+    def test_a_profile_on_a_relatives_live_enrollment_wins_over_own_closed_one(self):
+        from .models import (
+            EnrollmentStage, EnrollmentVerification, MemberDietaryProfile,
+        )
+        from .portal.serializers import active_enrollment
+
+        evan = self._client("Evan")
+        liam = self._client("Liam")
+        # Separate household records -- the production shape.
+        evan_hh = self._household(evan)
+        liam_hh = self._household(liam)
+
+        own_closed = EnrollmentVerification.objects.create(
+            client=evan, household=evan_hh, stage=EnrollmentStage.CLOSED,
+            closed_at=timezone.now(),
+        )
+        serving = EnrollmentVerification.objects.create(
+            client=liam, household=liam_hh, stage=EnrollmentStage.SERVICE_ACTIVE,
+        )
+        MemberDietaryProfile.objects.create(
+            enrollment=serving, client=evan, member_name="Evan Akalloo",
+        )
+
+        resolved = active_enrollment(evan)
+        self.assertIsNotNone(resolved)
+        self.assertEqual(
+            resolved.pk, serving.pk,
+            f"must resolve the LIVE serving enrollment, not the closed {own_closed.pk}",
+        )
+
+    def test_an_own_live_enrollment_still_wins(self):
+        """The common case must be untouched: never prefer somebody else's
+        enrollment over the client's own live one."""
+        from .models import (
+            EnrollmentStage, EnrollmentVerification, MemberDietaryProfile,
+        )
+        from .portal.serializers import active_enrollment
+
+        evan = self._client("Evan")
+        liam = self._client("Liam")
+        own_live = EnrollmentVerification.objects.create(
+            client=evan, household=self._household(evan),
+            stage=EnrollmentStage.SERVICE_ACTIVE,
+        )
+        other = EnrollmentVerification.objects.create(
+            client=liam, household=self._household(liam),
+            stage=EnrollmentStage.SERVICE_ACTIVE,
+        )
+        MemberDietaryProfile.objects.create(
+            enrollment=other, client=evan, member_name="Evan Akalloo",
+        )
+        self.assertEqual(active_enrollment(evan).pk, own_live.pk)
+
+    def test_with_nothing_live_the_own_closed_enrollment_is_still_returned(self):
+        """1,126 clients on the clone are in this state; none may change. The
+        closed row is their history and still drives the tab."""
+        from .models import EnrollmentStage, EnrollmentVerification
+        from .portal.serializers import active_enrollment
+
+        evan = self._client("Evan")
+        closed = EnrollmentVerification.objects.create(
+            client=evan, household=self._household(evan),
+            stage=EnrollmentStage.CLOSED, closed_at=timezone.now(),
+        )
+        self.assertEqual(active_enrollment(evan).pk, closed.pk)
+
+    def test_a_closed_serving_enrollment_is_not_resurrected(self):
+        """Only a LIVE candidate may override; a closed relative's enrollment is
+        no better than the client's own."""
+        from .models import (
+            EnrollmentStage, EnrollmentVerification, MemberDietaryProfile,
+        )
+        from .portal.serializers import active_enrollment
+
+        evan = self._client("Evan")
+        liam = self._client("Liam")
+        own_closed = EnrollmentVerification.objects.create(
+            client=evan, household=self._household(evan),
+            stage=EnrollmentStage.CLOSED, closed_at=timezone.now(),
+        )
+        dead = EnrollmentVerification.objects.create(
+            client=liam, household=self._household(liam),
+            stage=EnrollmentStage.CLOSED, closed_at=timezone.now(),
+        )
+        MemberDietaryProfile.objects.create(
+            enrollment=dead, client=evan, member_name="Evan Akalloo",
+        )
+        self.assertEqual(active_enrollment(evan).pk, own_closed.pk)
+
+
+class SharedEnrollmentCaseForkLoopTest(TestCase):
+    """Two members who each hold their own case must not fork a SHARED enrollment
+    back and forth for ever.
+
+    Production root cause. _primary_enrollment deliberately includes any
+    enrollment the client is a MEMBER PROFILE on, so a family served together
+    resolves to the SAME enrollment for every member. When two of them each held
+    an open approved case, replace_enrollment_for_case_change had no ownership
+    check: each reconcile pass forked the shared enrollment onto its own client's
+    case, undoing the other, so neither ever reached the "same case, nothing to do"
+    exit. One member accumulated 119 enrollments alternating 60/59 between two
+    cases -- six of them inside a single minute.
+    """
+
+    def _client(self, name):
+        from .models import Client
+
+        return Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name=name, last_name="Akalloo",
+            client_added_at=timezone.now(),
+        )
+
+    def _household(self, client):
+        from .models import Household, HouseholdMember
+
+        hh = Household.objects.create(name=f"{client.first_name} HH")
+        HouseholdMember.objects.create(household=hh, client=client, is_primary=True)
+        return hh
+
+    def _case(self, client):
+        from .models import Case, CaseStatus, CaseType, ServiceAuthorizationStatus
+
+        return Case.objects.create(
+            case_id=uuid.uuid4(), client=client, case_type=CaseType.INTERNAL_SERVICE,
+            case_status=CaseStatus.MANAGED, program_name="MTM Meals",
+            household_type="individual",
+            service_authorization_status=ServiceAuthorizationStatus.APPROVED,
+            case_created_at=timezone.now(),
+        )
+
+    def _setup(self):
+        """Owner with a live enrollment; a relative served on it via a profile,
+        each holding their own open approved case."""
+        from .models import (
+            EnrollmentStage, EnrollmentVerification, MemberDietaryProfile,
+        )
+
+        owner = self._client("Liam")
+        relative = self._client("Evan")
+        owner_hh = self._household(owner)
+        self._household(relative)          # separate household record
+        owner_case = self._case(owner)
+        relative_case = self._case(relative)
+        enr = EnrollmentVerification.objects.create(
+            client=owner, household=owner_hh, case=owner_case,
+            stage=EnrollmentStage.SERVICE_ACTIVE, verified_at=timezone.now(),
+        )
+        for c, n in ((owner, "Liam Akalloo"), (relative, "Evan Akalloo")):
+            MemberDietaryProfile.objects.create(
+                enrollment=enr, client=c, member_name=n,
+            )
+        return owner, relative, owner_case, relative_case, enr
+
+    def test_a_relatives_case_cannot_fork_the_owners_enrollment(self):
+        from .models import EnrollmentVerification
+        from .services.lifecycle import replace_enrollment_for_case_change
+
+        owner, relative, _oc, relative_case, enr = self._setup()
+        before = EnrollmentVerification.objects.count()
+
+        result = replace_enrollment_for_case_change(relative, relative_case)
+
+        self.assertFalse(result, "a non-owner must not fork someone else's enrollment")
+        self.assertEqual(EnrollmentVerification.objects.count(), before)
+        enr.refresh_from_db()
+        self.assertEqual(enr.case_id, _oc.case_id, "the owner's case still governs")
+
+    def test_the_owner_can_still_switch_their_own_enrollment(self):
+        """The feature must keep working: a genuine case change still forks."""
+        from .services.lifecycle import replace_enrollment_for_case_change
+
+        owner, _rel, _oc, _rc, enr = self._setup()
+        new_case = self._case(owner)
+
+        self.assertTrue(replace_enrollment_for_case_change(owner, new_case))
+        enr.refresh_from_db()
+        self.assertIn(enr.stage, ("closed", "cancelled"), "old one closed")
+
+    def test_repeated_reconciles_converge_instead_of_looping(self):
+        from .models import EnrollmentVerification
+        from .services.lifecycle import replace_enrollment_for_case_change
+
+        owner, relative, owner_case, relative_case, _enr = self._setup()
+        start = EnrollmentVerification.objects.count()
+        for _ in range(5):
+            replace_enrollment_for_case_change(relative, relative_case)
+            replace_enrollment_for_case_change(owner, owner_case)
+        self.assertEqual(
+            EnrollmentVerification.objects.count(), start,
+            "five reconcile passes must not create a single new enrollment",
+        )
+
+    def test_a_member_served_on_a_relatives_enrollment_gets_no_second_one(self):
+        """reopen_enrollment_for_new_case guarded on the client's OWN enrollments,
+        so a member served on a relative's live enrollment would have had a SECOND
+        enrollment opened -- duplicating their service (22 already-scheduled
+        deliveries in the production case)."""
+        from .models import EnrollmentVerification
+        from .services.lifecycle import reopen_enrollment_for_new_case
+
+        _owner, relative, _oc, relative_case, _enr = self._setup()
+        before = EnrollmentVerification.objects.count()
+
+        self.assertIsNone(reopen_enrollment_for_new_case(relative, relative_case))
+        self.assertEqual(EnrollmentVerification.objects.count(), before)
+
+    def test_a_household_primary_may_still_act_for_the_household(self):
+        from .models import (
+            EnrollmentStage, EnrollmentVerification, HouseholdMember,
+            MemberDietaryProfile,
+        )
+        from .services.lifecycle import _may_replace_enrollment
+
+        owner = self._client("Liam")
+        hh = self._household(owner)
+        dependent = self._client("Evan")
+        HouseholdMember.objects.create(household=hh, client=dependent, is_primary=False)
+        enr = EnrollmentVerification.objects.create(
+            client=owner, household=hh, stage=EnrollmentStage.SERVICE_ACTIVE,
+        )
+        self.assertTrue(_may_replace_enrollment(owner, enr), "owner may")
+        self.assertFalse(_may_replace_enrollment(dependent, enr), "dependent may not")
+
+
+class RemoveMemberPrimaryGuardTest(TestCase):
+    """The "primary cannot be removed" guard must be scoped to THIS household.
+
+    Reported while splitting the AKALLOO family: removing EVAN from LIAM's
+    enrollment failed with "The primary member cannot be removed" -- because the
+    guard asked whether EVAN is the primary of ANY household. He is: his OWN,
+    single-member one. He is only a member PROFILE on LIAM's enrollment, and he is
+    precisely the member who needs removing so the family can be split into
+    per-member enrollments. Same flaw as the Primary badge (see
+    HouseholdPrimaryBadgeTest).
+    """
+
+    def _client(self, name):
+        from .models import Client
+
+        return Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name=name, last_name="Akalloo",
+            client_added_at=timezone.now(),
+        )
+
+    def _household(self, client, primary=True):
+        from .models import Household, HouseholdMember
+
+        hh = Household.objects.create(name=f"{client.first_name} HH")
+        HouseholdMember.objects.create(household=hh, client=client, is_primary=primary)
+        return hh
+
+    def _enrollment(self, owner, household):
+        from .models import EnrollmentStage, EnrollmentVerification
+
+        return EnrollmentVerification.objects.create(
+            client=owner, household=household, stage=EnrollmentStage.SERVICE_ACTIVE,
+        )
+
+    def test_a_relative_who_heads_their_own_household_can_be_removed(self):
+        from .portal.views_members import _is_primary_of_enrollment_household
+
+        owner = self._client("Liam")
+        relative = self._client("Evan")
+        household = self._household(owner)
+        self._household(relative)          # his own, where he IS primary
+        enr = self._enrollment(owner, household)
+
+        self.assertFalse(
+            _is_primary_of_enrollment_household(relative, enr),
+            "primary of his OWN household must not block removal from this one",
+        )
+
+    def test_this_households_primary_is_still_protected(self):
+        from .portal.views_members import _is_primary_of_enrollment_household
+
+        owner = self._client("Liam")
+        household = self._household(owner)
+        enr = self._enrollment(owner, household)
+        self.assertTrue(_is_primary_of_enrollment_household(owner, enr))
+
+    def test_a_dependent_of_this_household_can_be_removed(self):
+        from .models import HouseholdMember
+        from .portal.views_members import _is_primary_of_enrollment_household
+
+        owner = self._client("Liam")
+        household = self._household(owner)
+        dependent = self._client("Evan")
+        HouseholdMember.objects.create(
+            household=household, client=dependent, is_primary=False,
+        )
+        enr = self._enrollment(owner, household)
+        self.assertFalse(_is_primary_of_enrollment_household(dependent, enr))
+
+    def test_an_enrollment_without_a_household_protects_its_owner(self):
+        from .models import EnrollmentStage, EnrollmentVerification
+        from .portal.views_members import _is_primary_of_enrollment_household
+
+        owner = self._client("Solo")
+        other = self._client("Guest")
+        self._household(owner)
+        enr = EnrollmentVerification.objects.create(
+            client=owner, stage=EnrollmentStage.SERVICE_ACTIVE,
+        )
+        self.assertTrue(_is_primary_of_enrollment_household(owner, enr))
+        self.assertFalse(_is_primary_of_enrollment_household(other, enr))
