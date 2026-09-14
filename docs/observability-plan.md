@@ -207,6 +207,30 @@ that could not be verified in advance).
    configuration (IAM, alarms, log groups) or READS log contents -> CloudShell.
    Anything that runs the app (agent install, systemctl, Django) -> the EC2 box.
 
+### Reading the logs
+
+journald entries carry a lot of structured metadata, so raw `aws logs tail` output
+is mostly noise. From CloudShell, this prints just the messages, with tracebacks
+intact and no unicode escaping:
+
+```
+aws logs tail /carecircle/gunicorn --region us-east-2 --since 1h --format short \
+  | python3 -c "import sys,json;[print(json.loads(l.split(' ',1)[1])['body']['MESSAGE']) for l in sys.stdin if l.strip().startswith('2026')]"
+```
+
+Or in Logs Insights on `/carecircle/gunicorn`:
+
+```
+fields @timestamp, body.MESSAGE as msg
+| filter msg like /Traceback|Error|SLOW REQUEST/
+| sort @timestamp desc
+| limit 50
+```
+
+Worth running daily for the first week. The first five minutes of readable logs
+found two real bugs (see 5084cdb), neither of which returned an error page or was
+reported by anybody.
+
 ### Watch the cost for the first week
 
 Ingestion is the driver ($0.50/GB; storage is $0.03/GB-month). nginx access is the
