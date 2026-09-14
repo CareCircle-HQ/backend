@@ -23900,8 +23900,53 @@ class DiagnoseCommandTest(TestCase):
         text = out.getvalue()
 
         self.assertIn("Import runs", text)
-        self.assertIn("RUNNING > 2h", text)
+        self.assertIn("in flight > 2h", text)
         self.assertIn("block features", text)
         self.assertIn("Delivery gaps", text)
         self.assertIn("Read model", text)
         self.assertNotIn("ERROR in", text, "no section may blow up")
+
+    def test_a_pending_member_prep_row_is_named_as_the_blocker(self):
+        """"Prepare Members for PO" refuses to start while its own latest row is
+        PENDING **or** RUNNING, so one abandoned row disables the feature. PENDING
+        is the easy one to miss -- a task Celery never picked up never reaches
+        RUNNING at all."""
+        from datetime import timedelta
+        from io import StringIO
+
+        from django.core.management import call_command
+
+        from .models import ImportRun, ImportRunStatus
+        from .tasks import MEMBER_PREP_SOURCE
+
+        run = ImportRun.objects.create(
+            source=MEMBER_PREP_SOURCE, status=ImportRunStatus.PENDING,
+        )
+        ImportRun.objects.filter(pk=run.pk).update(
+            started_at=timezone.now() - timedelta(days=1),
+        )
+
+        out = StringIO()
+        call_command("diagnose", stdout=out)
+        text = out.getvalue()
+
+        self.assertIn("member_prep latest", text)
+        self.assertIn("BLOCKS", text)
+        self.assertIn("Prepare Members for PO", text)
+
+    def test_a_completed_member_prep_row_is_not_flagged(self):
+        from io import StringIO
+
+        from django.core.management import call_command
+
+        from .models import ImportRun, ImportRunStatus
+        from .tasks import MEMBER_PREP_SOURCE
+
+        ImportRun.objects.create(
+            source=MEMBER_PREP_SOURCE, status=ImportRunStatus.COMPLETED,
+            finished_at=timezone.now(),
+        )
+        out = StringIO()
+        call_command("diagnose", stdout=out)
+        self.assertIn("member_prep latest", out.getvalue())
+        self.assertNotIn("BLOCKS", out.getvalue())
