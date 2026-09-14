@@ -379,14 +379,38 @@ def active_enrollment(client):
     enrollments = [
         e for e in client.enrollments.all() if e.stage not in _INERT
     ]
-    if not enrollments:
+    if not any(e.closed_at is None for e in enrollments):
+        # No LIVE enrollment of their own -- so find the one that actually serves
+        # them. Widened from "no enrollments AT ALL": a member whose own enrollment
+        # is CLOSED used to stop here, and every program action (address, dietary,
+        # kitchen + cadence, hold, member changes, /assign-kitchen/) resolves
+        # through this function, so agents were editing a dead row and nothing
+        # took effect -- reported as "we cannot service this member".
+        #
+        # Two sources, in order of authority:
+        #   1. the household's enrollments (the verification covers the household),
+        #   2. any enrollment where the client is a MEMBER PROFILE -- the ground
+        #      truth of who is being served, and the only link when a family is
+        #      served on ONE enrollment while each person still has a SEPARATE
+        #      household record (production: the AKALLOO family).
+        #
+        # Strictly additive: applied only when it yields a LIVE enrollment, so a
+        # client with nothing live still resolves to their own closed row exactly
+        # as before (1,126 such clients on a production clone, none affected).
+        candidates = []
         membership = getattr(client, "household_membership", None)
         if membership is not None:
-            enrollments = [
-                e
-                for e in membership.household.enrollment_verifications.all()
-                if e.stage not in _INERT
-            ]
+            candidates += list(membership.household.enrollment_verifications.all())
+        candidates += [
+            p.enrollment for p in client.member_profiles.all()
+            if p.enrollment_id
+        ]
+        live = [
+            e for e in candidates
+            if e.stage not in _INERT and e.closed_at is None
+        ]
+        if live:
+            enrollments = live
     if not enrollments:
         return None
     open_ones = [e for e in enrollments if e.closed_at is None]

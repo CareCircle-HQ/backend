@@ -24358,3 +24358,128 @@ class HouseholdPrimaryBadgeTest(TestCase):
             enrollment=enr, client=owner, member_name="Solo Akalloo",
         )
         self.assertEqual(self._serialize(enr), {"Solo Akalloo": True})
+
+
+class ActiveEnrollmentFallsBackToTheServingEnrollmentTest(TestCase):
+    """A member whose own enrollment is CLOSED must resolve to the live one that
+    actually serves them.
+
+    Production (EVAN AKALLOO): his governing case had moved Household ->
+    Individual, and the new open case was already attached to a LIVE enrollment
+    owned by a relative, with EVAN an active member profile on it and 22 upcoming
+    deliveries. But he also owned one CLOSED enrollment of his own, and
+    active_enrollment stopped there -- the household fallback only ran for clients
+    with NO enrollment at all. So the Cases tab showed the new case while the
+    Programs tab showed the old one, and because every program action (address,
+    dietary, kitchen + cadence, hold, member changes, /assign-kitchen/) resolves
+    through this function, agents were editing a dead row: "we cannot service this
+    member".
+
+    Measured on a production clone: of 1,126 clients whose own enrollments are all
+    closed, this changes exactly ONE -- the widening only applies when it finds a
+    genuinely LIVE enrollment.
+    """
+
+    def _client(self, name):
+        from .models import Client
+
+        return Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name=name, last_name="Akalloo",
+            client_added_at=timezone.now(),
+        )
+
+    def _household(self, client):
+        from .models import Household, HouseholdMember
+
+        hh = Household.objects.create(name=f"{client.first_name} HH")
+        HouseholdMember.objects.create(household=hh, client=client, is_primary=True)
+        return hh
+
+    def test_a_profile_on_a_relatives_live_enrollment_wins_over_own_closed_one(self):
+        from .models import (
+            EnrollmentStage, EnrollmentVerification, MemberDietaryProfile,
+        )
+        from .portal.serializers import active_enrollment
+
+        evan = self._client("Evan")
+        liam = self._client("Liam")
+        # Separate household records -- the production shape.
+        evan_hh = self._household(evan)
+        liam_hh = self._household(liam)
+
+        own_closed = EnrollmentVerification.objects.create(
+            client=evan, household=evan_hh, stage=EnrollmentStage.CLOSED,
+            closed_at=timezone.now(),
+        )
+        serving = EnrollmentVerification.objects.create(
+            client=liam, household=liam_hh, stage=EnrollmentStage.SERVICE_ACTIVE,
+        )
+        MemberDietaryProfile.objects.create(
+            enrollment=serving, client=evan, member_name="Evan Akalloo",
+        )
+
+        resolved = active_enrollment(evan)
+        self.assertIsNotNone(resolved)
+        self.assertEqual(
+            resolved.pk, serving.pk,
+            f"must resolve the LIVE serving enrollment, not the closed {own_closed.pk}",
+        )
+
+    def test_an_own_live_enrollment_still_wins(self):
+        """The common case must be untouched: never prefer somebody else's
+        enrollment over the client's own live one."""
+        from .models import (
+            EnrollmentStage, EnrollmentVerification, MemberDietaryProfile,
+        )
+        from .portal.serializers import active_enrollment
+
+        evan = self._client("Evan")
+        liam = self._client("Liam")
+        own_live = EnrollmentVerification.objects.create(
+            client=evan, household=self._household(evan),
+            stage=EnrollmentStage.SERVICE_ACTIVE,
+        )
+        other = EnrollmentVerification.objects.create(
+            client=liam, household=self._household(liam),
+            stage=EnrollmentStage.SERVICE_ACTIVE,
+        )
+        MemberDietaryProfile.objects.create(
+            enrollment=other, client=evan, member_name="Evan Akalloo",
+        )
+        self.assertEqual(active_enrollment(evan).pk, own_live.pk)
+
+    def test_with_nothing_live_the_own_closed_enrollment_is_still_returned(self):
+        """1,126 clients on the clone are in this state; none may change. The
+        closed row is their history and still drives the tab."""
+        from .models import EnrollmentStage, EnrollmentVerification
+        from .portal.serializers import active_enrollment
+
+        evan = self._client("Evan")
+        closed = EnrollmentVerification.objects.create(
+            client=evan, household=self._household(evan),
+            stage=EnrollmentStage.CLOSED, closed_at=timezone.now(),
+        )
+        self.assertEqual(active_enrollment(evan).pk, closed.pk)
+
+    def test_a_closed_serving_enrollment_is_not_resurrected(self):
+        """Only a LIVE candidate may override; a closed relative's enrollment is
+        no better than the client's own."""
+        from .models import (
+            EnrollmentStage, EnrollmentVerification, MemberDietaryProfile,
+        )
+        from .portal.serializers import active_enrollment
+
+        evan = self._client("Evan")
+        liam = self._client("Liam")
+        own_closed = EnrollmentVerification.objects.create(
+            client=evan, household=self._household(evan),
+            stage=EnrollmentStage.CLOSED, closed_at=timezone.now(),
+        )
+        dead = EnrollmentVerification.objects.create(
+            client=liam, household=self._household(liam),
+            stage=EnrollmentStage.CLOSED, closed_at=timezone.now(),
+        )
+        MemberDietaryProfile.objects.create(
+            enrollment=dead, client=evan, member_name="Evan Akalloo",
+        )
+        self.assertEqual(active_enrollment(evan).pk, own_closed.pk)
