@@ -593,19 +593,81 @@ back to restart (with a message), so deploys keep working -- just not gracefully
    this incident, nothing said WHEN. `$time_iso8601` added. It only surfaced the
    first time it was actually needed, which is the usual way.
 
-## Phase 5 -- Optional
+## Phase 5 -- DEFERRED, with triggers
 
-- **ALB access logs -> S3 + Athena**: per-request `target_processing_time` with no
-  agent on the box; good for historical analysis. Pay per GB scanned.
-- **Synthetics canary**: hits the app every minute; alerts before an agent notices.
-- **CloudWatch dashboard**: 3 free, then $3/mo.
-- **X-Ray**: skip. It needs SDK instrumentation and buys little for a
-  single-process monolith.
+Not started, and nothing currently known needs any of it. Recorded with the
+CONDITION that would make each one worth doing, so the decision is "has the
+trigger happened?" rather than a vague "someday".
 
-## Phase 6 -- Correlation (later)
+### ALB access logs -> S3 + Athena
 
-`X-Request-ID` generated in nginx, logged by Django, returned as a response
-header, so a user-reported problem maps to exact log lines.
+**What it adds.** Per-request ALB-side timing (`target_processing_time`,
+`request_processing_time`, `response_processing_time`) with no agent involved, and
+retention limited only by S3. Splits CLIENT time from SERVER time, which nginx
+`rt`/`urt` cannot: a slow mobile uplink and a slow view look similar in `rt`.
+
+**Trigger.** Any of:
+- a question about traffic older than the 90-day CloudWatch retention,
+- a complaint of slowness that nginx says was fast (i.e. suspect the network),
+- wanting per-request history without paying CloudWatch ingest for it.
+
+**Cost.** S3 storage (pennies) + Athena at ~$5/TB SCANNED. Partition by date on
+day one; an unpartitioned table scans everything on every query and that is how
+Athena bills get surprising.
+
+### Synthetics canary
+
+**What it adds.** An AWS-run request every minute, so an outage is detected
+without waiting for real traffic.
+
+**Trigger.** Deployment/outage detection outside working hours becomes a concern.
+NOTE `alb-unhealthy-host` ALREADY covers process death within ~2 minutes on a
+single-instance setup, so the marginal value today is small -- it mainly helps
+when the box is up but the app is broken in a way health checks miss (e.g. a
+500 on the login page).
+
+**Cost.** ~$0.0012 per run -> roughly $5/mo at one minute.
+
+### CloudWatch dashboard
+
+**What it adds.** A single page someone OTHER than the maintainer can look at.
+
+**Trigger.** Somebody besides you needs to see system state, or an incident
+review wants graphs rather than CLI output. Deliberately last: every alarm here
+is push, so a dashboard is for humans who want to browse, not for detection. The
+first 3 dashboards are free.
+
+### X-Ray -- skip
+
+Needs SDK instrumentation and buys little for a single-process monolith. The slow
+-request log plus nginx `rt`/`urt` already localises latency to a view.
+
+## Phase 6 -- Correlation, DEFERRED
+
+**The problem it solves.** An agent says "it broke around 2pm". Today that means
+guessing a time window and grepping. With ~2,600 requests per five minutes at
+peak, matching a report to specific log lines is luck.
+
+**The design.** nginx generates `$request_id` (it has one built in), passes it
+upstream as a header; Django logs it on every slow-request/error line AND returns
+it in the response. The UI surfaces it on an error toast, so a support ticket can
+quote an exact id:
+
+```nginx
+proxy_set_header X-Request-ID $request_id;
+log_format timed '... rid=$request_id ...';
+```
+
+Then a middleware puts it into the log record, and one Logs Insights query on
+`rid=` returns every line for that request -- across nginx AND Django.
+
+**Trigger.** The second time a user-reported problem cannot be located in the
+logs. (It has not happened yet: both real incidents so far were found from the
+alarm timestamp alone, because they were systemic rather than one user's request.)
+
+**Cost.** Free -- it is a header and a log field. The work is small but touches
+nginx, a Django middleware, the error response shape, and the frontend toast, so
+it wants doing deliberately rather than squeezed in.
 
 ---
 
@@ -696,7 +758,13 @@ for the monitoring to work.
   to 30s per poll at a 10s poll interval). Each one wants a short timeout, a
   cache, and ideally not to sit on a polling path. Highest-value remaining sweep.
 
-### Optional
+### Deferred (see Phase 5 / Phase 6 above for the trigger conditions)
 
-Phase 5 (ALB logs to S3/Athena, a Synthetics canary, a dashboard) and Phase 6
-(`X-Request-ID` correlation). Neither is needed for anything currently known.
+- **Phase 5** -- ALB logs to S3/Athena, a Synthetics canary, a dashboard.
+- **Phase 6** -- `X-Request-ID` correlation, so a user-reported problem maps to
+  exact log lines.
+
+Both are written up with the CONDITION that would justify them, so revisiting is
+a yes/no question rather than a re-investigation. Nothing currently known needs
+either: the two real incidents so far were both located from an alarm timestamp,
+because they were systemic rather than one user's request.
