@@ -475,7 +475,45 @@ ReadModelAgeHours      Data page staleness
 ImportRunsInFlight     PENDING+RUNNING
 ImportRunsStuck        ...older than 2h
 ReviewBucket           members needing human review
+UnmappedProgramNames   program identifiers matching NEITHER meals nor boxes
+ServiceTypeBlankWithCase  read-model rows with a case but no product kind
 ```
+
+### Why the last two exist
+
+On 2026-09-15 an Executive dashboard card read "229 pending" above rows of
+"174 meals" and "36 boxes". It had FOUR separate causes, and was found only
+because a human compared two numbers on a screen. These two metrics make that
+class of failure announce itself:
+
+- **`UnmappedProgramNames` (upstream)** fires the day a new Unite Us program
+  arrives whose name matches no keyword. `product_type_kind_for_name` matches on
+  "meal"; "box"/"voucher"/"produce prescription"/"food prescription"/"pantry"/
+  "groceries" -- so a future programme called e.g. "Nutrition Support Benefit"
+  maps to nothing and silently under-counts. Counts DISTINCT identifiers, because
+  the fix is per name: add the keyword. `publish_health_metrics` NAMES them.
+- **`ServiceTypeBlankWithCase` (downstream)** is what a manager sees: rows in a
+  card's total but in neither product row.
+
+Read them together: blank rows with `UnmappedProgramNames = 0` means the code is
+right and the rows just need rebuilding. Blank rows WITH unmapped names means a
+keyword is missing.
+
+`ServiceTypeBlankWithCase` is pinned to the PRIMARY, unlike `ReadModelAgeHours`.
+Freshness should be measured where users read it (the replica); CORRECTNESS must
+be measured against the truth. Reading the replica for this reported phantom rows
+-- 3, then 10, then 21 within minutes -- and a repair loop never converged.
+
+```
+aws cloudwatch put-metric-alarm --region us-east-2 --alarm-name biz-unmapped-program --namespace CareCircle/Business --metric-name UnmappedProgramNames --statistic Maximum --period 900 --evaluation-periods 2 --threshold 0 --comparison-operator GreaterThanThreshold --treat-missing-data notBreaching --alarm-actions $SNS --ok-actions $SNS
+aws cloudwatch put-metric-alarm --region us-east-2 --alarm-name biz-service-type-blank --namespace CareCircle/Business --metric-name ServiceTypeBlankWithCase --statistic Maximum --period 900 --evaluation-periods 2 --threshold 25 --comparison-operator GreaterThanThreshold --treat-missing-data notBreaching --alarm-actions $SNS --ok-actions $SNS
+```
+
+`UnmappedProgramNames` alarms on ANY occurrence -- one unmapped name is a
+five-minute fix and silently wrong numbers until it is done.
+`ServiceTypeBlankWithCase` gets a threshold of 25 rather than 0: a handful of rows
+is normal churn between a case edit and the next rebuild, so alarming at zero
+would flap.
 
 **No new IAM**: `CloudWatchAgentServerPolicy` (already attached for log shipping)
 grants `cloudwatch:PutMetricData`.

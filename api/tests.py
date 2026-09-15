@@ -25567,3 +25567,109 @@ class AnalyticsServiceTypeAgreesWithTheRowsCaseTest(TestCase):
         value = EnrollmentAnalytics.objects.get(client_id=client.pk).service_type
         self.assertEqual(value, "boxes")
         self.assertIsInstance(value, str)
+
+
+class UnmappedProgramNameMetricsTest(TestCase):
+    """Two metrics for one failure, firing at different times.
+
+    The failure: an Executive dashboard card whose total exceeds its own
+    meals + boxes rows. On 2026-09-15 that read "229 pending" over "174 + 36",
+    had FOUR separate causes, and was found only because a human compared two
+    numbers on a screen.
+
+    * UnmappedProgramNames (UPSTREAM) fires the day a new Unite Us program
+      arrives whose name matches no keyword -- before any rebuild, and while the
+      fix is still one line in the catalog.
+    * ServiceTypeBlankWithCase (DOWNSTREAM) measures what a manager actually
+      sees: rows counted in a card's total but in neither product row.
+    """
+
+    def _client(self, name):
+        from .models import Client
+
+        return Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name=name, last_name="Member",
+            client_added_at=timezone.now(),
+        )
+
+    def _case(self, client, program_name="", service_type=""):
+        from .models import Case, CaseStatus, CaseType
+
+        return Case.objects.create(
+            case_id=uuid.uuid4(), client=client, case_type=CaseType.INTERNAL_SERVICE,
+            case_status=CaseStatus.MANAGED, program_name=program_name,
+            service_type=service_type, case_created_at=timezone.now(),
+        )
+
+    def test_a_recognised_program_does_not_count(self):
+        from .services.health_metrics import collect
+
+        before = collect()["UnmappedProgramNames"][0]
+        self._case(
+            self._client("Known"),
+            program_name="Medically Tailored Meals (MTM) - Other Eligible Populations",
+        )
+        self.assertEqual(collect()["UnmappedProgramNames"][0], before)
+
+    def test_a_brand_new_program_name_is_flagged(self):
+        """The realistic future failure: Unite Us adds a program whose name
+        contains none of the keywords."""
+        from .services.health_metrics import collect
+
+        before = collect()["UnmappedProgramNames"][0]
+        self._case(self._client("Novel"), program_name="Nutrition Support Benefit")
+        self.assertEqual(collect()["UnmappedProgramNames"][0], before + 1)
+
+    def test_it_counts_DISTINCT_identifiers_not_cases(self):
+        """The fix is per name -- add one keyword -- so ten cases sharing an
+        unmapped name are one piece of work, not ten."""
+        from .services.health_metrics import collect
+
+        before = collect()["UnmappedProgramNames"][0]
+        for i in range(4):
+            self._case(self._client(f"N{i}"), program_name="Nutrition Support Benefit")
+        self.assertEqual(collect()["UnmappedProgramNames"][0], before + 1)
+
+    def test_service_type_rescues_an_empty_program_name(self):
+        """95 production cases carry an empty program_name while service_type
+        names the product -- those are NOT unmapped."""
+        from .services.health_metrics import collect
+
+        before = collect()["UnmappedProgramNames"][0]
+        self._case(
+            self._client("Rescued"), program_name="",
+            service_type="Produce Prescription/Voucher",
+        )
+        self.assertEqual(collect()["UnmappedProgramNames"][0], before)
+
+    def test_a_case_with_nothing_recorded_is_not_counted_as_unmapped(self):
+        """Missing DATA is a different problem from an unrecognised program: there
+        is no keyword to add. ServiceTypeBlankWithCase covers it instead."""
+        from .services.health_metrics import collect
+
+        before = collect()["UnmappedProgramNames"][0]
+        self._case(self._client("Empty"), program_name="", service_type="")
+        self.assertEqual(collect()["UnmappedProgramNames"][0], before)
+
+    def test_the_command_names_the_unmapped_identifiers(self):
+        from .management.commands.publish_health_metrics import (
+            _unmapped_program_identifiers,
+        )
+
+        self._case(self._client("Novel"), program_name="Nutrition Support Benefit")
+        self.assertIn("Nutrition Support Benefit", _unmapped_program_identifiers())
+
+    def test_the_blank_row_metric_reads_the_PRIMARY(self):
+        """It is a CORRECTNESS check, unlike ReadModelAgeHours which measures
+        user-visible freshness. Reading a lagging replica reported phantom rows on
+        2026-09-15 (3, then 10, then 21 within minutes) and a repair loop never
+        converged because of it."""
+        import inspect
+
+        from .services import health_metrics
+
+        src = inspect.getsource(health_metrics.collect)
+        self.assertIn(
+            'using("default")', src,
+            "ServiceTypeBlankWithCase must be pinned to the primary",
+        )

@@ -39,9 +39,9 @@ def collect():
     from django.db.models import Count, Max
 
     from ..models import (
-        EnrollmentAnalytics, EnrollmentStage, EnrollmentVerification, ImportRun,
-        ImportRunStatus, ScheduleStatus, SERVICE_EXCLUDED_MEMBER_STATUSES,
-        UniteUsCredential,
+        Case, CaseType, EnrollmentAnalytics, EnrollmentStage,
+        EnrollmentVerification, ImportRun, ImportRunStatus, ScheduleStatus,
+        SERVICE_EXCLUDED_MEMBER_STATUSES, UniteUsCredential,
     )
 
     now = timezone.now()
@@ -92,6 +92,12 @@ def collect():
     # --- Read-model freshness ----------------------------------------------
     # The Data page serves this table. When it goes stale the page silently shows
     # yesterday's reality, which no technical alarm can detect.
+    #
+    # NOTE this reads the REPLICA when one is configured (AnalyticsRouter routes
+    # EnrollmentAnalytics reads off the primary), so the number is REBUILD AGE
+    # PLUS REPLICATION LAG. Deliberately not pinned to the primary: this is the
+    # freshness a user of the Data page actually experiences, which is what the
+    # alarm should reflect. Just do not read it as "when did the rebuild finish".
     refreshed = EnrollmentAnalytics.objects.aggregate(t=Max("refreshed_at"))["t"]
     # An EMPTY read model is worse than a stale one -- the Data page has nothing
     # at all. Reporting -1 (or 0) for "never refreshed" would sit below any
@@ -117,6 +123,54 @@ def collect():
     metrics["ImportRunsInFlight"] = (in_flight.count(), "Count")
     metrics["ImportRunsStuck"] = (
         in_flight.filter(started_at__lt=now - timedelta(hours=2)).count(), "Count",
+    )
+
+    # --- Meals/Boxes classification ----------------------------------------
+    # Two signals for one failure, because they fire at different times.
+    #
+    # The failure: an Executive dashboard card shows a total above rows of
+    # "meals" and "boxes" that do not sum to it, because some members' product
+    # kind is blank. On 2026-09-15 that read "229 pending" over "174 + 36", and it
+    # had FOUR separate causes. It was found by a human comparing two numbers on a
+    # screen -- which is exactly what a metric is for.
+    from ..services.catalog import product_type_kind_for_name
+
+    # 1. UPSTREAM, fires the day a new program arrives. product_type_kind_for_name
+    #    matches by KEYWORD ("meal"; "box"/"voucher"/"produce prescription"/
+    #    "food prescription"/"pantry"/"groceries"), so a future Unite Us program
+    #    called e.g. "Nutrition Support Benefit" maps to nothing and silently
+    #    starts under-counting. Counts DISTINCT identifiers rather than cases,
+    #    because the fix is per name: add the keyword to the catalog.
+    #    Only non-empty values: a case with nothing recorded is missing DATA, not
+    #    an unrecognised program, and is covered by the second metric.
+    pairs = (
+        Case.objects.filter(case_type=CaseType.INTERNAL_SERVICE)
+        .values_list("program_name", "service_type").distinct()
+    )
+    unmapped = {
+        (program or service).strip()
+        for program, service in pairs
+        if (program or service)
+        and not (
+            product_type_kind_for_name(program)
+            or product_type_kind_for_name(service)
+        )
+    }
+    metrics["UnmappedProgramNames"] = (len(unmapped), "Count")
+
+    # 2. DOWNSTREAM, the thing a manager actually sees: read-model rows that HAVE
+    #    a case but no product kind, i.e. rows counted in a card's total while
+    #    appearing in neither product row.
+    #
+    #    PINNED TO THE PRIMARY, unlike ReadModelAgeHours above. That one measures
+    #    user-visible freshness, so reading the replica is right; this is a
+    #    CORRECTNESS check, and reading a lagging replica reports phantom rows --
+    #    on 2026-09-15 the same count read 3, then 10, then 21 within minutes and
+    #    a repair loop never converged because of it.
+    metrics["ServiceTypeBlankWithCase"] = (
+        EnrollmentAnalytics.objects.using("default")
+        .exclude(company_status="no_case").filter(service_type="").count(),
+        "Count",
     )
 
     # --- Members needing human review --------------------------------------
