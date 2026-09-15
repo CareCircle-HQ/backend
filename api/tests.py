@@ -25242,3 +25242,107 @@ class SyncDeliveryCalendarsProgressTest(TestCase):
         ):
             call_command("sync_delivery_calendars", stdout=out)
         self.assertIn("Done:", out.getvalue())
+
+
+class ServiceTypeFallsBackToTheCaseTest(TestCase):
+    """Meals/Boxes must resolve for a member who has a CASE but no enrollment.
+
+    Reported from the Executive dashboard: a card read "229 pending" above rows
+    of "174 meals" and "36 boxes" -- 19 members counted in the total but in
+    NEITHER product row. `_service_type_for_client` consulted only enrollments
+    (the member's own, then their household's) and returned "" when none named a
+    known product, so a member with an open case and no enrollment yet resolved
+    to blank.
+
+    The information was there all along: on a production clone all 18 such rows
+    were cleanly classifiable from their case program name -- "Medically Tailored
+    Meals (MTM) - ..." -> meals, "... Food Prescription" -> boxes. After the fix
+    that cohort went from total=256 meals=192 boxes=46 (gap 18) to
+    meals=206 boxes=50 (gap 0).
+    """
+
+    def _client(self, name="Case", last="Only"):
+        from .models import Client
+
+        return Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name=name, last_name=last,
+            client_added_at=timezone.now(),
+        )
+
+    def _case(self, client, program_name, **kw):
+        from .models import Case, CaseStatus, CaseType
+
+        return Case.objects.create(
+            case_id=uuid.uuid4(), client=client, case_type=CaseType.INTERNAL_SERVICE,
+            case_status=kw.pop("case_status", CaseStatus.MANAGED),
+            program_name=program_name, case_created_at=timezone.now(), **kw,
+        )
+
+    def _resolve(self, client):
+        from .models import Client
+        from .portal.views_members import MembersListView
+
+        # Re-fetch with the prefetches both real callers use.
+        fresh = Client.objects.prefetch_related(
+            "enrollments", "cases",
+            "household_membership__household__enrollment_verifications",
+        ).get(pk=client.pk)
+        return str(MembersListView._service_type_for_client(fresh) or "")
+
+    def test_a_meals_case_with_no_enrollment_resolves_to_meals(self):
+        client = self._client()
+        self._case(client, "Medically Tailored Meals (MTM) - Other Eligible Populations")
+        self.assertEqual(self._resolve(client), "meals")
+
+    def test_a_boxes_case_with_no_enrollment_resolves_to_boxes(self):
+        client = self._client()
+        self._case(
+            client,
+            "Medically Tailored or Nutritionally Appropriate Food Prescription",
+        )
+        self.assertEqual(self._resolve(client), "boxes")
+
+    def test_an_enrollment_still_wins_over_the_case(self):
+        """The case is a FALLBACK. An enrollment naming a product is the better
+        source -- it is what the member is actually being served."""
+        from .models import EnrollmentStage, EnrollmentVerification
+
+        client = self._client()
+        self._case(client, "Medically Tailored or Nutritionally Appropriate Food Prescription")
+        EnrollmentVerification.objects.create(
+            client=client, stage=EnrollmentStage.SERVICE_ACTIVE,
+            program_name="Medically Tailored Meals (MTM) - Other Eligible Populations",
+        )
+        self.assertEqual(self._resolve(client), "meals")
+
+    def test_a_non_internal_service_case_is_ignored(self):
+        from .models import CaseType
+
+        client = self._client()
+        case = self._case(client, "Medically Tailored Meals (MTM) - Other")
+        case.case_type = CaseType.NAVIGATION
+        case.save(update_fields=["case_type"])
+        self.assertEqual(self._resolve(client), "")
+
+    def test_an_unrecognised_program_name_still_resolves_to_blank(self):
+        """The fix must not invent a kind. Blank remains correct when no program
+        name names a known product."""
+        client = self._client()
+        self._case(client, "Some Programme We Have Never Heard Of")
+        self.assertEqual(self._resolve(client), "")
+
+    def test_ordering_uses_governing_case_key_and_survives_a_date_only_case(self):
+        """Regression on a trap in my own first attempt: case_created_at is a
+        DATETIME and date_opened a DATE, so sorting on `a or b` raises TypeError
+        as soon as a case carries only the latter. governing_case_key handles it."""
+        from datetime import date
+
+        client = self._client()
+        older = self._case(
+            client, "Medically Tailored Meals (MTM) - Other Eligible Populations",
+        )
+        older.case_created_at = None
+        older.date_opened = date(2026, 1, 1)
+        older.save(update_fields=["case_created_at", "date_opened"])
+
+        self.assertEqual(self._resolve(client), "meals")
