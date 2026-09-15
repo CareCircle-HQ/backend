@@ -37,6 +37,13 @@ User=ubuntu
 Group=www-data
 WorkingDirectory=/home/ubuntu/backend
 EnvironmentFile=/home/ubuntu/backend/.env
+# Without this, Python BLOCK-BUFFERS stdout/stderr into journald's pipe and the
+# service looks dead: on first install the log showed "beat: Starting..." and then
+# nothing for minutes, with no banner, no broker line and no dispatches -- while
+# beat was in fact fine. Third time this buffering hid what a process was doing on
+# 2026-09-15 (an empty rebuild log after a kill, a silent sync_delivery_calendars,
+# then this), which is why AGENTS.md now mandates `python -u` for long commands.
+Environment=PYTHONUNBUFFERED=1
 
 ExecStart=/home/ubuntu/backend/venv/bin/celery -A backend beat \
     --loglevel=info \
