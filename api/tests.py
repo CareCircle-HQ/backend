@@ -25141,3 +25141,65 @@ class ServiceHealthMetricsTest(TestCase):
         ) as pub:
             self.assertEqual(publish_health_metrics(), 8)
         pub.assert_called_once()
+
+
+class SyncDeliveryCalendarsProgressTest(TestCase):
+    """`sync_delivery_calendars` must show signs of life.
+
+    It printed one line, then ran silently for minutes, then printed "Done" --
+    even though sync_active_calendars already accepts a progress_cb (the "Prepare
+    Members for PO" task uses it to drive a UI percentage). Tailing the log could
+    not distinguish a long run from a hung one, which is the only question an
+    operator has while watching it.
+    """
+
+    def test_progress_is_reported_every_few_percent(self):
+        from io import StringIO
+        from unittest.mock import patch
+
+        from django.core.management import call_command
+
+        def fake_sync(from_date=None, progress_cb=None):
+            for i in range(1, 101):
+                if progress_cb:
+                    progress_cb(i, 100)
+            return {
+                "enrollments": 100, "plans_created": 0, "added": 0,
+                "removed": 0, "updated": 0,
+            }
+
+        out = StringIO()
+        with patch(
+            "api.management.commands.sync_delivery_calendars.sync_active_calendars",
+            side_effect=fake_sync,
+        ):
+            call_command("sync_delivery_calendars", stdout=out)
+
+        text = out.getvalue()
+        self.assertIn("Reconciling", text)
+        self.assertIn("Done:", text)
+        pct_lines = [ln for ln in text.splitlines() if "enrollments" in ln and "%" in ln]
+        self.assertGreaterEqual(len(pct_lines), 10, f"expected ~20 updates: {text}")
+        self.assertLessEqual(len(pct_lines), 25, "every 5%, not every row")
+
+    def test_a_zero_total_does_not_divide_by_zero(self):
+        from io import StringIO
+        from unittest.mock import patch
+
+        from django.core.management import call_command
+
+        def fake_sync(from_date=None, progress_cb=None):
+            if progress_cb:
+                progress_cb(0, 0)
+            return {
+                "enrollments": 0, "plans_created": 0, "added": 0,
+                "removed": 0, "updated": 0,
+            }
+
+        out = StringIO()
+        with patch(
+            "api.management.commands.sync_delivery_calendars.sync_active_calendars",
+            side_effect=fake_sync,
+        ):
+            call_command("sync_delivery_calendars", stdout=out)
+        self.assertIn("Done:", out.getvalue())
