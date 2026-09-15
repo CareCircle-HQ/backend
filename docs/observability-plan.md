@@ -550,16 +550,30 @@ is never released. systemd has no default reload action, so the unit needs
 `deploy/gunicorn.service`. nginx moved from `restart` to `reload` for the same
 reason.
 
-To make deploys graceful on the box:
+To make deploys graceful on the box, use a systemd DROP-IN rather than replacing
+the unit. `deploy/gunicorn.service` is a reference copy reconstructed from
+`systemctl cat`, and overwriting a working unit with a reconstruction risks
+changing how gunicorn runs (worker count, socket path) to fix a one-line gap:
 
 ```
-sudo cp ~/backend/deploy/gunicorn.service /etc/systemd/system/gunicorn.service
+sudo mkdir -p /etc/systemd/system/gunicorn.service.d
+printf '[Service]\nExecReload=/bin/kill -s HUP $MAINPID\n' | sudo tee /etc/systemd/system/gunicorn.service.d/reload.conf
 sudo systemctl daemon-reload
 sudo systemctl reload gunicorn && echo "graceful reload works"
 ```
 
-Until that is installed, `deploy.sh` detects the failed reload and falls back to
-restart (with a message), so deploys keep working -- just not gracefully.
+Verify, and note what "graceful" means here:
+
+```
+systemctl show -p ExecReload gunicorn
+systemctl show -p ActiveEnterTimestamp gunicorn   # UNCHANGED by a reload
+```
+
+A reload replaces the workers while the service keeps running -- which is why the
+listening socket survives and nginx never sees a missing file.
+
+Until the drop-in is installed, `deploy.sh` detects the failed reload and falls
+back to restart (with a message), so deploys keep working -- just not gracefully.
 
 **Two lessons worth keeping.**
 
