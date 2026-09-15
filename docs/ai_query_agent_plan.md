@@ -38,6 +38,110 @@ A management user who gets a confidently wrong number makes a decision on it.
 GLOSSARY -- each business term defined once, in code, mapped to one query fragment
 -- and the agent may only use terms from it. Anything else: "I can't express that."
 
+## Phase 0 in progress -- the glossary, VERIFIED against the schema
+
+Every term below was checked against the live schema and production data rather
+than accepted as written. Three of the first eight were wrong or unanswerable,
+which is the entire argument for doing this before any code.
+
+### Verified as stated
+
+| Term | Definition | Check |
+|---|---|---|
+"active" | enrollment `stage = service_active` | read model `stage` has it (14,831 rows) |
+"On Hold" | enrollment `stage = on_hold` | confirmed (4,087 rows) |
+"team" | `analytics.team` | populated 54,535 / 76,426 |
+"no delivery plan" | no `delivery_schedules` with `status = scheduled` | as used by `diagnose` + health metrics |
+"servable" | member status NOT IN `SERVICE_EXCLUDED_MEMBER_STATUSES` | existing constant -- reuse it, do not restate it |
+"household" | group by `household_id` | read model is member-grain, so this is an aggregation |
+
+### Corrected
+
+**"Ineligible" is NOT an enrollment stage.** There is no such stage
+(`pending_validation, validated, pending_verification, verified,
+kitchen_assignment, service_active, service_complete, closed, on_hold, cancelled,
+disregarded, scheduled_extension`). It lives on `Client.lifecycle_stage` -- and
+there are TWO values, which the code gates on TOGETHER:
+
+```python
+if (client.lifecycle_stage or "") in (ClientStage.NOT_ELIGIBLE, ClientStage.INELIGIBLE):
+```
+(`serializers.py` -- "the hard-ineligible off-ramp, or the LEGACY not_eligible denial")
+
+Three candidate definitions, three different answers:
+
+```
+read_model.eligibility == 'ineligible'              21,542   <- what the Data page shows
+lifecycle_stage == 'ineligible'                     21,694
+lifecycle_stage IN ('ineligible','not_eligible')    22,393   <- what the CODE gates on
+```
+
+**~850 members of spread on one word.** Per Q2 (same data as the Data page) the
+glossary uses `read_model.eligibility`, and this divergence is documented rather
+than discovered later by a manager comparing two screens.
+
+**"Individual" collides with itself.** Two distinct meanings, both real here:
+
+| meaning | maps to | seen in |
+|---|---|---|
+grain -- one row per member | no household grouping | "show me individuals with..." |
+case scope | `Case.household_type = 'individual'` | EVAN and LIAM each holding one, which caused this week's 149-enrollment fork loop |
+
+So the glossary needs separate words -- "per member" for the grain,
+"individual-scope case" / "household-scope case" for the case attribute -- and the
+interpretation line must show which was used, because the words genuinely overlap.
+
+**"open IS case" -- WHICH governing case?** The codebase has two definitions
+differing by ~443 cases. The read model uses
+`governing_service_case_for_display(client)`, plus inheritance: a caseless member
+BORROWS the household primary's case (unless `inherit_blocked`). The glossary
+therefore pins to the read model's `case_*` columns.
+
+> KNOWN DIVERGENCE: the Executive dashboard uses the OTHER definition
+> (`governing_internal_case_ids`). The agent will disagree with it. Documented on
+> purpose -- somebody will otherwise report it as an agent bug.
+
+### Blocked -- need one read-model column each
+
+`company_status` is deliberately COARSE and collapses exactly the distinctions
+these terms need (`enrollment_analytics._company_status`):
+
+```python
+if (parity.get("out_of_orbit") or parity.get("out_of_range") ...):
+    return "unable"     # both -> one bucket
+if (parity.get("paused") or member_status == "nutritionist_paused" ...):
+    return "paused"     # paused + nutritionist_paused -> one bucket
+```
+
+| Term | Wanted | Blocked because |
+|---|---|---|
+"Out of Orbit" | member status `out_of_orbit` (313) | folded into `company_status = unable` |
+"Out of Range" | member status `out_of_range` (291) | folded into `company_status = unable` |
+"paused" (precise) | member status `paused` (1,479) | `company_status = paused` is 1,793 -- a different, wider set |
+"individual-scope case" | `case.household_type` | not stored in the read model at all |
+
+**Proposed: two columns on `EnrollmentAnalytics`.**
+
+1. `member_status` -- the raw `MemberDietaryProfile.status`. Note the builder
+   ALREADY computes it and passes it into `_company_status`; it simply is not
+   persisted. One line in the row dict plus a migration.
+2. `case_household_type` -- individual vs household scope.
+
+Between them these unlock the motivating question, the whole
+out-of-orbit / out-of-range / nutritionist-paused family, and the case-scope
+questions behind EVAN, NAVITA and SKYLAR. Without them, four of the terms
+management just asked for cannot be expressed at all.
+
+Cheap, and precedented: the `medicaid_id` fix on 2026-09-15 was the same shape
+(one builder line, then a rebuild).
+
+### The lesson from doing this
+
+Of the first eight terms: **five verified, one wrong (`Ineligible`), one ambiguous
+with itself (`Individual`), and four blocked on missing columns.** Had the agent
+been built first, each of those would have surfaced as a confidently wrong answer
+to a manager instead of a line in a table.
+
 ## Decisions taken
 
 ### 1. The model emits a validated query IR, never SQL
