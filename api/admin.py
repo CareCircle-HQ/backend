@@ -181,7 +181,17 @@ class ProviderAdmin(admin.ModelAdmin):
 
 @admin.register(ProgramMainCategory)
 class ProgramMainCategoryAdmin(admin.ModelAdmin):
-    list_display = ("name", "created_at", "updated_at")
+    """``is_active`` marks a category as a program area we are PROCESSING.
+
+    It is the source of the available service types -- "Housing" was activated to
+    begin processing housing programs -- so it needs to be visible and filterable
+    rather than buried in the change form. Editable from the list so activating a
+    category is one click.
+    """
+
+    list_display = ("name", "is_active", "created_at", "updated_at")
+    list_filter = ("is_active",)
+    list_editable = ("is_active",)
     search_fields = ("name",)
     ordering = ("name",)
 

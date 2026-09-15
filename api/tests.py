@@ -25734,3 +25734,114 @@ class ClosedCaseSweepIsGatedTest(TestCase):
                 hasattr(module, func),
                 f"beat entry {name!r} points at {path!r}, which does not exist",
             )
+
+
+class HousingInternalServiceProgramTest(TestCase):
+    """Housing programs are Internal Services of a different TYPE.
+
+    We are beginning to process housing programs. The three Dwelling Assessment /
+    SOW Development programs are the housing service WE deliver, so they move from
+    External to Internal Services with `case_type = housing`; every other housing
+    program (the 7 under the active ProgramMainCategory "Housing" -- Asthma
+    Remediation, Tenancy Sustaining Services, ...) stays external.
+
+    Migrations are disabled under `manage.py test` (see AGENTS.md), so these build
+    their own ActiveProgram rows rather than asserting on migration 0262's output.
+    """
+
+    DWELLING = (
+        "Dwelling Assessment & Statement of Work (SOW) Development - "
+        "Modifications and Remediation Service - Brooklyn"
+    )
+
+    def test_housing_is_a_valid_program_type(self):
+        from .models import ActiveProgram
+
+        self.assertIn("housing", [c[0] for c in ActiveProgram.CaseType.choices])
+
+    def test_an_internal_housing_program_routes_to_INTERNAL_SERVICE(self):
+        """case_category is the authoritative routing label, so a housing program
+        marked Internal Services drives the service lifecycle."""
+        from .models import ActiveProgram, CaseType
+        from .serializers import derive_case_type_from_active_program
+
+        ActiveProgram.objects.create(
+            program_name=self.DWELLING, case_category="Internal Services",
+            case_type=ActiveProgram.CaseType.HOUSING, main_category="Housing",
+        )
+        self.assertEqual(
+            derive_case_type_from_active_program(self.DWELLING),
+            CaseType.INTERNAL_SERVICE,
+        )
+
+    def test_the_singular_and_plural_category_spellings_both_route(self):
+        """Existing rows use 'Internal Services' (plural); _CATEGORY_TO_CASE_TYPE
+        accepts both, and the migration matches the existing spelling."""
+        from .models import ActiveProgram, CaseType
+        from .serializers import derive_case_type_from_active_program
+
+        for i, spelling in enumerate(("Internal Service", "Internal Services")):
+            ActiveProgram.objects.create(
+                program_name=f"Housing Programme {i}", case_category=spelling,
+                case_type=ActiveProgram.CaseType.HOUSING,
+            )
+            self.assertEqual(
+                derive_case_type_from_active_program(f"Housing Programme {i}"),
+                CaseType.INTERNAL_SERVICE, spelling,
+            )
+
+    def test_other_housing_programs_stay_external(self):
+        """Only the three named programs become internal. The rest are referrals
+        out and must NOT enter the service lifecycle."""
+        from .models import ActiveProgram, CaseType
+        from .serializers import derive_case_type_from_active_program
+
+        for name in ("Tenancy Sustaining Services", "Asthma Remediation",
+                     "Rent/Temporary Housing Rent Payment Assistance"):
+            ActiveProgram.objects.create(
+                program_name=name, case_category="External Services",
+                case_type=ActiveProgram.CaseType.HOUSING, main_category="Housing",
+            )
+            self.assertEqual(
+                derive_case_type_from_active_program(name),
+                CaseType.EXTERNAL_SERVICE, name,
+            )
+
+    def test_a_housing_program_is_NOT_a_meals_or_boxes_product(self):
+        """Consequence worth pinning: product_type_kind_for_name matches food
+        keywords, so a housing program resolves to NO product kind. That is
+        correct -- and it means housing cases will show a blank service_type and
+        register in the UnmappedProgramNames health metric until the Meals/Boxes
+        reporting explicitly excludes non-food types.
+        """
+        from .services.catalog import product_type_kind_for_name
+
+        self.assertIsNone(product_type_kind_for_name(self.DWELLING))
+        self.assertIsNone(
+            product_type_kind_for_name("Dwelling Assessment & SOW Development"),
+        )
+
+    def test_the_default_program_type_is_still_food(self):
+        """Backwards compatibility: every program predating housing is food, and
+        an omitted case_type must not silently become housing."""
+        from .models import ActiveProgram
+
+        p = ActiveProgram.objects.create(program_name="Some Meals Programme")
+        self.assertEqual(p.case_type, ActiveProgram.CaseType.FOOD)
+
+
+class ProgramMainCategoryAdminTest(TestCase):
+    """`is_active` marks a category as a program area we are processing, and is
+    the source of the available service types -- "Housing" was activated to begin
+    this work. It must be visible and filterable in the admin, not buried in the
+    change form."""
+
+    def test_is_active_is_listed_filterable_and_editable(self):
+        from django.contrib import admin as dj_admin
+
+        from .models import ProgramMainCategory
+
+        cfg = dj_admin.site._registry[ProgramMainCategory]
+        self.assertIn("is_active", cfg.list_display)
+        self.assertIn("is_active", cfg.list_filter)
+        self.assertIn("is_active", cfg.list_editable)

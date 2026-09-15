@@ -3238,7 +3238,20 @@ class ActiveProgram(models.Model):
     """
 
     class CaseType(models.TextChoices):
+        """The service TYPE a program belongs to, within its case category.
+
+        Internal Services is no longer food-only: housing programs (Dwelling
+        Assessment / SOW Development) are internal services of a different TYPE.
+        The rule is one governing internal-service case PER TYPE, so a member can
+        hold a Food case and a Housing case at once without them competing.
+
+        Active types are tracked in ``ProgramMainCategory.is_active`` (Housing was
+        activated to begin processing housing programs); this enum is what the
+        routing code binds to.
+        """
+
         FOOD = "food", "Food"
+        HOUSING = "housing", "Housing"
         TRANSPORTATION = "transportation", "Transportation"
 
     class ServiceType(models.TextChoices):
@@ -3266,8 +3279,10 @@ class ActiveProgram(models.Model):
     # True when the program name contains the word "Household" (a household
     # pathway). Auto-derived from ``program_name`` on save.
     is_for_household = models.BooleanField(default=False)
-    # Food vs Transportation domain. Defaults to Food (every internal-service
-    # program today is food); set to Transportation for transport programs.
+    # The service TYPE within the case category (Food / Housing / Transportation).
+    # Defaults to Food for backwards compatibility -- every program predating the
+    # housing work is food. Internal-service routing is per TYPE: one governing
+    # internal-service case for each.
     case_type = models.CharField(
         max_length=20, choices=CaseType.choices, default=CaseType.FOOD
     )
