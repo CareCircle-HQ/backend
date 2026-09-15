@@ -12,6 +12,32 @@ from django.conf import settings
 from django.core.management.base import BaseCommand
 
 
+def _unmapped_program_identifiers():
+    """The distinct program identifiers that map to neither product kind.
+
+    Named rather than counted because the fix is per identifier: add its keyword
+    to ``api.services.catalog.product_type_kind_for_name``.
+    """
+    from api.models import Case, CaseType
+    from api.services.catalog import product_type_kind_for_name
+
+    pairs = (
+        Case.objects.filter(case_type=CaseType.INTERNAL_SERVICE)
+        .values_list("program_name", "service_type").distinct()
+    )
+    return sorted(
+        {
+            (program or service).strip()
+            for program, service in pairs
+            if (program or service)
+            and not (
+                product_type_kind_for_name(program)
+                or product_type_kind_for_name(service)
+            )
+        }
+    )
+
+
 def _stranded_without_cadence():
     """Enrollment ids that are service_active with a kitchen and a servable
     member, but have no delivery_weekdays -- so no script can build them a plan."""
@@ -80,6 +106,32 @@ class Command(BaseCommand):
             )
             for pk in _stranded_without_cadence():
                 self.stdout.write(f"      enrollment {pk}")
+        unmapped = metrics.get("UnmappedProgramNames", (0, ""))[0]
+        if unmapped:
+            # Name them: the fix is per identifier -- add the keyword to
+            # api/services/catalog.product_type_kind_for_name.
+            self.stdout.write(
+                self.style.ERROR(
+                    f"\n  {unmapped} program identifier(s) map to NEITHER meals nor "
+                    "boxes. Dashboard cards will under-count until the keyword is "
+                    "added to product_type_kind_for_name:"
+                )
+            )
+            for name in _unmapped_program_identifiers():
+                self.stdout.write(f"      {name!r}")
+
+        blank = metrics.get("ServiceTypeBlankWithCase", (0, ""))[0]
+        if blank:
+            self.stdout.write(
+                self.style.WARNING(
+                    f"\n  {blank} read-model row(s) have a case but no Meals/Boxes "
+                    "kind, so dashboard cards will not sum. If UnmappedProgramNames "
+                    "is 0 these just need rebuilding:\n"
+                    "      rebuild the ids from the PRIMARY -- reading the replica "
+                    "gives a stale, partial list (see AGENTS.md)"
+                )
+            )
+
         age = metrics.get("ReadModelAgeHours", (0, ""))[0]
         if age is not None and age > 12:
             self.stdout.write(
