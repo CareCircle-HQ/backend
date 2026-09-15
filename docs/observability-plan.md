@@ -515,7 +515,14 @@ condition PERSISTED, which is what makes it worth an email.
 
 `DeliveryGapsNoPlan` is deliberately NOT alarmed: it sat at 19 with 17 of them
 needing a member returned to service, so an alarm would be permanently ON and
-therefore ignored. `DeliveryGapsServable` is the actionable half.
+therefore ignored.
+
+`DeliveryGapsServable` (2) is the half worth acting on -- but see "Still open":
+production taught us those two need an AGENT, not a script, so
+`DeliveryGapsRepairable` was added for the genuinely script-fixable subset (0
+today). If you want an alarm that is always actionable by a script, alarm on
+`DeliveryGapsRepairable`; if you want to know a member is not being fed at all,
+alarm on `DeliveryGapsServable` and accept that clearing it needs a person.
 
 ## Incident 2026-09-15 15:38 UTC -- every deploy was a small outage
 
@@ -657,9 +664,20 @@ for the monitoring to work.
   deployed format has no timestamp, so reading the file on the box during an
   incident cannot answer "is this happening now?" -- which cost time on
   2026-09-15.
-- **Clear the two standing `biz-*` conditions** so those alarms mean something:
-  `python manage.py sync_delivery_calendars` (2 repairable households) and close
-  the `delivery_pod` run PENDING since 08-24.
+- ~~Close the `delivery_pod` run PENDING since 08-24~~ -- DONE, `ImportRunsStuck`
+  is now 0. POD import has no in-flight guard, so it had been blocking nothing.
+- **`DeliveryGapsServable` = 2 needs an AGENT, not a script.** Both enrollments
+  (15942, 12175) are `service_active` with a kitchen, a verified active member and
+  an address -- but `delivery_weekdays = []`. No cadence means nothing to build a
+  plan from, so `sync_delivery_calendars` walked all 15,731 enrollments and
+  correctly changed nothing. An agent must assign a cadence on the Programs tab.
+  (12175 also lacks nutritionist approval.)
+
+  This corrected the metric itself: `DeliveryGapsRepairable` now counts only the
+  stranded households that HAVE a cadence, and `publish_health_metrics` names the
+  enrollment ids that need a human instead of suggesting a command that cannot
+  help. The old wording -- "fixable by a calendar rebuild" -- was wrong for every
+  case actually in production.
 
 ### Worth investigating
 

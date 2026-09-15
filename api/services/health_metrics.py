@@ -57,15 +57,27 @@ def collect():
         .exclude(delivery_schedules__status=ScheduleStatus.SCHEDULED)
         .distinct().prefetch_related("member_profiles")[:500]
     )
-    servable = sum(
-        1 for e in stranded
+    servable_rows = [
+        e for e in stranded
         if any(
             p.status not in SERVICE_EXCLUDED_MEMBER_STATUSES
             for p in e.member_profiles.all()
         )
-    )
+    ]
+    # Split by WHO can fix it, because that is the only thing the number is for.
+    # A household with delivery_weekdays but no plan is script-repairable
+    # (sync_delivery_calendars rebuilds from the cadence). One with NO weekdays
+    # cannot be: there is nothing to infer delivery days from, and no script may
+    # invent which days a member gets fed -- an agent must assign a cadence.
+    #
+    # Learned the hard way: both of production's stranded households had
+    # weekdays=[], so the "fixable by a calendar rebuild" advice attached to this
+    # metric was wrong. sync_delivery_calendars walked all 15,731 enrollments and
+    # correctly changed nothing.
+    repairable = [e for e in servable_rows if (e.delivery_weekdays or [])]
     metrics["DeliveryGapsNoPlan"] = (len(stranded), "Count")
-    metrics["DeliveryGapsServable"] = (servable, "Count")
+    metrics["DeliveryGapsServable"] = (len(servable_rows), "Count")
+    metrics["DeliveryGapsRepairable"] = (len(repairable), "Count")
 
     # --- Unite Us credential pool ------------------------------------------
     # Expired sessions are how the 2026-09-14 outage began: refreshes walked the

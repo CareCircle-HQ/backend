@@ -25083,7 +25083,46 @@ class ServiceHealthMetricsTest(TestCase):
         )
         self.assertEqual(
             after["DeliveryGapsServable"][0], before["DeliveryGapsServable"][0] + 1,
-            "an active member on it makes the gap repairable",
+            "an active member on it makes the gap worth acting on",
+        )
+        self.assertEqual(
+            after["DeliveryGapsRepairable"][0], before["DeliveryGapsRepairable"][0],
+            "no delivery_weekdays -> NOT script-repairable",
+        )
+
+    def test_repairable_counts_only_households_that_have_a_cadence(self):
+        """The distinction that matters: WHO can fix it. With delivery_weekdays a
+        script rebuilds the plan; without them nothing can, because there is
+        nothing to infer delivery days from -- and both of production's stranded
+        households were the latter, so sync_delivery_calendars walked all 15,731
+        enrollments and correctly changed nothing."""
+        from .models import (
+            Client, EnrollmentStage, EnrollmentVerification, Household,
+            HouseholdMember, Kitchen, MemberDietaryProfile,
+        )
+        from .services.health_metrics import collect
+
+        before = collect()
+        kitchen = Kitchen.objects.create(name="Cadence Kitchen")
+        owner = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Has", last_name="Cadence",
+            client_added_at=timezone.now(),
+        )
+        hh = Household.objects.create(name="Cadence HH")
+        HouseholdMember.objects.create(household=hh, client=owner, is_primary=True)
+        enr = EnrollmentVerification.objects.create(
+            client=owner, household=hh, kitchen=kitchen,
+            stage=EnrollmentStage.SERVICE_ACTIVE, delivery_weekdays=["tue"],
+        )
+        MemberDietaryProfile.objects.create(
+            enrollment=enr, client=owner, member_name="Has Cadence", status="active",
+        )
+
+        after = collect()
+        self.assertEqual(
+            after["DeliveryGapsRepairable"][0],
+            before["DeliveryGapsRepairable"][0] + 1,
+            "weekdays present -> a calendar rebuild CAN fix it",
         )
 
     @override_settings(CLOUDWATCH_METRICS_ENABLED=False)
