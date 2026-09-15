@@ -89,7 +89,10 @@ def collect():
     if refreshed is None:
         age_hours = 9999.0
     else:
-        age_hours = (now - refreshed).total_seconds() / 3600
+        # Clamped at 0: ``now`` is captured before this query runs, so while a
+        # rebuild is actively writing rows max(refreshed_at) can land a hair AFTER
+        # it and the age reads "-0.0". Harmless but confusing in a chart.
+        age_hours = max(0.0, (now - refreshed).total_seconds() / 3600)
     metrics["ReadModelAgeHours"] = (round(age_hours, 2), "None")
 
     # --- Import runs in flight ---------------------------------------------

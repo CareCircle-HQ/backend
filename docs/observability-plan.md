@@ -517,6 +517,75 @@ condition PERSISTED, which is what makes it worth an email.
 needing a member returned to service, so an alarm would be permanently ON and
 therefore ignored. `DeliveryGapsServable` is the actionable half.
 
+## Incident 2026-09-15 15:38 UTC -- every deploy was a small outage
+
+`alb-target-5xx` fired: 25 server errors in five minutes. Worth recording because
+the diagnosis went WRONG first, and because the cause had been there all along.
+
+**The wrong theory.** A full `rebuild_enrollment_analytics` (76,370 rows) was
+running at the time, so I assumed it was starving the web workers -- the same
+shape as the day's earlier incidents -- and recommended killing it.
+
+**What the evidence actually said.** Zero tracebacks in gunicorn, which rules out
+an application error: a 500 from Django always logs one. And the nginx error log
+named it exactly:
+
+```
+connect() to unix:/home/ubuntu/backend/gunicorn.sock failed
+    (2: No such file or directory)
+```
+
+"No such file or directory" is not saturation -- saturation gives
+`Resource temporarily unavailable` or a timeout. The SOCKET WAS GONE, i.e. the
+process was down. Timestamps (11:38 EDT = 15:38 UTC) line up with the deploy.
+
+**Root cause.** `deploy.sh` ran `systemctl restart gunicorn`. With a unix socket,
+restart DELETES the socket file, so every request arriving in that second or two
+gets a 502. Nothing to do with the rebuild, which was innocent.
+
+**Fix.** `systemctl reload` (SIGHUP) instead: new workers start, load the new code
+(we do not use `--preload`), old ones retire gracefully, and the listening socket
+is never released. systemd has no default reload action, so the unit needs
+`ExecReload=/bin/kill -s HUP $MAINPID` -- now version-controlled in
+`deploy/gunicorn.service`. nginx moved from `restart` to `reload` for the same
+reason.
+
+To make deploys graceful on the box, use a systemd DROP-IN rather than replacing
+the unit. `deploy/gunicorn.service` is a reference copy reconstructed from
+`systemctl cat`, and overwriting a working unit with a reconstruction risks
+changing how gunicorn runs (worker count, socket path) to fix a one-line gap:
+
+```
+sudo mkdir -p /etc/systemd/system/gunicorn.service.d
+printf '[Service]\nExecReload=/bin/kill -s HUP $MAINPID\n' | sudo tee /etc/systemd/system/gunicorn.service.d/reload.conf
+sudo systemctl daemon-reload
+sudo systemctl reload gunicorn && echo "graceful reload works"
+```
+
+Verify, and note what "graceful" means here:
+
+```
+systemctl show -p ExecReload gunicorn
+systemctl show -p ActiveEnterTimestamp gunicorn   # UNCHANGED by a reload
+```
+
+A reload replaces the workers while the service keeps running -- which is why the
+listening socket survives and nginx never sees a missing file.
+
+Until the drop-in is installed, `deploy.sh` detects the failed reload and falls
+back to restart (with a message), so deploys keep working -- just not gracefully.
+
+**Two lessons worth keeping.**
+
+1. *Absence of evidence was the evidence.* No traceback + 5xx at the ALB means the
+   request never reached the application. That single observation pointed at the
+   proxy layer and away from my theory; I should have weighed it before proposing
+   a fix.
+2. *The nginx `log_format` I shipped had no timestamp.* In CloudWatch the agent
+   attaches its own, which hid the gap -- but reading the file on the box during
+   this incident, nothing said WHEN. `$time_iso8601` added. It only surfaced the
+   first time it was actually needed, which is the usual way.
+
 ## Phase 5 -- Optional
 
 - **ALB access logs -> S3 + Athena**: per-request `target_processing_time` with no

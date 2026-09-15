@@ -25030,6 +25030,27 @@ class ServiceHealthMetricsTest(TestCase):
         age, _unit = collect()["ReadModelAgeHours"]
         self.assertGreater(age, 1000, "an empty read model must trip a staleness alarm")
 
+    def test_the_age_never_reads_negative_during_a_rebuild(self):
+        """`now` is captured before the aggregate query, so while a rebuild writes
+        rows max(refreshed_at) can land just after it -- seen in production as
+        "-0.0"."""
+        from .models import EnrollmentAnalytics
+        from .services.health_metrics import collect
+
+        from .models import Client
+
+        client = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Fresh", last_name="Row",
+            client_added_at=timezone.now(),
+        )
+        EnrollmentAnalytics.objects.all().delete()
+        EnrollmentAnalytics.objects.create(
+            client=client, first_name="Fresh", last_name="Row",
+            refreshed_at=timezone.now() + timedelta(seconds=5),
+        )
+        age, _unit = collect()["ReadModelAgeHours"]
+        self.assertEqual(age, 0.0)
+
     def test_a_stranded_household_with_a_servable_member_is_counted_separately(self):
         """DeliveryGapsServable is the ACTIONABLE subset -- a calendar rebuild
         fixes those on its own, while the rest need a member returned to service
