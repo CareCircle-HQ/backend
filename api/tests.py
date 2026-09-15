@@ -24993,3 +24993,130 @@ class DataExportMedicaidAndTeamTest(TestCase):
         )))
         self.assertIn("medicaid_id", header)
         self.assertIn("team", header)
+
+
+class ServiceHealthMetricsTest(TestCase):
+    """Service health published as CloudWatch metrics.
+
+    Every alarm built before this watched the SERVER -- up, slow, throwing
+    tracebacks. None could report that nineteen households looked active but could
+    not receive a delivery, or that the Data page had been stale for a day. Those
+    only surfaced if somebody remembered to run `manage.py diagnose`, which leaves
+    the operator as the monitoring system.
+    """
+
+    def test_collect_returns_the_expected_gauges(self):
+        from .services.health_metrics import collect
+
+        metrics = collect()
+        for name in (
+            "DeliveryGapsNoPlan", "DeliveryGapsServable", "CredentialsActive",
+            "CredentialsExpired", "ReadModelAgeHours", "ImportRunsInFlight",
+            "ImportRunsStuck", "ReviewBucket",
+        ):
+            self.assertIn(name, metrics)
+            value, unit = metrics[name]
+            self.assertIsInstance(value, (int, float), name)
+            self.assertIn(unit, ("Count", "None"), name)
+
+    def test_an_EMPTY_read_model_reads_as_very_stale_not_as_healthy(self):
+        """The silent-zero trap. Reporting -1 or 0 for "never refreshed" would sit
+        BELOW any staleness threshold, so a read model with no rows at all -- worse
+        than a stale one -- would look perfectly healthy."""
+        from .models import EnrollmentAnalytics
+        from .services.health_metrics import collect
+
+        EnrollmentAnalytics.objects.all().delete()
+        age, _unit = collect()["ReadModelAgeHours"]
+        self.assertGreater(age, 1000, "an empty read model must trip a staleness alarm")
+
+    def test_a_stranded_household_with_a_servable_member_is_counted_separately(self):
+        """DeliveryGapsServable is the ACTIONABLE subset -- a calendar rebuild
+        fixes those on its own, while the rest need a member returned to service
+        first."""
+        from .models import (
+            Client, EnrollmentStage, EnrollmentVerification, Household,
+            HouseholdMember, Kitchen, MemberDietaryProfile,
+        )
+        from .services.health_metrics import collect
+
+        before = collect()
+        kitchen = Kitchen.objects.create(name="Test Kitchen")
+        owner = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Strand", last_name="Ed",
+            client_added_at=timezone.now(),
+        )
+        hh = Household.objects.create(name="Stranded HH")
+        HouseholdMember.objects.create(household=hh, client=owner, is_primary=True)
+        enr = EnrollmentVerification.objects.create(
+            client=owner, household=hh, kitchen=kitchen,
+            stage=EnrollmentStage.SERVICE_ACTIVE,
+        )
+        MemberDietaryProfile.objects.create(
+            enrollment=enr, client=owner, member_name="Strand Ed", status="active",
+        )
+
+        after = collect()
+        self.assertEqual(
+            after["DeliveryGapsNoPlan"][0], before["DeliveryGapsNoPlan"][0] + 1,
+        )
+        self.assertEqual(
+            after["DeliveryGapsServable"][0], before["DeliveryGapsServable"][0] + 1,
+            "an active member on it makes the gap repairable",
+        )
+
+    @override_settings(CLOUDWATCH_METRICS_ENABLED=False)
+    def test_publishing_is_a_no_op_when_disabled(self):
+        """So local development and this very test suite never call AWS."""
+        from unittest.mock import patch
+
+        from .services import health_metrics
+
+        with patch("boto3.client") as boto:
+            self.assertEqual(health_metrics.publish(), 0)
+        boto.assert_not_called()
+
+    @override_settings(
+        CLOUDWATCH_METRICS_ENABLED=True, CLOUDWATCH_METRICS_REGION="us-east-2",
+    )
+    def test_publishing_sends_the_gauges_to_the_business_namespace(self):
+        from unittest.mock import MagicMock, patch
+
+        from .services import health_metrics
+
+        client = MagicMock()
+        with patch("boto3.client", return_value=client) as boto:
+            sent = health_metrics.publish({"DeliveryGapsNoPlan": (19, "Count")})
+
+        self.assertEqual(sent, 1)
+        boto.assert_called_once()
+        self.assertEqual(boto.call_args.kwargs["region_name"], "us-east-2")
+        kwargs = client.put_metric_data.call_args.kwargs
+        self.assertEqual(kwargs["Namespace"], "CareCircle/Business")
+        datum = kwargs["MetricData"][0]
+        self.assertEqual(datum["MetricName"], "DeliveryGapsNoPlan")
+        self.assertEqual(datum["Value"], 19.0)
+        self.assertEqual(datum["Unit"], "Count")
+
+    @override_settings(CLOUDWATCH_METRICS_ENABLED=True)
+    def test_a_publish_failure_never_propagates(self):
+        """This runs on a beat tick beside real work: monitoring must not be able
+        to break the thing it monitors. A missing datapoint is itself a signal."""
+        from unittest.mock import patch
+
+        from .services import health_metrics
+
+        with patch("boto3.client", side_effect=RuntimeError("no credentials")):
+            self.assertEqual(health_metrics.publish({"X": (1, "Count")}), 0)
+
+    @override_settings(CLOUDWATCH_METRICS_ENABLED=True)
+    def test_the_celery_task_delegates_and_swallows(self):
+        from unittest.mock import patch
+
+        from .tasks import publish_health_metrics
+
+        with patch(
+            "api.services.health_metrics.publish", return_value=8,
+        ) as pub:
+            self.assertEqual(publish_health_metrics(), 8)
+        pub.assert_called_once()

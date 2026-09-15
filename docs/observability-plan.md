@@ -455,7 +455,69 @@ app-slow-request-rate         INSUFFICIENT_DATA  <- expected, see above
 app-traceback-rate            OK
 ```
 
-## Phase 4 -- Optional
+## Phase 4 -- SERVICE health, not server health -- DONE 2026-09-15 (~$3/mo)
+
+Everything in Phases 0-3 watches the SERVER: is it up, is it slow, is it throwing
+tracebacks. None of it can say that nineteen households look active but cannot
+receive a delivery, or that the Data page has been stale for a day. Those numbers
+only appeared if somebody remembered to run `manage.py diagnose` -- which leaves
+the OPERATOR as the monitoring system, just over SSH instead of a chart.
+
+`api/services/health_metrics.py` publishes the same numbers `diagnose` prints, as
+CloudWatch metrics in `CareCircle/Business`, every 15 minutes via Celery beat:
+
+```
+DeliveryGapsNoPlan     service_active + kitchen but no live plan
+DeliveryGapsServable   ...of those, with a servable member -> repairable NOW
+CredentialsActive      Unite Us session pool
+CredentialsExpired     how the 2026-09-14 outage began
+ReadModelAgeHours      Data page staleness
+ImportRunsInFlight     PENDING+RUNNING
+ImportRunsStuck        ...older than 2h
+ReviewBucket           members needing human review
+```
+
+**No new IAM**: `CloudWatchAgentServerPolicy` (already attached for log shipping)
+grants `cloudwatch:PutMetricData`.
+
+Publishing is OFF unless `CLOUDWATCH_METRICS_ENABLED=1`, so local development and
+the test suite never call AWS. To see the numbers without publishing:
+
+```
+python manage.py publish_health_metrics
+```
+
+which also names the two conditions worth acting on immediately (stranded
+households that a calendar rebuild would fix, and a read model over 12h old).
+
+### A trap worth remembering: never report a failure as a LOW number
+
+`ReadModelAgeHours` first returned `-1` when the table had never been refreshed.
+An EMPTY read model is WORSE than a stale one -- the Data page has nothing at all
+-- yet `-1` sits below any staleness threshold and reads as perfectly healthy. It
+now reports `9999` so the alarm fires loudly. Same shape as a metric filter that
+never matches, or `getattr(client, "medicaid_id", "")` silently defaulting: the
+broken state must be LOUD, not quiet.
+
+### Alarms (CloudShell)
+
+```
+export SNS=arn:aws:sns:us-east-2:235665523206:Carecircle-alerts
+aws cloudwatch put-metric-alarm --region us-east-2 --alarm-name biz-delivery-gap-servable --namespace CareCircle/Business --metric-name DeliveryGapsServable --statistic Maximum --period 900 --evaluation-periods 2 --threshold 0 --comparison-operator GreaterThanThreshold --treat-missing-data notBreaching --alarm-actions $SNS --ok-actions $SNS
+aws cloudwatch put-metric-alarm --region us-east-2 --alarm-name biz-read-model-stale --namespace CareCircle/Business --metric-name ReadModelAgeHours --statistic Maximum --period 900 --evaluation-periods 2 --threshold 12 --comparison-operator GreaterThanThreshold --treat-missing-data notBreaching --alarm-actions $SNS --ok-actions $SNS
+aws cloudwatch put-metric-alarm --region us-east-2 --alarm-name biz-import-run-stuck --namespace CareCircle/Business --metric-name ImportRunsStuck --statistic Maximum --period 900 --evaluation-periods 2 --threshold 0 --comparison-operator GreaterThanThreshold --treat-missing-data notBreaching --alarm-actions $SNS --ok-actions $SNS
+aws cloudwatch put-metric-alarm --region us-east-2 --alarm-name biz-credentials-expired --namespace CareCircle/Business --metric-name CredentialsExpired --statistic Maximum --period 900 --evaluation-periods 2 --threshold 25 --comparison-operator GreaterThanThreshold --treat-missing-data notBreaching --alarm-actions $SNS --ok-actions $SNS
+```
+
+`evaluation-periods 2` throughout: these are gauges on a 15-minute publish, and a
+single tick during a rebuild can move them. Two consecutive breaches means the
+condition PERSISTED, which is what makes it worth an email.
+
+`DeliveryGapsNoPlan` is deliberately NOT alarmed: it sat at 19 with 17 of them
+needing a member returned to service, so an alarm would be permanently ON and
+therefore ignored. `DeliveryGapsServable` is the actionable half.
+
+## Phase 5 -- Optional
 
 - **ALB access logs -> S3 + Athena**: per-request `target_processing_time` with no
   agent on the box; good for historical analysis. Pay per GB scanned.
