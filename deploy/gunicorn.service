@@ -1,0 +1,37 @@
+# Reference copy of /etc/systemd/system/gunicorn.service (version-controlled so
+# the deployed unit is reviewable, like the nginx vhosts in this directory).
+#
+# The ExecReload line is the important part: systemd has NO default reload action,
+# so without it `systemctl reload gunicorn` fails and a deploy has to `restart` --
+# which DELETES the unix socket. nginx then answers every request in that window
+# with 502 ("connect() to unix:.../gunicorn.sock failed (2: No such file or
+# directory)"). That produced 25 5xx on 2026-09-15 and tripped the ALB alarm.
+#
+# SIGHUP instead starts new workers, loads the NEW CODE (we do not use --preload),
+# gracefully retires the old ones, and never lets go of the listening socket.
+#
+# NOTE: a HUP reload does NOT re-read this file. Changing the ExecStart line
+# (workers, threads, timeout) still needs a real `restart`.
+
+[Unit]
+Description=Gunicorn daemon for Django project
+After=network.target
+
+[Service]
+User=ubuntu
+Group=www-data
+WorkingDirectory=/home/ubuntu/backend
+
+ExecStart=/home/ubuntu/backend/venv/bin/gunicorn \
+    --workers 9 \
+    --worker-class gthread \
+    --threads 2 \
+    --timeout 300 \
+    --keep-alive 5 \
+    --bind unix:/home/ubuntu/backend/gunicorn.sock \
+    backend.wsgi:application
+
+ExecReload=/bin/kill -s HUP $MAINPID
+
+[Install]
+WantedBy=multi-user.target
