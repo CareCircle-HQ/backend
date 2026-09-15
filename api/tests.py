@@ -25845,3 +25845,90 @@ class ProgramMainCategoryAdminTest(TestCase):
         self.assertIn("is_active", cfg.list_display)
         self.assertIn("is_active", cfg.list_filter)
         self.assertIn("is_active", cfg.list_editable)
+
+
+class HousingServiceTypeTest(TestCase):
+    """The housing programs deliver "Environmental Exposure Assessment".
+
+    Unite Us sends that string verbatim as the case's service_type -- confirmed
+    against the one housing case already in the CRM (KAMARI GREENE, program
+    "Dwelling Assessment & SOW Development ... - Brooklyn").
+
+    Migrations are disabled under `manage.py test` (AGENTS.md), so these build
+    their own rows rather than asserting on migration 0264's output.
+    """
+
+    DWELLING = (
+        "Dwelling Assessment & Statement of Work (SOW) Development - "
+        "Modifications and Remediation Service - Brooklyn"
+    )
+    SERVICE = "Environmental Exposure Assessment"
+
+    def _program(self, **kw):
+        from .models import ActiveProgram
+
+        opts = {
+            "program_name": self.DWELLING,
+            "case_category": "Internal Services",
+            "case_type": ActiveProgram.CaseType.HOUSING,
+            "service_type": ActiveProgram.ServiceType.ENVIRONMENTAL_EXPOSURE_ASSESSMENT,
+            "main_category": "Housing",
+        }
+        opts.update(kw)
+        return ActiveProgram.objects.create(**opts)
+
+    def test_environmental_exposure_assessment_is_a_valid_service_type(self):
+        from .models import ActiveProgram
+
+        self.assertIn(
+            "environmental_exposure_assessment",
+            [c[0] for c in ActiveProgram.ServiceType.choices],
+        )
+
+    def test_a_housing_case_classifies_as_internal_service(self):
+        from .models import CaseType
+        from .serializers import derive_case_type
+
+        self._program()
+        self.assertEqual(
+            derive_case_type(self.SERVICE, self.DWELLING), CaseType.INTERNAL_SERVICE,
+        )
+
+    def test_a_housing_case_is_now_IN_import_scope(self):
+        """Before the reclassification these programs were External Services, so
+        `case_in_import_scope` returned False and the importer SKIPPED them. This
+        is the switch that turns housing case import on."""
+        from .serializers import case_in_import_scope
+
+        self._program()
+        self.assertTrue(case_in_import_scope(self.SERVICE, self.DWELLING))
+
+    def test_a_referral_only_housing_programme_stays_OUT_of_scope(self):
+        """The 7 programs under the active Housing category are referrals out.
+        They must not be imported as our own service."""
+        from .serializers import case_in_import_scope
+
+        self._program(
+            program_name="Tenancy Sustaining Services",
+            case_category="External Services", service_type="",
+        )
+        self.assertFalse(case_in_import_scope("Housing", "Tenancy Sustaining Services"))
+
+    def test_housing_is_NOT_a_meal_box_subtype(self):
+        """INTERNAL_SERVICE_SUBTYPES means "IS our meal/box service": it forces
+        INTERNAL_SERVICE regardless of program AND drives
+        purge_out_of_scope_cases. Housing classifies via the program-name path
+        instead, so adding it there would blur that meaning for no gain."""
+        from .serializers import INTERNAL_SERVICE_SUBTYPES
+
+        self.assertNotIn(self.SERVICE.casefold(), INTERNAL_SERVICE_SUBTYPES)
+
+    def test_a_housing_case_with_NO_program_row_is_out_of_scope(self):
+        """The consequence of the decision above, stated: with a blank or
+        unmatched program_name a housing case cannot be recognised, because the
+        subtype path does not know about it. This is the one scenario that would
+        justify revisiting INTERNAL_SERVICE_SUBTYPES."""
+        from .serializers import case_in_import_scope
+
+        self.assertFalse(case_in_import_scope(self.SERVICE, ""))
+        self.assertFalse(case_in_import_scope(self.SERVICE, "Unknown Programme"))

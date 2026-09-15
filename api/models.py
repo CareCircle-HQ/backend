@@ -3270,6 +3270,11 @@ class ActiveProgram(models.Model):
         SOCIAL_SERVICE_CASE_MANAGEMENT = (
             "social_service_case_management", "Social Service Case Management",
         )
+        # Housing (type = HOUSING): the Dwelling Assessment / SOW Development
+        # programs. Unite Us sends this verbatim as the case's service_type.
+        ENVIRONMENTAL_EXPOSURE_ASSESSMENT = (
+            "environmental_exposure_assessment", "Environmental Exposure Assessment",
+        )
 
     program_name = models.CharField(max_length=255, unique=True, db_index=True)
     main_category = models.CharField(max_length=120, blank=True)
