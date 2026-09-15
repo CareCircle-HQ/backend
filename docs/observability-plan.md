@@ -389,17 +389,34 @@ aws cloudwatch put-metric-alarm --region us-east-2 --alarm-name app-credential-e
 
 ### Verify the filters actually match
 
-The failure mode here is silent, so TEST it rather than trusting it:
+The failure mode is silent -- a wrong pattern reports zero for ever and reads as
+health -- so verify rather than trust. In TWO steps, because they answer different
+questions.
+
+**1. Does the pattern match the text? (instant)** `test-metric-filter` evaluates a
+pattern against sample messages without touching a log group:
 
 ```
-aws logs put-metric-filter ... --filter-name test --filter-pattern '"SLOW REQUEST"' ...   # already done above
-aws cloudwatch get-metric-statistics --region us-east-2 --namespace CareCircle/App --metric-name SlowRequests --start-time $(date -u -d '2 hours ago' +%Y-%m-%dT%H:%M:%S) --end-time $(date -u +%Y-%m-%dT%H:%M:%S) --period 300 --statistics Sum --query 'Datapoints[?Sum>`0`]' --output table
+aws logs test-metric-filter --region us-east-2 --filter-pattern '"SLOW REQUEST"' --log-event-messages 'WARNING api.middleware: SLOW REQUEST POST /api/portal/members/x/refresh-uniteus/ -> 200 in 3963ms (agent=abc)'
+aws logs test-metric-filter --region us-east-2 --filter-pattern '"Traceback (most recent call last)"' --log-event-messages 'Traceback (most recent call last):'
+aws logs test-metric-filter --region us-east-2 --filter-pattern '"credential" "expired"' --log-event-messages 'WARNING api.services.uniteus_import: daily_pull credential 42 expired: token rejected'
 ```
 
-Non-empty output proves the pattern matches real log text. `SLOW REQUEST` is the
-easiest to confirm because refresh-uniteus reliably produces it. If it comes back
-empty while `aws logs tail` shows the lines, the PATTERN is wrong -- usually
-quoting.
+A non-empty `matches` array means the pattern is right. An empty one means it is
+wrong -- usually quoting.
+
+**2. Is the pipeline live? (minutes later)** NOTE: metric filters DO NOT BACKFILL.
+They only evaluate events that arrive AFTER creation, so querying history right
+after creating one always returns nothing -- which looks like a broken pattern and
+is not. Let some traffic happen, then:
+
+```
+aws cloudwatch get-metric-statistics --region us-east-2 --namespace CareCircle/App --metric-name SlowRequests --start-time $(date -u -d '30 minutes ago' +%Y-%m-%dT%H:%M:%S) --end-time $(date -u +%Y-%m-%dT%H:%M:%S) --period 300 --statistics Sum --output table
+```
+
+With `defaultValue=0` the rows appear even at zero, which is itself the proof the
+filter is wired up. `SlowRequests` is the easiest to confirm because a member-page
+"Refresh from Unite Us" reliably produces one.
 
 ## Phase 4 -- Optional
 
