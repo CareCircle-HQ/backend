@@ -595,7 +595,7 @@ back to restart (with a message), so deploys keep working -- just not gracefully
 - **X-Ray**: skip. It needs SDK instrumentation and buys little for a
   single-process monolith.
 
-## Phase 5 -- Correlation (later)
+## Phase 6 -- Correlation (later)
 
 `X-Request-ID` generated in nginx, logged by Django, returned as a response
 header, so a user-reported problem maps to exact log lines.
@@ -640,8 +640,45 @@ log groups.
 
 ## Still open
 
-- Phase 4/5 if ever wanted.
-- An audit of every `requests.` call reachable from a view. TWICE in one day this
-  shape caused production problems (Unite Us refresh 707-908s; CallTools presence
-  up to 30s per poll), so it is the highest-value remaining sweep: each one wants a
-  short timeout, a cache, and ideally not to sit on a polling path.
+Phases 0-4 are DONE and in production: 12 alarms, 4 log groups on 90-day
+retention, 8 service gauges published every 15 minutes. Nothing below is required
+for the monitoring to work.
+
+### Small, recommended
+
+- **`SLOW_REQUEST_MS=5000`** in production `.env` (+ `systemctl reload gunicorn`).
+  At the 3s default the baseline is ~9 slow requests per 5 minutes -- ONE below the
+  `app-slow-request-rate` threshold -- so the alarm will flap on any busy stretch,
+  and a flapping alarm gets ignored. Almost all of those 9 are `refresh-uniteus`
+  at 3-4s, which is expected for a multi-call Unite Us round trip, not an
+  incident. Trade-off: a 4s endpoint regression stops appearing in the log, with
+  ALB p99 as the remaining safety net.
+- **`$time_iso8601`** in the LIVE nginx `log_format` (the repo copy has it). The
+  deployed format has no timestamp, so reading the file on the box during an
+  incident cannot answer "is this happening now?" -- which cost time on
+  2026-09-15.
+- **Clear the two standing `biz-*` conditions** so those alarms mean something:
+  `python manage.py sync_delivery_calendars` (2 repairable households) and close
+  the `delivery_pod` run PENDING since 08-24.
+
+### Worth investigating
+
+- **`GET /api/portal/dashboard/` at 8-10s**, seen while the analytics rebuild ran,
+  with ONE agent retrying it six times in 90 seconds. It has a 600s cache
+  (`DASHBOARD_CACHE_TTL`) and was still that slow, so either the cache was missing
+  or the underlying queries are heavy. Check the slow-request log now the rebuild
+  is done: if `dashboard` still appears, it is the next `/orders/`-class win
+  (that one went 152 queries -> 9).
+- **A Celery worker OOM'd at 8.1 GB RSS on 2026-09-02** (`dmesg`). On a 15.7 GB
+  box that is a latent risk -- some task loads far too much into memory, and it
+  takes the worker down mid-import.
+- **An audit of every `requests.` call reachable from a view.** THREE of the
+  incidents in two days were this one shape -- an unbounded external call inside a
+  web request, worse when polled (Unite Us refresh 707-908s; CallTools presence up
+  to 30s per poll at a 10s poll interval). Each one wants a short timeout, a
+  cache, and ideally not to sit on a polling path. Highest-value remaining sweep.
+
+### Optional
+
+Phase 5 (ALB logs to S3/Athena, a Synthetics canary, a dashboard) and Phase 6
+(`X-Request-ID` correlation). Neither is needed for anything currently known.
