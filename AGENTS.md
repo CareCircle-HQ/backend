@@ -35,6 +35,44 @@ The frontend has **no TypeScript installed** (`node_modules/.bin/tsc` does not
 exist), so `tsc --noEmit` silently does nothing. Verify it with `npm run build`
 instead -- esbuild will surface syntax/JSX errors.
 
+## Long-running commands on production
+
+**Run full-table jobs OFF-HOURS.** A `rebuild_enrollment_analytics --prune`
+(76k rows, ~12k rows/5min) measurably degrades agents while it runs -- observed
+2026-09-15 12:34-12:37:
+
+```
+POST .../refresh-uniteus/   6915-12657ms   (normally 3000-4000ms)
+GET  /api/portal/dashboard/ 7957-9892ms    x6 from ONE agent retrying
+```
+
+It tripped `app-slow-request-rate`. It does NOT cause 5xx -- the 502s that day
+were a `systemctl restart gunicorn` deleting the unix socket, a separate fault
+(fixed: `deploy.sh` now reloads).
+
+**Detach properly, and unbuffer.**
+
+```
+setsid nohup python -u manage.py <cmd> > /tmp/<cmd>.log 2>&1 < /dev/null &
+```
+
+- `-u` -- without it Python BLOCK-BUFFERS stdout into the file, so if the process
+  dies the log is EMPTY and you learn nothing. Happened twice on 2026-09-15.
+- `setsid` -- `nohup` alone blocks SIGHUP but systemd-logind can still reap a
+  session's processes; a rebuild vanished mid-run this way, silently.
+
+**Check for a duplicate before starting one.** Two concurrent `--prune` passes
+delete each other's rows:
+
+```
+pgrep -af rebuild_enrollment_analytics
+```
+
+**Do not deploy while a long import runs.** `deploy.sh` restarts `celery-worker`;
+SIGTERM gives Celery a warm shutdown but systemd SIGKILLs at `TimeoutStopSec`
+(90s), so a long task dies mid-run -- that is what produced "Worker restarted
+mid-run" on ImportRun #1449 (member_prep, 8000/15148 rows).
+
 ## Deployment
 
 - Production runs nginx + gunicorn (unix socket
