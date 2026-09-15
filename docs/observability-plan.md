@@ -327,14 +327,79 @@ request**, made worse when that request is POLLED. Worth auditing for others --
 any view that calls a third party should have a short timeout, a cache, and
 ideally not be on a polling path.
 
-## Phase 3 -- Alarms on application patterns (~1h, ~$1/mo)
+## Phase 3 -- Alarms on application patterns (~$1.60/mo)
 
-Metric filters over the Phase 2 log groups, each wired to the SNS topic:
+Metric filters over the Phase 2 log groups, wired to the same SNS topic. Filters
+are free; each custom metric is ~$0.30/mo and each alarm ~$0.10/mo.
 
-- `IntegrityError` -> any occurrence
-- `SLOW REQUEST` (from the Phase 1 middleware) -> more than N per 5 min
-- `daily_pull credential .* expired` -> a spike (this pattern preceded the
-  2026-09-14 incident by minutes)
+The patterns below are the STRINGS THE CODE ACTUALLY LOGS -- checked against
+source, not guessed. A metric filter that does not match the real text is worse
+than no filter: it reports zero for ever and reads as health.
+
+```
+"Traceback (most recent call last)"   any unhandled exception       api/... (any logger)
+"IntegrityError"                      DB constraint violation
+"SLOW REQUEST"                        api/middleware.py:117
+"credential" "expired"                uniteus_import.py:552, 752   (space = AND)
+```
+
+### Why `Traceback` and not just `IntegrityError`
+
+`django.request` is pinned at ERROR (settings) so every 5xx logs
+`Internal Server Error: /path` plus a traceback -- but the highest-value bug found
+on 2026-09-14 was NOT a 5xx. The Unite Us import's
+`TypeError: 'int' object is not subscriptable` was caught per person, logged, and
+the request returned 200: it silently dropped that member's contracted services.
+The ALB 5xx alarm cannot see it and `IntegrityError` does not match it. A
+`Traceback` filter does.
+
+### Commands (CloudShell, not the EC2 box)
+
+```
+export SNS=arn:aws:sns:us-east-2:235665523206:Carecircle-alerts
+export LG=/carecircle/gunicorn
+```
+
+`defaultValue=0` matters: without it the metric only exists when something
+matches, so a brand-new filter sits in INSUFFICIENT_DATA and an alarm cannot tell
+"healthy" from "not wired up".
+
+```
+aws logs put-metric-filter --region us-east-2 --log-group-name $LG --filter-name app-traceback --filter-pattern '"Traceback (most recent call last)"' --metric-transformations metricName=AppTracebacks,metricNamespace=CareCircle/App,metricValue=1,defaultValue=0
+aws logs put-metric-filter --region us-east-2 --log-group-name $LG --filter-name app-integrity-error --filter-pattern '"IntegrityError"' --metric-transformations metricName=IntegrityErrors,metricNamespace=CareCircle/App,metricValue=1,defaultValue=0
+aws logs put-metric-filter --region us-east-2 --log-group-name $LG --filter-name app-slow-request --filter-pattern '"SLOW REQUEST"' --metric-transformations metricName=SlowRequests,metricNamespace=CareCircle/App,metricValue=1,defaultValue=0
+aws logs put-metric-filter --region us-east-2 --log-group-name $LG --filter-name app-credential-expired --filter-pattern '"credential" "expired"' --metric-transformations metricName=CredentialExpired,metricNamespace=CareCircle/App,metricValue=1,defaultValue=0
+```
+
+Then the alarms. Thresholds are deliberately different per signal:
+
+```
+aws cloudwatch put-metric-alarm --region us-east-2 --alarm-name app-integrity-error --namespace CareCircle/App --metric-name IntegrityErrors --statistic Sum --period 300 --evaluation-periods 1 --threshold 0 --comparison-operator GreaterThanThreshold --treat-missing-data notBreaching --alarm-actions $SNS --ok-actions $SNS
+aws cloudwatch put-metric-alarm --region us-east-2 --alarm-name app-traceback-rate --namespace CareCircle/App --metric-name AppTracebacks --statistic Sum --period 300 --evaluation-periods 1 --threshold 5 --comparison-operator GreaterThanThreshold --treat-missing-data notBreaching --alarm-actions $SNS --ok-actions $SNS
+aws cloudwatch put-metric-alarm --region us-east-2 --alarm-name app-slow-request-rate --namespace CareCircle/App --metric-name SlowRequests --statistic Sum --period 300 --evaluation-periods 1 --threshold 10 --comparison-operator GreaterThanThreshold --treat-missing-data notBreaching --alarm-actions $SNS --ok-actions $SNS
+aws cloudwatch put-metric-alarm --region us-east-2 --alarm-name app-credential-expired-spike --namespace CareCircle/App --metric-name CredentialExpired --statistic Sum --period 300 --evaluation-periods 1 --threshold 5 --comparison-operator GreaterThanThreshold --treat-missing-data notBreaching --alarm-actions $SNS --ok-actions $SNS
+```
+
+| alarm | threshold | reasoning |
+|---|---|---|
+`app-integrity-error` | **any** | a constraint violation means data we believe is impossible happened; one is worth reading |
+`app-traceback-rate` | >5 / 5 min | tracebacks are never zero in practice (today's TypeError repeated all day). A RATE catches a new systemic break without paging on one bad row |
+`app-slow-request-rate` | >10 / 5 min | one slow request is life; ten in five minutes is the site degrading |
+`app-credential-expired-spike` | >5 / 5 min | this pattern preceded the 2026-09-14 outage by minutes -- the earliest warning available |
+
+### Verify the filters actually match
+
+The failure mode here is silent, so TEST it rather than trusting it:
+
+```
+aws logs put-metric-filter ... --filter-name test --filter-pattern '"SLOW REQUEST"' ...   # already done above
+aws cloudwatch get-metric-statistics --region us-east-2 --namespace CareCircle/App --metric-name SlowRequests --start-time $(date -u -d '2 hours ago' +%Y-%m-%dT%H:%M:%S) --end-time $(date -u +%Y-%m-%dT%H:%M:%S) --period 300 --statistics Sum --query 'Datapoints[?Sum>`0`]' --output table
+```
+
+Non-empty output proves the pattern matches real log text. `SLOW REQUEST` is the
+easiest to confirm because refresh-uniteus reliably produces it. If it comes back
+empty while `aws logs tail` shows the lines, the PATTERN is wrong -- usually
+quoting.
 
 ## Phase 4 -- Optional
 
@@ -363,12 +428,35 @@ query strings**. A BAA is in place and CloudWatch Logs is HIPAA-eligible
 - retention must be set explicitly (90 days)
 - access to the log groups should be limited by IAM
 
+## Closed
+
+**gunicorn** (`--workers 9 --worker-class gthread --threads 2 --timeout 300`, on a
+4-vCPU m6i.xlarge with RDS off-box). Worker count is correct -- `(2 x CPU) + 1` --
+and 18 concurrent slots suit I/O-bound work. No change made.
+
+But it corrected a claim repeated several times that day: **`--timeout` does NOT
+cap request duration under `gthread`.** From the installed source,
+`ThreadWorker.run()` calls `self.notify()` in its own event loop while requests
+run in a separate `ThreadPoolExecutor`, so the arbiter keeps hearing a heartbeat
+no matter how long a request takes. It only kills a worker whose EVENT LOOP
+stalls. So "a sane timeout would have killed those 900s requests" was false: every
+guard in place was aimed elsewhere --
+
+```
+--timeout 300                  worker liveness only, not a request cap
+nginx proxy_read_timeout 300s  cuts the CLIENT connection; Django keeps working
+WEB_STATEMENT_TIMEOUT_MS 30s   caps SQL only -- the slow calls were HTTP
+```
+
+The real protection is architectural: no unbounded external call inside a request.
+
+**CloudWatch agent** is installed and running (1.300072.0b1766), shipping all four
+log groups.
+
 ## Still open
 
-- `systemctl cat gunicorn` -- need to see `--timeout` and worker count. A 900s
-  request COMPLETED during the incident, so the timeout must be very high. That is
-  not just a visibility gap but a missing safety net: a sane timeout would have
-  killed those requests and kept the site up. Changing it is a real behavioural
-  decision (long imports would start failing), so it needs the current value first.
-- Whether the CloudWatch agent is already installed
-  (`systemctl status amazon-cloudwatch-agent`).
+- Phase 4/5 if ever wanted.
+- An audit of every `requests.` call reachable from a view. TWICE in one day this
+  shape caused production problems (Unite Us refresh 707-908s; CallTools presence
+  up to 30s per poll), so it is the highest-value remaining sweep: each one wants a
+  short timeout, a cache, and ideally not to sit on a polling path.
