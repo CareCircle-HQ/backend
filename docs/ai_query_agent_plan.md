@@ -1,7 +1,7 @@
 # AI Query Agent — natural language over CRM data
 
-**Status:** design agreed on the points below; three decisions pending (see
-"Open decisions"). No code written yet, deliberately.
+**Status:** design agreed, including Q1-Q3. No code written yet, deliberately --
+Phase 0 (the glossary) is a conversation about definitions, not a coding task.
 
 ## Goal
 
@@ -267,33 +267,93 @@ enrollments showing more than one "primary" member      -> 6 before the fix
 Each becomes a `question -> expected IR` test. That is how the glossary stays
 honest as it grows.
 
-## OPEN DECISIONS (pending)
+## DECISIONS TAKEN (Q1-Q3 resolved)
 
-### Q1 -- Will it ever WRITE? (the big one)
+### Q1 -- The agent will NEVER write. READ-ONLY, permanently.
 
-*"Pause those members"* / *"assign Hicksville Tuesday cadence to these two"* is a
-different system: AG-UI human-confirmation checkpoints, per-action authorisation,
-an audit trail tying each write to the question that produced it, and idempotency.
+This is a constraint to design INTO the system, not a phase-1 limitation:
 
-Relevant evidence: on 2026-09-15 `replace_enrollment_for_case_change` was found to
-have forked **149 enrollments** across three families because ONE ownership guard
-was missing. A well-meaning automatic write is capable of real damage here.
+- the database role is **read-only** -- not "we don't generate writes", the
+  connection cannot write,
+- no action/tool surface exists for mutations, so there is nothing to
+  accidentally expose later,
+- the human-in-the-loop step is therefore about CONFIRMING THE INTERPRETATION
+  ("I read 'active' as enrollment stage = service_active"), not authorising a
+  change.
 
-If writes are ever in scope, the read-only version should be SHAPED for them now
-(IR -> proposed actions -> confirm -> execute) rather than bolted on later.
+It removes the entire risk class that produced the worst bug found this week
+(`replace_enrollment_for_case_change` forking 149 enrollments across three
+families because one ownership guard was missing).
 
-### Q2 -- Is "as of a few hours ago" acceptable?
+### Q2 -- Same data as the Data page
 
-If answers must be live, we query OLTP instead of the read model and the
-guardrails matter much more (no denormalised safety net, far more join surface,
-real risk of expensive plans). If read-model freshness is fine, a tighter rebuild
-cadence plus the visible "as of" stamp is enough.
+Confirmed: query `EnrollmentAnalytics`, the read model the Data page and its
+export already use. So "as of <refreshed_at>" is the contract, and the existing
+`biz-read-model-stale` alarm (>12h) already protects it -- a stale read model now
+pages somebody rather than quietly answering with yesterday's truth.
 
-### Q3 -- How many concurrent users?
+No OLTP querying, which keeps the join surface tiny and the guardrails
+precautionary rather than load-bearing.
 
-Drives whether the separate ASGI service is essential or merely tidy, and whether
-SSE connection limits need thought. A handful of managers: trivial. Every agent
-with a panel open: needs sizing.
+### Q3 -- Sizing: 2 uvicorn workers
+
+The audience is much smaller than the agent count suggests:
+
+```
+240 active agents
+ 21 Management + 16 is_manager  ->  ~21-30 eligible users
+```
+
+And async makes idle SSE connections nearly free -- which is the whole reason for
+not hosting them in gunicorn:
+
+```
+gunicorn gthread : one open panel = ONE THREAD of 18
+uvicorn async    : one open panel = a coroutine + a socket (a few KB)
+```
+
+Even with every eligible user holding a panel open, that is ~21 mostly-idle
+sockets. Realistic peak -- 8 managers asking a question every 30s -- is
+0.27 questions/sec, each costing one Bedrock call (1-3s) plus one read-model query
+(50-500ms).
+
+**2 workers is for zero-downtime reloads, not throughput.**
+
+The real ceilings are elsewhere, and neither is CPU:
+
+1. **Bedrock quotas** -- per-model, per-region requests/min and tokens/min. Check
+   the number when enabling model access in us-east-2; it is the one hard limit.
+2. **Keeping queries short** -- the row cap, `EXPLAIN` check and
+   `statement_timeout` are what make "50-500ms" true even for a pathological
+   question.
+
+## Architecture: one codebase, two servers
+
+Because the agent is read-only and shares the CRM's definitions, the cleanest
+deployment is NOT a separate service talking to Django over internal HTTP (an
+earlier draft of this plan said that). It is the SAME repo served by a second
+server process:
+
+```
+uvicorn agent_asgi:app     async SSE + Pydantic AI; shares api/ models + glossary
+gunicorn backend.wsgi      unchanged, serves the CRM
+```
+
+| | internal HTTP hop | same codebase under uvicorn |
+|---|---|---|
+glossary / query logic | duplicated or proxied | **one definition, shared** |
+service authentication | needs a service token | not needed |
+gunicorn slots consumed | yes, briefly | **none** |
+caveat | -- | Django ORM calls need `sync_to_async` |
+
+The shared-glossary column decides it: **semantic drift is this design's biggest
+risk**, and one codebase makes drift impossible by construction. Wrapping the
+short, synchronous ORM call in `sync_to_async` is a small, known cost.
+
+Still true from the earlier draft: nginx routes `/agent/` to its own socket with
+`proxy_buffering off` (nginx buffers by default, which breaks SSE), and the unit
+gets `ExecReload=/bin/kill -s HUP $MAINPID` -- a missing ExecReload is what made
+every CRM deploy a small outage until 2026-09-15.
 
 ## Risks
 
