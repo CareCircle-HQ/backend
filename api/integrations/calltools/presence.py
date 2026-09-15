@@ -7,8 +7,19 @@ Two upstream endpoints back this module:
   The other party's number is ``source`` for inbound calls and ``destination``
   for outbound ones.
 
-The live-calls list is cached briefly (a few seconds) in Django's cache so that
-many agents polling at once share a single upstream fetch.
+Both are cached briefly (a few seconds) in Django's cache so that many agents
+polling at once share a single upstream fetch.
+
+Why the caching matters more than it looks: the extension side panel polls
+``/api/calltools/status/`` every 10 SECONDS for every signed-in agent, and that
+view calls straight through to CallTools. An unbounded upstream call inside a
+polled request is how a third party's bad afternoon becomes our outage -- with 9
+workers x 2 threads, twenty agents polling while CallTools is slow saturates every
+worker in under a minute. A CloudWatch p99 alarm caught exactly this at 03:35 on
+2026-09-15 (19.5s, from two 15s-timeout calls per request).
+
+FAILURES ARE CACHED TOO, briefly: when CallTools is down, the failure path is the
+expensive one, and re-asking on every poll is what keeps the workers busy.
 """
 
 import logging
@@ -24,14 +35,41 @@ LIVE_CALLS_PATH = "/livephonecalls/"
 
 _LIVE_CALLS_CACHE_KEY = "calltools:live_calls"
 _LIVE_CALLS_TTL = 8  # seconds
+_USER_STATUS_TTL = 8  # seconds -- shorter than the 10s poll, so it stays fresh
+# A failed upstream call is cached for longer than a successful one: while
+# CallTools is down every poll would otherwise pay the full timeout again.
+_FAILURE_TTL = 20
 
 
-def get_user_status(app_user):
-    """Return the raw ``/userstatuses/{app_user}/`` dict (or ``{}``)."""
+def _user_status_key(app_user):
+    return f"calltools:user_status:{app_user}"
+
+
+def get_user_status(app_user, use_cache=True):
+    """Return the raw ``/userstatuses/{app_user}/`` dict (or ``{}``).
+
+    Cached like :func:`list_live_calls`: the side panel polls every 10s per agent,
+    so without this every poll is an uncached upstream round trip holding a
+    gunicorn thread for up to the client timeout.
+    """
     if not app_user:
         return {}
-    data = client.get(f"{USER_STATUS_PATH}{app_user}/")
-    return data if isinstance(data, dict) else {}
+    key = _user_status_key(app_user)
+    if use_cache:
+        cached = cache.get(key)
+        if cached is not None:
+            # A cached failure is stored as {} -- see below.
+            return cached
+    try:
+        data = client.get(f"{USER_STATUS_PATH}{app_user}/")
+    except client.CallToolsError:
+        # Remember the failure briefly so a CallTools outage costs one timeout per
+        # _FAILURE_TTL, not one per poll per agent.
+        cache.set(key, {}, _FAILURE_TTL)
+        raise
+    data = data if isinstance(data, dict) else {}
+    cache.set(key, data, _USER_STATUS_TTL)
+    return data
 
 
 def list_live_calls(use_cache=True):
@@ -40,7 +78,13 @@ def list_live_calls(use_cache=True):
         cached = cache.get(_LIVE_CALLS_CACHE_KEY)
         if cached is not None:
             return cached
-    calls = client.get_all(LIVE_CALLS_PATH)
+    try:
+        calls = client.get_all(LIVE_CALLS_PATH)
+    except client.CallToolsError:
+        # Same reasoning as get_user_status: cache the failure so a slow/broken
+        # CallTools is paid for once per _FAILURE_TTL rather than once per poll.
+        cache.set(_LIVE_CALLS_CACHE_KEY, [], _FAILURE_TTL)
+        raise
     cache.set(_LIVE_CALLS_CACHE_KEY, calls, _LIVE_CALLS_TTL)
     return calls
 
@@ -112,10 +156,12 @@ def agent_presence(app_user, client_phone=None):
     if not app_user:
         return snapshot
 
+    status_known = False
     try:
         status = get_user_status(app_user)
         snapshot["logged_in"] = bool(status.get("logged_in"))
         snapshot["logged_in_since"] = status.get("logged_in_since")
+        status_known = True
     except client.CallToolsError as exc:
         logger.warning("CallTools userstatus fetch failed for %s: %s", app_user, exc)
 
@@ -135,6 +181,10 @@ def agent_presence(app_user, client_phone=None):
         snapshot["status"] = "on_call"
     elif snapshot["logged_in"]:
         snapshot["status"] = "online"
-    else:
+    elif status_known:
         snapshot["status"] = "offline"
+    # else: leave "unknown" -- we could not ASK CallTools, which is not the same
+    # as being told the agent is logged out. This block used to overwrite it
+    # unconditionally, so an upstream outage reported every agent as offline and
+    # the documented "unknown" state was unreachable.
     return snapshot

@@ -24700,3 +24700,130 @@ class RemoveMemberPrimaryGuardTest(TestCase):
         )
         self.assertTrue(_is_primary_of_enrollment_household(owner, enr))
         self.assertFalse(_is_primary_of_enrollment_household(other, enr))
+
+
+@override_settings(
+    # The suite runs on DummyCache (see settings) so dashboard payloads cannot
+    # leak between tests; caching behaviour is unobservable under it.
+    CACHES={"default": {"BACKEND": "django.core.cache.backends.locmem.LocMemCache"}},
+)
+class CallToolsPresenceCachingTest(TestCase):
+    """Presence must not make an uncached upstream call on every poll.
+
+    The extension side panel polls /api/calltools/status/ every 10 SECONDS for
+    every signed-in agent, and the view called straight through to CallTools --
+    twice, each with a 15s timeout. A slow third party therefore held a gunicorn
+    thread for up to 30s per poll; with 9 workers x 2 threads, twenty agents
+    polling saturates every worker in under a minute. A CloudWatch p99 alarm
+    caught it at 03:35 on 2026-09-15 (19.5s) before it hit business hours.
+    """
+
+    def setUp(self):
+        from django.core.cache import cache
+
+        cache.clear()
+
+    def test_a_second_poll_is_served_from_cache(self):
+        from unittest.mock import patch
+
+        from .integrations.calltools import presence
+
+        with patch.object(
+            presence.client, "get", return_value={"logged_in": True},
+        ) as upstream:
+            presence.get_user_status("agent-1")
+            presence.get_user_status("agent-1")
+            presence.get_user_status("agent-1")
+
+        self.assertEqual(
+            upstream.call_count, 1,
+            "three polls inside the TTL must cost ONE upstream call",
+        )
+
+    def test_each_agent_is_cached_separately(self):
+        from unittest.mock import patch
+
+        from .integrations.calltools import presence
+
+        with patch.object(
+            presence.client, "get", return_value={"logged_in": True},
+        ) as upstream:
+            presence.get_user_status("agent-1")
+            presence.get_user_status("agent-2")
+        self.assertEqual(upstream.call_count, 2, "per-agent status, per-agent key")
+
+    def test_a_failure_is_cached_so_an_outage_is_not_re_paid_every_poll(self):
+        """The failure path is the EXPENSIVE one -- it costs the full timeout."""
+        from unittest.mock import patch
+
+        from .integrations.calltools import presence
+
+        with patch.object(
+            presence.client, "get", side_effect=presence.client.CallToolsError("down"),
+        ) as upstream:
+            with self.assertRaises(presence.client.CallToolsError):
+                presence.get_user_status("agent-1")
+            # Subsequent polls inside the failure TTL must NOT call upstream again.
+            self.assertEqual(presence.get_user_status("agent-1"), {})
+            self.assertEqual(presence.get_user_status("agent-1"), {})
+
+        self.assertEqual(upstream.call_count, 1, "one timeout paid, not three")
+
+    def test_live_calls_failures_are_cached_too(self):
+        from unittest.mock import patch
+
+        from .integrations.calltools import presence
+
+        with patch.object(
+            presence.client, "get_all",
+            side_effect=presence.client.CallToolsError("down"),
+        ) as upstream:
+            with self.assertRaises(presence.client.CallToolsError):
+                presence.list_live_calls()
+            self.assertEqual(presence.list_live_calls(), [])
+        self.assertEqual(upstream.call_count, 1)
+
+    def test_use_cache_false_still_forces_a_fetch(self):
+        from unittest.mock import patch
+
+        from .integrations.calltools import presence
+
+        with patch.object(
+            presence.client, "get", return_value={"logged_in": True},
+        ) as upstream:
+            presence.get_user_status("agent-1")
+            presence.get_user_status("agent-1", use_cache=False)
+        self.assertEqual(upstream.call_count, 2)
+
+    def test_the_upstream_timeout_is_a_few_seconds_not_fifteen(self):
+        """It is a per-request worker-hold budget, not patience: presence is
+        polled, so a long timeout multiplies across every agent."""
+        from .integrations.calltools import config
+
+        self.assertLessEqual(
+            config.TIMEOUT, 5,
+            "a polled presence endpoint must fail fast; 'unknown' beats holding a worker",
+        )
+
+    def test_presence_degrades_to_unknown_rather_than_raising(self):
+        """agent_presence swallows upstream errors -- the dot goes grey, the
+        request still returns promptly."""
+        from unittest.mock import patch
+
+        from .integrations.calltools import presence
+
+        with patch.object(
+            presence.client, "get", side_effect=presence.client.CallToolsError("down"),
+        ):
+            with patch.object(
+                presence.client, "get_all",
+                side_effect=presence.client.CallToolsError("down"),
+            ):
+                snap = presence.agent_presence("agent-1")
+
+        self.assertEqual(
+            snap["status"], "unknown",
+            "could not ASK CallTools -- not the same as being told 'logged out'",
+        )
+        self.assertFalse(snap["logged_in"])
+        self.assertIsNone(snap["active_call"])

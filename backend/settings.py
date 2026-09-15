@@ -621,7 +621,12 @@ GHL_CONTACT_SOURCE = os.getenv('GHL_CONTACT_SOURCE', 'Benefully extension')
 # ---------------------------------------------------------------------------
 CALLTOOLS_API_TOKEN = os.getenv('CALLTOOLS_API_TOKEN', '')
 CALLTOOLS_API_BASE = os.getenv('CALLTOOLS_API_BASE', 'https://east-1.calltools.io/api')
-CALLTOOLS_TIMEOUT = int(os.getenv('CALLTOOLS_TIMEOUT', '15'))
+# Presence is polled every 10s by every open side panel and can make TWO upstream
+# calls per request, so this is a per-request WORKER-HOLD budget, not patience. At
+# 15s a slow CallTools held a gunicorn thread up to 30s and spiked ALB p99 to
+# 19.5s (CloudWatch alarm, 2026-09-15 03:35); with 9 workers x 2 threads, twenty
+# agents polling would saturate the box. A presence dot is worth ~3s.
+CALLTOOLS_TIMEOUT = int(os.getenv('CALLTOOLS_TIMEOUT', '3'))
 
 
 # ---------------------------------------------------------------------------

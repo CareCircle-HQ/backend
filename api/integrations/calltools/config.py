@@ -14,7 +14,12 @@ API_BASE = getattr(
 API_TOKEN = getattr(settings, "CALLTOOLS_API_TOKEN", "")
 
 # Network timeout (seconds) for every CallTools request.
-TIMEOUT = getattr(settings, "CALLTOOLS_TIMEOUT", 15)
+# Presence is polled every 10s by every open side panel, and each request can
+# make TWO upstream calls, so the timeout is a per-request worker-hold budget --
+# not just "how patient are we". At 15s a slow CallTools held a gunicorn thread
+# for up to 30s and spiked p99 to 19.5s (CloudWatch alarm, 2026-09-15 03:35).
+# A presence dot is worth ~3s; beyond that "unknown" is the better answer.
+TIMEOUT = getattr(settings, "CALLTOOLS_TIMEOUT", 3)
 
 
 def is_enabled():
