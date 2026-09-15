@@ -327,7 +327,7 @@ request**, made worse when that request is POLLED. Worth auditing for others --
 any view that calls a third party should have a short timeout, a cache, and
 ideally not be on a polling path.
 
-## Phase 3 -- Alarms on application patterns (~$1.60/mo)
+## Phase 3 -- Alarms on application patterns -- DONE 2026-09-15 (~$1.60/mo)
 
 Metric filters over the Phase 2 log groups, wired to the same SNS topic. Filters
 are free; each custom metric is ~$0.30/mo and each alarm ~$0.10/mo.
@@ -414,9 +414,46 @@ is not. Let some traffic happen, then:
 aws cloudwatch get-metric-statistics --region us-east-2 --namespace CareCircle/App --metric-name SlowRequests --start-time $(date -u -d '30 minutes ago' +%Y-%m-%dT%H:%M:%S) --end-time $(date -u +%Y-%m-%dT%H:%M:%S) --period 300 --statistics Sum --output table
 ```
 
-With `defaultValue=0` the rows appear even at zero, which is itself the proof the
-filter is wired up. `SlowRequests` is the easiest to confirm because a member-page
-"Refresh from Unite Us" reliably produces one.
+`SlowRequests` is the easiest to confirm because a member-page "Refresh from Unite
+Us" reliably produces one.
+
+### As built, with two corrections from doing it
+
+Verified live: `SlowRequests` returned `Sum = 2.0` at 14:39 UTC from real traffic,
+and the pattern matches the REAL event shape -- worth checking separately, because
+the agent stores journald entries as JSON, so what the filter sees is
+
+```
+{"body":{"MESSAGE":"... SLOW REQUEST POST /api/... -\u003e 200 in 3963ms ...","PRIORITY":"6", ...}}
+```
+
+not the bare log line. A quoted-term pattern still matches inside that (confirmed
+with `test-metric-filter`), so no JSON-selector pattern is needed -- but it is a
+real failure mode: had CloudWatch parsed the event as JSON, the pattern would have
+needed `{ $.body.MESSAGE = "*SLOW REQUEST*" }` and would otherwise have reported
+zero for ever.
+
+**`defaultValue=0` does NOT make the metric continuous.** I claimed the rows would
+appear even at zero and prove the wiring; in practice the 30-minute window
+contained exactly ONE datapoint -- the period that had matches. So a quiet metric
+still looks like a missing one, and the only real proof is a datapoint appearing
+after traffic that should match.
+
+Consequently `app-slow-request-rate` can sit in INSUFFICIENT_DATA while the other
+three read OK. That is not a fault: with `--treat-missing-data notBreaching` a gap
+never alarms, and the state resolves once a period carries data. Do not "fix" it
+by lowering a threshold.
+
+```
+alb-p99-latency               OK
+alb-rejected-connections      OK
+alb-target-5xx                OK
+alb-unhealthy-host            OK
+app-credential-expired-spike  OK
+app-integrity-error           OK
+app-slow-request-rate         INSUFFICIENT_DATA  <- expected, see above
+app-traceback-rate            OK
+```
 
 ## Phase 4 -- Optional
 
