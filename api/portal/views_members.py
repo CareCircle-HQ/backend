@@ -2526,8 +2526,10 @@ class MembersListView(PortalGenericAPIView):
                 kind = product_type_kind_for_name(enr.program_name)
                 if kind:
                     return kind
-        # No enrollment anywhere names a product: fall back to the member's own
-        # internal-service cases, MOST-GOVERNING FIRST.
+        # No enrollment anywhere names a product: fall back to internal-service
+        # CASES -- the member's own first, then (for a covered dependent with no
+        # case of their own) the household PRIMARY's, mirroring the inheritance the
+        # read model already applies to its case_* columns.
         #
         # Ordered by governing_case_key rather than a hand-rolled "newest first":
         # it is the same ranking the rest of the system uses to pick a governing
@@ -2537,18 +2539,40 @@ class MembersListView(PortalGenericAPIView):
         # moment a case has only the latter.
         from ..services.lifecycle import governing_case_key
 
-        cases = sorted(
-            (
-                c for c in client.cases.all()
-                if getattr(c, "case_type", "") == CaseType.INTERNAL_SERVICE
-            ),
-            key=governing_case_key,
-            reverse=True,
-        )
-        for case in cases:
-            kind = product_type_kind_for_name(case.program_name)
-            if kind:
-                return kind
+        def _kind_from_cases(holder):
+            cases = sorted(
+                (
+                    c for c in holder.cases.all()
+                    if getattr(c, "case_type", "") == CaseType.INTERNAL_SERVICE
+                ),
+                key=governing_case_key,
+                reverse=True,
+            )
+            for case in cases:
+                # program_name FIRST, then service_type. 95 production cases carry
+                # an EMPTY program_name while service_type still names the product
+                # exactly ("Produce Prescription/Voucher" -> boxes, "Medically
+                # Tailored Meals" -> meals). Same keyword matcher, second source.
+                # service_category is deliberately NOT consulted: it is
+                # "Food Assistance" for both kinds and maps to nothing.
+                for text in (case.program_name, case.service_type):
+                    kind = product_type_kind_for_name(text)
+                    if kind:
+                        return kind
+            return None
+
+        kind = _kind_from_cases(client)
+        if kind:
+            return kind
+        # Covered dependent: the case sits on the household primary.
+        if household is not None:
+            for m in household.members.all():
+                if m.is_primary and m.client_id and m.client_id != client.pk:
+                    if m.client is not None:
+                        kind = _kind_from_cases(m.client)
+                        if kind:
+                            return kind
+                    break
         return ""
 
     def _group_entries(self, sort_field="created", descending=True):

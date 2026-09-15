@@ -25346,3 +25346,123 @@ class ServiceTypeFallsBackToTheCaseTest(TestCase):
         older.save(update_fields=["case_created_at", "date_opened"])
 
         self.assertEqual(self._resolve(client), "meals")
+
+
+class ServiceTypeResolvesFromCaseServiceTypeAndHouseholdTest(TestCase):
+    """The two remaining sources of a blank Meals/Boxes kind.
+
+    After the first fix (fall back to the member's own case program_name) the
+    Pending card reconciled, but four other cards still did not:
+
+        active GAP=14  paused GAP=7  closed GAP=280  unable GAP=16
+
+    Two distinct causes, both fixable, neither "unknowable data":
+
+    1. 95 production internal-service cases carry an EMPTY program_name while
+       `service_type` names the product exactly -- "Produce Prescription/Voucher"
+       -> boxes, "Medically Tailored Meals" -> meals. Same keyword matcher, a
+       second source that was never consulted.
+    2. 22 were covered DEPENDENTS with no case of their own; the case sits on the
+       household primary, which the read model already inherits for its case_*
+       columns but this resolver did not.
+
+    With both, all 335 affected rows resolve (335 -> 117 -> 0) and every card's
+    meals + boxes equals its total.
+    """
+
+    def _client(self, name):
+        from .models import Client
+
+        return Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name=name, last_name="Member",
+            client_added_at=timezone.now(),
+        )
+
+    def _case(self, client, program_name="", service_type="", **kw):
+        from .models import Case, CaseStatus, CaseType
+
+        return Case.objects.create(
+            case_id=uuid.uuid4(), client=client, case_type=CaseType.INTERNAL_SERVICE,
+            case_status=CaseStatus.MANAGED, program_name=program_name,
+            service_type=service_type, case_created_at=timezone.now(), **kw,
+        )
+
+    def _resolve(self, client):
+        from .models import Client
+        from .portal.views_members import MembersListView
+
+        fresh = Client.objects.prefetch_related(
+            "enrollments", "cases",
+            "household_membership__household__enrollment_verifications",
+            "household_membership__household__members__client__cases",
+        ).get(pk=client.pk)
+        return str(MembersListView._service_type_for_client(fresh) or "")
+
+    def test_case_service_type_is_used_when_program_name_is_empty(self):
+        client = self._client("Voucher")
+        self._case(client, program_name="", service_type="Produce Prescription/Voucher")
+        self.assertEqual(self._resolve(client), "boxes")
+
+    def test_case_service_type_meals(self):
+        client = self._client("Tailored")
+        self._case(client, program_name="", service_type="Medically Tailored Meals")
+        self.assertEqual(self._resolve(client), "meals")
+
+    def test_program_name_still_wins_over_service_type(self):
+        client = self._client("Both")
+        self._case(
+            client,
+            program_name="Medically Tailored Meals (MTM) - Other Eligible Populations",
+            service_type="Produce Prescription/Voucher",
+        )
+        self.assertEqual(self._resolve(client), "meals")
+
+    def test_service_category_is_NOT_consulted(self):
+        """"Food Assistance" is the service_category for BOTH kinds and maps to
+        nothing -- consulting it could only ever guess."""
+        client = self._client("Category")
+        self._case(client, program_name="", service_type="", case_description="x")
+        case = client.cases.first()
+        case.service_category = "Food Assistance"
+        case.save(update_fields=["service_category"])
+        self.assertEqual(self._resolve(client), "")
+
+    def test_a_dependent_inherits_the_household_primarys_case_kind(self):
+        from .models import Household, HouseholdMember
+
+        primary = self._client("Primary")
+        dependent = self._client("Dependent")
+        hh = Household.objects.create(name="Inherit HH")
+        HouseholdMember.objects.create(household=hh, client=primary, is_primary=True)
+        HouseholdMember.objects.create(household=hh, client=dependent, is_primary=False)
+        self._case(
+            primary,
+            program_name="Medically Tailored Meals (MTM) - Other Eligible Populations",
+        )
+
+        self.assertEqual(
+            self._resolve(dependent), "meals",
+            "a covered dependent with no case of their own inherits the kind",
+        )
+
+    def test_a_dependents_own_case_still_wins_over_the_primarys(self):
+        from .models import Household, HouseholdMember
+
+        primary = self._client("Primary")
+        dependent = self._client("Dependent")
+        hh = Household.objects.create(name="Own HH")
+        HouseholdMember.objects.create(household=hh, client=primary, is_primary=True)
+        HouseholdMember.objects.create(household=hh, client=dependent, is_primary=False)
+        self._case(primary, program_name="Medically Tailored Meals (MTM) - Other")
+        self._case(
+            dependent,
+            program_name="Medically Tailored or Nutritionally Appropriate Food Prescription",
+        )
+
+        self.assertEqual(self._resolve(dependent), "boxes")
+
+    def test_no_case_anywhere_is_still_blank(self):
+        """Members with nothing to classify must stay blank -- they are the
+        legitimate 53k no_case population, not a bug to paper over."""
+        client = self._client("Nothing")
+        self.assertEqual(self._resolve(client), "")
