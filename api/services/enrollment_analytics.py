@@ -210,6 +210,29 @@ def _agent_name_by_employee_id(employee_id):
     return (ag.name or f"{ag.first_name} {ag.last_name}".strip() or "")
 
 
+def _medicaid_id(client):
+    """The member's Medicaid ID for the Data page / export.
+
+    Lives on Insurance.external_member_id -- Client has NO medicaid_id field, so
+    this used to read ``getattr(client, "medicaid_id", "")`` and the default won
+    every single time: the column existed and was blank on all 75,455 rows.
+
+    Mirrors serializers.medicaid_member_id (primary medicaid plan first, then any
+    medicaid plan), but tolerates casing/whitespace in plan_type rather than
+    matching "medicaid" exactly, since the two implementations already disagreed
+    on that.
+    """
+    plans = list(client.insurances.all())
+    medicaid = [
+        p for p in plans
+        if (p.plan_type or "").strip().lower() == "medicaid" and p.external_member_id
+    ]
+    if not medicaid:
+        return ""
+    primary = next((p for p in medicaid if p.is_primary), medicaid[0])
+    return primary.external_member_id or ""
+
+
 @lru_cache(maxsize=4096)
 def _team_by_creator_name(name):
     """CareCircle originating team of the Unite Us agent with this NAME. Fallback
@@ -648,7 +671,7 @@ def build_row(client):
         "stage": (enr.stage or "") if enr is not None else "",
         "first_name": client.first_name or "",
         "last_name": client.last_name or "",
-        "medicaid_id": getattr(client, "medicaid_id", "") or "",
+        "medicaid_id": _medicaid_id(client),
         "dob": client.date_of_birth,
         "member_created_at": client.created_at,
         # OUR added date + the channel that created the member: what the Data

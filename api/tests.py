@@ -1,6 +1,6 @@
 import base64
 import uuid
-from datetime import timedelta
+from datetime import date, datetime, timedelta, timezone as dt_timezone
 from types import SimpleNamespace
 
 from unittest import mock
@@ -24700,3 +24700,423 @@ class RemoveMemberPrimaryGuardTest(TestCase):
         )
         self.assertTrue(_is_primary_of_enrollment_household(owner, enr))
         self.assertFalse(_is_primary_of_enrollment_household(other, enr))
+
+
+@override_settings(
+    # The suite runs on DummyCache (see settings) so dashboard payloads cannot
+    # leak between tests; caching behaviour is unobservable under it.
+    CACHES={"default": {"BACKEND": "django.core.cache.backends.locmem.LocMemCache"}},
+)
+class CallToolsPresenceCachingTest(TestCase):
+    """Presence must not make an uncached upstream call on every poll.
+
+    The extension side panel polls /api/calltools/status/ every 10 SECONDS for
+    every signed-in agent, and the view called straight through to CallTools --
+    twice, each with a 15s timeout. A slow third party therefore held a gunicorn
+    thread for up to 30s per poll; with 9 workers x 2 threads, twenty agents
+    polling saturates every worker in under a minute. A CloudWatch p99 alarm
+    caught it at 03:35 on 2026-09-15 (19.5s) before it hit business hours.
+    """
+
+    def setUp(self):
+        from django.core.cache import cache
+
+        cache.clear()
+
+    def test_a_second_poll_is_served_from_cache(self):
+        from unittest.mock import patch
+
+        from .integrations.calltools import presence
+
+        with patch.object(
+            presence.client, "get", return_value={"logged_in": True},
+        ) as upstream:
+            presence.get_user_status("agent-1")
+            presence.get_user_status("agent-1")
+            presence.get_user_status("agent-1")
+
+        self.assertEqual(
+            upstream.call_count, 1,
+            "three polls inside the TTL must cost ONE upstream call",
+        )
+
+    def test_each_agent_is_cached_separately(self):
+        from unittest.mock import patch
+
+        from .integrations.calltools import presence
+
+        with patch.object(
+            presence.client, "get", return_value={"logged_in": True},
+        ) as upstream:
+            presence.get_user_status("agent-1")
+            presence.get_user_status("agent-2")
+        self.assertEqual(upstream.call_count, 2, "per-agent status, per-agent key")
+
+    def test_a_failure_is_cached_so_an_outage_is_not_re_paid_every_poll(self):
+        """The failure path is the EXPENSIVE one -- it costs the full timeout."""
+        from unittest.mock import patch
+
+        from .integrations.calltools import presence
+
+        with patch.object(
+            presence.client, "get", side_effect=presence.client.CallToolsError("down"),
+        ) as upstream:
+            with self.assertRaises(presence.client.CallToolsError):
+                presence.get_user_status("agent-1")
+            # Subsequent polls inside the failure TTL must NOT call upstream again.
+            self.assertEqual(presence.get_user_status("agent-1"), {})
+            self.assertEqual(presence.get_user_status("agent-1"), {})
+
+        self.assertEqual(upstream.call_count, 1, "one timeout paid, not three")
+
+    def test_live_calls_failures_are_cached_too(self):
+        from unittest.mock import patch
+
+        from .integrations.calltools import presence
+
+        with patch.object(
+            presence.client, "get_all",
+            side_effect=presence.client.CallToolsError("down"),
+        ) as upstream:
+            with self.assertRaises(presence.client.CallToolsError):
+                presence.list_live_calls()
+            self.assertEqual(presence.list_live_calls(), [])
+        self.assertEqual(upstream.call_count, 1)
+
+    def test_use_cache_false_still_forces_a_fetch(self):
+        from unittest.mock import patch
+
+        from .integrations.calltools import presence
+
+        with patch.object(
+            presence.client, "get", return_value={"logged_in": True},
+        ) as upstream:
+            presence.get_user_status("agent-1")
+            presence.get_user_status("agent-1", use_cache=False)
+        self.assertEqual(upstream.call_count, 2)
+
+    def test_the_upstream_timeout_is_a_few_seconds_not_fifteen(self):
+        """It is a per-request worker-hold budget, not patience: presence is
+        polled, so a long timeout multiplies across every agent."""
+        from .integrations.calltools import config
+
+        self.assertLessEqual(
+            config.TIMEOUT, 5,
+            "a polled presence endpoint must fail fast; 'unknown' beats holding a worker",
+        )
+
+    def test_presence_degrades_to_unknown_rather_than_raising(self):
+        """agent_presence swallows upstream errors -- the dot goes grey, the
+        request still returns promptly."""
+        from unittest.mock import patch
+
+        from .integrations.calltools import presence
+
+        with patch.object(
+            presence.client, "get", side_effect=presence.client.CallToolsError("down"),
+        ):
+            with patch.object(
+                presence.client, "get_all",
+                side_effect=presence.client.CallToolsError("down"),
+            ):
+                snap = presence.agent_presence("agent-1")
+
+        self.assertEqual(
+            snap["status"], "unknown",
+            "could not ASK CallTools -- not the same as being told 'logged out'",
+        )
+        self.assertFalse(snap["logged_in"])
+        self.assertIsNone(snap["active_call"])
+
+
+class DataExportCellFormattingTest(SimpleTestCase):
+    """The Data export was "impossible to work with" in a spreadsheet.
+
+    str() on the raw values produced three different date shapes in ONE file:
+    "2026-09-14" from DateFields but "2026-09-14 14:45:03.123456+00:00" from
+    DateTimeFields -- UTC, with microseconds, which neither Excel nor Sheets will
+    parse as a date. So every export needed hand-editing before use.
+    """
+
+    def test_a_date_is_plain_iso(self):
+        self._assert(date(2026, 9, 14), "2026-09-14")
+
+    def test_a_datetime_loses_microseconds_and_the_utc_offset(self):
+        self._assert(
+            datetime(2026, 9, 14, 14, 45, 3, 123456, tzinfo=dt_timezone.utc),
+            "2026-09-14 10:45",
+        )
+
+    def test_a_datetime_is_rendered_in_LOCAL_time(self):
+        """An evening delivery must not read as the next day. 00:45 UTC on the
+        15th is 20:45 on the 14th in the program's timezone."""
+        self._assert(
+            datetime(2026, 9, 15, 0, 45, tzinfo=dt_timezone.utc),
+            "2026-09-14 20:45",
+        )
+
+    def test_the_never_expires_sentinel_stays_a_far_future_DATE(self):
+        """Year-9999 means "no expiration". Converting it to local time rendered
+        "9999-12-30 19:00" -- a day earlier, with a meaningless clock time. It must
+        still sort to the far future, which is what "expiring soon" filters rely
+        on."""
+        self._assert(
+            datetime(9999, 12, 31, 0, 0, tzinfo=dt_timezone.utc), "9999-12-31",
+        )
+
+    def test_none_is_empty_not_the_string_None(self):
+        self._assert(None, "")
+
+    def test_a_list_is_comma_joined(self):
+        self._assert(["Peanuts", "Shellfish"], "Peanuts,Shellfish")
+
+    def test_a_bool_reads_as_yes_no(self):
+        self._assert(True, "Yes")
+        self._assert(False, "No")
+
+    def test_plain_values_pass_through(self):
+        self._assert("CareCircle Call Center", "CareCircle Call Center")
+        self._assert(42, "42")
+
+    def _assert(self, value, expected):
+        from .portal.views_members import _export_cell
+
+        self.assertEqual(_export_cell(value), expected)
+
+
+class DataExportMedicaidAndTeamTest(TestCase):
+    """Medicaid ID and Team on the Data export.
+
+    Medicaid ID had a column and was blank on all 75,455 read-model rows: the
+    builder read ``getattr(client, "medicaid_id", "")``, and Client has no such
+    field, so the getattr DEFAULT won every time. The value lives on
+    Insurance.external_member_id.
+    """
+
+    def _client(self, name="Test"):
+        from .models import Client
+
+        return Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name=name, last_name="Member",
+            client_added_at=timezone.now(),
+        )
+
+    def test_the_medicaid_id_comes_from_the_insurance_record(self):
+        from .models import Insurance
+        from .services.enrollment_analytics import _medicaid_id
+
+        c = self._client()
+        Insurance.objects.create(
+            client=c, plan_type="medicaid", external_member_id="AB12345C",
+            is_primary=True,
+        )
+        c.refresh_from_db()
+        self.assertEqual(_medicaid_id(c), "AB12345C")
+
+    def test_the_primary_medicaid_plan_wins(self):
+        from .models import Insurance
+        from .services.enrollment_analytics import _medicaid_id
+
+        c = self._client()
+        Insurance.objects.create(
+            client=c, plan_type="medicaid", external_member_id="SECONDARY",
+            is_primary=False,
+        )
+        Insurance.objects.create(
+            client=c, plan_type="medicaid", external_member_id="PRIMARY1",
+            is_primary=True,
+        )
+        c.refresh_from_db()
+        self.assertEqual(_medicaid_id(c), "PRIMARY1")
+
+    def test_plan_type_casing_and_whitespace_do_not_hide_the_id(self):
+        """serializers.medicaid_member_id matches "medicaid" EXACTLY while
+        views_reports lowercases it -- the two already disagreed, so be tolerant."""
+        from .models import Insurance
+        from .services.enrollment_analytics import _medicaid_id
+
+        c = self._client()
+        Insurance.objects.create(
+            client=c, plan_type=" Medicaid ", external_member_id="CD67890E",
+            is_primary=True,
+        )
+        c.refresh_from_db()
+        self.assertEqual(_medicaid_id(c), "CD67890E")
+
+    def test_no_medicaid_plan_gives_an_empty_string_not_an_error(self):
+        from .models import Insurance
+        from .services.enrollment_analytics import _medicaid_id
+
+        c = self._client()
+        Insurance.objects.create(
+            client=c, plan_type="medicare", external_member_id="IGNORED",
+            is_primary=True,
+        )
+        c.refresh_from_db()
+        self.assertEqual(_medicaid_id(c), "")
+
+    def test_a_medicaid_plan_with_no_id_is_skipped(self):
+        from .models import Insurance
+        from .services.enrollment_analytics import _medicaid_id
+
+        c = self._client()
+        Insurance.objects.create(
+            client=c, plan_type="medicaid", external_member_id="", is_primary=True,
+        )
+        c.refresh_from_db()
+        self.assertEqual(_medicaid_id(c), "")
+
+    def test_the_export_header_carries_medicaid_id_and_team(self):
+        """Team already existed on the read model and drove the Data page filter;
+        it was simply missing from the export."""
+        import csv
+        import io
+
+        from .models import Agent
+
+        agent = Agent.objects.create(
+            agent_code="EXP-1", name="Mgr", email="mgr@example.com",
+            group="Management", status="Active",
+        )
+        access = AccessToken()
+        access["agent_id"] = str(agent.id)
+        access["agent_code"] = agent.agent_code
+        access["agent_name"] = agent.name
+        access["agent_group"] = agent.group
+        api = APIClient()
+        api.credentials(HTTP_AUTHORIZATION=f"Bearer {access}")
+
+        resp = api.get("/api/portal/data/export/")
+        self.assertEqual(resp.status_code, 200)
+        header = next(csv.reader(io.StringIO(
+            b"".join(resp.streaming_content).decode(),
+        )))
+        self.assertIn("medicaid_id", header)
+        self.assertIn("team", header)
+
+
+class ServiceHealthMetricsTest(TestCase):
+    """Service health published as CloudWatch metrics.
+
+    Every alarm built before this watched the SERVER -- up, slow, throwing
+    tracebacks. None could report that nineteen households looked active but could
+    not receive a delivery, or that the Data page had been stale for a day. Those
+    only surfaced if somebody remembered to run `manage.py diagnose`, which leaves
+    the operator as the monitoring system.
+    """
+
+    def test_collect_returns_the_expected_gauges(self):
+        from .services.health_metrics import collect
+
+        metrics = collect()
+        for name in (
+            "DeliveryGapsNoPlan", "DeliveryGapsServable", "CredentialsActive",
+            "CredentialsExpired", "ReadModelAgeHours", "ImportRunsInFlight",
+            "ImportRunsStuck", "ReviewBucket",
+        ):
+            self.assertIn(name, metrics)
+            value, unit = metrics[name]
+            self.assertIsInstance(value, (int, float), name)
+            self.assertIn(unit, ("Count", "None"), name)
+
+    def test_an_EMPTY_read_model_reads_as_very_stale_not_as_healthy(self):
+        """The silent-zero trap. Reporting -1 or 0 for "never refreshed" would sit
+        BELOW any staleness threshold, so a read model with no rows at all -- worse
+        than a stale one -- would look perfectly healthy."""
+        from .models import EnrollmentAnalytics
+        from .services.health_metrics import collect
+
+        EnrollmentAnalytics.objects.all().delete()
+        age, _unit = collect()["ReadModelAgeHours"]
+        self.assertGreater(age, 1000, "an empty read model must trip a staleness alarm")
+
+    def test_a_stranded_household_with_a_servable_member_is_counted_separately(self):
+        """DeliveryGapsServable is the ACTIONABLE subset -- a calendar rebuild
+        fixes those on its own, while the rest need a member returned to service
+        first."""
+        from .models import (
+            Client, EnrollmentStage, EnrollmentVerification, Household,
+            HouseholdMember, Kitchen, MemberDietaryProfile,
+        )
+        from .services.health_metrics import collect
+
+        before = collect()
+        kitchen = Kitchen.objects.create(name="Test Kitchen")
+        owner = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Strand", last_name="Ed",
+            client_added_at=timezone.now(),
+        )
+        hh = Household.objects.create(name="Stranded HH")
+        HouseholdMember.objects.create(household=hh, client=owner, is_primary=True)
+        enr = EnrollmentVerification.objects.create(
+            client=owner, household=hh, kitchen=kitchen,
+            stage=EnrollmentStage.SERVICE_ACTIVE,
+        )
+        MemberDietaryProfile.objects.create(
+            enrollment=enr, client=owner, member_name="Strand Ed", status="active",
+        )
+
+        after = collect()
+        self.assertEqual(
+            after["DeliveryGapsNoPlan"][0], before["DeliveryGapsNoPlan"][0] + 1,
+        )
+        self.assertEqual(
+            after["DeliveryGapsServable"][0], before["DeliveryGapsServable"][0] + 1,
+            "an active member on it makes the gap repairable",
+        )
+
+    @override_settings(CLOUDWATCH_METRICS_ENABLED=False)
+    def test_publishing_is_a_no_op_when_disabled(self):
+        """So local development and this very test suite never call AWS."""
+        from unittest.mock import patch
+
+        from .services import health_metrics
+
+        with patch("boto3.client") as boto:
+            self.assertEqual(health_metrics.publish(), 0)
+        boto.assert_not_called()
+
+    @override_settings(
+        CLOUDWATCH_METRICS_ENABLED=True, CLOUDWATCH_METRICS_REGION="us-east-2",
+    )
+    def test_publishing_sends_the_gauges_to_the_business_namespace(self):
+        from unittest.mock import MagicMock, patch
+
+        from .services import health_metrics
+
+        client = MagicMock()
+        with patch("boto3.client", return_value=client) as boto:
+            sent = health_metrics.publish({"DeliveryGapsNoPlan": (19, "Count")})
+
+        self.assertEqual(sent, 1)
+        boto.assert_called_once()
+        self.assertEqual(boto.call_args.kwargs["region_name"], "us-east-2")
+        kwargs = client.put_metric_data.call_args.kwargs
+        self.assertEqual(kwargs["Namespace"], "CareCircle/Business")
+        datum = kwargs["MetricData"][0]
+        self.assertEqual(datum["MetricName"], "DeliveryGapsNoPlan")
+        self.assertEqual(datum["Value"], 19.0)
+        self.assertEqual(datum["Unit"], "Count")
+
+    @override_settings(CLOUDWATCH_METRICS_ENABLED=True)
+    def test_a_publish_failure_never_propagates(self):
+        """This runs on a beat tick beside real work: monitoring must not be able
+        to break the thing it monitors. A missing datapoint is itself a signal."""
+        from unittest.mock import patch
+
+        from .services import health_metrics
+
+        with patch("boto3.client", side_effect=RuntimeError("no credentials")):
+            self.assertEqual(health_metrics.publish({"X": (1, "Count")}), 0)
+
+    @override_settings(CLOUDWATCH_METRICS_ENABLED=True)
+    def test_the_celery_task_delegates_and_swallows(self):
+        from unittest.mock import patch
+
+        from .tasks import publish_health_metrics
+
+        with patch(
+            "api.services.health_metrics.publish", return_value=8,
+        ) as pub:
+            self.assertEqual(publish_health_metrics(), 8)
+        pub.assert_called_once()

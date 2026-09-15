@@ -61,10 +61,18 @@ difference between an agent telling you and a system telling you.
 
 ```
 SNS topic  arn:aws:sns:us-east-2:235665523206:Carecircle-alerts  -> alexis@carecirclecs.com
-LB         app/Lb-Development/b8946aa01528d29d      (NOTE: serves PRODUCTION despite the name)
+LB         app/LB-Production/4549a1a233e4cde2        <- the one the alarms watch
 TG         targetgroup/G-Prod/fb66bfd251e98163
 alarms     alb-unhealthy-host  alb-p99-latency  alb-target-5xx  alb-rejected-connections
 ```
+
+CORRECTION, recorded because it wasted time: `describe-load-balancers` run from
+the EC2 box returned only `app/Lb-Development/b8946aa01528d29d`, and I concluded
+that ALB served production "despite the name". It does not. The first real alarm
+notification named `app/LB-Production/4549a1a233e4cde2` in its dimensions -- there
+is more than one load balancer, and the alarms were (correctly) built in the
+CONSOLE against the production one. Trust the alarm's own dimensions over a CLI
+listing taken with the instance role, whose visibility may be partial.
 
 Each alarm notifies the topic on BOTH `In alarm` and `OK`, so a recovery is
 reported as well as a failure.
@@ -253,16 +261,263 @@ fields @timestamp, @message
 | limit 20
 ```
 
-## Phase 3 -- Alarms on application patterns (~1h, ~$1/mo)
+## Worked example -- the first real alarm, night one (2026-09-15)
 
-Metric filters over the Phase 2 log groups, each wired to the SNS topic:
+The whole stack earning its cost within hours of being finished. Keep this as the
+runbook: it is what "how do I use this?" looks like end to end.
 
-- `IntegrityError` -> any occurrence
-- `SLOW REQUEST` (from the Phase 1 middleware) -> more than N per 5 min
-- `daily_pull credential .* expired` -> a spike (this pattern preceded the
-  2026-09-14 incident by minutes)
+**1. The alarm arrived by email, unprompted.**
 
-## Phase 4 -- Optional
+```
+03:35  p99 = 19.53s   ALARM  (email 03:42)
+03:40  p99 =  0.18s   OK     (email 03:47)
+```
+
+The OK edge matters as much as the ALARM one -- without `--ok-actions` you start
+the morning investigating something that fixed itself at 3am.
+
+**2. Logs Insights named the endpoint in one query** (nginx access, 03:25-03:50):
+
+```
+GET /api/calltools/status/  rt=20.199 urt=20.200  200  123 bytes
+GET /api/calltools/status/  rt=17.062 urt=17.063
+GET /api/calltools/status/  rt=16.341
+GET /api/calltools/status/  rt= 9.600
+GET /api/calltools/status/  rt= 0.184 urt=0.184   200  146 bytes   <- normal
+```
+
+Three things fell out of those lines alone:
+
+* `urt` == `rt`, so the time was inside Django -- not nginx, not the network.
+  This is why the log format carries BOTH.
+* the same endpoint normally answers in 0.18s, so it was ~100x slow, not slow.
+* the slow responses were 123 bytes vs 146 normally -- a DIFFERENT body, i.e. a
+  failure path. Logging `$body_bytes_sent` was accidental luck; it is worth
+  keeping deliberately.
+
+**3. The code confirmed it.** `/api/calltools/status/` -> `agent_presence()` made
+TWO uncached upstream calls at a 15s timeout, and the extension side panel polls
+it every 10 SECONDS per signed-in agent. Up to 30s of worker hold per poll, on 18
+threads: twenty agents polling saturate the box in under a minute. Fixed in
+21a0dfd (cache 8s, cache failures 20s, timeout 3s).
+
+**4. Verification is built in.** If the same CallTools blip recurs after that
+deploy, p99 should peak near 3s and never reach the 5s threshold. Silence is the
+proof.
+
+### What this says about the alarm's tuning
+
+At 03:00 a five-minute window holds only a few dozen requests, so p99 is
+effectively "the slowest single request" and ONE 20s request trips it. During
+business hours the same metric is far stronger. That is a trade-off, not a fault:
+
+```
+1 datapoint  (current)  any 20s request pages you, incl. transient 3am blips
+2 datapoints            quieter, but ~10 min to notice a real outage
+```
+
+Left at 1 deliberately -- a 20-second request is worth knowing about even when it
+self-heals, and the underlying cause is now capped anyway.
+
+### The pattern to watch for elsewhere
+
+This was the SECOND instance of one shape in a single day, after the Unite Us
+refresh incident (707-908s -> 2-8s): **an unbounded external call inside a web
+request**, made worse when that request is POLLED. Worth auditing for others --
+any view that calls a third party should have a short timeout, a cache, and
+ideally not be on a polling path.
+
+## Phase 3 -- Alarms on application patterns -- DONE 2026-09-15 (~$1.60/mo)
+
+Metric filters over the Phase 2 log groups, wired to the same SNS topic. Filters
+are free; each custom metric is ~$0.30/mo and each alarm ~$0.10/mo.
+
+The patterns below are the STRINGS THE CODE ACTUALLY LOGS -- checked against
+source, not guessed. A metric filter that does not match the real text is worse
+than no filter: it reports zero for ever and reads as health.
+
+```
+"Traceback (most recent call last)"   any unhandled exception       api/... (any logger)
+"IntegrityError"                      DB constraint violation
+"SLOW REQUEST"                        api/middleware.py:117
+"credential" "expired"                uniteus_import.py:552, 752   (space = AND)
+```
+
+### Why `Traceback` and not just `IntegrityError`
+
+`django.request` is pinned at ERROR (settings) so every 5xx logs
+`Internal Server Error: /path` plus a traceback -- but the highest-value bug found
+on 2026-09-14 was NOT a 5xx. The Unite Us import's
+`TypeError: 'int' object is not subscriptable` was caught per person, logged, and
+the request returned 200: it silently dropped that member's contracted services.
+The ALB 5xx alarm cannot see it and `IntegrityError` does not match it. A
+`Traceback` filter does.
+
+### Commands (CloudShell, not the EC2 box)
+
+```
+export SNS=arn:aws:sns:us-east-2:235665523206:Carecircle-alerts
+export LG=/carecircle/gunicorn
+```
+
+`defaultValue=0` matters: without it the metric only exists when something
+matches, so a brand-new filter sits in INSUFFICIENT_DATA and an alarm cannot tell
+"healthy" from "not wired up".
+
+```
+aws logs put-metric-filter --region us-east-2 --log-group-name $LG --filter-name app-traceback --filter-pattern '"Traceback (most recent call last)"' --metric-transformations metricName=AppTracebacks,metricNamespace=CareCircle/App,metricValue=1,defaultValue=0
+aws logs put-metric-filter --region us-east-2 --log-group-name $LG --filter-name app-integrity-error --filter-pattern '"IntegrityError"' --metric-transformations metricName=IntegrityErrors,metricNamespace=CareCircle/App,metricValue=1,defaultValue=0
+aws logs put-metric-filter --region us-east-2 --log-group-name $LG --filter-name app-slow-request --filter-pattern '"SLOW REQUEST"' --metric-transformations metricName=SlowRequests,metricNamespace=CareCircle/App,metricValue=1,defaultValue=0
+aws logs put-metric-filter --region us-east-2 --log-group-name $LG --filter-name app-credential-expired --filter-pattern '"credential" "expired"' --metric-transformations metricName=CredentialExpired,metricNamespace=CareCircle/App,metricValue=1,defaultValue=0
+```
+
+Then the alarms. Thresholds are deliberately different per signal:
+
+```
+aws cloudwatch put-metric-alarm --region us-east-2 --alarm-name app-integrity-error --namespace CareCircle/App --metric-name IntegrityErrors --statistic Sum --period 300 --evaluation-periods 1 --threshold 0 --comparison-operator GreaterThanThreshold --treat-missing-data notBreaching --alarm-actions $SNS --ok-actions $SNS
+aws cloudwatch put-metric-alarm --region us-east-2 --alarm-name app-traceback-rate --namespace CareCircle/App --metric-name AppTracebacks --statistic Sum --period 300 --evaluation-periods 1 --threshold 5 --comparison-operator GreaterThanThreshold --treat-missing-data notBreaching --alarm-actions $SNS --ok-actions $SNS
+aws cloudwatch put-metric-alarm --region us-east-2 --alarm-name app-slow-request-rate --namespace CareCircle/App --metric-name SlowRequests --statistic Sum --period 300 --evaluation-periods 1 --threshold 10 --comparison-operator GreaterThanThreshold --treat-missing-data notBreaching --alarm-actions $SNS --ok-actions $SNS
+aws cloudwatch put-metric-alarm --region us-east-2 --alarm-name app-credential-expired-spike --namespace CareCircle/App --metric-name CredentialExpired --statistic Sum --period 300 --evaluation-periods 1 --threshold 5 --comparison-operator GreaterThanThreshold --treat-missing-data notBreaching --alarm-actions $SNS --ok-actions $SNS
+```
+
+| alarm | threshold | reasoning |
+|---|---|---|
+`app-integrity-error` | **any** | a constraint violation means data we believe is impossible happened; one is worth reading |
+`app-traceback-rate` | >5 / 5 min | tracebacks are never zero in practice (today's TypeError repeated all day). A RATE catches a new systemic break without paging on one bad row |
+`app-slow-request-rate` | >10 / 5 min | one slow request is life; ten in five minutes is the site degrading |
+`app-credential-expired-spike` | >5 / 5 min | this pattern preceded the 2026-09-14 outage by minutes -- the earliest warning available |
+
+### Verify the filters actually match
+
+The failure mode is silent -- a wrong pattern reports zero for ever and reads as
+health -- so verify rather than trust. In TWO steps, because they answer different
+questions.
+
+**1. Does the pattern match the text? (instant)** `test-metric-filter` evaluates a
+pattern against sample messages without touching a log group:
+
+```
+aws logs test-metric-filter --region us-east-2 --filter-pattern '"SLOW REQUEST"' --log-event-messages 'WARNING api.middleware: SLOW REQUEST POST /api/portal/members/x/refresh-uniteus/ -> 200 in 3963ms (agent=abc)'
+aws logs test-metric-filter --region us-east-2 --filter-pattern '"Traceback (most recent call last)"' --log-event-messages 'Traceback (most recent call last):'
+aws logs test-metric-filter --region us-east-2 --filter-pattern '"credential" "expired"' --log-event-messages 'WARNING api.services.uniteus_import: daily_pull credential 42 expired: token rejected'
+```
+
+A non-empty `matches` array means the pattern is right. An empty one means it is
+wrong -- usually quoting.
+
+**2. Is the pipeline live? (minutes later)** NOTE: metric filters DO NOT BACKFILL.
+They only evaluate events that arrive AFTER creation, so querying history right
+after creating one always returns nothing -- which looks like a broken pattern and
+is not. Let some traffic happen, then:
+
+```
+aws cloudwatch get-metric-statistics --region us-east-2 --namespace CareCircle/App --metric-name SlowRequests --start-time $(date -u -d '30 minutes ago' +%Y-%m-%dT%H:%M:%S) --end-time $(date -u +%Y-%m-%dT%H:%M:%S) --period 300 --statistics Sum --output table
+```
+
+`SlowRequests` is the easiest to confirm because a member-page "Refresh from Unite
+Us" reliably produces one.
+
+### As built, with two corrections from doing it
+
+Verified live: `SlowRequests` returned `Sum = 2.0` at 14:39 UTC from real traffic,
+and the pattern matches the REAL event shape -- worth checking separately, because
+the agent stores journald entries as JSON, so what the filter sees is
+
+```
+{"body":{"MESSAGE":"... SLOW REQUEST POST /api/... -\u003e 200 in 3963ms ...","PRIORITY":"6", ...}}
+```
+
+not the bare log line. A quoted-term pattern still matches inside that (confirmed
+with `test-metric-filter`), so no JSON-selector pattern is needed -- but it is a
+real failure mode: had CloudWatch parsed the event as JSON, the pattern would have
+needed `{ $.body.MESSAGE = "*SLOW REQUEST*" }` and would otherwise have reported
+zero for ever.
+
+**`defaultValue=0` does NOT make the metric continuous.** I claimed the rows would
+appear even at zero and prove the wiring; in practice the 30-minute window
+contained exactly ONE datapoint -- the period that had matches. So a quiet metric
+still looks like a missing one, and the only real proof is a datapoint appearing
+after traffic that should match.
+
+Consequently `app-slow-request-rate` can sit in INSUFFICIENT_DATA while the other
+three read OK. That is not a fault: with `--treat-missing-data notBreaching` a gap
+never alarms, and the state resolves once a period carries data. Do not "fix" it
+by lowering a threshold.
+
+```
+alb-p99-latency               OK
+alb-rejected-connections      OK
+alb-target-5xx                OK
+alb-unhealthy-host            OK
+app-credential-expired-spike  OK
+app-integrity-error           OK
+app-slow-request-rate         INSUFFICIENT_DATA  <- expected, see above
+app-traceback-rate            OK
+```
+
+## Phase 4 -- SERVICE health, not server health -- DONE 2026-09-15 (~$3/mo)
+
+Everything in Phases 0-3 watches the SERVER: is it up, is it slow, is it throwing
+tracebacks. None of it can say that nineteen households look active but cannot
+receive a delivery, or that the Data page has been stale for a day. Those numbers
+only appeared if somebody remembered to run `manage.py diagnose` -- which leaves
+the OPERATOR as the monitoring system, just over SSH instead of a chart.
+
+`api/services/health_metrics.py` publishes the same numbers `diagnose` prints, as
+CloudWatch metrics in `CareCircle/Business`, every 15 minutes via Celery beat:
+
+```
+DeliveryGapsNoPlan     service_active + kitchen but no live plan
+DeliveryGapsServable   ...of those, with a servable member -> repairable NOW
+CredentialsActive      Unite Us session pool
+CredentialsExpired     how the 2026-09-14 outage began
+ReadModelAgeHours      Data page staleness
+ImportRunsInFlight     PENDING+RUNNING
+ImportRunsStuck        ...older than 2h
+ReviewBucket           members needing human review
+```
+
+**No new IAM**: `CloudWatchAgentServerPolicy` (already attached for log shipping)
+grants `cloudwatch:PutMetricData`.
+
+Publishing is OFF unless `CLOUDWATCH_METRICS_ENABLED=1`, so local development and
+the test suite never call AWS. To see the numbers without publishing:
+
+```
+python manage.py publish_health_metrics
+```
+
+which also names the two conditions worth acting on immediately (stranded
+households that a calendar rebuild would fix, and a read model over 12h old).
+
+### A trap worth remembering: never report a failure as a LOW number
+
+`ReadModelAgeHours` first returned `-1` when the table had never been refreshed.
+An EMPTY read model is WORSE than a stale one -- the Data page has nothing at all
+-- yet `-1` sits below any staleness threshold and reads as perfectly healthy. It
+now reports `9999` so the alarm fires loudly. Same shape as a metric filter that
+never matches, or `getattr(client, "medicaid_id", "")` silently defaulting: the
+broken state must be LOUD, not quiet.
+
+### Alarms (CloudShell)
+
+```
+export SNS=arn:aws:sns:us-east-2:235665523206:Carecircle-alerts
+aws cloudwatch put-metric-alarm --region us-east-2 --alarm-name biz-delivery-gap-servable --namespace CareCircle/Business --metric-name DeliveryGapsServable --statistic Maximum --period 900 --evaluation-periods 2 --threshold 0 --comparison-operator GreaterThanThreshold --treat-missing-data notBreaching --alarm-actions $SNS --ok-actions $SNS
+aws cloudwatch put-metric-alarm --region us-east-2 --alarm-name biz-read-model-stale --namespace CareCircle/Business --metric-name ReadModelAgeHours --statistic Maximum --period 900 --evaluation-periods 2 --threshold 12 --comparison-operator GreaterThanThreshold --treat-missing-data notBreaching --alarm-actions $SNS --ok-actions $SNS
+aws cloudwatch put-metric-alarm --region us-east-2 --alarm-name biz-import-run-stuck --namespace CareCircle/Business --metric-name ImportRunsStuck --statistic Maximum --period 900 --evaluation-periods 2 --threshold 0 --comparison-operator GreaterThanThreshold --treat-missing-data notBreaching --alarm-actions $SNS --ok-actions $SNS
+aws cloudwatch put-metric-alarm --region us-east-2 --alarm-name biz-credentials-expired --namespace CareCircle/Business --metric-name CredentialsExpired --statistic Maximum --period 900 --evaluation-periods 2 --threshold 25 --comparison-operator GreaterThanThreshold --treat-missing-data notBreaching --alarm-actions $SNS --ok-actions $SNS
+```
+
+`evaluation-periods 2` throughout: these are gauges on a 15-minute publish, and a
+single tick during a rebuild can move them. Two consecutive breaches means the
+condition PERSISTED, which is what makes it worth an email.
+
+`DeliveryGapsNoPlan` is deliberately NOT alarmed: it sat at 19 with 17 of them
+needing a member returned to service, so an alarm would be permanently ON and
+therefore ignored. `DeliveryGapsServable` is the actionable half.
+
+## Phase 5 -- Optional
 
 - **ALB access logs -> S3 + Athena**: per-request `target_processing_time` with no
   agent on the box; good for historical analysis. Pay per GB scanned.
@@ -289,12 +544,35 @@ query strings**. A BAA is in place and CloudWatch Logs is HIPAA-eligible
 - retention must be set explicitly (90 days)
 - access to the log groups should be limited by IAM
 
+## Closed
+
+**gunicorn** (`--workers 9 --worker-class gthread --threads 2 --timeout 300`, on a
+4-vCPU m6i.xlarge with RDS off-box). Worker count is correct -- `(2 x CPU) + 1` --
+and 18 concurrent slots suit I/O-bound work. No change made.
+
+But it corrected a claim repeated several times that day: **`--timeout` does NOT
+cap request duration under `gthread`.** From the installed source,
+`ThreadWorker.run()` calls `self.notify()` in its own event loop while requests
+run in a separate `ThreadPoolExecutor`, so the arbiter keeps hearing a heartbeat
+no matter how long a request takes. It only kills a worker whose EVENT LOOP
+stalls. So "a sane timeout would have killed those 900s requests" was false: every
+guard in place was aimed elsewhere --
+
+```
+--timeout 300                  worker liveness only, not a request cap
+nginx proxy_read_timeout 300s  cuts the CLIENT connection; Django keeps working
+WEB_STATEMENT_TIMEOUT_MS 30s   caps SQL only -- the slow calls were HTTP
+```
+
+The real protection is architectural: no unbounded external call inside a request.
+
+**CloudWatch agent** is installed and running (1.300072.0b1766), shipping all four
+log groups.
+
 ## Still open
 
-- `systemctl cat gunicorn` -- need to see `--timeout` and worker count. A 900s
-  request COMPLETED during the incident, so the timeout must be very high. That is
-  not just a visibility gap but a missing safety net: a sane timeout would have
-  killed those requests and kept the site up. Changing it is a real behavioural
-  decision (long imports would start failing), so it needs the current value first.
-- Whether the CloudWatch agent is already installed
-  (`systemctl status amazon-cloudwatch-agent`).
+- Phase 4/5 if ever wanted.
+- An audit of every `requests.` call reachable from a view. TWICE in one day this
+  shape caused production problems (Unite Us refresh 707-908s; CallTools presence
+  up to 30s per poll), so it is the highest-value remaining sweep: each one wants a
+  short timeout, a cache, and ideally not to sit on a polling path.

@@ -20,6 +20,22 @@ logger = logging.getLogger(__name__)
 
 
 @shared_task(bind=True, ignore_result=True)
+def publish_health_metrics(self):
+    """Publish SERVICE-health gauges to CloudWatch (see services.health_metrics).
+
+    Scheduled because the alternative is an operator remembering to run
+    ``manage.py diagnose``: every alarm before this one watched the SERVER, so
+    nothing could tell you a household had stopped receiving deliveries.
+
+    Never raises -- ``publish()`` swallows and logs. A monitoring task must not be
+    able to fail a beat tick, and a missing datapoint is itself a signal.
+    """
+    from .services.health_metrics import publish
+
+    return publish()
+
+
+@shared_task(bind=True, ignore_result=True)
 def push_hyros_enrollment(self, client_id):
     """Push a Meta Ads member to Hyros tagged 'Enrolled' (once per member)."""
     from .services.hyros import push_enrollment

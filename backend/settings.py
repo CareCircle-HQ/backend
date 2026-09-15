@@ -455,6 +455,14 @@ CELERY_TIMEZONE = "America/New_York"
 # cadence keeps latency low without hammering the API. Requesting exports is
 # UI/manual-triggered (or via api.tasks.request_uniteus_exports on demand).
 CELERY_BEAT_SCHEDULE = {
+    # Service-health gauges -> CloudWatch (delivery gaps, credential pool, read-
+    # model staleness). Every alarm before these watched the SERVER; none could
+    # report that a household had stopped receiving deliveries. 15 minutes is
+    # well inside a 5-minute alarm period doubling, and the queries are cheap.
+    "publish-health-metrics": {
+        "task": "api.tasks.publish_health_metrics",
+        "schedule": float(os.getenv("HEALTH_METRICS_SECONDS", "900")),
+    },
     "poll-uniteus-exports": {
         "task": "api.tasks.poll_uniteus_exports",
         "schedule": float(os.getenv("UNITEUS_EXPORT_POLL_SECONDS", "300")),
@@ -621,7 +629,25 @@ GHL_CONTACT_SOURCE = os.getenv('GHL_CONTACT_SOURCE', 'Benefully extension')
 # ---------------------------------------------------------------------------
 CALLTOOLS_API_TOKEN = os.getenv('CALLTOOLS_API_TOKEN', '')
 CALLTOOLS_API_BASE = os.getenv('CALLTOOLS_API_BASE', 'https://east-1.calltools.io/api')
-CALLTOOLS_TIMEOUT = int(os.getenv('CALLTOOLS_TIMEOUT', '15'))
+# Presence is polled every 10s by every open side panel and can make TWO upstream
+# calls per request, so this is a per-request WORKER-HOLD budget, not patience. At
+# 15s a slow CallTools held a gunicorn thread up to 30s and spiked ALB p99 to
+# 19.5s (CloudWatch alarm, 2026-09-15 03:35); with 9 workers x 2 threads, twenty
+# agents polling would saturate the box. A presence dot is worth ~3s.
+# ---------------------------------------------------------------------------
+# CloudWatch custom metrics (service health -- see api/services/health_metrics.py)
+# ---------------------------------------------------------------------------
+# OFF by default so local development and the test suite never call AWS. Set
+# CLOUDWATCH_METRICS_ENABLED=1 in production. No IAM change is needed: the
+# instance role's CloudWatchAgentServerPolicy already grants PutMetricData.
+CLOUDWATCH_METRICS_ENABLED = os.getenv("CLOUDWATCH_METRICS_ENABLED", "").lower() in (
+    "1", "true", "yes",
+)
+# Must match the region the ALARMS live in, which is NOT necessarily
+# AWS_S3_REGION_NAME (that defaults to us-east-1 while the alarms are us-east-2).
+CLOUDWATCH_METRICS_REGION = os.getenv("CLOUDWATCH_METRICS_REGION", "us-east-2")
+
+CALLTOOLS_TIMEOUT = int(os.getenv('CALLTOOLS_TIMEOUT', '3'))
 
 
 # ---------------------------------------------------------------------------
