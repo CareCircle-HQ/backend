@@ -1,6 +1,6 @@
 import base64
 import uuid
-from datetime import timedelta
+from datetime import date, datetime, timedelta, timezone as dt_timezone
 from types import SimpleNamespace
 
 from unittest import mock
@@ -24827,3 +24827,169 @@ class CallToolsPresenceCachingTest(TestCase):
         )
         self.assertFalse(snap["logged_in"])
         self.assertIsNone(snap["active_call"])
+
+
+class DataExportCellFormattingTest(SimpleTestCase):
+    """The Data export was "impossible to work with" in a spreadsheet.
+
+    str() on the raw values produced three different date shapes in ONE file:
+    "2026-09-14" from DateFields but "2026-09-14 14:45:03.123456+00:00" from
+    DateTimeFields -- UTC, with microseconds, which neither Excel nor Sheets will
+    parse as a date. So every export needed hand-editing before use.
+    """
+
+    def test_a_date_is_plain_iso(self):
+        self._assert(date(2026, 9, 14), "2026-09-14")
+
+    def test_a_datetime_loses_microseconds_and_the_utc_offset(self):
+        self._assert(
+            datetime(2026, 9, 14, 14, 45, 3, 123456, tzinfo=dt_timezone.utc),
+            "2026-09-14 10:45",
+        )
+
+    def test_a_datetime_is_rendered_in_LOCAL_time(self):
+        """An evening delivery must not read as the next day. 00:45 UTC on the
+        15th is 20:45 on the 14th in the program's timezone."""
+        self._assert(
+            datetime(2026, 9, 15, 0, 45, tzinfo=dt_timezone.utc),
+            "2026-09-14 20:45",
+        )
+
+    def test_the_never_expires_sentinel_stays_a_far_future_DATE(self):
+        """Year-9999 means "no expiration". Converting it to local time rendered
+        "9999-12-30 19:00" -- a day earlier, with a meaningless clock time. It must
+        still sort to the far future, which is what "expiring soon" filters rely
+        on."""
+        self._assert(
+            datetime(9999, 12, 31, 0, 0, tzinfo=dt_timezone.utc), "9999-12-31",
+        )
+
+    def test_none_is_empty_not_the_string_None(self):
+        self._assert(None, "")
+
+    def test_a_list_is_comma_joined(self):
+        self._assert(["Peanuts", "Shellfish"], "Peanuts,Shellfish")
+
+    def test_a_bool_reads_as_yes_no(self):
+        self._assert(True, "Yes")
+        self._assert(False, "No")
+
+    def test_plain_values_pass_through(self):
+        self._assert("CareCircle Call Center", "CareCircle Call Center")
+        self._assert(42, "42")
+
+    def _assert(self, value, expected):
+        from .portal.views_members import _export_cell
+
+        self.assertEqual(_export_cell(value), expected)
+
+
+class DataExportMedicaidAndTeamTest(TestCase):
+    """Medicaid ID and Team on the Data export.
+
+    Medicaid ID had a column and was blank on all 75,455 read-model rows: the
+    builder read ``getattr(client, "medicaid_id", "")``, and Client has no such
+    field, so the getattr DEFAULT won every time. The value lives on
+    Insurance.external_member_id.
+    """
+
+    def _client(self, name="Test"):
+        from .models import Client
+
+        return Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name=name, last_name="Member",
+            client_added_at=timezone.now(),
+        )
+
+    def test_the_medicaid_id_comes_from_the_insurance_record(self):
+        from .models import Insurance
+        from .services.enrollment_analytics import _medicaid_id
+
+        c = self._client()
+        Insurance.objects.create(
+            client=c, plan_type="medicaid", external_member_id="AB12345C",
+            is_primary=True,
+        )
+        c.refresh_from_db()
+        self.assertEqual(_medicaid_id(c), "AB12345C")
+
+    def test_the_primary_medicaid_plan_wins(self):
+        from .models import Insurance
+        from .services.enrollment_analytics import _medicaid_id
+
+        c = self._client()
+        Insurance.objects.create(
+            client=c, plan_type="medicaid", external_member_id="SECONDARY",
+            is_primary=False,
+        )
+        Insurance.objects.create(
+            client=c, plan_type="medicaid", external_member_id="PRIMARY1",
+            is_primary=True,
+        )
+        c.refresh_from_db()
+        self.assertEqual(_medicaid_id(c), "PRIMARY1")
+
+    def test_plan_type_casing_and_whitespace_do_not_hide_the_id(self):
+        """serializers.medicaid_member_id matches "medicaid" EXACTLY while
+        views_reports lowercases it -- the two already disagreed, so be tolerant."""
+        from .models import Insurance
+        from .services.enrollment_analytics import _medicaid_id
+
+        c = self._client()
+        Insurance.objects.create(
+            client=c, plan_type=" Medicaid ", external_member_id="CD67890E",
+            is_primary=True,
+        )
+        c.refresh_from_db()
+        self.assertEqual(_medicaid_id(c), "CD67890E")
+
+    def test_no_medicaid_plan_gives_an_empty_string_not_an_error(self):
+        from .models import Insurance
+        from .services.enrollment_analytics import _medicaid_id
+
+        c = self._client()
+        Insurance.objects.create(
+            client=c, plan_type="medicare", external_member_id="IGNORED",
+            is_primary=True,
+        )
+        c.refresh_from_db()
+        self.assertEqual(_medicaid_id(c), "")
+
+    def test_a_medicaid_plan_with_no_id_is_skipped(self):
+        from .models import Insurance
+        from .services.enrollment_analytics import _medicaid_id
+
+        c = self._client()
+        Insurance.objects.create(
+            client=c, plan_type="medicaid", external_member_id="", is_primary=True,
+        )
+        c.refresh_from_db()
+        self.assertEqual(_medicaid_id(c), "")
+
+    def test_the_export_header_carries_medicaid_id_and_team(self):
+        """Team already existed on the read model and drove the Data page filter;
+        it was simply missing from the export."""
+        import csv
+        import io
+
+        from .models import Agent
+
+        agent = Agent.objects.create(
+            agent_code="EXP-1", name="Mgr", email="mgr@example.com",
+            group="Management", status="Active",
+        )
+        access = AccessToken()
+        access["agent_id"] = str(agent.id)
+        access["agent_code"] = agent.agent_code
+        access["agent_name"] = agent.name
+        access["agent_group"] = agent.group
+        api = APIClient()
+        api.credentials(HTTP_AUTHORIZATION=f"Bearer {access}")
+
+        resp = api.get("/api/portal/data/export/")
+        self.assertEqual(resp.status_code, 200)
+        header = next(csv.reader(io.StringIO(
+            b"".join(resp.streaming_content).decode(),
+        )))
+        self.assertIn("medicaid_id", header)
+        self.assertIn("team", header)

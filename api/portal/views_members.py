@@ -5,7 +5,7 @@ the verification wizard write."""
 import logging
 import re
 import uuid
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 
 from django.db import transaction
 from django.utils import timezone
@@ -3236,6 +3236,42 @@ class DataSummaryView(PortalAPIView):
         })
 
 
+def _export_cell(value):
+    """Render one Data-export cell so a spreadsheet can actually use it.
+
+    ``str()`` on the raw values gave three different date shapes in one file --
+    ``2026-09-14`` from DateFields but
+    ``2026-09-14 14:45:03.123456+00:00`` from DateTimeFields -- and the latter is
+    UTC with microseconds, which Excel and Sheets both refuse to parse as a date.
+    So the data team was left hand-editing columns.
+
+    Now: dates ``YYYY-MM-DD``, datetimes ``YYYY-MM-DD HH:MM`` in the program's
+    LOCAL timezone (a delivery at 20:00 EDT is not "the 15th", which is what UTC
+    made it look like). Seconds and microseconds are dropped -- nothing in this
+    export is sub-minute.
+    """
+    if value is None:
+        return ""
+    if isinstance(value, list):
+        return ",".join("" if v is None else str(v) for v in value)
+    # datetime BEFORE date: datetime is a subclass of date.
+    if isinstance(value, datetime):
+        # "Never expires" is stored as a year-9999 sentinel. Converting THAT to
+        # local time renders it "9999-12-30 19:00" -- a day earlier, with a
+        # meaningless clock time. Emit the bare sentinel date so it still sorts to
+        # the far future (which is what filtering "expiring soon" relies on).
+        if value.year >= 9999:
+            return "9999-12-31"
+        if timezone.is_aware(value):
+            value = timezone.localtime(value)
+        return value.strftime("%Y-%m-%d %H:%M")
+    if isinstance(value, date):
+        return value.strftime("%Y-%m-%d")
+    if isinstance(value, bool):
+        return "Yes" if value else "No"
+    return str(value)
+
+
 class DataExportView(PortalAPIView):
     """CSV export of the Data list (same read model + filters). Management-only;
     streams with a bounded-memory iterator."""
@@ -3265,7 +3301,7 @@ class DataExportView(PortalAPIView):
         ))
         fields = [
             "enrollment_id", "client_id", "primary_client_id", "first_name", "last_name", "medicaid_id",
-            "dob", "stage", "is_primary", "care_coordinator", "primary_care_coordinator",
+            "dob", "stage", "is_primary", "team", "care_coordinator", "primary_care_coordinator",
             "cadence", "kitchen_name", "menu_type", "current_delivery_status",
             "last_po_delivery_status", "last_delivered_at", "insurance_status",
             "insurance_expires_at", "social_status", "social_expires_at",
@@ -3296,10 +3332,7 @@ class DataExportView(PortalAPIView):
             yield header
             for r in qs.values_list(*fetch_fields).iterator(chunk_size=1000):
                 *scalars, phones = r
-                line = [
-                    ",".join(v) if isinstance(v, list) else ("" if v is None else str(v))
-                    for v in scalars
-                ]
+                line = [_export_cell(v) for v in scalars]
                 phones = phones or []
                 line += [phones[i] if i < len(phones) else "" for i in range(max_phones)]
                 yield line
