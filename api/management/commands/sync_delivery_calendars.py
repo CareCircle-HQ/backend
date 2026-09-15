@@ -53,7 +53,26 @@ class Command(BaseCommand):
                 raise CommandError(f"Invalid --from date: {raw!r} (use YYYY-MM-DD).")
 
         self.stdout.write("Reconciling active delivery calendars...")
-        totals = sync_active_calendars(from_date=from_date)
+
+        # sync_active_calendars already accepts a progress callback (the
+        # "Prepare Members for PO" task uses it to drive a percentage in the UI);
+        # this command simply never passed one. So an operator watching the log
+        # saw a single line and then silence for minutes, with no way to tell a
+        # long run from a hung one -- which is exactly the question being asked
+        # when someone tails the log.
+        state = {"last": -1}
+
+        def progress(processed, total):
+            if not total:
+                return
+            pct = processed * 100 // total
+            # Every 5% -- enough to show life, not enough to spam a log file.
+            if pct >= state["last"] + 5:
+                state["last"] = pct
+                self.stdout.write(f"  {pct:3d}%  {processed}/{total} enrollments")
+                self.stdout.flush()
+
+        totals = sync_active_calendars(from_date=from_date, progress_cb=progress)
         self.stdout.write(self.style.SUCCESS(
             f"Done: {totals['enrollments']} enrollments · "
             f"{totals.get('plans_created', 0)} member plans created · "

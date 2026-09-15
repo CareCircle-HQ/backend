@@ -2499,10 +2499,22 @@ class MembersListView(PortalGenericAPIView):
 
     @staticmethod
     def _service_type_for_client(client):
-        """Meals/Boxes kind derived from the client's enrollment program name
-        (prefetched), falling back to the household's enrollments so a dependent
-        with no enrollment of their own still resolves (the kind is household-
-        wide). Empty when neither keyword is present anywhere."""
+        """Meals/Boxes kind for the client, from the first source that resolves:
+        their own enrollments, then their household's, then their INTERNAL-SERVICE
+        CASES. Empty only when no program name anywhere names a known product.
+
+        The case fallback matters because it is the ONLY source for a member who
+        has an open case but no enrollment yet. Without it those members resolved
+        to "", which put them in the total of an Executive dashboard card while
+        appearing in NEITHER the meals nor the boxes row -- "174 meals + 36 boxes"
+        under a heading of "229 pending". Every one of the 18 such rows on a
+        production clone was cleanly classifiable from its case program name
+        ("Medically Tailored Meals (MTM) - ..." -> meals, "... Food Prescription"
+        -> boxes), so the information was there and simply never consulted.
+
+        Cases are prefetched on both callers (the members list and the analytics
+        builder), so this adds no queries.
+        """
         for enr in client.enrollments.all():
             kind = product_type_kind_for_name(enr.program_name)
             if kind:
@@ -2514,6 +2526,29 @@ class MembersListView(PortalGenericAPIView):
                 kind = product_type_kind_for_name(enr.program_name)
                 if kind:
                     return kind
+        # No enrollment anywhere names a product: fall back to the member's own
+        # internal-service cases, MOST-GOVERNING FIRST.
+        #
+        # Ordered by governing_case_key rather than a hand-rolled "newest first":
+        # it is the same ranking the rest of the system uses to pick a governing
+        # case (approval beats denial, open beats closed, then created_at), it is
+        # already tested, and it sidesteps a trap -- case_created_at is a DATETIME
+        # while date_opened is a DATE, so sorting on `a or b` raises TypeError the
+        # moment a case has only the latter.
+        from ..services.lifecycle import governing_case_key
+
+        cases = sorted(
+            (
+                c for c in client.cases.all()
+                if getattr(c, "case_type", "") == CaseType.INTERNAL_SERVICE
+            ),
+            key=governing_case_key,
+            reverse=True,
+        )
+        for case in cases:
+            kind = product_type_kind_for_name(case.program_name)
+            if kind:
+                return kind
         return ""
 
     def _group_entries(self, sort_field="created", descending=True):

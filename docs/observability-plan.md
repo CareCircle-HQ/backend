@@ -515,7 +515,14 @@ condition PERSISTED, which is what makes it worth an email.
 
 `DeliveryGapsNoPlan` is deliberately NOT alarmed: it sat at 19 with 17 of them
 needing a member returned to service, so an alarm would be permanently ON and
-therefore ignored. `DeliveryGapsServable` is the actionable half.
+therefore ignored.
+
+`DeliveryGapsServable` (2) is the half worth acting on -- but see "Still open":
+production taught us those two need an AGENT, not a script, so
+`DeliveryGapsRepairable` was added for the genuinely script-fixable subset (0
+today). If you want an alarm that is always actionable by a script, alarm on
+`DeliveryGapsRepairable`; if you want to know a member is not being fed at all,
+alarm on `DeliveryGapsServable` and accept that clearing it needs a person.
 
 ## Incident 2026-09-15 15:38 UTC -- every deploy was a small outage
 
@@ -586,19 +593,81 @@ back to restart (with a message), so deploys keep working -- just not gracefully
    this incident, nothing said WHEN. `$time_iso8601` added. It only surfaced the
    first time it was actually needed, which is the usual way.
 
-## Phase 5 -- Optional
+## Phase 5 -- DEFERRED, with triggers
 
-- **ALB access logs -> S3 + Athena**: per-request `target_processing_time` with no
-  agent on the box; good for historical analysis. Pay per GB scanned.
-- **Synthetics canary**: hits the app every minute; alerts before an agent notices.
-- **CloudWatch dashboard**: 3 free, then $3/mo.
-- **X-Ray**: skip. It needs SDK instrumentation and buys little for a
-  single-process monolith.
+Not started, and nothing currently known needs any of it. Recorded with the
+CONDITION that would make each one worth doing, so the decision is "has the
+trigger happened?" rather than a vague "someday".
 
-## Phase 5 -- Correlation (later)
+### ALB access logs -> S3 + Athena
 
-`X-Request-ID` generated in nginx, logged by Django, returned as a response
-header, so a user-reported problem maps to exact log lines.
+**What it adds.** Per-request ALB-side timing (`target_processing_time`,
+`request_processing_time`, `response_processing_time`) with no agent involved, and
+retention limited only by S3. Splits CLIENT time from SERVER time, which nginx
+`rt`/`urt` cannot: a slow mobile uplink and a slow view look similar in `rt`.
+
+**Trigger.** Any of:
+- a question about traffic older than the 90-day CloudWatch retention,
+- a complaint of slowness that nginx says was fast (i.e. suspect the network),
+- wanting per-request history without paying CloudWatch ingest for it.
+
+**Cost.** S3 storage (pennies) + Athena at ~$5/TB SCANNED. Partition by date on
+day one; an unpartitioned table scans everything on every query and that is how
+Athena bills get surprising.
+
+### Synthetics canary
+
+**What it adds.** An AWS-run request every minute, so an outage is detected
+without waiting for real traffic.
+
+**Trigger.** Deployment/outage detection outside working hours becomes a concern.
+NOTE `alb-unhealthy-host` ALREADY covers process death within ~2 minutes on a
+single-instance setup, so the marginal value today is small -- it mainly helps
+when the box is up but the app is broken in a way health checks miss (e.g. a
+500 on the login page).
+
+**Cost.** ~$0.0012 per run -> roughly $5/mo at one minute.
+
+### CloudWatch dashboard
+
+**What it adds.** A single page someone OTHER than the maintainer can look at.
+
+**Trigger.** Somebody besides you needs to see system state, or an incident
+review wants graphs rather than CLI output. Deliberately last: every alarm here
+is push, so a dashboard is for humans who want to browse, not for detection. The
+first 3 dashboards are free.
+
+### X-Ray -- skip
+
+Needs SDK instrumentation and buys little for a single-process monolith. The slow
+-request log plus nginx `rt`/`urt` already localises latency to a view.
+
+## Phase 6 -- Correlation, DEFERRED
+
+**The problem it solves.** An agent says "it broke around 2pm". Today that means
+guessing a time window and grepping. With ~2,600 requests per five minutes at
+peak, matching a report to specific log lines is luck.
+
+**The design.** nginx generates `$request_id` (it has one built in), passes it
+upstream as a header; Django logs it on every slow-request/error line AND returns
+it in the response. The UI surfaces it on an error toast, so a support ticket can
+quote an exact id:
+
+```nginx
+proxy_set_header X-Request-ID $request_id;
+log_format timed '... rid=$request_id ...';
+```
+
+Then a middleware puts it into the log record, and one Logs Insights query on
+`rid=` returns every line for that request -- across nginx AND Django.
+
+**Trigger.** The second time a user-reported problem cannot be located in the
+logs. (It has not happened yet: both real incidents so far were found from the
+alarm timestamp alone, because they were systemic rather than one user's request.)
+
+**Cost.** Free -- it is a header and a log field. The work is small but touches
+nginx, a Django middleware, the error response shape, and the frontend toast, so
+it wants doing deliberately rather than squeezed in.
 
 ---
 
@@ -640,8 +709,62 @@ log groups.
 
 ## Still open
 
-- Phase 4/5 if ever wanted.
-- An audit of every `requests.` call reachable from a view. TWICE in one day this
-  shape caused production problems (Unite Us refresh 707-908s; CallTools presence
-  up to 30s per poll), so it is the highest-value remaining sweep: each one wants a
-  short timeout, a cache, and ideally not to sit on a polling path.
+Phases 0-4 are DONE and in production: 12 alarms, 4 log groups on 90-day
+retention, 8 service gauges published every 15 minutes. Nothing below is required
+for the monitoring to work.
+
+### Small, recommended
+
+- **`SLOW_REQUEST_MS=5000`** in production `.env` (+ `systemctl reload gunicorn`).
+  At the 3s default the baseline is ~9 slow requests per 5 minutes -- ONE below the
+  `app-slow-request-rate` threshold -- so the alarm will flap on any busy stretch,
+  and a flapping alarm gets ignored. Almost all of those 9 are `refresh-uniteus`
+  at 3-4s, which is expected for a multi-call Unite Us round trip, not an
+  incident. Trade-off: a 4s endpoint regression stops appearing in the log, with
+  ALB p99 as the remaining safety net.
+- **`$time_iso8601`** in the LIVE nginx `log_format` (the repo copy has it). The
+  deployed format has no timestamp, so reading the file on the box during an
+  incident cannot answer "is this happening now?" -- which cost time on
+  2026-09-15.
+- ~~Close the `delivery_pod` run PENDING since 08-24~~ -- DONE, `ImportRunsStuck`
+  is now 0. POD import has no in-flight guard, so it had been blocking nothing.
+- **`DeliveryGapsServable` = 2 needs an AGENT, not a script.** Both enrollments
+  (15942, 12175) are `service_active` with a kitchen, a verified active member and
+  an address -- but `delivery_weekdays = []`. No cadence means nothing to build a
+  plan from, so `sync_delivery_calendars` walked all 15,731 enrollments and
+  correctly changed nothing. An agent must assign a cadence on the Programs tab.
+  (12175 also lacks nutritionist approval.)
+
+  This corrected the metric itself: `DeliveryGapsRepairable` now counts only the
+  stranded households that HAVE a cadence, and `publish_health_metrics` names the
+  enrollment ids that need a human instead of suggesting a command that cannot
+  help. The old wording -- "fixable by a calendar rebuild" -- was wrong for every
+  case actually in production.
+
+### Worth investigating
+
+- **`GET /api/portal/dashboard/` at 8-10s**, seen while the analytics rebuild ran,
+  with ONE agent retrying it six times in 90 seconds. It has a 600s cache
+  (`DASHBOARD_CACHE_TTL`) and was still that slow, so either the cache was missing
+  or the underlying queries are heavy. Check the slow-request log now the rebuild
+  is done: if `dashboard` still appears, it is the next `/orders/`-class win
+  (that one went 152 queries -> 9).
+- **A Celery worker OOM'd at 8.1 GB RSS on 2026-09-02** (`dmesg`). On a 15.7 GB
+  box that is a latent risk -- some task loads far too much into memory, and it
+  takes the worker down mid-import.
+- **An audit of every `requests.` call reachable from a view.** THREE of the
+  incidents in two days were this one shape -- an unbounded external call inside a
+  web request, worse when polled (Unite Us refresh 707-908s; CallTools presence up
+  to 30s per poll at a 10s poll interval). Each one wants a short timeout, a
+  cache, and ideally not to sit on a polling path. Highest-value remaining sweep.
+
+### Deferred (see Phase 5 / Phase 6 above for the trigger conditions)
+
+- **Phase 5** -- ALB logs to S3/Athena, a Synthetics canary, a dashboard.
+- **Phase 6** -- `X-Request-ID` correlation, so a user-reported problem maps to
+  exact log lines.
+
+Both are written up with the CONDITION that would justify them, so revisiting is
+a yes/no question rather than a re-investigation. Nothing currently known needs
+either: the two real incidents so far were both located from an alarm timestamp,
+because they were systemic rather than one user's request.

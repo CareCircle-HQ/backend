@@ -25083,7 +25083,46 @@ class ServiceHealthMetricsTest(TestCase):
         )
         self.assertEqual(
             after["DeliveryGapsServable"][0], before["DeliveryGapsServable"][0] + 1,
-            "an active member on it makes the gap repairable",
+            "an active member on it makes the gap worth acting on",
+        )
+        self.assertEqual(
+            after["DeliveryGapsRepairable"][0], before["DeliveryGapsRepairable"][0],
+            "no delivery_weekdays -> NOT script-repairable",
+        )
+
+    def test_repairable_counts_only_households_that_have_a_cadence(self):
+        """The distinction that matters: WHO can fix it. With delivery_weekdays a
+        script rebuilds the plan; without them nothing can, because there is
+        nothing to infer delivery days from -- and both of production's stranded
+        households were the latter, so sync_delivery_calendars walked all 15,731
+        enrollments and correctly changed nothing."""
+        from .models import (
+            Client, EnrollmentStage, EnrollmentVerification, Household,
+            HouseholdMember, Kitchen, MemberDietaryProfile,
+        )
+        from .services.health_metrics import collect
+
+        before = collect()
+        kitchen = Kitchen.objects.create(name="Cadence Kitchen")
+        owner = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Has", last_name="Cadence",
+            client_added_at=timezone.now(),
+        )
+        hh = Household.objects.create(name="Cadence HH")
+        HouseholdMember.objects.create(household=hh, client=owner, is_primary=True)
+        enr = EnrollmentVerification.objects.create(
+            client=owner, household=hh, kitchen=kitchen,
+            stage=EnrollmentStage.SERVICE_ACTIVE, delivery_weekdays=["tue"],
+        )
+        MemberDietaryProfile.objects.create(
+            enrollment=enr, client=owner, member_name="Has Cadence", status="active",
+        )
+
+        after = collect()
+        self.assertEqual(
+            after["DeliveryGapsRepairable"][0],
+            before["DeliveryGapsRepairable"][0] + 1,
+            "weekdays present -> a calendar rebuild CAN fix it",
         )
 
     @override_settings(CLOUDWATCH_METRICS_ENABLED=False)
@@ -25141,3 +25180,169 @@ class ServiceHealthMetricsTest(TestCase):
         ) as pub:
             self.assertEqual(publish_health_metrics(), 8)
         pub.assert_called_once()
+
+
+class SyncDeliveryCalendarsProgressTest(TestCase):
+    """`sync_delivery_calendars` must show signs of life.
+
+    It printed one line, then ran silently for minutes, then printed "Done" --
+    even though sync_active_calendars already accepts a progress_cb (the "Prepare
+    Members for PO" task uses it to drive a UI percentage). Tailing the log could
+    not distinguish a long run from a hung one, which is the only question an
+    operator has while watching it.
+    """
+
+    def test_progress_is_reported_every_few_percent(self):
+        from io import StringIO
+        from unittest.mock import patch
+
+        from django.core.management import call_command
+
+        def fake_sync(from_date=None, progress_cb=None):
+            for i in range(1, 101):
+                if progress_cb:
+                    progress_cb(i, 100)
+            return {
+                "enrollments": 100, "plans_created": 0, "added": 0,
+                "removed": 0, "updated": 0,
+            }
+
+        out = StringIO()
+        with patch(
+            "api.management.commands.sync_delivery_calendars.sync_active_calendars",
+            side_effect=fake_sync,
+        ):
+            call_command("sync_delivery_calendars", stdout=out)
+
+        text = out.getvalue()
+        self.assertIn("Reconciling", text)
+        self.assertIn("Done:", text)
+        pct_lines = [ln for ln in text.splitlines() if "enrollments" in ln and "%" in ln]
+        self.assertGreaterEqual(len(pct_lines), 10, f"expected ~20 updates: {text}")
+        self.assertLessEqual(len(pct_lines), 25, "every 5%, not every row")
+
+    def test_a_zero_total_does_not_divide_by_zero(self):
+        from io import StringIO
+        from unittest.mock import patch
+
+        from django.core.management import call_command
+
+        def fake_sync(from_date=None, progress_cb=None):
+            if progress_cb:
+                progress_cb(0, 0)
+            return {
+                "enrollments": 0, "plans_created": 0, "added": 0,
+                "removed": 0, "updated": 0,
+            }
+
+        out = StringIO()
+        with patch(
+            "api.management.commands.sync_delivery_calendars.sync_active_calendars",
+            side_effect=fake_sync,
+        ):
+            call_command("sync_delivery_calendars", stdout=out)
+        self.assertIn("Done:", out.getvalue())
+
+
+class ServiceTypeFallsBackToTheCaseTest(TestCase):
+    """Meals/Boxes must resolve for a member who has a CASE but no enrollment.
+
+    Reported from the Executive dashboard: a card read "229 pending" above rows
+    of "174 meals" and "36 boxes" -- 19 members counted in the total but in
+    NEITHER product row. `_service_type_for_client` consulted only enrollments
+    (the member's own, then their household's) and returned "" when none named a
+    known product, so a member with an open case and no enrollment yet resolved
+    to blank.
+
+    The information was there all along: on a production clone all 18 such rows
+    were cleanly classifiable from their case program name -- "Medically Tailored
+    Meals (MTM) - ..." -> meals, "... Food Prescription" -> boxes. After the fix
+    that cohort went from total=256 meals=192 boxes=46 (gap 18) to
+    meals=206 boxes=50 (gap 0).
+    """
+
+    def _client(self, name="Case", last="Only"):
+        from .models import Client
+
+        return Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name=name, last_name=last,
+            client_added_at=timezone.now(),
+        )
+
+    def _case(self, client, program_name, **kw):
+        from .models import Case, CaseStatus, CaseType
+
+        return Case.objects.create(
+            case_id=uuid.uuid4(), client=client, case_type=CaseType.INTERNAL_SERVICE,
+            case_status=kw.pop("case_status", CaseStatus.MANAGED),
+            program_name=program_name, case_created_at=timezone.now(), **kw,
+        )
+
+    def _resolve(self, client):
+        from .models import Client
+        from .portal.views_members import MembersListView
+
+        # Re-fetch with the prefetches both real callers use.
+        fresh = Client.objects.prefetch_related(
+            "enrollments", "cases",
+            "household_membership__household__enrollment_verifications",
+        ).get(pk=client.pk)
+        return str(MembersListView._service_type_for_client(fresh) or "")
+
+    def test_a_meals_case_with_no_enrollment_resolves_to_meals(self):
+        client = self._client()
+        self._case(client, "Medically Tailored Meals (MTM) - Other Eligible Populations")
+        self.assertEqual(self._resolve(client), "meals")
+
+    def test_a_boxes_case_with_no_enrollment_resolves_to_boxes(self):
+        client = self._client()
+        self._case(
+            client,
+            "Medically Tailored or Nutritionally Appropriate Food Prescription",
+        )
+        self.assertEqual(self._resolve(client), "boxes")
+
+    def test_an_enrollment_still_wins_over_the_case(self):
+        """The case is a FALLBACK. An enrollment naming a product is the better
+        source -- it is what the member is actually being served."""
+        from .models import EnrollmentStage, EnrollmentVerification
+
+        client = self._client()
+        self._case(client, "Medically Tailored or Nutritionally Appropriate Food Prescription")
+        EnrollmentVerification.objects.create(
+            client=client, stage=EnrollmentStage.SERVICE_ACTIVE,
+            program_name="Medically Tailored Meals (MTM) - Other Eligible Populations",
+        )
+        self.assertEqual(self._resolve(client), "meals")
+
+    def test_a_non_internal_service_case_is_ignored(self):
+        from .models import CaseType
+
+        client = self._client()
+        case = self._case(client, "Medically Tailored Meals (MTM) - Other")
+        case.case_type = CaseType.NAVIGATION
+        case.save(update_fields=["case_type"])
+        self.assertEqual(self._resolve(client), "")
+
+    def test_an_unrecognised_program_name_still_resolves_to_blank(self):
+        """The fix must not invent a kind. Blank remains correct when no program
+        name names a known product."""
+        client = self._client()
+        self._case(client, "Some Programme We Have Never Heard Of")
+        self.assertEqual(self._resolve(client), "")
+
+    def test_ordering_uses_governing_case_key_and_survives_a_date_only_case(self):
+        """Regression on a trap in my own first attempt: case_created_at is a
+        DATETIME and date_opened a DATE, so sorting on `a or b` raises TypeError
+        as soon as a case carries only the latter. governing_case_key handles it."""
+        from datetime import date
+
+        client = self._client()
+        older = self._case(
+            client, "Medically Tailored Meals (MTM) - Other Eligible Populations",
+        )
+        older.case_created_at = None
+        older.date_opened = date(2026, 1, 1)
+        older.save(update_fields=["case_created_at", "date_opened"])
+
+        self.assertEqual(self._resolve(client), "meals")
