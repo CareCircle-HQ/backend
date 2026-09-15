@@ -92,6 +92,12 @@ def collect():
     # --- Read-model freshness ----------------------------------------------
     # The Data page serves this table. When it goes stale the page silently shows
     # yesterday's reality, which no technical alarm can detect.
+    #
+    # NOTE this reads the REPLICA when one is configured (AnalyticsRouter routes
+    # EnrollmentAnalytics reads off the primary), so the number is REBUILD AGE
+    # PLUS REPLICATION LAG. Deliberately not pinned to the primary: this is the
+    # freshness a user of the Data page actually experiences, which is what the
+    # alarm should reflect. Just do not read it as "when did the rebuild finish".
     refreshed = EnrollmentAnalytics.objects.aggregate(t=Max("refreshed_at"))["t"]
     # An EMPTY read model is worse than a stale one -- the Data page has nothing
     # at all. Reporting -1 (or 0) for "never refreshed" would sit below any

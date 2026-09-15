@@ -35,6 +35,35 @@ The frontend has **no TypeScript installed** (`node_modules/.bin/tsc` does not
 exist), so `tsc --noEmit` silently does nothing. Verify it with `npm run build`
 instead -- esbuild will surface syntax/JSX errors.
 
+## The read model is served from a REPLICA -- pin verification to the primary
+
+`EnrollmentAnalytics` READS are routed to the `replica` database whenever
+`REPLICA_DB_HOST` is set (`api/db_routers.AnalyticsRouter`, "keeping heavy
+analytics reads off the primary"). Writes -- including `rebuild()` -- go to the
+primary, which pins itself to `default` so it never computes from a lagging copy.
+
+**So you cannot verify a write by reading the default connection.** A check like
+
+```
+EnrollmentAnalytics.objects.filter(service_type='').count()      # reads the REPLICA
+```
+
+answers "what did the replica have a moment ago", not "what did the rebuild do".
+On 2026-09-15 that cost real time: the same count read 3, then 10, then 21 within
+a few minutes, and a repair loop never converged because the list of rows to fix
+was ALSO being read from the replica -- so each pass rebuilt a stale, partial set.
+
+Always pin both the diagnosis and the verification:
+
+```
+E.objects.using('default').exclude(company_status='no_case').filter(service_type='')
+```
+
+Consequence worth knowing: `ReadModelAgeHours` in `health_metrics` reads the
+replica, so it measures REBUILD AGE PLUS REPLICATION LAG. That is arguably the
+more honest number -- it is what the Data page actually shows a user -- but do not
+read it as "how long ago did the rebuild finish".
+
 ## Long-running commands on production
 
 **Run full-table jobs OFF-HOURS.** A `rebuild_enrollment_analytics --prune`
