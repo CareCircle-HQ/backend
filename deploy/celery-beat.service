@@ -1,0 +1,49 @@
+# /etc/systemd/system/celery-beat.service
+#
+# THE SCHEDULER. Until 2026-09-15 this did not exist and celery-worker ran WITHOUT
+# -B, so nothing in CELERY_BEAT_SCHEDULE had ever executed. Nine scheduled tasks
+# were silently inert, which explains a day's worth of symptoms:
+#
+#   rebuild-enrollment-analytics  hourly :20  -> read model found 26-28h stale
+#   warm-dashboard-cache          every 8m    -> /portal/dashboard/ taking 8-10s
+#   poll-uniteus-exports          every 5m    -> Settings > Import never advanced
+#   publish-health-metrics        every 15m   -> metrics only when run by hand
+#   sync-delivery-calendars       daily 05:00 -> 19 stranded households
+#   sweep-closed-case-service     daily 04:00 -> 1,476-member backlog
+#   process-reauthorization-extensions        -> 237 parked, none processed
+#   import-uniteus-assessment-results         -> flag off, no-op
+#   sync-member-warnings          daily 11:00 -> the ONLY one covered, by cron
+#
+# A SEPARATE unit rather than adding -B to the worker: embedded beat shares the
+# worker's lifecycle, so `--max-tasks-per-child=100` recycling and every deploy
+# restart take the scheduler with them, and two workers would each run their own
+# beat (firing every task twice).
+#
+# --schedule points at a writable state file OUTSIDE the deploy tree so a code
+# deploy never wipes the "last run" record (which would re-fire daily tasks).
+#
+# BEFORE ENABLING: sweep-closed-case-service is gated behind
+# CLOSED_CASE_SWEEP_ENABLED (default off) precisely because of that 1,476-member
+# backlog. Triage it before turning the flag on.
+
+[Unit]
+Description=CareCircle Celery beat (scheduler)
+After=network.target redis-server.service
+Requires=celery-worker.service
+
+[Service]
+Type=simple
+User=ubuntu
+Group=www-data
+WorkingDirectory=/home/ubuntu/backend
+EnvironmentFile=/home/ubuntu/backend/.env
+
+ExecStart=/home/ubuntu/backend/venv/bin/celery -A backend beat \
+    --loglevel=info \
+    --schedule=/home/ubuntu/celerybeat-schedule
+
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

@@ -35,6 +35,46 @@ The frontend has **no TypeScript installed** (`node_modules/.bin/tsc` does not
 exist), so `tsc --noEmit` silently does nothing. Verify it with `npm run build`
 instead -- esbuild will surface syntax/JSX errors.
 
+## Celery beat: the scheduler, and why nothing was scheduled
+
+Until 2026-09-15 there was NO beat. `celery-worker` runs without `-B` and no beat
+unit existed, so every entry in `CELERY_BEAT_SCHEDULE` had never executed. Nine
+tasks were silently inert, which explains a day of symptoms that each looked like
+a separate bug:
+
+```
+rebuild-enrollment-analytics  hourly :20  -> read model found 26-28h stale
+warm-dashboard-cache          every 8m    -> /portal/dashboard/ at 8-10s
+poll-uniteus-exports          every 5m    -> Settings > Import never advanced
+publish-health-metrics        every 15m   -> metrics only when run by hand
+sync-delivery-calendars       daily 05:00 -> 19 stranded households
+sweep-closed-case-service     daily 04:00 -> a 1,476-member backlog
+process-reauthorization-extensions        -> 237 parked, none processed
+import-uniteus-assessment-results         -> flag off, no-op anyway
+sync-member-warnings          daily 11:00 -> the ONLY one covered, via cron
+```
+
+The single actual cron entry is `sync_member_warnings.sh` at 03:00;
+`daily_pull.sh` is COMMENTED OUT, so the Unite Us daily pull only happens when an
+agent clicks refresh.
+
+`deploy/celery-beat.service` is the unit to install. Separate from the worker, NOT
+`-B`: embedded beat dies with `--max-tasks-per-child` recycling and every deploy
+restart, and two workers would each run their own scheduler and fire everything
+twice.
+
+**Before enabling beat, dry-run the state-changing tasks.** Eight of the nine are
+safe or no-ops, but `sweep-closed-case-service` had accumulated 1,476 candidates
+-- 20 of them with 8-45 deliveries already scheduled -- and would cancel the lot
+in one overnight pass. It is gated behind `CLOSED_CASE_SWEEP_ENABLED` (default
+off) for exactly that reason. Most of these commands dry-run by omitting
+`--apply`:
+
+```
+python manage.py stop_closed_case_service --all          # no --apply = dry run
+python manage.py process_reauthorization_extensions      # no --apply = dry run
+```
+
 ## The read model is served from a REPLICA -- pin verification to the primary
 
 `EnrollmentAnalytics` READS are routed to the `replica` database whenever
