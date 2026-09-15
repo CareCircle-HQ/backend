@@ -755,6 +755,28 @@ def build_row(client):
         "pause_date": pause_date,
     }
 
+    # Last-resort Meals/Boxes kind: THIS ROW'S governing case.
+    #
+    # _service_type_for_client walks enrollments, then the member's own cases,
+    # then the household primary's -- but a member can be covered by an
+    # ENROLLMENT they are only a member profile on, whose case holder is NOT in
+    # their household (the AKALLOO shape: separate household records, one shared
+    # enrollment). SKYLAR was exactly this: no case of her own, no case on her
+    # own household, yet a case_id on this row inherited via the enrollment.
+    #
+    # Deriving from `case` here guarantees service_type AGREES WITH THE ROW'S OWN
+    # case_id, so the dashboard's meals + boxes can only fail to sum when the
+    # governing case itself names no product in either field.
+    if not row.get("service_type") and case is not None:
+        from api.services.catalog import product_type_kind_for_name
+
+        _kind = (
+            product_type_kind_for_name(getattr(case, "program_name", ""))
+            or product_type_kind_for_name(getattr(case, "service_type", ""))
+        )
+        if _kind:
+            row["service_type"] = str(_kind)
+
     # NO internal-service case (No Case Created) -> the member has no food-program
     # engagement to describe, so blank every case/enrollment/delivery-derived
     # field. Any residual here is orphaned data (e.g. a deleted internal-service
