@@ -61,10 +61,18 @@ difference between an agent telling you and a system telling you.
 
 ```
 SNS topic  arn:aws:sns:us-east-2:235665523206:Carecircle-alerts  -> alexis@carecirclecs.com
-LB         app/Lb-Development/b8946aa01528d29d      (NOTE: serves PRODUCTION despite the name)
+LB         app/LB-Production/4549a1a233e4cde2        <- the one the alarms watch
 TG         targetgroup/G-Prod/fb66bfd251e98163
 alarms     alb-unhealthy-host  alb-p99-latency  alb-target-5xx  alb-rejected-connections
 ```
+
+CORRECTION, recorded because it wasted time: `describe-load-balancers` run from
+the EC2 box returned only `app/Lb-Development/b8946aa01528d29d`, and I concluded
+that ALB served production "despite the name". It does not. The first real alarm
+notification named `app/LB-Production/4549a1a233e4cde2` in its dimensions -- there
+is more than one load balancer, and the alarms were (correctly) built in the
+CONSOLE against the production one. Trust the alarm's own dimensions over a CLI
+listing taken with the instance role, whose visibility may be partial.
 
 Each alarm notifies the topic on BOTH `In alarm` and `OK`, so a recovery is
 reported as well as a failure.
@@ -252,6 +260,72 @@ fields @timestamp, @message
 | sort rt desc
 | limit 20
 ```
+
+## Worked example -- the first real alarm, night one (2026-09-15)
+
+The whole stack earning its cost within hours of being finished. Keep this as the
+runbook: it is what "how do I use this?" looks like end to end.
+
+**1. The alarm arrived by email, unprompted.**
+
+```
+03:35  p99 = 19.53s   ALARM  (email 03:42)
+03:40  p99 =  0.18s   OK     (email 03:47)
+```
+
+The OK edge matters as much as the ALARM one -- without `--ok-actions` you start
+the morning investigating something that fixed itself at 3am.
+
+**2. Logs Insights named the endpoint in one query** (nginx access, 03:25-03:50):
+
+```
+GET /api/calltools/status/  rt=20.199 urt=20.200  200  123 bytes
+GET /api/calltools/status/  rt=17.062 urt=17.063
+GET /api/calltools/status/  rt=16.341
+GET /api/calltools/status/  rt= 9.600
+GET /api/calltools/status/  rt= 0.184 urt=0.184   200  146 bytes   <- normal
+```
+
+Three things fell out of those lines alone:
+
+* `urt` == `rt`, so the time was inside Django -- not nginx, not the network.
+  This is why the log format carries BOTH.
+* the same endpoint normally answers in 0.18s, so it was ~100x slow, not slow.
+* the slow responses were 123 bytes vs 146 normally -- a DIFFERENT body, i.e. a
+  failure path. Logging `$body_bytes_sent` was accidental luck; it is worth
+  keeping deliberately.
+
+**3. The code confirmed it.** `/api/calltools/status/` -> `agent_presence()` made
+TWO uncached upstream calls at a 15s timeout, and the extension side panel polls
+it every 10 SECONDS per signed-in agent. Up to 30s of worker hold per poll, on 18
+threads: twenty agents polling saturate the box in under a minute. Fixed in
+21a0dfd (cache 8s, cache failures 20s, timeout 3s).
+
+**4. Verification is built in.** If the same CallTools blip recurs after that
+deploy, p99 should peak near 3s and never reach the 5s threshold. Silence is the
+proof.
+
+### What this says about the alarm's tuning
+
+At 03:00 a five-minute window holds only a few dozen requests, so p99 is
+effectively "the slowest single request" and ONE 20s request trips it. During
+business hours the same metric is far stronger. That is a trade-off, not a fault:
+
+```
+1 datapoint  (current)  any 20s request pages you, incl. transient 3am blips
+2 datapoints            quieter, but ~10 min to notice a real outage
+```
+
+Left at 1 deliberately -- a 20-second request is worth knowing about even when it
+self-heals, and the underlying cause is now capped anyway.
+
+### The pattern to watch for elsewhere
+
+This was the SECOND instance of one shape in a single day, after the Unite Us
+refresh incident (707-908s -> 2-8s): **an unbounded external call inside a web
+request**, made worse when that request is POLLED. Worth auditing for others --
+any view that calls a third party should have a short timeout, a cache, and
+ideally not be on a polling path.
 
 ## Phase 3 -- Alarms on application patterns (~1h, ~$1/mo)
 
