@@ -635,6 +635,20 @@ CALLTOOLS_API_BASE = os.getenv('CALLTOOLS_API_BASE', 'https://east-1.calltools.i
 # 19.5s (CloudWatch alarm, 2026-09-15 03:35); with 9 workers x 2 threads, twenty
 # agents polling would saturate the box. A presence dot is worth ~3s.
 # ---------------------------------------------------------------------------
+# Closed-case service sweep (api.tasks.sweep_closed_case_service)
+# ---------------------------------------------------------------------------
+# OFF by default. Celery beat was never running on this deployment (no -B and no
+# beat unit, found 2026-09-15), so the sweep never fired and a backlog built up:
+# 1,476 candidate members, 20 of them with 8-45 future deliveries already
+# scheduled. Enabling beat would cancel every one of them in a single overnight
+# pass with no human review -- and for those 20 that means either stopping an
+# unauthorised delivery (correct) or cutting off someone's food because of a data
+# error (harmful). Triage the backlog, then set this to 1.
+CLOSED_CASE_SWEEP_ENABLED = os.getenv("CLOSED_CASE_SWEEP_ENABLED", "").lower() in (
+    "1", "true", "yes",
+)
+
+# ---------------------------------------------------------------------------
 # CloudWatch custom metrics (service health -- see api/services/health_metrics.py)
 # ---------------------------------------------------------------------------
 # OFF by default so local development and the test suite never call AWS. Set

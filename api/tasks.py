@@ -302,9 +302,33 @@ def sweep_closed_case_service(self):
     deliveries are truncated and the enrollment(s) cancelled -- dropping them off
     Purchase Orders and the delivery calendar. A no-op once everything is clean.
     Scheduled daily on Celery beat; also safe to call ad-hoc. Delegates to the
-    management command so the sweep logic lives in one place."""
+    management command so the sweep logic lives in one place.
+
+    GATED behind CLOSED_CASE_SWEEP_ENABLED, default OFF. Celery beat was never
+    running on this deployment (no -B, no beat unit -- found 2026-09-15), so this
+    sweep has never fired and a BACKLOG accumulated: a dry run found 1,476
+    candidate members, 20 of whom have 8-45 future deliveries already scheduled
+    (~614 occurrences). Enabling beat would cancel all of them in one overnight
+    pass, unreviewed.
+
+    Those 20 are the ones that matter: a closed last internal-service case with
+    deliveries still scheduled is either a genuine billing exposure (food going
+    out unauthorised) or a data error of the kind found repeatedly on
+    2026-09-14/15 -- in which case stopping their food would be actively harmful.
+    Three of them were being viewed by agents the same afternoon.
+
+    So the backlog is a human decision, and the scheduler must not make it. Turn
+    the flag on once it is triaged; from then on the sweep handles one or two
+    members a day, which is what it was designed for."""
+    from django.conf import settings
     from django.core.management import call_command
 
+    if not getattr(settings, "CLOSED_CASE_SWEEP_ENABLED", False):
+        logger.info(
+            "sweep_closed_case_service skipped: CLOSED_CASE_SWEEP_ENABLED is off "
+            "(triage the backlog first -- see api/tasks.py)"
+        )
+        return
     call_command("stop_closed_case_service", "--all", "--apply")
 
 

@@ -25673,3 +25673,64 @@ class UnmappedProgramNameMetricsTest(TestCase):
             'using("default")', src,
             "ServiceTypeBlankWithCase must be pinned to the primary",
         )
+
+
+class ClosedCaseSweepIsGatedTest(TestCase):
+    """The closed-case sweep must not fire on a backlog nobody has reviewed.
+
+    Celery beat was never running on this deployment -- celery-worker has no -B
+    and there was no beat unit (found 2026-09-15) -- so NINE scheduled tasks had
+    never executed. Eight are safe or no-ops. This one is not: a dry run found
+    1,476 candidate members, 20 of them with 8-45 future deliveries already
+    scheduled (~614 occurrences).
+
+    For those 20, cancelling is either correct (food going out against a closed
+    authorisation -- a billing exposure) or actively harmful (the case closure was
+    a data error, of the kind found repeatedly the same week). Three of them were
+    being viewed by agents that afternoon. That is a human decision, and enabling
+    a scheduler must not make it for them.
+    """
+
+    @override_settings(CLOSED_CASE_SWEEP_ENABLED=False)
+    def test_the_sweep_is_a_no_op_while_the_flag_is_off(self):
+        from unittest.mock import patch
+
+        from .tasks import sweep_closed_case_service
+
+        with patch("django.core.management.call_command") as call:
+            sweep_closed_case_service()
+        call.assert_not_called()
+
+    @override_settings(CLOSED_CASE_SWEEP_ENABLED=True)
+    def test_the_sweep_runs_once_the_flag_is_on(self):
+        from unittest.mock import patch
+
+        from .tasks import sweep_closed_case_service
+
+        with patch("django.core.management.call_command") as call:
+            sweep_closed_case_service()
+        call.assert_called_once_with("stop_closed_case_service", "--all", "--apply")
+
+    def test_the_default_is_OFF(self):
+        """A fresh deployment must not inherit the sweep switched on."""
+        from django.conf import settings
+
+        self.assertFalse(getattr(settings, "CLOSED_CASE_SWEEP_ENABLED", False))
+
+    def test_every_beat_entry_names_a_real_task(self):
+        """Guards the whole schedule: beat resolves tasks by dotted path at
+        runtime, so a renamed task fails silently every tick instead of at
+        deploy. Cheap to assert, and it is about to matter -- beat has never run
+        here, so none of these names has ever been exercised."""
+        import importlib
+
+        from django.conf import settings
+
+        for name, cfg in settings.CELERY_BEAT_SCHEDULE.items():
+            path = cfg["task"]
+            module_name, _, func = path.rpartition(".")
+            module = importlib.import_module(module_name)
+            self.assertTrue(
+                hasattr(module, func),
+                f"beat entry {name!r} points at {path!r}, which does not exist",
+            )
