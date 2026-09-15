@@ -25466,3 +25466,104 @@ class ServiceTypeResolvesFromCaseServiceTypeAndHouseholdTest(TestCase):
         legitimate 53k no_case population, not a bug to paper over."""
         client = self._client("Nothing")
         self.assertEqual(self._resolve(client), "")
+
+
+class AnalyticsServiceTypeAgreesWithTheRowsCaseTest(TestCase):
+    """service_type must agree with the row's OWN governing case.
+
+    The fourth and last source of a blank Meals/Boxes kind, found only by checking
+    all five dashboard cards instead of the one that was reported.
+
+    `_service_type_for_client` walks enrollments, then the member's own cases,
+    then the household PRIMARY's. But a member can be covered by an ENROLLMENT
+    they are merely a member profile on, whose case holder is NOT in their
+    household -- the AKALLOO shape: separate household records sharing one
+    enrollment. SKYLAR was exactly that: no case of her own, none on her own
+    household, yet a case_id on her row, inherited via the enrollment.
+
+    Deriving from the row's `case` as a last resort means service_type can only
+    be blank when the governing case itself names no product in either field --
+    so meals + boxes cannot silently fail to sum.
+
+    Measured on a production clone: 335 blank rows -> 0, and every card GAP -> 0.
+    """
+
+    def _client(self, name):
+        from .models import Client
+
+        return Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name=name, last_name="Member",
+            client_added_at=timezone.now(),
+        )
+
+    def test_a_member_covered_only_via_a_relatives_enrollment_gets_a_kind(self):
+        from .models import (
+            Case, CaseStatus, CaseType, EnrollmentStage, EnrollmentVerification,
+            Household, HouseholdMember, MemberDietaryProfile,
+        )
+        from .services.enrollment_analytics import rebuild
+        from .models import EnrollmentAnalytics
+
+        holder = self._client("Holder")
+        covered = self._client("Covered")
+        # SEPARATE households -- the shape that defeats the primary fallback.
+        holder_hh = Household.objects.create(name="Holder HH")
+        HouseholdMember.objects.create(household=holder_hh, client=holder, is_primary=True)
+        covered_hh = Household.objects.create(name="Covered HH")
+        HouseholdMember.objects.create(household=covered_hh, client=covered, is_primary=True)
+
+        case = Case.objects.create(
+            case_id=uuid.uuid4(), client=holder, case_type=CaseType.INTERNAL_SERVICE,
+            case_status=CaseStatus.MANAGED, case_created_at=timezone.now(),
+            program_name="Medically Tailored Meals (MTM) - Other Eligible Populations",
+        )
+        enr = EnrollmentVerification.objects.create(
+            client=holder, household=holder_hh, case=case,
+            stage=EnrollmentStage.SERVICE_ACTIVE, verified_at=timezone.now(),
+        )
+        # The only link for `covered`: a member profile on the holder's enrollment.
+        MemberDietaryProfile.objects.create(
+            enrollment=enr, client=covered, member_name="Covered Member",
+            status="active",
+        )
+
+        rebuild(client_ids=[covered.pk])
+        row = EnrollmentAnalytics.objects.get(client_id=covered.pk)
+        self.assertEqual(
+            row.service_type, "meals",
+            "covered via the relative's enrollment -- kind comes from the row's case",
+        )
+
+    def test_a_case_naming_no_product_anywhere_stays_blank(self):
+        """The fallback must not invent a kind: blank is still correct when the
+        governing case names no product in program_name OR service_type."""
+        from .models import Case, CaseStatus, CaseType, EnrollmentAnalytics
+        from .services.enrollment_analytics import rebuild
+
+        client = self._client("Nameless")
+        Case.objects.create(
+            case_id=uuid.uuid4(), client=client, case_type=CaseType.INTERNAL_SERVICE,
+            case_status=CaseStatus.MANAGED, case_created_at=timezone.now(),
+            program_name="", service_type="",
+        )
+        rebuild(client_ids=[client.pk])
+        self.assertEqual(
+            EnrollmentAnalytics.objects.get(client_id=client.pk).service_type, "",
+        )
+
+    def test_the_kind_is_stored_as_a_plain_string(self):
+        """product_type_kind_for_name returns an enum; the column is a CharField
+        that filter_analytics compares against 'meals'/'boxes' literals."""
+        from .models import Case, CaseStatus, CaseType, EnrollmentAnalytics
+        from .services.enrollment_analytics import rebuild
+
+        client = self._client("Enum")
+        Case.objects.create(
+            case_id=uuid.uuid4(), client=client, case_type=CaseType.INTERNAL_SERVICE,
+            case_status=CaseStatus.MANAGED, case_created_at=timezone.now(),
+            program_name="", service_type="Produce Prescription/Voucher",
+        )
+        rebuild(client_ids=[client.pk])
+        value = EnrollmentAnalytics.objects.get(client_id=client.pk).service_type
+        self.assertEqual(value, "boxes")
+        self.assertIsInstance(value, str)
