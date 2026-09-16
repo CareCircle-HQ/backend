@@ -1791,20 +1791,55 @@ class PortalCaseOptionSerializer(serializers.ModelSerializer):
     # modal can auto-select it (matches the stage bar / Cases-tab star). Passed
     # in via context by MemberCasesView.
     governing = serializers.SerializerMethodField()
+    governing_domain = serializers.SerializerMethodField()
+    service_domain = serializers.SerializerMethodField()
+    service_type_code = serializers.SerializerMethodField()
 
     class Meta:
         model = Case
         fields = [
             "id", "code", "status", "status_label", "type_label",
             "service_type", "program_name", "date_opened", "governing",
+            "governing_domain", "service_domain", "service_type_code",
         ]
 
     def get_code(self, obj):
         return f"CSE-{str(obj.case_id)[:8]}"
 
     def get_governing(self, obj):
+        # True for the governing case of ANY service type. `governing_by_case`
+        # maps case id -> domain; falls back to the single food id for callers
+        # that have not been updated.
+        by_case = self.context.get("governing_by_case") or {}
+        if by_case:
+            return str(obj.case_id) in by_case
         gid = self.context.get("governing_case_id")
         return bool(gid) and str(obj.case_id) == str(gid)
+
+    def get_governing_domain(self, obj):
+        """"food" / "housing" for a governing case, else "".
+
+        Drives the F / H letter on the Cases tab: with one governing case per
+        type, a single star cannot say which service it governs.
+        """
+        by_case = self.context.get("governing_by_case") or {}
+        return by_case.get(str(obj.case_id), "")
+
+    def get_service_domain(self, obj):
+        from api.services.catalog import case_service_domain
+
+        return case_service_domain(obj)
+
+    def get_service_type_code(self, obj):
+        """The ServiceType code, e.g. "home_expense_assistance_repairs".
+
+        Lets the UI separate housing WORK ORDERS (the Home Assistance tab) from
+        the assessment that governs them, which a case_type filter cannot do --
+        both are `internal_service`.
+        """
+        from api.services.catalog import case_service_type_code
+
+        return case_service_type_code(obj)
 
 
 class PortalMemberCaseSerializer(serializers.ModelSerializer):
@@ -1831,6 +1866,9 @@ class PortalMemberCaseSerializer(serializers.ModelSerializer):
     # True for the client's GOVERNING internal-service case -- the same case the
     # stage progress bar stars. Passed in via context by MemberCasesView.
     governing = serializers.SerializerMethodField()
+    governing_domain = serializers.SerializerMethodField()
+    service_domain = serializers.SerializerMethodField()
+    service_type_code = serializers.SerializerMethodField()
     # Product kind (Meals / Boxes) resolved from the program/service name, and the
     # Household vs Individual scope -- mirrors the stage progress bar's chips.
     product_kind = serializers.SerializerMethodField()
@@ -1857,6 +1895,7 @@ class PortalMemberCaseSerializer(serializers.ModelSerializer):
             "service_authorization_denial_reason",
             "outcome_description", "resolution_type", "resolution_label",
             "case_description", "is_met_council", "governing",
+            "governing_domain", "service_domain", "service_type_code",
             "product_kind", "product_kind_label",
             "household_type", "household_type_label",
         ]
@@ -1865,8 +1904,39 @@ class PortalMemberCaseSerializer(serializers.ModelSerializer):
         return f"CSE-{str(obj.case_id)[:8]}"
 
     def get_governing(self, obj):
+        # True for the governing case of ANY service type. `governing_by_case`
+        # maps case id -> domain; falls back to the single food id for callers
+        # that have not been updated.
+        by_case = self.context.get("governing_by_case") or {}
+        if by_case:
+            return str(obj.case_id) in by_case
         gid = self.context.get("governing_case_id")
         return bool(gid) and str(obj.case_id) == str(gid)
+
+    def get_governing_domain(self, obj):
+        """"food" / "housing" for a governing case, else "".
+
+        Drives the F / H letter on the Cases tab: with one governing case per
+        type, a single star cannot say which service it governs.
+        """
+        by_case = self.context.get("governing_by_case") or {}
+        return by_case.get(str(obj.case_id), "")
+
+    def get_service_domain(self, obj):
+        from api.services.catalog import case_service_domain
+
+        return case_service_domain(obj)
+
+    def get_service_type_code(self, obj):
+        """The ServiceType code, e.g. "home_expense_assistance_repairs".
+
+        Lets the UI separate housing WORK ORDERS (the Home Assistance tab) from
+        the assessment that governs them, which a case_type filter cannot do --
+        both are `internal_service`.
+        """
+        from api.services.catalog import case_service_type_code
+
+        return case_service_type_code(obj)
 
     def _product_kind(self, obj):
         from api.services.catalog import product_type_kind_for_name

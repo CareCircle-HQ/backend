@@ -1766,13 +1766,21 @@ def program_tracks(client):
     if housing_assessments:
         governing_ids.add(housing_assessments[0].case_id)
 
+    # ONLY the governing case of each type is surfaced on the bar. Non-governing
+    # cases are noise there -- a housing assessment brings a work order per
+    # remediation item (9 for one member on day one), which swamped the two rows
+    # that actually describe the member's service.
+    #
+    # THIS ALSO HIDES three food signals that used to ride on non-governing rows:
+    # "Duplicated" (a second case of the same kind), "Conflicting" (a Meals case
+    # alongside a Boxes one) and "Reauthorization - Waiting" (a parked future
+    # extension, see docs/reauthorization_extension_plan.md). They remain visible
+    # on the Programs tab. Restoring them here means relaxing this filter back to
+    # "governing OR open".
     cases = [
         c for c in all_cases
         if c.service_authorization_status != A.NEVER_REQUESTED
-        and (
-            c.case_status not in _CLOSED_CASE_STATUSES
-            or c.case_id in governing_ids
-        )
+        and c.case_id in governing_ids
     ]
 
     # Representative enrollment (a verification is household-wide): the most

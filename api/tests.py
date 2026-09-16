@@ -8082,25 +8082,47 @@ class ProgramTracksTest(TestCase):
         )
         from .services.lifecycle import program_tracks
 
-        # Meals is Approved (governs); Housing is a second internal-service case.
+        # Meals is Approved (governs food); the assessment governs HOUSING.
+        from .models import ActiveProgram
+        from .services.catalog import clear_program_domain_cache
+
         client = self._setup(
             stage=EnrollmentStage.SERVICE_ACTIVE,
             auth=ServiceAuthorizationStatus.APPROVED,
         )
+        # The service TYPE is DERIVED from the program via ActiveProgram, so the
+        # program has to be registered as housing. Without the row it derives as
+        # FOOD -- unknown programs default to food so nothing predating housing
+        # changes behaviour -- and would be filtered off the bar as a
+        # non-governing food case.
+        housing_program = (
+            "Dwelling Assessment & Statement of Work (SOW) Development - "
+            "Modifications and Remediation Service - Brooklyn"
+        )
+        ActiveProgram.objects.create(
+            program_name=housing_program, case_category="Internal Services",
+            case_type=ActiveProgram.CaseType.HOUSING,
+            service_type=ActiveProgram.ServiceType.ENVIRONMENTAL_EXPOSURE_ASSESSMENT,
+        )
+        clear_program_domain_cache()
         Case.objects.create(
             case_id=str(uuid.uuid4()), client=client,
             case_type=CaseType.INTERNAL_SERVICE, case_status=CaseStatus.OPEN,
-            service_type="Housing", service_category="Housing",
-            program_name="Housing Program",
+            service_type="Environmental Exposure Assessment",
+            service_category="Housing", program_name=housing_program,
             service_authorization_status=ServiceAuthorizationStatus.PENDING,
         )
         tracks = program_tracks(client)
         self.assertEqual(len(tracks), 2)
-        housing = next(t for t in tracks if t["category"] == "Housing")
-        self.assertEqual(housing["service_type"], "Housing")
-        self.assertEqual(housing["service_type_value"], "housing")
-        self.assertFalse(housing["governing"])
+        housing = next(t for t in tracks if t["domain"] == "housing")
+        self.assertEqual(housing["service_type"], "Environmental Exposure Assessment")
+        # GOVERNING -- one governing case per service TYPE, so the housing
+        # assessment governs housing while Meals governs food. It was previously
+        # asserted non-governing, when a single case governed the whole member.
+        self.assertTrue(housing["governing"])
         self.assertEqual(housing["authorization"]["label"], "Requested")
+        # Verification/Service stay blank: they are food concepts driven by the
+        # meal/box enrollment, and a dwelling assessment has neither.
         self.assertEqual(housing["verification"]["label"], "")
         self.assertEqual(housing["service"]["label"], "")
         # The food program still resolves its phases from the enrollment.
@@ -8108,10 +8130,14 @@ class ProgramTracksTest(TestCase):
         self.assertTrue(meals["governing"])
         self.assertEqual(meals["service"]["label"], "Active")
 
-    def test_two_cases_same_kind_show_as_separate_tracks(self):
-        """Two Meals internal-service cases produce TWO tracks (not grouped): the
-        governing (Approved) one carries the Verification/Service phases; the
-        other (Pending) shows Authorization only."""
+    def test_only_the_governing_case_of_a_kind_is_on_the_bar(self):
+        """Two Meals internal-service cases produce ONE track: the governing
+        (Approved) one. The second is a duplicate and lives on the Programs tab.
+
+        Was "...show_as_separate_tracks", which asserted the duplicate rendered
+        with a "Duplicated" service label. The bar became governing-only when
+        housing arrived, because one assessment generates a work order per
+        remediation item and they buried the meaningful rows."""""
         from .models import (
             Case, CaseStatus, CaseType, EnrollmentStage, ServiceAuthorizationStatus,
         )
@@ -8128,20 +8154,19 @@ class ProgramTracksTest(TestCase):
             service_authorization_status=ServiceAuthorizationStatus.PENDING,
         )
         tracks = program_tracks(client)
-        self.assertEqual(len(tracks), 2)
-        self.assertTrue(all(t["service_type"] == "Meals" for t in tracks))
-        gov = next(t for t in tracks if t["governing"])
-        other = next(t for t in tracks if not t["governing"])
-        self.assertEqual(str(other["case_id"]), str(second.case_id))
+        # ONLY the governing case of each type is on the bar now. A housing
+        # assessment brings one work order per remediation item (9 for one member
+        # on day one), which swamped the rows that describe the member's service,
+        # so the bar shows the governing case per type and nothing else. The
+        # duplicate is still visible on the Programs tab.
+        self.assertEqual(len(tracks), 1)
+        gov = tracks[0]
+        self.assertTrue(gov["governing"])
+        self.assertNotEqual(str(gov["case_id"]), str(second.case_id))
+        self.assertEqual(gov["service_type"], "Meals")
         # Governing carries the household service phases.
         self.assertEqual(gov["authorization"]["label"], "Approved")
         self.assertEqual(gov["service"]["label"], "Active")
-        # The competing (duplicate) case shares the household verification but
-        # is not separately serviced -> "Duplicated".
-        self.assertEqual(other["authorization"]["label"], "Requested")
-        self.assertEqual(other["verification"]["label"], "Verified")
-        self.assertEqual(other["service"]["label"], "Duplicated")
-        self.assertEqual(other["service"]["value"], "duplicated")
 
     def test_non_governing_closed_case_is_not_shown(self):
         # A closed/cancelled NON-governing internal-service case drops off the
@@ -8303,12 +8328,12 @@ class ProgramTracksTest(TestCase):
             service_authorization_status=ServiceAuthorizationStatus.DENIED,
         )
         tracks = program_tracks(client)
-        boxes = next(t for t in tracks if t["service_type"] == "Boxes")
-        self.assertFalse(boxes["governing"])
-        self.assertEqual(boxes["authorization"]["label"], "Denied")
-        self.assertEqual(boxes["verification"]["label"], "Verified")
-        self.assertEqual(boxes["service"]["value"], "conflicting")
-        self.assertEqual(boxes["service"]["label"], "Conflicting")
+        # The conflicting Boxes case is NOT on the bar -- governing only. The
+        # conflict itself is still visible on the Programs tab, and the competing
+        # case still participates in governing-case selection; it just does not
+        # get a row here.
+        self.assertEqual([t["service_type"] for t in tracks], ["Meals"])
+        self.assertTrue(tracks[0]["governing"])
 
     def test_denied_authorization(self):
         from .models import EnrollmentStage, ServiceAuthorizationStatus

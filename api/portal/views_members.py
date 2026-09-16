@@ -5735,10 +5735,23 @@ class MemberCasesView(PortalAPIView):
         from api.services.lifecycle import program_tracks
 
         tracks = program_tracks(client)
+        # One governing case PER SERVICE TYPE now, so a single id is not enough:
+        # a member can hold a governing food case AND a governing housing
+        # assessment. Pass the map so each can be flagged with its own letter.
+        governing_by_case = {
+            str(t["case_id"]): t.get("domain") or "food"
+            for t in tracks if t["governing"]
+        }
         governing_case_id = next(
+            # The FOOD governing case stays the single "governing_case_id" the
+            # New-Ticket "related case" dropdown auto-selects -- tickets are a
+            # food-service concept, and program_tracks sorts food first.
             (t["case_id"] for t in tracks if t["governing"]), None
         )
-        context = {"governing_case_id": governing_case_id}
+        context = {
+            "governing_case_id": governing_case_id,
+            "governing_by_case": governing_by_case,
+        }
         if request.query_params.get("detail"):
             return Response(
                 s.PortalMemberCaseSerializer(cases, many=True, context=context).data
