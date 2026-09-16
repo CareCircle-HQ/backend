@@ -135,6 +135,26 @@ screener creates  Environmental Exposure Assessment (EEA)   governing housing ca
 creates  Home Expense Assistance/Repairs (HEAR) cases       = WORK ORDERS
 ```
 
+## PHASE 1 — the Assessment Order
+
+Planned in **`docs/housing-assessment-order-plan.md`**. An agent runs a wizard on
+the member profile, once per member, producing an Assessment Order a vendor
+executes at the home: questionnaires signed on site into a locked PDF, plus
+documents, proof images and findings. The findings then drive the Home Remediation
+work orders, which link back to the order.
+
+Two things there that differ sharply from the food side, and are worth carrying in
+mind before reading the rest of this document:
+
+- the order is **per MEMBER, not per case**, and there is no request/approve cycle;
+- it is **append-only** -- "keep the record, do not rebuild". No reconcile, no
+  supersede-and-replace. The food side's rebuild machinery is what forked 149
+  enrollments across three families, so the absence is deliberate.
+
+Six open questions are listed there; Q1 (one order per member vs one ACTIVE per
+member) and Q2 (what "locked after each signature" means technically) change the
+schema, so they want settling before implementation.
+
 ## STILL REQUIRED — the rest
 
 **This must land before housing volume arrives.** Governing-case resolution is
