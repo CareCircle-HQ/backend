@@ -26889,3 +26889,134 @@ class BarRowsDifferByServiceTypeTest(TestCase):
         self.assertEqual(len(tracks), 1)
         self.assertEqual(tracks[0]["domain"], "housing")
         self.assertTrue(tracks[0]["governing"])
+
+
+class StrandedDeliveryPlanTest(TestCase):
+    """A dead enrollment must not keep a delivery calendar.
+
+    THERESA HOLLAND (7a07db31) held a DISREGARDED enrollment whose mon_thu plan was
+    still `scheduled`, alongside a live service_active enrollment on tue_fri. PO
+    generation served BOTH: Mon 9, Tue 17, Thu 12, Fri 20 across 58 orders -- four
+    deliveries a week instead of two, for over a month, with nothing to notice it.
+
+    Two halves, both needed:
+      * the transition retires the plan (root cause), and
+      * a metric detects any that slip through -- one of the real rows was created
+        by a human setting close_reason='serving_duplicate_manual' in a shell, and
+        no call-site fix catches that.
+    """
+
+    def _member(self, name="Stranded"):
+        from .models import Client
+
+        return Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name=name, last_name="Member",
+            client_added_at=timezone.now(),
+        )
+
+    def _enrollment(self, client, stage):
+        from .models import EnrollmentVerification
+
+        return EnrollmentVerification.objects.create(client=client, stage=stage)
+
+    def _plan(self, enrollment, cadence, *, ends_on="2099-12-31"):
+        from .models import MemberDeliverySchedule
+
+        return MemberDeliverySchedule.objects.create(
+            enrollment=enrollment, delivery_days_cadence=cadence,
+            status="scheduled", starts_on=timezone.localdate(),
+            ends_on=ends_on,
+        )
+
+    def test_a_plan_on_a_dead_enrollment_is_stranded(self):
+        from .models import EnrollmentStage
+        from .services.health_metrics import stranded_plan_count
+
+        c = self._member()
+        self._plan(self._enrollment(c, EnrollmentStage.DISREGARDED), "mon_thu")
+        self.assertEqual(stranded_plan_count(), 1)
+
+    def test_a_plan_on_a_LIVE_enrollment_is_not_stranded(self):
+        from .models import EnrollmentStage
+        from .services.health_metrics import stranded_plan_count
+
+        c = self._member()
+        self._plan(self._enrollment(c, EnrollmentStage.SERVICE_ACTIVE), "tue_fri")
+        self.assertEqual(stranded_plan_count(), 0)
+
+    def test_on_hold_counts_as_live(self):
+        """A paused member keeps their calendar -- pausing is not ending."""
+        from .models import EnrollmentStage
+        from .services.health_metrics import stranded_plan_count
+
+        c = self._member()
+        self._plan(self._enrollment(c, EnrollmentStage.ON_HOLD), "tue_fri")
+        self.assertEqual(stranded_plan_count(), 0)
+
+    def test_AT_RISK_needs_a_live_enrollment_too(self):
+        """The distinction that matters: a dead plan with no live enrollment
+        generates nothing, so it is inert -- countable, but not harmful."""
+        from .models import EnrollmentStage
+        from .services.health_metrics import stranded_plan_count
+
+        lonely = self._member("Lonely")
+        self._plan(self._enrollment(lonely, EnrollmentStage.CLOSED), "mon_thu")
+        self.assertEqual(stranded_plan_count(), 1)
+        self.assertEqual(stranded_plan_count(at_risk=True), 0)
+
+        # Give them a live enrollment and the SAME row becomes at-risk.
+        self._enrollment(lonely, EnrollmentStage.SERVICE_ACTIVE)
+        self.assertEqual(stranded_plan_count(at_risk=True), 1)
+
+    def test_a_plan_whose_window_already_passed_is_not_stranded(self):
+        """Retiring works by shortening the window, so an already-retired plan
+        must not be recounted -- otherwise the sweep never converges."""
+        from .models import EnrollmentStage
+        from .services.health_metrics import stranded_plan_count
+
+        c = self._member()
+        enr = self._enrollment(c, EnrollmentStage.CLOSED)
+        self._plan(
+            enr, "mon_thu",
+            ends_on=timezone.localdate() - timedelta(days=1),
+        )
+        self.assertEqual(stranded_plan_count(), 0)
+
+    def test_the_sweep_retires_the_plan_and_spares_the_live_one(self):
+        from django.core.management import call_command
+
+        from .models import EnrollmentStage, MemberDeliverySchedule
+        from .services.health_metrics import stranded_plan_count
+
+        c = self._member("Both")
+        dead = self._enrollment(c, EnrollmentStage.DISREGARDED)
+        live = self._enrollment(c, EnrollmentStage.SERVICE_ACTIVE)
+        dead_plan = self._plan(dead, "mon_thu")
+        live_plan = self._plan(live, "tue_fri")
+
+        self.assertEqual(stranded_plan_count(at_risk=True), 1)
+        call_command("retire_dead_enrollment_plans", "--apply", verbosity=0)
+
+        dead_plan.refresh_from_db()
+        live_plan.refresh_from_db()
+        self.assertLess(
+            dead_plan.ends_on, timezone.localdate(),
+            "the dead plan's window must be shortened so the nightly sync cannot "
+            "regenerate it",
+        )
+        self.assertEqual(
+            live_plan.ends_on, datetime.strptime("2099-12-31", "%Y-%m-%d").date(),
+            "the LIVE plan must be untouched",
+        )
+        self.assertEqual(stranded_plan_count(), 0)
+
+    def test_the_sweep_writes_nothing_without_apply(self):
+        from django.core.management import call_command
+
+        from .models import EnrollmentStage
+        from .services.health_metrics import stranded_plan_count
+
+        c = self._member()
+        self._plan(self._enrollment(c, EnrollmentStage.DISREGARDED), "mon_thu")
+        call_command("retire_dead_enrollment_plans", verbosity=0)
+        self.assertEqual(stranded_plan_count(), 1, "dry run must not write")

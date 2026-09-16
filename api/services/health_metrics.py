@@ -115,6 +115,24 @@ def collect():
     metrics["DeliveryGapsServable"] = (len(servable_rows), "Count")
     metrics["DeliveryGapsRepairable"] = (len(repairable), "Count")
 
+    # --- Delivery plans stranded on DEAD enrollments -------------------------
+    # A plan belongs to an enrollment; when the enrollment ends its plan should
+    # stop serving. Several paths did not do that, and a plan left `scheduled`
+    # with a future or NULL window is inert ONLY while the member has no live
+    # enrollment. Give them a live one on a different cadence and PO generation
+    # serves BOTH: THERESA HOLLAND got Mon/Thu AND Tue/Fri -- four deliveries a
+    # week instead of two, for over a month, with nothing to notice it.
+    #
+    # AT-RISK (member also has a live enrollment) is the number to alarm on; the
+    # total is reported alongside because today's inert row is tomorrow's
+    # at-risk one, the moment that member is re-enrolled.
+    #
+    # This metric exists because the code fix CANNOT be complete: one of these
+    # was created by a human setting close_reason='serving_duplicate_manual' in a
+    # shell. No call-site change catches that, so it has to be detected instead.
+    metrics["StrandedDeliveryPlans"] = (stranded_plan_count(), "Count")
+    metrics["StrandedDeliveryPlansAtRisk"] = (stranded_plan_count(at_risk=True), "Count")
+
     # --- Unite Us credential pool ------------------------------------------
     # Expired sessions are how the 2026-09-14 outage began: refreshes walked the
     # whole pool and paid an auth failure for each dead one.
@@ -266,3 +284,50 @@ def publish(metrics=None):
     except Exception:
         logger.exception("failed to publish health metrics")
         return 0
+
+
+def stranded_delivery_plan_enrollments(at_risk=False):
+    """Enrollments that are NOT live yet still hold a `scheduled` delivery plan
+    whose window has not passed.
+
+    ``at_risk`` narrows to members who ALSO have a live enrollment -- the only
+    cohort that can actually double-deliver, since a dead plan with no live
+    enrollment generates nothing.
+
+    Shared by the metric and ``retire_dead_enrollment_plans`` so the number the
+    alarm reports and the number the sweep fixes cannot drift apart.
+    """
+    from api.models import (
+        EnrollmentStage, EnrollmentVerification, MemberDeliverySchedule,
+    )
+
+    live_stages = {
+        EnrollmentStage.SERVICE_ACTIVE,
+        EnrollmentStage.KITCHEN_ASSIGNMENT,
+        EnrollmentStage.ON_HOLD,
+    }
+    today = timezone.localdate()
+    out = {}
+    for p in (MemberDeliverySchedule.objects
+              .filter(status="scheduled")
+              .exclude(ends_on__lt=today)
+              .select_related("enrollment")):
+        enr = p.enrollment
+        if enr is None or EnrollmentStage(enr.stage) in live_stages:
+            continue
+        out.setdefault(enr.pk, (enr, []))[1].append(p)
+    if not at_risk:
+        return out
+    live_clients = {
+        str(c) for c in EnrollmentVerification.objects
+        .filter(stage__in=live_stages).values_list("client_id", flat=True) if c
+    }
+    return {
+        k: v for k, v in out.items() if str(v[0].client_id) in live_clients
+    }
+
+
+def stranded_plan_count(at_risk=False):
+    """Number of stranded `scheduled` PLANS (not enrollments)."""
+    grouped = stranded_delivery_plan_enrollments(at_risk=at_risk)
+    return sum(len(ps) for _, ps in grouped.values())

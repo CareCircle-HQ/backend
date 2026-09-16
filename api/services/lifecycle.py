@@ -3597,6 +3597,29 @@ def _create_missing_carried_profiles(target, source):
     return created
 
 
+def _retire_enrollment_deliveries(enr):
+    """Shorten every delivery plan on a now-dead enrollment so it stops serving.
+
+    Any path that ENDS an enrollment must call this. The window is shortened
+    rather than the occurrences merely deleted, because the nightly
+    ``sync_active_calendars`` regenerates from the window -- deleting alone lets
+    them come straight back.
+
+    Never raises: retiring a calendar must not fail the transition that triggered
+    it, or a swallowed error would leave the enrollment dead AND still serving --
+    the worst of both.
+    """
+    try:
+        from api.services.orders import truncate_future_deliveries
+
+        if enr.delivery_schedules.exists():
+            truncate_future_deliveries(enr)
+    except Exception:  # noqa: BLE001 - never fail the caller's transition
+        logger.exception(
+            "failed to retire deliveries for dead enrollment %s", enr.pk,
+        )
+
+
 def _force_close_enrollment(enr):
     """Terminate ``enr`` as CLOSED even when the transition map has no edge from
     its current stage (e.g. verified / kitchen_assignment). Used ONLY for the
@@ -4871,6 +4894,14 @@ def _bind_governing_case_to_serving_enrollment(client, governing):
             e.save(update_fields=["case", "stage", "close_reason"])
         except Exception:  # pragma: no cover - defensive
             pass
+        else:
+            # A DISREGARDED enrollment must not keep a delivery calendar. Without
+            # this the dead row's MemberDeliverySchedule stays `scheduled` with a
+            # future (or NULL) window, and PO generation serves BOTH plans: THERESA
+            # HOLLAND received Mon/Thu AND Tue/Fri, 4 deliveries a week instead of
+            # 2, for over a month. _force_close_enrollment already does this for
+            # the superseded side of a case replacement; this path did not.
+            _retire_enrollment_deliveries(e)
     serv.case = governing
     try:
         serv.save(update_fields=["case"])
