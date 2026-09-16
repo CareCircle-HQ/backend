@@ -259,7 +259,7 @@ would have passed and shipped the hole.
 stage bar        F / H badge per governing case; housing chip = amber + House,
                  "EEA" with the full name on hover
 Cases tab        same F / H badge; amber EEA chip before the scope label;
-                 new "Home Assistance" tab (housing WORK ORDERS, matched on
+                 new "Home Remediation" tab (housing WORK ORDERS, matched on
                  service_type_code -- a case_type filter cannot separate them,
                  both are internal_service); house-with-wrench icon
 ```

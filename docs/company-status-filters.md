@@ -61,7 +61,7 @@ outranks it.
 | Requirement | Detail |
 |---|---|
 | Real verification | `verified_at` is set on the enrollment |
-| Valid authorisation | `approved` **or** `not_required` |
+| Valid authorization | `approved` **or** `not_required` |
 | …plus **one** of the two routes below | |
 
 **Route A — being delivered:** a live delivery calendar. Either an upcoming
@@ -93,7 +93,7 @@ member whose case just closed reads **Closed**, and one whose coverage lapsed re
 
 | Requirement | Detail |
 |---|---|
-| Live authorisation | `approved` **or** `pending`/requested |
+| Live authorization | `approved` **or** `pending`/requested |
 | Pre-service stage | anything *before* being served — pending verification, verified-and-waiting, awaiting nutritionist |
 
 **Explicitly excluded:** `service_active` and `service_complete`. A member at
@@ -122,7 +122,7 @@ first, on purpose.
 | **No social care coverage** | Coverage missing, inactive or expired |
 | **Eligibility = ineligible** | The read model's eligibility says ineligible |
 | **Lifecycle off-ramp** | `lifecycle_stage` is `not_eligible` or `ineligible` |
-| **Authorization denied** | The case authorisation was refused |
+| **Authorization denied** | The case authorization was refused |
 | **Authorization expired** | The approval **window** has lapsed |
 
 **Two that surprise people:**
@@ -174,7 +174,7 @@ lacks coverage reads **Unable**.
 **Rule:** that is the whole check.
 
 Note what it deliberately ignores: the enrollment stage, whether deliveries are
-still scheduled, and whether the authorisation is still valid. **The case is the
+still scheduled, and whether the authorization is still valid. **The case is the
 authority.**
 
 **What outranks it:** only No Case Created.
@@ -220,7 +220,7 @@ arrive here:
 | Shape | Why it lands here |
 |---|---|
 | **Activated but not delivering** | `service_active`/`service_complete` with **no live delivery calendar** — not Active (no calendar), not Pending (excluded by stage) |
-| **Non-actionable authorisation** | e.g. `never_requested` — nothing to progress toward, nothing blocking delivery in the Unable sense |
+| **Non-actionable authorization** | e.g. `never_requested` — nothing to progress toward, nothing blocking delivery in the Unable sense |
 
 Only **12 members** on the clone. It is a quarantine bucket, tracked in
 `docs/company-status-review-activated-no-delivery.md`.
