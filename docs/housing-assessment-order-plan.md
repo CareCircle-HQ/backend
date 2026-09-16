@@ -261,13 +261,41 @@ DispatchOrder(remediation, parent=the assessment order)
 Identical chain for both kinds, which is the argument for one `DispatchOrder` with
 a `kind` rather than two models.
 
-**To confirm:** you listed the tail as "Submitted or Pending Submission or
-Uploaded". I have read that as a linear progression —
-`PENDING SUBMISSION -> SUBMITTED -> UPLOADED` — where Pending Submission is "visit
-done, not yet submittable or not yet submitted", Submitted is the vendor committing
-(and the lock point), and Uploaded is the Unite Us record. If those are meant as
-three independent flags rather than a sequence, say so, because it changes the
-state machine from a line into a set.
+**CONFIRMED: one status field, a linear chain** — not three independent flags. Plus
+a full transition history, "the same details we did for the food cases".
+
+### History — extend `StageEvent`, do not build a parallel log
+
+`StageEvent` is already an append-only audit log of stage transitions with a
+**nullable-FK + `entity_type` discriminator**, and its docstring says it "mirrors
+the nullable-FK pattern used by Answer". It spans Client and Enrollment today. So
+the dispatch order joins it:
+
+```
+StageEntityType   += DISPATCH_ORDER
+StageEvent        += dispatch_order FK (nullable)
+
+existing fields, unchanged and exactly what is wanted:
+    from_stage / to_stage      the transition
+    source                     auto | manual
+    actor                      WHICH user did it
+    note / metadata            why, and any detail
+    entered_at                 when
+```
+
+Extending it rather than adding `DispatchStageEvent` matters for a reason beyond
+tidiness: **"show me everything that happened to this member"** stays one query. A
+parallel log would need every history view, export and report to know about a
+second table -- and today already showed what duplicated definitions cost, when
+fixing the unmapped-program metric left the management command printing the old
+answer.
+
+A `TimelineEvent` type per dispatch transition is the second half, since that is
+what the member profile's History tab reads. `TimelineEventType` already follows
+exactly this pattern for the food stages -- one granular type per stage, "so the
+History tab reads each transition distinctly instead of a pile of generic rows".
+Worth following that precedent: `dispatch_scheduled`, `dispatch_confirmed`,
+`dispatch_submitted`, `dispatch_uploaded`, rather than one lumpy `dispatch` type.
 
 ## The submission GATE
 
@@ -383,9 +411,40 @@ order:
 - **create an orphan** — a remediation order with no parent; or
 - **backfill** — create the assessment order first, in whatever state.
 
-Skip is the honest default: those cases were never dispatched through this system,
-and inventing an assessment order they never had would fabricate history — exactly
-what rule 5 ("keep the record") argues against.
+**DECIDED: skip at import, then ADOPT on verification.**
+
+> "I agree, we will save the home remediations cases and rebuild it when the
+> dwelling case get verified"
+
+So the linking rule has two entry points, not one:
+
+| When | Member HAS an assessment order | Member has NONE |
+|---|---|---|
+| **A Home Remediation case imports** | create its remediation order immediately | keep the case, create nothing — it waits |
+| **An assessment order is created** (the dwelling case is verified) | — | **adopt** every unlinked Home Remediation case the member holds |
+
+That covers the real data. MIRIAM's nine cases sit unlinked today; the moment her
+dwelling case is verified and her assessment order exists, all nine are adopted
+under it.
+
+**Calling it "adopt" rather than "rebuild" on purpose.** Nothing is recomputed or
+rewritten — the cases already exist and are untouched; they simply gain a
+remediation order and a parent. That keeps rule 5 intact ("keep the record, do not
+rebuild") and avoids reaching for the food side's rebuild/replace vocabulary, which
+is the machinery that forked 149 enrollments. The distinction is worth preserving
+in the code's naming too: `adopt_unlinked_remediation_cases(order)`, not
+`rebuild_*`.
+
+Two details to settle when implementing:
+
+- **Is adoption idempotent?** It must be — running it twice must not create two
+  remediation orders for one case. A unique constraint on
+  `(case, kind=remediation)` gives that for free, and is cheaper than remembering
+  to check.
+- **Does adoption reach CLOSED remediation cases?** Four of MIRIAM's nine are
+  closed. Adopting them records history honestly; skipping them avoids dispatching
+  work nobody will do. Leaning: adopt them, but never in a schedulable status —
+  their order starts at the terminal end, as a record.
 
 ## Naming — the DISPATCH domain
 
