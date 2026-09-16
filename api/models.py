@@ -5257,6 +5257,9 @@ class EnrollmentAnalytics(models.Model):
     # Data page CSV ("Phone 1", "Phone 2", ...).
     phone_numbers = ArrayField(models.CharField(max_length=40), default=list, blank=True)
     tags = ArrayField(models.CharField(max_length=64), default=list, blank=True)
+    # Codes of EVERY ticket type the member has ever had, whatever the ticket's
+    # status -- the Data page filter is analytical ("who has ever had this"),
+    # unlike the Members page's work-queue filter which binds to OPEN tickets.
     ticket_types = ArrayField(models.CharField(max_length=64), default=list, blank=True)
 
     # When this row was last rebuilt (freshness watermark).

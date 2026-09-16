@@ -347,11 +347,26 @@ def _parity_fields(client):
     except Exception:  # noqa: BLE001
         team = ""
     try:
+        # EVERY ticket the member has ever had, whatever its status. The Data
+        # page's Ticket Type filter means "members who have a ticket of this
+        # type", and 81% of them would be invisible if only live tickets counted:
+        # 6,662 members hold a ticket, but just 1,258 hold an OPEN/IN_PROGRESS one
+        # (9,727 tickets are resolved against 1,186 open). That made the filter
+        # look broken rather than narrow.
+        #
+        # This is deliberately WIDER than the Members page filter, which binds to
+        # tickets__status=OPEN -- that page is a work queue ("what needs doing
+        # now"), while the Data page is analytical ("who has ever had this").
+        # order_by() clears Ticket.Meta.ordering = ['-created_at'] BEFORE the
+        # distinct(). Without it Django adds created_at to the SELECT, so DISTINCT
+        # applies to (code, created_at) and every ticket survives -- 51 rows in
+        # production carry ['case_closure', 'case_closure']. Harmless for the
+        # __overlap filter, but the column is meant to be a set.
         ticket_types = [
-            c for c in Ticket.objects.filter(
-                client_id=client.pk,
-                status__in=[TicketStatus.OPEN, TicketStatus.IN_PROGRESS],
-            ).values_list("type__code", flat=True).distinct() if c
+            c for c in Ticket.objects
+            .filter(client_id=client.pk)
+            .order_by()
+            .values_list("type__code", flat=True).distinct() if c
         ]
     except Exception:  # noqa: BLE001
         ticket_types = []

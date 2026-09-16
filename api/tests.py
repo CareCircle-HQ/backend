@@ -25977,3 +25977,98 @@ class HousingServiceTypeTest(TestCase):
 
         self.assertFalse(case_in_import_scope(self.SERVICE, ""))
         self.assertFalse(case_in_import_scope(self.SERVICE, "Unknown Programme"))
+
+
+class DataPageTicketTypeFilterTest(TestCase):
+    """The Data page's Ticket Type filter must match ANY ticket, not just live ones.
+
+    Reported as "Ticket Type filter not working": the intent is "members who have
+    a ticket of this type", but the read model only recorded types for
+    OPEN/IN_PROGRESS tickets, so 81% of the population was invisible --
+    6,662 members hold a ticket, only 1,258 hold a live one (9,727 tickets are
+    resolved against 1,186 open). The filter worked; it was just answering a
+    different question.
+
+    Deliberately WIDER than the Members page filter, which binds to
+    tickets__status=OPEN: that page is a work queue, this one is analytical.
+    """
+
+    def _member(self, name):
+        from .models import Client
+
+        return Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name=name, last_name="Ticketed",
+            client_added_at=timezone.now(),
+        )
+
+    def _ticket(self, client, code, status):
+        from .models import Ticket, TicketType
+
+        tt, _ = TicketType.objects.get_or_create(
+            code=code, defaults={"label": code.replace("_", " ").title()},
+        )
+        return Ticket.objects.create(client=client, type=tt, status=status)
+
+    def _types(self, client):
+        from .models import EnrollmentAnalytics
+        from .services.enrollment_analytics import rebuild
+
+        rebuild(client_ids=[client.pk])
+        return sorted(EnrollmentAnalytics.objects.get(client_id=client.pk).ticket_types)
+
+    def test_a_RESOLVED_ticket_type_is_recorded(self):
+        from .models import TicketStatus
+
+        c = self._member("Resolved")
+        self._ticket(c, "case_closure", TicketStatus.RESOLVED)
+        self.assertEqual(self._types(c), ["case_closure"])
+
+    def test_open_and_in_progress_are_still_recorded(self):
+        from .models import TicketStatus
+
+        c = self._member("Live")
+        self._ticket(c, "kitchen_switch", TicketStatus.OPEN)
+        self._ticket(c, "delivery_issue", TicketStatus.IN_PROGRESS)
+        self.assertEqual(self._types(c), ["delivery_issue", "kitchen_switch"])
+
+    def test_duplicate_types_collapse(self):
+        from .models import TicketStatus
+
+        c = self._member("Duplicated")
+        self._ticket(c, "case_closure", TicketStatus.RESOLVED)
+        self._ticket(c, "case_closure", TicketStatus.OPEN)
+        self.assertEqual(self._types(c), ["case_closure"])
+
+    def test_a_member_with_no_tickets_has_none(self):
+        self.assertEqual(self._types(self._member("None")), [])
+
+    def test_the_filter_now_FINDS_a_member_whose_only_ticket_is_resolved(self):
+        """The actual reported symptom, end to end."""
+        from .models import TicketStatus
+        from .services.enrollment_analytics import filter_analytics, rebuild
+
+        c = self._member("OnlyResolved")
+        self._ticket(c, "case_closure", TicketStatus.RESOLVED)
+        rebuild(client_ids=[c.pk])
+
+        found = filter_analytics({"ticket_types": "case_closure"})
+        self.assertIn(str(c.pk), [str(r.client_id) for r in found])
+
+    def test_the_filter_matches_ANY_of_several_codes(self):
+        """The dropdown sends one code, but the filter uses __overlap so a
+        comma-separated list means "any of these"."""
+        from .models import TicketStatus
+        from .services.enrollment_analytics import filter_analytics, rebuild
+
+        a = self._member("Alpha")
+        b = self._member("Beta")
+        self._ticket(a, "case_closure", TicketStatus.RESOLVED)
+        self._ticket(b, "kitchen_switch", TicketStatus.RESOLVED)
+        rebuild(client_ids=[a.pk, b.pk])
+
+        ids = [
+            str(r.client_id) for r in
+            filter_analytics({"ticket_types": "case_closure,kitchen_switch"})
+        ]
+        self.assertIn(str(a.pk), ids)
+        self.assertIn(str(b.pk), ids)
