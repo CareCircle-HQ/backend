@@ -23,6 +23,27 @@ remain External.
 `0262` | the 3 programs: `External Services` -> `Internal Services`, `food` -> `housing`, `Food` -> `Housing` |
 `0263` | `ActiveProgram.ServiceType` += `ENVIRONMENTAL_EXPOSURE_ASSESSMENT` |
 `0264` | the 3 programs: `service_type = environmental_exposure_assessment` |
+`0265` | `ActiveProgram.ServiceType` += `HOME_EXPENSE_ASSISTANCE_REPAIRS` |
+`0266` | the 15 `Home Remediation - <device> - <borough>` programs -> Internal Services / housing / `home_expense_assistance_repairs` / Housing |
+
+So TWO housing services are ours now, 18 programs in total:
+
+```
+Dwelling Assessment & SOW Development - ... - {Bk,Mn,Qns}    3   Environmental Exposure Assessment
+Home Remediation - {Air Conditioner, Air Filtration Device,
+                    De-humidifier, Heater, Humidifier}
+                  - {Bk,Mn,Qns}                             15   Home Expense Assistance/Repairs
+```
+
+Settings > Programs builds its service-type dropdown straight from
+`ServiceType.choices`, so adding the enum value is what puts it in the UI -- there
+is no separate list to maintain.
+
+0266 matches the `Home Remediation - ` PREFIX rather than 15 exact names, since
+they share a strict scheme. The trailing `" - "` is load-bearing: one of the 7
+referral-only programs under the active Housing category is "Home Remediation
+Assistance: Ventilation Improving Systems", and without it a referral programme
+would silently become our own service. There is a test for that collision.
 
 Also:
 
