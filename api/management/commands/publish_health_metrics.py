@@ -12,32 +12,6 @@ from django.conf import settings
 from django.core.management.base import BaseCommand
 
 
-def _unmapped_program_identifiers():
-    """The distinct program identifiers that map to neither product kind.
-
-    Named rather than counted because the fix is per identifier: add its keyword
-    to ``api.services.catalog.product_type_kind_for_name``.
-    """
-    from api.models import Case, CaseType
-    from api.services.catalog import product_type_kind_for_name
-
-    pairs = (
-        Case.objects.filter(case_type=CaseType.INTERNAL_SERVICE)
-        .values_list("program_name", "service_type").distinct()
-    )
-    return sorted(
-        {
-            (program or service).strip()
-            for program, service in pairs
-            if (program or service)
-            and not (
-                product_type_kind_for_name(program)
-                or product_type_kind_for_name(service)
-            )
-        }
-    )
-
-
 def _stranded_without_cadence():
     """Enrollment ids that are service_active with a kitchen and a servable
     member, but have no delivery_weekdays -- so no script can build them a plan."""
@@ -117,7 +91,9 @@ class Command(BaseCommand):
                     "added to product_type_kind_for_name:"
                 )
             )
-            for name in _unmapped_program_identifiers():
+            from api.services.health_metrics import unmapped_program_identifiers
+
+            for name in unmapped_program_identifiers():
                 self.stdout.write(f"      {name!r}")
 
         blank = metrics.get("ServiceTypeBlankWithCase", (0, ""))[0]

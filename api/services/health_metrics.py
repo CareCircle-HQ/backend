@@ -29,6 +29,58 @@ logger = logging.getLogger(__name__)
 NAMESPACE = "CareCircle/Business"
 
 
+def non_food_program_names():
+    """Program names whose ActiveProgram type is NOT food.
+
+    Housing programs (type HOUSING, "Environmental Exposure Assessment") are
+    internal services that deliver no meal or box, so they have no product kind by
+    design. Meals/Boxes metrics must exclude them or they read as defects -- the 3
+    Dwelling Assessment programs alone put UnmappedProgramNames at 2 and started an
+    alarm that could never clear.
+    """
+    from ..models import ActiveProgram
+
+    return [
+        n for n in ActiveProgram.objects
+        .exclude(case_type=ActiveProgram.CaseType.FOOD)
+        .values_list("program_name", flat=True) if n
+    ]
+
+
+def unmapped_program_identifiers():
+    """Distinct program identifiers on FOOD internal-service cases that map to
+    neither meals nor boxes.
+
+    ONE definition, used by both `collect()` and `publish_health_metrics` -- the
+    command previously carried its own copy, which then failed to pick up the
+    non-food exclusion and would have kept naming housing programs after the
+    metric itself was fixed.
+
+    Counts DISTINCT identifiers because the fix is per name: add the keyword to
+    `catalog.product_type_kind_for_name`. Cases with NOTHING recorded are excluded
+    -- missing data is a different problem with no keyword to add, and
+    ServiceTypeBlankWithCase covers it.
+    """
+    from ..models import Case, CaseType
+    from ..services.catalog import product_type_kind_for_name
+
+    non_food_cf = {n.strip().casefold() for n in non_food_program_names()}
+    pairs = (
+        Case.objects.filter(case_type=CaseType.INTERNAL_SERVICE)
+        .values_list("program_name", "service_type").distinct()
+    )
+    return sorted({
+        (program or service).strip()
+        for program, service in pairs
+        if (program or service)
+        and (program or "").strip().casefold() not in non_food_cf
+        and not (
+            product_type_kind_for_name(program)
+            or product_type_kind_for_name(service)
+        )
+    })
+
+
 def collect():
     """The service-health gauges, as ``{metric_name: (value, unit)}``.
 
@@ -133,7 +185,16 @@ def collect():
     # kind is blank. On 2026-09-15 that read "229 pending" over "174 + 36", and it
     # had FOUR separate causes. It was found by a human comparing two numbers on a
     # screen -- which is exactly what a metric is for.
+    from ..models import ActiveProgram
     from ..services.catalog import product_type_kind_for_name
+
+    # Both metrics below are about MEALS/BOXES reporting, so non-food internal
+    # services must be excluded or they read as defects. Housing programs (type
+    # HOUSING, "Environmental Exposure Assessment") are internal services that
+    # deliver no meal or box, so they legitimately have no product kind -- without
+    # this filter the 3 Dwelling Assessment programs alone put
+    # UnmappedProgramNames at 2 and started an alarm that could never clear.
+    non_food = non_food_program_names()
 
     # 1. UPSTREAM, fires the day a new program arrives. product_type_kind_for_name
     #    matches by KEYWORD ("meal"; "box"/"voucher"/"produce prescription"/
@@ -143,20 +204,9 @@ def collect():
     #    because the fix is per name: add the keyword to the catalog.
     #    Only non-empty values: a case with nothing recorded is missing DATA, not
     #    an unrecognised program, and is covered by the second metric.
-    pairs = (
-        Case.objects.filter(case_type=CaseType.INTERNAL_SERVICE)
-        .values_list("program_name", "service_type").distinct()
+    metrics["UnmappedProgramNames"] = (
+        len(unmapped_program_identifiers()), "Count",
     )
-    unmapped = {
-        (program or service).strip()
-        for program, service in pairs
-        if (program or service)
-        and not (
-            product_type_kind_for_name(program)
-            or product_type_kind_for_name(service)
-        )
-    }
-    metrics["UnmappedProgramNames"] = (len(unmapped), "Count")
 
     # 2. DOWNSTREAM, the thing a manager actually sees: read-model rows that HAVE
     #    a case but no product kind, i.e. rows counted in a card's total while
@@ -167,11 +217,23 @@ def collect():
     #    CORRECTNESS check, and reading a lagging replica reports phantom rows --
     #    on 2026-09-15 the same count read 3, then 10, then 21 within minutes and
     #    a repair loop never converged because of it.
-    metrics["ServiceTypeBlankWithCase"] = (
+    blank_rows = (
         EnrollmentAnalytics.objects.using("default")
-        .exclude(company_status="no_case").filter(service_type="").count(),
-        "Count",
+        .exclude(company_status="no_case").filter(service_type="")
     )
+    if non_food:
+        # Same reason: a housing member has no Meals/Boxes kind by design, so they
+        # are not a gap in the Meals/Boxes cards. iexact per name rather than __in
+        # because the read model's program_name is the CASE's string, which only
+        # matched ActiveProgram case-insensitively. Cheap while non-food programs
+        # number a handful; revisit if that grows.
+        from django.db.models import Q
+
+        q = Q()
+        for name in non_food:
+            q |= Q(program_name__iexact=name)
+        blank_rows = blank_rows.exclude(q)
+    metrics["ServiceTypeBlankWithCase"] = (blank_rows.count(), "Count")
 
     # --- Members needing human review --------------------------------------
     metrics["ReviewBucket"] = (

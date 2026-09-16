@@ -25652,12 +25652,57 @@ class UnmappedProgramNameMetricsTest(TestCase):
         self.assertEqual(collect()["UnmappedProgramNames"][0], before)
 
     def test_the_command_names_the_unmapped_identifiers(self):
-        from .management.commands.publish_health_metrics import (
-            _unmapped_program_identifiers,
-        )
+        from .services.health_metrics import unmapped_program_identifiers
 
         self._case(self._client("Novel"), program_name="Nutrition Support Benefit")
-        self.assertIn("Nutrition Support Benefit", _unmapped_program_identifiers())
+        self.assertIn("Nutrition Support Benefit", unmapped_program_identifiers())
+
+    def test_a_NON_FOOD_program_is_not_counted_as_unmapped(self):
+        """Housing programs deliver no meal or box, so having no product kind is
+        correct, not a defect. Without this exclusion the 3 Dwelling Assessment
+        programs put UnmappedProgramNames at 2 and started an alarm that could
+        never clear."""
+        from .models import ActiveProgram
+        from .services.health_metrics import collect, unmapped_program_identifiers
+
+        name = (
+            "Dwelling Assessment & Statement of Work (SOW) Development - "
+            "Modifications and Remediation Service - Brooklyn"
+        )
+        ActiveProgram.objects.create(
+            program_name=name, case_category="Internal Services",
+            case_type=ActiveProgram.CaseType.HOUSING,
+            service_type=ActiveProgram.ServiceType.ENVIRONMENTAL_EXPOSURE_ASSESSMENT,
+        )
+        before = collect()["UnmappedProgramNames"][0]
+        self._case(
+            self._client("Housing"), program_name=name,
+            service_type="Environmental Exposure Assessment",
+        )
+        self.assertEqual(collect()["UnmappedProgramNames"][0], before)
+        self.assertNotIn(name, unmapped_program_identifiers())
+
+    def test_a_housing_member_is_not_a_blank_MealsBoxes_row(self):
+        """Same reason, downstream: a housing member has no product kind by
+        design, so they are not a gap in the Meals/Boxes cards."""
+        from .models import ActiveProgram, Client, EnrollmentAnalytics
+        from .services.health_metrics import collect
+
+        name = "Dwelling Assessment & SOW Development - Housing Metric Test"
+        ActiveProgram.objects.create(
+            program_name=name, case_category="Internal Services",
+            case_type=ActiveProgram.CaseType.HOUSING,
+        )
+        owner = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Housing", last_name="Row",
+            client_added_at=timezone.now(),
+        )
+        before = collect()["ServiceTypeBlankWithCase"][0]
+        EnrollmentAnalytics.objects.create(
+            client=owner, company_status="active", service_type="",
+            program_name=name, refreshed_at=timezone.now(),
+        )
+        self.assertEqual(collect()["ServiceTypeBlankWithCase"][0], before)
 
     def test_the_blank_row_metric_reads_the_PRIMARY(self):
         """It is a CORRECTNESS check, unlike ReadModelAgeHours which measures
