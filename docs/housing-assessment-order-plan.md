@@ -211,6 +211,154 @@ revision of the form; fixed is faster and cheaper to get right.
 
 ---
 
+## The lifecycle (as given)
+
+### Assessment
+
+```
+Dwelling Assessment CASE imported
+      |
+      v  agent completes the wizard
+DispatchOrder(assessment)   status = PENDING SCHEDULE
+      |
+      v  scheduled with the vendor
+                            status = CONFIRMED      * fires a vendor calendar
+      |                                               event + reminder
+      v  visit done, evidence gathered
+                            status = PENDING SUBMISSION
+      |
+      v  submission GATE satisfied (see below)
+                            status = SUBMITTED      -> answers LOCK here
+      |
+      v  agent uploads to Unite Us and records it
+                            status = UPLOADED
+```
+
+### Remediation
+
+Once the assessment is **UPLOADED**, the screener creates one or more Home
+Remediation cases in Unite Us. Each imported case **automatically creates a
+remediation order under that member's assessment order**, so every Home Remediation
+case is linked to its Dwelling Assessment.
+
+```
+Home Remediation CASE imported
+      |
+      v  automatic
+DispatchOrder(remediation, parent=the assessment order)
+                            status = PENDING SCHEDULE
+      |                     the vendor sees it IMMEDIATELY and schedules it
+      v
+                            status = CONFIRMED  -> calendar event + reminder
+      v
+                            status = PENDING SUBMISSION
+      v
+                            status = SUBMITTED
+      v
+                            status = UPLOADED
+```
+
+Identical chain for both kinds, which is the argument for one `DispatchOrder` with
+a `kind` rather than two models.
+
+**To confirm:** you listed the tail as "Submitted or Pending Submission or
+Uploaded". I have read that as a linear progression —
+`PENDING SUBMISSION -> SUBMITTED -> UPLOADED` — where Pending Submission is "visit
+done, not yet submittable or not yet submitted", Submitted is the vendor committing
+(and the lock point), and Uploaded is the Unite Us record. If those are meant as
+three independent flags rather than a sequence, say so, because it changes the
+state machine from a line into a set.
+
+## The submission GATE
+
+> "any order can't be submitted if the order is missing the vendor signature, the
+> member signature and they need to upload at least one photo per finding."
+
+`PENDING SUBMISSION -> SUBMITTED` requires **all three**:
+
+| Requirement | Note |
+|---|---|
+| **Vendor signature** | |
+| **Member signature** | A second signer — the member, at their own home |
+| **≥ 1 photo per FINDING** | Per finding, not per order |
+
+### This changes the schema
+
+My earlier sketch hung proofs off the order. **The gate is per-finding, so a proof
+must be attachable to a finding** — otherwise "at least one photo per finding" is
+not expressible:
+
+```
+DispatchProof
+    order     FK
+    finding   FK, NULLABLE   <- general site photos have no finding;
+                                the GATE only counts the ones that do
+```
+
+Enforce it server-side in one place — a `can_submit(order)` returning the missing
+items, used by both the API and the UI. If the UI checks and the endpoint does not,
+it will be bypassed; that is precisely how the food verification endpoint still
+accepted a housing case after the picker had been fixed.
+
+Worth deciding: is a finding with **no** photo a blocker, or can a finding be
+marked "no photo applicable"? A hard rule with no escape hatch tends to produce a
+junk photo rather than compliance.
+
+## ⚠️ The signatures sharpen the CRM-only problem
+
+Both signatures are captured **at the member's home**, by people who have no way to
+log in until the vendor portal exists. So in a CRM-only Phase 1:
+
+**an order cannot legitimately reach SUBMITTED at all.**
+
+That is not a reason to stop — it is a reason to be explicit about what Phase 1 is:
+
+| Phase 1 (CRM only) | Needs the portal |
+|---|---|
+| Order created by the wizard | Vendor confirms their own appointment |
+| Scheduling and CONFIRMED | Vendor signature captured on site |
+| Findings recorded | Member signature captured on site |
+| Documents + photos attached by an agent | Questionnaire answers authored by the vendor |
+| The Unite Us upload record | |
+
+So Phase 1 takes an order to **CONFIRMED**, and then needs an honest answer for the
+tail. Two options:
+
+- **Agent attestation.** An agent records that the visit happened and attaches the
+  signed PAPER as a `DispatchDocument`, moving the order to Submitted/Uploaded.
+  Pragmatic, matches how this works today — but it MUST be stored as
+  agent-attested, distinguishable from vendor-signed, forever. Otherwise a
+  paper-era order later looks identical to a digitally signed one, and the
+  signature guarantee is retroactively worthless.
+- **Stop at Confirmed.** The tail waits for the portal. Cleaner, but then the
+  upload tracking you asked for has nothing to track until the portal ships.
+
+The first is almost certainly what you want, given you asked for upload tracking
+now. The condition is that `submitted_via = agent_attested | vendor_signed` exists
+from day one, not added later.
+
+## ⚠️ Legacy: work orders that predate all of this
+
+The auto-creation rule assumes the assessment order exists first. Real data does
+not:
+
+```
+MIRIAM ISRAEL (fad1f448)   1 assessment case + 9 Home Remediation cases,
+                           all imported before this feature existed
+```
+
+Three members currently hold housing cases, and none has an assessment order. So
+the import needs a rule for a remediation case whose member has no assessment
+order:
+
+- **skip** — create no remediation order (they stay plain cases, as today);
+- **create an orphan** — a remediation order with no parent; or
+- **backfill** — create the assessment order first, in whatever state.
+
+Skip is the honest default: those cases were never dispatched through this system,
+and inventing an assessment order they never had would fabricate history — exactly
+what rule 5 ("keep the record") argues against.
+
 ## Naming — the DISPATCH domain
 
 You liked "work dispatcher system", so that is the head concept: **dispatch** —
@@ -231,16 +379,24 @@ DispatchOrder            the unit of dispatched work
     client               FK
     dwellings            JSON {"primary": <case_id>, "secondary": <case_id>}
     case                 the Unite Us case this order serves
-    status               draft -> dispatched -> in_progress -> completed
+    status               pending_schedule -> confirmed -> pending_submission
+                         -> submitted -> uploaded
+    submitted_via        agent_attested | vendor_signed     <- from day one
     vendor / created_by
 
-DispatchVisit            an appointment and the visit itself
+DispatchVisit            the appointment and the visit itself
     scheduled_for / confirmed_at / started_at / completed_at
+    calendar_event_ref   what was pushed to the vendor's calendar (portal phase)
 
-DispatchProof            an image        S3 + sha256   (mirrors DeliveryOrderProof)
-DispatchDocument         a document      S3 + sha256
+DispatchSignature        many per order -- the gate needs TWO kinds
+    signer_role          vendor | member
+    signed_at / signed_by_name / image or PDF ref
+
 DispatchFinding          an inspection result; may spawn remediation orders
-DispatchQuestionnaire    the signed form + its answers
+DispatchProof            an image        S3 + sha256   (mirrors DeliveryOrderProof)
+    finding              FK NULLABLE -- the GATE counts photos PER FINDING
+DispatchDocument         a document      S3 + sha256
+DispatchQuestionnaire    the signed form + its answers      (portal phase)
 
 DispatchUniteUsUpload    the manual upload record -- see below
 ```
