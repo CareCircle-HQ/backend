@@ -304,7 +304,40 @@ Worth deciding: is a finding with **no** photo a blocker, or can a finding be
 marked "no photo applicable"? A hard rule with no escape hatch tends to produce a
 junk photo rather than compliance.
 
-## ⚠️ The signatures sharpen the CRM-only problem
+## RESOLVED — the CRM DISPLAYS status; the vendor page PRODUCES it
+
+> "the crm will show the status the vendor page produce. we will implement just
+> after we do the structure for those orders"
+
+This settles the scope tension below, and settles it better than the agent-
+attestation compromise I proposed. The build order is:
+
+```
+1. the ORDER STRUCTURE          <- THIS TASK
+     models, the creation wizard, CRM read-only display, upload tracking
+2. the VENDOR PAGE              <- immediately after
+     scheduling, check-in, signatures, photos -> the statuses the CRM shows
+```
+
+So the vendor portal is **next**, not deferred indefinitely, and that changes two
+things:
+
+- **No agent-attestation path is needed.** `submitted_via` can be dropped. The CRM
+  never authors evidence or status — it displays what the vendor produced, which
+  keeps Q2's locking rule pure instead of carving an exception into it on day one.
+- **Orders sitting at PENDING SCHEDULE / CONFIRMED is the expected state**, not a
+  gap. Nothing can legitimately reach SUBMITTED until step 2 ships, and that is
+  correct rather than incomplete.
+
+The one consequence worth stating: the **upload tracking has nothing to track until
+step 2 ships**, because there is no submitted evidence to upload. It should still be
+built now — it is part of the structure, and building it later means revisiting the
+same models — but do not expect the queue to show anything yet.
+
+The section below is kept because it is still the right analysis of *why* the CRM
+cannot author a submission. Only its conclusion changed.
+
+## The signatures, and why the CRM cannot close an order
 
 Both signatures are captured **at the member's home**, by people who have no way to
 log in until the vendor portal exists. So in a CRM-only Phase 1:
@@ -321,21 +354,16 @@ That is not a reason to stop — it is a reason to be explicit about what Phase 
 | Documents + photos attached by an agent | Questionnaire answers authored by the vendor |
 | The Unite Us upload record | |
 
-So Phase 1 takes an order to **CONFIRMED**, and then needs an honest answer for the
-tail. Two options:
+So this task takes an order to **CONFIRMED** and stops there, and the vendor page
+supplies the tail. That is the resolution above: the tail waits, which is clean,
+and it is affordable precisely because the vendor page is the NEXT task rather than
+a distant one.
 
-- **Agent attestation.** An agent records that the visit happened and attaches the
-  signed PAPER as a `DispatchDocument`, moving the order to Submitted/Uploaded.
-  Pragmatic, matches how this works today — but it MUST be stored as
-  agent-attested, distinguishable from vendor-signed, forever. Otherwise a
-  paper-era order later looks identical to a digitally signed one, and the
-  signature guarantee is retroactively worthless.
-- **Stop at Confirmed.** The tail waits for the portal. Cleaner, but then the
-  upload tracking you asked for has nothing to track until the portal ships.
-
-The first is almost certainly what you want, given you asked for upload tracking
-now. The condition is that `submitted_via = agent_attested | vendor_signed` exists
-from day one, not added later.
+Recorded for the future: if that ordering ever slips and an agent has to close
+orders from paper, then `submitted_via = agent_attested | vendor_signed` must be
+added BEFORE the first such order, not after. Retrofitted, it cannot distinguish
+the paper-era rows from digitally signed ones, and the signature guarantee becomes
+retroactively worthless.
 
 ## ⚠️ Legacy: work orders that predate all of this
 
@@ -381,7 +409,6 @@ DispatchOrder            the unit of dispatched work
     case                 the Unite Us case this order serves
     status               pending_schedule -> confirmed -> pending_submission
                          -> submitted -> uploaded
-    submitted_via        agent_attested | vendor_signed     <- from day one
     vendor / created_by
 
 DispatchVisit            the appointment and the visit itself
