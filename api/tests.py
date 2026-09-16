@@ -26415,3 +26415,219 @@ class FoodScopedGoverningCaseTest(TestCase):
         self.assertIsNotNone(q)
         matched = list(Case.objects.filter(q).values_list("case_id", flat=True))
         self.assertIn(housing.case_id, matched)
+
+
+class HousingGoverningCaseTest(TestCase):
+    """Housing resolution: one governing case per type, EEA only, primary only.
+
+    Mirrors food's rules via the existing governing_case_key, with three housing
+    specifics enforced structurally rather than by convention:
+
+      1. only an Environmental Exposure Assessment may govern (an ALLOWLIST, so a
+         service type added later cannot start governing by default),
+      2. the member's OWN case only -- no household fallback, unlike food, because
+         a dwelling is one property and the case belongs to the primary,
+      3. Home Expense Assistance/Repairs cases are WORK ORDERS and can never
+         govern.
+    """
+
+    EEA_PROGRAM = (
+        "Dwelling Assessment & Statement of Work (SOW) Development - "
+        "Modifications and Remediation Service - Brooklyn"
+    )
+    HEAR_PROGRAM = "Home Remediation - Heater - Queens"
+    MEALS_PROGRAM = "Medically Tailored Meals (MTM) - Other - Brooklyn"
+
+    def setUp(self):
+        from .models import ActiveProgram
+        from .services.catalog import clear_program_domain_cache
+
+        ActiveProgram.objects.create(
+            program_name=self.EEA_PROGRAM, case_category="Internal Services",
+            case_type=ActiveProgram.CaseType.HOUSING,
+            service_type=ActiveProgram.ServiceType.ENVIRONMENTAL_EXPOSURE_ASSESSMENT,
+        )
+        ActiveProgram.objects.create(
+            program_name=self.HEAR_PROGRAM, case_category="Internal Services",
+            case_type=ActiveProgram.CaseType.HOUSING,
+            service_type=ActiveProgram.ServiceType.HOME_EXPENSE_ASSISTANCE_REPAIRS,
+        )
+        ActiveProgram.objects.create(
+            program_name=self.MEALS_PROGRAM, case_category="Internal Services",
+            case_type=ActiveProgram.CaseType.FOOD,
+        )
+        clear_program_domain_cache()
+
+    def _client(self, name="Housing"):
+        from .models import Client
+
+        return Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name=name, last_name="Member",
+            client_added_at=timezone.now(),
+        )
+
+    def _case(self, client, program, *, auth="approved", status=None, created=None,
+              service_type=""):
+        from .models import Case, CaseStatus, CaseType
+
+        return Case.objects.create(
+            case_id=uuid.uuid4(), client=client, case_type=CaseType.INTERNAL_SERVICE,
+            case_status=status or CaseStatus.MANAGED, program_name=program,
+            service_type=service_type, service_authorization_status=auth,
+            case_created_at=created or timezone.now(),
+        )
+
+    def _refetch(self, client):
+        from .models import Client
+
+        return Client.objects.prefetch_related("cases").get(pk=client.pk)
+
+    # ── the allowlist ────────────────────────────────────────────────────────
+    def test_an_assessment_governs(self):
+        from .services.housing import housing_service_case
+
+        c = self._client()
+        eea = self._case(c, self.EEA_PROGRAM)
+        gov = housing_service_case(self._refetch(c))
+        self.assertEqual(str(gov.case_id), str(eea.case_id))
+
+    def test_a_work_order_can_NEVER_govern(self):
+        """Even as the only housing case, and even approved and newest."""
+        from .services.housing import housing_service_case, is_work_order_case
+
+        c = self._client()
+        hear = self._case(c, self.HEAR_PROGRAM)
+        self.assertTrue(is_work_order_case(hear))
+        self.assertIsNone(housing_service_case(self._refetch(c)))
+
+    def test_a_newer_work_order_does_not_displace_the_assessment(self):
+        from .services.housing import housing_service_case
+
+        c = self._client()
+        eea = self._case(c, self.EEA_PROGRAM,
+                         created=timezone.now() - timedelta(days=30))
+        self._case(c, self.HEAR_PROGRAM, created=timezone.now())
+
+        gov = housing_service_case(self._refetch(c))
+        self.assertEqual(str(gov.case_id), str(eea.case_id))
+
+    def test_work_orders_are_listed_separately(self):
+        from .services.housing import housing_work_orders
+
+        c = self._client()
+        self._case(c, self.EEA_PROGRAM)
+        a = self._case(c, self.HEAR_PROGRAM)
+        b = self._case(c, self.HEAR_PROGRAM)
+
+        got = {str(x.case_id) for x in housing_work_orders(self._refetch(c))}
+        self.assertEqual(got, {str(a.case_id), str(b.case_id)})
+
+    # ── individual only ──────────────────────────────────────────────────────
+    def test_a_dependent_does_NOT_inherit_the_primarys_housing_case(self):
+        """Food deliberately falls back to the household's case so no member shows
+        a blank authorization. Housing must not: a dwelling is one property and
+        the case belongs to the primary."""
+        from .models import Household, HouseholdMember
+        from .services.housing import housing_service_case
+
+        primary = self._client("Primary")
+        dependent = self._client("Dependent")
+        hh = Household.objects.create(name="Housing HH")
+        HouseholdMember.objects.create(household=hh, client=primary, is_primary=True)
+        HouseholdMember.objects.create(household=hh, client=dependent, is_primary=False)
+        self._case(primary, self.EEA_PROGRAM)
+
+        self.assertIsNotNone(housing_service_case(self._refetch(primary)))
+        self.assertIsNone(
+            housing_service_case(self._refetch(dependent)),
+            "a dependent must not appear to hold a housing case",
+        )
+
+    # ── the two types do not compete ─────────────────────────────────────────
+    def test_food_and_housing_govern_independently(self):
+        """The whole point: one governing case PER TYPE."""
+        from .portal.serializers import internal_service_case
+        from .services.housing import housing_service_case
+
+        c = self._client("Both")
+        meals = self._case(c, self.MEALS_PROGRAM,
+                           created=timezone.now() - timedelta(days=30))
+        eea = self._case(c, self.EEA_PROGRAM, created=timezone.now())
+
+        fresh = self._refetch(c)
+        self.assertEqual(
+            str(internal_service_case(fresh).case_id), str(meals.case_id),
+        )
+        self.assertEqual(
+            str(housing_service_case(fresh).case_id), str(eea.case_id),
+        )
+
+    def test_a_meals_case_is_not_a_housing_case(self):
+        from .services.housing import is_assessment_case, is_housing_case
+
+        c = self._client()
+        meals = self._case(c, self.MEALS_PROGRAM)
+        self.assertFalse(is_housing_case(meals))
+        self.assertFalse(is_assessment_case(meals))
+
+    # ── classification sources ───────────────────────────────────────────────
+    def test_the_case_service_type_string_classifies_an_unmapped_program(self):
+        """Unite Us sends the service as a LABEL on the case, so a housing case
+        whose program is not in our table is still classifiable."""
+        from .models import ActiveProgram
+        from .services.catalog import case_service_type_code
+
+        c = self._client()
+        case = self._case(c, "Some Unmapped Dwelling Programme",
+                          service_type="Environmental Exposure Assessment")
+        self.assertEqual(
+            case_service_type_code(case),
+            ActiveProgram.ServiceType.ENVIRONMENTAL_EXPOSURE_ASSESSMENT,
+        )
+
+    def test_our_program_mapping_wins_over_the_source_string(self):
+        """An agent's correction in Settings > Programs is authoritative."""
+        from .models import ActiveProgram
+        from .services.catalog import case_service_type_code
+
+        c = self._client()
+        case = self._case(c, self.HEAR_PROGRAM,
+                          service_type="Environmental Exposure Assessment")
+        self.assertEqual(
+            case_service_type_code(case),
+            ActiveProgram.ServiceType.HOME_EXPENSE_ASSISTANCE_REPAIRS,
+        )
+
+    def test_a_housing_case_of_neither_service_type_is_neither(self):
+        """A classification gap should be visible, not silently a work order."""
+        from .models import ActiveProgram
+        from .services.catalog import clear_program_domain_cache
+        from .services.housing import (
+            housing_service_case, is_assessment_case, is_housing_case,
+            is_work_order_case,
+        )
+
+        name = "Housing Programme With No Service Type"
+        ActiveProgram.objects.create(
+            program_name=name, case_category="Internal Services",
+            case_type=ActiveProgram.CaseType.HOUSING, service_type="",
+        )
+        clear_program_domain_cache()
+
+        c = self._client()
+        case = self._case(c, name)
+        self.assertTrue(is_housing_case(case))
+        self.assertFalse(is_assessment_case(case))
+        self.assertFalse(is_work_order_case(case))
+        self.assertIsNone(housing_service_case(self._refetch(c)))
+
+    def test_open_housing_case_ignores_closed_assessments(self):
+        from .models import CaseStatus
+        from .services.housing import has_open_housing_case
+
+        c = self._client()
+        self._case(c, self.EEA_PROGRAM, status=CaseStatus.CLOSED)
+        self.assertFalse(has_open_housing_case(self._refetch(c)))
+
+        self._case(c, self.EEA_PROGRAM)
+        self.assertTrue(has_open_housing_case(self._refetch(c)))

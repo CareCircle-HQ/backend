@@ -367,8 +367,14 @@ def _program_domain_map():
 
 
 def clear_program_domain_cache():
-    """Drop the cached program -> type map (an ActiveProgram row changed)."""
+    """Drop every cached ActiveProgram-derived map (a row changed).
+
+    One entry point on purpose: the post_save signal in api/apps.py calls this,
+    and a second cache added later must be cleared here rather than needing the
+    signal to know about it.
+    """
     _program_domain_map.cache_clear()
+    _program_service_type_map.cache_clear()
 
 
 def program_service_domain(program_name):
@@ -435,3 +441,65 @@ def non_food_program_q():
     for name in names:
         q |= Q(program_name__iexact=name)
     return q
+
+
+# ── Service TYPE CODE of a case (which service within its type) ───────────────
+# The type says food vs housing; this says WHICH service -- and for housing that
+# distinction decides whether a case can govern at all. Environmental Exposure
+# Assessment governs; Home Expense Assistance/Repairs is a work order and never
+# governs.
+
+
+@lru_cache(maxsize=1)
+def _program_service_type_map():
+    """``{program_name.casefold(): ActiveProgram.service_type}``."""
+    from api.models import ActiveProgram
+
+    return {
+        (name or "").strip().casefold(): (code or "")
+        for name, code in ActiveProgram.objects.values_list(
+            "program_name", "service_type",
+        )
+        if name
+    }
+
+
+@lru_cache(maxsize=1)
+def _service_type_label_map():
+    """``{label.casefold(): code}`` for ActiveProgram.ServiceType.
+
+    Unite Us sends the service as a LABEL on the case ("Environmental Exposure
+    Assessment"), so a case whose program is not in our table can still be
+    classified from what the source told us.
+    """
+    from api.models import ActiveProgram
+
+    return {
+        label.strip().casefold(): code
+        for code, label in ActiveProgram.ServiceType.choices
+    }
+
+
+def program_service_type_code(program_name):
+    """The ServiceType CODE a program delivers, or "" when unknown."""
+    key = (program_name or "").strip().casefold()
+    if not key:
+        return ""
+    return _program_service_type_map().get(key) or ""
+
+
+def case_service_type_code(case):
+    """The ServiceType code for a case.
+
+    Our curated program mapping FIRST -- it is the authoritative classification
+    and an agent can correct it in Settings > Programs -- then the case's own
+    ``service_type`` string as sent by Unite Us, matched against the choice
+    labels. Blank when neither resolves.
+    """
+    code = program_service_type_code(getattr(case, "program_name", ""))
+    if code:
+        return code
+    raw = (getattr(case, "service_type", "") or "").strip().casefold()
+    if not raw:
+        return ""
+    return _service_type_label_map().get(raw) or ""
