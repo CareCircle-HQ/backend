@@ -93,7 +93,49 @@ service": it forces `CaseType.INTERNAL_SERVICE` regardless of program AND drives
 Cost: a housing case arriving with a **blank or unmatched `program_name`** is out
 of scope and gets skipped. That is the one scenario that would justify revisiting.
 
-## REQUIRED NEXT — one governing case PER TYPE
+## Governing case per TYPE — design agreed
+
+Answers from the operator:
+
+1. **Housing gets its OWN enrollment model** — not `EnrollmentVerification`.
+2. **Individual only, tied to the PRIMARY.** Food can be household-scoped with
+   several members; a housing case cannot. Specific consequence:
+   `governing_service_case_for_display` deliberately falls back to the HOUSEHOLD's
+   case for a dependent so "every household member shows the same authorization
+   instead of a blank" — correct for food, WRONG for housing. Housing resolution
+   must use the member's own case, with no household fallback, ever.
+3. **All work orders hang off the same governing housing case.**
+4. **Always the governing case.** A re-assessment is not a second live case: if the
+   assessment could not be performed and the authorization window expired, a NEW
+   EEA case is created.
+5. **Derive the type from `program_name`** via the ActiveProgram table.
+
+### The eligible-set rule
+
+An allowlist per type rather than a count, so "one governing case per type" falls
+out by construction:
+
+```
+food     -> {medically tailored meals, produce prescription/voucher}
+housing  -> {environmental exposure assessment}          <- ONLY
+```
+
+`Home Expense Assistance/Repairs` is an internal-service housing case but is
+absent from the allowlist, so it can never govern — it is a WORK ORDER. The
+existing `governing_case_key` ranking then applies unchanged WITHIN each type.
+
+### The Unite Us flow
+
+```
+screener creates  Environmental Exposure Assessment (EEA)   governing housing case
+      v  verification (a NEW kind — deferred)
+      v  creates an ASSESSMENT ORDER
+      v  vendor attends the home and inspects
+      v  inspection results
+creates  Home Expense Assistance/Repairs (HEAR) cases       = WORK ORDERS
+```
+
+## STILL REQUIRED — the rest
 
 **This must land before housing volume arrives.** Governing-case resolution is
 currently per MEMBER, not per type, so a member holding both a Food case and a
@@ -120,19 +162,77 @@ api/services/enrollment_analytics.py  build_row() -- case_* columns, company_sta
 api/serializers.py          derive_case_type() / _CATEGORY_TO_CASE_TYPE
 ```
 
-### Design question, undecided
+### Decided: derive, with an in-process cache
 
-How does a `Case` carry its type at query time?
+Derive from `program_name` via ActiveProgram. The performance objection (an
+uncached query at hundreds of resolution points, including the 76k-row rebuild) is
+answered by caching the small map rather than by adding a column -- see STEP 1
+below.
 
-- **Derive** from `program_name` via `ActiveProgram` on each call. No migration,
-  but `derive_case_type_from_active_program` is an UNCACHED query per call, and
-  governing-case resolution runs everywhere -- including the 76k-row analytics
-  rebuild. Would need caching.
-- **Store** a discriminator on `Case` (e.g. `service_domain`), populated on import
-  and backfilled. Costs a migration; makes the type filterable, indexable, and
-  available to the read model and the AI query agent.
+The read model should still STORE the derived type as a column so the Data page
+and the AI query agent can filter on it. Derive for logic, store for reporting.
 
-Leaning **store**, for the same reason `EnrollmentAnalytics` exists at all.
+### STEP 1 DONE -- the food-scoping guard
+
+Every governing-case resolver was
+`[c for c in client.cases.all() if c.case_type == INTERNAL_SERVICE]` with no type
+filter, while `governing_case_key` ranks by authorization favour, then open, then
+recency. So a freshly APPROVED housing assessment would have OUTRANKED an older
+approved meals case and taken over the member's food service -- verification,
+kitchen assignment, delivery calendar, Purchase Orders. The default behaviour the
+moment the first housing case imported, not an edge case.
+
+`api/services/catalog.py` now owns the derivation:
+
+```
+program_service_domain(name)  -> 'food' | 'housing' | 'transportation'
+case_service_domain(case)     -> derived from case.program_name
+is_food_case(case)            -> the filter every food resolver applies
+non_food_program_q()          -> iexact Q for SQL-side exclusions
+```
+
+- **An UNKNOWN or blank program defaults to FOOD.** Load-bearing: every
+  internal-service case predating housing is food, so an unrecognised program must
+  behave exactly as today rather than silently dropping out of the food pipeline.
+- The program -> type map is an in-process `lru_cache`, cleared by a
+  `post_save`/`post_delete` signal in `api/apps.py`, so moving a program between
+  Food and Housing in Settings takes effect without a restart.
+- `non_food_program_q()` matches `iexact` per name rather than `__in`: a
+  case-sensitivity near-miss fails in the DANGEROUS direction, a housing case
+  slipping through as food.
+
+Scoped: `internal_service_case`, `internal_service_cases` (the verification
+picker), lifecycle's `_internal_service_cases`, the deferred-extension check, and
+the prior-case lookup in the replace path. Verified on a production clone --
+19,998 internal-service cases derive as food, 2 as housing, food governing cases
+unchanged.
+
+**NOT yet scoped:** the ~90 reporting/count sites (dashboards, exports). They
+would include housing in totals, which is visible rather than corrupting, so they
+follow once we know how housing should be counted.
+
+### Open: does a re-assessment actually take over?
+
+`governing_case_key` ranks authorization favour FIRST:
+
+```
+APPROVED / NOT_REQUIRED  4
+PENDING                  3
+DENIED / NEVER_REQUESTED 2
+EXPIRED                  1
+```
+
+If a lapsed EEA's status flips to EXPIRED, the new PENDING EEA wins -- what rule 4
+wants. But it may NOT flip: the analytics code already warns that "window lapsed
+-> needs reauthorization; raw status can still read 'approved', so we key off the
+computed program_status". If Unite Us leaves it `approved` after
+`approval_ends_at` passes, the DEAD assessment (rank 4) keeps governing over the
+new one (rank 3) and the re-assessment never takes over.
+
+For food that is deliberate -- it keeps a meals case governing through a
+meals->boxes switch. For housing it is a bug, so housing's ranking wants WINDOW
+AWARENESS: an approved authorization whose window has passed should rank below
+pending.
 
 ### Also to settle
 
