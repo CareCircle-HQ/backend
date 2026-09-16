@@ -633,9 +633,18 @@ def internal_service_case(client):
     deferral-aware: a future-dated reauthorization extension does NOT supplant the
     currently-serving case until its window begins (see
     docs/reauthorization_extension_plan.md), so the profile/header keeps showing
-    the case actually in service. None when there is no Internal Service case."""
+    the case actually in service. None when there is no Internal Service case.
+
+    FOOD ONLY. Housing internal-service cases (Dwelling Assessment / Home
+    Remediation) are a different TYPE with their own governing case, and must
+    never drive meal/box service -- a freshly APPROVED housing assessment would
+    otherwise outrank an older approved meals case under governing_case_key and
+    take over the member's food service."""
+    from api.services.catalog import is_food_case
+
     cases = [
-        c for c in client.cases.all() if c.case_type == CaseType.INTERNAL_SERVICE
+        c for c in client.cases.all()
+        if c.case_type == CaseType.INTERNAL_SERVICE and is_food_case(c)
     ]
     if not cases:
         return None
@@ -670,9 +679,15 @@ def governing_service_case_for_display(client):
 def internal_service_cases(client):
     """All of the client's Internal Service cases, most-governing first (by
     :func:`governing_case_key`). The verification can attach to any of them; the
-    agent picks which one in the verification pop-up when there's more than one."""
+    agent picks which one in the verification pop-up when there's more than one.
+
+    FOOD ONLY -- a housing case must not be offered as something the meal/box
+    verification can attach to."""
+    from api.services.catalog import is_food_case
+
     cases = [
-        c for c in client.cases.all() if c.case_type == CaseType.INTERNAL_SERVICE
+        c for c in client.cases.all()
+        if c.case_type == CaseType.INTERNAL_SERVICE and is_food_case(c)
     ]
     return sorted(cases, key=governing_case_key, reverse=True)
 

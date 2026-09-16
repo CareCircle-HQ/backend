@@ -29,24 +29,6 @@ logger = logging.getLogger(__name__)
 NAMESPACE = "CareCircle/Business"
 
 
-def non_food_program_names():
-    """Program names whose ActiveProgram type is NOT food.
-
-    Housing programs (type HOUSING, "Environmental Exposure Assessment") are
-    internal services that deliver no meal or box, so they have no product kind by
-    design. Meals/Boxes metrics must exclude them or they read as defects -- the 3
-    Dwelling Assessment programs alone put UnmappedProgramNames at 2 and started an
-    alarm that could never clear.
-    """
-    from ..models import ActiveProgram
-
-    return [
-        n for n in ActiveProgram.objects
-        .exclude(case_type=ActiveProgram.CaseType.FOOD)
-        .values_list("program_name", flat=True) if n
-    ]
-
-
 def unmapped_program_identifiers():
     """Distinct program identifiers on FOOD internal-service cases that map to
     neither meals nor boxes.
@@ -63,6 +45,8 @@ def unmapped_program_identifiers():
     """
     from ..models import Case, CaseType
     from ..services.catalog import product_type_kind_for_name
+
+    from ..services.catalog import non_food_program_names
 
     non_food_cf = {n.strip().casefold() for n in non_food_program_names()}
     pairs = (
@@ -194,6 +178,8 @@ def collect():
     # deliver no meal or box, so they legitimately have no product kind -- without
     # this filter the 3 Dwelling Assessment programs alone put
     # UnmappedProgramNames at 2 and started an alarm that could never clear.
+    from ..services.catalog import non_food_program_names
+
     non_food = non_food_program_names()
 
     # 1. UPSTREAM, fires the day a new program arrives. product_type_kind_for_name

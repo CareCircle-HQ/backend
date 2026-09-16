@@ -4250,12 +4250,19 @@ def replace_enrollment_for_case_change(
         }
         # The PRIOR internal-service case this enrollment used to serve under (the
         # one that CLOSED and unbound it). Newest by governing-case tie-breaker.
-        prior_case = (
+        # FOOD only -- a housing case is never the "prior" case a meal/box
+        # enrollment used to serve under. Excluded by program name because the
+        # service TYPE is derived, not a column, so it cannot be a SQL filter.
+        from api.services.catalog import non_food_program_q
+
+        _prior_qs = (
             client.cases.filter(case_type=CaseType.INTERNAL_SERVICE)
             .exclude(case_id=new_governing_case.case_id)
-            .order_by("-case_created_at", "-date_opened")
-            .first()
         )
+        _non_food = non_food_program_q()
+        if _non_food is not None:
+            _prior_qs = _prior_qs.exclude(_non_food)
+        prior_case = _prior_qs.order_by("-case_created_at", "-date_opened").first()
         if EnrollmentStage(live.stage) not in _served_stages or prior_case is None:
             return None
         # INVARIANT: every enrollment must reference its case. This served
@@ -4494,7 +4501,19 @@ def replace_enrollment_for_case_change(
 
 
 def _internal_service_cases(client):
-    return [c for c in client.cases.all() if c.case_type == CaseType.INTERNAL_SERVICE]
+    """The client's FOOD internal-service cases.
+
+    Housing internal-service cases are a different TYPE with their own governing
+    case and must never enter the meal/box lifecycle -- enrollment binding,
+    switches, close-outs. is_food_case defaults an UNKNOWN program to food, so
+    nothing predating the housing work changes.
+    """
+    from api.services.catalog import is_food_case
+
+    return [
+        c for c in client.cases.all()
+        if c.case_type == CaseType.INTERNAL_SERVICE and is_food_case(c)
+    ]
 
 
 def open_internal_service_cases(client):
@@ -4767,7 +4786,7 @@ def _bind_governing_case_to_serving_enrollment(client, governing):
         # running on the right case, instead of letting the switch logic park or
         # close the serving member. A genuine change to a NON-deferred case is a
         # real switch and is left to the replace path.
-        _cases = [c for c in client.cases.all() if c.case_type == CaseType.INTERNAL_SERVICE]
+        _cases = _internal_service_cases(client)  # FOOD only
         if str(serv.case_id) not in {str(x) for x in deferred_extension_case_ids(_cases)}:
             return False  # a genuine case change is handled elsewhere
     # Holders across ALL clients (the per-case unique constraint is global): skip

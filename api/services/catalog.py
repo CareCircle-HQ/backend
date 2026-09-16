@@ -9,6 +9,7 @@ underlying client/case/screening save, so callers wrap them in try/except.
 import logging
 import re
 import uuid
+from functools import lru_cache
 
 from django.utils.text import slugify
 
@@ -332,3 +333,105 @@ def upsert_service_from_case(service_type, program_name):
         service.program = program
         service.save(update_fields=["program"])
     return service
+
+
+# ── Service TYPE (domain) of a case ───────────────────────────────────────────
+# Internal Services is no longer food-only: housing programs (Dwelling Assessment
+# / SOW Development, Home Remediation) are internal services of a different TYPE.
+# The rule is ONE GOVERNING INTERNAL-SERVICE CASE PER TYPE, so a member can hold a
+# Food case and a Housing case at once without them competing.
+#
+# A case carries no type column -- it is derived from ``program_name`` via the
+# ActiveProgram table, which is the same place `derive_case_type_from_active_program`
+# reads the case CATEGORY from. That table is small (~324 rows) and changes rarely,
+# so the lookup is an in-process cached dict rather than a query per call: governing
+# -case resolution runs at hundreds of sites, including the 76k-row analytics
+# rebuild. The cache is cleared whenever an ActiveProgram row is saved or deleted
+# (see api/apps.py).
+
+FOOD_DOMAIN = "food"
+
+
+@lru_cache(maxsize=1)
+def _program_domain_map():
+    """``{program_name.casefold(): case_type}`` for every ActiveProgram row."""
+    from api.models import ActiveProgram
+
+    return {
+        (name or "").strip().casefold(): (ctype or "")
+        for name, ctype in ActiveProgram.objects.values_list(
+            "program_name", "case_type",
+        )
+        if name
+    }
+
+
+def clear_program_domain_cache():
+    """Drop the cached program -> type map (an ActiveProgram row changed)."""
+    _program_domain_map.cache_clear()
+
+
+def program_service_domain(program_name):
+    """The service TYPE a program belongs to: 'food' / 'housing' / ...
+
+    Defaults to FOOD for an unknown or blank program name. That default is
+    deliberate and load-bearing: every internal-service case predating the housing
+    work is food, so an unrecognised program must keep behaving exactly as it does
+    today rather than silently dropping out of the food pipeline.
+    """
+    key = (program_name or "").strip().casefold()
+    if not key:
+        return FOOD_DOMAIN
+    return _program_domain_map().get(key) or FOOD_DOMAIN
+
+
+def case_service_domain(case):
+    """The service TYPE of a case, derived from its program name."""
+    return program_service_domain(getattr(case, "program_name", ""))
+
+
+def is_food_case(case):
+    """True when this case belongs to the FOOD service type.
+
+    Every existing governing-case resolver filters on this, so a housing case can
+    never become the case that drives meals/boxes -- verification, kitchen
+    assignment, delivery calendars and Purchase Orders. Without the filter a
+    freshly APPROVED housing assessment would outrank an older approved meals case
+    under `governing_case_key` (authorization favour, then open, then recency) and
+    take over the member's food service.
+    """
+    return case_service_domain(case) == FOOD_DOMAIN
+
+
+def non_food_program_names():
+    """Program names whose type is NOT food.
+
+    For SQL-side exclusions, where the derived type cannot be expressed as a
+    filter. Small by nature (18 housing programs today).
+    """
+    from api.models import ActiveProgram
+
+    return [
+        n for n in ActiveProgram.objects
+        .exclude(case_type=ActiveProgram.CaseType.FOOD)
+        .values_list("program_name", flat=True) if n
+    ]
+
+
+def non_food_program_q():
+    """A ``Q`` matching any non-food program by name, case-insensitively, or None
+    when every program is food.
+
+    ``__in`` would be case-sensitive, and a near-miss here fails in the DANGEROUS
+    direction -- a housing case slipping through as food is exactly what these
+    guards exist to prevent -- so each name is matched with ``iexact``.
+    """
+    from django.db.models import Q
+
+    names = non_food_program_names()
+    if not names:
+        return None
+    q = Q()
+    for name in names:
+        q |= Q(program_name__iexact=name)
+    return q

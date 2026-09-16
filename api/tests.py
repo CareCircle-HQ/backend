@@ -26260,10 +26260,158 @@ class HomeRemediationProgramsTest(TestCase):
         self.assertIsNone(product_type_kind_for_name(self.NAME))
 
     def test_it_is_excluded_from_the_MealsBoxes_metrics(self):
-        from .services.health_metrics import (
-            non_food_program_names, unmapped_program_identifiers,
-        )
+        from .services.catalog import non_food_program_names
+        from .services.health_metrics import unmapped_program_identifiers
 
         self._program()
         self.assertIn(self.NAME, non_food_program_names())
         self.assertNotIn(self.NAME, unmapped_program_identifiers())
+
+
+class FoodScopedGoverningCaseTest(TestCase):
+    """A housing case must never become the governing case for FOOD service.
+
+    Internal Services stopped being food-only when the 18 housing programs were
+    reclassified. Every governing-case resolver was simply
+    `[c for c in client.cases.all() if c.case_type == INTERNAL_SERVICE]` -- no
+    type filter -- and `governing_case_key` ranks by authorization favour, then
+    open, then most recent. So a freshly APPROVED housing assessment would
+    outrank an older approved meals case and take over the member's food service:
+    verification, kitchen assignment, delivery calendar, Purchase Orders.
+
+    That was the DEFAULT behaviour the moment the first housing case imported, not
+    an edge case.
+    """
+
+    MEALS = "Medically Tailored Meals (MTM) - Other Eligible Populations - Brooklyn"
+    HOUSING = (
+        "Dwelling Assessment & Statement of Work (SOW) Development - "
+        "Modifications and Remediation Service - Brooklyn"
+    )
+
+    def setUp(self):
+        from .models import ActiveProgram
+        from .services.catalog import clear_program_domain_cache
+
+        ActiveProgram.objects.create(
+            program_name=self.MEALS, case_category="Internal Services",
+            case_type=ActiveProgram.CaseType.FOOD,
+        )
+        ActiveProgram.objects.create(
+            program_name=self.HOUSING, case_category="Internal Services",
+            case_type=ActiveProgram.CaseType.HOUSING,
+        )
+        clear_program_domain_cache()
+
+    def _client(self, name="Both"):
+        from .models import Client
+
+        return Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name=name, last_name="Services",
+            client_added_at=timezone.now(),
+        )
+
+    def _case(self, client, program, *, auth="approved", created=None):
+        from .models import Case, CaseStatus, CaseType, ServiceAuthorizationStatus
+
+        return Case.objects.create(
+            case_id=uuid.uuid4(), client=client, case_type=CaseType.INTERNAL_SERVICE,
+            case_status=CaseStatus.MANAGED, program_name=program,
+            service_authorization_status=auth,
+            case_created_at=created or timezone.now(),
+        )
+
+    def _refetch(self, client):
+        from .models import Client
+
+        return Client.objects.prefetch_related("cases").get(pk=client.pk)
+
+    def test_the_domain_is_derived_from_the_program_name(self):
+        from .services.catalog import case_service_domain
+
+        c = self._client()
+        self.assertEqual(case_service_domain(self._case(c, self.MEALS)), "food")
+        self.assertEqual(case_service_domain(self._case(c, self.HOUSING)), "housing")
+
+    def test_an_UNKNOWN_program_defaults_to_food(self):
+        """Load-bearing: every internal-service case predating housing is food, so
+        an unrecognised program must behave exactly as it does today rather than
+        silently dropping out of the food pipeline."""
+        from .services.catalog import case_service_domain, program_service_domain
+
+        c = self._client()
+        self.assertEqual(case_service_domain(self._case(c, "Never Heard Of It")), "food")
+        self.assertEqual(program_service_domain(""), "food")
+        self.assertEqual(program_service_domain(None), "food")
+
+    def test_a_NEWER_APPROVED_housing_case_does_not_steal_the_food_governing_case(self):
+        """The precise failure this guard exists for."""
+        from .portal.serializers import internal_service_case
+
+        c = self._client()
+        meals = self._case(
+            c, self.MEALS, created=timezone.now() - timedelta(days=30),
+        )
+        self._case(c, self.HOUSING, created=timezone.now())  # newer AND approved
+
+        gov = internal_service_case(self._refetch(c))
+        self.assertIsNotNone(gov)
+        self.assertEqual(
+            str(gov.case_id), str(meals.case_id),
+            "the meals case must keep governing food service",
+        )
+
+    def test_a_member_with_ONLY_a_housing_case_has_no_food_governing_case(self):
+        from .portal.serializers import internal_service_case
+
+        c = self._client()
+        self._case(c, self.HOUSING)
+        self.assertIsNone(internal_service_case(self._refetch(c)))
+
+    def test_housing_is_not_offered_to_the_food_verification(self):
+        """internal_service_cases feeds the verification pop-up's case picker."""
+        from .portal.serializers import internal_service_cases
+
+        c = self._client()
+        meals = self._case(c, self.MEALS)
+        self._case(c, self.HOUSING)
+
+        got = [str(x.case_id) for x in internal_service_cases(self._refetch(c))]
+        self.assertEqual(got, [str(meals.case_id)])
+
+    def test_the_lifecycle_helper_is_food_scoped_too(self):
+        from .services.lifecycle import _internal_service_cases
+
+        c = self._client()
+        meals = self._case(c, self.MEALS)
+        self._case(c, self.HOUSING)
+
+        got = [str(x.case_id) for x in _internal_service_cases(self._refetch(c))]
+        self.assertEqual(got, [str(meals.case_id)])
+
+    def test_the_program_domain_cache_is_dropped_when_a_program_changes(self):
+        """Agents move programs between Food and Housing in Settings > Programs.
+        Without invalidation the change would not apply until a restart."""
+        from .models import ActiveProgram
+        from .services.catalog import program_service_domain
+
+        self.assertEqual(program_service_domain(self.HOUSING), "housing")
+        row = ActiveProgram.objects.get(program_name=self.HOUSING)
+        row.case_type = ActiveProgram.CaseType.FOOD
+        row.save()  # post_save must clear the cache
+        self.assertEqual(program_service_domain(self.HOUSING), "food")
+
+    def test_non_food_program_q_matches_case_insensitively(self):
+        """__in would be case-sensitive, and a near-miss fails in the dangerous
+        direction -- a housing case slipping through as food."""
+        from .models import Case
+        from .services.catalog import non_food_program_q
+
+        c = self._client()
+        self._case(c, self.MEALS)
+        housing = self._case(c, self.HOUSING.upper())
+
+        q = non_food_program_q()
+        self.assertIsNotNone(q)
+        matched = list(Case.objects.filter(q).values_list("case_id", flat=True))
+        self.assertIn(housing.case_id, matched)
