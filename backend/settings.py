@@ -509,13 +509,31 @@ CELERY_BEAT_SCHEDULE = {
         "task": "api.tasks.import_uniteus_assessment_results",
         "schedule": crontab(minute=30, hour=3),
     },
-    # Hourly rebuild of the EnrollmentAnalytics read model backing the
-    # Administration > Data page (1-hour freshness SLA). Full rebuild + orphan
-    # prune; safe to run any time. Runs at :20 past each hour to avoid the
-    # top-of-hour crunch with the export poller. See docs/analytics-architecture.md.
+    # Rebuild of the EnrollmentAnalytics read model backing the Administration >
+    # Data page. Full rebuild + orphan prune; safe to run any time. At :20 to
+    # avoid the top-of-hour crunch with the export poller. See
+    # docs/analytics-architecture.md.
+    #
+    # EVERY 4 HOURS, not hourly. The rebuild is FULL and takes 30.2 MINUTES at
+    # 77,360 rows (~43 rows/sec, measured on production 2026-09-16 18:20-18:50
+    # UTC), so an hourly schedule spent HALF of every hour grinding the read
+    # model. It pushed ALB p99 to the 5s alarm threshold and tripped both
+    # alb-p99-latency and app-slow-request-rate in the run's final minutes.
+    #
+    # This was dormant until celery beat was installed on 2026-09-15: the hourly
+    # entry had simply never executed, so a "small table" assumption from when
+    # the task was written became a 50% duty cycle overnight.
+    #
+    # 4-hourly cuts the exposure to ~12.5% of the clock. Freshness goes to <=4h,
+    # against the 26-28h staleness that was the actual state until beat ran.
+    # The real fix is the one the task's own docstring names -- watermark
+    # INCREMENTAL rebuild, a few hundred changed rows instead of 77k -- after
+    # which hourly (or better) becomes cheap. Until then this MUST NOT go back to
+    # hourly: the table only grows, and two overlapping --prune passes delete
+    # each other's rows.
     "rebuild-enrollment-analytics": {
         "task": "api.tasks.rebuild_enrollment_analytics",
-        "schedule": crontab(minute=20),
+        "schedule": crontab(minute=20, hour="*/4"),
     },
     # Keep the management Dashboard's preset windows warm in the shared cache so
     # those views load instantly. Every 8 min (< DASHBOARD_CACHE_TTL=10 min).
