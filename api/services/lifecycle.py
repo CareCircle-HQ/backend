@@ -1766,21 +1766,32 @@ def program_tracks(client):
     if housing_assessments:
         governing_ids.add(housing_assessments[0].case_id)
 
-    # ONLY the governing case of each type is surfaced on the bar. Non-governing
-    # cases are noise there -- a housing assessment brings a work order per
-    # remediation item (9 for one member on day one), which swamped the two rows
-    # that actually describe the member's service.
+    # What earns a row differs BY TYPE, because the two types carry different
+    # amounts of noise.
     #
-    # THIS ALSO HIDES three food signals that used to ride on non-governing rows:
-    # "Duplicated" (a second case of the same kind), "Conflicting" (a Meals case
-    # alongside a Boxes one) and "Reauthorization - Waiting" (a parked future
-    # extension, see docs/reauthorization_extension_plan.md). They remain visible
-    # on the Programs tab. Restoring them here means relaxing this filter back to
-    # "governing OR open".
+    # FOOD keeps its non-governing OPEN cases: they carry three real signals --
+    # "Duplicated" (a second case of the same kind), "Conflicting" (a Boxes case
+    # beside a governing Meals case) and "Reauthorization - Waiting" (a parked
+    # future extension, docs/reauthorization_extension_plan.md). A Conflicting row
+    # is how an agent SEES two competing food cases, which is the precondition of
+    # the enrollment fork loop that rewrote 149 enrollments across three families
+    # in the week of 2026-09-14. Hiding it would remove the cue for that exact
+    # failure.
+    #
+    # HOUSING shows only its governing assessment. Its non-governing cases are
+    # WORK ORDERS -- one per remediation item, 9 for the first member -- which
+    # buried the rows that describe the member's service and carry no
+    # authorization decision worth a row. They live on the Cases tab's
+    # "Home Assistance" filter instead.
+    from api.services.catalog import is_food_case as _is_food
+
     cases = [
         c for c in all_cases
         if c.service_authorization_status != A.NEVER_REQUESTED
-        and c.case_id in governing_ids
+        and (
+            c.case_id in governing_ids
+            or (_is_food(c) and c.case_status not in _CLOSED_CASE_STATUSES)
+        )
     ]
 
     # Representative enrollment (a verification is household-wide): the most
