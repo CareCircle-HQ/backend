@@ -26177,3 +26177,93 @@ class SocialCareCoverageStatusTest(TestCase):
             for r in filter_analytics({"social_status": "non_enrolled"})
         ]
         self.assertNotIn(str(c.pk), not_enrolled)
+
+
+class HomeRemediationProgramsTest(TestCase):
+    """The 15 Home Remediation programs: Internal Services, type Housing.
+
+    The second housing service we deliver, after Dwelling Assessment / SOW
+    Development. Five devices across three boroughs, all delivering
+    "Home Expense Assistance/Repairs".
+
+    Migrations are disabled under `manage.py test` (AGENTS.md), so these build
+    their own rows rather than asserting on migration 0266's output.
+    """
+
+    NAME = "Home Remediation - Air Conditioner - Brooklyn"
+
+    def _program(self, name=None, **kw):
+        from .models import ActiveProgram
+
+        opts = {
+            "program_name": name or self.NAME,
+            "case_category": "Internal Services",
+            "case_type": ActiveProgram.CaseType.HOUSING,
+            "service_type":
+                ActiveProgram.ServiceType.HOME_EXPENSE_ASSISTANCE_REPAIRS,
+            "main_category": "Housing",
+        }
+        opts.update(kw)
+        return ActiveProgram.objects.create(**opts)
+
+    def test_the_new_service_type_exists(self):
+        from .models import ActiveProgram
+
+        self.assertIn(
+            "home_expense_assistance_repairs",
+            [c[0] for c in ActiveProgram.ServiceType.choices],
+        )
+
+    def test_its_label_is_offered_to_the_settings_dropdown(self):
+        """Settings > Programs builds its dropdown straight from
+        ServiceType.choices (views_settings, "service_types"), so adding the enum
+        value is what puts it in the UI -- there is no separate list to update."""
+        from .models import ActiveProgram
+
+        labels = dict(ActiveProgram.ServiceType.choices)
+        self.assertEqual(
+            labels["home_expense_assistance_repairs"],
+            "Home Expense Assistance/Repairs",
+        )
+
+    def test_a_home_remediation_case_routes_to_INTERNAL_SERVICE(self):
+        from .models import CaseType
+        from .serializers import derive_case_type_from_active_program
+
+        self._program()
+        self.assertEqual(
+            derive_case_type_from_active_program(self.NAME),
+            CaseType.INTERNAL_SERVICE,
+        )
+
+    def test_it_is_now_in_import_scope(self):
+        """As External Services these were silently skipped by the importer."""
+        from .serializers import case_in_import_scope
+
+        self._program()
+        self.assertTrue(case_in_import_scope("", self.NAME))
+
+    def test_the_referral_only_lookalike_is_NOT_caught_by_the_prefix(self):
+        """0266 matches the "Home Remediation - " prefix, and one of the 7
+        referral-only programs under the active Housing category is
+        "Home Remediation Assistance: Ventilation Improving Systems". The
+        trailing " - " is what keeps them apart -- if it were dropped, a referral
+        programme would silently become our own service."""
+        name = "Home Remediation Assistance: Ventilation Improving Systems"
+        self.assertFalse(name.lower().startswith("home remediation - "))
+
+    def test_a_home_remediation_program_has_no_meals_or_boxes_kind(self):
+        """It is housing, so no product kind -- and the non-food exclusion in the
+        health metrics is what stops that reading as a defect."""
+        from .services.catalog import product_type_kind_for_name
+
+        self.assertIsNone(product_type_kind_for_name(self.NAME))
+
+    def test_it_is_excluded_from_the_MealsBoxes_metrics(self):
+        from .services.health_metrics import (
+            non_food_program_names, unmapped_program_identifiers,
+        )
+
+        self._program()
+        self.assertIn(self.NAME, non_food_program_names())
+        self.assertNotIn(self.NAME, unmapped_program_identifiers())

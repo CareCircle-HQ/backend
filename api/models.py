@@ -3275,6 +3275,12 @@ class ActiveProgram(models.Model):
         ENVIRONMENTAL_EXPOSURE_ASSESSMENT = (
             "environmental_exposure_assessment", "Environmental Exposure Assessment",
         )
+        # Housing (type = HOUSING): the 15 "Home Remediation - <device> -
+        # <borough>" programs (air conditioner, air filtration device,
+        # de-humidifier, heater, humidifier x Brooklyn/Manhattan/Queens).
+        HOME_EXPENSE_ASSISTANCE_REPAIRS = (
+            "home_expense_assistance_repairs", "Home Expense Assistance/Repairs",
+        )
 
     program_name = models.CharField(max_length=255, unique=True, db_index=True)
     main_category = models.CharField(max_length=120, blank=True)
