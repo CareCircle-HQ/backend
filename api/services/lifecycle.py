@@ -1733,7 +1733,7 @@ def program_tracks(client):
     """
     from api.models import CaseHouseholdType, ProductTypeKind
     from api.models import ServiceAuthorizationStatus as A
-    from api.services.catalog import product_type_kind_for_name
+    from api.services.catalog import case_service_domain, product_type_kind_for_name
 
     if client is None:
         return []
@@ -1744,16 +1744,34 @@ def program_tracks(client):
     # non-governing case drops off (its history lives on the Programs tab). A
     # NEVER_REQUESTED authorization is treated like a denial and stays hidden for
     # every case (governing included) -- it is not a real program to surface.
-    all_cases = _internal_service_cases(client)
+    # DISPLAY includes every service TYPE; RESOLUTION stays per type. The bar is
+    # the member's whole picture, so a housing assessment belongs on it -- but it
+    # must not be mistaken for the case governing FOOD. So each type contributes
+    # its own governing case, and `governing` is true for each of them.
+    from api.services.housing import housing_assessment_cases, housing_work_orders
+
+    food_cases = _internal_service_cases(client)
+    housing_assessments = housing_assessment_cases(client)
+    all_cases = food_cases + housing_assessments + housing_work_orders(client)
     if not all_cases:
         return []
-    governing = pick_governing_case(all_cases)
+
+    # `governing` stays the FOOD governing case: gov_kind / gov_label and the
+    # duplicate/conflict rules below are food concepts (Meals vs Boxes).
+    governing = pick_governing_case(food_cases) if food_cases else None
+
+    # One governing case PER TYPE. Only an ASSESSMENT can govern housing -- work
+    # orders never do, so they render as ordinary rows.
+    governing_ids = {governing.case_id} if governing is not None else set()
+    if housing_assessments:
+        governing_ids.add(housing_assessments[0].case_id)
+
     cases = [
         c for c in all_cases
         if c.service_authorization_status != A.NEVER_REQUESTED
         and (
             c.case_status not in _CLOSED_CASE_STATUSES
-            or c.case_id == governing.case_id
+            or c.case_id in governing_ids
         )
     ]
 
@@ -1799,7 +1817,7 @@ def program_tracks(client):
     for c in cases:
         kind = product_type_kind_for_name(c.service_type or c.program_name)
         is_food = kind is not None
-        is_governing = governing is not None and c.case_id == governing.case_id
+        is_governing = c.case_id in governing_ids
         if is_food:
             # A "duplicate" is a non-governing case for the SAME food kind; a
             # DIFFERENT-kind non-governing food case CONFLICTS (a household runs
@@ -1860,16 +1878,20 @@ def program_tracks(client):
             # already closed/cancelled (a closed governing case still renders).
             "case_status": getattr(c, "case_status", "") or "",
             "governing": is_governing,
+            # Service TYPE, so the bar can mark WHICH governing case this is:
+            # F for food, H for housing. Two cases can be governing at once.
+            "domain": case_service_domain(c),
             "scope": {"value": ht, "label": CaseHouseholdType(ht).label},
             "authorization": {"value": a_val, "label": a_lbl},
             "verification": {"value": v_val, "label": v_lbl},
             "nutritionist": {"value": n_val, "label": n_lbl},
             "service": {"value": s_val, "label": s_lbl},
         })
-    # Governing first, then by service-type label + case id (a stable,
-    # environment-independent order).
+    # Governing first, then FOOD before other types -- food is the primary
+    # service and should lead the bar -- then by service-type label + case id (a
+    # stable, environment-independent order).
     tracks.sort(key=lambda t: (
-        not t["governing"], t["service_type"], t["case_id"]
+        not t["governing"], t["domain"] != "food", t["service_type"], t["case_id"]
     ))
     return tracks
 
