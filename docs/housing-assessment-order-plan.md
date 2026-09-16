@@ -83,46 +83,66 @@ cannot reach CRM endpoints even by accident.
 
 ## Open questions — these change the schema, so worth settling first
 
-### Q1. "One per member" — hard constraint, or one ACTIVE per member?
+### Q1. RESOLVED — labelled dwellings in a JSON field, not a OneToOne
 
-Rules 1 and 5 pull in different directions: one order per member, but a member may
-have several Dwelling Assessment cases.
+> "let setup the Primary Dwelling to the governing case and lets add a secondary
+> Dwelling the old Dwelling case, we dont need a one to one we can used a json
+> field with labels"
 
-A `OneToOneField(Client)` enforces rule 1 at the database level and is
-self-documenting — but it makes a second assessment **impossible**, and a dwelling
-assessment is about a **property**. A member who moves house is not an exotic
-scenario, and neither is an assessment that could not be completed.
+So: **one order per member**, holding a JSON map of **labelled** dwelling cases —
+`primary` is the governing EEA case, `secondary` the older one. A second assessment
+does not need a second order; it becomes another label on the same order. That
+resolves the tension between rules 1 and 5 without a partial unique constraint.
 
-Options:
-- **`OneToOne`** — simplest, matches rule 1 literally, blocks any second order.
-- **FK + "one active per member"** — a partial unique constraint on
-  `(client, active)`. Keeps the record (rule 5), still prevents two live orders.
+One cost worth accepting knowingly: a case id inside JSON has **no foreign-key
+integrity** and is awkward to query. Nothing stops it pointing at a deleted or
+wrong case, and "find every order whose primary dwelling is case X" becomes a JSON
+scan rather than an index lookup.
 
-Recommend the second unless you are certain a member can never need a second
-assessment. It satisfies both rules and costs one migration rather than a painful
-one later.
+Cheap mitigation, if you want it: keep a **real FK for the primary/governing case**
+— the one the code actually resolves against — and use the JSON for the labelled
+set and its history. Belt and braces, one extra column, and the JSON stays as
+flexible as you intended. Worth deciding, not worth blocking on.
 
-**What happens when a member moves address mid-assessment?**
+### Q2. RESOLVED — "locked" is an authorization rule, not a file format
 
-### Q2. What exactly does "locked after each signature" mean?
+> "locked mean the answers can not be modified by any crm internal users, only the
+> vendor can do before they submitted the order or assessment as completed"
 
-This is the most delicate part of the feature — it is a signed record about
-someone's home, so tamper-evidence matters more than convenience.
+Much simpler than the PDF-versioning scheme I sketched. The rule is about **who may
+write, and when**:
 
-Two readings:
-- **One PDF per questionnaire**, locked when that questionnaire is signed; or
-- **One accumulating PDF**, re-locked after each of several signatures.
+| Actor | Before the vendor submits | After submission as completed |
+|---|---|---|
+| **Vendor** | may edit their answers | ❌ no |
+| **CRM internal users** | ❌ never | ❌ never |
 
-And "locked" technically:
-- **Recommended:** generate the PDF, store it in S3, record its `sha256`, and mark
-  the row immutable. A later signature produces a **NEW version** rather than
-  mutating the object. That gives a verifiable chain — any bytes change is
-  detectable — and keeps every intermediate state.
-- Mutating a stored PDF in place would destroy the evidence value of the
-  signature, so it is worth ruling out explicitly.
+So CRM users are **read-only on vendor answers at all times** — the CRM displays
+the evidence, it does not author it. That is a clean separation and easy to state.
 
-**Who signs — the vendor only, or the member too? And can anything be
-un-locked, by whom, with what audit trail?**
+Two implementation consequences:
+
+- **Enforce it server-side on BOTH surfaces**, not in the UI. The CRM endpoint must
+  refuse writes to answers even for a manager, and the vendor endpoint must refuse
+  them once `completed`. A UI-only rule would be bypassed by any direct call — the
+  same lesson as the food verification, where the picker excluded housing cases but
+  the endpoint still accepted one.
+- **The PDF becomes a rendering of locked answers**, not the thing being locked.
+  Still worth storing its `sha256` so the artifact can be proved unaltered, but the
+  answers are the record.
+
+**One thing this creates: there is now no correction path.** If a vendor submits
+wrong answers, nobody can fix them — not even a manager. That is defensible for a
+signed record, but it needs a deliberate answer:
+
+- can a manager **reopen** an order, returning it to vendor-editable?
+- if so, is the prior state kept (append-only, per rule 5) and audited?
+- if not, is the remedy a **new** assessment order rather than an edit?
+
+Silence here becomes a support ticket the first time a vendor fat-fingers a
+finding.
+
+**And: who signs — the vendor only, or the member too?**
 
 ### Q3. How does a work order link back to its finding?
 
@@ -142,17 +162,33 @@ Options:
 The last is the cheapest and may be enough. Worth knowing whether "which finding
 caused this repair?" is a question anyone will actually ask.
 
-### Q4. Does the vendor work offline?
+### Q4. ANSWERED — both online and offline wanted
 
-Signing happens **in the client's house**. Basements, poor signal, and a
-questionnaire that must not be lost after 40 minutes of work.
+> "will be great if we can do online and offline."
 
-If offline capture is needed, that is a substantially larger piece: local
-persistence, sync, conflict handling, and an answer to "the vendor signed at 14:02
-but it arrived at 18:30". If the vendor can be assumed online, the API is
-straightforward.
+Offline is the single most expensive requirement in this feature, so the honest
+recommendation is **build online first, but design it offline-ready**, then add
+local persistence as its own piece of work. Three specific things, cheap to do up
+front and painful to retrofit:
 
-**Worth answering early — it is the difference between a form and a sync engine.**
+| Design choice | Why it has to be decided now |
+|---|---|
+| **Client-generated UUIDs** for orders, answers and photos | An offline client retries. Without an id the client chose, a retry creates a DUPLICATE finding or a second signature. Idempotency has to come from the client, and the server has to honour it. |
+| **`captured_at` (device) separate from `received_at` (server)** | The vendor signs at 14:02 in a basement and syncs at 18:30. Both timestamps matter, and the device clock is UNTRUSTED — it can be wrong or deliberately set. Storing one field loses the distinction permanently. |
+| **Photos as their own idempotent uploads** | A questionnaire is bytes; a photo set is megabytes on a bad connection. If photos are part of the submission payload, a failed upload loses the answers too. Separate them so answers land immediately and images drain independently — the `content_hash` in `DeliveryOrderProof` already gives us upload idempotency for free. |
+
+What is genuinely hard about offline, and should not be hidden: **conflict**. If the
+same order is edited on two devices, or edited offline while a manager reopens it,
+something has to win. Rule 5's append-only stance helps — keep both, mark one
+superseded — but it needs stating rather than discovering.
+
+A realistic sequencing:
+
+1. online submission, offline-ready ids and timestamps as above;
+2. offline **draft** capture (answers persisted locally, submitted on reconnect);
+3. offline **photo queue** with background drain.
+
+Step 1 alone makes the feature usable and does not foreclose 2 and 3.
 
 ### Q5. Who creates the Home Remediation cases in Unite Us?
 
@@ -171,26 +207,87 @@ revision of the form; fixed is faster and cheaper to get right.
 
 ---
 
+## Later phase — the VENDOR PORTAL
+
+> "in the future we will need to add a vendor portal, where vendors will login to
+> confirm appointments for assessments and work orders. they will also check in,
+> start the visit and collect photos as proof of service needed. so all those
+> generated work orders and assessments need to be worked by external users to
+> produce evidence we will display in the crm so it can be uploaded to unite us."
+
+This reframes the whole feature. The Assessment Order is not a form an agent fills
+in — it is **work dispatched to external people**, and the CRM's job is to display
+the evidence they produce.
+
+### What the portal needs, that nothing here has yet
+
+| Need | Status today |
+|---|---|
+| **Human vendor logins** | ❌ Does not exist. `api/partner/` is MACHINE-to-machine: its principal is explicitly "not a Django user", it carries a `delivery_company` and scopes, and authenticates a client-id/secret. A portal needs vendor USERS — real people, with sessions, and an identity to attribute a signature to. |
+| **Appointments** | ❌ New. Confirming an appointment for an assessment OR a work order implies a scheduling model both types share. |
+| **Check-in / start visit** | ❌ New. Timestamps at minimum; possibly location, which is a privacy decision, not just a field. |
+| **Photos as proof of service** | ⚠️ Partly. `DeliveryOrderProof` is the pattern (S3 + sha256), but it hangs off a delivery order. |
+| **Host isolation** | ✅ Exists. `PARTNER_API_HOST` already serves partner routes on their own hostname with CRM routes absent — the right foundation, and already reasoned about. |
+
+### The consequence worth flagging now
+
+**Work orders become first-class work, not just imported cases.** Today a Home
+Remediation case is a record that arrives from Unite Us. In the portal it is
+something a vendor is assigned, confirms, attends, and produces evidence for.
+
+So the appointment/check-in/proof model must attach to **both** an assessment order
+and a work order. If the assessment order is designed as a one-off member-scoped
+object with proofs bolted onto it, work orders will need a parallel set of the same
+machinery later. Better to design the visit/evidence layer as something both point
+at, even if only assessments use it in Phase 1.
+
+### And a new integration direction: writing BACK to Unite Us
+
+"…so it can be uploaded to unite us" is the first requirement to **push** data to
+Unite Us. Everything today is one-way, Unite Us → CRM. That is a new capability
+with its own failure modes: partial uploads, retries, duplicate evidence, and no
+obvious idempotency key.
+
+Two questions:
+- is the upload **manual** (an agent reviews the evidence, then clicks upload) or
+  **automatic** on completion?
+- what happens when it fails — a queue and retry, or an agent-visible error?
+
+Manual-first is safer: it keeps a human between vendor-supplied evidence and the
+system of record, and it makes the failure mode a visible button rather than a
+silent background task.
+
+---
+
 ## Sketch, for discussion only
 
 ```
 HousingAssessmentOrder
-    client            FK (one ACTIVE per member -- Q1)
-    case              FK to the governing EEA case, nullable
-    status            draft -> dispatched -> in_progress -> complete
+    id                CLIENT-generated UUID          (offline idempotency, Q4)
+    client            FK -- ONE per member
+    dwellings         JSON {"primary": <case_id>, "secondary": <case_id>}   (Q1)
+    primary_case      FK to the governing EEA case   (optional, for integrity/query)
+    status            draft -> dispatched -> in_progress -> completed
     created_by        the verification agent
     vendor            who executes it
     ... wizard answers ...
 
 HousingAssessmentDocument        many per order   S3 + sha256
-HousingAssessmentProof           many per order   S3 + sha256   (mirrors DeliveryOrderProof)
+HousingAssessmentProof           many per order   S3 + sha256  (mirrors DeliveryOrderProof)
 HousingAssessmentFinding         many per order   the inspection results
 HousingAssessmentQuestionnaire   many per order
-    signed_at / signed_by / pdf_s3_key / pdf_sha256 / locked   (Q2)
+    answers          writable by the VENDOR until submitted; NEVER by CRM users (Q2)
+    signed_at / signed_by
+    pdf_s3_key / pdf_sha256       a rendering of the locked answers
+    captured_at / received_at     device time vs server time (Q4)
 
 work orders: the Home Remediation CASES, linked by member today
              (housing_work_orders), or by FK if we add one (Q3)
 ```
+
+A visit/evidence layer that BOTH an assessment order and a work order can point at
+is the shape the vendor portal will need -- see that section. Designing proofs to
+hang solely off the assessment order means building the same machinery twice.
 
 Deliberately NOT included: any reconcile, rebuild or supersede step. Rule 5 says
 keep the record, and the food side is the cautionary tale.
