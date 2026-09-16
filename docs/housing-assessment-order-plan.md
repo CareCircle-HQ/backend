@@ -446,6 +446,115 @@ Two details to settle when implementing:
   work nobody will do. Leaning: adopt them, but never in a schedulable status —
   their order starts at the terminal end, as a record.
 
+## The wizard
+
+Launched from a button on the member profile, once per member. On completion the
+order exists at `PENDING SCHEDULE` and **the vendor sees it on their dashboard**.
+
+### Step 1 — who and where
+
+| Field | Notes |
+|---|---|
+| Member full name | Display only |
+| Phone + type | Type is a dropdown: **mobile / landline** |
+| Email | Optional |
+| **Address** | Show the member's PRIMARY address, and also offer Google autocomplete |
+| Address notes | Free text |
+
+**Google Places already exists — reuse it.** `HouseholdTab.tsx` autocompletes the
+delivery street through a BACKEND proxy (`/places/autocomplete/`,
+`/places/details/`), so `GOOGLE_MAP_KEY` stays server-side. No new dependency and no
+key in the browser; the same two endpoints serve this wizard.
+
+**The address deserves care, because it is the SUBJECT of the assessment.** The
+member's primary address is the sensible default, but a dwelling assessment is
+about a specific property, so the address must be **captured on the order**, not
+read live from the client record. Otherwise a later address edit silently rewrites
+where a completed assessment happened.
+
+Worth storing the structured result (`place_id`, formatted address, lat/lng) rather
+than a string: it gives the vendor something to navigate to, and it makes any future
+service-area check possible without re-geocoding.
+
+### Step 2 — the dispatch
+
+| Field | Notes |
+|---|---|
+| **Referral type** | `Mobility` / `Ventilation` / `Combined` |
+| **Assign to vendor** | Dropdown of all vendor companies |
+| **Member availability** | At least **3 days**, each with a time window. NOT the appointment |
+| **Consent to call and text** | So the vendor may contact the member |
+| **ECM case billed?** | Confirmation checkbox |
+| Other notes | Free text |
+
+#### Referral type is functional, not a label
+
+It selects which questionnaire the member is asked later, and `Combined` means
+**both**. So the questionnaire model needs a template/type concept from the start,
+even though questionnaires themselves ship with the vendor page. Storing
+`referral_type` as a plain string and inferring later would repeat the
+`case_category`-vs-`case_type` confusion the housing work already untangled.
+
+#### Vendor companies — a new model, not `DeliveryCompany`
+
+There is no vendor model that fits. `Provider` is the Unite Us organization
+("normalized provider/organization from the source system"), and `DeliveryCompany`
+is explicitly "a delivery company/vendor that transports meal orders".
+
+A housing vendor inspects and remediates homes; it is a different relationship with
+different people and different work. Overloading `DeliveryCompany` would put
+"companies that drive meals" and "companies that assess dwellings" in one table and
+make every existing delivery query ambiguous.
+
+⚠️ One consequence for the vendor page that follows: `api/partner/` auth binds its
+principal to a `delivery_company`. Serving housing vendors on that surface means
+generalizing the partner principal — worth knowing NOW, while the model is being
+named, rather than discovering it when the portal is built.
+
+#### Availability: the rule is 3 DAYS, not 3 windows
+
+"a minimum of 3 available days with time frame for each" — so validation counts
+**distinct dates**, not rows. Three windows on one Tuesday does not satisfy it, and
+a naive `len(windows) >= 3` check would accept it.
+
+```
+DispatchAvailabilityWindow      many per order
+    date / start_time / end_time
+```
+
+And it is explicitly **not** the appointment — the vendor picks from these. So the
+order needs both: the member's offered availability (many) and the agreed
+appointment (one, on `DispatchVisit`).
+
+#### Consent: call and text are legally distinct
+
+One checkbox is what you asked for, and it is what the agent should see. But in the
+US, consent to **text** (SMS) and consent to **call** are separately regulated, and
+the evidence you want later is "what did the member agree to, when, and who
+recorded it".
+
+Storing two booleans plus a timestamp and the capturing agent costs nothing now and
+cannot be reconstructed later. The UI can still be one checkbox that sets both.
+
+This is also **narrower than the Client's existing consent** (`consent_accepted`,
+`consent_status`, `consented_at`), which is consent to the programme. Vendor-contact
+consent is its own fact and belongs on the order.
+
+#### "ECM case billed?" — ask the data, not the agent
+
+This is an attestation: the agent ticks a box asserting something about an Enhanced
+Care Management case. But the CRM **already holds those cases** — MIRIAM has
+"Enhanced Care Management - Care Management Level 2 Only - Queens" among hers.
+
+So the better shape is to **show the member's ECM case and its billing state**, and
+have the agent confirm what they can see, rather than recall it. A checkbox alone
+records that someone clicked; a displayed fact plus a confirmation records that
+someone clicked **while looking at the right thing**.
+
+Keep the checkbox — it is the human sign-off — but render the evidence beside it.
+Worth confirming whether "billed" is derivable from the case data we hold, or lives
+only in a billing system we cannot see.
+
 ## Naming — the DISPATCH domain
 
 You liked "work dispatcher system", so that is the head concept: **dispatch** —
@@ -460,6 +569,8 @@ authorization decision) and cost a rename today. So the generic head is
 **DispatchOrder**, and "work order" keeps meaning what it already means.
 
 ```
+Vendor                   a housing vendor company (NOT DeliveryCompany)
+
 DispatchOrder            the unit of dispatched work
     kind                 assessment | remediation
     parent               FK self -- remediation orders hang off their assessment
@@ -468,7 +579,24 @@ DispatchOrder            the unit of dispatched work
     case                 the Unite Us case this order serves
     status               pending_schedule -> confirmed -> pending_submission
                          -> submitted -> uploaded
-    vendor / created_by
+    vendor               FK Vendor
+    created_by           the agent who ran the wizard
+
+    -- step 1: captured ON the order, not read live from the client --
+    contact_phone / phone_type        mobile | landline
+    contact_email                     optional
+    address_*                         formatted + place_id + lat/lng
+    address_notes
+
+    -- step 2 --
+    referral_type                     mobility | ventilation | combined
+    consent_to_call / consent_to_text  two booleans, one checkbox in the UI
+    consent_captured_at / consent_captured_by
+    ecm_billed_confirmed              the human sign-off
+    notes
+
+DispatchAvailabilityWindow  many per order -- >= 3 DISTINCT DATES
+    date / start_time / end_time
 
 DispatchVisit            the appointment and the visit itself
     scheduled_for / confirmed_at / started_at / completed_at
