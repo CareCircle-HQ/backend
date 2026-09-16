@@ -26631,3 +26631,136 @@ class HousingGoverningCaseTest(TestCase):
 
         self._case(c, self.EEA_PROGRAM)
         self.assertTrue(has_open_housing_case(self._refetch(c)))
+
+
+class FoodVerificationRejectsHousingCaseTest(TestCase):
+    """The food verification pop-up must NEVER verify a housing case.
+
+    Two separate holes, both closed here:
+
+    1. `has_open_internal_service_case` gates entry to the wizard and counted ANY
+       internal-service case, so a HOUSING-ONLY member passed it and was offered
+       food verification.
+    2. `MemberVerificationCreateView` takes `case_id` from the REQUEST BODY and
+       validated only `case_type == INTERNAL_SERVICE`. The picker
+       (`internal_service_cases`) already excludes housing, but a stale tab, a
+       replayed request or a hand-made call would still have verified a member
+       against their dwelling assessment.
+
+    A housing assessment is verified by a vendor inspection, not by the meal/box
+    wizard, so the check belongs at the endpoint rather than in the UI.
+    """
+
+    EEA = (
+        "Dwelling Assessment & Statement of Work (SOW) Development - "
+        "Modifications and Remediation Service - Brooklyn"
+    )
+    MEALS = "Medically Tailored Meals (MTM) - Other Eligible Populations - Brooklyn"
+
+    def setUp(self):
+        from .models import ActiveProgram
+        from .services.catalog import clear_program_domain_cache
+
+        ActiveProgram.objects.create(
+            program_name=self.EEA, case_category="Internal Services",
+            case_type=ActiveProgram.CaseType.HOUSING,
+            service_type=ActiveProgram.ServiceType.ENVIRONMENTAL_EXPOSURE_ASSESSMENT,
+        )
+        ActiveProgram.objects.create(
+            program_name=self.MEALS, case_category="Internal Services",
+            case_type=ActiveProgram.CaseType.FOOD,
+        )
+        clear_program_domain_cache()
+
+    def _member(self, name="Housing"):
+        from .models import Client
+
+        return Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name=name, last_name="Only",
+            client_added_at=timezone.now(),
+        )
+
+    def _case(self, client, program):
+        from .models import Case, CaseStatus, CaseType
+
+        return Case.objects.create(
+            case_id=uuid.uuid4(), client=client, case_type=CaseType.INTERNAL_SERVICE,
+            case_status=CaseStatus.MANAGED, program_name=program,
+            service_authorization_status="approved",
+            case_created_at=timezone.now(),
+        )
+
+    def _refetch(self, client):
+        from .models import Client
+
+        return Client.objects.prefetch_related("cases").get(pk=client.pk)
+
+    def _api(self):
+        from rest_framework_simplejwt.tokens import AccessToken
+
+        from .models import Agent
+
+        a = Agent.objects.create(name="V", agent_code="777", group="Management")
+        acc = AccessToken()
+        acc["agent_id"] = str(a.id); acc["agent_code"] = a.agent_code
+        acc["agent_name"] = a.name; acc["agent_group"] = a.group
+        api = APIClient(); api.credentials(HTTP_AUTHORIZATION=f"Bearer {acc}")
+        return api
+
+    def test_a_housing_only_member_cannot_enter_the_wizard(self):
+        from .services.lifecycle import has_open_internal_service_case
+
+        c = self._member()
+        self._case(c, self.EEA)
+        self.assertFalse(has_open_internal_service_case(self._refetch(c)))
+
+    def test_a_food_case_still_opens_the_wizard(self):
+        """The guard must not break food."""
+        from .services.lifecycle import has_open_internal_service_case
+
+        c = self._member("Food")
+        self._case(c, self.MEALS)
+        self.assertTrue(has_open_internal_service_case(self._refetch(c)))
+
+    def test_the_picker_never_offers_a_housing_case(self):
+        from .portal.serializers import internal_service_cases
+
+        c = self._member("Both")
+        meals = self._case(c, self.MEALS)
+        self._case(c, self.EEA)
+        offered = [str(x.case_id) for x in internal_service_cases(self._refetch(c))]
+        self.assertEqual(offered, [str(meals.case_id)])
+
+    def test_the_ENDPOINT_refuses_a_housing_case_id(self):
+        """The hole that the picker alone did not close."""
+        from .models import EnrollmentVerification
+
+        c = self._member("Posted")
+        self._case(c, self.MEALS)
+        housing = self._case(c, self.EEA)
+
+        resp = self._api().post(
+            f"/api/portal/members/{c.pk}/verification/",
+            {"case_id": str(housing.case_id), "members": []},
+            format="json",
+        )
+        # Whatever the outcome, no enrollment may end up bound to the housing case.
+        bound = EnrollmentVerification.objects.filter(case=housing)
+        self.assertFalse(
+            bound.exists(),
+            "a verification was created against a HOUSING case",
+        )
+        self.assertNotEqual(resp.status_code, 500)
+
+    def test_a_housing_only_member_is_refused_by_the_endpoint(self):
+        from .models import EnrollmentVerification
+
+        c = self._member("HousingOnly")
+        housing = self._case(c, self.EEA)
+
+        self._api().post(
+            f"/api/portal/members/{c.pk}/verification/",
+            {"case_id": str(housing.case_id), "members": []},
+            format="json",
+        )
+        self.assertFalse(EnrollmentVerification.objects.filter(client=c).exists())

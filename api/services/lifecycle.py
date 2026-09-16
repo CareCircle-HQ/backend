@@ -877,10 +877,19 @@ def valid_social_care_exists():
 
 
 def has_open_internal_service_case(client):
-    """True when the client holds an internal-service (meal/box) case that is
-    not closed/cancelled -- the case the verification + delivery attach to."""
+    """True when the client holds an open FOOD internal-service (meal/box) case --
+    the case the verification + delivery attach to.
+
+    FOOD ONLY. This gates entry to the verification wizard, so without the filter
+    a HOUSING-only member would pass it and be offered food verification: a
+    dwelling assessment is verified by a different process entirely (a vendor
+    inspection), never by the meal/box wizard.
+    """
+    from api.services.catalog import is_food_case
+
     return any(
         c.case_type == CaseType.INTERNAL_SERVICE
+        and is_food_case(c)
         and c.case_status not in (CaseStatus.CLOSED, CaseStatus.CANCELLED)
         for c in client.cases.all()
     )
@@ -1391,12 +1400,21 @@ def governing_internal_case(enrollment):
     reauthorization extension is deferred (see :func:`pick_governing_case`) so it
     doesn't prematurely supplant the serving case. Falls back to
     ``enrollment.case`` when the client has no internal-service case.
+
+    FOOD ONLY. This is the enrollment's governing case for MEAL/BOX service, and
+    it is the fallback the verification wizard binds to when no case_id is posted.
+    Without the filter an approved housing assessment -- newest, so highest-ranked
+    -- became the "governing" case and the verification was written against a
+    dwelling assessment. Caught by a test, after the picker and the endpoint
+    filter had both been closed and this third path was still open.
     """
+    from api.services.catalog import is_food_case
+
     client = enrollment.client
     if client is not None:
         cases = [
             c for c in client.cases.all()
-            if c.case_type == CaseType.INTERNAL_SERVICE
+            if c.case_type == CaseType.INTERNAL_SERVICE and is_food_case(c)
         ]
         if cases:
             return pick_governing_case(cases)

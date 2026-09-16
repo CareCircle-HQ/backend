@@ -6696,12 +6696,21 @@ class MemberVerificationCreateView(PortalAPIView):
         selected_case = None
         sel_case_id = request.data.get("case_id")
         if sel_case_id:
+            # FOOD ONLY, and checked HERE rather than relying on the picker. The
+            # case_id arrives in the request body: internal_service_cases already
+            # keeps housing cases out of the pop-up, but a stale tab, a replayed
+            # request or a hand-made call would otherwise verify a member against
+            # their dwelling assessment. A housing case is never verified by the
+            # meal/box wizard -- it is verified by a vendor inspection.
+            from api.services.catalog import is_food_case
+
             selected_case = next(
                 (
                     c
                     for c in client.cases.all()
                     if str(c.case_id) == str(sel_case_id)
                     and c.case_type == CaseType.INTERNAL_SERVICE
+                    and is_food_case(c)
                 ),
                 None,
             )
