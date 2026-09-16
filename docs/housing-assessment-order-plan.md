@@ -7,6 +7,10 @@ can execute at the member's home.
 
 **Status: planning. No code written.**
 
+**Scope: CRM ONLY.** The vendor portal is explicitly deferred to a later task, so
+nothing here depends on an external user being able to log in. That constraint has
+one sharp consequence for the questionnaires -- see the scope-tension section.
+
 ---
 
 ## The flow
@@ -207,7 +211,108 @@ revision of the form; fixed is faster and cheaper to get right.
 
 ---
 
-## Later phase — the VENDOR PORTAL
+## Naming — the DISPATCH domain
+
+You liked "work dispatcher system", so that is the head concept: **dispatch** —
+work sent out to be executed somewhere else, which comes back as evidence.
+
+One naming hazard to avoid deliberately: **"work order" is already taken.** In this
+project it means a Home Remediation case specifically, and it is used that way in
+`api/services/housing.py`, the Cases tab and this plan. Promoting `WorkOrder` to
+the generic head would give one term two meanings — the exact trap that made
+"Rejected" ambiguous on the Executive dashboard (member eligibility vs
+authorization decision) and cost a rename today. So the generic head is
+**DispatchOrder**, and "work order" keeps meaning what it already means.
+
+```
+DispatchOrder            the unit of dispatched work
+    kind                 assessment | remediation
+    parent               FK self -- remediation orders hang off their assessment
+    client               FK
+    dwellings            JSON {"primary": <case_id>, "secondary": <case_id>}
+    case                 the Unite Us case this order serves
+    status               draft -> dispatched -> in_progress -> completed
+    vendor / created_by
+
+DispatchVisit            an appointment and the visit itself
+    scheduled_for / confirmed_at / started_at / completed_at
+
+DispatchProof            an image        S3 + sha256   (mirrors DeliveryOrderProof)
+DispatchDocument         a document      S3 + sha256
+DispatchFinding          an inspection result; may spawn remediation orders
+DispatchQuestionnaire    the signed form + its answers
+
+DispatchUniteUsUpload    the manual upload record -- see below
+```
+
+**Why one `DispatchOrder` with a `kind` rather than two models.** The assessment
+and the remediations share everything that matters: an appointment, a check-in,
+photos, documents, evidence, and an upload to Unite Us. Two parallel models means
+building that layer twice, which is the structural warning below. A `kind`
+discriminator plus a self-FK gives "one assessment, many remediation orders under
+it" (rule 2) directly, and the shared layer comes for free.
+
+The cost, stated plainly: a `kind` column invites `if kind == ...` branching, and
+if the two diverge a lot that becomes the worse choice. Today they differ only in
+what they produce -- an assessment produces findings, a remediation consumes one --
+so the shared shape looks right. Worth revisiting if remediation grows its own
+lifecycle.
+
+## Tracking the Unite Us upload (manual, but recorded)
+
+> "we will upload the documents to united us manually first. but we need to track
+> the upload action manually."
+
+So the CRM does not push anything. It keeps the **record of the human action**,
+which makes "what is still waiting to go to Unite Us?" answerable instead of
+living in someone's memory.
+
+```
+DispatchUniteUsUpload
+    order            FK DispatchOrder
+    target           what was uploaded -- document / proof / questionnaire PDF
+    uploaded_by      the agent who did it in Unite Us
+    uploaded_at      when they say they did it
+    recorded_at      when the CRM was told          (these are NOT the same)
+    uniteus_ref      optional reference/note from the Unite Us side
+```
+
+Two design notes:
+
+- **`uploaded_at` and `recorded_at` are separate**, for the same reason
+  `captured_at` and `received_at` are on the questionnaire: an agent uploads at
+  10:00 and ticks the box at 16:30. Collapsing them loses which is which
+  permanently, and the delivery-order work today showed how much confusion
+  follows from one timestamp standing for two events (`case_created_at` being
+  source data, not ingestion).
+- **It is a queue, not just a log.** Evidence that exists but has no upload record
+  is a work item. That is worth surfacing as a count in the CRM -- and eventually
+  a health metric -- because an un-uploaded assessment is invisible to the payer.
+
+Deliberately NOT modelled yet: any automatic push, retry or reconciliation against
+Unite Us. Manual-first keeps a human between vendor-supplied evidence and the
+system of record.
+
+## ⚠️ Scope tension: with no vendor portal, who fills the questionnaires?
+
+The portal is deferred and Phase 1 is CRM-only — but Q2 says **CRM internal users
+may never modify vendor answers**. With no portal, there is nobody left who can
+author them.
+
+Three ways out, and this needs deciding before implementation:
+
+| Option | Consequence |
+|---|---|
+| **A. Phase 1 has no questionnaires.** Build the order, visits, documents, proofs, findings and upload tracking. Questionnaires arrive with the portal. | Cleanest, keeps Q2 intact. The vendor's paperwork stays on paper/PDF and is attached as a DOCUMENT, which is what actually happens today. |
+| **B. An agent transcribes the vendor's answers**, recorded as agent-entered rather than vendor-signed. | Contradicts Q2 unless the distinction is explicit in the data — and a transcribed answer must never be presentable as a signed one. |
+| **C. Vendors get a minimal signed link** (no portal, one tokenised URL per order). | Smaller than a portal, but it is still external auth and evidence capture, i.e. most of the hard part. |
+
+**I would suggest A.** It is the only option that does not weaken the locking rule,
+it delivers everything the CRM can actually use today, and the signed-questionnaire
+machinery lands with the portal that gives it a real author. The vendor's signed
+paperwork is simply a `DispatchDocument` until then.
+
+## Later phase — the VENDOR PORTAL (deferred)
 
 > "in the future we will need to add a vendor portal, where vendors will login to
 > confirm appointments for assessments and work orders. they will also check in,
@@ -259,7 +364,10 @@ silent background task.
 
 ---
 
-## Sketch, for discussion only
+## Sketch, superseded by the Naming section above
+
+Kept for the field-level detail; the model NAMES are the ones in
+"Naming -- the DISPATCH domain".
 
 ```
 HousingAssessmentOrder
