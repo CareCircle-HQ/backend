@@ -211,6 +211,86 @@ unchanged.
 would include housing in totals, which is visible rather than corrupting, so they
 follow once we know how housing should be counted.
 
+### STEP 2 DONE -- housing resolution (`api/services/housing.py`)
+
+```
+housing_service_case(client)       the governing assessment, or None
+housing_assessment_cases(client)   the member's OWN EEA cases, most-governing first
+housing_work_orders(client)        the Home Expense Assistance/Repairs cases
+is_assessment_case / is_work_order_case / is_housing_case
+has_open_housing_case(client)
+```
+
+- `GOVERNING_SERVICE_TYPES` is an **allowlist** holding only EEA, rather than
+  excluding HEAR. A housing service added later therefore cannot start governing
+  by default; it has to be admitted deliberately.
+- **No household fallback**, unlike food's `governing_service_case_for_display`.
+  A dwelling is one property, so the case belongs to the primary; a dependent
+  resolving to a housing case would be wrong. Tested.
+- `is_work_order_case` is its own predicate, not "housing and not assessment": a
+  housing case resolving to NEITHER service type is a classification gap worth
+  seeing, not something silently treated as a work order.
+- Classification uses our curated program mapping FIRST (an agent can correct it
+  in Settings > Programs), then falls back to the case's own `service_type`
+  string as sent by Unite Us, matched against the choice labels.
+
+### STEP 2b DONE -- the verification can never touch a housing case
+
+Three paths could bind a food verification to a housing case. Step 1 closed the
+picker only:
+
+1. `has_open_internal_service_case` gates ENTRY to the wizard and counted any
+   internal-service case, so a HOUSING-ONLY member passed it. It also feeds the
+   verify button, `can_request_verification` and the exports.
+2. `MemberVerificationCreateView` takes `case_id` from the REQUEST BODY and
+   checked only `case_type == INTERNAL_SERVICE`.
+3. `governing_internal_case` (164 call sites) was never scoped -- and it is the
+   FALLBACK the wizard binds to when no `case_id` is posted. So with 1 and 2
+   closed, an approved assessment (newest, highest-ranked) still became the
+   "governing" case and the verification was written against it.
+
+What found #3 was an API-level test asserting no `EnrollmentVerification` ends up
+bound to a housing case. It failed on the first run. Testing the helpers alone
+would have passed and shipped the hole.
+
+### UI DONE
+
+```
+stage bar        F / H badge per governing case; housing chip = amber + House,
+                 "EEA" with the full name on hover
+Cases tab        same F / H badge; amber EEA chip before the scope label;
+                 new "Home Assistance" tab (housing WORK ORDERS, matched on
+                 service_type_code -- a case_type filter cannot separate them,
+                 both are internal_service); house-with-wrench icon
+```
+
+What earns a row on the bar differs BY TYPE, and this was got wrong once before
+being corrected: FOOD keeps its non-governing OPEN cases, because they carry
+"Duplicated", "Conflicting" and "Reauthorization - Waiting" -- a Conflicting row
+is how an agent SEES two competing food cases, the precondition of the fork loop
+that rewrote 149 enrollments. HOUSING shows only its governing assessment,
+because its non-governing cases are work orders (9 for the first member) and
+they buried everything else.
+
+### Both entry points verified (2026-09-16)
+
+**Extension**, against localhost: MIRIAM ISRAEL (`fad1f448`) landed with 1
+assessment + 9 work orders + live food service, resolving as one governing case
+per type and a single FOOD enrollment.
+
+**CSV import**: a hand-made file proved the classification end to end -- the
+Home Remediation and Dwelling rows imported and classified as work order /
+assessment, an `External Services` row was REJECTED, and no enrollment was
+created for either housing case. Note the first two attempts "passed" for the
+wrong reason; see the five-gate note in `AGENTS.md`.
+
+Correction to an earlier claim in this document: reclassifying the programs is
+**not** what opened the CSV importer, because those cases never came through it.
+The gate that had been rejecting them on every other path is `CaseSerializer`'s
+`EXTERNAL_SERVICE` backstop. The housing cases existed in Unite Us since August
+(`case_created_at`) but were only STORED once the programs became Internal
+Services (`added_to_system_at = 2026-09-16`).
+
 ### Open: does a re-assessment actually take over?
 
 `governing_case_key` ranks authorization favour FIRST:
@@ -229,10 +309,15 @@ computed program_status". If Unite Us leaves it `approved` after
 `approval_ends_at` passes, the DEAD assessment (rank 4) keeps governing over the
 new one (rank 3) and the re-assessment never takes over.
 
-For food that is deliberate -- it keeps a meals case governing through a
-meals->boxes switch. For housing it is a bug, so housing's ranking wants WINDOW
-AWARENESS: an approved authorization whose window has passed should rank below
-pending.
+**CLOSED: the operator states re-assessment cases never occur**, so a member never
+holds two live assessments and the situation does not arise. Housing therefore
+uses `governing_case_key` UNCHANGED -- "the same rules we did for food". Recorded
+in `api/services/housing.py` as known behaviour so nobody "fixes" it blindly.
+
+One observed consequence worth knowing, from the CSV test: authorization favour
+ranks above recency, so an assessment with a **blank** auth status (rank 0) loses
+to any approved one, even one created five days earlier. KAMARI GREENE's real
+assessment has a blank auth status.
 
 ### Also to settle
 

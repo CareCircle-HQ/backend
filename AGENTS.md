@@ -26,14 +26,41 @@ settings builds tables straight from model state). So data migrations never run
 in the suite: a test can never assert on rows a migration seeds, and must create
 them itself. Verify a data migration by running it against the local clone.
 
-`npm test` in the frontend currently FAILS on its own: the only test file
-(`ClientStageProgress.test.tsx`, 12 tests) renders a component that calls
-`useNavigate()` without a `<Router>` wrapper. Verified against a clean tree, so
-it is not your change -- but it also means the suite catches nothing.
+### Frontend (fixed 2026-09-16 -- this section used to say the opposite)
 
-The frontend has **no TypeScript installed** (`node_modules/.bin/tsc` does not
-exist), so `tsc --noEmit` silently does nothing. Verify it with `npm run build`
-instead -- esbuild will surface syntax/JSX errors.
+```
+npx vitest run       # passes
+npm run typecheck    # tsc --noEmit
+npm run build        # esbuild
+```
+
+`npm test` used to FAIL on its own -- `ClientStageProgress.test.tsx` rendered a
+component calling `useNavigate()` outside a `<Router>`, so all 12 tests failed and
+the only frontend test file caught nothing. Fixed by passing a `MemoryRouter`
+through Testing Library's **`wrapper` option** rather than wrapping the element:
+`wrapper` is reapplied by `rerender()`, and three tests call it, so inline
+wrapping would have left those failing.
+
+TypeScript **is** now installed (it was not, so `tsc --noEmit` silently did
+nothing). It is pinned in `devDependencies` with a deliberately LOOSE
+`tsconfig.json` -- `noEmit`, `strict: false` -- because the codebase was written
+without a checker and `strict` would produce hundreds of errors and be switched
+off again. It catches the class of mistake that was previously invisible: a
+reference to a type that does not exist, a misspelled property, a bad import
+path.
+
+**`npm run build` alone does NOT type-check.** esbuild strips types without
+checking them, so a reference to a non-existent type builds cleanly. That shipped
+a real bug on 2026-09-16 (`CaseRow` where the type is `MemberCase`). Run
+`typecheck` too.
+
+There are **14 pre-existing errors** -- including `EnrollmentsTab.tsx`
+referencing a `Validation` type that does not exist. They are known and left
+alone; `typecheck` is not clean, so compare the COUNT before and after your
+change rather than expecting zero.
+
+Use **pnpm**, not npm, for installs: `node_modules` is a pnpm store and
+`npm install` fails with "Cannot read properties of null (reading 'matches')".
 
 ## Celery beat: the scheduler, and why nothing was scheduled
 
@@ -122,13 +149,20 @@ were a `systemctl restart gunicorn` deleting the unix socket, a separate fault
 **Detach properly, and unbuffer.**
 
 ```
-setsid nohup python -u manage.py <cmd> > /tmp/<cmd>.log 2>&1 < /dev/null &
+setsid nohup python -u manage.py <cmd> > /tmp/<cmd>.log 2>&1 < /dev/null &   # EC2 only
+nohup python -u manage.py <cmd> > /tmp/<cmd>.log 2>&1 < /dev/null &          # local Mac
 ```
 
 - `-u` -- without it Python BLOCK-BUFFERS stdout into the file, so if the process
   dies the log is EMPTY and you learn nothing. Happened twice on 2026-09-15.
 - `setsid` -- `nohup` alone blocks SIGHUP but systemd-logind can still reap a
   session's processes; a rebuild vanished mid-run this way, silently.
+- **`setsid` does NOT exist on macOS.** It fails with
+  `bash: setsid: command not found` -- and because that happens BEFORE the
+  redirect, the log file is never created and the command silently never starts.
+  Cost ~5 minutes on 2026-09-16 waiting on an import that was never running.
+  Always confirm a background job actually started (`pgrep -f`), rather than
+  assuming the `&` succeeded.
 
 **Check for a duplicate before starting one.** Two concurrent `--prune` passes
 delete each other's rows:
@@ -141,6 +175,70 @@ pgrep -af rebuild_enrollment_analytics
 SIGTERM gives Celery a warm shutdown but systemd SIGKILLs at `TimeoutStopSec`
 (90s), so a long task dies mid-run -- that is what produced "Worker restarted
 mid-run" on ImportRun #1449 (member_prep, 8000/15148 rows).
+
+## A rebuild applies the code that is RUNNING -- deploy first
+
+A `rebuild_enrollment_analytics` (or any repair loop) executes the deployed code,
+not the code on your branch. Running it before the deploy produces a confident,
+wrong "verified" result. This bit three times in two days -- the `medicaid_id`
+backfill, the Meals/Boxes service-type fix, and the ticket-type filter, where a
+production rebuild produced 782 rows instead of ~11,000 because the fix was still
+sitting on `dev`.
+
+The tell is a metric that moves the wrong DISTANCE rather than not at all. Look
+for a second, independent signal before concluding the data is fixed: for the
+ticket-type work it was 25 rows with duplicate codes, which only the undeployed
+`order_by()` fix could have cleared.
+
+```
+git -C ~/backend log --oneline -1     # what is actually running
+```
+
+## Case timestamps: most are SOURCE data, not ours
+
+`Case.case_created_at` and `Case.updated_at` are **Unite Us fields** --
+`auto_now`/`auto_now_add` are both False and both are nullable. So
+`case_created_at` is when UNITE US created the case, which can be months before
+we ever saw it, and `updated_at` is routinely NULL.
+
+**`added_to_system_at` is the ingestion timestamp** -- "when did WE learn about
+this". On 2026-09-16 reading `case_created_at` as local led to "these housing
+cases arrived in August through a path with no scope check", when in fact they
+were stored that same afternoon (`added_to_system_at = 09-16 17:48`) and had
+simply existed in Unite Us since August. The scope guard had been working
+correctly all along.
+
+## The cases CSV import has FIVE gates, in order
+
+A skipped row does NOT mean the classification rejected it. `_import_cases`
+drops rows in this sequence, all counted identically as "skipped":
+
+```
+1  case_id present
+2  Met Council is the MANAGING provider   provider_id / provider_name;
+                                          originating_* is deliberately IGNORED
+3  creator is on a CareCircle team        UniteUsAgent.originating_team in
+                                          CARECIRCLE_ALLOWLIST_TEAMS (195 ids on
+                                          the clone -- an EMPTY list means no gate)
+4  case_status != "referred"
+5  case_in_import_scope(service_subtype, program_name)
+```
+
+A hand-made test CSV needs `provider_name = "Met Council - SCN - PHS"` AND a
+`case_created_by_id` from the allowlist, or it never reaches gate 5. Verifying a
+scope change without those produces a PASS for entirely the wrong reason -- which
+is what happened twice on 2026-09-16 before the third attempt actually exercised
+the gate.
+
+Note `case_in_import_scope` is applied **only** in the CSV importer. Every other
+path (extension `POST /api/cases/`, Unite Us pull, admin) relies on
+`CaseSerializer` rejecting `CaseType.EXTERNAL_SERVICE` -- the universal backstop.
+That guard derives `case_type` ONLY when the payload omits it, so a caller that
+sends its own `case_type` bypasses the classification.
+
+`ImportRun` field names are `processed_count` / `created_count` / `updated_count`
+/ `skipped_count` / `error_count` / `progress_total` / `export_type` -- not
+`processed`, `errors` or `import_type`.
 
 ## Deployment
 
