@@ -26072,3 +26072,108 @@ class DataPageTicketTypeFilterTest(TestCase):
         ]
         self.assertIn(str(a.pk), ids)
         self.assertIn(str(b.pk), ids)
+
+
+class SocialCareCoverageStatusTest(TestCase):
+    """Social care coverages are CONCURRENT PLANS, not a status history.
+
+    Reported: "filter for Social Care = Not Enrolled and you get people that are
+    enrolled". The builder took the coverage with the latest `enrolled_at`, but 70%
+    of members hold more than one, and a member is routinely enrolled in "Enhanced
+    HRSN Services" while several "Screening and Navigation" plans come and go. On a
+    production clone 1,643 members read `non_enrolled` while holding a live
+    enrolled coverage; after the fix all 1,643 read `enrolled`.
+    """
+
+    def _client(self, name="Covered"):
+        from .models import Client
+
+        return Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name=name, last_name="Member",
+            client_added_at=timezone.now(),
+        )
+
+    def _coverage(self, client, status, enrolled_at, expired_at, plan="Plan"):
+        from .models import SocialCareCoverage
+
+        return SocialCareCoverage.objects.create(
+            client=client, coverage_id=uuid.uuid4(), status=status,
+            plan_name=plan, enrolled_at=enrolled_at, expired_at=expired_at,
+        )
+
+    def _status(self, client):
+        from .models import EnrollmentAnalytics
+        from .services.enrollment_analytics import rebuild
+
+        rebuild(client_ids=[client.pk])
+        return EnrollmentAnalytics.objects.get(client_id=client.pk).social_status
+
+    def test_a_live_enrolled_plan_beats_a_MORE_RECENT_expired_one(self):
+        """The exact reported shape."""
+        now = timezone.now()
+        c = self._client()
+        self._coverage(c, "enrolled", now - timedelta(days=90), None,
+                       plan="Enhanced HRSN Services")
+        self._coverage(c, "non_enrolled", now - timedelta(days=10),
+                       now - timedelta(days=1),
+                       plan="FFS Screening and Navigation")
+        self.assertEqual(self._status(c), "enrolled")
+
+    def test_enrolled_wins_over_non_enrolled_on_the_SAME_plan(self):
+        """One member had the same plan twice, where non_enrolled won by a 4-hour
+        timezone offset."""
+        base = timezone.now() - timedelta(days=30)
+        c = self._client()
+        self._coverage(c, "enrolled", base, None, plan="MCO Screening")
+        self._coverage(c, "non_enrolled", base + timedelta(hours=4), None,
+                       plan="MCO Screening")
+        self.assertEqual(self._status(c), "enrolled")
+
+    def test_a_never_expiring_sentinel_counts_as_live(self):
+        """9999-12-31 is the "never expires" sentinel."""
+        c = self._client()
+        self._coverage(
+            c, "enrolled", timezone.now() - timedelta(days=5),
+            timezone.make_aware(datetime(9999, 12, 31)),
+        )
+        self.assertEqual(self._status(c), "enrolled")
+
+    def test_an_EXPIRED_enrolled_plan_does_not_claim_coverage(self):
+        """Being enrolled in something that has lapsed is not current coverage: a
+        live non_enrolled row outranks an expired enrolled one."""
+        now = timezone.now()
+        c = self._client()
+        self._coverage(c, "enrolled", now - timedelta(days=400),
+                       now - timedelta(days=200))
+        self._coverage(c, "non_enrolled", now - timedelta(days=10), None)
+        self.assertEqual(self._status(c), "non_enrolled")
+
+    def test_genuinely_not_enrolled_stays_not_enrolled(self):
+        """The fix must not turn everyone into 'enrolled' -- the filter has to
+        keep working for the people it is actually about."""
+        now = timezone.now()
+        c = self._client()
+        self._coverage(c, "non_enrolled", now - timedelta(days=30), None)
+        self._coverage(c, "non_enrolled", now - timedelta(days=10),
+                       now - timedelta(days=1))
+        self.assertEqual(self._status(c), "non_enrolled")
+
+    def test_no_coverage_at_all_is_blank(self):
+        self.assertEqual(self._status(self._client()), "")
+
+    def test_the_filter_no_longer_returns_an_enrolled_member(self):
+        """End to end through filter_analytics, which is what the page calls."""
+        from .services.enrollment_analytics import filter_analytics, rebuild
+
+        now = timezone.now()
+        c = self._client("Enrolled")
+        self._coverage(c, "enrolled", now - timedelta(days=90), None)
+        self._coverage(c, "non_enrolled", now - timedelta(days=2),
+                       now - timedelta(days=1))
+        rebuild(client_ids=[c.pk])
+
+        not_enrolled = [
+            str(r.client_id)
+            for r in filter_analytics({"social_status": "non_enrolled"})
+        ]
+        self.assertNotIn(str(c.pk), not_enrolled)

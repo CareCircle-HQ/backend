@@ -9,6 +9,7 @@ source of truth.
 """
 
 import logging
+import datetime
 from functools import lru_cache
 
 from django.db.models import Prefetch
@@ -168,11 +169,52 @@ def _as_aware(value):
     return value
 
 
+_DT_FLOOR = datetime.datetime(1, 1, 1, tzinfo=datetime.timezone.utc)
+
+
+def _best_social_coverage(rows):
+    """The coverage that represents the member's CURRENT social-care standing.
+
+    Social care coverages are CONCURRENT PLANS, not a status history: 70% of
+    members hold more than one, and a member is routinely enrolled in "Enhanced
+    HRSN Services" while several "Screening and Navigation" plans have come and
+    gone. Picking the latest ``enrolled_at`` therefore reported the wrong answer
+    for 1,643 members -- the Data page's "Social Care = Not Enrolled" filter
+    returned people who ARE enrolled, e.g.
+
+        non_enrolled  Queens FFS Screening and Navigation   expired 2026-07-31
+        ENROLLED      Queens NY1115 Enhanced HRSN Services  expired_at = None
+        non_enrolled  Brooklyn MCO Screening and Navigation expired 2026-07-10
+
+    where the expired FFS row won on recency. One member had the SAME plan twice,
+    enrolled and non_enrolled, where non_enrolled won by a 4-hour timezone offset.
+
+    So rank by what the answer should be, most significant first:
+      1. enrolled AND still live  -- the member has coverage
+      2. LIVE at all
+      3. enrolled at all
+      4. most recent
+
+    LIVE outranks ENROLLED at 2/3 deliberately: being enrolled in something that
+    LAPSED is not current coverage, so a live non_enrolled row must beat an expired
+    enrolled one. Getting that order wrong is how the original bug read in reverse.
+    """
+    if not rows:
+        return None
+    now = timezone.now()
+
+    def rank(s):
+        live = s.expired_at is None or s.expired_at > now
+        enrolled = (s.status or "").strip().casefold() == "enrolled"
+        return (enrolled and live, live, enrolled, s.enrolled_at or _DT_FLOOR)
+
+    return max(rows, key=rank)
+
+
 def _coverage(client_id):
     ins = (Insurance.objects.filter(client_id=client_id)
            .order_by("-is_primary", "-enrolled_at").first())
-    soc = (SocialCareCoverage.objects.filter(client_id=client_id)
-           .order_by("-enrolled_at").first())
+    soc = _best_social_coverage(list(SocialCareCoverage.objects.filter(client_id=client_id)))
     return (
         (ins.status if ins else ""), (ins.expired_at if ins else None),
         (soc.status if soc else ""), (soc.expired_at if soc else None),
