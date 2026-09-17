@@ -9,6 +9,7 @@ rather than by a permission check someone can widen later.
 See docs/housing-assessment-order-plan.md.
 """
 import logging
+import re
 
 from django.db import IntegrityError, transaction
 from django.shortcuts import get_object_or_404
@@ -172,18 +173,43 @@ class MemberAssessmentOrderCreateView(PortalAPIView):
                 status=http.HTTP_400_BAD_REQUEST,
             )
 
-        vendor = None
+        # REQUIRED fields, enforced here and not only in the wizard. The UI
+        # disables its buttons, but a disabled button is not a rule: the food
+        # verification's picker excluded housing cases while its ENDPOINT still
+        # accepted one, and only an API-level test found it. An order missing a
+        # phone or an address cannot be executed by a vendor, so it should not
+        # exist.
+        missing = []
+        if len(re.sub(r"\D", "", data.get("contact_phone") or "")) < 10:
+            missing.append("contact_phone")
+        if not (data.get("address_line1") or "").strip():
+            missing.append("address_line1")
+        if not (data.get("referral_type") or "").strip():
+            missing.append("referral_type")
+        if not (data.get("vendor_id") or "").strip():
+            missing.append("vendor_id")
+        # Consent is the vendor's authority to contact the member at all, and the
+        # ECM confirmation is the agent's sign-off. Neither is optional.
+        if not data.get("consent_to_call") and not data.get("consent_to_text"):
+            missing.append("consent_to_call/consent_to_text")
+        if not data.get("ecm_billed_confirmed"):
+            missing.append("ecm_billed_confirmed")
+        if missing:
+            return Response(
+                {"detail": f"Missing required field(s): {', '.join(missing)}"},
+                status=http.HTTP_400_BAD_REQUEST,
+            )
+
         vendor_id = (data.get("vendor_id") or "").strip()
-        if vendor_id:
-            vendor = Vendor.objects.filter(pk=vendor_id, is_active=True).first()
-            if vendor is None:
-                return Response(
-                    {"detail": "Unknown or inactive vendor."},
-                    status=http.HTTP_400_BAD_REQUEST,
-                )
+        vendor = Vendor.objects.filter(pk=vendor_id, is_active=True).first()
+        if vendor is None:
+            return Response(
+                {"detail": "Unknown or inactive vendor."},
+                status=http.HTTP_400_BAD_REQUEST,
+            )
 
         referral_type = (data.get("referral_type") or "").strip()
-        if referral_type and referral_type not in DispatchReferralType.values:
+        if referral_type not in DispatchReferralType.values:
             return Response(
                 {"detail": f"Unknown referral type: {referral_type}"},
                 status=http.HTTP_400_BAD_REQUEST,

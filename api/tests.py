@@ -27401,9 +27401,11 @@ class AssessmentOrderWizardApiTest(TestCase):
             "referral_type": "combined",
             "contact_phone": "718-555-0100",
             "contact_phone_type": "mobile",
+            "address_line1": "123 Verified St",
             "address_formatted": "123 Verified St, Brooklyn NY",
             "consent_to_call": True,
             "consent_to_text": True,
+            "ecm_billed_confirmed": True,
             "availability": [
                 {"date": "2026-10-01", "start_time": "09:00", "end_time": "12:00"},
                 {"date": "2026-10-02", "start_time": "13:00", "end_time": "17:00"},
@@ -27788,3 +27790,139 @@ class HomeAccessibilityProgramsTest(TestCase):
         and only one is ours."""
         self.assertTrue(self.LISTED.startswith(self.PREFIX))
         self.assertTrue(self.NOT_LISTED.startswith(self.PREFIX))
+
+
+class AssessmentOrderRequiredFieldsTest(TestCase):
+    """The wizard's required fields are enforced by the ENDPOINT, not just the UI.
+
+    The wizard disables its buttons, but a disabled button is not a rule. The food
+    verification is the precedent: its picker excluded housing cases while the
+    endpoint still accepted one, and only an API-level test caught it.
+    """
+
+    EEA = (
+        "Dwelling Assessment & Statement of Work (SOW) Development - "
+        "Modifications and Remediation Service - Brooklyn"
+    )
+
+    def setUp(self):
+        from .models import ActiveProgram, Client, Vendor
+        from .services.catalog import clear_program_domain_cache
+
+        ActiveProgram.objects.create(
+            program_name=self.EEA, case_category="Internal Services",
+            case_type=ActiveProgram.CaseType.HOUSING,
+            service_type=ActiveProgram.ServiceType.ENVIRONMENTAL_EXPOSURE_ASSESSMENT,
+        )
+        clear_program_domain_cache()
+        self.vendor = Vendor.objects.create(name="Acme Remediation")
+        self.member = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Req", last_name="Fields",
+            client_added_at=timezone.now(),
+        )
+        from .models import Case, CaseStatus, CaseType
+
+        Case.objects.create(
+            case_id=uuid.uuid4(), client=self.member,
+            case_type=CaseType.INTERNAL_SERVICE, case_status=CaseStatus.MANAGED,
+            program_name=self.EEA, service_authorization_status="approved",
+            case_created_at=timezone.now(),
+        )
+
+    def _api(self):
+        from rest_framework_simplejwt.tokens import AccessToken
+
+        from .models import Agent
+
+        if not hasattr(self, "_agent"):
+            self._agent = Agent.objects.create(
+                name="R", agent_code="883", group="Management",
+            )
+        acc = AccessToken()
+        acc["agent_id"] = str(self._agent.id)
+        acc["agent_code"] = self._agent.agent_code
+        acc["agent_name"] = self._agent.name
+        acc["agent_group"] = self._agent.group
+        api = APIClient(); api.credentials(HTTP_AUTHORIZATION=f"Bearer {acc}")
+        return api
+
+    def _payload(self, **over):
+        base = {
+            "contact_phone": "(718) 555-0100",
+            "contact_phone_type": "mobile",
+            "address_line1": "123 Verified St",
+            "address_city": "Brooklyn",
+            "address_state": "NY",
+            "address_zip": "11201",
+            "referral_type": "combined",
+            "vendor_id": str(self.vendor.pk),
+            "consent_to_call": True,
+            "consent_to_text": True,
+            "ecm_billed_confirmed": True,
+            "availability": [
+                {"date": "2026-10-01", "start_time": "09:00", "end_time": "12:00"},
+                {"date": "2026-10-02", "start_time": "09:00", "end_time": "12:00"},
+                {"date": "2026-10-03", "start_time": "09:00", "end_time": "12:00"},
+            ],
+        }
+        base.update(over)
+        return base
+
+    def _post(self, **over):
+        return self._api().post(
+            f"/api/portal/members/{self.member.pk}/assessment-order/",
+            self._payload(**over), format="json",
+        )
+
+    def test_a_complete_payload_succeeds(self):
+        """The baseline -- without it, every refusal below could be a false pass."""
+        self.assertEqual(self._post().status_code, 201, self._post().content)
+
+    def test_phone_is_required(self):
+        resp = self._post(contact_phone="")
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("contact_phone", resp.data["detail"])
+
+    def test_a_PARTIAL_phone_is_refused(self):
+        """Ten digits, not merely "something typed" -- the vendor has to call."""
+        resp = self._post(contact_phone="(718) 555")
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("contact_phone", resp.data["detail"])
+
+    def test_address_is_required(self):
+        resp = self._post(address_line1="")
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("address_line1", resp.data["detail"])
+
+    def test_referral_type_is_required(self):
+        resp = self._post(referral_type="")
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("referral_type", resp.data["detail"])
+
+    def test_vendor_is_required(self):
+        resp = self._post(vendor_id="")
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("vendor_id", resp.data["detail"])
+
+    def test_consent_is_required(self):
+        """The vendor's authority to contact the member at all."""
+        resp = self._post(consent_to_call=False, consent_to_text=False)
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("consent", resp.data["detail"])
+
+    def test_ecm_confirmation_is_required(self):
+        resp = self._post(ecm_billed_confirmed=False)
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("ecm_billed_confirmed", resp.data["detail"])
+
+    def test_every_missing_field_is_named_at_once(self):
+        """One round trip should tell an agent everything, not the first problem."""
+        resp = self._post(
+            contact_phone="", address_line1="", referral_type="", vendor_id="",
+            consent_to_call=False, consent_to_text=False,
+            ecm_billed_confirmed=False,
+        )
+        self.assertEqual(resp.status_code, 400)
+        for f in ("contact_phone", "address_line1", "referral_type", "vendor_id",
+                  "consent", "ecm_billed_confirmed"):
+            self.assertIn(f, resp.data["detail"])
