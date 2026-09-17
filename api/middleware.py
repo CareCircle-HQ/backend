@@ -9,6 +9,39 @@ from django.db import connection
 logger = logging.getLogger(__name__)
 
 
+class VendorHostMiddleware:
+    """Serve ONLY the vendor API on ``settings.VENDOR_API_HOST``.
+
+    The same device as :class:`PartnerHostMiddleware`, and for the same reason:
+    swapping ``request.urlconf`` means the CRM's routes do not EXIST on that
+    hostname, so ``/api/clients/`` is a 404 rather than a 403. That is what lets
+    a vendor's staff be handed a URL without exposing any other part of the CRM.
+
+    A SEPARATE host from the partner API, deliberately. A delivery company's
+    machine credential and a vendor employee's session token should never be
+    presentable to the same surface.
+
+    Must run BEFORE URL resolution, hence its position near the top of MIDDLEWARE.
+    Inert when ``VENDOR_API_HOST`` is unset.
+    """
+
+    URLCONF = "api.vendor.urls"
+
+    def __init__(self, get_response):
+        self.get_response = get_response
+
+    def __call__(self, request):
+        # Read the setting per request so tests can override_settings it.
+        expected = (getattr(settings, "VENDOR_API_HOST", "") or "").strip().lower()
+        if expected:
+            # Host header only, never a forwarded one: a client must not be able
+            # to select -- or escape -- this surface by spoofing a proxy header.
+            host = (request.get_host() or "").split(":")[0].lower()
+            if host == expected:
+                request.urlconf = self.URLCONF
+        return self.get_response(request)
+
+
 class PartnerHostMiddleware:
     """Serve ONLY the delivery-partner API on ``settings.PARTNER_API_HOST``.
 

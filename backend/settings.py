@@ -129,6 +129,10 @@ MIDDLEWARE = [
     # Swaps in the delivery-partner URLConf on PARTNER_API_HOST so no CRM route
     # exists on that hostname. Must precede URL resolution.
     'api.middleware.PartnerHostMiddleware',
+    # Same position and same reason: must run before URL resolution so it can
+    # swap request.urlconf. See api/vendor/__init__.py for the three isolation
+    # layers this is the second of.
+    'api.middleware.VendorHostMiddleware',
     'whitenoise.middleware.WhiteNoiseMiddleware',
     'corsheaders.middleware.CorsMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
@@ -176,6 +180,10 @@ HYROS_LEADS_URL = os.getenv(
 # Must also appear in DJANGO_ALLOWED_HOSTS. Deliberately NOT added to
 # CORS_ALLOWED_ORIGINS or CSRF_TRUSTED_ORIGINS: it is server-to-server only.
 PARTNER_API_HOST = os.getenv('PARTNER_API_HOST', '').strip()
+# The vendor API/app hostname. A SEPARATE host from the partner API: a
+# delivery company's machine credential and a vendor employee's session token
+# must never be presentable to the same surface. Unset -> the middleware is inert.
+VENDOR_API_HOST = os.getenv('VENDOR_API_HOST', '').strip()
 
 # Partner access-token lifetime, and how long a rotated-away client secret keeps
 # working so a vendor can redeploy without an outage.

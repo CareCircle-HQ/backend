@@ -5432,6 +5432,48 @@ class VendorUser(models.Model):
         return f"{self.name} ({self.vendor.name})"
 
 
+class VendorAccessToken(models.Model):
+    """A short-lived OPAQUE bearer token for a logged-in vendor user.
+
+    Mirrors :class:`PartnerAccessToken` and for the same reason, restated because
+    it is the single most important decision on this surface: the project's
+    DEFAULT_AUTHENTICATION_CLASSES include JWT authenticators, so a vendor JWT
+    signed with the shared key would authenticate against the WHOLE CRM. An
+    opaque random token is meaningless to those authenticators, and revoking it is
+    one row update -- which is what makes "this vendor lost their phone" a
+    two-second fix.
+
+    Differs from the partner token in one way that matters: the principal is a
+    PERSON, not a company credential, so the token carries the user and the
+    vendor. Every query is scoped to the vendor; the user is who did it.
+    """
+
+    vendor_user = models.ForeignKey(
+        VendorUser, on_delete=models.CASCADE, related_name="tokens"
+    )
+    # sha256 of the token; the raw value is returned once and never stored.
+    token_hash = models.CharField(max_length=64, unique=True, db_index=True)
+    expires_at = models.DateTimeField(db_index=True)
+    revoked_at = models.DateTimeField(null=True, blank=True)
+    created_ip = models.CharField(max_length=64, blank=True)
+    # Free text from the login request, for "sign out my other devices" and for
+    # telling one shared tablet from another.
+    device_label = models.CharField(max_length=120, blank=True)
+    last_used_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        indexes = [models.Index(fields=["vendor_user", "expires_at"])]
+
+    def __str__(self):
+        return f"VendorAccessToken({self.vendor_user_id})"
+
+    @property
+    def is_valid(self):
+        return self.revoked_at is None and self.expires_at > timezone.now()
+
+
 class DispatchKind(models.TextChoices):
     ASSESSMENT = "assessment", "Dwelling Assessment"
     REMEDIATION = "remediation", "Home Remediation"

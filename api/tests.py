@@ -7,6 +7,8 @@ from unittest import mock
 from unittest.mock import patch
 
 from django.core.files.uploadedfile import SimpleUploadedFile
+import json
+
 from django.test import SimpleTestCase, TestCase, override_settings
 from django.urls import reverse
 from django.utils import timezone
@@ -29454,3 +29456,306 @@ class AssessmentFormTest(TestCase):
             f"/api/portal/members/{other.pk}/assessment-form/",
         )
         self.assertEqual(resp.status_code, 404)
+
+
+VENDOR_HOST = "vendor.test"
+
+
+@override_settings(VENDOR_API_HOST=VENDOR_HOST, ALLOWED_HOSTS=["*"])
+class VendorApiAuthTest(TestCase):
+    """The vendor API's isolation and scoping.
+
+    These are the tests that matter most on this surface: the requirement is that
+    vendor users reach neither the CRM nor any CRM API, and that one vendor never
+    sees another's work.
+    """
+
+    def setUp(self):
+        from django.contrib.auth.hashers import make_password
+
+        from .models import Vendor, VendorUser
+
+        self.vendor = Vendor.objects.create(name="Acme Remediation")
+        self.other_vendor = Vendor.objects.create(name="Beta Repairs")
+        self.user = VendorUser.objects.create(
+            vendor=self.vendor, email="boss@acme.test", name="Ada Boss",
+            password=make_password("vendor-pass-1"), is_admin=True,
+        )
+        self.other_user = VendorUser.objects.create(
+            vendor=self.other_vendor, email="rival@beta.test", name="Rival",
+            password=make_password("vendor-pass-2"),
+        )
+
+    def _client(self):
+        return APIClient()
+
+    def _login(self, email="boss@acme.test", password="vendor-pass-1"):
+        return self._client().post(
+            "/v1/auth/login/", {"email": email, "password": password},
+            format="json", HTTP_HOST=VENDOR_HOST,
+        )
+
+    def _token(self, **kw):
+        resp = self._login(**kw)
+        self.assertEqual(resp.status_code, 200, resp.content)
+        return resp.data["access_token"]
+
+    def _as(self, token):
+        api = APIClient()
+        api.credentials(HTTP_AUTHORIZATION=f"Bearer {token}")
+        return api
+
+    # ── login ────────────────────────────────────────────────────────────────
+    def test_a_vendor_user_can_log_in_and_gets_an_opaque_token(self):
+        resp = self._login()
+        self.assertEqual(resp.status_code, 200, resp.content)
+        token = resp.data["access_token"]
+        self.assertTrue(token.startswith("ccvt_"))
+        # Opaque, NOT a JWT. A JWT signed with the shared key would authenticate
+        # against the whole CRM -- the single most important property here.
+        self.assertNotIn(".", token.replace("ccvt_", ""))
+        self.assertEqual(resp.data["vendor"]["name"], "Acme Remediation")
+
+    def test_the_raw_token_is_never_stored(self):
+        from .models import VendorAccessToken
+
+        token = self._token()
+        stored = VendorAccessToken.objects.get()
+        self.assertNotEqual(stored.token_hash, token)
+        self.assertEqual(len(stored.token_hash), 64)  # sha256 hex
+
+    def test_a_wrong_password_and_a_missing_user_give_the_SAME_answer(self):
+        """A different message for each would let anyone enumerate vendor staff
+        against an endpoint on the public internet."""
+        wrong = self._login(password="nope")
+        missing = self._login(email="nobody@acme.test", password="nope")
+        self.assertEqual(wrong.status_code, 401)
+        self.assertEqual(missing.status_code, 401)
+        self.assertEqual(wrong.data["error"], missing.data["error"])
+        self.assertEqual(wrong.data["detail"], missing.data["detail"])
+
+    def test_a_DEACTIVATED_user_cannot_log_in(self):
+        self.user.is_active = False
+        self.user.save(update_fields=["is_active"])
+        self.assertEqual(self._login().status_code, 401)
+
+    def test_a_deactivated_VENDOR_locks_out_its_staff(self):
+        self.vendor.is_active = False
+        self.vendor.save(update_fields=["is_active"])
+        self.assertEqual(self._login().status_code, 401)
+
+    def test_deactivation_takes_effect_IMMEDIATELY_on_an_existing_token(self):
+        """Re-checked every request, not only at login: deactivating someone must
+        not wait for their token to expire."""
+        token = self._token()
+        self.assertEqual(
+            self._as(token).get("/v1/me/", HTTP_HOST=VENDOR_HOST).status_code, 200,
+        )
+        self.user.is_active = False
+        self.user.save(update_fields=["is_active"])
+        self.assertEqual(
+            self._as(token).get("/v1/me/", HTTP_HOST=VENDOR_HOST).status_code, 401,
+        )
+
+    def test_logout_revokes_the_token(self):
+        token = self._token()
+        api = self._as(token)
+        self.assertEqual(
+            api.post("/v1/auth/logout/", {}, format="json",
+                     HTTP_HOST=VENDOR_HOST).status_code, 200,
+        )
+        self.assertEqual(
+            api.get("/v1/me/", HTTP_HOST=VENDOR_HOST).status_code, 401,
+        )
+
+    def test_an_EXPIRED_token_is_refused(self):
+        from .models import VendorAccessToken
+
+        token = self._token()
+        VendorAccessToken.objects.update(
+            expires_at=timezone.now() - timezone.timedelta(minutes=1),
+        )
+        self.assertEqual(
+            self._as(token).get("/v1/me/", HTTP_HOST=VENDOR_HOST).status_code, 401,
+        )
+
+    # ── isolation ────────────────────────────────────────────────────────────
+    def test_the_CRM_ROUTES_DO_NOT_EXIST_on_the_vendor_host(self):
+        """404, not 403. The urlconf is swapped, so they are absent rather than
+        forbidden -- which is what lets a vendor be handed this URL at all."""
+        api = self._as(self._token())
+        for path in ("/api/clients/", "/api/portal/dashboard/", "/api/cases/"):
+            resp = api.get(path, HTTP_HOST=VENDOR_HOST)
+            self.assertEqual(resp.status_code, 404, f"{path} -> {resp.status_code}")
+
+    def test_the_VENDOR_ROUTES_DO_NOT_EXIST_on_the_main_host(self):
+        """The reverse direction: api.vendor.urls is never included by
+        backend/urls.py, so the surface is absent from the CRM's own hostname."""
+        api = self._as(self._token())
+        for path in ("/v1/me/", "/v1/work/", "/v1/auth/login/"):
+            resp = api.get(path, HTTP_HOST="localhost")
+            self.assertEqual(resp.status_code, 404, f"{path} -> {resp.status_code}")
+
+    def test_a_vendor_token_is_UNRECOGNISED_by_the_CRM(self):
+        """Not merely unauthorised. The auth class is deliberately absent from
+        DEFAULT_AUTHENTICATION_CLASSES, so a CRM endpoint cannot even parse it."""
+        from .models import Client
+
+        Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="A", last_name="B",
+            client_added_at=timezone.now(),
+        )
+        resp = self._as(self._token()).get(
+            "/api/portal/members/", HTTP_HOST="localhost",
+        )
+        self.assertIn(resp.status_code, (401, 403, 404))
+        self.assertNotEqual(resp.status_code, 200)
+
+    def test_an_AGENT_JWT_is_unrecognised_by_the_vendor_API(self):
+        from rest_framework_simplejwt.tokens import AccessToken
+
+        from .models import Agent
+
+        agent = Agent.objects.create(
+            name="Agent", agent_code="991", group="Management",
+        )
+        acc = AccessToken()
+        acc["agent_id"] = str(agent.id); acc["agent_code"] = agent.agent_code
+        acc["agent_name"] = agent.name; acc["agent_group"] = agent.group
+
+        api = APIClient()
+        api.credentials(HTTP_AUTHORIZATION=f"Bearer {acc}")
+        resp = api.get("/v1/work/", HTTP_HOST=VENDOR_HOST)
+        self.assertEqual(resp.status_code, 401)
+
+    def test_a_PARTNER_token_is_unrecognised_by_the_vendor_API(self):
+        """The two external surfaces must not accept each other's credentials."""
+        from .models import DeliveryCompany, DeliveryCompanyApiClient
+        from .partner.auth import generate_client_id, generate_secret, hash_secret, issue_token
+
+        company = DeliveryCompany.objects.create(name="Couriers Ltd")
+        secret = generate_secret()
+        api_client = DeliveryCompanyApiClient.objects.create(
+            delivery_company=company, client_id=generate_client_id("couriers"),
+            secret_hash=hash_secret(secret), scopes=["pod:write"],
+        )
+        raw, _tok = issue_token(api_client)
+
+        api = APIClient()
+        api.credentials(HTTP_AUTHORIZATION=f"Bearer {raw}")
+        self.assertEqual(
+            api.get("/v1/work/", HTTP_HOST=VENDOR_HOST).status_code, 401,
+        )
+
+    def test_no_credentials_is_401(self):
+        self.assertEqual(
+            self._client().get("/v1/work/", HTTP_HOST=VENDOR_HOST).status_code, 401,
+        )
+
+
+@override_settings(VENDOR_API_HOST=VENDOR_HOST, ALLOWED_HOSTS=["*"])
+class VendorWorkScopingTest(TestCase):
+    """A vendor sees only their own work, and only the member fields agreed."""
+
+    def setUp(self):
+        from django.contrib.auth.hashers import make_password
+
+        from .models import (
+            Client, DispatchKind, DispatchOrder, DispatchStatus, Vendor, VendorUser,
+        )
+
+        self.vendor = Vendor.objects.create(name="Acme")
+        self.rival = Vendor.objects.create(name="Beta")
+        VendorUser.objects.create(
+            vendor=self.vendor, email="a@acme.test", name="Ada",
+            password=make_password("pw-acme-123"),
+        )
+        # medicaid_id lives on Lead/EnrollmentAnalytics rather than Client, so the
+        # DOB is the sensitive field actually reachable from here -- and the leak
+        # assertion below checks for both it and the word "medicaid" anyway.
+        self.member = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Tracey", last_name="Johnson",
+            date_of_birth="1975-01-31", client_added_at=timezone.now(),
+        )
+        self.mine = DispatchOrder.objects.create(
+            kind=DispatchKind.ASSESSMENT, client=self.member, vendor=self.vendor,
+            referral_type="combined", contact_phone="(347) 394-6843",
+            address_formatted="1550 E 102ND ST 3E BROOKLYN, NY 11236",
+            address_notes="Buzzer 3E",
+        )
+        self.theirs = DispatchOrder.objects.create(
+            kind=DispatchKind.ASSESSMENT, client=Client.objects.create(
+                client_id=str(uuid.uuid4()), first_name="Someone", last_name="Else",
+                client_added_at=timezone.now(),
+            ),
+            vendor=self.rival,
+        )
+        self.done = DispatchOrder.objects.create(
+            kind=DispatchKind.REMEDIATION, client=self.member, vendor=self.vendor,
+            status=DispatchStatus.UPLOADED,
+        )
+
+    def _api(self):
+        resp = APIClient().post(
+            "/v1/auth/login/", {"email": "a@acme.test", "password": "pw-acme-123"},
+            format="json", HTTP_HOST=VENDOR_HOST,
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        api = APIClient()
+        api.credentials(HTTP_AUTHORIZATION=f"Bearer {resp.data['access_token']}")
+        return api
+
+    def test_the_work_list_shows_only_THIS_vendors_orders(self):
+        resp = self._api().get("/v1/work/", HTTP_HOST=VENDOR_HOST)
+        self.assertEqual(resp.status_code, 200)
+        ids = {o["id"] for o in resp.data}
+        self.assertIn(str(self.mine.pk), ids)
+        self.assertNotIn(str(self.theirs.pk), ids)
+
+    def test_terminal_orders_are_excluded_unless_asked_for(self):
+        """An installer opens this to find what to do next, not to browse."""
+        api = self._api()
+        ids = {o["id"] for o in api.get("/v1/work/", HTTP_HOST=VENDOR_HOST).data}
+        self.assertNotIn(str(self.done.pk), ids)
+
+        all_ids = {
+            o["id"] for o in
+            api.get("/v1/work/?include_done=1", HTTP_HOST=VENDOR_HOST).data
+        }
+        self.assertIn(str(self.done.pk), all_ids)
+
+    def test_another_vendors_order_is_a_404_NOT_a_403(self):
+        """A 403 would confirm the id exists."""
+        resp = self._api().get(
+            f"/v1/work/{self.theirs.pk}/", HTTP_HOST=VENDOR_HOST,
+        )
+        self.assertEqual(resp.status_code, 404)
+
+    def test_the_device_gets_ONLY_name_phone_address_and_notes(self):
+        """PII minimisation, enforced server-side. The device is unmanaged and
+        holds data offline, so it must never receive the most sensitive fields --
+        the PDF still prints them because the SERVER renders it."""
+        resp = self._api().get(f"/v1/work/{self.mine.pk}/", HTTP_HOST=VENDOR_HOST)
+        self.assertEqual(resp.status_code, 200)
+        member = resp.data["member"]
+        self.assertEqual(set(member), {
+            "name", "phone", "phone_type", "address", "address_notes",
+        })
+        self.assertEqual(member["name"], "Tracey Johnson")
+
+        body = json.dumps(resp.data, default=str)
+        for forbidden in ("1975-01-31", "medicaid", "date_of_birth"):
+            self.assertNotIn(
+                forbidden.lower(), body.lower(),
+                f"{forbidden} must never reach a vendor device",
+            )
+
+    def test_an_assessment_detail_carries_the_FORM(self):
+        resp = self._api().get(f"/v1/work/{self.mine.pk}/", HTTP_HOST=VENDOR_HOST)
+        form = resp.data["form"]
+        self.assertEqual(form["state"], "not_started")
+        # Combined referral -> both modules, the same schema the CRM renders.
+        self.assertEqual(
+            [m["code"] for m in form["schema"]["modules"]],
+            ["mobility", "ventilation"],
+        )
