@@ -28197,3 +28197,172 @@ class VendorAgentSetPasswordTest(TestCase):
         )
         self.assertEqual(resp.status_code, 400)
         self.assertIn("8 characters", resp.data["error"])
+
+
+class VendorActivationTest(TestCase):
+    """Activate / deactivate, and why a vendor is never deleted."""
+
+    def _api(self):
+        from rest_framework_simplejwt.tokens import AccessToken
+
+        from .models import Agent
+
+        if not hasattr(self, "_agent"):
+            self._agent = Agent.objects.create(
+                name="A", agent_code="886", group="Management",
+            )
+        acc = AccessToken()
+        acc["agent_id"] = str(self._agent.id)
+        acc["agent_code"] = self._agent.agent_code
+        acc["agent_name"] = self._agent.name
+        acc["agent_group"] = self._agent.group
+        api = APIClient(); api.credentials(HTTP_AUTHORIZATION=f"Bearer {acc}")
+        return api
+
+    def setUp(self):
+        from .models import Vendor
+
+        self.vendor = Vendor.objects.create(name="Acme Remediation")
+
+    def _patch(self, body):
+        return self._api().patch(
+            f"/api/portal/settings/vendors/{self.vendor.pk}/", body, format="json",
+        )
+
+    def test_a_vendor_can_be_deactivated_and_reactivated(self):
+        self.assertEqual(self._patch({"is_active": False}).status_code, 200)
+        self.vendor.refresh_from_db()
+        self.assertFalse(self.vendor.is_active)
+
+        self.assertEqual(self._patch({"is_active": True}).status_code, 200)
+        self.vendor.refresh_from_db()
+        self.assertTrue(self.vendor.is_active)
+
+    def test_a_deactivated_vendor_cannot_be_assigned_a_new_order(self):
+        """The point of deactivating: no new work goes their way."""
+        from .models import (
+            ActiveProgram, Case, CaseStatus, CaseType, Client,
+        )
+        from .services.catalog import clear_program_domain_cache
+
+        eea = (
+            "Dwelling Assessment & Statement of Work (SOW) Development - "
+            "Modifications and Remediation Service - Brooklyn"
+        )
+        ActiveProgram.objects.create(
+            program_name=eea, case_category="Internal Services",
+            case_type=ActiveProgram.CaseType.HOUSING,
+            service_type=ActiveProgram.ServiceType.ENVIRONMENTAL_EXPOSURE_ASSESSMENT,
+        )
+        clear_program_domain_cache()
+        member = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="No", last_name="Vendor",
+            client_added_at=timezone.now(),
+        )
+        Case.objects.create(
+            case_id=uuid.uuid4(), client=member,
+            case_type=CaseType.INTERNAL_SERVICE, case_status=CaseStatus.MANAGED,
+            program_name=eea, service_authorization_status="approved",
+            case_created_at=timezone.now(),
+        )
+        self.vendor.is_active = False
+        self.vendor.save(update_fields=["is_active"])
+
+        resp = self._api().post(
+            f"/api/portal/members/{member.pk}/assessment-order/",
+            {
+                "contact_phone": "(718) 555-0100",
+                "address_line1": "1 St",
+                "referral_type": "combined",
+                "vendor_id": str(self.vendor.pk),
+                "consent_to_call": True,
+                "ecm_billed_confirmed": True,
+                "availability": [
+                    {"date": "2026-10-01", "start_time": "09:00", "end_time": "12:00"},
+                    {"date": "2026-10-02", "start_time": "09:00", "end_time": "12:00"},
+                    {"date": "2026-10-03", "start_time": "09:00", "end_time": "12:00"},
+                ],
+            },
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("inactive", resp.data["detail"].lower())
+
+    def test_deactivating_does_NOT_touch_existing_orders(self):
+        """Work already dispatched must still be completable and attributable."""
+        from .models import Client, DispatchKind, DispatchOrder, DispatchStatus
+
+        c = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Live", last_name="Order",
+            client_added_at=timezone.now(),
+        )
+        order = DispatchOrder.objects.create(
+            kind=DispatchKind.ASSESSMENT, client=c, vendor=self.vendor,
+            status=DispatchStatus.CONFIRMED,
+        )
+        self._patch({"is_active": False})
+        order.refresh_from_db()
+        self.assertEqual(order.vendor_id, self.vendor.pk)
+        self.assertEqual(order.status, DispatchStatus.CONFIRMED)
+
+    def test_a_vendor_with_orders_cannot_be_DELETED(self):
+        """Deleting one would erase who did the work on every order they executed
+        -- and DispatchOrder.vendor is PROTECT, so it would fail opaquely anyway."""
+        from .models import Client, DispatchKind, DispatchOrder
+
+        c = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Del", last_name="Guard",
+            client_added_at=timezone.now(),
+        )
+        DispatchOrder.objects.create(
+            kind=DispatchKind.ASSESSMENT, client=c, vendor=self.vendor,
+        )
+        resp = self._api().delete(f"/api/portal/settings/vendors/{self.vendor.pk}/")
+        self.assertEqual(resp.status_code, 409)
+        self.assertIn("Deactivate", resp.data["error"])
+
+    def test_an_unused_vendor_can_be_deleted(self):
+        """A typo'd vendor created a minute ago should not be permanent."""
+        from .models import Vendor
+
+        resp = self._api().delete(f"/api/portal/settings/vendors/{self.vendor.pk}/")
+        self.assertEqual(resp.status_code, 204)
+        self.assertFalse(Vendor.objects.filter(pk=self.vendor.pk).exists())
+
+    def test_the_password_can_be_reset_after_creation(self):
+        """Resetting is the recovery path, since a password is never readable back."""
+        from django.contrib.auth.hashers import check_password
+
+        from .models import VendorUser
+
+        self._api().post(
+            f"/api/portal/settings/vendors/{self.vendor.pk}/admin-user/",
+            {"email": "boss@acme.test", "name": "Ada", "password": "first-pass1"},
+            format="json",
+        )
+        resp = self._api().post(
+            f"/api/portal/settings/vendors/{self.vendor.pk}/reset-admin-password/",
+            {}, format="json",
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        new_pw = resp.data["temporary_password"]
+        self.assertTrue(new_pw)
+
+        user = VendorUser.objects.get(email="boss@acme.test")
+        self.assertTrue(check_password(new_pw, user.password))
+        # The old one must stop working, or a reset is theatre.
+        self.assertFalse(check_password("first-pass1", user.password))
+
+    def test_a_reset_works_even_when_the_vendor_is_inactive(self):
+        """Deactivation is not a reason to lock an admin out of recovery -- the
+        account may need reactivating later."""
+        self._api().post(
+            f"/api/portal/settings/vendors/{self.vendor.pk}/admin-user/",
+            {"email": "b@acme.test", "name": "B"}, format="json",
+        )
+        self._patch({"is_active": False})
+        resp = self._api().post(
+            f"/api/portal/settings/vendors/{self.vendor.pk}/reset-admin-password/",
+            {}, format="json",
+        )
+        self.assertEqual(resp.status_code, 200)

@@ -445,6 +445,51 @@ class VendorViewSet(viewsets.ModelViewSet):
     queryset = Vendor.objects.all().prefetch_related("users", "dispatch_orders")
     serializer_class = s.PortalVendorSerializer
 
+    def perform_update(self, serializer):
+        """Log an activation change; it is not just another field edit.
+
+        Deactivating a vendor removes them from every assignment dropdown, so work
+        can no longer be sent their way. Worth knowing who did it and whether they
+        still had live orders at the time.
+        """
+        was_active = serializer.instance.is_active
+        vendor = serializer.save()
+        if vendor.is_active != was_active:
+            open_orders = self._open_order_count(vendor)
+            _log_vendor_action(
+                self.request, vendor,
+                "activated" if vendor.is_active else "deactivated",
+                {"open_orders": open_orders},
+            )
+
+    @staticmethod
+    def _open_order_count(vendor):
+        from ..models import DispatchStatus
+
+        return vendor.dispatch_orders.exclude(
+            status__in=[DispatchStatus.UPLOADED, DispatchStatus.CANCELLED],
+        ).count()
+
+    def destroy(self, request, *args, **kwargs):
+        """Refuse to DELETE a vendor that holds orders; deactivate instead.
+
+        DispatchOrder.vendor is PROTECT, so the delete would fail at the database
+        with an opaque error. More importantly, a vendor is history: deleting one
+        would erase who did the work on every order they ever executed.
+        """
+        vendor = self.get_object()
+        if vendor.dispatch_orders.exists():
+            return Response(
+                {
+                    "error": (
+                        "This vendor has orders and cannot be deleted — the record "
+                        "of who did that work must survive. Deactivate them instead."
+                    )
+                },
+                status=http.HTTP_409_CONFLICT,
+            )
+        return super().destroy(request, *args, **kwargs)
+
     @action(detail=True, methods=["post"], url_path="admin-user")
     def admin_user(self, request, pk=None):
         """Provision the vendor's single admin user.
