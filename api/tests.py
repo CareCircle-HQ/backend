@@ -29022,6 +29022,37 @@ class DispatchHistoryApiTest(TestCase):
         row = [r for r in self._history() if r["note"] == "by a codeless agent"][0]
         self.assertEqual(row["user"], "Nocode Agent")
 
+    def test_the_creation_event_carries_the_WIZARD_SUMMARY(self):
+        """Reported as "created by ... didn't show any details": the event recorded
+        only a case id, so the history line rendered blank. It now says what was
+        ordered, not merely that something was."""
+        self._create_order()
+        row = [
+            r for r in self._history() if "assessment order created" in r["note"]
+        ][0]
+        self.assertEqual(row["detail"]["vendor"], "Acme")
+        self.assertEqual(row["detail"]["referral_type"], "combined")
+        self.assertEqual(row["detail"]["address"], "1 Verified St")
+        self.assertEqual(row["detail"]["availability_days"], 3)
+
+    def test_the_user_falls_back_to_the_orders_CREATED_BY(self):
+        """The last link in the chain. For the order-created event, created_by IS
+        the authoritative record of who ran the wizard -- and it rescues every row
+        written before the metadata carried a name, including the one on the local
+        clone whose agent has no code at all."""
+        from .models import DispatchOrder
+        from .services import dispatch
+
+        self._create_order()
+        order = DispatchOrder.objects.get(client=self.member, kind="assessment")
+        ev = dispatch.record_transition(
+            order, order.status, order.status, note="no agent metadata at all",
+        )
+        self.assertEqual(ev.metadata, {})
+
+        row = [r for r in self._history() if r["note"] == "no agent metadata at all"][0]
+        self.assertEqual(row["user"], "Dana Historian")
+
     def test_the_history_is_NEWEST_FIRST(self):
         from .models import DispatchOrder
 

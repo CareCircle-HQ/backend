@@ -361,7 +361,16 @@ class MemberAssessmentOrderCreateView(PortalAPIView):
             actor=getattr(request, "user", None), source=StageEventSource.MANUAL,
             agent=agent,
             note="assessment order created",
-            metadata={"case_id": str(governing.case_id)},
+            metadata={
+                "case_id": str(governing.case_id),
+                # The wizard's answers, so the history line says what was ordered
+                # rather than only that something was. Read from the saved order,
+                # not the request, so it records what was actually stored.
+                "vendor": vendor.name if vendor else "",
+                "referral_type": order.referral_type,
+                "address": order.address_formatted or order.address_line1,
+                "availability_days": len({w.get("date") for w in windows if w.get("date")}),
+            },
         )
 
         # Home Remediation cases that arrived BEFORE this order have been waiting
@@ -577,7 +586,7 @@ class MemberDispatchHistoryView(PortalAPIView):
                 entity_type=StageEntityType.DISPATCH_ORDER,
                 dispatch_order__client=client,
             )
-            .select_related("actor", "dispatch_order")
+            .select_related("actor", "dispatch_order", "dispatch_order__created_by", "dispatch_order__vendor")
             .order_by("-entered_at")[:200]
         )
 
@@ -635,6 +644,22 @@ class MemberDispatchHistoryView(PortalAPIView):
                         meta.get("agent_name")
                         or names_by_id.get(meta.get("agent_id"), "")
                         or names_by_code.get(meta.get("agent_code"), "")
+                        # Last resort: the order's own created_by. For the
+                        # order-created event that IS the authoritative record of
+                        # who ran the wizard, and it rescues every row written
+                        # before the metadata carried a name.
+                        #
+                        # MANUAL events ONLY. An item added by an import was not
+                        # done by the agent who created the order, and attributing
+                        # it to them would put a name against work nobody did --
+                        # which a test caught when this was unscoped.
+                        or (
+                            order.created_by.name
+                            if (
+                                e.source == StageEventSource.MANUAL
+                                and order and order.created_by_id
+                            ) else ""
+                        )
                     )
                 ),
                 "agent_code": meta.get("agent_code") or "",
