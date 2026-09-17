@@ -43,10 +43,16 @@ def _serialize_item(row):
         # truncated one cannot be searched with.
         "case_id": str(row.case_id) if row.case_id else "",
         "case_status": row.case.case_status if row.case_id else "",
-        "authorization": {
+        "authorization": (lambda w: {
             "status": row.authorization_status,
             "approved": row.is_approved,
-        },
+            # The WINDOW, shown so an agent can see why an "approved" item is not
+            # selectable. Without the dates, an expired item looks identical to a
+            # live one.
+            "starts_at": w[0],
+            "ends_at": w[1],
+            "expired": row.authorization_expired,
+        })(row.authorization_window),
         # Which work order covers it, or null when it is still waiting.
         "work_order_id": (
             str(row.dispatch_order_id) if row.dispatch_order_id else None

@@ -28713,3 +28713,134 @@ class DispatchItemTest(TestCase):
         ev = StageEvent.objects.get(dispatch_order=wo)
         self.assertIn("Air Conditioner", ev.metadata["items"])
         self.assertIn(str(item.case_id), ev.metadata["case_ids"])
+
+
+class ItemAuthorizationWindowTest(TestCase):
+    """An approved item whose authorization window has LAPSED is not dispatchable.
+
+    The trap this closes: a case keeps reading ``approved`` after its window ends --
+    the same thing the food side names "Authorization Expired". Installing against a
+    lapsed authorization is unbilled work.
+    """
+
+    HEAR = "Home Remediation - Air Conditioner - Manhattan"
+    EEA = (
+        "Dwelling Assessment & Statement of Work (SOW) Development - "
+        "Modifications and Remediation Service - Manhattan"
+    )
+
+    def setUp(self):
+        from .models import ActiveProgram, Vendor
+        from .services.catalog import clear_program_domain_cache
+
+        for name, stype in (
+            (self.EEA, ActiveProgram.ServiceType.ENVIRONMENTAL_EXPOSURE_ASSESSMENT),
+            (self.HEAR, ActiveProgram.ServiceType.HOME_EXPENSE_ASSISTANCE_REPAIRS),
+        ):
+            ActiveProgram.objects.create(
+                program_name=name, case_category="Internal Services",
+                case_type=ActiveProgram.CaseType.HOUSING, service_type=stype,
+            )
+        clear_program_domain_cache()
+        self.vendor = Vendor.objects.create(name="Acme")
+
+    def _item(self, *, starts=None, ends=None, auth="approved", use_request=False):
+        from .models import (
+            Case, CaseStatus, CaseType, Client, DispatchKind, DispatchOrder,
+        )
+        from .services import dispatch
+
+        c = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="W", last_name="in",
+            client_added_at=timezone.now(),
+        )
+        fields = {}
+        if use_request:
+            fields["service_authorization_request_starts_at"] = starts
+            fields["service_authorization_request_ends_at"] = ends
+        else:
+            fields["service_authorization_approval_starts_at"] = starts
+            fields["service_authorization_approval_ends_at"] = ends
+        Case.objects.create(
+            case_id=uuid.uuid4(), client=c, case_type=CaseType.INTERNAL_SERVICE,
+            case_status=CaseStatus.MANAGED, program_name=self.HEAR,
+            service_authorization_status=auth, case_created_at=timezone.now(),
+            **fields,
+        )
+        assessment = DispatchOrder.objects.create(
+            kind=DispatchKind.ASSESSMENT, client=c, vendor=self.vendor,
+        )
+        return assessment, dispatch.sync_dispatch_items(assessment)[0]
+
+    def test_an_item_inside_its_window_is_available(self):
+        _a, item = self._item(
+            starts=timezone.now() - timezone.timedelta(days=10),
+            ends=timezone.now() + timezone.timedelta(days=10),
+        )
+        self.assertFalse(item.authorization_expired)
+        self.assertTrue(item.is_available)
+
+    def test_an_EXPIRED_window_makes_it_unavailable_even_though_approved(self):
+        _a, item = self._item(
+            starts=timezone.now() - timezone.timedelta(days=40),
+            ends=timezone.now() - timezone.timedelta(days=1),
+        )
+        self.assertTrue(item.is_approved, "the case still reads approved")
+        self.assertTrue(item.authorization_expired)
+        self.assertFalse(item.is_available)
+
+    def test_an_expired_item_is_REFUSED_by_the_service_with_the_date(self):
+        """The date is in the message: "expired" alone leaves an agent guessing
+        whether it lapsed yesterday or last year."""
+        from .services import dispatch
+
+        ends = timezone.now() - timezone.timedelta(days=3)
+        assessment, item = self._item(
+            starts=timezone.now() - timezone.timedelta(days=40), ends=ends,
+        )
+        with self.assertRaises(ValueError) as ctx:
+            dispatch.create_work_order(assessment, [item.dispatch_item_id])
+        msg = str(ctx.exception)
+        self.assertIn("authorization expired", msg)
+        self.assertIn(ends.strftime("%Y-%m-%d"), msg)
+
+    def test_NO_end_date_is_not_treated_as_expired(self):
+        """An approved case with no window exported is a gap in the SOURCE data.
+        Refusing to install because Unite Us omitted a date is the wrong failure."""
+        _a, item = self._item(starts=None, ends=None)
+        self.assertFalse(item.authorization_expired)
+        self.assertTrue(item.is_available)
+
+    def test_it_falls_back_to_the_REQUEST_window_when_approval_dates_are_missing(self):
+        """Case.effective_authorization_window() exists for this: some exports carry
+        only the request window on an already-approved authorization, and reading
+        approval_ends_at alone would call every one of them expired."""
+        _a, item = self._item(
+            starts=timezone.now() - timezone.timedelta(days=5),
+            ends=timezone.now() + timezone.timedelta(days=25),
+            use_request=True,
+        )
+        _s, end = item.authorization_window
+        self.assertIsNotNone(end, "the request window must be used as a fallback")
+        self.assertFalse(item.authorization_expired)
+        self.assertTrue(item.is_available)
+
+    def test_a_window_that_lapses_AFTER_the_page_loads_is_caught_at_submit(self):
+        """The gate is server-side for this reason: an agent can load a list, take a
+        call, and submit after the authorization has run out."""
+        from .models import Case
+        from .services import dispatch
+
+        assessment, item = self._item(
+            starts=timezone.now() - timezone.timedelta(days=10),
+            ends=timezone.now() + timezone.timedelta(days=10),
+        )
+        self.assertTrue(item.is_available)
+
+        Case.objects.filter(pk=item.case_id).update(
+            service_authorization_approval_ends_at=(
+                timezone.now() - timezone.timedelta(minutes=1)
+            ),
+        )
+        with self.assertRaises(ValueError):
+            dispatch.create_work_order(assessment, [item.dispatch_item_id])

@@ -5668,25 +5668,53 @@ class DispatchItem(models.Model):
         return self.authorization_status.lower() == "approved"
 
     @property
+    def authorization_window(self):
+        """``(start, end)`` of the case's authorization window, or ``(None, None)``.
+
+        Delegates to ``Case.effective_authorization_window()`` rather than reading
+        the fields directly, so it inherits the request-window fallback: some Unite
+        Us exports carry only the REQUEST window on an already-approved
+        authorization, and reading ``approval_ends_at`` alone would call those
+        expired.
+        """
+        if not self.case_id:
+            return None, None
+        return self.case.effective_authorization_window()
+
+    @property
+    def authorization_expired(self):
+        """True when the window has an END that is in the past.
+
+        A missing end date is NOT expired: an approved case with no window exported
+        is a gap in the source data, and refusing to install a device because Unite
+        Us omitted a date would be the wrong failure.
+        """
+        _start, end = self.authorization_window
+        return bool(end) and end < timezone.now()
+
+    @property
     def is_available(self):
         """Selectable for a NEW work order.
 
-        Two conditions: the authorization is APPROVED (nothing unapproved may be
-        fitted), and the item is not already in a work order (no double-dispatch --
-        and that FK is the only place that is tracked).
+        Three conditions:
 
-        The case's own status is deliberately NOT a condition. A Home Remediation
+        * the authorization is APPROVED -- nothing unapproved may be fitted;
+        * its window has not EXPIRED -- an approval that has lapsed still reads
+          "approved" on the case, which is exactly the trap the food side names
+          "Authorization Expired". Installing against a lapsed authorization is
+          unbilled work.
+        * the item is not already in a work order -- no double-dispatch, and that
+          FK is the only place that is tracked.
+
+        The case's own STATUS is deliberately not a condition: a Home Remediation
         case can be closed in Unite Us while the approved device still has to be
-        installed, so gating on it hid four of MIRIAM's five approved items and made
-        the work-order builder look broken.
-
-        Note this does not check the authorization WINDOW either -- only the status
-        string. An approval that has lapsed still reads "approved" on the case, so
-        an expired item remains selectable. The food side treats that as a distinct
-        state ("Authorization Expired"); worth revisiting here if housing
-        authorizations start expiring in practice.
+        installed.
         """
-        return self.is_approved and self.dispatch_order_id is None
+        return (
+            self.is_approved
+            and not self.authorization_expired
+            and self.dispatch_order_id is None
+        )
 
 
 class DispatchAvailabilityWindow(models.Model):
