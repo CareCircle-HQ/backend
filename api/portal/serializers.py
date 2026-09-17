@@ -1283,6 +1283,13 @@ class MemberDetailSerializer(serializers.Serializer):
                 # actionable pending verification -- e.g. enrollment regressed to
                 # Validated, or missing). Requesting (re-)opens the verification.
                 "can_request_verification": can_request_primary_verification(client),
+                # Drives the member-profile "Assessment Order" button, beside
+                # Verification and Nutritionist. True when the member holds a
+                # governing Dwelling Assessment case and has NO assessment order
+                # yet -- one per member. Computed here rather than fetched by the
+                # header, so the profile does not pay an extra round trip on every
+                # load just to decide whether to draw a button.
+                "can_create_assessment_order": _can_create_assessment_order(client),
                 # Williamsburg exception (lead source == "Williamsburg"): the
                 # verification wizard forces the Kosher menu and the save
                 # auto-assigns the Williamsburg kitchen + activates directly.
@@ -3011,3 +3018,22 @@ class PortalVendorSerializer(serializers.ModelSerializer):
         return obj.dispatch_orders.exclude(
             status__in=[DispatchStatus.UPLOADED, DispatchStatus.CANCELLED],
         ).count()
+
+def _can_create_assessment_order(client):
+    """True when a Dwelling Assessment governs this member and no order exists.
+
+    Both halves matter: without a governing housing case the wizard has nothing to
+    assess (the endpoint refuses it), and with an order already there the
+    one-per-member constraint would reject a second.
+    """
+    from ..models import DispatchKind, DispatchOrder
+    from ..services.housing import housing_service_case
+
+    try:
+        if housing_service_case(client) is None:
+            return False
+        return not DispatchOrder.objects.filter(
+            client=client, kind=DispatchKind.ASSESSMENT,
+        ).exists()
+    except Exception:  # noqa: BLE001 - a button must never break the profile
+        return False
