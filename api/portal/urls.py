@@ -193,6 +193,10 @@ from .views_imports import (
     UniteUsExportPollView,
     UniteUsExportsView,
 )
+from .views_dispatch import (
+    MemberAssessmentOrderCreateView,
+    MemberDispatchOrdersView,
+)
 from .views_settings import (
     ActiveProgramViewSet,
     CadenceViewSet,
@@ -276,6 +280,17 @@ urlpatterns = [
     path("teams/", TeamsListView.as_view(), name="portal-teams"),
     path("verifiers/", VerifiersListView.as_view(), name="portal-verifiers"),
     path("ticket-types/", TicketTypesListView.as_view(), name="portal-ticket-types"),
+    # Housing dispatch (CRM side): read every order, and run the assessment-order
+    # wizard. Nothing here writes vendor evidence -- see views_dispatch.
+    path(
+        "members/<uuid:client_id>/dispatch-orders/",
+        MemberDispatchOrdersView.as_view(), name="portal-member-dispatch-orders",
+    ),
+    path(
+        "members/<uuid:client_id>/assessment-order/",
+        MemberAssessmentOrderCreateView.as_view(),
+        name="portal-member-assessment-order",
+    ),
     path("cadences/", CadencesListView.as_view(), name="portal-cadences"),
     path("members/<uuid:client_id>/", MemberDetailView.as_view(), name="portal-member-detail"),
     path("members/<uuid:client_id>/tags/", MemberTagsView.as_view(), name="portal-member-tags"),

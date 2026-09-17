@@ -27330,3 +27330,207 @@ class DispatchOrderTest(TestCase):
             case=self._case(c, self.HEAR),
         )
         self.assertEqual(child.service_address, "123 Verified St, Brooklyn NY")
+
+
+class AssessmentOrderWizardApiTest(TestCase):
+    """The wizard endpoint. Validation is tested at the API, not the helper.
+
+    The lesson from the food verification: its picker excluded housing cases while
+    the ENDPOINT still accepted one, and only an API-level test found it.
+    """
+
+    EEA = (
+        "Dwelling Assessment & Statement of Work (SOW) Development - "
+        "Modifications and Remediation Service - Brooklyn"
+    )
+    HEAR = "Home Remediation - Heater - Queens"
+
+    def setUp(self):
+        from .models import ActiveProgram, Vendor
+        from .services.catalog import clear_program_domain_cache
+
+        for name, stype in (
+            (self.EEA, ActiveProgram.ServiceType.ENVIRONMENTAL_EXPOSURE_ASSESSMENT),
+            (self.HEAR, ActiveProgram.ServiceType.HOME_EXPENSE_ASSISTANCE_REPAIRS),
+        ):
+            ActiveProgram.objects.create(
+                program_name=name, case_category="Internal Services",
+                case_type=ActiveProgram.CaseType.HOUSING, service_type=stype,
+            )
+        clear_program_domain_cache()
+        self.vendor = Vendor.objects.create(name="Acme Remediation")
+
+    def _api(self):
+        from rest_framework_simplejwt.tokens import AccessToken
+
+        from .models import Agent
+
+        # A fresh code per call: agent_code is unique, and tests that post twice
+        # would otherwise collide rather than exercise the endpoint.
+        if not hasattr(self, "_agent"):
+            self._agent = Agent.objects.create(
+                name="W", agent_code="881", group="Management",
+            )
+        a = self._agent
+        acc = AccessToken()
+        acc["agent_id"] = str(a.id); acc["agent_code"] = a.agent_code
+        acc["agent_name"] = a.name; acc["agent_group"] = a.group
+        api = APIClient(); api.credentials(HTTP_AUTHORIZATION=f"Bearer {acc}")
+        return api
+
+    def _member(self, name="Wizard"):
+        from .models import Client
+
+        return Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name=name, last_name="Member",
+            client_added_at=timezone.now(),
+        )
+
+    def _case(self, client, program, *, status=None):
+        from .models import Case, CaseStatus, CaseType
+
+        return Case.objects.create(
+            case_id=uuid.uuid4(), client=client, case_type=CaseType.INTERNAL_SERVICE,
+            case_status=status or CaseStatus.MANAGED, program_name=program,
+            service_authorization_status="approved", case_created_at=timezone.now(),
+        )
+
+    def _payload(self, **over):
+        base = {
+            "vendor_id": str(self.vendor.pk),
+            "referral_type": "combined",
+            "contact_phone": "718-555-0100",
+            "contact_phone_type": "mobile",
+            "address_formatted": "123 Verified St, Brooklyn NY",
+            "consent_to_call": True,
+            "consent_to_text": True,
+            "availability": [
+                {"date": "2026-10-01", "start_time": "09:00", "end_time": "12:00"},
+                {"date": "2026-10-02", "start_time": "13:00", "end_time": "17:00"},
+                {"date": "2026-10-03", "start_time": "09:00", "end_time": "12:00"},
+            ],
+        }
+        base.update(over)
+        return base
+
+    def _post(self, client, **over):
+        return self._api().post(
+            f"/api/portal/members/{client.pk}/assessment-order/",
+            self._payload(**over), format="json",
+        )
+
+    def test_the_wizard_creates_an_order_at_pending_schedule(self):
+        from .models import DispatchStatus
+
+        c = self._member()
+        self._case(c, self.EEA)
+        resp = self._post(c)
+        self.assertEqual(resp.status_code, 201, resp.content)
+        self.assertEqual(resp.data["status"], DispatchStatus.PENDING_SCHEDULE)
+        self.assertEqual(resp.data["vendor"]["name"], "Acme Remediation")
+        self.assertEqual(len(resp.data["availability"]), 3)
+
+    def test_it_refuses_a_member_with_no_governing_housing_case(self):
+        """An assessment of nothing."""
+        resp = self._post(self._member())
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("no governing", resp.data["detail"])
+
+    def test_THREE_WINDOWS_ON_ONE_DAY_is_refused(self):
+        """The rule is three DATES. A len(windows) >= 3 check would pass this,
+        which is exactly why it is tested."""
+        c = self._member()
+        self._case(c, self.EEA)
+        resp = self._post(c, availability=[
+            {"date": "2026-10-01", "start_time": "09:00", "end_time": "10:00"},
+            {"date": "2026-10-01", "start_time": "11:00", "end_time": "12:00"},
+            {"date": "2026-10-01", "start_time": "14:00", "end_time": "15:00"},
+        ])
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("different", resp.data["detail"])
+
+    def test_more_than_one_window_per_day_is_fine_once_there_are_three_days(self):
+        c = self._member()
+        self._case(c, self.EEA)
+        resp = self._post(c, availability=[
+            {"date": "2026-10-01", "start_time": "09:00", "end_time": "10:00"},
+            {"date": "2026-10-01", "start_time": "14:00", "end_time": "15:00"},
+            {"date": "2026-10-02", "start_time": "09:00", "end_time": "10:00"},
+            {"date": "2026-10-03", "start_time": "09:00", "end_time": "10:00"},
+        ])
+        self.assertEqual(resp.status_code, 201, resp.content)
+        self.assertEqual(len(resp.data["availability"]), 4)
+
+    def test_an_unknown_referral_type_is_refused(self):
+        c = self._member()
+        self._case(c, self.EEA)
+        resp = self._post(c, referral_type="plumbing")
+        self.assertEqual(resp.status_code, 400)
+
+    def test_consent_records_method_and_who_heard_it(self):
+        """GDPR: the burden is to DEMONSTRATE consent."""
+        from .models import DispatchOrder
+
+        c = self._member()
+        self._case(c, self.EEA)
+        self._post(c)
+        order = DispatchOrder.objects.get(client=c)
+        self.assertTrue(order.consent_to_call)
+        self.assertTrue(order.consent_to_text)
+        self.assertEqual(order.consent_method, "verbal")
+        self.assertIsNotNone(order.consent_captured_at)
+        self.assertIsNotNone(order.consent_captured_by)
+
+    def test_a_double_submitted_wizard_returns_the_EXISTING_order(self):
+        """One assessment per member is a DB constraint; a resubmitted wizard
+        should be harmless rather than a 500."""
+        from .models import DispatchOrder
+
+        c = self._member()
+        self._case(c, self.EEA)
+        first = self._post(c)
+        self.assertEqual(first.status_code, 201)
+        second = self._post(c)
+        self.assertEqual(second.status_code, 200)
+        self.assertEqual(first.data["id"], second.data["id"])
+        self.assertEqual(DispatchOrder.objects.filter(client=c).count(), 1)
+
+    def test_creating_the_order_ADOPTS_waiting_remediation_cases(self):
+        c = self._member("Miriam")
+        self._case(c, self.EEA)
+        for _ in range(3):
+            self._case(c, self.HEAR)
+        resp = self._post(c)
+        self.assertEqual(resp.status_code, 201, resp.content)
+        self.assertEqual(resp.data["adopted_remediation_orders"], 3)
+
+    def test_the_list_endpoint_reports_what_blocks_submission(self):
+        """So the CRM shows progress without re-implementing the gate."""
+        from .models import DispatchFinding, DispatchOrder
+        from .services import dispatch
+
+        c = self._member()
+        self._case(c, self.EEA)
+        self._post(c)
+        order = DispatchOrder.objects.get(client=c)
+        DispatchFinding.objects.create(dispatch_order=order, title="Damp")
+        dispatch.open_submission(order)
+
+        resp = self._api().get(f"/api/portal/members/{c.pk}/dispatch-orders/")
+        self.assertEqual(resp.status_code, 200)
+        missing = resp.data[0]["missing_for_submission"]
+        self.assertIn("vendor signature", missing)
+        self.assertIn("photo for finding: Damp", missing)
+
+    def test_the_order_keeps_its_OWN_address(self):
+        """Not read live from the client: a later address edit must not rewrite
+        where a completed assessment happened."""
+        from .models import DispatchOrder
+
+        c = self._member()
+        self._case(c, self.EEA)
+        self._post(c)
+        self.assertEqual(
+            DispatchOrder.objects.get(client=c).address_formatted,
+            "123 Verified St, Brooklyn NY",
+        )

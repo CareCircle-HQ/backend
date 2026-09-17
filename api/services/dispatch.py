@@ -48,6 +48,13 @@ def record_transition(order, from_status, to_status, *, actor=None, source=None,
     Deliberately the shared log rather than a dispatch-only table, so "everything
     that happened to this member" stays one query.
     """
+    # StageEvent.actor is a FK to the Django auth User, but portal callers hand us
+    # the DRF AgentUser principal or an Agent row. Assigning either raises
+    # ValueError and, per stage_event_actor's own docstring, "aborts the stage
+    # change (and, via reconcile, the whole case upsert)". Coerce HERE rather than
+    # at each call site, so no future caller can reintroduce it.
+    from api.services.lifecycle import stage_event_actor
+
     return StageEvent.objects.create(
         entity_type=StageEntityType.DISPATCH_ORDER,
         client=order.client,
@@ -55,7 +62,7 @@ def record_transition(order, from_status, to_status, *, actor=None, source=None,
         from_stage=from_status or "",
         to_stage=to_status,
         source=source or StageEventSource.MANUAL,
-        actor=actor,
+        actor=stage_event_actor(actor),
         note=note,
         metadata=metadata or {},
     )
@@ -280,3 +287,29 @@ def adopt_unlinked_remediation_cases(assessment):
         if order is not None:
             adopted.append(order)
     return adopted
+
+
+@transaction.atomic
+def reconcile_dispatch_orders(client):
+    """Bring a member's dispatch orders in line with their housing cases.
+
+    Called ONCE per client after an import, from the same places as
+    ``reconcile_internal_service_authorization`` -- so it sees the COMPLETE case
+    picture rather than firing per row against a partial one. A member can arrive
+    carrying several Home Remediation cases in one payload.
+
+    Only ever CREATES: a remediation order for each Home Remediation case, once the
+    member has an assessment order. Cases that arrive first simply wait, and are
+    picked up here on a later import or by adoption when the assessment is created.
+
+    Never raises -- a dispatch hiccup must not fail a case import, the same
+    contract the food reconcile already honours.
+    """
+    try:
+        assessment = assessment_order_for(client)
+        if assessment is None:
+            return []
+        return adopt_unlinked_remediation_cases(assessment)
+    except Exception:  # noqa: BLE001 - never fail the import
+        logger.exception("reconcile_dispatch_orders failed for client %s", client.pk)
+        return []
