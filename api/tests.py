@@ -28101,3 +28101,99 @@ class AssessmentOrderEditTest(TestCase):
         self.assertEqual(
             StageEvent.objects.filter(dispatch_order=self.order).count(), before,
         )
+
+
+class VendorAgentSetPasswordTest(TestCase):
+    """An agent may choose the vendor admin's password, or let one be generated."""
+
+    def _api(self):
+        from rest_framework_simplejwt.tokens import AccessToken
+
+        from .models import Agent
+
+        if not hasattr(self, "_agent"):
+            self._agent = Agent.objects.create(
+                name="P", agent_code="885", group="Management",
+            )
+        acc = AccessToken()
+        acc["agent_id"] = str(self._agent.id)
+        acc["agent_code"] = self._agent.agent_code
+        acc["agent_name"] = self._agent.name
+        acc["agent_group"] = self._agent.group
+        api = APIClient(); api.credentials(HTTP_AUTHORIZATION=f"Bearer {acc}")
+        return api
+
+    def _vendor(self, **extra):
+        body = {"name": "Acme Remediation"}
+        body.update(extra)
+        resp = self._api().post("/api/portal/settings/vendors/", body, format="json")
+        self.assertEqual(resp.status_code, 201, resp.content)
+        return resp.data
+
+    def test_a_vendor_stores_address_phone_and_website(self):
+        data = self._vendor(
+            address="500 Industrial Ave, Brooklyn NY",
+            contact_phone="(718) 555-2000",
+            website="https://acme-remediation.example",
+            contact_email="ops@acme.test",
+        )
+        self.assertEqual(data["address"], "500 Industrial Ave, Brooklyn NY")
+        self.assertEqual(data["contact_phone"], "(718) 555-2000")
+        self.assertEqual(data["website"], "https://acme-remediation.example")
+
+    def test_a_malformed_website_is_refused(self):
+        resp = self._api().post(
+            "/api/portal/settings/vendors/",
+            {"name": "Bad Site", "website": "not a url"}, format="json",
+        )
+        self.assertEqual(resp.status_code, 400)
+
+    def test_an_agent_supplied_password_is_used_and_NOT_echoed(self):
+        """The agent already has it. Repeating it back would put a secret they
+        chose into a response body and any log that captures one."""
+        from django.contrib.auth.hashers import check_password
+
+        from .models import VendorUser
+
+        vid = self._vendor()["vendor_id"]
+        resp = self._api().post(
+            f"/api/portal/settings/vendors/{vid}/admin-user/",
+            {"email": "boss@acme.test", "name": "Ada", "password": "s3cret-pass"},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 201, resp.content)
+        self.assertEqual(resp.data["temporary_password"], "")
+        self.assertTrue(resp.data["password_was_supplied"])
+
+        user = VendorUser.objects.get(email="boss@acme.test")
+        self.assertTrue(check_password("s3cret-pass", user.password))
+        self.assertNotIn("s3cret-pass", user.password)
+
+    def test_a_generated_password_IS_echoed_once(self):
+        """Nobody else knows it, so withholding it would strand the account."""
+        from django.contrib.auth.hashers import check_password
+
+        from .models import VendorUser
+
+        vid = self._vendor()["vendor_id"]
+        resp = self._api().post(
+            f"/api/portal/settings/vendors/{vid}/admin-user/",
+            {"email": "gen@acme.test", "name": "Gen"}, format="json",
+        )
+        self.assertEqual(resp.status_code, 201)
+        pw = resp.data["temporary_password"]
+        self.assertTrue(pw)
+        self.assertFalse(resp.data["password_was_supplied"])
+        self.assertTrue(
+            check_password(pw, VendorUser.objects.get(email="gen@acme.test").password),
+        )
+
+    def test_a_too_short_password_is_refused(self):
+        vid = self._vendor()["vendor_id"]
+        resp = self._api().post(
+            f"/api/portal/settings/vendors/{vid}/admin-user/",
+            {"email": "short@acme.test", "name": "S", "password": "abc"},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("8 characters", resp.data["error"])

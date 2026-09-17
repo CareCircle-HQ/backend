@@ -3001,7 +3001,7 @@ class PortalVendorSerializer(serializers.ModelSerializer):
         model = Vendor
         fields = [
             "vendor_id", "name", "contact_name", "contact_email", "contact_phone",
-            "address", "notes", "is_active", "created_at",
+            "address", "website", "notes", "is_active", "created_at",
             "users", "admin_user", "open_order_count",
         ]
         read_only_fields = ["vendor_id", "created_at"]

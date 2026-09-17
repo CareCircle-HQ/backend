@@ -13,6 +13,25 @@
   or the local Mac (`/Users/alex/Projects/ext/backend`). They have separate
   databases; the local one is a periodically refreshed CLONE of production.
 
+## Frontend: `apiFetch` stringifies the body FOR you
+
+`api.ts` does `body: JSON.stringify(body)` internally, so callers pass a plain
+object:
+
+```ts
+apiFetch("/settings/vendors/", { method: "POST", body: { name } })    // correct
+apiFetch("/settings/vendors/", { method: "POST", body: JSON.stringify({ name }) })
+```
+
+The second double-encodes: the server receives a JSON *string* rather than fields,
+DRF finds no `name`, and it fails with a validation error that looks like a
+backend bug. It broke vendor creation on 2026-09-17 and was present in five call
+sites, because the mistake is invisible at the call site and the API tests -- which
+post proper objects -- all passed.
+
+The raw `fetch` in `startReportExport` DOES stringify its own body; that one is
+correct.
+
 ## Verification
 
 ```

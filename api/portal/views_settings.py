@@ -479,9 +479,17 @@ class VendorViewSet(viewsets.ModelViewSet):
         from django.contrib.auth.hashers import make_password
         from django.utils.crypto import get_random_string
 
-        # Generated here and returned ONCE. Never stored in the clear, and never
-        # retrievable afterwards -- a reset issues a new one.
-        temp_password = get_random_string(14)
+        # An agent may SET the password (they are handing it over by phone or in
+        # person); otherwise one is generated. Either way it is stored hashed and
+        # returned ONCE -- there is no path that reads it back, and a lost password
+        # is replaced by a reset rather than looked up.
+        supplied = (request.data.get("password") or "").strip()
+        if supplied and len(supplied) < 8:
+            return Response(
+                {"error": "Password must be at least 8 characters."},
+                status=http.HTTP_400_BAD_REQUEST,
+            )
+        temp_password = supplied or get_random_string(14)
         user = VendorUser.objects.create(
             vendor=vendor, email=email, name=name,
             phone=(request.data.get("phone") or "").strip(),
@@ -492,7 +500,11 @@ class VendorViewSet(viewsets.ModelViewSet):
             request, vendor, "admin user provisioned", {"email": email},
         )
         payload = s.PortalVendorUserSerializer(user).data
-        payload["temporary_password"] = temp_password
+        # Echoed only when WE generated it. An agent who typed the password already
+        # has it, and repeating it back puts a secret they chose into a response
+        # body and any log that captures one.
+        payload["temporary_password"] = "" if supplied else temp_password
+        payload["password_was_supplied"] = bool(supplied)
         return Response(payload, status=http.HTTP_201_CREATED)
 
     @action(detail=True, methods=["post"], url_path="reset-admin-password")
