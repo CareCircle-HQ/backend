@@ -28060,6 +28060,53 @@ class AssessmentOrderEditTest(TestCase):
         self.assertEqual(row["dwelling_case_id"], str(case.case_id))
         self.assertEqual(row["dwellings"]["primary"], str(case.case_id))
 
+    def test_the_order_carries_its_OWN_authorization_window(self):
+        """Shown beside the vendor in the header. It bounds the whole engagement:
+        once the Dwelling Assessment case's authorization lapses, the assessment is
+        out of authorization whatever any individual item says.
+
+        MIRIAM is the live example -- her assessment case expired 2026-08-18 while
+        her items run to 2026-09-18, so the two genuinely differ.
+        """
+        from .models import Case, CaseStatus, CaseType
+
+        case = Case.objects.create(
+            case_id=uuid.uuid4(), client=self.member,
+            case_type=CaseType.INTERNAL_SERVICE, case_status=CaseStatus.MANAGED,
+            program_name=self.EEA, service_authorization_status="approved",
+            service_authorization_approval_starts_at=(
+                timezone.now() - timezone.timedelta(days=40)
+            ),
+            service_authorization_approval_ends_at=(
+                timezone.now() - timezone.timedelta(days=5)
+            ),
+            case_created_at=timezone.now(),
+        )
+        self.order.case = case
+        self.order.save(update_fields=["case"])
+
+        resp = self._api().get(
+            f"/api/portal/members/{self.member.pk}/dispatch-orders/",
+        )
+        row = [o for o in resp.data if o["kind"] == "assessment"][0]
+        self.assertEqual(row["authorization"]["status"], "approved")
+        self.assertTrue(row["authorization"]["approved"])
+        self.assertTrue(
+            row["authorization"]["expired"],
+            "an approved case past its window must report expired",
+        )
+        self.assertIsNotNone(row["authorization"]["ends_at"])
+
+    def test_an_order_with_no_case_reports_a_blank_authorization(self):
+        """A work order has no case of its own -- its items carry the windows -- so
+        the block has to be safe to render rather than absent."""
+        resp = self._api().get(
+            f"/api/portal/members/{self.member.pk}/dispatch-orders/",
+        )
+        row = [o for o in resp.data if o["kind"] == "assessment"][0]
+        self.assertEqual(row["authorization"]["status"], "")
+        self.assertFalse(row["authorization"]["expired"])
+
     def test_a_CONFIRMED_order_cannot_be_edited(self):
         from .models import DispatchStatus
 

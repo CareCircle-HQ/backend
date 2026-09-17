@@ -28,6 +28,28 @@ from .base import PortalAPIView, current_agent
 logger = logging.getLogger(__name__)
 
 
+def _authorization_block(case):
+    """``status`` / ``starts_at`` / ``ends_at`` / ``approved`` / ``expired``.
+
+    One shape for a case's authorization, used for both the order header and each
+    item, so the two can never disagree about what "expired" means.
+    """
+    if case is None:
+        return {
+            "status": "", "starts_at": None, "ends_at": None,
+            "approved": False, "expired": False,
+        }
+    start, end = case.effective_authorization_window()
+    status = case.service_authorization_status or ""
+    return {
+        "status": status,
+        "starts_at": start,
+        "ends_at": end,
+        "approved": status.lower() == "approved",
+        "expired": bool(end) and end < timezone.now(),
+    }
+
+
 def _serialize_item(row):
     """One installable item.
 
@@ -44,16 +66,10 @@ def _serialize_item(row):
         # truncated one cannot be searched with.
         "case_id": str(row.case_id) if row.case_id else "",
         "case_status": row.case.case_status if row.case_id else "",
-        "authorization": (lambda w: {
-            "status": row.authorization_status,
-            "approved": row.is_approved,
-            # The WINDOW, shown so an agent can see why an "approved" item is not
-            # selectable. Without the dates, an expired item looks identical to a
-            # live one.
-            "starts_at": w[0],
-            "ends_at": w[1],
-            "expired": row.authorization_expired,
-        })(row.authorization_window),
+        # The same shape the order header uses, so the two can never disagree
+        # about what "expired" means. The WINDOW matters as much as the status: an
+        # expired item looks identical to a live one without the dates.
+        "authorization": _authorization_block(row.case if row.case_id else None),
         # Which work order covers it, or null when it is still waiting.
         "work_order_id": (
             str(row.dispatch_order_id) if row.dispatch_order_id else None
@@ -86,6 +102,12 @@ def _serialize_order(order):
         # "secondary" appears when the member is reassessed at another address.
         "dwelling_case_id": str(order.case_id) if order.case_id else "",
         "dwellings": order.dwellings or {},
+        # The ORDER's own authorization -- the Dwelling Assessment case's window.
+        # Shown in the header because it bounds the whole engagement: once it
+        # lapses, the assessment itself is out of authorization, regardless of what
+        # any individual item says. Uses effective_authorization_window() so it
+        # inherits the request-window fallback.
+        "authorization": _authorization_block(order.case if order.case_id else None),
         # The ITEMS. On an assessment these are every item found; on a work order,
         # the ones that work order covers. An item is not a status -- it is a thing
         # to install -- so it carries its case's AUTHORIZATION rather than a
