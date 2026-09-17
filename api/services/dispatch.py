@@ -285,9 +285,9 @@ def create_work_order(assessment, item_ids, *, vendor=None, actor=None, notes=""
     them: an agent who selected six and got a work order for four would not notice,
     and the two that vanished are exactly the ones someone is waiting on.
 
-    Every item must be AVAILABLE -- approved, not already dispatched, case still
-    open. Those are checked here rather than trusted from the request, because the
-    selection list an agent saw may be seconds stale.
+    Every item must be AVAILABLE -- approved, and not already dispatched. Checked
+    here rather than trusted from the request, because the selection list an agent
+    saw may be seconds stale.
     """
     from api.models import DispatchItem, DispatchKind, DispatchOrder
 
@@ -308,7 +308,8 @@ def create_work_order(assessment, item_ids, *, vendor=None, actor=None, notes=""
     unavailable = [i for i in items if not i.is_available]
     if unavailable:
         why = ", ".join(
-            f"{i.item or i.case_id} ({'already in a work order' if i.dispatch_order_id else i.authorization_status or 'not approved'})"
+            f"{i.item or i.case_id} ("
+            f"{'already in a work order' if i.dispatch_order_id else i.authorization_status or 'no authorization'})"
             for i in unavailable
         )
         raise ValueError(f"cannot dispatch: {why}")

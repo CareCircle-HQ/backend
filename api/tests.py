@@ -27287,10 +27287,10 @@ class DispatchOrderTest(TestCase):
         dispatch.adopt_unlinked_remediation_cases(assessment)
         self.assertEqual(DispatchItem.objects.filter(assessment=assessment).count(), 1)
 
-    def test_a_CLOSED_case_becomes_an_item_that_is_NOT_dispatchable(self):
-        """Four of MIRIAM's nine are closed. They are recorded as items -- the
-        history is real -- but must never be selectable for a work order, or a
-        vendor gets sent to do work nobody will pay for."""
+    def test_a_CLOSED_case_still_yields_a_DISPATCHABLE_item_when_approved(self):
+        """Four of MIRIAM's five approved items sit on closed cases, and the device
+        still has to be installed -- so a closed case is recorded AND dispatchable.
+        Only the authorization decides."""
         from .models import CaseStatus
         from .services import dispatch
 
@@ -27300,7 +27300,7 @@ class DispatchOrderTest(TestCase):
 
         adopted = dispatch.adopt_unlinked_remediation_cases(assessment)
         self.assertEqual(len(adopted), 1)
-        self.assertFalse(adopted[0].is_available)
+        self.assertTrue(adopted[0].is_available)
 
     # ── history + address inheritance ────────────────────────────────────────
     def test_transitions_land_in_the_SHARED_stage_event_log(self):
@@ -28583,7 +28583,14 @@ class DispatchItemTest(TestCase):
         self.assertEqual(item.item, "Air Conditioner")  # captured
 
     # ── availability ─────────────────────────────────────────────────────────
-    def test_only_approved_undispatched_open_items_are_available(self):
+    def test_availability_turns_on_the_AUTHORIZATION_only(self):
+        """Approved and not already dispatched -- nothing else.
+
+        The case's own status is explicitly NOT a condition: a Home Remediation
+        case can be closed in Unite Us while the approved device still has to be
+        fitted. Gating on it hid four of MIRIAM's five approved items and made the
+        work-order builder look broken.
+        """
         from .models import CaseStatus
         from .services import dispatch
 
@@ -28596,7 +28603,10 @@ class DispatchItemTest(TestCase):
         by_item = {i.item: i.is_available for i in items}
         self.assertTrue(by_item["Air Conditioner"])
         self.assertFalse(by_item["Heater"], "denied must not be dispatchable")
-        self.assertFalse(by_item["Grab Bars"], "a closed case is history, not work")
+        self.assertTrue(
+            by_item["Grab Bars"],
+            "an approved item on a CLOSED case is still installable",
+        )
 
     # ── work orders ──────────────────────────────────────────────────────────
     def test_a_work_order_batches_several_items(self):

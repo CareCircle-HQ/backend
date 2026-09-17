@@ -5671,12 +5671,22 @@ class DispatchItem(models.Model):
     def is_available(self):
         """Selectable for a NEW work order.
 
-        Three conditions, all necessary: approved (nothing unapproved may be
-        fitted), not already in a work order (no double-dispatch), and the case
-        still open (a closed case is history, not work).
+        Two conditions: the authorization is APPROVED (nothing unapproved may be
+        fitted), and the item is not already in a work order (no double-dispatch --
+        and that FK is the only place that is tracked).
+
+        The case's own status is deliberately NOT a condition. A Home Remediation
+        case can be closed in Unite Us while the approved device still has to be
+        installed, so gating on it hid four of MIRIAM's five approved items and made
+        the work-order builder look broken.
+
+        Note this does not check the authorization WINDOW either -- only the status
+        string. An approval that has lapsed still reads "approved" on the case, so
+        an expired item remains selectable. The food side treats that as a distinct
+        state ("Authorization Expired"); worth revisiting here if housing
+        authorizations start expiring in practice.
         """
-        closed = (self.case.case_status or "").lower() in ("closed", "cancelled")
-        return self.is_approved and self.dispatch_order_id is None and not closed
+        return self.is_approved and self.dispatch_order_id is None
 
 
 class DispatchAvailabilityWindow(models.Model):
