@@ -80,6 +80,12 @@ def _serialize_order(order):
         "referral_type": order.referral_type,
         "location": order.location,
         "program_name": order.case.program_name if order.case_id else "",
+        # The governing Dwelling Assessment case -- the FULL id, because an agent
+        # pastes it into Unite Us and a truncated one cannot be searched with. The
+        # labelled dwellings are exposed too: "primary" is this case, and a
+        # "secondary" appears when the member is reassessed at another address.
+        "dwelling_case_id": str(order.case_id) if order.case_id else "",
+        "dwellings": order.dwellings or {},
         # The ITEMS. On an assessment these are every item found; on a work order,
         # the ones that work order covers. An item is not a status -- it is a thing
         # to install -- so it carries its case's AUTHORIZATION rather than a
@@ -500,7 +506,13 @@ class MemberAssessmentOrderUpdateView(PortalAPIView):
             changed["availability"] = f"{len(dates)} dates"
 
         if not changed:
-            return Response(_serialize_order(order))
+            # A Save that does nothing has to SAY so. Returning the order silently
+            # is why an edit appeared to succeed while leaving no history and no
+            # updated_at -- order.save() is never reached on this path, which is
+            # exactly how the "nothing was recorded" report arose.
+            payload = _serialize_order(order)
+            payload["changed_fields"] = []
+            return Response(payload)
 
         order.save()
         # Audited: an order is work promised to a vendor, so a change to its
@@ -513,7 +525,9 @@ class MemberAssessmentOrderUpdateView(PortalAPIView):
             note="order edited",
             metadata={"changed": sorted(changed)},
         )
-        return Response(_serialize_order(order))
+        payload = _serialize_order(order)
+        payload["changed_fields"] = sorted(changed)
+        return Response(payload)
 
 
 class MemberWorkOrderCreateView(PortalAPIView):

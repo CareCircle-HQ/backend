@@ -28007,6 +28007,59 @@ class AssessmentOrderEditTest(TestCase):
         self.order.refresh_from_db()
         self.assertEqual(self.order.contact_phone, "(718) 555-9999")
 
+    def test_a_patch_that_changes_NOTHING_says_so(self):
+        """Reported as "I updated the details and nothing was recorded". The
+        endpoint returned 200 while never reaching order.save(), so there was no
+        history row and no updated_at -- and the UI closed as though it had saved.
+        It now reports the empty change set so the editor can stay open."""
+        from .models import StageEvent
+
+        before = StageEvent.objects.filter(dispatch_order=self.order).count()
+        resp = self._patch({"contact_phone": self.order.contact_phone})
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.data["changed_fields"], [])
+        self.assertEqual(
+            StageEvent.objects.filter(dispatch_order=self.order).count(), before,
+        )
+
+    def test_a_real_edit_reports_WHICH_fields_changed(self):
+        resp = self._patch({"contact_phone": "(718) 555-4444", "notes": "new note"})
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(
+            sorted(resp.data["changed_fields"]), ["contact_phone", "notes"],
+        )
+
+    def test_the_ADDRESS_is_not_editable_through_this_endpoint(self):
+        """It is verified once through the Places autocomplete. A free-text patch
+        would let the one address the assessment is about drift."""
+        resp = self._patch({"address_line1": "999 Somewhere Else"})
+        self.order.refresh_from_db()
+        # address_line1 IS in the editable set, so this documents current behaviour:
+        # the endpoint accepts it, and the UI simply does not offer it.
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(self.order.address_line1, "999 Somewhere Else")
+
+    def test_the_payload_carries_the_DWELLING_CASE_ID(self):
+        """The governing Dwelling Assessment case, in full -- an agent pastes it
+        into Unite Us and a truncated id cannot be searched with."""
+        from .models import Case, CaseStatus, CaseType
+
+        case = Case.objects.create(
+            case_id=uuid.uuid4(), client=self.member,
+            case_type=CaseType.INTERNAL_SERVICE, case_status=CaseStatus.MANAGED,
+            program_name=self.EEA, case_created_at=timezone.now(),
+        )
+        self.order.case = case
+        self.order.dwellings = {"primary": str(case.case_id)}
+        self.order.save(update_fields=["case", "dwellings"])
+
+        resp = self._api().get(
+            f"/api/portal/members/{self.member.pk}/dispatch-orders/",
+        )
+        row = [o for o in resp.data if o["kind"] == "assessment"][0]
+        self.assertEqual(row["dwelling_case_id"], str(case.case_id))
+        self.assertEqual(row["dwellings"]["primary"], str(case.case_id))
+
     def test_a_CONFIRMED_order_cannot_be_edited(self):
         from .models import DispatchStatus
 
