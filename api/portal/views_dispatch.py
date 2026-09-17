@@ -713,3 +713,122 @@ class MemberDispatchHistoryView(PortalAPIView):
                 },
             })
         return Response(out)
+
+
+class MemberAssessmentFormView(PortalAPIView):
+    """GET: the Dwelling Assessment form, READ-ONLY.
+
+    Returns the questions with whatever the vendor has answered so far -- every
+    question, always, so the CRM shows the blank form before a visit and the
+    completed one after. An unanswered form is not an empty response; it is the
+    form with nothing ticked, which is what an agent needs to see to know what will
+    be asked.
+
+    There is deliberately no POST or PATCH here. Only the vendor completes an
+    assessment, and that is enforced by the absence of a route rather than by a
+    permission check.
+    """
+
+    def get(self, request, client_id):
+        client = get_object_or_404(Client, pk=client_id)
+        order = dispatch_svc.assessment_order_for(client)
+        if order is None:
+            return Response(
+                {"detail": "This member has no assessment order yet."},
+                status=http.HTTP_404_NOT_FOUND,
+            )
+
+        from ..models import DispatchQuestionnaire
+        from ..services.assessment_forms import (
+            build_schema, modules_for_referral,
+        )
+
+        form = DispatchQuestionnaire.objects.filter(dispatch_order=order).first()
+        if form is not None:
+            schema = form.schema()
+            answers = form.answers or {}
+            others = form.section_other or {}
+            chosen = {
+                i.get("option"): i.get("qty") or 1
+                for i in (form.interventions or []) if i.get("option")
+            }
+        else:
+            # No questionnaire row yet. Render the form the referral type implies,
+            # so the tab is useful before the vendor has touched anything.
+            schema = build_schema(modules_for_referral(order.referral_type))
+            answers, others, chosen = {}, {}, {}
+
+        modules = []
+        for module in schema.get("modules", []):
+            sections = []
+            for section in module["sections"]:
+                sections.append({
+                    "code": section["code"],
+                    "title": section["title"],
+                    "allows_other": section.get("allows_other", False),
+                    "other": others.get(section["code"], ""),
+                    "groups": [
+                        {
+                            "code": g["code"],
+                            "label": g["label"],
+                            "questions": [
+                                {
+                                    "code": q["code"],
+                                    "label": q["label"],
+                                    "checked": bool(answers.get(q["code"])),
+                                }
+                                for q in g["questions"]
+                            ],
+                        }
+                        for g in section["groups"]
+                    ],
+                })
+            groups = []
+            for g in module["intervention_groups"]:
+                groups.append({
+                    "code": g["code"],
+                    "label": g["label"],
+                    "program_item": g.get("program_item") or "",
+                    "options": [
+                        {
+                            "code": o["code"],
+                            "label": o["label"],
+                            # qty 0 renders as "Not added", matching the vendor's
+                            # own form rather than hiding unchosen options -- the
+                            # full catalogue is what shows an agent what COULD have
+                            # been recommended.
+                            "qty": chosen.get(o["code"], 0),
+                        }
+                        for o in g["options"]
+                    ],
+                })
+            modules.append({
+                "code": module["code"],
+                "label": module["label"],
+                "service_code": module["service_code"],
+                "sections": sections,
+                "intervention_groups": groups,
+            })
+
+        active = dispatch_svc.active_submission(order)
+        return Response({
+            "order_id": str(order.dispatch_order_id),
+            "referral_type": order.referral_type,
+            "state": form.state if form else "not_started",
+            "submitted_at": form.submitted_at if form else None,
+            "template_version": (
+                form.template_version if form else schema.get("version")
+            ),
+            "modules": modules,
+            "justification": form.justification if form else "",
+            "assessor_notes": form.assessor_notes if form else "",
+            # The wrapper the form shares across modules: photos and the two
+            # signatures. The real form's submit rule is "at least one photo of the
+            # dwelling, your signature, and the member's signature".
+            "photo_count": order.proofs.count(),
+            "signatures": [
+                {"role": sig.signer_role, "signed_at": sig.signed_at,
+                 "signer_name": sig.signer_name}
+                for sig in (active.signatures.all() if active else [])
+            ],
+        })

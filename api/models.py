@@ -5862,6 +5862,87 @@ class DispatchDocument(models.Model):
         return self.filename or f"Document {self.content_hash[:12]}"
 
 
+class DispatchQuestionnaireState(models.TextChoices):
+    DRAFT = "draft", "Draft"
+    SUBMITTED = "submitted", "Submitted"
+
+
+class DispatchQuestionnaire(models.Model):
+    """The Dwelling Assessment form for one assessment order.
+
+    One per order. Which MODULES it contains follows the order's referral type --
+    Mobility, Ventilation, or both for Combined -- so the form a vendor sees is
+    bounded by what was authorized.
+
+    Answers are stored as JSON keyed by the question codes in
+    ``api/services/assessment_forms.py`` rather than as columns. The questions are
+    CONTENT: adding one should not need a migration, and 33 boolean columns would
+    churn the schema at every revision of the form.
+
+    WRITABLE BY THE VENDOR ONLY. There is deliberately no CRM endpoint that writes
+    these answers -- the CRM renders them read-only. That is the locking rule the
+    whole feature rests on, enforced by the absence of a route rather than by a
+    permission check someone can widen later.
+    """
+
+    dispatch_questionnaire_id = models.UUIDField(
+        primary_key=True, default=uuid.uuid4, editable=False
+    )
+    dispatch_order = models.OneToOneField(
+        DispatchOrder, on_delete=models.CASCADE, related_name="questionnaire",
+    )
+    # ["mobility"], ["ventilation"], or both.
+    modules = models.JSONField(default=list, blank=True)
+    template_version = models.PositiveIntegerField(default=1)
+    # The form definition as it stood when SUBMITTED. Empty while a draft: a draft
+    # renders against the live template, but a signed form must render years later
+    # exactly as it was signed rather than acquiring blank questions from a later
+    # revision.
+    schema_snapshot = models.JSONField(default=dict, blank=True)
+
+    # {"mob.reason.fall_risk": true, ...}
+    answers = models.JSONField(default=dict, blank=True)
+    # The "Other..." box each Reason for Assessment section carries:
+    # {"mob.reason": "..."}
+    section_other = models.JSONField(default=dict, blank=True)
+    # [{"option": "window_ac", "qty": 2}, ...] -- QUANTIFIED, not merely ticked:
+    # the form has a -/+ stepper per option and a member can need two air
+    # conditioners.
+    interventions = models.JSONField(default=list, blank=True)
+
+    justification = models.TextField(blank=True)   # Clinical / Safety Justification
+    assessor_notes = models.TextField(blank=True)
+
+    state = models.CharField(
+        max_length=10, choices=DispatchQuestionnaireState.choices,
+        default=DispatchQuestionnaireState.DRAFT, db_index=True,
+    )
+    submitted_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+
+    def __str__(self):
+        return f"Assessment form ({self.state}) for {self.dispatch_order_id}"
+
+    @property
+    def is_submitted(self):
+        return self.state == DispatchQuestionnaireState.SUBMITTED
+
+    def schema(self):
+        """The definition to render against.
+
+        The frozen snapshot once submitted, the live template while a draft.
+        """
+        from api.services.assessment_forms import build_schema
+
+        if self.is_submitted and self.schema_snapshot:
+            return self.schema_snapshot
+        return build_schema(self.modules or [])
+
+
 class DispatchSubmissionState(models.TextChoices):
     ACTIVE = "active", "Active"
     VOIDED = "voided", "Voided"

@@ -29195,3 +29195,262 @@ class DispatchHistoryApiTest(TestCase):
         )
         notes = [r["note"] for r in self._history()]
         self.assertNotIn("someone else's order", notes)
+
+
+class AssessmentFormTest(TestCase):
+    """The Dwelling Assessment form: the template, and the CRM's read-only view.
+
+    Transcribed from the three real forms, so the counts here are assertions about
+    the actual documents rather than about my transcription of them.
+    """
+
+    EEA = (
+        "Dwelling Assessment & Statement of Work (SOW) Development - "
+        "Modifications and Remediation Service - Manhattan"
+    )
+
+    def setUp(self):
+        from .models import (
+            ActiveProgram, Case, CaseStatus, CaseType, Client, DispatchKind,
+            DispatchOrder, Vendor,
+        )
+        from .services.catalog import clear_program_domain_cache
+
+        ActiveProgram.objects.create(
+            program_name=self.EEA, case_category="Internal Services",
+            case_type=ActiveProgram.CaseType.HOUSING,
+            service_type=ActiveProgram.ServiceType.ENVIRONMENTAL_EXPOSURE_ASSESSMENT,
+        )
+        clear_program_domain_cache()
+        self.member = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Form", last_name="Member",
+            client_added_at=timezone.now(),
+        )
+        Case.objects.create(
+            case_id=uuid.uuid4(), client=self.member,
+            case_type=CaseType.INTERNAL_SERVICE, case_status=CaseStatus.MANAGED,
+            program_name=self.EEA, case_created_at=timezone.now(),
+        )
+        self.order = DispatchOrder.objects.create(
+            kind=DispatchKind.ASSESSMENT, client=self.member,
+            vendor=Vendor.objects.create(name="Acme"),
+            referral_type="combined",
+        )
+
+    def _api(self):
+        from rest_framework_simplejwt.tokens import AccessToken
+
+        from .models import Agent
+
+        if not hasattr(self, "_agent"):
+            self._agent = Agent.objects.create(
+                name="F", agent_code="888", group="Management",
+            )
+        acc = AccessToken()
+        acc["agent_id"] = str(self._agent.id)
+        acc["agent_code"] = self._agent.agent_code
+        acc["agent_name"] = self._agent.name
+        acc["agent_group"] = self._agent.group
+        api = APIClient(); api.credentials(HTTP_AUTHORIZATION=f"Bearer {acc}")
+        return api
+
+    def _get(self):
+        resp = self._api().get(
+            f"/api/portal/members/{self.member.pk}/assessment-form/",
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        return resp.data
+
+    # ── the template ─────────────────────────────────────────────────────────
+    def test_the_question_counts_match_the_real_forms(self):
+        from .services.assessment_forms import all_question_codes
+
+        self.assertEqual(len(all_question_codes(["mobility"])), 17)
+        self.assertEqual(len(all_question_codes(["ventilation"])), 16)
+        self.assertEqual(len(all_question_codes()), 33)
+
+    def test_the_intervention_counts_match_the_real_forms(self):
+        from .services.assessment_forms import INTERVENTIONS, all_option_codes
+
+        self.assertEqual(len(INTERVENTIONS["mobility"]), 7)
+        self.assertEqual(len(INTERVENTIONS["ventilation"]), 5)
+        self.assertEqual(len(all_option_codes(["mobility"])), 18)
+        self.assertEqual(len(all_option_codes(["ventilation"])), 8)
+
+    def test_every_code_is_UNIQUE(self):
+        """Answers are keyed by code, so a duplicate would silently merge two
+        different questions into one answer."""
+        from .services.assessment_forms import all_option_codes, all_question_codes
+
+        for codes in (all_question_codes(), all_option_codes()):
+            self.assertEqual(len(codes), len(set(codes)))
+
+    def test_a_referral_type_selects_its_modules(self):
+        from .services.assessment_forms import modules_for_referral
+
+        self.assertEqual(modules_for_referral("mobility"), ["mobility"])
+        self.assertEqual(modules_for_referral("ventilation"), ["ventilation"])
+        self.assertEqual(
+            modules_for_referral("combined"), ["mobility", "ventilation"],
+        )
+
+    def test_an_UNKNOWN_referral_type_selects_NO_module(self):
+        """Rendering a Mobility assessment for a referral nobody classified would
+        put questions in front of a vendor that no authorization covers."""
+        from .services.assessment_forms import modules_for_referral
+
+        for junk in ("", None, "plumbing"):
+            self.assertEqual(modules_for_referral(junk), [])
+
+    # ── the read-only view ───────────────────────────────────────────────────
+    def test_the_blank_form_still_shows_EVERY_question(self):
+        """An unanswered form is not an empty screen -- it is the form with nothing
+        ticked, which is what tells an agent what the vendor will be asked."""
+        data = self._get()
+        self.assertEqual(data["state"], "not_started")
+        self.assertEqual(len(data["modules"]), 2)
+        total = sum(
+            len(g["questions"])
+            for m in data["modules"] for s in m["sections"] for g in s["groups"]
+        )
+        self.assertEqual(total, 33)
+        self.assertFalse(any(
+            q["checked"]
+            for m in data["modules"] for s in m["sections"]
+            for g in s["groups"] for q in g["questions"]
+        ))
+
+    def test_a_MOBILITY_only_referral_renders_one_module(self):
+        self.order.referral_type = "mobility"
+        self.order.save(update_fields=["referral_type"])
+        data = self._get()
+        self.assertEqual([m["code"] for m in data["modules"]], ["mobility"])
+        self.assertEqual(
+            sum(len(g["questions"])
+                for m in data["modules"] for s in m["sections"] for g in s["groups"]),
+            17,
+        )
+
+    def test_REASON_FOR_ASSESSMENT_appears_in_BOTH_modules(self):
+        """The combined form genuinely repeats it -- the real PDF shows it twice --
+        so the renderer must key on module AND section, not section alone."""
+        data = self._get()
+        titles = [
+            s["title"] for m in data["modules"] for s in m["sections"]
+        ]
+        self.assertEqual(titles.count("Reason for Assessment"), 2)
+
+    def test_only_REASON_sections_offer_an_Other_box(self):
+        data = self._get()
+        for m in data["modules"]:
+            for s in m["sections"]:
+                self.assertEqual(
+                    s["allows_other"], s["title"] == "Reason for Assessment",
+                    f"{m['code']}.{s['code']}",
+                )
+
+    def test_a_submitted_form_renders_the_ANSWERS(self):
+        from .models import DispatchQuestionnaire
+        from .services.assessment_forms import build_schema
+
+        DispatchQuestionnaire.objects.create(
+            dispatch_order=self.order, modules=["mobility", "ventilation"],
+            schema_snapshot=build_schema(["mobility", "ventilation"]),
+            answers={"mob.reason.fall_risk": True, "vent.air.excessive_dust": True},
+            section_other={"mob.reason": "reported by daughter"},
+            interventions=[{"option": "window_ac", "qty": 2}],
+            justification="too hot", state="submitted",
+            submitted_at=timezone.now(),
+        )
+        data = self._get()
+        self.assertEqual(data["state"], "submitted")
+
+        ticked = {
+            q["code"]
+            for m in data["modules"] for s in m["sections"]
+            for g in s["groups"] for q in g["questions"] if q["checked"]
+        }
+        self.assertEqual(ticked, {"mob.reason.fall_risk", "vent.air.excessive_dust"})
+        self.assertEqual(data["justification"], "too hot")
+
+        other = [
+            s["other"] for m in data["modules"] for s in m["sections"]
+            if s["code"] == "mob.reason"
+        ]
+        self.assertEqual(other, ["reported by daughter"])
+
+    def test_an_intervention_carries_its_QUANTITY(self):
+        """The form has a -/+ stepper, not a checkbox: a member can need two air
+        conditioners, and "x2" is what the vendor is being asked to fit."""
+        from .models import DispatchQuestionnaire
+        from .services.assessment_forms import build_schema
+
+        DispatchQuestionnaire.objects.create(
+            dispatch_order=self.order, modules=["ventilation"],
+            schema_snapshot=build_schema(["ventilation"]),
+            interventions=[{"option": "window_ac", "qty": 2}],
+            state="submitted", submitted_at=timezone.now(),
+        )
+        data = self._get()
+        opts = {
+            o["code"]: o["qty"]
+            for m in data["modules"] for g in m["intervention_groups"]
+            for o in g["options"]
+        }
+        self.assertEqual(opts["window_ac"], 2)
+        # Unchosen options are still listed, at qty 0 -- the full catalogue shows
+        # what COULD have been recommended.
+        self.assertEqual(opts["portable_ac"], 0)
+        self.assertIn("hepa_purifier", opts)
+
+    def test_a_SUBMITTED_form_renders_from_its_FROZEN_snapshot(self):
+        """The reason the snapshot exists. A signed form must render years later
+        exactly as signed, not acquire blank questions from a later template."""
+        from .models import DispatchQuestionnaire
+        from .services.assessment_forms import build_schema
+
+        snapshot = build_schema(["ventilation"])
+        # Simulate a later template revision by removing a section from the copy
+        # the questionnaire froze.
+        snapshot["modules"][0]["sections"] = snapshot["modules"][0]["sections"][:1]
+        DispatchQuestionnaire.objects.create(
+            dispatch_order=self.order, modules=["ventilation"],
+            schema_snapshot=snapshot, state="submitted",
+            submitted_at=timezone.now(),
+        )
+        data = self._get()
+        self.assertEqual(len(data["modules"][0]["sections"]), 1)
+
+    def test_a_DRAFT_renders_against_the_LIVE_template(self):
+        """The mirror image: an unfinished form should pick up template fixes."""
+        from .models import DispatchQuestionnaire
+
+        DispatchQuestionnaire.objects.create(
+            dispatch_order=self.order, modules=["ventilation"],
+            schema_snapshot={}, state="draft",
+        )
+        data = self._get()
+        self.assertEqual(data["state"], "draft")
+        self.assertEqual(len(data["modules"][0]["sections"]), 3)
+
+    def test_there_is_NO_way_for_the_CRM_to_write_the_form(self):
+        """Only the vendor completes an assessment, enforced by the absence of a
+        route rather than a permission check someone can widen."""
+        url = f"/api/portal/members/{self.member.pk}/assessment-form/"
+        for method in ("post", "patch", "put", "delete"):
+            resp = getattr(self._api(), method)(url, {}, format="json")
+            self.assertEqual(
+                resp.status_code, 405, f"{method.upper()} must not be allowed",
+            )
+
+    def test_a_member_with_no_order_gets_a_404_not_a_blank_form(self):
+        from .models import Client
+
+        other = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="No", last_name="Order",
+            client_added_at=timezone.now(),
+        )
+        resp = self._api().get(
+            f"/api/portal/members/{other.pk}/assessment-form/",
+        )
+        self.assertEqual(resp.status_code, 404)

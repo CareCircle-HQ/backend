@@ -194,6 +194,7 @@ from .views_imports import (
     UniteUsExportsView,
 )
 from .views_dispatch import (
+    MemberAssessmentFormView,
     MemberAssessmentOrderCreateView,
     MemberAssessmentOrderUpdateView,
     MemberWorkOrderCreateView,
@@ -295,6 +296,10 @@ urlpatterns = [
         "members/<uuid:client_id>/assessment-order/",
         MemberAssessmentOrderCreateView.as_view(),
         name="portal-member-assessment-order",
+    ),
+    path(
+        "members/<uuid:client_id>/assessment-form/",
+        MemberAssessmentFormView.as_view(), name="portal-member-assessment-form",
     ),
     path(
         "members/<uuid:client_id>/dispatch-history/",
