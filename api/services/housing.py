@@ -49,8 +49,16 @@ GOVERNING_SERVICE_TYPES = frozenset({
 
 # Service types that are WORK ORDERS -- the output of an inspection, never the
 # authority for service.
+#
+# MUST be kept in step with the housing service types: a housing case whose service
+# resolves to NEITHER this set nor GOVERNING_SERVICE_TYPES is classified as neither
+# an assessment nor a work order. That gap is deliberately visible rather than
+# silently defaulting, but it means adding a housing service and forgetting this set
+# leaves those cases in limbo -- which is exactly what nearly happened when
+# Environmental Modifications/Accessibility was introduced.
 WORK_ORDER_SERVICE_TYPES = frozenset({
     ActiveProgram.ServiceType.HOME_EXPENSE_ASSISTANCE_REPAIRS.value,
+    ActiveProgram.ServiceType.ENVIRONMENTAL_MODIFICATIONS_ACCESSIBILITY.value,
 })
 
 

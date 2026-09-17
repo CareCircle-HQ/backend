@@ -3293,6 +3293,14 @@ class ActiveProgram(models.Model):
         HOME_EXPENSE_ASSISTANCE_REPAIRS = (
             "home_expense_assistance_repairs", "Home Expense Assistance/Repairs",
         )
+        # Housing (type = HOUSING): the "Home Accessibility and Safety
+        # Modification - <item> - <borough>" programs (bathroom facilities, grab
+        # bars, hand rails, non-skid surfaces). A sibling of the Repairs service --
+        # both are WORK ORDERS raised from an assessment, neither can govern.
+        ENVIRONMENTAL_MODIFICATIONS_ACCESSIBILITY = (
+            "environmental_modifications_accessibility",
+            "Environmental Modifications/Accessibility",
+        )
 
     program_name = models.CharField(max_length=255, unique=True, db_index=True)
     main_category = models.CharField(max_length=120, blank=True)
@@ -3313,8 +3321,11 @@ class ActiveProgram(models.Model):
     # program name by data migration; blank when the program isn't one of the
     # services we deliver. ``db_default`` guards against an omitted-column
     # insert during a deploy window (see ``to_extend`` below).
+    # 64, not 40: "environmental_modifications_accessibility" is 41 characters and
+    # Django refuses a max_length that cannot hold its own longest choice
+    # (fields.E009). Headroom so the next service name does not need a migration.
     service_type = models.CharField(
-        max_length=40, choices=ServiceType.choices, blank=True,
+        max_length=64, choices=ServiceType.choices, blank=True,
         default="", db_default="",
     )
     # Opt-in flag (managed from Settings > Programs): this program should be

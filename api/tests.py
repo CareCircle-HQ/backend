@@ -27699,7 +27699,7 @@ class HomeAccessibilityProgramsTest(TestCase):
                 else ActiveProgram.CaseType.FOOD
             ),
             service_type=(
-                ActiveProgram.ServiceType.HOME_EXPENSE_ASSISTANCE_REPAIRS
+                ActiveProgram.ServiceType.ENVIRONMENTAL_MODIFICATIONS_ACCESSIBILITY
                 if internal else ""
             ),
             main_category="Housing" if internal else "Food",
@@ -27707,13 +27707,17 @@ class HomeAccessibilityProgramsTest(TestCase):
         clear_program_domain_cache()
         return p
 
-    def test_a_listed_program_is_housing_with_the_repairs_service(self):
+    def test_a_listed_program_delivers_environmental_modifications(self):
+        """A DIFFERENT service from Home Remediation's repairs, and the
+        distinction is functional: the chip, the bar and the vendor's
+        questionnaire all key off it."""
         from .services.catalog import program_service_domain, program_service_type_code
 
         self._program(self.LISTED, internal=True)
         self.assertEqual(program_service_domain(self.LISTED), "housing")
         self.assertEqual(
-            program_service_type_code(self.LISTED), "home_expense_assistance_repairs",
+            program_service_type_code(self.LISTED),
+            "environmental_modifications_accessibility",
         )
 
     def test_a_listed_program_routes_to_internal_service_and_imports(self):
@@ -27752,6 +27756,32 @@ class HomeAccessibilityProgramsTest(TestCase):
 
         self._program(self.NOT_LISTED, internal=False)
         self.assertFalse(case_in_import_scope("", self.NOT_LISTED))
+
+    def test_the_new_service_is_in_the_WORK_ORDER_set_not_limbo(self):
+        """A housing case whose service is in NEITHER set is classified as neither
+        an assessment nor a work order -- visible by design, but it means adding a
+        housing service and forgetting WORK_ORDER_SERVICE_TYPES leaves its cases in
+        limbo. That nearly happened with this one."""
+        from .models import ActiveProgram
+        from .services.housing import (
+            GOVERNING_SERVICE_TYPES, WORK_ORDER_SERVICE_TYPES,
+        )
+
+        code = ActiveProgram.ServiceType.ENVIRONMENTAL_MODIFICATIONS_ACCESSIBILITY
+        self.assertIn(code.value, WORK_ORDER_SERVICE_TYPES)
+        self.assertNotIn(code.value, GOVERNING_SERVICE_TYPES)
+
+        # Every housing service must be in exactly ONE of the two sets.
+        housing_services = {
+            ActiveProgram.ServiceType.ENVIRONMENTAL_EXPOSURE_ASSESSMENT.value,
+            ActiveProgram.ServiceType.HOME_EXPENSE_ASSISTANCE_REPAIRS.value,
+            ActiveProgram.ServiceType.ENVIRONMENTAL_MODIFICATIONS_ACCESSIBILITY.value,
+        }
+        classified = GOVERNING_SERVICE_TYPES | WORK_ORDER_SERVICE_TYPES
+        self.assertEqual(
+            housing_services - classified, set(),
+            "a housing service is in neither set and its cases would be in limbo",
+        )
 
     def test_the_prefix_alone_does_not_identify_a_listed_program(self):
         """Pins the reason for the explicit list: both of these share the prefix,
