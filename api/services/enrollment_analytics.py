@@ -9,6 +9,7 @@ source of truth.
 """
 
 import logging
+import datetime
 from functools import lru_cache
 
 from django.db.models import Prefetch
@@ -168,11 +169,52 @@ def _as_aware(value):
     return value
 
 
+_DT_FLOOR = datetime.datetime(1, 1, 1, tzinfo=datetime.timezone.utc)
+
+
+def _best_social_coverage(rows):
+    """The coverage that represents the member's CURRENT social-care standing.
+
+    Social care coverages are CONCURRENT PLANS, not a status history: 70% of
+    members hold more than one, and a member is routinely enrolled in "Enhanced
+    HRSN Services" while several "Screening and Navigation" plans have come and
+    gone. Picking the latest ``enrolled_at`` therefore reported the wrong answer
+    for 1,643 members -- the Data page's "Social Care = Not Enrolled" filter
+    returned people who ARE enrolled, e.g.
+
+        non_enrolled  Queens FFS Screening and Navigation   expired 2026-07-31
+        ENROLLED      Queens NY1115 Enhanced HRSN Services  expired_at = None
+        non_enrolled  Brooklyn MCO Screening and Navigation expired 2026-07-10
+
+    where the expired FFS row won on recency. One member had the SAME plan twice,
+    enrolled and non_enrolled, where non_enrolled won by a 4-hour timezone offset.
+
+    So rank by what the answer should be, most significant first:
+      1. enrolled AND still live  -- the member has coverage
+      2. LIVE at all
+      3. enrolled at all
+      4. most recent
+
+    LIVE outranks ENROLLED at 2/3 deliberately: being enrolled in something that
+    LAPSED is not current coverage, so a live non_enrolled row must beat an expired
+    enrolled one. Getting that order wrong is how the original bug read in reverse.
+    """
+    if not rows:
+        return None
+    now = timezone.now()
+
+    def rank(s):
+        live = s.expired_at is None or s.expired_at > now
+        enrolled = (s.status or "").strip().casefold() == "enrolled"
+        return (enrolled and live, live, enrolled, s.enrolled_at or _DT_FLOOR)
+
+    return max(rows, key=rank)
+
+
 def _coverage(client_id):
     ins = (Insurance.objects.filter(client_id=client_id)
            .order_by("-is_primary", "-enrolled_at").first())
-    soc = (SocialCareCoverage.objects.filter(client_id=client_id)
-           .order_by("-enrolled_at").first())
+    soc = _best_social_coverage(list(SocialCareCoverage.objects.filter(client_id=client_id)))
     return (
         (ins.status if ins else ""), (ins.expired_at if ins else None),
         (soc.status if soc else ""), (soc.expired_at if soc else None),
@@ -347,11 +389,26 @@ def _parity_fields(client):
     except Exception:  # noqa: BLE001
         team = ""
     try:
+        # EVERY ticket the member has ever had, whatever its status. The Data
+        # page's Ticket Type filter means "members who have a ticket of this
+        # type", and 81% of them would be invisible if only live tickets counted:
+        # 6,662 members hold a ticket, but just 1,258 hold an OPEN/IN_PROGRESS one
+        # (9,727 tickets are resolved against 1,186 open). That made the filter
+        # look broken rather than narrow.
+        #
+        # This is deliberately WIDER than the Members page filter, which binds to
+        # tickets__status=OPEN -- that page is a work queue ("what needs doing
+        # now"), while the Data page is analytical ("who has ever had this").
+        # order_by() clears Ticket.Meta.ordering = ['-created_at'] BEFORE the
+        # distinct(). Without it Django adds created_at to the SELECT, so DISTINCT
+        # applies to (code, created_at) and every ticket survives -- 51 rows in
+        # production carry ['case_closure', 'case_closure']. Harmless for the
+        # __overlap filter, but the column is meant to be a set.
         ticket_types = [
-            c for c in Ticket.objects.filter(
-                client_id=client.pk,
-                status__in=[TicketStatus.OPEN, TicketStatus.IN_PROGRESS],
-            ).values_list("type__code", flat=True).distinct() if c
+            c for c in Ticket.objects
+            .filter(client_id=client.pk)
+            .order_by()
+            .values_list("type__code", flat=True).distinct() if c
         ]
     except Exception:  # noqa: BLE001
         ticket_types = []

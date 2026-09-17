@@ -1,0 +1,397 @@
+"""Dispatch: work sent to external vendors, and the evidence that comes back.
+
+The rules this enforces, and where each comes from
+(`docs/housing-assessment-order-plan.md`):
+
+* ONE assessment order per member; remediation orders hang off it.
+* An order cannot be SUBMITTED without a vendor signature, a member signature, and
+  at least one photo PER FINDING.
+* A submitted order is LOCKED. CRM users may never edit vendor evidence; the vendor
+  corrects a mistake by VOIDING their submission and making a new one, and the
+  voided copy is kept.
+* Remediation cases that arrive before the assessment order exists are ADOPTED when
+  it is created -- not rebuilt. Nothing here recomputes or rewrites; the food
+  side's rebuild/replace machinery is what forked 149 enrollments.
+"""
+import logging
+
+from django.db import transaction
+from django.utils import timezone
+
+from api.models import (
+    DispatchKind, DispatchOrder, DispatchSignerRole, DispatchStatus,
+    DispatchSubmission, DispatchSubmissionState, StageEntityType, StageEvent,
+    StageEventSource,
+)
+
+logger = logging.getLogger(__name__)
+
+# The linear chain. Not independent flags: each status has exactly one successor,
+# which is what makes "what happens next?" answerable from the data alone.
+STATUS_ORDER = [
+    DispatchStatus.PENDING_SCHEDULE,
+    DispatchStatus.CONFIRMED,
+    DispatchStatus.PENDING_SUBMISSION,
+    DispatchStatus.SUBMITTED,
+    DispatchStatus.UPLOADED,
+]
+
+# Minimum DISTINCT DATES of member availability the wizard must collect. Counted as
+# dates, not rows -- three windows on one Tuesday does not satisfy it.
+MIN_AVAILABILITY_DATES = 3
+
+
+def record_transition(order, from_status, to_status, *, actor=None, source=None,
+                      note="", metadata=None, agent=None):
+    """Append the transition to StageEvent -- the same log the food stages use.
+
+    Deliberately the shared log rather than a dispatch-only table, so "everything
+    that happened to this member" stays one query.
+
+    ``agent`` is written into the metadata as a NAME and CODE. That is not
+    redundant with ``actor``: StageEvent.actor is a FK to the auth User, portal
+    callers only ever have the DRF AgentUser principal, and stage_event_actor
+    coerces it to None -- so without this the History tab would show every
+    agent-driven change as having no user. Storing the name rather than only an id
+    also means the history still reads correctly if an agent record is later
+    renamed or deactivated.
+    """
+    # StageEvent.actor is a FK to the Django auth User, but portal callers hand us
+    # the DRF AgentUser principal or an Agent row. Assigning either raises
+    # ValueError and, per stage_event_actor's own docstring, "aborts the stage
+    # change (and, via reconcile, the whole case upsert)". Coerce HERE rather than
+    # at each call site, so no future caller can reintroduce it.
+    from api.services.lifecycle import stage_event_actor
+
+    meta = dict(metadata or {})
+    if agent is not None:
+        meta.setdefault("agent_name", getattr(agent, "name", "") or "")
+        # agent_code is NULLABLE in real data -- "Alexis Tamayo" has none -- so the
+        # id is stored as well. The name is what gets displayed; the id is what
+        # still identifies the actor if a name is later changed.
+        meta.setdefault("agent_code", getattr(agent, "agent_code", "") or "")
+        meta.setdefault("agent_id", str(getattr(agent, "pk", "") or ""))
+
+    return StageEvent.objects.create(
+        entity_type=StageEntityType.DISPATCH_ORDER,
+        client=order.client,
+        dispatch_order=order,
+        from_stage=from_status or "",
+        to_stage=to_status,
+        source=source or StageEventSource.MANUAL,
+        actor=stage_event_actor(actor),
+        note=note,
+        metadata=meta,
+    )
+
+
+def set_status(order, to_status, *, actor=None, source=None, note="", metadata=None,
+               agent=None):
+    """Move an order and record it. No-op when already there."""
+    from_status = order.status
+    if from_status == to_status:
+        return None
+    order.status = to_status
+    order.save(update_fields=["status", "updated_at"])
+    return record_transition(
+        order, from_status, to_status,
+        actor=actor, source=source, note=note, metadata=metadata, agent=agent,
+    )
+
+
+# ── the submission gate ──────────────────────────────────────────────────────
+
+def missing_for_submission(order):
+    """What still blocks SUBMITTED. Empty list means the gate is satisfied.
+
+    Returns REASONS rather than a bool on purpose: the vendor has to be told what
+    is missing, and a bare False at the end of a home visit is useless. The API and
+    any UI both read this, so the rule lives in exactly one place -- a UI-only
+    check is how the food verification endpoint still accepted a housing case after
+    the picker had been fixed.
+    """
+    missing = []
+
+    submission = active_submission(order)
+    roles = set()
+    if submission is not None:
+        roles = set(
+            submission.signatures.values_list("signer_role", flat=True)
+        )
+    if DispatchSignerRole.VENDOR not in roles:
+        missing.append("vendor signature")
+    if DispatchSignerRole.MEMBER not in roles:
+        missing.append("member signature")
+
+    # At least one photo PER FINDING -- which is why DispatchProof carries a
+    # finding FK. Proofs with no finding are general site photos and do not count
+    # toward any finding's requirement.
+    for finding in order.findings.all():
+        if not finding.proofs.exists():
+            missing.append(f"photo for finding: {finding.title}")
+
+    return missing
+
+
+def can_submit(order):
+    return not missing_for_submission(order)
+
+
+# ── submissions: create, submit, void ────────────────────────────────────────
+
+def active_submission(order):
+    """The one live submission, or None. Voided ones are history."""
+    return order.submissions.filter(
+        state=DispatchSubmissionState.ACTIVE,
+    ).first()
+
+
+@transaction.atomic
+def open_submission(order):
+    """Start (or return) the live submission the vendor is filling in.
+
+    Idempotent: an offline client that retries must not create two.
+    """
+    existing = active_submission(order)
+    if existing is not None:
+        return existing
+    last = order.submissions.order_by("-sequence").first()
+    return DispatchSubmission.objects.create(
+        dispatch_order=order,
+        sequence=(last.sequence + 1) if last else 1,
+    )
+
+
+@transaction.atomic
+def submit(order, *, vendor_user=None, note=""):
+    """Submit the active submission. Raises ValueError listing what is missing.
+
+    The gate is checked HERE, server-side, not in the caller.
+    """
+    missing = missing_for_submission(order)
+    if missing:
+        raise ValueError(f"cannot submit: missing {', '.join(missing)}")
+
+    submission = active_submission(order)
+    if submission is None:
+        raise ValueError("cannot submit: no active submission")
+
+    submission.submitted_at = timezone.now()
+    submission.submitted_by = vendor_user
+    submission.save(update_fields=["submitted_at", "submitted_by"])
+    set_status(
+        order, DispatchStatus.SUBMITTED,
+        source=StageEventSource.AUTO, note=note,
+        metadata={"submission": str(submission.dispatch_submission_id)},
+    )
+    return submission
+
+
+@transaction.atomic
+def void_submission(submission, *, vendor_user=None, reason=""):
+    """Void a submitted submission so the vendor can correct and resubmit.
+
+    Keeps the voided copy entire -- its signatures and its PDF hash are the record
+    of what was attested at the time, and are what make the correction auditable
+    rather than a rewrite.
+
+    Returns the NEW active submission, ready to be filled in.
+    """
+    if submission.state == DispatchSubmissionState.VOIDED:
+        raise ValueError("submission is already voided")
+
+    order = submission.dispatch_order
+    submission.state = DispatchSubmissionState.VOIDED
+    submission.voided_at = timezone.now()
+    submission.voided_by = vendor_user
+    submission.void_reason = reason
+    submission.save(
+        update_fields=["state", "voided_at", "voided_by", "void_reason"]
+    )
+
+    # Unite Us may already hold this evidence. Flag those uploads as superseded so
+    # the drift is VISIBLE -- otherwise Unite Us keeps a document the CRM now
+    # rejects and nothing says so, which is the silent-divergence class of bug.
+    superseded = submission.uniteus_uploads.filter(superseded_at=None).update(
+        superseded_at=timezone.now()
+    )
+
+    record_transition(
+        order, order.status, order.status,
+        actor=None, source=StageEventSource.MANUAL,
+        note=reason or "submission voided",
+        metadata={
+            "voided_submission": str(submission.dispatch_submission_id),
+            "sequence": submission.sequence,
+            "superseded_uploads": superseded,
+        },
+    )
+    # The order is awaiting a valid submission again; the gate must be met afresh.
+    set_status(
+        order, DispatchStatus.PENDING_SUBMISSION,
+        source=StageEventSource.AUTO, note="voided, awaiting resubmission",
+    )
+    return open_submission(order)
+
+
+# ── linking remediation cases ────────────────────────────────────────────────
+
+def assessment_order_for(client):
+    """The member's assessment order, or None."""
+    return DispatchOrder.objects.filter(
+        client=client, kind=DispatchKind.ASSESSMENT,
+    ).first()
+
+
+@transaction.atomic
+def sync_dispatch_items(assessment):
+    """Create a DispatchItem for each of the member's housing work-order cases.
+
+    Replaces the old one-order-per-case model. A case now yields an ITEM -- "a grab
+    bar in Brooklyn" -- and a work order is a batch an agent later assembles from
+    approved items. So this runs on both entry points and only ever ADDS:
+
+      * when the assessment order is created, for cases that arrived first;
+      * on every import, for cases that arrive afterwards.
+
+    Idempotent through the one-item-per-case constraint, and it never touches an
+    item that is already in a work order -- re-importing a case must not re-describe
+    work a vendor has already been sent.
+    """
+    from api.models import DispatchItem
+    from api.services.housing import housing_work_order_item, housing_work_orders
+
+    created = []
+    existing = set(
+        DispatchItem.objects
+        .filter(case__client=assessment.client)
+        .values_list("case_id", flat=True)
+    )
+    for case in housing_work_orders(assessment.client):
+        if case.case_id in existing:
+            continue
+        item, location = housing_work_order_item(case)
+        row = DispatchItem.objects.create(
+            assessment=assessment, case=case,
+            item=item, location=location, program_name=case.program_name or "",
+        )
+        created.append(row)
+        record_transition(
+            assessment, assessment.status, assessment.status,
+            source=StageEventSource.AUTO,
+            note=(f"item added: {item} ({location})" if item else "housing item added"),
+            metadata={
+                "case_id": str(case.case_id), "item": item, "location": location,
+                "program_name": case.program_name or "",
+            },
+        )
+    return created
+
+
+# Kept under the old name because the assessment-order endpoint and the import
+# reconcile both call it, and "adopt" is still what it does -- it now adopts the
+# member's waiting cases as ITEMS rather than as orders.
+def adopt_unlinked_remediation_cases(assessment):
+    return sync_dispatch_items(assessment)
+
+
+@transaction.atomic
+def create_work_order(assessment, item_ids, *, vendor=None, actor=None, notes="",
+                      agent=None):
+    """Assemble a work order from approved, undispatched items.
+
+    Raises ValueError naming the offending items rather than silently dropping
+    them: an agent who selected six and got a work order for four would not notice,
+    and the two that vanished are exactly the ones someone is waiting on.
+
+    Every item must be AVAILABLE -- approved, its authorization window still open,
+    and not already dispatched. Checked here rather than trusted from the request,
+    because the selection list an agent saw may be seconds stale -- and an
+    authorization window can lapse between loading the page and submitting it.
+    """
+    from api.models import DispatchItem, DispatchKind, DispatchOrder
+
+    items = list(
+        DispatchItem.objects
+        .select_related("case")
+        .filter(dispatch_item_id__in=item_ids, assessment=assessment)
+    )
+    if not items:
+        raise ValueError("select at least one item")
+
+    missing = set(str(i) for i in item_ids) - {
+        str(i.dispatch_item_id) for i in items
+    }
+    if missing:
+        raise ValueError(f"unknown item(s): {', '.join(sorted(missing))}")
+
+    unavailable = [i for i in items if not i.is_available]
+    if unavailable:
+        def _reason(i):
+            if i.dispatch_order_id:
+                return "already in a work order"
+            if not i.is_approved:
+                return i.authorization_status or "no authorization"
+            _s, end = i.authorization_window
+            return f"authorization expired {end:%Y-%m-%d}" if end else "not authorized"
+
+        why = ", ".join(f"{i.item or i.case_id} ({_reason(i)})" for i in unavailable)
+        raise ValueError(f"cannot dispatch: {why}")
+
+    # One borough per work order: a vendor visit is a trip to an address, and the
+    # items all belong to the same dwelling anyway. Mixed boroughs would mean the
+    # parse went wrong somewhere.
+    locations = {i.location for i in items if i.location}
+    order = DispatchOrder.objects.create(
+        kind=DispatchKind.REMEDIATION,
+        parent=assessment,
+        client=assessment.client,
+        vendor=vendor or assessment.vendor,
+        location=locations.pop() if len(locations) == 1 else "",
+        status=DispatchStatus.PENDING_SCHEDULE,
+        notes=notes,
+        # Inherited, not copied: the address was verified once on the assessment.
+    )
+    DispatchItem.objects.filter(
+        dispatch_item_id__in=[i.dispatch_item_id for i in items],
+    ).update(dispatch_order=order)
+
+    record_transition(
+        order, "", order.status,
+        actor=actor, source=StageEventSource.MANUAL, agent=agent,
+        note=f"work order created with {len(items)} item(s)",
+        metadata={
+            "items": [i.item for i in items],
+            "item_ids": [str(i.dispatch_item_id) for i in items],
+            "case_ids": [str(i.case_id) for i in items],
+        },
+    )
+    return order
+
+
+@transaction.atomic
+def reconcile_dispatch_orders(client):
+    """Bring a member's dispatch orders in line with their housing cases.
+
+    Called ONCE per client after an import, from the same places as
+    ``reconcile_internal_service_authorization`` -- so it sees the COMPLETE case
+    picture rather than firing per row against a partial one. A member can arrive
+    carrying several Home Remediation cases in one payload.
+
+    Only ever CREATES: a DispatchItem for each housing work-order case, once the
+    member has an assessment order. Cases that arrive first simply wait, and are
+    picked up here on a later import or when the assessment is created. Assembling
+    items into a WORK ORDER stays a deliberate agent action -- an import must never
+    dispatch a vendor by itself.
+
+    Never raises -- a dispatch hiccup must not fail a case import, the same
+    contract the food reconcile already honours.
+    """
+    try:
+        assessment = assessment_order_for(client)
+        if assessment is None:
+            return []
+        return sync_dispatch_items(assessment)
+    except Exception:  # noqa: BLE001 - never fail the import
+        logger.exception("reconcile_dispatch_orders failed for client %s", client.pk)
+        return []

@@ -1374,6 +1374,7 @@ class CsvImporter:
         Runs OUTSIDE the ``deferred_internal_service_reconcile`` context, so this
         is the reconcile the deferred per-save calls were skipped in favor of.
         Each client is isolated -- one reconcile hiccup never fails the run."""
+        from api.services.dispatch import reconcile_dispatch_orders
         from api.services.lifecycle import reconcile_internal_service_authorization
 
         ids = list(self.reconcile_client_ids)
@@ -1390,6 +1391,10 @@ class CsvImporter:
             for client in clients:
                 try:
                     reconcile_internal_service_authorization(client)
+                    # Housing dispatch, same contract: once per client, on the
+                    # complete case picture. A member can arrive with several Home
+                    # Remediation cases in one payload.
+                    reconcile_dispatch_orders(client)
                 except Exception:  # noqa: BLE001 - never fail the run on a reconcile hiccup
                     logger.warning(
                         "csv_import reconcile failed for %s", client.pk, exc_info=True

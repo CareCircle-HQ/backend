@@ -877,10 +877,19 @@ def valid_social_care_exists():
 
 
 def has_open_internal_service_case(client):
-    """True when the client holds an internal-service (meal/box) case that is
-    not closed/cancelled -- the case the verification + delivery attach to."""
+    """True when the client holds an open FOOD internal-service (meal/box) case --
+    the case the verification + delivery attach to.
+
+    FOOD ONLY. This gates entry to the verification wizard, so without the filter
+    a HOUSING-only member would pass it and be offered food verification: a
+    dwelling assessment is verified by a different process entirely (a vendor
+    inspection), never by the meal/box wizard.
+    """
+    from api.services.catalog import is_food_case
+
     return any(
         c.case_type == CaseType.INTERNAL_SERVICE
+        and is_food_case(c)
         and c.case_status not in (CaseStatus.CLOSED, CaseStatus.CANCELLED)
         for c in client.cases.all()
     )
@@ -1391,12 +1400,21 @@ def governing_internal_case(enrollment):
     reauthorization extension is deferred (see :func:`pick_governing_case`) so it
     doesn't prematurely supplant the serving case. Falls back to
     ``enrollment.case`` when the client has no internal-service case.
+
+    FOOD ONLY. This is the enrollment's governing case for MEAL/BOX service, and
+    it is the fallback the verification wizard binds to when no case_id is posted.
+    Without the filter an approved housing assessment -- newest, so highest-ranked
+    -- became the "governing" case and the verification was written against a
+    dwelling assessment. Caught by a test, after the picker and the endpoint
+    filter had both been closed and this third path was still open.
     """
+    from api.services.catalog import is_food_case
+
     client = enrollment.client
     if client is not None:
         cases = [
             c for c in client.cases.all()
-            if c.case_type == CaseType.INTERNAL_SERVICE
+            if c.case_type == CaseType.INTERNAL_SERVICE and is_food_case(c)
         ]
         if cases:
             return pick_governing_case(cases)
@@ -1715,7 +1733,7 @@ def program_tracks(client):
     """
     from api.models import CaseHouseholdType, ProductTypeKind
     from api.models import ServiceAuthorizationStatus as A
-    from api.services.catalog import product_type_kind_for_name
+    from api.services.catalog import case_service_domain, product_type_kind_for_name
 
     if client is None:
         return []
@@ -1726,16 +1744,53 @@ def program_tracks(client):
     # non-governing case drops off (its history lives on the Programs tab). A
     # NEVER_REQUESTED authorization is treated like a denial and stays hidden for
     # every case (governing included) -- it is not a real program to surface.
-    all_cases = _internal_service_cases(client)
+    # DISPLAY includes every service TYPE; RESOLUTION stays per type. The bar is
+    # the member's whole picture, so a housing assessment belongs on it -- but it
+    # must not be mistaken for the case governing FOOD. So each type contributes
+    # its own governing case, and `governing` is true for each of them.
+    from api.services.housing import housing_assessment_cases, housing_work_orders
+
+    food_cases = _internal_service_cases(client)
+    housing_assessments = housing_assessment_cases(client)
+    all_cases = food_cases + housing_assessments + housing_work_orders(client)
     if not all_cases:
         return []
-    governing = pick_governing_case(all_cases)
+
+    # `governing` stays the FOOD governing case: gov_kind / gov_label and the
+    # duplicate/conflict rules below are food concepts (Meals vs Boxes).
+    governing = pick_governing_case(food_cases) if food_cases else None
+
+    # One governing case PER TYPE. Only an ASSESSMENT can govern housing -- work
+    # orders never do, so they render as ordinary rows.
+    governing_ids = {governing.case_id} if governing is not None else set()
+    if housing_assessments:
+        governing_ids.add(housing_assessments[0].case_id)
+
+    # What earns a row differs BY TYPE, because the two types carry different
+    # amounts of noise.
+    #
+    # FOOD keeps its non-governing OPEN cases: they carry three real signals --
+    # "Duplicated" (a second case of the same kind), "Conflicting" (a Boxes case
+    # beside a governing Meals case) and "Reauthorization - Waiting" (a parked
+    # future extension, docs/reauthorization_extension_plan.md). A Conflicting row
+    # is how an agent SEES two competing food cases, which is the precondition of
+    # the enrollment fork loop that rewrote 149 enrollments across three families
+    # in the week of 2026-09-14. Hiding it would remove the cue for that exact
+    # failure.
+    #
+    # HOUSING shows only its governing assessment. Its non-governing cases are
+    # WORK ORDERS -- one per remediation item, 9 for the first member -- which
+    # buried the rows that describe the member's service and carry no
+    # authorization decision worth a row. They live on the Cases tab's
+    # "Home Assistance" filter instead.
+    from api.services.catalog import is_food_case as _is_food
+
     cases = [
         c for c in all_cases
         if c.service_authorization_status != A.NEVER_REQUESTED
         and (
-            c.case_status not in _CLOSED_CASE_STATUSES
-            or c.case_id == governing.case_id
+            c.case_id in governing_ids
+            or (_is_food(c) and c.case_status not in _CLOSED_CASE_STATUSES)
         )
     ]
 
@@ -1781,7 +1836,7 @@ def program_tracks(client):
     for c in cases:
         kind = product_type_kind_for_name(c.service_type or c.program_name)
         is_food = kind is not None
-        is_governing = governing is not None and c.case_id == governing.case_id
+        is_governing = c.case_id in governing_ids
         if is_food:
             # A "duplicate" is a non-governing case for the SAME food kind; a
             # DIFFERENT-kind non-governing food case CONFLICTS (a household runs
@@ -1842,16 +1897,20 @@ def program_tracks(client):
             # already closed/cancelled (a closed governing case still renders).
             "case_status": getattr(c, "case_status", "") or "",
             "governing": is_governing,
+            # Service TYPE, so the bar can mark WHICH governing case this is:
+            # F for food, H for housing. Two cases can be governing at once.
+            "domain": case_service_domain(c),
             "scope": {"value": ht, "label": CaseHouseholdType(ht).label},
             "authorization": {"value": a_val, "label": a_lbl},
             "verification": {"value": v_val, "label": v_lbl},
             "nutritionist": {"value": n_val, "label": n_lbl},
             "service": {"value": s_val, "label": s_lbl},
         })
-    # Governing first, then by service-type label + case id (a stable,
-    # environment-independent order).
+    # Governing first, then FOOD before other types -- food is the primary
+    # service and should lead the bar -- then by service-type label + case id (a
+    # stable, environment-independent order).
     tracks.sort(key=lambda t: (
-        not t["governing"], t["service_type"], t["case_id"]
+        not t["governing"], t["domain"] != "food", t["service_type"], t["case_id"]
     ))
     return tracks
 
@@ -3538,6 +3597,29 @@ def _create_missing_carried_profiles(target, source):
     return created
 
 
+def _retire_enrollment_deliveries(enr):
+    """Shorten every delivery plan on a now-dead enrollment so it stops serving.
+
+    Any path that ENDS an enrollment must call this. The window is shortened
+    rather than the occurrences merely deleted, because the nightly
+    ``sync_active_calendars`` regenerates from the window -- deleting alone lets
+    them come straight back.
+
+    Never raises: retiring a calendar must not fail the transition that triggered
+    it, or a swallowed error would leave the enrollment dead AND still serving --
+    the worst of both.
+    """
+    try:
+        from api.services.orders import truncate_future_deliveries
+
+        if enr.delivery_schedules.exists():
+            truncate_future_deliveries(enr)
+    except Exception:  # noqa: BLE001 - never fail the caller's transition
+        logger.exception(
+            "failed to retire deliveries for dead enrollment %s", enr.pk,
+        )
+
+
 def _force_close_enrollment(enr):
     """Terminate ``enr`` as CLOSED even when the transition map has no edge from
     its current stage (e.g. verified / kitchen_assignment). Used ONLY for the
@@ -4250,12 +4332,19 @@ def replace_enrollment_for_case_change(
         }
         # The PRIOR internal-service case this enrollment used to serve under (the
         # one that CLOSED and unbound it). Newest by governing-case tie-breaker.
-        prior_case = (
+        # FOOD only -- a housing case is never the "prior" case a meal/box
+        # enrollment used to serve under. Excluded by program name because the
+        # service TYPE is derived, not a column, so it cannot be a SQL filter.
+        from api.services.catalog import non_food_program_q
+
+        _prior_qs = (
             client.cases.filter(case_type=CaseType.INTERNAL_SERVICE)
             .exclude(case_id=new_governing_case.case_id)
-            .order_by("-case_created_at", "-date_opened")
-            .first()
         )
+        _non_food = non_food_program_q()
+        if _non_food is not None:
+            _prior_qs = _prior_qs.exclude(_non_food)
+        prior_case = _prior_qs.order_by("-case_created_at", "-date_opened").first()
         if EnrollmentStage(live.stage) not in _served_stages or prior_case is None:
             return None
         # INVARIANT: every enrollment must reference its case. This served
@@ -4494,7 +4583,19 @@ def replace_enrollment_for_case_change(
 
 
 def _internal_service_cases(client):
-    return [c for c in client.cases.all() if c.case_type == CaseType.INTERNAL_SERVICE]
+    """The client's FOOD internal-service cases.
+
+    Housing internal-service cases are a different TYPE with their own governing
+    case and must never enter the meal/box lifecycle -- enrollment binding,
+    switches, close-outs. is_food_case defaults an UNKNOWN program to food, so
+    nothing predating the housing work changes.
+    """
+    from api.services.catalog import is_food_case
+
+    return [
+        c for c in client.cases.all()
+        if c.case_type == CaseType.INTERNAL_SERVICE and is_food_case(c)
+    ]
 
 
 def open_internal_service_cases(client):
@@ -4767,7 +4868,7 @@ def _bind_governing_case_to_serving_enrollment(client, governing):
         # running on the right case, instead of letting the switch logic park or
         # close the serving member. A genuine change to a NON-deferred case is a
         # real switch and is left to the replace path.
-        _cases = [c for c in client.cases.all() if c.case_type == CaseType.INTERNAL_SERVICE]
+        _cases = _internal_service_cases(client)  # FOOD only
         if str(serv.case_id) not in {str(x) for x in deferred_extension_case_ids(_cases)}:
             return False  # a genuine case change is handled elsewhere
     # Holders across ALL clients (the per-case unique constraint is global): skip
@@ -4793,6 +4894,14 @@ def _bind_governing_case_to_serving_enrollment(client, governing):
             e.save(update_fields=["case", "stage", "close_reason"])
         except Exception:  # pragma: no cover - defensive
             pass
+        else:
+            # A DISREGARDED enrollment must not keep a delivery calendar. Without
+            # this the dead row's MemberDeliverySchedule stays `scheduled` with a
+            # future (or NULL) window, and PO generation serves BOTH plans: THERESA
+            # HOLLAND received Mon/Thu AND Tue/Fri, 4 deliveries a week instead of
+            # 2, for over a month. _force_close_enrollment already does this for
+            # the superseded side of a case replacement; this path did not.
+            _retire_enrollment_deliveries(e)
     serv.case = governing
     try:
         serv.save(update_fields=["case"])

@@ -774,6 +774,7 @@ class CaseViewSet(BulkUpsertMixin, viewsets.ModelViewSet):
         per-save reconcile for the loop, collect the touched clients, then
         reconcile each exactly once. Mirrors the CSV import + Unite Us pull.
         """
+        from .services.dispatch import reconcile_dispatch_orders
         from .services.lifecycle import (
             deferred_internal_service_reconcile,
             reconcile_internal_service_authorization,
@@ -794,6 +795,9 @@ class CaseViewSet(BulkUpsertMixin, viewsets.ModelViewSet):
                 continue
             try:
                 reconcile_internal_service_authorization(client, actor=actor)
+                # Housing dispatch, same contract as above: once per client, on
+                # the complete case picture.
+                reconcile_dispatch_orders(client)
             except Exception:  # noqa: BLE001 - never fail the write on a reconcile
                 logger.exception("bulk case reconcile failed for client %s", cid)
         return response

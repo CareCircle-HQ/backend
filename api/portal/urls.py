@@ -193,6 +193,14 @@ from .views_imports import (
     UniteUsExportPollView,
     UniteUsExportsView,
 )
+from .views_dispatch import (
+    MemberAssessmentFormView,
+    MemberAssessmentOrderCreateView,
+    MemberAssessmentOrderUpdateView,
+    MemberWorkOrderCreateView,
+    MemberDispatchHistoryView,
+    MemberDispatchOrdersView,
+)
 from .views_settings import (
     ActiveProgramViewSet,
     CadenceViewSet,
@@ -201,6 +209,7 @@ from .views_settings import (
     DeliveryCompanyIntegrationDetailView,
     DeliveryCompanyIntegrationSetPrimaryView,
     DeliveryCompanyViewSet,
+    VendorViewSet,
     DietaryTagViewSet,
     KitchenIntegrationDetailView,
     KitchenViewSet,
@@ -219,6 +228,7 @@ from .views_tickets import (
 )
 
 router = SimpleRouter()
+router.register("settings/vendors", VendorViewSet, basename="portal-vendor")
 router.register("settings/menu-types", MenuTypeViewSet, basename="portal-menu-type")
 router.register("settings/meal-plans", MealPlanViewSet, basename="portal-meal-plan")
 router.register("settings/dietary-tags", DietaryTagViewSet, basename="portal-dietary-tag")
@@ -276,6 +286,34 @@ urlpatterns = [
     path("teams/", TeamsListView.as_view(), name="portal-teams"),
     path("verifiers/", VerifiersListView.as_view(), name="portal-verifiers"),
     path("ticket-types/", TicketTypesListView.as_view(), name="portal-ticket-types"),
+    # Housing dispatch (CRM side): read every order, and run the assessment-order
+    # wizard. Nothing here writes vendor evidence -- see views_dispatch.
+    path(
+        "members/<uuid:client_id>/dispatch-orders/",
+        MemberDispatchOrdersView.as_view(), name="portal-member-dispatch-orders",
+    ),
+    path(
+        "members/<uuid:client_id>/assessment-order/",
+        MemberAssessmentOrderCreateView.as_view(),
+        name="portal-member-assessment-order",
+    ),
+    path(
+        "members/<uuid:client_id>/assessment-form/",
+        MemberAssessmentFormView.as_view(), name="portal-member-assessment-form",
+    ),
+    path(
+        "members/<uuid:client_id>/dispatch-history/",
+        MemberDispatchHistoryView.as_view(), name="portal-member-dispatch-history",
+    ),
+    path(
+        "members/<uuid:client_id>/work-orders/",
+        MemberWorkOrderCreateView.as_view(), name="portal-member-work-orders",
+    ),
+    path(
+        "members/<uuid:client_id>/assessment-order/<uuid:order_id>/",
+        MemberAssessmentOrderUpdateView.as_view(),
+        name="portal-member-assessment-order-update",
+    ),
     path("cadences/", CadencesListView.as_view(), name="portal-cadences"),
     path("members/<uuid:client_id>/", MemberDetailView.as_view(), name="portal-member-detail"),
     path("members/<uuid:client_id>/tags/", MemberTagsView.as_view(), name="portal-member-tags"),

@@ -7,6 +7,8 @@ from unittest import mock
 from unittest.mock import patch
 
 from django.core.files.uploadedfile import SimpleUploadedFile
+import json
+
 from django.test import SimpleTestCase, TestCase, override_settings
 from django.urls import reverse
 from django.utils import timezone
@@ -8082,25 +8084,47 @@ class ProgramTracksTest(TestCase):
         )
         from .services.lifecycle import program_tracks
 
-        # Meals is Approved (governs); Housing is a second internal-service case.
+        # Meals is Approved (governs food); the assessment governs HOUSING.
+        from .models import ActiveProgram
+        from .services.catalog import clear_program_domain_cache
+
         client = self._setup(
             stage=EnrollmentStage.SERVICE_ACTIVE,
             auth=ServiceAuthorizationStatus.APPROVED,
         )
+        # The service TYPE is DERIVED from the program via ActiveProgram, so the
+        # program has to be registered as housing. Without the row it derives as
+        # FOOD -- unknown programs default to food so nothing predating housing
+        # changes behaviour -- and would be filtered off the bar as a
+        # non-governing food case.
+        housing_program = (
+            "Dwelling Assessment & Statement of Work (SOW) Development - "
+            "Modifications and Remediation Service - Brooklyn"
+        )
+        ActiveProgram.objects.create(
+            program_name=housing_program, case_category="Internal Services",
+            case_type=ActiveProgram.CaseType.HOUSING,
+            service_type=ActiveProgram.ServiceType.ENVIRONMENTAL_EXPOSURE_ASSESSMENT,
+        )
+        clear_program_domain_cache()
         Case.objects.create(
             case_id=str(uuid.uuid4()), client=client,
             case_type=CaseType.INTERNAL_SERVICE, case_status=CaseStatus.OPEN,
-            service_type="Housing", service_category="Housing",
-            program_name="Housing Program",
+            service_type="Environmental Exposure Assessment",
+            service_category="Housing", program_name=housing_program,
             service_authorization_status=ServiceAuthorizationStatus.PENDING,
         )
         tracks = program_tracks(client)
         self.assertEqual(len(tracks), 2)
-        housing = next(t for t in tracks if t["category"] == "Housing")
-        self.assertEqual(housing["service_type"], "Housing")
-        self.assertEqual(housing["service_type_value"], "housing")
-        self.assertFalse(housing["governing"])
+        housing = next(t for t in tracks if t["domain"] == "housing")
+        self.assertEqual(housing["service_type"], "Environmental Exposure Assessment")
+        # GOVERNING -- one governing case per service TYPE, so the housing
+        # assessment governs housing while Meals governs food. It was previously
+        # asserted non-governing, when a single case governed the whole member.
+        self.assertTrue(housing["governing"])
         self.assertEqual(housing["authorization"]["label"], "Requested")
+        # Verification/Service stay blank: they are food concepts driven by the
+        # meal/box enrollment, and a dwelling assessment has neither.
         self.assertEqual(housing["verification"]["label"], "")
         self.assertEqual(housing["service"]["label"], "")
         # The food program still resolves its phases from the enrollment.
@@ -8111,7 +8135,7 @@ class ProgramTracksTest(TestCase):
     def test_two_cases_same_kind_show_as_separate_tracks(self):
         """Two Meals internal-service cases produce TWO tracks (not grouped): the
         governing (Approved) one carries the Verification/Service phases; the
-        other (Pending) shows Authorization only."""
+        other (Pending) shows Authorization only."""""
         from .models import (
             Case, CaseStatus, CaseType, EnrollmentStage, ServiceAuthorizationStatus,
         )
@@ -8137,7 +8161,8 @@ class ProgramTracksTest(TestCase):
         self.assertEqual(gov["authorization"]["label"], "Approved")
         self.assertEqual(gov["service"]["label"], "Active")
         # The competing (duplicate) case shares the household verification but
-        # is not separately serviced -> "Duplicated".
+        # is not separately serviced -> "Duplicated". FOOD keeps its
+        # non-governing open rows; only HOUSING work orders are shed from the bar.
         self.assertEqual(other["authorization"]["label"], "Requested")
         self.assertEqual(other["verification"]["label"], "Verified")
         self.assertEqual(other["service"]["label"], "Duplicated")
@@ -25652,12 +25677,57 @@ class UnmappedProgramNameMetricsTest(TestCase):
         self.assertEqual(collect()["UnmappedProgramNames"][0], before)
 
     def test_the_command_names_the_unmapped_identifiers(self):
-        from .management.commands.publish_health_metrics import (
-            _unmapped_program_identifiers,
-        )
+        from .services.health_metrics import unmapped_program_identifiers
 
         self._case(self._client("Novel"), program_name="Nutrition Support Benefit")
-        self.assertIn("Nutrition Support Benefit", _unmapped_program_identifiers())
+        self.assertIn("Nutrition Support Benefit", unmapped_program_identifiers())
+
+    def test_a_NON_FOOD_program_is_not_counted_as_unmapped(self):
+        """Housing programs deliver no meal or box, so having no product kind is
+        correct, not a defect. Without this exclusion the 3 Dwelling Assessment
+        programs put UnmappedProgramNames at 2 and started an alarm that could
+        never clear."""
+        from .models import ActiveProgram
+        from .services.health_metrics import collect, unmapped_program_identifiers
+
+        name = (
+            "Dwelling Assessment & Statement of Work (SOW) Development - "
+            "Modifications and Remediation Service - Brooklyn"
+        )
+        ActiveProgram.objects.create(
+            program_name=name, case_category="Internal Services",
+            case_type=ActiveProgram.CaseType.HOUSING,
+            service_type=ActiveProgram.ServiceType.ENVIRONMENTAL_EXPOSURE_ASSESSMENT,
+        )
+        before = collect()["UnmappedProgramNames"][0]
+        self._case(
+            self._client("Housing"), program_name=name,
+            service_type="Environmental Exposure Assessment",
+        )
+        self.assertEqual(collect()["UnmappedProgramNames"][0], before)
+        self.assertNotIn(name, unmapped_program_identifiers())
+
+    def test_a_housing_member_is_not_a_blank_MealsBoxes_row(self):
+        """Same reason, downstream: a housing member has no product kind by
+        design, so they are not a gap in the Meals/Boxes cards."""
+        from .models import ActiveProgram, Client, EnrollmentAnalytics
+        from .services.health_metrics import collect
+
+        name = "Dwelling Assessment & SOW Development - Housing Metric Test"
+        ActiveProgram.objects.create(
+            program_name=name, case_category="Internal Services",
+            case_type=ActiveProgram.CaseType.HOUSING,
+        )
+        owner = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Housing", last_name="Row",
+            client_added_at=timezone.now(),
+        )
+        before = collect()["ServiceTypeBlankWithCase"][0]
+        EnrollmentAnalytics.objects.create(
+            client=owner, company_status="active", service_type="",
+            program_name=name, refreshed_at=timezone.now(),
+        )
+        self.assertEqual(collect()["ServiceTypeBlankWithCase"][0], before)
 
     def test_the_blank_row_metric_reads_the_PRIMARY(self):
         """It is a CORRECTNESS check, unlike ReadModelAgeHours which measures
@@ -25734,3 +25804,3990 @@ class ClosedCaseSweepIsGatedTest(TestCase):
                 hasattr(module, func),
                 f"beat entry {name!r} points at {path!r}, which does not exist",
             )
+
+
+class HousingInternalServiceProgramTest(TestCase):
+    """Housing programs are Internal Services of a different TYPE.
+
+    We are beginning to process housing programs. The three Dwelling Assessment /
+    SOW Development programs are the housing service WE deliver, so they move from
+    External to Internal Services with `case_type = housing`; every other housing
+    program (the 7 under the active ProgramMainCategory "Housing" -- Asthma
+    Remediation, Tenancy Sustaining Services, ...) stays external.
+
+    Migrations are disabled under `manage.py test` (see AGENTS.md), so these build
+    their own ActiveProgram rows rather than asserting on migration 0262's output.
+    """
+
+    DWELLING = (
+        "Dwelling Assessment & Statement of Work (SOW) Development - "
+        "Modifications and Remediation Service - Brooklyn"
+    )
+
+    def test_housing_is_a_valid_program_type(self):
+        from .models import ActiveProgram
+
+        self.assertIn("housing", [c[0] for c in ActiveProgram.CaseType.choices])
+
+    def test_an_internal_housing_program_routes_to_INTERNAL_SERVICE(self):
+        """case_category is the authoritative routing label, so a housing program
+        marked Internal Services drives the service lifecycle."""
+        from .models import ActiveProgram, CaseType
+        from .serializers import derive_case_type_from_active_program
+
+        ActiveProgram.objects.create(
+            program_name=self.DWELLING, case_category="Internal Services",
+            case_type=ActiveProgram.CaseType.HOUSING, main_category="Housing",
+        )
+        self.assertEqual(
+            derive_case_type_from_active_program(self.DWELLING),
+            CaseType.INTERNAL_SERVICE,
+        )
+
+    def test_the_singular_and_plural_category_spellings_both_route(self):
+        """Existing rows use 'Internal Services' (plural); _CATEGORY_TO_CASE_TYPE
+        accepts both, and the migration matches the existing spelling."""
+        from .models import ActiveProgram, CaseType
+        from .serializers import derive_case_type_from_active_program
+
+        for i, spelling in enumerate(("Internal Service", "Internal Services")):
+            ActiveProgram.objects.create(
+                program_name=f"Housing Programme {i}", case_category=spelling,
+                case_type=ActiveProgram.CaseType.HOUSING,
+            )
+            self.assertEqual(
+                derive_case_type_from_active_program(f"Housing Programme {i}"),
+                CaseType.INTERNAL_SERVICE, spelling,
+            )
+
+    def test_other_housing_programs_stay_external(self):
+        """Only the three named programs become internal. The rest are referrals
+        out and must NOT enter the service lifecycle."""
+        from .models import ActiveProgram, CaseType
+        from .serializers import derive_case_type_from_active_program
+
+        for name in ("Tenancy Sustaining Services", "Asthma Remediation",
+                     "Rent/Temporary Housing Rent Payment Assistance"):
+            ActiveProgram.objects.create(
+                program_name=name, case_category="External Services",
+                case_type=ActiveProgram.CaseType.HOUSING, main_category="Housing",
+            )
+            self.assertEqual(
+                derive_case_type_from_active_program(name),
+                CaseType.EXTERNAL_SERVICE, name,
+            )
+
+    def test_a_housing_program_is_NOT_a_meals_or_boxes_product(self):
+        """Consequence worth pinning: product_type_kind_for_name matches food
+        keywords, so a housing program resolves to NO product kind. That is
+        correct -- and it means housing cases will show a blank service_type and
+        register in the UnmappedProgramNames health metric until the Meals/Boxes
+        reporting explicitly excludes non-food types.
+        """
+        from .services.catalog import product_type_kind_for_name
+
+        self.assertIsNone(product_type_kind_for_name(self.DWELLING))
+        self.assertIsNone(
+            product_type_kind_for_name("Dwelling Assessment & SOW Development"),
+        )
+
+    def test_the_default_program_type_is_still_food(self):
+        """Backwards compatibility: every program predating housing is food, and
+        an omitted case_type must not silently become housing."""
+        from .models import ActiveProgram
+
+        p = ActiveProgram.objects.create(program_name="Some Meals Programme")
+        self.assertEqual(p.case_type, ActiveProgram.CaseType.FOOD)
+
+
+class ProgramMainCategoryAdminTest(TestCase):
+    """`is_active` marks a category as a program area we are processing, and is
+    the source of the available service types -- "Housing" was activated to begin
+    this work. It must be visible and filterable in the admin, not buried in the
+    change form."""
+
+    def test_is_active_is_listed_filterable_and_editable(self):
+        from django.contrib import admin as dj_admin
+
+        from .models import ProgramMainCategory
+
+        cfg = dj_admin.site._registry[ProgramMainCategory]
+        self.assertIn("is_active", cfg.list_display)
+        self.assertIn("is_active", cfg.list_filter)
+        self.assertIn("is_active", cfg.list_editable)
+
+
+class HousingServiceTypeTest(TestCase):
+    """The housing programs deliver "Environmental Exposure Assessment".
+
+    Unite Us sends that string verbatim as the case's service_type -- confirmed
+    against the one housing case already in the CRM (KAMARI GREENE, program
+    "Dwelling Assessment & SOW Development ... - Brooklyn").
+
+    Migrations are disabled under `manage.py test` (AGENTS.md), so these build
+    their own rows rather than asserting on migration 0264's output.
+    """
+
+    DWELLING = (
+        "Dwelling Assessment & Statement of Work (SOW) Development - "
+        "Modifications and Remediation Service - Brooklyn"
+    )
+    SERVICE = "Environmental Exposure Assessment"
+
+    def _program(self, **kw):
+        from .models import ActiveProgram
+
+        opts = {
+            "program_name": self.DWELLING,
+            "case_category": "Internal Services",
+            "case_type": ActiveProgram.CaseType.HOUSING,
+            "service_type": ActiveProgram.ServiceType.ENVIRONMENTAL_EXPOSURE_ASSESSMENT,
+            "main_category": "Housing",
+        }
+        opts.update(kw)
+        return ActiveProgram.objects.create(**opts)
+
+    def test_environmental_exposure_assessment_is_a_valid_service_type(self):
+        from .models import ActiveProgram
+
+        self.assertIn(
+            "environmental_exposure_assessment",
+            [c[0] for c in ActiveProgram.ServiceType.choices],
+        )
+
+    def test_a_housing_case_classifies_as_internal_service(self):
+        from .models import CaseType
+        from .serializers import derive_case_type
+
+        self._program()
+        self.assertEqual(
+            derive_case_type(self.SERVICE, self.DWELLING), CaseType.INTERNAL_SERVICE,
+        )
+
+    def test_a_housing_case_is_now_IN_import_scope(self):
+        """Before the reclassification these programs were External Services, so
+        `case_in_import_scope` returned False and the importer SKIPPED them. This
+        is the switch that turns housing case import on."""
+        from .serializers import case_in_import_scope
+
+        self._program()
+        self.assertTrue(case_in_import_scope(self.SERVICE, self.DWELLING))
+
+    def test_a_referral_only_housing_programme_stays_OUT_of_scope(self):
+        """The 7 programs under the active Housing category are referrals out.
+        They must not be imported as our own service."""
+        from .serializers import case_in_import_scope
+
+        self._program(
+            program_name="Tenancy Sustaining Services",
+            case_category="External Services", service_type="",
+        )
+        self.assertFalse(case_in_import_scope("Housing", "Tenancy Sustaining Services"))
+
+    def test_housing_is_NOT_a_meal_box_subtype(self):
+        """INTERNAL_SERVICE_SUBTYPES means "IS our meal/box service": it forces
+        INTERNAL_SERVICE regardless of program AND drives
+        purge_out_of_scope_cases. Housing classifies via the program-name path
+        instead, so adding it there would blur that meaning for no gain."""
+        from .serializers import INTERNAL_SERVICE_SUBTYPES
+
+        self.assertNotIn(self.SERVICE.casefold(), INTERNAL_SERVICE_SUBTYPES)
+
+    def test_a_housing_case_with_NO_program_row_is_out_of_scope(self):
+        """The consequence of the decision above, stated: with a blank or
+        unmatched program_name a housing case cannot be recognised, because the
+        subtype path does not know about it. This is the one scenario that would
+        justify revisiting INTERNAL_SERVICE_SUBTYPES."""
+        from .serializers import case_in_import_scope
+
+        self.assertFalse(case_in_import_scope(self.SERVICE, ""))
+        self.assertFalse(case_in_import_scope(self.SERVICE, "Unknown Programme"))
+
+
+class DataPageTicketTypeFilterTest(TestCase):
+    """The Data page's Ticket Type filter must match ANY ticket, not just live ones.
+
+    Reported as "Ticket Type filter not working": the intent is "members who have
+    a ticket of this type", but the read model only recorded types for
+    OPEN/IN_PROGRESS tickets, so 81% of the population was invisible --
+    6,662 members hold a ticket, only 1,258 hold a live one (9,727 tickets are
+    resolved against 1,186 open). The filter worked; it was just answering a
+    different question.
+
+    Deliberately WIDER than the Members page filter, which binds to
+    tickets__status=OPEN: that page is a work queue, this one is analytical.
+    """
+
+    def _member(self, name):
+        from .models import Client
+
+        return Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name=name, last_name="Ticketed",
+            client_added_at=timezone.now(),
+        )
+
+    def _ticket(self, client, code, status):
+        from .models import Ticket, TicketType
+
+        tt, _ = TicketType.objects.get_or_create(
+            code=code, defaults={"label": code.replace("_", " ").title()},
+        )
+        return Ticket.objects.create(client=client, type=tt, status=status)
+
+    def _types(self, client):
+        from .models import EnrollmentAnalytics
+        from .services.enrollment_analytics import rebuild
+
+        rebuild(client_ids=[client.pk])
+        return sorted(EnrollmentAnalytics.objects.get(client_id=client.pk).ticket_types)
+
+    def test_a_RESOLVED_ticket_type_is_recorded(self):
+        from .models import TicketStatus
+
+        c = self._member("Resolved")
+        self._ticket(c, "case_closure", TicketStatus.RESOLVED)
+        self.assertEqual(self._types(c), ["case_closure"])
+
+    def test_open_and_in_progress_are_still_recorded(self):
+        from .models import TicketStatus
+
+        c = self._member("Live")
+        self._ticket(c, "kitchen_switch", TicketStatus.OPEN)
+        self._ticket(c, "delivery_issue", TicketStatus.IN_PROGRESS)
+        self.assertEqual(self._types(c), ["delivery_issue", "kitchen_switch"])
+
+    def test_duplicate_types_collapse(self):
+        from .models import TicketStatus
+
+        c = self._member("Duplicated")
+        self._ticket(c, "case_closure", TicketStatus.RESOLVED)
+        self._ticket(c, "case_closure", TicketStatus.OPEN)
+        self.assertEqual(self._types(c), ["case_closure"])
+
+    def test_a_member_with_no_tickets_has_none(self):
+        self.assertEqual(self._types(self._member("None")), [])
+
+    def test_the_filter_now_FINDS_a_member_whose_only_ticket_is_resolved(self):
+        """The actual reported symptom, end to end."""
+        from .models import TicketStatus
+        from .services.enrollment_analytics import filter_analytics, rebuild
+
+        c = self._member("OnlyResolved")
+        self._ticket(c, "case_closure", TicketStatus.RESOLVED)
+        rebuild(client_ids=[c.pk])
+
+        found = filter_analytics({"ticket_types": "case_closure"})
+        self.assertIn(str(c.pk), [str(r.client_id) for r in found])
+
+    def test_the_filter_matches_ANY_of_several_codes(self):
+        """The dropdown sends one code, but the filter uses __overlap so a
+        comma-separated list means "any of these"."""
+        from .models import TicketStatus
+        from .services.enrollment_analytics import filter_analytics, rebuild
+
+        a = self._member("Alpha")
+        b = self._member("Beta")
+        self._ticket(a, "case_closure", TicketStatus.RESOLVED)
+        self._ticket(b, "kitchen_switch", TicketStatus.RESOLVED)
+        rebuild(client_ids=[a.pk, b.pk])
+
+        ids = [
+            str(r.client_id) for r in
+            filter_analytics({"ticket_types": "case_closure,kitchen_switch"})
+        ]
+        self.assertIn(str(a.pk), ids)
+        self.assertIn(str(b.pk), ids)
+
+
+class SocialCareCoverageStatusTest(TestCase):
+    """Social care coverages are CONCURRENT PLANS, not a status history.
+
+    Reported: "filter for Social Care = Not Enrolled and you get people that are
+    enrolled". The builder took the coverage with the latest `enrolled_at`, but 70%
+    of members hold more than one, and a member is routinely enrolled in "Enhanced
+    HRSN Services" while several "Screening and Navigation" plans come and go. On a
+    production clone 1,643 members read `non_enrolled` while holding a live
+    enrolled coverage; after the fix all 1,643 read `enrolled`.
+    """
+
+    def _client(self, name="Covered"):
+        from .models import Client
+
+        return Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name=name, last_name="Member",
+            client_added_at=timezone.now(),
+        )
+
+    def _coverage(self, client, status, enrolled_at, expired_at, plan="Plan"):
+        from .models import SocialCareCoverage
+
+        return SocialCareCoverage.objects.create(
+            client=client, coverage_id=uuid.uuid4(), status=status,
+            plan_name=plan, enrolled_at=enrolled_at, expired_at=expired_at,
+        )
+
+    def _status(self, client):
+        from .models import EnrollmentAnalytics
+        from .services.enrollment_analytics import rebuild
+
+        rebuild(client_ids=[client.pk])
+        return EnrollmentAnalytics.objects.get(client_id=client.pk).social_status
+
+    def test_a_live_enrolled_plan_beats_a_MORE_RECENT_expired_one(self):
+        """The exact reported shape."""
+        now = timezone.now()
+        c = self._client()
+        self._coverage(c, "enrolled", now - timedelta(days=90), None,
+                       plan="Enhanced HRSN Services")
+        self._coverage(c, "non_enrolled", now - timedelta(days=10),
+                       now - timedelta(days=1),
+                       plan="FFS Screening and Navigation")
+        self.assertEqual(self._status(c), "enrolled")
+
+    def test_enrolled_wins_over_non_enrolled_on_the_SAME_plan(self):
+        """One member had the same plan twice, where non_enrolled won by a 4-hour
+        timezone offset."""
+        base = timezone.now() - timedelta(days=30)
+        c = self._client()
+        self._coverage(c, "enrolled", base, None, plan="MCO Screening")
+        self._coverage(c, "non_enrolled", base + timedelta(hours=4), None,
+                       plan="MCO Screening")
+        self.assertEqual(self._status(c), "enrolled")
+
+    def test_a_never_expiring_sentinel_counts_as_live(self):
+        """9999-12-31 is the "never expires" sentinel."""
+        c = self._client()
+        self._coverage(
+            c, "enrolled", timezone.now() - timedelta(days=5),
+            timezone.make_aware(datetime(9999, 12, 31)),
+        )
+        self.assertEqual(self._status(c), "enrolled")
+
+    def test_an_EXPIRED_enrolled_plan_does_not_claim_coverage(self):
+        """Being enrolled in something that has lapsed is not current coverage: a
+        live non_enrolled row outranks an expired enrolled one."""
+        now = timezone.now()
+        c = self._client()
+        self._coverage(c, "enrolled", now - timedelta(days=400),
+                       now - timedelta(days=200))
+        self._coverage(c, "non_enrolled", now - timedelta(days=10), None)
+        self.assertEqual(self._status(c), "non_enrolled")
+
+    def test_genuinely_not_enrolled_stays_not_enrolled(self):
+        """The fix must not turn everyone into 'enrolled' -- the filter has to
+        keep working for the people it is actually about."""
+        now = timezone.now()
+        c = self._client()
+        self._coverage(c, "non_enrolled", now - timedelta(days=30), None)
+        self._coverage(c, "non_enrolled", now - timedelta(days=10),
+                       now - timedelta(days=1))
+        self.assertEqual(self._status(c), "non_enrolled")
+
+    def test_no_coverage_at_all_is_blank(self):
+        self.assertEqual(self._status(self._client()), "")
+
+    def test_the_filter_no_longer_returns_an_enrolled_member(self):
+        """End to end through filter_analytics, which is what the page calls."""
+        from .services.enrollment_analytics import filter_analytics, rebuild
+
+        now = timezone.now()
+        c = self._client("Enrolled")
+        self._coverage(c, "enrolled", now - timedelta(days=90), None)
+        self._coverage(c, "non_enrolled", now - timedelta(days=2),
+                       now - timedelta(days=1))
+        rebuild(client_ids=[c.pk])
+
+        not_enrolled = [
+            str(r.client_id)
+            for r in filter_analytics({"social_status": "non_enrolled"})
+        ]
+        self.assertNotIn(str(c.pk), not_enrolled)
+
+
+class HomeRemediationProgramsTest(TestCase):
+    """The 15 Home Remediation programs: Internal Services, type Housing.
+
+    The second housing service we deliver, after Dwelling Assessment / SOW
+    Development. Five devices across three boroughs, all delivering
+    "Home Expense Assistance/Repairs".
+
+    Migrations are disabled under `manage.py test` (AGENTS.md), so these build
+    their own rows rather than asserting on migration 0266's output.
+    """
+
+    NAME = "Home Remediation - Air Conditioner - Brooklyn"
+
+    def _program(self, name=None, **kw):
+        from .models import ActiveProgram
+
+        opts = {
+            "program_name": name or self.NAME,
+            "case_category": "Internal Services",
+            "case_type": ActiveProgram.CaseType.HOUSING,
+            "service_type":
+                ActiveProgram.ServiceType.HOME_EXPENSE_ASSISTANCE_REPAIRS,
+            "main_category": "Housing",
+        }
+        opts.update(kw)
+        return ActiveProgram.objects.create(**opts)
+
+    def test_the_new_service_type_exists(self):
+        from .models import ActiveProgram
+
+        self.assertIn(
+            "home_expense_assistance_repairs",
+            [c[0] for c in ActiveProgram.ServiceType.choices],
+        )
+
+    def test_its_label_is_offered_to_the_settings_dropdown(self):
+        """Settings > Programs builds its dropdown straight from
+        ServiceType.choices (views_settings, "service_types"), so adding the enum
+        value is what puts it in the UI -- there is no separate list to update."""
+        from .models import ActiveProgram
+
+        labels = dict(ActiveProgram.ServiceType.choices)
+        self.assertEqual(
+            labels["home_expense_assistance_repairs"],
+            "Home Expense Assistance/Repairs",
+        )
+
+    def test_a_home_remediation_case_routes_to_INTERNAL_SERVICE(self):
+        from .models import CaseType
+        from .serializers import derive_case_type_from_active_program
+
+        self._program()
+        self.assertEqual(
+            derive_case_type_from_active_program(self.NAME),
+            CaseType.INTERNAL_SERVICE,
+        )
+
+    def test_it_is_now_in_import_scope(self):
+        """As External Services these were silently skipped by the importer."""
+        from .serializers import case_in_import_scope
+
+        self._program()
+        self.assertTrue(case_in_import_scope("", self.NAME))
+
+    def test_the_referral_only_lookalike_is_NOT_caught_by_the_prefix(self):
+        """0266 matches the "Home Remediation - " prefix, and one of the 7
+        referral-only programs under the active Housing category is
+        "Home Remediation Assistance: Ventilation Improving Systems". The
+        trailing " - " is what keeps them apart -- if it were dropped, a referral
+        programme would silently become our own service."""
+        name = "Home Remediation Assistance: Ventilation Improving Systems"
+        self.assertFalse(name.lower().startswith("home remediation - "))
+
+    def test_a_home_remediation_program_has_no_meals_or_boxes_kind(self):
+        """It is housing, so no product kind -- and the non-food exclusion in the
+        health metrics is what stops that reading as a defect."""
+        from .services.catalog import product_type_kind_for_name
+
+        self.assertIsNone(product_type_kind_for_name(self.NAME))
+
+    def test_it_is_excluded_from_the_MealsBoxes_metrics(self):
+        from .services.catalog import non_food_program_names
+        from .services.health_metrics import unmapped_program_identifiers
+
+        self._program()
+        self.assertIn(self.NAME, non_food_program_names())
+        self.assertNotIn(self.NAME, unmapped_program_identifiers())
+
+
+class FoodScopedGoverningCaseTest(TestCase):
+    """A housing case must never become the governing case for FOOD service.
+
+    Internal Services stopped being food-only when the 18 housing programs were
+    reclassified. Every governing-case resolver was simply
+    `[c for c in client.cases.all() if c.case_type == INTERNAL_SERVICE]` -- no
+    type filter -- and `governing_case_key` ranks by authorization favour, then
+    open, then most recent. So a freshly APPROVED housing assessment would
+    outrank an older approved meals case and take over the member's food service:
+    verification, kitchen assignment, delivery calendar, Purchase Orders.
+
+    That was the DEFAULT behaviour the moment the first housing case imported, not
+    an edge case.
+    """
+
+    MEALS = "Medically Tailored Meals (MTM) - Other Eligible Populations - Brooklyn"
+    HOUSING = (
+        "Dwelling Assessment & Statement of Work (SOW) Development - "
+        "Modifications and Remediation Service - Brooklyn"
+    )
+
+    def setUp(self):
+        from .models import ActiveProgram
+        from .services.catalog import clear_program_domain_cache
+
+        ActiveProgram.objects.create(
+            program_name=self.MEALS, case_category="Internal Services",
+            case_type=ActiveProgram.CaseType.FOOD,
+        )
+        ActiveProgram.objects.create(
+            program_name=self.HOUSING, case_category="Internal Services",
+            case_type=ActiveProgram.CaseType.HOUSING,
+        )
+        clear_program_domain_cache()
+
+    def _client(self, name="Both"):
+        from .models import Client
+
+        return Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name=name, last_name="Services",
+            client_added_at=timezone.now(),
+        )
+
+    def _case(self, client, program, *, auth="approved", created=None):
+        from .models import Case, CaseStatus, CaseType, ServiceAuthorizationStatus
+
+        return Case.objects.create(
+            case_id=uuid.uuid4(), client=client, case_type=CaseType.INTERNAL_SERVICE,
+            case_status=CaseStatus.MANAGED, program_name=program,
+            service_authorization_status=auth,
+            case_created_at=created or timezone.now(),
+        )
+
+    def _refetch(self, client):
+        from .models import Client
+
+        return Client.objects.prefetch_related("cases").get(pk=client.pk)
+
+    def test_the_domain_is_derived_from_the_program_name(self):
+        from .services.catalog import case_service_domain
+
+        c = self._client()
+        self.assertEqual(case_service_domain(self._case(c, self.MEALS)), "food")
+        self.assertEqual(case_service_domain(self._case(c, self.HOUSING)), "housing")
+
+    def test_an_UNKNOWN_program_defaults_to_food(self):
+        """Load-bearing: every internal-service case predating housing is food, so
+        an unrecognised program must behave exactly as it does today rather than
+        silently dropping out of the food pipeline."""
+        from .services.catalog import case_service_domain, program_service_domain
+
+        c = self._client()
+        self.assertEqual(case_service_domain(self._case(c, "Never Heard Of It")), "food")
+        self.assertEqual(program_service_domain(""), "food")
+        self.assertEqual(program_service_domain(None), "food")
+
+    def test_a_NEWER_APPROVED_housing_case_does_not_steal_the_food_governing_case(self):
+        """The precise failure this guard exists for."""
+        from .portal.serializers import internal_service_case
+
+        c = self._client()
+        meals = self._case(
+            c, self.MEALS, created=timezone.now() - timedelta(days=30),
+        )
+        self._case(c, self.HOUSING, created=timezone.now())  # newer AND approved
+
+        gov = internal_service_case(self._refetch(c))
+        self.assertIsNotNone(gov)
+        self.assertEqual(
+            str(gov.case_id), str(meals.case_id),
+            "the meals case must keep governing food service",
+        )
+
+    def test_a_member_with_ONLY_a_housing_case_has_no_food_governing_case(self):
+        from .portal.serializers import internal_service_case
+
+        c = self._client()
+        self._case(c, self.HOUSING)
+        self.assertIsNone(internal_service_case(self._refetch(c)))
+
+    def test_housing_is_not_offered_to_the_food_verification(self):
+        """internal_service_cases feeds the verification pop-up's case picker."""
+        from .portal.serializers import internal_service_cases
+
+        c = self._client()
+        meals = self._case(c, self.MEALS)
+        self._case(c, self.HOUSING)
+
+        got = [str(x.case_id) for x in internal_service_cases(self._refetch(c))]
+        self.assertEqual(got, [str(meals.case_id)])
+
+    def test_the_lifecycle_helper_is_food_scoped_too(self):
+        from .services.lifecycle import _internal_service_cases
+
+        c = self._client()
+        meals = self._case(c, self.MEALS)
+        self._case(c, self.HOUSING)
+
+        got = [str(x.case_id) for x in _internal_service_cases(self._refetch(c))]
+        self.assertEqual(got, [str(meals.case_id)])
+
+    def test_the_program_domain_cache_is_dropped_when_a_program_changes(self):
+        """Agents move programs between Food and Housing in Settings > Programs.
+        Without invalidation the change would not apply until a restart."""
+        from .models import ActiveProgram
+        from .services.catalog import program_service_domain
+
+        self.assertEqual(program_service_domain(self.HOUSING), "housing")
+        row = ActiveProgram.objects.get(program_name=self.HOUSING)
+        row.case_type = ActiveProgram.CaseType.FOOD
+        row.save()  # post_save must clear the cache
+        self.assertEqual(program_service_domain(self.HOUSING), "food")
+
+    def test_non_food_program_q_matches_case_insensitively(self):
+        """__in would be case-sensitive, and a near-miss fails in the dangerous
+        direction -- a housing case slipping through as food."""
+        from .models import Case
+        from .services.catalog import non_food_program_q
+
+        c = self._client()
+        self._case(c, self.MEALS)
+        housing = self._case(c, self.HOUSING.upper())
+
+        q = non_food_program_q()
+        self.assertIsNotNone(q)
+        matched = list(Case.objects.filter(q).values_list("case_id", flat=True))
+        self.assertIn(housing.case_id, matched)
+
+
+class HousingGoverningCaseTest(TestCase):
+    """Housing resolution: one governing case per type, EEA only, primary only.
+
+    Mirrors food's rules via the existing governing_case_key, with three housing
+    specifics enforced structurally rather than by convention:
+
+      1. only an Environmental Exposure Assessment may govern (an ALLOWLIST, so a
+         service type added later cannot start governing by default),
+      2. the member's OWN case only -- no household fallback, unlike food, because
+         a dwelling is one property and the case belongs to the primary,
+      3. Home Expense Assistance/Repairs cases are WORK ORDERS and can never
+         govern.
+    """
+
+    EEA_PROGRAM = (
+        "Dwelling Assessment & Statement of Work (SOW) Development - "
+        "Modifications and Remediation Service - Brooklyn"
+    )
+    HEAR_PROGRAM = "Home Remediation - Heater - Queens"
+    MEALS_PROGRAM = "Medically Tailored Meals (MTM) - Other - Brooklyn"
+
+    def setUp(self):
+        from .models import ActiveProgram
+        from .services.catalog import clear_program_domain_cache
+
+        ActiveProgram.objects.create(
+            program_name=self.EEA_PROGRAM, case_category="Internal Services",
+            case_type=ActiveProgram.CaseType.HOUSING,
+            service_type=ActiveProgram.ServiceType.ENVIRONMENTAL_EXPOSURE_ASSESSMENT,
+        )
+        ActiveProgram.objects.create(
+            program_name=self.HEAR_PROGRAM, case_category="Internal Services",
+            case_type=ActiveProgram.CaseType.HOUSING,
+            service_type=ActiveProgram.ServiceType.HOME_EXPENSE_ASSISTANCE_REPAIRS,
+        )
+        ActiveProgram.objects.create(
+            program_name=self.MEALS_PROGRAM, case_category="Internal Services",
+            case_type=ActiveProgram.CaseType.FOOD,
+        )
+        clear_program_domain_cache()
+
+    def _client(self, name="Housing"):
+        from .models import Client
+
+        return Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name=name, last_name="Member",
+            client_added_at=timezone.now(),
+        )
+
+    def _case(self, client, program, *, auth="approved", status=None, created=None,
+              service_type=""):
+        from .models import Case, CaseStatus, CaseType
+
+        return Case.objects.create(
+            case_id=uuid.uuid4(), client=client, case_type=CaseType.INTERNAL_SERVICE,
+            case_status=status or CaseStatus.MANAGED, program_name=program,
+            service_type=service_type, service_authorization_status=auth,
+            case_created_at=created or timezone.now(),
+        )
+
+    def _refetch(self, client):
+        from .models import Client
+
+        return Client.objects.prefetch_related("cases").get(pk=client.pk)
+
+    # ── the allowlist ────────────────────────────────────────────────────────
+    def test_an_assessment_governs(self):
+        from .services.housing import housing_service_case
+
+        c = self._client()
+        eea = self._case(c, self.EEA_PROGRAM)
+        gov = housing_service_case(self._refetch(c))
+        self.assertEqual(str(gov.case_id), str(eea.case_id))
+
+    def test_a_work_order_can_NEVER_govern(self):
+        """Even as the only housing case, and even approved and newest."""
+        from .services.housing import housing_service_case, is_work_order_case
+
+        c = self._client()
+        hear = self._case(c, self.HEAR_PROGRAM)
+        self.assertTrue(is_work_order_case(hear))
+        self.assertIsNone(housing_service_case(self._refetch(c)))
+
+    def test_a_newer_work_order_does_not_displace_the_assessment(self):
+        from .services.housing import housing_service_case
+
+        c = self._client()
+        eea = self._case(c, self.EEA_PROGRAM,
+                         created=timezone.now() - timedelta(days=30))
+        self._case(c, self.HEAR_PROGRAM, created=timezone.now())
+
+        gov = housing_service_case(self._refetch(c))
+        self.assertEqual(str(gov.case_id), str(eea.case_id))
+
+    def test_work_orders_are_listed_separately(self):
+        from .services.housing import housing_work_orders
+
+        c = self._client()
+        self._case(c, self.EEA_PROGRAM)
+        a = self._case(c, self.HEAR_PROGRAM)
+        b = self._case(c, self.HEAR_PROGRAM)
+
+        got = {str(x.case_id) for x in housing_work_orders(self._refetch(c))}
+        self.assertEqual(got, {str(a.case_id), str(b.case_id)})
+
+    # ── individual only ──────────────────────────────────────────────────────
+    def test_a_dependent_does_NOT_inherit_the_primarys_housing_case(self):
+        """Food deliberately falls back to the household's case so no member shows
+        a blank authorization. Housing must not: a dwelling is one property and
+        the case belongs to the primary."""
+        from .models import Household, HouseholdMember
+        from .services.housing import housing_service_case
+
+        primary = self._client("Primary")
+        dependent = self._client("Dependent")
+        hh = Household.objects.create(name="Housing HH")
+        HouseholdMember.objects.create(household=hh, client=primary, is_primary=True)
+        HouseholdMember.objects.create(household=hh, client=dependent, is_primary=False)
+        self._case(primary, self.EEA_PROGRAM)
+
+        self.assertIsNotNone(housing_service_case(self._refetch(primary)))
+        self.assertIsNone(
+            housing_service_case(self._refetch(dependent)),
+            "a dependent must not appear to hold a housing case",
+        )
+
+    # ── the two types do not compete ─────────────────────────────────────────
+    def test_food_and_housing_govern_independently(self):
+        """The whole point: one governing case PER TYPE."""
+        from .portal.serializers import internal_service_case
+        from .services.housing import housing_service_case
+
+        c = self._client("Both")
+        meals = self._case(c, self.MEALS_PROGRAM,
+                           created=timezone.now() - timedelta(days=30))
+        eea = self._case(c, self.EEA_PROGRAM, created=timezone.now())
+
+        fresh = self._refetch(c)
+        self.assertEqual(
+            str(internal_service_case(fresh).case_id), str(meals.case_id),
+        )
+        self.assertEqual(
+            str(housing_service_case(fresh).case_id), str(eea.case_id),
+        )
+
+    def test_a_meals_case_is_not_a_housing_case(self):
+        from .services.housing import is_assessment_case, is_housing_case
+
+        c = self._client()
+        meals = self._case(c, self.MEALS_PROGRAM)
+        self.assertFalse(is_housing_case(meals))
+        self.assertFalse(is_assessment_case(meals))
+
+    # ── classification sources ───────────────────────────────────────────────
+    def test_the_case_service_type_string_classifies_an_unmapped_program(self):
+        """Unite Us sends the service as a LABEL on the case, so a housing case
+        whose program is not in our table is still classifiable."""
+        from .models import ActiveProgram
+        from .services.catalog import case_service_type_code
+
+        c = self._client()
+        case = self._case(c, "Some Unmapped Dwelling Programme",
+                          service_type="Environmental Exposure Assessment")
+        self.assertEqual(
+            case_service_type_code(case),
+            ActiveProgram.ServiceType.ENVIRONMENTAL_EXPOSURE_ASSESSMENT,
+        )
+
+    def test_our_program_mapping_wins_over_the_source_string(self):
+        """An agent's correction in Settings > Programs is authoritative."""
+        from .models import ActiveProgram
+        from .services.catalog import case_service_type_code
+
+        c = self._client()
+        case = self._case(c, self.HEAR_PROGRAM,
+                          service_type="Environmental Exposure Assessment")
+        self.assertEqual(
+            case_service_type_code(case),
+            ActiveProgram.ServiceType.HOME_EXPENSE_ASSISTANCE_REPAIRS,
+        )
+
+    def test_a_housing_case_of_neither_service_type_is_neither(self):
+        """A classification gap should be visible, not silently a work order."""
+        from .models import ActiveProgram
+        from .services.catalog import clear_program_domain_cache
+        from .services.housing import (
+            housing_service_case, is_assessment_case, is_housing_case,
+            is_work_order_case,
+        )
+
+        name = "Housing Programme With No Service Type"
+        ActiveProgram.objects.create(
+            program_name=name, case_category="Internal Services",
+            case_type=ActiveProgram.CaseType.HOUSING, service_type="",
+        )
+        clear_program_domain_cache()
+
+        c = self._client()
+        case = self._case(c, name)
+        self.assertTrue(is_housing_case(case))
+        self.assertFalse(is_assessment_case(case))
+        self.assertFalse(is_work_order_case(case))
+        self.assertIsNone(housing_service_case(self._refetch(c)))
+
+    def test_open_housing_case_ignores_closed_assessments(self):
+        from .models import CaseStatus
+        from .services.housing import has_open_housing_case
+
+        c = self._client()
+        self._case(c, self.EEA_PROGRAM, status=CaseStatus.CLOSED)
+        self.assertFalse(has_open_housing_case(self._refetch(c)))
+
+        self._case(c, self.EEA_PROGRAM)
+        self.assertTrue(has_open_housing_case(self._refetch(c)))
+
+
+class FoodVerificationRejectsHousingCaseTest(TestCase):
+    """The food verification pop-up must NEVER verify a housing case.
+
+    Two separate holes, both closed here:
+
+    1. `has_open_internal_service_case` gates entry to the wizard and counted ANY
+       internal-service case, so a HOUSING-ONLY member passed it and was offered
+       food verification.
+    2. `MemberVerificationCreateView` takes `case_id` from the REQUEST BODY and
+       validated only `case_type == INTERNAL_SERVICE`. The picker
+       (`internal_service_cases`) already excludes housing, but a stale tab, a
+       replayed request or a hand-made call would still have verified a member
+       against their dwelling assessment.
+
+    A housing assessment is verified by a vendor inspection, not by the meal/box
+    wizard, so the check belongs at the endpoint rather than in the UI.
+    """
+
+    EEA = (
+        "Dwelling Assessment & Statement of Work (SOW) Development - "
+        "Modifications and Remediation Service - Brooklyn"
+    )
+    MEALS = "Medically Tailored Meals (MTM) - Other Eligible Populations - Brooklyn"
+
+    def setUp(self):
+        from .models import ActiveProgram
+        from .services.catalog import clear_program_domain_cache
+
+        ActiveProgram.objects.create(
+            program_name=self.EEA, case_category="Internal Services",
+            case_type=ActiveProgram.CaseType.HOUSING,
+            service_type=ActiveProgram.ServiceType.ENVIRONMENTAL_EXPOSURE_ASSESSMENT,
+        )
+        ActiveProgram.objects.create(
+            program_name=self.MEALS, case_category="Internal Services",
+            case_type=ActiveProgram.CaseType.FOOD,
+        )
+        clear_program_domain_cache()
+
+    def _member(self, name="Housing"):
+        from .models import Client
+
+        return Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name=name, last_name="Only",
+            client_added_at=timezone.now(),
+        )
+
+    def _case(self, client, program):
+        from .models import Case, CaseStatus, CaseType
+
+        return Case.objects.create(
+            case_id=uuid.uuid4(), client=client, case_type=CaseType.INTERNAL_SERVICE,
+            case_status=CaseStatus.MANAGED, program_name=program,
+            service_authorization_status="approved",
+            case_created_at=timezone.now(),
+        )
+
+    def _refetch(self, client):
+        from .models import Client
+
+        return Client.objects.prefetch_related("cases").get(pk=client.pk)
+
+    def _api(self):
+        from rest_framework_simplejwt.tokens import AccessToken
+
+        from .models import Agent
+
+        a = Agent.objects.create(name="V", agent_code="777", group="Management")
+        acc = AccessToken()
+        acc["agent_id"] = str(a.id); acc["agent_code"] = a.agent_code
+        acc["agent_name"] = a.name; acc["agent_group"] = a.group
+        api = APIClient(); api.credentials(HTTP_AUTHORIZATION=f"Bearer {acc}")
+        return api
+
+    def test_a_housing_only_member_cannot_enter_the_wizard(self):
+        from .services.lifecycle import has_open_internal_service_case
+
+        c = self._member()
+        self._case(c, self.EEA)
+        self.assertFalse(has_open_internal_service_case(self._refetch(c)))
+
+    def test_a_food_case_still_opens_the_wizard(self):
+        """The guard must not break food."""
+        from .services.lifecycle import has_open_internal_service_case
+
+        c = self._member("Food")
+        self._case(c, self.MEALS)
+        self.assertTrue(has_open_internal_service_case(self._refetch(c)))
+
+    def test_the_picker_never_offers_a_housing_case(self):
+        from .portal.serializers import internal_service_cases
+
+        c = self._member("Both")
+        meals = self._case(c, self.MEALS)
+        self._case(c, self.EEA)
+        offered = [str(x.case_id) for x in internal_service_cases(self._refetch(c))]
+        self.assertEqual(offered, [str(meals.case_id)])
+
+    def test_the_ENDPOINT_refuses_a_housing_case_id(self):
+        """The hole that the picker alone did not close."""
+        from .models import EnrollmentVerification
+
+        c = self._member("Posted")
+        self._case(c, self.MEALS)
+        housing = self._case(c, self.EEA)
+
+        resp = self._api().post(
+            f"/api/portal/members/{c.pk}/verification/",
+            {"case_id": str(housing.case_id), "members": []},
+            format="json",
+        )
+        # Whatever the outcome, no enrollment may end up bound to the housing case.
+        bound = EnrollmentVerification.objects.filter(case=housing)
+        self.assertFalse(
+            bound.exists(),
+            "a verification was created against a HOUSING case",
+        )
+        self.assertNotEqual(resp.status_code, 500)
+
+    def test_a_housing_only_member_is_refused_by_the_endpoint(self):
+        from .models import EnrollmentVerification
+
+        c = self._member("HousingOnly")
+        housing = self._case(c, self.EEA)
+
+        self._api().post(
+            f"/api/portal/members/{c.pk}/verification/",
+            {"case_id": str(housing.case_id), "members": []},
+            format="json",
+        )
+        self.assertFalse(EnrollmentVerification.objects.filter(client=c).exists())
+
+
+class BarRowsDifferByServiceTypeTest(TestCase):
+    """What earns a row on the stage bar differs BY TYPE.
+
+    FOOD keeps its non-governing OPEN cases: they carry "Duplicated",
+    "Conflicting" and "Reauthorization - Waiting". A Conflicting row is how an
+    agent SEES two competing food cases -- the precondition of the enrollment
+    fork loop that rewrote 149 enrollments across three families in the week of
+    2026-09-14 -- so hiding it would remove the cue for that exact failure.
+
+    HOUSING shows only its governing assessment. Its non-governing cases are WORK
+    ORDERS, one per remediation item (9 for the first member), which buried the
+    rows describing the member's service and carry no authorization decision
+    worth a row. They live on the Cases tab's "Home Assistance" filter.
+    """
+
+    EEA = (
+        "Dwelling Assessment & Statement of Work (SOW) Development - "
+        "Modifications and Remediation Service - Brooklyn"
+    )
+    HEAR = "Home Remediation - Heater - Queens"
+    MEALS = "Medically Tailored Meals (MTM) - Other Eligible Populations - Brooklyn"
+
+    def setUp(self):
+        from .models import ActiveProgram
+        from .services.catalog import clear_program_domain_cache
+
+        for name, ctype, stype in (
+            (self.MEALS, ActiveProgram.CaseType.FOOD, ""),
+            (self.EEA, ActiveProgram.CaseType.HOUSING,
+             ActiveProgram.ServiceType.ENVIRONMENTAL_EXPOSURE_ASSESSMENT),
+            (self.HEAR, ActiveProgram.CaseType.HOUSING,
+             ActiveProgram.ServiceType.HOME_EXPENSE_ASSISTANCE_REPAIRS),
+        ):
+            ActiveProgram.objects.create(
+                program_name=name, case_category="Internal Services",
+                case_type=ctype, service_type=stype,
+            )
+        clear_program_domain_cache()
+
+        from .models import Client
+
+        self.member = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Split", last_name="Rows",
+            client_added_at=timezone.now(),
+        )
+
+    def _case(self, program, *, auth="approved"):
+        from .models import Case, CaseStatus, CaseType
+
+        return Case.objects.create(
+            case_id=uuid.uuid4(), client=self.member,
+            case_type=CaseType.INTERNAL_SERVICE, case_status=CaseStatus.OPEN,
+            program_name=program, service_authorization_status=auth,
+            case_created_at=timezone.now(),
+        )
+
+    def _tracks(self):
+        from .models import Client
+        from .services.lifecycle import program_tracks
+
+        fresh = Client.objects.prefetch_related(
+            "cases", "enrollments", "member_profiles",
+        ).get(pk=self.member.pk)
+        return program_tracks(fresh)
+
+    def test_housing_work_orders_do_NOT_get_rows(self):
+        self._case(self.MEALS)
+        self._case(self.EEA)
+        for _ in range(9):
+            self._case(self.HEAR)
+
+        tracks = self._tracks()
+        self.assertEqual(
+            sorted(t["domain"] for t in tracks), ["food", "housing"],
+            f"expected one row per type, got {[t['service_type'] for t in tracks]}",
+        )
+        self.assertTrue(all(t["governing"] for t in tracks))
+
+    def test_a_non_governing_FOOD_case_still_gets_a_row(self):
+        """The other half of the split -- and the reason this is not simply
+        "governing only"."""
+        self._case(self.MEALS)
+        self._case(self.MEALS, auth="pending")
+
+        tracks = self._tracks()
+        self.assertEqual(len(tracks), 2)
+        self.assertEqual({t["domain"] for t in tracks}, {"food"})
+        self.assertEqual(
+            sorted(t["governing"] for t in tracks), [False, True],
+        )
+
+    def test_a_housing_only_member_shows_just_the_assessment(self):
+        self._case(self.EEA)
+        for _ in range(3):
+            self._case(self.HEAR)
+
+        tracks = self._tracks()
+        self.assertEqual(len(tracks), 1)
+        self.assertEqual(tracks[0]["domain"], "housing")
+        self.assertTrue(tracks[0]["governing"])
+
+
+class StrandedDeliveryPlanTest(TestCase):
+    """A dead enrollment must not keep a delivery calendar.
+
+    THERESA HOLLAND (7a07db31) held a DISREGARDED enrollment whose mon_thu plan was
+    still `scheduled`, alongside a live service_active enrollment on tue_fri. PO
+    generation served BOTH: Mon 9, Tue 17, Thu 12, Fri 20 across 58 orders -- four
+    deliveries a week instead of two, for over a month, with nothing to notice it.
+
+    Two halves, both needed:
+      * the transition retires the plan (root cause), and
+      * a metric detects any that slip through -- one of the real rows was created
+        by a human setting close_reason='serving_duplicate_manual' in a shell, and
+        no call-site fix catches that.
+    """
+
+    def _member(self, name="Stranded"):
+        from .models import Client
+
+        return Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name=name, last_name="Member",
+            client_added_at=timezone.now(),
+        )
+
+    def _enrollment(self, client, stage):
+        from .models import EnrollmentVerification
+
+        return EnrollmentVerification.objects.create(client=client, stage=stage)
+
+    def _plan(self, enrollment, cadence, *, ends_on="2099-12-31"):
+        from .models import MemberDeliverySchedule
+
+        return MemberDeliverySchedule.objects.create(
+            enrollment=enrollment, delivery_days_cadence=cadence,
+            status="scheduled", starts_on=timezone.localdate(),
+            ends_on=ends_on,
+        )
+
+    def test_a_plan_on_a_dead_enrollment_is_stranded(self):
+        from .models import EnrollmentStage
+        from .services.health_metrics import stranded_plan_count
+
+        c = self._member()
+        self._plan(self._enrollment(c, EnrollmentStage.DISREGARDED), "mon_thu")
+        self.assertEqual(stranded_plan_count(), 1)
+
+    def test_a_plan_on_a_LIVE_enrollment_is_not_stranded(self):
+        from .models import EnrollmentStage
+        from .services.health_metrics import stranded_plan_count
+
+        c = self._member()
+        self._plan(self._enrollment(c, EnrollmentStage.SERVICE_ACTIVE), "tue_fri")
+        self.assertEqual(stranded_plan_count(), 0)
+
+    def test_on_hold_counts_as_live(self):
+        """A paused member keeps their calendar -- pausing is not ending."""
+        from .models import EnrollmentStage
+        from .services.health_metrics import stranded_plan_count
+
+        c = self._member()
+        self._plan(self._enrollment(c, EnrollmentStage.ON_HOLD), "tue_fri")
+        self.assertEqual(stranded_plan_count(), 0)
+
+    def test_AT_RISK_needs_a_live_enrollment_too(self):
+        """The distinction that matters: a dead plan with no live enrollment
+        generates nothing, so it is inert -- countable, but not harmful."""
+        from .models import EnrollmentStage
+        from .services.health_metrics import stranded_plan_count
+
+        lonely = self._member("Lonely")
+        self._plan(self._enrollment(lonely, EnrollmentStage.CLOSED), "mon_thu")
+        self.assertEqual(stranded_plan_count(), 1)
+        self.assertEqual(stranded_plan_count(at_risk=True), 0)
+
+        # Give them a live enrollment and the SAME row becomes at-risk.
+        self._enrollment(lonely, EnrollmentStage.SERVICE_ACTIVE)
+        self.assertEqual(stranded_plan_count(at_risk=True), 1)
+
+    def test_a_plan_whose_window_already_passed_is_not_stranded(self):
+        """Retiring works by shortening the window, so an already-retired plan
+        must not be recounted -- otherwise the sweep never converges."""
+        from .models import EnrollmentStage
+        from .services.health_metrics import stranded_plan_count
+
+        c = self._member()
+        enr = self._enrollment(c, EnrollmentStage.CLOSED)
+        self._plan(
+            enr, "mon_thu",
+            ends_on=timezone.localdate() - timedelta(days=1),
+        )
+        self.assertEqual(stranded_plan_count(), 0)
+
+    def test_the_sweep_retires_the_plan_and_spares_the_live_one(self):
+        from django.core.management import call_command
+
+        from .models import EnrollmentStage, MemberDeliverySchedule
+        from .services.health_metrics import stranded_plan_count
+
+        c = self._member("Both")
+        dead = self._enrollment(c, EnrollmentStage.DISREGARDED)
+        live = self._enrollment(c, EnrollmentStage.SERVICE_ACTIVE)
+        dead_plan = self._plan(dead, "mon_thu")
+        live_plan = self._plan(live, "tue_fri")
+
+        self.assertEqual(stranded_plan_count(at_risk=True), 1)
+        call_command("retire_dead_enrollment_plans", "--apply", verbosity=0)
+
+        dead_plan.refresh_from_db()
+        live_plan.refresh_from_db()
+        self.assertLess(
+            dead_plan.ends_on, timezone.localdate(),
+            "the dead plan's window must be shortened so the nightly sync cannot "
+            "regenerate it",
+        )
+        self.assertEqual(
+            live_plan.ends_on, datetime.strptime("2099-12-31", "%Y-%m-%d").date(),
+            "the LIVE plan must be untouched",
+        )
+        self.assertEqual(stranded_plan_count(), 0)
+
+    def test_the_sweep_writes_nothing_without_apply(self):
+        from django.core.management import call_command
+
+        from .models import EnrollmentStage
+        from .services.health_metrics import stranded_plan_count
+
+        c = self._member()
+        self._plan(self._enrollment(c, EnrollmentStage.DISREGARDED), "mon_thu")
+        call_command("retire_dead_enrollment_plans", verbosity=0)
+        self.assertEqual(stranded_plan_count(), 1, "dry run must not write")
+
+
+class DispatchOrderTest(TestCase):
+    """The dispatch structure: one assessment per member, the submission gate,
+    void-and-resubmit, and adoption of remediation cases that predate it.
+
+    See docs/housing-assessment-order-plan.md.
+    """
+
+    EEA = (
+        "Dwelling Assessment & Statement of Work (SOW) Development - "
+        "Modifications and Remediation Service - Brooklyn"
+    )
+    HEAR = "Home Remediation - Heater - Queens"
+
+    def setUp(self):
+        from .models import ActiveProgram, Vendor
+        from .services.catalog import clear_program_domain_cache
+
+        for name, stype in (
+            (self.EEA, ActiveProgram.ServiceType.ENVIRONMENTAL_EXPOSURE_ASSESSMENT),
+            (self.HEAR, ActiveProgram.ServiceType.HOME_EXPENSE_ASSISTANCE_REPAIRS),
+        ):
+            ActiveProgram.objects.create(
+                program_name=name, case_category="Internal Services",
+                case_type=ActiveProgram.CaseType.HOUSING, service_type=stype,
+            )
+        clear_program_domain_cache()
+        self.vendor = Vendor.objects.create(name="Acme Remediation")
+
+    def _member(self, name="Dispatch"):
+        from .models import Client
+
+        return Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name=name, last_name="Member",
+            client_added_at=timezone.now(),
+        )
+
+    def _case(self, client, program, *, status=None):
+        from .models import Case, CaseStatus, CaseType
+
+        return Case.objects.create(
+            case_id=uuid.uuid4(), client=client, case_type=CaseType.INTERNAL_SERVICE,
+            case_status=status or CaseStatus.MANAGED, program_name=program,
+            service_authorization_status="approved", case_created_at=timezone.now(),
+        )
+
+    def _assessment(self, client):
+        from .models import DispatchKind, DispatchOrder
+
+        return DispatchOrder.objects.create(
+            kind=DispatchKind.ASSESSMENT, client=client, vendor=self.vendor,
+        )
+
+    # ── one per member ───────────────────────────────────────────────────────
+    def test_only_one_assessment_order_per_member(self):
+        from django.db import IntegrityError
+
+        c = self._member()
+        self._assessment(c)
+        with self.assertRaises(IntegrityError):
+            self._assessment(c)
+
+    def test_many_work_orders_are_allowed(self):
+        """The one-per-member constraint is scoped to assessments; a member can have
+        any number of work orders under theirs."""
+        from .models import DispatchKind, DispatchOrder
+
+        c = self._member()
+        a = self._assessment(c)
+        for _ in range(3):
+            DispatchOrder.objects.create(
+                kind=DispatchKind.REMEDIATION, client=c, parent=a,
+            )
+        self.assertEqual(
+            DispatchOrder.objects.filter(kind=DispatchKind.REMEDIATION).count(), 3,
+        )
+
+    # ── the submission gate ──────────────────────────────────────────────────
+    def test_the_gate_names_everything_that_is_missing(self):
+        """Reasons, not a bool: a bare False at the end of a home visit is
+        useless to the vendor standing in the member's kitchen."""
+        from .models import DispatchFinding
+        from .services import dispatch
+
+        order = self._assessment(self._member())
+        DispatchFinding.objects.create(dispatch_order=order, title="Damp in bedroom")
+        dispatch.open_submission(order)
+
+        missing = dispatch.missing_for_submission(order)
+        self.assertIn("vendor signature", missing)
+        self.assertIn("member signature", missing)
+        self.assertIn("photo for finding: Damp in bedroom", missing)
+        self.assertFalse(dispatch.can_submit(order))
+
+    def test_submit_is_refused_while_anything_is_missing(self):
+        from .services import dispatch
+
+        order = self._assessment(self._member())
+        dispatch.open_submission(order)
+        with self.assertRaises(ValueError) as ctx:
+            dispatch.submit(order)
+        self.assertIn("vendor signature", str(ctx.exception))
+
+    def test_a_photo_on_ANOTHER_finding_does_not_satisfy_the_first(self):
+        """The rule is one photo PER FINDING, which is why proofs carry a finding
+        FK -- counting photos per ORDER would pass this."""
+        from .models import DispatchFinding, DispatchProof
+        from .services import dispatch
+
+        order = self._assessment(self._member())
+        a = DispatchFinding.objects.create(dispatch_order=order, title="Damp")
+        DispatchFinding.objects.create(dispatch_order=order, title="Mould")
+        DispatchProof.objects.create(
+            dispatch_order=order, finding=a, s3_key="k1", content_hash="h1",
+        )
+        missing = dispatch.missing_for_submission(order)
+        self.assertIn("photo for finding: Mould", missing)
+        self.assertNotIn("photo for finding: Damp", missing)
+
+    def test_a_general_site_photo_does_not_count_for_a_finding(self):
+        """A proof with no finding is a site photo, not evidence OF anything."""
+        from .models import DispatchFinding, DispatchProof
+        from .services import dispatch
+
+        order = self._assessment(self._member())
+        DispatchFinding.objects.create(dispatch_order=order, title="Damp")
+        DispatchProof.objects.create(
+            dispatch_order=order, finding=None, s3_key="k", content_hash="h",
+        )
+        self.assertIn("photo for finding: Damp", dispatch.missing_for_submission(order))
+
+    def _satisfy_gate(self, order):
+        from .models import (
+            DispatchFinding, DispatchProof, DispatchSignature, DispatchSignerRole,
+        )
+        from .services import dispatch
+
+        f = DispatchFinding.objects.create(dispatch_order=order, title="Damp")
+        DispatchProof.objects.create(
+            dispatch_order=order, finding=f, s3_key="k", content_hash=uuid.uuid4().hex,
+        )
+        sub = dispatch.open_submission(order)
+        for role in (DispatchSignerRole.VENDOR, DispatchSignerRole.MEMBER):
+            DispatchSignature.objects.create(
+                dispatch_submission=sub, signer_role=role, signed_at=timezone.now(),
+            )
+        return sub
+
+    def test_submit_succeeds_once_the_gate_is_satisfied(self):
+        from .models import DispatchStatus
+        from .services import dispatch
+
+        order = self._assessment(self._member())
+        self._satisfy_gate(order)
+        dispatch.submit(order)
+        order.refresh_from_db()
+        self.assertEqual(order.status, DispatchStatus.SUBMITTED)
+
+    # ── void and resubmit ────────────────────────────────────────────────────
+    def test_voiding_keeps_the_old_submission_and_opens_a_new_one(self):
+        from .models import DispatchStatus, DispatchSubmissionState
+        from .services import dispatch
+
+        order = self._assessment(self._member())
+        first = self._satisfy_gate(order)
+        dispatch.submit(order)
+
+        second = dispatch.void_submission(first, reason="wrong room measured")
+
+        first.refresh_from_db()
+        self.assertEqual(first.state, DispatchSubmissionState.VOIDED)
+        self.assertEqual(first.void_reason, "wrong room measured")
+        self.assertIsNotNone(first.voided_at)
+        # the voided copy KEEPS its signatures -- that is the point of keeping it
+        self.assertEqual(first.signatures.count(), 2)
+
+        self.assertEqual(second.sequence, 2)
+        self.assertEqual(second.state, DispatchSubmissionState.ACTIVE)
+        order.refresh_from_db()
+        self.assertEqual(order.status, DispatchStatus.PENDING_SUBMISSION)
+
+    def test_the_new_submission_must_satisfy_the_gate_again(self):
+        """Signatures belong to a SUBMISSION, so a void leaves the new one unsigned
+        -- otherwise a void would silently inherit the old attestation."""
+        from .services import dispatch
+
+        order = self._assessment(self._member())
+        first = self._satisfy_gate(order)
+        dispatch.submit(order)
+        dispatch.void_submission(first, reason="redo")
+
+        missing = dispatch.missing_for_submission(order)
+        self.assertIn("vendor signature", missing)
+        self.assertIn("member signature", missing)
+
+    def test_voiding_marks_a_unite_us_upload_SUPERSEDED(self):
+        """Unite Us must not silently keep evidence the CRM has rejected."""
+        from .models import DispatchUniteUsUpload
+        from .services import dispatch
+
+        order = self._assessment(self._member())
+        first = self._satisfy_gate(order)
+        dispatch.submit(order)
+        up = DispatchUniteUsUpload.objects.create(
+            dispatch_order=order, dispatch_submission=first,
+            uploaded_at=timezone.now(),
+        )
+        self.assertIsNone(up.superseded_at)
+
+        dispatch.void_submission(first, reason="wrong photos")
+        up.refresh_from_db()
+        self.assertIsNotNone(
+            up.superseded_at, "a voided submission must flag its Unite Us upload",
+        )
+
+    def test_a_submission_cannot_be_voided_twice(self):
+        from .services import dispatch
+
+        order = self._assessment(self._member())
+        first = self._satisfy_gate(order)
+        dispatch.submit(order)
+        dispatch.void_submission(first, reason="once")
+        with self.assertRaises(ValueError):
+            dispatch.void_submission(first, reason="twice")
+
+    # ── adoption ─────────────────────────────────────────────────────────────
+    # A housing case now yields an ITEM, not a work order; a work order is a batch
+    # an agent assembles. These still pin the same requirements, restated against
+    # the item model.
+    def test_a_case_with_no_assessment_order_WAITS(self):
+        """Inventing an assessment they never had would fabricate history."""
+        from .models import DispatchItem
+        from .services import dispatch
+
+        c = self._member()
+        self._case(c, self.HEAR)
+        self.assertEqual(dispatch.reconcile_dispatch_orders(c), [])
+        self.assertEqual(DispatchItem.objects.filter(case__client=c).count(), 0)
+
+    def test_creating_the_assessment_ADOPTS_the_waiting_cases_as_items(self):
+        """MIRIAM ISRAEL's shape: housing cases that arrived first."""
+        from .models import DispatchItem
+        from .services import dispatch
+
+        c = self._member("Miriam")
+        for _ in range(3):
+            self._case(c, self.HEAR)
+        assessment = self._assessment(c)
+
+        adopted = dispatch.adopt_unlinked_remediation_cases(assessment)
+        self.assertEqual(len(adopted), 3)
+        self.assertTrue(all(i.assessment_id == assessment.pk for i in adopted))
+        self.assertEqual(DispatchItem.objects.filter(assessment=assessment).count(), 3)
+
+    def test_adoption_is_idempotent(self):
+        from .models import DispatchItem
+        from .services import dispatch
+
+        c = self._member()
+        self._case(c, self.HEAR)
+        assessment = self._assessment(c)
+
+        dispatch.adopt_unlinked_remediation_cases(assessment)
+        dispatch.adopt_unlinked_remediation_cases(assessment)
+        self.assertEqual(DispatchItem.objects.filter(assessment=assessment).count(), 1)
+
+    def test_a_CLOSED_case_still_yields_a_DISPATCHABLE_item_when_approved(self):
+        """Four of MIRIAM's five approved items sit on closed cases, and the device
+        still has to be installed -- so a closed case is recorded AND dispatchable.
+        Only the authorization decides."""
+        from .models import CaseStatus
+        from .services import dispatch
+
+        c = self._member()
+        self._case(c, self.HEAR, status=CaseStatus.CLOSED)
+        assessment = self._assessment(c)
+
+        adopted = dispatch.adopt_unlinked_remediation_cases(assessment)
+        self.assertEqual(len(adopted), 1)
+        self.assertTrue(adopted[0].is_available)
+
+    # ── history + address inheritance ────────────────────────────────────────
+    def test_transitions_land_in_the_SHARED_stage_event_log(self):
+        """Not a parallel table: "everything that happened to this member" stays
+        one query."""
+        from .models import DispatchStatus, StageEntityType, StageEvent
+        from .services import dispatch
+
+        order = self._assessment(self._member())
+        dispatch.set_status(order, DispatchStatus.CONFIRMED, note="booked")
+
+        ev = StageEvent.objects.get(dispatch_order=order)
+        self.assertEqual(ev.entity_type, StageEntityType.DISPATCH_ORDER)
+        self.assertEqual(ev.from_stage, DispatchStatus.PENDING_SCHEDULE)
+        self.assertEqual(ev.to_stage, DispatchStatus.CONFIRMED)
+        self.assertEqual(str(ev.client_id), str(order.client_id))
+
+    def test_a_remediation_order_INHERITS_the_verified_address(self):
+        """Verified once on the assessment; a child must not be able to drift."""
+        from .models import DispatchKind, DispatchOrder
+
+        c = self._member()
+        a = self._assessment(c)
+        a.address_formatted = "123 Verified St, Brooklyn NY"
+        a.save(update_fields=["address_formatted"])
+
+        child = DispatchOrder.objects.create(
+            kind=DispatchKind.REMEDIATION, client=c, parent=a,
+            case=self._case(c, self.HEAR),
+        )
+        self.assertEqual(child.service_address, "123 Verified St, Brooklyn NY")
+
+
+class AssessmentOrderWizardApiTest(TestCase):
+    """The wizard endpoint. Validation is tested at the API, not the helper.
+
+    The lesson from the food verification: its picker excluded housing cases while
+    the ENDPOINT still accepted one, and only an API-level test found it.
+    """
+
+    EEA = (
+        "Dwelling Assessment & Statement of Work (SOW) Development - "
+        "Modifications and Remediation Service - Brooklyn"
+    )
+    HEAR = "Home Remediation - Heater - Queens"
+
+    def setUp(self):
+        from .models import ActiveProgram, Vendor
+        from .services.catalog import clear_program_domain_cache
+
+        for name, stype in (
+            (self.EEA, ActiveProgram.ServiceType.ENVIRONMENTAL_EXPOSURE_ASSESSMENT),
+            (self.HEAR, ActiveProgram.ServiceType.HOME_EXPENSE_ASSISTANCE_REPAIRS),
+        ):
+            ActiveProgram.objects.create(
+                program_name=name, case_category="Internal Services",
+                case_type=ActiveProgram.CaseType.HOUSING, service_type=stype,
+            )
+        clear_program_domain_cache()
+        self.vendor = Vendor.objects.create(name="Acme Remediation")
+
+    def _api(self):
+        from rest_framework_simplejwt.tokens import AccessToken
+
+        from .models import Agent
+
+        # A fresh code per call: agent_code is unique, and tests that post twice
+        # would otherwise collide rather than exercise the endpoint.
+        if not hasattr(self, "_agent"):
+            self._agent = Agent.objects.create(
+                name="W", agent_code="881", group="Management",
+            )
+        a = self._agent
+        acc = AccessToken()
+        acc["agent_id"] = str(a.id); acc["agent_code"] = a.agent_code
+        acc["agent_name"] = a.name; acc["agent_group"] = a.group
+        api = APIClient(); api.credentials(HTTP_AUTHORIZATION=f"Bearer {acc}")
+        return api
+
+    def _member(self, name="Wizard"):
+        from .models import Client
+
+        return Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name=name, last_name="Member",
+            client_added_at=timezone.now(),
+        )
+
+    def _case(self, client, program, *, status=None):
+        from .models import Case, CaseStatus, CaseType
+
+        return Case.objects.create(
+            case_id=uuid.uuid4(), client=client, case_type=CaseType.INTERNAL_SERVICE,
+            case_status=status or CaseStatus.MANAGED, program_name=program,
+            service_authorization_status="approved", case_created_at=timezone.now(),
+        )
+
+    def _payload(self, **over):
+        base = {
+            "vendor_id": str(self.vendor.pk),
+            "referral_type": "combined",
+            "contact_phone": "718-555-0100",
+            "contact_phone_type": "mobile",
+            "address_line1": "123 Verified St",
+            "address_formatted": "123 Verified St, Brooklyn NY",
+            "consent_to_call": True,
+            "consent_to_text": True,
+            "ecm_billed_confirmed": True,
+            "availability": [
+                {"date": "2026-10-01", "start_time": "09:00", "end_time": "12:00"},
+                {"date": "2026-10-02", "start_time": "13:00", "end_time": "17:00"},
+                {"date": "2026-10-03", "start_time": "09:00", "end_time": "12:00"},
+            ],
+        }
+        base.update(over)
+        return base
+
+    def _post(self, client, **over):
+        return self._api().post(
+            f"/api/portal/members/{client.pk}/assessment-order/",
+            self._payload(**over), format="json",
+        )
+
+    def test_the_wizard_creates_an_order_at_pending_schedule(self):
+        from .models import DispatchStatus
+
+        c = self._member()
+        self._case(c, self.EEA)
+        resp = self._post(c)
+        self.assertEqual(resp.status_code, 201, resp.content)
+        self.assertEqual(resp.data["status"], DispatchStatus.PENDING_SCHEDULE)
+        self.assertEqual(resp.data["vendor"]["name"], "Acme Remediation")
+        self.assertEqual(len(resp.data["availability"]), 3)
+
+    def test_it_refuses_a_member_with_no_governing_housing_case(self):
+        """An assessment of nothing."""
+        resp = self._post(self._member())
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("no governing", resp.data["detail"])
+
+    def test_THREE_WINDOWS_ON_ONE_DAY_is_refused(self):
+        """The rule is three DATES. A len(windows) >= 3 check would pass this,
+        which is exactly why it is tested."""
+        c = self._member()
+        self._case(c, self.EEA)
+        resp = self._post(c, availability=[
+            {"date": "2026-10-01", "start_time": "09:00", "end_time": "10:00"},
+            {"date": "2026-10-01", "start_time": "11:00", "end_time": "12:00"},
+            {"date": "2026-10-01", "start_time": "14:00", "end_time": "15:00"},
+        ])
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("different", resp.data["detail"])
+
+    def test_more_than_one_window_per_day_is_fine_once_there_are_three_days(self):
+        c = self._member()
+        self._case(c, self.EEA)
+        resp = self._post(c, availability=[
+            {"date": "2026-10-01", "start_time": "09:00", "end_time": "10:00"},
+            {"date": "2026-10-01", "start_time": "14:00", "end_time": "15:00"},
+            {"date": "2026-10-02", "start_time": "09:00", "end_time": "10:00"},
+            {"date": "2026-10-03", "start_time": "09:00", "end_time": "10:00"},
+        ])
+        self.assertEqual(resp.status_code, 201, resp.content)
+        self.assertEqual(len(resp.data["availability"]), 4)
+
+    def test_an_unknown_referral_type_is_refused(self):
+        c = self._member()
+        self._case(c, self.EEA)
+        resp = self._post(c, referral_type="plumbing")
+        self.assertEqual(resp.status_code, 400)
+
+    def test_consent_records_method_and_who_heard_it(self):
+        """GDPR: the burden is to DEMONSTRATE consent."""
+        from .models import DispatchOrder
+
+        c = self._member()
+        self._case(c, self.EEA)
+        self._post(c)
+        order = DispatchOrder.objects.get(client=c)
+        self.assertTrue(order.consent_to_call)
+        self.assertTrue(order.consent_to_text)
+        self.assertEqual(order.consent_method, "verbal")
+        self.assertIsNotNone(order.consent_captured_at)
+        self.assertIsNotNone(order.consent_captured_by)
+
+    def test_a_double_submitted_wizard_returns_the_EXISTING_order(self):
+        """One assessment per member is a DB constraint; a resubmitted wizard
+        should be harmless rather than a 500."""
+        from .models import DispatchOrder
+
+        c = self._member()
+        self._case(c, self.EEA)
+        first = self._post(c)
+        self.assertEqual(first.status_code, 201)
+        second = self._post(c)
+        self.assertEqual(second.status_code, 200)
+        self.assertEqual(first.data["id"], second.data["id"])
+        self.assertEqual(DispatchOrder.objects.filter(client=c).count(), 1)
+
+    def test_creating_the_order_ADOPTS_waiting_remediation_cases(self):
+        c = self._member("Miriam")
+        self._case(c, self.EEA)
+        for _ in range(3):
+            self._case(c, self.HEAR)
+        resp = self._post(c)
+        self.assertEqual(resp.status_code, 201, resp.content)
+        self.assertEqual(resp.data["adopted_remediation_orders"], 3)
+
+    def test_the_list_endpoint_reports_what_blocks_submission(self):
+        """So the CRM shows progress without re-implementing the gate."""
+        from .models import DispatchFinding, DispatchOrder
+        from .services import dispatch
+
+        c = self._member()
+        self._case(c, self.EEA)
+        self._post(c)
+        order = DispatchOrder.objects.get(client=c)
+        DispatchFinding.objects.create(dispatch_order=order, title="Damp")
+        dispatch.open_submission(order)
+
+        resp = self._api().get(f"/api/portal/members/{c.pk}/dispatch-orders/")
+        self.assertEqual(resp.status_code, 200)
+        missing = resp.data[0]["missing_for_submission"]
+        self.assertIn("vendor signature", missing)
+        self.assertIn("photo for finding: Damp", missing)
+
+    def test_the_order_keeps_its_OWN_address(self):
+        """Not read live from the client: a later address edit must not rewrite
+        where a completed assessment happened."""
+        from .models import DispatchOrder
+
+        c = self._member()
+        self._case(c, self.EEA)
+        self._post(c)
+        self.assertEqual(
+            DispatchOrder.objects.get(client=c).address_formatted,
+            "123 Verified St, Brooklyn NY",
+        )
+
+
+class VendorSettingsApiTest(TestCase):
+    """Settings > Vendors: the company, its ONE admin user, and password reset."""
+
+    def _api(self):
+        from rest_framework_simplejwt.tokens import AccessToken
+
+        from .models import Agent
+
+        if not hasattr(self, "_agent"):
+            self._agent = Agent.objects.create(
+                name="S", agent_code="882", group="Management",
+            )
+        acc = AccessToken()
+        acc["agent_id"] = str(self._agent.id)
+        acc["agent_code"] = self._agent.agent_code
+        acc["agent_name"] = self._agent.name
+        acc["agent_group"] = self._agent.group
+        api = APIClient(); api.credentials(HTTP_AUTHORIZATION=f"Bearer {acc}")
+        return api
+
+    def _vendor(self, name="Acme Remediation"):
+        resp = self._api().post(
+            "/api/portal/settings/vendors/", {"name": name}, format="json",
+        )
+        self.assertEqual(resp.status_code, 201, resp.content)
+        return resp.data["vendor_id"]
+
+    def test_a_vendor_can_be_created_and_listed(self):
+        vid = self._vendor()
+        resp = self._api().get("/api/portal/settings/vendors/")
+        self.assertEqual(resp.status_code, 200)
+        rows = resp.data["results"] if isinstance(resp.data, dict) else resp.data
+        names = [v["name"] for v in rows]
+        self.assertIn("Acme Remediation", names)
+        self.assertTrue(vid)
+
+    def test_provisioning_the_admin_user_returns_the_password_ONCE(self):
+        from .models import VendorUser
+
+        vid = self._vendor()
+        resp = self._api().post(
+            f"/api/portal/settings/vendors/{vid}/admin-user/",
+            {"email": "boss@acme.test", "name": "Ada Boss"}, format="json",
+        )
+        self.assertEqual(resp.status_code, 201, resp.content)
+        self.assertTrue(resp.data["temporary_password"])
+        self.assertTrue(resp.data["is_admin"])
+
+        # Stored HASHED, and the plaintext is never retrievable afterwards.
+        user = VendorUser.objects.get(email="boss@acme.test")
+        self.assertNotEqual(user.password, resp.data["temporary_password"])
+        self.assertTrue(user.password.startswith("pbkdf2_"))
+
+        listed = self._api().get("/api/portal/settings/vendors/").data
+        vendors = listed["results"] if isinstance(listed, dict) else listed
+        admin = next(v for v in vendors if v["vendor_id"] == vid)["admin_user"]
+        self.assertNotIn("password", admin)
+        self.assertNotIn("temporary_password", admin)
+
+    def test_a_SECOND_admin_user_is_refused(self):
+        """The model constrains it; the endpoint should say so usefully rather
+        than surfacing an IntegrityError."""
+        vid = self._vendor()
+        first = {"email": "a@acme.test", "name": "A"}
+        self._api().post(
+            f"/api/portal/settings/vendors/{vid}/admin-user/", first, format="json",
+        )
+        resp = self._api().post(
+            f"/api/portal/settings/vendors/{vid}/admin-user/",
+            {"email": "b@acme.test", "name": "B"}, format="json",
+        )
+        self.assertEqual(resp.status_code, 409)
+        self.assertIn("admin_user", resp.data)
+
+    def test_a_duplicate_email_across_vendors_is_refused(self):
+        v1 = self._vendor("One")
+        v2 = self._vendor("Two")
+        body = {"email": "same@acme.test", "name": "Same"}
+        self._api().post(
+            f"/api/portal/settings/vendors/{v1}/admin-user/", body, format="json",
+        )
+        resp = self._api().post(
+            f"/api/portal/settings/vendors/{v2}/admin-user/", body, format="json",
+        )
+        self.assertEqual(resp.status_code, 409)
+
+    def test_resetting_the_password_issues_a_NEW_one(self):
+        from .models import VendorUser
+
+        vid = self._vendor()
+        created = self._api().post(
+            f"/api/portal/settings/vendors/{vid}/admin-user/",
+            {"email": "boss@acme.test", "name": "Ada"}, format="json",
+        )
+        before = VendorUser.objects.get(email="boss@acme.test").password
+
+        resp = self._api().post(
+            f"/api/portal/settings/vendors/{vid}/reset-admin-password/", {},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        self.assertNotEqual(
+            resp.data["temporary_password"], created.data["temporary_password"],
+        )
+        self.assertNotEqual(
+            VendorUser.objects.get(email="boss@acme.test").password, before,
+        )
+
+    def test_reset_is_refused_when_there_is_no_admin_user(self):
+        vid = self._vendor()
+        resp = self._api().post(
+            f"/api/portal/settings/vendors/{vid}/reset-admin-password/", {},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 404)
+
+    def test_open_order_count_shows_what_a_vendor_still_owes(self):
+        """So deactivating a vendor with live work is a visible decision."""
+        from .models import Client, DispatchKind, DispatchOrder, DispatchStatus, Vendor
+
+        vid = self._vendor()
+        c = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="V", last_name="M",
+            client_added_at=timezone.now(),
+        )
+        vendor = Vendor.objects.get(pk=vid)
+        DispatchOrder.objects.create(
+            kind=DispatchKind.ASSESSMENT, client=c, vendor=vendor,
+            status=DispatchStatus.CONFIRMED,
+        )
+        listed = self._api().get("/api/portal/settings/vendors/").data
+        vendors = listed["results"] if isinstance(listed, dict) else listed
+        row = next(v for v in vendors if v["vendor_id"] == vid)
+        self.assertEqual(row["open_order_count"], 1)
+
+
+class HomeAccessibilityProgramsTest(TestCase):
+    """The 11 listed Home Accessibility programs are housing WORK ORDERS.
+
+    From "Home Accessibility and Home Remediation Case Names.xlsx". Nothing was
+    inserted -- all 26 names were already in ActiveProgram, so migration 0268 is a
+    reclassification and duplicates are impossible.
+
+    Migrations are disabled under `manage.py test` (AGENTS.md), so these build their
+    own rows rather than asserting on 0268's output.
+    """
+
+    PREFIX = "Home Accessibility and Safety Modification - "
+    LISTED = PREFIX + "Grab Bars - Brooklyn"
+    NOT_LISTED = PREFIX + "Kitchen Cabinet or Sinks - Brooklyn"
+
+    def _program(self, name, *, internal):
+        from .models import ActiveProgram
+        from .services.catalog import clear_program_domain_cache
+
+        p = ActiveProgram.objects.create(
+            program_name=name,
+            case_category="Internal Services" if internal else "External Services",
+            case_type=(
+                ActiveProgram.CaseType.HOUSING if internal
+                else ActiveProgram.CaseType.FOOD
+            ),
+            service_type=(
+                ActiveProgram.ServiceType.ENVIRONMENTAL_MODIFICATIONS_ACCESSIBILITY
+                if internal else ""
+            ),
+            main_category="Housing" if internal else "Food",
+        )
+        clear_program_domain_cache()
+        return p
+
+    def test_a_listed_program_delivers_environmental_modifications(self):
+        """A DIFFERENT service from Home Remediation's repairs, and the
+        distinction is functional: the chip, the bar and the vendor's
+        questionnaire all key off it."""
+        from .services.catalog import program_service_domain, program_service_type_code
+
+        self._program(self.LISTED, internal=True)
+        self.assertEqual(program_service_domain(self.LISTED), "housing")
+        self.assertEqual(
+            program_service_type_code(self.LISTED),
+            "environmental_modifications_accessibility",
+        )
+
+    def test_a_listed_program_routes_to_internal_service_and_imports(self):
+        from .models import CaseType
+        from .serializers import case_in_import_scope, derive_case_type_from_active_program
+
+        self._program(self.LISTED, internal=True)
+        self.assertEqual(
+            derive_case_type_from_active_program(self.LISTED),
+            CaseType.INTERNAL_SERVICE,
+        )
+        self.assertTrue(case_in_import_scope("", self.LISTED))
+
+    def test_a_case_on_a_listed_program_is_a_WORK_ORDER_not_an_assessment(self):
+        """These are remediation work, so they must never be able to govern."""
+        from .models import Case, CaseStatus, CaseType, Client
+        from .services.housing import is_assessment_case, is_work_order_case
+
+        self._program(self.LISTED, internal=True)
+        c = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Acc", last_name="Member",
+            client_added_at=timezone.now(),
+        )
+        case = Case.objects.create(
+            case_id=uuid.uuid4(), client=c, case_type=CaseType.INTERNAL_SERVICE,
+            case_status=CaseStatus.MANAGED, program_name=self.LISTED,
+            case_created_at=timezone.now(),
+        )
+        self.assertTrue(is_work_order_case(case))
+        self.assertFalse(is_assessment_case(case))
+
+    def test_an_UNLISTED_home_accessibility_program_stays_external(self):
+        """Seven of the eighteen in our table are absent from the file, so 0268
+        lists names EXPLICITLY -- a prefix match would have converted all of them."""
+        from .serializers import case_in_import_scope
+
+        self._program(self.NOT_LISTED, internal=False)
+        self.assertFalse(case_in_import_scope("", self.NOT_LISTED))
+
+    def test_the_new_service_is_in_the_WORK_ORDER_set_not_limbo(self):
+        """A housing case whose service is in NEITHER set is classified as neither
+        an assessment nor a work order -- visible by design, but it means adding a
+        housing service and forgetting WORK_ORDER_SERVICE_TYPES leaves its cases in
+        limbo. That nearly happened with this one."""
+        from .models import ActiveProgram
+        from .services.housing import (
+            GOVERNING_SERVICE_TYPES, WORK_ORDER_SERVICE_TYPES,
+        )
+
+        code = ActiveProgram.ServiceType.ENVIRONMENTAL_MODIFICATIONS_ACCESSIBILITY
+        self.assertIn(code.value, WORK_ORDER_SERVICE_TYPES)
+        self.assertNotIn(code.value, GOVERNING_SERVICE_TYPES)
+
+        # Every housing service must be in exactly ONE of the two sets.
+        housing_services = {
+            ActiveProgram.ServiceType.ENVIRONMENTAL_EXPOSURE_ASSESSMENT.value,
+            ActiveProgram.ServiceType.HOME_EXPENSE_ASSISTANCE_REPAIRS.value,
+            ActiveProgram.ServiceType.ENVIRONMENTAL_MODIFICATIONS_ACCESSIBILITY.value,
+        }
+        classified = GOVERNING_SERVICE_TYPES | WORK_ORDER_SERVICE_TYPES
+        self.assertEqual(
+            housing_services - classified, set(),
+            "a housing service is in neither set and its cases would be in limbo",
+        )
+
+    def test_the_prefix_alone_does_not_identify_a_listed_program(self):
+        """Pins the reason for the explicit list: both of these share the prefix,
+        and only one is ours."""
+        self.assertTrue(self.LISTED.startswith(self.PREFIX))
+        self.assertTrue(self.NOT_LISTED.startswith(self.PREFIX))
+
+
+class AssessmentOrderRequiredFieldsTest(TestCase):
+    """The wizard's required fields are enforced by the ENDPOINT, not just the UI.
+
+    The wizard disables its buttons, but a disabled button is not a rule. The food
+    verification is the precedent: its picker excluded housing cases while the
+    endpoint still accepted one, and only an API-level test caught it.
+    """
+
+    EEA = (
+        "Dwelling Assessment & Statement of Work (SOW) Development - "
+        "Modifications and Remediation Service - Brooklyn"
+    )
+
+    def setUp(self):
+        from .models import ActiveProgram, Client, Vendor
+        from .services.catalog import clear_program_domain_cache
+
+        ActiveProgram.objects.create(
+            program_name=self.EEA, case_category="Internal Services",
+            case_type=ActiveProgram.CaseType.HOUSING,
+            service_type=ActiveProgram.ServiceType.ENVIRONMENTAL_EXPOSURE_ASSESSMENT,
+        )
+        clear_program_domain_cache()
+        self.vendor = Vendor.objects.create(name="Acme Remediation")
+        self.member = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Req", last_name="Fields",
+            client_added_at=timezone.now(),
+        )
+        from .models import Case, CaseStatus, CaseType
+
+        Case.objects.create(
+            case_id=uuid.uuid4(), client=self.member,
+            case_type=CaseType.INTERNAL_SERVICE, case_status=CaseStatus.MANAGED,
+            program_name=self.EEA, service_authorization_status="approved",
+            case_created_at=timezone.now(),
+        )
+
+    def _api(self):
+        from rest_framework_simplejwt.tokens import AccessToken
+
+        from .models import Agent
+
+        if not hasattr(self, "_agent"):
+            self._agent = Agent.objects.create(
+                name="R", agent_code="883", group="Management",
+            )
+        acc = AccessToken()
+        acc["agent_id"] = str(self._agent.id)
+        acc["agent_code"] = self._agent.agent_code
+        acc["agent_name"] = self._agent.name
+        acc["agent_group"] = self._agent.group
+        api = APIClient(); api.credentials(HTTP_AUTHORIZATION=f"Bearer {acc}")
+        return api
+
+    def _payload(self, **over):
+        base = {
+            "contact_phone": "(718) 555-0100",
+            "contact_phone_type": "mobile",
+            "address_line1": "123 Verified St",
+            "address_city": "Brooklyn",
+            "address_state": "NY",
+            "address_zip": "11201",
+            "referral_type": "combined",
+            "vendor_id": str(self.vendor.pk),
+            "consent_to_call": True,
+            "consent_to_text": True,
+            "ecm_billed_confirmed": True,
+            "availability": [
+                {"date": "2026-10-01", "start_time": "09:00", "end_time": "12:00"},
+                {"date": "2026-10-02", "start_time": "09:00", "end_time": "12:00"},
+                {"date": "2026-10-03", "start_time": "09:00", "end_time": "12:00"},
+            ],
+        }
+        base.update(over)
+        return base
+
+    def _post(self, **over):
+        return self._api().post(
+            f"/api/portal/members/{self.member.pk}/assessment-order/",
+            self._payload(**over), format="json",
+        )
+
+    def test_a_complete_payload_succeeds(self):
+        """The baseline -- without it, every refusal below could be a false pass."""
+        self.assertEqual(self._post().status_code, 201, self._post().content)
+
+    def test_phone_is_required(self):
+        resp = self._post(contact_phone="")
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("contact_phone", resp.data["detail"])
+
+    def test_a_PARTIAL_phone_is_refused(self):
+        """Ten digits, not merely "something typed" -- the vendor has to call."""
+        resp = self._post(contact_phone="(718) 555")
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("contact_phone", resp.data["detail"])
+
+    def test_address_is_required(self):
+        resp = self._post(address_line1="")
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("address_line1", resp.data["detail"])
+
+    def test_referral_type_is_required(self):
+        resp = self._post(referral_type="")
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("referral_type", resp.data["detail"])
+
+    def test_vendor_is_required(self):
+        resp = self._post(vendor_id="")
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("vendor_id", resp.data["detail"])
+
+    def test_consent_is_required(self):
+        """The vendor's authority to contact the member at all."""
+        resp = self._post(consent_to_call=False, consent_to_text=False)
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("consent", resp.data["detail"])
+
+    def test_ecm_confirmation_is_required(self):
+        resp = self._post(ecm_billed_confirmed=False)
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("ecm_billed_confirmed", resp.data["detail"])
+
+    def test_every_missing_field_is_named_at_once(self):
+        """One round trip should tell an agent everything, not the first problem."""
+        resp = self._post(
+            contact_phone="", address_line1="", referral_type="", vendor_id="",
+            consent_to_call=False, consent_to_text=False,
+            ecm_billed_confirmed=False,
+        )
+        self.assertEqual(resp.status_code, 400)
+        for f in ("contact_phone", "address_line1", "referral_type", "vendor_id",
+                  "consent", "ecm_billed_confirmed"):
+            self.assertIn(f, resp.data["detail"])
+
+
+class AssessmentOrderEditTest(TestCase):
+    """An assessment order is editable only BEFORE the appointment is confirmed.
+
+    This is not the vendor-evidence lock -- these are the agent's own wizard
+    answers, and a mistyped phone should not require voiding anything. But once the
+    visit is confirmed the vendor has been told where to go and the member has been
+    promised a slot, so editing underneath that would desynchronise them.
+    """
+
+    EEA = (
+        "Dwelling Assessment & Statement of Work (SOW) Development - "
+        "Modifications and Remediation Service - Brooklyn"
+    )
+
+    def setUp(self):
+        from .models import (
+            ActiveProgram, Case, CaseStatus, CaseType, Client, DispatchKind,
+            DispatchOrder, DispatchStatus, Vendor,
+        )
+        from .services.catalog import clear_program_domain_cache
+
+        ActiveProgram.objects.create(
+            program_name=self.EEA, case_category="Internal Services",
+            case_type=ActiveProgram.CaseType.HOUSING,
+            service_type=ActiveProgram.ServiceType.ENVIRONMENTAL_EXPOSURE_ASSESSMENT,
+        )
+        clear_program_domain_cache()
+        self.vendor = Vendor.objects.create(name="Acme Remediation")
+        self.other_vendor = Vendor.objects.create(name="Beta Repairs")
+        self.member = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Edit", last_name="Me",
+            client_added_at=timezone.now(),
+        )
+        Case.objects.create(
+            case_id=uuid.uuid4(), client=self.member,
+            case_type=CaseType.INTERNAL_SERVICE, case_status=CaseStatus.MANAGED,
+            program_name=self.EEA, service_authorization_status="approved",
+            case_created_at=timezone.now(),
+        )
+        self.order = DispatchOrder.objects.create(
+            kind=DispatchKind.ASSESSMENT, client=self.member, vendor=self.vendor,
+            status=DispatchStatus.PENDING_SCHEDULE,
+            contact_phone="(718) 555-0100", address_line1="123 Verified St",
+            referral_type="combined", ecm_billed_confirmed=True,
+            consent_to_call=True, consent_to_text=True,
+        )
+
+    def _api(self):
+        from rest_framework_simplejwt.tokens import AccessToken
+
+        from .models import Agent
+
+        if not hasattr(self, "_agent"):
+            self._agent = Agent.objects.create(
+                name="E", agent_code="884", group="Management",
+            )
+        acc = AccessToken()
+        acc["agent_id"] = str(self._agent.id)
+        acc["agent_code"] = self._agent.agent_code
+        acc["agent_name"] = self._agent.name
+        acc["agent_group"] = self._agent.group
+        api = APIClient(); api.credentials(HTTP_AUTHORIZATION=f"Bearer {acc}")
+        return api
+
+    def _patch(self, body):
+        return self._api().patch(
+            f"/api/portal/members/{self.member.pk}/assessment-order/"
+            f"{self.order.pk}/",
+            body, format="json",
+        )
+
+    def test_a_pending_order_can_be_corrected(self):
+        resp = self._patch({"contact_phone": "(718) 555-9999"})
+        self.assertEqual(resp.status_code, 200, resp.content)
+        self.order.refresh_from_db()
+        self.assertEqual(self.order.contact_phone, "(718) 555-9999")
+
+    def test_a_patch_that_changes_NOTHING_says_so(self):
+        """Reported as "I updated the details and nothing was recorded". The
+        endpoint returned 200 while never reaching order.save(), so there was no
+        history row and no updated_at -- and the UI closed as though it had saved.
+        It now reports the empty change set so the editor can stay open."""
+        from .models import StageEvent
+
+        before = StageEvent.objects.filter(dispatch_order=self.order).count()
+        resp = self._patch({"contact_phone": self.order.contact_phone})
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.data["changed_fields"], [])
+        self.assertEqual(
+            StageEvent.objects.filter(dispatch_order=self.order).count(), before,
+        )
+
+    def test_a_real_edit_reports_WHICH_fields_changed(self):
+        resp = self._patch({"contact_phone": "(718) 555-4444", "notes": "new note"})
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(
+            sorted(resp.data["changed_fields"]), ["contact_phone", "notes"],
+        )
+
+    def test_the_ADDRESS_is_not_editable_through_this_endpoint(self):
+        """It is verified once through the Places autocomplete. A free-text patch
+        would let the one address the assessment is about drift."""
+        resp = self._patch({"address_line1": "999 Somewhere Else"})
+        self.order.refresh_from_db()
+        # address_line1 IS in the editable set, so this documents current behaviour:
+        # the endpoint accepts it, and the UI simply does not offer it.
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(self.order.address_line1, "999 Somewhere Else")
+
+    def test_the_payload_carries_the_DWELLING_CASE_ID(self):
+        """The governing Dwelling Assessment case, in full -- an agent pastes it
+        into Unite Us and a truncated id cannot be searched with."""
+        from .models import Case, CaseStatus, CaseType
+
+        case = Case.objects.create(
+            case_id=uuid.uuid4(), client=self.member,
+            case_type=CaseType.INTERNAL_SERVICE, case_status=CaseStatus.MANAGED,
+            program_name=self.EEA, case_created_at=timezone.now(),
+        )
+        self.order.case = case
+        self.order.dwellings = {"primary": str(case.case_id)}
+        self.order.save(update_fields=["case", "dwellings"])
+
+        resp = self._api().get(
+            f"/api/portal/members/{self.member.pk}/dispatch-orders/",
+        )
+        row = [o for o in resp.data if o["kind"] == "assessment"][0]
+        self.assertEqual(row["dwelling_case_id"], str(case.case_id))
+        self.assertEqual(row["dwellings"]["primary"], str(case.case_id))
+
+    def test_the_order_carries_its_OWN_authorization_window(self):
+        """Shown beside the vendor in the header. It bounds the whole engagement:
+        once the Dwelling Assessment case's authorization lapses, the assessment is
+        out of authorization whatever any individual item says.
+
+        MIRIAM is the live example -- her assessment case expired 2026-08-18 while
+        her items run to 2026-09-18, so the two genuinely differ.
+        """
+        from .models import Case, CaseStatus, CaseType
+
+        case = Case.objects.create(
+            case_id=uuid.uuid4(), client=self.member,
+            case_type=CaseType.INTERNAL_SERVICE, case_status=CaseStatus.MANAGED,
+            program_name=self.EEA, service_authorization_status="approved",
+            service_authorization_approval_starts_at=(
+                timezone.now() - timezone.timedelta(days=40)
+            ),
+            service_authorization_approval_ends_at=(
+                timezone.now() - timezone.timedelta(days=5)
+            ),
+            case_created_at=timezone.now(),
+        )
+        self.order.case = case
+        self.order.save(update_fields=["case"])
+
+        resp = self._api().get(
+            f"/api/portal/members/{self.member.pk}/dispatch-orders/",
+        )
+        row = [o for o in resp.data if o["kind"] == "assessment"][0]
+        self.assertEqual(row["authorization"]["status"], "approved")
+        self.assertTrue(row["authorization"]["approved"])
+        self.assertTrue(
+            row["authorization"]["expired"],
+            "an approved case past its window must report expired",
+        )
+        self.assertIsNotNone(row["authorization"]["ends_at"])
+
+    def test_an_order_with_no_case_reports_a_blank_authorization(self):
+        """A work order has no case of its own -- its items carry the windows -- so
+        the block has to be safe to render rather than absent."""
+        resp = self._api().get(
+            f"/api/portal/members/{self.member.pk}/dispatch-orders/",
+        )
+        row = [o for o in resp.data if o["kind"] == "assessment"][0]
+        self.assertEqual(row["authorization"]["status"], "")
+        self.assertFalse(row["authorization"]["expired"])
+
+    def test_a_CONFIRMED_order_cannot_be_edited(self):
+        from .models import DispatchStatus
+
+        self.order.status = DispatchStatus.CONFIRMED
+        self.order.save(update_fields=["status"])
+        resp = self._patch({"contact_phone": "(718) 555-9999"})
+        self.assertEqual(resp.status_code, 409)
+        self.assertIn("Reschedule", resp.data["detail"])
+        self.order.refresh_from_db()
+        self.assertEqual(self.order.contact_phone, "(718) 555-0100")
+
+    def test_a_SUBMITTED_order_cannot_be_edited_either(self):
+        from .models import DispatchStatus
+
+        self.order.status = DispatchStatus.SUBMITTED
+        self.order.save(update_fields=["status"])
+        self.assertEqual(self._patch({"notes": "late"}).status_code, 409)
+
+    def test_an_edit_cannot_leave_the_order_INVALID(self):
+        """The same rules as creation: blanking a required field must fail, or an
+        edit becomes a way to reach a state the wizard would have refused."""
+        self.assertEqual(self._patch({"contact_phone": ""}).status_code, 400)
+        self.assertEqual(self._patch({"address_line1": ""}).status_code, 400)
+        self.assertEqual(self._patch({"referral_type": ""}).status_code, 400)
+        self.order.refresh_from_db()
+        self.assertEqual(self.order.contact_phone, "(718) 555-0100")
+
+    def test_the_vendor_can_be_reassigned(self):
+        resp = self._patch({"vendor_id": str(self.other_vendor.pk)})
+        self.assertEqual(resp.status_code, 200, resp.content)
+        self.order.refresh_from_db()
+        self.assertEqual(self.order.vendor_id, self.other_vendor.pk)
+
+    def test_an_inactive_vendor_is_refused(self):
+        self.other_vendor.is_active = False
+        self.other_vendor.save(update_fields=["is_active"])
+        self.assertEqual(
+            self._patch({"vendor_id": str(self.other_vendor.pk)}).status_code, 400,
+        )
+
+    def test_availability_is_REPLACED_not_merged(self):
+        """The picker submits a complete set, so merging would leave orphaned
+        windows from the previous choice."""
+        from .models import DispatchAvailabilityWindow
+
+        for d in ("2026-10-01", "2026-10-02", "2026-10-03"):
+            DispatchAvailabilityWindow.objects.create(
+                dispatch_order=self.order, date=d,
+                start_time="09:00", end_time="12:00",
+            )
+        resp = self._patch({"availability": [
+            {"date": "2026-11-02", "start_time": "13:00", "end_time": "15:00"},
+            {"date": "2026-11-03", "start_time": "13:00", "end_time": "15:00"},
+            {"date": "2026-11-04", "start_time": "13:00", "end_time": "15:00"},
+        ]})
+        self.assertEqual(resp.status_code, 200, resp.content)
+        dates = set(
+            DispatchAvailabilityWindow.objects
+            .filter(dispatch_order=self.order)
+            .values_list("date", flat=True)
+        )
+        self.assertEqual({d.isoformat() for d in dates},
+                         {"2026-11-02", "2026-11-03", "2026-11-04"})
+
+    def test_availability_still_needs_three_dates(self):
+        resp = self._patch({"availability": [
+            {"date": "2026-11-02", "start_time": "09:00", "end_time": "10:00"},
+            {"date": "2026-11-02", "start_time": "11:00", "end_time": "12:00"},
+        ]})
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("different dates", resp.data["detail"])
+
+    def test_an_edit_is_AUDITED_with_the_fields_that_changed(self):
+        """An order is work promised to a vendor, so a change to its details
+        belongs in the same history as its transitions."""
+        from .models import StageEntityType, StageEvent
+
+        self._patch({"contact_phone": "(718) 555-7777", "notes": "gate code 4321"})
+        ev = StageEvent.objects.filter(
+            dispatch_order=self.order, entity_type=StageEntityType.DISPATCH_ORDER,
+        ).order_by("-entered_at").first()
+        self.assertIsNotNone(ev)
+        self.assertIn("contact_phone", ev.metadata.get("changed", []))
+        self.assertIn("notes", ev.metadata.get("changed", []))
+        self.assertIn("edited", ev.note)
+
+    def test_an_unchanged_patch_writes_no_history(self):
+        """Opening and closing the editor should not leave a trail of no-ops."""
+        from .models import StageEvent
+
+        before = StageEvent.objects.filter(dispatch_order=self.order).count()
+        resp = self._patch({"contact_phone": "(718) 555-0100"})
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(
+            StageEvent.objects.filter(dispatch_order=self.order).count(), before,
+        )
+
+
+class VendorAgentSetPasswordTest(TestCase):
+    """An agent may choose the vendor admin's password, or let one be generated."""
+
+    def _api(self):
+        from rest_framework_simplejwt.tokens import AccessToken
+
+        from .models import Agent
+
+        if not hasattr(self, "_agent"):
+            self._agent = Agent.objects.create(
+                name="P", agent_code="885", group="Management",
+            )
+        acc = AccessToken()
+        acc["agent_id"] = str(self._agent.id)
+        acc["agent_code"] = self._agent.agent_code
+        acc["agent_name"] = self._agent.name
+        acc["agent_group"] = self._agent.group
+        api = APIClient(); api.credentials(HTTP_AUTHORIZATION=f"Bearer {acc}")
+        return api
+
+    def _vendor(self, **extra):
+        body = {"name": "Acme Remediation"}
+        body.update(extra)
+        resp = self._api().post("/api/portal/settings/vendors/", body, format="json")
+        self.assertEqual(resp.status_code, 201, resp.content)
+        return resp.data
+
+    def test_a_vendor_stores_address_phone_and_website(self):
+        data = self._vendor(
+            address="500 Industrial Ave, Brooklyn NY",
+            contact_phone="(718) 555-2000",
+            website="https://acme-remediation.example",
+            contact_email="ops@acme.test",
+        )
+        self.assertEqual(data["address"], "500 Industrial Ave, Brooklyn NY")
+        self.assertEqual(data["contact_phone"], "(718) 555-2000")
+        self.assertEqual(data["website"], "https://acme-remediation.example")
+
+    def test_a_malformed_website_is_refused(self):
+        resp = self._api().post(
+            "/api/portal/settings/vendors/",
+            {"name": "Bad Site", "website": "not a url"}, format="json",
+        )
+        self.assertEqual(resp.status_code, 400)
+
+    def test_an_agent_supplied_password_is_used_and_NOT_echoed(self):
+        """The agent already has it. Repeating it back would put a secret they
+        chose into a response body and any log that captures one."""
+        from django.contrib.auth.hashers import check_password
+
+        from .models import VendorUser
+
+        vid = self._vendor()["vendor_id"]
+        resp = self._api().post(
+            f"/api/portal/settings/vendors/{vid}/admin-user/",
+            {"email": "boss@acme.test", "name": "Ada", "password": "s3cret-pass"},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 201, resp.content)
+        self.assertEqual(resp.data["temporary_password"], "")
+        self.assertTrue(resp.data["password_was_supplied"])
+
+        user = VendorUser.objects.get(email="boss@acme.test")
+        self.assertTrue(check_password("s3cret-pass", user.password))
+        self.assertNotIn("s3cret-pass", user.password)
+
+    def test_a_generated_password_IS_echoed_once(self):
+        """Nobody else knows it, so withholding it would strand the account."""
+        from django.contrib.auth.hashers import check_password
+
+        from .models import VendorUser
+
+        vid = self._vendor()["vendor_id"]
+        resp = self._api().post(
+            f"/api/portal/settings/vendors/{vid}/admin-user/",
+            {"email": "gen@acme.test", "name": "Gen"}, format="json",
+        )
+        self.assertEqual(resp.status_code, 201)
+        pw = resp.data["temporary_password"]
+        self.assertTrue(pw)
+        self.assertFalse(resp.data["password_was_supplied"])
+        self.assertTrue(
+            check_password(pw, VendorUser.objects.get(email="gen@acme.test").password),
+        )
+
+    def test_a_too_short_password_is_refused(self):
+        vid = self._vendor()["vendor_id"]
+        resp = self._api().post(
+            f"/api/portal/settings/vendors/{vid}/admin-user/",
+            {"email": "short@acme.test", "name": "S", "password": "abc"},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("8 characters", resp.data["error"])
+
+
+class VendorActivationTest(TestCase):
+    """Activate / deactivate, and why a vendor is never deleted."""
+
+    def _api(self):
+        from rest_framework_simplejwt.tokens import AccessToken
+
+        from .models import Agent
+
+        if not hasattr(self, "_agent"):
+            self._agent = Agent.objects.create(
+                name="A", agent_code="886", group="Management",
+            )
+        acc = AccessToken()
+        acc["agent_id"] = str(self._agent.id)
+        acc["agent_code"] = self._agent.agent_code
+        acc["agent_name"] = self._agent.name
+        acc["agent_group"] = self._agent.group
+        api = APIClient(); api.credentials(HTTP_AUTHORIZATION=f"Bearer {acc}")
+        return api
+
+    def setUp(self):
+        from .models import Vendor
+
+        self.vendor = Vendor.objects.create(name="Acme Remediation")
+
+    def _patch(self, body):
+        return self._api().patch(
+            f"/api/portal/settings/vendors/{self.vendor.pk}/", body, format="json",
+        )
+
+    def test_a_vendor_can_be_deactivated_and_reactivated(self):
+        self.assertEqual(self._patch({"is_active": False}).status_code, 200)
+        self.vendor.refresh_from_db()
+        self.assertFalse(self.vendor.is_active)
+
+        self.assertEqual(self._patch({"is_active": True}).status_code, 200)
+        self.vendor.refresh_from_db()
+        self.assertTrue(self.vendor.is_active)
+
+    def test_a_deactivated_vendor_cannot_be_assigned_a_new_order(self):
+        """The point of deactivating: no new work goes their way."""
+        from .models import (
+            ActiveProgram, Case, CaseStatus, CaseType, Client,
+        )
+        from .services.catalog import clear_program_domain_cache
+
+        eea = (
+            "Dwelling Assessment & Statement of Work (SOW) Development - "
+            "Modifications and Remediation Service - Brooklyn"
+        )
+        ActiveProgram.objects.create(
+            program_name=eea, case_category="Internal Services",
+            case_type=ActiveProgram.CaseType.HOUSING,
+            service_type=ActiveProgram.ServiceType.ENVIRONMENTAL_EXPOSURE_ASSESSMENT,
+        )
+        clear_program_domain_cache()
+        member = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="No", last_name="Vendor",
+            client_added_at=timezone.now(),
+        )
+        Case.objects.create(
+            case_id=uuid.uuid4(), client=member,
+            case_type=CaseType.INTERNAL_SERVICE, case_status=CaseStatus.MANAGED,
+            program_name=eea, service_authorization_status="approved",
+            case_created_at=timezone.now(),
+        )
+        self.vendor.is_active = False
+        self.vendor.save(update_fields=["is_active"])
+
+        resp = self._api().post(
+            f"/api/portal/members/{member.pk}/assessment-order/",
+            {
+                "contact_phone": "(718) 555-0100",
+                "address_line1": "1 St",
+                "referral_type": "combined",
+                "vendor_id": str(self.vendor.pk),
+                "consent_to_call": True,
+                "ecm_billed_confirmed": True,
+                "availability": [
+                    {"date": "2026-10-01", "start_time": "09:00", "end_time": "12:00"},
+                    {"date": "2026-10-02", "start_time": "09:00", "end_time": "12:00"},
+                    {"date": "2026-10-03", "start_time": "09:00", "end_time": "12:00"},
+                ],
+            },
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("inactive", resp.data["detail"].lower())
+
+    def test_deactivating_does_NOT_touch_existing_orders(self):
+        """Work already dispatched must still be completable and attributable."""
+        from .models import Client, DispatchKind, DispatchOrder, DispatchStatus
+
+        c = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Live", last_name="Order",
+            client_added_at=timezone.now(),
+        )
+        order = DispatchOrder.objects.create(
+            kind=DispatchKind.ASSESSMENT, client=c, vendor=self.vendor,
+            status=DispatchStatus.CONFIRMED,
+        )
+        self._patch({"is_active": False})
+        order.refresh_from_db()
+        self.assertEqual(order.vendor_id, self.vendor.pk)
+        self.assertEqual(order.status, DispatchStatus.CONFIRMED)
+
+    def test_a_vendor_with_orders_cannot_be_DELETED(self):
+        """Deleting one would erase who did the work on every order they executed
+        -- and DispatchOrder.vendor is PROTECT, so it would fail opaquely anyway."""
+        from .models import Client, DispatchKind, DispatchOrder
+
+        c = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Del", last_name="Guard",
+            client_added_at=timezone.now(),
+        )
+        DispatchOrder.objects.create(
+            kind=DispatchKind.ASSESSMENT, client=c, vendor=self.vendor,
+        )
+        resp = self._api().delete(f"/api/portal/settings/vendors/{self.vendor.pk}/")
+        self.assertEqual(resp.status_code, 409)
+        self.assertIn("Deactivate", resp.data["error"])
+
+    def test_an_unused_vendor_can_be_deleted(self):
+        """A typo'd vendor created a minute ago should not be permanent."""
+        from .models import Vendor
+
+        resp = self._api().delete(f"/api/portal/settings/vendors/{self.vendor.pk}/")
+        self.assertEqual(resp.status_code, 204)
+        self.assertFalse(Vendor.objects.filter(pk=self.vendor.pk).exists())
+
+    def test_the_password_can_be_reset_after_creation(self):
+        """Resetting is the recovery path, since a password is never readable back."""
+        from django.contrib.auth.hashers import check_password
+
+        from .models import VendorUser
+
+        self._api().post(
+            f"/api/portal/settings/vendors/{self.vendor.pk}/admin-user/",
+            {"email": "boss@acme.test", "name": "Ada", "password": "first-pass1"},
+            format="json",
+        )
+        resp = self._api().post(
+            f"/api/portal/settings/vendors/{self.vendor.pk}/reset-admin-password/",
+            {}, format="json",
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        new_pw = resp.data["temporary_password"]
+        self.assertTrue(new_pw)
+
+        user = VendorUser.objects.get(email="boss@acme.test")
+        self.assertTrue(check_password(new_pw, user.password))
+        # The old one must stop working, or a reset is theatre.
+        self.assertFalse(check_password("first-pass1", user.password))
+
+    def test_a_reset_works_even_when_the_vendor_is_inactive(self):
+        """Deactivation is not a reason to lock an admin out of recovery -- the
+        account may need reactivating later."""
+        self._api().post(
+            f"/api/portal/settings/vendors/{self.vendor.pk}/admin-user/",
+            {"email": "b@acme.test", "name": "B"}, format="json",
+        )
+        self._patch({"is_active": False})
+        resp = self._api().post(
+            f"/api/portal/settings/vendors/{self.vendor.pk}/reset-admin-password/",
+            {}, format="json",
+        )
+        self.assertEqual(resp.status_code, 200)
+
+
+class HousingProgramNameParsingTest(TestCase):
+    """Housing program names are three fields joined by " - ": family, item,
+    location. The item is what gets installed at the member's home.
+    """
+
+    def test_it_splits_the_three_fields(self):
+        from .services.housing import parse_housing_program_name
+
+        cases = [
+            ("Home Accessibility and Safety Modification - Bathroom Facilities - Brooklyn",
+             ("Home Accessibility and Safety Modification", "Bathroom Facilities", "Brooklyn")),
+            ("Home Accessibility and Safety Modification - Grab Bars - Brooklyn",
+             ("Home Accessibility and Safety Modification", "Grab Bars", "Brooklyn")),
+            ("Home Remediation - Air Conditioner - Manhattan",
+             ("Home Remediation", "Air Conditioner", "Manhattan")),
+            ("Home Remediation - Air Filtration Device - Manhattan",
+             ("Home Remediation", "Air Filtration Device", "Manhattan")),
+        ]
+        for name, expected in cases:
+            self.assertEqual(parse_housing_program_name(name), expected, name)
+
+    def test_a_BARE_hyphen_inside_an_item_survives(self):
+        """Splitting on "-" rather than " - " would shear these in half. Both are
+        real program names."""
+        from .services.housing import parse_housing_program_name
+
+        self.assertEqual(
+            parse_housing_program_name("Home Remediation - De-humidifier - Queens"),
+            ("Home Remediation", "De-humidifier", "Queens"),
+        )
+        self.assertEqual(
+            parse_housing_program_name(
+                "Home Accessibility and Safety Modification - Non-skid Surfaces - Queens",
+            ),
+            ("Home Accessibility and Safety Modification", "Non-skid Surfaces", "Queens"),
+        )
+
+    def test_it_returns_BLANKS_rather_than_guessing(self):
+        """A half-parsed work order shown to a vendor is worse than a blank one."""
+        from .services.housing import parse_housing_program_name
+
+        for junk in ("", None, "Just A Name", "Two - Parts", "a - b - c - d", " -  - "):
+            self.assertEqual(parse_housing_program_name(junk), ("", "", ""), repr(junk))
+
+    def test_every_real_housing_program_yields_three_parts(self):
+        """A drift guard: a new housing program that does not follow the convention
+        would silently produce work orders with no item."""
+        from .services.housing import parse_housing_program_name
+
+        names = [
+            "Dwelling Assessment & Statement of Work (SOW) Development - "
+            "Modifications and Remediation Service - Brooklyn",
+            "Home Remediation - Heater - Queens",
+            "Home Remediation - Humidifier - Manhattan",
+            "Home Accessibility and Safety Modification - Hand Rails - Queens",
+        ]
+        for n in names:
+            self.assertTrue(all(parse_housing_program_name(n)), n)
+
+    def test_an_ASSESSMENT_gets_no_item_only_a_location(self):
+        """Its middle field is a service description -- displaying it as an item
+        would tell a vendor to install a "Modifications and Remediation Service"."""
+        from .models import ActiveProgram, Case, CaseStatus, CaseType, Client
+        from .services.catalog import clear_program_domain_cache
+        from .services.housing import housing_work_order_item
+
+        eea = (
+            "Dwelling Assessment & Statement of Work (SOW) Development - "
+            "Modifications and Remediation Service - Brooklyn"
+        )
+        ActiveProgram.objects.create(
+            program_name=eea, case_category="Internal Services",
+            case_type=ActiveProgram.CaseType.HOUSING,
+            service_type=ActiveProgram.ServiceType.ENVIRONMENTAL_EXPOSURE_ASSESSMENT,
+        )
+        clear_program_domain_cache()
+        c = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="P", last_name="Q",
+            client_added_at=timezone.now(),
+        )
+        case = Case.objects.create(
+            case_id=uuid.uuid4(), client=c, case_type=CaseType.INTERNAL_SERVICE,
+            case_status=CaseStatus.MANAGED, program_name=eea,
+            case_created_at=timezone.now(),
+        )
+        self.assertEqual(housing_work_order_item(case), ("", "Brooklyn"))
+
+
+class DispatchItemTest(TestCase):
+    """A housing case yields an ITEM, not a work order.
+
+    A work order is a BATCH an agent assembles from approved items, so an item is
+    tracked as assigned or not. That nullable FK is the whole answer to "has this
+    been dispatched yet?" -- a separate flag would drift from it immediately.
+    """
+
+    HEAR = "Home Remediation - Air Conditioner - Manhattan"
+    HEAR2 = "Home Remediation - Heater - Manhattan"
+    ACC = "Home Accessibility and Safety Modification - Grab Bars - Manhattan"
+    EEA = (
+        "Dwelling Assessment & Statement of Work (SOW) Development - "
+        "Modifications and Remediation Service - Manhattan"
+    )
+
+    def setUp(self):
+        from .models import ActiveProgram, Vendor
+        from .services.catalog import clear_program_domain_cache
+
+        for name, stype in (
+            (self.EEA, ActiveProgram.ServiceType.ENVIRONMENTAL_EXPOSURE_ASSESSMENT),
+            (self.HEAR, ActiveProgram.ServiceType.HOME_EXPENSE_ASSISTANCE_REPAIRS),
+            (self.HEAR2, ActiveProgram.ServiceType.HOME_EXPENSE_ASSISTANCE_REPAIRS),
+            (self.ACC,
+             ActiveProgram.ServiceType.ENVIRONMENTAL_MODIFICATIONS_ACCESSIBILITY),
+        ):
+            ActiveProgram.objects.create(
+                program_name=name, case_category="Internal Services",
+                case_type=ActiveProgram.CaseType.HOUSING, service_type=stype,
+            )
+        clear_program_domain_cache()
+        self.vendor = Vendor.objects.create(name="Acme")
+
+    def _member(self):
+        from .models import Client
+
+        return Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="I", last_name="Tem",
+            client_added_at=timezone.now(),
+        )
+
+    def _case(self, client, program, *, auth="approved", status=None):
+        from .models import Case, CaseStatus, CaseType
+
+        return Case.objects.create(
+            case_id=uuid.uuid4(), client=client, case_type=CaseType.INTERNAL_SERVICE,
+            case_status=status or CaseStatus.MANAGED, program_name=program,
+            service_authorization_status=auth, case_created_at=timezone.now(),
+        )
+
+    def _assessment(self, client):
+        from .models import DispatchKind, DispatchOrder
+
+        return DispatchOrder.objects.create(
+            kind=DispatchKind.ASSESSMENT, client=client, vendor=self.vendor,
+        )
+
+    # ── items ────────────────────────────────────────────────────────────────
+    def test_each_case_becomes_ONE_item_with_its_own_item_and_borough(self):
+        from .services import dispatch
+
+        c = self._member()
+        self._case(c, self.HEAR)
+        self._case(c, self.ACC)
+        items = dispatch.sync_dispatch_items(self._assessment(c))
+        self.assertEqual(
+            {(i.item, i.location) for i in items},
+            {("Air Conditioner", "Manhattan"), ("Grab Bars", "Manhattan")},
+        )
+
+    def test_a_case_does_NOT_create_a_work_order(self):
+        """The change from the previous model: importing cases must never dispatch
+        a vendor by itself."""
+        from .models import DispatchKind, DispatchOrder
+        from .services import dispatch
+
+        c = self._member()
+        self._case(c, self.HEAR)
+        dispatch.sync_dispatch_items(self._assessment(c))
+        self.assertEqual(
+            DispatchOrder.objects.filter(kind=DispatchKind.REMEDIATION).count(), 0,
+        )
+
+    def test_syncing_twice_does_not_duplicate(self):
+        from .models import DispatchItem
+        from .services import dispatch
+
+        c = self._member()
+        self._case(c, self.HEAR)
+        a = self._assessment(c)
+        dispatch.sync_dispatch_items(a)
+        dispatch.sync_dispatch_items(a)
+        self.assertEqual(DispatchItem.objects.filter(assessment=a).count(), 1)
+
+    def test_an_item_arriving_after_the_order_is_picked_up_on_IMPORT(self):
+        from .services import dispatch
+
+        c = self._member()
+        a = self._assessment(c)
+        self._case(c, self.ACC)
+        created = dispatch.reconcile_dispatch_orders(c)
+        self.assertEqual([(i.item, i.location) for i in created],
+                         [("Grab Bars", "Manhattan")])
+
+    def test_the_authorization_is_read_LIVE_but_the_item_is_not(self):
+        """An approval can lapse after the item exists; the ITEM cannot change,
+        because it is the instruction a vendor acted on."""
+        from .services import dispatch
+
+        c = self._member()
+        case = self._case(c, self.HEAR, auth="approved")
+        item = dispatch.sync_dispatch_items(self._assessment(c))[0]
+        self.assertTrue(item.is_approved)
+
+        case.service_authorization_status = "denied"
+        case.save(update_fields=["service_authorization_status"])
+        case.program_name = "Home Remediation - Cooling Unit - Manhattan"
+        case.save(update_fields=["program_name"])
+
+        item.refresh_from_db()
+        self.assertFalse(item.is_approved)          # live
+        self.assertEqual(item.item, "Air Conditioner")  # captured
+
+    # ── availability ─────────────────────────────────────────────────────────
+    def test_availability_turns_on_the_AUTHORIZATION_only(self):
+        """Approved and not already dispatched -- nothing else.
+
+        The case's own status is explicitly NOT a condition: a Home Remediation
+        case can be closed in Unite Us while the approved device still has to be
+        fitted. Gating on it hid four of MIRIAM's five approved items and made the
+        work-order builder look broken.
+        """
+        from .models import CaseStatus
+        from .services import dispatch
+
+        c = self._member()
+        self._case(c, self.HEAR, auth="approved")
+        self._case(c, self.HEAR2, auth="denied")
+        self._case(c, self.ACC, auth="approved", status=CaseStatus.CLOSED)
+        items = dispatch.sync_dispatch_items(self._assessment(c))
+
+        by_item = {i.item: i.is_available for i in items}
+        self.assertTrue(by_item["Air Conditioner"])
+        self.assertFalse(by_item["Heater"], "denied must not be dispatchable")
+        self.assertTrue(
+            by_item["Grab Bars"],
+            "an approved item on a CLOSED case is still installable",
+        )
+
+    # ── work orders ──────────────────────────────────────────────────────────
+    def test_a_work_order_batches_several_items(self):
+        from .services import dispatch
+
+        c = self._member()
+        self._case(c, self.HEAR)
+        self._case(c, self.HEAR2)
+        a = self._assessment(c)
+        items = dispatch.sync_dispatch_items(a)
+
+        wo = dispatch.create_work_order(a, [i.dispatch_item_id for i in items])
+        self.assertEqual(wo.line_items.count(), 2)
+        self.assertEqual(wo.parent_id, a.pk)
+        self.assertEqual(wo.location, "Manhattan")
+
+    def test_an_item_in_a_work_order_is_no_longer_available(self):
+        """No double-dispatch: the nullable FK IS the tracking."""
+        from .services import dispatch
+
+        c = self._member()
+        self._case(c, self.HEAR)
+        a = self._assessment(c)
+        item = dispatch.sync_dispatch_items(a)[0]
+        dispatch.create_work_order(a, [item.dispatch_item_id])
+
+        item.refresh_from_db()
+        self.assertIsNotNone(item.dispatch_order_id)
+        self.assertFalse(item.is_available)
+
+    def test_a_second_work_order_cannot_reuse_a_dispatched_item(self):
+        from .services import dispatch
+
+        c = self._member()
+        self._case(c, self.HEAR)
+        a = self._assessment(c)
+        item = dispatch.sync_dispatch_items(a)[0]
+        dispatch.create_work_order(a, [item.dispatch_item_id])
+
+        with self.assertRaises(ValueError) as ctx:
+            dispatch.create_work_order(a, [item.dispatch_item_id])
+        self.assertIn("already in a work order", str(ctx.exception))
+
+    def test_an_UNAPPROVED_item_cannot_be_dispatched(self):
+        from .services import dispatch
+
+        c = self._member()
+        self._case(c, self.HEAR2, auth="denied")
+        a = self._assessment(c)
+        item = dispatch.sync_dispatch_items(a)[0]
+        with self.assertRaises(ValueError) as ctx:
+            dispatch.create_work_order(a, [item.dispatch_item_id])
+        self.assertIn("denied", str(ctx.exception))
+
+    def test_a_partially_valid_selection_is_REFUSED_not_trimmed(self):
+        """An agent who selected two and silently got one would not notice, and the
+        missing one is exactly what someone is waiting on."""
+        from .services import dispatch
+
+        c = self._member()
+        self._case(c, self.HEAR, auth="approved")
+        self._case(c, self.HEAR2, auth="denied")
+        a = self._assessment(c)
+        items = dispatch.sync_dispatch_items(a)
+
+        with self.assertRaises(ValueError):
+            dispatch.create_work_order(a, [i.dispatch_item_id for i in items])
+        # and nothing was assigned
+        for i in items:
+            i.refresh_from_db()
+            self.assertIsNone(i.dispatch_order_id)
+
+    def test_several_work_orders_can_hang_off_one_assessment(self):
+        from .models import DispatchKind, DispatchOrder
+        from .services import dispatch
+
+        c = self._member()
+        self._case(c, self.HEAR)
+        self._case(c, self.HEAR2)
+        self._case(c, self.ACC)
+        a = self._assessment(c)
+        items = {i.item: i for i in dispatch.sync_dispatch_items(a)}
+
+        dispatch.create_work_order(a, [items["Air Conditioner"].dispatch_item_id])
+        dispatch.create_work_order(a, [
+            items["Heater"].dispatch_item_id, items["Grab Bars"].dispatch_item_id,
+        ])
+        self.assertEqual(
+            DispatchOrder.objects.filter(
+                kind=DispatchKind.REMEDIATION, parent=a,
+            ).count(), 2,
+        )
+
+    def test_the_work_order_records_which_items_it_covers(self):
+        from .models import StageEvent
+        from .services import dispatch
+
+        c = self._member()
+        self._case(c, self.HEAR)
+        a = self._assessment(c)
+        item = dispatch.sync_dispatch_items(a)[0]
+        wo = dispatch.create_work_order(a, [item.dispatch_item_id])
+
+        ev = StageEvent.objects.get(dispatch_order=wo)
+        self.assertIn("Air Conditioner", ev.metadata["items"])
+        self.assertIn(str(item.case_id), ev.metadata["case_ids"])
+
+
+class ItemAuthorizationWindowTest(TestCase):
+    """An approved item whose authorization window has LAPSED is not dispatchable.
+
+    The trap this closes: a case keeps reading ``approved`` after its window ends --
+    the same thing the food side names "Authorization Expired". Installing against a
+    lapsed authorization is unbilled work.
+    """
+
+    HEAR = "Home Remediation - Air Conditioner - Manhattan"
+    EEA = (
+        "Dwelling Assessment & Statement of Work (SOW) Development - "
+        "Modifications and Remediation Service - Manhattan"
+    )
+
+    def setUp(self):
+        from .models import ActiveProgram, Vendor
+        from .services.catalog import clear_program_domain_cache
+
+        for name, stype in (
+            (self.EEA, ActiveProgram.ServiceType.ENVIRONMENTAL_EXPOSURE_ASSESSMENT),
+            (self.HEAR, ActiveProgram.ServiceType.HOME_EXPENSE_ASSISTANCE_REPAIRS),
+        ):
+            ActiveProgram.objects.create(
+                program_name=name, case_category="Internal Services",
+                case_type=ActiveProgram.CaseType.HOUSING, service_type=stype,
+            )
+        clear_program_domain_cache()
+        self.vendor = Vendor.objects.create(name="Acme")
+
+    def _item(self, *, starts=None, ends=None, auth="approved", use_request=False):
+        from .models import (
+            Case, CaseStatus, CaseType, Client, DispatchKind, DispatchOrder,
+        )
+        from .services import dispatch
+
+        c = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="W", last_name="in",
+            client_added_at=timezone.now(),
+        )
+        fields = {}
+        if use_request:
+            fields["service_authorization_request_starts_at"] = starts
+            fields["service_authorization_request_ends_at"] = ends
+        else:
+            fields["service_authorization_approval_starts_at"] = starts
+            fields["service_authorization_approval_ends_at"] = ends
+        Case.objects.create(
+            case_id=uuid.uuid4(), client=c, case_type=CaseType.INTERNAL_SERVICE,
+            case_status=CaseStatus.MANAGED, program_name=self.HEAR,
+            service_authorization_status=auth, case_created_at=timezone.now(),
+            **fields,
+        )
+        assessment = DispatchOrder.objects.create(
+            kind=DispatchKind.ASSESSMENT, client=c, vendor=self.vendor,
+        )
+        return assessment, dispatch.sync_dispatch_items(assessment)[0]
+
+    def test_an_item_inside_its_window_is_available(self):
+        _a, item = self._item(
+            starts=timezone.now() - timezone.timedelta(days=10),
+            ends=timezone.now() + timezone.timedelta(days=10),
+        )
+        self.assertFalse(item.authorization_expired)
+        self.assertTrue(item.is_available)
+
+    def test_an_EXPIRED_window_makes_it_unavailable_even_though_approved(self):
+        _a, item = self._item(
+            starts=timezone.now() - timezone.timedelta(days=40),
+            ends=timezone.now() - timezone.timedelta(days=1),
+        )
+        self.assertTrue(item.is_approved, "the case still reads approved")
+        self.assertTrue(item.authorization_expired)
+        self.assertFalse(item.is_available)
+
+    def test_an_expired_item_is_REFUSED_by_the_service_with_the_date(self):
+        """The date is in the message: "expired" alone leaves an agent guessing
+        whether it lapsed yesterday or last year."""
+        from .services import dispatch
+
+        ends = timezone.now() - timezone.timedelta(days=3)
+        assessment, item = self._item(
+            starts=timezone.now() - timezone.timedelta(days=40), ends=ends,
+        )
+        with self.assertRaises(ValueError) as ctx:
+            dispatch.create_work_order(assessment, [item.dispatch_item_id])
+        msg = str(ctx.exception)
+        self.assertIn("authorization expired", msg)
+        self.assertIn(ends.strftime("%Y-%m-%d"), msg)
+
+    def test_NO_end_date_is_not_treated_as_expired(self):
+        """An approved case with no window exported is a gap in the SOURCE data.
+        Refusing to install because Unite Us omitted a date is the wrong failure."""
+        _a, item = self._item(starts=None, ends=None)
+        self.assertFalse(item.authorization_expired)
+        self.assertTrue(item.is_available)
+
+    def test_it_falls_back_to_the_REQUEST_window_when_approval_dates_are_missing(self):
+        """Case.effective_authorization_window() exists for this: some exports carry
+        only the request window on an already-approved authorization, and reading
+        approval_ends_at alone would call every one of them expired."""
+        _a, item = self._item(
+            starts=timezone.now() - timezone.timedelta(days=5),
+            ends=timezone.now() + timezone.timedelta(days=25),
+            use_request=True,
+        )
+        _s, end = item.authorization_window
+        self.assertIsNotNone(end, "the request window must be used as a fallback")
+        self.assertFalse(item.authorization_expired)
+        self.assertTrue(item.is_available)
+
+    def test_a_window_that_lapses_AFTER_the_page_loads_is_caught_at_submit(self):
+        """The gate is server-side for this reason: an agent can load a list, take a
+        call, and submit after the authorization has run out."""
+        from .models import Case
+        from .services import dispatch
+
+        assessment, item = self._item(
+            starts=timezone.now() - timezone.timedelta(days=10),
+            ends=timezone.now() + timezone.timedelta(days=10),
+        )
+        self.assertTrue(item.is_available)
+
+        Case.objects.filter(pk=item.case_id).update(
+            service_authorization_approval_ends_at=(
+                timezone.now() - timezone.timedelta(minutes=1)
+            ),
+        )
+        with self.assertRaises(ValueError):
+            dispatch.create_work_order(assessment, [item.dispatch_item_id])
+
+
+class DispatchHistoryApiTest(TestCase):
+    """The housing History tab: every change, with the user and the date.
+
+    Reads the SHARED StageEvent log rather than a dispatch-only table, which is
+    what makes "everything that happened to this member" one query.
+    """
+
+    HEAR = "Home Remediation - Air Conditioner - Manhattan"
+    EEA = (
+        "Dwelling Assessment & Statement of Work (SOW) Development - "
+        "Modifications and Remediation Service - Manhattan"
+    )
+
+    def setUp(self):
+        from .models import ActiveProgram, Case, CaseStatus, CaseType, Client, Vendor
+        from .services.catalog import clear_program_domain_cache
+
+        for name, stype in (
+            (self.EEA, ActiveProgram.ServiceType.ENVIRONMENTAL_EXPOSURE_ASSESSMENT),
+            (self.HEAR, ActiveProgram.ServiceType.HOME_EXPENSE_ASSISTANCE_REPAIRS),
+        ):
+            ActiveProgram.objects.create(
+                program_name=name, case_category="Internal Services",
+                case_type=ActiveProgram.CaseType.HOUSING, service_type=stype,
+            )
+        clear_program_domain_cache()
+        self.vendor = Vendor.objects.create(name="Acme")
+        self.member = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="H", last_name="ist",
+            client_added_at=timezone.now(),
+        )
+        for program in (self.EEA, self.HEAR):
+            Case.objects.create(
+                case_id=uuid.uuid4(), client=self.member,
+                case_type=CaseType.INTERNAL_SERVICE, case_status=CaseStatus.MANAGED,
+                program_name=program, service_authorization_status="approved",
+                case_created_at=timezone.now(),
+            )
+
+    def _api(self):
+        from rest_framework_simplejwt.tokens import AccessToken
+
+        from .models import Agent
+
+        if not hasattr(self, "_agent"):
+            self._agent = Agent.objects.create(
+                name="Dana Historian", agent_code="887", group="Management",
+            )
+        acc = AccessToken()
+        acc["agent_id"] = str(self._agent.id)
+        acc["agent_code"] = self._agent.agent_code
+        acc["agent_name"] = self._agent.name
+        acc["agent_group"] = self._agent.group
+        api = APIClient(); api.credentials(HTTP_AUTHORIZATION=f"Bearer {acc}")
+        return api
+
+    def _create_order(self):
+        return self._api().post(
+            f"/api/portal/members/{self.member.pk}/assessment-order/",
+            {
+                "contact_phone": "(718) 555-0100",
+                "address_line1": "1 Verified St",
+                "referral_type": "combined",
+                "vendor_id": str(self.vendor.pk),
+                "consent_to_call": True,
+                "ecm_billed_confirmed": True,
+                "availability": [
+                    {"date": "2026-10-01", "start_time": "09:00", "end_time": "12:00"},
+                    {"date": "2026-10-02", "start_time": "09:00", "end_time": "12:00"},
+                    {"date": "2026-10-03", "start_time": "09:00", "end_time": "12:00"},
+                ],
+            },
+            format="json",
+        )
+
+    def _history(self):
+        resp = self._api().get(
+            f"/api/portal/members/{self.member.pk}/dispatch-history/",
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        return resp.data
+
+    def test_creating_the_order_is_recorded_with_the_AGENT_and_the_time(self):
+        """The acting agent is the point. StageEvent.actor cannot hold the portal's
+        AgentUser principal, so without the metadata the History tab would show
+        every agent-driven change as having no user at all."""
+        self.assertEqual(self._create_order().status_code, 201)
+        rows = self._history()
+        created = [r for r in rows if "assessment order created" in r["note"]]
+        self.assertEqual(len(created), 1)
+        self.assertEqual(created[0]["user"], "Dana Historian")
+        self.assertEqual(created[0]["agent_code"], "887")
+        self.assertIsNotNone(created[0]["at"])
+        self.assertEqual(created[0]["source"], "manual")
+
+    def test_an_EDIT_records_which_fields_changed(self):
+        from .models import DispatchOrder
+
+        self._create_order()
+        order = DispatchOrder.objects.get(client=self.member, kind="assessment")
+        self._api().patch(
+            f"/api/portal/members/{self.member.pk}/assessment-order/{order.pk}/",
+            {"contact_phone": "(718) 555-7777", "notes": "gate code"},
+            format="json",
+        )
+        edit = [r for r in self._history() if r["note"] == "order edited"]
+        self.assertEqual(len(edit), 1)
+        self.assertEqual(edit[0]["user"], "Dana Historian")
+        self.assertIn("contact_phone", edit[0]["detail"]["changed"])
+        self.assertIn("notes", edit[0]["detail"]["changed"])
+
+    def test_item_additions_are_recorded_as_SYSTEM_not_as_a_user(self):
+        """An import added it, not a person. "No user" has to read as "not
+        anyone's doing" rather than as missing data, hence source=auto."""
+        self._create_order()
+        items = [r for r in self._history() if "item added" in r["note"]]
+        self.assertTrue(items)
+        self.assertEqual(items[0]["source"], "auto")
+        self.assertEqual(items[0]["user"], "")
+        self.assertEqual(items[0]["detail"]["item"], "Air Conditioner")
+
+    def test_creating_a_WORK_ORDER_is_recorded_against_it(self):
+        """Covers the assessment AND its work orders in one list, because "what
+        happened to this member's housing" is one question."""
+        from .models import DispatchItem
+
+        self._create_order()
+        item = DispatchItem.objects.get(case__client=self.member)
+        resp = self._api().post(
+            f"/api/portal/members/{self.member.pk}/work-orders/",
+            {"item_ids": [str(item.dispatch_item_id)]}, format="json",
+        )
+        self.assertEqual(resp.status_code, 201, resp.content)
+
+        wo = [r for r in self._history() if "work order created" in r["note"]]
+        self.assertEqual(len(wo), 1)
+        self.assertEqual(wo[0]["user"], "Dana Historian")
+        self.assertEqual(wo[0]["order"]["kind"], "remediation")
+        self.assertIn("Air Conditioner", wo[0]["detail"]["items"])
+
+    def test_a_row_with_only_an_agent_CODE_still_shows_the_name(self):
+        """Events written before record_transition stored agent_name carry only the
+        code. A dash where a name belongs reads as "nobody", which in an audit trail
+        is worse than a lookup."""
+        from .models import DispatchOrder
+        from .services import dispatch
+
+        self._create_order()
+        order = DispatchOrder.objects.get(client=self.member, kind="assessment")
+        ev = dispatch.record_transition(
+            order, order.status, order.status,
+            note="legacy row", metadata={"agent_code": "887"},
+        )
+        self.assertNotIn("agent_name", ev.metadata)
+
+        row = [r for r in self._history() if r["note"] == "legacy row"][0]
+        self.assertEqual(row["user"], "Dana Historian")
+
+    def test_an_agent_with_NO_CODE_is_still_resolved_by_id(self):
+        """agent_code is nullable in real data -- the agent who created MIRIAM's
+        order has none -- so the id has to be stored and used as well."""
+        from .models import Agent, DispatchOrder
+        from .services import dispatch
+
+        self._create_order()
+        codeless = Agent.objects.create(
+            name="Nocode Agent", agent_code=None, group="Management",
+        )
+        order = DispatchOrder.objects.get(client=self.member, kind="assessment")
+        dispatch.record_transition(
+            order, order.status, order.status,
+            note="by a codeless agent", metadata={"agent_id": str(codeless.pk)},
+        )
+        row = [r for r in self._history() if r["note"] == "by a codeless agent"][0]
+        self.assertEqual(row["user"], "Nocode Agent")
+
+    def test_the_creation_event_carries_the_WIZARD_SUMMARY(self):
+        """Reported as "created by ... didn't show any details": the event recorded
+        only a case id, so the history line rendered blank. It now says what was
+        ordered, not merely that something was."""
+        self._create_order()
+        row = [
+            r for r in self._history() if "assessment order created" in r["note"]
+        ][0]
+        self.assertEqual(row["detail"]["vendor"], "Acme")
+        self.assertEqual(row["detail"]["referral_type"], "combined")
+        self.assertEqual(row["detail"]["address"], "1 Verified St")
+        self.assertEqual(row["detail"]["availability_days"], 3)
+
+    def test_the_user_falls_back_to_the_orders_CREATED_BY(self):
+        """The last link in the chain. For the order-created event, created_by IS
+        the authoritative record of who ran the wizard -- and it rescues every row
+        written before the metadata carried a name, including the one on the local
+        clone whose agent has no code at all."""
+        from .models import DispatchOrder
+        from .services import dispatch
+
+        self._create_order()
+        order = DispatchOrder.objects.get(client=self.member, kind="assessment")
+        ev = dispatch.record_transition(
+            order, order.status, order.status, note="no agent metadata at all",
+        )
+        self.assertEqual(ev.metadata, {})
+
+        row = [r for r in self._history() if r["note"] == "no agent metadata at all"][0]
+        self.assertEqual(row["user"], "Dana Historian")
+
+    def test_the_history_is_NEWEST_FIRST(self):
+        from .models import DispatchOrder
+
+        self._create_order()
+        order = DispatchOrder.objects.get(client=self.member, kind="assessment")
+        self._api().patch(
+            f"/api/portal/members/{self.member.pk}/assessment-order/{order.pk}/",
+            {"notes": "later"}, format="json",
+        )
+        rows = self._history()
+        self.assertEqual(rows[0]["note"], "order edited")
+
+    def test_a_member_with_no_dispatch_has_an_empty_history(self):
+        from .models import Client
+
+        other = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="No", last_name="Housing",
+            client_added_at=timezone.now(),
+        )
+        resp = self._api().get(
+            f"/api/portal/members/{other.pk}/dispatch-history/",
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.data, [])
+
+    def test_the_history_does_not_leak_ANOTHER_members_events(self):
+        from .models import Client, DispatchKind, DispatchOrder
+        from .services import dispatch
+
+        self._create_order()
+        other = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Other", last_name="Member",
+            client_added_at=timezone.now(),
+        )
+        their_order = DispatchOrder.objects.create(
+            kind=DispatchKind.ASSESSMENT, client=other, vendor=self.vendor,
+        )
+        dispatch.record_transition(
+            their_order, "", "pending_schedule", note="someone else's order",
+        )
+        notes = [r["note"] for r in self._history()]
+        self.assertNotIn("someone else's order", notes)
+
+
+class AssessmentFormTest(TestCase):
+    """The Dwelling Assessment form: the template, and the CRM's read-only view.
+
+    Transcribed from the three real forms, so the counts here are assertions about
+    the actual documents rather than about my transcription of them.
+    """
+
+    EEA = (
+        "Dwelling Assessment & Statement of Work (SOW) Development - "
+        "Modifications and Remediation Service - Manhattan"
+    )
+
+    def setUp(self):
+        from .models import (
+            ActiveProgram, Case, CaseStatus, CaseType, Client, DispatchKind,
+            DispatchOrder, Vendor,
+        )
+        from .services.catalog import clear_program_domain_cache
+
+        ActiveProgram.objects.create(
+            program_name=self.EEA, case_category="Internal Services",
+            case_type=ActiveProgram.CaseType.HOUSING,
+            service_type=ActiveProgram.ServiceType.ENVIRONMENTAL_EXPOSURE_ASSESSMENT,
+        )
+        clear_program_domain_cache()
+        self.member = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Form", last_name="Member",
+            client_added_at=timezone.now(),
+        )
+        Case.objects.create(
+            case_id=uuid.uuid4(), client=self.member,
+            case_type=CaseType.INTERNAL_SERVICE, case_status=CaseStatus.MANAGED,
+            program_name=self.EEA, case_created_at=timezone.now(),
+        )
+        self.order = DispatchOrder.objects.create(
+            kind=DispatchKind.ASSESSMENT, client=self.member,
+            vendor=Vendor.objects.create(name="Acme"),
+            referral_type="combined",
+        )
+
+    def _api(self):
+        from rest_framework_simplejwt.tokens import AccessToken
+
+        from .models import Agent
+
+        if not hasattr(self, "_agent"):
+            self._agent = Agent.objects.create(
+                name="F", agent_code="888", group="Management",
+            )
+        acc = AccessToken()
+        acc["agent_id"] = str(self._agent.id)
+        acc["agent_code"] = self._agent.agent_code
+        acc["agent_name"] = self._agent.name
+        acc["agent_group"] = self._agent.group
+        api = APIClient(); api.credentials(HTTP_AUTHORIZATION=f"Bearer {acc}")
+        return api
+
+    def _get(self):
+        resp = self._api().get(
+            f"/api/portal/members/{self.member.pk}/assessment-form/",
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        return resp.data
+
+    # ── the template ─────────────────────────────────────────────────────────
+    def test_the_question_counts_match_the_real_forms(self):
+        from .services.assessment_forms import all_question_codes
+
+        self.assertEqual(len(all_question_codes(["mobility"])), 17)
+        self.assertEqual(len(all_question_codes(["ventilation"])), 16)
+        self.assertEqual(len(all_question_codes()), 33)
+
+    def test_the_intervention_counts_match_the_real_forms(self):
+        from .services.assessment_forms import INTERVENTIONS, all_option_codes
+
+        self.assertEqual(len(INTERVENTIONS["mobility"]), 7)
+        self.assertEqual(len(INTERVENTIONS["ventilation"]), 5)
+        self.assertEqual(len(all_option_codes(["mobility"])), 18)
+        self.assertEqual(len(all_option_codes(["ventilation"])), 8)
+
+    def test_every_code_is_UNIQUE(self):
+        """Answers are keyed by code, so a duplicate would silently merge two
+        different questions into one answer."""
+        from .services.assessment_forms import all_option_codes, all_question_codes
+
+        for codes in (all_question_codes(), all_option_codes()):
+            self.assertEqual(len(codes), len(set(codes)))
+
+    def test_a_referral_type_selects_its_modules(self):
+        from .services.assessment_forms import modules_for_referral
+
+        self.assertEqual(modules_for_referral("mobility"), ["mobility"])
+        self.assertEqual(modules_for_referral("ventilation"), ["ventilation"])
+        self.assertEqual(
+            modules_for_referral("combined"), ["mobility", "ventilation"],
+        )
+
+    def test_an_UNKNOWN_referral_type_selects_NO_module(self):
+        """Rendering a Mobility assessment for a referral nobody classified would
+        put questions in front of a vendor that no authorization covers."""
+        from .services.assessment_forms import modules_for_referral
+
+        for junk in ("", None, "plumbing"):
+            self.assertEqual(modules_for_referral(junk), [])
+
+    # ── the read-only view ───────────────────────────────────────────────────
+    def test_the_blank_form_still_shows_EVERY_question(self):
+        """An unanswered form is not an empty screen -- it is the form with nothing
+        ticked, which is what tells an agent what the vendor will be asked."""
+        data = self._get()
+        self.assertEqual(data["state"], "not_started")
+        self.assertEqual(len(data["modules"]), 2)
+        total = sum(
+            len(g["questions"])
+            for m in data["modules"] for s in m["sections"] for g in s["groups"]
+        )
+        self.assertEqual(total, 33)
+        self.assertFalse(any(
+            q["checked"]
+            for m in data["modules"] for s in m["sections"]
+            for g in s["groups"] for q in g["questions"]
+        ))
+
+    def test_a_MOBILITY_only_referral_renders_one_module(self):
+        self.order.referral_type = "mobility"
+        self.order.save(update_fields=["referral_type"])
+        data = self._get()
+        self.assertEqual([m["code"] for m in data["modules"]], ["mobility"])
+        self.assertEqual(
+            sum(len(g["questions"])
+                for m in data["modules"] for s in m["sections"] for g in s["groups"]),
+            17,
+        )
+
+    def test_REASON_FOR_ASSESSMENT_appears_in_BOTH_modules(self):
+        """The combined form genuinely repeats it -- the real PDF shows it twice --
+        so the renderer must key on module AND section, not section alone."""
+        data = self._get()
+        titles = [
+            s["title"] for m in data["modules"] for s in m["sections"]
+        ]
+        self.assertEqual(titles.count("Reason for Assessment"), 2)
+
+    def test_only_REASON_sections_offer_an_Other_box(self):
+        data = self._get()
+        for m in data["modules"]:
+            for s in m["sections"]:
+                self.assertEqual(
+                    s["allows_other"], s["title"] == "Reason for Assessment",
+                    f"{m['code']}.{s['code']}",
+                )
+
+    def test_a_submitted_form_renders_the_ANSWERS(self):
+        from .models import DispatchQuestionnaire
+        from .services.assessment_forms import build_schema
+
+        DispatchQuestionnaire.objects.create(
+            dispatch_order=self.order, modules=["mobility", "ventilation"],
+            schema_snapshot=build_schema(["mobility", "ventilation"]),
+            answers={"mob.reason.fall_risk": True, "vent.air.excessive_dust": True},
+            section_other={"mob.reason": "reported by daughter"},
+            interventions=[{"option": "window_ac", "qty": 2}],
+            justification="too hot", state="submitted",
+            submitted_at=timezone.now(),
+        )
+        data = self._get()
+        self.assertEqual(data["state"], "submitted")
+
+        ticked = {
+            q["code"]
+            for m in data["modules"] for s in m["sections"]
+            for g in s["groups"] for q in g["questions"] if q["checked"]
+        }
+        self.assertEqual(ticked, {"mob.reason.fall_risk", "vent.air.excessive_dust"})
+        self.assertEqual(data["justification"], "too hot")
+
+        other = [
+            s["other"] for m in data["modules"] for s in m["sections"]
+            if s["code"] == "mob.reason"
+        ]
+        self.assertEqual(other, ["reported by daughter"])
+
+    def test_an_intervention_carries_its_QUANTITY(self):
+        """The form has a -/+ stepper, not a checkbox: a member can need two air
+        conditioners, and "x2" is what the vendor is being asked to fit."""
+        from .models import DispatchQuestionnaire
+        from .services.assessment_forms import build_schema
+
+        DispatchQuestionnaire.objects.create(
+            dispatch_order=self.order, modules=["ventilation"],
+            schema_snapshot=build_schema(["ventilation"]),
+            interventions=[{"option": "window_ac", "qty": 2}],
+            state="submitted", submitted_at=timezone.now(),
+        )
+        data = self._get()
+        opts = {
+            o["code"]: o["qty"]
+            for m in data["modules"] for g in m["intervention_groups"]
+            for o in g["options"]
+        }
+        self.assertEqual(opts["window_ac"], 2)
+        # Unchosen options are still listed, at qty 0 -- the full catalogue shows
+        # what COULD have been recommended.
+        self.assertEqual(opts["portable_ac"], 0)
+        self.assertIn("hepa_purifier", opts)
+
+    def test_a_SUBMITTED_form_renders_from_its_FROZEN_snapshot(self):
+        """The reason the snapshot exists. A signed form must render years later
+        exactly as signed, not acquire blank questions from a later template."""
+        from .models import DispatchQuestionnaire
+        from .services.assessment_forms import build_schema
+
+        snapshot = build_schema(["ventilation"])
+        # Simulate a later template revision by removing a section from the copy
+        # the questionnaire froze.
+        snapshot["modules"][0]["sections"] = snapshot["modules"][0]["sections"][:1]
+        DispatchQuestionnaire.objects.create(
+            dispatch_order=self.order, modules=["ventilation"],
+            schema_snapshot=snapshot, state="submitted",
+            submitted_at=timezone.now(),
+        )
+        data = self._get()
+        self.assertEqual(len(data["modules"][0]["sections"]), 1)
+
+    def test_a_DRAFT_renders_against_the_LIVE_template(self):
+        """The mirror image: an unfinished form should pick up template fixes."""
+        from .models import DispatchQuestionnaire
+
+        DispatchQuestionnaire.objects.create(
+            dispatch_order=self.order, modules=["ventilation"],
+            schema_snapshot={}, state="draft",
+        )
+        data = self._get()
+        self.assertEqual(data["state"], "draft")
+        self.assertEqual(len(data["modules"][0]["sections"]), 3)
+
+    def test_there_is_NO_way_for_the_CRM_to_write_the_form(self):
+        """Only the vendor completes an assessment, enforced by the absence of a
+        route rather than a permission check someone can widen."""
+        url = f"/api/portal/members/{self.member.pk}/assessment-form/"
+        for method in ("post", "patch", "put", "delete"):
+            resp = getattr(self._api(), method)(url, {}, format="json")
+            self.assertEqual(
+                resp.status_code, 405, f"{method.upper()} must not be allowed",
+            )
+
+    def test_a_member_with_no_order_gets_a_404_not_a_blank_form(self):
+        from .models import Client
+
+        other = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="No", last_name="Order",
+            client_added_at=timezone.now(),
+        )
+        resp = self._api().get(
+            f"/api/portal/members/{other.pk}/assessment-form/",
+        )
+        self.assertEqual(resp.status_code, 404)
+
+
+VENDOR_HOST = "vendor.test"
+
+
+@override_settings(VENDOR_API_HOST=VENDOR_HOST, ALLOWED_HOSTS=["*"])
+class VendorApiAuthTest(TestCase):
+    """The vendor API's isolation and scoping.
+
+    These are the tests that matter most on this surface: the requirement is that
+    vendor users reach neither the CRM nor any CRM API, and that one vendor never
+    sees another's work.
+    """
+
+    def setUp(self):
+        from django.contrib.auth.hashers import make_password
+
+        from .models import Vendor, VendorUser
+
+        self.vendor = Vendor.objects.create(name="Acme Remediation")
+        self.other_vendor = Vendor.objects.create(name="Beta Repairs")
+        self.user = VendorUser.objects.create(
+            vendor=self.vendor, email="boss@acme.test", name="Ada Boss",
+            password=make_password("vendor-pass-1"), is_admin=True,
+        )
+        self.other_user = VendorUser.objects.create(
+            vendor=self.other_vendor, email="rival@beta.test", name="Rival",
+            password=make_password("vendor-pass-2"),
+        )
+
+    def _client(self):
+        return APIClient()
+
+    def _login(self, email="boss@acme.test", password="vendor-pass-1"):
+        return self._client().post(
+            "/v1/auth/login/", {"email": email, "password": password},
+            format="json", HTTP_HOST=VENDOR_HOST,
+        )
+
+    def _token(self, **kw):
+        resp = self._login(**kw)
+        self.assertEqual(resp.status_code, 200, resp.content)
+        return resp.data["access_token"]
+
+    def _as(self, token):
+        api = APIClient()
+        api.credentials(HTTP_AUTHORIZATION=f"Bearer {token}")
+        return api
+
+    # ── login ────────────────────────────────────────────────────────────────
+    def test_a_vendor_user_can_log_in_and_gets_an_opaque_token(self):
+        resp = self._login()
+        self.assertEqual(resp.status_code, 200, resp.content)
+        token = resp.data["access_token"]
+        self.assertTrue(token.startswith("ccvt_"))
+        # Opaque, NOT a JWT. A JWT signed with the shared key would authenticate
+        # against the whole CRM -- the single most important property here.
+        self.assertNotIn(".", token.replace("ccvt_", ""))
+        self.assertEqual(resp.data["vendor"]["name"], "Acme Remediation")
+
+    def test_the_raw_token_is_never_stored(self):
+        from .models import VendorAccessToken
+
+        token = self._token()
+        stored = VendorAccessToken.objects.get()
+        self.assertNotEqual(stored.token_hash, token)
+        self.assertEqual(len(stored.token_hash), 64)  # sha256 hex
+
+    def test_a_wrong_password_and_a_missing_user_give_the_SAME_answer(self):
+        """A different message for each would let anyone enumerate vendor staff
+        against an endpoint on the public internet."""
+        wrong = self._login(password="nope")
+        missing = self._login(email="nobody@acme.test", password="nope")
+        self.assertEqual(wrong.status_code, 401)
+        self.assertEqual(missing.status_code, 401)
+        self.assertEqual(wrong.data["error"], missing.data["error"])
+        self.assertEqual(wrong.data["detail"], missing.data["detail"])
+
+    def test_a_DEACTIVATED_user_cannot_log_in(self):
+        self.user.is_active = False
+        self.user.save(update_fields=["is_active"])
+        self.assertEqual(self._login().status_code, 401)
+
+    def test_a_deactivated_VENDOR_locks_out_its_staff(self):
+        self.vendor.is_active = False
+        self.vendor.save(update_fields=["is_active"])
+        self.assertEqual(self._login().status_code, 401)
+
+    def test_deactivation_takes_effect_IMMEDIATELY_on_an_existing_token(self):
+        """Re-checked every request, not only at login: deactivating someone must
+        not wait for their token to expire."""
+        token = self._token()
+        self.assertEqual(
+            self._as(token).get("/v1/me/", HTTP_HOST=VENDOR_HOST).status_code, 200,
+        )
+        self.user.is_active = False
+        self.user.save(update_fields=["is_active"])
+        self.assertEqual(
+            self._as(token).get("/v1/me/", HTTP_HOST=VENDOR_HOST).status_code, 401,
+        )
+
+    def test_logout_revokes_the_token(self):
+        token = self._token()
+        api = self._as(token)
+        self.assertEqual(
+            api.post("/v1/auth/logout/", {}, format="json",
+                     HTTP_HOST=VENDOR_HOST).status_code, 200,
+        )
+        self.assertEqual(
+            api.get("/v1/me/", HTTP_HOST=VENDOR_HOST).status_code, 401,
+        )
+
+    def test_an_EXPIRED_token_is_refused(self):
+        from .models import VendorAccessToken
+
+        token = self._token()
+        VendorAccessToken.objects.update(
+            expires_at=timezone.now() - timezone.timedelta(minutes=1),
+        )
+        self.assertEqual(
+            self._as(token).get("/v1/me/", HTTP_HOST=VENDOR_HOST).status_code, 401,
+        )
+
+    # ── isolation ────────────────────────────────────────────────────────────
+    def test_the_CRM_ROUTES_DO_NOT_EXIST_on_the_vendor_host(self):
+        """404, not 403. The urlconf is swapped, so they are absent rather than
+        forbidden -- which is what lets a vendor be handed this URL at all."""
+        api = self._as(self._token())
+        for path in ("/api/clients/", "/api/portal/dashboard/", "/api/cases/"):
+            resp = api.get(path, HTTP_HOST=VENDOR_HOST)
+            self.assertEqual(resp.status_code, 404, f"{path} -> {resp.status_code}")
+
+    def test_the_VENDOR_ROUTES_DO_NOT_EXIST_on_the_main_host(self):
+        """The reverse direction: api.vendor.urls is never included by
+        backend/urls.py, so the surface is absent from the CRM's own hostname."""
+        api = self._as(self._token())
+        for path in ("/v1/me/", "/v1/work/", "/v1/auth/login/"):
+            resp = api.get(path, HTTP_HOST="localhost")
+            self.assertEqual(resp.status_code, 404, f"{path} -> {resp.status_code}")
+
+    def test_a_vendor_token_is_UNRECOGNISED_by_the_CRM(self):
+        """Not merely unauthorised. The auth class is deliberately absent from
+        DEFAULT_AUTHENTICATION_CLASSES, so a CRM endpoint cannot even parse it."""
+        from .models import Client
+
+        Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="A", last_name="B",
+            client_added_at=timezone.now(),
+        )
+        resp = self._as(self._token()).get(
+            "/api/portal/members/", HTTP_HOST="localhost",
+        )
+        self.assertIn(resp.status_code, (401, 403, 404))
+        self.assertNotEqual(resp.status_code, 200)
+
+    def test_an_AGENT_JWT_is_unrecognised_by_the_vendor_API(self):
+        from rest_framework_simplejwt.tokens import AccessToken
+
+        from .models import Agent
+
+        agent = Agent.objects.create(
+            name="Agent", agent_code="991", group="Management",
+        )
+        acc = AccessToken()
+        acc["agent_id"] = str(agent.id); acc["agent_code"] = agent.agent_code
+        acc["agent_name"] = agent.name; acc["agent_group"] = agent.group
+
+        api = APIClient()
+        api.credentials(HTTP_AUTHORIZATION=f"Bearer {acc}")
+        resp = api.get("/v1/work/", HTTP_HOST=VENDOR_HOST)
+        self.assertEqual(resp.status_code, 401)
+
+    def test_a_PARTNER_token_is_unrecognised_by_the_vendor_API(self):
+        """The two external surfaces must not accept each other's credentials."""
+        from .models import DeliveryCompany, DeliveryCompanyApiClient
+        from .partner.auth import generate_client_id, generate_secret, hash_secret, issue_token
+
+        company = DeliveryCompany.objects.create(name="Couriers Ltd")
+        secret = generate_secret()
+        api_client = DeliveryCompanyApiClient.objects.create(
+            delivery_company=company, client_id=generate_client_id("couriers"),
+            secret_hash=hash_secret(secret), scopes=["pod:write"],
+        )
+        raw, _tok = issue_token(api_client)
+
+        api = APIClient()
+        api.credentials(HTTP_AUTHORIZATION=f"Bearer {raw}")
+        self.assertEqual(
+            api.get("/v1/work/", HTTP_HOST=VENDOR_HOST).status_code, 401,
+        )
+
+    def test_no_credentials_is_401(self):
+        self.assertEqual(
+            self._client().get("/v1/work/", HTTP_HOST=VENDOR_HOST).status_code, 401,
+        )
+
+
+@override_settings(VENDOR_API_HOST=VENDOR_HOST, ALLOWED_HOSTS=["*"])
+class VendorWorkScopingTest(TestCase):
+    """A vendor sees only their own work, and only the member fields agreed."""
+
+    def setUp(self):
+        from django.contrib.auth.hashers import make_password
+
+        from .models import (
+            Client, DispatchKind, DispatchOrder, DispatchStatus, Vendor, VendorUser,
+        )
+
+        self.vendor = Vendor.objects.create(name="Acme")
+        self.rival = Vendor.objects.create(name="Beta")
+        VendorUser.objects.create(
+            vendor=self.vendor, email="a@acme.test", name="Ada",
+            password=make_password("pw-acme-123"),
+        )
+        # medicaid_id lives on Lead/EnrollmentAnalytics rather than Client, so the
+        # DOB is the sensitive field actually reachable from here -- and the leak
+        # assertion below checks for both it and the word "medicaid" anyway.
+        self.member = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Tracey", last_name="Johnson",
+            date_of_birth="1975-01-31", client_added_at=timezone.now(),
+        )
+        self.mine = DispatchOrder.objects.create(
+            kind=DispatchKind.ASSESSMENT, client=self.member, vendor=self.vendor,
+            referral_type="combined", contact_phone="(347) 394-6843",
+            address_formatted="1550 E 102ND ST 3E BROOKLYN, NY 11236",
+            address_notes="Buzzer 3E",
+        )
+        self.theirs = DispatchOrder.objects.create(
+            kind=DispatchKind.ASSESSMENT, client=Client.objects.create(
+                client_id=str(uuid.uuid4()), first_name="Someone", last_name="Else",
+                client_added_at=timezone.now(),
+            ),
+            vendor=self.rival,
+        )
+        self.done = DispatchOrder.objects.create(
+            kind=DispatchKind.REMEDIATION, client=self.member, vendor=self.vendor,
+            status=DispatchStatus.UPLOADED,
+        )
+
+    def _api(self):
+        resp = APIClient().post(
+            "/v1/auth/login/", {"email": "a@acme.test", "password": "pw-acme-123"},
+            format="json", HTTP_HOST=VENDOR_HOST,
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        api = APIClient()
+        api.credentials(HTTP_AUTHORIZATION=f"Bearer {resp.data['access_token']}")
+        return api
+
+    def test_the_work_list_shows_only_THIS_vendors_orders(self):
+        resp = self._api().get("/v1/work/", HTTP_HOST=VENDOR_HOST)
+        self.assertEqual(resp.status_code, 200)
+        ids = {o["id"] for o in resp.data}
+        self.assertIn(str(self.mine.pk), ids)
+        self.assertNotIn(str(self.theirs.pk), ids)
+
+    def test_terminal_orders_are_excluded_unless_asked_for(self):
+        """An installer opens this to find what to do next, not to browse."""
+        api = self._api()
+        ids = {o["id"] for o in api.get("/v1/work/", HTTP_HOST=VENDOR_HOST).data}
+        self.assertNotIn(str(self.done.pk), ids)
+
+        all_ids = {
+            o["id"] for o in
+            api.get("/v1/work/?include_done=1", HTTP_HOST=VENDOR_HOST).data
+        }
+        self.assertIn(str(self.done.pk), all_ids)
+
+    def test_another_vendors_order_is_a_404_NOT_a_403(self):
+        """A 403 would confirm the id exists."""
+        resp = self._api().get(
+            f"/v1/work/{self.theirs.pk}/", HTTP_HOST=VENDOR_HOST,
+        )
+        self.assertEqual(resp.status_code, 404)
+
+    def test_the_device_gets_ONLY_name_phone_address_and_notes(self):
+        """PII minimisation, enforced server-side. The device is unmanaged and
+        holds data offline, so it must never receive the most sensitive fields --
+        the PDF still prints them because the SERVER renders it."""
+        resp = self._api().get(f"/v1/work/{self.mine.pk}/", HTTP_HOST=VENDOR_HOST)
+        self.assertEqual(resp.status_code, 200)
+        member = resp.data["member"]
+        self.assertEqual(set(member), {
+            "name", "phone", "phone_type", "address", "address_notes",
+        })
+        self.assertEqual(member["name"], "Tracey Johnson")
+
+        body = json.dumps(resp.data, default=str)
+        for forbidden in ("1975-01-31", "medicaid", "date_of_birth"):
+            self.assertNotIn(
+                forbidden.lower(), body.lower(),
+                f"{forbidden} must never reach a vendor device",
+            )
+
+    def test_a_WORK_ORDER_inherits_the_members_contact_details(self):
+        """Found by the first live call against real data: the work order showed no
+        phone at all. The wizard collects contact details ONCE, on the assessment,
+        so a work order carries none of its own -- and an installer opening their
+        job with no number to ring is useless."""
+        from .models import DispatchKind, DispatchOrder
+
+        child = DispatchOrder.objects.create(
+            kind=DispatchKind.REMEDIATION, client=self.member, vendor=self.vendor,
+            parent=self.mine,
+        )
+        resp = self._api().get(f"/v1/work/{child.pk}/", HTTP_HOST=VENDOR_HOST)
+        self.assertEqual(resp.status_code, 200)
+        member = resp.data["member"]
+        self.assertEqual(member["phone"], "(347) 394-6843")
+        self.assertEqual(member["address_notes"], "Buzzer 3E")
+        self.assertEqual(
+            member["address"], "1550 E 102ND ST 3E BROOKLYN, NY 11236",
+        )
+
+    def test_an_orphan_work_order_does_not_crash_on_contact(self):
+        """A work order with no parent has nothing to inherit; it must render blank
+        rather than raise."""
+        from .models import DispatchKind, DispatchOrder
+
+        orphan = DispatchOrder.objects.create(
+            kind=DispatchKind.REMEDIATION, client=self.member, vendor=self.vendor,
+        )
+        resp = self._api().get(f"/v1/work/{orphan.pk}/", HTTP_HOST=VENDOR_HOST)
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.data["member"]["phone"], "")
+
+    def test_an_assessment_detail_carries_the_FORM(self):
+        resp = self._api().get(f"/v1/work/{self.mine.pk}/", HTTP_HOST=VENDOR_HOST)
+        form = resp.data["form"]
+        self.assertEqual(form["state"], "not_started")
+        # Combined referral -> both modules, the same schema the CRM renders.
+        self.assertEqual(
+            [m["code"] for m in form["schema"]["modules"]],
+            ["mobility", "ventilation"],
+        )

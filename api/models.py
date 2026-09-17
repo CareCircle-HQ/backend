@@ -2178,6 +2178,11 @@ class ScheduleCadence(models.TextChoices):
 class StageEntityType(models.TextChoices):
     CLIENT = "client", "Client"
     ENROLLMENT = "enrollment", "Enrollment"
+    # Housing work dispatched to a vendor. Joins this log rather than getting its
+    # own, so "everything that happened to this member" stays ONE query -- a
+    # parallel table would need every history view, export and report to learn
+    # about it.
+    DISPATCH_ORDER = "dispatch_order", "Dispatch Order"
 
 
 class StageEventSource(models.TextChoices):
@@ -2909,6 +2914,12 @@ class StageEvent(models.Model):
         EnrollmentVerification, on_delete=models.CASCADE, null=True, blank=True,
         related_name="stage_events",
     )
+    # Housing dispatch. A lazy reference because DispatchOrder is defined further
+    # down the module.
+    dispatch_order = models.ForeignKey(
+        "DispatchOrder", on_delete=models.CASCADE, null=True, blank=True,
+        related_name="stage_events",
+    )
     from_stage = models.CharField(max_length=25, blank=True)
     to_stage = models.CharField(max_length=25)
     source = models.CharField(
@@ -2929,6 +2940,7 @@ class StageEvent(models.Model):
             models.Index(fields=["entity_type", "to_stage"]),
             models.Index(fields=["client", "entered_at"]),
             models.Index(fields=["enrollment", "entered_at"]),
+            models.Index(fields=["dispatch_order", "entered_at"]),
         ]
 
     def __str__(self):
@@ -3238,7 +3250,20 @@ class ActiveProgram(models.Model):
     """
 
     class CaseType(models.TextChoices):
+        """The service TYPE a program belongs to, within its case category.
+
+        Internal Services is no longer food-only: housing programs (Dwelling
+        Assessment / SOW Development) are internal services of a different TYPE.
+        The rule is one governing internal-service case PER TYPE, so a member can
+        hold a Food case and a Housing case at once without them competing.
+
+        Active types are tracked in ``ProgramMainCategory.is_active`` (Housing was
+        activated to begin processing housing programs); this enum is what the
+        routing code binds to.
+        """
+
         FOOD = "food", "Food"
+        HOUSING = "housing", "Housing"
         TRANSPORTATION = "transportation", "Transportation"
 
     class ServiceType(models.TextChoices):
@@ -3257,6 +3282,25 @@ class ActiveProgram(models.Model):
         SOCIAL_SERVICE_CASE_MANAGEMENT = (
             "social_service_case_management", "Social Service Case Management",
         )
+        # Housing (type = HOUSING): the Dwelling Assessment / SOW Development
+        # programs. Unite Us sends this verbatim as the case's service_type.
+        ENVIRONMENTAL_EXPOSURE_ASSESSMENT = (
+            "environmental_exposure_assessment", "Environmental Exposure Assessment",
+        )
+        # Housing (type = HOUSING): the 15 "Home Remediation - <device> -
+        # <borough>" programs (air conditioner, air filtration device,
+        # de-humidifier, heater, humidifier x Brooklyn/Manhattan/Queens).
+        HOME_EXPENSE_ASSISTANCE_REPAIRS = (
+            "home_expense_assistance_repairs", "Home Expense Assistance/Repairs",
+        )
+        # Housing (type = HOUSING): the "Home Accessibility and Safety
+        # Modification - <item> - <borough>" programs (bathroom facilities, grab
+        # bars, hand rails, non-skid surfaces). A sibling of the Repairs service --
+        # both are WORK ORDERS raised from an assessment, neither can govern.
+        ENVIRONMENTAL_MODIFICATIONS_ACCESSIBILITY = (
+            "environmental_modifications_accessibility",
+            "Environmental Modifications/Accessibility",
+        )
 
     program_name = models.CharField(max_length=255, unique=True, db_index=True)
     main_category = models.CharField(max_length=120, blank=True)
@@ -3266,8 +3310,10 @@ class ActiveProgram(models.Model):
     # True when the program name contains the word "Household" (a household
     # pathway). Auto-derived from ``program_name`` on save.
     is_for_household = models.BooleanField(default=False)
-    # Food vs Transportation domain. Defaults to Food (every internal-service
-    # program today is food); set to Transportation for transport programs.
+    # The service TYPE within the case category (Food / Housing / Transportation).
+    # Defaults to Food for backwards compatibility -- every program predating the
+    # housing work is food. Internal-service routing is per TYPE: one governing
+    # internal-service case for each.
     case_type = models.CharField(
         max_length=20, choices=CaseType.choices, default=CaseType.FOOD
     )
@@ -3275,8 +3321,11 @@ class ActiveProgram(models.Model):
     # program name by data migration; blank when the program isn't one of the
     # services we deliver. ``db_default`` guards against an omitted-column
     # insert during a deploy window (see ``to_extend`` below).
+    # 64, not 40: "environmental_modifications_accessibility" is 41 characters and
+    # Django refuses a max_length that cannot hold its own longest choice
+    # (fields.E009). Headroom so the next service name does not need a migration.
     service_type = models.CharField(
-        max_length=40, choices=ServiceType.choices, blank=True,
+        max_length=64, choices=ServiceType.choices, blank=True,
         default="", db_default="",
     )
     # Opt-in flag (managed from Settings > Programs): this program should be
@@ -3828,6 +3877,18 @@ class TimelineEventType(models.TextChoices):
     SERVICE_CLOSED = "service_closed", "Service Closed"
     SERVICE_CANCELLED = "service_cancelled", "Service Cancelled"
     ENROLLED = "enrolled", "Enrolled"
+    # --- Housing dispatch: one granular type per transition, following the
+    # verification precedent above, so the History tab reads each step distinctly
+    # instead of a pile of generic "Dispatch" rows. ---
+    DISPATCH_CREATED = "dispatch_created", "Assessment Order Created"
+    DISPATCH_SCHEDULED = "dispatch_scheduled", "Dispatch Scheduled"
+    DISPATCH_CONFIRMED = "dispatch_confirmed", "Dispatch Confirmed"
+    DISPATCH_VISIT_STARTED = "dispatch_visit_started", "Vendor Visit Started"
+    DISPATCH_PENDING_SUBMISSION = "dispatch_pending_submission", "Dispatch Pending Submission"
+    DISPATCH_SUBMITTED = "dispatch_submitted", "Dispatch Submitted"
+    DISPATCH_VOIDED = "dispatch_voided", "Dispatch Submission Voided"
+    DISPATCH_UPLOADED = "dispatch_uploaded", "Dispatch Uploaded to Unite Us"
+    DISPATCH_CANCELLED = "dispatch_cancelled", "Dispatch Cancelled"
     # --- Other client-lifecycle events not tied to a stage transition. ---
     TICKET_CREATED = "ticket_created", "New Ticket Created"
     DELIVERY_ADDRESS_CHANGED = "delivery_address_changed", "Delivery Address Changed"
@@ -5237,6 +5298,9 @@ class EnrollmentAnalytics(models.Model):
     # Data page CSV ("Phone 1", "Phone 2", ...).
     phone_numbers = ArrayField(models.CharField(max_length=40), default=list, blank=True)
     tags = ArrayField(models.CharField(max_length=64), default=list, blank=True)
+    # Codes of EVERY ticket type the member has ever had, whatever the ticket's
+    # status -- the Data page filter is analytical ("who has ever had this"),
+    # unlike the Members page's work-queue filter which binds to OPEN tickets.
     ticket_types = ArrayField(models.CharField(max_length=64), default=list, blank=True)
 
     # When this row was last rebuilt (freshness watermark).
@@ -5275,3 +5339,804 @@ class AnalyticsRebuildRun(models.Model):
 
     def __str__(self):
         return f"AnalyticsRebuildRun({self.started_at:%Y-%m-%d %H:%M} {self.trigger})"
+
+
+# ── Dispatch: work sent out to external vendors ───────────────────────────────
+# Housing services are executed by VENDORS at the member's home, not by us. The
+# dispatch domain is the record of that work: an order, the visit, the evidence
+# produced, and the manual upload of that evidence back to Unite Us.
+#
+# "Work order" is NOT the head name on purpose -- in this project it already means
+# a Home Remediation case specifically (api/services/housing.py, the Cases tab), so
+# promoting it to the generic term would give one word two meanings. The head is
+# DispatchOrder; a Home Remediation case remains a "work order".
+#
+# See docs/housing-assessment-order-plan.md.
+
+
+class Vendor(models.Model):
+    """A company that executes housing work at a member's home.
+
+    Deliberately NOT ``DeliveryCompany`` (which is "a delivery company/vendor that
+    transports meal orders") and NOT ``Provider`` (the Unite Us organization).
+    Assessing a dwelling and driving meals are different relationships with
+    different people; sharing a table would make every existing delivery query
+    ambiguous.
+
+    Created by an admin in CRM Settings, which also provisions exactly one
+    :class:`VendorUser` with ``is_admin`` -- that person then creates their own
+    staff in the vendor portal.
+    """
+
+    vendor_id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    name = models.CharField(max_length=255, unique=True)
+    contact_name = models.CharField(max_length=255, blank=True)
+    contact_email = models.EmailField(blank=True)
+    contact_phone = models.CharField(max_length=40, blank=True)
+    address = models.CharField(max_length=255, blank=True)
+    website = models.URLField(max_length=255, blank=True)
+    notes = models.TextField(blank=True)
+    is_active = models.BooleanField(default=True, db_index=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["name"]
+
+    def __str__(self):
+        return self.name
+
+
+class VendorUser(models.Model):
+    """A person at a vendor company. NOT a CRM user.
+
+    Kept separate from ``Agent`` on purpose: a vendor must never reach CRM
+    endpoints. Every vendor query is scoped to ``vendor``, following the partner
+    API's principal, which exists "to carry the company every query must be scoped
+    to" -- the boundary lives in the principal, not in a filter remembered at each
+    call site.
+
+    ``is_admin`` marks the single bootstrap user CRM Settings provisions. That
+    person creates the rest of their staff in the vendor portal; CRM retains only
+    the ability to reset THIS user's password.
+    """
+
+    vendor_user_id = models.UUIDField(
+        primary_key=True, default=uuid.uuid4, editable=False
+    )
+    vendor = models.ForeignKey(Vendor, on_delete=models.CASCADE, related_name="users")
+    email = models.EmailField(unique=True)
+    name = models.CharField(max_length=255)
+    phone = models.CharField(max_length=40, blank=True)
+    # Django's hasher; never a plaintext or reversible value.
+    password = models.CharField(max_length=255, blank=True)
+    is_admin = models.BooleanField(default=False)
+    is_active = models.BooleanField(default=True, db_index=True)
+    last_login_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["vendor__name", "name"]
+        constraints = [
+            # CRM Settings provisions exactly ONE admin per vendor. Enforced here
+            # rather than in the view, so a second cannot arrive via the shell or
+            # a future endpoint.
+            models.UniqueConstraint(
+                fields=["vendor"], condition=models.Q(is_admin=True),
+                name="one_admin_user_per_vendor",
+            ),
+        ]
+
+    def __str__(self):
+        return f"{self.name} ({self.vendor.name})"
+
+
+class VendorAccessToken(models.Model):
+    """A short-lived OPAQUE bearer token for a logged-in vendor user.
+
+    Mirrors :class:`PartnerAccessToken` and for the same reason, restated because
+    it is the single most important decision on this surface: the project's
+    DEFAULT_AUTHENTICATION_CLASSES include JWT authenticators, so a vendor JWT
+    signed with the shared key would authenticate against the WHOLE CRM. An
+    opaque random token is meaningless to those authenticators, and revoking it is
+    one row update -- which is what makes "this vendor lost their phone" a
+    two-second fix.
+
+    Differs from the partner token in one way that matters: the principal is a
+    PERSON, not a company credential, so the token carries the user and the
+    vendor. Every query is scoped to the vendor; the user is who did it.
+    """
+
+    vendor_user = models.ForeignKey(
+        VendorUser, on_delete=models.CASCADE, related_name="tokens"
+    )
+    # sha256 of the token; the raw value is returned once and never stored.
+    token_hash = models.CharField(max_length=64, unique=True, db_index=True)
+    expires_at = models.DateTimeField(db_index=True)
+    revoked_at = models.DateTimeField(null=True, blank=True)
+    created_ip = models.CharField(max_length=64, blank=True)
+    # Free text from the login request, for "sign out my other devices" and for
+    # telling one shared tablet from another.
+    device_label = models.CharField(max_length=120, blank=True)
+    last_used_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        indexes = [models.Index(fields=["vendor_user", "expires_at"])]
+
+    def __str__(self):
+        return f"VendorAccessToken({self.vendor_user_id})"
+
+    @property
+    def is_valid(self):
+        return self.revoked_at is None and self.expires_at > timezone.now()
+
+
+class DispatchKind(models.TextChoices):
+    ASSESSMENT = "assessment", "Dwelling Assessment"
+    REMEDIATION = "remediation", "Home Remediation"
+
+
+class DispatchStatus(models.TextChoices):
+    """A single LINEAR chain -- not independent flags."""
+
+    PENDING_SCHEDULE = "pending_schedule", "Pending Schedule"
+    CONFIRMED = "confirmed", "Confirmed"
+    PENDING_SUBMISSION = "pending_submission", "Pending Submission"
+    SUBMITTED = "submitted", "Submitted"
+    UPLOADED = "uploaded", "Uploaded"
+    CANCELLED = "cancelled", "Cancelled"
+
+
+class DispatchReferralType(models.TextChoices):
+    MOBILITY = "mobility", "Mobility"
+    VENTILATION = "ventilation", "Ventilation"
+    COMBINED = "combined", "Combined"
+
+
+class DispatchOrder(models.Model):
+    """A unit of work dispatched to a vendor.
+
+    ONE model with a ``kind`` rather than separate assessment and remediation
+    models, because the two share everything that matters -- the appointment, the
+    visit, signatures, photos, documents, findings and the Unite Us upload. Two
+    models would mean building that layer twice.
+
+    An ASSESSMENT order is created once per member by an agent running the wizard
+    on the member profile. Each REMEDIATION order is created automatically from an
+    imported Home Remediation case and parented to that member's assessment order,
+    so every remediation hangs off the assessment that found the need for it.
+
+    Append-only in spirit: nothing here is reconciled, rebuilt or superseded-in-
+    place. A correction is a new :class:`DispatchSubmission`, never an edit.
+    """
+
+    dispatch_order_id = models.UUIDField(
+        # CLIENT-generated: an offline vendor retries, and without an id the
+        # client chose, a retry creates a DUPLICATE order.
+        primary_key=True, default=uuid.uuid4, editable=False,
+    )
+    kind = models.CharField(max_length=20, choices=DispatchKind.choices, db_index=True)
+    # Remediation orders hang off their assessment. Null for an assessment.
+    parent = models.ForeignKey(
+        "self", on_delete=models.CASCADE, null=True, blank=True,
+        related_name="children",
+    )
+    client = models.ForeignKey(
+        Client, on_delete=models.CASCADE, related_name="dispatch_orders"
+    )
+    # The Unite Us case this order serves: the Dwelling Assessment case for an
+    # assessment, the Home Remediation case for a remediation.
+    case = models.ForeignKey(
+        Case, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="dispatch_orders",
+    )
+    # Labelled dwelling cases, e.g. {"primary": "<case_id>", "secondary": "..."}.
+    # A second assessment becomes another LABEL here rather than a second order.
+    dwellings = models.JSONField(default=dict, blank=True)
+
+    # The borough the work happens in, parsed from the case's program name. The
+    # ITEMS themselves live on DispatchItem: a work order is a BATCH, so it has
+    # many items and cannot carry one.
+    location = models.CharField(max_length=120, blank=True)
+
+    status = models.CharField(
+        max_length=20, choices=DispatchStatus.choices,
+        default=DispatchStatus.PENDING_SCHEDULE, db_index=True,
+    )
+    vendor = models.ForeignKey(
+        Vendor, on_delete=models.PROTECT, null=True, blank=True,
+        related_name="dispatch_orders",
+    )
+    created_by = models.ForeignKey(
+        Agent, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="dispatch_orders_created",
+    )
+
+    # --- step 1 of the wizard: captured ON the order ------------------------
+    # NOT read live from the client. A dwelling assessment is about a specific
+    # PROPERTY, so a later edit to the member's address must not rewrite where a
+    # completed assessment happened. Verified ONCE, on the assessment; remediation
+    # orders inherit it through `parent` (see `service_address`).
+    contact_phone = models.CharField(max_length=40, blank=True)
+    contact_phone_type = models.CharField(max_length=10, blank=True)  # mobile/landline
+    contact_email = models.EmailField(blank=True)
+    address_line1 = models.CharField(max_length=255, blank=True)
+    address_line2 = models.CharField(max_length=255, blank=True)
+    address_city = models.CharField(max_length=120, blank=True)
+    address_state = models.CharField(max_length=40, blank=True)
+    address_zip = models.CharField(max_length=20, blank=True)
+    address_formatted = models.CharField(max_length=500, blank=True)
+    address_place_id = models.CharField(max_length=255, blank=True)
+    address_lat = models.DecimalField(
+        max_digits=9, decimal_places=6, null=True, blank=True
+    )
+    address_lng = models.DecimalField(
+        max_digits=9, decimal_places=6, null=True, blank=True
+    )
+    address_notes = models.TextField(blank=True)
+
+    # --- step 2 of the wizard ------------------------------------------------
+    # Functional, not a label: it selects which questionnaire the member is asked,
+    # and COMBINED means both.
+    referral_type = models.CharField(
+        max_length=20, choices=DispatchReferralType.choices, blank=True,
+    )
+    # VERBAL consent for the vendor to contact the member. Two booleans behind one
+    # checkbox because SMS and calls are separable and a member may later object to
+    # one; that distinction cannot be reconstructed from a single flag. GDPR puts
+    # the burden on us to DEMONSTRATE consent, hence method/when/who.
+    consent_to_call = models.BooleanField(default=False)
+    consent_to_text = models.BooleanField(default=False)
+    consent_method = models.CharField(max_length=20, blank=True, default="verbal")
+    consent_captured_at = models.DateTimeField(null=True, blank=True)
+    consent_captured_by = models.ForeignKey(
+        Agent, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="dispatch_consents_captured",
+    )
+    # Agent sign-off that the Enhanced Care Management case is billed. A plain
+    # attestation for now; showing the underlying ECM case is deferred until the
+    # Unite Us case details/invoice reveal whether "billed" is derivable at all.
+    ecm_billed_confirmed = models.BooleanField(default=False)
+    notes = models.TextField(blank=True)
+
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        constraints = [
+            # Rule 1: one assessment order per member. A partial unique index, so
+            # remediation orders are unaffected.
+            models.UniqueConstraint(
+                fields=["client"],
+                condition=models.Q(kind="assessment"),
+                name="one_assessment_order_per_client",
+            ),
+            # NOTE there is deliberately no per-case constraint on remediation
+            # orders any more. A work order is a BATCH of items drawn from several
+            # cases, and one case's item may be re-dispatched in a later batch if
+            # the first was cancelled. Uniqueness now belongs to DispatchItem,
+            # which IS one per case.
+        ]
+        indexes = [
+            models.Index(fields=["client", "kind"]),
+            models.Index(fields=["vendor", "status"]),
+        ]
+
+    def __str__(self):
+        return f"{self.get_kind_display()} {str(self.dispatch_order_id)[:8]}"
+
+    @property
+    def service_address(self):
+        """The address the work happens at.
+
+        A remediation order INHERITS from its assessment rather than copying, so a
+        child can never drift from the address that was verified once.
+        """
+        if self.kind == DispatchKind.REMEDIATION and self.parent_id:
+            return self.parent.address_formatted or self.parent.address_line1
+        return self.address_formatted or self.address_line1
+
+    @property
+    def service_contact(self):
+        """``(phone, phone_type, notes)`` for reaching the member about this order.
+
+        Inherited by a remediation order for the same reason as the address: the
+        wizard collects contact details ONCE, on the assessment, so a work order
+        has none of its own. Without this an installer opens their job and sees no
+        number to ring -- which is exactly what the first live vendor-API call
+        showed.
+        """
+        source = self
+        if self.kind == DispatchKind.REMEDIATION and self.parent_id:
+            source = self.parent
+        return source.contact_phone, source.contact_phone_type, source.address_notes
+
+
+class DispatchItem(models.Model):
+    """One installable thing, drawn from one housing case.
+
+    This is the unit the business actually thinks in: "a grab bar in Brooklyn,
+    approved". It comes from a Home Remediation or Home Accessibility case, whose
+    program name encodes ``<family> - <item> - <borough>``.
+
+    An item is NOT a work order. A work order is a batch an agent assembles from
+    approved items, so ``dispatch_order`` is nullable and an item sits unassigned
+    until someone includes it. That nullable FK is the whole "has this been
+    dispatched yet?" answer -- tracking it separately would immediately drift.
+
+    One item per case (unique), so re-importing a case cannot duplicate it.
+    """
+
+    dispatch_item_id = models.UUIDField(
+        primary_key=True, default=uuid.uuid4, editable=False
+    )
+    # The assessment that found the need. Items always hang off an assessment,
+    # even before any work order exists.
+    assessment = models.ForeignKey(
+        DispatchOrder, on_delete=models.CASCADE, related_name="items",
+    )
+    case = models.ForeignKey(
+        Case, on_delete=models.CASCADE, related_name="dispatch_items",
+    )
+    # The work order that includes this item, once one does. NULL = not yet
+    # dispatched.
+    dispatch_order = models.ForeignKey(
+        DispatchOrder, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="line_items",
+    )
+    # Captured at creation from the program name, NOT derived on read: this is the
+    # instruction a vendor acts on, and a later program rename must not rewrite
+    # what was installed.
+    item = models.CharField(max_length=255, blank=True)
+    location = models.CharField(max_length=120, blank=True)
+    # The program name as it read when the item was created, for provenance.
+    program_name = models.CharField(max_length=255, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["location", "item"]
+        constraints = [
+            models.UniqueConstraint(fields=["case"], name="one_item_per_case"),
+        ]
+        indexes = [
+            models.Index(fields=["assessment", "dispatch_order"]),
+        ]
+
+    def __str__(self):
+        return f"{self.item} ({self.location})" if self.item else str(self.case_id)
+
+    @property
+    def authorization_status(self):
+        """Read LIVE from the case, unlike ``item``.
+
+        Deliberately not captured: an authorization can be approved, denied or
+        expire after the item exists, and a stale copy would have a vendor fitting
+        something that is no longer covered.
+        """
+        return (self.case.service_authorization_status or "") if self.case_id else ""
+
+    @property
+    def is_approved(self):
+        return self.authorization_status.lower() == "approved"
+
+    @property
+    def authorization_window(self):
+        """``(start, end)`` of the case's authorization window, or ``(None, None)``.
+
+        Delegates to ``Case.effective_authorization_window()`` rather than reading
+        the fields directly, so it inherits the request-window fallback: some Unite
+        Us exports carry only the REQUEST window on an already-approved
+        authorization, and reading ``approval_ends_at`` alone would call those
+        expired.
+        """
+        if not self.case_id:
+            return None, None
+        return self.case.effective_authorization_window()
+
+    @property
+    def authorization_expired(self):
+        """True when the window has an END that is in the past.
+
+        A missing end date is NOT expired: an approved case with no window exported
+        is a gap in the source data, and refusing to install a device because Unite
+        Us omitted a date would be the wrong failure.
+        """
+        _start, end = self.authorization_window
+        return bool(end) and end < timezone.now()
+
+    @property
+    def is_available(self):
+        """Selectable for a NEW work order.
+
+        Three conditions:
+
+        * the authorization is APPROVED -- nothing unapproved may be fitted;
+        * its window has not EXPIRED -- an approval that has lapsed still reads
+          "approved" on the case, which is exactly the trap the food side names
+          "Authorization Expired". Installing against a lapsed authorization is
+          unbilled work.
+        * the item is not already in a work order -- no double-dispatch, and that
+          FK is the only place that is tracked.
+
+        The case's own STATUS is deliberately not a condition: a Home Remediation
+        case can be closed in Unite Us while the approved device still has to be
+        installed.
+        """
+        return (
+            self.is_approved
+            and not self.authorization_expired
+            and self.dispatch_order_id is None
+        )
+
+
+class DispatchAvailabilityWindow(models.Model):
+    """A window the MEMBER offered. Not the appointment.
+
+    The wizard requires at least THREE DISTINCT DATES, each with one or more time
+    windows -- so validation counts dates, not rows: three windows on one Tuesday
+    does not satisfy it. The vendor then picks from these and the agreed slot
+    becomes a :class:`DispatchVisit`.
+    """
+
+    dispatch_order = models.ForeignKey(
+        DispatchOrder, on_delete=models.CASCADE, related_name="availability_windows"
+    )
+    date = models.DateField()
+    start_time = models.TimeField()
+    end_time = models.TimeField()
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["date", "start_time"]
+
+    def __str__(self):
+        return f"{self.date} {self.start_time}-{self.end_time}"
+
+
+class DispatchVisit(models.Model):
+    """The agreed appointment, and the visit itself.
+
+    Separate from the availability windows: those are what the member OFFERED,
+    this is what was agreed. Confirming one is what fires the vendor's calendar
+    event and reminder (vendor portal phase).
+    """
+
+    dispatch_order = models.ForeignKey(
+        DispatchOrder, on_delete=models.CASCADE, related_name="visits"
+    )
+    scheduled_for = models.DateTimeField(null=True, blank=True)
+    scheduled_end = models.DateTimeField(null=True, blank=True)
+    confirmed_at = models.DateTimeField(null=True, blank=True)
+    started_at = models.DateTimeField(null=True, blank=True)
+    completed_at = models.DateTimeField(null=True, blank=True)
+    # What was pushed to the vendor's calendar, for later reconciliation.
+    calendar_event_ref = models.CharField(max_length=255, blank=True)
+    notes = models.TextField(blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["-scheduled_for"]
+
+    def __str__(self):
+        return f"Visit {self.scheduled_for:%Y-%m-%d %H:%M}" if self.scheduled_for else "Visit (unscheduled)"
+
+
+class DispatchFinding(models.Model):
+    """One result of the inspection. May justify a Home Remediation case.
+
+    The submission GATE requires at least one photo PER FINDING, so a finding is
+    the thing proofs attach to -- not just the order.
+    """
+
+    dispatch_order = models.ForeignKey(
+        DispatchOrder, on_delete=models.CASCADE, related_name="findings"
+    )
+    title = models.CharField(max_length=255)
+    description = models.TextField(blank=True)
+    # What the finding suggests should be done, free text for now; the screener
+    # turns these into Home Remediation cases in Unite Us.
+    recommendation = models.TextField(blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["created_at"]
+
+    def __str__(self):
+        return self.title
+
+
+class DispatchProof(models.Model):
+    """A proof image. Mirrors :class:`DeliveryOrderProof`: our S3 + a sha256.
+
+    ``content_hash`` makes re-uploads idempotent and de-dupes the same image --
+    which matters more here than for deliveries, because an OFFLINE vendor retries.
+
+    ``finding`` is nullable: general site photos have none, and the submission gate
+    counts only the photos that DO have one.
+    """
+
+    dispatch_order = models.ForeignKey(
+        DispatchOrder, on_delete=models.CASCADE, related_name="proofs"
+    )
+    finding = models.ForeignKey(
+        DispatchFinding, on_delete=models.CASCADE, null=True, blank=True,
+        related_name="proofs",
+    )
+    s3_key = models.CharField(max_length=500)
+    file_url = models.URLField(max_length=1000, blank=True)
+    content_hash = models.CharField(max_length=64, db_index=True)
+    caption = models.CharField(max_length=255, blank=True)
+    # Device time vs server time. The vendor signs at 14:02 in a basement and syncs
+    # at 18:30; the device clock is UNTRUSTED, so both are kept.
+    captured_at = models.DateTimeField(null=True, blank=True)
+    received_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["received_at"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["dispatch_order", "content_hash"],
+                name="one_proof_per_hash_per_order",
+            ),
+        ]
+
+    def __str__(self):
+        return f"Proof {self.content_hash[:12]}"
+
+
+class DispatchDocument(models.Model):
+    """A document attached to an order -- signed paperwork, reports, permits."""
+
+    dispatch_order = models.ForeignKey(
+        DispatchOrder, on_delete=models.CASCADE, related_name="documents"
+    )
+    s3_key = models.CharField(max_length=500)
+    file_url = models.URLField(max_length=1000, blank=True)
+    content_hash = models.CharField(max_length=64, db_index=True)
+    filename = models.CharField(max_length=255, blank=True)
+    doc_type = models.CharField(max_length=60, blank=True)
+    uploaded_by_agent = models.ForeignKey(
+        Agent, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="dispatch_documents",
+    )
+    uploaded_by_vendor_user = models.ForeignKey(
+        VendorUser, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="dispatch_documents",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["created_at"]
+
+    def __str__(self):
+        return self.filename or f"Document {self.content_hash[:12]}"
+
+
+class DispatchQuestionnaireState(models.TextChoices):
+    DRAFT = "draft", "Draft"
+    SUBMITTED = "submitted", "Submitted"
+
+
+class DispatchQuestionnaire(models.Model):
+    """The Dwelling Assessment form for one assessment order.
+
+    One per order. Which MODULES it contains follows the order's referral type --
+    Mobility, Ventilation, or both for Combined -- so the form a vendor sees is
+    bounded by what was authorized.
+
+    Answers are stored as JSON keyed by the question codes in
+    ``api/services/assessment_forms.py`` rather than as columns. The questions are
+    CONTENT: adding one should not need a migration, and 33 boolean columns would
+    churn the schema at every revision of the form.
+
+    WRITABLE BY THE VENDOR ONLY. There is deliberately no CRM endpoint that writes
+    these answers -- the CRM renders them read-only. That is the locking rule the
+    whole feature rests on, enforced by the absence of a route rather than by a
+    permission check someone can widen later.
+    """
+
+    dispatch_questionnaire_id = models.UUIDField(
+        primary_key=True, default=uuid.uuid4, editable=False
+    )
+    dispatch_order = models.OneToOneField(
+        DispatchOrder, on_delete=models.CASCADE, related_name="questionnaire",
+    )
+    # ["mobility"], ["ventilation"], or both.
+    modules = models.JSONField(default=list, blank=True)
+    template_version = models.PositiveIntegerField(default=1)
+    # The form definition as it stood when SUBMITTED. Empty while a draft: a draft
+    # renders against the live template, but a signed form must render years later
+    # exactly as it was signed rather than acquiring blank questions from a later
+    # revision.
+    schema_snapshot = models.JSONField(default=dict, blank=True)
+
+    # {"mob.reason.fall_risk": true, ...}
+    answers = models.JSONField(default=dict, blank=True)
+    # The "Other..." box each Reason for Assessment section carries:
+    # {"mob.reason": "..."}
+    section_other = models.JSONField(default=dict, blank=True)
+    # [{"option": "window_ac", "qty": 2}, ...] -- QUANTIFIED, not merely ticked:
+    # the form has a -/+ stepper per option and a member can need two air
+    # conditioners.
+    interventions = models.JSONField(default=list, blank=True)
+
+    justification = models.TextField(blank=True)   # Clinical / Safety Justification
+    assessor_notes = models.TextField(blank=True)
+
+    state = models.CharField(
+        max_length=10, choices=DispatchQuestionnaireState.choices,
+        default=DispatchQuestionnaireState.DRAFT, db_index=True,
+    )
+    submitted_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+
+    def __str__(self):
+        return f"Assessment form ({self.state}) for {self.dispatch_order_id}"
+
+    @property
+    def is_submitted(self):
+        return self.state == DispatchQuestionnaireState.SUBMITTED
+
+    def schema(self):
+        """The definition to render against.
+
+        The frozen snapshot once submitted, the live template while a draft.
+        """
+        from api.services.assessment_forms import build_schema
+
+        if self.is_submitted and self.schema_snapshot:
+            return self.schema_snapshot
+        return build_schema(self.modules or [])
+
+
+class DispatchSubmissionState(models.TextChoices):
+    ACTIVE = "active", "Active"
+    VOIDED = "voided", "Voided"
+
+
+class DispatchSubmission(models.Model):
+    """One submission of an order's evidence. APPEND-ONLY, one ACTIVE at a time.
+
+    The submission -- not the order -- is the versioned thing, which is how the two
+    rules coexist: answers cannot change after submission (they are locked), yet a
+    vendor may correct a mistake. A correction VOIDS this submission and creates
+    the next one; the voided copy, its signatures and its PDF survive untouched.
+
+    ``pdf_sha256`` is what makes the voided copy worth keeping: it proves the old
+    record was not quietly edited to match the new story.
+
+    Note the asymmetry -- the VENDOR may void their own submission; CRM users may
+    not edit anything, ever. The correction belongs to the party who signed.
+    """
+
+    dispatch_submission_id = models.UUIDField(
+        primary_key=True, default=uuid.uuid4, editable=False
+    )
+    dispatch_order = models.ForeignKey(
+        DispatchOrder, on_delete=models.CASCADE, related_name="submissions"
+    )
+    sequence = models.PositiveIntegerField(default=1)
+    state = models.CharField(
+        max_length=10, choices=DispatchSubmissionState.choices,
+        default=DispatchSubmissionState.ACTIVE, db_index=True,
+    )
+    submitted_at = models.DateTimeField(null=True, blank=True)
+    submitted_by = models.ForeignKey(
+        VendorUser, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="dispatch_submissions",
+    )
+    voided_at = models.DateTimeField(null=True, blank=True)
+    voided_by = models.ForeignKey(
+        VendorUser, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="dispatch_submissions_voided",
+    )
+    void_reason = models.TextField(blank=True)
+    # The immutable snapshot of what was signed.
+    pdf_s3_key = models.CharField(max_length=500, blank=True)
+    pdf_sha256 = models.CharField(max_length=64, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-sequence"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["dispatch_order", "sequence"],
+                name="one_submission_per_sequence",
+            ),
+            # Exactly one live submission per order; voided ones are unconstrained.
+            models.UniqueConstraint(
+                fields=["dispatch_order"], condition=models.Q(state="active"),
+                name="one_active_submission_per_order",
+            ),
+        ]
+
+    def __str__(self):
+        return f"Submission #{self.sequence} ({self.state})"
+
+
+class DispatchSignerRole(models.TextChoices):
+    VENDOR = "vendor", "Vendor"
+    MEMBER = "member", "Member"
+
+
+class DispatchSignature(models.Model):
+    """A signature on a SUBMISSION -- not on the order.
+
+    Tied to the submission so a void keeps the signatures that belonged to it:
+    submission #1 still shows exactly who signed what, even after #2 supersedes it.
+
+    The gate needs BOTH roles present before a submission can be made.
+    """
+
+    dispatch_submission = models.ForeignKey(
+        DispatchSubmission, on_delete=models.CASCADE, related_name="signatures"
+    )
+    signer_role = models.CharField(max_length=10, choices=DispatchSignerRole.choices)
+    signer_name = models.CharField(max_length=255, blank=True)
+    s3_key = models.CharField(max_length=500, blank=True)
+    content_hash = models.CharField(max_length=64, blank=True)
+    signed_at = models.DateTimeField(null=True, blank=True)
+    received_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["signed_at"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["dispatch_submission", "signer_role"],
+                name="one_signature_per_role_per_submission",
+            ),
+        ]
+
+    def __str__(self):
+        return f"{self.get_signer_role_display()} signature"
+
+
+class DispatchUniteUsUpload(models.Model):
+    """A record that a human uploaded this order's evidence to Unite Us.
+
+    The CRM pushes NOTHING. This is the record of the manual action, so "what is
+    still waiting to go to Unite Us?" is answerable instead of living in someone's
+    memory -- a queue, not just a log.
+
+    ``uploaded_at`` and ``recorded_at`` are separate on purpose: an agent uploads at
+    10:00 and ticks the box at 16:30. One field standing for two events is exactly
+    the confusion that ``Case.case_created_at`` (source time, not ingestion) caused.
+    """
+
+    dispatch_order = models.ForeignKey(
+        DispatchOrder, on_delete=models.CASCADE, related_name="uniteus_uploads"
+    )
+    # Which submission's evidence went up -- so a later VOID can mark this
+    # superseded rather than leaving Unite Us holding a document we now reject.
+    dispatch_submission = models.ForeignKey(
+        DispatchSubmission, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="uniteus_uploads",
+    )
+    uploaded_by = models.ForeignKey(
+        Agent, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="dispatch_uniteus_uploads",
+    )
+    uploaded_at = models.DateTimeField()
+    recorded_at = models.DateTimeField(auto_now_add=True)
+    uniteus_ref = models.CharField(max_length=255, blank=True)
+    note = models.TextField(blank=True)
+    # Set when the submission it covered was voided: Unite Us holds evidence the
+    # CRM no longer considers current, and someone must re-upload.
+    superseded_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["-uploaded_at"]
+
+    def __str__(self):
+        return f"Uploaded {self.uploaded_at:%Y-%m-%d}"

@@ -24,6 +24,8 @@ from api.services.lifecycle import (
 )
 
 from ..models import (
+    Vendor,
+    VendorUser,
     ActiveProgram,
     Address,
     Agent,
@@ -633,9 +635,18 @@ def internal_service_case(client):
     deferral-aware: a future-dated reauthorization extension does NOT supplant the
     currently-serving case until its window begins (see
     docs/reauthorization_extension_plan.md), so the profile/header keeps showing
-    the case actually in service. None when there is no Internal Service case."""
+    the case actually in service. None when there is no Internal Service case.
+
+    FOOD ONLY. Housing internal-service cases (Dwelling Assessment / Home
+    Remediation) are a different TYPE with their own governing case, and must
+    never drive meal/box service -- a freshly APPROVED housing assessment would
+    otherwise outrank an older approved meals case under governing_case_key and
+    take over the member's food service."""
+    from api.services.catalog import is_food_case
+
     cases = [
-        c for c in client.cases.all() if c.case_type == CaseType.INTERNAL_SERVICE
+        c for c in client.cases.all()
+        if c.case_type == CaseType.INTERNAL_SERVICE and is_food_case(c)
     ]
     if not cases:
         return None
@@ -670,9 +681,15 @@ def governing_service_case_for_display(client):
 def internal_service_cases(client):
     """All of the client's Internal Service cases, most-governing first (by
     :func:`governing_case_key`). The verification can attach to any of them; the
-    agent picks which one in the verification pop-up when there's more than one."""
+    agent picks which one in the verification pop-up when there's more than one.
+
+    FOOD ONLY -- a housing case must not be offered as something the meal/box
+    verification can attach to."""
+    from api.services.catalog import is_food_case
+
     cases = [
-        c for c in client.cases.all() if c.case_type == CaseType.INTERNAL_SERVICE
+        c for c in client.cases.all()
+        if c.case_type == CaseType.INTERNAL_SERVICE and is_food_case(c)
     ]
     return sorted(cases, key=governing_case_key, reverse=True)
 
@@ -1266,6 +1283,13 @@ class MemberDetailSerializer(serializers.Serializer):
                 # actionable pending verification -- e.g. enrollment regressed to
                 # Validated, or missing). Requesting (re-)opens the verification.
                 "can_request_verification": can_request_primary_verification(client),
+                # Drives the member-profile "Assessment Order" button, beside
+                # Verification and Nutritionist. True when the member holds a
+                # governing Dwelling Assessment case and has NO assessment order
+                # yet -- one per member. Computed here rather than fetched by the
+                # header, so the profile does not pay an extra round trip on every
+                # load just to decide whether to draw a button.
+                "can_create_assessment_order": _can_create_assessment_order(client),
                 # Williamsburg exception (lead source == "Williamsburg"): the
                 # verification wizard forces the Kosher menu and the save
                 # auto-assigns the Williamsburg kitchen + activates directly.
@@ -1776,20 +1800,55 @@ class PortalCaseOptionSerializer(serializers.ModelSerializer):
     # modal can auto-select it (matches the stage bar / Cases-tab star). Passed
     # in via context by MemberCasesView.
     governing = serializers.SerializerMethodField()
+    governing_domain = serializers.SerializerMethodField()
+    service_domain = serializers.SerializerMethodField()
+    service_type_code = serializers.SerializerMethodField()
 
     class Meta:
         model = Case
         fields = [
             "id", "code", "status", "status_label", "type_label",
             "service_type", "program_name", "date_opened", "governing",
+            "governing_domain", "service_domain", "service_type_code",
         ]
 
     def get_code(self, obj):
         return f"CSE-{str(obj.case_id)[:8]}"
 
     def get_governing(self, obj):
+        # True for the governing case of ANY service type. `governing_by_case`
+        # maps case id -> domain; falls back to the single food id for callers
+        # that have not been updated.
+        by_case = self.context.get("governing_by_case") or {}
+        if by_case:
+            return str(obj.case_id) in by_case
         gid = self.context.get("governing_case_id")
         return bool(gid) and str(obj.case_id) == str(gid)
+
+    def get_governing_domain(self, obj):
+        """"food" / "housing" for a governing case, else "".
+
+        Drives the F / H letter on the Cases tab: with one governing case per
+        type, a single star cannot say which service it governs.
+        """
+        by_case = self.context.get("governing_by_case") or {}
+        return by_case.get(str(obj.case_id), "")
+
+    def get_service_domain(self, obj):
+        from api.services.catalog import case_service_domain
+
+        return case_service_domain(obj)
+
+    def get_service_type_code(self, obj):
+        """The ServiceType code, e.g. "home_expense_assistance_repairs".
+
+        Lets the UI separate housing WORK ORDERS (the Home Assistance tab) from
+        the assessment that governs them, which a case_type filter cannot do --
+        both are `internal_service`.
+        """
+        from api.services.catalog import case_service_type_code
+
+        return case_service_type_code(obj)
 
 
 class PortalMemberCaseSerializer(serializers.ModelSerializer):
@@ -1816,6 +1875,9 @@ class PortalMemberCaseSerializer(serializers.ModelSerializer):
     # True for the client's GOVERNING internal-service case -- the same case the
     # stage progress bar stars. Passed in via context by MemberCasesView.
     governing = serializers.SerializerMethodField()
+    governing_domain = serializers.SerializerMethodField()
+    service_domain = serializers.SerializerMethodField()
+    service_type_code = serializers.SerializerMethodField()
     # Product kind (Meals / Boxes) resolved from the program/service name, and the
     # Household vs Individual scope -- mirrors the stage progress bar's chips.
     product_kind = serializers.SerializerMethodField()
@@ -1842,6 +1904,7 @@ class PortalMemberCaseSerializer(serializers.ModelSerializer):
             "service_authorization_denial_reason",
             "outcome_description", "resolution_type", "resolution_label",
             "case_description", "is_met_council", "governing",
+            "governing_domain", "service_domain", "service_type_code",
             "product_kind", "product_kind_label",
             "household_type", "household_type_label",
         ]
@@ -1850,8 +1913,39 @@ class PortalMemberCaseSerializer(serializers.ModelSerializer):
         return f"CSE-{str(obj.case_id)[:8]}"
 
     def get_governing(self, obj):
+        # True for the governing case of ANY service type. `governing_by_case`
+        # maps case id -> domain; falls back to the single food id for callers
+        # that have not been updated.
+        by_case = self.context.get("governing_by_case") or {}
+        if by_case:
+            return str(obj.case_id) in by_case
         gid = self.context.get("governing_case_id")
         return bool(gid) and str(obj.case_id) == str(gid)
+
+    def get_governing_domain(self, obj):
+        """"food" / "housing" for a governing case, else "".
+
+        Drives the F / H letter on the Cases tab: with one governing case per
+        type, a single star cannot say which service it governs.
+        """
+        by_case = self.context.get("governing_by_case") or {}
+        return by_case.get(str(obj.case_id), "")
+
+    def get_service_domain(self, obj):
+        from api.services.catalog import case_service_domain
+
+        return case_service_domain(obj)
+
+    def get_service_type_code(self, obj):
+        """The ServiceType code, e.g. "home_expense_assistance_repairs".
+
+        Lets the UI separate housing WORK ORDERS (the Home Assistance tab) from
+        the assessment that governs them, which a case_type filter cannot do --
+        both are `internal_service`.
+        """
+        from api.services.catalog import case_service_type_code
+
+        return case_service_type_code(obj)
 
     def _product_kind(self, obj):
         from api.services.catalog import product_type_kind_for_name
@@ -2882,3 +2976,64 @@ class EnrollmentAnalyticsSerializer(serializers.ModelSerializer):
         import datetime
         t = datetime.date.today()
         return t.year - obj.dob.year - ((t.month, t.day) < (obj.dob.month, obj.dob.day))
+
+
+class PortalVendorUserSerializer(serializers.ModelSerializer):
+    """A vendor's person. The password hash is NEVER exposed."""
+
+    class Meta:
+        model = VendorUser
+        fields = [
+            "vendor_user_id", "email", "name", "phone", "is_admin", "is_active",
+            "last_login_at", "created_at",
+        ]
+        read_only_fields = ["vendor_user_id", "last_login_at", "created_at"]
+
+
+class PortalVendorSerializer(serializers.ModelSerializer):
+    """A housing vendor company, with its users nested for the Settings page."""
+
+    users = PortalVendorUserSerializer(many=True, read_only=True)
+    admin_user = serializers.SerializerMethodField()
+    open_order_count = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Vendor
+        fields = [
+            "vendor_id", "name", "contact_name", "contact_email", "contact_phone",
+            "address", "website", "notes", "is_active", "created_at",
+            "users", "admin_user", "open_order_count",
+        ]
+        read_only_fields = ["vendor_id", "created_at"]
+
+    def get_admin_user(self, obj):
+        admin = next((u for u in obj.users.all() if u.is_admin), None)
+        return PortalVendorUserSerializer(admin).data if admin else None
+
+    def get_open_order_count(self, obj):
+        """Orders NOT yet uploaded -- what this vendor still owes us. Deactivating
+        a vendor with open work should be a visible decision, not a silent one."""
+        from ..models import DispatchStatus
+
+        return obj.dispatch_orders.exclude(
+            status__in=[DispatchStatus.UPLOADED, DispatchStatus.CANCELLED],
+        ).count()
+
+def _can_create_assessment_order(client):
+    """True when a Dwelling Assessment governs this member and no order exists.
+
+    Both halves matter: without a governing housing case the wizard has nothing to
+    assess (the endpoint refuses it), and with an order already there the
+    one-per-member constraint would reject a second.
+    """
+    from ..models import DispatchKind, DispatchOrder
+    from ..services.housing import housing_service_case
+
+    try:
+        if housing_service_case(client) is None:
+            return False
+        return not DispatchOrder.objects.filter(
+            client=client, kind=DispatchKind.ASSESSMENT,
+        ).exists()
+    except Exception:  # noqa: BLE001 - a button must never break the profile
+        return False

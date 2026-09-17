@@ -327,6 +327,131 @@ ExecReload made every deploy a small outage).
 needs `proxy_buffering off`, or the UI appears frozen and then dumps everything at
 once.
 
+## Frontend integration -- a PAGE, not a chat
+
+### The stack decides part of this
+
+```
+CRM frontend: Vite 6 SPA + React 18 + react-router 7 + MUI/Radix/Tailwind
+auth        : agent JWT in localStorage -> "Authorization: Bearer <token>"
+served      : statically by nginx. NO Next.js, NO server-side runtime.
+typing      : .tsx files, but `typescript` is NOT installed -- esbuild transpiles
+              and nothing type-checks (see AGENTS.md)
+```
+
+**CopilotKit's `CopilotRuntime` needs a Node server** -- normally a Next.js API
+route. There isn't one, so using CopilotKit here would mean deploying a THIRD
+runtime (Django + Python agent + Node) for a read-only query box.
+
+And what CopilotKit mainly provides is a CHAT UI and generative UI, both of which
+decision 4 already rejected in favour of a table, a computed summary, a visible
+interpretation and a clean CSV. So:
+
+**AG-UI as the protocol, no CopilotKit in the CRM.** Decided.
+
+```
+CRM SPA (Vite)  --fetch (+SSE later)-->  /agent/ask   (uvicorn, Pydantic AI)
+   |  Bearer token from getToken()             |  same repo, same models+glossary
+   |  renders the Data page's own table        v
+   +-------------------------------------> Django ORM (read-only role)
+```
+
+- **Same origin**: nginx routes `/agent/` to the uvicorn socket, so there is no
+  CORS and the existing `Authorization: Bearer` header just works.
+- **Same auth**: the agent validates the same portal JWT -- possible precisely
+  because it is one codebase (see "one codebase, two servers").
+- CopilotKit still fits **ext-v2**, which IS a Next.js app. It does not fit here.
+
+### v1 needs no streaming
+
+The agent's work is: question -> IR (one Bedrock call, 1-3s) -> read-model query
+(50-500ms) -> table. There is no long multi-step reasoning to stream.
+
+So v1 is a plain `POST /agent/ask` returning:
+
+```json
+{"ir": {...}, "interpretation": "...", "rows": [...], "as_of": "...", "total": 19}
+```
+
+No SSE, no AG-UI client library, no streaming infrastructure. Add AG-UI streaming
+when there are progress events or multi-step tools worth showing. Nothing in the
+design forecloses it -- and `proxy_buffering off` on the `/agent/` location is
+needed the day it arrives, or the UI freezes and then dumps everything at once.
+
+### The UI: refinements ARE filter pills
+
+Because the conversation state is a structured IR rather than free text, it can be
+RENDERED. This is the whole reason a page beats a chat: a transcript cannot show
+what is currently applied; pills can.
+
+```
++----------------------------------------------------------------------+
+|  Ask about members                                             [?]   |
+|  [ of those, only Hicksville                              -> ]       |
+|                                                                      |
+|  households x  active x  any member paused x  kitchen: Hicksville x  |
+|  ^ how I read your questions -- click x to undo                      |
+|                                                                      |
+|  2 households - 2 paused members - as of 14:45        [Export CSV]   |
+|  +--------------+---------+------------------+---------------------+  |
+|  | household    | primary | paused member    | case                |  |
+|  | 474b6df1     | LIAM    | EVAN (paused)    | a1bab5ac open       |  |
+|  | 474b6df1     | LIAM    | NAVITA (paused)  | a1bab5ac open       |  |
+|  +--------------+---------+------------------+---------------------+  |
+|                                                                      |
+|  > Your questions (3)                                                |
++----------------------------------------------------------------------+
+```
+
+| | chat | this page |
+|---|---|---|
+result stays visible while refining | scrolls away | updates in place |
+see what is currently applied | reconstruct the transcript | the pills ARE the state |
+undo ONE refinement | "ignore the Hicksville bit" | click x |
+export what you are looking at | which table? | one current result |
+share / bookmark | no | encode the IR in the URL |
+saved questions | awkward | save the IR |
+
+The last two are the real payoff: a manager can **send a colleague a link** and
+they see the same query re-run against fresh data. A chat cannot do that.
+
+It also resembles something they already use -- the Data page is a filtered table
+with an export. This is the same object, with the filters built by asking, which
+is a far smaller leap than learning to converse with a database.
+
+### Where the conversation survives
+
+The question box IS the conversational surface: follow-ups are typed there and
+carry context. The transcript becomes a collapsible "Your questions (3)" list --
+useful for "what did I ask to get this?", not the primary UI. If a chat feel is
+ever wanted, AG-UI is already the protocol, so a CopilotKit sidebar can be added
+without touching the backend.
+
+### Built from existing components
+
+| Piece | Reuse |
+|---|---|
+question box | existing input + `sonner` for errors |
+interpretation pills | new, small; derived from the IR |
+result table | **the Data page's table** -- same columns, same read model |
+computed summary | derived from the rows, NOT generated |
+export | the existing `stream_csv_response` path, same IR, unpaginated |
+
+Route it beside Data (e.g. `/data/ask`), gated to management -- the same gate as
+`DataExportView`.
+
+### Two caveats worth knowing up front
+
+**Install `typescript`.** `tsc --noEmit` currently does nothing because the
+package is absent, so a typed SDK would give runtime errors instead of build
+errors. One devDependency.
+
+**Pills are only as legible as the IR is simple.** `kitchen=Hicksville` makes a
+clean, removable pill. "households where at least two members are paused and the
+primary is not" becomes one dense pill that is hard to render and harder to undo
+partially. Plan for pills in the common case, an expandable readable sentence for
+the rest, and accept that nested quantifiers will look like one blob.
+
 ## Phasing -- value before any AI
 
 | Phase | What | Why this order |
@@ -334,7 +459,7 @@ once.
 **0** | **Glossary + IR schema.** The 30-50 terms management actually asks about, each pinned to one query fragment | The unglamorous step that decides whether any of it can be trusted |
 **1** | **IR compiler + guards + audit**, as an internal endpoint, driven by HAND-WRITTEN IRs. No LLM | Ships value alone (saved/shareable queries) and is fully unit-testable |
 **2** | **Pydantic AI agent**: question -> IR, AG-UI endpoint, golden-set evals | The AI becomes the easy part once the target is typed |
-**3** | **CopilotKit UI**: interpretation chips, result table, freshness stamp, CSV export | |
+**3** | **The page** (no CopilotKit): interpretation pills, result table, freshness stamp, CSV export. Plain POST -- no streaming in v1 | |
 **4** | Aggregates/trends, saved questions, scheduled digests | |
 **5** | Optional narrative over aggregates; converge with `ai_explain` for drill-down | |
 

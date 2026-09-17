@@ -5,6 +5,28 @@ class ApiConfig(AppConfig):
     name = 'api'
 
     def ready(self):
+        # The program -> service TYPE map is cached in-process (ActiveProgram is
+        # ~324 rows and governing-case resolution runs at hundreds of sites,
+        # including the 76k-row analytics rebuild). Agents edit that table from
+        # Settings > Programs, so drop the cache whenever a row changes -- without
+        # this, moving a program between Food and Housing would not take effect
+        # until the next restart.
+        from django.db.models.signals import post_delete, post_save
+
+        def _clear_program_domain_cache(sender, **kwargs):
+            from api.services.catalog import clear_program_domain_cache
+
+            clear_program_domain_cache()
+
+        post_save.connect(
+            _clear_program_domain_cache, sender="api.ActiveProgram",
+            dispatch_uid="clear_program_domain_cache_save",
+        )
+        post_delete.connect(
+            _clear_program_domain_cache, sender="api.ActiveProgram",
+            dispatch_uid="clear_program_domain_cache_delete",
+        )
+
         # TEMP DEBUG (remove after root-causing the false-verification incident):
         # when TRACE_SYSTEM_VERIFICATION=1, log a full stack trace the instant an
         # EnrollmentVerification is saved with verified_at SET but verified_by
