@@ -5495,6 +5495,19 @@ class DispatchOrder(models.Model):
     # A second assessment becomes another LABEL here rather than a second order.
     dwellings = models.JSONField(default=dict, blank=True)
 
+    # What gets installed or remediated, and where -- parsed from the case's
+    # program name ("Home Remediation - Air Conditioner - Manhattan").
+    #
+    # STORED rather than derived on read, because this is an INSTRUCTION TO A
+    # VENDOR: "fit an air conditioner in Manhattan". Renaming or reclassifying the
+    # program later must not silently rewrite what a vendor was dispatched to do,
+    # and a completed order has to keep saying what was actually installed.
+    #
+    # Empty on an assessment order: its program's middle field is a service
+    # description, not an installable item.
+    item = models.CharField(max_length=255, blank=True)
+    location = models.CharField(max_length=120, blank=True)
+
     status = models.CharField(
         max_length=20, choices=DispatchStatus.choices,
         default=DispatchStatus.PENDING_SCHEDULE, db_index=True,

@@ -247,12 +247,19 @@ def create_remediation_order(case, *, assessment=None):
     from api.models import CaseStatus
 
     closed = (case.case_status or "").lower() in ("closed", "cancelled")
+    # What the vendor is being asked to fit, and where. Captured NOW, from the
+    # program name, so the instruction survives a later program rename.
+    from api.services.housing import housing_work_order_item
+
+    item, location = housing_work_order_item(case)
     order = DispatchOrder.objects.create(
         kind=DispatchKind.REMEDIATION,
         parent=assessment,
         client=case.client,
         case=case,
         vendor=assessment.vendor,
+        item=item,
+        location=location,
         # A closed case is adopted as RECORD ONLY. Putting it in a schedulable
         # status would dispatch a vendor to work nobody is paying for.
         status=(
@@ -262,8 +269,15 @@ def create_remediation_order(case, *, assessment=None):
     record_transition(
         order, "", order.status,
         source=StageEventSource.AUTO,
-        note="created from Home Remediation case",
-        metadata={"case_id": str(case.case_id), "adopted_closed": closed},
+        note=(
+            f"work order created: {item} ({location})" if item
+            else "work order created from housing case"
+        ),
+        metadata={
+            "case_id": str(case.case_id), "adopted_closed": closed,
+            "item": item, "location": location,
+            "program_name": case.program_name or "",
+        },
     )
     return order
 

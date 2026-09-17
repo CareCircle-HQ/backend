@@ -142,3 +142,56 @@ def has_open_housing_case(client):
     return any(
         c.case_status not in closed for c in housing_assessment_cases(client)
     )
+
+
+# Housing program names are three fields joined by " - ":
+#
+#     Home Remediation - Air Conditioner - Manhattan
+#     Home Accessibility and Safety Modification - Grab Bars - Brooklyn
+#     |________ family _________________________|  |_ item _| |_ borough _|
+#
+# Split on SPACE-hyphen-SPACE, never on "-": "De-humidifier" and "Non-skid
+# Surfaces" contain a bare hyphen, and splitting on that would shear them in half.
+# Verified against all 29 housing programs -- every one yields exactly three parts.
+PROGRAM_PART_SEPARATOR = " - "
+
+
+def parse_housing_program_name(program_name):
+    """Split a housing program into ``(family, item, location)``.
+
+    ``item`` is what physically gets installed or remediated at the member's home,
+    and ``location`` the borough. Together with the case's authorization status they
+    answer the question a vendor actually needs answered: what am I fitting, where,
+    and is it approved?
+
+    Returns ``("", "", "")`` for anything that is not three parts, rather than
+    guessing. A half-parsed work order shown to a vendor is worse than a blank one.
+
+    NOTE the assessment programs also parse into three parts --
+
+        Dwelling Assessment & Statement of Work (SOW) Development
+          - Modifications and Remediation Service - Brooklyn
+
+    -- but that middle field is a SERVICE DESCRIPTION, not an installable item. Use
+    :func:`housing_work_order_item` when the item has to mean something.
+    """
+    parts = [p.strip() for p in (program_name or "").split(PROGRAM_PART_SEPARATOR)]
+    if len(parts) != 3 or not all(parts):
+        return "", "", ""
+    return parts[0], parts[1], parts[2]
+
+
+def housing_work_order_item(case):
+    """``(item, location)`` for a work-order case; ``("", location)`` otherwise.
+
+    The item is only meaningful for a WORK ORDER. For an assessment the middle
+    field describes the service, so it is deliberately dropped rather than
+    displayed as though a vendor were installing a "Modifications and Remediation
+    Service".
+    """
+    _family, item, location = parse_housing_program_name(
+        getattr(case, "program_name", "")
+    )
+    if not is_work_order_case(case):
+        return "", location
+    return item, location

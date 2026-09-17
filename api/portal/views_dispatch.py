@@ -43,6 +43,21 @@ def _serialize_order(order):
             if order.vendor_id else None
         ),
         "referral_type": order.referral_type,
+        # WHAT gets installed, WHERE, and whether it is APPROVED. The three
+        # together are the vendor's actual instruction; any one alone is not
+        # actionable -- an approved case with no item says nothing, and an item on
+        # an unapproved case must not be fitted.
+        "item": order.item,
+        "location": order.location,
+        "program_name": order.case.program_name if order.case_id else "",
+        "authorization": (
+            {
+                "status": order.case.service_authorization_status or "",
+                "approved": (order.case.service_authorization_status or "").lower()
+                == "approved",
+            }
+            if order.case_id else {"status": "", "approved": False}
+        ),
         "service_address": order.service_address,
         "address_notes": order.address_notes,
         "contact_phone": order.contact_phone,
@@ -137,7 +152,7 @@ class MemberDispatchOrdersView(PortalAPIView):
         orders = (
             DispatchOrder.objects
             .filter(client=client)
-            .select_related("vendor", "parent")
+            .select_related("vendor", "parent", "case")
             .prefetch_related(
                 "availability_windows", "visits", "findings__proofs", "documents",
                 "submissions__signatures", "uniteus_uploads",

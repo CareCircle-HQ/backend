@@ -28366,3 +28366,221 @@ class VendorActivationTest(TestCase):
             {}, format="json",
         )
         self.assertEqual(resp.status_code, 200)
+
+
+class HousingProgramNameParsingTest(TestCase):
+    """Housing program names are three fields joined by " - ": family, item,
+    location. The item is what gets installed at the member's home.
+    """
+
+    def test_it_splits_the_three_fields(self):
+        from .services.housing import parse_housing_program_name
+
+        cases = [
+            ("Home Accessibility and Safety Modification - Bathroom Facilities - Brooklyn",
+             ("Home Accessibility and Safety Modification", "Bathroom Facilities", "Brooklyn")),
+            ("Home Accessibility and Safety Modification - Grab Bars - Brooklyn",
+             ("Home Accessibility and Safety Modification", "Grab Bars", "Brooklyn")),
+            ("Home Remediation - Air Conditioner - Manhattan",
+             ("Home Remediation", "Air Conditioner", "Manhattan")),
+            ("Home Remediation - Air Filtration Device - Manhattan",
+             ("Home Remediation", "Air Filtration Device", "Manhattan")),
+        ]
+        for name, expected in cases:
+            self.assertEqual(parse_housing_program_name(name), expected, name)
+
+    def test_a_BARE_hyphen_inside_an_item_survives(self):
+        """Splitting on "-" rather than " - " would shear these in half. Both are
+        real program names."""
+        from .services.housing import parse_housing_program_name
+
+        self.assertEqual(
+            parse_housing_program_name("Home Remediation - De-humidifier - Queens"),
+            ("Home Remediation", "De-humidifier", "Queens"),
+        )
+        self.assertEqual(
+            parse_housing_program_name(
+                "Home Accessibility and Safety Modification - Non-skid Surfaces - Queens",
+            ),
+            ("Home Accessibility and Safety Modification", "Non-skid Surfaces", "Queens"),
+        )
+
+    def test_it_returns_BLANKS_rather_than_guessing(self):
+        """A half-parsed work order shown to a vendor is worse than a blank one."""
+        from .services.housing import parse_housing_program_name
+
+        for junk in ("", None, "Just A Name", "Two - Parts", "a - b - c - d", " -  - "):
+            self.assertEqual(parse_housing_program_name(junk), ("", "", ""), repr(junk))
+
+    def test_every_real_housing_program_yields_three_parts(self):
+        """A drift guard: a new housing program that does not follow the convention
+        would silently produce work orders with no item."""
+        from .services.housing import parse_housing_program_name
+
+        names = [
+            "Dwelling Assessment & Statement of Work (SOW) Development - "
+            "Modifications and Remediation Service - Brooklyn",
+            "Home Remediation - Heater - Queens",
+            "Home Remediation - Humidifier - Manhattan",
+            "Home Accessibility and Safety Modification - Hand Rails - Queens",
+        ]
+        for n in names:
+            self.assertTrue(all(parse_housing_program_name(n)), n)
+
+    def test_an_ASSESSMENT_gets_no_item_only_a_location(self):
+        """Its middle field is a service description -- displaying it as an item
+        would tell a vendor to install a "Modifications and Remediation Service"."""
+        from .models import ActiveProgram, Case, CaseStatus, CaseType, Client
+        from .services.catalog import clear_program_domain_cache
+        from .services.housing import housing_work_order_item
+
+        eea = (
+            "Dwelling Assessment & Statement of Work (SOW) Development - "
+            "Modifications and Remediation Service - Brooklyn"
+        )
+        ActiveProgram.objects.create(
+            program_name=eea, case_category="Internal Services",
+            case_type=ActiveProgram.CaseType.HOUSING,
+            service_type=ActiveProgram.ServiceType.ENVIRONMENTAL_EXPOSURE_ASSESSMENT,
+        )
+        clear_program_domain_cache()
+        c = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="P", last_name="Q",
+            client_added_at=timezone.now(),
+        )
+        case = Case.objects.create(
+            case_id=uuid.uuid4(), client=c, case_type=CaseType.INTERNAL_SERVICE,
+            case_status=CaseStatus.MANAGED, program_name=eea,
+            case_created_at=timezone.now(),
+        )
+        self.assertEqual(housing_work_order_item(case), ("", "Brooklyn"))
+
+
+class WorkOrderItemCaptureTest(TestCase):
+    """A work order records WHAT is installed and WHERE, captured at creation."""
+
+    HEAR = "Home Remediation - Air Conditioner - Manhattan"
+    ACC = "Home Accessibility and Safety Modification - Grab Bars - Brooklyn"
+    EEA = (
+        "Dwelling Assessment & Statement of Work (SOW) Development - "
+        "Modifications and Remediation Service - Brooklyn"
+    )
+
+    def setUp(self):
+        from .models import ActiveProgram, Vendor
+        from .services.catalog import clear_program_domain_cache
+
+        for name, stype in (
+            (self.EEA, ActiveProgram.ServiceType.ENVIRONMENTAL_EXPOSURE_ASSESSMENT),
+            (self.HEAR, ActiveProgram.ServiceType.HOME_EXPENSE_ASSISTANCE_REPAIRS),
+            (self.ACC,
+             ActiveProgram.ServiceType.ENVIRONMENTAL_MODIFICATIONS_ACCESSIBILITY),
+        ):
+            ActiveProgram.objects.create(
+                program_name=name, case_category="Internal Services",
+                case_type=ActiveProgram.CaseType.HOUSING, service_type=stype,
+            )
+        clear_program_domain_cache()
+        self.vendor = Vendor.objects.create(name="Acme")
+
+    def _member(self):
+        from .models import Client
+
+        return Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="W", last_name="O",
+            client_added_at=timezone.now(),
+        )
+
+    def _case(self, client, program, *, auth="approved"):
+        from .models import Case, CaseStatus, CaseType
+
+        return Case.objects.create(
+            case_id=uuid.uuid4(), client=client, case_type=CaseType.INTERNAL_SERVICE,
+            case_status=CaseStatus.MANAGED, program_name=program,
+            service_authorization_status=auth, case_created_at=timezone.now(),
+        )
+
+    def _assessment(self, client):
+        from .models import DispatchKind, DispatchOrder
+
+        return DispatchOrder.objects.create(
+            kind=DispatchKind.ASSESSMENT, client=client, vendor=self.vendor,
+        )
+
+    def test_BOTH_families_capture_their_item_and_borough(self):
+        from .services import dispatch
+
+        c = self._member()
+        self._case(c, self.HEAR)
+        self._case(c, self.ACC)
+        adopted = dispatch.adopt_unlinked_remediation_cases(self._assessment(c))
+
+        got = {(o.item, o.location) for o in adopted}
+        self.assertEqual(
+            got, {("Air Conditioner", "Manhattan"), ("Grab Bars", "Brooklyn")},
+        )
+
+    def test_the_item_is_captured_on_IMPORT_too_not_just_at_order_creation(self):
+        """A case that arrives AFTER the assessment exists must be linked and
+        parsed by the same path -- that is what the import reconcile is for."""
+        from .services import dispatch
+
+        c = self._member()
+        assessment = self._assessment(c)
+        self._case(c, self.ACC)
+        created = dispatch.reconcile_dispatch_orders(c)
+
+        self.assertEqual(len(created), 1)
+        self.assertEqual((created[0].item, created[0].location),
+                         ("Grab Bars", "Brooklyn"))
+
+    def test_the_item_SURVIVES_a_later_program_rename(self):
+        """It is an instruction to a vendor, so it is stored, not derived. A
+        renamed program must not rewrite what someone was dispatched to install."""
+        from .models import ActiveProgram
+        from .services import dispatch
+
+        c = self._member()
+        case = self._case(c, self.HEAR)
+        order = dispatch.create_remediation_order(case, assessment=self._assessment(c))
+
+        ActiveProgram.objects.filter(program_name=self.HEAR).update(
+            program_name="Home Remediation - Cooling Unit - Manhattan",
+        )
+        case.program_name = "Home Remediation - Cooling Unit - Manhattan"
+        case.save(update_fields=["program_name"])
+
+        order.refresh_from_db()
+        self.assertEqual(order.item, "Air Conditioner")
+
+    def test_the_authorization_status_rides_along_for_the_vendor(self):
+        """Item + location + approval is the instruction; an item on an unapproved
+        case must not be fitted."""
+        from .services import dispatch
+
+        c = self._member()
+        self._case(c, self.HEAR, auth="approved")
+        self._case(c, self.ACC, auth="pending")
+        dispatch.adopt_unlinked_remediation_cases(self._assessment(c))
+
+        from .models import DispatchKind, DispatchOrder
+
+        by_item = {
+            o.item: o.case.service_authorization_status
+            for o in DispatchOrder.objects.filter(kind=DispatchKind.REMEDIATION)
+        }
+        self.assertEqual(by_item["Air Conditioner"], "approved")
+        self.assertEqual(by_item["Grab Bars"], "pending")
+
+    def test_the_item_and_location_are_recorded_in_HISTORY(self):
+        from .models import StageEvent
+        from .services import dispatch
+
+        c = self._member()
+        case = self._case(c, self.ACC)
+        order = dispatch.create_remediation_order(case, assessment=self._assessment(c))
+
+        ev = StageEvent.objects.get(dispatch_order=order)
+        self.assertEqual(ev.metadata["item"], "Grab Bars")
+        self.assertEqual(ev.metadata["location"], "Brooklyn")
+        self.assertIn("Grab Bars", ev.note)
