@@ -27020,3 +27020,313 @@ class StrandedDeliveryPlanTest(TestCase):
         self._plan(self._enrollment(c, EnrollmentStage.DISREGARDED), "mon_thu")
         call_command("retire_dead_enrollment_plans", verbosity=0)
         self.assertEqual(stranded_plan_count(), 1, "dry run must not write")
+
+
+class DispatchOrderTest(TestCase):
+    """The dispatch structure: one assessment per member, the submission gate,
+    void-and-resubmit, and adoption of remediation cases that predate it.
+
+    See docs/housing-assessment-order-plan.md.
+    """
+
+    EEA = (
+        "Dwelling Assessment & Statement of Work (SOW) Development - "
+        "Modifications and Remediation Service - Brooklyn"
+    )
+    HEAR = "Home Remediation - Heater - Queens"
+
+    def setUp(self):
+        from .models import ActiveProgram, Vendor
+        from .services.catalog import clear_program_domain_cache
+
+        for name, stype in (
+            (self.EEA, ActiveProgram.ServiceType.ENVIRONMENTAL_EXPOSURE_ASSESSMENT),
+            (self.HEAR, ActiveProgram.ServiceType.HOME_EXPENSE_ASSISTANCE_REPAIRS),
+        ):
+            ActiveProgram.objects.create(
+                program_name=name, case_category="Internal Services",
+                case_type=ActiveProgram.CaseType.HOUSING, service_type=stype,
+            )
+        clear_program_domain_cache()
+        self.vendor = Vendor.objects.create(name="Acme Remediation")
+
+    def _member(self, name="Dispatch"):
+        from .models import Client
+
+        return Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name=name, last_name="Member",
+            client_added_at=timezone.now(),
+        )
+
+    def _case(self, client, program, *, status=None):
+        from .models import Case, CaseStatus, CaseType
+
+        return Case.objects.create(
+            case_id=uuid.uuid4(), client=client, case_type=CaseType.INTERNAL_SERVICE,
+            case_status=status or CaseStatus.MANAGED, program_name=program,
+            service_authorization_status="approved", case_created_at=timezone.now(),
+        )
+
+    def _assessment(self, client):
+        from .models import DispatchKind, DispatchOrder
+
+        return DispatchOrder.objects.create(
+            kind=DispatchKind.ASSESSMENT, client=client, vendor=self.vendor,
+        )
+
+    # ── one per member ───────────────────────────────────────────────────────
+    def test_only_one_assessment_order_per_member(self):
+        from django.db import IntegrityError
+
+        c = self._member()
+        self._assessment(c)
+        with self.assertRaises(IntegrityError):
+            self._assessment(c)
+
+    def test_many_remediation_orders_are_allowed(self):
+        """The constraint is scoped to assessments -- remediations are unlimited."""
+        from .models import DispatchKind, DispatchOrder
+
+        c = self._member()
+        a = self._assessment(c)
+        for _ in range(3):
+            DispatchOrder.objects.create(
+                kind=DispatchKind.REMEDIATION, client=c, parent=a,
+                case=self._case(c, self.HEAR),
+            )
+        self.assertEqual(
+            DispatchOrder.objects.filter(kind=DispatchKind.REMEDIATION).count(), 3,
+        )
+
+    # ── the submission gate ──────────────────────────────────────────────────
+    def test_the_gate_names_everything_that_is_missing(self):
+        """Reasons, not a bool: a bare False at the end of a home visit is
+        useless to the vendor standing in the member's kitchen."""
+        from .models import DispatchFinding
+        from .services import dispatch
+
+        order = self._assessment(self._member())
+        DispatchFinding.objects.create(dispatch_order=order, title="Damp in bedroom")
+        dispatch.open_submission(order)
+
+        missing = dispatch.missing_for_submission(order)
+        self.assertIn("vendor signature", missing)
+        self.assertIn("member signature", missing)
+        self.assertIn("photo for finding: Damp in bedroom", missing)
+        self.assertFalse(dispatch.can_submit(order))
+
+    def test_submit_is_refused_while_anything_is_missing(self):
+        from .services import dispatch
+
+        order = self._assessment(self._member())
+        dispatch.open_submission(order)
+        with self.assertRaises(ValueError) as ctx:
+            dispatch.submit(order)
+        self.assertIn("vendor signature", str(ctx.exception))
+
+    def test_a_photo_on_ANOTHER_finding_does_not_satisfy_the_first(self):
+        """The rule is one photo PER FINDING, which is why proofs carry a finding
+        FK -- counting photos per ORDER would pass this."""
+        from .models import DispatchFinding, DispatchProof
+        from .services import dispatch
+
+        order = self._assessment(self._member())
+        a = DispatchFinding.objects.create(dispatch_order=order, title="Damp")
+        DispatchFinding.objects.create(dispatch_order=order, title="Mould")
+        DispatchProof.objects.create(
+            dispatch_order=order, finding=a, s3_key="k1", content_hash="h1",
+        )
+        missing = dispatch.missing_for_submission(order)
+        self.assertIn("photo for finding: Mould", missing)
+        self.assertNotIn("photo for finding: Damp", missing)
+
+    def test_a_general_site_photo_does_not_count_for_a_finding(self):
+        """A proof with no finding is a site photo, not evidence OF anything."""
+        from .models import DispatchFinding, DispatchProof
+        from .services import dispatch
+
+        order = self._assessment(self._member())
+        DispatchFinding.objects.create(dispatch_order=order, title="Damp")
+        DispatchProof.objects.create(
+            dispatch_order=order, finding=None, s3_key="k", content_hash="h",
+        )
+        self.assertIn("photo for finding: Damp", dispatch.missing_for_submission(order))
+
+    def _satisfy_gate(self, order):
+        from .models import (
+            DispatchFinding, DispatchProof, DispatchSignature, DispatchSignerRole,
+        )
+        from .services import dispatch
+
+        f = DispatchFinding.objects.create(dispatch_order=order, title="Damp")
+        DispatchProof.objects.create(
+            dispatch_order=order, finding=f, s3_key="k", content_hash=uuid.uuid4().hex,
+        )
+        sub = dispatch.open_submission(order)
+        for role in (DispatchSignerRole.VENDOR, DispatchSignerRole.MEMBER):
+            DispatchSignature.objects.create(
+                dispatch_submission=sub, signer_role=role, signed_at=timezone.now(),
+            )
+        return sub
+
+    def test_submit_succeeds_once_the_gate_is_satisfied(self):
+        from .models import DispatchStatus
+        from .services import dispatch
+
+        order = self._assessment(self._member())
+        self._satisfy_gate(order)
+        dispatch.submit(order)
+        order.refresh_from_db()
+        self.assertEqual(order.status, DispatchStatus.SUBMITTED)
+
+    # ── void and resubmit ────────────────────────────────────────────────────
+    def test_voiding_keeps_the_old_submission_and_opens_a_new_one(self):
+        from .models import DispatchStatus, DispatchSubmissionState
+        from .services import dispatch
+
+        order = self._assessment(self._member())
+        first = self._satisfy_gate(order)
+        dispatch.submit(order)
+
+        second = dispatch.void_submission(first, reason="wrong room measured")
+
+        first.refresh_from_db()
+        self.assertEqual(first.state, DispatchSubmissionState.VOIDED)
+        self.assertEqual(first.void_reason, "wrong room measured")
+        self.assertIsNotNone(first.voided_at)
+        # the voided copy KEEPS its signatures -- that is the point of keeping it
+        self.assertEqual(first.signatures.count(), 2)
+
+        self.assertEqual(second.sequence, 2)
+        self.assertEqual(second.state, DispatchSubmissionState.ACTIVE)
+        order.refresh_from_db()
+        self.assertEqual(order.status, DispatchStatus.PENDING_SUBMISSION)
+
+    def test_the_new_submission_must_satisfy_the_gate_again(self):
+        """Signatures belong to a SUBMISSION, so a void leaves the new one unsigned
+        -- otherwise a void would silently inherit the old attestation."""
+        from .services import dispatch
+
+        order = self._assessment(self._member())
+        first = self._satisfy_gate(order)
+        dispatch.submit(order)
+        dispatch.void_submission(first, reason="redo")
+
+        missing = dispatch.missing_for_submission(order)
+        self.assertIn("vendor signature", missing)
+        self.assertIn("member signature", missing)
+
+    def test_voiding_marks_a_unite_us_upload_SUPERSEDED(self):
+        """Unite Us must not silently keep evidence the CRM has rejected."""
+        from .models import DispatchUniteUsUpload
+        from .services import dispatch
+
+        order = self._assessment(self._member())
+        first = self._satisfy_gate(order)
+        dispatch.submit(order)
+        up = DispatchUniteUsUpload.objects.create(
+            dispatch_order=order, dispatch_submission=first,
+            uploaded_at=timezone.now(),
+        )
+        self.assertIsNone(up.superseded_at)
+
+        dispatch.void_submission(first, reason="wrong photos")
+        up.refresh_from_db()
+        self.assertIsNotNone(
+            up.superseded_at, "a voided submission must flag its Unite Us upload",
+        )
+
+    def test_a_submission_cannot_be_voided_twice(self):
+        from .services import dispatch
+
+        order = self._assessment(self._member())
+        first = self._satisfy_gate(order)
+        dispatch.submit(order)
+        dispatch.void_submission(first, reason="once")
+        with self.assertRaises(ValueError):
+            dispatch.void_submission(first, reason="twice")
+
+    # ── adoption ─────────────────────────────────────────────────────────────
+    def test_a_remediation_case_with_no_assessment_order_WAITS(self):
+        """Inventing an assessment they never had would fabricate history."""
+        from .services import dispatch
+
+        c = self._member()
+        case = self._case(c, self.HEAR)
+        self.assertIsNone(dispatch.create_remediation_order(case))
+
+    def test_creating_the_assessment_ADOPTS_the_waiting_cases(self):
+        """MIRIAM ISRAEL's shape: remediation cases that arrived first."""
+        from .models import DispatchKind, DispatchOrder
+        from .services import dispatch
+
+        c = self._member("Miriam")
+        for _ in range(3):
+            self._case(c, self.HEAR)
+        assessment = self._assessment(c)
+
+        adopted = dispatch.adopt_unlinked_remediation_cases(assessment)
+        self.assertEqual(len(adopted), 3)
+        self.assertTrue(all(o.parent_id == assessment.pk for o in adopted))
+        self.assertEqual(
+            DispatchOrder.objects.filter(kind=DispatchKind.REMEDIATION).count(), 3,
+        )
+
+    def test_adoption_is_idempotent(self):
+        from .models import DispatchKind, DispatchOrder
+        from .services import dispatch
+
+        c = self._member()
+        self._case(c, self.HEAR)
+        assessment = self._assessment(c)
+
+        dispatch.adopt_unlinked_remediation_cases(assessment)
+        dispatch.adopt_unlinked_remediation_cases(assessment)
+        self.assertEqual(
+            DispatchOrder.objects.filter(kind=DispatchKind.REMEDIATION).count(), 1,
+        )
+
+    def test_a_CLOSED_remediation_case_is_adopted_as_record_only(self):
+        """Four of MIRIAM's nine are closed. Adopting them records history, but a
+        schedulable status would dispatch a vendor to work nobody will pay for."""
+        from .models import CaseStatus, DispatchStatus
+        from .services import dispatch
+
+        c = self._member()
+        self._case(c, self.HEAR, status=CaseStatus.CLOSED)
+        assessment = self._assessment(c)
+
+        adopted = dispatch.adopt_unlinked_remediation_cases(assessment)
+        self.assertEqual(len(adopted), 1)
+        self.assertEqual(adopted[0].status, DispatchStatus.CANCELLED)
+
+    # ── history + address inheritance ────────────────────────────────────────
+    def test_transitions_land_in_the_SHARED_stage_event_log(self):
+        """Not a parallel table: "everything that happened to this member" stays
+        one query."""
+        from .models import DispatchStatus, StageEntityType, StageEvent
+        from .services import dispatch
+
+        order = self._assessment(self._member())
+        dispatch.set_status(order, DispatchStatus.CONFIRMED, note="booked")
+
+        ev = StageEvent.objects.get(dispatch_order=order)
+        self.assertEqual(ev.entity_type, StageEntityType.DISPATCH_ORDER)
+        self.assertEqual(ev.from_stage, DispatchStatus.PENDING_SCHEDULE)
+        self.assertEqual(ev.to_stage, DispatchStatus.CONFIRMED)
+        self.assertEqual(str(ev.client_id), str(order.client_id))
+
+    def test_a_remediation_order_INHERITS_the_verified_address(self):
+        """Verified once on the assessment; a child must not be able to drift."""
+        from .models import DispatchKind, DispatchOrder
+
+        c = self._member()
+        a = self._assessment(c)
+        a.address_formatted = "123 Verified St, Brooklyn NY"
+        a.save(update_fields=["address_formatted"])
+
+        child = DispatchOrder.objects.create(
+            kind=DispatchKind.REMEDIATION, client=c, parent=a,
+            case=self._case(c, self.HEAR),
+        )
+        self.assertEqual(child.service_address, "123 Verified St, Brooklyn NY")

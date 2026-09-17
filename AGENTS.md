@@ -21,6 +21,32 @@ python manage.py makemigrations --check --dry-run
 python manage.py test api.tests --parallel 4
 ```
 
+### Four tests fail after 20:00 EDT — a UTC/local date boundary, not your change
+
+Between 20:00 EDT and midnight, `timezone.now()` is already TOMORROW in UTC while
+`timezone.localdate()` is still today (`TIME_ZONE = America/New_York`). Tests that
+build a date as `timezone.now() - timedelta(days=1)` and expect it to read as
+"yesterday" therefore get TODAY, and any "has it expired?" assertion inverts:
+
+```
+local: 2026-09-16 20:29 EDT      timezone.now()   -> 2026-09-17 00:29 UTC
+                                 localdate()      -> 2026-09-16
+```
+
+Known to affect, verified failing on a CLEAN tree at 00:29 UTC:
+
+```
+ResumeRevalidationTest.test_expired_authorization_blocks
+ClientAddedAtAndSourceTest.test_data_page_member_created_filter_uses_the_added_date
+CalendarKeepsOccurrencesOnExclusionTest.test_sync_active_calendars_heals_fully_lapsed_calendar
+CaseInsuranceCoverageTimelineMetadataTest.test_coverage_event_records_status_and_expiry
+```
+
+Before assuming you broke them, `git stash -u` and re-run: that is how these were
+identified. The real fix is for those tests to build dates from
+`timezone.localdate()` rather than `timezone.now()`, which is worth doing but is
+not urgent.
+
 **Migrations are DISABLED under `manage.py test`** (`_DisableMigrations` in
 settings builds tables straight from model state). So data migrations never run
 in the suite: a test can never assert on rows a migration seeds, and must create
