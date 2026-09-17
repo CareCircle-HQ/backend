@@ -27083,8 +27083,9 @@ class DispatchOrderTest(TestCase):
         with self.assertRaises(IntegrityError):
             self._assessment(c)
 
-    def test_many_remediation_orders_are_allowed(self):
-        """The constraint is scoped to assessments -- remediations are unlimited."""
+    def test_many_work_orders_are_allowed(self):
+        """The one-per-member constraint is scoped to assessments; a member can have
+        any number of work orders under theirs."""
         from .models import DispatchKind, DispatchOrder
 
         c = self._member()
@@ -27092,7 +27093,6 @@ class DispatchOrderTest(TestCase):
         for _ in range(3):
             DispatchOrder.objects.create(
                 kind=DispatchKind.REMEDIATION, client=c, parent=a,
-                case=self._case(c, self.HEAR),
             )
         self.assertEqual(
             DispatchOrder.objects.filter(kind=DispatchKind.REMEDIATION).count(), 3,
@@ -27247,17 +27247,22 @@ class DispatchOrderTest(TestCase):
             dispatch.void_submission(first, reason="twice")
 
     # ── adoption ─────────────────────────────────────────────────────────────
-    def test_a_remediation_case_with_no_assessment_order_WAITS(self):
+    # A housing case now yields an ITEM, not a work order; a work order is a batch
+    # an agent assembles. These still pin the same requirements, restated against
+    # the item model.
+    def test_a_case_with_no_assessment_order_WAITS(self):
         """Inventing an assessment they never had would fabricate history."""
+        from .models import DispatchItem
         from .services import dispatch
 
         c = self._member()
-        case = self._case(c, self.HEAR)
-        self.assertIsNone(dispatch.create_remediation_order(case))
+        self._case(c, self.HEAR)
+        self.assertEqual(dispatch.reconcile_dispatch_orders(c), [])
+        self.assertEqual(DispatchItem.objects.filter(case__client=c).count(), 0)
 
-    def test_creating_the_assessment_ADOPTS_the_waiting_cases(self):
-        """MIRIAM ISRAEL's shape: remediation cases that arrived first."""
-        from .models import DispatchKind, DispatchOrder
+    def test_creating_the_assessment_ADOPTS_the_waiting_cases_as_items(self):
+        """MIRIAM ISRAEL's shape: housing cases that arrived first."""
+        from .models import DispatchItem
         from .services import dispatch
 
         c = self._member("Miriam")
@@ -27267,13 +27272,11 @@ class DispatchOrderTest(TestCase):
 
         adopted = dispatch.adopt_unlinked_remediation_cases(assessment)
         self.assertEqual(len(adopted), 3)
-        self.assertTrue(all(o.parent_id == assessment.pk for o in adopted))
-        self.assertEqual(
-            DispatchOrder.objects.filter(kind=DispatchKind.REMEDIATION).count(), 3,
-        )
+        self.assertTrue(all(i.assessment_id == assessment.pk for i in adopted))
+        self.assertEqual(DispatchItem.objects.filter(assessment=assessment).count(), 3)
 
     def test_adoption_is_idempotent(self):
-        from .models import DispatchKind, DispatchOrder
+        from .models import DispatchItem
         from .services import dispatch
 
         c = self._member()
@@ -27282,14 +27285,13 @@ class DispatchOrderTest(TestCase):
 
         dispatch.adopt_unlinked_remediation_cases(assessment)
         dispatch.adopt_unlinked_remediation_cases(assessment)
-        self.assertEqual(
-            DispatchOrder.objects.filter(kind=DispatchKind.REMEDIATION).count(), 1,
-        )
+        self.assertEqual(DispatchItem.objects.filter(assessment=assessment).count(), 1)
 
-    def test_a_CLOSED_remediation_case_is_adopted_as_record_only(self):
-        """Four of MIRIAM's nine are closed. Adopting them records history, but a
-        schedulable status would dispatch a vendor to work nobody will pay for."""
-        from .models import CaseStatus, DispatchStatus
+    def test_a_CLOSED_case_becomes_an_item_that_is_NOT_dispatchable(self):
+        """Four of MIRIAM's nine are closed. They are recorded as items -- the
+        history is real -- but must never be selectable for a work order, or a
+        vendor gets sent to do work nobody will pay for."""
+        from .models import CaseStatus
         from .services import dispatch
 
         c = self._member()
@@ -27298,7 +27300,7 @@ class DispatchOrderTest(TestCase):
 
         adopted = dispatch.adopt_unlinked_remediation_cases(assessment)
         self.assertEqual(len(adopted), 1)
-        self.assertEqual(adopted[0].status, DispatchStatus.CANCELLED)
+        self.assertFalse(adopted[0].is_available)
 
     # ── history + address inheritance ────────────────────────────────────────
     def test_transitions_land_in_the_SHARED_stage_event_log(self):
@@ -28456,14 +28458,20 @@ class HousingProgramNameParsingTest(TestCase):
         self.assertEqual(housing_work_order_item(case), ("", "Brooklyn"))
 
 
-class WorkOrderItemCaptureTest(TestCase):
-    """A work order records WHAT is installed and WHERE, captured at creation."""
+class DispatchItemTest(TestCase):
+    """A housing case yields an ITEM, not a work order.
+
+    A work order is a BATCH an agent assembles from approved items, so an item is
+    tracked as assigned or not. That nullable FK is the whole answer to "has this
+    been dispatched yet?" -- a separate flag would drift from it immediately.
+    """
 
     HEAR = "Home Remediation - Air Conditioner - Manhattan"
-    ACC = "Home Accessibility and Safety Modification - Grab Bars - Brooklyn"
+    HEAR2 = "Home Remediation - Heater - Manhattan"
+    ACC = "Home Accessibility and Safety Modification - Grab Bars - Manhattan"
     EEA = (
         "Dwelling Assessment & Statement of Work (SOW) Development - "
-        "Modifications and Remediation Service - Brooklyn"
+        "Modifications and Remediation Service - Manhattan"
     )
 
     def setUp(self):
@@ -28473,6 +28481,7 @@ class WorkOrderItemCaptureTest(TestCase):
         for name, stype in (
             (self.EEA, ActiveProgram.ServiceType.ENVIRONMENTAL_EXPOSURE_ASSESSMENT),
             (self.HEAR, ActiveProgram.ServiceType.HOME_EXPENSE_ASSISTANCE_REPAIRS),
+            (self.HEAR2, ActiveProgram.ServiceType.HOME_EXPENSE_ASSISTANCE_REPAIRS),
             (self.ACC,
              ActiveProgram.ServiceType.ENVIRONMENTAL_MODIFICATIONS_ACCESSIBILITY),
         ):
@@ -28487,16 +28496,16 @@ class WorkOrderItemCaptureTest(TestCase):
         from .models import Client
 
         return Client.objects.create(
-            client_id=str(uuid.uuid4()), first_name="W", last_name="O",
+            client_id=str(uuid.uuid4()), first_name="I", last_name="Tem",
             client_added_at=timezone.now(),
         )
 
-    def _case(self, client, program, *, auth="approved"):
+    def _case(self, client, program, *, auth="approved", status=None):
         from .models import Case, CaseStatus, CaseType
 
         return Case.objects.create(
             case_id=uuid.uuid4(), client=client, case_type=CaseType.INTERNAL_SERVICE,
-            case_status=CaseStatus.MANAGED, program_name=program,
+            case_status=status or CaseStatus.MANAGED, program_name=program,
             service_authorization_status=auth, case_created_at=timezone.now(),
         )
 
@@ -28507,80 +28516,190 @@ class WorkOrderItemCaptureTest(TestCase):
             kind=DispatchKind.ASSESSMENT, client=client, vendor=self.vendor,
         )
 
-    def test_BOTH_families_capture_their_item_and_borough(self):
+    # ── items ────────────────────────────────────────────────────────────────
+    def test_each_case_becomes_ONE_item_with_its_own_item_and_borough(self):
         from .services import dispatch
 
         c = self._member()
         self._case(c, self.HEAR)
         self._case(c, self.ACC)
-        adopted = dispatch.adopt_unlinked_remediation_cases(self._assessment(c))
-
-        got = {(o.item, o.location) for o in adopted}
+        items = dispatch.sync_dispatch_items(self._assessment(c))
         self.assertEqual(
-            got, {("Air Conditioner", "Manhattan"), ("Grab Bars", "Brooklyn")},
+            {(i.item, i.location) for i in items},
+            {("Air Conditioner", "Manhattan"), ("Grab Bars", "Manhattan")},
         )
 
-    def test_the_item_is_captured_on_IMPORT_too_not_just_at_order_creation(self):
-        """A case that arrives AFTER the assessment exists must be linked and
-        parsed by the same path -- that is what the import reconcile is for."""
+    def test_a_case_does_NOT_create_a_work_order(self):
+        """The change from the previous model: importing cases must never dispatch
+        a vendor by itself."""
+        from .models import DispatchKind, DispatchOrder
         from .services import dispatch
 
         c = self._member()
-        assessment = self._assessment(c)
+        self._case(c, self.HEAR)
+        dispatch.sync_dispatch_items(self._assessment(c))
+        self.assertEqual(
+            DispatchOrder.objects.filter(kind=DispatchKind.REMEDIATION).count(), 0,
+        )
+
+    def test_syncing_twice_does_not_duplicate(self):
+        from .models import DispatchItem
+        from .services import dispatch
+
+        c = self._member()
+        self._case(c, self.HEAR)
+        a = self._assessment(c)
+        dispatch.sync_dispatch_items(a)
+        dispatch.sync_dispatch_items(a)
+        self.assertEqual(DispatchItem.objects.filter(assessment=a).count(), 1)
+
+    def test_an_item_arriving_after_the_order_is_picked_up_on_IMPORT(self):
+        from .services import dispatch
+
+        c = self._member()
+        a = self._assessment(c)
         self._case(c, self.ACC)
         created = dispatch.reconcile_dispatch_orders(c)
+        self.assertEqual([(i.item, i.location) for i in created],
+                         [("Grab Bars", "Manhattan")])
 
-        self.assertEqual(len(created), 1)
-        self.assertEqual((created[0].item, created[0].location),
-                         ("Grab Bars", "Brooklyn"))
-
-    def test_the_item_SURVIVES_a_later_program_rename(self):
-        """It is an instruction to a vendor, so it is stored, not derived. A
-        renamed program must not rewrite what someone was dispatched to install."""
-        from .models import ActiveProgram
+    def test_the_authorization_is_read_LIVE_but_the_item_is_not(self):
+        """An approval can lapse after the item exists; the ITEM cannot change,
+        because it is the instruction a vendor acted on."""
         from .services import dispatch
 
         c = self._member()
-        case = self._case(c, self.HEAR)
-        order = dispatch.create_remediation_order(case, assessment=self._assessment(c))
+        case = self._case(c, self.HEAR, auth="approved")
+        item = dispatch.sync_dispatch_items(self._assessment(c))[0]
+        self.assertTrue(item.is_approved)
 
-        ActiveProgram.objects.filter(program_name=self.HEAR).update(
-            program_name="Home Remediation - Cooling Unit - Manhattan",
-        )
+        case.service_authorization_status = "denied"
+        case.save(update_fields=["service_authorization_status"])
         case.program_name = "Home Remediation - Cooling Unit - Manhattan"
         case.save(update_fields=["program_name"])
 
-        order.refresh_from_db()
-        self.assertEqual(order.item, "Air Conditioner")
+        item.refresh_from_db()
+        self.assertFalse(item.is_approved)          # live
+        self.assertEqual(item.item, "Air Conditioner")  # captured
 
-    def test_the_authorization_status_rides_along_for_the_vendor(self):
-        """Item + location + approval is the instruction; an item on an unapproved
-        case must not be fitted."""
+    # ── availability ─────────────────────────────────────────────────────────
+    def test_only_approved_undispatched_open_items_are_available(self):
+        from .models import CaseStatus
         from .services import dispatch
 
         c = self._member()
         self._case(c, self.HEAR, auth="approved")
-        self._case(c, self.ACC, auth="pending")
-        dispatch.adopt_unlinked_remediation_cases(self._assessment(c))
+        self._case(c, self.HEAR2, auth="denied")
+        self._case(c, self.ACC, auth="approved", status=CaseStatus.CLOSED)
+        items = dispatch.sync_dispatch_items(self._assessment(c))
 
+        by_item = {i.item: i.is_available for i in items}
+        self.assertTrue(by_item["Air Conditioner"])
+        self.assertFalse(by_item["Heater"], "denied must not be dispatchable")
+        self.assertFalse(by_item["Grab Bars"], "a closed case is history, not work")
+
+    # ── work orders ──────────────────────────────────────────────────────────
+    def test_a_work_order_batches_several_items(self):
+        from .services import dispatch
+
+        c = self._member()
+        self._case(c, self.HEAR)
+        self._case(c, self.HEAR2)
+        a = self._assessment(c)
+        items = dispatch.sync_dispatch_items(a)
+
+        wo = dispatch.create_work_order(a, [i.dispatch_item_id for i in items])
+        self.assertEqual(wo.line_items.count(), 2)
+        self.assertEqual(wo.parent_id, a.pk)
+        self.assertEqual(wo.location, "Manhattan")
+
+    def test_an_item_in_a_work_order_is_no_longer_available(self):
+        """No double-dispatch: the nullable FK IS the tracking."""
+        from .services import dispatch
+
+        c = self._member()
+        self._case(c, self.HEAR)
+        a = self._assessment(c)
+        item = dispatch.sync_dispatch_items(a)[0]
+        dispatch.create_work_order(a, [item.dispatch_item_id])
+
+        item.refresh_from_db()
+        self.assertIsNotNone(item.dispatch_order_id)
+        self.assertFalse(item.is_available)
+
+    def test_a_second_work_order_cannot_reuse_a_dispatched_item(self):
+        from .services import dispatch
+
+        c = self._member()
+        self._case(c, self.HEAR)
+        a = self._assessment(c)
+        item = dispatch.sync_dispatch_items(a)[0]
+        dispatch.create_work_order(a, [item.dispatch_item_id])
+
+        with self.assertRaises(ValueError) as ctx:
+            dispatch.create_work_order(a, [item.dispatch_item_id])
+        self.assertIn("already in a work order", str(ctx.exception))
+
+    def test_an_UNAPPROVED_item_cannot_be_dispatched(self):
+        from .services import dispatch
+
+        c = self._member()
+        self._case(c, self.HEAR2, auth="denied")
+        a = self._assessment(c)
+        item = dispatch.sync_dispatch_items(a)[0]
+        with self.assertRaises(ValueError) as ctx:
+            dispatch.create_work_order(a, [item.dispatch_item_id])
+        self.assertIn("denied", str(ctx.exception))
+
+    def test_a_partially_valid_selection_is_REFUSED_not_trimmed(self):
+        """An agent who selected two and silently got one would not notice, and the
+        missing one is exactly what someone is waiting on."""
+        from .services import dispatch
+
+        c = self._member()
+        self._case(c, self.HEAR, auth="approved")
+        self._case(c, self.HEAR2, auth="denied")
+        a = self._assessment(c)
+        items = dispatch.sync_dispatch_items(a)
+
+        with self.assertRaises(ValueError):
+            dispatch.create_work_order(a, [i.dispatch_item_id for i in items])
+        # and nothing was assigned
+        for i in items:
+            i.refresh_from_db()
+            self.assertIsNone(i.dispatch_order_id)
+
+    def test_several_work_orders_can_hang_off_one_assessment(self):
         from .models import DispatchKind, DispatchOrder
+        from .services import dispatch
 
-        by_item = {
-            o.item: o.case.service_authorization_status
-            for o in DispatchOrder.objects.filter(kind=DispatchKind.REMEDIATION)
-        }
-        self.assertEqual(by_item["Air Conditioner"], "approved")
-        self.assertEqual(by_item["Grab Bars"], "pending")
+        c = self._member()
+        self._case(c, self.HEAR)
+        self._case(c, self.HEAR2)
+        self._case(c, self.ACC)
+        a = self._assessment(c)
+        items = {i.item: i for i in dispatch.sync_dispatch_items(a)}
 
-    def test_the_item_and_location_are_recorded_in_HISTORY(self):
+        dispatch.create_work_order(a, [items["Air Conditioner"].dispatch_item_id])
+        dispatch.create_work_order(a, [
+            items["Heater"].dispatch_item_id, items["Grab Bars"].dispatch_item_id,
+        ])
+        self.assertEqual(
+            DispatchOrder.objects.filter(
+                kind=DispatchKind.REMEDIATION, parent=a,
+            ).count(), 2,
+        )
+
+    def test_the_work_order_records_which_items_it_covers(self):
         from .models import StageEvent
         from .services import dispatch
 
         c = self._member()
-        case = self._case(c, self.ACC)
-        order = dispatch.create_remediation_order(case, assessment=self._assessment(c))
+        self._case(c, self.HEAR)
+        a = self._assessment(c)
+        item = dispatch.sync_dispatch_items(a)[0]
+        wo = dispatch.create_work_order(a, [item.dispatch_item_id])
 
-        ev = StageEvent.objects.get(dispatch_order=order)
-        self.assertEqual(ev.metadata["item"], "Grab Bars")
-        self.assertEqual(ev.metadata["location"], "Brooklyn")
-        self.assertIn("Grab Bars", ev.note)
+        ev = StageEvent.objects.get(dispatch_order=wo)
+        self.assertIn("Air Conditioner", ev.metadata["items"])
+        self.assertIn(str(item.case_id), ev.metadata["case_ids"])

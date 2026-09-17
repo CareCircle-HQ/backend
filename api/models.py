@@ -5495,17 +5495,9 @@ class DispatchOrder(models.Model):
     # A second assessment becomes another LABEL here rather than a second order.
     dwellings = models.JSONField(default=dict, blank=True)
 
-    # What gets installed or remediated, and where -- parsed from the case's
-    # program name ("Home Remediation - Air Conditioner - Manhattan").
-    #
-    # STORED rather than derived on read, because this is an INSTRUCTION TO A
-    # VENDOR: "fit an air conditioner in Manhattan". Renaming or reclassifying the
-    # program later must not silently rewrite what a vendor was dispatched to do,
-    # and a completed order has to keep saying what was actually installed.
-    #
-    # Empty on an assessment order: its program's middle field is a service
-    # description, not an installable item.
-    item = models.CharField(max_length=255, blank=True)
+    # The borough the work happens in, parsed from the case's program name. The
+    # ITEMS themselves live on DispatchItem: a work order is a BATCH, so it has
+    # many items and cannot carry one.
     location = models.CharField(max_length=120, blank=True)
 
     status = models.CharField(
@@ -5581,14 +5573,11 @@ class DispatchOrder(models.Model):
                 condition=models.Q(kind="assessment"),
                 name="one_assessment_order_per_client",
             ),
-            # Adoption must be idempotent: running it twice must not create two
-            # remediation orders for the same case. Cheaper than remembering to
-            # check.
-            models.UniqueConstraint(
-                fields=["case"],
-                condition=models.Q(kind="remediation"),
-                name="one_remediation_order_per_case",
-            ),
+            # NOTE there is deliberately no per-case constraint on remediation
+            # orders any more. A work order is a BATCH of items drawn from several
+            # cases, and one case's item may be re-dispatched in a later batch if
+            # the first was cancelled. Uniqueness now belongs to DispatchItem,
+            # which IS one per case.
         ]
         indexes = [
             models.Index(fields=["client", "kind"]),
@@ -5608,6 +5597,86 @@ class DispatchOrder(models.Model):
         if self.kind == DispatchKind.REMEDIATION and self.parent_id:
             return self.parent.address_formatted or self.parent.address_line1
         return self.address_formatted or self.address_line1
+
+
+class DispatchItem(models.Model):
+    """One installable thing, drawn from one housing case.
+
+    This is the unit the business actually thinks in: "a grab bar in Brooklyn,
+    approved". It comes from a Home Remediation or Home Accessibility case, whose
+    program name encodes ``<family> - <item> - <borough>``.
+
+    An item is NOT a work order. A work order is a batch an agent assembles from
+    approved items, so ``dispatch_order`` is nullable and an item sits unassigned
+    until someone includes it. That nullable FK is the whole "has this been
+    dispatched yet?" answer -- tracking it separately would immediately drift.
+
+    One item per case (unique), so re-importing a case cannot duplicate it.
+    """
+
+    dispatch_item_id = models.UUIDField(
+        primary_key=True, default=uuid.uuid4, editable=False
+    )
+    # The assessment that found the need. Items always hang off an assessment,
+    # even before any work order exists.
+    assessment = models.ForeignKey(
+        DispatchOrder, on_delete=models.CASCADE, related_name="items",
+    )
+    case = models.ForeignKey(
+        Case, on_delete=models.CASCADE, related_name="dispatch_items",
+    )
+    # The work order that includes this item, once one does. NULL = not yet
+    # dispatched.
+    dispatch_order = models.ForeignKey(
+        DispatchOrder, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="line_items",
+    )
+    # Captured at creation from the program name, NOT derived on read: this is the
+    # instruction a vendor acts on, and a later program rename must not rewrite
+    # what was installed.
+    item = models.CharField(max_length=255, blank=True)
+    location = models.CharField(max_length=120, blank=True)
+    # The program name as it read when the item was created, for provenance.
+    program_name = models.CharField(max_length=255, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["location", "item"]
+        constraints = [
+            models.UniqueConstraint(fields=["case"], name="one_item_per_case"),
+        ]
+        indexes = [
+            models.Index(fields=["assessment", "dispatch_order"]),
+        ]
+
+    def __str__(self):
+        return f"{self.item} ({self.location})" if self.item else str(self.case_id)
+
+    @property
+    def authorization_status(self):
+        """Read LIVE from the case, unlike ``item``.
+
+        Deliberately not captured: an authorization can be approved, denied or
+        expire after the item exists, and a stale copy would have a vendor fitting
+        something that is no longer covered.
+        """
+        return (self.case.service_authorization_status or "") if self.case_id else ""
+
+    @property
+    def is_approved(self):
+        return self.authorization_status.lower() == "approved"
+
+    @property
+    def is_available(self):
+        """Selectable for a NEW work order.
+
+        Three conditions, all necessary: approved (nothing unapproved may be
+        fitted), not already in a work order (no double-dispatch), and the case
+        still open (a closed case is history, not work).
+        """
+        closed = (self.case.case_status or "").lower() in ("closed", "cancelled")
+        return self.is_approved and self.dispatch_order_id is None and not closed
 
 
 class DispatchAvailabilityWindow(models.Model):

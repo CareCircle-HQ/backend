@@ -226,81 +226,122 @@ def assessment_order_for(client):
 
 
 @transaction.atomic
-def create_remediation_order(case, *, assessment=None):
-    """Create the remediation order for a Home Remediation case.
+def sync_dispatch_items(assessment):
+    """Create a DispatchItem for each of the member's housing work-order cases.
 
-    Returns None when the member has no assessment order yet -- the case simply
-    WAITS and is adopted when the assessment is created. Inventing an assessment
-    they never had would fabricate history.
+    Replaces the old one-order-per-case model. A case now yields an ITEM -- "a grab
+    bar in Brooklyn" -- and a work order is a batch an agent later assembles from
+    approved items. So this runs on both entry points and only ever ADDS:
 
-    Idempotent via the (case, kind=remediation) unique constraint.
+      * when the assessment order is created, for cases that arrived first;
+      * on every import, for cases that arrive afterwards.
+
+    Idempotent through the one-item-per-case constraint, and it never touches an
+    item that is already in a work order -- re-importing a case must not re-describe
+    work a vendor has already been sent.
     """
-    assessment = assessment or assessment_order_for(case.client)
-    if assessment is None:
-        return None
-    existing = DispatchOrder.objects.filter(
-        case=case, kind=DispatchKind.REMEDIATION,
-    ).first()
-    if existing is not None:
-        return existing
+    from api.models import DispatchItem
+    from api.services.housing import housing_work_order_item, housing_work_orders
 
-    from api.models import CaseStatus
-
-    closed = (case.case_status or "").lower() in ("closed", "cancelled")
-    # What the vendor is being asked to fit, and where. Captured NOW, from the
-    # program name, so the instruction survives a later program rename.
-    from api.services.housing import housing_work_order_item
-
-    item, location = housing_work_order_item(case)
-    order = DispatchOrder.objects.create(
-        kind=DispatchKind.REMEDIATION,
-        parent=assessment,
-        client=case.client,
-        case=case,
-        vendor=assessment.vendor,
-        item=item,
-        location=location,
-        # A closed case is adopted as RECORD ONLY. Putting it in a schedulable
-        # status would dispatch a vendor to work nobody is paying for.
-        status=(
-            DispatchStatus.CANCELLED if closed else DispatchStatus.PENDING_SCHEDULE
-        ),
+    created = []
+    existing = set(
+        DispatchItem.objects
+        .filter(case__client=assessment.client)
+        .values_list("case_id", flat=True)
     )
-    record_transition(
-        order, "", order.status,
-        source=StageEventSource.AUTO,
-        note=(
-            f"work order created: {item} ({location})" if item
-            else "work order created from housing case"
-        ),
-        metadata={
-            "case_id": str(case.case_id), "adopted_closed": closed,
-            "item": item, "location": location,
-            "program_name": case.program_name or "",
-        },
-    )
-    return order
+    for case in housing_work_orders(assessment.client):
+        if case.case_id in existing:
+            continue
+        item, location = housing_work_order_item(case)
+        row = DispatchItem.objects.create(
+            assessment=assessment, case=case,
+            item=item, location=location, program_name=case.program_name or "",
+        )
+        created.append(row)
+        record_transition(
+            assessment, assessment.status, assessment.status,
+            source=StageEventSource.AUTO,
+            note=(f"item added: {item} ({location})" if item else "housing item added"),
+            metadata={
+                "case_id": str(case.case_id), "item": item, "location": location,
+                "program_name": case.program_name or "",
+            },
+        )
+    return created
+
+
+# Kept under the old name because the assessment-order endpoint and the import
+# reconcile both call it, and "adopt" is still what it does -- it now adopts the
+# member's waiting cases as ITEMS rather than as orders.
+def adopt_unlinked_remediation_cases(assessment):
+    return sync_dispatch_items(assessment)
 
 
 @transaction.atomic
-def adopt_unlinked_remediation_cases(assessment):
-    """Attach the member's existing Home Remediation cases to their new assessment.
+def create_work_order(assessment, item_ids, *, vendor=None, actor=None, notes=""):
+    """Assemble a work order from approved, undispatched items.
 
-    Called when an assessment order is created. Cases that arrived BEFORE it --
-    MIRIAM ISRAEL holds nine, five open and four closed -- have been waiting with
-    no order; this gives them one.
+    Raises ValueError naming the offending items rather than silently dropping
+    them: an agent who selected six and got a work order for four would not notice,
+    and the two that vanished are exactly the ones someone is waiting on.
 
-    Called ADOPTION, not rebuild: nothing is recomputed and the cases themselves
-    are untouched. They simply gain an order and a parent.
+    Every item must be AVAILABLE -- approved, not already dispatched, case still
+    open. Those are checked here rather than trusted from the request, because the
+    selection list an agent saw may be seconds stale.
     """
-    from api.services.housing import housing_work_orders
+    from api.models import DispatchItem, DispatchKind, DispatchOrder
 
-    adopted = []
-    for case in housing_work_orders(assessment.client):
-        order = create_remediation_order(case, assessment=assessment)
-        if order is not None:
-            adopted.append(order)
-    return adopted
+    items = list(
+        DispatchItem.objects
+        .select_related("case")
+        .filter(dispatch_item_id__in=item_ids, assessment=assessment)
+    )
+    if not items:
+        raise ValueError("select at least one item")
+
+    missing = set(str(i) for i in item_ids) - {
+        str(i.dispatch_item_id) for i in items
+    }
+    if missing:
+        raise ValueError(f"unknown item(s): {', '.join(sorted(missing))}")
+
+    unavailable = [i for i in items if not i.is_available]
+    if unavailable:
+        why = ", ".join(
+            f"{i.item or i.case_id} ({'already in a work order' if i.dispatch_order_id else i.authorization_status or 'not approved'})"
+            for i in unavailable
+        )
+        raise ValueError(f"cannot dispatch: {why}")
+
+    # One borough per work order: a vendor visit is a trip to an address, and the
+    # items all belong to the same dwelling anyway. Mixed boroughs would mean the
+    # parse went wrong somewhere.
+    locations = {i.location for i in items if i.location}
+    order = DispatchOrder.objects.create(
+        kind=DispatchKind.REMEDIATION,
+        parent=assessment,
+        client=assessment.client,
+        vendor=vendor or assessment.vendor,
+        location=locations.pop() if len(locations) == 1 else "",
+        status=DispatchStatus.PENDING_SCHEDULE,
+        notes=notes,
+        # Inherited, not copied: the address was verified once on the assessment.
+    )
+    DispatchItem.objects.filter(
+        dispatch_item_id__in=[i.dispatch_item_id for i in items],
+    ).update(dispatch_order=order)
+
+    record_transition(
+        order, "", order.status,
+        actor=actor, source=StageEventSource.MANUAL,
+        note=f"work order created with {len(items)} item(s)",
+        metadata={
+            "items": [i.item for i in items],
+            "item_ids": [str(i.dispatch_item_id) for i in items],
+            "case_ids": [str(i.case_id) for i in items],
+        },
+    )
+    return order
 
 
 @transaction.atomic
@@ -312,9 +353,11 @@ def reconcile_dispatch_orders(client):
     picture rather than firing per row against a partial one. A member can arrive
     carrying several Home Remediation cases in one payload.
 
-    Only ever CREATES: a remediation order for each Home Remediation case, once the
+    Only ever CREATES: a DispatchItem for each housing work-order case, once the
     member has an assessment order. Cases that arrive first simply wait, and are
-    picked up here on a later import or by adoption when the assessment is created.
+    picked up here on a later import or when the assessment is created. Assembling
+    items into a WORK ORDER stays a deliberate agent action -- an import must never
+    dispatch a vendor by itself.
 
     Never raises -- a dispatch hiccup must not fail a case import, the same
     contract the food reconcile already honours.
@@ -323,7 +366,7 @@ def reconcile_dispatch_orders(client):
         assessment = assessment_order_for(client)
         if assessment is None:
             return []
-        return adopt_unlinked_remediation_cases(assessment)
+        return sync_dispatch_items(assessment)
     except Exception:  # noqa: BLE001 - never fail the import
         logger.exception("reconcile_dispatch_orders failed for client %s", client.pk)
         return []

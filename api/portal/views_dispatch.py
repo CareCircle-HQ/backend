@@ -27,6 +27,34 @@ from .base import PortalAPIView, current_agent
 logger = logging.getLogger(__name__)
 
 
+def _serialize_item(row):
+    """One installable item.
+
+    ``authorization`` is read live from the case, unlike ``item``: an approval can
+    change or lapse after the item exists, and a stale copy would have a vendor
+    fitting something no longer covered.
+    """
+    return {
+        "id": str(row.dispatch_item_id),
+        "item": row.item,
+        "location": row.location,
+        "program_name": row.program_name,
+        # The FULL case id: it is what an agent pastes into Unite Us, and a
+        # truncated one cannot be searched with.
+        "case_id": str(row.case_id) if row.case_id else "",
+        "case_status": row.case.case_status if row.case_id else "",
+        "authorization": {
+            "status": row.authorization_status,
+            "approved": row.is_approved,
+        },
+        # Which work order covers it, or null when it is still waiting.
+        "work_order_id": (
+            str(row.dispatch_order_id) if row.dispatch_order_id else None
+        ),
+        "available": row.is_available,
+    }
+
+
 def _serialize_order(order):
     """Everything the CRM shows about an order. Read-only by construction."""
     active = dispatch_svc.active_submission(order)
@@ -43,21 +71,19 @@ def _serialize_order(order):
             if order.vendor_id else None
         ),
         "referral_type": order.referral_type,
-        # WHAT gets installed, WHERE, and whether it is APPROVED. The three
-        # together are the vendor's actual instruction; any one alone is not
-        # actionable -- an approved case with no item says nothing, and an item on
-        # an unapproved case must not be fitted.
-        "item": order.item,
         "location": order.location,
         "program_name": order.case.program_name if order.case_id else "",
-        "authorization": (
-            {
-                "status": order.case.service_authorization_status or "",
-                "approved": (order.case.service_authorization_status or "").lower()
-                == "approved",
-            }
-            if order.case_id else {"status": "", "approved": False}
-        ),
+        # The ITEMS. On an assessment these are every item found; on a work order,
+        # the ones that work order covers. An item is not a status -- it is a thing
+        # to install -- so it carries its case's AUTHORIZATION rather than a
+        # dispatch stage.
+        "items": [
+            _serialize_item(i)
+            for i in (
+                order.items.all() if order.kind == DispatchKind.ASSESSMENT
+                else order.line_items.all()
+            )
+        ],
         "service_address": order.service_address,
         "address_notes": order.address_notes,
         "contact_phone": order.contact_phone,
@@ -156,6 +182,7 @@ class MemberDispatchOrdersView(PortalAPIView):
             .prefetch_related(
                 "availability_windows", "visits", "findings__proofs", "documents",
                 "submissions__signatures", "uniteus_uploads",
+                "items__case", "line_items__case",
             )
             # Assessment first, then its remediation orders newest-first.
             .order_by("kind", "-created_at")
@@ -259,6 +286,10 @@ class MemberAssessmentOrderCreateView(PortalAPIView):
         # query.
         existing = dispatch_svc.assessment_order_for(client)
         if existing is not None:
+            # Sync items before returning: an order created before its housing
+            # cases imported -- or before items existed at all -- would otherwise
+            # show an empty Items tab for ever, since nothing else re-checks.
+            dispatch_svc.sync_dispatch_items(existing)
             return Response(_serialize_order(existing), status=http.HTTP_200_OK)
 
         try:
@@ -478,3 +509,52 @@ class MemberAssessmentOrderUpdateView(PortalAPIView):
             },
         )
         return Response(_serialize_order(order))
+
+
+class MemberWorkOrderCreateView(PortalAPIView):
+    """POST: assemble a work order from approved, undispatched items.
+
+    Creating one is a deliberate agent action, never an import side effect: an
+    import discovers ITEMS, a human decides what gets dispatched together.
+    """
+
+    @transaction.atomic
+    def post(self, request, client_id):
+        client = get_object_or_404(Client, pk=client_id)
+        assessment = dispatch_svc.assessment_order_for(client)
+        if assessment is None:
+            return Response(
+                {"detail": "This member has no assessment order yet."},
+                status=http.HTTP_400_BAD_REQUEST,
+            )
+
+        data = request.data or {}
+        item_ids = data.get("item_ids") or []
+        if not item_ids:
+            return Response(
+                {"detail": "Select at least one item."},
+                status=http.HTTP_400_BAD_REQUEST,
+            )
+
+        vendor = None
+        vendor_id = (data.get("vendor_id") or "").strip()
+        if vendor_id:
+            vendor = Vendor.objects.filter(pk=vendor_id, is_active=True).first()
+            if vendor is None:
+                return Response(
+                    {"detail": "Unknown or inactive vendor."},
+                    status=http.HTTP_400_BAD_REQUEST,
+                )
+
+        try:
+            order = dispatch_svc.create_work_order(
+                assessment, item_ids, vendor=vendor,
+                actor=getattr(request, "user", None),
+                notes=(data.get("notes") or "").strip(),
+            )
+        except ValueError as exc:
+            # The message names the offending items, so an agent can see WHICH
+            # selection was stale rather than being told "invalid".
+            return Response({"detail": str(exc)}, status=http.HTTP_400_BAD_REQUEST)
+
+        return Response(_serialize_order(order), status=http.HTTP_201_CREATED)
