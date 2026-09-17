@@ -205,6 +205,7 @@ from .views_settings import (
     DeliveryCompanyIntegrationDetailView,
     DeliveryCompanyIntegrationSetPrimaryView,
     DeliveryCompanyViewSet,
+    VendorViewSet,
     DietaryTagViewSet,
     KitchenIntegrationDetailView,
     KitchenViewSet,
@@ -223,6 +224,7 @@ from .views_tickets import (
 )
 
 router = SimpleRouter()
+router.register("settings/vendors", VendorViewSet, basename="portal-vendor")
 router.register("settings/menu-types", MenuTypeViewSet, basename="portal-menu-type")
 router.register("settings/meal-plans", MealPlanViewSet, basename="portal-meal-plan")
 router.register("settings/dietary-tags", DietaryTagViewSet, basename="portal-dietary-tag")

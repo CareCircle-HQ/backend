@@ -24,6 +24,8 @@ from api.services.lifecycle import (
 )
 
 from ..models import (
+    Vendor,
+    VendorUser,
     ActiveProgram,
     Address,
     Agent,
@@ -2967,3 +2969,45 @@ class EnrollmentAnalyticsSerializer(serializers.ModelSerializer):
         import datetime
         t = datetime.date.today()
         return t.year - obj.dob.year - ((t.month, t.day) < (obj.dob.month, obj.dob.day))
+
+
+class PortalVendorUserSerializer(serializers.ModelSerializer):
+    """A vendor's person. The password hash is NEVER exposed."""
+
+    class Meta:
+        model = VendorUser
+        fields = [
+            "vendor_user_id", "email", "name", "phone", "is_admin", "is_active",
+            "last_login_at", "created_at",
+        ]
+        read_only_fields = ["vendor_user_id", "last_login_at", "created_at"]
+
+
+class PortalVendorSerializer(serializers.ModelSerializer):
+    """A housing vendor company, with its users nested for the Settings page."""
+
+    users = PortalVendorUserSerializer(many=True, read_only=True)
+    admin_user = serializers.SerializerMethodField()
+    open_order_count = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Vendor
+        fields = [
+            "vendor_id", "name", "contact_name", "contact_email", "contact_phone",
+            "address", "notes", "is_active", "created_at",
+            "users", "admin_user", "open_order_count",
+        ]
+        read_only_fields = ["vendor_id", "created_at"]
+
+    def get_admin_user(self, obj):
+        admin = next((u for u in obj.users.all() if u.is_admin), None)
+        return PortalVendorUserSerializer(admin).data if admin else None
+
+    def get_open_order_count(self, obj):
+        """Orders NOT yet uploaded -- what this vendor still owes us. Deactivating
+        a vendor with open work should be a visible decision, not a silent one."""
+        from ..models import DispatchStatus
+
+        return obj.dispatch_orders.exclude(
+            status__in=[DispatchStatus.UPLOADED, DispatchStatus.CANCELLED],
+        ).count()

@@ -1,12 +1,15 @@
 """Settings CRUD: menu types, dietary tags, kitchens, delivery companies and
 their integrations."""
 
+import logging
 from django.shortcuts import get_object_or_404
 from rest_framework import status as http, viewsets
 from rest_framework.decorators import action
 from rest_framework.response import Response
 
 from ..models import (
+    Vendor,
+    VendorUser,
     ActiveProgram,
     Agent,
     Cadence,
@@ -24,7 +27,9 @@ from ..models import (
     ProductType,
     ProgramMainCategory,
 )
-from .base import PortalAPIView
+from .base import PortalAPIView, current_agent
+
+logger = logging.getLogger(__name__)
 from .permissions import IsPortalAgent
 from . import serializers as s
 
@@ -424,3 +429,115 @@ class ActiveProgramViewSet(viewsets.ModelViewSet):
                 "results": data,
             }
         )
+
+
+class VendorViewSet(viewsets.ModelViewSet):
+    """Settings > Vendors -- housing vendor companies and their users.
+
+    Vendors are provisioned here: create the company, then ONE admin user. That
+    person creates the rest of their staff in the vendor portal; the CRM keeps only
+    the ability to reset THIS user's password.
+
+    See docs/housing-assessment-order-plan.md.
+    """
+
+    permission_classes = [IsPortalAgent]
+    queryset = Vendor.objects.all().prefetch_related("users", "dispatch_orders")
+    serializer_class = s.PortalVendorSerializer
+
+    @action(detail=True, methods=["post"], url_path="admin-user")
+    def admin_user(self, request, pk=None):
+        """Provision the vendor's single admin user.
+
+        Refuses a second: the model constrains it, and returning 409 with the
+        existing user is more useful than surfacing an IntegrityError.
+        """
+        vendor = self.get_object()
+        existing = vendor.users.filter(is_admin=True).first()
+        if existing is not None:
+            return Response(
+                {
+                    "error": "This vendor already has an admin user.",
+                    "admin_user": s.PortalVendorUserSerializer(existing).data,
+                },
+                status=http.HTTP_409_CONFLICT,
+            )
+
+        email = (request.data.get("email") or "").strip().lower()
+        name = (request.data.get("name") or "").strip()
+        if not email or not name:
+            return Response(
+                {"error": "email and name are required."},
+                status=http.HTTP_400_BAD_REQUEST,
+            )
+        if VendorUser.objects.filter(email__iexact=email).exists():
+            return Response(
+                {"error": "A vendor user with that email already exists."},
+                status=http.HTTP_409_CONFLICT,
+            )
+
+        from django.contrib.auth.hashers import make_password
+        from django.utils.crypto import get_random_string
+
+        # Generated here and returned ONCE. Never stored in the clear, and never
+        # retrievable afterwards -- a reset issues a new one.
+        temp_password = get_random_string(14)
+        user = VendorUser.objects.create(
+            vendor=vendor, email=email, name=name,
+            phone=(request.data.get("phone") or "").strip(),
+            password=make_password(temp_password),
+            is_admin=True,
+        )
+        _log_vendor_action(
+            request, vendor, "admin user provisioned", {"email": email},
+        )
+        payload = s.PortalVendorUserSerializer(user).data
+        payload["temporary_password"] = temp_password
+        return Response(payload, status=http.HTTP_201_CREATED)
+
+    @action(detail=True, methods=["post"], url_path="reset-admin-password")
+    def reset_admin_password(self, request, pk=None):
+        """Issue a new temporary password for the vendor's admin user.
+
+        Returned once. This is a privileged action on an EXTERNAL account, so it is
+        recorded -- who reset it and when.
+        """
+        vendor = self.get_object()
+        admin = vendor.users.filter(is_admin=True).first()
+        if admin is None:
+            return Response(
+                {"error": "This vendor has no admin user yet."},
+                status=http.HTTP_404_NOT_FOUND,
+            )
+
+        from django.contrib.auth.hashers import make_password
+        from django.utils.crypto import get_random_string
+
+        temp_password = get_random_string(14)
+        admin.password = make_password(temp_password)
+        admin.save(update_fields=["password", "updated_at"])
+        _log_vendor_action(
+            request, vendor, "admin password reset", {"email": admin.email},
+        )
+        return Response({
+            "vendor_user_id": str(admin.vendor_user_id),
+            "email": admin.email,
+            "temporary_password": temp_password,
+        })
+
+
+def _log_vendor_action(request, vendor, what, extra=None):
+    """Record a privileged action against an external vendor account.
+
+    Vendor provisioning and password resets happen to accounts we do not own, so
+    "who did this and when" needs to survive the request. Written to the
+    application log rather than a new table: the volume is tiny and CloudWatch
+    already ships these.
+    """
+    agent = current_agent(request)
+    logger.warning(
+        "vendor action: %s | vendor=%s (%s) | agent=%s (%s) | %s",
+        what, vendor.name, vendor.pk,
+        getattr(agent, "name", "?"), getattr(agent, "agent_code", "?"),
+        extra or {},
+    )

@@ -27534,3 +27534,139 @@ class AssessmentOrderWizardApiTest(TestCase):
             DispatchOrder.objects.get(client=c).address_formatted,
             "123 Verified St, Brooklyn NY",
         )
+
+
+class VendorSettingsApiTest(TestCase):
+    """Settings > Vendors: the company, its ONE admin user, and password reset."""
+
+    def _api(self):
+        from rest_framework_simplejwt.tokens import AccessToken
+
+        from .models import Agent
+
+        if not hasattr(self, "_agent"):
+            self._agent = Agent.objects.create(
+                name="S", agent_code="882", group="Management",
+            )
+        acc = AccessToken()
+        acc["agent_id"] = str(self._agent.id)
+        acc["agent_code"] = self._agent.agent_code
+        acc["agent_name"] = self._agent.name
+        acc["agent_group"] = self._agent.group
+        api = APIClient(); api.credentials(HTTP_AUTHORIZATION=f"Bearer {acc}")
+        return api
+
+    def _vendor(self, name="Acme Remediation"):
+        resp = self._api().post(
+            "/api/portal/settings/vendors/", {"name": name}, format="json",
+        )
+        self.assertEqual(resp.status_code, 201, resp.content)
+        return resp.data["vendor_id"]
+
+    def test_a_vendor_can_be_created_and_listed(self):
+        vid = self._vendor()
+        resp = self._api().get("/api/portal/settings/vendors/")
+        self.assertEqual(resp.status_code, 200)
+        rows = resp.data["results"] if isinstance(resp.data, dict) else resp.data
+        names = [v["name"] for v in rows]
+        self.assertIn("Acme Remediation", names)
+        self.assertTrue(vid)
+
+    def test_provisioning_the_admin_user_returns_the_password_ONCE(self):
+        from .models import VendorUser
+
+        vid = self._vendor()
+        resp = self._api().post(
+            f"/api/portal/settings/vendors/{vid}/admin-user/",
+            {"email": "boss@acme.test", "name": "Ada Boss"}, format="json",
+        )
+        self.assertEqual(resp.status_code, 201, resp.content)
+        self.assertTrue(resp.data["temporary_password"])
+        self.assertTrue(resp.data["is_admin"])
+
+        # Stored HASHED, and the plaintext is never retrievable afterwards.
+        user = VendorUser.objects.get(email="boss@acme.test")
+        self.assertNotEqual(user.password, resp.data["temporary_password"])
+        self.assertTrue(user.password.startswith("pbkdf2_"))
+
+        listed = self._api().get("/api/portal/settings/vendors/").data
+        vendors = listed["results"] if isinstance(listed, dict) else listed
+        admin = next(v for v in vendors if v["vendor_id"] == vid)["admin_user"]
+        self.assertNotIn("password", admin)
+        self.assertNotIn("temporary_password", admin)
+
+    def test_a_SECOND_admin_user_is_refused(self):
+        """The model constrains it; the endpoint should say so usefully rather
+        than surfacing an IntegrityError."""
+        vid = self._vendor()
+        first = {"email": "a@acme.test", "name": "A"}
+        self._api().post(
+            f"/api/portal/settings/vendors/{vid}/admin-user/", first, format="json",
+        )
+        resp = self._api().post(
+            f"/api/portal/settings/vendors/{vid}/admin-user/",
+            {"email": "b@acme.test", "name": "B"}, format="json",
+        )
+        self.assertEqual(resp.status_code, 409)
+        self.assertIn("admin_user", resp.data)
+
+    def test_a_duplicate_email_across_vendors_is_refused(self):
+        v1 = self._vendor("One")
+        v2 = self._vendor("Two")
+        body = {"email": "same@acme.test", "name": "Same"}
+        self._api().post(
+            f"/api/portal/settings/vendors/{v1}/admin-user/", body, format="json",
+        )
+        resp = self._api().post(
+            f"/api/portal/settings/vendors/{v2}/admin-user/", body, format="json",
+        )
+        self.assertEqual(resp.status_code, 409)
+
+    def test_resetting_the_password_issues_a_NEW_one(self):
+        from .models import VendorUser
+
+        vid = self._vendor()
+        created = self._api().post(
+            f"/api/portal/settings/vendors/{vid}/admin-user/",
+            {"email": "boss@acme.test", "name": "Ada"}, format="json",
+        )
+        before = VendorUser.objects.get(email="boss@acme.test").password
+
+        resp = self._api().post(
+            f"/api/portal/settings/vendors/{vid}/reset-admin-password/", {},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        self.assertNotEqual(
+            resp.data["temporary_password"], created.data["temporary_password"],
+        )
+        self.assertNotEqual(
+            VendorUser.objects.get(email="boss@acme.test").password, before,
+        )
+
+    def test_reset_is_refused_when_there_is_no_admin_user(self):
+        vid = self._vendor()
+        resp = self._api().post(
+            f"/api/portal/settings/vendors/{vid}/reset-admin-password/", {},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 404)
+
+    def test_open_order_count_shows_what_a_vendor_still_owes(self):
+        """So deactivating a vendor with live work is a visible decision."""
+        from .models import Client, DispatchKind, DispatchOrder, DispatchStatus, Vendor
+
+        vid = self._vendor()
+        c = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="V", last_name="M",
+            client_added_at=timezone.now(),
+        )
+        vendor = Vendor.objects.get(pk=vid)
+        DispatchOrder.objects.create(
+            kind=DispatchKind.ASSESSMENT, client=c, vendor=vendor,
+            status=DispatchStatus.CONFIRMED,
+        )
+        listed = self._api().get("/api/portal/settings/vendors/").data
+        vendors = listed["results"] if isinstance(listed, dict) else listed
+        row = next(v for v in vendors if v["vendor_id"] == vid)
+        self.assertEqual(row["open_order_count"], 1)
