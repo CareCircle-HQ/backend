@@ -5640,6 +5640,21 @@ class DispatchOrder(models.Model):
             return self.parent.address_formatted or self.parent.address_line1
         return self.address_formatted or self.address_line1
 
+    @property
+    def service_contact(self):
+        """``(phone, phone_type, notes)`` for reaching the member about this order.
+
+        Inherited by a remediation order for the same reason as the address: the
+        wizard collects contact details ONCE, on the assessment, so a work order
+        has none of its own. Without this an installer opens their job and sees no
+        number to ring -- which is exactly what the first live vendor-API call
+        showed.
+        """
+        source = self
+        if self.kind == DispatchKind.REMEDIATION and self.parent_id:
+            source = self.parent
+        return source.contact_phone, source.contact_phone_type, source.address_notes
+
 
 class DispatchItem(models.Model):
     """One installable thing, drawn from one housing case.

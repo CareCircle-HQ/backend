@@ -136,12 +136,16 @@ def _member_block(order):
     client = order.client
     first = (client.first_name or "").strip()
     last = (client.last_name or "").strip()
+    # Contact details are INHERITED by a work order, like the address: the wizard
+    # collects them once on the assessment, so a work order carries none of its
+    # own and an installer would otherwise see no number to ring.
+    phone, phone_type, notes = order.service_contact
     return {
         "name": f"{first} {last}".strip(),
-        "phone": order.contact_phone,
-        "phone_type": order.contact_phone_type,
+        "phone": phone,
+        "phone_type": phone_type,
         "address": order.service_address,
-        "address_notes": order.address_notes,
+        "address_notes": notes,
     }
 
 

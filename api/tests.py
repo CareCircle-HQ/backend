@@ -29750,6 +29750,38 @@ class VendorWorkScopingTest(TestCase):
                 f"{forbidden} must never reach a vendor device",
             )
 
+    def test_a_WORK_ORDER_inherits_the_members_contact_details(self):
+        """Found by the first live call against real data: the work order showed no
+        phone at all. The wizard collects contact details ONCE, on the assessment,
+        so a work order carries none of its own -- and an installer opening their
+        job with no number to ring is useless."""
+        from .models import DispatchKind, DispatchOrder
+
+        child = DispatchOrder.objects.create(
+            kind=DispatchKind.REMEDIATION, client=self.member, vendor=self.vendor,
+            parent=self.mine,
+        )
+        resp = self._api().get(f"/v1/work/{child.pk}/", HTTP_HOST=VENDOR_HOST)
+        self.assertEqual(resp.status_code, 200)
+        member = resp.data["member"]
+        self.assertEqual(member["phone"], "(347) 394-6843")
+        self.assertEqual(member["address_notes"], "Buzzer 3E")
+        self.assertEqual(
+            member["address"], "1550 E 102ND ST 3E BROOKLYN, NY 11236",
+        )
+
+    def test_an_orphan_work_order_does_not_crash_on_contact(self):
+        """A work order with no parent has nothing to inherit; it must render blank
+        rather than raise."""
+        from .models import DispatchKind, DispatchOrder
+
+        orphan = DispatchOrder.objects.create(
+            kind=DispatchKind.REMEDIATION, client=self.member, vendor=self.vendor,
+        )
+        resp = self._api().get(f"/v1/work/{orphan.pk}/", HTTP_HOST=VENDOR_HOST)
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.data["member"]["phone"], "")
+
     def test_an_assessment_detail_carries_the_FORM(self):
         resp = self._api().get(f"/v1/work/{self.mine.pk}/", HTTP_HOST=VENDOR_HOST)
         form = resp.data["form"]
