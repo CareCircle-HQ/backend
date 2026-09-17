@@ -30716,3 +30716,205 @@ class MemberMessageLogTest(TestCase):
             )
         )
         self.assertEqual(log, [("outbound", "First"), ("inbound", "Reply")])
+
+
+class HousingStageBarTest(TestCase):
+    """The housing row on the member stage bar: Authorization -> Assessment -> WOs.
+
+    Near-binary on purpose. The detailed dispatch lifecycle lives on the Programs >
+    Housing accordion; this bar answers "where is this member" at a glance.
+    """
+
+    EEA = (
+        "Dwelling Assessment & Statement of Work (SOW) Development - "
+        "Modifications and Remediation Service - Manhattan"
+    )
+    HEAR = "Home Remediation - Air Conditioner - Manhattan"
+
+    def setUp(self):
+        from .models import ActiveProgram, Client, Vendor
+        from .services.catalog import clear_program_domain_cache
+
+        for name, stype in (
+            (self.EEA, ActiveProgram.ServiceType.ENVIRONMENTAL_EXPOSURE_ASSESSMENT),
+            (self.HEAR, ActiveProgram.ServiceType.HOME_EXPENSE_ASSISTANCE_REPAIRS),
+        ):
+            ActiveProgram.objects.create(
+                program_name=name, case_category="Internal Services",
+                case_type=ActiveProgram.CaseType.HOUSING, service_type=stype,
+            )
+        clear_program_domain_cache()
+        self.vendor = Vendor.objects.create(name="Acme")
+        self.member = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Bar", last_name="Member",
+            client_added_at=timezone.now(),
+        )
+
+    def _case(self, program, *, auth="approved", starts=None, ends=None):
+        from .models import Case, CaseStatus, CaseType
+
+        return Case.objects.create(
+            case_id=uuid.uuid4(), client=self.member,
+            case_type=CaseType.INTERNAL_SERVICE, case_status=CaseStatus.MANAGED,
+            program_name=program, service_authorization_status=auth,
+            service_authorization_approval_starts_at=starts,
+            service_authorization_approval_ends_at=ends,
+            case_created_at=timezone.now(),
+        )
+
+    def _housing_track(self):
+        from .services.lifecycle import program_tracks
+
+        tracks = [
+            t for t in program_tracks(self.member) if t["domain"] == "housing"
+        ]
+        return tracks[0] if tracks else None
+
+    # ── the row exists when the dwelling case does ───────────────────────────
+    def test_no_dwelling_case_means_NO_housing_row(self):
+        self.assertIsNone(self._housing_track())
+
+    def test_a_dwelling_case_alone_creates_the_row(self):
+        self._case(self.EEA)
+        track = self._housing_track()
+        self.assertIsNotNone(track)
+        self.assertEqual(track["authorization"]["label"], "Approved")
+
+    # ── the assessment node ──────────────────────────────────────────────────
+    def test_approved_with_no_order_reads_READY_TO_ORDER(self):
+        self._case(self.EEA)
+        t = self._housing_track()
+        self.assertEqual(t["assessment_order"]["value"], "ready")
+        self.assertEqual(t["assessment_order"]["label"], "Ready to Order")
+
+    def test_an_EXPIRED_window_reads_EXPIRED_even_though_auth_says_approved(self):
+        """Housing's expiry has nowhere else to surface. _authorization_phase
+        deliberately still reads "Approved" for a lapsed authorization -- food shows
+        it in the Service phase, and housing has no Service phase."""
+        self._case(
+            self.EEA,
+            starts=timezone.now() - timezone.timedelta(days=40),
+            ends=timezone.now() - timezone.timedelta(days=5),
+        )
+        t = self._housing_track()
+        self.assertEqual(t["authorization"]["label"], "Approved")
+        self.assertEqual(t["assessment_order"]["value"], "expired")
+
+    def test_a_REQUESTED_authorization_leaves_the_assessment_node_BLANK(self):
+        """Nothing to order yet, and the Authorization chip already says so --
+        "Ready to Order" beside "Requested" would be a contradiction."""
+        self._case(self.EEA, auth="pending")
+        t = self._housing_track()
+        self.assertEqual(t["assessment_order"]["value"], "")
+
+    def test_a_DENIED_authorization_leaves_it_blank_too(self):
+        self._case(self.EEA, auth="denied")
+        t = self._housing_track()
+        self.assertEqual(t["assessment_order"]["value"], "")
+
+    def test_an_existing_order_reads_ORDERED(self):
+        from .models import DispatchKind, DispatchOrder
+
+        self._case(self.EEA)
+        DispatchOrder.objects.create(
+            kind=DispatchKind.ASSESSMENT, client=self.member, vendor=self.vendor,
+        )
+        t = self._housing_track()
+        self.assertEqual(t["assessment_order"]["value"], "ordered")
+
+    def test_a_CANCELLED_order_does_NOT_count_as_existing(self):
+        """Green for a dead order is the worst possible failure for a glance-level
+        indicator."""
+        from .models import DispatchKind, DispatchOrder, DispatchStatus
+
+        self._case(self.EEA)
+        DispatchOrder.objects.create(
+            kind=DispatchKind.ASSESSMENT, client=self.member, vendor=self.vendor,
+            status=DispatchStatus.CANCELLED,
+        )
+        t = self._housing_track()
+        self.assertEqual(t["assessment_order"]["value"], "cancelled")
+
+    # ── the work-orders node ─────────────────────────────────────────────────
+    def test_no_items_leaves_the_work_orders_node_BLANK(self):
+        self._case(self.EEA)
+        self.assertEqual(self._housing_track()["work_orders"]["value"], "")
+
+    def test_items_with_NO_batch_read_AMBER_with_a_count(self):
+        """The state that matters. A binary green would say "work orders: done"
+        while approved, authorized items sat unbatched."""
+        from .models import DispatchKind, DispatchOrder
+        from .services import dispatch
+
+        self._case(self.EEA)
+        self._case(self.HEAR)
+        assessment = DispatchOrder.objects.create(
+            kind=DispatchKind.ASSESSMENT, client=self.member, vendor=self.vendor,
+        )
+        dispatch.sync_dispatch_items(assessment)
+
+        t = self._housing_track()
+        self.assertEqual(t["work_orders"]["value"], "waiting")
+        self.assertEqual(t["work_orders"]["label"], "1 item waiting")
+
+    def test_a_batch_reads_GREEN_and_names_whats_left(self):
+        """Still green -- work IS being done -- but the count says what remains, so
+        "1 order" cannot be mistaken for "everything is handled"."""
+        from .models import DispatchItem, DispatchKind, DispatchOrder
+        from .services import dispatch
+
+        self._case(self.EEA)
+        self._case(self.HEAR)
+        second = self._case("Home Remediation - Heater - Manhattan")
+        from .models import ActiveProgram
+        ActiveProgram.objects.create(
+            program_name="Home Remediation - Heater - Manhattan",
+            case_category="Internal Services",
+            case_type=ActiveProgram.CaseType.HOUSING,
+            service_type=ActiveProgram.ServiceType.HOME_EXPENSE_ASSISTANCE_REPAIRS,
+        )
+        from .services.catalog import clear_program_domain_cache
+        clear_program_domain_cache()
+
+        assessment = DispatchOrder.objects.create(
+            kind=DispatchKind.ASSESSMENT, client=self.member, vendor=self.vendor,
+        )
+        dispatch.sync_dispatch_items(assessment)
+        items = list(DispatchItem.objects.filter(assessment=assessment))
+        self.assertGreaterEqual(len(items), 2)
+
+        dispatch.create_work_order(
+            assessment, [items[0].dispatch_item_id], vendor=self.vendor,
+        )
+        t = self._housing_track()
+        self.assertEqual(t["work_orders"]["value"], "created")
+        self.assertIn("1 order", t["work_orders"]["label"])
+        self.assertIn("unbatched", t["work_orders"]["label"])
+
+    # ── food is untouched ───────────────────────────────────────────────────
+    def test_a_FOOD_track_carries_no_housing_phases(self):
+        """Blank on food, so the frontend picks by domain rather than by which keys
+        happen to be set."""
+        from .models import ActiveProgram, Case, CaseStatus, CaseType
+        from .services.catalog import clear_program_domain_cache
+
+        ActiveProgram.objects.create(
+            program_name="Meals - Individual - Manhattan",
+            case_category="Internal Services",
+            case_type=ActiveProgram.CaseType.FOOD,
+            service_type=ActiveProgram.ServiceType.MEDICALLY_TAILORED_MEALS,
+        )
+        clear_program_domain_cache()
+        Case.objects.create(
+            case_id=uuid.uuid4(), client=self.member,
+            case_type=CaseType.INTERNAL_SERVICE, case_status=CaseStatus.MANAGED,
+            program_name="Meals - Individual - Manhattan",
+            service_authorization_status="approved",
+            case_created_at=timezone.now(),
+        )
+        from .services.lifecycle import program_tracks
+
+        food = [t for t in program_tracks(self.member) if t["domain"] == "food"]
+        self.assertTrue(food)
+        self.assertEqual(food[0]["assessment_order"]["value"], "")
+        self.assertEqual(food[0]["work_orders"]["value"], "")

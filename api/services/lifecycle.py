@@ -1579,6 +1579,95 @@ def _authorization_phase(auth):
     return ("requested", "Requested")
 
 
+def _housing_assessment_phase(client, case):
+    """The EEA node: has an assessment order been raised for this member?
+
+    Deliberately near-BINARY -- grey or green -- because the detailed lifecycle
+    (Pending Schedule / Confirmed / Submitted / Uploaded) lives on the Programs >
+    Housing accordion, where an agent can act on it. A glance-level bar answering
+    "where is this member" should not try to encode nine states.
+
+    Two refinements on the plain "does a row exist?" test:
+
+    * a CANCELLED order does not count as existing. It technically does, so a
+      naive check would turn the node green for a dead order -- the worst possible
+      failure for an at-a-glance indicator.
+    * with no order yet, the node reports whether one CAN be raised. An expired
+      authorization blocks it, and that is where housing's expiry surfaces:
+      _authorization_phase deliberately still reads "Approved" for an expired
+      authorization (the food bar shows the expiry in its Service phase), and
+      housing has no Service phase, so it would otherwise vanish.
+    """
+    from api.models import DispatchKind, DispatchOrder, DispatchStatus
+    from api.models import ServiceAuthorizationStatus as A
+
+    order = (
+        DispatchOrder.objects
+        .filter(client=client, kind=DispatchKind.ASSESSMENT)
+        .order_by("-created_at").first()
+    )
+    if order is not None and order.status != DispatchStatus.CANCELLED:
+        return ("ordered", "Ordered")
+    if order is not None:
+        return ("cancelled", "Cancelled")
+
+    auth = getattr(case, "service_authorization_status", "") or ""
+    if auth == A.DENIED:
+        return ("", "")
+    if auth == A.EXPIRED:
+        return ("expired", "Authorization Expired")
+    if auth in (A.APPROVED, A.NOT_REQUIRED):
+        # Approved on paper, but check the WINDOW: the status keeps reading
+        # "approved" after the window lapses, which is the trap the Items tab hit.
+        _start, end = case.effective_authorization_window()
+        if end and end < timezone.now():
+            return ("expired", "Authorization Expired")
+        return ("ready", "Ready to Order")
+    # Requested, never requested, blank: nothing to order yet, and the
+    # Authorization chip beside this one already says so.
+    return ("", "")
+
+
+def _housing_work_orders_phase(client):
+    """The Work Orders node: is there outstanding remediation work?
+
+    THREE states rather than two, because "a batch exists" and "there is nothing
+    left to do" are not the same thing:
+
+        grey    no items at all -- the assessment has produced nothing yet
+        amber   items exist but NONE is in a work order -- someone must batch them
+        green   at least one work order batch exists
+
+    The amber state is the one that matters. MIRIAM has 9 items with 4 still
+    unassigned; a binary green would read "work orders: done" while approved,
+    authorized items sat unbatched -- exactly what the Items tab was built to
+    surface.
+
+    Counted from BATCHES for green and ITEMS for amber, because items appearing is
+    automatic (an import discovers them) while a batch is a deliberate human
+    action.
+    """
+    from api.models import DispatchItem, DispatchKind, DispatchOrder, DispatchStatus
+
+    batches = DispatchOrder.objects.filter(
+        client=client, kind=DispatchKind.REMEDIATION,
+    ).exclude(status=DispatchStatus.CANCELLED).count()
+    items = DispatchItem.objects.filter(case__client=client)
+    total = items.count()
+
+    if batches:
+        unassigned = items.filter(dispatch_order__isnull=True).count()
+        label = f"{batches} order{'' if batches == 1 else 's'}"
+        if unassigned:
+            # Still green -- work IS being done -- but the count says what is left,
+            # so "1 order" cannot be mistaken for "everything is handled".
+            label = f"{label} · {unassigned} unbatched"
+        return ("created", label)
+    if total:
+        return ("waiting", f"{total} item{'' if total == 1 else 's'} waiting")
+    return ("", "")
+
+
 def _verification_phase(enrollment):
     """Verification phase for the program bar:
 
@@ -1888,6 +1977,15 @@ def program_tracks(client):
         from api.serializers import derive_household_type
 
         ht = derive_household_type(None, getattr(c, "program_name", "")) or CaseHouseholdType.INDIVIDUAL
+
+        # The housing row's two extra nodes. Only computed for the housing
+        # GOVERNING case -- a work-order case never renders a row, and food has no
+        # assessment order.
+        ao_val = ao_lbl = wo_val = wo_lbl = ""
+        if case_service_domain(c) == "housing" and is_governing:
+            ao_val, ao_lbl = _housing_assessment_phase(client, c)
+            wo_val, wo_lbl = _housing_work_orders_phase(client)
+
         tracks.append({
             "category": category,
             "service_type": service_type,
@@ -1905,6 +2003,12 @@ def program_tracks(client):
             "verification": {"value": v_val, "label": v_lbl},
             "nutritionist": {"value": n_val, "label": n_lbl},
             "service": {"value": s_val, "label": s_lbl},
+            # HOUSING-only phases, named for what they are rather than reusing the
+            # food slots -- putting the assessment order in "verification" would
+            # make the payload lie about what it holds. Blank for food, so the
+            # frontend picks by DOMAIN rather than by which keys happen to be set.
+            "assessment_order": {"value": ao_val, "label": ao_lbl},
+            "work_orders": {"value": wo_val, "label": wo_lbl},
         })
     # Governing first, then FOOD before other types -- food is the primary
     # service and should lead the bar -- then by service-type label + case id (a
