@@ -554,10 +554,15 @@ class VendorViewSet(viewsets.ModelViewSet):
 
     @action(detail=True, methods=["post"], url_path="reset-admin-password")
     def reset_admin_password(self, request, pk=None):
-        """Issue a new temporary password for the vendor's admin user.
+        """Reset the vendor admin's password.
 
-        Returned once. This is a privileged action on an EXTERNAL account, so it is
-        recorded -- who reset it and when.
+        An agent may SUPPLY one -- they are usually reading it down the phone --
+        or leave it blank to have one generated. Same rule as provisioning, which
+        is the point: being able to type a password when creating an account but
+        not when resetting it is a surprise with no reason behind it.
+
+        A privileged action on an EXTERNAL account, so it is recorded: who reset
+        it and when.
         """
         vendor = self.get_object()
         admin = vendor.users.filter(is_admin=True).first()
@@ -570,16 +575,30 @@ class VendorViewSet(viewsets.ModelViewSet):
         from django.contrib.auth.hashers import make_password
         from django.utils.crypto import get_random_string
 
-        temp_password = get_random_string(14)
+        supplied = (request.data.get("password") or "").strip()
+        if supplied and len(supplied) < 8:
+            return Response(
+                {"error": "Password must be at least 8 characters."},
+                status=http.HTTP_400_BAD_REQUEST,
+            )
+        temp_password = supplied or get_random_string(14)
         admin.password = make_password(temp_password)
         admin.save(update_fields=["password", "updated_at"])
         _log_vendor_action(
-            request, vendor, "admin password reset", {"email": admin.email},
+            request, vendor, "admin password reset", {
+                "email": admin.email,
+                # Whether it was chosen or generated, never the value itself.
+                "supplied": bool(supplied),
+            },
         )
         return Response({
             "vendor_user_id": str(admin.vendor_user_id),
             "email": admin.email,
-            "temporary_password": temp_password,
+            # Echoed only when WE generated it. An agent who typed the password
+            # already has it, and repeating it back puts a secret they chose into
+            # a response body and any log that captures one.
+            "temporary_password": "" if supplied else temp_password,
+            "password_was_supplied": bool(supplied),
         })
 
 

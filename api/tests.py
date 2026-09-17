@@ -27650,6 +27650,59 @@ class VendorSettingsApiTest(TestCase):
             VendorUser.objects.get(email="boss@acme.test").password, before,
         )
 
+    def test_a_reset_can_SUPPLY_the_new_password(self):
+        """Being able to type a password when creating an account but not when
+        resetting it is a surprise with no reason behind it."""
+        from django.contrib.auth.hashers import check_password
+
+        from .models import VendorUser
+
+        vid = self._vendor()
+        self._api().post(
+            f"/api/portal/settings/vendors/{vid}/admin-user/",
+            {"email": "boss@acme.test", "name": "Ada"}, format="json",
+        )
+        resp = self._api().post(
+            f"/api/portal/settings/vendors/{vid}/reset-admin-password/",
+            {"password": "chosen-by-agent-1"}, format="json",
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        # Not echoed: the agent typed it, so repeating it back would put a secret
+        # they chose into a response body and any log that captures one.
+        self.assertEqual(resp.data["temporary_password"], "")
+        self.assertTrue(resp.data["password_was_supplied"])
+
+        user = VendorUser.objects.get(email="boss@acme.test")
+        self.assertTrue(check_password("chosen-by-agent-1", user.password))
+
+    def test_a_reset_with_a_BLANK_password_still_generates_one(self):
+        vid = self._vendor()
+        self._api().post(
+            f"/api/portal/settings/vendors/{vid}/admin-user/",
+            {"email": "b@acme.test", "name": "B"}, format="json",
+        )
+        resp = self._api().post(
+            f"/api/portal/settings/vendors/{vid}/reset-admin-password/",
+            {"password": "   "}, format="json",
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertTrue(resp.data["temporary_password"])
+        self.assertFalse(resp.data["password_was_supplied"])
+
+    def test_a_reset_password_under_8_characters_is_refused(self):
+        """Same rule as provisioning -- the two paths must not disagree."""
+        vid = self._vendor()
+        self._api().post(
+            f"/api/portal/settings/vendors/{vid}/admin-user/",
+            {"email": "c@acme.test", "name": "C"}, format="json",
+        )
+        resp = self._api().post(
+            f"/api/portal/settings/vendors/{vid}/reset-admin-password/",
+            {"password": "short"}, format="json",
+        )
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("8 characters", resp.data["error"])
+
     def test_reset_is_refused_when_there_is_no_admin_user(self):
         vid = self._vendor()
         resp = self._api().post(
