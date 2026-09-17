@@ -14,6 +14,8 @@ from .views import (
     VendorLogoutView,
     VendorMeView,
     VendorWorkDetailView,
+    VendorTeamDetailView,
+    VendorTeamListView,
     VendorWorkListView,
 )
 
@@ -22,6 +24,11 @@ urlpatterns = [
     path("v1/auth/logout/", VendorLogoutView.as_view(), name="vendor-logout"),
     path("v1/me/", VendorMeView.as_view(), name="vendor-me"),
     path("v1/dashboard/", VendorDashboardView.as_view(), name="vendor-dashboard"),
+    path("v1/team/", VendorTeamListView.as_view(), name="vendor-team-list"),
+    path(
+        "v1/team/<uuid:user_id>/",
+        VendorTeamDetailView.as_view(), name="vendor-team-detail",
+    ),
     path("v1/work/", VendorWorkListView.as_view(), name="vendor-work-list"),
     path(
         "v1/work/<uuid:order_id>/",

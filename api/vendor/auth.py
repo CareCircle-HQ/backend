@@ -159,3 +159,19 @@ class IsVendorUser(permissions.BasePermission):
 
     def has_permission(self, request, view):
         return isinstance(getattr(request, "user", None), VendorPrincipal)
+
+
+class IsVendorAdmin(permissions.BasePermission):
+    """The vendor's own administrator.
+
+    Only they may add or remove their colleagues. The admin slot itself is
+    CRM-provisioned and there is exactly one per vendor
+    (``one_admin_user_per_vendor``), so a vendor cannot promote their way to a
+    second one even through this API.
+    """
+
+    message = "Only your company administrator can do that."
+
+    def has_permission(self, request, view):
+        user = getattr(request, "user", None)
+        return isinstance(user, VendorPrincipal) and user.is_vendor_admin

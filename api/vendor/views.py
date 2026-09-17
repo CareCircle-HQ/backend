@@ -20,9 +20,12 @@ from rest_framework import status as http
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from ..models import DispatchKind, DispatchOrder, DispatchStatus, DispatchVisit
+from ..models import (
+    DispatchKind, DispatchOrder, DispatchStatus, DispatchVisit, VendorUser,
+)
 from .auth import (
-    IsVendorUser, VendorAuthentication, authenticate_user, client_ip, issue_token,
+    IsVendorAdmin, IsVendorUser, VendorAuthentication, authenticate_user,
+    client_ip, issue_token,
 )
 
 logger = logging.getLogger(__name__)
@@ -364,3 +367,214 @@ class VendorDashboardView(VendorAPIView):
                 if next_visit else None
             ),
         })
+
+
+# ── the team ─────────────────────────────────────────────────────────────────
+
+class VendorAdminAPIView(VendorAPIView):
+    """Base for endpoints only the vendor's administrator may call."""
+
+    permission_classes = [IsVendorUser, IsVendorAdmin]
+
+
+def _team_member(user):
+    return {
+        "id": str(user.vendor_user_id),
+        "name": user.name,
+        "email": user.email,
+        "phone": user.phone,
+        "is_admin": user.is_admin,
+        "is_active": user.is_active,
+        "last_login_at": user.last_login_at,
+        "created_at": user.created_at,
+    }
+
+
+class VendorTeamListView(VendorAdminAPIView):
+    """GET / POST /v1/team/ -- the company's staff.
+
+    Scoped to the caller's vendor, so an administrator cannot see or touch another
+    company's people even by guessing an id.
+    """
+
+    def get(self, request):
+        users = (
+            VendorUser.objects
+            .filter(vendor=request.user.vendor)
+            # The administrator first, then alphabetically -- a list that starts
+            # with "who runs this account" reads better than one that starts with
+            # whoever happens to sort first.
+            .order_by("-is_admin", "name")
+        )
+        return Response([_team_member(u) for u in users])
+
+    def post(self, request):
+        from django.contrib.auth.hashers import make_password
+        from django.utils.crypto import get_random_string
+
+        data = request.data or {}
+        name = (data.get("name") or "").strip()
+        email = (data.get("email") or "").strip().lower()
+        if not name or not email:
+            return error("missing_fields", "Name and email are required.")
+
+        # Unique across ALL vendors, because email is the login identifier. Answer
+        # the same way whether the clash is inside this company or another one:
+        # "already exists elsewhere" would leak that a person works for a
+        # competitor.
+        if VendorUser.objects.filter(email__iexact=email).exists():
+            return error(
+                "email_taken", "That email is already in use.",
+                http.HTTP_409_CONFLICT,
+            )
+
+        supplied = (data.get("password") or "").strip()
+        if supplied and len(supplied) < 8:
+            return error(
+                "password_too_short", "Password must be at least 8 characters.",
+            )
+        password = supplied or get_random_string(14)
+
+        user = VendorUser.objects.create(
+            vendor=request.user.vendor,
+            name=name,
+            email=email,
+            phone=(data.get("phone") or "").strip(),
+            password=make_password(password),
+            # NEVER an admin. The admin slot is CRM-provisioned and constrained to
+            # one per vendor, so a company cannot grow a second administrator --
+            # which is what keeps "who can add people" answerable.
+            is_admin=False,
+        )
+        logger.info(
+            "vendor team: %s added %s (%s) at %s",
+            request.user.vendor_user.email, email, user.vendor_user_id,
+            request.user.vendor.name,
+        )
+        payload = _team_member(user)
+        # Echoed only when WE generated it -- an admin who typed the password
+        # already has it, and repeating it puts a secret they chose in the
+        # response body.
+        payload["temporary_password"] = "" if supplied else password
+        payload["password_was_supplied"] = bool(supplied)
+        return Response(payload, status=http.HTTP_201_CREATED)
+
+
+class VendorTeamDetailView(VendorAdminAPIView):
+    """PATCH / DELETE /v1/team/<user_id>/ -- change or remove a colleague."""
+
+    def _get(self, request, user_id):
+        return VendorUser.objects.filter(
+            pk=user_id, vendor=request.user.vendor,
+        ).first()
+
+    def patch(self, request, user_id):
+        user = self._get(request, user_id)
+        if user is None:
+            # 404 rather than 403: a 403 would confirm the id exists.
+            return error("not_found", "No such user.", http.HTTP_404_NOT_FOUND)
+
+        data = request.data or {}
+        changed = []
+
+        if "is_active" in data:
+            active = bool(data["is_active"])
+            if user.is_admin and not active:
+                # Deactivating the only administrator locks the company out of its
+                # own account, and only the CRM could undo it.
+                return error(
+                    "cannot_deactivate_admin",
+                    "The administrator account cannot be deactivated here. "
+                    "Ask CareCircle to do it.",
+                )
+            if user.is_active != active:
+                user.is_active = active
+                changed.append("is_active")
+
+        for field in ("name", "phone"):
+            if field in data:
+                value = (data.get(field) or "").strip()
+                if getattr(user, field) != value:
+                    setattr(user, field, value)
+                    changed.append(field)
+
+        if "password" in data:
+            from django.contrib.auth.hashers import make_password
+
+            supplied = (data.get("password") or "").strip()
+            if len(supplied) < 8:
+                return error(
+                    "password_too_short",
+                    "Password must be at least 8 characters.",
+                )
+            user.password = make_password(supplied)
+            changed.append("password")
+
+        if changed:
+            user.save()
+            logger.info(
+                "vendor team: %s changed %s on %s",
+                request.user.vendor_user.email, sorted(changed), user.email,
+            )
+        payload = _team_member(user)
+        # Reported so the app can say "nothing to save" rather than appearing to
+        # have saved -- the same gap that made a CRM edit look successful while
+        # leaving no trace.
+        payload["changed_fields"] = sorted(changed)
+        return Response(payload)
+
+    def delete(self, request, user_id):
+        """Remove a colleague.
+
+        DEACTIVATES rather than deletes when they have done any work, because
+        submissions and signatures point at them and the record of who assessed a
+        member's home must survive. A user who has never submitted anything is
+        deleted outright -- an email typed wrong five minutes ago should not be
+        permanent.
+
+        Deactivation takes effect immediately: the authenticator re-checks
+        is_active on EVERY request, so an existing token stops working at once
+        rather than lasting until it expires.
+        """
+        user = self._get(request, user_id)
+        if user is None:
+            return error("not_found", "No such user.", http.HTTP_404_NOT_FOUND)
+        if user.is_admin:
+            return error(
+                "cannot_remove_admin",
+                "The administrator account cannot be removed here. "
+                "Ask CareCircle to do it.",
+            )
+        if user.pk == request.user.vendor_user.pk:
+            # Belt and braces: the admin check above already covers today's only
+            # admin, but removing yourself should never be possible.
+            return error("cannot_remove_self", "You cannot remove yourself.")
+
+        has_history = (
+            user.dispatch_submissions.exists()
+            or user.dispatch_submissions_voided.exists()
+            or user.dispatch_documents.exists()
+        )
+        if has_history:
+            user.is_active = False
+            user.save(update_fields=["is_active", "updated_at"])
+            logger.info(
+                "vendor team: %s deactivated %s (has history)",
+                request.user.vendor_user.email, user.email,
+            )
+            return Response({
+                "removed": False,
+                "deactivated": True,
+                "detail": (
+                    "This user has submitted work, so their access was removed but "
+                    "their record is kept."
+                ),
+            })
+
+        email = user.email
+        user.delete()
+        logger.info(
+            "vendor team: %s deleted %s (no history)",
+            request.user.vendor_user.email, email,
+        )
+        return Response({"removed": True, "deactivated": False})

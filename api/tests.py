@@ -30020,3 +30020,243 @@ class VendorDashboardTest(TestCase):
             "/v1/work/?status=confirmed", HTTP_HOST=VENDOR_HOST,
         )
         self.assertEqual([o["id"] for o in resp.data], [str(self.confirmed.pk)])
+
+
+@override_settings(VENDOR_API_HOST=VENDOR_HOST, ALLOWED_HOSTS=["*"])
+class VendorTeamTest(TestCase):
+    """A vendor admin manages their own staff. Only the admin, only their own."""
+
+    def setUp(self):
+        from django.contrib.auth.hashers import make_password
+
+        from .models import Vendor, VendorUser
+
+        self.vendor = Vendor.objects.create(name="Acme")
+        self.rival = Vendor.objects.create(name="Beta")
+        self.admin = VendorUser.objects.create(
+            vendor=self.vendor, email="admin@acme.test", name="Ada Admin",
+            password=make_password("pw-admin-123"), is_admin=True,
+        )
+        self.staff = VendorUser.objects.create(
+            vendor=self.vendor, email="staff@acme.test", name="Sam Staff",
+            password=make_password("pw-staff-123"),
+        )
+        self.rival_admin = VendorUser.objects.create(
+            vendor=self.rival, email="admin@beta.test", name="Bea Admin",
+            password=make_password("pw-beta-1234"), is_admin=True,
+        )
+
+    def _as(self, email, password):
+        resp = APIClient().post(
+            "/v1/auth/login/", {"email": email, "password": password},
+            format="json", HTTP_HOST=VENDOR_HOST,
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        api = APIClient()
+        api.credentials(HTTP_AUTHORIZATION=f"Bearer {resp.data['access_token']}")
+        return api
+
+    def _admin(self):
+        return self._as("admin@acme.test", "pw-admin-123")
+
+    def _staff(self):
+        return self._as("staff@acme.test", "pw-staff-123")
+
+    # ── who may ──────────────────────────────────────────────────────────────
+    def test_the_admin_sees_their_team_admin_first(self):
+        resp = self._admin().get("/v1/team/", HTTP_HOST=VENDOR_HOST)
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual([u["email"] for u in resp.data],
+                         ["admin@acme.test", "staff@acme.test"])
+
+    def test_a_NON_ADMIN_cannot_list_or_add(self):
+        staff = self._staff()
+        self.assertEqual(
+            staff.get("/v1/team/", HTTP_HOST=VENDOR_HOST).status_code, 403,
+        )
+        self.assertEqual(
+            staff.post("/v1/team/", {"name": "X", "email": "x@acme.test"},
+                       format="json", HTTP_HOST=VENDOR_HOST).status_code, 403,
+        )
+
+    def test_a_non_admin_cannot_remove_anyone(self):
+        resp = self._staff().delete(
+            f"/v1/team/{self.staff.pk}/", HTTP_HOST=VENDOR_HOST,
+        )
+        self.assertEqual(resp.status_code, 403)
+
+    def test_an_admin_cannot_touch_ANOTHER_companys_staff(self):
+        """404, not 403 -- a 403 would confirm the id exists."""
+        api = self._admin()
+        self.assertEqual(
+            api.patch(f"/v1/team/{self.rival_admin.pk}/", {"name": "hax"},
+                      format="json", HTTP_HOST=VENDOR_HOST).status_code, 404,
+        )
+        self.assertEqual(
+            api.delete(f"/v1/team/{self.rival_admin.pk}/",
+                       HTTP_HOST=VENDOR_HOST).status_code, 404,
+        )
+
+    def test_the_team_list_shows_only_THIS_company(self):
+        emails = {
+            u["email"] for u in
+            self._admin().get("/v1/team/", HTTP_HOST=VENDOR_HOST).data
+        }
+        self.assertNotIn("admin@beta.test", emails)
+
+    # ── adding ───────────────────────────────────────────────────────────────
+    def test_the_admin_can_add_a_colleague_who_can_then_log_in(self):
+        resp = self._admin().post(
+            "/v1/team/",
+            {"name": "New Hire", "email": "new@acme.test",
+             "password": "their-own-pw-1"},
+            format="json", HTTP_HOST=VENDOR_HOST,
+        )
+        self.assertEqual(resp.status_code, 201, resp.content)
+        self.assertFalse(resp.data["is_admin"])
+        # Supplied, so not echoed.
+        self.assertEqual(resp.data["temporary_password"], "")
+
+        api = self._as("new@acme.test", "their-own-pw-1")
+        self.assertEqual(api.get("/v1/me/", HTTP_HOST=VENDOR_HOST).status_code, 200)
+
+    def test_a_generated_password_is_returned_once(self):
+        resp = self._admin().post(
+            "/v1/team/", {"name": "Gen", "email": "gen@acme.test"},
+            format="json", HTTP_HOST=VENDOR_HOST,
+        )
+        self.assertEqual(resp.status_code, 201)
+        pw = resp.data["temporary_password"]
+        self.assertTrue(pw)
+        self._as("gen@acme.test", pw)  # it works
+
+    def test_an_added_user_is_NEVER_an_admin(self):
+        """The admin slot is CRM-provisioned and constrained to one per vendor, so
+        a company cannot grow a second administrator."""
+        from .models import VendorUser
+
+        self._admin().post(
+            "/v1/team/",
+            {"name": "Sneaky", "email": "sneaky@acme.test", "is_admin": True},
+            format="json", HTTP_HOST=VENDOR_HOST,
+        )
+        self.assertFalse(VendorUser.objects.get(email="sneaky@acme.test").is_admin)
+
+    def test_a_duplicate_email_is_refused_the_same_way_across_companies(self):
+        """"Already used by another company" would leak that a person works for a
+        competitor."""
+        api = self._admin()
+        inside = api.post(
+            "/v1/team/", {"name": "Dup", "email": "staff@acme.test"},
+            format="json", HTTP_HOST=VENDOR_HOST,
+        )
+        outside = api.post(
+            "/v1/team/", {"name": "Dup", "email": "admin@beta.test"},
+            format="json", HTTP_HOST=VENDOR_HOST,
+        )
+        self.assertEqual(inside.status_code, 409)
+        self.assertEqual(outside.status_code, 409)
+        self.assertEqual(inside.data["detail"], outside.data["detail"])
+
+    def test_a_short_password_is_refused(self):
+        resp = self._admin().post(
+            "/v1/team/",
+            {"name": "Short", "email": "short@acme.test", "password": "abc"},
+            format="json", HTTP_HOST=VENDOR_HOST,
+        )
+        self.assertEqual(resp.status_code, 400)
+
+    # ── changing and removing ────────────────────────────────────────────────
+    def test_deactivating_a_colleague_takes_effect_IMMEDIATELY(self):
+        """The authenticator re-checks is_active on every request, so an existing
+        token must stop working at once rather than lasting until it expires."""
+        staff_api = self._staff()
+        self.assertEqual(
+            staff_api.get("/v1/work/", HTTP_HOST=VENDOR_HOST).status_code, 200,
+        )
+        self._admin().patch(
+            f"/v1/team/{self.staff.pk}/", {"is_active": False},
+            format="json", HTTP_HOST=VENDOR_HOST,
+        )
+        self.assertEqual(
+            staff_api.get("/v1/work/", HTTP_HOST=VENDOR_HOST).status_code, 401,
+        )
+
+    def test_an_unchanged_patch_reports_nothing_changed(self):
+        resp = self._admin().patch(
+            f"/v1/team/{self.staff.pk}/", {"name": "Sam Staff"},
+            format="json", HTTP_HOST=VENDOR_HOST,
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.data["changed_fields"], [])
+
+    def test_a_user_with_NO_history_is_deleted_outright(self):
+        """An email typed wrong five minutes ago should not be permanent."""
+        from .models import VendorUser
+
+        resp = self._admin().delete(
+            f"/v1/team/{self.staff.pk}/", HTTP_HOST=VENDOR_HOST,
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        self.assertTrue(resp.data["removed"])
+        self.assertFalse(VendorUser.objects.filter(pk=self.staff.pk).exists())
+
+    def test_a_user_WITH_history_is_deactivated_not_deleted(self):
+        """Submissions point at them, and the record of who assessed a member's
+        home has to survive."""
+        from .models import (
+            Client, DispatchKind, DispatchOrder, DispatchSubmission, VendorUser,
+        )
+
+        member = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="H", last_name="M",
+            client_added_at=timezone.now(),
+        )
+        order = DispatchOrder.objects.create(
+            kind=DispatchKind.ASSESSMENT, client=member, vendor=self.vendor,
+        )
+        DispatchSubmission.objects.create(
+            dispatch_order=order, sequence=1, submitted_by=self.staff,
+            submitted_at=timezone.now(),
+        )
+
+        resp = self._admin().delete(
+            f"/v1/team/{self.staff.pk}/", HTTP_HOST=VENDOR_HOST,
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertFalse(resp.data["removed"])
+        self.assertTrue(resp.data["deactivated"])
+
+        still_there = VendorUser.objects.get(pk=self.staff.pk)
+        self.assertFalse(still_there.is_active)
+
+    def test_the_ADMIN_cannot_be_removed_or_deactivated_here(self):
+        """Either would lock the company out of its own account, and only the CRM
+        could undo it."""
+        api = self._admin()
+        self.assertEqual(
+            api.delete(f"/v1/team/{self.admin.pk}/",
+                       HTTP_HOST=VENDOR_HOST).status_code, 400,
+        )
+        resp = api.patch(
+            f"/v1/team/{self.admin.pk}/", {"is_active": False},
+            format="json", HTTP_HOST=VENDOR_HOST,
+        )
+        self.assertEqual(resp.status_code, 400)
+        self.admin.refresh_from_db()
+        self.assertTrue(self.admin.is_active)
+
+    def test_the_admin_can_reset_a_colleagues_password(self):
+        from django.contrib.auth.hashers import check_password
+
+        from .models import VendorUser
+
+        resp = self._admin().patch(
+            f"/v1/team/{self.staff.pk}/", {"password": "reset-by-admin-1"},
+            format="json", HTTP_HOST=VENDOR_HOST,
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn("password", resp.data["changed_fields"])
+        self.assertTrue(check_password(
+            "reset-by-admin-1", VendorUser.objects.get(pk=self.staff.pk).password,
+        ))
