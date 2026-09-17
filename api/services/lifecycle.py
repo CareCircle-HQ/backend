@@ -1607,25 +1607,25 @@ def _housing_assessment_phase(client, case):
         .order_by("-created_at").first()
     )
     if order is not None and order.status != DispatchStatus.CANCELLED:
-        return ("ordered", "Ordered")
+        return ("ordered", "Assessment order created")
     if order is not None:
-        return ("cancelled", "Cancelled")
+        return ("cancelled", "The assessment order was cancelled")
 
     auth = getattr(case, "service_authorization_status", "") or ""
     if auth == A.DENIED:
-        return ("", "")
+        return ("", "Authorization denied — no assessment can be ordered")
     if auth == A.EXPIRED:
-        return ("expired", "Authorization Expired")
+        return ("expired", "Authorization expired — renew it before ordering")
     if auth in (A.APPROVED, A.NOT_REQUIRED):
         # Approved on paper, but check the WINDOW: the status keeps reading
         # "approved" after the window lapses, which is the trap the Items tab hit.
         _start, end = case.effective_authorization_window()
         if end and end < timezone.now():
-            return ("expired", "Authorization Expired")
-        return ("ready", "Ready to Order")
+            return ("expired", "Authorization expired — renew it before ordering")
+        return ("ready", "No assessment order yet — ready to create one")
     # Requested, never requested, blank: nothing to order yet, and the
     # Authorization chip beside this one already says so.
-    return ("", "")
+    return ("", "Waiting on authorization before an assessment can be ordered")
 
 
 def _housing_work_orders_phase(client):
@@ -1657,15 +1657,18 @@ def _housing_work_orders_phase(client):
 
     if batches:
         unassigned = items.filter(dispatch_order__isnull=True).count()
-        label = f"{batches} order{'' if batches == 1 else 's'}"
+        detail = f"{batches} work order{'' if batches == 1 else 's'}"
         if unassigned:
-            # Still green -- work IS being done -- but the count says what is left,
-            # so "1 order" cannot be mistaken for "everything is handled".
-            label = f"{label} · {unassigned} unbatched"
-        return ("created", label)
+            # Still green -- work IS being done -- but the detail says what is
+            # left, so a green chip cannot be read as "everything is handled".
+            detail = f"{detail}, {unassigned} item{'' if unassigned == 1 else 's'} not yet batched"
+        return ("created", detail)
     if total:
-        return ("waiting", f"{total} item{'' if total == 1 else 's'} waiting")
-    return ("", "")
+        return (
+            "waiting",
+            f"{total} item{'' if total == 1 else 's'} waiting to be put in a work order",
+        )
+    return ("", "No remediation items yet")
 
 
 def _verification_phase(enrollment):
@@ -2007,8 +2010,21 @@ def program_tracks(client):
             # food slots -- putting the assessment order in "verification" would
             # make the payload lie about what it holds. Blank for food, so the
             # frontend picks by DOMAIN rather than by which keys happen to be set.
-            "assessment_order": {"value": ao_val, "label": ao_lbl},
-            "work_orders": {"value": wo_val, "label": wo_lbl},
+            # The LABEL is the node's NAME and the VALUE drives its colour --
+            # these read as a stepper ("EEA", "Work Orders"), not as states like
+            # the food chips. "Ordered" as a label was confusing: the chip is the
+            # node, and whether it is green is the answer.
+            #
+            # `detail` carries the state for the tooltip, so the glance stays clean
+            # while the specifics are still one hover away rather than only on the
+            # Programs tab.
+            "assessment_order": {
+                "value": ao_val, "label": "EEA" if ao_lbl else "", "detail": ao_lbl,
+            },
+            "work_orders": {
+                "value": wo_val,
+                "label": "Work Orders" if wo_lbl else "", "detail": wo_lbl,
+            },
         })
     # Governing first, then FOOD before other types -- food is the primary
     # service and should lead the bar -- then by service-type label + case id (a

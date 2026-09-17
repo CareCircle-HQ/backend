@@ -30785,7 +30785,10 @@ class HousingStageBarTest(TestCase):
         self._case(self.EEA)
         t = self._housing_track()
         self.assertEqual(t["assessment_order"]["value"], "ready")
-        self.assertEqual(t["assessment_order"]["label"], "Ready to Order")
+        # The LABEL is the node's name; the state is the colour (value) plus the
+        # tooltip. "Ordered" as a label read as confusing on screen.
+        self.assertEqual(t["assessment_order"]["label"], "EEA")
+        self.assertIn("ready to create", t["assessment_order"]["detail"])
 
     def test_an_EXPIRED_window_reads_EXPIRED_even_though_auth_says_approved(self):
         """Housing's expiry has nowhere else to surface. _authorization_phase
@@ -30855,7 +30858,8 @@ class HousingStageBarTest(TestCase):
 
         t = self._housing_track()
         self.assertEqual(t["work_orders"]["value"], "waiting")
-        self.assertEqual(t["work_orders"]["label"], "1 item waiting")
+        self.assertEqual(t["work_orders"]["label"], "Work Orders")
+        self.assertIn("1 item waiting", t["work_orders"]["detail"])
 
     def test_a_batch_reads_GREEN_and_names_whats_left(self):
         """Still green -- work IS being done -- but the count says what remains, so
@@ -30888,8 +30892,35 @@ class HousingStageBarTest(TestCase):
         )
         t = self._housing_track()
         self.assertEqual(t["work_orders"]["value"], "created")
-        self.assertIn("1 order", t["work_orders"]["label"])
-        self.assertIn("unbatched", t["work_orders"]["label"])
+        self.assertEqual(t["work_orders"]["label"], "Work Orders")
+        # Green, but the detail still names what is left, so it cannot be read as
+        # "everything is handled".
+        self.assertIn("1 work order", t["work_orders"]["detail"])
+        self.assertIn("not yet batched", t["work_orders"]["detail"])
+
+    def test_the_node_LABELS_are_constant_and_the_colour_carries_the_state(self):
+        """These two read as a stepper: the chip is the node, and whether it is
+        green is the answer. A label that changed with the state ("Ordered") was
+        confusing on screen."""
+        from .models import DispatchKind, DispatchOrder
+
+        self._case(self.EEA)
+        before = self._housing_track()
+        DispatchOrder.objects.create(
+            kind=DispatchKind.ASSESSMENT, client=self.member, vendor=self.vendor,
+        )
+        after = self._housing_track()
+
+        self.assertEqual(before["assessment_order"]["label"], "EEA")
+        self.assertEqual(after["assessment_order"]["label"], "EEA")
+        # Only the value (colour) and the tooltip moved.
+        self.assertNotEqual(
+            before["assessment_order"]["value"], after["assessment_order"]["value"],
+        )
+        self.assertNotEqual(
+            before["assessment_order"]["detail"],
+            after["assessment_order"]["detail"],
+        )
 
     # ── food is untouched ───────────────────────────────────────────────────
     def test_a_FOOD_track_carries_no_housing_phases(self):
