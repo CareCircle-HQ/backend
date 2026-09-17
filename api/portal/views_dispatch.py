@@ -325,3 +325,141 @@ class MemberAssessmentOrderCreateView(PortalAPIView):
         payload = _serialize_order(order)
         payload["adopted_remediation_orders"] = len(adopted)
         return Response(payload, status=http.HTTP_201_CREATED)
+
+
+# Fields an agent may still change, and the ONLY statuses in which they may. Once
+# the appointment is CONFIRMED the vendor has been told when and where to go, and
+# the member has been promised a slot -- editing the address or the phone at that
+# point silently desynchronises the two. A confirmed order is corrected by
+# rescheduling, not by editing underneath it.
+EDITABLE_BEFORE_CONFIRMED = {
+    "contact_phone", "contact_phone_type", "contact_email",
+    "address_line1", "address_line2", "address_city", "address_state",
+    "address_zip", "address_formatted", "address_place_id", "address_notes",
+    "referral_type", "ecm_billed_confirmed", "notes",
+}
+
+
+class MemberAssessmentOrderUpdateView(PortalAPIView):
+    """PATCH: correct an assessment order that has not been confirmed yet.
+
+    Editing is limited to PENDING_SCHEDULE. This is NOT the vendor-evidence lock
+    (which forbids CRM writes entirely) -- these are the agent's own wizard answers,
+    and an agent who mistypes a phone number should not have to void anything to fix
+    it. But once the visit is confirmed the details have been acted on, so they stop
+    being editable.
+    """
+
+    @transaction.atomic
+    def patch(self, request, client_id, order_id):
+        client = get_object_or_404(Client, pk=client_id)
+        order = get_object_or_404(
+            DispatchOrder, pk=order_id, client=client, kind=DispatchKind.ASSESSMENT,
+        )
+        if order.status != DispatchStatus.PENDING_SCHEDULE:
+            return Response(
+                {
+                    "detail": (
+                        f"This order is {order.get_status_display()} and can no "
+                        "longer be edited. Reschedule it instead."
+                    )
+                },
+                status=http.HTTP_409_CONFLICT,
+            )
+
+        data = request.data or {}
+        agent = current_agent(request)
+        changed = {}
+
+        for field in EDITABLE_BEFORE_CONFIRMED:
+            if field not in data:
+                continue
+            value = data[field]
+            if field == "ecm_billed_confirmed":
+                value = bool(value)
+            elif field == "contact_email":
+                value = (value or "").strip().lower()
+            else:
+                value = (value or "").strip() if isinstance(value, str) else value
+            if getattr(order, field) != value:
+                changed[field] = value
+                setattr(order, field, value)
+
+        # Same required-field rules as creation: an edit must not be able to leave
+        # an order in a state the wizard would have refused to create.
+        if len(re.sub(r"\D", "", order.contact_phone or "")) < 10:
+            return Response(
+                {"detail": "A full phone number is required."},
+                status=http.HTTP_400_BAD_REQUEST,
+            )
+        if not (order.address_line1 or "").strip():
+            return Response(
+                {"detail": "An address is required."},
+                status=http.HTTP_400_BAD_REQUEST,
+            )
+        if order.referral_type not in DispatchReferralType.values:
+            return Response(
+                {"detail": f"Unknown referral type: {order.referral_type}"},
+                status=http.HTTP_400_BAD_REQUEST,
+            )
+
+        if "vendor_id" in data:
+            vendor_id = (data.get("vendor_id") or "").strip()
+            vendor = Vendor.objects.filter(pk=vendor_id, is_active=True).first()
+            if vendor is None:
+                return Response(
+                    {"detail": "Unknown or inactive vendor."},
+                    status=http.HTTP_400_BAD_REQUEST,
+                )
+            if order.vendor_id != vendor.pk:
+                changed["vendor"] = vendor.name
+                order.vendor = vendor
+
+        # Availability is replaced wholesale rather than diffed: the picker submits
+        # a complete set of three days, and a partial merge would leave orphaned
+        # windows from a previous choice.
+        windows = data.get("availability")
+        if windows is not None:
+            dates = {
+                (w.get("date") or "").strip() for w in windows
+                if (w.get("date") or "").strip()
+            }
+            if len(dates) < dispatch_svc.MIN_AVAILABILITY_DATES:
+                return Response(
+                    {
+                        "detail": (
+                            f"At least {dispatch_svc.MIN_AVAILABILITY_DATES} "
+                            f"different dates are required (got {len(dates)})."
+                        )
+                    },
+                    status=http.HTTP_400_BAD_REQUEST,
+                )
+            order.availability_windows.all().delete()
+            for w in windows:
+                if not (w.get("date") and w.get("start_time") and w.get("end_time")):
+                    continue
+                DispatchAvailabilityWindow.objects.create(
+                    dispatch_order=order, date=w["date"],
+                    start_time=w["start_time"], end_time=w["end_time"],
+                )
+            changed["availability"] = f"{len(dates)} dates"
+
+        if not changed:
+            return Response(_serialize_order(order))
+
+        order.save()
+        # Audited: an order is work promised to a vendor, so a change to its
+        # details belongs in the same history as its transitions.
+        dispatch_svc.record_transition(
+            order, order.status, order.status,
+            actor=getattr(request, "user", None),
+            source=StageEventSource.MANUAL,
+            note=(
+                f"order edited by {agent.name}" if agent else "order edited"
+            ),
+            metadata={
+                "changed": sorted(changed),
+                "agent_code": getattr(agent, "agent_code", ""),
+            },
+        )
+        return Response(_serialize_order(order))

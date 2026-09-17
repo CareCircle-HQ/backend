@@ -27926,3 +27926,178 @@ class AssessmentOrderRequiredFieldsTest(TestCase):
         for f in ("contact_phone", "address_line1", "referral_type", "vendor_id",
                   "consent", "ecm_billed_confirmed"):
             self.assertIn(f, resp.data["detail"])
+
+
+class AssessmentOrderEditTest(TestCase):
+    """An assessment order is editable only BEFORE the appointment is confirmed.
+
+    This is not the vendor-evidence lock -- these are the agent's own wizard
+    answers, and a mistyped phone should not require voiding anything. But once the
+    visit is confirmed the vendor has been told where to go and the member has been
+    promised a slot, so editing underneath that would desynchronise them.
+    """
+
+    EEA = (
+        "Dwelling Assessment & Statement of Work (SOW) Development - "
+        "Modifications and Remediation Service - Brooklyn"
+    )
+
+    def setUp(self):
+        from .models import (
+            ActiveProgram, Case, CaseStatus, CaseType, Client, DispatchKind,
+            DispatchOrder, DispatchStatus, Vendor,
+        )
+        from .services.catalog import clear_program_domain_cache
+
+        ActiveProgram.objects.create(
+            program_name=self.EEA, case_category="Internal Services",
+            case_type=ActiveProgram.CaseType.HOUSING,
+            service_type=ActiveProgram.ServiceType.ENVIRONMENTAL_EXPOSURE_ASSESSMENT,
+        )
+        clear_program_domain_cache()
+        self.vendor = Vendor.objects.create(name="Acme Remediation")
+        self.other_vendor = Vendor.objects.create(name="Beta Repairs")
+        self.member = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Edit", last_name="Me",
+            client_added_at=timezone.now(),
+        )
+        Case.objects.create(
+            case_id=uuid.uuid4(), client=self.member,
+            case_type=CaseType.INTERNAL_SERVICE, case_status=CaseStatus.MANAGED,
+            program_name=self.EEA, service_authorization_status="approved",
+            case_created_at=timezone.now(),
+        )
+        self.order = DispatchOrder.objects.create(
+            kind=DispatchKind.ASSESSMENT, client=self.member, vendor=self.vendor,
+            status=DispatchStatus.PENDING_SCHEDULE,
+            contact_phone="(718) 555-0100", address_line1="123 Verified St",
+            referral_type="combined", ecm_billed_confirmed=True,
+            consent_to_call=True, consent_to_text=True,
+        )
+
+    def _api(self):
+        from rest_framework_simplejwt.tokens import AccessToken
+
+        from .models import Agent
+
+        if not hasattr(self, "_agent"):
+            self._agent = Agent.objects.create(
+                name="E", agent_code="884", group="Management",
+            )
+        acc = AccessToken()
+        acc["agent_id"] = str(self._agent.id)
+        acc["agent_code"] = self._agent.agent_code
+        acc["agent_name"] = self._agent.name
+        acc["agent_group"] = self._agent.group
+        api = APIClient(); api.credentials(HTTP_AUTHORIZATION=f"Bearer {acc}")
+        return api
+
+    def _patch(self, body):
+        return self._api().patch(
+            f"/api/portal/members/{self.member.pk}/assessment-order/"
+            f"{self.order.pk}/",
+            body, format="json",
+        )
+
+    def test_a_pending_order_can_be_corrected(self):
+        resp = self._patch({"contact_phone": "(718) 555-9999"})
+        self.assertEqual(resp.status_code, 200, resp.content)
+        self.order.refresh_from_db()
+        self.assertEqual(self.order.contact_phone, "(718) 555-9999")
+
+    def test_a_CONFIRMED_order_cannot_be_edited(self):
+        from .models import DispatchStatus
+
+        self.order.status = DispatchStatus.CONFIRMED
+        self.order.save(update_fields=["status"])
+        resp = self._patch({"contact_phone": "(718) 555-9999"})
+        self.assertEqual(resp.status_code, 409)
+        self.assertIn("Reschedule", resp.data["detail"])
+        self.order.refresh_from_db()
+        self.assertEqual(self.order.contact_phone, "(718) 555-0100")
+
+    def test_a_SUBMITTED_order_cannot_be_edited_either(self):
+        from .models import DispatchStatus
+
+        self.order.status = DispatchStatus.SUBMITTED
+        self.order.save(update_fields=["status"])
+        self.assertEqual(self._patch({"notes": "late"}).status_code, 409)
+
+    def test_an_edit_cannot_leave_the_order_INVALID(self):
+        """The same rules as creation: blanking a required field must fail, or an
+        edit becomes a way to reach a state the wizard would have refused."""
+        self.assertEqual(self._patch({"contact_phone": ""}).status_code, 400)
+        self.assertEqual(self._patch({"address_line1": ""}).status_code, 400)
+        self.assertEqual(self._patch({"referral_type": ""}).status_code, 400)
+        self.order.refresh_from_db()
+        self.assertEqual(self.order.contact_phone, "(718) 555-0100")
+
+    def test_the_vendor_can_be_reassigned(self):
+        resp = self._patch({"vendor_id": str(self.other_vendor.pk)})
+        self.assertEqual(resp.status_code, 200, resp.content)
+        self.order.refresh_from_db()
+        self.assertEqual(self.order.vendor_id, self.other_vendor.pk)
+
+    def test_an_inactive_vendor_is_refused(self):
+        self.other_vendor.is_active = False
+        self.other_vendor.save(update_fields=["is_active"])
+        self.assertEqual(
+            self._patch({"vendor_id": str(self.other_vendor.pk)}).status_code, 400,
+        )
+
+    def test_availability_is_REPLACED_not_merged(self):
+        """The picker submits a complete set, so merging would leave orphaned
+        windows from the previous choice."""
+        from .models import DispatchAvailabilityWindow
+
+        for d in ("2026-10-01", "2026-10-02", "2026-10-03"):
+            DispatchAvailabilityWindow.objects.create(
+                dispatch_order=self.order, date=d,
+                start_time="09:00", end_time="12:00",
+            )
+        resp = self._patch({"availability": [
+            {"date": "2026-11-02", "start_time": "13:00", "end_time": "15:00"},
+            {"date": "2026-11-03", "start_time": "13:00", "end_time": "15:00"},
+            {"date": "2026-11-04", "start_time": "13:00", "end_time": "15:00"},
+        ]})
+        self.assertEqual(resp.status_code, 200, resp.content)
+        dates = set(
+            DispatchAvailabilityWindow.objects
+            .filter(dispatch_order=self.order)
+            .values_list("date", flat=True)
+        )
+        self.assertEqual({d.isoformat() for d in dates},
+                         {"2026-11-02", "2026-11-03", "2026-11-04"})
+
+    def test_availability_still_needs_three_dates(self):
+        resp = self._patch({"availability": [
+            {"date": "2026-11-02", "start_time": "09:00", "end_time": "10:00"},
+            {"date": "2026-11-02", "start_time": "11:00", "end_time": "12:00"},
+        ]})
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("different dates", resp.data["detail"])
+
+    def test_an_edit_is_AUDITED_with_the_fields_that_changed(self):
+        """An order is work promised to a vendor, so a change to its details
+        belongs in the same history as its transitions."""
+        from .models import StageEntityType, StageEvent
+
+        self._patch({"contact_phone": "(718) 555-7777", "notes": "gate code 4321"})
+        ev = StageEvent.objects.filter(
+            dispatch_order=self.order, entity_type=StageEntityType.DISPATCH_ORDER,
+        ).order_by("-entered_at").first()
+        self.assertIsNotNone(ev)
+        self.assertIn("contact_phone", ev.metadata.get("changed", []))
+        self.assertIn("notes", ev.metadata.get("changed", []))
+        self.assertIn("edited", ev.note)
+
+    def test_an_unchanged_patch_writes_no_history(self):
+        """Opening and closing the editor should not leave a trail of no-ops."""
+        from .models import StageEvent
+
+        before = StageEvent.objects.filter(dispatch_order=self.order).count()
+        resp = self._patch({"contact_phone": "(718) 555-0100"})
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(
+            StageEvent.objects.filter(dispatch_order=self.order).count(), before,
+        )
