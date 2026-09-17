@@ -20,7 +20,7 @@ from rest_framework import status as http
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from ..models import DispatchKind, DispatchOrder, DispatchStatus
+from ..models import DispatchKind, DispatchOrder, DispatchStatus, DispatchVisit
 from .auth import (
     IsVendorUser, VendorAuthentication, authenticate_user, client_ip, issue_token,
 )
@@ -193,19 +193,35 @@ class VendorWorkListView(VendorAPIView):
     """
 
     def get(self, request):
-        include_done = (request.query_params.get("include_done") or "").lower() in (
-            "1", "true", "yes",
-        )
+        params = request.query_params
         qs = (
             DispatchOrder.objects
             .filter(vendor=request.user.vendor)
             .select_related("client")
             .prefetch_related("availability_windows", "visits", "line_items")
         )
-        if not include_done:
+
+        # ?status=confirmed&status=submitted -- repeatable, so the app's filter
+        # chips are multi-select without inventing a comma syntax. An unknown
+        # value is IGNORED rather than 400: a stale app version sending a status
+        # we have retired should show everything, not fail.
+        wanted = [
+            v for v in params.getlist("status")
+            if v in DispatchStatus.values
+        ]
+        if wanted:
+            qs = qs.filter(status__in=wanted)
+        elif (params.get("include_done") or "").lower() not in ("1", "true", "yes"):
+            # Default: the work still to do. An installer opens this to find what
+            # is next, not to browse history.
             qs = qs.exclude(
                 status__in=[DispatchStatus.UPLOADED, DispatchStatus.CANCELLED],
             )
+
+        kind = (params.get("kind") or "").strip()
+        if kind in DispatchKind.values:
+            qs = qs.filter(kind=kind)
+
         # Assessments first -- a work order cannot be done before the assessment
         # that justified it -- then oldest first, because the longest-waiting
         # member should be visited soonest.
@@ -254,3 +270,97 @@ class VendorWorkDetailView(VendorAPIView):
                 "assessor_notes": form.assessor_notes if form else "",
             }
         return Response(payload)
+
+
+class VendorDashboardView(VendorAPIView):
+    """GET /v1/dashboard/ -- the numbers a vendor opens the app to see.
+
+    Counts, not a list: the work list already does lists. These answer "what do I
+    owe, and what is coming" at a glance, which is the only reason to look at a
+    dashboard before starting a day.
+
+    Every count is scoped to ``request.user.vendor``.
+    """
+
+    def get(self, request):
+        from django.db.models import Count, Q
+
+        vendor = request.user.vendor
+        today = timezone.localdate()
+        week_end = today + timezone.timedelta(days=7)
+
+        base = DispatchOrder.objects.filter(vendor=vendor)
+
+        # One query for the status spread rather than six counts.
+        by_status = {
+            row["status"]: row["n"]
+            for row in base.values("status").annotate(n=Count("pk"))
+        }
+        by_kind = {
+            row["kind"]: row["n"]
+            for row in base.exclude(
+                status__in=[DispatchStatus.UPLOADED, DispatchStatus.CANCELLED],
+            ).values("kind").annotate(n=Count("pk"))
+        }
+
+        # Visits, which is what "today" and "this week" actually mean to an
+        # installer -- an order's status says nothing about when they must travel.
+        visits = DispatchVisit.objects.filter(
+            dispatch_order__vendor=vendor,
+            completed_at__isnull=True,
+        ).select_related("dispatch_order", "dispatch_order__client")
+
+        today_visits = visits.filter(scheduled_for__date=today)
+        week_visits = visits.filter(
+            scheduled_for__date__gt=today, scheduled_for__date__lte=week_end,
+        )
+        # Scheduled, in the past, never started: the queue that quietly rots.
+        # Worth its own number because no status transition marks it.
+        overdue = visits.filter(
+            scheduled_for__date__lt=today, started_at__isnull=True,
+        )
+
+        next_visit = (
+            visits.filter(scheduled_for__gte=timezone.now())
+            .order_by("scheduled_for").first()
+        )
+
+        return Response({
+            "vendor": {"id": str(vendor.vendor_id), "name": vendor.name},
+            "open": {
+                # The three states a vendor can act on, named for what to DO
+                # rather than for the status value.
+                "needs_scheduling": by_status.get(
+                    DispatchStatus.PENDING_SCHEDULE, 0,
+                ),
+                "confirmed": by_status.get(DispatchStatus.CONFIRMED, 0),
+                "awaiting_submission": by_status.get(
+                    DispatchStatus.PENDING_SUBMISSION, 0,
+                ),
+            },
+            "done": {
+                "submitted": by_status.get(DispatchStatus.SUBMITTED, 0),
+                "uploaded": by_status.get(DispatchStatus.UPLOADED, 0),
+            },
+            "open_by_kind": {
+                "assessment": by_kind.get(DispatchKind.ASSESSMENT, 0),
+                "remediation": by_kind.get(DispatchKind.REMEDIATION, 0),
+            },
+            "visits": {
+                "today": today_visits.count(),
+                "next_7_days": week_visits.count(),
+                "overdue": overdue.count(),
+            },
+            "next_visit": (
+                {
+                    "order_id": str(next_visit.dispatch_order_id),
+                    "scheduled_for": next_visit.scheduled_for,
+                    "member_name": (
+                        f"{next_visit.dispatch_order.client.first_name} "
+                        f"{next_visit.dispatch_order.client.last_name}"
+                    ).strip(),
+                    "kind": next_visit.dispatch_order.kind,
+                }
+                if next_visit else None
+            ),
+        })

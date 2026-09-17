@@ -29844,3 +29844,179 @@ class VendorWorkScopingTest(TestCase):
             [m["code"] for m in form["schema"]["modules"]],
             ["mobility", "ventilation"],
         )
+
+
+@override_settings(VENDOR_API_HOST=VENDOR_HOST, ALLOWED_HOSTS=["*"])
+class VendorDashboardTest(TestCase):
+    """The dashboard counts, and status filtering on the work list."""
+
+    def setUp(self):
+        from django.contrib.auth.hashers import make_password
+
+        from .models import (
+            Client, DispatchKind, DispatchOrder, DispatchStatus, DispatchVisit,
+            Vendor, VendorUser,
+        )
+
+        self.vendor = Vendor.objects.create(name="Acme")
+        self.rival = Vendor.objects.create(name="Beta")
+        VendorUser.objects.create(
+            vendor=self.vendor, email="a@acme.test", name="Ada",
+            password=make_password("pw-acme-123"),
+        )
+        self.member = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Tracey", last_name="Johnson",
+            client_added_at=timezone.now(),
+        )
+
+        def order(kind, status, vendor=None, client=None):
+            return DispatchOrder.objects.create(
+                kind=kind, client=client or self.member,
+                vendor=vendor or self.vendor, status=status,
+            )
+
+        self.pending = order(DispatchKind.ASSESSMENT, DispatchStatus.PENDING_SCHEDULE)
+        self.confirmed = order(DispatchKind.REMEDIATION, DispatchStatus.CONFIRMED)
+        self.awaiting = order(
+            DispatchKind.REMEDIATION, DispatchStatus.PENDING_SUBMISSION,
+        )
+        self.uploaded = order(DispatchKind.REMEDIATION, DispatchStatus.UPLOADED)
+        # Another vendor's work, which must never appear in any count. A DIFFERENT
+        # member, because one_assessment_order_per_client is per MEMBER regardless
+        # of vendor -- the constraint caught this fixture, which is the constraint
+        # doing its job.
+        order(
+            DispatchKind.ASSESSMENT, DispatchStatus.CONFIRMED, vendor=self.rival,
+            client=Client.objects.create(
+                client_id=str(uuid.uuid4()), first_name="Rival", last_name="Member",
+                client_added_at=timezone.now(),
+            ),
+        )
+
+        today = timezone.now()
+        DispatchVisit.objects.create(
+            dispatch_order=self.confirmed, scheduled_for=today,
+        )
+        DispatchVisit.objects.create(
+            dispatch_order=self.confirmed,
+            scheduled_for=today + timezone.timedelta(days=3),
+        )
+        # Scheduled in the past and never started -- the queue that quietly rots.
+        DispatchVisit.objects.create(
+            dispatch_order=self.awaiting,
+            scheduled_for=today - timezone.timedelta(days=2),
+        )
+
+    def _api(self):
+        resp = APIClient().post(
+            "/v1/auth/login/", {"email": "a@acme.test", "password": "pw-acme-123"},
+            format="json", HTTP_HOST=VENDOR_HOST,
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        api = APIClient()
+        api.credentials(HTTP_AUTHORIZATION=f"Bearer {resp.data['access_token']}")
+        return api
+
+    def _dash(self):
+        resp = self._api().get("/v1/dashboard/", HTTP_HOST=VENDOR_HOST)
+        self.assertEqual(resp.status_code, 200, resp.content)
+        return resp.data
+
+    # ── counts ───────────────────────────────────────────────────────────────
+    def test_the_open_counts_are_named_for_what_to_DO(self):
+        d = self._dash()
+        self.assertEqual(d["open"]["needs_scheduling"], 1)
+        self.assertEqual(d["open"]["confirmed"], 1)
+        self.assertEqual(d["open"]["awaiting_submission"], 1)
+        self.assertEqual(d["done"]["uploaded"], 1)
+
+    def test_ANOTHER_vendors_work_is_in_no_count(self):
+        """The rival has a CONFIRMED order; ours must still read 1."""
+        d = self._dash()
+        self.assertEqual(d["open"]["confirmed"], 1)
+        self.assertEqual(d["vendor"]["name"], "Acme")
+
+    def test_open_by_kind_excludes_terminal_orders(self):
+        """A dashboard that counts finished work as outstanding is worse than no
+        dashboard."""
+        d = self._dash()
+        self.assertEqual(d["open_by_kind"]["assessment"], 1)
+        # confirmed + awaiting, NOT the uploaded one
+        self.assertEqual(d["open_by_kind"]["remediation"], 2)
+
+    def test_visits_are_counted_by_WHEN_not_by_status(self):
+        """An order's status says nothing about when someone must travel."""
+        d = self._dash()
+        self.assertEqual(d["visits"]["today"], 1)
+        self.assertEqual(d["visits"]["next_7_days"], 1)
+        self.assertEqual(d["visits"]["overdue"], 1)
+
+    def test_a_COMPLETED_visit_is_not_counted_as_upcoming(self):
+        from .models import DispatchVisit
+
+        DispatchVisit.objects.filter(
+            dispatch_order=self.confirmed,
+        ).update(completed_at=timezone.now())
+        d = self._dash()
+        self.assertEqual(d["visits"]["today"], 0)
+        self.assertEqual(d["visits"]["next_7_days"], 0)
+
+    def test_the_next_visit_is_the_soonest_FUTURE_one(self):
+        d = self._dash()
+        self.assertIsNotNone(d["next_visit"])
+        self.assertEqual(d["next_visit"]["member_name"], "Tracey Johnson")
+        self.assertEqual(d["next_visit"]["order_id"], str(self.confirmed.pk))
+
+    def test_a_vendor_with_nothing_gets_zeroes_not_an_error(self):
+        from django.contrib.auth.hashers import make_password
+
+        from .models import VendorUser
+
+        VendorUser.objects.create(
+            vendor=self.rival, email="b@beta.test", name="Bea",
+            password=make_password("pw-beta-123"),
+        )
+        resp = APIClient().post(
+            "/v1/auth/login/", {"email": "b@beta.test", "password": "pw-beta-123"},
+            format="json", HTTP_HOST=VENDOR_HOST,
+        )
+        api = APIClient()
+        api.credentials(HTTP_AUTHORIZATION=f"Bearer {resp.data['access_token']}")
+        d = api.get("/v1/dashboard/", HTTP_HOST=VENDOR_HOST).data
+        self.assertEqual(d["open"]["needs_scheduling"], 0)
+        self.assertEqual(d["visits"]["today"], 0)
+        self.assertIsNone(d["next_visit"])
+
+    # ── filtering ────────────────────────────────────────────────────────────
+    def test_status_filters_are_REPEATABLE_for_multi_select(self):
+        resp = self._api().get(
+            "/v1/work/?status=confirmed&status=pending_submission",
+            HTTP_HOST=VENDOR_HOST,
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(
+            {o["status"] for o in resp.data},
+            {"confirmed", "pending_submission"},
+        )
+
+    def test_an_explicit_status_filter_can_reach_TERMINAL_orders(self):
+        """Otherwise "show me what I finished" would be impossible."""
+        resp = self._api().get("/v1/work/?status=uploaded", HTTP_HOST=VENDOR_HOST)
+        self.assertEqual([o["id"] for o in resp.data], [str(self.uploaded.pk)])
+
+    def test_an_UNKNOWN_status_is_ignored_rather_than_rejected(self):
+        """A stale app version sending a status we have retired should show
+        everything, not fail."""
+        resp = self._api().get("/v1/work/?status=nonsense", HTTP_HOST=VENDOR_HOST)
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(len(resp.data), 3)  # the default open set
+
+    def test_kind_filters_assessments_from_work_orders(self):
+        resp = self._api().get("/v1/work/?kind=assessment", HTTP_HOST=VENDOR_HOST)
+        self.assertEqual([o["id"] for o in resp.data], [str(self.pending.pk)])
+
+    def test_filtering_still_cannot_reach_another_vendor(self):
+        resp = self._api().get(
+            "/v1/work/?status=confirmed", HTTP_HOST=VENDOR_HOST,
+        )
+        self.assertEqual([o["id"] for o in resp.data], [str(self.confirmed.pk)])
