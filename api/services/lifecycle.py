@@ -1671,6 +1671,57 @@ def _housing_work_orders_phase(client):
     return ("", "No remediation items yet")
 
 
+def _housing_overall_phase(client, case):
+    """The housing row's LAST chip: Open / Expired / Completed / Closed.
+
+    Unlike the EEA and Work Orders nodes, this chip's LABEL *is* the state -- it is
+    the answer to "where does this member's housing stand overall", not a waypoint.
+
+    PRECEDENCE, which matters more than the individual rules:
+
+    1. CLOSED   the dwelling case is closed or cancelled. Terminal and factual, so
+                it wins even over completed work -- an agent reading "Completed" on
+                a closed case would go looking for the case to act on.
+    2. COMPLETED every live order is uploaded AND nothing is left unbatched. Beats
+                Expired deliberately: if the work got done, a window that has since
+                lapsed is history rather than a problem.
+    3. EXPIRED  the authorization window has passed with work outstanding. This is
+                the one that needs somebody.
+    4. OPEN     the default while the case is live.
+    """
+    from api.models import (
+        DispatchItem, DispatchOrder, DispatchStatus,
+    )
+
+    if case.case_status in _CLOSED_CASE_STATUSES:
+        return ("closed", "The dwelling assessment case is closed")
+
+    live_orders = list(
+        DispatchOrder.objects
+        .filter(client=client)
+        .exclude(status=DispatchStatus.CANCELLED)
+        .values_list("status", flat=True)
+    )
+    unbatched = DispatchItem.objects.filter(
+        case__client=client, dispatch_order__isnull=True,
+    ).count()
+    # "All orders are done" requires there to BE orders -- otherwise a member who
+    # has never been assessed would read as Completed, which is the opposite of
+    # the truth.
+    if (
+        live_orders
+        and all(st == DispatchStatus.UPLOADED for st in live_orders)
+        and not unbatched
+    ):
+        return ("completed", "Every order is complete and uploaded")
+
+    _start, end = case.effective_authorization_window()
+    if end and end < timezone.now():
+        return ("expired", "The authorization window has passed")
+
+    return ("open", "The dwelling assessment case is open")
+
+
 def _verification_phase(enrollment):
     """Verification phase for the program bar:
 
@@ -1984,10 +2035,11 @@ def program_tracks(client):
         # The housing row's two extra nodes. Only computed for the housing
         # GOVERNING case -- a work-order case never renders a row, and food has no
         # assessment order.
-        ao_val = ao_lbl = wo_val = wo_lbl = ""
+        ao_val = ao_lbl = wo_val = wo_lbl = ov_val = ov_lbl = ""
         if case_service_domain(c) == "housing" and is_governing:
             ao_val, ao_lbl = _housing_assessment_phase(client, c)
             wo_val, wo_lbl = _housing_work_orders_phase(client)
+            ov_val, ov_lbl = _housing_overall_phase(client, c)
 
         tracks.append({
             "category": category,
@@ -2024,6 +2076,16 @@ def program_tracks(client):
             "work_orders": {
                 "value": wo_val,
                 "label": "Work Orders" if wo_lbl else "", "detail": wo_lbl,
+            },
+            # Unlike the two above, this chip's LABEL IS the state: it answers
+            # "where does housing stand overall" rather than marking a waypoint.
+            "housing_overall": {
+                "value": ov_val,
+                "label": {
+                    "open": "Open", "expired": "Expired",
+                    "completed": "Completed", "closed": "Closed",
+                }.get(ov_val, ""),
+                "detail": ov_lbl,
             },
         })
     # Governing first, then FOOD before other types -- food is the primary

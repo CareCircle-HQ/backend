@@ -30922,6 +30922,129 @@ class HousingStageBarTest(TestCase):
             after["assessment_order"]["detail"],
         )
 
+    # ── the overall chip ────────────────────────────────────────────────────
+    def test_an_open_dwelling_case_reads_OPEN(self):
+        self._case(self.EEA)
+        self.assertEqual(self._housing_track()["housing_overall"]["label"], "Open")
+
+    def test_a_CLOSED_dwelling_case_reads_CLOSED(self):
+        from .models import CaseStatus
+
+        case = self._case(self.EEA)
+        case.case_status = CaseStatus.CLOSED
+        case.save(update_fields=["case_status"])
+        self.assertEqual(self._housing_track()["housing_overall"]["label"], "Closed")
+
+    def test_an_EXPIRED_window_reads_EXPIRED(self):
+        self._case(
+            self.EEA,
+            starts=timezone.now() - timezone.timedelta(days=40),
+            ends=timezone.now() - timezone.timedelta(days=5),
+        )
+        self.assertEqual(
+            self._housing_track()["housing_overall"]["label"], "Expired",
+        )
+
+    def test_CLOSED_beats_EXPIRED(self):
+        """Terminal and factual wins: "Expired" on a closed case would send an
+        agent looking for something to fix."""
+        from .models import CaseStatus
+
+        case = self._case(
+            self.EEA,
+            starts=timezone.now() - timezone.timedelta(days=40),
+            ends=timezone.now() - timezone.timedelta(days=5),
+        )
+        case.case_status = CaseStatus.CLOSED
+        case.save(update_fields=["case_status"])
+        self.assertEqual(self._housing_track()["housing_overall"]["label"], "Closed")
+
+    def test_all_orders_UPLOADED_reads_COMPLETED(self):
+        from .models import DispatchKind, DispatchOrder, DispatchStatus
+
+        self._case(self.EEA)
+        DispatchOrder.objects.create(
+            kind=DispatchKind.ASSESSMENT, client=self.member, vendor=self.vendor,
+            status=DispatchStatus.UPLOADED,
+        )
+        self.assertEqual(
+            self._housing_track()["housing_overall"]["label"], "Completed",
+        )
+
+    def test_COMPLETED_beats_EXPIRED(self):
+        """If the work got done, a window that has since lapsed is history rather
+        than a problem."""
+        from .models import DispatchKind, DispatchOrder, DispatchStatus
+
+        self._case(
+            self.EEA,
+            starts=timezone.now() - timezone.timedelta(days=40),
+            ends=timezone.now() - timezone.timedelta(days=5),
+        )
+        DispatchOrder.objects.create(
+            kind=DispatchKind.ASSESSMENT, client=self.member, vendor=self.vendor,
+            status=DispatchStatus.UPLOADED,
+        )
+        self.assertEqual(
+            self._housing_track()["housing_overall"]["label"], "Completed",
+        )
+
+    def test_one_order_still_in_flight_is_NOT_completed(self):
+        from .models import DispatchKind, DispatchOrder, DispatchStatus
+
+        self._case(self.EEA)
+        DispatchOrder.objects.create(
+            kind=DispatchKind.ASSESSMENT, client=self.member, vendor=self.vendor,
+            status=DispatchStatus.UPLOADED,
+        )
+        DispatchOrder.objects.create(
+            kind=DispatchKind.REMEDIATION, client=self.member, vendor=self.vendor,
+            status=DispatchStatus.CONFIRMED,
+        )
+        self.assertEqual(self._housing_track()["housing_overall"]["label"], "Open")
+
+    def test_UNBATCHED_items_prevent_COMPLETED(self):
+        """Uploaded orders with items still waiting is not complete -- that is the
+        gap the amber Work Orders node exists to show."""
+        from .models import DispatchItem, DispatchKind, DispatchOrder, DispatchStatus
+        from .services import dispatch
+
+        self._case(self.EEA)
+        self._case(self.HEAR)
+        assessment = DispatchOrder.objects.create(
+            kind=DispatchKind.ASSESSMENT, client=self.member, vendor=self.vendor,
+            status=DispatchStatus.UPLOADED,
+        )
+        dispatch.sync_dispatch_items(assessment)
+        self.assertTrue(
+            DispatchItem.objects.filter(
+                assessment=assessment, dispatch_order__isnull=True,
+            ).exists()
+        )
+        self.assertEqual(self._housing_track()["housing_overall"]["label"], "Open")
+
+    def test_a_member_with_NO_orders_is_not_COMPLETED(self):
+        """"All orders are done" requires there to BE orders, or a member who has
+        never been assessed would read as Completed."""
+        self._case(self.EEA)
+        self.assertEqual(self._housing_track()["housing_overall"]["label"], "Open")
+
+    def test_a_CANCELLED_order_does_not_block_COMPLETED(self):
+        from .models import DispatchKind, DispatchOrder, DispatchStatus
+
+        self._case(self.EEA)
+        DispatchOrder.objects.create(
+            kind=DispatchKind.ASSESSMENT, client=self.member, vendor=self.vendor,
+            status=DispatchStatus.UPLOADED,
+        )
+        DispatchOrder.objects.create(
+            kind=DispatchKind.REMEDIATION, client=self.member, vendor=self.vendor,
+            status=DispatchStatus.CANCELLED,
+        )
+        self.assertEqual(
+            self._housing_track()["housing_overall"]["label"], "Completed",
+        )
+
     # ── food is untouched ───────────────────────────────────────────────────
     def test_a_FOOD_track_carries_no_housing_phases(self):
         """Blank on food, so the frontend picks by domain rather than by which keys
