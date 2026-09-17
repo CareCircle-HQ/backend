@@ -578,3 +578,171 @@ class VendorTeamDetailView(VendorAdminAPIView):
             request.user.vendor_user.email, email,
         )
         return Response({"removed": True, "deactivated": False})
+
+
+# ── scheduling ───────────────────────────────────────────────────────────────
+
+class VendorScheduleView(VendorAPIView):
+    """GET / POST /v1/work/<order_id>/schedule/
+
+    GET returns what the vendor needs to choose a time: the windows the member
+    offered, and the vendor's OWN appointments on each of those days. Those two
+    together are the whole decision, and fetching them separately would let the
+    list disagree with the overlap check.
+
+    POST books it, texts the member and sets the reminders.
+    """
+
+    def _order(self, request, order_id):
+        return (
+            DispatchOrder.objects
+            .filter(pk=order_id, vendor=request.user.vendor)
+            .select_related("client", "vendor")
+            .prefetch_related("availability_windows", "visits")
+            .first()
+        )
+
+    def get(self, request, order_id):
+        from ..services import scheduling
+
+        order = self._order(request, order_id)
+        if order is None:
+            return error("not_found", "No such assignment.", http.HTTP_404_NOT_FOUND)
+
+        windows = list(order.availability_windows.all())
+        # The vendor's existing appointments on each offered day, so the app can
+        # warn before they pick rather than after they submit.
+        dates = sorted({w.date for w in windows})
+        extra = (request.query_params.get("date") or "").strip()
+        if extra:
+            from datetime import date as _date
+
+            try:
+                parsed = _date.fromisoformat(extra)
+                if parsed not in dates:
+                    dates.append(parsed)
+            except ValueError:
+                pass
+
+        busy = {}
+        for day in dates:
+            busy[day.isoformat()] = [
+                {
+                    "order_id": str(v.dispatch_order_id),
+                    "member_name": (
+                        f"{v.dispatch_order.client.first_name} "
+                        f"{v.dispatch_order.client.last_name}"
+                    ).strip(),
+                    "starts_at": v.scheduled_for,
+                    "ends_at": v.scheduled_end,
+                }
+                for v in scheduling.day_appointments(
+                    request.user.vendor, day, exclude_order=order,
+                )
+            ]
+
+        visit = order.visits.first()
+        return Response({
+            "order_id": str(order.dispatch_order_id),
+            "status": order.status,
+            "member_name": (
+                f"{order.client.first_name} {order.client.last_name}"
+            ).strip(),
+            # Stated so the app can label the screen rather than guess. Every time
+            # in this payload is the MEMBER's local time -- they are the one waiting
+            # at home.
+            "timezone": str(timezone.get_default_timezone()),
+            # service_consent so a work order reflects the consent recorded on its
+            # assessment rather than its own always-False flag.
+            "consent_to_text": order.service_consent[1],
+            "availability": [
+                {
+                    "id": w.pk,
+                    "date": w.date,
+                    "start_time": w.start_time,
+                    "end_time": w.end_time,
+                }
+                for w in windows
+            ],
+            "appointments_by_date": busy,
+            "allowed_durations": list(scheduling.ALLOWED_DURATIONS),
+            "default_duration": scheduling.DEFAULT_DURATION,
+            "current": (
+                {
+                    "starts_at": visit.scheduled_for,
+                    "ends_at": visit.scheduled_end,
+                    "confirmed_at": visit.confirmed_at,
+                }
+                if visit and visit.scheduled_for else None
+            ),
+        })
+
+    def post(self, request, order_id):
+        from datetime import date as _date, time as _time
+
+        from ..services import scheduling
+
+        order = self._order(request, order_id)
+        if order is None:
+            return error("not_found", "No such assignment.", http.HTTP_404_NOT_FOUND)
+
+        data = request.data or {}
+        try:
+            date_value = _date.fromisoformat((data.get("date") or "").strip())
+        except ValueError:
+            return error("bad_date", "A valid date is required (YYYY-MM-DD).")
+        raw_time = (data.get("arrival_time") or "").strip()
+        try:
+            # Accept "09:00" and "09:00:00" -- an <input type=time> sends the
+            # former and our own API returns the latter.
+            arrival = _time.fromisoformat(raw_time)
+        except ValueError:
+            return error("bad_time", "A valid arrival time is required (HH:MM).")
+
+        try:
+            duration = int(data.get("duration_minutes") or scheduling.DEFAULT_DURATION)
+        except (TypeError, ValueError):
+            return error("bad_duration", "Session length must be a number of minutes.")
+
+        try:
+            visit, message = scheduling.schedule_visit(
+                order,
+                date_value=date_value,
+                arrival_time=arrival,
+                duration_minutes=duration,
+                vendor_user=request.user.vendor_user,
+                notes=(data.get("notes") or "").strip(),
+            )
+        except scheduling.SchedulingError as exc:
+            return error(exc.code, str(exc))
+
+        order.refresh_from_db()
+        return Response({
+            "order_id": str(order.dispatch_order_id),
+            "status": order.status,
+            "status_label": order.get_status_display(),
+            "visit": {
+                "starts_at": visit.scheduled_for,
+                "ends_at": visit.scheduled_end,
+                "confirmed_at": visit.confirmed_at,
+            },
+            # Whether the member was actually told, and if not, why. The vendor has
+            # to know: a booking the member never heard about is a wasted journey,
+            # and silence here would hide that.
+            "member_notified": message.status not in ("blocked", "failed"),
+            "message": {
+                "status": message.status,
+                "reason": message.error_code,
+                "detail": message.error_detail,
+                "to": message.to_number,
+                "body": message.body,
+            },
+            "reminders": [
+                {
+                    "kind": r.kind, "audience": r.audience, "send_at": r.send_at,
+                }
+                for r in visit.reminders.filter(
+                    cancelled_at__isnull=True, sent_at__isnull=True,
+                ).order_by("send_at")
+            ],
+        }, status=http.HTTP_201_CREATED)

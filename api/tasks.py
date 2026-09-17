@@ -455,3 +455,31 @@ def generate_report_export(self, export_id):
                 os.unlink(tmp.name)
             except OSError:
                 pass
+
+
+@shared_task
+def send_due_reminders():
+    """Fire dispatch-visit reminders that are due.
+
+    Every 5 minutes: a 30-minute reminder sent 20 minutes late is worse than
+    useless, because the vendor is already travelling.
+
+    Each reminder is fired independently so one failure cannot strand the rest of
+    the pass -- the next one may be a visit starting in half an hour.
+    """
+    from api.services import scheduling
+
+    sent = 0
+    failed = 0
+    for reminder in list(scheduling.due_reminders()[:500]):
+        try:
+            scheduling.fire_reminder(reminder)
+            sent += 1
+        except Exception:
+            failed += 1
+            logger.exception(
+                "reminder failed: %s", reminder.reminder_id,
+            )
+    if sent or failed:
+        logger.info("reminders fired: sent=%s failed=%s", sent, failed)
+    return {"sent": sent, "failed": failed}

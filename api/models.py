@@ -5650,10 +5650,28 @@ class DispatchOrder(models.Model):
         number to ring -- which is exactly what the first live vendor-API call
         showed.
         """
-        source = self
-        if self.kind == DispatchKind.REMEDIATION and self.parent_id:
-            source = self.parent
+        source = self._contact_source()
         return source.contact_phone, source.contact_phone_type, source.address_notes
+
+    def _contact_source(self):
+        """The order the member's contact details and consent actually live on."""
+        if self.kind == DispatchKind.REMEDIATION and self.parent_id:
+            return self.parent
+        return self
+
+    @property
+    def service_consent(self):
+        """``(consent_to_call, consent_to_text)`` for messaging about this order.
+
+        INHERITED by a work order for the same reason as the phone number: the
+        wizard records consent once, on the assessment, so a work order's own flags
+        are always False. Without this, every text about an installation was
+        blocked as "no consent" while the member had in fact consented -- which is
+        what the first end-to-end reminder run showed, two messages blocked with the
+        member's consent sitting on the parent order.
+        """
+        source = self._contact_source()
+        return source.consent_to_call, source.consent_to_text
 
 
 class DispatchItem(models.Model):
@@ -5917,6 +5935,162 @@ class DispatchDocument(models.Model):
 
     def __str__(self):
         return self.filename or f"Document {self.content_hash[:12]}"
+
+
+class MessageDirection(models.TextChoices):
+    OUTBOUND = "outbound", "Outbound"
+    INBOUND = "inbound", "Inbound"
+
+
+class MessageStatus(models.TextChoices):
+    # Outbound lifecycle. QUEUED means stored but not yet handed to a provider,
+    # which is every message until Twilio is wired up.
+    QUEUED = "queued", "Queued"
+    SENT = "sent", "Sent"
+    DELIVERED = "delivered", "Delivered"
+    FAILED = "failed", "Failed"
+    # Never handed to a provider at all, and why. Kept as a real status rather
+    # than a silent no-op: "we did not text the member" is something an agent has
+    # to be able to SEE, not infer from an absence.
+    BLOCKED = "blocked", "Blocked"
+    # Inbound.
+    RECEIVED = "received", "Received"
+
+
+class MessageKind(models.TextChoices):
+    APPOINTMENT_SCHEDULED = "appointment_scheduled", "Appointment scheduled"
+    APPOINTMENT_REMINDER = "appointment_reminder", "Appointment reminder"
+    APPOINTMENT_CHANGED = "appointment_changed", "Appointment changed"
+    FREEFORM = "freeform", "Free text"
+    INBOUND_REPLY = "inbound_reply", "Inbound reply"
+
+
+class MemberMessage(models.Model):
+    """Every SMS to or from a member. One row per message, both directions.
+
+    Stored BEFORE any provider is called, and stored even when we decline to send,
+    because the requirement is a complete record of communication with the member
+    -- and a log that only contains successes cannot answer "did anyone tell her?".
+
+    Twilio is not wired up yet (see ``api/services/messaging.py``). Until it is,
+    outbound rows are created with status QUEUED and no provider id, which is
+    exactly what they will look like in the instant before a real send anyway.
+    """
+
+    message_id = models.UUIDField(
+        primary_key=True, default=uuid.uuid4, editable=False
+    )
+    # Nullable: an inbound text can arrive from a number we cannot match to a
+    # member, and dropping it would lose the one thing that might identify them.
+    client = models.ForeignKey(
+        Client, on_delete=models.CASCADE, related_name="messages",
+        null=True, blank=True,
+    )
+    direction = models.CharField(max_length=10, choices=MessageDirection.choices)
+    kind = models.CharField(
+        max_length=32, choices=MessageKind.choices, default=MessageKind.FREEFORM,
+    )
+    status = models.CharField(
+        max_length=12, choices=MessageStatus.choices,
+        default=MessageStatus.QUEUED, db_index=True,
+    )
+
+    to_number = models.CharField(max_length=32, blank=True)
+    from_number = models.CharField(max_length=32, blank=True)
+    body = models.TextField()
+
+    # What this message was ABOUT, so a member's log reads as a story rather than a
+    # pile of texts.
+    dispatch_order = models.ForeignKey(
+        "DispatchOrder", on_delete=models.SET_NULL, related_name="messages",
+        null=True, blank=True,
+    )
+
+    provider = models.CharField(max_length=20, blank=True)
+    provider_message_id = models.CharField(max_length=64, blank=True, db_index=True)
+    error_code = models.CharField(max_length=40, blank=True)
+    error_detail = models.TextField(blank=True)
+
+    # Who caused it. Both null = the system did it (a reminder). SET_NULL on both,
+    # because a message is history and must outlive the account that sent it.
+    sent_by_vendor_user = models.ForeignKey(
+        "VendorUser", on_delete=models.SET_NULL, related_name="messages_sent",
+        null=True, blank=True,
+    )
+    sent_by_agent = models.ForeignKey(
+        "Agent", on_delete=models.SET_NULL, related_name="member_messages_sent",
+        null=True, blank=True,
+    )
+
+    sent_at = models.DateTimeField(null=True, blank=True)
+    delivered_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["client", "-created_at"]),
+            models.Index(fields=["direction", "status"]),
+        ]
+
+    def __str__(self):
+        who = self.client_id or self.from_number or "unknown"
+        return f"{self.direction} {self.kind} {who}"
+
+
+class ReminderKind(models.TextChoices):
+    DAY_BEFORE = "day_before", "Day before"
+    THIRTY_MIN = "thirty_min", "30 minutes before"
+
+
+class ReminderAudience(models.TextChoices):
+    VENDOR = "vendor", "Vendor"
+    MEMBER = "member", "Member"
+
+
+class DispatchReminder(models.Model):
+    """A reminder to fire for a scheduled visit.
+
+    Rows in a table rather than a per-vendor calendar integration: the requirement
+    is "remind them the day before and 30 minutes before", and a row with a
+    ``send_at`` is something we can inspect, re-run and prove. A Google/Outlook
+    calendar would move that state somewhere we cannot query when a vendor says
+    they were never told.
+
+    ``calendar_event_ref`` on DispatchVisit stays available for a real calendar
+    integration later; these reminders do not depend on it.
+    """
+
+    reminder_id = models.UUIDField(
+        primary_key=True, default=uuid.uuid4, editable=False
+    )
+    visit = models.ForeignKey(
+        DispatchVisit, on_delete=models.CASCADE, related_name="reminders",
+    )
+    kind = models.CharField(max_length=16, choices=ReminderKind.choices)
+    audience = models.CharField(
+        max_length=10, choices=ReminderAudience.choices,
+        default=ReminderAudience.VENDOR,
+    )
+    send_at = models.DateTimeField(db_index=True)
+    sent_at = models.DateTimeField(null=True, blank=True)
+    # A reschedule cancels the unsent reminders for the old time rather than
+    # editing them, so the record shows that a reminder for the old slot existed
+    # and was stood down.
+    cancelled_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["send_at"]
+        indexes = [models.Index(fields=["send_at", "sent_at"])]
+
+    def __str__(self):
+        return f"{self.audience} {self.kind} at {self.send_at:%Y-%m-%d %H:%M}"
+
+    @property
+    def is_pending(self):
+        return self.sent_at is None and self.cancelled_at is None
 
 
 class DispatchQuestionnaireState(models.TextChoices):

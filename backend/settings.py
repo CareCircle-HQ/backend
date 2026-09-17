@@ -475,6 +475,14 @@ CELERY_BEAT_SCHEDULE = {
         "task": "api.tasks.poll_uniteus_exports",
         "schedule": float(os.getenv("UNITEUS_EXPORT_POLL_SECONDS", "300")),
     },
+    # Dispatch-visit reminders: the day before, and 30 minutes before. Every 5
+    # minutes because a 30-minute reminder delivered 20 minutes late is worse than
+    # useless -- the vendor is already on the road. The task no-ops when nothing is
+    # due, so the frequency costs one indexed query.
+    "send-due-reminders": {
+        "task": "api.tasks.send_due_reminders",
+        "schedule": float(os.getenv("DISPATCH_REMINDER_SECONDS", "300")),
+    },
     # Daily safety-net sweep so time-based warnings (e.g. an insurance or
     # authorization that lapses with the passing of a day) re-evaluate even when
     # no write re-triggers them. Runs at 11:00 America/New_York.

@@ -30260,3 +30260,459 @@ class VendorTeamTest(TestCase):
         self.assertTrue(check_password(
             "reset-by-admin-1", VendorUser.objects.get(pk=self.staff.pk).password,
         ))
+
+
+@override_settings(VENDOR_API_HOST=VENDOR_HOST, ALLOWED_HOSTS=["*"])
+class VendorSchedulingTest(TestCase):
+    """Booking a visit: overlap, timezone, the member's text and the reminders."""
+
+    def setUp(self):
+        from django.contrib.auth.hashers import make_password
+
+        from .models import (
+            Client, DispatchAvailabilityWindow, DispatchKind, DispatchOrder,
+            DispatchStatus, Vendor, VendorUser,
+        )
+
+        self.vendor = Vendor.objects.create(name="X-Man Home Repair")
+        self.user = VendorUser.objects.create(
+            vendor=self.vendor, email="a@xman.test", name="Ada",
+            password=make_password("pw-xman-1234"),
+        )
+        self.member = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="miriam", last_name="Israel",
+            client_added_at=timezone.now(),
+        )
+        self.order = DispatchOrder.objects.create(
+            kind=DispatchKind.ASSESSMENT, client=self.member, vendor=self.vendor,
+            status=DispatchStatus.PENDING_SCHEDULE, referral_type="combined",
+            contact_phone="(305) 781-3277", contact_phone_type="mobile",
+            consent_to_text=True, consent_to_call=True,
+            address_formatted="1 Test St, Brooklyn NY",
+        )
+        # Three offered windows, starting comfortably in the future so the tests do
+        # not depend on the hour they run at.
+        self.day = timezone.localdate() + timezone.timedelta(days=10)
+        for offset in range(3):
+            DispatchAvailabilityWindow.objects.create(
+                dispatch_order=self.order,
+                date=self.day + timezone.timedelta(days=offset),
+                start_time="09:00", end_time="12:00",
+            )
+
+    def _api(self):
+        resp = APIClient().post(
+            "/v1/auth/login/", {"email": "a@xman.test", "password": "pw-xman-1234"},
+            format="json", HTTP_HOST=VENDOR_HOST,
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        api = APIClient()
+        api.credentials(HTTP_AUTHORIZATION=f"Bearer {resp.data['access_token']}")
+        return api
+
+    def _book(self, *, date_value=None, arrival="09:00", duration=60, api=None):
+        return (api or self._api()).post(
+            f"/v1/work/{self.order.pk}/schedule/",
+            {
+                "date": (date_value or self.day).isoformat(),
+                "arrival_time": arrival,
+                "duration_minutes": duration,
+            },
+            format="json", HTTP_HOST=VENDOR_HOST,
+        )
+
+    # ── the choosing screen ──────────────────────────────────────────────────
+    def test_the_GET_returns_the_offered_windows_and_the_vendors_own_day(self):
+        resp = self._api().get(
+            f"/v1/work/{self.order.pk}/schedule/", HTTP_HOST=VENDOR_HOST,
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        self.assertEqual(len(resp.data["availability"]), 3)
+        self.assertEqual(resp.data["timezone"], "America/New_York")
+        self.assertTrue(resp.data["consent_to_text"])
+        # A key per offered day, so the app can warn BEFORE the vendor picks.
+        self.assertEqual(len(resp.data["appointments_by_date"]), 3)
+
+    def test_the_GET_is_404_for_another_vendors_order(self):
+        from .models import Client, DispatchKind, DispatchOrder, Vendor
+
+        other = DispatchOrder.objects.create(
+            kind=DispatchKind.ASSESSMENT,
+            client=Client.objects.create(
+                client_id=str(uuid.uuid4()), first_name="X", last_name="Y",
+                client_added_at=timezone.now(),
+            ),
+            vendor=Vendor.objects.create(name="Rival"),
+        )
+        resp = self._api().get(
+            f"/v1/work/{other.pk}/schedule/", HTTP_HOST=VENDOR_HOST,
+        )
+        self.assertEqual(resp.status_code, 404)
+
+    # ── booking ─────────────────────────────────────────────────────────────
+    def test_booking_confirms_the_order_and_stores_the_local_time(self):
+        """The vendor picks 9am meaning nine o'clock at the member's door, so the
+        stored instant must be 9am EASTERN, not 9am UTC."""
+        from .models import DispatchStatus
+
+        resp = self._book()
+        self.assertEqual(resp.status_code, 201, resp.content)
+        self.assertEqual(resp.data["status"], DispatchStatus.CONFIRMED)
+
+        self.order.refresh_from_db()
+        visit = self.order.visits.get()
+        local = timezone.localtime(visit.scheduled_for)
+        self.assertEqual(local.hour, 9)
+        self.assertEqual(local.minute, 0)
+        self.assertEqual(local.date(), self.day)
+        # 60 minutes, which is what the member is told to expect.
+        self.assertEqual(
+            (visit.scheduled_end - visit.scheduled_for).total_seconds() / 60, 60,
+        )
+
+    def test_an_OVERLAPPING_time_is_refused_with_the_designs_wording(self):
+        from .models import Client, DispatchKind, DispatchOrder, DispatchVisit
+
+        # An existing 9:00-10:00 for this vendor, another member.
+        other = DispatchOrder.objects.create(
+            kind=DispatchKind.REMEDIATION, vendor=self.vendor,
+            client=Client.objects.create(
+                client_id=str(uuid.uuid4()), first_name="Other", last_name="Member",
+                client_added_at=timezone.now(),
+            ),
+        )
+        from .services.scheduling import combine_local
+        from datetime import time
+
+        start = combine_local(self.day, time(9, 0))
+        DispatchVisit.objects.create(
+            dispatch_order=other, scheduled_for=start,
+            scheduled_end=start + timezone.timedelta(minutes=60),
+        )
+
+        resp = self._book(arrival="09:30")
+        self.assertEqual(resp.status_code, 400)
+        self.assertEqual(resp.data["error"], "overlap")
+        self.assertIn("overlaps one of your existing appointments", resp.data["detail"])
+
+    def test_a_TOUCHING_appointment_is_allowed(self):
+        """A visit ending at 10:00 does not clash with one starting at 10:00 --
+        treating that as a conflict would block the back-to-back bookings that make
+        a day's route workable."""
+        from datetime import time
+
+        from .models import Client, DispatchKind, DispatchOrder, DispatchVisit
+        from .services.scheduling import combine_local
+
+        other = DispatchOrder.objects.create(
+            kind=DispatchKind.REMEDIATION, vendor=self.vendor,
+            client=Client.objects.create(
+                client_id=str(uuid.uuid4()), first_name="Back", last_name="ToBack",
+                client_added_at=timezone.now(),
+            ),
+        )
+        start = combine_local(self.day, time(9, 0))
+        DispatchVisit.objects.create(
+            dispatch_order=other, scheduled_for=start,
+            scheduled_end=start + timezone.timedelta(minutes=60),
+        )
+        self.assertEqual(self._book(arrival="10:00").status_code, 201)
+
+    def test_ANOTHER_vendors_appointment_does_not_block_this_one(self):
+        from datetime import time
+
+        from .models import Client, DispatchKind, DispatchOrder, DispatchVisit, Vendor
+        from .services.scheduling import combine_local
+
+        rival_order = DispatchOrder.objects.create(
+            kind=DispatchKind.REMEDIATION,
+            vendor=Vendor.objects.create(name="Rival Co"),
+            client=Client.objects.create(
+                client_id=str(uuid.uuid4()), first_name="R", last_name="M",
+                client_added_at=timezone.now(),
+            ),
+        )
+        start = combine_local(self.day, time(9, 0))
+        DispatchVisit.objects.create(
+            dispatch_order=rival_order, scheduled_for=start,
+            scheduled_end=start + timezone.timedelta(minutes=60),
+        )
+        self.assertEqual(self._book(arrival="09:00").status_code, 201)
+
+    def test_a_time_in_the_past_is_refused(self):
+        past = timezone.localdate() - timezone.timedelta(days=1)
+        resp = self._book(date_value=past)
+        self.assertEqual(resp.status_code, 400)
+        self.assertEqual(resp.data["error"], "in_the_past")
+
+    def test_an_unsupported_session_length_is_refused(self):
+        resp = self._book(duration=37)
+        self.assertEqual(resp.status_code, 400)
+        self.assertEqual(resp.data["error"], "bad_duration")
+
+    def test_a_RESCHEDULE_updates_the_same_visit_rather_than_adding_one(self):
+        """A second row would make "when is this appointment?" ambiguous."""
+        self.assertEqual(self._book(arrival="09:00").status_code, 201)
+        self.assertEqual(self._book(arrival="11:00").status_code, 201)
+        self.assertEqual(self.order.visits.count(), 1)
+        local = timezone.localtime(self.order.visits.get().scheduled_for)
+        self.assertEqual(local.hour, 11)
+
+    def test_a_reschedule_does_not_clash_with_ITSELF(self):
+        """The order's own existing visit must be excluded from the overlap check,
+        or moving an appointment by 15 minutes would be impossible."""
+        self._book(arrival="09:00")
+        resp = self._book(arrival="09:15")
+        self.assertEqual(resp.status_code, 201, resp.content)
+
+    # ── the member's text ───────────────────────────────────────────────────
+    def test_booking_STORES_the_members_sms(self):
+        from .models import MemberMessage, MessageDirection, MessageKind
+
+        resp = self._book()
+        self.assertTrue(resp.data["member_notified"])
+
+        msg = MemberMessage.objects.get()
+        self.assertEqual(msg.direction, MessageDirection.OUTBOUND)
+        self.assertEqual(msg.kind, MessageKind.APPOINTMENT_SCHEDULED)
+        # QUEUED, not "sent": no provider exists yet, and claiming a text went out
+        # would make the log lie.
+        self.assertEqual(msg.status, "queued")
+        self.assertEqual(msg.to_number, "(305) 781-3277")
+        self.assertEqual(msg.dispatch_order_id, self.order.pk)
+        self.assertEqual(msg.sent_by_vendor_user_id, self.user.pk)
+        # Named properly, and in the member's own timezone.
+        self.assertIn("Miriam", msg.body)
+        self.assertIn("X-Man Home Repair", msg.body)
+        self.assertIn("ET", msg.body)
+
+    def test_NO_TEXT_CONSENT_blocks_the_sms_but_NOT_the_booking(self):
+        """The appointment matters more than the text. A blocked row records that
+        the member was not told, which the vendor is shown."""
+        from .models import MemberMessage
+
+        self.order.consent_to_text = False
+        self.order.save(update_fields=["consent_to_text"])
+
+        resp = self._book()
+        self.assertEqual(resp.status_code, 201)
+        self.assertFalse(resp.data["member_notified"])
+        self.assertEqual(resp.data["message"]["reason"], "no_text_consent")
+
+        msg = MemberMessage.objects.get()
+        self.assertEqual(msg.status, "blocked")
+        self.assertEqual(msg.error_code, "no_text_consent")
+
+    def test_a_WORK_ORDER_inherits_the_members_text_consent(self):
+        """Found by the first end-to-end reminder run: every text about an
+        installation was blocked as "no consent" while the member had consented --
+        the wizard records consent ONCE, on the assessment, so a work order's own
+        flag is always False. Same bug class as the phone number."""
+        from .models import DispatchKind, DispatchOrder, MemberMessage
+
+        child = DispatchOrder.objects.create(
+            kind=DispatchKind.REMEDIATION, client=self.member, vendor=self.vendor,
+            parent=self.order,
+        )
+        self.assertFalse(child.consent_to_text)          # its own flag
+        self.assertTrue(child.service_consent[1])        # inherited
+
+        resp = self._api().post(
+            f"/v1/work/{child.pk}/schedule/",
+            {
+                "date": self.day.isoformat(),
+                "arrival_time": "14:00", "duration_minutes": 60,
+            },
+            format="json", HTTP_HOST=VENDOR_HOST,
+        )
+        self.assertEqual(resp.status_code, 201, resp.content)
+        self.assertTrue(
+            resp.data["member_notified"],
+            "a work order must inherit consent from its assessment",
+        )
+        self.assertEqual(
+            MemberMessage.objects.filter(dispatch_order=child).get().status,
+            "queued",
+        )
+
+    def test_no_phone_number_blocks_the_sms_but_NOT_the_booking(self):
+        from .models import MemberMessage
+
+        self.order.contact_phone = ""
+        self.order.save(update_fields=["contact_phone"])
+        resp = self._book()
+        self.assertEqual(resp.status_code, 201)
+        self.assertEqual(MemberMessage.objects.get().error_code, "no_phone_number")
+
+    def test_a_RESCHEDULE_sends_the_CHANGED_wording(self):
+        from .models import MemberMessage, MessageKind
+
+        self._book(arrival="09:00")
+        self._book(arrival="11:00")
+        kinds = list(MemberMessage.objects.order_by("created_at").values_list(
+            "kind", flat=True,
+        ))
+        self.assertEqual(kinds, [
+            MessageKind.APPOINTMENT_SCHEDULED, MessageKind.APPOINTMENT_CHANGED,
+        ])
+
+    # ── reminders ───────────────────────────────────────────────────────────
+    def test_booking_creates_the_day_before_and_30_minute_reminders(self):
+        from .models import DispatchReminder, ReminderAudience, ReminderKind
+
+        resp = self._book()
+        self.assertEqual(len(resp.data["reminders"]), 3)
+
+        rems = DispatchReminder.objects.filter(visit__dispatch_order=self.order)
+        vendor_kinds = set(
+            rems.filter(audience=ReminderAudience.VENDOR)
+            .values_list("kind", flat=True)
+        )
+        self.assertEqual(
+            vendor_kinds, {ReminderKind.DAY_BEFORE, ReminderKind.THIRTY_MIN},
+        )
+        # The member gets a day-before nudge too.
+        self.assertTrue(
+            rems.filter(
+                audience=ReminderAudience.MEMBER, kind=ReminderKind.DAY_BEFORE,
+            ).exists()
+        )
+
+    def test_the_reminder_times_are_relative_to_the_visit(self):
+        from .models import DispatchReminder, ReminderAudience, ReminderKind
+
+        self._book()
+        visit = self.order.visits.get()
+        day_before = DispatchReminder.objects.get(
+            visit=visit, kind=ReminderKind.DAY_BEFORE,
+            audience=ReminderAudience.VENDOR,
+        )
+        thirty = DispatchReminder.objects.get(
+            visit=visit, kind=ReminderKind.THIRTY_MIN,
+        )
+        self.assertEqual(
+            (visit.scheduled_for - day_before.send_at).total_seconds(), 86400,
+        )
+        self.assertEqual(
+            (visit.scheduled_for - thirty.send_at).total_seconds(), 1800,
+        )
+
+    def test_a_reschedule_CANCELS_the_old_reminders_rather_than_duplicating(self):
+        from .models import DispatchReminder
+
+        self._book(arrival="09:00")
+        self._book(arrival="11:00")
+        rems = DispatchReminder.objects.filter(visit__dispatch_order=self.order)
+        self.assertEqual(rems.filter(cancelled_at__isnull=True).count(), 3)
+        # Cancelled, not deleted: the record shows a reminder for the old slot
+        # existed and was stood down.
+        self.assertEqual(rems.filter(cancelled_at__isnull=False).count(), 3)
+
+    def test_a_reminder_whose_time_has_PASSED_is_not_created(self):
+        """Booking something for this afternoon must not fire a "day before" notice
+        immediately -- that is noise that teaches people to ignore reminders."""
+        from datetime import time
+
+        from .models import DispatchAvailabilityWindow, DispatchReminder, ReminderKind
+
+        soon = timezone.localtime(timezone.now() + timezone.timedelta(hours=2))
+        DispatchAvailabilityWindow.objects.create(
+            dispatch_order=self.order, date=soon.date(),
+            start_time="00:00", end_time="23:59",
+        )
+        resp = self._book(
+            date_value=soon.date(), arrival=soon.strftime("%H:%M"),
+        )
+        self.assertEqual(resp.status_code, 201, resp.content)
+        kinds = set(
+            DispatchReminder.objects
+            .filter(visit__dispatch_order=self.order, cancelled_at__isnull=True)
+            .values_list("kind", flat=True)
+        )
+        self.assertNotIn(ReminderKind.DAY_BEFORE, kinds)
+        self.assertIn(ReminderKind.THIRTY_MIN, kinds)
+
+    def test_firing_a_MEMBER_reminder_stores_another_sms(self):
+        from .models import (
+            DispatchReminder, MemberMessage, MessageKind, ReminderAudience,
+        )
+        from .services import scheduling
+
+        self._book()
+        reminder = DispatchReminder.objects.get(
+            visit__dispatch_order=self.order, audience=ReminderAudience.MEMBER,
+        )
+        scheduling.fire_reminder(reminder)
+
+        reminder.refresh_from_db()
+        self.assertIsNotNone(reminder.sent_at)
+        self.assertTrue(
+            MemberMessage.objects.filter(
+                kind=MessageKind.APPOINTMENT_REMINDER,
+            ).exists()
+        )
+
+    def test_due_reminders_excludes_sent_and_cancelled_ones(self):
+        from .models import DispatchReminder
+        from .services import scheduling
+
+        self._book()
+        # Nothing is due yet -- the visit is ten days out.
+        self.assertEqual(scheduling.due_reminders().count(), 0)
+
+        DispatchReminder.objects.filter(
+            visit__dispatch_order=self.order,
+        ).update(send_at=timezone.now() - timezone.timedelta(minutes=1))
+        self.assertEqual(scheduling.due_reminders().count(), 3)
+
+        DispatchReminder.objects.filter(
+            visit__dispatch_order=self.order,
+        ).update(cancelled_at=timezone.now())
+        self.assertEqual(scheduling.due_reminders().count(), 0)
+
+
+class MemberMessageLogTest(TestCase):
+    """The message log itself, independent of scheduling."""
+
+    def setUp(self):
+        from .models import Client
+
+        self.member = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Ann", last_name="Reply",
+            client_phone_number="(347) 555-0199", client_added_at=timezone.now(),
+        )
+
+    def test_an_inbound_text_is_matched_to_a_member_by_number(self):
+        from .models import MessageDirection
+        from .services import messaging
+
+        msg = messaging.record_inbound("+13475550199", "Yes that works")
+        # str() on both sides: the FK reads back as a UUID while the fixture set the
+        # pk from a string.
+        self.assertEqual(str(msg.client_id), str(self.member.pk))
+        self.assertEqual(msg.direction, MessageDirection.INBOUND)
+        self.assertEqual(msg.status, "received")
+
+    def test_an_UNMATCHED_inbound_text_is_still_stored(self):
+        """An unmatched reply is the only evidence someone tried to reach us.
+        Discarding it is the one unrecoverable option."""
+        from .services import messaging
+
+        msg = messaging.record_inbound("+15550000000", "who is this")
+        self.assertIsNone(msg.client_id)
+        self.assertEqual(msg.body, "who is this")
+
+    def test_the_whole_conversation_reads_in_order(self):
+        from .services import messaging
+
+        messaging.send_to_member(
+            self.member, "First", to_number="(347) 555-0199",
+            require_consent=False,
+        )
+        messaging.record_inbound("+13475550199", "Reply")
+        log = list(
+            self.member.messages.order_by("created_at").values_list(
+                "direction", "body",
+            )
+        )
+        self.assertEqual(log, [("outbound", "First"), ("inbound", "Reply")])
