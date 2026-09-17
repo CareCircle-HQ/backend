@@ -197,6 +197,7 @@ from .views_dispatch import (
     MemberAssessmentOrderCreateView,
     MemberAssessmentOrderUpdateView,
     MemberWorkOrderCreateView,
+    MemberDispatchHistoryView,
     MemberDispatchOrdersView,
 )
 from .views_settings import (
@@ -294,6 +295,10 @@ urlpatterns = [
         "members/<uuid:client_id>/assessment-order/",
         MemberAssessmentOrderCreateView.as_view(),
         name="portal-member-assessment-order",
+    ),
+    path(
+        "members/<uuid:client_id>/dispatch-history/",
+        MemberDispatchHistoryView.as_view(), name="portal-member-dispatch-history",
     ),
     path(
         "members/<uuid:client_id>/work-orders/",

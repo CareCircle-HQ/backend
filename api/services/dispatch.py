@@ -42,11 +42,19 @@ MIN_AVAILABILITY_DATES = 3
 
 
 def record_transition(order, from_status, to_status, *, actor=None, source=None,
-                      note="", metadata=None):
+                      note="", metadata=None, agent=None):
     """Append the transition to StageEvent -- the same log the food stages use.
 
     Deliberately the shared log rather than a dispatch-only table, so "everything
     that happened to this member" stays one query.
+
+    ``agent`` is written into the metadata as a NAME and CODE. That is not
+    redundant with ``actor``: StageEvent.actor is a FK to the auth User, portal
+    callers only ever have the DRF AgentUser principal, and stage_event_actor
+    coerces it to None -- so without this the History tab would show every
+    agent-driven change as having no user. Storing the name rather than only an id
+    also means the history still reads correctly if an agent record is later
+    renamed or deactivated.
     """
     # StageEvent.actor is a FK to the Django auth User, but portal callers hand us
     # the DRF AgentUser principal or an Agent row. Assigning either raises
@@ -54,6 +62,15 @@ def record_transition(order, from_status, to_status, *, actor=None, source=None,
     # change (and, via reconcile, the whole case upsert)". Coerce HERE rather than
     # at each call site, so no future caller can reintroduce it.
     from api.services.lifecycle import stage_event_actor
+
+    meta = dict(metadata or {})
+    if agent is not None:
+        meta.setdefault("agent_name", getattr(agent, "name", "") or "")
+        # agent_code is NULLABLE in real data -- "Alexis Tamayo" has none -- so the
+        # id is stored as well. The name is what gets displayed; the id is what
+        # still identifies the actor if a name is later changed.
+        meta.setdefault("agent_code", getattr(agent, "agent_code", "") or "")
+        meta.setdefault("agent_id", str(getattr(agent, "pk", "") or ""))
 
     return StageEvent.objects.create(
         entity_type=StageEntityType.DISPATCH_ORDER,
@@ -64,11 +81,12 @@ def record_transition(order, from_status, to_status, *, actor=None, source=None,
         source=source or StageEventSource.MANUAL,
         actor=stage_event_actor(actor),
         note=note,
-        metadata=metadata or {},
+        metadata=meta,
     )
 
 
-def set_status(order, to_status, *, actor=None, source=None, note="", metadata=None):
+def set_status(order, to_status, *, actor=None, source=None, note="", metadata=None,
+               agent=None):
     """Move an order and record it. No-op when already there."""
     from_status = order.status
     if from_status == to_status:
@@ -77,7 +95,7 @@ def set_status(order, to_status, *, actor=None, source=None, note="", metadata=N
     order.save(update_fields=["status", "updated_at"])
     return record_transition(
         order, from_status, to_status,
-        actor=actor, source=source, note=note, metadata=metadata,
+        actor=actor, source=source, note=note, metadata=metadata, agent=agent,
     )
 
 
@@ -278,7 +296,8 @@ def adopt_unlinked_remediation_cases(assessment):
 
 
 @transaction.atomic
-def create_work_order(assessment, item_ids, *, vendor=None, actor=None, notes=""):
+def create_work_order(assessment, item_ids, *, vendor=None, actor=None, notes="",
+                      agent=None):
     """Assemble a work order from approved, undispatched items.
 
     Raises ValueError naming the offending items rather than silently dropping
@@ -339,7 +358,7 @@ def create_work_order(assessment, item_ids, *, vendor=None, actor=None, notes=""
 
     record_transition(
         order, "", order.status,
-        actor=actor, source=StageEventSource.MANUAL,
+        actor=actor, source=StageEventSource.MANUAL, agent=agent,
         note=f"work order created with {len(items)} item(s)",
         metadata={
             "items": [i.item for i in items],

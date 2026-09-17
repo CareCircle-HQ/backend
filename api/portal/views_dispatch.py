@@ -19,7 +19,8 @@ from rest_framework.response import Response
 
 from ..models import (
     Client, DispatchAvailabilityWindow, DispatchKind, DispatchOrder,
-    DispatchReferralType, DispatchStatus, StageEventSource, Vendor,
+    DispatchReferralType, DispatchStatus, StageEntityType, StageEvent,
+    StageEventSource, Vendor,
 )
 from ..services import dispatch as dispatch_svc
 from .base import PortalAPIView, current_agent
@@ -358,16 +359,9 @@ class MemberAssessmentOrderCreateView(PortalAPIView):
         dispatch_svc.record_transition(
             order, "", order.status,
             actor=getattr(request, "user", None), source=StageEventSource.MANUAL,
-            note=(
-                f"assessment order created by {agent.name}" if agent
-                else "assessment order created"
-            ),
-            metadata={
-                "case_id": str(governing.case_id),
-                # The FK cannot hold an AgentUser, so the acting agent is preserved
-                # here and in the note -- the pattern stage_event_actor documents.
-                "agent_code": getattr(agent, "agent_code", ""),
-            },
+            agent=agent,
+            note="assessment order created",
+            metadata={"case_id": str(governing.case_id)},
         )
 
         # Home Remediation cases that arrived BEFORE this order have been waiting
@@ -506,13 +500,9 @@ class MemberAssessmentOrderUpdateView(PortalAPIView):
             order, order.status, order.status,
             actor=getattr(request, "user", None),
             source=StageEventSource.MANUAL,
-            note=(
-                f"order edited by {agent.name}" if agent else "order edited"
-            ),
-            metadata={
-                "changed": sorted(changed),
-                "agent_code": getattr(agent, "agent_code", ""),
-            },
+            agent=agent,
+            note="order edited",
+            metadata={"changed": sorted(changed)},
         )
         return Response(_serialize_order(order))
 
@@ -556,6 +546,7 @@ class MemberWorkOrderCreateView(PortalAPIView):
             order = dispatch_svc.create_work_order(
                 assessment, item_ids, vendor=vendor,
                 actor=getattr(request, "user", None),
+                agent=current_agent(request),
                 notes=(data.get("notes") or "").strip(),
             )
         except ValueError as exc:
@@ -564,3 +555,100 @@ class MemberWorkOrderCreateView(PortalAPIView):
             return Response({"detail": str(exc)}, status=http.HTTP_400_BAD_REQUEST)
 
         return Response(_serialize_order(order), status=http.HTTP_201_CREATED)
+
+
+class MemberDispatchHistoryView(PortalAPIView):
+    """GET: every recorded change to this member's housing dispatch.
+
+    Reads the SHARED StageEvent log, filtered to the member's dispatch orders --
+    the same table the food stages use, which is why extending it rather than
+    building a dispatch-only log mattered.
+
+    Covers the assessment order AND its work orders in one list, because "what
+    happened to this member's housing" is one question, and answering it from two
+    places invites the two disagreeing.
+    """
+
+    def get(self, request, client_id):
+        client = get_object_or_404(Client, pk=client_id)
+        events = (
+            StageEvent.objects
+            .filter(
+                entity_type=StageEntityType.DISPATCH_ORDER,
+                dispatch_order__client=client,
+            )
+            .select_related("actor", "dispatch_order")
+            .order_by("-entered_at")[:200]
+        )
+
+        # Rows written before record_transition stored agent_name carry only the
+        # CODE. Resolve those in one query rather than leaving a dash where a name
+        # belongs -- the history is the audit trail, and "-" reads as "nobody",
+        # which is worse than slightly stale.
+        # Rows written before record_transition stored agent_name carry only an id
+        # or a code. Resolved in one query rather than leaving a dash where a name
+        # belongs -- the history is the audit trail, and "-" reads as "nobody".
+        #
+        # BOTH keys are tried because agent_code is nullable in real data: the agent
+        # who created MIRIAM's order has no code at all.
+        needs = [e for e in events if not (e.metadata or {}).get("agent_name")]
+        ids = {(e.metadata or {}).get("agent_id") for e in needs}
+        codes = {(e.metadata or {}).get("agent_code") for e in needs}
+        ids.discard(None); ids.discard(""); codes.discard(None); codes.discard("")
+        names_by_id, names_by_code = {}, {}
+        if ids or codes:
+            from ..models import Agent
+
+            if ids:
+                names_by_id = {
+                    str(pk): name
+                    for pk, name in Agent.objects.filter(pk__in=ids)
+                    .values_list("pk", "name")
+                }
+            if codes:
+                names_by_code = dict(
+                    Agent.objects.filter(agent_code__in=codes)
+                    .values_list("agent_code", "name")
+                )
+
+        out = []
+        for e in events:
+            order = e.dispatch_order
+            meta = e.metadata or {}
+            out.append({
+                "id": e.pk,
+                "at": e.entered_at,
+                # AUTO means the system did it (an import, a cascade); MANUAL means
+                # a person. Surfaced so "no user" reads as "not a person's doing"
+                # rather than as missing data.
+                "source": e.source,
+                "from_status": e.from_stage,
+                "to_status": e.to_stage,
+                "note": e.note,
+                # The acting user. StageEvent.actor cannot hold the portal's
+                # AgentUser principal, so the agent's NAME is read from the
+                # metadata that record_transition writes; a real auth User (a
+                # management command, say) still wins.
+                "user": (
+                    (e.actor.get_full_name() or e.actor.username) if e.actor_id
+                    else (
+                        meta.get("agent_name")
+                        or names_by_id.get(meta.get("agent_id"), "")
+                        or names_by_code.get(meta.get("agent_code"), "")
+                    )
+                ),
+                "agent_code": meta.get("agent_code") or "",
+                "order": {
+                    "id": str(order.dispatch_order_id) if order else None,
+                    "kind": order.kind if order else "",
+                    "kind_label": order.get_kind_display() if order else "",
+                },
+                # Whatever the change carried: the fields edited, the items added,
+                # the case involved. Rendered as-is so a new event type needs no
+                # frontend change to become readable.
+                "detail": {
+                    k: v for k, v in meta.items()
+                    if k not in ("agent_name", "agent_code", "agent_id")
+                },
+            })
+        return Response(out)

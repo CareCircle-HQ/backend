@@ -28844,3 +28844,223 @@ class ItemAuthorizationWindowTest(TestCase):
         )
         with self.assertRaises(ValueError):
             dispatch.create_work_order(assessment, [item.dispatch_item_id])
+
+
+class DispatchHistoryApiTest(TestCase):
+    """The housing History tab: every change, with the user and the date.
+
+    Reads the SHARED StageEvent log rather than a dispatch-only table, which is
+    what makes "everything that happened to this member" one query.
+    """
+
+    HEAR = "Home Remediation - Air Conditioner - Manhattan"
+    EEA = (
+        "Dwelling Assessment & Statement of Work (SOW) Development - "
+        "Modifications and Remediation Service - Manhattan"
+    )
+
+    def setUp(self):
+        from .models import ActiveProgram, Case, CaseStatus, CaseType, Client, Vendor
+        from .services.catalog import clear_program_domain_cache
+
+        for name, stype in (
+            (self.EEA, ActiveProgram.ServiceType.ENVIRONMENTAL_EXPOSURE_ASSESSMENT),
+            (self.HEAR, ActiveProgram.ServiceType.HOME_EXPENSE_ASSISTANCE_REPAIRS),
+        ):
+            ActiveProgram.objects.create(
+                program_name=name, case_category="Internal Services",
+                case_type=ActiveProgram.CaseType.HOUSING, service_type=stype,
+            )
+        clear_program_domain_cache()
+        self.vendor = Vendor.objects.create(name="Acme")
+        self.member = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="H", last_name="ist",
+            client_added_at=timezone.now(),
+        )
+        for program in (self.EEA, self.HEAR):
+            Case.objects.create(
+                case_id=uuid.uuid4(), client=self.member,
+                case_type=CaseType.INTERNAL_SERVICE, case_status=CaseStatus.MANAGED,
+                program_name=program, service_authorization_status="approved",
+                case_created_at=timezone.now(),
+            )
+
+    def _api(self):
+        from rest_framework_simplejwt.tokens import AccessToken
+
+        from .models import Agent
+
+        if not hasattr(self, "_agent"):
+            self._agent = Agent.objects.create(
+                name="Dana Historian", agent_code="887", group="Management",
+            )
+        acc = AccessToken()
+        acc["agent_id"] = str(self._agent.id)
+        acc["agent_code"] = self._agent.agent_code
+        acc["agent_name"] = self._agent.name
+        acc["agent_group"] = self._agent.group
+        api = APIClient(); api.credentials(HTTP_AUTHORIZATION=f"Bearer {acc}")
+        return api
+
+    def _create_order(self):
+        return self._api().post(
+            f"/api/portal/members/{self.member.pk}/assessment-order/",
+            {
+                "contact_phone": "(718) 555-0100",
+                "address_line1": "1 Verified St",
+                "referral_type": "combined",
+                "vendor_id": str(self.vendor.pk),
+                "consent_to_call": True,
+                "ecm_billed_confirmed": True,
+                "availability": [
+                    {"date": "2026-10-01", "start_time": "09:00", "end_time": "12:00"},
+                    {"date": "2026-10-02", "start_time": "09:00", "end_time": "12:00"},
+                    {"date": "2026-10-03", "start_time": "09:00", "end_time": "12:00"},
+                ],
+            },
+            format="json",
+        )
+
+    def _history(self):
+        resp = self._api().get(
+            f"/api/portal/members/{self.member.pk}/dispatch-history/",
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        return resp.data
+
+    def test_creating_the_order_is_recorded_with_the_AGENT_and_the_time(self):
+        """The acting agent is the point. StageEvent.actor cannot hold the portal's
+        AgentUser principal, so without the metadata the History tab would show
+        every agent-driven change as having no user at all."""
+        self.assertEqual(self._create_order().status_code, 201)
+        rows = self._history()
+        created = [r for r in rows if "assessment order created" in r["note"]]
+        self.assertEqual(len(created), 1)
+        self.assertEqual(created[0]["user"], "Dana Historian")
+        self.assertEqual(created[0]["agent_code"], "887")
+        self.assertIsNotNone(created[0]["at"])
+        self.assertEqual(created[0]["source"], "manual")
+
+    def test_an_EDIT_records_which_fields_changed(self):
+        from .models import DispatchOrder
+
+        self._create_order()
+        order = DispatchOrder.objects.get(client=self.member, kind="assessment")
+        self._api().patch(
+            f"/api/portal/members/{self.member.pk}/assessment-order/{order.pk}/",
+            {"contact_phone": "(718) 555-7777", "notes": "gate code"},
+            format="json",
+        )
+        edit = [r for r in self._history() if r["note"] == "order edited"]
+        self.assertEqual(len(edit), 1)
+        self.assertEqual(edit[0]["user"], "Dana Historian")
+        self.assertIn("contact_phone", edit[0]["detail"]["changed"])
+        self.assertIn("notes", edit[0]["detail"]["changed"])
+
+    def test_item_additions_are_recorded_as_SYSTEM_not_as_a_user(self):
+        """An import added it, not a person. "No user" has to read as "not
+        anyone's doing" rather than as missing data, hence source=auto."""
+        self._create_order()
+        items = [r for r in self._history() if "item added" in r["note"]]
+        self.assertTrue(items)
+        self.assertEqual(items[0]["source"], "auto")
+        self.assertEqual(items[0]["user"], "")
+        self.assertEqual(items[0]["detail"]["item"], "Air Conditioner")
+
+    def test_creating_a_WORK_ORDER_is_recorded_against_it(self):
+        """Covers the assessment AND its work orders in one list, because "what
+        happened to this member's housing" is one question."""
+        from .models import DispatchItem
+
+        self._create_order()
+        item = DispatchItem.objects.get(case__client=self.member)
+        resp = self._api().post(
+            f"/api/portal/members/{self.member.pk}/work-orders/",
+            {"item_ids": [str(item.dispatch_item_id)]}, format="json",
+        )
+        self.assertEqual(resp.status_code, 201, resp.content)
+
+        wo = [r for r in self._history() if "work order created" in r["note"]]
+        self.assertEqual(len(wo), 1)
+        self.assertEqual(wo[0]["user"], "Dana Historian")
+        self.assertEqual(wo[0]["order"]["kind"], "remediation")
+        self.assertIn("Air Conditioner", wo[0]["detail"]["items"])
+
+    def test_a_row_with_only_an_agent_CODE_still_shows_the_name(self):
+        """Events written before record_transition stored agent_name carry only the
+        code. A dash where a name belongs reads as "nobody", which in an audit trail
+        is worse than a lookup."""
+        from .models import DispatchOrder
+        from .services import dispatch
+
+        self._create_order()
+        order = DispatchOrder.objects.get(client=self.member, kind="assessment")
+        ev = dispatch.record_transition(
+            order, order.status, order.status,
+            note="legacy row", metadata={"agent_code": "887"},
+        )
+        self.assertNotIn("agent_name", ev.metadata)
+
+        row = [r for r in self._history() if r["note"] == "legacy row"][0]
+        self.assertEqual(row["user"], "Dana Historian")
+
+    def test_an_agent_with_NO_CODE_is_still_resolved_by_id(self):
+        """agent_code is nullable in real data -- the agent who created MIRIAM's
+        order has none -- so the id has to be stored and used as well."""
+        from .models import Agent, DispatchOrder
+        from .services import dispatch
+
+        self._create_order()
+        codeless = Agent.objects.create(
+            name="Nocode Agent", agent_code=None, group="Management",
+        )
+        order = DispatchOrder.objects.get(client=self.member, kind="assessment")
+        dispatch.record_transition(
+            order, order.status, order.status,
+            note="by a codeless agent", metadata={"agent_id": str(codeless.pk)},
+        )
+        row = [r for r in self._history() if r["note"] == "by a codeless agent"][0]
+        self.assertEqual(row["user"], "Nocode Agent")
+
+    def test_the_history_is_NEWEST_FIRST(self):
+        from .models import DispatchOrder
+
+        self._create_order()
+        order = DispatchOrder.objects.get(client=self.member, kind="assessment")
+        self._api().patch(
+            f"/api/portal/members/{self.member.pk}/assessment-order/{order.pk}/",
+            {"notes": "later"}, format="json",
+        )
+        rows = self._history()
+        self.assertEqual(rows[0]["note"], "order edited")
+
+    def test_a_member_with_no_dispatch_has_an_empty_history(self):
+        from .models import Client
+
+        other = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="No", last_name="Housing",
+            client_added_at=timezone.now(),
+        )
+        resp = self._api().get(
+            f"/api/portal/members/{other.pk}/dispatch-history/",
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.data, [])
+
+    def test_the_history_does_not_leak_ANOTHER_members_events(self):
+        from .models import Client, DispatchKind, DispatchOrder
+        from .services import dispatch
+
+        self._create_order()
+        other = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Other", last_name="Member",
+            client_added_at=timezone.now(),
+        )
+        their_order = DispatchOrder.objects.create(
+            kind=DispatchKind.ASSESSMENT, client=other, vendor=self.vendor,
+        )
+        dispatch.record_transition(
+            their_order, "", "pending_schedule", note="someone else's order",
+        )
+        notes = [r["note"] for r in self._history()]
+        self.assertNotIn("someone else's order", notes)
