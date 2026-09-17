@@ -466,15 +466,29 @@ delivery street through a BACKEND proxy (`/places/autocomplete/`,
 `/places/details/`), so `GOOGLE_MAP_KEY` stays server-side. No new dependency and no
 key in the browser; the same two endpoints serve this wizard.
 
-**The address deserves care, because it is the SUBJECT of the assessment.** The
-member's primary address is the sensible default, but a dwelling assessment is
-about a specific property, so the address must be **captured on the order**, not
-read live from the client record. Otherwise a later address edit silently rewrites
-where a completed assessment happened.
+**CONFIRMED — captured on the order, and verified ONCE.**
 
-Worth storing the structured result (`place_id`, formatted address, lat/lng) rather
-than a string: it gives the vendor something to navigate to, and it makes any future
+> "the address must be captured on the order, same address for all orders,
+> remember we only verify the address one time on the dwelling assessment"
+
+So the address is verified once, on the **assessment** order, and every remediation
+order under it uses that same address. Since remediation orders are children
+(`parent` FK), they **inherit** rather than copy: one verified address per
+assessment, and no way for a child to drift from it.
+
+That also settles the risk for free — a later edit to the client's primary address
+cannot rewrite where a completed assessment happened, because the order holds its
+own.
+
+Store the structured result (`place_id`, formatted address, lat/lng) rather than a
+string: it gives the vendor something to navigate to, and makes any future
 service-area check possible without re-geocoding.
+
+⚠️ One thing to decide when building: if the member genuinely **moves**, the
+existing assessment keeps its address (correct — that is where the assessment
+happened), but the new dwelling needs a new assessment. That is the `secondary`
+dwelling label from Q1 doing its job, and the remediation orders under the OLD
+assessment must keep pointing at the OLD address.
 
 ### Step 2 — the dispatch
 
@@ -511,6 +525,41 @@ principal to a `delivery_company`. Serving housing vendors on that surface means
 generalizing the partner principal — worth knowing NOW, while the model is being
 named, rather than discovering it when the portal is built.
 
+#### Vendor users: admin-provisioned, then self-managed
+
+> "vendors will be added by the admin in the crm settings. we will provide one
+> admin user so they can add more users on their side. we can also reset the admin
+> user password."
+
+So the model is **bootstrap-and-delegate**:
+
+```
+CRM Settings  ->  create Vendor (the company)
+              ->  create ONE vendor ADMIN user        <- we provision this
+                        |
+                        v  in the vendor portal (next task)
+                  the vendor admin creates their own staff users
+CRM Settings  ->  reset the vendor admin's password   <- we retain this
+```
+
+This means **vendor users exist as a model in THIS task**, not the next one: CRM
+Settings has to create the company and its admin user, so the user model and the
+password-reset path are part of the structure even though nobody can log in until
+the portal ships.
+
+Three things to settle while building it:
+
+- **Vendor users are not CRM users.** They must not be `Agent`s, and they must not
+  be able to reach CRM endpoints. The `api/partner/` host isolation is the right
+  answer, but the principal needs generalizing (above).
+- **Scoping is the security boundary.** Every vendor query must be filtered to that
+  vendor's own orders. The partner API already establishes this — its principal
+  exists "to carry the company every query must be scoped to" — so follow that
+  exactly rather than relying on filters at each call site.
+- **Password reset needs an audit trail.** "We can reset the admin user password"
+  is a support action on an external account; who did it and when should be
+  recorded, the same as any other privileged action.
+
 #### Availability: the rule is 3 DAYS, not 3 windows
 
 "a minimum of 3 available days with time frame for each" — so validation counts
@@ -526,34 +575,115 @@ And it is explicitly **not** the appointment — the vendor picks from these. So
 order needs both: the member's offered availability (many) and the agreed
 appointment (one, on `DispatchVisit`).
 
-#### Consent: call and text are legally distinct
+#### Consent: VERBAL, recorded, and GDPR-shaped
 
-One checkbox is what you asked for, and it is what the agent should see. But in the
-US, consent to **text** (SMS) and consent to **call** are separately regulated, and
-the evidence you want later is "what did the member agree to, when, and who
-recorded it".
+> "this is a verbal consent to send sms and call as gdpr required"
 
-Storing two booleans plus a timestamp and the capturing agent costs nothing now and
-cannot be reconstructed later. The UI can still be one checkbox that sets both.
+Verbal consent given by the member to the agent, for the vendor to contact them.
+Under GDPR the burden is to **demonstrate** consent, so the record has to answer:
+who consented, to what, when, and on what basis.
 
-This is also **narrower than the Client's existing consent** (`consent_accepted`,
-`consent_status`, `consented_at`), which is consent to the programme. Vendor-contact
-consent is its own fact and belongs on the order.
+```
+consent_to_call / consent_to_text     what they agreed to
+consent_method                        verbal          <- explicit, not implied
+consent_captured_at / _by             when, and which agent heard it
+```
 
-#### "ECM case billed?" — ask the data, not the agent
+Two booleans behind one checkbox, because "SMS and call" are separable and a
+member may later object to one. That distinction cannot be reconstructed later if
+only a single flag is stored.
 
-This is an attestation: the agent ticks a box asserting something about an Enhanced
-Care Management case. But the CRM **already holds those cases** — MIRIAM has
-"Enhanced Care Management - Care Management Level 2 Only - Queens" among hers.
+**GDPR also requires that consent can be WITHDRAWN**, and as easily as it was
+given. Worth deciding now whether withdrawal is a status on this record (append a
+withdrawal rather than flipping the boolean, so the history survives) or handled
+through the Client's existing consent machinery. Recording only the grant leaves
+no place to put a later refusal.
 
-So the better shape is to **show the member's ECM case and its billing state**, and
-have the agent confirm what they can see, rather than recall it. A checkbox alone
-records that someone clicked; a displayed fact plus a confirmation records that
-someone clicked **while looking at the right thing**.
+This is **narrower than the Client's existing consent** (`consent_accepted`,
+`consent_status`, `consented_at`), which is consent to the programme.
+Vendor-contact consent is its own fact and belongs on the order.
 
-Keep the checkbox — it is the human sign-off — but render the evidence beside it.
-Worth confirming whether "billed" is derivable from the case data we hold, or lives
-only in a billing system we cannot see.
+#### "ECM case billed?" — a checkbox for now, DEFERRED
+
+> "we will decide later when we get the case details or the invoice from united us"
+
+So: a plain confirmation checkbox in this task, with the data-driven version
+deferred until the Unite Us case details or invoice show whether "billed" is
+derivable at all.
+
+Worth keeping in view: a checkbox alone records only that someone clicked. If it
+later turns out the CRM can show the member's ECM case and its billing state, the
+agent should be confirming something they can SEE rather than recall. That is a UI
+change on the same field, so nothing here forecloses it.
+
+## VOID and resubmit — the correction path
+
+> "lets let the vendor have the option to void an assessment that they submitted
+> and resubmit the new assessment, but the system should keep the voided copy as
+> well."
+
+This answers the "no correction path" problem directly, and answers it the right
+way: **not by unlocking, but by superseding.** A submitted assessment stays exactly
+as signed; a correction is a NEW submission, and the voided one is kept.
+
+### It makes SUBMISSION the versioned thing
+
+Locking (Q2) says answers cannot change after submission. Void-and-resubmit says a
+correction must be possible. Both hold if the **submission** — not the order — is
+what gets versioned:
+
+```
+DispatchSubmission           many per order, append-only
+    sequence                 1, 2, 3...
+    state                    active | voided
+    submitted_at / submitted_by
+    voided_at / voided_by / void_reason
+    pdf_s3_key / pdf_sha256  the IMMUTABLE snapshot of what was signed
+    signatures               vendor + member, belonging to THIS submission
+```
+
+Exactly one submission is `active` per order. Voiding does not delete or edit
+anything — it marks that submission voided and lets a new one be built. The old
+PDF, its hash and its signatures survive untouched, which is what "keep the voided
+copy" has to mean for a signed record to be worth anything.
+
+### What the PDF is for
+
+Findings and photos live on the **order** and describe the dwelling; they can be
+corrected after a void. The **PDF is the snapshot** — an immutable record of what
+the findings and answers looked like at the moment someone signed. So after a void:
+
+- the vendor fixes the wrong finding,
+- re-signs, producing submission #2 with a new PDF and new signatures,
+- and submission #1 still shows exactly what was originally attested.
+
+That is why the `sha256` matters: it proves the voided copy has not been quietly
+edited to match the new story.
+
+### Three things to settle
+
+**1. Does voiding return the order to `PENDING SUBMISSION`?** It should — the order
+is once again awaiting a valid submission, and the gate (two signatures, a photo
+per finding) must be satisfied again. Otherwise a voided order sits in a status
+that claims work is finished.
+
+**2. ⚠️ Can a vendor void something already UPLOADED to Unite Us?** This is the
+sharp edge. If the evidence has been uploaded and the vendor then voids it, Unite
+Us holds a document the CRM now considers wrong, and nothing in the CRM will say
+so. The upload record needs a **superseded** state and the order needs to surface
+"re-upload required", or the two systems drift silently — which is precisely the
+class of bug that had four members being double-delivered for a month.
+
+**3. Is there a limit, and who can see the voids?** No limit is fine, but the CRM
+should show the void history — `submission #2 (previous voided: wrong room
+measured)` — rather than only the current one. A void with no visible reason looks
+like a system glitch to whoever finds it later.
+
+### Note the asymmetry, deliberately
+
+The **vendor** can void their own submission. **CRM users still cannot edit
+anything** — Q2 is untouched. The correction path belongs to the party who signed,
+which is the only party whose correction means anything.
 
 ## Naming — the DISPATCH domain
 
@@ -570,6 +700,10 @@ authorization decision) and cost a rename today. So the generic head is
 
 ```
 Vendor                   a housing vendor company (NOT DeliveryCompany)
+    added in CRM Settings; we provision ONE admin user and can reset its password
+
+VendorUser               NOT an Agent, and never reaches CRM endpoints
+    is_admin             the bootstrap user; creates their own staff in the portal
 
 DispatchOrder            the unit of dispatched work
     kind                 assessment | remediation
@@ -586,11 +720,13 @@ DispatchOrder            the unit of dispatched work
     contact_phone / phone_type        mobile | landline
     contact_email                     optional
     address_*                         formatted + place_id + lat/lng
-    address_notes
+    address_notes                     verified ONCE on the assessment;
+                                      remediation orders INHERIT via parent
 
     -- step 2 --
     referral_type                     mobility | ventilation | combined
     consent_to_call / consent_to_text  two booleans, one checkbox in the UI
+    consent_method                    verbal (GDPR: demonstrable)
     consent_captured_at / consent_captured_by
     ecm_billed_confirmed              the human sign-off
     notes
@@ -602,8 +738,14 @@ DispatchVisit            the appointment and the visit itself
     scheduled_for / confirmed_at / started_at / completed_at
     calendar_event_ref   what was pushed to the vendor's calendar (portal phase)
 
-DispatchSignature        many per order -- the gate needs TWO kinds
-    signer_role          vendor | member
+DispatchSubmission       many per order, append-only -- ONE active at a time
+    sequence / state     active | voided
+    submitted_at / submitted_by
+    voided_at / voided_by / void_reason
+    pdf_s3_key / pdf_sha256      the immutable snapshot of what was signed
+
+DispatchSignature        belongs to a SUBMISSION, not the order
+    signer_role          vendor | member      -- the gate needs BOTH
     signed_at / signed_by_name / image or PDF ref
 
 DispatchFinding          an inspection result; may spawn remediation orders
