@@ -25,8 +25,44 @@ rather than acquiring blank questions from a later revision.
 
 TEMPLATE_VERSION = 1
 
-# Module codes. "2.1" and "2.2b" are the service codes the form prints beside each
+# Module codes.
+#
+# "2.1" and "2.2b" are NYS MEDICAID 1115 WAIVER (NYHER) HRSN SERVICE CODES, not
+# form labels -- they identify the billable service under the Social Care Network
+# programme, which is why the form prints them beside each module
 # ("Programs Approved: [X] Mobility (2.1)  [ ] Ventilation (2.2b)").
+#
+#   2.1   Home Accessibility and Safety Modifications
+#         ramps, handrails, grab bars, electric door openers, widening of
+#         doorways and pathways, door and cabinet handles, bathroom facilities,
+#         kitchen cabinet or sinks, non-skid surfaces
+#   2.2b  Home Remediation: Ventilation
+#         air conditioners, heaters, humidifiers, dehumidifiers
+#
+# Source: NYS DOH HRSN Services protocol and the SCN eligibility summary
+# (health.ny.gov/health_care/medicaid/redesign). The codes appear NOWHERE in our
+# own data -- they arrive only on the vendor's form -- so this comment is the only
+# place the mapping is written down.
+#
+# Two things follow, and both explain earlier puzzles:
+#
+#   * our programme families ARE these waiver services. "Home Accessibility and
+#     Safety Modification - <item> - <borough>" is 2.1; "Home Remediation -
+#     <device> - <borough>" is 2.2b. The item lists match the waiver's almost
+#     exactly.
+#   * the 2.1 service also covers ACCESSIBILITY RAMPS, PATHWAYS/doorway widening
+#     and ELECTRIC DOOR OPENERS, for which we have no programme at all. That is
+#     why the form offers Ramps and Pathways: they are funded services, not stray
+#     options. Those programmes are pending.
+#
+# Other waiver services in the same family that we do NOT model yet:
+#   2.2a  Home Remediation: Mold and Pest Remediation
+#         (our referral-only "Home Remediation Assistance: Ventilation Improving
+#          Systems" programme belongs here)
+#   2.2c  Home Remediation: Equipment Provision
+#   2.3a  Asthma Remediation: Self-Management
+# And on the care-management side: 1.1 Navigation, 1.2 Enhanced HRSN Care
+# Management -- the latter being what the wizard's "ECM case billed?" refers to.
 MOBILITY = "mobility"
 VENTILATION = "ventilation"
 
