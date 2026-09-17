@@ -27670,3 +27670,91 @@ class VendorSettingsApiTest(TestCase):
         vendors = listed["results"] if isinstance(listed, dict) else listed
         row = next(v for v in vendors if v["vendor_id"] == vid)
         self.assertEqual(row["open_order_count"], 1)
+
+
+class HomeAccessibilityProgramsTest(TestCase):
+    """The 11 listed Home Accessibility programs are housing WORK ORDERS.
+
+    From "Home Accessibility and Home Remediation Case Names.xlsx". Nothing was
+    inserted -- all 26 names were already in ActiveProgram, so migration 0268 is a
+    reclassification and duplicates are impossible.
+
+    Migrations are disabled under `manage.py test` (AGENTS.md), so these build their
+    own rows rather than asserting on 0268's output.
+    """
+
+    PREFIX = "Home Accessibility and Safety Modification - "
+    LISTED = PREFIX + "Grab Bars - Brooklyn"
+    NOT_LISTED = PREFIX + "Kitchen Cabinet or Sinks - Brooklyn"
+
+    def _program(self, name, *, internal):
+        from .models import ActiveProgram
+        from .services.catalog import clear_program_domain_cache
+
+        p = ActiveProgram.objects.create(
+            program_name=name,
+            case_category="Internal Services" if internal else "External Services",
+            case_type=(
+                ActiveProgram.CaseType.HOUSING if internal
+                else ActiveProgram.CaseType.FOOD
+            ),
+            service_type=(
+                ActiveProgram.ServiceType.HOME_EXPENSE_ASSISTANCE_REPAIRS
+                if internal else ""
+            ),
+            main_category="Housing" if internal else "Food",
+        )
+        clear_program_domain_cache()
+        return p
+
+    def test_a_listed_program_is_housing_with_the_repairs_service(self):
+        from .services.catalog import program_service_domain, program_service_type_code
+
+        self._program(self.LISTED, internal=True)
+        self.assertEqual(program_service_domain(self.LISTED), "housing")
+        self.assertEqual(
+            program_service_type_code(self.LISTED), "home_expense_assistance_repairs",
+        )
+
+    def test_a_listed_program_routes_to_internal_service_and_imports(self):
+        from .models import CaseType
+        from .serializers import case_in_import_scope, derive_case_type_from_active_program
+
+        self._program(self.LISTED, internal=True)
+        self.assertEqual(
+            derive_case_type_from_active_program(self.LISTED),
+            CaseType.INTERNAL_SERVICE,
+        )
+        self.assertTrue(case_in_import_scope("", self.LISTED))
+
+    def test_a_case_on_a_listed_program_is_a_WORK_ORDER_not_an_assessment(self):
+        """These are remediation work, so they must never be able to govern."""
+        from .models import Case, CaseStatus, CaseType, Client
+        from .services.housing import is_assessment_case, is_work_order_case
+
+        self._program(self.LISTED, internal=True)
+        c = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Acc", last_name="Member",
+            client_added_at=timezone.now(),
+        )
+        case = Case.objects.create(
+            case_id=uuid.uuid4(), client=c, case_type=CaseType.INTERNAL_SERVICE,
+            case_status=CaseStatus.MANAGED, program_name=self.LISTED,
+            case_created_at=timezone.now(),
+        )
+        self.assertTrue(is_work_order_case(case))
+        self.assertFalse(is_assessment_case(case))
+
+    def test_an_UNLISTED_home_accessibility_program_stays_external(self):
+        """Seven of the eighteen in our table are absent from the file, so 0268
+        lists names EXPLICITLY -- a prefix match would have converted all of them."""
+        from .serializers import case_in_import_scope
+
+        self._program(self.NOT_LISTED, internal=False)
+        self.assertFalse(case_in_import_scope("", self.NOT_LISTED))
+
+    def test_the_prefix_alone_does_not_identify_a_listed_program(self):
+        """Pins the reason for the explicit list: both of these share the prefix,
+        and only one is ours."""
+        self.assertTrue(self.LISTED.startswith(self.PREFIX))
+        self.assertTrue(self.NOT_LISTED.startswith(self.PREFIX))
