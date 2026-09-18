@@ -1,8 +1,10 @@
 # Product <-> programme map (housing)
 
-Generated from the local production clone. Every priced product, the category
-it belongs to, and the exact `ActiveProgram` row a case would be opened
-against.
+Every product in the billable-items catalogue, the category it belongs to, and
+the exact `ActiveProgram` row a case would be opened against.
+
+Generated from the programme table and the product catalogue, so the programme
+names below are exact rather than retyped.
 
 A housing programme name is three parts separated by ` - `:
 
@@ -11,136 +13,185 @@ Home Remediation - Air Conditioner - Manhattan
 |____ family ___|  |____ item ____|  |_ borough _|
 ```
 
-The middle part is what links a product to a programme. For **Home
-Remediation** it is the product-level item; for **Home Accessibility** it is the
-CATEGORY, so several products share one programme.
+The middle part links a product to a programme, and the two families use it
+differently:
+
+* **Home Accessibility** puts the CATEGORY there, so several products share one
+  programme -- the three bathroom products all map to
+  `... - Bathroom Facilities - <borough>`.
+* **Home Remediation** puts the product-level item there, which is also our
+  category -- so one programme still covers both air conditioners.
+
+---
 
 ## Bathroom Facilities
 
-*Home Accessibility and Safety Modification* · 3 product(s)
+*Home Accessibility and Safety Modification*
 
-| Product | Vendor price | Programme name | Brooklyn | Manhattan | Queens |
-|---|---:|---|---|---|---|
-| Shower chair | $456.75 | `Home Accessibility and Safety Modification - Bathroom Facilities - <borough>` | internal | internal | internal |
-| Bath bench | $509.25 |  |  |  |  |
-| Raised toilet seat | $509.25 |  |  |  |  |
+Products:
+
+* Shower chair
+* Bath bench
+* Raised toilet seat
+
+| Programme | Brooklyn | Manhattan | Queens |
+|---|---|---|---|
+| `Home Accessibility and Safety Modification - Bathroom Facilities - <borough>` | internal | internal | internal |
 
 ## Non-skid Surfaces
 
-*Home Accessibility and Safety Modification* · 3 product(s)
+*Home Accessibility and Safety Modification*
 
-| Product | Vendor price | Programme name | Brooklyn | Manhattan | Queens |
-|---|---:|---|---|---|---|
-| Non-skid bath mat | $325.50 | `Home Accessibility and Safety Modification - Non-skid Surfaces - <borough>` | internal | internal | internal |
-| Non-slip adhesive strips | $404.25 |  |  |  |  |
-| Non-slip tape | $404.25 |  |  |  |  |
+Products:
+
+* Non-skid bath mat
+* Non-slip adhesive strips
+* Non-slip tape
+
+| Programme | Brooklyn | Manhattan | Queens |
+|---|---|---|---|
+| `Home Accessibility and Safety Modification - Non-skid Surfaces - <borough>` | internal | internal | internal |
 
 ## Grab Bars
 
-*Home Accessibility and Safety Modification* · 4 product(s)
+*Home Accessibility and Safety Modification*
 
-| Product | Vendor price | Programme name | Brooklyn | Manhattan | Queens |
-|---|---:|---|---|---|---|
-| Grab bar at toilet | $498.75 | `Home Accessibility and Safety Modification - Grab Bars - <borough>` | internal | internal | **EXTERNAL** |
-| Grab bar at tub | $498.75 |  |  |  |  |
-| Grab bar at shower | $498.75 |  |  |  |  |
-| Floor-to-ceiling safety pole | $693.00 |  |  |  |  |
+Products:
+
+* Grab bar at toilet
+* Grab bar at tub
+* Grab bar at shower
+* Floor-to-ceiling safety pole
+
+| Programme | Brooklyn | Manhattan | Queens |
+|---|---|---|---|
+| `Home Accessibility and Safety Modification - Grab Bars - <borough>` | internal | internal | **EXTERNAL** |
 
 ## Doors & Cabinet Handles
 
-*Home Accessibility and Safety Modification* · 3 product(s)
+*Home Accessibility and Safety Modification*
 
-| Product | Vendor price | Programme name | Brooklyn | Manhattan | Queens |
-|---|---:|---|---|---|---|
-| Lever door handle | $430.50 | `Home Accessibility and Safety Modification - Doors and Cabinet Handles - <borough>` | **EXTERNAL** | **EXTERNAL** | **EXTERNAL** |
-| D-ring cabinet pull | $262.50 |  |  |  |  |
-| Loop cabinet handle | $262.50 |  |  |  |  |
+Products:
+
+* Lever door handle
+* D-ring cabinet pull
+* Loop cabinet handle
+
+| Programme | Brooklyn | Manhattan | Queens |
+|---|---|---|---|
+| `Home Accessibility and Safety Modification - Doors and Cabinet Handles - <borough>` | **EXTERNAL** | **EXTERNAL** | **EXTERNAL** |
 
 ## Accessibility Ramps
 
-*Home Accessibility and Safety Modification* · 2 product(s)
+*Home Accessibility and Safety Modification*
 
 **No programme exists for this category in any borough.**
 
-| Product | Vendor price | Programme |
-|---|---:|---|
-| Modular/portable ramp | $876.75 | — |
-| Threshold ramp | $666.75 | — |
+* Modular/portable ramp
+* Threshold ramp
 
 ## Handrails
 
-*Home Accessibility and Safety Modification* · 2 product(s)
+*Home Accessibility and Safety Modification*
 
-| Product | Vendor price | Programme name | Brooklyn | Manhattan | Queens |
-|---|---:|---|---|---|---|
-| Interior staircase handrail | $666.75 | `Home Accessibility and Safety Modification - Hand Rails - <borough>` | internal | internal | internal |
-| Hallway handrail | $666.75 |  |  |  |  |
+Products:
+
+* Interior staircase handrail
+* Hallway handrail
+
+| Programme | Brooklyn | Manhattan | Queens |
+|---|---|---|---|
+| `Home Accessibility and Safety Modification - Hand Rails - <borough>` | internal | internal | internal |
 
 ## Pathways
 
-*Home Accessibility and Safety Modification* · 1 product(s)
+*Home Accessibility and Safety Modification*
 
 **No programme exists for this category in any borough.**
 
-| Product | Vendor price | Programme |
-|---|---:|---|
-| Threshold reducer | $456.75 | — |
+* Threshold reducer
 
 ## Air Filtration Devices
 
-*Home Remediation* · 2 product(s)
+*Home Remediation*
 
-| Product | Vendor price | Programme name | Brooklyn | Manhattan | Queens |
-|---|---:|---|---|---|---|
-| HEPA air purifier | $693.00 | `Home Remediation - Air Filtration Device - <borough>` | internal | internal | internal |
-| Portable air filtration unit | $693.00 |  |  |  |  |
+Products:
+
+* HEPA air purifier
+* Portable air filtration unit
+
+| Programme | Brooklyn | Manhattan | Queens |
+|---|---|---|---|
+| `Home Remediation - Air Filtration Device - <borough>` | internal | internal | internal |
 
 ## De-humidifier
 
-*Home Remediation* · 1 product(s)
+*Home Remediation*
 
-| Product | Vendor price | Programme name | Brooklyn | Manhattan | Queens |
-|---|---:|---|---|---|---|
-| Dehumidifier (portable) | $693.00 | `Home Remediation - De-humidifier - <borough>` | internal | internal | internal |
+Products:
+
+* Dehumidifier (portable)
+
+| Programme | Brooklyn | Manhattan | Queens |
+|---|---|---|---|
+| `Home Remediation - De-humidifier - <borough>` | internal | internal | internal |
 
 ## Humidifier
 
-*Home Remediation* · 2 product(s)
+*Home Remediation*
 
-| Product | Vendor price | Programme name | Brooklyn | Manhattan | Queens |
-|---|---:|---|---|---|---|
-| Portable humidifier | $561.75 | `Home Remediation - Humidifier - <borough>` | internal | internal | internal |
-| Cool mist humidifier | $666.75 |  |  |  |  |
+Products:
+
+* Portable humidifier
+* Cool mist humidifier
+
+| Programme | Brooklyn | Manhattan | Queens |
+|---|---|---|---|
+| `Home Remediation - Humidifier - <borough>` | internal | internal | internal |
 
 ## Air Conditioner
 
-*Home Remediation* · 2 product(s)
+*Home Remediation*
 
-| Product | Vendor price | Programme name | Brooklyn | Manhattan | Queens |
-|---|---:|---|---|---|---|
-| Window air conditioner | $1323.00 | `Home Remediation - Air Conditioner - <borough>` | internal | internal | internal |
-| Portable air conditioner | $903.00 |  |  |  |  |
+Products:
+
+* Window air conditioner
+* Portable air conditioner
+
+| Programme | Brooklyn | Manhattan | Queens |
+|---|---|---|---|
+| `Home Remediation - Air Conditioner - <borough>` | internal | internal | internal |
 
 ## Heater
 
-*Home Remediation* · 1 product(s)
+*Home Remediation*
 
-| Product | Vendor price | Programme name | Brooklyn | Manhattan | Queens |
-|---|---:|---|---|---|---|
-| Portable space heater | $509.25 | `Home Remediation - Heater - <borough>` | internal | internal | internal |
+Products:
+
+* Portable space heater
+
+| Programme | Brooklyn | Manhattan | Queens |
+|---|---|---|---|
+| `Home Remediation - Heater - <borough>` | internal | internal | internal |
 
 ---
 
 # Missing: products with no internal-service programme
 
-**10 of 26 priced products** cannot become an
-internal-service case today.
+**10 of 26 products** cannot become an internal-service case today.
+They are recommendable on the assessment form with no case that can be opened
+for them.
 
 ### Grab Bars
 
-Products affected: Grab bar at toilet, Grab bar at tub, Grab bar at shower, Floor-to-ceiling safety pole
+Products affected:
 
-**Reclassify from External to Internal Services:**
+* Grab bar at toilet
+* Grab bar at tub
+* Grab bar at shower
+* Floor-to-ceiling safety pole
+
+**Reclassify from External Services to Internal Services:**
 
 ```
 Home Accessibility and Safety Modification - Grab Bars - Queens
@@ -148,9 +199,13 @@ Home Accessibility and Safety Modification - Grab Bars - Queens
 
 ### Doors & Cabinet Handles
 
-Products affected: Lever door handle, D-ring cabinet pull, Loop cabinet handle
+Products affected:
 
-**Reclassify from External to Internal Services:**
+* Lever door handle
+* D-ring cabinet pull
+* Loop cabinet handle
+
+**Reclassify from External Services to Internal Services:**
 
 ```
 Home Accessibility and Safety Modification - Doors and Cabinet Handles - Brooklyn
@@ -160,7 +215,10 @@ Home Accessibility and Safety Modification - Doors and Cabinet Handles - Queens
 
 ### Accessibility Ramps
 
-Products affected: Modular/portable ramp, Threshold ramp
+Products affected:
+
+* Modular/portable ramp
+* Threshold ramp
 
 No programme exists in any borough. **Create three:**
 
@@ -172,7 +230,9 @@ Home Accessibility and Safety Modification - Accessibility Ramps - Queens
 
 ### Pathways
 
-Products affected: Threshold reducer
+Products affected:
+
+* Threshold reducer
 
 No programme exists in any borough. **Create three:**
 
@@ -184,8 +244,8 @@ Home Accessibility and Safety Modification - Pathways - Queens
 
 ## What each row needs
 
-Every gap above is in the **Home Accessibility** family, so they all take the same
-values -- the Home Remediation side is already complete:
+Every gap is in the **Home Accessibility** family -- the Home Remediation side
+is already complete -- so they all take the same values:
 
 ```
 case_category = Internal Services
@@ -197,11 +257,11 @@ Matching migration `0268_seed_home_accessibility_programs.py`. Call
 `clear_program_domain_cache()` afterwards, or the classification cache keeps
 refusing them until the next restart.
 
-## Verified against the clone
+## Verified
 
-Every name listed under "Reclassify" exists verbatim and is currently
-`External Services`. Every name under "Create" does NOT exist -- so neither list
-would produce a duplicate.
+Every name under *Reclassify* exists verbatim and is currently
+`External Services`. Every name under *Create* does not exist -- so neither
+list can produce a duplicate.
 
-Re-check against PRODUCTION before acting: agents edit the programme table there,
-so the external rows may differ.
+Checked against the local clone. Re-check against PRODUCTION before acting:
+agents edit the programme table there, so the external rows may differ.
