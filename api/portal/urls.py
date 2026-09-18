@@ -195,6 +195,7 @@ from .views_imports import (
 )
 from .views_dispatch import (
     MemberAssessmentFormView,
+    MemberCaseRecommendationsView,
     MemberAssessmentOrderCreateView,
     MemberAssessmentOrderUpdateView,
     MemberWorkOrderCreateView,
@@ -300,6 +301,11 @@ urlpatterns = [
         "members/<uuid:client_id>/assessment-order/",
         MemberAssessmentOrderCreateView.as_view(),
         name="portal-member-assessment-order",
+    ),
+    path(
+        "members/<uuid:client_id>/case-recommendations/",
+        MemberCaseRecommendationsView.as_view(),
+        name="portal-member-case-recommendations",
     ),
     path(
         "members/<uuid:client_id>/assessment-form/",

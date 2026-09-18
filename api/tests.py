@@ -31652,3 +31652,232 @@ class VendorPricingTest(TestCase):
                 VendorPrice.objects.create(
                     vendor=self.vendor, billable_item=self.ac, price=Decimal("2"),
                 )
+
+
+class CaseRecommendationTest(TestCase):
+    """Which Unite Us cases an agent should open after an assessment.
+
+    The rule that matters: MANY PRODUCTS COLLAPSE INTO ONE CASE per programme per
+    borough. Four grab bars are one case with four items, not four cases.
+    """
+
+    EEA = (
+        "Dwelling Assessment & Statement of Work (SOW) Development - "
+        "Modifications and Remediation Service - Queens"
+    )
+
+    def setUp(self):
+        from decimal import Decimal
+
+        from .models import (
+            ActiveProgram, BillableItem, BillingSettings, Case, CaseStatus,
+            CaseType, Client, DispatchKind, DispatchOrder, Vendor,
+        )
+        from .services.catalog import clear_program_domain_cache
+
+        BillingSettings.objects.update_or_create(
+            singleton_id=1, defaults={"admin_fee_percent": Decimal("10.00")},
+        )
+        ActiveProgram.objects.create(
+            program_name=self.EEA, case_category="Internal Services",
+            case_type=ActiveProgram.CaseType.HOUSING,
+            service_type=ActiveProgram.ServiceType.ENVIRONMENTAL_EXPOSURE_ASSESSMENT,
+        )
+        # Grab Bars is INTERNAL in Queens here; a later test flips it.
+        for item, cat in (
+            ("Grab Bars", "Internal Services"),
+            ("Bathroom Facilities", "Internal Services"),
+            ("Doors and Cabinet Handles", "External Services"),
+        ):
+            ActiveProgram.objects.create(
+                program_name=(
+                    f"Home Accessibility and Safety Modification - {item} - Queens"
+                ),
+                case_category=cat,
+                case_type=ActiveProgram.CaseType.HOUSING,
+                service_type=(
+                    ActiveProgram.ServiceType.ENVIRONMENTAL_MODIFICATIONS_ACCESSIBILITY
+                ),
+            )
+        clear_program_domain_cache()
+
+        for code, item, cat, price in (
+            ("grab_bar_toilet", "Grab bar at toilet", "Grab Bars", "498.75"),
+            ("grab_bar_tub", "Grab bar at tub", "Grab Bars", "498.75"),
+            ("shower_chair", "Shower chair", "Bathroom Facilities", "456.75"),
+            ("lever_door_handle", "Lever door handle", "Doors & Cabinet Handles", "430.50"),
+            ("modular_portable_ramp", "Modular/portable ramp", "Accessibility Ramps", "876.75"),
+        ):
+            BillableItem.objects.create(
+                item=item, option_code=code, billing_category=cat,
+                vendor_price=Decimal(price),
+            )
+
+        self.vendor = Vendor.objects.create(name="Acme")
+        self.member = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Rec", last_name="Member",
+            client_added_at=timezone.now(),
+        )
+        Case.objects.create(
+            case_id=uuid.uuid4(), client=self.member,
+            case_type=CaseType.INTERNAL_SERVICE, case_status=CaseStatus.MANAGED,
+            program_name=self.EEA, case_created_at=timezone.now(),
+        )
+        self.order = DispatchOrder.objects.create(
+            kind=DispatchKind.ASSESSMENT, client=self.member, vendor=self.vendor,
+            referral_type="combined",
+        )
+
+    def _submit(self, interventions):
+        from .models import DispatchQuestionnaire
+        from .services.assessment_forms import build_schema
+
+        return DispatchQuestionnaire.objects.create(
+            dispatch_order=self.order, modules=["mobility", "ventilation"],
+            schema_snapshot=build_schema(["mobility", "ventilation"]),
+            state="submitted", submitted_at=timezone.now(),
+            interventions=interventions,
+        )
+
+    def _recs(self, interventions):
+        from .services import case_recommendations as recs
+
+        return recs.recommended_cases(self._submit(interventions))
+
+    # ── the grouping rule ───────────────────────────────────────────────────
+    def test_products_in_ONE_CATEGORY_collapse_into_ONE_case(self):
+        """Opening one case per product would create duplicates in Unite Us."""
+        out = self._recs([
+            {"option": "grab_bar_toilet", "qty": 1},
+            {"option": "grab_bar_tub", "qty": 2},
+        ])
+        self.assertEqual(len(out), 1)
+        self.assertEqual(len(out[0]["products"]), 2)
+        self.assertEqual(
+            out[0]["program_name"],
+            "Home Accessibility and Safety Modification - Grab Bars - Queens",
+        )
+
+    def test_products_in_DIFFERENT_categories_are_separate_cases(self):
+        out = self._recs([
+            {"option": "grab_bar_toilet", "qty": 1},
+            {"option": "shower_chair", "qty": 1},
+        ])
+        self.assertEqual(len(out), 2)
+
+    def test_quantities_are_kept_and_totalled(self):
+        from decimal import Decimal
+
+        out = self._recs([
+            {"option": "grab_bar_toilet", "qty": 1},
+            {"option": "grab_bar_tub", "qty": 2},
+        ])
+        self.assertEqual(Decimal(out[0]["total"]), Decimal("1496.25"))
+        # 1496.25 + 10%
+        self.assertEqual(Decimal(out[0]["billed_total"]), Decimal("1645.88"))
+
+    def test_a_zero_quantity_is_not_recommended(self):
+        out = self._recs([
+            {"option": "grab_bar_toilet", "qty": 0},
+            {"option": "shower_chair", "qty": 1},
+        ])
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0]["program_item"], "Bathroom Facilities")
+
+    # ── the borough ─────────────────────────────────────────────────────────
+    def test_the_borough_comes_from_the_GOVERNING_CASE_not_the_address(self):
+        """The order's address is the dwelling and may be anywhere -- on the local
+        clone it is in Florida. The governing case's programme name carries the
+        borough the member is actually served in."""
+        self.order.address_city = "Hialeah"
+        self.order.address_state = "FL"
+        self.order.save(update_fields=["address_city", "address_state"])
+
+        out = self._recs([{"option": "grab_bar_toilet", "qty": 1}])
+        self.assertEqual(out[0]["borough"], "Queens")
+        self.assertIn("Queens", out[0]["program_name"])
+
+    # ── what an agent must be TOLD, not have hidden ─────────────────────────
+    def test_an_EXTERNAL_programme_is_reported_not_filtered_out(self):
+        """"You should open this, but the programme is External" is the useful
+        answer. Dropping it silently leaves a recommended product with no
+        explanation for why no case appeared."""
+        out = self._recs([{"option": "lever_door_handle", "qty": 1}])
+        self.assertEqual(len(out), 1)
+        self.assertTrue(out[0]["exists"])
+        self.assertFalse(out[0]["is_internal"])
+
+    def test_a_MISSING_programme_is_reported_separately_from_an_external_one(self):
+        """Different problems: one needs creating, the other reclassifying."""
+        out = self._recs([{"option": "modular_portable_ramp", "qty": 1}])
+        self.assertEqual(len(out), 1)
+        self.assertFalse(out[0]["exists"])
+        self.assertFalse(out[0]["is_internal"])
+
+    def test_a_case_the_member_ALREADY_has_is_flagged(self):
+        """So an agent does not open a second one."""
+        from .models import Case, CaseStatus, CaseType
+
+        Case.objects.create(
+            case_id=uuid.uuid4(), client=self.member,
+            case_type=CaseType.INTERNAL_SERVICE, case_status=CaseStatus.MANAGED,
+            program_name=(
+                "Home Accessibility and Safety Modification - Grab Bars - Queens"
+            ),
+            case_created_at=timezone.now(),
+        )
+        out = self._recs([{"option": "grab_bar_toilet", "qty": 1}])
+        self.assertTrue(out[0]["already_open"])
+
+    def test_an_UNPRICED_recommendation_still_appears(self):
+        """An agent still has to decide what to do with it, so it is surfaced
+        rather than dropped."""
+        out = self._recs([{"option": "no_such_product", "qty": 1}])
+        self.assertEqual(len(out), 1)
+        self.assertIsNone(out[0]["products"][0]["vendor_price"])
+
+    def test_NOTHING_recommended_produces_no_cases(self):
+        self.assertEqual(self._recs([]), [])
+
+    # ── the endpoint ────────────────────────────────────────────────────────
+    def _api(self):
+        from rest_framework_simplejwt.tokens import AccessToken
+
+        from .models import Agent
+
+        agent = Agent.objects.create(
+            name="Rec Agent", agent_code="779", group="Management",
+        )
+        acc = AccessToken()
+        acc["agent_id"] = str(agent.id)
+        acc["agent_code"] = agent.agent_code
+        acc["agent_name"] = agent.name
+        acc["agent_group"] = agent.group
+        api = APIClient(); api.credentials(HTTP_AUTHORIZATION=f"Bearer {acc}")
+        return api
+
+    def test_the_endpoint_reports_a_form_that_is_not_submitted(self):
+        """Not an error: "the vendor has not submitted yet" is the answer to the
+        question the screen is asking."""
+        resp = self._api().get(
+            f"/api/portal/members/{self.member.pk}/case-recommendations/",
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.data["state"], "not_started")
+        self.assertEqual(resp.data["cases"], [])
+
+    def test_the_endpoint_summarises_what_is_blocked(self):
+        self._submit([
+            {"option": "grab_bar_toilet", "qty": 1},
+            {"option": "shower_chair", "qty": 1},
+            {"option": "lever_door_handle", "qty": 1},
+            {"option": "modular_portable_ramp", "qty": 1},
+        ])
+        resp = self._api().get(
+            f"/api/portal/members/{self.member.pk}/case-recommendations/",
+        )
+        self.assertEqual(resp.data["state"], "submitted")
+        self.assertEqual(resp.data["summary"]["cases"], 4)
+        self.assertEqual(resp.data["summary"]["products"], 4)
+        # the external one and the missing one
+        self.assertEqual(resp.data["summary"]["blocked"], 2)

@@ -840,3 +840,56 @@ class MemberAssessmentFormView(PortalAPIView):
                 for sig in (active.signatures.all() if active else [])
             ],
         })
+
+
+class MemberCaseRecommendationsView(PortalAPIView):
+    """GET: the Unite Us cases to open after the vendor's assessment.
+
+    MANY PRODUCTS COLLAPSE INTO ONE CASE. Four grab bars are not four cases; they
+    are one "Grab Bars - <borough>" case with four items on it. Opening one per
+    product would create duplicates in Unite Us.
+
+    Read-only, and deliberately so: a case is opened in Unite Us, and the CRM only
+    learns about it on the next import. This tells an agent what to create.
+    """
+
+    def get(self, request, client_id):
+        from ..models import DispatchQuestionnaire
+        from ..services import case_recommendations as recs
+
+        client = get_object_or_404(Client, pk=client_id)
+        order = dispatch_svc.assessment_order_for(client)
+        if order is None:
+            return Response({
+                "state": "no_order", "borough": "", "cases": [],
+                "detail": "This member has no assessment order.",
+            })
+
+        form = DispatchQuestionnaire.objects.filter(dispatch_order=order).first()
+        if form is None or not form.is_submitted:
+            # Reported rather than 404'd: "the vendor has not submitted yet" is the
+            # answer to the question, not an error.
+            return Response({
+                "state": form.state if form else "not_started",
+                "borough": recs.member_borough(client),
+                "cases": [],
+                "detail": "The vendor has not submitted the assessment yet.",
+            })
+
+        cases = recs.recommended_cases(form)
+        return Response({
+            "state": "submitted",
+            "submitted_at": form.submitted_at,
+            "borough": recs.member_borough(client),
+            "cases": cases,
+            # Counted here so the UI does not have to re-derive the rules it is
+            # about to explain.
+            "summary": {
+                "cases": len(cases),
+                "products": sum(len(c["products"]) for c in cases),
+                "blocked": sum(
+                    1 for c in cases if not (c["exists"] and c["is_internal"])
+                ),
+                "already_open": sum(1 for c in cases if c["already_open"]),
+            },
+        })
