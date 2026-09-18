@@ -231,6 +231,22 @@ def void_submission(submission, *, vendor_user=None, reason=""):
             "superseded_uploads": superseded,
         },
     )
+    # REOPEN THE QUESTIONNAIRE. Without this the void was only half done: the
+    # order went back to PENDING_SUBMISSION while the form stayed SUBMITTED, so the
+    # vendor's draft endpoint answered 409 and "void so the vendor can correct and
+    # resubmit" was impossible to actually do.
+    #
+    # The ANSWERS are kept -- a correction is an edit, and retyping 33 questions to
+    # fix one is how a vendor ends up ticking from memory. What is cleared is
+    # submitted_at, because the form is no longer submitted.
+    from ..models import DispatchQuestionnaireState
+
+    questionnaire = getattr(order, "questionnaire", None)
+    if questionnaire is not None and questionnaire.is_submitted:
+        questionnaire.state = DispatchQuestionnaireState.DRAFT
+        questionnaire.submitted_at = None
+        questionnaire.save(update_fields=["state", "submitted_at", "updated_at"])
+
     # The order is awaiting a valid submission again; the gate must be met afresh.
     set_status(
         order, DispatchStatus.PENDING_SUBMISSION,

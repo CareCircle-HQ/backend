@@ -32401,3 +32401,98 @@ class VendorSubmitAssessmentTest(TestCase):
                 format="json", HTTP_HOST=VENDOR_HOST,
             )
             self.assertEqual(resp.status_code, 404, f"{verb} {suffix}")
+
+
+class VoidReopensTheQuestionnaireTest(TestCase):
+    """Voiding a submission must make the form editable again.
+
+    It did not. The order went back to PENDING_SUBMISSION while the questionnaire
+    stayed SUBMITTED, so the vendor's draft endpoint answered 409 -- and
+    void_submission's own docstring ("so the vendor can correct and resubmit")
+    described something that could not be done. Found by voiding a real submission
+    and watching the form stay locked.
+    """
+
+    def setUp(self):
+        from .models import (
+            Client, DispatchKind, DispatchOrder, DispatchProof,
+            DispatchQuestionnaire, DispatchSignature, Vendor, VendorUser,
+        )
+        from .services import dispatch
+        from .services.assessment_forms import build_schema
+
+        self.vendor = Vendor.objects.create(name="Acme")
+        self.user = VendorUser.objects.create(
+            vendor=self.vendor, email="v@acme.test", name="Vic",
+        )
+        member = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Void", last_name="Member",
+            client_added_at=timezone.now(),
+        )
+        self.order = DispatchOrder.objects.create(
+            kind=DispatchKind.ASSESSMENT, client=member, vendor=self.vendor,
+            referral_type="combined",
+        )
+        self.form = DispatchQuestionnaire.objects.create(
+            dispatch_order=self.order, modules=["mobility"],
+            schema_snapshot=build_schema(["mobility"]),
+            answers={"mob.reason.fall_risk": True},
+            interventions=[{"option": "grab_bar_tub", "qty": 2}],
+            state="submitted", submitted_at=timezone.now(),
+        )
+        DispatchProof.objects.create(
+            dispatch_order=self.order, s3_key="k", content_hash="h",
+        )
+        self.submission = dispatch.open_submission(self.order)
+        for role in ("vendor", "member"):
+            DispatchSignature.objects.create(
+                dispatch_submission=self.submission, signer_role=role,
+                signer_name=role, s3_key=f"s-{role}", content_hash=f"h-{role}",
+                signed_at=timezone.now(),
+            )
+        dispatch.submit(self.order, vendor_user=self.user)
+
+    def test_voiding_returns_the_form_to_DRAFT(self):
+        from .services import dispatch
+
+        dispatch.void_submission(
+            self.submission, vendor_user=self.user, reason="wrong dwelling",
+        )
+        self.form.refresh_from_db()
+        self.assertEqual(self.form.state, "draft")
+        self.assertIsNone(self.form.submitted_at)
+
+    def test_the_ANSWERS_survive_the_void(self):
+        """A correction is an edit. Retyping 33 questions to fix one is how a vendor
+        ends up ticking from memory."""
+        from .services import dispatch
+
+        dispatch.void_submission(self.submission, vendor_user=self.user)
+        self.form.refresh_from_db()
+        self.assertEqual(self.form.answers, {"mob.reason.fall_risk": True})
+        self.assertEqual(
+            self.form.interventions, [{"option": "grab_bar_tub", "qty": 2}],
+        )
+
+    def test_the_VOIDED_submission_keeps_its_signatures_as_history(self):
+        """They are the record of what was attested at the time, and are what make
+        the correction auditable rather than a rewrite."""
+        from .services import dispatch
+
+        dispatch.void_submission(self.submission, vendor_user=self.user)
+        self.submission.refresh_from_db()
+        self.assertEqual(self.submission.state, "voided")
+        self.assertEqual(self.submission.signatures.count(), 2)
+
+    def test_the_gate_must_be_met_AFRESH(self):
+        """The new submission has no signatures, so submitting again requires both
+        -- a void that left the old signatures counting would let a correction be
+        submitted with nobody having seen it."""
+        from .services import dispatch
+
+        dispatch.void_submission(self.submission, vendor_user=self.user)
+        missing = dispatch.missing_for_submission(self.order)
+        self.assertIn("vendor signature", missing)
+        self.assertIn("member signature", missing)
+        # The photo belongs to the ORDER, not the submission, so it still counts.
+        self.assertNotIn("at least one photo of the dwelling", missing)
