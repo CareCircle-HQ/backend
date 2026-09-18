@@ -5376,6 +5376,13 @@ class Vendor(models.Model):
     contact_phone = models.CharField(max_length=40, blank=True)
     address = models.CharField(max_length=255, blank=True)
     website = models.URLField(max_length=255, blank=True)
+    # The mark-up we add to THIS vendor's prices when billing Unite Us. NULL means
+    # "use the global default" rather than 0 -- so a vendor nobody has set a fee for
+    # inherits the house rate, and changing that rate moves them with it. Storing a
+    # copy of the default would leave every vendor stale the day it changed.
+    admin_fee_percent = models.DecimalField(
+        max_digits=5, decimal_places=2, null=True, blank=True,
+    )
     notes = models.TextField(blank=True)
     is_active = models.BooleanField(default=True, db_index=True)
     created_at = models.DateTimeField(auto_now_add=True)
@@ -6047,6 +6054,56 @@ class BillingSettings(models.Model):
     def get(cls):
         obj, _created = cls.objects.get_or_create(singleton_id=1)
         return obj
+
+
+class VendorPrice(models.Model):
+    """One vendor's price for one billable item -- an OVERRIDE, not a copy.
+
+    Absent means "use the base price". That is deliberately not the same as copying
+    all 27 rows to every vendor:
+
+    * a new item added to the base list is immediately available to every vendor,
+      rather than needing 27 inserts per vendor and being silently missing until
+      someone remembers;
+    * changing a base price updates every vendor who has not negotiated their own;
+    * "which prices did we actually agree with this vendor?" is answerable by
+      looking at which rows exist.
+
+    THE INVOICE MUST SNAPSHOT THIS. A bill already sent must not move when a price
+    is renegotiated, so an invoice line will store the price and fee it used rather
+    than pointing here. This table is what the NEXT invoice will be built from.
+    """
+
+    vendor_price_id = models.UUIDField(
+        primary_key=True, default=uuid.uuid4, editable=False
+    )
+    vendor = models.ForeignKey(
+        "Vendor", on_delete=models.CASCADE, related_name="prices",
+    )
+    billable_item = models.ForeignKey(
+        BillableItem, on_delete=models.CASCADE, related_name="vendor_prices",
+    )
+    # What THIS vendor charges us for this item.
+    price = models.DecimalField(max_digits=10, decimal_places=2)
+    note = models.CharField(max_length=200, blank=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    updated_by = models.ForeignKey(
+        "Agent", on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="vendor_price_updates",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["billable_item__sort_order"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["vendor", "billable_item"],
+                name="uniq_vendor_price_per_item",
+            ),
+        ]
+
+    def __str__(self):
+        return f"{self.vendor_id} {self.billable_item_id} ${self.price}"
 
 
 class MessageDirection(models.TextChoices):

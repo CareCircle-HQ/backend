@@ -552,6 +552,100 @@ class VendorViewSet(viewsets.ModelViewSet):
         payload["password_was_supplied"] = bool(supplied)
         return Response(payload, status=http.HTTP_201_CREATED)
 
+    @action(detail=True, methods=["get", "patch"], url_path="pricing")
+    def pricing(self, request, pk=None):
+        """This vendor's price list, resolved against the base.
+
+        GET returns EVERY billable item with the price in force for this vendor and
+        whether it was negotiated or inherited -- so the table shows the full
+        catalogue rather than only what someone has already touched.
+
+        PATCH sets or clears ONE item's price:
+
+            {"billable_item_id": "...", "price": "480.00"}   set an override
+            {"billable_item_id": "...", "price": null}       fall back to the base
+
+        Clearing is a real operation, not a matter of typing the base price back in:
+        a row that happens to equal the base still means "negotiated", and the
+        distinction is what makes the list readable.
+        """
+        from decimal import Decimal, InvalidOperation
+
+        from ..models import BillableItem, VendorPrice
+        from ..services import pricing
+
+        vendor = self.get_object()
+
+        if request.method.lower() == "patch":
+            item_id = (request.data.get("billable_item_id") or "").strip()
+            item = BillableItem.objects.filter(pk=item_id).first() if item_id else None
+            if item is None:
+                return Response(
+                    {"error": "billable_item_id is required and must exist."},
+                    status=http.HTTP_400_BAD_REQUEST,
+                )
+
+            raw = request.data.get("price", "__missing__")
+            agent = current_agent(request)
+            agent_obj = agent if isinstance(agent, Agent) else None
+
+            if raw is None:
+                deleted, _ = VendorPrice.objects.filter(
+                    vendor=vendor, billable_item=item,
+                ).delete()
+                if deleted:
+                    logger.warning(
+                        "vendor pricing: %s CLEARED %s for %s (back to base %s)",
+                        getattr(agent, "name", "?"), item.item, vendor.name,
+                        item.vendor_price,
+                    )
+            else:
+                try:
+                    price = Decimal(str(raw))
+                except (InvalidOperation, TypeError):
+                    return Response(
+                        {"error": "price must be a number, or null to clear it."},
+                        status=http.HTTP_400_BAD_REQUEST,
+                    )
+                if price < 0:
+                    return Response(
+                        {"error": "A price cannot be negative."},
+                        status=http.HTTP_400_BAD_REQUEST,
+                    )
+                existing = VendorPrice.objects.filter(
+                    vendor=vendor, billable_item=item,
+                ).first()
+                before = existing.price if existing else None
+                VendorPrice.objects.update_or_create(
+                    vendor=vendor, billable_item=item,
+                    defaults={
+                        "price": price,
+                        "note": (request.data.get("note") or "").strip(),
+                        "updated_by": agent_obj,
+                    },
+                )
+                # Money, so the old value is recorded -- "what did we agree before?"
+                # is the first question about a disputed invoice.
+                logger.warning(
+                    "vendor pricing: %s set %s for %s to %s (was %s)",
+                    getattr(agent, "name", "?"), item.item, vendor.name, price,
+                    before if before is not None else f"base {item.vendor_price}",
+                )
+
+        return Response({
+            "vendor": {
+                "vendor_id": str(vendor.vendor_id),
+                "name": vendor.name,
+                # NULL means inherit; the effective value is on each row.
+                "admin_fee_percent": (
+                    str(vendor.admin_fee_percent)
+                    if vendor.admin_fee_percent is not None else None
+                ),
+                "default_admin_fee_percent": str(pricing.default_fee_percent()),
+            },
+            "items": pricing.price_list_for(vendor),
+        })
+
     @action(detail=True, methods=["post"], url_path="reset-admin-password")
     def reset_admin_password(self, request, pk=None):
         """Reset the vendor admin's password.

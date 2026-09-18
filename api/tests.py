@@ -31396,3 +31396,259 @@ class BillablePricingTest(TestCase):
         ).data
         rows = rows["results"] if isinstance(rows, dict) else rows
         self.assertNotIn("Dwelling assessment", [r["item"] for r in rows])
+
+
+class VendorPricingTest(TestCase):
+    """Per-vendor prices and fees, and the two INDEPENDENT fallbacks.
+
+    Absent means "inherit" for both. That is the whole design: a vendor nobody has
+    negotiated with follows the house rate, and changing that rate moves them with
+    it.
+    """
+
+    def setUp(self):
+        from decimal import Decimal
+
+        from .models import BillableItem, BillingSettings, Vendor
+
+        BillingSettings.objects.update_or_create(
+            singleton_id=1, defaults={"admin_fee_percent": Decimal("10.00")},
+        )
+        self.vendor = Vendor.objects.create(name="Acme Repairs")
+        self.other = Vendor.objects.create(name="Beta Repairs")
+        self.ac = BillableItem.objects.create(
+            item="Window air conditioner", option_code="window_ac",
+            billing_category="Air Conditioner", main_category="Temperature Control",
+            vendor_price=Decimal("1323.00"), sort_order=1,
+        )
+        self.chair = BillableItem.objects.create(
+            item="Shower chair", option_code="shower_chair",
+            billing_category="Bathroom Facilities", main_category="Bathroom",
+            vendor_price=Decimal("456.75"), sort_order=2,
+        )
+
+    def _api(self):
+        from rest_framework_simplejwt.tokens import AccessToken
+
+        from .models import Agent
+
+        agent = Agent.objects.create(
+            name="Price Agent", agent_code="778", group="Management",
+        )
+        acc = AccessToken()
+        acc["agent_id"] = str(agent.id)
+        acc["agent_code"] = agent.agent_code
+        acc["agent_name"] = agent.name
+        acc["agent_group"] = agent.group
+        api = APIClient(); api.credentials(HTTP_AUTHORIZATION=f"Bearer {acc}")
+        return api
+
+    def _rows(self, vendor=None):
+        from .services import pricing
+
+        return {
+            r["item"]: r for r in pricing.price_list_for(vendor or self.vendor)
+        }
+
+    # ── the price fallback ───────────────────────────────────────────────────
+    def test_with_no_override_a_vendor_gets_the_BASE_price(self):
+        row = self._rows()["Window air conditioner"]
+        self.assertEqual(row["price"], "1323.00")
+        self.assertEqual(row["base_price"], "1323.00")
+        self.assertFalse(row["is_custom"])
+
+    def test_the_whole_catalogue_appears_even_with_no_overrides(self):
+        """The table is the vendor's SCHEDULE, not a list of exceptions -- so a
+        price nobody has touched still has to be visible and editable."""
+        self.assertEqual(len(self._rows()), 2)
+
+    def test_an_override_replaces_only_THAT_vendors_price(self):
+        from decimal import Decimal
+
+        from .models import VendorPrice
+
+        VendorPrice.objects.create(
+            vendor=self.vendor, billable_item=self.ac, price=Decimal("1200.00"),
+        )
+        mine = self._rows()["Window air conditioner"]
+        theirs = self._rows(self.other)["Window air conditioner"]
+
+        self.assertEqual(mine["price"], "1200.00")
+        self.assertTrue(mine["is_custom"])
+        # The base stays visible beside it, so the discount is readable without
+        # arithmetic.
+        self.assertEqual(mine["base_price"], "1323.00")
+        self.assertEqual(theirs["price"], "1323.00")
+        self.assertFalse(theirs["is_custom"])
+
+    def test_changing_the_BASE_moves_vendors_who_have_not_negotiated(self):
+        """The reason overrides are not copies. A new base price should reach every
+        vendor who has not agreed their own -- 27 copies per vendor would leave them
+        all stale."""
+        from decimal import Decimal
+
+        from .models import VendorPrice
+
+        VendorPrice.objects.create(
+            vendor=self.vendor, billable_item=self.ac, price=Decimal("1200.00"),
+        )
+        self.ac.vendor_price = Decimal("1400.00")
+        self.ac.save(update_fields=["vendor_price"])
+
+        # Negotiated: unmoved. Not negotiated: follows the base.
+        self.assertEqual(self._rows()["Window air conditioner"]["price"], "1200.00")
+        self.assertEqual(
+            self._rows(self.other)["Window air conditioner"]["price"], "1400.00",
+        )
+
+    # ── the fee fallback, which is INDEPENDENT ──────────────────────────────
+    def test_a_vendor_with_no_fee_INHERITS_the_house_rate(self):
+        row = self._rows()["Window air conditioner"]
+        self.assertEqual(row["admin_fee_percent"], "10.00")
+        self.assertTrue(row["fee_is_inherited"])
+        self.assertEqual(row["billed_price"], "1455.30")
+
+    def test_a_vendor_fee_overrides_the_house_rate(self):
+        from decimal import Decimal
+
+        self.vendor.admin_fee_percent = Decimal("15.00")
+        self.vendor.save(update_fields=["admin_fee_percent"])
+
+        row = self._rows()["Window air conditioner"]
+        self.assertFalse(row["fee_is_inherited"])
+        self.assertEqual(row["admin_fee"], "198.45")
+        self.assertEqual(row["billed_price"], "1521.45")
+        # The other vendor is untouched.
+        self.assertEqual(
+            self._rows(self.other)["Window air conditioner"]["billed_price"],
+            "1455.30",
+        )
+
+    def test_a_vendor_fee_of_ZERO_is_not_the_same_as_inheriting(self):
+        """NULL means inherit; 0 means bill at cost. Conflating them would silently
+        under-bill every item for a vendor whose fee was merely unset."""
+        from decimal import Decimal
+
+        self.vendor.admin_fee_percent = Decimal("0")
+        self.vendor.save(update_fields=["admin_fee_percent"])
+        row = self._rows()["Window air conditioner"]
+        self.assertEqual(row["billed_price"], "1323.00")
+        self.assertFalse(row["fee_is_inherited"])
+
+    def test_the_two_fallbacks_are_independent(self):
+        """A custom price with an inherited fee, and vice versa, both have to work
+        -- they are separate decisions negotiated at different times."""
+        from decimal import Decimal
+
+        from .models import VendorPrice
+
+        VendorPrice.objects.create(
+            vendor=self.vendor, billable_item=self.ac, price=Decimal("1200.00"),
+        )
+        row = self._rows()["Window air conditioner"]
+        self.assertTrue(row["is_custom"])
+        self.assertTrue(row["fee_is_inherited"])
+        self.assertEqual(row["billed_price"], "1320.00")  # 1200 + 10%
+
+    # ── the option-code join ────────────────────────────────────────────────
+    def test_resolved_price_works_from_an_INTERVENTION_OPTION_code(self):
+        """What a recommended intervention will be billed at -- the join that makes
+        an assessment's recommendations invoiceable."""
+        from decimal import Decimal
+
+        from .models import VendorPrice
+        from .services import pricing
+
+        VendorPrice.objects.create(
+            vendor=self.vendor, billable_item=self.ac, price=Decimal("1200.00"),
+        )
+        price, percent, billed = pricing.resolved_price(self.vendor, "window_ac")
+        self.assertEqual(price, Decimal("1200.00"))
+        self.assertEqual(percent, Decimal("10.00"))
+        self.assertEqual(billed, Decimal("1320.00"))
+
+    def test_an_unknown_option_code_returns_None_rather_than_zero(self):
+        """Silently billing nothing for an item we have no price for would be worse
+        than failing."""
+        from .services import pricing
+
+        self.assertIsNone(pricing.resolved_price(self.vendor, "no_such_thing"))
+
+    # ── the API ─────────────────────────────────────────────────────────────
+    def test_an_agent_can_set_and_CLEAR_a_vendor_price(self):
+        api = self._api()
+        url = f"/api/portal/settings/vendors/{self.vendor.pk}/pricing/"
+
+        resp = api.patch(url, {
+            "billable_item_id": str(self.ac.pk), "price": "1200.00",
+            "note": "bulk deal",
+        }, format="json")
+        self.assertEqual(resp.status_code, 200, resp.content)
+        row = [r for r in resp.data["items"] if r["item"] == "Window air conditioner"][0]
+        self.assertEqual(row["price"], "1200.00")
+        self.assertTrue(row["is_custom"])
+        self.assertEqual(row["note"], "bulk deal")
+
+        # Clearing is a real operation, not typing the base back in.
+        resp2 = api.patch(url, {
+            "billable_item_id": str(self.ac.pk), "price": None,
+        }, format="json")
+        row2 = [r for r in resp2.data["items"] if r["item"] == "Window air conditioner"][0]
+        self.assertFalse(row2["is_custom"])
+        self.assertEqual(row2["price"], "1323.00")
+
+    def test_a_negative_vendor_price_is_refused(self):
+        resp = self._api().patch(
+            f"/api/portal/settings/vendors/{self.vendor.pk}/pricing/",
+            {"billable_item_id": str(self.ac.pk), "price": "-1"}, format="json",
+        )
+        self.assertEqual(resp.status_code, 400)
+
+    def test_an_unknown_item_id_is_refused(self):
+        resp = self._api().patch(
+            f"/api/portal/settings/vendors/{self.vendor.pk}/pricing/",
+            {"billable_item_id": str(uuid.uuid4()), "price": "10"}, format="json",
+        )
+        self.assertEqual(resp.status_code, 400)
+
+    def test_the_vendor_fee_can_be_set_and_cleared_through_the_vendor_endpoint(self):
+        api = self._api()
+        url = f"/api/portal/settings/vendors/{self.vendor.pk}/"
+
+        self.assertEqual(
+            api.patch(url, {"admin_fee_percent": "15"}, format="json").status_code,
+            200,
+        )
+        self.vendor.refresh_from_db()
+        self.assertEqual(str(self.vendor.admin_fee_percent), "15.00")
+
+        # null returns them to the house rate.
+        self.assertEqual(
+            api.patch(url, {"admin_fee_percent": None}, format="json").status_code,
+            200,
+        )
+        self.vendor.refresh_from_db()
+        self.assertIsNone(self.vendor.admin_fee_percent)
+
+    def test_a_vendor_fee_over_100_is_refused(self):
+        resp = self._api().patch(
+            f"/api/portal/settings/vendors/{self.vendor.pk}/",
+            {"admin_fee_percent": "150"}, format="json",
+        )
+        self.assertEqual(resp.status_code, 400)
+
+    def test_one_price_per_vendor_per_item(self):
+        from decimal import Decimal
+
+        from django.db import IntegrityError, transaction
+
+        from .models import VendorPrice
+
+        VendorPrice.objects.create(
+            vendor=self.vendor, billable_item=self.ac, price=Decimal("1"),
+        )
+        with self.assertRaises(IntegrityError):
+            with transaction.atomic():
+                VendorPrice.objects.create(
+                    vendor=self.vendor, billable_item=self.ac, price=Decimal("2"),
+                )

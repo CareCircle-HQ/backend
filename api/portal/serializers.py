@@ -3004,9 +3004,23 @@ class PortalVendorSerializer(serializers.ModelSerializer):
         fields = [
             "vendor_id", "name", "contact_name", "contact_email", "contact_phone",
             "address", "website", "notes", "is_active", "created_at",
+            # NULL means "use the house rate", which is not the same as 0. Writable
+            # here so the Vendors list can set it without a second endpoint.
+            "admin_fee_percent",
             "users", "admin_user", "open_order_count",
         ]
         read_only_fields = ["vendor_id", "created_at"]
+
+    def validate_admin_fee_percent(self, value):
+        # None is legitimate: it clears the override and returns the vendor to the
+        # house rate. 0 is also legitimate -- billing at cost.
+        if value is None:
+            return None
+        if value < 0 or value > 100:
+            raise serializers.ValidationError(
+                "The admin fee must be between 0 and 100 percent.",
+            )
+        return value
 
     def get_admin_user(self, obj):
         admin = next((u for u in obj.users.all() if u.is_admin), None)
