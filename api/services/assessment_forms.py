@@ -388,6 +388,81 @@ INTERVENTIONS = {
 }
 
 
+# ── which questions indicate which interventions ─────────────────────────────
+# A ticked question SUGGESTS the intervention categories that could answer it, so
+# the vendor picks quantities from a short list instead of scrolling 26 options.
+#
+# Keyed by question code and listing intervention GROUP codes. Deliberately
+# generous where a finding has more than one reasonable remedy -- a balance
+# impairment can be met with grab bars, a handrail or a non-skid surface, and
+# narrowing that to one would be us making a clinical choice from a data file.
+#
+# SOME QUESTIONS SUGGEST NOTHING, and that is correct rather than missing:
+# "Poor lighting present" is a real fall risk with no product in the catalogue to
+# answer it. It still belongs on the form -- it is evidence for the justification
+# and for a later programme -- but it must not conjure a category.
+QUESTION_SUGGESTS = {
+    # Mobility -- reason for assessment
+    "mob.reason.mobility_limitation": ["ramps", "pathways", "doors"],
+    "mob.reason.fall_risk": ["grab_bars", "non_skid", "handrails"],
+    "mob.reason.bathroom_safety": ["bathroom", "grab_bars", "non_skid"],
+    "mob.reason.stair_safety": ["handrails"],
+    # Mobility -- functional limitations
+    "mob.aids.uses_device": ["ramps", "pathways", "doors"],
+    "mob.physical.bathing_transfer": ["bathroom", "grab_bars"],
+    "mob.physical.stairs": ["handrails"],
+    "mob.physical.balance": ["grab_bars", "handrails", "non_skid"],
+    "mob.physical.falls": ["grab_bars", "non_skid", "handrails"],
+    # Mobility -- observed risks
+    "mob.risk.slippery_tub": ["non_skid", "bathroom"],
+    "mob.risk.grab_bars_absent": ["grab_bars"],
+    "mob.risk.wet_floor": ["non_skid"],
+    "mob.risk.handrail_absent": ["handrails"],
+    "mob.risk.poor_lighting": [],          # no lighting product exists
+    "mob.risk.uneven_flooring": ["pathways", "ramps"],
+    "mob.risk.cluttered_pathways": ["pathways"],
+    "mob.risk.unsafe_transfers": ["grab_bars", "bathroom"],
+
+    # Ventilation -- reason for assessment
+    "vent.reason.poor_air_quality": ["air_filtration"],
+    "vent.reason.inadequate_ventilation": ["air_filtration"],
+    "vent.reason.extreme_temperature": ["air_conditioner", "heater"],
+    "vent.reason.humidity_issues": ["dehumidifier", "humidifier"],
+    # Ventilation -- observed conditions
+    "vent.air.poor_ventilation": ["air_filtration"],
+    "vent.air.excessive_dust": ["air_filtration"],
+    "vent.air.smoke_odors": ["air_filtration"],
+    "vent.air.mold_odor": ["air_filtration", "dehumidifier"],
+    "vent.temp.excessive_heat": ["air_conditioner"],
+    "vent.temp.excessive_cold": ["heater"],
+    "vent.temp.high_humidity": ["dehumidifier"],
+    "vent.temp.low_humidity": ["humidifier"],
+    # Ventilation -- member-reported
+    "vent.reported.breathing": ["air_filtration"],
+    "vent.reported.allergies": ["air_filtration"],
+    "vent.reported.extreme_temp": ["air_conditioner", "heater"],
+    "vent.reported.no_ac_heat": ["air_conditioner", "heater"],
+}
+
+
+def suggested_groups(answers, modules=None):
+    """Intervention group codes indicated by the TICKED answers.
+
+    Unknown or unticked codes contribute nothing. Returns a set, so a category
+    reached by three different findings appears once.
+    """
+    out = set()
+    for code, ticked in (answers or {}).items():
+        if ticked:
+            out.update(QUESTION_SUGGESTS.get(code, ()))
+    if modules is not None:
+        allowed = {
+            g["code"] for m in modules for g in INTERVENTIONS.get(m, [])
+        }
+        out &= allowed
+    return out
+
+
 def modules_for_referral(referral_type):
     """Which modules a referral type performs. Unknown -> none.
 
@@ -413,12 +488,38 @@ def build_schema(modules):
                 "code": m,
                 "label": MODULE_LABELS[m],
                 "service_code": MODULE_SERVICE_CODES[m],
-                "sections": QUESTIONS[m],
+                # Each question carries the intervention groups it SUGGESTS, so the
+                # app can narrow the catalogue without a second copy of the mapping.
+                # Shipping it in the schema also means a SUBMITTED form records the
+                # relationships that were in force when it was signed.
+                "sections": _sections_with_suggestions(m),
                 "intervention_groups": INTERVENTIONS[m],
             }
             for m in mods
         ],
     }
+
+
+def _sections_with_suggestions(module):
+    """QUESTIONS[module] with a ``suggests`` list on every question.
+
+    Copies rather than mutating the module-level constant -- QUESTIONS is shared
+    across requests, and annotating it in place would leak into every later schema
+    and into the snapshots frozen onto submitted forms.
+    """
+    out = []
+    for section in QUESTIONS[module]:
+        groups = []
+        for group in section["groups"]:
+            groups.append({
+                **group,
+                "questions": [
+                    {**q, "suggests": list(QUESTION_SUGGESTS.get(q["code"], ()))}
+                    for q in group["questions"]
+                ],
+            })
+        out.append({**section, "groups": groups})
+    return out
 
 
 def all_question_codes(modules=None):

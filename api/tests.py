@@ -32496,3 +32496,115 @@ class VoidReopensTheQuestionnaireTest(TestCase):
         self.assertIn("member signature", missing)
         # The photo belongs to the ORDER, not the submission, so it still counts.
         self.assertNotIn("at least one photo of the dwelling", missing)
+
+
+class QuestionSuggestsInterventionsTest(TestCase):
+    """Which intervention categories a ticked finding points at.
+
+    The point is fewer products on screen: a bathroom fall risk narrows 12
+    categories to 3, so the vendor picks quantities from a short list instead of
+    scrolling 26 options in someone's hallway.
+    """
+
+    def test_every_mapped_key_is_a_REAL_question(self):
+        """A typo would silently suggest nothing, which looks like a deliberate
+        "no product answers this" rather than a mistake."""
+        from .services.assessment_forms import QUESTION_SUGGESTS, all_question_codes
+
+        self.assertEqual(set(QUESTION_SUGGESTS) - set(all_question_codes()), set())
+
+    def test_EVERY_question_is_mapped(self):
+        """Including the ones that map to nothing -- an unmapped question and a
+        question that indicates no product are indistinguishable at runtime, so the
+        empty list has to be written down deliberately."""
+        from .services.assessment_forms import QUESTION_SUGGESTS, all_question_codes
+
+        self.assertEqual(set(all_question_codes()) - set(QUESTION_SUGGESTS), set())
+
+    def test_every_suggested_group_code_EXISTS(self):
+        from .services.assessment_forms import INTERVENTIONS, QUESTION_SUGGESTS
+
+        real = {g["code"] for gs in INTERVENTIONS.values() for g in gs}
+        used = {c for codes in QUESTION_SUGGESTS.values() for c in codes}
+        self.assertEqual(used - real, set())
+
+    def test_every_category_is_REACHABLE_from_some_question(self):
+        """A category no finding points at is invisible unless the vendor taps
+        "Show all" -- effectively removed from the form by accident."""
+        from .services.assessment_forms import INTERVENTIONS, QUESTION_SUGGESTS
+
+        real = {g["code"] for gs in INTERVENTIONS.values() for g in gs}
+        used = {c for codes in QUESTION_SUGGESTS.values() for c in codes}
+        self.assertEqual(real - used, set())
+
+    def test_a_bathroom_fall_risk_narrows_twelve_categories_to_three(self):
+        from .services.assessment_forms import suggested_groups
+
+        got = suggested_groups({
+            "mob.reason.bathroom_safety": True,
+            "mob.risk.grab_bars_absent": True,
+            "mob.risk.slippery_tub": True,
+        })
+        self.assertEqual(got, {"bathroom", "grab_bars", "non_skid"})
+
+    def test_poor_lighting_suggests_NOTHING_and_that_is_correct(self):
+        """A real fall risk with no product in the catalogue to answer it. It stays
+        on the form as evidence for the justification, but must not conjure a
+        category."""
+        from .services.assessment_forms import suggested_groups
+
+        self.assertEqual(suggested_groups({"mob.risk.poor_lighting": True}), set())
+
+    def test_an_UNTICKED_answer_suggests_nothing(self):
+        from .services.assessment_forms import suggested_groups
+
+        self.assertEqual(
+            suggested_groups({"mob.risk.grab_bars_absent": False}), set(),
+        )
+
+    def test_an_unknown_code_is_ignored_rather_than_raising(self):
+        from .services.assessment_forms import suggested_groups
+
+        self.assertEqual(suggested_groups({"made.up": True}), set())
+
+    def test_a_category_reached_twice_appears_ONCE(self):
+        from .services.assessment_forms import suggested_groups
+
+        got = suggested_groups({
+            "mob.risk.handrail_absent": True,   # handrails
+            "mob.physical.stairs": True,        # handrails again
+        })
+        self.assertEqual(got, {"handrails"})
+
+    def test_suggestions_are_limited_to_the_MODULES_in_play(self):
+        """A ventilation-only referral must not be offered grab bars because a
+        mobility answer was somehow present."""
+        from .services.assessment_forms import suggested_groups
+
+        got = suggested_groups(
+            {"mob.risk.grab_bars_absent": True, "vent.temp.excessive_heat": True},
+            modules=["ventilation"],
+        )
+        self.assertEqual(got, {"air_conditioner"})
+
+    def test_the_schema_carries_suggests_on_every_question(self):
+        from .services.assessment_forms import build_schema
+
+        schema = build_schema(["mobility", "ventilation"])
+        for module in schema["modules"]:
+            for section in module["sections"]:
+                for group in section["groups"]:
+                    for question in group["questions"]:
+                        self.assertIn("suggests", question, question["code"])
+
+    def test_building_the_schema_does_NOT_mutate_the_shared_constant(self):
+        """QUESTIONS is module-level and shared across requests. Annotating it in
+        place would leak into every later schema and into the snapshots frozen onto
+        submitted forms."""
+        from .services.assessment_forms import QUESTIONS, build_schema
+
+        build_schema(["mobility"])
+        for section in QUESTIONS["mobility"]:
+            for group in section["groups"]:
+                for question in group["questions"]:
+                    self.assertNotIn("suggests", question)
