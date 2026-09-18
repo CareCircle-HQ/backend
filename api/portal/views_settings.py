@@ -617,3 +617,84 @@ def _log_vendor_action(request, vendor, what, extra=None):
         getattr(agent, "name", "?"), getattr(agent, "agent_code", "?"),
         extra or {},
     )
+
+
+class BillableItemViewSet(viewsets.ModelViewSet):
+    """Settings > Pricing: the housing price list.
+
+    ``vendor_price`` is what we RECOMMEND a vendor charge us; the billed price is
+    that plus the adjustable admin fee, and is DERIVED on every read rather than
+    stored -- so changing the fee reprices the whole list at once, which is what
+    makes it adjustable in any useful sense.
+
+    Per-vendor pricing comes later. This is the base every vendor starts from.
+    """
+
+    serializer_class = s.BillableItemSerializer
+    permission_classes = [IsPortalAgent]
+
+    def get_queryset(self):
+        from ..models import BillableItem
+
+        qs = BillableItem.objects.all()
+        if (self.request.query_params.get("active_only") or "").lower() in (
+            "1", "true", "yes",
+        ):
+            qs = qs.filter(is_active=True)
+        return qs
+
+    def perform_update(self, serializer):
+        from ..models import BillableItem
+
+        before = BillableItem.objects.get(pk=serializer.instance.pk)
+        item = serializer.save()
+        # A price change is a money change, so it is recorded with the old value.
+        # "What did we charge before?" is the first question anyone asks about a
+        # disputed invoice.
+        if before.vendor_price != item.vendor_price:
+            agent = current_agent(self.request)
+            logger.warning(
+                "pricing: %s changed %s from %s to %s | agent=%s",
+                "agent", item.item, before.vendor_price, item.vendor_price,
+                getattr(agent, "name", "?"),
+            )
+
+    @action(detail=False, methods=["get", "patch"], url_path="billing-settings")
+    def billing_settings(self, request):
+        """The admin fee, as a percentage. One row, so no id in the path."""
+        from decimal import Decimal, InvalidOperation
+
+        from ..models import BillingSettings
+
+        settings_row = BillingSettings.get()
+        if request.method.lower() == "patch":
+            raw = request.data.get("admin_fee_percent")
+            try:
+                pct = Decimal(str(raw))
+            except (InvalidOperation, TypeError):
+                return Response(
+                    {"error": "admin_fee_percent must be a number."},
+                    status=http.HTTP_400_BAD_REQUEST,
+                )
+            # 0 is legitimate -- billing at cost. Above 100 is not: it would mean
+            # charging more than double, which is a typo rather than a policy.
+            if pct < 0 or pct > 100:
+                return Response(
+                    {"error": "The admin fee must be between 0 and 100 percent."},
+                    status=http.HTTP_400_BAD_REQUEST,
+                )
+            if settings_row.admin_fee_percent != pct:
+                logger.warning(
+                    "pricing: admin fee changed from %s%% to %s%% | agent=%s",
+                    settings_row.admin_fee_percent, pct,
+                    getattr(current_agent(request), "name", "?"),
+                )
+                settings_row.admin_fee_percent = pct
+                settings_row.updated_by = current_agent(request) if isinstance(
+                    current_agent(request), Agent,
+                ) else None
+                settings_row.save()
+        return Response({
+            "admin_fee_percent": str(settings_row.admin_fee_percent),
+            "updated_at": settings_row.updated_at,
+        })

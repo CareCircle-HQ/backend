@@ -1,5 +1,6 @@
 import secrets
 import uuid
+from decimal import Decimal
 from datetime import timedelta
 
 from django.conf import settings
@@ -5935,6 +5936,117 @@ class DispatchDocument(models.Model):
 
     def __str__(self):
         return self.filename or f"Document {self.content_hash[:12]}"
+
+
+class BillableItem(models.Model):
+    """The price list: what a vendor charges us, and what we bill Unite Us.
+
+    Transcribed from Simplified_Billable_Items_Pricing. Every one of the 26
+    physical items matches an intervention option in
+    ``api/services/assessment_forms.py`` EXACTLY, in both directions -- the pricing
+    sheet and the assessment form are the same catalogue seen from two angles. So
+    ``option_code`` is a real join rather than a label match: it is what lets a
+    recommended intervention become a priced line.
+
+    ``billing_category`` is the housing programme item ("Grab Bars"), which is also
+    the intervention GROUP on the form. ``main_category`` is the sheet's own
+    grouping (Bathroom, Air Quality...) and exists for display order only.
+
+    THE BILLED PRICE IS NOT STORED. It is ``vendor_price`` plus the admin fee, and
+    the fee is adjustable -- so storing the total would leave stale numbers behind
+    the moment anyone changed it. An INVOICE will need to snapshot both, because a
+    bill already sent must not move; that belongs with the invoicing work.
+    """
+
+    billable_item_id = models.UUIDField(
+        primary_key=True, default=uuid.uuid4, editable=False
+    )
+    # "Shower chair". The form's option label.
+    item = models.CharField(max_length=120)
+    # The intervention option this prices, e.g. "shower_chair". Blank only for a
+    # priced line that is not an installable item -- the dwelling assessment
+    # itself.
+    option_code = models.CharField(max_length=60, blank=True, db_index=True)
+    # "Grab Bars" -- the housing programme item, and the form's group label.
+    billing_category = models.CharField(max_length=120, db_index=True)
+    # The sheet's own section: Bathroom / Air Quality / Temperature Control...
+    main_category = models.CharField(max_length=120, blank=True)
+
+    # HCPCS code and modifiers, from the 1115 waiver's billing rules. Every row is
+    # S5165 today; kept per row because that is a billing fact, not a constant we
+    # should bake in.
+    hcpcs_code = models.CharField(max_length=20, blank=True)
+    modifiers = models.CharField(max_length=40, blank=True)
+
+    # What we RECOMMEND the vendor charge us. Per-vendor pricing comes later; this
+    # is the base every vendor starts from.
+    vendor_price = models.DecimalField(max_digits=10, decimal_places=2)
+
+    sort_order = models.PositiveIntegerField(default=0)
+    is_active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["sort_order", "billing_category", "item"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["item", "billing_category"],
+                name="uniq_billable_item_per_category",
+            ),
+        ]
+        indexes = [models.Index(fields=["is_active", "billing_category"])]
+
+    def __str__(self):
+        return f"{self.item} ({self.billing_category}) ${self.vendor_price}"
+
+    def admin_fee(self, percent=None):
+        """The mark-up, rounded to the cent."""
+        from decimal import ROUND_HALF_UP, Decimal
+
+        pct = BillingSettings.get().admin_fee_percent if percent is None else percent
+        raw = self.vendor_price * (Decimal(pct) / Decimal("100"))
+        return raw.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+    def billed_price(self, percent=None):
+        """What we bill Unite Us: the vendor price plus the admin fee."""
+        return self.vendor_price + self.admin_fee(percent)
+
+
+class BillingSettings(models.Model):
+    """Singleton settings for housing billing.
+
+    A row rather than a Django setting, because the operator has to be able to
+    change the admin fee from the CRM without a deploy -- which is the whole point
+    of "make the 10% adjustable".
+    """
+
+    singleton_id = models.PositiveSmallIntegerField(primary_key=True, default=1)
+    # The mark-up on a vendor's price, as a percentage. 10% today.
+    admin_fee_percent = models.DecimalField(
+        max_digits=5, decimal_places=2, default=Decimal("10.00"),
+    )
+    updated_at = models.DateTimeField(auto_now=True)
+    updated_by = models.ForeignKey(
+        "Agent", on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="billing_settings_updates",
+    )
+
+    class Meta:
+        verbose_name_plural = "Billing settings"
+
+    def __str__(self):
+        return f"Admin fee {self.admin_fee_percent}%"
+
+    def save(self, *args, **kwargs):
+        # One row, always. A second would make "what is the fee?" ambiguous.
+        self.singleton_id = 1
+        super().save(*args, **kwargs)
+
+    @classmethod
+    def get(cls):
+        obj, _created = cls.objects.get_or_create(singleton_id=1)
+        return obj
 
 
 class MessageDirection(models.TextChoices):

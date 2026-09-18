@@ -31185,3 +31185,214 @@ class HousingStageBarTest(TestCase):
         self.assertTrue(food)
         self.assertEqual(food[0]["assessment_order"]["value"], "")
         self.assertEqual(food[0]["work_orders"]["value"], "")
+
+
+class BillablePricingTest(TestCase):
+    """The housing price list, and the adjustable admin fee.
+
+    The numbers here are the real sheet's, so these assert the transcription as
+    much as the code.
+    """
+
+    def setUp(self):
+        from decimal import Decimal
+
+        from .models import BillableItem, BillingSettings
+
+        BillingSettings.objects.update_or_create(
+            singleton_id=1, defaults={"admin_fee_percent": Decimal("10.00")},
+        )
+        # Migrations do not run under manage.py test, so the seeded rows do not
+        # exist here -- build the two the assertions need.
+        self.ac = BillableItem.objects.create(
+            item="Window air conditioner", option_code="window_ac",
+            billing_category="Air Conditioner", main_category="Temperature Control",
+            hcpcs_code="S5165", modifiers="U8, UC",
+            vendor_price=Decimal("1323.00"),
+        )
+        self.assessment = BillableItem.objects.create(
+            item="Dwelling assessment", option_code="",
+            billing_category="Dwelling Assessment & SOW Development",
+            main_category="Assessment", hcpcs_code="S5165", modifiers="UA, U8",
+            vendor_price=Decimal("750.00"),
+        )
+
+    def _api(self):
+        from rest_framework_simplejwt.tokens import AccessToken
+
+        from .models import Agent
+
+        agent = Agent.objects.create(
+            name="Pricing Agent", agent_code="777", group="Management",
+        )
+        acc = AccessToken()
+        acc["agent_id"] = str(agent.id)
+        acc["agent_code"] = agent.agent_code
+        acc["agent_name"] = agent.name
+        acc["agent_group"] = agent.group
+        api = APIClient(); api.credentials(HTTP_AUTHORIZATION=f"Bearer {acc}")
+        return api
+
+    # ── the arithmetic ───────────────────────────────────────────────────────
+    def test_the_billed_price_matches_the_sheet(self):
+        """1323 + 10% = 1455.30, and 750 + 10% = 825 -- the sheet's own totals."""
+        from decimal import Decimal
+
+        self.assertEqual(self.ac.admin_fee(), Decimal("132.30"))
+        self.assertEqual(self.ac.billed_price(), Decimal("1455.30"))
+        self.assertEqual(self.assessment.billed_price(), Decimal("825.00"))
+
+    def test_the_fee_rounds_to_the_CENT(self):
+        """456.75 x 10% = 45.675, which the sheet shows as 45.68 -- half-up, not
+        truncated, or every odd price would be a cent light."""
+        from decimal import Decimal
+
+        from .models import BillableItem
+
+        chair = BillableItem.objects.create(
+            item="Shower chair", option_code="shower_chair",
+            billing_category="Bathroom Facilities",
+            vendor_price=Decimal("456.75"),
+        )
+        self.assertEqual(chair.admin_fee(), Decimal("45.68"))
+        self.assertEqual(chair.billed_price(), Decimal("502.43"))
+
+    def test_changing_the_fee_REPRICES_everything(self):
+        """The billed price is derived, never stored -- which is what makes the fee
+        adjustable in any useful sense."""
+        from decimal import Decimal
+
+        from .models import BillingSettings
+
+        row = BillingSettings.get()
+        row.admin_fee_percent = Decimal("15.00")
+        row.save()
+
+        self.ac.refresh_from_db()
+        self.assertEqual(self.ac.admin_fee(), Decimal("198.45"))
+        self.assertEqual(self.ac.billed_price(), Decimal("1521.45"))
+
+    def test_a_ZERO_fee_bills_at_cost(self):
+        from decimal import Decimal
+
+        from .models import BillingSettings
+
+        row = BillingSettings.get()
+        row.admin_fee_percent = Decimal("0")
+        row.save()
+        self.assertEqual(self.ac.billed_price(), Decimal("1323.00"))
+
+    def test_a_SECOND_settings_row_cannot_be_created(self):
+        """save() forces the pk to 1, so a second row raises rather than quietly
+        replacing the fee someone else set. Loud beats silent where money is
+        concerned -- and get() is the only accessor that should be used anyway."""
+        from decimal import Decimal
+
+        from django.db import IntegrityError, transaction
+
+        from .models import BillingSettings
+
+        with self.assertRaises(IntegrityError):
+            with transaction.atomic():
+                BillingSettings.objects.create(admin_fee_percent=Decimal("99"))
+
+        self.assertEqual(BillingSettings.objects.count(), 1)
+        self.assertEqual(
+            BillingSettings.get().admin_fee_percent, Decimal("10.00"),
+        )
+
+    # ── the join to the assessment form ──────────────────────────────────────
+    def test_every_priced_item_matches_an_INTERVENTION_OPTION(self):
+        """The pricing sheet and the assessment form are the same catalogue. If
+        this fails, a recommended intervention can no longer become a priced line
+        -- which is the whole reason option_code exists."""
+        from .services.assessment_forms import all_option_codes
+
+        known = set(all_option_codes())
+        from .migrations import __name__ as _  # noqa: F401
+
+        from .migrations import (  # the seed data, as the single source
+            __path__ as _p,  # noqa: F401
+        )
+        import importlib
+
+        seed = importlib.import_module("api.migrations.0279_seed_billable_items")
+        priced = {code for (_m, _i, code, _c, _mod, _p2) in seed.ROWS if code}
+        self.assertEqual(
+            priced - known, set(),
+            "a priced item references an option code the form does not have",
+        )
+        self.assertEqual(
+            known - priced, set(),
+            "a form option has no price row",
+        )
+
+    # ── the API ──────────────────────────────────────────────────────────────
+    def test_an_agent_can_change_a_vendor_price(self):
+        resp = self._api().patch(
+            f"/api/portal/settings/billable-items/{self.ac.pk}/",
+            {"vendor_price": "1400.00"}, format="json",
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        # 1400 + 10% -- the default fee in this test's setUp.
+        self.assertEqual(resp.data["billed_price"], "1540.00")
+
+    def test_the_item_and_its_CODES_are_read_only(self):
+        """They come from the waiver's own sheet, and editing them would silently
+        break the join to the form's intervention options."""
+        resp = self._api().patch(
+            f"/api/portal/settings/billable-items/{self.ac.pk}/",
+            {"item": "Hacked", "option_code": "nonsense", "hcpcs_code": "X1"},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.ac.refresh_from_db()
+        self.assertEqual(self.ac.item, "Window air conditioner")
+        self.assertEqual(self.ac.option_code, "window_ac")
+        self.assertEqual(self.ac.hcpcs_code, "S5165")
+
+    def test_a_NEGATIVE_price_is_refused(self):
+        resp = self._api().patch(
+            f"/api/portal/settings/billable-items/{self.ac.pk}/",
+            {"vendor_price": "-5"}, format="json",
+        )
+        self.assertEqual(resp.status_code, 400)
+
+    def test_the_admin_fee_can_be_changed_through_the_API(self):
+        api = self._api()
+        resp = api.patch(
+            "/api/portal/settings/billable-items/billing-settings/",
+            {"admin_fee_percent": "12.5"}, format="json",
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        self.assertEqual(resp.data["admin_fee_percent"], "12.5")
+
+        rows = api.get("/api/portal/settings/billable-items/").data
+        rows = rows["results"] if isinstance(rows, dict) else rows
+        ac = [r for r in rows if r["item"] == "Window air conditioner"][0]
+        self.assertEqual(ac["billed_price"], "1488.38")
+
+    def test_a_fee_over_100_percent_is_refused(self):
+        """Charging more than double is a typo, not a policy. Zero IS allowed --
+        billing at cost is legitimate."""
+        api = self._api()
+        for bad in ("150", "-1", "abc"):
+            resp = api.patch(
+                "/api/portal/settings/billable-items/billing-settings/",
+                {"admin_fee_percent": bad}, format="json",
+            )
+            self.assertEqual(resp.status_code, 400, f"{bad} should be refused")
+        ok = api.patch(
+            "/api/portal/settings/billable-items/billing-settings/",
+            {"admin_fee_percent": "0"}, format="json",
+        )
+        self.assertEqual(ok.status_code, 200)
+
+    def test_active_only_filters_the_list(self):
+        self.assessment.is_active = False
+        self.assessment.save(update_fields=["is_active"])
+        rows = self._api().get(
+            "/api/portal/settings/billable-items/?active_only=1",
+        ).data
+        rows = rows["results"] if isinstance(rows, dict) else rows
+        self.assertNotIn("Dwelling assessment", [r["item"] for r in rows])

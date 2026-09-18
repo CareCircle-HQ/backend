@@ -202,6 +202,7 @@ from .views_dispatch import (
     MemberDispatchOrdersView,
 )
 from .views_settings import (
+    BillableItemViewSet,
     ActiveProgramViewSet,
     CadenceViewSet,
     ClientTagViewSet,
@@ -229,6 +230,9 @@ from .views_tickets import (
 
 router = SimpleRouter()
 router.register("settings/vendors", VendorViewSet, basename="portal-vendor")
+router.register(
+    "settings/billable-items", BillableItemViewSet, basename="portal-billable-item",
+)
 router.register("settings/menu-types", MenuTypeViewSet, basename="portal-menu-type")
 router.register("settings/meal-plans", MealPlanViewSet, basename="portal-meal-plan")
 router.register("settings/dietary-tags", DietaryTagViewSet, basename="portal-dietary-tag")
