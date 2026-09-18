@@ -29791,8 +29791,10 @@ class VendorWorkScopingTest(TestCase):
         resp = self._api().get(f"/v1/work/{self.mine.pk}/", HTTP_HOST=VENDOR_HOST)
         self.assertEqual(resp.status_code, 200)
         member = resp.data["member"]
+        # The phone is MASKED now, so the key set changed with it.
         self.assertEqual(set(member), {
-            "name", "phone", "phone_type", "address", "address_notes",
+            "name", "phone_masked", "phone_last4", "has_phone", "phone_type",
+            "address", "address_notes",
         })
         self.assertEqual(member["name"], "Tracey Johnson")
 
@@ -29817,7 +29819,8 @@ class VendorWorkScopingTest(TestCase):
         resp = self._api().get(f"/v1/work/{child.pk}/", HTTP_HOST=VENDOR_HOST)
         self.assertEqual(resp.status_code, 200)
         member = resp.data["member"]
-        self.assertEqual(member["phone"], "(347) 394-6843")
+        self.assertEqual(member["phone_masked"], "(•••) •••-6843")
+        self.assertTrue(member["has_phone"])
         self.assertEqual(member["address_notes"], "Buzzer 3E")
         self.assertEqual(
             member["address"], "1550 E 102ND ST 3E BROOKLYN, NY 11236",
@@ -29833,7 +29836,117 @@ class VendorWorkScopingTest(TestCase):
         )
         resp = self._api().get(f"/v1/work/{orphan.pk}/", HTTP_HOST=VENDOR_HOST)
         self.assertEqual(resp.status_code, 200)
-        self.assertEqual(resp.data["member"]["phone"], "")
+        self.assertEqual(resp.data["member"]["phone_masked"], "")
+        self.assertFalse(resp.data["member"]["has_phone"])
+
+    def test_the_phone_is_MASKED_by_default(self):
+        """The device is unmanaged and the number is the most directly identifying
+        thing a vendor handles. The last four stay visible so they can confirm they
+        have the right member before asking to see the rest."""
+        resp = self._api().get(f"/v1/work/{self.mine.pk}/", HTTP_HOST=VENDOR_HOST)
+        member = resp.data["member"]
+        self.assertEqual(member["phone_masked"], "(•••) •••-6843")
+        self.assertEqual(member["phone_last4"], "6843")
+        self.assertTrue(member["has_phone"])
+        # The full number must not be anywhere in the payload.
+        self.assertNotIn("394-6843", json.dumps(resp.data, default=str))
+
+    def test_revealing_the_phone_returns_it_and_RECORDS_the_lookup(self):
+        from .models import StageEntityType, StageEvent
+
+        resp = self._api().post(
+            f"/v1/work/{self.mine.pk}/reveal-phone/", {}, format="json",
+            HTTP_HOST=VENDOR_HOST,
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        self.assertEqual(resp.data["phone"], "(347) 394-6843")
+
+        event = StageEvent.objects.filter(
+            entity_type=StageEntityType.DISPATCH_ORDER,
+            dispatch_order=self.mine,
+            note="vendor viewed the member's phone number",
+        ).get()
+        self.assertEqual(event.metadata["vendor_user"], "a@acme.test")
+        # The NUMBER itself is not recorded: logging it to prove someone looked at
+        # it would spread it further than the lookup did.
+        self.assertNotIn("6843", json.dumps(event.metadata))
+
+    def test_the_reveal_is_NOT_written_to_the_members_timeline(self):
+        """The member did nothing. Filling their history with vendor lookups would
+        bury the events that describe their care."""
+        from .models import TimelineEvent
+
+        before = TimelineEvent.objects.filter(client=self.member).count()
+        self._api().post(
+            f"/v1/work/{self.mine.pk}/reveal-phone/", {}, format="json",
+            HTTP_HOST=VENDOR_HOST,
+        )
+        self.assertEqual(
+            TimelineEvent.objects.filter(client=self.member).count(), before,
+        )
+
+    def test_another_vendor_cannot_reveal_a_phone(self):
+        resp = self._api().post(
+            f"/v1/work/{self.theirs.pk}/reveal-phone/", {}, format="json",
+            HTTP_HOST=VENDOR_HOST,
+        )
+        self.assertEqual(resp.status_code, 404)
+
+    def test_the_detail_carries_the_dwelling_case_id_and_programme(self):
+        from .models import ActiveProgram, Case, CaseStatus, CaseType
+        from .services.catalog import clear_program_domain_cache
+
+        name = (
+            "Dwelling Assessment & Statement of Work (SOW) Development - "
+            "Modifications and Remediation Service - Manhattan"
+        )
+        ActiveProgram.objects.create(
+            program_name=name, case_category="Internal Services",
+            case_type=ActiveProgram.CaseType.HOUSING,
+            service_type=ActiveProgram.ServiceType.ENVIRONMENTAL_EXPOSURE_ASSESSMENT,
+        )
+        clear_program_domain_cache()
+        case = Case.objects.create(
+            case_id=uuid.uuid4(), client=self.member,
+            case_type=CaseType.INTERNAL_SERVICE, case_status=CaseStatus.MANAGED,
+            program_name=name, case_created_at=timezone.now(),
+        )
+        self.mine.case = case
+        self.mine.save(update_fields=["case"])
+
+        resp = self._api().get(f"/v1/work/{self.mine.pk}/", HTTP_HOST=VENDOR_HOST)
+        self.assertEqual(resp.data["dwelling_case_id"], str(case.case_id))
+        self.assertEqual(resp.data["program_name"], name)
+
+    def test_a_WORK_ORDER_inherits_the_dwelling_case_id(self):
+        """A vendor quotes that number on paperwork for the installation too."""
+        from .models import ActiveProgram, Case, CaseStatus, CaseType, DispatchKind
+        from .models import DispatchOrder
+        from .services.catalog import clear_program_domain_cache
+
+        name = (
+            "Dwelling Assessment & Statement of Work (SOW) Development - "
+            "Modifications and Remediation Service - Brooklyn"
+        )
+        ActiveProgram.objects.create(
+            program_name=name, case_category="Internal Services",
+            case_type=ActiveProgram.CaseType.HOUSING,
+            service_type=ActiveProgram.ServiceType.ENVIRONMENTAL_EXPOSURE_ASSESSMENT,
+        )
+        clear_program_domain_cache()
+        case = Case.objects.create(
+            case_id=uuid.uuid4(), client=self.member,
+            case_type=CaseType.INTERNAL_SERVICE, case_status=CaseStatus.MANAGED,
+            program_name=name, case_created_at=timezone.now(),
+        )
+        self.mine.case = case
+        self.mine.save(update_fields=["case"])
+        child = DispatchOrder.objects.create(
+            kind=DispatchKind.REMEDIATION, client=self.member, vendor=self.vendor,
+            parent=self.mine,
+        )
+        resp = self._api().get(f"/v1/work/{child.pk}/", HTTP_HOST=VENDOR_HOST)
+        self.assertEqual(resp.data["dwelling_case_id"], str(case.case_id))
 
     def test_an_assessment_detail_carries_the_FORM(self):
         resp = self._api().get(f"/v1/work/{self.mine.pk}/", HTTP_HOST=VENDOR_HOST)

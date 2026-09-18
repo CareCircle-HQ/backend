@@ -145,11 +145,30 @@ def _member_block(order):
     phone, phone_type, notes = order.service_contact
     return {
         "name": f"{first} {last}".strip(),
-        "phone": phone,
+        # MASKED by default. The full number is a separate, RECORDED request --
+        # see VendorRevealPhoneView. The last four digits are shown because a
+        # vendor needs to confirm they have the right person before ringing, and
+        # that much does not identify anybody on its own.
+        "phone_masked": _mask_phone(phone),
+        "phone_last4": "".join(c for c in phone if c.isdigit())[-4:],
+        "has_phone": bool(phone.strip()),
         "phone_type": phone_type,
         "address": order.service_address,
         "address_notes": notes,
     }
+
+
+def _mask_phone(phone):
+    """``(305) 781-3277`` -> ``(•••) •••-3277``.
+
+    Keeps the SHAPE so it reads as a phone number rather than a redaction, and
+    keeps the last four so the vendor can check they are looking at the right
+    member before asking to see the rest.
+    """
+    digits = "".join(c for c in (phone or "") if c.isdigit())
+    if len(digits) < 4:
+        return ""
+    return f"(•••) •••-{digits[-4:]}"
 
 
 def _order_block(order):
@@ -162,6 +181,20 @@ def _order_block(order):
         "status_label": order.get_status_display(),
         "referral_type": order.referral_type,
         "location": order.location,
+        # The governing Dwelling Assessment case, in FULL. A vendor quotes this
+        # number on paperwork, and a truncated id cannot be quoted.
+        "dwelling_case_id": (
+            str(order.case_id) if order.case_id
+            else str(order.parent.case_id) if order.parent_id and order.parent.case_id
+            else ""
+        ),
+        # The programme name, so the app can head the screen with the real service
+        # ("Environmental Exposure Assessment") rather than our internal kind.
+        "program_name": (
+            order.case.program_name if order.case_id
+            else order.parent.case.program_name
+            if order.parent_id and order.parent.case_id else ""
+        ),
         "member": _member_block(order),
         # What the member offered. The vendor picks from these to confirm an
         # appointment; it is not itself an appointment.
@@ -200,7 +233,7 @@ class VendorWorkListView(VendorAPIView):
         qs = (
             DispatchOrder.objects
             .filter(vendor=request.user.vendor)
-            .select_related("client")
+            .select_related("client", "case", "parent", "parent__case")
             .prefetch_related("availability_windows", "visits", "line_items")
         )
 
@@ -243,7 +276,7 @@ class VendorWorkDetailView(VendorAPIView):
         order = (
             DispatchOrder.objects
             .filter(pk=order_id, vendor=request.user.vendor)
-            .select_related("client")
+            .select_related("client", "case", "parent", "parent__case")
             .prefetch_related("availability_windows", "visits", "line_items")
             .first()
         )
@@ -746,3 +779,52 @@ class VendorScheduleView(VendorAPIView):
                 ).order_by("send_at")
             ],
         }, status=http.HTTP_201_CREATED)
+
+
+class VendorRevealPhoneView(VendorAPIView):
+    """POST /v1/work/<order_id>/reveal-phone/ -- the member's full number.
+
+    A DELIBERATE, RECORDED action rather than a field on the order. The device is
+    unmanaged and the number is the most directly identifying thing a vendor
+    handles, so "who looked at this, and when" has to be answerable.
+
+    Recorded on the CASE history (StageEvent against the dispatch order), NOT the
+    member's timeline: the member did not do anything, and filling their history
+    with vendor lookups would bury the events that describe their care.
+    """
+
+    def post(self, request, order_id):
+        from ..models import StageEventSource
+        from ..services import dispatch as dispatch_svc
+
+        order = (
+            DispatchOrder.objects
+            .filter(pk=order_id, vendor=request.user.vendor)
+            .select_related("client", "vendor")
+            .first()
+        )
+        if order is None:
+            return error("not_found", "No such assignment.", http.HTTP_404_NOT_FOUND)
+
+        phone, phone_type, _notes = order.service_contact
+        if not (phone or "").strip():
+            return error("no_phone", "No phone number on this order.")
+
+        user = request.user.vendor_user
+        dispatch_svc.record_transition(
+            order, order.status, order.status,
+            source=StageEventSource.MANUAL,
+            note="vendor viewed the member's phone number",
+            metadata={
+                # The value itself is NOT recorded. Logging the number to prove
+                # someone looked at the number would spread it further than the
+                # lookup did.
+                "vendor_user": user.email,
+                "vendor_user_name": user.name,
+                "vendor": order.vendor.name if order.vendor_id else "",
+            },
+        )
+        logger.info(
+            "vendor phone reveal: order=%s vendor_user=%s", order.pk, user.email,
+        )
+        return Response({"phone": phone, "phone_type": phone_type})

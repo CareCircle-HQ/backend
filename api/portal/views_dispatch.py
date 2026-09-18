@@ -100,6 +100,14 @@ def _serialize_order(order):
         # pastes it into Unite Us and a truncated one cannot be searched with. The
         # labelled dwellings are exposed too: "primary" is this case, and a
         # "secondary" appears when the member is reassessed at another address.
+        # DERIVED from the client rather than stored on the order. A snapshot would
+        # be a second copy of the member's name that can drift from the record, and
+        # the PDF is rendered server-side from the client anyway -- so there is
+        # nothing a stored copy would make correct that this does not.
+        "member_name": (
+            f"{(order.client.first_name or '').strip()} "
+            f"{(order.client.last_name or '').strip()}"
+        ).strip(),
         "dwelling_case_id": str(order.case_id) if order.case_id else "",
         "dwellings": order.dwellings or {},
         # The ORDER's own authorization -- the Dwelling Assessment case's window.

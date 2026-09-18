@@ -14,6 +14,7 @@ from .views import (
     VendorLogoutView,
     VendorMeView,
     VendorWorkDetailView,
+    VendorRevealPhoneView,
     VendorScheduleView,
     VendorTeamDetailView,
     VendorTeamListView,
@@ -31,6 +32,10 @@ urlpatterns = [
         VendorTeamDetailView.as_view(), name="vendor-team-detail",
     ),
     path("v1/work/", VendorWorkListView.as_view(), name="vendor-work-list"),
+    path(
+        "v1/work/<uuid:order_id>/reveal-phone/",
+        VendorRevealPhoneView.as_view(), name="vendor-reveal-phone",
+    ),
     path(
         "v1/work/<uuid:order_id>/schedule/",
         VendorScheduleView.as_view(), name="vendor-schedule",
