@@ -290,15 +290,36 @@ class VendorWorkDetailView(VendorAPIView):
             from ..services.assessment_forms import (
                 build_schema, modules_for_referral,
             )
+            from ..services import pricing
 
             form = getattr(order, "questionnaire", None)
+            schema = (
+                form.schema() if form
+                else build_schema(modules_for_referral(order.referral_type))
+            )
+            # THIS VENDOR's price on each intervention option, so they can see what
+            # they will invoice us while choosing quantities. Their negotiated price
+            # where one exists, otherwise the base.
+            #
+            # The vendor sees ONLY their own price -- never the admin fee or what we
+            # bill Unite Us. That is our margin, and putting it on their device
+            # would be handing a supplier our mark-up.
+            prices = {
+                r["option_code"]: r["price"]
+                for r in pricing.price_list_for(order.vendor)
+                if r["option_code"]
+            }
+            for module in schema.get("modules", []):
+                for group in module.get("intervention_groups", []):
+                    for option in group.get("options", []):
+                        # Absent rather than zero when unpriced: a missing price is
+                        # something to ask about, and "$0.00" reads as free.
+                        option["vendor_price"] = prices.get(option["code"])
+
             payload["form"] = {
                 "state": form.state if form else "not_started",
                 "template_version": form.template_version if form else None,
-                "schema": (
-                    form.schema() if form
-                    else build_schema(modules_for_referral(order.referral_type))
-                ),
+                "schema": schema,
                 "answers": form.answers if form else {},
                 "section_other": form.section_other if form else {},
                 "interventions": form.interventions if form else [],

@@ -1,29 +1,3 @@
-# Product <-> programme map (housing)
-
-Every product in the billable-items catalogue, the category it belongs to, and
-the exact `ActiveProgram` row a case would be opened against.
-
-Generated from the programme table and the product catalogue, so the programme
-names below are exact rather than retyped.
-
-A housing programme name is three parts separated by ` - `:
-
-```
-Home Remediation - Air Conditioner - Manhattan
-|____ family ___|  |____ item ____|  |_ borough _|
-```
-
-The middle part links a product to a programme, and the two families use it
-differently:
-
-* **Home Accessibility** puts the CATEGORY there, so several products share one
-  programme -- the three bathroom products all map to
-  `... - Bathroom Facilities - <borough>`.
-* **Home Remediation** puts the product-level item there, which is also our
-  category -- so one programme still covers both air conditioners.
-
----
-
 ## Bathroom Facilities
 
 *Home Accessibility and Safety Modification*
@@ -34,7 +8,7 @@ Products:
 * Bath bench
 * Raised toilet seat
 
-| Programme | Brooklyn | Manhattan | Queens |
+| Programmed | Brooklyn | Manhattan | Queens |
 |---|---|---|---|
 | `Home Accessibility and Safety Modification - Bathroom Facilities - <borough>` | internal | internal | internal |
 
@@ -205,13 +179,7 @@ Products affected:
 * D-ring cabinet pull
 * Loop cabinet handle
 
-**Reclassify from External Services to Internal Services:**
 
-```
-Home Accessibility and Safety Modification - Doors and Cabinet Handles - Brooklyn
-Home Accessibility and Safety Modification - Doors and Cabinet Handles - Manhattan
-Home Accessibility and Safety Modification - Doors and Cabinet Handles - Queens
-```
 
 ### Accessibility Ramps
 
@@ -222,11 +190,15 @@ Products affected:
 
 No programme exists in any borough. **Create three:**
 
-```
-Home Accessibility and Safety Modification - Accessibility Ramps - Brooklyn
-Home Accessibility and Safety Modification - Accessibility Ramps - Manhattan
-Home Accessibility and Safety Modification - Accessibility Ramps - Queens
-```
+
+## We don't have any program for those products: 
+
+### Accessibility Ramps
+
+- Home Accessibility and Safety Modification - Accessibility Ramps - Brooklyn
+- Home Accessibility and Safety Modification - Accessibility Ramps - Manhattan
+- Home Accessibility and Safety Modification - Accessibility Ramps - Queens
+
 
 ### Pathways
 
@@ -234,34 +206,13 @@ Products affected:
 
 * Threshold reducer
 
-No programme exists in any borough. **Create three:**
+No program exists in any borough. **Create three:**
 
-```
+
+
+- Pathways
+
 Home Accessibility and Safety Modification - Pathways - Brooklyn
 Home Accessibility and Safety Modification - Pathways - Manhattan
 Home Accessibility and Safety Modification - Pathways - Queens
-```
 
-## What each row needs
-
-Every gap is in the **Home Accessibility** family -- the Home Remediation side
-is already complete -- so they all take the same values:
-
-```
-case_category = Internal Services
-case_type     = housing
-service_type  = environmental_modifications_accessibility
-```
-
-Matching migration `0268_seed_home_accessibility_programs.py`. Call
-`clear_program_domain_cache()` afterwards, or the classification cache keeps
-refusing them until the next restart.
-
-## Verified
-
-Every name under *Reclassify* exists verbatim and is currently
-`External Services`. Every name under *Create* does not exist -- so neither
-list can produce a duplicate.
-
-Checked against the local clone. Re-check against PRODUCTION before acting:
-agents edit the programme table there, so the external rows may differ.
