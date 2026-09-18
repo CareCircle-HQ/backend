@@ -4,9 +4,10 @@
 `Simplified_Billable_Items_Pricing` against the `ActiveProgram` table, matching on
 the item parsed out of each programme name.
 
-**10 programmes are needed: 6 created, 4 reclassified.** Until they exist, an
-assessor can recommend those interventions and no internal-service case can be
-opened for them — they are priced but unorderable.
+**10 of the 26 priced products cannot become an internal-service case**, because
+the programme their category needs is either missing or marked External.
+
+Fixing it takes **10 programme rows: 6 created, 4 reclassified.**
 
 ---
 
@@ -37,27 +38,63 @@ duplicates.
 
 ---
 
-## Current state
+## Every product, and whether it can become an internal-service case
+
+`Y` = an internal programme exists for that borough. **10 of 26 products have a
+gap.**
 
 ```
-PRICE CATEGORY             PROGRAMME ITEM               BK    MN    QN
-Accessibility Ramps        -- none --                   ---   ---   ---
-Pathways                   -- none --                   ---   ---   ---
-Doors & Cabinet Handles    Doors and Cabinet Handles    EXT   EXT   EXT
-Grab Bars                  Grab Bars                    INT   INT   EXT
-Bathroom Facilities        Bathroom Facilities          INT   INT   INT
-Non-skid Surfaces          Non-skid Surfaces            INT   INT   INT
-Handrails                  Hand Rails                   INT   INT   INT
-Air Conditioner            Air Conditioner              INT   INT   INT
-Air Filtration Devices     Air Filtration Device        INT   INT   INT
-De-humidifier              De-humidifier                INT   INT   INT
-Heater                     Heater                       INT   INT   INT
-Humidifier                 Humidifier                   INT   INT   INT
+PRODUCT                        CATEGORY                 PROGRAMME (middle)        BK MN QN
+Shower chair                   Bathroom Facilities      Bathroom Facilities        Y  Y  Y
+Bath bench                     Bathroom Facilities      Bathroom Facilities        Y  Y  Y
+Raised toilet seat             Bathroom Facilities      Bathroom Facilities        Y  Y  Y
+Non-skid bath mat              Non-skid Surfaces        Non-skid Surfaces          Y  Y  Y
+Non-slip adhesive strips       Non-skid Surfaces        Non-skid Surfaces          Y  Y  Y
+Non-slip tape                  Non-skid Surfaces        Non-skid Surfaces          Y  Y  Y
+Grab bar at toilet             Grab Bars                Grab Bars                  Y  Y  .   <- gap
+Grab bar at tub                Grab Bars                Grab Bars                  Y  Y  .   <- gap
+Grab bar at shower             Grab Bars                Grab Bars                  Y  Y  .   <- gap
+Floor-to-ceiling safety pole   Grab Bars                Grab Bars                  Y  Y  .   <- gap
+Lever door handle              Doors & Cabinet Handles  Doors and Cabinet Handles  .  .  .   <- gap
+D-ring cabinet pull            Doors & Cabinet Handles  Doors and Cabinet Handles  .  .  .   <- gap
+Loop cabinet handle            Doors & Cabinet Handles  Doors and Cabinet Handles  .  .  .   <- gap
+Modular/portable ramp          Accessibility Ramps      ** NONE **                --  -- --  <- gap
+Threshold ramp                 Accessibility Ramps      ** NONE **                --  -- --  <- gap
+Interior staircase handrail    Handrails                Hand Rails                 Y  Y  Y
+Hallway handrail               Handrails                Hand Rails                 Y  Y  Y
+Threshold reducer              Pathways                 ** NONE **                --  -- --  <- gap
+HEPA air purifier              Air Filtration Devices   Air Filtration Device      Y  Y  Y
+Portable air filtration unit   Air Filtration Devices   Air Filtration Device      Y  Y  Y
+Dehumidifier (portable)        De-humidifier            De-humidifier              Y  Y  Y
+Portable humidifier            Humidifier               Humidifier                 Y  Y  Y
+Cool mist humidifier           Humidifier               Humidifier                 Y  Y  Y
+Window air conditioner         Air Conditioner          Air Conditioner            Y  Y  Y
+Portable air conditioner       Air Conditioner          Air Conditioner            Y  Y  Y
+Portable space heater          Heater                   Heater                     Y  Y  Y
 ```
 
-Boroughs are Brooklyn, Manhattan and Queens — the only three in the table today.
+### The two levels behave differently, which is why both are shown
 
----
+* **Home Accessibility** programmes name a CATEGORY in the middle
+  (`... - Bathroom Facilities - Brooklyn`), so one programme covers several
+  products — three bathroom products share one programme.
+* **Home Remediation** programmes name the PRODUCT-level item
+  (`... - Air Conditioner - Brooklyn`), which is also our category, so the two
+  levels coincide there — one programme still covers both the window and portable
+  air conditioners.
+
+Either way the question is the same: **does an internal programme exist for the
+category this product sits in, in this borough?** A product with no internal
+programme is priced, recommendable on the assessment form, and unorderable.
+
+### Four categories account for all ten
+
+```
+Grab Bars                 4 products   Queens only
+Doors & Cabinet Handles   3 products   all three boroughs
+Accessibility Ramps       2 products   no programme in any borough
+Pathways                  1 product    no programme in any borough
+```
 
 ## 1. Create — 6 programmes that do not exist at all
 
