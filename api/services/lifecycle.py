@@ -1696,6 +1696,28 @@ def _housing_overall_phase(client, case):
     if case.case_status in _CLOSED_CASE_STATUSES:
         return ("closed", "The dwelling assessment case is closed")
 
+    # OUT OF RANGE beats everything below Closed. If we do not serve the dwelling's
+    # ZIP, the authorization window and the work orders are beside the point --
+    # nobody can be sent there. Mirrors the food bar, which surfaces a coverage
+    # block as Out of Range rather than a generic hold.
+    from ..models import DispatchKind, DispatchOrder
+    from .service_area import order_service_area
+
+    order = (
+        DispatchOrder.objects
+        .filter(client=client, kind=DispatchKind.ASSESSMENT)
+        .order_by("-created_at").first()
+    )
+    if order is not None and (order.address_zip or order.address_formatted):
+        area = order_service_area(order)
+        if not area["in_service_area"]:
+            return (
+                "out_of_range",
+                f"{area['zip'] or 'This address'} is outside our service area"
+                if area["reason"] == "out_of_area"
+                else "The dwelling address has no ZIP code",
+            )
+
     live_orders = list(
         DispatchOrder.objects
         .filter(client=client)
@@ -2084,6 +2106,7 @@ def program_tracks(client):
                 "label": {
                     "open": "Open", "expired": "Expired",
                     "completed": "Completed", "closed": "Closed",
+                    "out_of_range": "Out of Range",
                 }.get(ov_val, ""),
                 "detail": ov_lbl,
             },

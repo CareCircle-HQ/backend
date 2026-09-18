@@ -3334,6 +3334,12 @@ class ActiveProgram(models.Model):
     # for internal-service "Reauthorization: ..." programs by data migration.
     # ``db_default`` guards against an omitted-column insert during a deploy window
     # (see Case.is_extension).
+    # DECODED from the programme name, whose last part is the borough
+    # ("Home Remediation - Air Conditioner - Queens"). Stored rather than parsed on
+    # every read so it can be filtered and grouped in SQL -- and backfilled by
+    # migration, so it cannot drift from the name it came from without someone
+    # editing the name.
+    borough = models.CharField(max_length=40, blank=True, db_index=True)
     to_extend = models.BooleanField(default=False, db_default=False)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)

@@ -23,6 +23,7 @@ from ..models import (
     StageEventSource, Vendor,
 )
 from ..services import dispatch as dispatch_svc
+from ..services import service_area
 from .base import PortalAPIView, current_agent
 
 logger = logging.getLogger(__name__)
@@ -116,6 +117,11 @@ def _serialize_order(order):
         # any individual item says. Uses effective_authorization_window() so it
         # inherits the request-window fallback.
         "authorization": _authorization_block(order.case if order.case_id else None),
+        # Whether we serve this dwelling, and which borough it is in. Derived from
+        # the ZIP on every read rather than stored: a ZIP removed from the service
+        # table means we no longer serve there, and an order holding its old answer
+        # would send a vendor somewhere we cannot bill for.
+        "service_area": service_area.order_service_area(order),
         # The ITEMS. On an assessment these are every item found; on a work order,
         # the ones that work order covers. An item is not a status -- it is a thing
         # to install -- so it carries its case's AUTHORIZATION rather than a
@@ -880,7 +886,12 @@ class MemberCaseRecommendationsView(PortalAPIView):
         return Response({
             "state": "submitted",
             "submitted_at": form.submitted_at,
-            "borough": recs.member_borough(client),
+            "borough": recs.member_borough(client, order),
+            "service_area": service_area.order_service_area(order),
+            # Reported when the dwelling's ZIP and the governing case disagree: a
+            # member who has moved needs cases in the NEW borough, but an agent
+            # should be told the records differ rather than find out on an invoice.
+            "borough_conflict": recs.borough_conflict(client, order),
             "cases": cases,
             # Counted here so the UI does not have to re-derive the rules it is
             # about to explain.

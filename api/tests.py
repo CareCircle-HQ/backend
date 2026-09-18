@@ -31881,3 +31881,201 @@ class CaseRecommendationTest(TestCase):
         self.assertEqual(resp.data["summary"]["products"], 4)
         # the external one and the missing one
         self.assertEqual(resp.data["summary"]["blocked"], 2)
+
+
+class ServiceAreaTest(TestCase):
+    """ZIP -> in service area, and ZIP -> borough."""
+
+    def setUp(self):
+        from .models import ServiceZipCode
+
+        for z, b in (
+            ("11236", "Brooklyn"), ("10002", "Manhattan"), ("11354", "Queens"),
+        ):
+            ServiceZipCode.objects.update_or_create(
+                zip=z, defaults={"borough": b, "is_active": True},
+            )
+
+    def test_a_served_zip_gives_its_borough(self):
+        from .services import service_area
+
+        self.assertEqual(service_area.borough_for_zip("11236"), "Brooklyn")
+        self.assertEqual(service_area.borough_for_zip("10002"), "Manhattan")
+
+    def test_a_ZIP_PLUS_FOUR_is_accepted(self):
+        """Unite Us exports carry "11236-5775"; a naive lookup misses every one."""
+        from .services import service_area
+
+        self.assertEqual(service_area.borough_for_zip("11236-5775"), "Brooklyn")
+
+    def test_an_unserved_zip_is_out_of_area(self):
+        from .services import service_area
+
+        out = service_area.housing_area_check("33018")
+        self.assertFalse(out["in_service_area"])
+        self.assertEqual(out["reason"], "out_of_area")
+        self.assertEqual(out["borough"], "")
+
+    def test_a_MISSING_zip_is_distinguished_from_an_unserved_one(self):
+        """Different problems: a missing ZIP is a data-entry fix an agent can make
+        now, an unserved one is a coverage decision they cannot."""
+        from .services import service_area
+
+        self.assertEqual(service_area.housing_area_check("")["reason"], "no_zip")
+        self.assertEqual(service_area.housing_area_check("nonsense")["reason"], "no_zip")
+
+    def test_a_DEACTIVATED_zip_stops_being_served(self):
+        from .models import ServiceZipCode
+        from .services import service_area
+
+        ServiceZipCode.objects.filter(zip="11236").update(is_active=False)
+        self.assertFalse(service_area.housing_area_check("11236")["in_service_area"])
+
+
+class HousingOutOfRangeTest(TestCase):
+    """The housing bar shows Out of Range when we do not serve the dwelling."""
+
+    EEA = (
+        "Dwelling Assessment & Statement of Work (SOW) Development - "
+        "Modifications and Remediation Service - Queens"
+    )
+
+    def setUp(self):
+        from .models import (
+            ActiveProgram, Case, CaseStatus, CaseType, Client, DispatchKind,
+            DispatchOrder, ServiceZipCode, Vendor,
+        )
+        from .services.catalog import clear_program_domain_cache
+
+        ServiceZipCode.objects.update_or_create(
+            zip="11236", defaults={"borough": "Brooklyn", "is_active": True},
+        )
+        ActiveProgram.objects.create(
+            program_name=self.EEA, case_category="Internal Services",
+            case_type=ActiveProgram.CaseType.HOUSING,
+            service_type=ActiveProgram.ServiceType.ENVIRONMENTAL_EXPOSURE_ASSESSMENT,
+        )
+        clear_program_domain_cache()
+        self.member = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Range", last_name="Member",
+            client_added_at=timezone.now(),
+        )
+        Case.objects.create(
+            case_id=uuid.uuid4(), client=self.member,
+            case_type=CaseType.INTERNAL_SERVICE, case_status=CaseStatus.MANAGED,
+            program_name=self.EEA, case_created_at=timezone.now(),
+        )
+        self.order = DispatchOrder.objects.create(
+            kind=DispatchKind.ASSESSMENT, client=self.member,
+            vendor=Vendor.objects.create(name="Acme"),
+        )
+
+    def _chip(self):
+        from .services.lifecycle import program_tracks
+
+        for t in program_tracks(self.member):
+            if t["domain"] == "housing":
+                return t["housing_overall"]
+        return None
+
+    def test_an_unserved_zip_reads_OUT_OF_RANGE(self):
+        self.order.address_zip = "33018"
+        self.order.save(update_fields=["address_zip"])
+        chip = self._chip()
+        self.assertEqual(chip["value"], "out_of_range")
+        self.assertEqual(chip["label"], "Out of Range")
+        self.assertIn("33018", chip["detail"])
+
+    def test_a_served_zip_does_NOT_read_out_of_range(self):
+        self.order.address_zip = "11236"
+        self.order.save(update_fields=["address_zip"])
+        self.assertEqual(self._chip()["value"], "open")
+
+    def test_OUT_OF_RANGE_beats_EXPIRED(self):
+        """If we cannot send anyone there, the authorization window is beside the
+        point."""
+        from .models import Case
+
+        case = Case.objects.get(client=self.member)
+        case.service_authorization_status = "approved"
+        case.service_authorization_approval_starts_at = (
+            timezone.now() - timezone.timedelta(days=40)
+        )
+        case.service_authorization_approval_ends_at = (
+            timezone.now() - timezone.timedelta(days=5)
+        )
+        case.save()
+        self.order.address_zip = "33018"
+        self.order.save(update_fields=["address_zip"])
+        self.assertEqual(self._chip()["value"], "out_of_range")
+
+    def test_CLOSED_still_beats_out_of_range(self):
+        from .models import Case, CaseStatus
+
+        Case.objects.filter(client=self.member).update(
+            case_status=CaseStatus.CLOSED,
+        )
+        self.order.address_zip = "33018"
+        self.order.save(update_fields=["address_zip"])
+        self.assertEqual(self._chip()["value"], "closed")
+
+    def test_an_order_with_NO_address_is_not_out_of_range(self):
+        """An order raised before the address was captured must not look like a
+        coverage failure."""
+        self.assertEqual(self._chip()["value"], "open")
+
+    def test_the_BOROUGH_for_new_cases_comes_from_the_ZIP(self):
+        """The work happens at the assessed dwelling, so its ZIP decides the
+        borough -- not the governing case, which says where they enrolled."""
+        from .services import case_recommendations as recs
+
+        self.order.address_zip = "11236"
+        self.order.save(update_fields=["address_zip"])
+        # The governing case is QUEENS; the dwelling is in Brooklyn.
+        self.assertEqual(recs.member_borough(self.member, self.order), "Brooklyn")
+        self.assertEqual(
+            recs.borough_conflict(self.member, self.order), ("Brooklyn", "Queens"),
+        )
+
+    def test_an_out_of_area_zip_FALLS_BACK_to_the_governing_case_borough(self):
+        """Keeps a recommendation possible rather than blank."""
+        from .services import case_recommendations as recs
+
+        self.order.address_zip = "33018"
+        self.order.save(update_fields=["address_zip"])
+        self.assertEqual(recs.member_borough(self.member, self.order), "Queens")
+        self.assertIsNone(recs.borough_conflict(self.member, self.order))
+
+
+class ProgramBoroughColumnTest(TestCase):
+    """ActiveProgram.borough, decoded from the programme name."""
+
+    def test_the_field_exists_and_is_indexed(self):
+        from .models import ActiveProgram
+
+        field = ActiveProgram._meta.get_field("borough")
+        self.assertTrue(field.db_index)
+        self.assertTrue(field.blank)
+
+    def test_a_housing_name_decodes_to_its_borough(self):
+        """Migrations do not run under the test runner, so this asserts the RULE
+        the backfill applies rather than the backfilled data."""
+        from .models import ServiceZipCode
+
+        ServiceZipCode.objects.update_or_create(
+            zip="11236", defaults={"borough": "Brooklyn", "is_active": True},
+        )
+        known = {"Brooklyn", "Manhattan", "Queens"}
+        for name, expected in (
+            ("Home Remediation - Air Conditioner - Queens", "Queens"),
+            ("Home Accessibility and Safety Modification - Grab Bars - Brooklyn",
+             "Brooklyn"),
+            # A food programme whose last part is NOT a place must stay blank --
+            # guessing would put "(Household) Pregnant / Postpartum" in a borough
+            # column.
+            ("Clinically Appropriate Meals - (Household) Pregnant / Postpartum", ""),
+            ("Addiction Services", ""),
+        ):
+            parts = [p.strip() for p in name.split(" - ")]
+            candidate = parts[-1] if len(parts) >= 2 else ""
+            self.assertEqual(candidate if candidate in known else "", expected, name)

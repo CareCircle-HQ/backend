@@ -47,20 +47,59 @@ _CATEGORY_FAMILY = {
 }
 
 
-def member_borough(client):
-    """The borough this member is served in, from their governing housing case.
+def member_borough(client, order=None):
+    """The borough the new cases should be opened in.
 
-    Returns "" when they have no housing case -- which the caller must handle
-    rather than guessing, because a case opened in the wrong borough is billed
-    against the wrong programme.
+    THE DWELLING'S ZIP WINS. The work happens at the assessed address, so its
+    borough is the one the remediation programmes must name -- and it comes from
+    ServiceZipCode, the same table that decides whether we serve the address at
+    all.
+
+    Falls back to the GOVERNING CASE's borough when the ZIP gives no answer: an
+    address outside the service area, or one entered before this check existed.
+    That keeps a recommendation possible rather than blank, and the two agreeing is
+    the normal case.
+
+    Returns "" when neither knows -- which the caller must handle rather than
+    guess, because a case opened in the wrong borough is billed against the wrong
+    programme.
     """
     from .housing import housing_service_case
+    from .service_area import order_service_area
+
+    if order is not None and (order.address_zip or order.address_formatted):
+        borough = order_service_area(order)["borough"]
+        if borough:
+            return borough
 
     case = housing_service_case(client)
     if case is None:
         return ""
     _family, _item, borough = parse_housing_program_name(case.program_name)
     return borough
+
+
+def borough_conflict(client, order):
+    """``(zip_borough, case_borough)`` when the two DISAGREE, else None.
+
+    Worth surfacing rather than silently preferring one: a member enrolled through
+    a Queens case who has moved to Brooklyn needs new cases in Brooklyn, but an
+    agent should be told the records disagree rather than discovering it on an
+    invoice.
+    """
+    from .housing import housing_service_case
+    from .service_area import order_service_area
+
+    if order is None:
+        return None
+    zip_borough = order_service_area(order)["borough"]
+    case = housing_service_case(client)
+    case_borough = ""
+    if case is not None:
+        _f, _i, case_borough = parse_housing_program_name(case.program_name)
+    if zip_borough and case_borough and zip_borough != case_borough:
+        return (zip_borough, case_borough)
+    return None
 
 
 def _existing_housing_cases(client):
@@ -101,7 +140,7 @@ def recommended_cases(questionnaire):
     order = questionnaire.dispatch_order
     client = order.client
     vendor = order.vendor
-    borough = member_borough(client)
+    borough = member_borough(client, order)
 
     chosen = [
         i for i in (questionnaire.interventions or [])
