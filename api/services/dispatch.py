@@ -123,12 +123,17 @@ def missing_for_submission(order):
     if DispatchSignerRole.MEMBER not in roles:
         missing.append("member signature")
 
-    # At least one photo PER FINDING -- which is why DispatchProof carries a
-    # finding FK. Proofs with no finding are general site photos and do not count
-    # toward any finding's requirement.
-    for finding in order.findings.all():
-        if not finding.proofs.exists():
-            missing.append(f"photo for finding: {finding.title}")
+    # AT LEAST ONE PHOTO OF THE DWELLING. Not one per finding, which is what this
+    # used to require and what the real form contradicts:
+    #
+    #   "At least one photo of the dwelling, your signature, and the member's
+    #    signature are all required before you can submit."
+    #
+    # Every real submission supplied carried Photos (1) against roughly ten ticked
+    # risks, so the per-finding rule would have rejected all of them. A photo per
+    # finding belongs to WORK ORDERS, where proof of service is per item installed.
+    if not order.proofs.exists():
+        missing.append("at least one photo of the dwelling")
 
     return missing
 

@@ -18,6 +18,7 @@ import logging
 from django.utils import timezone
 from rest_framework import status as http
 from rest_framework.response import Response
+from rest_framework.parsers import FormParser, MultiPartParser
 from rest_framework.views import APIView
 
 from ..models import (
@@ -849,3 +850,325 @@ class VendorRevealPhoneView(VendorAPIView):
             "vendor phone reveal: order=%s vendor_user=%s", order.pk, user.email,
         )
         return Response({"phone": phone, "phone_type": phone_type})
+
+
+# ── completing the assessment ────────────────────────────────────────────────
+
+class VendorAssessmentSaveView(VendorAPIView):
+    """PATCH /v1/work/<order_id>/assessment/ -- save the answers as a DRAFT.
+
+    Idempotent and whole-document: the app sends everything it has, and this
+    replaces it. A field-by-field merge would need the client and server to agree
+    about which of them last touched each answer, and an assessor who unticks a box
+    offline must see it unticked when they sync.
+
+    Saving is NOT submitting. A draft has no gate and can be saved as often as the
+    app likes.
+    """
+
+    def _questionnaire(self, request, order_id):
+        from ..models import DispatchKind, DispatchOrder, DispatchQuestionnaire
+        from ..services.assessment_forms import modules_for_referral
+
+        order = (
+            DispatchOrder.objects
+            .filter(pk=order_id, vendor=request.user.vendor,
+                    kind=DispatchKind.ASSESSMENT)
+            .select_related("client", "vendor").first()
+        )
+        if order is None:
+            return None, None
+        form, _created = DispatchQuestionnaire.objects.get_or_create(
+            dispatch_order=order,
+            defaults={"modules": modules_for_referral(order.referral_type)},
+        )
+        return order, form
+
+    def patch(self, request, order_id):
+        from ..models import DispatchQuestionnaireState
+        from ..services.assessment_forms import all_option_codes, all_question_codes
+
+        order, form = self._questionnaire(request, order_id)
+        if order is None:
+            return error("not_found", "No such assignment.", http.HTTP_404_NOT_FOUND)
+        if form.state == DispatchQuestionnaireState.SUBMITTED:
+            return error(
+                "already_submitted",
+                "This assessment has been submitted and cannot be edited.",
+                http.HTTP_409_CONFLICT,
+            )
+
+        data = request.data or {}
+        modules = form.modules or []
+
+        if "answers" in data:
+            # UNKNOWN CODES ARE DROPPED, not rejected. A stale app holding a
+            # retired question should still be able to save the answers that do
+            # exist -- failing the whole save would lose a completed visit over a
+            # question nobody asks any more.
+            known = set(all_question_codes(modules))
+            form.answers = {
+                k: bool(v) for k, v in (data.get("answers") or {}).items()
+                if k in known
+            }
+        if "section_other" in data:
+            form.section_other = {
+                str(k): str(v)[:1000]
+                for k, v in (data.get("section_other") or {}).items()
+            }
+        if "interventions" in data:
+            known_options = set(all_option_codes(modules))
+            cleaned = []
+            for entry in (data.get("interventions") or []):
+                code = (entry or {}).get("option")
+                try:
+                    qty = int((entry or {}).get("qty") or 0)
+                except (TypeError, ValueError):
+                    qty = 0
+                # qty 0 means "not recommended", so it is simply not stored --
+                # keeping zeros would make "what did they recommend?" a filter
+                # rather than a read.
+                if code in known_options and qty > 0:
+                    cleaned.append({"option": code, "qty": qty})
+            form.interventions = cleaned
+        if "justification" in data:
+            form.justification = (data.get("justification") or "").strip()
+        if "assessor_notes" in data:
+            form.assessor_notes = (data.get("assessor_notes") or "").strip()
+
+        form.save()
+        return Response({
+            "state": form.state,
+            "answers": form.answers,
+            "section_other": form.section_other,
+            "interventions": form.interventions,
+            "justification": form.justification,
+            "assessor_notes": form.assessor_notes,
+            "updated_at": form.updated_at,
+        })
+
+
+class VendorPhotoView(VendorAPIView):
+    """POST /v1/work/<order_id>/photos/ -- attach a dwelling photo.
+
+    Accepts multipart for now. The POD API's presign/confirm flow is the better
+    shape at volume -- it keeps a 5 MB cellular upload off a gunicorn worker -- and
+    this endpoint is deliberately compatible with moving to it: the response shape
+    is the same either way.
+    """
+
+    parser_classes = [MultiPartParser, FormParser]
+    # A phone photo after client-side compression is well under this; the ceiling
+    # exists so an uncompressed 12 MP image fails with our JSON error rather than
+    # an nginx HTML 413.
+    MAX_BYTES = 12 * 1024 * 1024
+
+    def post(self, request, order_id):
+        import hashlib
+
+        from ..models import DispatchOrder, DispatchProof
+        from ..services import import_storage
+
+        order = DispatchOrder.objects.filter(
+            pk=order_id, vendor=request.user.vendor,
+        ).first()
+        if order is None:
+            return error("not_found", "No such assignment.", http.HTTP_404_NOT_FOUND)
+
+        files = request.FILES.getlist("file") or request.FILES.getlist("photo")
+        if not files:
+            return error("no_file", "Attach an image as 'file'.")
+
+        created = []
+        for upload in files:
+            if upload.size > self.MAX_BYTES:
+                return error(
+                    "too_large",
+                    f"{upload.name} is larger than 12 MB. Compress it first.",
+                )
+            raw = upload.read()
+            digest = hashlib.sha256(raw).hexdigest()
+            # Content-addressed and idempotent: an offline client retrying an upload
+            # must not produce a second copy of the same photo.
+            existing = DispatchProof.objects.filter(
+                dispatch_order=order, content_hash=digest,
+            ).first()
+            if existing is not None:
+                created.append(existing)
+                continue
+            key = import_storage.build_key(
+                f"dispatch-proofs/{order.pk}/{digest[:16]}-{upload.name}"
+            )
+            import_storage.upload_bytes(
+                key, raw, content_type=upload.content_type or "image/jpeg",
+            )
+            created.append(DispatchProof.objects.create(
+                dispatch_order=order,
+                s3_key=key,
+                content_hash=digest,
+                caption=(request.data.get("caption") or "").strip(),
+                captured_at=timezone.now(),
+            ))
+
+        return Response({
+            "photos": [
+                {"id": p.pk, "content_hash": p.content_hash,
+                 "captured_at": p.captured_at}
+                for p in created
+            ],
+            "total": order.proofs.count(),
+        }, status=http.HTTP_201_CREATED)
+
+
+class VendorSignatureView(VendorAPIView):
+    """POST /v1/work/<order_id>/signatures/ -- store a drawn signature.
+
+    The canvas arrives as a base64 data URL. Stored like a proof: an S3 key plus a
+    sha256, so the image is content-addressed and a retry cannot duplicate it.
+
+    One signature per role. Re-signing REPLACES, because the second attempt is the
+    one the person meant -- a member who signs, sees a typo in their name and signs
+    again should not leave two signatures on the record.
+    """
+
+    def post(self, request, order_id):
+        import base64
+        import hashlib
+
+        from ..models import (
+            DispatchOrder, DispatchSignature, DispatchSignerRole,
+        )
+        from ..services import dispatch as dispatch_svc
+        from ..services import import_storage
+
+        order = DispatchOrder.objects.filter(
+            pk=order_id, vendor=request.user.vendor,
+        ).select_related("client").first()
+        if order is None:
+            return error("not_found", "No such assignment.", http.HTTP_404_NOT_FOUND)
+
+        role = (request.data.get("role") or "").strip().lower()
+        if role not in (DispatchSignerRole.VENDOR, DispatchSignerRole.MEMBER):
+            return error("bad_role", "role must be 'vendor' or 'member'.")
+
+        raw_image = request.data.get("image") or ""
+        if "," in raw_image:
+            raw_image = raw_image.split(",", 1)[1]
+        try:
+            blob = base64.b64decode(raw_image, validate=True)
+        except Exception:  # noqa: BLE001 - any decode failure is the same answer
+            return error("bad_image", "image must be a base64 PNG data URL.")
+        if not blob:
+            return error("bad_image", "The signature is empty.")
+
+        submission = dispatch_svc.open_submission(order)
+        digest = hashlib.sha256(blob).hexdigest()
+        key = import_storage.build_key(
+            f"dispatch-signatures/{order.pk}/{role}-{digest[:16]}.png"
+        )
+        import_storage.upload_bytes(key, blob, content_type="image/png")
+
+        default_name = (
+            request.user.vendor_user.name if role == DispatchSignerRole.VENDOR
+            else f"{order.client.first_name} {order.client.last_name}".strip()
+        )
+        signature, _created = DispatchSignature.objects.update_or_create(
+            dispatch_submission=submission, signer_role=role,
+            defaults={
+                "signer_name": (
+                    request.data.get("signer_name") or default_name
+                ).strip()[:255],
+                "s3_key": key,
+                "content_hash": digest,
+                "signed_at": timezone.now(),
+            },
+        )
+        return Response({
+            "role": signature.signer_role,
+            "signer_name": signature.signer_name,
+            "signed_at": signature.signed_at,
+            "missing_for_submission": dispatch_svc.missing_for_submission(order),
+        }, status=http.HTTP_201_CREATED)
+
+
+class VendorSubmitAssessmentView(VendorAPIView):
+    """POST /v1/work/<order_id>/submit/ -- submit the assessment.
+
+    GET reports what is still missing, so the app can disable the button and SAY
+    WHY rather than leaving a vendor guessing at the end of a home visit.
+
+    The gate lives in dispatch.missing_for_submission and is enforced HERE as well
+    as shown in the app: a UI-only check is how a housing case reached the food
+    verification endpoint after the picker had been fixed.
+    """
+
+    def get(self, request, order_id):
+        from ..models import DispatchOrder
+        from ..services import dispatch as dispatch_svc
+
+        order = DispatchOrder.objects.filter(
+            pk=order_id, vendor=request.user.vendor,
+        ).first()
+        if order is None:
+            return error("not_found", "No such assignment.", http.HTTP_404_NOT_FOUND)
+        return Response({
+            "missing": dispatch_svc.missing_for_submission(order),
+            "photo_count": order.proofs.count(),
+        })
+
+    def post(self, request, order_id):
+        from django.utils import timezone as tz
+
+        from ..models import (
+            DispatchOrder, DispatchQuestionnaire, DispatchQuestionnaireState,
+        )
+        from ..services import dispatch as dispatch_svc
+        from ..services.assessment_forms import build_schema
+
+        order = DispatchOrder.objects.filter(
+            pk=order_id, vendor=request.user.vendor,
+        ).select_related("client", "vendor").first()
+        if order is None:
+            return error("not_found", "No such assignment.", http.HTTP_404_NOT_FOUND)
+
+        form = DispatchQuestionnaire.objects.filter(dispatch_order=order).first()
+        if form is None:
+            return error(
+                "no_answers", "Save the assessment before submitting it.",
+            )
+        if form.state == DispatchQuestionnaireState.SUBMITTED:
+            # Idempotent: an offline client retrying must not submit twice.
+            return Response({
+                "state": form.state, "submitted_at": form.submitted_at,
+                "already": True,
+            })
+
+        missing = dispatch_svc.missing_for_submission(order)
+        if missing:
+            return error(
+                "incomplete",
+                "Still needed: " + ", ".join(missing),
+                http.HTTP_400_BAD_REQUEST,
+                missing=missing,
+            )
+
+        # FREEZE the schema. A signed form must render years later exactly as it was
+        # signed rather than acquiring blank questions from a later template.
+        form.schema_snapshot = build_schema(form.modules or [])
+        form.state = DispatchQuestionnaireState.SUBMITTED
+        form.submitted_at = tz.now()
+        form.save(update_fields=[
+            "schema_snapshot", "state", "submitted_at", "updated_at",
+        ])
+
+        # vendor_user, not a bare call: the record has to say WHO submitted, and
+        # "the assessor who signed it" is the answer.
+        dispatch_svc.submit(order, vendor_user=request.user.vendor_user)
+        order.refresh_from_db()
+        return Response({
+            "state": form.state,
+            "submitted_at": form.submitted_at,
+            "order_status": order.status,
+            "order_status_label": order.get_status_display(),
+            "already": False,
+        }, status=http.HTTP_201_CREATED)

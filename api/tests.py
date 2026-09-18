@@ -27114,7 +27114,10 @@ class DispatchOrderTest(TestCase):
         missing = dispatch.missing_for_submission(order)
         self.assertIn("vendor signature", missing)
         self.assertIn("member signature", missing)
-        self.assertIn("photo for finding: Damp in bedroom", missing)
+        # ONE photo of the dwelling, not one per finding -- the real form says
+        # "at least one photo of the dwelling", and every submission supplied
+        # carried a single photo against ~10 ticked risks.
+        self.assertIn("at least one photo of the dwelling", missing)
         self.assertFalse(dispatch.can_submit(order))
 
     def test_submit_is_refused_while_anything_is_missing(self):
@@ -27126,9 +27129,15 @@ class DispatchOrderTest(TestCase):
             dispatch.submit(order)
         self.assertIn("vendor signature", str(ctx.exception))
 
-    def test_a_photo_on_ANOTHER_finding_does_not_satisfy_the_first(self):
-        """The rule is one photo PER FINDING, which is why proofs carry a finding
-        FK -- counting photos per ORDER would pass this."""
+    def test_ONE_photo_satisfies_the_gate_however_many_findings_there_are(self):
+        """This test used to assert the opposite -- one photo PER FINDING -- which
+        the real form contradicts: "at least one photo of the dwelling". Every
+        submission supplied carried a single photo against roughly ten ticked
+        risks, so the per-finding rule would have rejected all of them.
+
+        A photo per item belongs to WORK ORDERS, where it is proof of service for
+        something installed.
+        """
         from .models import DispatchFinding, DispatchProof
         from .services import dispatch
 
@@ -27139,11 +27148,26 @@ class DispatchOrderTest(TestCase):
             dispatch_order=order, finding=a, s3_key="k1", content_hash="h1",
         )
         missing = dispatch.missing_for_submission(order)
-        self.assertIn("photo for finding: Mould", missing)
-        self.assertNotIn("photo for finding: Damp", missing)
+        self.assertNotIn("at least one photo of the dwelling", missing)
+        # Only the signatures remain.
+        self.assertEqual(
+            sorted(missing), ["member signature", "vendor signature"],
+        )
 
-    def test_a_general_site_photo_does_not_count_for_a_finding(self):
-        """A proof with no finding is a site photo, not evidence OF anything."""
+    def test_NO_photo_at_all_blocks_the_gate(self):
+        from .services import dispatch
+
+        order = self._assessment(self._member())
+        self.assertIn(
+            "at least one photo of the dwelling",
+            dispatch.missing_for_submission(order),
+        )
+
+    def test_a_general_site_photo_DOES_satisfy_the_gate(self):
+        """The inverse of what this asserted before, and the form is explicit: "at
+        least one photo of the dwelling". A photo of the dwelling is the thing being
+        asked for -- it does not have to be evidence of a particular finding.
+        """
         from .models import DispatchFinding, DispatchProof
         from .services import dispatch
 
@@ -27152,7 +27176,10 @@ class DispatchOrderTest(TestCase):
         DispatchProof.objects.create(
             dispatch_order=order, finding=None, s3_key="k", content_hash="h",
         )
-        self.assertIn("photo for finding: Damp", dispatch.missing_for_submission(order))
+        self.assertNotIn(
+            "at least one photo of the dwelling",
+            dispatch.missing_for_submission(order),
+        )
 
     def _satisfy_gate(self, order):
         from .models import (
@@ -27526,7 +27553,7 @@ class AssessmentOrderWizardApiTest(TestCase):
         self.assertEqual(resp.status_code, 200)
         missing = resp.data[0]["missing_for_submission"]
         self.assertIn("vendor signature", missing)
-        self.assertIn("photo for finding: Damp", missing)
+        self.assertIn("at least one photo of the dwelling", missing)
 
     def test_the_order_keeps_its_OWN_address(self):
         """Not read live from the client: a later address edit must not rewrite
@@ -32079,3 +32106,298 @@ class ProgramBoroughColumnTest(TestCase):
             parts = [p.strip() for p in name.split(" - ")]
             candidate = parts[-1] if len(parts) >= 2 else ""
             self.assertEqual(candidate if candidate in known else "", expected, name)
+
+
+@override_settings(VENDOR_API_HOST=VENDOR_HOST, ALLOWED_HOSTS=["*"])
+class VendorSubmitAssessmentTest(TestCase):
+    """Saving a draft, photos, signatures, and the submit gate."""
+
+    EEA = (
+        "Dwelling Assessment & Statement of Work (SOW) Development - "
+        "Modifications and Remediation Service - Queens"
+    )
+
+    def setUp(self):
+        from django.contrib.auth.hashers import make_password
+
+        from .models import (
+            ActiveProgram, Case, CaseStatus, CaseType, Client, DispatchKind,
+            DispatchOrder, Vendor, VendorUser,
+        )
+        from .services.catalog import clear_program_domain_cache
+
+        ActiveProgram.objects.create(
+            program_name=self.EEA, case_category="Internal Services",
+            case_type=ActiveProgram.CaseType.HOUSING,
+            service_type=ActiveProgram.ServiceType.ENVIRONMENTAL_EXPOSURE_ASSESSMENT,
+        )
+        clear_program_domain_cache()
+        self.vendor = Vendor.objects.create(name="Acme")
+        self.user = VendorUser.objects.create(
+            vendor=self.vendor, email="a@acme.test", name="Ada Assessor",
+            password=make_password("pw-acme-1234"),
+        )
+        self.member = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Sub", last_name="Member",
+            client_added_at=timezone.now(),
+        )
+        Case.objects.create(
+            case_id=uuid.uuid4(), client=self.member,
+            case_type=CaseType.INTERNAL_SERVICE, case_status=CaseStatus.MANAGED,
+            program_name=self.EEA, case_created_at=timezone.now(),
+        )
+        self.order = DispatchOrder.objects.create(
+            kind=DispatchKind.ASSESSMENT, client=self.member, vendor=self.vendor,
+            referral_type="combined",
+        )
+
+    def _api(self):
+        resp = APIClient().post(
+            "/v1/auth/login/", {"email": "a@acme.test", "password": "pw-acme-1234"},
+            format="json", HTTP_HOST=VENDOR_HOST,
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        api = APIClient()
+        api.credentials(HTTP_AUTHORIZATION=f"Bearer {resp.data['access_token']}")
+        return api
+
+    def _url(self, suffix):
+        return f"/v1/work/{self.order.pk}/{suffix}"
+
+    # a 1x1 PNG
+    PNG = (
+        "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAA"
+        "DUlEQVR42mP8z8AAAwAB/wFcXwAAAABJRU5ErkJggg=="
+    )
+
+    # ── saving a draft ──────────────────────────────────────────────────────
+    def test_saving_answers_creates_a_DRAFT(self):
+        resp = self._api().patch(
+            self._url("assessment/"),
+            {
+                "answers": {"mob.reason.fall_risk": True},
+                "interventions": [{"option": "grab_bar_tub", "qty": 2}],
+                "justification": "blood thinners",
+            },
+            format="json", HTTP_HOST=VENDOR_HOST,
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        self.assertEqual(resp.data["state"], "draft")
+        self.assertEqual(resp.data["answers"], {"mob.reason.fall_risk": True})
+        self.assertEqual(
+            resp.data["interventions"], [{"option": "grab_bar_tub", "qty": 2}],
+        )
+
+    def test_an_UNKNOWN_question_code_is_dropped_not_rejected(self):
+        """A stale app holding a retired question must still save the answers that
+        do exist -- failing the whole save would lose a completed visit over a
+        question nobody asks any more."""
+        resp = self._api().patch(
+            self._url("assessment/"),
+            {"answers": {"mob.reason.fall_risk": True, "made.up.code": True}},
+            format="json", HTTP_HOST=VENDOR_HOST,
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.data["answers"], {"mob.reason.fall_risk": True})
+
+    def test_a_ZERO_quantity_is_not_stored(self):
+        """"What did they recommend?" should be a read, not a filter."""
+        resp = self._api().patch(
+            self._url("assessment/"),
+            {"interventions": [
+                {"option": "grab_bar_tub", "qty": 0},
+                {"option": "shower_chair", "qty": 1},
+            ]},
+            format="json", HTTP_HOST=VENDOR_HOST,
+        )
+        self.assertEqual(
+            resp.data["interventions"], [{"option": "shower_chair", "qty": 1}],
+        )
+
+    def test_saving_REPLACES_rather_than_merging(self):
+        """An assessor who unticks a box offline must see it unticked after they
+        sync -- a merge would need both sides to agree who touched what last."""
+        api = self._api()
+        api.patch(
+            self._url("assessment/"),
+            {"answers": {"mob.reason.fall_risk": True, "mob.physical.balance": True}},
+            format="json", HTTP_HOST=VENDOR_HOST,
+        )
+        resp = api.patch(
+            self._url("assessment/"),
+            {"answers": {"mob.reason.fall_risk": True}},
+            format="json", HTTP_HOST=VENDOR_HOST,
+        )
+        self.assertEqual(resp.data["answers"], {"mob.reason.fall_risk": True})
+
+    # ── the gate ────────────────────────────────────────────────────────────
+    def test_the_gate_names_all_three_requirements(self):
+        resp = self._api().get(self._url("submit/"), HTTP_HOST=VENDOR_HOST)
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(sorted(resp.data["missing"]), [
+            "at least one photo of the dwelling",
+            "member signature",
+            "vendor signature",
+        ])
+
+    def test_submitting_without_the_gate_is_REFUSED_and_says_why(self):
+        api = self._api()
+        api.patch(
+            self._url("assessment/"), {"answers": {}},
+            format="json", HTTP_HOST=VENDOR_HOST,
+        )
+        resp = api.post(self._url("submit/"), {}, format="json", HTTP_HOST=VENDOR_HOST)
+        self.assertEqual(resp.status_code, 400)
+        self.assertEqual(resp.data["error"], "incomplete")
+        self.assertIn("member signature", resp.data["missing"])
+
+    def test_the_gate_is_enforced_SERVER_SIDE_not_only_in_the_app(self):
+        """A UI-only check is how a housing case reached the food verification
+        endpoint after the picker had been fixed."""
+        from .models import DispatchProof
+
+        api = self._api()
+        api.patch(
+            self._url("assessment/"), {"answers": {}},
+            format="json", HTTP_HOST=VENDOR_HOST,
+        )
+        # A photo but no signatures: the app might enable the button; the server
+        # must not.
+        DispatchProof.objects.create(
+            dispatch_order=self.order, s3_key="k", content_hash="h",
+        )
+        resp = api.post(self._url("submit/"), {}, format="json", HTTP_HOST=VENDOR_HOST)
+        self.assertEqual(resp.status_code, 400)
+
+    # ── signatures ──────────────────────────────────────────────────────────
+    def test_a_signature_is_stored_and_reports_what_is_left(self):
+        resp = self._api().post(
+            self._url("signatures/"), {"role": "member", "image": self.PNG},
+            format="json", HTTP_HOST=VENDOR_HOST,
+        )
+        self.assertEqual(resp.status_code, 201, resp.content)
+        self.assertEqual(resp.data["role"], "member")
+        self.assertEqual(resp.data["signer_name"], "Sub Member")
+        self.assertIn("vendor signature", resp.data["missing_for_submission"])
+        self.assertNotIn("member signature", resp.data["missing_for_submission"])
+
+    def test_re_signing_REPLACES_rather_than_adding_a_second(self):
+        """A member who signs, sees a typo in their name and signs again should not
+        leave two signatures on the record."""
+        from .models import DispatchSignature
+
+        api = self._api()
+        for name in ("Wrong Name", "Right Name"):
+            api.post(
+                self._url("signatures/"),
+                {"role": "member", "image": self.PNG, "signer_name": name},
+                format="json", HTTP_HOST=VENDOR_HOST,
+            )
+        sigs = DispatchSignature.objects.filter(signer_role="member")
+        self.assertEqual(sigs.count(), 1)
+        self.assertEqual(sigs.get().signer_name, "Right Name")
+
+    def test_a_bad_role_is_refused(self):
+        resp = self._api().post(
+            self._url("signatures/"), {"role": "auditor", "image": self.PNG},
+            format="json", HTTP_HOST=VENDOR_HOST,
+        )
+        self.assertEqual(resp.status_code, 400)
+
+    def test_an_EMPTY_signature_is_refused(self):
+        """A canvas nobody drew on must not count as a signature."""
+        resp = self._api().post(
+            self._url("signatures/"), {"role": "member", "image": ""},
+            format="json", HTTP_HOST=VENDOR_HOST,
+        )
+        self.assertEqual(resp.status_code, 400)
+
+    # ── submitting ──────────────────────────────────────────────────────────
+    def _satisfy_gate(self, api):
+        from .models import DispatchProof
+
+        DispatchProof.objects.create(
+            dispatch_order=self.order, s3_key="k", content_hash="h",
+        )
+        for role in ("member", "vendor"):
+            api.post(
+                self._url("signatures/"), {"role": role, "image": self.PNG},
+                format="json", HTTP_HOST=VENDOR_HOST,
+            )
+
+    def test_a_complete_assessment_submits_and_FREEZES_its_schema(self):
+        from .models import DispatchQuestionnaire
+
+        api = self._api()
+        api.patch(
+            self._url("assessment/"),
+            {"answers": {"mob.reason.fall_risk": True}},
+            format="json", HTTP_HOST=VENDOR_HOST,
+        )
+        self._satisfy_gate(api)
+
+        resp = api.post(self._url("submit/"), {}, format="json", HTTP_HOST=VENDOR_HOST)
+        self.assertEqual(resp.status_code, 201, resp.content)
+        self.assertEqual(resp.data["state"], "submitted")
+
+        form = DispatchQuestionnaire.objects.get(dispatch_order=self.order)
+        # The snapshot is what lets a signed form render years later exactly as it
+        # was signed.
+        self.assertTrue(form.schema_snapshot)
+        self.assertEqual(
+            [m["code"] for m in form.schema_snapshot["modules"]],
+            ["mobility", "ventilation"],
+        )
+
+    def test_submitting_TWICE_is_idempotent(self):
+        """An offline client retrying must not submit twice."""
+        api = self._api()
+        api.patch(
+            self._url("assessment/"), {"answers": {}},
+            format="json", HTTP_HOST=VENDOR_HOST,
+        )
+        self._satisfy_gate(api)
+        first = api.post(self._url("submit/"), {}, format="json", HTTP_HOST=VENDOR_HOST)
+        second = api.post(self._url("submit/"), {}, format="json", HTTP_HOST=VENDOR_HOST)
+        self.assertEqual(first.status_code, 201)
+        self.assertEqual(second.status_code, 200)
+        self.assertTrue(second.data["already"])
+
+    def test_a_SUBMITTED_assessment_cannot_be_edited(self):
+        api = self._api()
+        api.patch(
+            self._url("assessment/"), {"answers": {}},
+            format="json", HTTP_HOST=VENDOR_HOST,
+        )
+        self._satisfy_gate(api)
+        api.post(self._url("submit/"), {}, format="json", HTTP_HOST=VENDOR_HOST)
+
+        resp = api.patch(
+            self._url("assessment/"),
+            {"answers": {"mob.reason.fall_risk": True}},
+            format="json", HTTP_HOST=VENDOR_HOST,
+        )
+        self.assertEqual(resp.status_code, 409)
+
+    def test_ANOTHER_vendor_cannot_save_photos_sign_or_submit(self):
+        from .models import Client, DispatchKind, DispatchOrder, Vendor
+
+        theirs = DispatchOrder.objects.create(
+            kind=DispatchKind.ASSESSMENT,
+            vendor=Vendor.objects.create(name="Rival"),
+            client=Client.objects.create(
+                client_id=str(uuid.uuid4()), first_name="R", last_name="M",
+                client_added_at=timezone.now(),
+            ),
+        )
+        api = self._api()
+        for verb, suffix, body in (
+            ("patch", "assessment/", {"answers": {}}),
+            ("post", "signatures/", {"role": "member", "image": self.PNG}),
+            ("post", "submit/", {}),
+        ):
+            resp = getattr(api, verb)(
+                f"/v1/work/{theirs.pk}/{suffix}", body,
+                format="json", HTTP_HOST=VENDOR_HOST,
+            )
+            self.assertEqual(resp.status_code, 404, f"{verb} {suffix}")

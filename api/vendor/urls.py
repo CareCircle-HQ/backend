@@ -9,13 +9,17 @@ exist, not because it is forbidden.
 from django.urls import path
 
 from .views import (
+    VendorAssessmentSaveView,
     VendorDashboardView,
+    VendorPhotoView,
     VendorLoginView,
     VendorLogoutView,
     VendorMeView,
     VendorWorkDetailView,
     VendorRevealPhoneView,
     VendorScheduleView,
+    VendorSignatureView,
+    VendorSubmitAssessmentView,
     VendorTeamDetailView,
     VendorTeamListView,
     VendorWorkListView,
@@ -32,6 +36,22 @@ urlpatterns = [
         VendorTeamDetailView.as_view(), name="vendor-team-detail",
     ),
     path("v1/work/", VendorWorkListView.as_view(), name="vendor-work-list"),
+    path(
+        "v1/work/<uuid:order_id>/assessment/",
+        VendorAssessmentSaveView.as_view(), name="vendor-assessment-save",
+    ),
+    path(
+        "v1/work/<uuid:order_id>/photos/",
+        VendorPhotoView.as_view(), name="vendor-photos",
+    ),
+    path(
+        "v1/work/<uuid:order_id>/signatures/",
+        VendorSignatureView.as_view(), name="vendor-signatures",
+    ),
+    path(
+        "v1/work/<uuid:order_id>/submit/",
+        VendorSubmitAssessmentView.as_view(), name="vendor-submit",
+    ),
     path(
         "v1/work/<uuid:order_id>/reveal-phone/",
         VendorRevealPhoneView.as_view(), name="vendor-reveal-phone",
