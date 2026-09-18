@@ -123,19 +123,53 @@ def missing_for_submission(order):
     if DispatchSignerRole.MEMBER not in roles:
         missing.append("member signature")
 
-    # AT LEAST ONE PHOTO OF THE DWELLING. Not one per finding, which is what this
-    # used to require and what the real form contradicts:
+    # A PHOTO PER IDENTIFIED PROBLEM, and at least one of the dwelling.
     #
-    #   "At least one photo of the dwelling, your signature, and the member's
-    #    signature are all required before you can submit."
+    # Per CATEGORY, not per question: three questions point at grab bars, and a
+    # photo each would ask for the same photo three times. The problem evidenced is
+    # "no grab bars", however many questions surfaced it.
     #
-    # Every real submission supplied carried Photos (1) against roughly ten ticked
-    # risks, so the per-finding rule would have rejected all of them. A photo per
-    # finding belongs to WORK ORDERS, where proof of service is per item installed.
-    if not order.proofs.exists():
+    # This is stricter than the form's printed minimum ("at least one photo of the
+    # dwelling"), which it subsumes -- a category photo IS a photo of the dwelling.
+    # It is NOT the old per-FINDING rule that shipped here and that every real
+    # submission would have failed; findings are a different concept, and a photo
+    # per item belongs to work orders as proof of service.
+    from .assessment_forms import suggested_groups
+
+    questionnaire = getattr(order, "questionnaire", None)
+    categories = (
+        suggested_groups(questionnaire.answers, modules=questionnaire.modules)
+        if questionnaire is not None else set()
+    )
+
+    if categories:
+        labels = _intervention_group_labels()
+        have = set(
+            order.proofs.exclude(intervention_group="")
+            .values_list("intervention_group", flat=True)
+        )
+        for code in sorted(categories - have):
+            missing.append(f"photo of: {labels.get(code, code)}")
+    elif not order.proofs.exists():
+        # Nothing identified -- the printed minimum still applies, so a visit that
+        # found no problems is still evidenced.
         missing.append("at least one photo of the dwelling")
 
     return missing
+
+
+def _intervention_group_labels():
+    """Group code -> human label, for naming what is missing.
+
+    A vendor is told "photo of: Grab Bars", not "photo of: grab_bars" -- the gate's
+    whole purpose is to be actionable at the end of a home visit.
+    """
+    from .assessment_forms import INTERVENTIONS
+
+    return {
+        g["code"]: g["label"]
+        for groups in INTERVENTIONS.values() for g in groups
+    }
 
 
 def can_submit(order):

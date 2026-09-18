@@ -979,6 +979,22 @@ class VendorPhotoView(VendorAPIView):
         if not files:
             return error("no_file", "Attach an image as 'file'.")
 
+        # Which identified problem this evidences. Optional -- a general photo of
+        # the dwelling has no category -- but a WRONG one is refused rather than
+        # stored, because a typo would leave the gate permanently unsatisfiable and
+        # the vendor unable to submit with no way to see why.
+        from ..services.assessment_forms import INTERVENTIONS
+
+        group = (request.data.get("intervention_group") or "").strip()
+        if group:
+            valid = {
+                g["code"] for groups in INTERVENTIONS.values() for g in groups
+            }
+            if group not in valid:
+                return error(
+                    "bad_group", f"'{group}' is not an intervention category.",
+                )
+
         created = []
         for upload in files:
             if upload.size > self.MAX_BYTES:
@@ -990,12 +1006,37 @@ class VendorPhotoView(VendorAPIView):
             digest = hashlib.sha256(raw).hexdigest()
             # Content-addressed and idempotent: an offline client retrying an upload
             # must not produce a second copy of the same photo.
+            # Keyed on the HASH ALONE, matching the one_proof_per_hash_per_order
+            # constraint. I first keyed it on (hash, category) so one wide shot
+            # could evidence two problems, and the database refused it -- rightly.
+            #
+            # One image, one category is the stronger rule: if a single photo could
+            # clear every category, the per-problem requirement would be theatre.
+            # Taking a second photo while standing in the room is a trivial ask.
             existing = DispatchProof.objects.filter(
                 dispatch_order=order, content_hash=digest,
             ).first()
             if existing is not None:
-                created.append(existing)
-                continue
+                if existing.intervention_group == group:
+                    # The same upload retried -- idempotent, as an offline client
+                    # needs.
+                    created.append(existing)
+                    continue
+                # The same image offered for a DIFFERENT problem. Said plainly,
+                # because the alternative is a database error the vendor cannot act
+                # on.
+                labels = {
+                    g["code"]: g["label"]
+                    for groups in INTERVENTIONS.values() for g in groups
+                }
+                where = labels.get(
+                    existing.intervention_group, "the general photos",
+                )
+                return error(
+                    "already_used",
+                    f"That photo is already attached to {where}. "
+                    f"Take a new photo for this one.",
+                )
             key = import_storage.build_key(
                 f"dispatch-proofs/{order.pk}/{digest[:16]}-{upload.name}"
             )
@@ -1006,18 +1047,49 @@ class VendorPhotoView(VendorAPIView):
                 dispatch_order=order,
                 s3_key=key,
                 content_hash=digest,
+                intervention_group=group,
                 caption=(request.data.get("caption") or "").strip(),
                 captured_at=timezone.now(),
             ))
 
+        from ..services import dispatch as dispatch_svc
+
         return Response({
             "photos": [
                 {"id": p.pk, "content_hash": p.content_hash,
+                 "intervention_group": p.intervention_group,
                  "captured_at": p.captured_at}
                 for p in created
             ],
             "total": order.proofs.count(),
+            # Returned on every upload so the app can tick a category off without a
+            # second round trip, and cannot drift from the server's view of the gate.
+            "missing_for_submission": dispatch_svc.missing_for_submission(order),
         }, status=http.HTTP_201_CREATED)
+
+
+    def get(self, request, order_id):
+        """What has already been photographed, by category.
+
+        A visit interrupted and resumed -- or continued on a second device -- must
+        not ask again for a photo the server already holds.
+        """
+        from ..models import DispatchOrder
+        from ..services import dispatch as dispatch_svc
+
+        order = DispatchOrder.objects.filter(
+            pk=order_id, vendor=request.user.vendor,
+        ).first()
+        if order is None:
+            return error("not_found", "No such assignment.", http.HTTP_404_NOT_FOUND)
+        return Response({
+            "photos": [
+                {"id": p.pk, "intervention_group": p.intervention_group,
+                 "caption": p.caption, "captured_at": p.captured_at}
+                for p in order.proofs.order_by("received_at")
+            ],
+            "missing_for_submission": dispatch_svc.missing_for_submission(order),
+        })
 
 
 class VendorSignatureView(VendorAPIView):

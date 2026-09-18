@@ -32314,11 +32314,34 @@ class VendorSubmitAssessmentTest(TestCase):
 
     # ── submitting ──────────────────────────────────────────────────────────
     def _satisfy_gate(self, api):
-        from .models import DispatchProof
+        """Photos for whatever the SAVED ANSWERS identified, plus both signatures.
 
-        DispatchProof.objects.create(
-            dispatch_order=self.order, s3_key="k", content_hash="h",
+        The categories are DERIVED rather than listed: the gate now demands a photo
+        per identified problem, so a hard-coded fixture would have to be edited
+        every time the question/intervention mapping changed -- the same trap that
+        made the step-packing tests brittle three times.
+        """
+        from .models import DispatchProof, DispatchQuestionnaire
+        from .services.assessment_forms import suggested_groups
+
+        form = DispatchQuestionnaire.objects.filter(
+            dispatch_order=self.order,
+        ).first()
+        needed = suggested_groups(
+            form.answers if form else {},
+            modules=form.modules if form else None,
         )
+        # One uncategorised photo covers the "nothing identified" case; a distinct
+        # image per category covers the rest, since one_proof_per_hash_per_order
+        # allows each image to evidence exactly one problem.
+        DispatchProof.objects.create(
+            dispatch_order=self.order, s3_key="k-general", content_hash="h-general",
+        )
+        for code in sorted(needed):
+            DispatchProof.objects.create(
+                dispatch_order=self.order, s3_key=f"k-{code}",
+                content_hash=f"h-{code}", intervention_group=code,
+            )
         for role in ("member", "vendor"):
             api.post(
                 self._url("signatures/"), {"role": role, "image": self.PNG},
@@ -32440,9 +32463,16 @@ class VoidReopensTheQuestionnaireTest(TestCase):
             interventions=[{"option": "grab_bar_tub", "qty": 2}],
             state="submitted", submitted_at=timezone.now(),
         )
-        DispatchProof.objects.create(
-            dispatch_order=self.order, s3_key="k", content_hash="h",
-        )
+        # A photo per identified problem, DERIVED from the answers above -- the gate
+        # demands one per category, so a fixed list would need editing whenever the
+        # question/intervention mapping changed.
+        from .services.assessment_forms import suggested_groups
+
+        for code in sorted(suggested_groups(self.form.answers, modules=["mobility"])):
+            DispatchProof.objects.create(
+                dispatch_order=self.order, s3_key=f"k-{code}",
+                content_hash=f"h-{code}", intervention_group=code,
+            )
         self.submission = dispatch.open_submission(self.order)
         for role in ("vendor", "member"):
             DispatchSignature.objects.create(
@@ -32494,8 +32524,11 @@ class VoidReopensTheQuestionnaireTest(TestCase):
         missing = dispatch.missing_for_submission(self.order)
         self.assertIn("vendor signature", missing)
         self.assertIn("member signature", missing)
-        # The photo belongs to the ORDER, not the submission, so it still counts.
-        self.assertNotIn("at least one photo of the dwelling", missing)
+        # The photos belong to the ORDER, not the submission, so they still count --
+        # the dwelling has not changed just because the attestation was voided.
+        self.assertEqual(
+            [m for m in missing if m.startswith("photo of")], [],
+        )
 
 
 class QuestionSuggestsInterventionsTest(TestCase):
@@ -32608,3 +32641,167 @@ class QuestionSuggestsInterventionsTest(TestCase):
             for group in section["groups"]:
                 for question in group["questions"]:
                     self.assertNotIn("suggests", question)
+
+
+class PhotoPerIdentifiedProblemTest(TestCase):
+    """A photo is required for each problem the answers identified.
+
+    Per CATEGORY, not per question: three questions point at grab bars, and a photo
+    each would ask for the same photo three times.
+    """
+
+    def setUp(self):
+        from .models import (
+            Client, DispatchKind, DispatchOrder, DispatchQuestionnaire, Vendor,
+        )
+
+        self.vendor = Vendor.objects.create(name="Acme")
+        member = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Photo", last_name="Member",
+            client_added_at=timezone.now(),
+        )
+        self.order = DispatchOrder.objects.create(
+            kind=DispatchKind.ASSESSMENT, client=member, vendor=self.vendor,
+            referral_type="combined",
+        )
+        self.form = DispatchQuestionnaire.objects.create(
+            dispatch_order=self.order, modules=["mobility", "ventilation"],
+        )
+
+    def _answer(self, **answers):
+        self.form.answers = answers
+        self.form.save(update_fields=["answers", "updated_at"])
+
+    def _photo(self, group="", suffix="x"):
+        from .models import DispatchProof
+
+        return DispatchProof.objects.create(
+            dispatch_order=self.order, s3_key=f"k{group}{suffix}",
+            content_hash=f"h{group}{suffix}", intervention_group=group,
+        )
+
+    def _photo_gaps(self):
+        from .services import dispatch
+
+        return [
+            m for m in dispatch.missing_for_submission(self.order)
+            if m.startswith("photo")
+        ] + [
+            m for m in dispatch.missing_for_submission(self.order)
+            if m.startswith("at least one")
+        ]
+
+    def test_each_identified_CATEGORY_needs_its_own_photo(self):
+        self._answer(**{
+            "mob.risk.grab_bars_absent": True,      # grab_bars
+            "mob.risk.handrail_absent": True,       # handrails
+        })
+        gaps = self._photo_gaps()
+        self.assertIn("photo of: Grab Bars", gaps)
+        self.assertIn("photo of: Handrails", gaps)
+
+    def test_the_gap_names_the_category_in_WORDS(self):
+        """"photo of: Grab Bars", not "photo of: grab_bars" -- the gate exists to be
+        actionable at the end of a home visit."""
+        self._answer(**{"mob.risk.grab_bars_absent": True})
+        self.assertIn("photo of: Grab Bars", self._photo_gaps())
+
+    def test_a_photo_in_that_category_SATISFIES_it(self):
+        self._answer(**{"mob.risk.grab_bars_absent": True})
+        self._photo("grab_bars")
+        self.assertEqual(self._photo_gaps(), [])
+
+    def test_THREE_questions_pointing_at_one_category_need_ONE_photo(self):
+        """The problem evidenced is "no grab bars", however many questions surfaced
+        it."""
+        self._answer(**{
+            "mob.risk.grab_bars_absent": True,
+            "mob.physical.bathing_transfer": True,
+            "mob.risk.unsafe_transfers": True,
+        })
+        self._photo("grab_bars")
+        self._photo("bathroom")
+        self.assertEqual(self._photo_gaps(), [])
+
+    def test_a_GENERAL_photo_does_not_satisfy_a_category(self):
+        """Otherwise one photo of the front door would clear every problem."""
+        self._answer(**{"mob.risk.grab_bars_absent": True})
+        self._photo("")
+        self.assertIn("photo of: Grab Bars", self._photo_gaps())
+
+    def test_a_photo_in_ANOTHER_category_does_not_satisfy_this_one(self):
+        self._answer(**{
+            "mob.risk.grab_bars_absent": True,
+            "mob.risk.handrail_absent": True,
+        })
+        self._photo("grab_bars")
+        gaps = self._photo_gaps()
+        self.assertIn("photo of: Handrails", gaps)
+        self.assertNotIn("photo of: Grab Bars", gaps)
+
+    def test_with_NOTHING_identified_the_printed_minimum_still_applies(self):
+        """A visit that found no problems is still evidenced."""
+        self._answer()
+        self.assertIn("at least one photo of the dwelling", self._photo_gaps())
+        self._photo("")
+        self.assertEqual(self._photo_gaps(), [])
+
+    def test_a_question_that_suggests_NOTHING_demands_no_category_photo(self):
+        """Poor lighting has no product, so it cannot demand a product photo -- but
+        the dwelling minimum still applies."""
+        self._answer(**{"mob.risk.poor_lighting": True})
+        gaps = self._photo_gaps()
+        self.assertEqual(gaps, ["at least one photo of the dwelling"])
+
+    def test_categories_outside_the_MODULES_in_play_are_not_demanded(self):
+        """A ventilation-only referral must not ask for a grab-bar photo."""
+        self.form.modules = ["ventilation"]
+        self.form.save(update_fields=["modules", "updated_at"])
+        self._answer(**{
+            "mob.risk.grab_bars_absent": True,
+            "vent.temp.excessive_heat": True,
+        })
+        gaps = self._photo_gaps()
+        self.assertIn("photo of: Air Conditioner", gaps)
+        self.assertNotIn("photo of: Grab Bars", gaps)
+
+    def test_an_order_with_no_questionnaire_falls_back_to_the_minimum(self):
+        """A remediation work order has no questionnaire at all."""
+        from .models import Client, DispatchKind, DispatchOrder
+        from .services import dispatch
+
+        bare = DispatchOrder.objects.create(
+            kind=DispatchKind.REMEDIATION, vendor=self.vendor,
+            client=Client.objects.create(
+                client_id=str(uuid.uuid4()), first_name="B", last_name="O",
+                client_added_at=timezone.now(),
+            ),
+        )
+        self.assertIn(
+            "at least one photo of the dwelling",
+            dispatch.missing_for_submission(bare),
+        )
+
+    def test_the_same_image_cannot_evidence_TWO_problems(self):
+        """one_proof_per_hash_per_order enforces one image per order, and that is
+        the stronger rule: if a single photo could clear every category, the
+        per-problem requirement would be theatre.
+
+        I wrote the de-duplication keyed on (hash, category) first and the database
+        refused it. The vendor now gets a sentence they can act on rather than a
+        500.
+        """
+        from .models import DispatchProof
+
+        DispatchProof.objects.create(
+            dispatch_order=self.order, s3_key="k", content_hash="same",
+            intervention_group="grab_bars",
+        )
+        from django.db import IntegrityError, transaction
+
+        with self.assertRaises(IntegrityError):
+            with transaction.atomic():
+                DispatchProof.objects.create(
+                    dispatch_order=self.order, s3_key="k2", content_hash="same",
+                    intervention_group="handrails",
+                )

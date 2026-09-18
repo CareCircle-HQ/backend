@@ -5904,6 +5904,17 @@ class DispatchProof(models.Model):
     s3_key = models.CharField(max_length=500)
     file_url = models.URLField(max_length=1000, blank=True)
     content_hash = models.CharField(max_length=64, db_index=True)
+    # Which identified problem this photo evidences: an intervention GROUP code
+    # ("grab_bars", "air_filtration"). Blank means a general photo of the dwelling.
+    #
+    # The group, not the question. Three separate questions point at grab bars, and
+    # a photo per question would ask for the same photo three times; the problem
+    # being evidenced is "no grab bars", however many questions surfaced it.
+    #
+    # A plain code rather than a FK: it names a row in the form TEMPLATE, which is
+    # versioned data rather than a table, and a submitted form keeps its own frozen
+    # copy of that template.
+    intervention_group = models.CharField(max_length=40, blank=True, db_index=True)
     caption = models.CharField(max_length=255, blank=True)
     # Device time vs server time. The vendor signs at 14:02 in a basement and syncs
     # at 18:30; the device clock is UNTRUSTED, so both are kept.
