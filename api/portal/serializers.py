@@ -2142,13 +2142,17 @@ class PortalActiveProgramSerializer(serializers.ModelSerializer):
             "case_type_label",
             "service_type",
             "service_type_label",
+            # DECODED from the programme name by migration 0282, not typed. Read
+            # only: editing it here would let it disagree with the name it came
+            # from, and the name is what Unite Us sends us.
+            "borough",
             "is_for_household",
             "to_extend",
             "updated_at",
         ]
         read_only_fields = [
             "id", "case_type_label", "service_type_label", "is_for_household",
-            "updated_at",
+            "updated_at", "borough",
         ]
 
 
