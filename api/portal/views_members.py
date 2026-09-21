@@ -1942,9 +1942,17 @@ class MembersListView(PortalGenericAPIView):
                 # On Hold is a PROGRAM (enrollment) state -- scope to the member's
                 # GOVERNING enrollment (not "any enrollment"), so a stray On Hold
                 # enrollment alongside a newer live one doesn't misfile them.
+                #
+                # SERVICE_INACTIVE is excluded so the filter agrees with the column
+                # it filters on. serializers.verification_status shows "On Hold"
+                # only when the stage is not SERVICE_INACTIVE -- a closed programme
+                # parks the client there with the enrollment still held, and that is
+                # a finished programme rather than a manual hold. Without this,
+                # 617 of the 4,121 matches on the production snapshot came back
+                # reading "Inactive" under an On Hold filter.
                 qs = qs.annotate(_gov_stage=governing_enrollment_stage()).filter(
                     _gov_stage=EnrollmentStage.ON_HOLD
-                )
+                ).exclude(lifecycle_stage=ClientStage.SERVICE_INACTIVE)
             elif sv == "out_of_range":
                 qs = qs.filter(current_member_status_exists(MemberStatus.OUT_OF_RANGE))
             # ── Terminal axis (program / enrollment stage) ── all keyed off the

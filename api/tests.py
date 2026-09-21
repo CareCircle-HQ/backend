@@ -33721,3 +33721,134 @@ class PodImportWithoutPhotosTest(TestCase):
         self.assertEqual(self.order.delivery_driver, "Marcus T")
         # No status in the row, so the order keeps the one it had.
         self.assertEqual(self.order.status, "ready_for_delivery")
+
+
+class OnHoldFilterTest(TestCase):
+    """The On Hold filter must return exactly what the column labels On Hold.
+
+    On the production snapshot the filter matched 4,086 members of whom 617 had a
+    Verification column reading "Inactive" -- their programme is closed and the
+    enrollment merely parked, which serializers.verification_status deliberately
+    does NOT call On Hold.
+    """
+
+    def setUp(self):
+        from rest_framework_simplejwt.tokens import AccessToken
+
+        from .models import Agent
+
+        agent = Agent.objects.create(
+            name="Hold Agent", agent_code="782", group="Management",
+        )
+        acc = AccessToken()
+        acc["agent_id"] = str(agent.id)
+        acc["agent_code"] = agent.agent_code
+        acc["agent_name"] = agent.name
+        acc["agent_group"] = agent.group
+        self.api = APIClient()
+        self.api.credentials(HTTP_AUTHORIZATION=f"Bearer {acc}")
+
+    def _member(self, *, stage, lifecycle, first="Held"):
+        from .models import Client, EnrollmentVerification
+
+        client = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name=first, last_name="Member",
+            client_added_at=timezone.now(), lifecycle_stage=lifecycle,
+        )
+        EnrollmentVerification.objects.create(
+            client=client, stage=stage, opened_at=timezone.now(),
+        )
+        return client
+
+    def _ids(self):
+        resp = self.api.get("/api/portal/members/?status=on_hold")
+        self.assertEqual(resp.status_code, 200, resp.content)
+        rows = resp.data["results"]
+        out = set()
+        for group in rows:
+            for m in group.get("members", []) or []:
+                out.add(m.get("client_id") or m.get("id"))
+            if group.get("client_id"):
+                out.add(group["client_id"])
+        return out
+
+    def test_a_held_member_is_returned(self):
+        from .models import ClientStage, EnrollmentStage
+
+        held = self._member(
+            stage=EnrollmentStage.ON_HOLD, lifecycle=ClientStage.ACTIVE,
+        )
+        self.assertIn(str(held.client_id), self._ids())
+
+    def test_a_CLOSED_programme_parked_on_hold_is_NOT_returned(self):
+        """Its column reads "Inactive", so an On Hold filter returning it would
+        disagree with the row it shows."""
+        from .models import ClientStage, EnrollmentStage
+        from .portal.serializers import verification_status
+
+        parked = self._member(
+            stage=EnrollmentStage.ON_HOLD, lifecycle=ClientStage.SERVICE_INACTIVE,
+            first="Parked",
+        )
+        # The column's own answer, which is what the filter must agree with.
+        self.assertEqual(verification_status(parked), "Inactive")
+        self.assertNotIn(str(parked.client_id), self._ids())
+
+    def test_everything_returned_is_LABELLED_On_Hold(self):
+        """The property that matters, stated directly."""
+        from .models import Client, ClientStage, EnrollmentStage
+        from .portal.serializers import verification_status
+
+        self._member(
+            stage=EnrollmentStage.ON_HOLD, lifecycle=ClientStage.ACTIVE,
+        )
+        self._member(
+            stage=EnrollmentStage.ON_HOLD, lifecycle=ClientStage.SERVICE_INACTIVE,
+            first="Parked",
+        )
+        self._member(
+            stage=EnrollmentStage.SERVICE_ACTIVE,
+            lifecycle=ClientStage.ACTIVE, first="Serving",
+        )
+        for client_id in self._ids():
+            client = Client.objects.get(client_id=client_id)
+            self.assertEqual(
+                verification_status(client), "On Hold", client.first_name,
+            )
+
+    def test_a_serving_member_is_not_returned(self):
+        from .models import ClientStage, EnrollmentStage
+
+        serving = self._member(
+            stage=EnrollmentStage.SERVICE_ACTIVE,
+            lifecycle=ClientStage.ACTIVE, first="Serving",
+        )
+        self.assertNotIn(str(serving.client_id), self._ids())
+
+    def test_a_STRAY_held_enrollment_beside_a_live_one_is_not_returned(self):
+        """The filter keys off the GOVERNING enrollment, so a member serving now
+        does not appear because of an older hold."""
+        from .models import ClientStage, EnrollmentStage, EnrollmentVerification
+
+        client = self._member(
+            stage=EnrollmentStage.ON_HOLD, lifecycle=ClientStage.ACTIVE,
+            first="Resumed",
+        )
+        # A newer, open enrollment governs.
+        EnrollmentVerification.objects.create(
+            client=client, stage=EnrollmentStage.SERVICE_ACTIVE,
+            opened_at=timezone.now() + timezone.timedelta(days=1),
+        )
+        self.assertNotIn(str(client.client_id), self._ids())
+
+    def test_it_works_on_the_VERIFICATION_scope_too(self):
+        """The chip was added to the Verification page, which passes scope."""
+        from .models import ClientStage, EnrollmentStage
+
+        self._member(
+            stage=EnrollmentStage.ON_HOLD, lifecycle=ClientStage.ACTIVE,
+        )
+        resp = self.api.get(
+            "/api/portal/members/?status=on_hold&scope=verification",
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
