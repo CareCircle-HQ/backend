@@ -33560,3 +33560,164 @@ class SpendCapTest(TestCase):
         joined = " ".join(dispatch.missing_for_submission(order))
         for forbidden in ("9000", "9,000", "$", "750"):
             self.assertNotIn(forbidden, joined)
+
+
+class PodImportHeaderMatchingTest(TestCase):
+    """Which CSV columns the POD importer recognises.
+
+    A real USP report lost its driver and route because the aliases listed only
+    "driver" and "route" and the file said "Delivery Driver".
+    """
+
+    def test_a_DELIVERY_prefixed_header_is_recognised(self):
+        from .services.pod_import import build_header_index
+
+        index = build_header_index([
+            "Order #", "Delivery Status", "Delivery Date", "Delivery Time",
+            "Delivery Driver", "Route", "Delivery Note", "Photos",
+        ])
+        self.assertEqual(index["driver"], "Delivery Driver")
+        self.assertEqual(index["route"], "Route")
+        self.assertEqual(index["note"], "Delivery Note")
+
+    def test_decorated_spellings_all_resolve(self):
+        from .services.pod_import import build_header_index
+
+        for header, canonical in (
+            ("Driver ID", "driver"),
+            ("Driver Name", "driver"),
+            ("Assigned Driver", "driver"),
+            ("Route Name", "route"),
+            ("Route #", "route"),
+            ("Delivery Route", "route"),
+            ("POD - Note", "note"),
+        ):
+            index = build_header_index(["Order #", header])
+            self.assertEqual(index[canonical], header, header)
+
+    def test_an_EXACT_alias_still_wins(self):
+        """The loose pass must never change a file that imports correctly today."""
+        from .services.pod_import import build_header_index
+
+        index = build_header_index(["Order #", "DriverID", "RouteID"])
+        self.assertEqual(index["driver"], "DriverID")
+        self.assertEqual(index["route"], "RouteID")
+
+    def test_two_canonical_fields_never_claim_the_SAME_column(self):
+        from .services.pod_import import build_header_index
+
+        index = build_header_index(["Order #", "Delivery Date", "Delivery Time"])
+        self.assertEqual(index["date"], "Delivery Date")
+        self.assertEqual(index["time"], "Delivery Time")
+
+    def test_an_unrelated_column_is_not_claimed(self):
+        """Loosening must not start matching things it should ignore."""
+        from .services.pod_import import build_header_index
+
+        index = build_header_index(["Order #", "Delivery Fee", "Signature Name"])
+        self.assertIsNone(index["driver"])
+        self.assertIsNone(index["note"])
+
+
+class PodImportWithoutPhotosTest(TestCase):
+    """Driver, route and note survive a report that carries NO photos.
+
+    This is the defect that lost them: they were written only onto a
+    DeliveryOrderProof, and a proof row exists only when a photo does. One real USP
+    file updated 184 orders and created ZERO proofs, so 184 drivers and routes were
+    parsed and discarded.
+    """
+
+    def setUp(self):
+        from .models import (
+            DeliveryOrder, DeliveryOrderStatus, PurchaseOrder,
+        )
+
+        # A bare order is enough: the importer matches on the order id, and none of
+        # what is being tested touches the member or the household.
+        self.order = DeliveryOrder.objects.create(
+            purchase_order=PurchaseOrder.objects.create(status="draft"),
+            status=DeliveryOrderStatus.READY_FOR_DELIVERY,
+        )
+
+    def _import(self, rows, **kwargs):
+        import csv
+        import io
+
+        from .services.pod_import import run_pod_import_from_reader
+
+        return run_pod_import_from_reader(
+            reader=csv.DictReader(io.StringIO(rows)), apply=True, fetch=False,
+            **kwargs,
+        )
+
+    def _row(self, **over):
+        cells = {
+            "Order #": str(self.order.pk), "Member ID": "",
+            "Delivery Status": "Completed", "Delivery Date": "09/11/2026",
+            "Delivery Time": "10:30 AM", "Delivery Driver": "Marcus T",
+            "Route": "RT-14", "Delivery Note": "Left with the doorman",
+            "Photos": "",
+        }
+        cells.update(over)
+        header = ",".join(cells)
+        return f"{header}\n" + ",".join(cells.values()) + "\n"
+
+    def test_driver_route_and_note_land_on_the_ORDER(self):
+        self._import(self._row())
+        self.order.refresh_from_db()
+        self.assertEqual(self.order.delivery_driver, "Marcus T")
+        self.assertEqual(self.order.delivery_route, "RT-14")
+        self.assertEqual(self.order.delivery_note, "Left with the doorman")
+
+    def test_the_status_source_records_CSV(self):
+        self._import(self._row())
+        self.order.refresh_from_db()
+        self.assertEqual(self.order.status_source, "csv")
+
+    def test_a_later_BLANK_value_does_not_erase_one_we_have(self):
+        """A status-only report that omits the driver must not wipe the driver an
+        earlier report gave us."""
+        from .services import pod_ingest
+
+        self._import(self._row())
+        pod_ingest.apply_delivery_outcome(
+            self.order, status="failed", status_source="api",
+        )
+        self.order.refresh_from_db()
+        self.assertEqual(self.order.status, "failed")
+        self.assertEqual(self.order.delivery_driver, "Marcus T")
+
+    def test_the_status_source_moves_with_the_STATUS(self):
+        from .services import pod_ingest
+
+        self._import(self._row())
+        pod_ingest.apply_delivery_outcome(
+            self.order, status="failed", status_source="api",
+        )
+        self.order.refresh_from_db()
+        self.assertEqual(self.order.status_source, "api")
+
+    def test_a_reimport_that_changes_NOTHING_leaves_the_source_alone(self):
+        """Otherwise re-running a CSV would rewrite the provenance of a status the
+        API had already reported."""
+        from .services import pod_ingest
+
+        self._import(self._row())
+        pod_ingest.apply_delivery_outcome(
+            self.order, status="failed", status_source="api",
+        )
+        # The same outcome again, from the CSV channel: nothing moves, so the
+        # source must not flip.
+        pod_ingest.apply_delivery_outcome(
+            self.order, status="failed", status_source="csv",
+        )
+        self.order.refresh_from_db()
+        self.assertEqual(self.order.status_source, "api")
+
+    def test_a_DRIVER_only_report_updates_nothing_else(self):
+        self._import(self._row(**{"Delivery Status": "", "Delivery Date": ""}))
+        self.order.refresh_from_db()
+        self.assertEqual(self.order.delivery_driver, "Marcus T")
+        # No status in the row, so the order keeps the one it had.
+        self.assertEqual(self.order.status, "ready_for_delivery")

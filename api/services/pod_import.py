@@ -18,6 +18,7 @@ import hashlib
 import io
 import json
 import logging
+import re
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
@@ -30,7 +31,7 @@ from django.db import IntegrityError, transaction
 from django.utils import timezone
 
 from ..models import (
-    DeliveryOrder, DeliveryOrderProof, DeliveryOrderStatus,
+    DeliveryOrder, DeliveryOrderProof, DeliveryOrderStatus, DeliveryStatusSource,
 )
 from . import import_storage, pod_ingest
 
@@ -81,13 +82,72 @@ def _norm(h):
     return (h or "").strip().lower()
 
 
+# Words that decorate a header without changing what it means. "Delivery Driver",
+# "Driver ID" and "driver_id" are all the driver column, and maintaining an alias
+# for each spelling every vendor invents is a treadmill -- the comment above
+# _CANDIDATES ("New vendors usually just add an alias") describes the treadmill
+# rather than a design.
+_HEADER_PREFIXES = ("delivery", "pod", "actual", "final", "assigned")
+_HEADER_SUFFIXES = ("id", "name", "number", "no", "num", "code", "ref")
+
+
+def _core(header):
+    """A header reduced to the word that identifies it.
+
+    ``Delivery Driver`` -> ``driver``, ``Route Name`` -> ``route``,
+    ``POD - Note`` -> ``note``, ``Driver ID`` -> ``driver``.
+
+    Punctuation and separators go first, then a leading decorator, then a trailing
+    one. Only ONE of each is stripped: removing them repeatedly would reduce
+    "Delivery Delivery" to nothing and, worse, turn an unrelated header into a
+    collision.
+    """
+    words = [w for w in re.split(r"[^a-z0-9]+", _norm(header)) if w]
+    if len(words) > 1 and words[0] in _HEADER_PREFIXES:
+        words = words[1:]
+    if len(words) > 1 and words[-1] in _HEADER_SUFFIXES:
+        words = words[:-1]
+    return "".join(words)
+
+
 def build_header_index(fieldnames):
     """Map canonical field -> the actual header present in this file (or None).
-    Company-agnostic: matches any known alias, case-insensitively."""
-    present = {_norm(h): h for h in (fieldnames or [])}
+
+    Two passes, in this order:
+
+    1. EXACT alias match, case-insensitively. Unchanged, so no file that imports
+       correctly today can start behaving differently.
+    2. CORE match, which catches the decorated spellings -- "Delivery Driver",
+       "Route Name", "Delivery Note". This is what a real USP report needed: its
+       driver and route columns were silently dropped because the aliases listed
+       only "driver" and "route".
+
+    The second pass never overrides the first, and never claims a header another
+    canonical field already took.
+    """
+    fields = [h for h in (fieldnames or []) if h]
+    present = {_norm(h): h for h in fields}
     index = {}
     for canonical, aliases in _CANDIDATES.items():
         index[canonical] = next((present[a] for a in aliases if a in present), None)
+
+    taken = {h for h in index.values() if h}
+    by_core = {}
+    for header in fields:
+        by_core.setdefault(_core(header), header)
+    for canonical, aliases in _CANDIDATES.items():
+        if index[canonical]:
+            continue
+        # The canonical name and every alias, reduced the same way, so "driver"
+        # matches a column called "Delivery Driver".
+        wanted = {_core(canonical)} | {_core(a) for a in aliases}
+        match = next(
+            (by_core[w] for w in wanted if w in by_core and by_core[w] not in taken),
+            None,
+        )
+        if match:
+            index[canonical] = match
+            taken.add(match)
     return index
 
 
@@ -269,6 +329,11 @@ class PodImporter:
                 if pod_ingest.apply_delivery_outcome(
                     order, status=status, delivered_at=delivered_at,
                     company=self.company or None,
+                    status_source=DeliveryStatusSource.CSV,
+                    # Passed here TOO, not only onto the proof: this is the path a
+                    # photo-less report takes, and it is the one that was losing
+                    # them.
+                    driver=driver, route=route, note=note,
                 ):
                     self.stats["orders_updated"] += 1
 
@@ -322,6 +387,8 @@ class PodImporter:
             driver=task["driver"],
             route_id=task.get("route") or "",
             note=task["note"],
+            # This importer is the CSV channel, by definition.
+            status_source=DeliveryStatusSource.CSV,
             delivered_at=task["delivered_at"],
             source_url=url,
             source_report=self.source_report,

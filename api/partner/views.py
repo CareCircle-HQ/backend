@@ -25,7 +25,7 @@ from rest_framework.response import Response
 from rest_framework.throttling import ScopedRateThrottle
 from rest_framework.views import APIView
 
-from ..models import DeliveryOrder, PartnerScope
+from ..models import DeliveryOrder, DeliveryStatusSource, PartnerScope
 from ..services import import_storage, pod_ingest
 from ..services.pod_import import map_pod_status, parse_delivered_at
 from .auth import (
@@ -220,9 +220,13 @@ class DeliveryStatusView(PartnerAPIView):
         changed = pod_ingest.apply_delivery_outcome(
             order, status=mapped, delivered_at=delivered_at,
             company=request.user.delivery_company,
+            status_source=DeliveryStatusSource.API,
+            driver=meta.get("driver", ""), route=meta.get("route_id", ""),
+            note=meta.get("note", ""),
         )
-        # Driver/route/note are proof-level fields; with no image to attach them
-        # to we acknowledge them but only the order outcome is persisted.
+        # Driver, route and note are persisted on the ORDER, so a status-only
+        # report keeps them. They used to be proof-only, which meant a report
+        # without a photo parsed them and threw them away.
         return Response({
             "order_id": str(order.pk),
             "status": order.status,
@@ -270,6 +274,7 @@ class ProofUploadView(PartnerAPIView):
                 company=request.user.delivery_company, delivered_at=delivered_at,
                 source_report=f"api:{request.user.client.client_id}",
                 filename=f.name, **meta,
+                status_source=DeliveryStatusSource.API,
             )
             if outcome == pod_ingest.FAILED:
                 failures.append({"filename": f.name, "detail": err})
@@ -336,6 +341,7 @@ class ProofBase64View(PartnerAPIView):
                 company=request.user.delivery_company, delivered_at=delivered_at,
                 source_report=f"api:{request.user.client.client_id}",
                 filename=name, **meta,
+                status_source=DeliveryStatusSource.API,
             )
             if outcome == pod_ingest.FAILED:
                 failures.append({"filename": name, "detail": err})
@@ -451,6 +457,7 @@ class ProofConfirmView(PartnerAPIView):
                 company=request.user.delivery_company, delivered_at=delivered_at,
                 source_report=f"api:{request.user.client.client_id}",
                 filename=key.rsplit("/", 1)[-1], **meta,
+                status_source=DeliveryStatusSource.API,
             )
             if outcome == pod_ingest.FAILED:
                 failures.append({"s3_key": key, "detail": err})
@@ -470,6 +477,7 @@ def _proof_response(order, results, failures, delivered_at, meta, request):
             status=map_pod_status(request.data.get("status")) if request.data.get("status") else None,
             delivered_at=delivered_at,
             company=request.user.delivery_company,
+            status_source=DeliveryStatusSource.API,
         )
     body = {
         "order_id": str(order.pk),

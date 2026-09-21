@@ -61,6 +61,7 @@ def store_proof(
     driver="",
     route_id="",
     note="",
+    status_source="",
     delivered_at=None,
     source_url="",
     source_report="",
@@ -106,6 +107,7 @@ def store_proof(
                 driver=(driver or "")[:255],
                 route_id=(route_id or "")[:255],
                 note=note or "",
+                status_source=status_source or "",
                 delivered_at=delivered_at,
             )
     except IntegrityError:
@@ -116,23 +118,46 @@ def store_proof(
     return CREATED, proof, None
 
 
-def apply_delivery_outcome(order, *, status=None, delivered_at=None, company=None):
+def apply_delivery_outcome(order, *, status=None, delivered_at=None, company=None,
+                          status_source="", driver="", route="", note=""):
     """Apply what a delivery report may change on the order itself.
 
     Deliberately narrow: status, the delivered timestamp and (when we know it)
     the delivery company. Everything else on a DeliveryOrder is ours. Returns
     the list of fields actually changed (empty when nothing moved).
+
+    ``status_source`` records WHICH CHANNEL reported the outcome -- a CSV upload or
+    the courier's API. It is stamped only when the status actually moves, so a
+    re-import that changes nothing does not rewrite the provenance of a status the
+    other channel had already set.
     """
     fields = []
     if status and order.status != status:
         order.status = status
         fields.append("status")
+        if status_source and order.status_source != status_source:
+            order.status_source = status_source
+            fields.append("status_source")
     if delivered_at and order.delivered_at != delivered_at:
         order.delivered_at = delivered_at
         fields.append("delivered_at")
     if company is not None and order.delivery_company_id != company.pk:
         order.delivery_company = company
         fields.append("delivery_company")
+
+    # Driver, route and note, whether or not a photo came with them. They used to
+    # be written only onto a proof, so a report without photos threw them away.
+    #
+    # A BLANK VALUE NEVER OVERWRITES a populated one: a later status-only report
+    # that omits the driver should not erase the driver an earlier report gave us.
+    for attr, value in (
+        ("delivery_driver", (driver or "").strip()[:255]),
+        ("delivery_route", (route or "").strip()[:255]),
+        ("delivery_note", (note or "").strip()),
+    ):
+        if value and getattr(order, attr) != value:
+            setattr(order, attr, value)
+            fields.append(attr)
     if fields:
         order.save(update_fields=fields)
     return fields

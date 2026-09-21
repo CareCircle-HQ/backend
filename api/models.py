@@ -4767,6 +4767,19 @@ class PurchaseOrder(models.Model):
         return f"PO {self.purchase_order_id} ({self.get_status_display()})"
 
 
+class DeliveryStatusSource(models.TextChoices):
+    """How a delivery's outcome reached us.
+
+    Worth recording because the two channels have different reliability: a CSV is a
+    file someone uploaded, possibly days late and possibly the wrong week, while the
+    API is the courier's own system reporting as it happens. "Where did this status
+    come from?" is the first question when a delivery looks wrong.
+    """
+
+    CSV = "csv", "CSV import"
+    API = "api", "Partner API"
+
+
 class DeliveryOrder(models.Model):
     """A single member's delivery within a PurchaseOrder."""
 
@@ -4822,6 +4835,28 @@ class DeliveryOrder(models.Model):
     )
     # True when ``kitchen`` differs from ``default_kitchen`` (load-balanced to a
     # different capable kitchen for this delivery).
+    # Where the CURRENT status came from. Set alongside the status itself, so a
+    # delivery whose outcome arrived by CSV can be told from one the courier's API
+    # reported -- including for a status-only report that carries no photo, which a
+    # field on the proof could never answer.
+    status_source = models.CharField(
+        max_length=8, choices=DeliveryStatusSource.choices, blank=True,
+    )
+
+    # WHO DELIVERED IT, BY WHICH ROUTE, AND WHAT THEY SAID.
+    #
+    # These live here as well as on DeliveryOrderProof, and that duplication is the
+    # fix for a real defect rather than an oversight: they were proof-ONLY fields,
+    # and a proof row exists only when a photo does. A report with no photos --
+    # which is most of them; one real USP file updated 184 orders and created ZERO
+    # proofs -- parsed the driver and route and then discarded both.
+    #
+    # They are facts about the DELIVERY, not about a photograph of it, so the order
+    # is where they belong. The proof keeps its own copies, because a specific photo
+    # can legitimately come from a different driver on a redelivery.
+    delivery_driver = models.CharField(max_length=255, blank=True)
+    delivery_route = models.CharField(max_length=255, blank=True)
+    delivery_note = models.TextField(blank=True)
     rerouted = models.BooleanField(default=False)
     menu_type = models.ForeignKey(
         MenuType,
@@ -4901,6 +4936,12 @@ class DeliveryOrderProof(models.Model):
     delivered_at = models.DateTimeField(null=True, blank=True)
     # The source report filename / import identifier this image came from.
     source_report = models.CharField(max_length=255, blank=True)
+    # Which channel delivered this proof. source_report names the FILE for a CSV;
+    # this names the CHANNEL, which is the part that is comparable across the two.
+    status_source = models.CharField(
+        max_length=8, choices=DeliveryStatusSource.choices, blank=True,
+        db_index=True,
+    )
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
