@@ -119,3 +119,77 @@ def resolved_price(vendor, option_code):
     percent = fee_percent_for(vendor)
     fee = admin_fee(price, percent)
     return price, percent, price + fee
+
+
+# ── the spend cap ────────────────────────────────────────────────────────────
+
+def spend_cap():
+    """The most a vendor may recommend on one assessment, including its own fee."""
+    return BillingSettings.get().vendor_spend_cap
+
+
+def assessment_price(vendor=None):
+    """The dwelling assessment's own price -- the visit, not an installed item.
+
+    It counts against the cap: Unite Us authorises one amount for the whole service,
+    and the assessment is part of what that amount buys. Leaving it out would let a
+    vendor recommend the full cap in products and put us over.
+    """
+    item = BillableItem.objects.filter(option_code="", is_active=True).first()
+    if item is None:
+        return Decimal("0")
+    if vendor is not None:
+        override = VendorPrice.objects.filter(
+            vendor=vendor, billable_item=item,
+        ).first()
+        if override is not None:
+            return override.price
+    return item.vendor_price
+
+
+def cap_status(vendor, interventions):
+    """How the recommended items stand against the cap.
+
+    ``interventions`` is the questionnaire's own list: ``[{option, qty}]``.
+
+    Returns amounts as well as flags. The CRM shows the amounts; the VENDOR APP is
+    given only the flags, because a figure on a screen in the member's living room
+    is our commercial position on display.
+    """
+    prices = {
+        r["option_code"]: Decimal(r["price"])
+        for r in price_list_for(vendor) if r["option_code"]
+    }
+    products = Decimal("0")
+    unpriced = []
+    for entry in interventions or []:
+        code = (entry or {}).get("option")
+        try:
+            qty = int((entry or {}).get("qty") or 0)
+        except (TypeError, ValueError):
+            qty = 0
+        if qty <= 0 or not code:
+            continue
+        price = prices.get(code)
+        if price is None:
+            # Counted as nothing but REPORTED, so "why is the total lower than I
+            # expect?" has an answer rather than being a silent gap.
+            unpriced.append(code)
+            continue
+        products += price * qty
+
+    cap = spend_cap()
+    assessment = assessment_price(vendor)
+    total = products + assessment
+    return {
+        "cap": cap,
+        "assessment": assessment,
+        "products": products,
+        "total": total,
+        "remaining": cap - total,
+        # AT the cap is a warning, not an error: spending the authorisation exactly
+        # is allowed and is what the operator asked to be told about.
+        "at_cap": total >= cap,
+        "over_cap": total > cap,
+        "unpriced": unpriced,
+    }

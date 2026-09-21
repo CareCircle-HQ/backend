@@ -123,6 +123,20 @@ def missing_for_submission(order):
     if DispatchSignerRole.MEMBER not in roles:
         missing.append("member signature")
 
+    # THE SPEND CAP. Unite Us authorises one amount for the whole service, so a
+    # recommendation above it cannot be billed -- refusing at submit is the last
+    # point at which it is cheap to fix, because the vendor is still on site.
+    #
+    # The message carries NO amount: the vendor app shows this to a member.
+    from .pricing import cap_status
+
+    questionnaire = getattr(order, "questionnaire", None)
+    if questionnaire is not None and questionnaire.interventions:
+        if cap_status(order.vendor, questionnaire.interventions)["over_cap"]:
+            missing.append(
+                "the recommended items exceed the funding limit for this service"
+            )
+
     # A PHOTO PER IDENTIFIED PROBLEM, and at least one of the dwelling.
     #
     # Per CATEGORY, not per question: three questions point at grab bars, and a

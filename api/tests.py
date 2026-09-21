@@ -33351,3 +33351,212 @@ class AssessmentQuoteLinesTest(TestCase):
             case_created_at=timezone.now(),
         )
         self.assertTrue(self._lines()["window_ac"]["case"]["already_open"])
+
+
+class SpendCapTest(TestCase):
+    """The funding cap: $9,000 of vendor spend, INCLUDING the assessment's own fee.
+
+    Unite Us authorises up to $10,000 for this service and our admin fee comes out
+    of that. The vendor app is told only that the limit is reached -- never the
+    figure.
+    """
+
+    def setUp(self):
+        from decimal import Decimal
+
+        from .models import BillableItem, BillingSettings, Vendor
+
+        BillingSettings.objects.update_or_create(
+            singleton_id=1, defaults={
+                "admin_fee_percent": Decimal("10.00"),
+                "vendor_spend_cap": Decimal("9000.00"),
+            },
+        )
+        self.vendor = Vendor.objects.create(name="Acme")
+        # The assessment itself, which has no option code because it is the visit.
+        BillableItem.objects.create(
+            item="Dwelling assessment", option_code="",
+            billing_category="Dwelling Assessment & SOW Development",
+            vendor_price=Decimal("750.00"),
+        )
+        BillableItem.objects.create(
+            item="Window air conditioner", option_code="window_ac",
+            billing_category="Air Conditioner", main_category="Temperature Control",
+            vendor_price=Decimal("1323.00"),
+        )
+        BillableItem.objects.create(
+            item="Grab bar at tub", option_code="grab_bar_tub",
+            billing_category="Grab Bars", main_category="Bathroom",
+            vendor_price=Decimal("498.75"),
+        )
+
+    def _status(self, items):
+        from .services import pricing
+
+        return pricing.cap_status(self.vendor, items)
+
+    def test_the_ASSESSMENT_FEE_counts_toward_the_cap(self):
+        """Leaving it out would let a vendor recommend the full cap in products and
+        put us over the authorisation."""
+        from decimal import Decimal
+
+        status = self._status([])
+        self.assertEqual(status["assessment"], Decimal("750.00"))
+        self.assertEqual(status["total"], Decimal("750.00"))
+        self.assertEqual(status["remaining"], Decimal("8250.00"))
+
+    def test_products_and_the_fee_are_totalled_together(self):
+        from decimal import Decimal
+
+        status = self._status([{"option": "window_ac", "qty": 2}])
+        self.assertEqual(status["products"], Decimal("2646.00"))
+        self.assertEqual(status["total"], Decimal("3396.00"))
+        self.assertFalse(status["at_cap"])
+
+    def test_EXACTLY_at_the_cap_warns_but_is_not_over(self):
+        """Spending the authorisation precisely is allowed -- and is the case the
+        operator asked to be warned about."""
+        from decimal import Decimal
+
+        from .models import BillableItem
+
+        BillableItem.objects.create(
+            item="Exact filler", option_code="filler",
+            billing_category="Air Conditioner", vendor_price=Decimal("8250.00"),
+        )
+        status = self._status([{"option": "filler", "qty": 1}])
+        self.assertEqual(status["total"], Decimal("9000.00"))
+        self.assertTrue(status["at_cap"])
+        self.assertFalse(status["over_cap"])
+
+    def test_a_penny_over_is_OVER(self):
+        from decimal import Decimal
+
+        from .models import BillableItem
+
+        BillableItem.objects.create(
+            item="One penny more", option_code="penny",
+            billing_category="Air Conditioner", vendor_price=Decimal("8250.01"),
+        )
+        status = self._status([{"option": "penny", "qty": 1}])
+        self.assertTrue(status["over_cap"])
+
+    def test_quantities_multiply(self):
+        from decimal import Decimal
+
+        self.assertEqual(
+            self._status([{"option": "grab_bar_tub", "qty": 4}])["products"],
+            Decimal("1995.00"),
+        )
+
+    def test_a_zero_quantity_costs_nothing(self):
+        from decimal import Decimal
+
+        self.assertEqual(
+            self._status([{"option": "window_ac", "qty": 0}])["products"],
+            Decimal("0"),
+        )
+
+    def test_an_UNPRICED_item_is_reported_rather_than_silently_free(self):
+        """So "why is the total lower than I expect?" has an answer."""
+        status = self._status([{"option": "no_such_item", "qty": 1}])
+        self.assertEqual(status["unpriced"], ["no_such_item"])
+
+    def test_a_VENDOR_price_override_changes_the_cap_arithmetic(self):
+        """The cap is measured in what WE pay, so a negotiated price moves it."""
+        from decimal import Decimal
+
+        from .models import BillableItem, VendorPrice
+
+        VendorPrice.objects.create(
+            vendor=self.vendor,
+            billable_item=BillableItem.objects.get(option_code="window_ac"),
+            price=Decimal("1000.00"),
+        )
+        self.assertEqual(
+            self._status([{"option": "window_ac", "qty": 2}])["products"],
+            Decimal("2000.00"),
+        )
+
+    def test_a_negotiated_ASSESSMENT_price_is_used(self):
+        from decimal import Decimal
+
+        from .models import BillableItem, VendorPrice
+
+        VendorPrice.objects.create(
+            vendor=self.vendor,
+            billable_item=BillableItem.objects.get(option_code=""),
+            price=Decimal("600.00"),
+        )
+        self.assertEqual(self._status([])["assessment"], Decimal("600.00"))
+
+    def test_the_cap_is_ADJUSTABLE(self):
+        from decimal import Decimal
+
+        from .models import BillingSettings
+
+        row = BillingSettings.get()
+        row.vendor_spend_cap = Decimal("5000.00")
+        row.save()
+        status = self._status([{"option": "window_ac", "qty": 4}])
+        self.assertEqual(status["total"], Decimal("6042.00"))
+        self.assertTrue(status["over_cap"])
+
+    def test_the_GATE_refuses_a_submission_over_the_cap(self):
+        from decimal import Decimal
+
+        from .models import (
+            BillableItem, Client, DispatchKind, DispatchOrder,
+            DispatchQuestionnaire,
+        )
+        from .services import dispatch
+
+        BillableItem.objects.create(
+            item="Too much", option_code="too_much",
+            billing_category="Air Conditioner", vendor_price=Decimal("9000.00"),
+        )
+        order = DispatchOrder.objects.create(
+            kind=DispatchKind.ASSESSMENT, vendor=self.vendor,
+            client=Client.objects.create(
+                client_id=str(uuid.uuid4()), first_name="Cap", last_name="Member",
+                client_added_at=timezone.now(),
+            ),
+        )
+        DispatchQuestionnaire.objects.create(
+            dispatch_order=order, modules=["combined"],
+            interventions=[{"option": "too_much", "qty": 1}],
+        )
+        missing = dispatch.missing_for_submission(order)
+        self.assertIn(
+            "the recommended items exceed the funding limit for this service",
+            missing,
+        )
+
+    def test_the_gate_message_carries_NO_AMOUNT(self):
+        """The vendor app shows this to a member."""
+        from decimal import Decimal
+
+        from .models import (
+            BillableItem, Client, DispatchKind, DispatchOrder,
+            DispatchQuestionnaire,
+        )
+        from .services import dispatch
+
+        BillableItem.objects.create(
+            item="Too much", option_code="too_much",
+            billing_category="Air Conditioner", vendor_price=Decimal("9000.00"),
+        )
+        order = DispatchOrder.objects.create(
+            kind=DispatchKind.ASSESSMENT, vendor=self.vendor,
+            client=Client.objects.create(
+                client_id=str(uuid.uuid4()), first_name="Cap2", last_name="Member",
+                client_added_at=timezone.now(),
+            ),
+        )
+        DispatchQuestionnaire.objects.create(
+            dispatch_order=order, modules=["combined"],
+            interventions=[{"option": "too_much", "qty": 1}],
+        )
+        joined = " ".join(dispatch.missing_for_submission(order))
+        for forbidden in ("9000", "9,000", "$", "750"):
+            self.assertNotIn(forbidden, joined)

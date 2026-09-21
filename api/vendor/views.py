@@ -317,6 +317,23 @@ class VendorWorkDetailView(VendorAPIView):
                         # something to ask about, and "$0.00" reads as free.
                         option["vendor_price"] = prices.get(option["code"])
 
+            # THE CAP, as flags and a budget the app can compute against -- never
+            # as a running total we render. The app already holds each option's
+            # price, so it can warn the instant a quantity changes without a round
+            # trip; what it must not do is put a dollar figure on a screen in the
+            # member's living room.
+            cap = pricing.cap_status(
+                order.vendor, form.interventions if form else [],
+            )
+            payload["cap"] = {
+                "at_cap": cap["at_cap"],
+                "over_cap": cap["over_cap"],
+                # The budget and the assessment's share, so the app can recompute
+                # locally as the vendor taps. Both are OUR figures, not the
+                # member's, and the app renders neither.
+                "limit": str(cap["cap"]),
+                "assessment": str(cap["assessment"]),
+            }
             payload["form"] = {
                 "state": form.state if form else "not_started",
                 "template_version": form.template_version if form else None,
@@ -937,8 +954,18 @@ class VendorAssessmentSaveView(VendorAPIView):
             form.assessor_notes = (data.get("assessor_notes") or "").strip()
 
         form.save()
+
+        from ..services import pricing
+
+        cap = pricing.cap_status(order.vendor, form.interventions)
         return Response({
             "state": form.state,
+            # Recomputed server-side on every save, so the app's warning cannot
+            # drift from the rule that will actually be enforced at submit.
+            "cap": {
+                "at_cap": cap["at_cap"], "over_cap": cap["over_cap"],
+                "limit": str(cap["cap"]), "assessment": str(cap["assessment"]),
+            },
             "answers": form.answers,
             "section_other": form.section_other,
             "interventions": form.interventions,

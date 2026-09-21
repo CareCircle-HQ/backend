@@ -6050,6 +6050,19 @@ class BillingSettings(models.Model):
     admin_fee_percent = models.DecimalField(
         max_digits=5, decimal_places=2, default=Decimal("10.00"),
     )
+    # The most a vendor may recommend on one assessment, INCLUDING the assessment's
+    # own fee. Unite Us authorises up to $10,000 for this service and our admin fee
+    # comes out of that, leaving $9,000 of vendor spend.
+    #
+    # Stored rather than derived from admin_fee_percent, because the two are not the
+    # same arithmetic: 10% treated as a SHARE of the $10,000 gives $9,000 (billing
+    # $9,900), while 10% as a MARKUP on the vendor price would allow $9,090.91
+    # (billing exactly $10,000). $9,000 is the figure the business states and it is
+    # the conservative one; deriving it would quietly change the cap whenever
+    # somebody edited the fee.
+    vendor_spend_cap = models.DecimalField(
+        max_digits=10, decimal_places=2, default=Decimal("9000.00"),
+    )
     updated_at = models.DateTimeField(auto_now=True)
     updated_by = models.ForeignKey(
         "Agent", on_delete=models.SET_NULL, null=True, blank=True,
