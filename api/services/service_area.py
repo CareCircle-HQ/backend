@@ -136,3 +136,78 @@ def out_of_range_ticket_reason(zip_code, source="delivery address", member_names
         f"household has been placed on hold and every member set Out of Range. "
         f"Please review this case for closure.{who}"
     )
+
+
+# ── borough lookup (housing) ────────────────────────────────────────────────
+# The same whitelist answers a second question for housing: WHICH borough. A
+# ServiceZipCode row carries one, and the three it uses -- Brooklyn, Manhattan,
+# Queens -- are exactly the three the housing programme names use, so a served ZIP
+# gives the programme's borough for free.
+#
+# NOT AllowedZipCode: that table's "borough" column holds NEIGHBOURHOODS
+# (Williamsburg, Coney Island) for the Williamsburg pilot, and using it would
+# produce "Home Remediation - Heater - Bedford-Stuyvesant", which does not exist.
+
+def borough_for_zip(zip_value):
+    """The borough for a ZIP, or "" when it is not in the whitelist."""
+    from api.models import ServiceZipCode
+
+    zip5 = _zip5(zip_value)
+    if not zip5:
+        return ""
+    row = ServiceZipCode.objects.filter(zip=zip5, is_active=True).first()
+    return (row.borough or "").strip() if row else ""
+
+
+def housing_area_check(zip_value):
+    """``{zip, in_service_area, borough, reason}`` for a dwelling's ZIP.
+
+    Defers to :func:`is_zip_out_of_range` for the IN/OUT decision so housing and
+    food cannot disagree about coverage -- including its rule that an UNCONFIGURED
+    whitelist is inert. Without that, a fresh database would mark every dwelling
+    Out of Range.
+
+    ``reason`` separates the two failures because they need different responses: a
+    missing ZIP is a data-entry problem an agent can fix now, an unserved one is a
+    coverage decision they cannot.
+    """
+    zip5 = _zip5(zip_value)
+    # _zip5 takes the first five CHARACTERS, so "nonsense" becomes "nonse". That is
+    # fine for the food whitelist -- a non-ZIP is simply not in it -- but housing
+    # distinguishes "no usable ZIP" from "a real ZIP we do not serve", so it checks
+    # the shape here rather than tightening the shared helper and changing the food
+    # path's behaviour.
+    usable = zip5.isdigit() and len(zip5) == 5
+    if not usable:
+        return {
+            "zip": "", "in_service_area": False, "borough": "", "reason": "no_zip",
+        }
+    if is_zip_out_of_range(zip5):
+        return {
+            "zip": zip5,
+            "in_service_area": False,
+            "borough": "",
+            "reason": "out_of_area",
+        }
+    # In range -- which, with an empty whitelist, may mean "not configured". The
+    # borough is then simply unknown, and the caller falls back.
+    return {
+        "zip": zip5,
+        "in_service_area": True,
+        "borough": borough_for_zip(zip5),
+        "reason": "",
+    }
+
+
+def order_service_area(order):
+    """The coverage answer for a dispatch order's dwelling address.
+
+    A remediation order inherits its parent's address, so it inherits the answer:
+    the work happens at the same dwelling.
+    """
+    from api.models import DispatchKind
+
+    source = order
+    if order.kind == DispatchKind.REMEDIATION and order.parent_id:
+        source = order.parent
+    return housing_area_check(source.address_zip or "")

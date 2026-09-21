@@ -123,14 +123,69 @@ def missing_for_submission(order):
     if DispatchSignerRole.MEMBER not in roles:
         missing.append("member signature")
 
-    # At least one photo PER FINDING -- which is why DispatchProof carries a
-    # finding FK. Proofs with no finding are general site photos and do not count
-    # toward any finding's requirement.
-    for finding in order.findings.all():
-        if not finding.proofs.exists():
-            missing.append(f"photo for finding: {finding.title}")
+    # THE SPEND CAP. Unite Us authorises one amount for the whole service, so a
+    # recommendation above it cannot be billed -- refusing at submit is the last
+    # point at which it is cheap to fix, because the vendor is still on site.
+    #
+    # The message carries NO amount: the vendor app shows this to a member.
+    from .pricing import cap_status
+
+    questionnaire = getattr(order, "questionnaire", None)
+    if questionnaire is not None and questionnaire.interventions:
+        if cap_status(order.vendor, questionnaire.interventions)["over_cap"]:
+            missing.append(
+                "the recommended items exceed the funding limit for this service"
+            )
+
+    # A PHOTO PER IDENTIFIED PROBLEM, and at least one of the dwelling.
+    #
+    # Per CATEGORY, not per question: three questions point at grab bars, and a
+    # photo each would ask for the same photo three times. The problem evidenced is
+    # "no grab bars", however many questions surfaced it.
+    #
+    # This is stricter than the form's printed minimum ("at least one photo of the
+    # dwelling"), which it subsumes -- a category photo IS a photo of the dwelling.
+    # It is NOT the old per-FINDING rule that shipped here and that every real
+    # submission would have failed; findings are a different concept, and a photo
+    # per item belongs to work orders as proof of service.
+    from .assessment_forms import photo_groups_required
+
+    questionnaire = getattr(order, "questionnaire", None)
+    needed = (
+        photo_groups_required(questionnaire.answers, questionnaire.modules)
+        if questionnaire is not None else []
+    )
+
+    if needed:
+        have = set(
+            order.proofs.exclude(intervention_group="")
+            .values_list("intervention_group", flat=True)
+        )
+        for code, label in needed:
+            if code not in have:
+                missing.append(f"photo of: {label}")
+    elif not order.proofs.exists():
+        # Nothing that needs evidencing was ticked -- the printed minimum still
+        # applies, so a visit that found no problems is still evidenced.
+        missing.append("at least one photo of the dwelling")
 
     return missing
+
+
+def _intervention_group_labels():
+    """Product group code -> human label. Used when naming a product, not the gate.
+
+    The gate now names the QUESTION group a photo is owed for ("photo of:
+    Bathroom"), because that is the heading the vendor just answered under -- the
+    questionnaires attach the photo requirement to the question group, not to a
+    product category.
+    """
+    from .assessment_forms import INTERVENTIONS
+
+    return {
+        g["code"]: g["label"]
+        for groups in INTERVENTIONS.values() for g in groups
+    }
 
 
 def can_submit(order):
@@ -226,6 +281,22 @@ def void_submission(submission, *, vendor_user=None, reason=""):
             "superseded_uploads": superseded,
         },
     )
+    # REOPEN THE QUESTIONNAIRE. Without this the void was only half done: the
+    # order went back to PENDING_SUBMISSION while the form stayed SUBMITTED, so the
+    # vendor's draft endpoint answered 409 and "void so the vendor can correct and
+    # resubmit" was impossible to actually do.
+    #
+    # The ANSWERS are kept -- a correction is an edit, and retyping 33 questions to
+    # fix one is how a vendor ends up ticking from memory. What is cleared is
+    # submitted_at, because the form is no longer submitted.
+    from ..models import DispatchQuestionnaireState
+
+    questionnaire = getattr(order, "questionnaire", None)
+    if questionnaire is not None and questionnaire.is_submitted:
+        questionnaire.state = DispatchQuestionnaireState.DRAFT
+        questionnaire.submitted_at = None
+        questionnaire.save(update_fields=["state", "submitted_at", "updated_at"])
+
     # The order is awaiting a valid submission again; the gate must be met afresh.
     set_status(
         order, DispatchStatus.PENDING_SUBMISSION,

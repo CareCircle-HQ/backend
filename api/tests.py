@@ -27114,7 +27114,10 @@ class DispatchOrderTest(TestCase):
         missing = dispatch.missing_for_submission(order)
         self.assertIn("vendor signature", missing)
         self.assertIn("member signature", missing)
-        self.assertIn("photo for finding: Damp in bedroom", missing)
+        # ONE photo of the dwelling, not one per finding -- the real form says
+        # "at least one photo of the dwelling", and every submission supplied
+        # carried a single photo against ~10 ticked risks.
+        self.assertIn("at least one photo of the dwelling", missing)
         self.assertFalse(dispatch.can_submit(order))
 
     def test_submit_is_refused_while_anything_is_missing(self):
@@ -27126,9 +27129,15 @@ class DispatchOrderTest(TestCase):
             dispatch.submit(order)
         self.assertIn("vendor signature", str(ctx.exception))
 
-    def test_a_photo_on_ANOTHER_finding_does_not_satisfy_the_first(self):
-        """The rule is one photo PER FINDING, which is why proofs carry a finding
-        FK -- counting photos per ORDER would pass this."""
+    def test_ONE_photo_satisfies_the_gate_however_many_findings_there_are(self):
+        """This test used to assert the opposite -- one photo PER FINDING -- which
+        the real form contradicts: "at least one photo of the dwelling". Every
+        submission supplied carried a single photo against roughly ten ticked
+        risks, so the per-finding rule would have rejected all of them.
+
+        A photo per item belongs to WORK ORDERS, where it is proof of service for
+        something installed.
+        """
         from .models import DispatchFinding, DispatchProof
         from .services import dispatch
 
@@ -27139,11 +27148,26 @@ class DispatchOrderTest(TestCase):
             dispatch_order=order, finding=a, s3_key="k1", content_hash="h1",
         )
         missing = dispatch.missing_for_submission(order)
-        self.assertIn("photo for finding: Mould", missing)
-        self.assertNotIn("photo for finding: Damp", missing)
+        self.assertNotIn("at least one photo of the dwelling", missing)
+        # Only the signatures remain.
+        self.assertEqual(
+            sorted(missing), ["member signature", "vendor signature"],
+        )
 
-    def test_a_general_site_photo_does_not_count_for_a_finding(self):
-        """A proof with no finding is a site photo, not evidence OF anything."""
+    def test_NO_photo_at_all_blocks_the_gate(self):
+        from .services import dispatch
+
+        order = self._assessment(self._member())
+        self.assertIn(
+            "at least one photo of the dwelling",
+            dispatch.missing_for_submission(order),
+        )
+
+    def test_a_general_site_photo_DOES_satisfy_the_gate(self):
+        """The inverse of what this asserted before, and the form is explicit: "at
+        least one photo of the dwelling". A photo of the dwelling is the thing being
+        asked for -- it does not have to be evidence of a particular finding.
+        """
         from .models import DispatchFinding, DispatchProof
         from .services import dispatch
 
@@ -27152,7 +27176,10 @@ class DispatchOrderTest(TestCase):
         DispatchProof.objects.create(
             dispatch_order=order, finding=None, s3_key="k", content_hash="h",
         )
-        self.assertIn("photo for finding: Damp", dispatch.missing_for_submission(order))
+        self.assertNotIn(
+            "at least one photo of the dwelling",
+            dispatch.missing_for_submission(order),
+        )
 
     def _satisfy_gate(self, order):
         from .models import (
@@ -27526,7 +27553,7 @@ class AssessmentOrderWizardApiTest(TestCase):
         self.assertEqual(resp.status_code, 200)
         missing = resp.data[0]["missing_for_submission"]
         self.assertIn("vendor signature", missing)
-        self.assertIn("photo for finding: Damp", missing)
+        self.assertIn("at least one photo of the dwelling", missing)
 
     def test_the_order_keeps_its_OWN_address(self):
         """Not read live from the client: a later address edit must not rewrite
@@ -27649,6 +27676,59 @@ class VendorSettingsApiTest(TestCase):
         self.assertNotEqual(
             VendorUser.objects.get(email="boss@acme.test").password, before,
         )
+
+    def test_a_reset_can_SUPPLY_the_new_password(self):
+        """Being able to type a password when creating an account but not when
+        resetting it is a surprise with no reason behind it."""
+        from django.contrib.auth.hashers import check_password
+
+        from .models import VendorUser
+
+        vid = self._vendor()
+        self._api().post(
+            f"/api/portal/settings/vendors/{vid}/admin-user/",
+            {"email": "boss@acme.test", "name": "Ada"}, format="json",
+        )
+        resp = self._api().post(
+            f"/api/portal/settings/vendors/{vid}/reset-admin-password/",
+            {"password": "chosen-by-agent-1"}, format="json",
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        # Not echoed: the agent typed it, so repeating it back would put a secret
+        # they chose into a response body and any log that captures one.
+        self.assertEqual(resp.data["temporary_password"], "")
+        self.assertTrue(resp.data["password_was_supplied"])
+
+        user = VendorUser.objects.get(email="boss@acme.test")
+        self.assertTrue(check_password("chosen-by-agent-1", user.password))
+
+    def test_a_reset_with_a_BLANK_password_still_generates_one(self):
+        vid = self._vendor()
+        self._api().post(
+            f"/api/portal/settings/vendors/{vid}/admin-user/",
+            {"email": "b@acme.test", "name": "B"}, format="json",
+        )
+        resp = self._api().post(
+            f"/api/portal/settings/vendors/{vid}/reset-admin-password/",
+            {"password": "   "}, format="json",
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertTrue(resp.data["temporary_password"])
+        self.assertFalse(resp.data["password_was_supplied"])
+
+    def test_a_reset_password_under_8_characters_is_refused(self):
+        """Same rule as provisioning -- the two paths must not disagree."""
+        vid = self._vendor()
+        self._api().post(
+            f"/api/portal/settings/vendors/{vid}/admin-user/",
+            {"email": "c@acme.test", "name": "C"}, format="json",
+        )
+        resp = self._api().post(
+            f"/api/portal/settings/vendors/{vid}/reset-admin-password/",
+            {"password": "short"}, format="json",
+        )
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("8 characters", resp.data["error"])
 
     def test_reset_is_refused_when_there_is_no_admin_user(self):
         vid = self._vendor()
@@ -29200,15 +29280,11 @@ class DispatchHistoryApiTest(TestCase):
 
 
 class AssessmentFormTest(TestCase):
-    """The Dwelling Assessment form: the template, and the CRM's read-only view.
-
-    Transcribed from the three real forms, so the counts here are assertions about
-    the actual documents rather than about my transcription of them.
-    """
+    """The CRM's read-only view of the Dwelling Assessment form."""
 
     EEA = (
         "Dwelling Assessment & Statement of Work (SOW) Development - "
-        "Modifications and Remediation Service - Manhattan"
+        "Modifications and Remediation Service - Queens"
     )
 
     def setUp(self):
@@ -29235,8 +29311,7 @@ class AssessmentFormTest(TestCase):
         )
         self.order = DispatchOrder.objects.create(
             kind=DispatchKind.ASSESSMENT, client=self.member,
-            vendor=Vendor.objects.create(name="Acme"),
-            referral_type="combined",
+            vendor=Vendor.objects.create(name="Acme"), referral_type="combined",
         )
 
     def _api(self):
@@ -29244,218 +29319,1477 @@ class AssessmentFormTest(TestCase):
 
         from .models import Agent
 
-        if not hasattr(self, "_agent"):
-            self._agent = Agent.objects.create(
-                name="F", agent_code="888", group="Management",
+        # Cached: agent_code is unique, and two calls in one test would collide.
+        agent = getattr(self, "_agent", None)
+        if agent is None:
+            agent = Agent.objects.create(
+                name="Form Agent", agent_code="780", group="Management",
             )
+            self._agent = agent
         acc = AccessToken()
-        acc["agent_id"] = str(self._agent.id)
-        acc["agent_code"] = self._agent.agent_code
-        acc["agent_name"] = self._agent.name
-        acc["agent_group"] = self._agent.group
+        acc["agent_id"] = str(agent.id)
+        acc["agent_code"] = agent.agent_code
+        acc["agent_name"] = agent.name
+        acc["agent_group"] = agent.group
         api = APIClient(); api.credentials(HTTP_AUTHORIZATION=f"Bearer {acc}")
         return api
 
     def _get(self):
-        resp = self._api().get(
+        return self._api().get(
             f"/api/portal/members/{self.member.pk}/assessment-form/",
         )
-        self.assertEqual(resp.status_code, 200, resp.content)
-        return resp.data
 
-    # ── the template ─────────────────────────────────────────────────────────
-    def test_the_question_counts_match_the_real_forms(self):
-        from .services.assessment_forms import all_question_codes
-
-        self.assertEqual(len(all_question_codes(["mobility"])), 17)
-        self.assertEqual(len(all_question_codes(["ventilation"])), 16)
-        self.assertEqual(len(all_question_codes()), 33)
-
-    def test_the_intervention_counts_match_the_real_forms(self):
-        from .services.assessment_forms import INTERVENTIONS, all_option_codes
-
-        self.assertEqual(len(INTERVENTIONS["mobility"]), 7)
-        self.assertEqual(len(INTERVENTIONS["ventilation"]), 5)
-        self.assertEqual(len(all_option_codes(["mobility"])), 18)
-        self.assertEqual(len(all_option_codes(["ventilation"])), 8)
-
-    def test_every_code_is_UNIQUE(self):
-        """Answers are keyed by code, so a duplicate would silently merge two
-        different questions into one answer."""
-        from .services.assessment_forms import all_option_codes, all_question_codes
-
-        for codes in (all_question_codes(), all_option_codes()):
-            self.assertEqual(len(codes), len(set(codes)))
-
-    def test_a_referral_type_selects_its_modules(self):
-        from .services.assessment_forms import modules_for_referral
-
-        self.assertEqual(modules_for_referral("mobility"), ["mobility"])
-        self.assertEqual(modules_for_referral("ventilation"), ["ventilation"])
-        self.assertEqual(
-            modules_for_referral("combined"), ["mobility", "ventilation"],
-        )
-
-    def test_an_UNKNOWN_referral_type_selects_NO_module(self):
-        """Rendering a Mobility assessment for a referral nobody classified would
-        put questions in front of a vendor that no authorization covers."""
-        from .services.assessment_forms import modules_for_referral
-
-        for junk in ("", None, "plumbing"):
-            self.assertEqual(modules_for_referral(junk), [])
-
-    # ── the read-only view ───────────────────────────────────────────────────
-    def test_the_blank_form_still_shows_EVERY_question(self):
-        """An unanswered form is not an empty screen -- it is the form with nothing
-        ticked, which is what tells an agent what the vendor will be asked."""
-        data = self._get()
+    def test_the_blank_form_shows_EVERY_question(self):
+        """An unanswered form is not an empty response; it is the form with nothing
+        ticked, which is what tells an agent what will be asked."""
+        data = self._get().data
         self.assertEqual(data["state"], "not_started")
-        self.assertEqual(len(data["modules"]), 2)
-        total = sum(
-            len(g["questions"])
-            for m in data["modules"] for s in m["sections"] for g in s["groups"]
-        )
-        self.assertEqual(total, 33)
-        self.assertFalse(any(
-            q["checked"]
-            for m in data["modules"] for s in m["sections"]
-            for g in s["groups"] for q in g["questions"]
-        ))
+        questions = [
+            q for s in data["sections"] for g in s["groups"] for q in g["questions"]
+        ]
+        self.assertEqual(len(questions), 29)
+        self.assertTrue(all(q["checked"] is False for q in questions))
 
-    def test_a_MOBILITY_only_referral_renders_one_module(self):
+    def test_a_referral_type_selects_its_FORM(self):
+        self.assertEqual(self._get().data["form"], "combined")
         self.order.referral_type = "mobility"
         self.order.save(update_fields=["referral_type"])
-        data = self._get()
-        self.assertEqual([m["code"] for m in data["modules"]], ["mobility"])
+        data = self._get().data
+        self.assertEqual(data["form"], "mobility")
         self.assertEqual(
-            sum(len(g["questions"])
-                for m in data["modules"] for s in m["sections"] for g in s["groups"]),
-            17,
+            [s["code"] for s in data["sections"]], ["reason", "functional", "risks"],
         )
 
-    def test_REASON_FOR_ASSESSMENT_appears_in_BOTH_modules(self):
-        """The combined form genuinely repeats it -- the real PDF shows it twice --
-        so the renderer must key on module AND section, not section alone."""
-        data = self._get()
-        titles = [
-            s["title"] for m in data["modules"] for s in m["sections"]
-        ]
-        self.assertEqual(titles.count("Reason for Assessment"), 2)
-
-    def test_only_REASON_sections_offer_an_Other_box(self):
-        data = self._get()
-        for m in data["modules"]:
-            for s in m["sections"]:
-                self.assertEqual(
-                    s["allows_other"], s["title"] == "Reason for Assessment",
-                    f"{m['code']}.{s['code']}",
-                )
-
-    def test_a_submitted_form_renders_the_ANSWERS(self):
-        from .models import DispatchQuestionnaire
-        from .services.assessment_forms import build_schema
-
-        DispatchQuestionnaire.objects.create(
-            dispatch_order=self.order, modules=["mobility", "ventilation"],
-            schema_snapshot=build_schema(["mobility", "ventilation"]),
-            answers={"mob.reason.fall_risk": True, "vent.air.excessive_dust": True},
-            section_other={"mob.reason": "reported by daughter"},
-            interventions=[{"option": "window_ac", "qty": 2}],
-            justification="too hot", state="submitted",
-            submitted_at=timezone.now(),
+    def test_a_VENTILATION_referral_keeps_its_member_reported_section(self):
+        """Which combined does not have -- the documents differ, and the CRM must
+        show whichever was actually used."""
+        self.order.referral_type = "ventilation"
+        self.order.save(update_fields=["referral_type"])
+        self.assertIn(
+            "reported", [s["code"] for s in self._get().data["sections"]],
         )
-        data = self._get()
-        self.assertEqual(data["state"], "submitted")
 
-        ticked = {
-            q["code"]
-            for m in data["modules"] for s in m["sections"]
-            for g in s["groups"] for q in g["questions"] if q["checked"]
+    def test_COMBINED_merges_the_two_reason_sections_into_one(self):
+        data = self._get().data
+        reason = [s for s in data["sections"] if s["code"] == "reason"][0]
+        self.assertEqual(
+            [g["label"] for g in reason["groups"]], ["Mobility", "Ventilation"],
+        )
+
+    def test_each_group_reports_its_CATEGORY_and_photo_rule(self):
+        """So the CRM can show why a category of products was offered, and which
+        sections owed a photo."""
+        data = self._get().data
+        groups = {
+            g["code"]: g for s in data["sections"] for g in s["groups"]
         }
-        self.assertEqual(ticked, {"mob.reason.fall_risk", "vent.air.excessive_dust"})
-        self.assertEqual(data["justification"], "too hot")
+        self.assertEqual(groups["mob.risk.bathroom"]["category"], "bathroom")
+        self.assertTrue(groups["mob.risk.bathroom"]["requires_photo"])
+        self.assertEqual(groups["comb.reason.mob"]["category"], "")
+        self.assertFalse(groups["comb.reason.mob"]["requires_photo"])
 
-        other = [
-            s["other"] for m in data["modules"] for s in m["sections"]
-            if s["code"] == "mob.reason"
-        ]
-        self.assertEqual(other, ["reported by daughter"])
+    def test_the_CATEGORIES_carry_the_whole_product_catalogue(self):
+        data = self._get().data
+        labels = {c["label"] for c in data["categories"]}
+        self.assertEqual(labels, {
+            "Mobility & Access", "Bathroom", "Air Quality", "Temperature Control",
+        })
 
-    def test_an_intervention_carries_its_QUANTITY(self):
-        """The form has a -/+ stepper, not a checkbox: a member can need two air
-        conditioners, and "x2" is what the vendor is being asked to fit."""
+    def test_a_submitted_form_renders_the_ANSWERS_and_quantities(self):
         from .models import DispatchQuestionnaire
         from .services.assessment_forms import build_schema
 
         DispatchQuestionnaire.objects.create(
-            dispatch_order=self.order, modules=["ventilation"],
-            schema_snapshot=build_schema(["ventilation"]),
-            interventions=[{"option": "window_ac", "qty": 2}],
+            dispatch_order=self.order, modules=["combined"],
+            schema_snapshot=build_schema(["combined"]),
+            answers={"mob.risk.slippery_tub": True},
+            section_other={"reason": "referred by the care manager"},
+            interventions=[{"option": "grab_bar_tub", "qty": 2}],
             state="submitted", submitted_at=timezone.now(),
         )
-        data = self._get()
-        opts = {
-            o["code"]: o["qty"]
-            for m in data["modules"] for g in m["intervention_groups"]
-            for o in g["options"]
+        data = self._get().data
+        self.assertEqual(data["state"], "submitted")
+        ticked = [
+            q["code"] for s in data["sections"] for g in s["groups"]
+            for q in g["questions"] if q["checked"]
+        ]
+        self.assertEqual(ticked, ["mob.risk.slippery_tub"])
+        qty = {
+            o["code"]: o["qty"] for c in data["categories"]
+            for g in c["groups"] for o in g["options"]
         }
-        self.assertEqual(opts["window_ac"], 2)
-        # Unchosen options are still listed, at qty 0 -- the full catalogue shows
-        # what COULD have been recommended.
-        self.assertEqual(opts["portable_ac"], 0)
-        self.assertIn("hepa_purifier", opts)
+        self.assertEqual(qty["grab_bar_tub"], 2)
+        # Unchosen options still render, at 0 -- the full catalogue is what shows
+        # an agent what COULD have been recommended.
+        self.assertEqual(qty["shower_chair"], 0)
+        reason = [s for s in data["sections"] if s["code"] == "reason"][0]
+        self.assertEqual(reason["other"], "referred by the care manager")
 
     def test_a_SUBMITTED_form_renders_from_its_FROZEN_snapshot(self):
-        """The reason the snapshot exists. A signed form must render years later
-        exactly as signed, not acquire blank questions from a later template."""
+        """A signed form must render as it was signed, not acquire later
+        questions."""
+        from .models import DispatchQuestionnaire
+
+        frozen = {
+            "version": 1, "form": "mobility", "label": "Mobility",
+            "service_code": "2.1",
+            "sections": [{
+                "code": "reason", "title": "Reason for Assessment",
+                "allows_other": True,
+                "groups": [{
+                    "code": "old", "label": "", "category": None,
+                    "requires_photo": False,
+                    "questions": [
+                        {"code": "retired.question", "label": "A retired question"},
+                    ],
+                }],
+            }],
+            "categories": [],
+        }
+        DispatchQuestionnaire.objects.create(
+            dispatch_order=self.order, modules=["mobility"],
+            schema_snapshot=frozen, answers={"retired.question": True},
+            state="submitted", submitted_at=timezone.now(),
+        )
+        data = self._get().data
+        labels = [
+            q["label"] for s in data["sections"] for g in s["groups"]
+            for q in g["questions"]
+        ]
+        self.assertEqual(labels, ["A retired question"])
+
+    def test_a_DRAFT_renders_against_the_LIVE_template(self):
+        """A draft is not evidence yet, so it follows the current form."""
+        from .models import DispatchQuestionnaire
+
+        DispatchQuestionnaire.objects.create(
+            dispatch_order=self.order, modules=["combined"], state="draft",
+        )
+        questions = [
+            q for s in self._get().data["sections"] for g in s["groups"]
+            for q in g["questions"]
+        ]
+        self.assertEqual(len(questions), 29)
+
+    def test_photos_are_reported_by_the_SECTION_they_evidence(self):
+        from .models import DispatchProof
+
+        DispatchProof.objects.create(
+            dispatch_order=self.order, s3_key="a", content_hash="a",
+            intervention_group="mob.risk.bathroom",
+        )
+        DispatchProof.objects.create(
+            dispatch_order=self.order, s3_key="b", content_hash="b",
+        )
+        data = self._get().data
+        self.assertEqual(data["photos_by_group"]["mob.risk.bathroom"], 1)
+        self.assertEqual(data["photos_by_group"][""], 1)
+        self.assertEqual(data["photo_count"], 2)
+
+    def test_there_is_NO_write_route(self):
+        """Only the vendor completes an assessment, enforced by the absence of a
+        route rather than a permission check."""
+        url = f"/api/portal/members/{self.member.pk}/assessment-form/"
+        for verb in ("post", "patch", "put", "delete"):
+            resp = getattr(self._api(), verb)(url, {}, format="json")
+            self.assertEqual(resp.status_code, 405, verb)
+
+
+class MemberMessageLogTest(TestCase):
+    """The message log itself, independent of scheduling."""
+
+    def setUp(self):
+        from .models import Client
+
+        self.member = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Ann", last_name="Reply",
+            client_phone_number="(347) 555-0199", client_added_at=timezone.now(),
+        )
+
+    def test_an_inbound_text_is_matched_to_a_member_by_number(self):
+        from .models import MessageDirection
+        from .services import messaging
+
+        msg = messaging.record_inbound("+13475550199", "Yes that works")
+        # str() on both sides: the FK reads back as a UUID while the fixture set the
+        # pk from a string.
+        self.assertEqual(str(msg.client_id), str(self.member.pk))
+        self.assertEqual(msg.direction, MessageDirection.INBOUND)
+        self.assertEqual(msg.status, "received")
+
+    def test_an_UNMATCHED_inbound_text_is_still_stored(self):
+        """An unmatched reply is the only evidence someone tried to reach us.
+        Discarding it is the one unrecoverable option."""
+        from .services import messaging
+
+        msg = messaging.record_inbound("+15550000000", "who is this")
+        self.assertIsNone(msg.client_id)
+        self.assertEqual(msg.body, "who is this")
+
+    def test_the_whole_conversation_reads_in_order(self):
+        from .services import messaging
+
+        messaging.send_to_member(
+            self.member, "First", to_number="(347) 555-0199",
+            require_consent=False,
+        )
+        messaging.record_inbound("+13475550199", "Reply")
+        log = list(
+            self.member.messages.order_by("created_at").values_list(
+                "direction", "body",
+            )
+        )
+        self.assertEqual(log, [("outbound", "First"), ("inbound", "Reply")])
+
+
+class HousingStageBarTest(TestCase):
+    """The housing row on the member stage bar: Authorization -> Assessment -> WOs.
+
+    Near-binary on purpose. The detailed dispatch lifecycle lives on the Programs >
+    Housing accordion; this bar answers "where is this member" at a glance.
+    """
+
+    EEA = (
+        "Dwelling Assessment & Statement of Work (SOW) Development - "
+        "Modifications and Remediation Service - Manhattan"
+    )
+    HEAR = "Home Remediation - Air Conditioner - Manhattan"
+
+    def setUp(self):
+        from .models import ActiveProgram, Client, Vendor
+        from .services.catalog import clear_program_domain_cache
+
+        for name, stype in (
+            (self.EEA, ActiveProgram.ServiceType.ENVIRONMENTAL_EXPOSURE_ASSESSMENT),
+            (self.HEAR, ActiveProgram.ServiceType.HOME_EXPENSE_ASSISTANCE_REPAIRS),
+        ):
+            ActiveProgram.objects.create(
+                program_name=name, case_category="Internal Services",
+                case_type=ActiveProgram.CaseType.HOUSING, service_type=stype,
+            )
+        clear_program_domain_cache()
+        self.vendor = Vendor.objects.create(name="Acme")
+        self.member = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Bar", last_name="Member",
+            client_added_at=timezone.now(),
+        )
+
+    def _case(self, program, *, auth="approved", starts=None, ends=None):
+        from .models import Case, CaseStatus, CaseType
+
+        return Case.objects.create(
+            case_id=uuid.uuid4(), client=self.member,
+            case_type=CaseType.INTERNAL_SERVICE, case_status=CaseStatus.MANAGED,
+            program_name=program, service_authorization_status=auth,
+            service_authorization_approval_starts_at=starts,
+            service_authorization_approval_ends_at=ends,
+            case_created_at=timezone.now(),
+        )
+
+    def _housing_track(self):
+        from .services.lifecycle import program_tracks
+
+        tracks = [
+            t for t in program_tracks(self.member) if t["domain"] == "housing"
+        ]
+        return tracks[0] if tracks else None
+
+    # ── the row exists when the dwelling case does ───────────────────────────
+    def test_no_dwelling_case_means_NO_housing_row(self):
+        self.assertIsNone(self._housing_track())
+
+    def test_a_dwelling_case_alone_creates_the_row(self):
+        self._case(self.EEA)
+        track = self._housing_track()
+        self.assertIsNotNone(track)
+        self.assertEqual(track["authorization"]["label"], "Approved")
+
+    # ── the assessment node ──────────────────────────────────────────────────
+    def test_approved_with_no_order_reads_READY_TO_ORDER(self):
+        self._case(self.EEA)
+        t = self._housing_track()
+        self.assertEqual(t["assessment_order"]["value"], "ready")
+        # The LABEL is the node's name; the state is the colour (value) plus the
+        # tooltip. "Ordered" as a label read as confusing on screen.
+        self.assertEqual(t["assessment_order"]["label"], "EEA")
+        self.assertIn("ready to create", t["assessment_order"]["detail"])
+
+    def test_an_EXPIRED_window_reads_EXPIRED_even_though_auth_says_approved(self):
+        """Housing's expiry has nowhere else to surface. _authorization_phase
+        deliberately still reads "Approved" for a lapsed authorization -- food shows
+        it in the Service phase, and housing has no Service phase."""
+        self._case(
+            self.EEA,
+            starts=timezone.now() - timezone.timedelta(days=40),
+            ends=timezone.now() - timezone.timedelta(days=5),
+        )
+        t = self._housing_track()
+        self.assertEqual(t["authorization"]["label"], "Approved")
+        self.assertEqual(t["assessment_order"]["value"], "expired")
+
+    def test_a_REQUESTED_authorization_leaves_the_assessment_node_BLANK(self):
+        """Nothing to order yet, and the Authorization chip already says so --
+        "Ready to Order" beside "Requested" would be a contradiction."""
+        self._case(self.EEA, auth="pending")
+        t = self._housing_track()
+        self.assertEqual(t["assessment_order"]["value"], "")
+
+    def test_a_DENIED_authorization_leaves_it_blank_too(self):
+        self._case(self.EEA, auth="denied")
+        t = self._housing_track()
+        self.assertEqual(t["assessment_order"]["value"], "")
+
+    def test_an_existing_order_reads_ORDERED(self):
+        from .models import DispatchKind, DispatchOrder
+
+        self._case(self.EEA)
+        DispatchOrder.objects.create(
+            kind=DispatchKind.ASSESSMENT, client=self.member, vendor=self.vendor,
+        )
+        t = self._housing_track()
+        self.assertEqual(t["assessment_order"]["value"], "ordered")
+
+    def test_a_CANCELLED_order_does_NOT_count_as_existing(self):
+        """Green for a dead order is the worst possible failure for a glance-level
+        indicator."""
+        from .models import DispatchKind, DispatchOrder, DispatchStatus
+
+        self._case(self.EEA)
+        DispatchOrder.objects.create(
+            kind=DispatchKind.ASSESSMENT, client=self.member, vendor=self.vendor,
+            status=DispatchStatus.CANCELLED,
+        )
+        t = self._housing_track()
+        self.assertEqual(t["assessment_order"]["value"], "cancelled")
+
+    # ── the work-orders node ─────────────────────────────────────────────────
+    def test_no_items_leaves_the_work_orders_node_BLANK(self):
+        self._case(self.EEA)
+        self.assertEqual(self._housing_track()["work_orders"]["value"], "")
+
+    def test_items_with_NO_batch_read_AMBER_with_a_count(self):
+        """The state that matters. A binary green would say "work orders: done"
+        while approved, authorized items sat unbatched."""
+        from .models import DispatchKind, DispatchOrder
+        from .services import dispatch
+
+        self._case(self.EEA)
+        self._case(self.HEAR)
+        assessment = DispatchOrder.objects.create(
+            kind=DispatchKind.ASSESSMENT, client=self.member, vendor=self.vendor,
+        )
+        dispatch.sync_dispatch_items(assessment)
+
+        t = self._housing_track()
+        self.assertEqual(t["work_orders"]["value"], "waiting")
+        self.assertEqual(t["work_orders"]["label"], "Work Orders")
+        self.assertIn("1 item waiting", t["work_orders"]["detail"])
+
+    def test_a_batch_reads_GREEN_and_names_whats_left(self):
+        """Still green -- work IS being done -- but the count says what remains, so
+        "1 order" cannot be mistaken for "everything is handled"."""
+        from .models import DispatchItem, DispatchKind, DispatchOrder
+        from .services import dispatch
+
+        self._case(self.EEA)
+        self._case(self.HEAR)
+        second = self._case("Home Remediation - Heater - Manhattan")
+        from .models import ActiveProgram
+        ActiveProgram.objects.create(
+            program_name="Home Remediation - Heater - Manhattan",
+            case_category="Internal Services",
+            case_type=ActiveProgram.CaseType.HOUSING,
+            service_type=ActiveProgram.ServiceType.HOME_EXPENSE_ASSISTANCE_REPAIRS,
+        )
+        from .services.catalog import clear_program_domain_cache
+        clear_program_domain_cache()
+
+        assessment = DispatchOrder.objects.create(
+            kind=DispatchKind.ASSESSMENT, client=self.member, vendor=self.vendor,
+        )
+        dispatch.sync_dispatch_items(assessment)
+        items = list(DispatchItem.objects.filter(assessment=assessment))
+        self.assertGreaterEqual(len(items), 2)
+
+        dispatch.create_work_order(
+            assessment, [items[0].dispatch_item_id], vendor=self.vendor,
+        )
+        t = self._housing_track()
+        self.assertEqual(t["work_orders"]["value"], "created")
+        self.assertEqual(t["work_orders"]["label"], "Work Orders")
+        # Green, but the detail still names what is left, so it cannot be read as
+        # "everything is handled".
+        self.assertIn("1 work order", t["work_orders"]["detail"])
+        self.assertIn("not yet batched", t["work_orders"]["detail"])
+
+    def test_the_node_LABELS_are_constant_and_the_colour_carries_the_state(self):
+        """These two read as a stepper: the chip is the node, and whether it is
+        green is the answer. A label that changed with the state ("Ordered") was
+        confusing on screen."""
+        from .models import DispatchKind, DispatchOrder
+
+        self._case(self.EEA)
+        before = self._housing_track()
+        DispatchOrder.objects.create(
+            kind=DispatchKind.ASSESSMENT, client=self.member, vendor=self.vendor,
+        )
+        after = self._housing_track()
+
+        self.assertEqual(before["assessment_order"]["label"], "EEA")
+        self.assertEqual(after["assessment_order"]["label"], "EEA")
+        # Only the value (colour) and the tooltip moved.
+        self.assertNotEqual(
+            before["assessment_order"]["value"], after["assessment_order"]["value"],
+        )
+        self.assertNotEqual(
+            before["assessment_order"]["detail"],
+            after["assessment_order"]["detail"],
+        )
+
+    # ── the overall chip ────────────────────────────────────────────────────
+    def test_an_open_dwelling_case_reads_OPEN(self):
+        self._case(self.EEA)
+        self.assertEqual(self._housing_track()["housing_overall"]["label"], "Open")
+
+    def test_a_CLOSED_dwelling_case_reads_CLOSED(self):
+        from .models import CaseStatus
+
+        case = self._case(self.EEA)
+        case.case_status = CaseStatus.CLOSED
+        case.save(update_fields=["case_status"])
+        self.assertEqual(self._housing_track()["housing_overall"]["label"], "Closed")
+
+    def test_an_EXPIRED_window_reads_EXPIRED(self):
+        self._case(
+            self.EEA,
+            starts=timezone.now() - timezone.timedelta(days=40),
+            ends=timezone.now() - timezone.timedelta(days=5),
+        )
+        self.assertEqual(
+            self._housing_track()["housing_overall"]["label"], "Expired",
+        )
+
+    def test_CLOSED_beats_EXPIRED(self):
+        """Terminal and factual wins: "Expired" on a closed case would send an
+        agent looking for something to fix."""
+        from .models import CaseStatus
+
+        case = self._case(
+            self.EEA,
+            starts=timezone.now() - timezone.timedelta(days=40),
+            ends=timezone.now() - timezone.timedelta(days=5),
+        )
+        case.case_status = CaseStatus.CLOSED
+        case.save(update_fields=["case_status"])
+        self.assertEqual(self._housing_track()["housing_overall"]["label"], "Closed")
+
+    def test_all_orders_UPLOADED_reads_COMPLETED(self):
+        from .models import DispatchKind, DispatchOrder, DispatchStatus
+
+        self._case(self.EEA)
+        DispatchOrder.objects.create(
+            kind=DispatchKind.ASSESSMENT, client=self.member, vendor=self.vendor,
+            status=DispatchStatus.UPLOADED,
+        )
+        self.assertEqual(
+            self._housing_track()["housing_overall"]["label"], "Completed",
+        )
+
+    def test_COMPLETED_beats_EXPIRED(self):
+        """If the work got done, a window that has since lapsed is history rather
+        than a problem."""
+        from .models import DispatchKind, DispatchOrder, DispatchStatus
+
+        self._case(
+            self.EEA,
+            starts=timezone.now() - timezone.timedelta(days=40),
+            ends=timezone.now() - timezone.timedelta(days=5),
+        )
+        DispatchOrder.objects.create(
+            kind=DispatchKind.ASSESSMENT, client=self.member, vendor=self.vendor,
+            status=DispatchStatus.UPLOADED,
+        )
+        self.assertEqual(
+            self._housing_track()["housing_overall"]["label"], "Completed",
+        )
+
+    def test_one_order_still_in_flight_is_NOT_completed(self):
+        from .models import DispatchKind, DispatchOrder, DispatchStatus
+
+        self._case(self.EEA)
+        DispatchOrder.objects.create(
+            kind=DispatchKind.ASSESSMENT, client=self.member, vendor=self.vendor,
+            status=DispatchStatus.UPLOADED,
+        )
+        DispatchOrder.objects.create(
+            kind=DispatchKind.REMEDIATION, client=self.member, vendor=self.vendor,
+            status=DispatchStatus.CONFIRMED,
+        )
+        self.assertEqual(self._housing_track()["housing_overall"]["label"], "Open")
+
+    def test_UNBATCHED_items_prevent_COMPLETED(self):
+        """Uploaded orders with items still waiting is not complete -- that is the
+        gap the amber Work Orders node exists to show."""
+        from .models import DispatchItem, DispatchKind, DispatchOrder, DispatchStatus
+        from .services import dispatch
+
+        self._case(self.EEA)
+        self._case(self.HEAR)
+        assessment = DispatchOrder.objects.create(
+            kind=DispatchKind.ASSESSMENT, client=self.member, vendor=self.vendor,
+            status=DispatchStatus.UPLOADED,
+        )
+        dispatch.sync_dispatch_items(assessment)
+        self.assertTrue(
+            DispatchItem.objects.filter(
+                assessment=assessment, dispatch_order__isnull=True,
+            ).exists()
+        )
+        self.assertEqual(self._housing_track()["housing_overall"]["label"], "Open")
+
+    def test_a_member_with_NO_orders_is_not_COMPLETED(self):
+        """"All orders are done" requires there to BE orders, or a member who has
+        never been assessed would read as Completed."""
+        self._case(self.EEA)
+        self.assertEqual(self._housing_track()["housing_overall"]["label"], "Open")
+
+    def test_a_CANCELLED_order_does_not_block_COMPLETED(self):
+        from .models import DispatchKind, DispatchOrder, DispatchStatus
+
+        self._case(self.EEA)
+        DispatchOrder.objects.create(
+            kind=DispatchKind.ASSESSMENT, client=self.member, vendor=self.vendor,
+            status=DispatchStatus.UPLOADED,
+        )
+        DispatchOrder.objects.create(
+            kind=DispatchKind.REMEDIATION, client=self.member, vendor=self.vendor,
+            status=DispatchStatus.CANCELLED,
+        )
+        self.assertEqual(
+            self._housing_track()["housing_overall"]["label"], "Completed",
+        )
+
+    # ── food is untouched ───────────────────────────────────────────────────
+    def test_a_FOOD_track_carries_no_housing_phases(self):
+        """Blank on food, so the frontend picks by domain rather than by which keys
+        happen to be set."""
+        from .models import ActiveProgram, Case, CaseStatus, CaseType
+        from .services.catalog import clear_program_domain_cache
+
+        ActiveProgram.objects.create(
+            program_name="Meals - Individual - Manhattan",
+            case_category="Internal Services",
+            case_type=ActiveProgram.CaseType.FOOD,
+            service_type=ActiveProgram.ServiceType.MEDICALLY_TAILORED_MEALS,
+        )
+        clear_program_domain_cache()
+        Case.objects.create(
+            case_id=uuid.uuid4(), client=self.member,
+            case_type=CaseType.INTERNAL_SERVICE, case_status=CaseStatus.MANAGED,
+            program_name="Meals - Individual - Manhattan",
+            service_authorization_status="approved",
+            case_created_at=timezone.now(),
+        )
+        from .services.lifecycle import program_tracks
+
+        food = [t for t in program_tracks(self.member) if t["domain"] == "food"]
+        self.assertTrue(food)
+        self.assertEqual(food[0]["assessment_order"]["value"], "")
+        self.assertEqual(food[0]["work_orders"]["value"], "")
+
+
+class BillablePricingTest(TestCase):
+    """The housing price list, and the adjustable admin fee.
+
+    The numbers here are the real sheet's, so these assert the transcription as
+    much as the code.
+    """
+
+    def setUp(self):
+        from decimal import Decimal
+
+        from .models import BillableItem, BillingSettings
+
+        BillingSettings.objects.update_or_create(
+            singleton_id=1, defaults={"admin_fee_percent": Decimal("10.00")},
+        )
+        # Migrations do not run under manage.py test, so the seeded rows do not
+        # exist here -- build the two the assertions need.
+        self.ac = BillableItem.objects.create(
+            item="Window air conditioner", option_code="window_ac",
+            billing_category="Air Conditioner", main_category="Temperature Control",
+            hcpcs_code="S5165", modifiers="U8, UC",
+            vendor_price=Decimal("1323.00"),
+        )
+        self.assessment = BillableItem.objects.create(
+            item="Dwelling assessment", option_code="",
+            billing_category="Dwelling Assessment & SOW Development",
+            main_category="Assessment", hcpcs_code="S5165", modifiers="UA, U8",
+            vendor_price=Decimal("750.00"),
+        )
+
+    def _api(self):
+        from rest_framework_simplejwt.tokens import AccessToken
+
+        from .models import Agent
+
+        agent = Agent.objects.create(
+            name="Pricing Agent", agent_code="777", group="Management",
+        )
+        acc = AccessToken()
+        acc["agent_id"] = str(agent.id)
+        acc["agent_code"] = agent.agent_code
+        acc["agent_name"] = agent.name
+        acc["agent_group"] = agent.group
+        api = APIClient(); api.credentials(HTTP_AUTHORIZATION=f"Bearer {acc}")
+        return api
+
+    # ── the arithmetic ───────────────────────────────────────────────────────
+    def test_the_billed_price_matches_the_sheet(self):
+        """1323 + 10% = 1455.30, and 750 + 10% = 825 -- the sheet's own totals."""
+        from decimal import Decimal
+
+        self.assertEqual(self.ac.admin_fee(), Decimal("132.30"))
+        self.assertEqual(self.ac.billed_price(), Decimal("1455.30"))
+        self.assertEqual(self.assessment.billed_price(), Decimal("825.00"))
+
+    def test_the_fee_rounds_to_the_CENT(self):
+        """456.75 x 10% = 45.675, which the sheet shows as 45.68 -- half-up, not
+        truncated, or every odd price would be a cent light."""
+        from decimal import Decimal
+
+        from .models import BillableItem
+
+        chair = BillableItem.objects.create(
+            item="Shower chair", option_code="shower_chair",
+            billing_category="Bathroom Facilities",
+            vendor_price=Decimal("456.75"),
+        )
+        self.assertEqual(chair.admin_fee(), Decimal("45.68"))
+        self.assertEqual(chair.billed_price(), Decimal("502.43"))
+
+    def test_changing_the_fee_REPRICES_everything(self):
+        """The billed price is derived, never stored -- which is what makes the fee
+        adjustable in any useful sense."""
+        from decimal import Decimal
+
+        from .models import BillingSettings
+
+        row = BillingSettings.get()
+        row.admin_fee_percent = Decimal("15.00")
+        row.save()
+
+        self.ac.refresh_from_db()
+        self.assertEqual(self.ac.admin_fee(), Decimal("198.45"))
+        self.assertEqual(self.ac.billed_price(), Decimal("1521.45"))
+
+    def test_a_ZERO_fee_bills_at_cost(self):
+        from decimal import Decimal
+
+        from .models import BillingSettings
+
+        row = BillingSettings.get()
+        row.admin_fee_percent = Decimal("0")
+        row.save()
+        self.assertEqual(self.ac.billed_price(), Decimal("1323.00"))
+
+    def test_a_SECOND_settings_row_cannot_be_created(self):
+        """save() forces the pk to 1, so a second row raises rather than quietly
+        replacing the fee someone else set. Loud beats silent where money is
+        concerned -- and get() is the only accessor that should be used anyway."""
+        from decimal import Decimal
+
+        from django.db import IntegrityError, transaction
+
+        from .models import BillingSettings
+
+        with self.assertRaises(IntegrityError):
+            with transaction.atomic():
+                BillingSettings.objects.create(admin_fee_percent=Decimal("99"))
+
+        self.assertEqual(BillingSettings.objects.count(), 1)
+        self.assertEqual(
+            BillingSettings.get().admin_fee_percent, Decimal("10.00"),
+        )
+
+    # ── the join to the assessment form ──────────────────────────────────────
+    def test_every_priced_item_matches_an_INTERVENTION_OPTION(self):
+        """The pricing sheet and the assessment form are the same catalogue. If
+        this fails, a recommended intervention can no longer become a priced line
+        -- which is the whole reason option_code exists."""
+        from .services.assessment_forms import all_option_codes
+
+        known = set(all_option_codes())
+        from .migrations import __name__ as _  # noqa: F401
+
+        from .migrations import (  # the seed data, as the single source
+            __path__ as _p,  # noqa: F401
+        )
+        import importlib
+
+        seed = importlib.import_module("api.migrations.0279_seed_billable_items")
+        priced = {code for (_m, _i, code, _c, _mod, _p2) in seed.ROWS if code}
+        self.assertEqual(
+            priced - known, set(),
+            "a priced item references an option code the form does not have",
+        )
+        self.assertEqual(
+            known - priced, set(),
+            "a form option has no price row",
+        )
+
+    # ── the API ──────────────────────────────────────────────────────────────
+    def test_an_agent_can_change_a_vendor_price(self):
+        resp = self._api().patch(
+            f"/api/portal/settings/billable-items/{self.ac.pk}/",
+            {"vendor_price": "1400.00"}, format="json",
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        # 1400 + 10% -- the default fee in this test's setUp.
+        self.assertEqual(resp.data["billed_price"], "1540.00")
+
+    def test_the_item_and_its_CODES_are_read_only(self):
+        """They come from the waiver's own sheet, and editing them would silently
+        break the join to the form's intervention options."""
+        resp = self._api().patch(
+            f"/api/portal/settings/billable-items/{self.ac.pk}/",
+            {"item": "Hacked", "option_code": "nonsense", "hcpcs_code": "X1"},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.ac.refresh_from_db()
+        self.assertEqual(self.ac.item, "Window air conditioner")
+        self.assertEqual(self.ac.option_code, "window_ac")
+        self.assertEqual(self.ac.hcpcs_code, "S5165")
+
+    def test_a_NEGATIVE_price_is_refused(self):
+        resp = self._api().patch(
+            f"/api/portal/settings/billable-items/{self.ac.pk}/",
+            {"vendor_price": "-5"}, format="json",
+        )
+        self.assertEqual(resp.status_code, 400)
+
+    def test_the_admin_fee_can_be_changed_through_the_API(self):
+        api = self._api()
+        resp = api.patch(
+            "/api/portal/settings/billable-items/billing-settings/",
+            {"admin_fee_percent": "12.5"}, format="json",
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        self.assertEqual(resp.data["admin_fee_percent"], "12.5")
+
+        rows = api.get("/api/portal/settings/billable-items/").data
+        rows = rows["results"] if isinstance(rows, dict) else rows
+        ac = [r for r in rows if r["item"] == "Window air conditioner"][0]
+        self.assertEqual(ac["billed_price"], "1488.38")
+
+    def test_a_fee_over_100_percent_is_refused(self):
+        """Charging more than double is a typo, not a policy. Zero IS allowed --
+        billing at cost is legitimate."""
+        api = self._api()
+        for bad in ("150", "-1", "abc"):
+            resp = api.patch(
+                "/api/portal/settings/billable-items/billing-settings/",
+                {"admin_fee_percent": bad}, format="json",
+            )
+            self.assertEqual(resp.status_code, 400, f"{bad} should be refused")
+        ok = api.patch(
+            "/api/portal/settings/billable-items/billing-settings/",
+            {"admin_fee_percent": "0"}, format="json",
+        )
+        self.assertEqual(ok.status_code, 200)
+
+    def test_active_only_filters_the_list(self):
+        self.assessment.is_active = False
+        self.assessment.save(update_fields=["is_active"])
+        rows = self._api().get(
+            "/api/portal/settings/billable-items/?active_only=1",
+        ).data
+        rows = rows["results"] if isinstance(rows, dict) else rows
+        self.assertNotIn("Dwelling assessment", [r["item"] for r in rows])
+
+
+class VendorPricingTest(TestCase):
+    """Per-vendor prices and fees, and the two INDEPENDENT fallbacks.
+
+    Absent means "inherit" for both. That is the whole design: a vendor nobody has
+    negotiated with follows the house rate, and changing that rate moves them with
+    it.
+    """
+
+    def setUp(self):
+        from decimal import Decimal
+
+        from .models import BillableItem, BillingSettings, Vendor
+
+        BillingSettings.objects.update_or_create(
+            singleton_id=1, defaults={"admin_fee_percent": Decimal("10.00")},
+        )
+        self.vendor = Vendor.objects.create(name="Acme Repairs")
+        self.other = Vendor.objects.create(name="Beta Repairs")
+        self.ac = BillableItem.objects.create(
+            item="Window air conditioner", option_code="window_ac",
+            billing_category="Air Conditioner", main_category="Temperature Control",
+            vendor_price=Decimal("1323.00"), sort_order=1,
+        )
+        self.chair = BillableItem.objects.create(
+            item="Shower chair", option_code="shower_chair",
+            billing_category="Bathroom Facilities", main_category="Bathroom",
+            vendor_price=Decimal("456.75"), sort_order=2,
+        )
+
+    def _api(self):
+        from rest_framework_simplejwt.tokens import AccessToken
+
+        from .models import Agent
+
+        agent = Agent.objects.create(
+            name="Price Agent", agent_code="778", group="Management",
+        )
+        acc = AccessToken()
+        acc["agent_id"] = str(agent.id)
+        acc["agent_code"] = agent.agent_code
+        acc["agent_name"] = agent.name
+        acc["agent_group"] = agent.group
+        api = APIClient(); api.credentials(HTTP_AUTHORIZATION=f"Bearer {acc}")
+        return api
+
+    def _rows(self, vendor=None):
+        from .services import pricing
+
+        return {
+            r["item"]: r for r in pricing.price_list_for(vendor or self.vendor)
+        }
+
+    # ── the price fallback ───────────────────────────────────────────────────
+    def test_with_no_override_a_vendor_gets_the_BASE_price(self):
+        row = self._rows()["Window air conditioner"]
+        self.assertEqual(row["price"], "1323.00")
+        self.assertEqual(row["base_price"], "1323.00")
+        self.assertFalse(row["is_custom"])
+
+    def test_the_whole_catalogue_appears_even_with_no_overrides(self):
+        """The table is the vendor's SCHEDULE, not a list of exceptions -- so a
+        price nobody has touched still has to be visible and editable."""
+        self.assertEqual(len(self._rows()), 2)
+
+    def test_an_override_replaces_only_THAT_vendors_price(self):
+        from decimal import Decimal
+
+        from .models import VendorPrice
+
+        VendorPrice.objects.create(
+            vendor=self.vendor, billable_item=self.ac, price=Decimal("1200.00"),
+        )
+        mine = self._rows()["Window air conditioner"]
+        theirs = self._rows(self.other)["Window air conditioner"]
+
+        self.assertEqual(mine["price"], "1200.00")
+        self.assertTrue(mine["is_custom"])
+        # The base stays visible beside it, so the discount is readable without
+        # arithmetic.
+        self.assertEqual(mine["base_price"], "1323.00")
+        self.assertEqual(theirs["price"], "1323.00")
+        self.assertFalse(theirs["is_custom"])
+
+    def test_changing_the_BASE_moves_vendors_who_have_not_negotiated(self):
+        """The reason overrides are not copies. A new base price should reach every
+        vendor who has not agreed their own -- 27 copies per vendor would leave them
+        all stale."""
+        from decimal import Decimal
+
+        from .models import VendorPrice
+
+        VendorPrice.objects.create(
+            vendor=self.vendor, billable_item=self.ac, price=Decimal("1200.00"),
+        )
+        self.ac.vendor_price = Decimal("1400.00")
+        self.ac.save(update_fields=["vendor_price"])
+
+        # Negotiated: unmoved. Not negotiated: follows the base.
+        self.assertEqual(self._rows()["Window air conditioner"]["price"], "1200.00")
+        self.assertEqual(
+            self._rows(self.other)["Window air conditioner"]["price"], "1400.00",
+        )
+
+    # ── the fee fallback, which is INDEPENDENT ──────────────────────────────
+    def test_a_vendor_with_no_fee_INHERITS_the_house_rate(self):
+        row = self._rows()["Window air conditioner"]
+        self.assertEqual(row["admin_fee_percent"], "10.00")
+        self.assertTrue(row["fee_is_inherited"])
+        self.assertEqual(row["billed_price"], "1455.30")
+
+    def test_a_vendor_fee_overrides_the_house_rate(self):
+        from decimal import Decimal
+
+        self.vendor.admin_fee_percent = Decimal("15.00")
+        self.vendor.save(update_fields=["admin_fee_percent"])
+
+        row = self._rows()["Window air conditioner"]
+        self.assertFalse(row["fee_is_inherited"])
+        self.assertEqual(row["admin_fee"], "198.45")
+        self.assertEqual(row["billed_price"], "1521.45")
+        # The other vendor is untouched.
+        self.assertEqual(
+            self._rows(self.other)["Window air conditioner"]["billed_price"],
+            "1455.30",
+        )
+
+    def test_a_vendor_fee_of_ZERO_is_not_the_same_as_inheriting(self):
+        """NULL means inherit; 0 means bill at cost. Conflating them would silently
+        under-bill every item for a vendor whose fee was merely unset."""
+        from decimal import Decimal
+
+        self.vendor.admin_fee_percent = Decimal("0")
+        self.vendor.save(update_fields=["admin_fee_percent"])
+        row = self._rows()["Window air conditioner"]
+        self.assertEqual(row["billed_price"], "1323.00")
+        self.assertFalse(row["fee_is_inherited"])
+
+    def test_the_two_fallbacks_are_independent(self):
+        """A custom price with an inherited fee, and vice versa, both have to work
+        -- they are separate decisions negotiated at different times."""
+        from decimal import Decimal
+
+        from .models import VendorPrice
+
+        VendorPrice.objects.create(
+            vendor=self.vendor, billable_item=self.ac, price=Decimal("1200.00"),
+        )
+        row = self._rows()["Window air conditioner"]
+        self.assertTrue(row["is_custom"])
+        self.assertTrue(row["fee_is_inherited"])
+        self.assertEqual(row["billed_price"], "1320.00")  # 1200 + 10%
+
+    # ── the option-code join ────────────────────────────────────────────────
+    def test_resolved_price_works_from_an_INTERVENTION_OPTION_code(self):
+        """What a recommended intervention will be billed at -- the join that makes
+        an assessment's recommendations invoiceable."""
+        from decimal import Decimal
+
+        from .models import VendorPrice
+        from .services import pricing
+
+        VendorPrice.objects.create(
+            vendor=self.vendor, billable_item=self.ac, price=Decimal("1200.00"),
+        )
+        price, percent, billed = pricing.resolved_price(self.vendor, "window_ac")
+        self.assertEqual(price, Decimal("1200.00"))
+        self.assertEqual(percent, Decimal("10.00"))
+        self.assertEqual(billed, Decimal("1320.00"))
+
+    def test_an_unknown_option_code_returns_None_rather_than_zero(self):
+        """Silently billing nothing for an item we have no price for would be worse
+        than failing."""
+        from .services import pricing
+
+        self.assertIsNone(pricing.resolved_price(self.vendor, "no_such_thing"))
+
+    # ── the API ─────────────────────────────────────────────────────────────
+    def test_an_agent_can_set_and_CLEAR_a_vendor_price(self):
+        api = self._api()
+        url = f"/api/portal/settings/vendors/{self.vendor.pk}/pricing/"
+
+        resp = api.patch(url, {
+            "billable_item_id": str(self.ac.pk), "price": "1200.00",
+            "note": "bulk deal",
+        }, format="json")
+        self.assertEqual(resp.status_code, 200, resp.content)
+        row = [r for r in resp.data["items"] if r["item"] == "Window air conditioner"][0]
+        self.assertEqual(row["price"], "1200.00")
+        self.assertTrue(row["is_custom"])
+        self.assertEqual(row["note"], "bulk deal")
+
+        # Clearing is a real operation, not typing the base back in.
+        resp2 = api.patch(url, {
+            "billable_item_id": str(self.ac.pk), "price": None,
+        }, format="json")
+        row2 = [r for r in resp2.data["items"] if r["item"] == "Window air conditioner"][0]
+        self.assertFalse(row2["is_custom"])
+        self.assertEqual(row2["price"], "1323.00")
+
+    def test_a_negative_vendor_price_is_refused(self):
+        resp = self._api().patch(
+            f"/api/portal/settings/vendors/{self.vendor.pk}/pricing/",
+            {"billable_item_id": str(self.ac.pk), "price": "-1"}, format="json",
+        )
+        self.assertEqual(resp.status_code, 400)
+
+    def test_an_unknown_item_id_is_refused(self):
+        resp = self._api().patch(
+            f"/api/portal/settings/vendors/{self.vendor.pk}/pricing/",
+            {"billable_item_id": str(uuid.uuid4()), "price": "10"}, format="json",
+        )
+        self.assertEqual(resp.status_code, 400)
+
+    def test_the_vendor_fee_can_be_set_and_cleared_through_the_vendor_endpoint(self):
+        api = self._api()
+        url = f"/api/portal/settings/vendors/{self.vendor.pk}/"
+
+        self.assertEqual(
+            api.patch(url, {"admin_fee_percent": "15"}, format="json").status_code,
+            200,
+        )
+        self.vendor.refresh_from_db()
+        self.assertEqual(str(self.vendor.admin_fee_percent), "15.00")
+
+        # null returns them to the house rate.
+        self.assertEqual(
+            api.patch(url, {"admin_fee_percent": None}, format="json").status_code,
+            200,
+        )
+        self.vendor.refresh_from_db()
+        self.assertIsNone(self.vendor.admin_fee_percent)
+
+    def test_a_vendor_fee_over_100_is_refused(self):
+        resp = self._api().patch(
+            f"/api/portal/settings/vendors/{self.vendor.pk}/",
+            {"admin_fee_percent": "150"}, format="json",
+        )
+        self.assertEqual(resp.status_code, 400)
+
+    def test_one_price_per_vendor_per_item(self):
+        from decimal import Decimal
+
+        from django.db import IntegrityError, transaction
+
+        from .models import VendorPrice
+
+        VendorPrice.objects.create(
+            vendor=self.vendor, billable_item=self.ac, price=Decimal("1"),
+        )
+        with self.assertRaises(IntegrityError):
+            with transaction.atomic():
+                VendorPrice.objects.create(
+                    vendor=self.vendor, billable_item=self.ac, price=Decimal("2"),
+                )
+
+
+class CaseRecommendationTest(TestCase):
+    """Which Unite Us cases an agent should open after an assessment.
+
+    The rule that matters: MANY PRODUCTS COLLAPSE INTO ONE CASE per programme per
+    borough. Four grab bars are one case with four items, not four cases.
+    """
+
+    EEA = (
+        "Dwelling Assessment & Statement of Work (SOW) Development - "
+        "Modifications and Remediation Service - Queens"
+    )
+
+    def setUp(self):
+        from decimal import Decimal
+
+        from .models import (
+            ActiveProgram, BillableItem, BillingSettings, Case, CaseStatus,
+            CaseType, Client, DispatchKind, DispatchOrder, Vendor,
+        )
+        from .services.catalog import clear_program_domain_cache
+
+        BillingSettings.objects.update_or_create(
+            singleton_id=1, defaults={"admin_fee_percent": Decimal("10.00")},
+        )
+        ActiveProgram.objects.create(
+            program_name=self.EEA, case_category="Internal Services",
+            case_type=ActiveProgram.CaseType.HOUSING,
+            service_type=ActiveProgram.ServiceType.ENVIRONMENTAL_EXPOSURE_ASSESSMENT,
+        )
+        # Grab Bars is INTERNAL in Queens here; a later test flips it.
+        for item, cat in (
+            ("Grab Bars", "Internal Services"),
+            ("Bathroom Facilities", "Internal Services"),
+            ("Doors and Cabinet Handles", "External Services"),
+        ):
+            ActiveProgram.objects.create(
+                program_name=(
+                    f"Home Accessibility and Safety Modification - {item} - Queens"
+                ),
+                case_category=cat,
+                case_type=ActiveProgram.CaseType.HOUSING,
+                service_type=(
+                    ActiveProgram.ServiceType.ENVIRONMENTAL_MODIFICATIONS_ACCESSIBILITY
+                ),
+            )
+        clear_program_domain_cache()
+
+        for code, item, cat, price in (
+            ("grab_bar_toilet", "Grab bar at toilet", "Grab Bars", "498.75"),
+            ("grab_bar_tub", "Grab bar at tub", "Grab Bars", "498.75"),
+            ("shower_chair", "Shower chair", "Bathroom Facilities", "456.75"),
+            ("lever_door_handle", "Lever door handle", "Doors & Cabinet Handles", "430.50"),
+            ("modular_portable_ramp", "Modular/portable ramp", "Accessibility Ramps", "876.75"),
+        ):
+            BillableItem.objects.create(
+                item=item, option_code=code, billing_category=cat,
+                vendor_price=Decimal(price),
+            )
+
+        self.vendor = Vendor.objects.create(name="Acme")
+        self.member = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Rec", last_name="Member",
+            client_added_at=timezone.now(),
+        )
+        Case.objects.create(
+            case_id=uuid.uuid4(), client=self.member,
+            case_type=CaseType.INTERNAL_SERVICE, case_status=CaseStatus.MANAGED,
+            program_name=self.EEA, case_created_at=timezone.now(),
+        )
+        self.order = DispatchOrder.objects.create(
+            kind=DispatchKind.ASSESSMENT, client=self.member, vendor=self.vendor,
+            referral_type="combined",
+        )
+
+    def _submit(self, interventions):
         from .models import DispatchQuestionnaire
         from .services.assessment_forms import build_schema
 
-        snapshot = build_schema(["ventilation"])
-        # Simulate a later template revision by removing a section from the copy
-        # the questionnaire froze.
-        snapshot["modules"][0]["sections"] = snapshot["modules"][0]["sections"][:1]
-        DispatchQuestionnaire.objects.create(
-            dispatch_order=self.order, modules=["ventilation"],
-            schema_snapshot=snapshot, state="submitted",
-            submitted_at=timezone.now(),
+        return DispatchQuestionnaire.objects.create(
+            dispatch_order=self.order, modules=["mobility", "ventilation"],
+            schema_snapshot=build_schema(["mobility", "ventilation"]),
+            state="submitted", submitted_at=timezone.now(),
+            interventions=interventions,
         )
-        data = self._get()
-        self.assertEqual(len(data["modules"][0]["sections"]), 1)
 
-    def test_a_DRAFT_renders_against_the_LIVE_template(self):
-        """The mirror image: an unfinished form should pick up template fixes."""
-        from .models import DispatchQuestionnaire
+    def _recs(self, interventions):
+        from .services import case_recommendations as recs
 
-        DispatchQuestionnaire.objects.create(
-            dispatch_order=self.order, modules=["ventilation"],
-            schema_snapshot={}, state="draft",
+        return recs.recommended_cases(self._submit(interventions))
+
+    # ── the grouping rule ───────────────────────────────────────────────────
+    def test_products_in_ONE_CATEGORY_collapse_into_ONE_case(self):
+        """Opening one case per product would create duplicates in Unite Us."""
+        out = self._recs([
+            {"option": "grab_bar_toilet", "qty": 1},
+            {"option": "grab_bar_tub", "qty": 2},
+        ])
+        self.assertEqual(len(out), 1)
+        self.assertEqual(len(out[0]["products"]), 2)
+        self.assertEqual(
+            out[0]["program_name"],
+            "Home Accessibility and Safety Modification - Grab Bars - Queens",
         )
-        data = self._get()
-        self.assertEqual(data["state"], "draft")
-        self.assertEqual(len(data["modules"][0]["sections"]), 3)
 
-    def test_there_is_NO_way_for_the_CRM_to_write_the_form(self):
-        """Only the vendor completes an assessment, enforced by the absence of a
-        route rather than a permission check someone can widen."""
-        url = f"/api/portal/members/{self.member.pk}/assessment-form/"
-        for method in ("post", "patch", "put", "delete"):
-            resp = getattr(self._api(), method)(url, {}, format="json")
-            self.assertEqual(
-                resp.status_code, 405, f"{method.upper()} must not be allowed",
+    def test_products_in_DIFFERENT_categories_are_separate_cases(self):
+        out = self._recs([
+            {"option": "grab_bar_toilet", "qty": 1},
+            {"option": "shower_chair", "qty": 1},
+        ])
+        self.assertEqual(len(out), 2)
+
+    def test_quantities_are_kept_and_totalled(self):
+        from decimal import Decimal
+
+        out = self._recs([
+            {"option": "grab_bar_toilet", "qty": 1},
+            {"option": "grab_bar_tub", "qty": 2},
+        ])
+        self.assertEqual(Decimal(out[0]["total"]), Decimal("1496.25"))
+        # 1496.25 + 10%
+        self.assertEqual(Decimal(out[0]["billed_total"]), Decimal("1645.88"))
+
+    def test_a_zero_quantity_is_not_recommended(self):
+        out = self._recs([
+            {"option": "grab_bar_toilet", "qty": 0},
+            {"option": "shower_chair", "qty": 1},
+        ])
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0]["program_item"], "Bathroom Facilities")
+
+    # ── the borough ─────────────────────────────────────────────────────────
+    def test_the_borough_comes_from_the_GOVERNING_CASE_not_the_address(self):
+        """The order's address is the dwelling and may be anywhere -- on the local
+        clone it is in Florida. The governing case's programme name carries the
+        borough the member is actually served in."""
+        self.order.address_city = "Hialeah"
+        self.order.address_state = "FL"
+        self.order.save(update_fields=["address_city", "address_state"])
+
+        out = self._recs([{"option": "grab_bar_toilet", "qty": 1}])
+        self.assertEqual(out[0]["borough"], "Queens")
+        self.assertIn("Queens", out[0]["program_name"])
+
+    # ── what an agent must be TOLD, not have hidden ─────────────────────────
+    def test_an_EXTERNAL_programme_is_reported_not_filtered_out(self):
+        """"You should open this, but the programme is External" is the useful
+        answer. Dropping it silently leaves a recommended product with no
+        explanation for why no case appeared."""
+        out = self._recs([{"option": "lever_door_handle", "qty": 1}])
+        self.assertEqual(len(out), 1)
+        self.assertTrue(out[0]["exists"])
+        self.assertFalse(out[0]["is_internal"])
+
+    def test_a_MISSING_programme_is_reported_separately_from_an_external_one(self):
+        """Different problems: one needs creating, the other reclassifying."""
+        out = self._recs([{"option": "modular_portable_ramp", "qty": 1}])
+        self.assertEqual(len(out), 1)
+        self.assertFalse(out[0]["exists"])
+        self.assertFalse(out[0]["is_internal"])
+
+    def test_a_case_the_member_ALREADY_has_is_flagged(self):
+        """So an agent does not open a second one."""
+        from .models import Case, CaseStatus, CaseType
+
+        Case.objects.create(
+            case_id=uuid.uuid4(), client=self.member,
+            case_type=CaseType.INTERNAL_SERVICE, case_status=CaseStatus.MANAGED,
+            program_name=(
+                "Home Accessibility and Safety Modification - Grab Bars - Queens"
+            ),
+            case_created_at=timezone.now(),
+        )
+        out = self._recs([{"option": "grab_bar_toilet", "qty": 1}])
+        self.assertTrue(out[0]["already_open"])
+
+    def test_an_UNPRICED_recommendation_still_appears(self):
+        """An agent still has to decide what to do with it, so it is surfaced
+        rather than dropped."""
+        out = self._recs([{"option": "no_such_product", "qty": 1}])
+        self.assertEqual(len(out), 1)
+        self.assertIsNone(out[0]["products"][0]["vendor_price"])
+
+    def test_NOTHING_recommended_produces_no_cases(self):
+        self.assertEqual(self._recs([]), [])
+
+    # ── the endpoint ────────────────────────────────────────────────────────
+    def _api(self):
+        from rest_framework_simplejwt.tokens import AccessToken
+
+        from .models import Agent
+
+        agent = Agent.objects.create(
+            name="Rec Agent", agent_code="779", group="Management",
+        )
+        acc = AccessToken()
+        acc["agent_id"] = str(agent.id)
+        acc["agent_code"] = agent.agent_code
+        acc["agent_name"] = agent.name
+        acc["agent_group"] = agent.group
+        api = APIClient(); api.credentials(HTTP_AUTHORIZATION=f"Bearer {acc}")
+        return api
+
+    def test_the_endpoint_reports_a_form_that_is_not_submitted(self):
+        """Not an error: "the vendor has not submitted yet" is the answer to the
+        question the screen is asking."""
+        resp = self._api().get(
+            f"/api/portal/members/{self.member.pk}/case-recommendations/",
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.data["state"], "not_started")
+        self.assertEqual(resp.data["cases"], [])
+
+    def test_the_endpoint_summarises_what_is_blocked(self):
+        self._submit([
+            {"option": "grab_bar_toilet", "qty": 1},
+            {"option": "shower_chair", "qty": 1},
+            {"option": "lever_door_handle", "qty": 1},
+            {"option": "modular_portable_ramp", "qty": 1},
+        ])
+        resp = self._api().get(
+            f"/api/portal/members/{self.member.pk}/case-recommendations/",
+        )
+        self.assertEqual(resp.data["state"], "submitted")
+        self.assertEqual(resp.data["summary"]["cases"], 4)
+        self.assertEqual(resp.data["summary"]["products"], 4)
+        # the external one and the missing one
+        self.assertEqual(resp.data["summary"]["blocked"], 2)
+
+
+class ServiceAreaTest(TestCase):
+    """ZIP -> in service area, and ZIP -> borough."""
+
+    def setUp(self):
+        from .models import ServiceZipCode
+
+        for z, b in (
+            ("11236", "Brooklyn"), ("10002", "Manhattan"), ("11354", "Queens"),
+        ):
+            ServiceZipCode.objects.update_or_create(
+                zip=z, defaults={"borough": b, "is_active": True},
             )
 
-    def test_a_member_with_no_order_gets_a_404_not_a_blank_form(self):
-        from .models import Client
+    def test_a_served_zip_gives_its_borough(self):
+        from .services import service_area
 
-        other = Client.objects.create(
-            client_id=str(uuid.uuid4()), first_name="No", last_name="Order",
+        self.assertEqual(service_area.borough_for_zip("11236"), "Brooklyn")
+        self.assertEqual(service_area.borough_for_zip("10002"), "Manhattan")
+
+    def test_a_ZIP_PLUS_FOUR_is_accepted(self):
+        """Unite Us exports carry "11236-5775"; a naive lookup misses every one."""
+        from .services import service_area
+
+        self.assertEqual(service_area.borough_for_zip("11236-5775"), "Brooklyn")
+
+    def test_an_unserved_zip_is_out_of_area(self):
+        from .services import service_area
+
+        out = service_area.housing_area_check("33018")
+        self.assertFalse(out["in_service_area"])
+        self.assertEqual(out["reason"], "out_of_area")
+        self.assertEqual(out["borough"], "")
+
+    def test_a_MISSING_zip_is_distinguished_from_an_unserved_one(self):
+        """Different problems: a missing ZIP is a data-entry fix an agent can make
+        now, an unserved one is a coverage decision they cannot."""
+        from .services import service_area
+
+        self.assertEqual(service_area.housing_area_check("")["reason"], "no_zip")
+        self.assertEqual(service_area.housing_area_check("nonsense")["reason"], "no_zip")
+
+    def test_a_DEACTIVATED_zip_stops_being_served(self):
+        from .models import ServiceZipCode
+        from .services import service_area
+
+        ServiceZipCode.objects.filter(zip="11236").update(is_active=False)
+        self.assertFalse(service_area.housing_area_check("11236")["in_service_area"])
+
+
+class HousingOutOfRangeTest(TestCase):
+    """The housing bar shows Out of Range when we do not serve the dwelling."""
+
+    EEA = (
+        "Dwelling Assessment & Statement of Work (SOW) Development - "
+        "Modifications and Remediation Service - Queens"
+    )
+
+    def setUp(self):
+        from .models import (
+            ActiveProgram, Case, CaseStatus, CaseType, Client, DispatchKind,
+            DispatchOrder, ServiceZipCode, Vendor,
+        )
+        from .services.catalog import clear_program_domain_cache
+
+        ServiceZipCode.objects.update_or_create(
+            zip="11236", defaults={"borough": "Brooklyn", "is_active": True},
+        )
+        ActiveProgram.objects.create(
+            program_name=self.EEA, case_category="Internal Services",
+            case_type=ActiveProgram.CaseType.HOUSING,
+            service_type=ActiveProgram.ServiceType.ENVIRONMENTAL_EXPOSURE_ASSESSMENT,
+        )
+        clear_program_domain_cache()
+        self.member = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Range", last_name="Member",
             client_added_at=timezone.now(),
         )
-        resp = self._api().get(
-            f"/api/portal/members/{other.pk}/assessment-form/",
+        Case.objects.create(
+            case_id=uuid.uuid4(), client=self.member,
+            case_type=CaseType.INTERNAL_SERVICE, case_status=CaseStatus.MANAGED,
+            program_name=self.EEA, case_created_at=timezone.now(),
         )
-        self.assertEqual(resp.status_code, 404)
+        self.order = DispatchOrder.objects.create(
+            kind=DispatchKind.ASSESSMENT, client=self.member,
+            vendor=Vendor.objects.create(name="Acme"),
+        )
+
+    def _chip(self):
+        from .services.lifecycle import program_tracks
+
+        for t in program_tracks(self.member):
+            if t["domain"] == "housing":
+                return t["housing_overall"]
+        return None
+
+    def test_an_unserved_zip_reads_OUT_OF_RANGE(self):
+        self.order.address_zip = "33018"
+        self.order.save(update_fields=["address_zip"])
+        chip = self._chip()
+        self.assertEqual(chip["value"], "out_of_range")
+        self.assertEqual(chip["label"], "Out of Range")
+        self.assertIn("33018", chip["detail"])
+
+    def test_a_served_zip_does_NOT_read_out_of_range(self):
+        self.order.address_zip = "11236"
+        self.order.save(update_fields=["address_zip"])
+        self.assertEqual(self._chip()["value"], "open")
+
+    def test_OUT_OF_RANGE_beats_EXPIRED(self):
+        """If we cannot send anyone there, the authorization window is beside the
+        point."""
+        from .models import Case
+
+        case = Case.objects.get(client=self.member)
+        case.service_authorization_status = "approved"
+        case.service_authorization_approval_starts_at = (
+            timezone.now() - timezone.timedelta(days=40)
+        )
+        case.service_authorization_approval_ends_at = (
+            timezone.now() - timezone.timedelta(days=5)
+        )
+        case.save()
+        self.order.address_zip = "33018"
+        self.order.save(update_fields=["address_zip"])
+        self.assertEqual(self._chip()["value"], "out_of_range")
+
+    def test_CLOSED_still_beats_out_of_range(self):
+        from .models import Case, CaseStatus
+
+        Case.objects.filter(client=self.member).update(
+            case_status=CaseStatus.CLOSED,
+        )
+        self.order.address_zip = "33018"
+        self.order.save(update_fields=["address_zip"])
+        self.assertEqual(self._chip()["value"], "closed")
+
+    def test_an_order_with_NO_address_is_not_out_of_range(self):
+        """An order raised before the address was captured must not look like a
+        coverage failure."""
+        self.assertEqual(self._chip()["value"], "open")
+
+    def test_the_BOROUGH_for_new_cases_comes_from_the_ZIP(self):
+        """The work happens at the assessed dwelling, so its ZIP decides the
+        borough -- not the governing case, which says where they enrolled."""
+        from .services import case_recommendations as recs
+
+        self.order.address_zip = "11236"
+        self.order.save(update_fields=["address_zip"])
+        # The governing case is QUEENS; the dwelling is in Brooklyn.
+        self.assertEqual(recs.member_borough(self.member, self.order), "Brooklyn")
+        self.assertEqual(
+            recs.borough_conflict(self.member, self.order), ("Brooklyn", "Queens"),
+        )
+
+    def test_an_out_of_area_zip_FALLS_BACK_to_the_governing_case_borough(self):
+        """Keeps a recommendation possible rather than blank."""
+        from .services import case_recommendations as recs
+
+        self.order.address_zip = "33018"
+        self.order.save(update_fields=["address_zip"])
+        self.assertEqual(recs.member_borough(self.member, self.order), "Queens")
+        self.assertIsNone(recs.borough_conflict(self.member, self.order))
+
+
+class ProgramBoroughColumnTest(TestCase):
+    """ActiveProgram.borough, decoded from the programme name."""
+
+    def test_the_field_exists_and_is_indexed(self):
+        from .models import ActiveProgram
+
+        field = ActiveProgram._meta.get_field("borough")
+        self.assertTrue(field.db_index)
+        self.assertTrue(field.blank)
+
+    def test_a_housing_name_decodes_to_its_borough(self):
+        """Migrations do not run under the test runner, so this asserts the RULE
+        the backfill applies rather than the backfilled data."""
+        from .models import ServiceZipCode
+
+        ServiceZipCode.objects.update_or_create(
+            zip="11236", defaults={"borough": "Brooklyn", "is_active": True},
+        )
+        known = {"Brooklyn", "Manhattan", "Queens"}
+        for name, expected in (
+            ("Home Remediation - Air Conditioner - Queens", "Queens"),
+            ("Home Accessibility and Safety Modification - Grab Bars - Brooklyn",
+             "Brooklyn"),
+            # A food programme whose last part is NOT a place must stay blank --
+            # guessing would put "(Household) Pregnant / Postpartum" in a borough
+            # column.
+            ("Clinically Appropriate Meals - (Household) Pregnant / Postpartum", ""),
+            ("Addiction Services", ""),
+        ):
+            parts = [p.strip() for p in name.split(" - ")]
+            candidate = parts[-1] if len(parts) >= 2 else ""
+            self.assertEqual(candidate if candidate in known else "", expected, name)
 
 
 VENDOR_HOST = "vendor.test"
@@ -29738,8 +31072,10 @@ class VendorWorkScopingTest(TestCase):
         resp = self._api().get(f"/v1/work/{self.mine.pk}/", HTTP_HOST=VENDOR_HOST)
         self.assertEqual(resp.status_code, 200)
         member = resp.data["member"]
+        # The phone is MASKED now, so the key set changed with it.
         self.assertEqual(set(member), {
-            "name", "phone", "phone_type", "address", "address_notes",
+            "name", "phone_masked", "phone_last4", "has_phone", "phone_type",
+            "address", "address_notes",
         })
         self.assertEqual(member["name"], "Tracey Johnson")
 
@@ -29764,7 +31100,8 @@ class VendorWorkScopingTest(TestCase):
         resp = self._api().get(f"/v1/work/{child.pk}/", HTTP_HOST=VENDOR_HOST)
         self.assertEqual(resp.status_code, 200)
         member = resp.data["member"]
-        self.assertEqual(member["phone"], "(347) 394-6843")
+        self.assertEqual(member["phone_masked"], "(•••) •••-6843")
+        self.assertTrue(member["has_phone"])
         self.assertEqual(member["address_notes"], "Buzzer 3E")
         self.assertEqual(
             member["address"], "1550 E 102ND ST 3E BROOKLYN, NY 11236",
@@ -29780,14 +31117,2894 @@ class VendorWorkScopingTest(TestCase):
         )
         resp = self._api().get(f"/v1/work/{orphan.pk}/", HTTP_HOST=VENDOR_HOST)
         self.assertEqual(resp.status_code, 200)
-        self.assertEqual(resp.data["member"]["phone"], "")
+        self.assertEqual(resp.data["member"]["phone_masked"], "")
+        self.assertFalse(resp.data["member"]["has_phone"])
+
+    def test_the_phone_is_MASKED_by_default(self):
+        """The device is unmanaged and the number is the most directly identifying
+        thing a vendor handles. The last four stay visible so they can confirm they
+        have the right member before asking to see the rest."""
+        resp = self._api().get(f"/v1/work/{self.mine.pk}/", HTTP_HOST=VENDOR_HOST)
+        member = resp.data["member"]
+        self.assertEqual(member["phone_masked"], "(•••) •••-6843")
+        self.assertEqual(member["phone_last4"], "6843")
+        self.assertTrue(member["has_phone"])
+        # The full number must not be anywhere in the payload.
+        self.assertNotIn("394-6843", json.dumps(resp.data, default=str))
+
+    def test_revealing_the_phone_returns_it_and_RECORDS_the_lookup(self):
+        from .models import StageEntityType, StageEvent
+
+        resp = self._api().post(
+            f"/v1/work/{self.mine.pk}/reveal-phone/", {}, format="json",
+            HTTP_HOST=VENDOR_HOST,
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        self.assertEqual(resp.data["phone"], "(347) 394-6843")
+
+        event = StageEvent.objects.filter(
+            entity_type=StageEntityType.DISPATCH_ORDER,
+            dispatch_order=self.mine,
+            note="vendor viewed the member's phone number",
+        ).get()
+        self.assertEqual(event.metadata["vendor_user"], "a@acme.test")
+        # The NUMBER itself is not recorded: logging it to prove someone looked at
+        # it would spread it further than the lookup did.
+        self.assertNotIn("6843", json.dumps(event.metadata))
+
+    def test_the_reveal_is_NOT_written_to_the_members_timeline(self):
+        """The member did nothing. Filling their history with vendor lookups would
+        bury the events that describe their care."""
+        from .models import TimelineEvent
+
+        before = TimelineEvent.objects.filter(client=self.member).count()
+        self._api().post(
+            f"/v1/work/{self.mine.pk}/reveal-phone/", {}, format="json",
+            HTTP_HOST=VENDOR_HOST,
+        )
+        self.assertEqual(
+            TimelineEvent.objects.filter(client=self.member).count(), before,
+        )
+
+    def test_another_vendor_cannot_reveal_a_phone(self):
+        resp = self._api().post(
+            f"/v1/work/{self.theirs.pk}/reveal-phone/", {}, format="json",
+            HTTP_HOST=VENDOR_HOST,
+        )
+        self.assertEqual(resp.status_code, 404)
+
+    def test_the_detail_carries_the_dwelling_case_id_and_programme(self):
+        from .models import ActiveProgram, Case, CaseStatus, CaseType
+        from .services.catalog import clear_program_domain_cache
+
+        name = (
+            "Dwelling Assessment & Statement of Work (SOW) Development - "
+            "Modifications and Remediation Service - Manhattan"
+        )
+        ActiveProgram.objects.create(
+            program_name=name, case_category="Internal Services",
+            case_type=ActiveProgram.CaseType.HOUSING,
+            service_type=ActiveProgram.ServiceType.ENVIRONMENTAL_EXPOSURE_ASSESSMENT,
+        )
+        clear_program_domain_cache()
+        case = Case.objects.create(
+            case_id=uuid.uuid4(), client=self.member,
+            case_type=CaseType.INTERNAL_SERVICE, case_status=CaseStatus.MANAGED,
+            program_name=name, case_created_at=timezone.now(),
+        )
+        self.mine.case = case
+        self.mine.save(update_fields=["case"])
+
+        resp = self._api().get(f"/v1/work/{self.mine.pk}/", HTTP_HOST=VENDOR_HOST)
+        self.assertEqual(resp.data["dwelling_case_id"], str(case.case_id))
+        self.assertEqual(resp.data["program_name"], name)
+
+    def test_a_WORK_ORDER_inherits_the_dwelling_case_id(self):
+        """A vendor quotes that number on paperwork for the installation too."""
+        from .models import ActiveProgram, Case, CaseStatus, CaseType, DispatchKind
+        from .models import DispatchOrder
+        from .services.catalog import clear_program_domain_cache
+
+        name = (
+            "Dwelling Assessment & Statement of Work (SOW) Development - "
+            "Modifications and Remediation Service - Brooklyn"
+        )
+        ActiveProgram.objects.create(
+            program_name=name, case_category="Internal Services",
+            case_type=ActiveProgram.CaseType.HOUSING,
+            service_type=ActiveProgram.ServiceType.ENVIRONMENTAL_EXPOSURE_ASSESSMENT,
+        )
+        clear_program_domain_cache()
+        case = Case.objects.create(
+            case_id=uuid.uuid4(), client=self.member,
+            case_type=CaseType.INTERNAL_SERVICE, case_status=CaseStatus.MANAGED,
+            program_name=name, case_created_at=timezone.now(),
+        )
+        self.mine.case = case
+        self.mine.save(update_fields=["case"])
+        child = DispatchOrder.objects.create(
+            kind=DispatchKind.REMEDIATION, client=self.member, vendor=self.vendor,
+            parent=self.mine,
+        )
+        resp = self._api().get(f"/v1/work/{child.pk}/", HTTP_HOST=VENDOR_HOST)
+        self.assertEqual(resp.data["dwelling_case_id"], str(case.case_id))
 
     def test_an_assessment_detail_carries_the_FORM(self):
         resp = self._api().get(f"/v1/work/{self.mine.pk}/", HTTP_HOST=VENDOR_HOST)
         form = resp.data["form"]
         self.assertEqual(form["state"], "not_started")
-        # Combined referral -> both modules, the same schema the CRM renders.
+        # A combined referral is ONE form now -- its own document, not the two
+        # others concatenated -- and it is the same schema the CRM renders.
+        schema = form["schema"]
+        self.assertEqual(schema["form"], "combined")
         self.assertEqual(
-            [m["code"] for m in form["schema"]["modules"]],
-            ["mobility", "ventilation"],
+            [s["code"] for s in schema["sections"]],
+            ["reason", "functional", "risks", "conditions"],
         )
+        # The categories carry the products, so the app can offer a whole category
+        # once an answer points at it.
+        self.assertEqual(
+            {c["code"] for c in schema["categories"]},
+            {"mobility_access", "bathroom", "air_quality", "temperature"},
+        )
+
+
+@override_settings(VENDOR_API_HOST=VENDOR_HOST, ALLOWED_HOSTS=["*"])
+class VendorDashboardTest(TestCase):
+    """The dashboard counts, and status filtering on the work list."""
+
+    def setUp(self):
+        from django.contrib.auth.hashers import make_password
+
+        from .models import (
+            Client, DispatchKind, DispatchOrder, DispatchStatus, DispatchVisit,
+            Vendor, VendorUser,
+        )
+
+        self.vendor = Vendor.objects.create(name="Acme")
+        self.rival = Vendor.objects.create(name="Beta")
+        VendorUser.objects.create(
+            vendor=self.vendor, email="a@acme.test", name="Ada",
+            password=make_password("pw-acme-123"),
+        )
+        self.member = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Tracey", last_name="Johnson",
+            client_added_at=timezone.now(),
+        )
+
+        def order(kind, status, vendor=None, client=None):
+            return DispatchOrder.objects.create(
+                kind=kind, client=client or self.member,
+                vendor=vendor or self.vendor, status=status,
+            )
+
+        self.pending = order(DispatchKind.ASSESSMENT, DispatchStatus.PENDING_SCHEDULE)
+        self.confirmed = order(DispatchKind.REMEDIATION, DispatchStatus.CONFIRMED)
+        self.awaiting = order(
+            DispatchKind.REMEDIATION, DispatchStatus.PENDING_SUBMISSION,
+        )
+        self.uploaded = order(DispatchKind.REMEDIATION, DispatchStatus.UPLOADED)
+        # Another vendor's work, which must never appear in any count. A DIFFERENT
+        # member, because one_assessment_order_per_client is per MEMBER regardless
+        # of vendor -- the constraint caught this fixture, which is the constraint
+        # doing its job.
+        order(
+            DispatchKind.ASSESSMENT, DispatchStatus.CONFIRMED, vendor=self.rival,
+            client=Client.objects.create(
+                client_id=str(uuid.uuid4()), first_name="Rival", last_name="Member",
+                client_added_at=timezone.now(),
+            ),
+        )
+
+        today = timezone.now()
+        DispatchVisit.objects.create(
+            dispatch_order=self.confirmed, scheduled_for=today,
+        )
+        DispatchVisit.objects.create(
+            dispatch_order=self.confirmed,
+            scheduled_for=today + timezone.timedelta(days=3),
+        )
+        # Scheduled in the past and never started -- the queue that quietly rots.
+        DispatchVisit.objects.create(
+            dispatch_order=self.awaiting,
+            scheduled_for=today - timezone.timedelta(days=2),
+        )
+
+    def _api(self):
+        resp = APIClient().post(
+            "/v1/auth/login/", {"email": "a@acme.test", "password": "pw-acme-123"},
+            format="json", HTTP_HOST=VENDOR_HOST,
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        api = APIClient()
+        api.credentials(HTTP_AUTHORIZATION=f"Bearer {resp.data['access_token']}")
+        return api
+
+    def _dash(self):
+        resp = self._api().get("/v1/dashboard/", HTTP_HOST=VENDOR_HOST)
+        self.assertEqual(resp.status_code, 200, resp.content)
+        return resp.data
+
+    # ── counts ───────────────────────────────────────────────────────────────
+    def test_the_open_counts_are_named_for_what_to_DO(self):
+        d = self._dash()
+        self.assertEqual(d["open"]["needs_scheduling"], 1)
+        self.assertEqual(d["open"]["confirmed"], 1)
+        self.assertEqual(d["open"]["awaiting_submission"], 1)
+        self.assertEqual(d["done"]["uploaded"], 1)
+
+    def test_ANOTHER_vendors_work_is_in_no_count(self):
+        """The rival has a CONFIRMED order; ours must still read 1."""
+        d = self._dash()
+        self.assertEqual(d["open"]["confirmed"], 1)
+        self.assertEqual(d["vendor"]["name"], "Acme")
+
+    def test_open_by_kind_excludes_terminal_orders(self):
+        """A dashboard that counts finished work as outstanding is worse than no
+        dashboard."""
+        d = self._dash()
+        self.assertEqual(d["open_by_kind"]["assessment"], 1)
+        # confirmed + awaiting, NOT the uploaded one
+        self.assertEqual(d["open_by_kind"]["remediation"], 2)
+
+    def test_visits_are_counted_by_WHEN_not_by_status(self):
+        """An order's status says nothing about when someone must travel."""
+        d = self._dash()
+        self.assertEqual(d["visits"]["today"], 1)
+        self.assertEqual(d["visits"]["next_7_days"], 1)
+        self.assertEqual(d["visits"]["overdue"], 1)
+
+    def test_a_COMPLETED_visit_is_not_counted_as_upcoming(self):
+        from .models import DispatchVisit
+
+        DispatchVisit.objects.filter(
+            dispatch_order=self.confirmed,
+        ).update(completed_at=timezone.now())
+        d = self._dash()
+        self.assertEqual(d["visits"]["today"], 0)
+        self.assertEqual(d["visits"]["next_7_days"], 0)
+
+    def test_the_next_visit_is_the_soonest_FUTURE_one(self):
+        d = self._dash()
+        self.assertIsNotNone(d["next_visit"])
+        self.assertEqual(d["next_visit"]["member_name"], "Tracey Johnson")
+        self.assertEqual(d["next_visit"]["order_id"], str(self.confirmed.pk))
+
+    def test_a_vendor_with_nothing_gets_zeroes_not_an_error(self):
+        from django.contrib.auth.hashers import make_password
+
+        from .models import VendorUser
+
+        VendorUser.objects.create(
+            vendor=self.rival, email="b@beta.test", name="Bea",
+            password=make_password("pw-beta-123"),
+        )
+        resp = APIClient().post(
+            "/v1/auth/login/", {"email": "b@beta.test", "password": "pw-beta-123"},
+            format="json", HTTP_HOST=VENDOR_HOST,
+        )
+        api = APIClient()
+        api.credentials(HTTP_AUTHORIZATION=f"Bearer {resp.data['access_token']}")
+        d = api.get("/v1/dashboard/", HTTP_HOST=VENDOR_HOST).data
+        self.assertEqual(d["open"]["needs_scheduling"], 0)
+        self.assertEqual(d["visits"]["today"], 0)
+        self.assertIsNone(d["next_visit"])
+
+    # ── filtering ────────────────────────────────────────────────────────────
+    def test_status_filters_are_REPEATABLE_for_multi_select(self):
+        resp = self._api().get(
+            "/v1/work/?status=confirmed&status=pending_submission",
+            HTTP_HOST=VENDOR_HOST,
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(
+            {o["status"] for o in resp.data},
+            {"confirmed", "pending_submission"},
+        )
+
+    def test_an_explicit_status_filter_can_reach_TERMINAL_orders(self):
+        """Otherwise "show me what I finished" would be impossible."""
+        resp = self._api().get("/v1/work/?status=uploaded", HTTP_HOST=VENDOR_HOST)
+        self.assertEqual([o["id"] for o in resp.data], [str(self.uploaded.pk)])
+
+    def test_an_UNKNOWN_status_is_ignored_rather_than_rejected(self):
+        """A stale app version sending a status we have retired should show
+        everything, not fail."""
+        resp = self._api().get("/v1/work/?status=nonsense", HTTP_HOST=VENDOR_HOST)
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(len(resp.data), 3)  # the default open set
+
+    def test_kind_filters_assessments_from_work_orders(self):
+        resp = self._api().get("/v1/work/?kind=assessment", HTTP_HOST=VENDOR_HOST)
+        self.assertEqual([o["id"] for o in resp.data], [str(self.pending.pk)])
+
+    def test_filtering_still_cannot_reach_another_vendor(self):
+        resp = self._api().get(
+            "/v1/work/?status=confirmed", HTTP_HOST=VENDOR_HOST,
+        )
+        self.assertEqual([o["id"] for o in resp.data], [str(self.confirmed.pk)])
+
+
+@override_settings(VENDOR_API_HOST=VENDOR_HOST, ALLOWED_HOSTS=["*"])
+class VendorTeamTest(TestCase):
+    """A vendor admin manages their own staff. Only the admin, only their own."""
+
+    def setUp(self):
+        from django.contrib.auth.hashers import make_password
+
+        from .models import Vendor, VendorUser
+
+        self.vendor = Vendor.objects.create(name="Acme")
+        self.rival = Vendor.objects.create(name="Beta")
+        self.admin = VendorUser.objects.create(
+            vendor=self.vendor, email="admin@acme.test", name="Ada Admin",
+            password=make_password("pw-admin-123"), is_admin=True,
+        )
+        self.staff = VendorUser.objects.create(
+            vendor=self.vendor, email="staff@acme.test", name="Sam Staff",
+            password=make_password("pw-staff-123"),
+        )
+        self.rival_admin = VendorUser.objects.create(
+            vendor=self.rival, email="admin@beta.test", name="Bea Admin",
+            password=make_password("pw-beta-1234"), is_admin=True,
+        )
+
+    def _as(self, email, password):
+        resp = APIClient().post(
+            "/v1/auth/login/", {"email": email, "password": password},
+            format="json", HTTP_HOST=VENDOR_HOST,
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        api = APIClient()
+        api.credentials(HTTP_AUTHORIZATION=f"Bearer {resp.data['access_token']}")
+        return api
+
+    def _admin(self):
+        return self._as("admin@acme.test", "pw-admin-123")
+
+    def _staff(self):
+        return self._as("staff@acme.test", "pw-staff-123")
+
+    # ── who may ──────────────────────────────────────────────────────────────
+    def test_the_admin_sees_their_team_admin_first(self):
+        resp = self._admin().get("/v1/team/", HTTP_HOST=VENDOR_HOST)
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual([u["email"] for u in resp.data],
+                         ["admin@acme.test", "staff@acme.test"])
+
+    def test_a_NON_ADMIN_cannot_list_or_add(self):
+        staff = self._staff()
+        self.assertEqual(
+            staff.get("/v1/team/", HTTP_HOST=VENDOR_HOST).status_code, 403,
+        )
+        self.assertEqual(
+            staff.post("/v1/team/", {"name": "X", "email": "x@acme.test"},
+                       format="json", HTTP_HOST=VENDOR_HOST).status_code, 403,
+        )
+
+    def test_a_non_admin_cannot_remove_anyone(self):
+        resp = self._staff().delete(
+            f"/v1/team/{self.staff.pk}/", HTTP_HOST=VENDOR_HOST,
+        )
+        self.assertEqual(resp.status_code, 403)
+
+    def test_an_admin_cannot_touch_ANOTHER_companys_staff(self):
+        """404, not 403 -- a 403 would confirm the id exists."""
+        api = self._admin()
+        self.assertEqual(
+            api.patch(f"/v1/team/{self.rival_admin.pk}/", {"name": "hax"},
+                      format="json", HTTP_HOST=VENDOR_HOST).status_code, 404,
+        )
+        self.assertEqual(
+            api.delete(f"/v1/team/{self.rival_admin.pk}/",
+                       HTTP_HOST=VENDOR_HOST).status_code, 404,
+        )
+
+    def test_the_team_list_shows_only_THIS_company(self):
+        emails = {
+            u["email"] for u in
+            self._admin().get("/v1/team/", HTTP_HOST=VENDOR_HOST).data
+        }
+        self.assertNotIn("admin@beta.test", emails)
+
+    # ── adding ───────────────────────────────────────────────────────────────
+    def test_the_admin_can_add_a_colleague_who_can_then_log_in(self):
+        resp = self._admin().post(
+            "/v1/team/",
+            {"name": "New Hire", "email": "new@acme.test",
+             "password": "their-own-pw-1"},
+            format="json", HTTP_HOST=VENDOR_HOST,
+        )
+        self.assertEqual(resp.status_code, 201, resp.content)
+        self.assertFalse(resp.data["is_admin"])
+        # Supplied, so not echoed.
+        self.assertEqual(resp.data["temporary_password"], "")
+
+        api = self._as("new@acme.test", "their-own-pw-1")
+        self.assertEqual(api.get("/v1/me/", HTTP_HOST=VENDOR_HOST).status_code, 200)
+
+    def test_a_generated_password_is_returned_once(self):
+        resp = self._admin().post(
+            "/v1/team/", {"name": "Gen", "email": "gen@acme.test"},
+            format="json", HTTP_HOST=VENDOR_HOST,
+        )
+        self.assertEqual(resp.status_code, 201)
+        pw = resp.data["temporary_password"]
+        self.assertTrue(pw)
+        self._as("gen@acme.test", pw)  # it works
+
+    def test_an_added_user_is_NEVER_an_admin(self):
+        """The admin slot is CRM-provisioned and constrained to one per vendor, so
+        a company cannot grow a second administrator."""
+        from .models import VendorUser
+
+        self._admin().post(
+            "/v1/team/",
+            {"name": "Sneaky", "email": "sneaky@acme.test", "is_admin": True},
+            format="json", HTTP_HOST=VENDOR_HOST,
+        )
+        self.assertFalse(VendorUser.objects.get(email="sneaky@acme.test").is_admin)
+
+    def test_a_duplicate_email_is_refused_the_same_way_across_companies(self):
+        """"Already used by another company" would leak that a person works for a
+        competitor."""
+        api = self._admin()
+        inside = api.post(
+            "/v1/team/", {"name": "Dup", "email": "staff@acme.test"},
+            format="json", HTTP_HOST=VENDOR_HOST,
+        )
+        outside = api.post(
+            "/v1/team/", {"name": "Dup", "email": "admin@beta.test"},
+            format="json", HTTP_HOST=VENDOR_HOST,
+        )
+        self.assertEqual(inside.status_code, 409)
+        self.assertEqual(outside.status_code, 409)
+        self.assertEqual(inside.data["detail"], outside.data["detail"])
+
+    def test_a_short_password_is_refused(self):
+        resp = self._admin().post(
+            "/v1/team/",
+            {"name": "Short", "email": "short@acme.test", "password": "abc"},
+            format="json", HTTP_HOST=VENDOR_HOST,
+        )
+        self.assertEqual(resp.status_code, 400)
+
+    # ── changing and removing ────────────────────────────────────────────────
+    def test_deactivating_a_colleague_takes_effect_IMMEDIATELY(self):
+        """The authenticator re-checks is_active on every request, so an existing
+        token must stop working at once rather than lasting until it expires."""
+        staff_api = self._staff()
+        self.assertEqual(
+            staff_api.get("/v1/work/", HTTP_HOST=VENDOR_HOST).status_code, 200,
+        )
+        self._admin().patch(
+            f"/v1/team/{self.staff.pk}/", {"is_active": False},
+            format="json", HTTP_HOST=VENDOR_HOST,
+        )
+        self.assertEqual(
+            staff_api.get("/v1/work/", HTTP_HOST=VENDOR_HOST).status_code, 401,
+        )
+
+    def test_an_unchanged_patch_reports_nothing_changed(self):
+        resp = self._admin().patch(
+            f"/v1/team/{self.staff.pk}/", {"name": "Sam Staff"},
+            format="json", HTTP_HOST=VENDOR_HOST,
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.data["changed_fields"], [])
+
+    def test_a_user_with_NO_history_is_deleted_outright(self):
+        """An email typed wrong five minutes ago should not be permanent."""
+        from .models import VendorUser
+
+        resp = self._admin().delete(
+            f"/v1/team/{self.staff.pk}/", HTTP_HOST=VENDOR_HOST,
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        self.assertTrue(resp.data["removed"])
+        self.assertFalse(VendorUser.objects.filter(pk=self.staff.pk).exists())
+
+    def test_a_user_WITH_history_is_deactivated_not_deleted(self):
+        """Submissions point at them, and the record of who assessed a member's
+        home has to survive."""
+        from .models import (
+            Client, DispatchKind, DispatchOrder, DispatchSubmission, VendorUser,
+        )
+
+        member = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="H", last_name="M",
+            client_added_at=timezone.now(),
+        )
+        order = DispatchOrder.objects.create(
+            kind=DispatchKind.ASSESSMENT, client=member, vendor=self.vendor,
+        )
+        DispatchSubmission.objects.create(
+            dispatch_order=order, sequence=1, submitted_by=self.staff,
+            submitted_at=timezone.now(),
+        )
+
+        resp = self._admin().delete(
+            f"/v1/team/{self.staff.pk}/", HTTP_HOST=VENDOR_HOST,
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertFalse(resp.data["removed"])
+        self.assertTrue(resp.data["deactivated"])
+
+        still_there = VendorUser.objects.get(pk=self.staff.pk)
+        self.assertFalse(still_there.is_active)
+
+    def test_the_ADMIN_cannot_be_removed_or_deactivated_here(self):
+        """Either would lock the company out of its own account, and only the CRM
+        could undo it."""
+        api = self._admin()
+        self.assertEqual(
+            api.delete(f"/v1/team/{self.admin.pk}/",
+                       HTTP_HOST=VENDOR_HOST).status_code, 400,
+        )
+        resp = api.patch(
+            f"/v1/team/{self.admin.pk}/", {"is_active": False},
+            format="json", HTTP_HOST=VENDOR_HOST,
+        )
+        self.assertEqual(resp.status_code, 400)
+        self.admin.refresh_from_db()
+        self.assertTrue(self.admin.is_active)
+
+    def test_the_admin_can_reset_a_colleagues_password(self):
+        from django.contrib.auth.hashers import check_password
+
+        from .models import VendorUser
+
+        resp = self._admin().patch(
+            f"/v1/team/{self.staff.pk}/", {"password": "reset-by-admin-1"},
+            format="json", HTTP_HOST=VENDOR_HOST,
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn("password", resp.data["changed_fields"])
+        self.assertTrue(check_password(
+            "reset-by-admin-1", VendorUser.objects.get(pk=self.staff.pk).password,
+        ))
+
+
+@override_settings(VENDOR_API_HOST=VENDOR_HOST, ALLOWED_HOSTS=["*"])
+class VendorSchedulingTest(TestCase):
+    """Booking a visit: overlap, timezone, the member's text and the reminders."""
+
+    def setUp(self):
+        from django.contrib.auth.hashers import make_password
+
+        from .models import (
+            Client, DispatchAvailabilityWindow, DispatchKind, DispatchOrder,
+            DispatchStatus, Vendor, VendorUser,
+        )
+
+        self.vendor = Vendor.objects.create(name="X-Man Home Repair")
+        self.user = VendorUser.objects.create(
+            vendor=self.vendor, email="a@xman.test", name="Ada",
+            password=make_password("pw-xman-1234"),
+        )
+        self.member = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="miriam", last_name="Israel",
+            client_added_at=timezone.now(),
+        )
+        self.order = DispatchOrder.objects.create(
+            kind=DispatchKind.ASSESSMENT, client=self.member, vendor=self.vendor,
+            status=DispatchStatus.PENDING_SCHEDULE, referral_type="combined",
+            contact_phone="(305) 781-3277", contact_phone_type="mobile",
+            consent_to_text=True, consent_to_call=True,
+            address_formatted="1 Test St, Brooklyn NY",
+        )
+        # Three offered windows, starting comfortably in the future so the tests do
+        # not depend on the hour they run at.
+        self.day = timezone.localdate() + timezone.timedelta(days=10)
+        for offset in range(3):
+            DispatchAvailabilityWindow.objects.create(
+                dispatch_order=self.order,
+                date=self.day + timezone.timedelta(days=offset),
+                start_time="09:00", end_time="12:00",
+            )
+
+    def _api(self):
+        resp = APIClient().post(
+            "/v1/auth/login/", {"email": "a@xman.test", "password": "pw-xman-1234"},
+            format="json", HTTP_HOST=VENDOR_HOST,
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        api = APIClient()
+        api.credentials(HTTP_AUTHORIZATION=f"Bearer {resp.data['access_token']}")
+        return api
+
+    def _book(self, *, date_value=None, arrival="09:00", duration=60, api=None):
+        return (api or self._api()).post(
+            f"/v1/work/{self.order.pk}/schedule/",
+            {
+                "date": (date_value or self.day).isoformat(),
+                "arrival_time": arrival,
+                "duration_minutes": duration,
+            },
+            format="json", HTTP_HOST=VENDOR_HOST,
+        )
+
+    # ── the choosing screen ──────────────────────────────────────────────────
+    def test_the_GET_returns_the_offered_windows_and_the_vendors_own_day(self):
+        resp = self._api().get(
+            f"/v1/work/{self.order.pk}/schedule/", HTTP_HOST=VENDOR_HOST,
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        self.assertEqual(len(resp.data["availability"]), 3)
+        self.assertEqual(resp.data["timezone"], "America/New_York")
+        self.assertTrue(resp.data["consent_to_text"])
+        # A key per offered day, so the app can warn BEFORE the vendor picks.
+        self.assertEqual(len(resp.data["appointments_by_date"]), 3)
+
+    def test_the_GET_is_404_for_another_vendors_order(self):
+        from .models import Client, DispatchKind, DispatchOrder, Vendor
+
+        other = DispatchOrder.objects.create(
+            kind=DispatchKind.ASSESSMENT,
+            client=Client.objects.create(
+                client_id=str(uuid.uuid4()), first_name="X", last_name="Y",
+                client_added_at=timezone.now(),
+            ),
+            vendor=Vendor.objects.create(name="Rival"),
+        )
+        resp = self._api().get(
+            f"/v1/work/{other.pk}/schedule/", HTTP_HOST=VENDOR_HOST,
+        )
+        self.assertEqual(resp.status_code, 404)
+
+    # ── booking ─────────────────────────────────────────────────────────────
+    def test_booking_confirms_the_order_and_stores_the_local_time(self):
+        """The vendor picks 9am meaning nine o'clock at the member's door, so the
+        stored instant must be 9am EASTERN, not 9am UTC."""
+        from .models import DispatchStatus
+
+        resp = self._book()
+        self.assertEqual(resp.status_code, 201, resp.content)
+        self.assertEqual(resp.data["status"], DispatchStatus.CONFIRMED)
+
+        self.order.refresh_from_db()
+        visit = self.order.visits.get()
+        local = timezone.localtime(visit.scheduled_for)
+        self.assertEqual(local.hour, 9)
+        self.assertEqual(local.minute, 0)
+        self.assertEqual(local.date(), self.day)
+        # 60 minutes, which is what the member is told to expect.
+        self.assertEqual(
+            (visit.scheduled_end - visit.scheduled_for).total_seconds() / 60, 60,
+        )
+
+    def test_an_OVERLAPPING_time_is_refused_with_the_designs_wording(self):
+        from .models import Client, DispatchKind, DispatchOrder, DispatchVisit
+
+        # An existing 9:00-10:00 for this vendor, another member.
+        other = DispatchOrder.objects.create(
+            kind=DispatchKind.REMEDIATION, vendor=self.vendor,
+            client=Client.objects.create(
+                client_id=str(uuid.uuid4()), first_name="Other", last_name="Member",
+                client_added_at=timezone.now(),
+            ),
+        )
+        from .services.scheduling import combine_local
+        from datetime import time
+
+        start = combine_local(self.day, time(9, 0))
+        DispatchVisit.objects.create(
+            dispatch_order=other, scheduled_for=start,
+            scheduled_end=start + timezone.timedelta(minutes=60),
+        )
+
+        resp = self._book(arrival="09:30")
+        self.assertEqual(resp.status_code, 400)
+        self.assertEqual(resp.data["error"], "overlap")
+        self.assertIn("overlaps one of your existing appointments", resp.data["detail"])
+
+    def test_a_TOUCHING_appointment_is_allowed(self):
+        """A visit ending at 10:00 does not clash with one starting at 10:00 --
+        treating that as a conflict would block the back-to-back bookings that make
+        a day's route workable."""
+        from datetime import time
+
+        from .models import Client, DispatchKind, DispatchOrder, DispatchVisit
+        from .services.scheduling import combine_local
+
+        other = DispatchOrder.objects.create(
+            kind=DispatchKind.REMEDIATION, vendor=self.vendor,
+            client=Client.objects.create(
+                client_id=str(uuid.uuid4()), first_name="Back", last_name="ToBack",
+                client_added_at=timezone.now(),
+            ),
+        )
+        start = combine_local(self.day, time(9, 0))
+        DispatchVisit.objects.create(
+            dispatch_order=other, scheduled_for=start,
+            scheduled_end=start + timezone.timedelta(minutes=60),
+        )
+        self.assertEqual(self._book(arrival="10:00").status_code, 201)
+
+    def test_ANOTHER_vendors_appointment_does_not_block_this_one(self):
+        from datetime import time
+
+        from .models import Client, DispatchKind, DispatchOrder, DispatchVisit, Vendor
+        from .services.scheduling import combine_local
+
+        rival_order = DispatchOrder.objects.create(
+            kind=DispatchKind.REMEDIATION,
+            vendor=Vendor.objects.create(name="Rival Co"),
+            client=Client.objects.create(
+                client_id=str(uuid.uuid4()), first_name="R", last_name="M",
+                client_added_at=timezone.now(),
+            ),
+        )
+        start = combine_local(self.day, time(9, 0))
+        DispatchVisit.objects.create(
+            dispatch_order=rival_order, scheduled_for=start,
+            scheduled_end=start + timezone.timedelta(minutes=60),
+        )
+        self.assertEqual(self._book(arrival="09:00").status_code, 201)
+
+    def test_a_time_in_the_past_is_refused(self):
+        past = timezone.localdate() - timezone.timedelta(days=1)
+        resp = self._book(date_value=past)
+        self.assertEqual(resp.status_code, 400)
+        self.assertEqual(resp.data["error"], "in_the_past")
+
+    def test_an_unsupported_session_length_is_refused(self):
+        resp = self._book(duration=37)
+        self.assertEqual(resp.status_code, 400)
+        self.assertEqual(resp.data["error"], "bad_duration")
+
+    def test_a_RESCHEDULE_updates_the_same_visit_rather_than_adding_one(self):
+        """A second row would make "when is this appointment?" ambiguous."""
+        self.assertEqual(self._book(arrival="09:00").status_code, 201)
+        self.assertEqual(self._book(arrival="11:00").status_code, 201)
+        self.assertEqual(self.order.visits.count(), 1)
+        local = timezone.localtime(self.order.visits.get().scheduled_for)
+        self.assertEqual(local.hour, 11)
+
+    def test_a_reschedule_does_not_clash_with_ITSELF(self):
+        """The order's own existing visit must be excluded from the overlap check,
+        or moving an appointment by 15 minutes would be impossible."""
+        self._book(arrival="09:00")
+        resp = self._book(arrival="09:15")
+        self.assertEqual(resp.status_code, 201, resp.content)
+
+    # ── the member's text ───────────────────────────────────────────────────
+    def test_booking_STORES_the_members_sms(self):
+        from .models import MemberMessage, MessageDirection, MessageKind
+
+        resp = self._book()
+        self.assertTrue(resp.data["member_notified"])
+
+        msg = MemberMessage.objects.get()
+        self.assertEqual(msg.direction, MessageDirection.OUTBOUND)
+        self.assertEqual(msg.kind, MessageKind.APPOINTMENT_SCHEDULED)
+        # QUEUED, not "sent": no provider exists yet, and claiming a text went out
+        # would make the log lie.
+        self.assertEqual(msg.status, "queued")
+        self.assertEqual(msg.to_number, "(305) 781-3277")
+        self.assertEqual(msg.dispatch_order_id, self.order.pk)
+        self.assertEqual(msg.sent_by_vendor_user_id, self.user.pk)
+        # Named properly, and in the member's own timezone.
+        self.assertIn("Miriam", msg.body)
+        self.assertIn("X-Man Home Repair", msg.body)
+        self.assertIn("ET", msg.body)
+
+    def test_NO_TEXT_CONSENT_blocks_the_sms_but_NOT_the_booking(self):
+        """The appointment matters more than the text. A blocked row records that
+        the member was not told, which the vendor is shown."""
+        from .models import MemberMessage
+
+        self.order.consent_to_text = False
+        self.order.save(update_fields=["consent_to_text"])
+
+        resp = self._book()
+        self.assertEqual(resp.status_code, 201)
+        self.assertFalse(resp.data["member_notified"])
+        self.assertEqual(resp.data["message"]["reason"], "no_text_consent")
+
+        msg = MemberMessage.objects.get()
+        self.assertEqual(msg.status, "blocked")
+        self.assertEqual(msg.error_code, "no_text_consent")
+
+    def test_a_WORK_ORDER_inherits_the_members_text_consent(self):
+        """Found by the first end-to-end reminder run: every text about an
+        installation was blocked as "no consent" while the member had consented --
+        the wizard records consent ONCE, on the assessment, so a work order's own
+        flag is always False. Same bug class as the phone number."""
+        from .models import DispatchKind, DispatchOrder, MemberMessage
+
+        child = DispatchOrder.objects.create(
+            kind=DispatchKind.REMEDIATION, client=self.member, vendor=self.vendor,
+            parent=self.order,
+        )
+        self.assertFalse(child.consent_to_text)          # its own flag
+        self.assertTrue(child.service_consent[1])        # inherited
+
+        resp = self._api().post(
+            f"/v1/work/{child.pk}/schedule/",
+            {
+                "date": self.day.isoformat(),
+                "arrival_time": "14:00", "duration_minutes": 60,
+            },
+            format="json", HTTP_HOST=VENDOR_HOST,
+        )
+        self.assertEqual(resp.status_code, 201, resp.content)
+        self.assertTrue(
+            resp.data["member_notified"],
+            "a work order must inherit consent from its assessment",
+        )
+        self.assertEqual(
+            MemberMessage.objects.filter(dispatch_order=child).get().status,
+            "queued",
+        )
+
+    def test_no_phone_number_blocks_the_sms_but_NOT_the_booking(self):
+        from .models import MemberMessage
+
+        self.order.contact_phone = ""
+        self.order.save(update_fields=["contact_phone"])
+        resp = self._book()
+        self.assertEqual(resp.status_code, 201)
+        self.assertEqual(MemberMessage.objects.get().error_code, "no_phone_number")
+
+    def test_a_RESCHEDULE_sends_the_CHANGED_wording(self):
+        from .models import MemberMessage, MessageKind
+
+        self._book(arrival="09:00")
+        self._book(arrival="11:00")
+        kinds = list(MemberMessage.objects.order_by("created_at").values_list(
+            "kind", flat=True,
+        ))
+        self.assertEqual(kinds, [
+            MessageKind.APPOINTMENT_SCHEDULED, MessageKind.APPOINTMENT_CHANGED,
+        ])
+
+    # ── reminders ───────────────────────────────────────────────────────────
+    def test_booking_creates_the_day_before_and_30_minute_reminders(self):
+        from .models import DispatchReminder, ReminderAudience, ReminderKind
+
+        resp = self._book()
+        self.assertEqual(len(resp.data["reminders"]), 3)
+
+        rems = DispatchReminder.objects.filter(visit__dispatch_order=self.order)
+        vendor_kinds = set(
+            rems.filter(audience=ReminderAudience.VENDOR)
+            .values_list("kind", flat=True)
+        )
+        self.assertEqual(
+            vendor_kinds, {ReminderKind.DAY_BEFORE, ReminderKind.THIRTY_MIN},
+        )
+        # The member gets a day-before nudge too.
+        self.assertTrue(
+            rems.filter(
+                audience=ReminderAudience.MEMBER, kind=ReminderKind.DAY_BEFORE,
+            ).exists()
+        )
+
+    def test_the_reminder_times_are_relative_to_the_visit(self):
+        from .models import DispatchReminder, ReminderAudience, ReminderKind
+
+        self._book()
+        visit = self.order.visits.get()
+        day_before = DispatchReminder.objects.get(
+            visit=visit, kind=ReminderKind.DAY_BEFORE,
+            audience=ReminderAudience.VENDOR,
+        )
+        thirty = DispatchReminder.objects.get(
+            visit=visit, kind=ReminderKind.THIRTY_MIN,
+        )
+        self.assertEqual(
+            (visit.scheduled_for - day_before.send_at).total_seconds(), 86400,
+        )
+        self.assertEqual(
+            (visit.scheduled_for - thirty.send_at).total_seconds(), 1800,
+        )
+
+    def test_a_reschedule_CANCELS_the_old_reminders_rather_than_duplicating(self):
+        from .models import DispatchReminder
+
+        self._book(arrival="09:00")
+        self._book(arrival="11:00")
+        rems = DispatchReminder.objects.filter(visit__dispatch_order=self.order)
+        self.assertEqual(rems.filter(cancelled_at__isnull=True).count(), 3)
+        # Cancelled, not deleted: the record shows a reminder for the old slot
+        # existed and was stood down.
+        self.assertEqual(rems.filter(cancelled_at__isnull=False).count(), 3)
+
+    def test_a_reminder_whose_time_has_PASSED_is_not_created(self):
+        """Booking something for this afternoon must not fire a "day before" notice
+        immediately -- that is noise that teaches people to ignore reminders."""
+        from datetime import time
+
+        from .models import DispatchAvailabilityWindow, DispatchReminder, ReminderKind
+
+        soon = timezone.localtime(timezone.now() + timezone.timedelta(hours=2))
+        DispatchAvailabilityWindow.objects.create(
+            dispatch_order=self.order, date=soon.date(),
+            start_time="00:00", end_time="23:59",
+        )
+        resp = self._book(
+            date_value=soon.date(), arrival=soon.strftime("%H:%M"),
+        )
+        self.assertEqual(resp.status_code, 201, resp.content)
+        kinds = set(
+            DispatchReminder.objects
+            .filter(visit__dispatch_order=self.order, cancelled_at__isnull=True)
+            .values_list("kind", flat=True)
+        )
+        self.assertNotIn(ReminderKind.DAY_BEFORE, kinds)
+        self.assertIn(ReminderKind.THIRTY_MIN, kinds)
+
+    def test_firing_a_MEMBER_reminder_stores_another_sms(self):
+        from .models import (
+            DispatchReminder, MemberMessage, MessageKind, ReminderAudience,
+        )
+        from .services import scheduling
+
+        self._book()
+        reminder = DispatchReminder.objects.get(
+            visit__dispatch_order=self.order, audience=ReminderAudience.MEMBER,
+        )
+        scheduling.fire_reminder(reminder)
+
+        reminder.refresh_from_db()
+        self.assertIsNotNone(reminder.sent_at)
+        self.assertTrue(
+            MemberMessage.objects.filter(
+                kind=MessageKind.APPOINTMENT_REMINDER,
+            ).exists()
+        )
+
+    def test_due_reminders_excludes_sent_and_cancelled_ones(self):
+        from .models import DispatchReminder
+        from .services import scheduling
+
+        self._book()
+        # Nothing is due yet -- the visit is ten days out.
+        self.assertEqual(scheduling.due_reminders().count(), 0)
+
+        DispatchReminder.objects.filter(
+            visit__dispatch_order=self.order,
+        ).update(send_at=timezone.now() - timezone.timedelta(minutes=1))
+        self.assertEqual(scheduling.due_reminders().count(), 3)
+
+        DispatchReminder.objects.filter(
+            visit__dispatch_order=self.order,
+        ).update(cancelled_at=timezone.now())
+        self.assertEqual(scheduling.due_reminders().count(), 0)
+
+
+class MemberMessageLogTest(TestCase):
+    """The message log itself, independent of scheduling."""
+
+    def setUp(self):
+        from .models import Client
+
+        self.member = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Ann", last_name="Reply",
+            client_phone_number="(347) 555-0199", client_added_at=timezone.now(),
+        )
+
+    def test_an_inbound_text_is_matched_to_a_member_by_number(self):
+        from .models import MessageDirection
+        from .services import messaging
+
+        msg = messaging.record_inbound("+13475550199", "Yes that works")
+        # str() on both sides: the FK reads back as a UUID while the fixture set the
+        # pk from a string.
+        self.assertEqual(str(msg.client_id), str(self.member.pk))
+        self.assertEqual(msg.direction, MessageDirection.INBOUND)
+        self.assertEqual(msg.status, "received")
+
+    def test_an_UNMATCHED_inbound_text_is_still_stored(self):
+        """An unmatched reply is the only evidence someone tried to reach us.
+        Discarding it is the one unrecoverable option."""
+        from .services import messaging
+
+        msg = messaging.record_inbound("+15550000000", "who is this")
+        self.assertIsNone(msg.client_id)
+        self.assertEqual(msg.body, "who is this")
+
+    def test_the_whole_conversation_reads_in_order(self):
+        from .services import messaging
+
+        messaging.send_to_member(
+            self.member, "First", to_number="(347) 555-0199",
+            require_consent=False,
+        )
+        messaging.record_inbound("+13475550199", "Reply")
+        log = list(
+            self.member.messages.order_by("created_at").values_list(
+                "direction", "body",
+            )
+        )
+        self.assertEqual(log, [("outbound", "First"), ("inbound", "Reply")])
+
+
+class HousingStageBarTest(TestCase):
+    """The housing row on the member stage bar: Authorization -> Assessment -> WOs.
+
+    Near-binary on purpose. The detailed dispatch lifecycle lives on the Programs >
+    Housing accordion; this bar answers "where is this member" at a glance.
+    """
+
+    EEA = (
+        "Dwelling Assessment & Statement of Work (SOW) Development - "
+        "Modifications and Remediation Service - Manhattan"
+    )
+    HEAR = "Home Remediation - Air Conditioner - Manhattan"
+
+    def setUp(self):
+        from .models import ActiveProgram, Client, Vendor
+        from .services.catalog import clear_program_domain_cache
+
+        for name, stype in (
+            (self.EEA, ActiveProgram.ServiceType.ENVIRONMENTAL_EXPOSURE_ASSESSMENT),
+            (self.HEAR, ActiveProgram.ServiceType.HOME_EXPENSE_ASSISTANCE_REPAIRS),
+        ):
+            ActiveProgram.objects.create(
+                program_name=name, case_category="Internal Services",
+                case_type=ActiveProgram.CaseType.HOUSING, service_type=stype,
+            )
+        clear_program_domain_cache()
+        self.vendor = Vendor.objects.create(name="Acme")
+        self.member = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Bar", last_name="Member",
+            client_added_at=timezone.now(),
+        )
+
+    def _case(self, program, *, auth="approved", starts=None, ends=None):
+        from .models import Case, CaseStatus, CaseType
+
+        return Case.objects.create(
+            case_id=uuid.uuid4(), client=self.member,
+            case_type=CaseType.INTERNAL_SERVICE, case_status=CaseStatus.MANAGED,
+            program_name=program, service_authorization_status=auth,
+            service_authorization_approval_starts_at=starts,
+            service_authorization_approval_ends_at=ends,
+            case_created_at=timezone.now(),
+        )
+
+    def _housing_track(self):
+        from .services.lifecycle import program_tracks
+
+        tracks = [
+            t for t in program_tracks(self.member) if t["domain"] == "housing"
+        ]
+        return tracks[0] if tracks else None
+
+    # ── the row exists when the dwelling case does ───────────────────────────
+    def test_no_dwelling_case_means_NO_housing_row(self):
+        self.assertIsNone(self._housing_track())
+
+    def test_a_dwelling_case_alone_creates_the_row(self):
+        self._case(self.EEA)
+        track = self._housing_track()
+        self.assertIsNotNone(track)
+        self.assertEqual(track["authorization"]["label"], "Approved")
+
+    # ── the assessment node ──────────────────────────────────────────────────
+    def test_approved_with_no_order_reads_READY_TO_ORDER(self):
+        self._case(self.EEA)
+        t = self._housing_track()
+        self.assertEqual(t["assessment_order"]["value"], "ready")
+        # The LABEL is the node's name; the state is the colour (value) plus the
+        # tooltip. "Ordered" as a label read as confusing on screen.
+        self.assertEqual(t["assessment_order"]["label"], "EEA")
+        self.assertIn("ready to create", t["assessment_order"]["detail"])
+
+    def test_an_EXPIRED_window_reads_EXPIRED_even_though_auth_says_approved(self):
+        """Housing's expiry has nowhere else to surface. _authorization_phase
+        deliberately still reads "Approved" for a lapsed authorization -- food shows
+        it in the Service phase, and housing has no Service phase."""
+        self._case(
+            self.EEA,
+            starts=timezone.now() - timezone.timedelta(days=40),
+            ends=timezone.now() - timezone.timedelta(days=5),
+        )
+        t = self._housing_track()
+        self.assertEqual(t["authorization"]["label"], "Approved")
+        self.assertEqual(t["assessment_order"]["value"], "expired")
+
+    def test_a_REQUESTED_authorization_leaves_the_assessment_node_BLANK(self):
+        """Nothing to order yet, and the Authorization chip already says so --
+        "Ready to Order" beside "Requested" would be a contradiction."""
+        self._case(self.EEA, auth="pending")
+        t = self._housing_track()
+        self.assertEqual(t["assessment_order"]["value"], "")
+
+    def test_a_DENIED_authorization_leaves_it_blank_too(self):
+        self._case(self.EEA, auth="denied")
+        t = self._housing_track()
+        self.assertEqual(t["assessment_order"]["value"], "")
+
+    def test_an_existing_order_reads_ORDERED(self):
+        from .models import DispatchKind, DispatchOrder
+
+        self._case(self.EEA)
+        DispatchOrder.objects.create(
+            kind=DispatchKind.ASSESSMENT, client=self.member, vendor=self.vendor,
+        )
+        t = self._housing_track()
+        self.assertEqual(t["assessment_order"]["value"], "ordered")
+
+    def test_a_CANCELLED_order_does_NOT_count_as_existing(self):
+        """Green for a dead order is the worst possible failure for a glance-level
+        indicator."""
+        from .models import DispatchKind, DispatchOrder, DispatchStatus
+
+        self._case(self.EEA)
+        DispatchOrder.objects.create(
+            kind=DispatchKind.ASSESSMENT, client=self.member, vendor=self.vendor,
+            status=DispatchStatus.CANCELLED,
+        )
+        t = self._housing_track()
+        self.assertEqual(t["assessment_order"]["value"], "cancelled")
+
+    # ── the work-orders node ─────────────────────────────────────────────────
+    def test_no_items_leaves_the_work_orders_node_BLANK(self):
+        self._case(self.EEA)
+        self.assertEqual(self._housing_track()["work_orders"]["value"], "")
+
+    def test_items_with_NO_batch_read_AMBER_with_a_count(self):
+        """The state that matters. A binary green would say "work orders: done"
+        while approved, authorized items sat unbatched."""
+        from .models import DispatchKind, DispatchOrder
+        from .services import dispatch
+
+        self._case(self.EEA)
+        self._case(self.HEAR)
+        assessment = DispatchOrder.objects.create(
+            kind=DispatchKind.ASSESSMENT, client=self.member, vendor=self.vendor,
+        )
+        dispatch.sync_dispatch_items(assessment)
+
+        t = self._housing_track()
+        self.assertEqual(t["work_orders"]["value"], "waiting")
+        self.assertEqual(t["work_orders"]["label"], "Work Orders")
+        self.assertIn("1 item waiting", t["work_orders"]["detail"])
+
+    def test_a_batch_reads_GREEN_and_names_whats_left(self):
+        """Still green -- work IS being done -- but the count says what remains, so
+        "1 order" cannot be mistaken for "everything is handled"."""
+        from .models import DispatchItem, DispatchKind, DispatchOrder
+        from .services import dispatch
+
+        self._case(self.EEA)
+        self._case(self.HEAR)
+        second = self._case("Home Remediation - Heater - Manhattan")
+        from .models import ActiveProgram
+        ActiveProgram.objects.create(
+            program_name="Home Remediation - Heater - Manhattan",
+            case_category="Internal Services",
+            case_type=ActiveProgram.CaseType.HOUSING,
+            service_type=ActiveProgram.ServiceType.HOME_EXPENSE_ASSISTANCE_REPAIRS,
+        )
+        from .services.catalog import clear_program_domain_cache
+        clear_program_domain_cache()
+
+        assessment = DispatchOrder.objects.create(
+            kind=DispatchKind.ASSESSMENT, client=self.member, vendor=self.vendor,
+        )
+        dispatch.sync_dispatch_items(assessment)
+        items = list(DispatchItem.objects.filter(assessment=assessment))
+        self.assertGreaterEqual(len(items), 2)
+
+        dispatch.create_work_order(
+            assessment, [items[0].dispatch_item_id], vendor=self.vendor,
+        )
+        t = self._housing_track()
+        self.assertEqual(t["work_orders"]["value"], "created")
+        self.assertEqual(t["work_orders"]["label"], "Work Orders")
+        # Green, but the detail still names what is left, so it cannot be read as
+        # "everything is handled".
+        self.assertIn("1 work order", t["work_orders"]["detail"])
+        self.assertIn("not yet batched", t["work_orders"]["detail"])
+
+    def test_the_node_LABELS_are_constant_and_the_colour_carries_the_state(self):
+        """These two read as a stepper: the chip is the node, and whether it is
+        green is the answer. A label that changed with the state ("Ordered") was
+        confusing on screen."""
+        from .models import DispatchKind, DispatchOrder
+
+        self._case(self.EEA)
+        before = self._housing_track()
+        DispatchOrder.objects.create(
+            kind=DispatchKind.ASSESSMENT, client=self.member, vendor=self.vendor,
+        )
+        after = self._housing_track()
+
+        self.assertEqual(before["assessment_order"]["label"], "EEA")
+        self.assertEqual(after["assessment_order"]["label"], "EEA")
+        # Only the value (colour) and the tooltip moved.
+        self.assertNotEqual(
+            before["assessment_order"]["value"], after["assessment_order"]["value"],
+        )
+        self.assertNotEqual(
+            before["assessment_order"]["detail"],
+            after["assessment_order"]["detail"],
+        )
+
+    # ── the overall chip ────────────────────────────────────────────────────
+    def test_an_open_dwelling_case_reads_OPEN(self):
+        self._case(self.EEA)
+        self.assertEqual(self._housing_track()["housing_overall"]["label"], "Open")
+
+    def test_a_CLOSED_dwelling_case_reads_CLOSED(self):
+        from .models import CaseStatus
+
+        case = self._case(self.EEA)
+        case.case_status = CaseStatus.CLOSED
+        case.save(update_fields=["case_status"])
+        self.assertEqual(self._housing_track()["housing_overall"]["label"], "Closed")
+
+    def test_an_EXPIRED_window_reads_EXPIRED(self):
+        self._case(
+            self.EEA,
+            starts=timezone.now() - timezone.timedelta(days=40),
+            ends=timezone.now() - timezone.timedelta(days=5),
+        )
+        self.assertEqual(
+            self._housing_track()["housing_overall"]["label"], "Expired",
+        )
+
+    def test_CLOSED_beats_EXPIRED(self):
+        """Terminal and factual wins: "Expired" on a closed case would send an
+        agent looking for something to fix."""
+        from .models import CaseStatus
+
+        case = self._case(
+            self.EEA,
+            starts=timezone.now() - timezone.timedelta(days=40),
+            ends=timezone.now() - timezone.timedelta(days=5),
+        )
+        case.case_status = CaseStatus.CLOSED
+        case.save(update_fields=["case_status"])
+        self.assertEqual(self._housing_track()["housing_overall"]["label"], "Closed")
+
+    def test_all_orders_UPLOADED_reads_COMPLETED(self):
+        from .models import DispatchKind, DispatchOrder, DispatchStatus
+
+        self._case(self.EEA)
+        DispatchOrder.objects.create(
+            kind=DispatchKind.ASSESSMENT, client=self.member, vendor=self.vendor,
+            status=DispatchStatus.UPLOADED,
+        )
+        self.assertEqual(
+            self._housing_track()["housing_overall"]["label"], "Completed",
+        )
+
+    def test_COMPLETED_beats_EXPIRED(self):
+        """If the work got done, a window that has since lapsed is history rather
+        than a problem."""
+        from .models import DispatchKind, DispatchOrder, DispatchStatus
+
+        self._case(
+            self.EEA,
+            starts=timezone.now() - timezone.timedelta(days=40),
+            ends=timezone.now() - timezone.timedelta(days=5),
+        )
+        DispatchOrder.objects.create(
+            kind=DispatchKind.ASSESSMENT, client=self.member, vendor=self.vendor,
+            status=DispatchStatus.UPLOADED,
+        )
+        self.assertEqual(
+            self._housing_track()["housing_overall"]["label"], "Completed",
+        )
+
+    def test_one_order_still_in_flight_is_NOT_completed(self):
+        from .models import DispatchKind, DispatchOrder, DispatchStatus
+
+        self._case(self.EEA)
+        DispatchOrder.objects.create(
+            kind=DispatchKind.ASSESSMENT, client=self.member, vendor=self.vendor,
+            status=DispatchStatus.UPLOADED,
+        )
+        DispatchOrder.objects.create(
+            kind=DispatchKind.REMEDIATION, client=self.member, vendor=self.vendor,
+            status=DispatchStatus.CONFIRMED,
+        )
+        self.assertEqual(self._housing_track()["housing_overall"]["label"], "Open")
+
+    def test_UNBATCHED_items_prevent_COMPLETED(self):
+        """Uploaded orders with items still waiting is not complete -- that is the
+        gap the amber Work Orders node exists to show."""
+        from .models import DispatchItem, DispatchKind, DispatchOrder, DispatchStatus
+        from .services import dispatch
+
+        self._case(self.EEA)
+        self._case(self.HEAR)
+        assessment = DispatchOrder.objects.create(
+            kind=DispatchKind.ASSESSMENT, client=self.member, vendor=self.vendor,
+            status=DispatchStatus.UPLOADED,
+        )
+        dispatch.sync_dispatch_items(assessment)
+        self.assertTrue(
+            DispatchItem.objects.filter(
+                assessment=assessment, dispatch_order__isnull=True,
+            ).exists()
+        )
+        self.assertEqual(self._housing_track()["housing_overall"]["label"], "Open")
+
+    def test_a_member_with_NO_orders_is_not_COMPLETED(self):
+        """"All orders are done" requires there to BE orders, or a member who has
+        never been assessed would read as Completed."""
+        self._case(self.EEA)
+        self.assertEqual(self._housing_track()["housing_overall"]["label"], "Open")
+
+    def test_a_CANCELLED_order_does_not_block_COMPLETED(self):
+        from .models import DispatchKind, DispatchOrder, DispatchStatus
+
+        self._case(self.EEA)
+        DispatchOrder.objects.create(
+            kind=DispatchKind.ASSESSMENT, client=self.member, vendor=self.vendor,
+            status=DispatchStatus.UPLOADED,
+        )
+        DispatchOrder.objects.create(
+            kind=DispatchKind.REMEDIATION, client=self.member, vendor=self.vendor,
+            status=DispatchStatus.CANCELLED,
+        )
+        self.assertEqual(
+            self._housing_track()["housing_overall"]["label"], "Completed",
+        )
+
+    # ── food is untouched ───────────────────────────────────────────────────
+    def test_a_FOOD_track_carries_no_housing_phases(self):
+        """Blank on food, so the frontend picks by domain rather than by which keys
+        happen to be set."""
+        from .models import ActiveProgram, Case, CaseStatus, CaseType
+        from .services.catalog import clear_program_domain_cache
+
+        ActiveProgram.objects.create(
+            program_name="Meals - Individual - Manhattan",
+            case_category="Internal Services",
+            case_type=ActiveProgram.CaseType.FOOD,
+            service_type=ActiveProgram.ServiceType.MEDICALLY_TAILORED_MEALS,
+        )
+        clear_program_domain_cache()
+        Case.objects.create(
+            case_id=uuid.uuid4(), client=self.member,
+            case_type=CaseType.INTERNAL_SERVICE, case_status=CaseStatus.MANAGED,
+            program_name="Meals - Individual - Manhattan",
+            service_authorization_status="approved",
+            case_created_at=timezone.now(),
+        )
+        from .services.lifecycle import program_tracks
+
+        food = [t for t in program_tracks(self.member) if t["domain"] == "food"]
+        self.assertTrue(food)
+        self.assertEqual(food[0]["assessment_order"]["value"], "")
+        self.assertEqual(food[0]["work_orders"]["value"], "")
+
+
+@override_settings(VENDOR_API_HOST=VENDOR_HOST, ALLOWED_HOSTS=["*"])
+class VendorSubmitAssessmentTest(TestCase):
+    """Saving a draft, photos, signatures, and the submit gate."""
+
+    EEA = (
+        "Dwelling Assessment & Statement of Work (SOW) Development - "
+        "Modifications and Remediation Service - Queens"
+    )
+
+    def setUp(self):
+        from django.contrib.auth.hashers import make_password
+
+        from .models import (
+            ActiveProgram, Case, CaseStatus, CaseType, Client, DispatchKind,
+            DispatchOrder, Vendor, VendorUser,
+        )
+        from .services.catalog import clear_program_domain_cache
+
+        ActiveProgram.objects.create(
+            program_name=self.EEA, case_category="Internal Services",
+            case_type=ActiveProgram.CaseType.HOUSING,
+            service_type=ActiveProgram.ServiceType.ENVIRONMENTAL_EXPOSURE_ASSESSMENT,
+        )
+        clear_program_domain_cache()
+        self.vendor = Vendor.objects.create(name="Acme")
+        self.user = VendorUser.objects.create(
+            vendor=self.vendor, email="a@acme.test", name="Ada Assessor",
+            password=make_password("pw-acme-1234"),
+        )
+        self.member = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Sub", last_name="Member",
+            client_added_at=timezone.now(),
+        )
+        Case.objects.create(
+            case_id=uuid.uuid4(), client=self.member,
+            case_type=CaseType.INTERNAL_SERVICE, case_status=CaseStatus.MANAGED,
+            program_name=self.EEA, case_created_at=timezone.now(),
+        )
+        self.order = DispatchOrder.objects.create(
+            kind=DispatchKind.ASSESSMENT, client=self.member, vendor=self.vendor,
+            referral_type="combined",
+        )
+
+    def _api(self):
+        resp = APIClient().post(
+            "/v1/auth/login/", {"email": "a@acme.test", "password": "pw-acme-1234"},
+            format="json", HTTP_HOST=VENDOR_HOST,
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        api = APIClient()
+        api.credentials(HTTP_AUTHORIZATION=f"Bearer {resp.data['access_token']}")
+        return api
+
+    def _url(self, suffix):
+        return f"/v1/work/{self.order.pk}/{suffix}"
+
+    # a 1x1 PNG
+    PNG = (
+        "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAA"
+        "DUlEQVR42mP8z8AAAwAB/wFcXwAAAABJRU5ErkJggg=="
+    )
+
+    # ── saving a draft ──────────────────────────────────────────────────────
+    def test_saving_answers_creates_a_DRAFT(self):
+        resp = self._api().patch(
+            self._url("assessment/"),
+            {
+                "answers": {"mob.reason.fall_risk": True},
+                "interventions": [{"option": "grab_bar_tub", "qty": 2}],
+                "justification": "blood thinners",
+            },
+            format="json", HTTP_HOST=VENDOR_HOST,
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        self.assertEqual(resp.data["state"], "draft")
+        self.assertEqual(resp.data["answers"], {"mob.reason.fall_risk": True})
+        self.assertEqual(
+            resp.data["interventions"], [{"option": "grab_bar_tub", "qty": 2}],
+        )
+
+    def test_an_UNKNOWN_question_code_is_dropped_not_rejected(self):
+        """A stale app holding a retired question must still save the answers that
+        do exist -- failing the whole save would lose a completed visit over a
+        question nobody asks any more."""
+        resp = self._api().patch(
+            self._url("assessment/"),
+            {"answers": {"mob.reason.fall_risk": True, "made.up.code": True}},
+            format="json", HTTP_HOST=VENDOR_HOST,
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.data["answers"], {"mob.reason.fall_risk": True})
+
+    def test_a_ZERO_quantity_is_not_stored(self):
+        """"What did they recommend?" should be a read, not a filter."""
+        resp = self._api().patch(
+            self._url("assessment/"),
+            {"interventions": [
+                {"option": "grab_bar_tub", "qty": 0},
+                {"option": "shower_chair", "qty": 1},
+            ]},
+            format="json", HTTP_HOST=VENDOR_HOST,
+        )
+        self.assertEqual(
+            resp.data["interventions"], [{"option": "shower_chair", "qty": 1}],
+        )
+
+    def test_saving_REPLACES_rather_than_merging(self):
+        """An assessor who unticks a box offline must see it unticked after they
+        sync -- a merge would need both sides to agree who touched what last."""
+        api = self._api()
+        api.patch(
+            self._url("assessment/"),
+            {"answers": {"mob.reason.fall_risk": True, "mob.physical.balance": True}},
+            format="json", HTTP_HOST=VENDOR_HOST,
+        )
+        resp = api.patch(
+            self._url("assessment/"),
+            {"answers": {"mob.reason.fall_risk": True}},
+            format="json", HTTP_HOST=VENDOR_HOST,
+        )
+        self.assertEqual(resp.data["answers"], {"mob.reason.fall_risk": True})
+
+    # ── the gate ────────────────────────────────────────────────────────────
+    def test_the_gate_names_all_three_requirements(self):
+        resp = self._api().get(self._url("submit/"), HTTP_HOST=VENDOR_HOST)
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(sorted(resp.data["missing"]), [
+            "at least one photo of the dwelling",
+            "member signature",
+            "vendor signature",
+        ])
+
+    def test_submitting_without_the_gate_is_REFUSED_and_says_why(self):
+        api = self._api()
+        api.patch(
+            self._url("assessment/"), {"answers": {}},
+            format="json", HTTP_HOST=VENDOR_HOST,
+        )
+        resp = api.post(self._url("submit/"), {}, format="json", HTTP_HOST=VENDOR_HOST)
+        self.assertEqual(resp.status_code, 400)
+        self.assertEqual(resp.data["error"], "incomplete")
+        self.assertIn("member signature", resp.data["missing"])
+
+    def test_the_gate_is_enforced_SERVER_SIDE_not_only_in_the_app(self):
+        """A UI-only check is how a housing case reached the food verification
+        endpoint after the picker had been fixed."""
+        from .models import DispatchProof
+
+        api = self._api()
+        api.patch(
+            self._url("assessment/"), {"answers": {}},
+            format="json", HTTP_HOST=VENDOR_HOST,
+        )
+        # A photo but no signatures: the app might enable the button; the server
+        # must not.
+        DispatchProof.objects.create(
+            dispatch_order=self.order, s3_key="k", content_hash="h",
+        )
+        resp = api.post(self._url("submit/"), {}, format="json", HTTP_HOST=VENDOR_HOST)
+        self.assertEqual(resp.status_code, 400)
+
+    # ── signatures ──────────────────────────────────────────────────────────
+    def test_a_signature_is_stored_and_reports_what_is_left(self):
+        resp = self._api().post(
+            self._url("signatures/"), {"role": "member", "image": self.PNG},
+            format="json", HTTP_HOST=VENDOR_HOST,
+        )
+        self.assertEqual(resp.status_code, 201, resp.content)
+        self.assertEqual(resp.data["role"], "member")
+        self.assertEqual(resp.data["signer_name"], "Sub Member")
+        self.assertIn("vendor signature", resp.data["missing_for_submission"])
+        self.assertNotIn("member signature", resp.data["missing_for_submission"])
+
+    def test_re_signing_REPLACES_rather_than_adding_a_second(self):
+        """A member who signs, sees a typo in their name and signs again should not
+        leave two signatures on the record."""
+        from .models import DispatchSignature
+
+        api = self._api()
+        for name in ("Wrong Name", "Right Name"):
+            api.post(
+                self._url("signatures/"),
+                {"role": "member", "image": self.PNG, "signer_name": name},
+                format="json", HTTP_HOST=VENDOR_HOST,
+            )
+        sigs = DispatchSignature.objects.filter(signer_role="member")
+        self.assertEqual(sigs.count(), 1)
+        self.assertEqual(sigs.get().signer_name, "Right Name")
+
+    def test_a_bad_role_is_refused(self):
+        resp = self._api().post(
+            self._url("signatures/"), {"role": "auditor", "image": self.PNG},
+            format="json", HTTP_HOST=VENDOR_HOST,
+        )
+        self.assertEqual(resp.status_code, 400)
+
+    def test_an_EMPTY_signature_is_refused(self):
+        """A canvas nobody drew on must not count as a signature."""
+        resp = self._api().post(
+            self._url("signatures/"), {"role": "member", "image": ""},
+            format="json", HTTP_HOST=VENDOR_HOST,
+        )
+        self.assertEqual(resp.status_code, 400)
+
+    # ── submitting ──────────────────────────────────────────────────────────
+    def _satisfy_gate(self, api):
+        """Photos for whatever the SAVED ANSWERS identified, plus both signatures.
+
+        The categories are DERIVED rather than listed: the gate now demands a photo
+        per identified problem, so a hard-coded fixture would have to be edited
+        every time the question/intervention mapping changed -- the same trap that
+        made the step-packing tests brittle three times.
+        """
+        from .models import DispatchProof, DispatchQuestionnaire
+        from .services.assessment_forms import photo_groups_required
+
+        form = DispatchQuestionnaire.objects.filter(
+            dispatch_order=self.order,
+        ).first()
+        needed = [
+            code for code, _label in photo_groups_required(
+                form.answers if form else {}, form.modules if form else None,
+            )
+        ]
+        # One uncategorised photo covers the "nothing answered" case; a distinct
+        # image per answered SECTION covers the rest, since
+        # one_proof_per_hash_per_order allows each image to evidence one thing.
+        DispatchProof.objects.create(
+            dispatch_order=self.order, s3_key="k-general", content_hash="h-general",
+        )
+        for code in sorted(needed):
+            DispatchProof.objects.create(
+                dispatch_order=self.order, s3_key=f"k-{code}",
+                content_hash=f"h-{code}", intervention_group=code,
+            )
+        for role in ("member", "vendor"):
+            api.post(
+                self._url("signatures/"), {"role": role, "image": self.PNG},
+                format="json", HTTP_HOST=VENDOR_HOST,
+            )
+
+    def test_a_complete_assessment_submits_and_FREEZES_its_schema(self):
+        from .models import DispatchQuestionnaire
+
+        api = self._api()
+        api.patch(
+            self._url("assessment/"),
+            {"answers": {"mob.reason.fall_risk": True}},
+            format="json", HTTP_HOST=VENDOR_HOST,
+        )
+        self._satisfy_gate(api)
+
+        resp = api.post(self._url("submit/"), {}, format="json", HTTP_HOST=VENDOR_HOST)
+        self.assertEqual(resp.status_code, 201, resp.content)
+        self.assertEqual(resp.data["state"], "submitted")
+
+        form = DispatchQuestionnaire.objects.get(dispatch_order=self.order)
+        # The snapshot is what lets a signed form render years later exactly as it
+        # was signed.
+        self.assertTrue(form.schema_snapshot)
+        self.assertEqual(form.schema_snapshot["form"], "combined")
+        self.assertEqual(
+            [s["code"] for s in form.schema_snapshot["sections"]],
+            ["reason", "functional", "risks", "conditions"],
+        )
+
+    def test_submitting_TWICE_is_idempotent(self):
+        """An offline client retrying must not submit twice."""
+        api = self._api()
+        api.patch(
+            self._url("assessment/"), {"answers": {}},
+            format="json", HTTP_HOST=VENDOR_HOST,
+        )
+        self._satisfy_gate(api)
+        first = api.post(self._url("submit/"), {}, format="json", HTTP_HOST=VENDOR_HOST)
+        second = api.post(self._url("submit/"), {}, format="json", HTTP_HOST=VENDOR_HOST)
+        self.assertEqual(first.status_code, 201)
+        self.assertEqual(second.status_code, 200)
+        self.assertTrue(second.data["already"])
+
+    def test_a_SUBMITTED_assessment_cannot_be_edited(self):
+        api = self._api()
+        api.patch(
+            self._url("assessment/"), {"answers": {}},
+            format="json", HTTP_HOST=VENDOR_HOST,
+        )
+        self._satisfy_gate(api)
+        api.post(self._url("submit/"), {}, format="json", HTTP_HOST=VENDOR_HOST)
+
+        resp = api.patch(
+            self._url("assessment/"),
+            {"answers": {"mob.reason.fall_risk": True}},
+            format="json", HTTP_HOST=VENDOR_HOST,
+        )
+        self.assertEqual(resp.status_code, 409)
+
+    def test_ANOTHER_vendor_cannot_save_photos_sign_or_submit(self):
+        from .models import Client, DispatchKind, DispatchOrder, Vendor
+
+        theirs = DispatchOrder.objects.create(
+            kind=DispatchKind.ASSESSMENT,
+            vendor=Vendor.objects.create(name="Rival"),
+            client=Client.objects.create(
+                client_id=str(uuid.uuid4()), first_name="R", last_name="M",
+                client_added_at=timezone.now(),
+            ),
+        )
+        api = self._api()
+        for verb, suffix, body in (
+            ("patch", "assessment/", {"answers": {}}),
+            ("post", "signatures/", {"role": "member", "image": self.PNG}),
+            ("post", "submit/", {}),
+        ):
+            resp = getattr(api, verb)(
+                f"/v1/work/{theirs.pk}/{suffix}", body,
+                format="json", HTTP_HOST=VENDOR_HOST,
+            )
+            self.assertEqual(resp.status_code, 404, f"{verb} {suffix}")
+
+
+class VoidReopensTheQuestionnaireTest(TestCase):
+    """Voiding a submission must make the form editable again.
+
+    It did not. The order went back to PENDING_SUBMISSION while the questionnaire
+    stayed SUBMITTED, so the vendor's draft endpoint answered 409 -- and
+    void_submission's own docstring ("so the vendor can correct and resubmit")
+    described something that could not be done. Found by voiding a real submission
+    and watching the form stay locked.
+    """
+
+    def setUp(self):
+        from .models import (
+            Client, DispatchKind, DispatchOrder, DispatchProof,
+            DispatchQuestionnaire, DispatchSignature, Vendor, VendorUser,
+        )
+        from .services import dispatch
+        from .services.assessment_forms import build_schema
+
+        self.vendor = Vendor.objects.create(name="Acme")
+        self.user = VendorUser.objects.create(
+            vendor=self.vendor, email="v@acme.test", name="Vic",
+        )
+        member = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Void", last_name="Member",
+            client_added_at=timezone.now(),
+        )
+        self.order = DispatchOrder.objects.create(
+            kind=DispatchKind.ASSESSMENT, client=member, vendor=self.vendor,
+            referral_type="combined",
+        )
+        self.form = DispatchQuestionnaire.objects.create(
+            dispatch_order=self.order, modules=["mobility"],
+            schema_snapshot=build_schema(["mobility"]),
+            answers={"mob.reason.fall_risk": True},
+            interventions=[{"option": "grab_bar_tub", "qty": 2}],
+            state="submitted", submitted_at=timezone.now(),
+        )
+        # A photo per answered section, DERIVED from the answers above -- the gate
+        # demands one per section, so a fixed list would need editing whenever the
+        # questionnaire changed.
+        from .services.assessment_forms import photo_groups_required
+
+        for code, _label in photo_groups_required(self.form.answers, ["mobility"]):
+            DispatchProof.objects.create(
+                dispatch_order=self.order, s3_key=f"k-{code}",
+                content_hash=f"h-{code}", intervention_group=code,
+            )
+        # Plus a general one: these answers are in Reason for Assessment, which owes
+        # no section photo, so the dwelling minimum is what applies.
+        DispatchProof.objects.create(
+            dispatch_order=self.order, s3_key="k-general",
+            content_hash="h-general",
+        )
+        self.submission = dispatch.open_submission(self.order)
+        for role in ("vendor", "member"):
+            DispatchSignature.objects.create(
+                dispatch_submission=self.submission, signer_role=role,
+                signer_name=role, s3_key=f"s-{role}", content_hash=f"h-{role}",
+                signed_at=timezone.now(),
+            )
+        dispatch.submit(self.order, vendor_user=self.user)
+
+    def test_voiding_returns_the_form_to_DRAFT(self):
+        from .services import dispatch
+
+        dispatch.void_submission(
+            self.submission, vendor_user=self.user, reason="wrong dwelling",
+        )
+        self.form.refresh_from_db()
+        self.assertEqual(self.form.state, "draft")
+        self.assertIsNone(self.form.submitted_at)
+
+    def test_the_ANSWERS_survive_the_void(self):
+        """A correction is an edit. Retyping 33 questions to fix one is how a vendor
+        ends up ticking from memory."""
+        from .services import dispatch
+
+        dispatch.void_submission(self.submission, vendor_user=self.user)
+        self.form.refresh_from_db()
+        self.assertEqual(self.form.answers, {"mob.reason.fall_risk": True})
+        self.assertEqual(
+            self.form.interventions, [{"option": "grab_bar_tub", "qty": 2}],
+        )
+
+    def test_the_VOIDED_submission_keeps_its_signatures_as_history(self):
+        """They are the record of what was attested at the time, and are what make
+        the correction auditable rather than a rewrite."""
+        from .services import dispatch
+
+        dispatch.void_submission(self.submission, vendor_user=self.user)
+        self.submission.refresh_from_db()
+        self.assertEqual(self.submission.state, "voided")
+        self.assertEqual(self.submission.signatures.count(), 2)
+
+    def test_the_gate_must_be_met_AFRESH(self):
+        """The new submission has no signatures, so submitting again requires both
+        -- a void that left the old signatures counting would let a correction be
+        submitted with nobody having seen it."""
+        from .services import dispatch
+
+        dispatch.void_submission(self.submission, vendor_user=self.user)
+        missing = dispatch.missing_for_submission(self.order)
+        self.assertIn("vendor signature", missing)
+        self.assertIn("member signature", missing)
+        # The photos belong to the ORDER, not the submission, so they still count --
+        # the dwelling has not changed just because the attestation was voided.
+        self.assertEqual(
+            [m for m in missing if m.startswith("photo of")], [],
+        )
+
+
+class QuestionCategoryTest(TestCase):
+    """A question GROUP points at a product category.
+
+    Per the questionnaires: "if any question is selected then we show the whole
+    list of products under that category". The unit is the group, not the
+    question -- which is why this replaced a per-question mapping.
+    """
+
+    def test_a_group_offers_its_WHOLE_category(self):
+        """Ticking one bathroom risk offers Bathroom Facilities, Grab Bars AND
+        Non-skid Surfaces -- the document asks for the whole list."""
+        from .services.assessment_forms import suggested_groups
+
+        self.assertEqual(
+            suggested_groups({"mob.risk.slippery_tub": True}, ["combined"]),
+            {"bathroom", "grab_bars", "non_skid"},
+        )
+
+    def test_temperature_questions_offer_temperature_products(self):
+        from .services.assessment_forms import suggested_groups
+
+        self.assertEqual(
+            suggested_groups({"vent.temp.excessive_heat": True}, ["combined"]),
+            {"air_conditioner", "heater"},
+        )
+
+    def test_REASON_FOR_ASSESSMENT_offers_nothing(self):
+        """Marked "No recommend any product" on all three documents."""
+        from .services.assessment_forms import suggested_categories
+
+        self.assertEqual(
+            suggested_categories({"mob.reason.fall_risk": True}, ["combined"]), set(),
+        )
+
+    def test_MEMBER_REPORTED_CONCERNS_offers_nothing(self):
+        from .services.assessment_forms import suggested_categories
+
+        self.assertEqual(
+            suggested_categories({"vent.reported.breathing": True}, ["ventilation"]),
+            set(),
+        )
+
+    def test_two_questions_in_one_group_offer_that_category_ONCE(self):
+        from .services.assessment_forms import suggested_categories
+
+        self.assertEqual(
+            suggested_categories({
+                "mob.risk.slippery_tub": True,
+                "mob.risk.grab_bars_absent": True,
+            }, ["combined"]),
+            {"bathroom"},
+        )
+
+    def test_a_MOBILITY_form_never_offers_ventilation_products(self):
+        """The answers cannot reach a group the form does not contain."""
+        from .services.assessment_forms import suggested_categories
+
+        self.assertEqual(
+            suggested_categories({"vent.temp.excessive_heat": True}, ["mobility"]),
+            set(),
+        )
+
+    def test_the_OLD_stored_module_shape_still_resolves(self):
+        """Rows already in the database hold ["mobility", "ventilation"], which is
+        how combined used to be stored."""
+        from .services.assessment_forms import suggested_categories
+
+        self.assertEqual(
+            suggested_categories(
+                {"vent.air.mold_odor": True}, ["mobility", "ventilation"],
+            ),
+            {"air_quality"},
+        )
+
+    def test_every_question_belongs_to_a_group_with_a_known_category_or_none(self):
+        from .services.assessment_forms import CATEGORY_LABELS, FORMS
+
+        for form, sections in FORMS.items():
+            for section in sections:
+                for group in section["groups"]:
+                    category = group.get("category")
+                    if category is not None:
+                        self.assertIn(category, CATEGORY_LABELS, f"{form}/{group['code']}")
+
+    def test_every_PRODUCT_category_has_products(self):
+        from .services.assessment_forms import CATEGORY_LABELS, INTERVENTIONS
+
+        for code in CATEGORY_LABELS:
+            self.assertTrue(INTERVENTIONS.get(code), code)
+
+    def test_DOORS_has_products_but_no_question_reaches_it(self):
+        """Recorded, not asserted away. "Doors, Handles & Access" holds three priced
+        products and NONE of the three questionnaires asks anything that points at
+        it -- so a vendor can only reach lever handles and cabinet pulls through
+        "Show all". Worth a question to the operator rather than a silent gap.
+        """
+        from .services.assessment_forms import FORMS, INTERVENTIONS
+
+        reached = {
+            g["category"] for sections in FORMS.values()
+            for sec in sections for g in sec["groups"] if g.get("category")
+        }
+        self.assertNotIn("doors", reached)
+        self.assertTrue(INTERVENTIONS["doors"])
+
+    def test_the_schema_carries_the_categories_and_their_products(self):
+        from .services.assessment_forms import build_schema
+
+        schema = build_schema(["combined"])
+        codes = {c["code"] for c in schema["categories"]}
+        self.assertEqual(
+            codes, {"mobility_access", "bathroom", "air_quality", "temperature"},
+        )
+        for category in schema["categories"]:
+            self.assertTrue(category["groups"])
+
+
+class PhotoPerAnsweredSectionTest(TestCase):
+    """A photo is owed for each SECTION GROUP that has an answer.
+
+    Per the questionnaires: "Required photo if any is selected", written against
+    the question group -- Bathroom, Mobility & Access, Air Quality, Temperature
+    Control. The Reason and Member-Reported sections say "Doesn't required photo".
+    """
+
+    def setUp(self):
+        from .models import (
+            Client, DispatchKind, DispatchOrder, DispatchQuestionnaire, Vendor,
+        )
+
+        self.vendor = Vendor.objects.create(name="Acme")
+        member = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Photo", last_name="Member",
+            client_added_at=timezone.now(),
+        )
+        self.order = DispatchOrder.objects.create(
+            kind=DispatchKind.ASSESSMENT, client=member, vendor=self.vendor,
+            referral_type="combined",
+        )
+        self.form = DispatchQuestionnaire.objects.create(
+            dispatch_order=self.order, modules=["combined"],
+        )
+
+    def _answer(self, **answers):
+        self.form.answers = answers
+        self.form.save(update_fields=["answers", "updated_at"])
+
+    def _photo(self, group="", suffix="x"):
+        from .models import DispatchProof
+
+        return DispatchProof.objects.create(
+            dispatch_order=self.order, s3_key=f"k{group}{suffix}",
+            content_hash=f"h{group}{suffix}", intervention_group=group,
+        )
+
+    def _gaps(self):
+        from .services import dispatch
+
+        return [
+            m for m in dispatch.missing_for_submission(self.order) if "photo" in m
+        ]
+
+    def test_each_answered_SECTION_needs_its_own_photo(self):
+        self._answer(**{
+            "mob.risk.slippery_tub": True,        # Bathroom
+            "mob.risk.handrail_absent": True,     # Mobility & Access
+            "vent.temp.excessive_heat": True,     # Temperature Control
+        })
+        gaps = self._gaps()
+        self.assertIn("photo of: Bathroom", gaps)
+        self.assertIn("photo of: Mobility & Access", gaps)
+        self.assertIn("photo of: Temperature Control", gaps)
+
+    def test_the_gap_names_the_HEADING_the_vendor_just_answered_under(self):
+        self._answer(**{"mob.risk.slippery_tub": True})
+        self.assertEqual(self._gaps(), ["photo of: Bathroom"])
+
+    def test_THREE_answers_in_ONE_section_need_ONE_photo(self):
+        self._answer(**{
+            "mob.risk.slippery_tub": True,
+            "mob.risk.grab_bars_absent": True,
+            "mob.risk.wet_floor": True,
+        })
+        self._photo("mob.risk.bathroom")
+        self.assertEqual(self._gaps(), [])
+
+    def test_a_GENERAL_photo_does_not_satisfy_a_section(self):
+        """Otherwise one shot of the front door would clear every requirement."""
+        self._answer(**{"mob.risk.slippery_tub": True})
+        self._photo("")
+        self.assertIn("photo of: Bathroom", self._gaps())
+
+    def test_a_photo_for_ANOTHER_section_does_not_satisfy_this_one(self):
+        self._answer(**{
+            "mob.risk.slippery_tub": True,
+            "vent.temp.excessive_heat": True,
+        })
+        self._photo("mob.risk.bathroom")
+        gaps = self._gaps()
+        self.assertIn("photo of: Temperature Control", gaps)
+        self.assertNotIn("photo of: Bathroom", gaps)
+
+    def test_REASON_FOR_ASSESSMENT_alone_needs_no_section_photo(self):
+        """Marked "Doesn't required photo" -- the dwelling minimum still applies."""
+        self._answer(**{"mob.reason.fall_risk": True})
+        self.assertEqual(self._gaps(), ["at least one photo of the dwelling"])
+
+    def test_MEMBER_REPORTED_alone_needs_no_section_photo(self):
+        from .models import DispatchQuestionnaire
+
+        DispatchQuestionnaire.objects.filter(pk=self.form.pk).update(
+            modules=["ventilation"],
+        )
+        self.form.refresh_from_db()
+        self._answer(**{"vent.reported.breathing": True})
+        self.assertEqual(self._gaps(), ["at least one photo of the dwelling"])
+
+    def test_with_NOTHING_answered_the_printed_minimum_applies(self):
+        self._answer()
+        self.assertIn("at least one photo of the dwelling", self._gaps())
+        self._photo("")
+        self.assertEqual(self._gaps(), [])
+
+    def test_sections_outside_the_FORM_in_play_are_not_demanded(self):
+        """A ventilation-only form must not ask for a bathroom photo."""
+        from .models import DispatchQuestionnaire
+
+        DispatchQuestionnaire.objects.filter(pk=self.form.pk).update(
+            modules=["ventilation"],
+        )
+        self.form.refresh_from_db()
+        self._answer(**{
+            "mob.risk.slippery_tub": True,
+            "vent.temp.excessive_heat": True,
+        })
+        gaps = self._gaps()
+        self.assertIn("photo of: Temperature Control", gaps)
+        self.assertNotIn("photo of: Bathroom", gaps)
+
+    def test_an_order_with_no_questionnaire_falls_back_to_the_minimum(self):
+        from .models import Client, DispatchKind, DispatchOrder
+        from .services import dispatch
+
+        bare = DispatchOrder.objects.create(
+            kind=DispatchKind.REMEDIATION, vendor=self.vendor,
+            client=Client.objects.create(
+                client_id=str(uuid.uuid4()), first_name="B", last_name="O",
+                client_added_at=timezone.now(),
+            ),
+        )
+        self.assertIn(
+            "at least one photo of the dwelling",
+            dispatch.missing_for_submission(bare),
+        )
+
+    def test_the_same_image_cannot_evidence_TWO_sections(self):
+        """one_proof_per_hash_per_order enforces one image per order, and that is
+        the stronger rule: if a single photo could clear every section, the
+        per-problem requirement would be theatre."""
+        from django.db import IntegrityError, transaction
+
+        from .models import DispatchProof
+
+        self._photo("mob.risk.bathroom")
+        with self.assertRaises(IntegrityError):
+            with transaction.atomic():
+                DispatchProof.objects.create(
+                    dispatch_order=self.order, s3_key="other",
+                    content_hash="hmob.risk.bathroomx",
+                    intervention_group="vent.temp",
+                )
+
+
+class AssessmentQuoteLinesTest(TestCase):
+    """The recommended-interventions table: a quote line plus the case to open."""
+
+    EEA = (
+        "Dwelling Assessment & Statement of Work (SOW) Development - "
+        "Modifications and Remediation Service - Queens"
+    )
+
+    def setUp(self):
+        from decimal import Decimal
+
+        from .models import (
+            ActiveProgram, BillableItem, BillingSettings, Case, CaseStatus,
+            CaseType, Client, DispatchKind, DispatchOrder, DispatchQuestionnaire,
+            Vendor,
+        )
+        from .services.assessment_forms import build_schema
+        from .services.catalog import clear_program_domain_cache
+
+        BillingSettings.objects.update_or_create(
+            singleton_id=1, defaults={"admin_fee_percent": Decimal("10.00")},
+        )
+        ActiveProgram.objects.create(
+            program_name=self.EEA, case_category="Internal Services",
+            case_type=ActiveProgram.CaseType.HOUSING,
+            service_type=ActiveProgram.ServiceType.ENVIRONMENTAL_EXPOSURE_ASSESSMENT,
+        )
+        # Grab Bars internal, Air Conditioner internal, Handrails EXTERNAL.
+        for name, category in (
+            ("Home Accessibility and Safety Modification - Grab Bars - Queens",
+             "Internal Services"),
+            ("Home Accessibility and Safety Modification - Hand Rails - Queens",
+             "External Services"),
+            ("Home Remediation - Air Conditioner - Queens", "Internal Services"),
+        ):
+            ActiveProgram.objects.create(
+                program_name=name, case_category=category,
+                case_type=ActiveProgram.CaseType.HOUSING,
+            )
+        clear_program_domain_cache()
+
+        for code, item, cat, main, price in (
+            ("grab_bar_tub", "Grab bar at tub", "Grab Bars", "Bathroom", "498.75"),
+            ("window_ac", "Window air conditioner", "Air Conditioner",
+             "Temperature Control", "1323.00"),
+            ("hallway_handrail", "Hallway handrail", "Handrails",
+             "Mobility & Access", "666.75"),
+        ):
+            BillableItem.objects.create(
+                item=item, option_code=code, billing_category=cat,
+                main_category=main, vendor_price=Decimal(price),
+            )
+
+        self.member = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Quote", last_name="Member",
+            client_added_at=timezone.now(),
+        )
+        Case.objects.create(
+            case_id=uuid.uuid4(), client=self.member,
+            case_type=CaseType.INTERNAL_SERVICE, case_status=CaseStatus.MANAGED,
+            program_name=self.EEA, case_created_at=timezone.now(),
+        )
+        self.order = DispatchOrder.objects.create(
+            kind=DispatchKind.ASSESSMENT, client=self.member,
+            vendor=Vendor.objects.create(name="Acme"), referral_type="combined",
+        )
+        self.form = DispatchQuestionnaire.objects.create(
+            dispatch_order=self.order, modules=["combined"],
+            schema_snapshot=build_schema(["combined"]),
+            interventions=[
+                {"option": "grab_bar_tub", "qty": 2},
+                {"option": "window_ac", "qty": 1},
+                {"option": "hallway_handrail", "qty": 1},
+            ],
+            state="submitted", submitted_at=timezone.now(),
+        )
+
+    def _lines(self):
+        from rest_framework_simplejwt.tokens import AccessToken
+
+        from .models import Agent
+
+        agent = Agent.objects.create(
+            name="Quote Agent", agent_code="781", group="Management",
+        )
+        acc = AccessToken()
+        acc["agent_id"] = str(agent.id)
+        acc["agent_code"] = agent.agent_code
+        acc["agent_name"] = agent.name
+        acc["agent_group"] = agent.group
+        api = APIClient(); api.credentials(HTTP_AUTHORIZATION=f"Bearer {acc}")
+        data = api.get(
+            f"/api/portal/members/{self.member.pk}/assessment-form/",
+        ).data
+        return {
+            o["code"]: o
+            for c in data["categories"] for g in c["groups"] for o in g["options"]
+        }
+
+    def test_a_line_carries_qty_unit_price_and_totals(self):
+        line = self._lines()["grab_bar_tub"]
+        self.assertEqual(line["qty"], 2)
+        self.assertEqual(line["unit_price"], "498.75")
+        self.assertEqual(line["line_total"], "997.50")
+        # 997.50 + 10%
+        self.assertEqual(line["billed_total"], "1097.25")
+
+    def test_a_line_names_the_CASE_an_agent_must_open(self):
+        case = self._lines()["window_ac"]["case"]
+        self.assertEqual(
+            case["program_name"], "Home Remediation - Air Conditioner - Queens",
+        )
+        self.assertTrue(case["exists"])
+        self.assertTrue(case["is_internal"])
+
+    def test_the_borough_comes_from_the_members_governing_case(self):
+        for line in self._lines().values():
+            if line["case"]["program_item"]:
+                self.assertEqual(line["case"]["borough"], "Queens")
+
+    def test_MANY_products_share_ONE_case(self):
+        """Every grab bar is one "Grab Bars" case. The name repeating down the
+        column is the point -- the agent opens it once."""
+        lines = self._lines()
+        names = {
+            lines[code]["case"]["program_name"]
+            for code in lines
+            if lines[code]["case"]["program_item"] == "Grab Bars"
+        }
+        self.assertEqual(
+            names,
+            {"Home Accessibility and Safety Modification - Grab Bars - Queens"},
+        )
+
+    def test_an_EXTERNAL_programme_is_flagged_on_the_line(self):
+        """So an agent sees why a recommended product cannot become a case."""
+        case = self._lines()["hallway_handrail"]["case"]
+        self.assertTrue(case["exists"])
+        self.assertFalse(case["is_internal"])
+
+    def test_a_product_with_NO_programme_item_says_so(self):
+        """Accessibility Ramps and Pathways have no programme item at all."""
+        case = self._lines()["modular_portable_ramp"]["case"]
+        self.assertEqual(case["program_item"], "")
+        self.assertEqual(case["program_name"], "")
+
+    def test_an_UNCHOSEN_product_still_renders_with_no_totals(self):
+        """The full catalogue is what shows an agent what COULD have been
+        recommended; a zero line must not invent a total."""
+        line = self._lines()["shower_chair"]
+        self.assertEqual(line["qty"], 0)
+        self.assertIsNone(line["line_total"])
+        self.assertIsNone(line["billed_total"])
+
+    def test_an_UNPRICED_product_has_no_unit_price(self):
+        """Absent rather than zero: a missing price is a question to ask, and 0.00
+        reads as free."""
+        line = self._lines()["threshold_reducer"]
+        self.assertIsNone(line["unit_price"])
+
+    def test_a_case_the_member_ALREADY_has_is_flagged(self):
+        from .models import Case, CaseStatus, CaseType
+
+        Case.objects.create(
+            case_id=uuid.uuid4(), client=self.member,
+            case_type=CaseType.INTERNAL_SERVICE, case_status=CaseStatus.MANAGED,
+            program_name="Home Remediation - Air Conditioner - Queens",
+            case_created_at=timezone.now(),
+        )
+        self.assertTrue(self._lines()["window_ac"]["case"]["already_open"])
+
+
+class SpendCapTest(TestCase):
+    """The funding cap: $9,000 of vendor spend, INCLUDING the assessment's own fee.
+
+    Unite Us authorises up to $10,000 for this service and our admin fee comes out
+    of that. The vendor app is told only that the limit is reached -- never the
+    figure.
+    """
+
+    def setUp(self):
+        from decimal import Decimal
+
+        from .models import BillableItem, BillingSettings, Vendor
+
+        BillingSettings.objects.update_or_create(
+            singleton_id=1, defaults={
+                "admin_fee_percent": Decimal("10.00"),
+                "vendor_spend_cap": Decimal("9000.00"),
+            },
+        )
+        self.vendor = Vendor.objects.create(name="Acme")
+        # The assessment itself, which has no option code because it is the visit.
+        BillableItem.objects.create(
+            item="Dwelling assessment", option_code="",
+            billing_category="Dwelling Assessment & SOW Development",
+            vendor_price=Decimal("750.00"),
+        )
+        BillableItem.objects.create(
+            item="Window air conditioner", option_code="window_ac",
+            billing_category="Air Conditioner", main_category="Temperature Control",
+            vendor_price=Decimal("1323.00"),
+        )
+        BillableItem.objects.create(
+            item="Grab bar at tub", option_code="grab_bar_tub",
+            billing_category="Grab Bars", main_category="Bathroom",
+            vendor_price=Decimal("498.75"),
+        )
+
+    def _status(self, items):
+        from .services import pricing
+
+        return pricing.cap_status(self.vendor, items)
+
+    def test_the_ASSESSMENT_FEE_counts_toward_the_cap(self):
+        """Leaving it out would let a vendor recommend the full cap in products and
+        put us over the authorisation."""
+        from decimal import Decimal
+
+        status = self._status([])
+        self.assertEqual(status["assessment"], Decimal("750.00"))
+        self.assertEqual(status["total"], Decimal("750.00"))
+        self.assertEqual(status["remaining"], Decimal("8250.00"))
+
+    def test_products_and_the_fee_are_totalled_together(self):
+        from decimal import Decimal
+
+        status = self._status([{"option": "window_ac", "qty": 2}])
+        self.assertEqual(status["products"], Decimal("2646.00"))
+        self.assertEqual(status["total"], Decimal("3396.00"))
+        self.assertFalse(status["at_cap"])
+
+    def test_EXACTLY_at_the_cap_warns_but_is_not_over(self):
+        """Spending the authorisation precisely is allowed -- and is the case the
+        operator asked to be warned about."""
+        from decimal import Decimal
+
+        from .models import BillableItem
+
+        BillableItem.objects.create(
+            item="Exact filler", option_code="filler",
+            billing_category="Air Conditioner", vendor_price=Decimal("8250.00"),
+        )
+        status = self._status([{"option": "filler", "qty": 1}])
+        self.assertEqual(status["total"], Decimal("9000.00"))
+        self.assertTrue(status["at_cap"])
+        self.assertFalse(status["over_cap"])
+
+    def test_a_penny_over_is_OVER(self):
+        from decimal import Decimal
+
+        from .models import BillableItem
+
+        BillableItem.objects.create(
+            item="One penny more", option_code="penny",
+            billing_category="Air Conditioner", vendor_price=Decimal("8250.01"),
+        )
+        status = self._status([{"option": "penny", "qty": 1}])
+        self.assertTrue(status["over_cap"])
+
+    def test_quantities_multiply(self):
+        from decimal import Decimal
+
+        self.assertEqual(
+            self._status([{"option": "grab_bar_tub", "qty": 4}])["products"],
+            Decimal("1995.00"),
+        )
+
+    def test_a_zero_quantity_costs_nothing(self):
+        from decimal import Decimal
+
+        self.assertEqual(
+            self._status([{"option": "window_ac", "qty": 0}])["products"],
+            Decimal("0"),
+        )
+
+    def test_an_UNPRICED_item_is_reported_rather_than_silently_free(self):
+        """So "why is the total lower than I expect?" has an answer."""
+        status = self._status([{"option": "no_such_item", "qty": 1}])
+        self.assertEqual(status["unpriced"], ["no_such_item"])
+
+    def test_a_VENDOR_price_override_changes_the_cap_arithmetic(self):
+        """The cap is measured in what WE pay, so a negotiated price moves it."""
+        from decimal import Decimal
+
+        from .models import BillableItem, VendorPrice
+
+        VendorPrice.objects.create(
+            vendor=self.vendor,
+            billable_item=BillableItem.objects.get(option_code="window_ac"),
+            price=Decimal("1000.00"),
+        )
+        self.assertEqual(
+            self._status([{"option": "window_ac", "qty": 2}])["products"],
+            Decimal("2000.00"),
+        )
+
+    def test_a_negotiated_ASSESSMENT_price_is_used(self):
+        from decimal import Decimal
+
+        from .models import BillableItem, VendorPrice
+
+        VendorPrice.objects.create(
+            vendor=self.vendor,
+            billable_item=BillableItem.objects.get(option_code=""),
+            price=Decimal("600.00"),
+        )
+        self.assertEqual(self._status([])["assessment"], Decimal("600.00"))
+
+    def test_the_cap_is_ADJUSTABLE(self):
+        from decimal import Decimal
+
+        from .models import BillingSettings
+
+        row = BillingSettings.get()
+        row.vendor_spend_cap = Decimal("5000.00")
+        row.save()
+        status = self._status([{"option": "window_ac", "qty": 4}])
+        self.assertEqual(status["total"], Decimal("6042.00"))
+        self.assertTrue(status["over_cap"])
+
+    def test_the_GATE_refuses_a_submission_over_the_cap(self):
+        from decimal import Decimal
+
+        from .models import (
+            BillableItem, Client, DispatchKind, DispatchOrder,
+            DispatchQuestionnaire,
+        )
+        from .services import dispatch
+
+        BillableItem.objects.create(
+            item="Too much", option_code="too_much",
+            billing_category="Air Conditioner", vendor_price=Decimal("9000.00"),
+        )
+        order = DispatchOrder.objects.create(
+            kind=DispatchKind.ASSESSMENT, vendor=self.vendor,
+            client=Client.objects.create(
+                client_id=str(uuid.uuid4()), first_name="Cap", last_name="Member",
+                client_added_at=timezone.now(),
+            ),
+        )
+        DispatchQuestionnaire.objects.create(
+            dispatch_order=order, modules=["combined"],
+            interventions=[{"option": "too_much", "qty": 1}],
+        )
+        missing = dispatch.missing_for_submission(order)
+        self.assertIn(
+            "the recommended items exceed the funding limit for this service",
+            missing,
+        )
+
+    def test_the_gate_message_carries_NO_AMOUNT(self):
+        """The vendor app shows this to a member."""
+        from decimal import Decimal
+
+        from .models import (
+            BillableItem, Client, DispatchKind, DispatchOrder,
+            DispatchQuestionnaire,
+        )
+        from .services import dispatch
+
+        BillableItem.objects.create(
+            item="Too much", option_code="too_much",
+            billing_category="Air Conditioner", vendor_price=Decimal("9000.00"),
+        )
+        order = DispatchOrder.objects.create(
+            kind=DispatchKind.ASSESSMENT, vendor=self.vendor,
+            client=Client.objects.create(
+                client_id=str(uuid.uuid4()), first_name="Cap2", last_name="Member",
+                client_added_at=timezone.now(),
+            ),
+        )
+        DispatchQuestionnaire.objects.create(
+            dispatch_order=order, modules=["combined"],
+            interventions=[{"option": "too_much", "qty": 1}],
+        )
+        joined = " ".join(dispatch.missing_for_submission(order))
+        for forbidden in ("9000", "9,000", "$", "750"):
+            self.assertNotIn(forbidden, joined)
+
+
+class PodImportHeaderMatchingTest(TestCase):
+    """Which CSV columns the POD importer recognises.
+
+    A real USP report lost its driver and route because the aliases listed only
+    "driver" and "route" and the file said "Delivery Driver".
+    """
+
+    def test_a_DELIVERY_prefixed_header_is_recognised(self):
+        from .services.pod_import import build_header_index
+
+        index = build_header_index([
+            "Order #", "Delivery Status", "Delivery Date", "Delivery Time",
+            "Delivery Driver", "Route", "Delivery Note", "Photos",
+        ])
+        self.assertEqual(index["driver"], "Delivery Driver")
+        self.assertEqual(index["route"], "Route")
+        self.assertEqual(index["note"], "Delivery Note")
+
+    def test_decorated_spellings_all_resolve(self):
+        from .services.pod_import import build_header_index
+
+        for header, canonical in (
+            ("Driver ID", "driver"),
+            ("Driver Name", "driver"),
+            ("Assigned Driver", "driver"),
+            ("Route Name", "route"),
+            ("Route #", "route"),
+            ("Delivery Route", "route"),
+            ("POD - Note", "note"),
+        ):
+            index = build_header_index(["Order #", header])
+            self.assertEqual(index[canonical], header, header)
+
+    def test_an_EXACT_alias_still_wins(self):
+        """The loose pass must never change a file that imports correctly today."""
+        from .services.pod_import import build_header_index
+
+        index = build_header_index(["Order #", "DriverID", "RouteID"])
+        self.assertEqual(index["driver"], "DriverID")
+        self.assertEqual(index["route"], "RouteID")
+
+    def test_two_canonical_fields_never_claim_the_SAME_column(self):
+        from .services.pod_import import build_header_index
+
+        index = build_header_index(["Order #", "Delivery Date", "Delivery Time"])
+        self.assertEqual(index["date"], "Delivery Date")
+        self.assertEqual(index["time"], "Delivery Time")
+
+    def test_an_unrelated_column_is_not_claimed(self):
+        """Loosening must not start matching things it should ignore."""
+        from .services.pod_import import build_header_index
+
+        index = build_header_index(["Order #", "Delivery Fee", "Signature Name"])
+        self.assertIsNone(index["driver"])
+        self.assertIsNone(index["note"])
+
+
+class PodImportWithoutPhotosTest(TestCase):
+    """Driver, route and note survive a report that carries NO photos.
+
+    This is the defect that lost them: they were written only onto a
+    DeliveryOrderProof, and a proof row exists only when a photo does. One real USP
+    file updated 184 orders and created ZERO proofs, so 184 drivers and routes were
+    parsed and discarded.
+    """
+
+    def setUp(self):
+        from .models import (
+            DeliveryOrder, DeliveryOrderStatus, PurchaseOrder,
+        )
+
+        # A bare order is enough: the importer matches on the order id, and none of
+        # what is being tested touches the member or the household.
+        self.order = DeliveryOrder.objects.create(
+            purchase_order=PurchaseOrder.objects.create(status="draft"),
+            status=DeliveryOrderStatus.READY_FOR_DELIVERY,
+        )
+
+    def _import(self, rows, **kwargs):
+        import csv
+        import io
+
+        from .services.pod_import import run_pod_import_from_reader
+
+        return run_pod_import_from_reader(
+            reader=csv.DictReader(io.StringIO(rows)), apply=True, fetch=False,
+            **kwargs,
+        )
+
+    def _row(self, **over):
+        cells = {
+            "Order #": str(self.order.pk), "Member ID": "",
+            "Delivery Status": "Completed", "Delivery Date": "09/11/2026",
+            "Delivery Time": "10:30 AM", "Delivery Driver": "Marcus T",
+            "Route": "RT-14", "Delivery Note": "Left with the doorman",
+            "Photos": "",
+        }
+        cells.update(over)
+        header = ",".join(cells)
+        return f"{header}\n" + ",".join(cells.values()) + "\n"
+
+    def test_driver_route_and_note_land_on_the_ORDER(self):
+        self._import(self._row())
+        self.order.refresh_from_db()
+        self.assertEqual(self.order.delivery_driver, "Marcus T")
+        self.assertEqual(self.order.delivery_route, "RT-14")
+        self.assertEqual(self.order.delivery_note, "Left with the doorman")
+
+    def test_the_status_source_records_CSV(self):
+        self._import(self._row())
+        self.order.refresh_from_db()
+        self.assertEqual(self.order.status_source, "csv")
+
+    def test_a_later_BLANK_value_does_not_erase_one_we_have(self):
+        """A status-only report that omits the driver must not wipe the driver an
+        earlier report gave us."""
+        from .services import pod_ingest
+
+        self._import(self._row())
+        pod_ingest.apply_delivery_outcome(
+            self.order, status="failed", status_source="api",
+        )
+        self.order.refresh_from_db()
+        self.assertEqual(self.order.status, "failed")
+        self.assertEqual(self.order.delivery_driver, "Marcus T")
+
+    def test_the_status_source_moves_with_the_STATUS(self):
+        from .services import pod_ingest
+
+        self._import(self._row())
+        pod_ingest.apply_delivery_outcome(
+            self.order, status="failed", status_source="api",
+        )
+        self.order.refresh_from_db()
+        self.assertEqual(self.order.status_source, "api")
+
+    def test_a_reimport_that_changes_NOTHING_leaves_the_source_alone(self):
+        """Otherwise re-running a CSV would rewrite the provenance of a status the
+        API had already reported."""
+        from .services import pod_ingest
+
+        self._import(self._row())
+        pod_ingest.apply_delivery_outcome(
+            self.order, status="failed", status_source="api",
+        )
+        # The same outcome again, from the CSV channel: nothing moves, so the
+        # source must not flip.
+        pod_ingest.apply_delivery_outcome(
+            self.order, status="failed", status_source="csv",
+        )
+        self.order.refresh_from_db()
+        self.assertEqual(self.order.status_source, "api")
+
+    def test_a_DRIVER_only_report_updates_nothing_else(self):
+        self._import(self._row(**{"Delivery Status": "", "Delivery Date": ""}))
+        self.order.refresh_from_db()
+        self.assertEqual(self.order.delivery_driver, "Marcus T")
+        # No status in the row, so the order keeps the one it had.
+        self.assertEqual(self.order.status, "ready_for_delivery")
+
+
+class OnHoldFilterTest(TestCase):
+    """The On Hold filter must return exactly what the column labels On Hold.
+
+    On the production snapshot the filter matched 4,086 members of whom 617 had a
+    Verification column reading "Inactive" -- their programme is closed and the
+    enrollment merely parked, which serializers.verification_status deliberately
+    does NOT call On Hold.
+    """
+
+    def setUp(self):
+        from rest_framework_simplejwt.tokens import AccessToken
+
+        from .models import Agent
+
+        agent = Agent.objects.create(
+            name="Hold Agent", agent_code="782", group="Management",
+        )
+        acc = AccessToken()
+        acc["agent_id"] = str(agent.id)
+        acc["agent_code"] = agent.agent_code
+        acc["agent_name"] = agent.name
+        acc["agent_group"] = agent.group
+        self.api = APIClient()
+        self.api.credentials(HTTP_AUTHORIZATION=f"Bearer {acc}")
+
+    def _member(self, *, stage, lifecycle, first="Held"):
+        from .models import Client, EnrollmentVerification
+
+        client = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name=first, last_name="Member",
+            client_added_at=timezone.now(), lifecycle_stage=lifecycle,
+        )
+        EnrollmentVerification.objects.create(
+            client=client, stage=stage, opened_at=timezone.now(),
+        )
+        return client
+
+    def _ids(self):
+        resp = self.api.get("/api/portal/members/?status=on_hold")
+        self.assertEqual(resp.status_code, 200, resp.content)
+        rows = resp.data["results"]
+        out = set()
+        for group in rows:
+            for m in group.get("members", []) or []:
+                out.add(m.get("client_id") or m.get("id"))
+            if group.get("client_id"):
+                out.add(group["client_id"])
+        return out
+
+    def test_a_held_member_is_returned(self):
+        from .models import ClientStage, EnrollmentStage
+
+        held = self._member(
+            stage=EnrollmentStage.ON_HOLD, lifecycle=ClientStage.ACTIVE,
+        )
+        self.assertIn(str(held.client_id), self._ids())
+
+    def test_a_CLOSED_programme_parked_on_hold_is_NOT_returned(self):
+        """Its column reads "Inactive", so an On Hold filter returning it would
+        disagree with the row it shows."""
+        from .models import ClientStage, EnrollmentStage
+        from .portal.serializers import verification_status
+
+        parked = self._member(
+            stage=EnrollmentStage.ON_HOLD, lifecycle=ClientStage.SERVICE_INACTIVE,
+            first="Parked",
+        )
+        # The column's own answer, which is what the filter must agree with.
+        self.assertEqual(verification_status(parked), "Inactive")
+        self.assertNotIn(str(parked.client_id), self._ids())
+
+    def test_everything_returned_is_LABELLED_On_Hold(self):
+        """The property that matters, stated directly."""
+        from .models import Client, ClientStage, EnrollmentStage
+        from .portal.serializers import verification_status
+
+        self._member(
+            stage=EnrollmentStage.ON_HOLD, lifecycle=ClientStage.ACTIVE,
+        )
+        self._member(
+            stage=EnrollmentStage.ON_HOLD, lifecycle=ClientStage.SERVICE_INACTIVE,
+            first="Parked",
+        )
+        self._member(
+            stage=EnrollmentStage.SERVICE_ACTIVE,
+            lifecycle=ClientStage.ACTIVE, first="Serving",
+        )
+        for client_id in self._ids():
+            client = Client.objects.get(client_id=client_id)
+            self.assertEqual(
+                verification_status(client), "On Hold", client.first_name,
+            )
+
+    def test_a_serving_member_is_not_returned(self):
+        from .models import ClientStage, EnrollmentStage
+
+        serving = self._member(
+            stage=EnrollmentStage.SERVICE_ACTIVE,
+            lifecycle=ClientStage.ACTIVE, first="Serving",
+        )
+        self.assertNotIn(str(serving.client_id), self._ids())
+
+    def test_a_STRAY_held_enrollment_beside_a_live_one_is_not_returned(self):
+        """The filter keys off the GOVERNING enrollment, so a member serving now
+        does not appear because of an older hold."""
+        from .models import ClientStage, EnrollmentStage, EnrollmentVerification
+
+        client = self._member(
+            stage=EnrollmentStage.ON_HOLD, lifecycle=ClientStage.ACTIVE,
+            first="Resumed",
+        )
+        # A newer, open enrollment governs.
+        EnrollmentVerification.objects.create(
+            client=client, stage=EnrollmentStage.SERVICE_ACTIVE,
+            opened_at=timezone.now() + timezone.timedelta(days=1),
+        )
+        self.assertNotIn(str(client.client_id), self._ids())
+
+    def test_it_works_on_the_VERIFICATION_scope_too(self):
+        """The chip was added to the Verification page, which passes scope."""
+        from .models import ClientStage, EnrollmentStage
+
+        self._member(
+            stage=EnrollmentStage.ON_HOLD, lifecycle=ClientStage.ACTIVE,
+        )
+        resp = self.api.get(
+            "/api/portal/members/?status=on_hold&scope=verification",
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+
+
+class DataPageDomainFilterTest(TestCase):
+    """The Data page's food/housing selector.
+
+    The point of these tests is the operator's actual request: every filter that
+    page already had was written for FOOD, before housing existed, so passing the
+    new parameter must not change a single one of their answers.
+    """
+
+    def setUp(self):
+        from rest_framework_simplejwt.tokens import AccessToken
+
+        from .models import Agent
+
+        agent = Agent.objects.create(
+            name="Data Agent", agent_code="783", group="Management",
+        )
+        acc = AccessToken()
+        acc["agent_id"] = str(agent.id)
+        acc["agent_code"] = agent.agent_code
+        acc["agent_name"] = agent.name
+        acc["agent_group"] = agent.group
+        self.api = APIClient()
+        self.api.credentials(HTTP_AUTHORIZATION=f"Bearer {acc}")
+
+    # Every filter the page sends, with a value that exercises it. Kept as data so
+    # a new filter can be added to the page and to this list together.
+    # Some filters take UUIDs rather than names; the values only have to be VALID,
+    # since what is being compared is the SQL each produces with and without the
+    # domain parameter.
+    FILTERS = [
+        {"search": "smith"},
+        {"has_internal_service": "yes"},
+        {"internal_status": "open"},
+        {"internal_status": "closed"},
+        {"company_status": "active"},
+        {"age_min": "18"},
+        {"age_max": "65"},
+        {"age_min": "18", "age_max": "65"},
+        {"eligibility": "yes"},
+        {"insurance_status": "active"},
+        {"auth_status": "approved"},
+        {"allergies": "nuts"},
+        {"medical_conditions": "diabetes"},
+        {"medications": "metformin"},
+        {"program": "Clinically Appropriate Meals"},
+        {"program_status": "open"},
+        {"program_type": "household"},
+        {"service_type": "meals"},
+        {"service_type": "boxes"},
+        {"case_status": "managed"},
+        {"verification_state": "verified"},
+        {"nutritionist_status": "approved"},
+        {"attestation_status": "yes"},
+        {"stage": "active"},
+        {"primary_member": "yes"},
+        {"kitchen": "11111111-1111-1111-1111-111111111111"},
+        {"menu_type": "regular"},
+        {"cadence": "weekly"},
+        {"delivery_company": "22222222-2222-2222-2222-222222222222"},
+        {"delivered": "yes"},
+        {"current_delivery_status": "delivered"},
+        {"last_po_delivery_status": "delivered"},
+        {"team": "PHS"},  # a name, not an id
+        {"screening_agent": "33333333-3333-3333-3333-333333333333"},
+        {"verified_by": "44444444-4444-4444-4444-444444444444"},
+        {"lead_source": "referral"},
+        {"care_coordinator": "someone"},
+        {"primary_care_coordinator": "someone"},
+        {"tags": "vip"},
+        {"ticket_types": "complaint"},
+        {"eligible_services": "meals"},
+        {"pause_type": "paused"},
+        {"has_screening": "yes"},
+        {"has_eligibility_assessment": "yes"},
+        {"social_status": "active"},
+        {"case_opened": "2026-01-01"},
+        {"auth_start": "2026-01-01"},
+        {"auth_end": "2026-12-31"},
+        {"insurance_exp": "2026-12-31"},
+        {"social_exp": "2026-12-31"},
+        {"pause_date": "2026-01-01"},
+        {"requested": "2026-01-01"},
+        {"verified": "2026-01-01"},
+        {"screening": "2026-01-01"},
+        {"assessment": "2026-01-01"},
+        {"member_added_at": "2026-01-01"},
+        {"last_po_delivered": "2026-01-01"},
+        {"sort": "name", "dir": "asc"},
+        {"sort": "case_opened", "dir": "desc"},
+    ]
+
+    def test_EVERY_filter_gives_the_same_answer_with_domain_food(self):
+        """The operator's ask, stated as a test: the new parameter must not change
+        any filter that already worked. Compared as SQL, so it holds for an empty
+        test database as well as a populated one."""
+        from .services.enrollment_analytics import filter_analytics
+
+        for params in self.FILTERS:
+            without = str(filter_analytics(dict(params)).query)
+            with_food = str(filter_analytics({**params, "domain": "food"}).query)
+            self.assertEqual(without, with_food, f"changed by domain=food: {params}")
+
+    def test_every_filter_returns_NOTHING_for_housing(self):
+        """Not because the filters fail, but because this read model has no housing
+        rows at all -- it is built from the FOOD governing case by design."""
+        from .services.enrollment_analytics import filter_analytics
+
+        for params in self.FILTERS:
+            self.assertEqual(
+                filter_analytics({**params, "domain": "housing"}).count(), 0, params,
+            )
+
+    def test_the_default_is_FOOD(self):
+        from .services.enrollment_analytics import filter_analytics
+
+        self.assertEqual(
+            str(filter_analytics({}).query),
+            str(filter_analytics({"domain": "food"}).query),
+        )
+
+    def test_an_UNKNOWN_domain_falls_back_to_food_rather_than_erroring(self):
+        """A stale page sending a retired value should show the food data, not a
+        500 or a blank screen."""
+        from .services.enrollment_analytics import filter_analytics
+
+        self.assertEqual(
+            str(filter_analytics({"domain": "nonsense"}).query),
+            str(filter_analytics({"domain": "food"}).query),
+        )
+
+    def test_domain_food_does_NOT_filter_on_service_type(self):
+        """Filtering food to service_type in (meals, boxes) would drop every member
+        with no governing food case -- 53,875 rows on the production snapshot, most
+        of the page."""
+        from .services.enrollment_analytics import filter_analytics
+
+        sql = str(filter_analytics({"domain": "food"}).query)
+        # Checked against the WHERE clause, not the whole statement -- every column
+        # appears in the SELECT list, so a naive substring test always "passes".
+        where = sql.split(" WHERE ")[1] if " WHERE " in sql else ""
+        self.assertEqual(where, "", f"domain=food added a filter: {where}")
+
+    def test_the_endpoint_reports_whether_the_domain_has_data(self):
+        """An empty page because a domain is not ready is a different answer from
+        an empty page because the filters matched nothing, and they look the same
+        on screen."""
+        food = self.api.get("/api/portal/data/?domain=food")
+        self.assertEqual(food.data["domain"], "food")
+        self.assertTrue(food.data["domain_available"])
+
+        housing = self.api.get("/api/portal/data/?domain=housing")
+        self.assertEqual(housing.data["domain"], "housing")
+        self.assertFalse(housing.data["domain_available"])
+        self.assertEqual(housing.data["count"], 0)

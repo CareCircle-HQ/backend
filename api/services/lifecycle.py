@@ -1579,6 +1579,171 @@ def _authorization_phase(auth):
     return ("requested", "Requested")
 
 
+def _housing_assessment_phase(client, case):
+    """The EEA node: has an assessment order been raised for this member?
+
+    Deliberately near-BINARY -- grey or green -- because the detailed lifecycle
+    (Pending Schedule / Confirmed / Submitted / Uploaded) lives on the Programs >
+    Housing accordion, where an agent can act on it. A glance-level bar answering
+    "where is this member" should not try to encode nine states.
+
+    Two refinements on the plain "does a row exist?" test:
+
+    * a CANCELLED order does not count as existing. It technically does, so a
+      naive check would turn the node green for a dead order -- the worst possible
+      failure for an at-a-glance indicator.
+    * with no order yet, the node reports whether one CAN be raised. An expired
+      authorization blocks it, and that is where housing's expiry surfaces:
+      _authorization_phase deliberately still reads "Approved" for an expired
+      authorization (the food bar shows the expiry in its Service phase), and
+      housing has no Service phase, so it would otherwise vanish.
+    """
+    from api.models import DispatchKind, DispatchOrder, DispatchStatus
+    from api.models import ServiceAuthorizationStatus as A
+
+    order = (
+        DispatchOrder.objects
+        .filter(client=client, kind=DispatchKind.ASSESSMENT)
+        .order_by("-created_at").first()
+    )
+    if order is not None and order.status != DispatchStatus.CANCELLED:
+        return ("ordered", "Assessment order created")
+    if order is not None:
+        return ("cancelled", "The assessment order was cancelled")
+
+    auth = getattr(case, "service_authorization_status", "") or ""
+    if auth == A.DENIED:
+        return ("", "Authorization denied — no assessment can be ordered")
+    if auth == A.EXPIRED:
+        return ("expired", "Authorization expired — renew it before ordering")
+    if auth in (A.APPROVED, A.NOT_REQUIRED):
+        # Approved on paper, but check the WINDOW: the status keeps reading
+        # "approved" after the window lapses, which is the trap the Items tab hit.
+        _start, end = case.effective_authorization_window()
+        if end and end < timezone.now():
+            return ("expired", "Authorization expired — renew it before ordering")
+        return ("ready", "No assessment order yet — ready to create one")
+    # Requested, never requested, blank: nothing to order yet, and the
+    # Authorization chip beside this one already says so.
+    return ("", "Waiting on authorization before an assessment can be ordered")
+
+
+def _housing_work_orders_phase(client):
+    """The Work Orders node: is there outstanding remediation work?
+
+    THREE states rather than two, because "a batch exists" and "there is nothing
+    left to do" are not the same thing:
+
+        grey    no items at all -- the assessment has produced nothing yet
+        amber   items exist but NONE is in a work order -- someone must batch them
+        green   at least one work order batch exists
+
+    The amber state is the one that matters. MIRIAM has 9 items with 4 still
+    unassigned; a binary green would read "work orders: done" while approved,
+    authorized items sat unbatched -- exactly what the Items tab was built to
+    surface.
+
+    Counted from BATCHES for green and ITEMS for amber, because items appearing is
+    automatic (an import discovers them) while a batch is a deliberate human
+    action.
+    """
+    from api.models import DispatchItem, DispatchKind, DispatchOrder, DispatchStatus
+
+    batches = DispatchOrder.objects.filter(
+        client=client, kind=DispatchKind.REMEDIATION,
+    ).exclude(status=DispatchStatus.CANCELLED).count()
+    items = DispatchItem.objects.filter(case__client=client)
+    total = items.count()
+
+    if batches:
+        unassigned = items.filter(dispatch_order__isnull=True).count()
+        detail = f"{batches} work order{'' if batches == 1 else 's'}"
+        if unassigned:
+            # Still green -- work IS being done -- but the detail says what is
+            # left, so a green chip cannot be read as "everything is handled".
+            detail = f"{detail}, {unassigned} item{'' if unassigned == 1 else 's'} not yet batched"
+        return ("created", detail)
+    if total:
+        return (
+            "waiting",
+            f"{total} item{'' if total == 1 else 's'} waiting to be put in a work order",
+        )
+    return ("", "No remediation items yet")
+
+
+def _housing_overall_phase(client, case):
+    """The housing row's LAST chip: Open / Expired / Completed / Closed.
+
+    Unlike the EEA and Work Orders nodes, this chip's LABEL *is* the state -- it is
+    the answer to "where does this member's housing stand overall", not a waypoint.
+
+    PRECEDENCE, which matters more than the individual rules:
+
+    1. CLOSED   the dwelling case is closed or cancelled. Terminal and factual, so
+                it wins even over completed work -- an agent reading "Completed" on
+                a closed case would go looking for the case to act on.
+    2. COMPLETED every live order is uploaded AND nothing is left unbatched. Beats
+                Expired deliberately: if the work got done, a window that has since
+                lapsed is history rather than a problem.
+    3. EXPIRED  the authorization window has passed with work outstanding. This is
+                the one that needs somebody.
+    4. OPEN     the default while the case is live.
+    """
+    from api.models import (
+        DispatchItem, DispatchOrder, DispatchStatus,
+    )
+
+    if case.case_status in _CLOSED_CASE_STATUSES:
+        return ("closed", "The dwelling assessment case is closed")
+
+    # OUT OF RANGE beats everything below Closed. If we do not serve the dwelling's
+    # ZIP, the authorization window and the work orders are beside the point --
+    # nobody can be sent there. Mirrors the food bar, which surfaces a coverage
+    # block as Out of Range rather than a generic hold.
+    from ..models import DispatchKind, DispatchOrder
+    from .service_area import order_service_area
+
+    order = (
+        DispatchOrder.objects
+        .filter(client=client, kind=DispatchKind.ASSESSMENT)
+        .order_by("-created_at").first()
+    )
+    if order is not None and (order.address_zip or order.address_formatted):
+        area = order_service_area(order)
+        if not area["in_service_area"]:
+            return (
+                "out_of_range",
+                f"{area['zip'] or 'This address'} is outside our service area"
+                if area["reason"] == "out_of_area"
+                else "The dwelling address has no ZIP code",
+            )
+
+    live_orders = list(
+        DispatchOrder.objects
+        .filter(client=client)
+        .exclude(status=DispatchStatus.CANCELLED)
+        .values_list("status", flat=True)
+    )
+    unbatched = DispatchItem.objects.filter(
+        case__client=client, dispatch_order__isnull=True,
+    ).count()
+    # "All orders are done" requires there to BE orders -- otherwise a member who
+    # has never been assessed would read as Completed, which is the opposite of
+    # the truth.
+    if (
+        live_orders
+        and all(st == DispatchStatus.UPLOADED for st in live_orders)
+        and not unbatched
+    ):
+        return ("completed", "Every order is complete and uploaded")
+
+    _start, end = case.effective_authorization_window()
+    if end and end < timezone.now():
+        return ("expired", "The authorization window has passed")
+
+    return ("open", "The dwelling assessment case is open")
+
+
 def _verification_phase(enrollment):
     """Verification phase for the program bar:
 
@@ -1888,6 +2053,16 @@ def program_tracks(client):
         from api.serializers import derive_household_type
 
         ht = derive_household_type(None, getattr(c, "program_name", "")) or CaseHouseholdType.INDIVIDUAL
+
+        # The housing row's two extra nodes. Only computed for the housing
+        # GOVERNING case -- a work-order case never renders a row, and food has no
+        # assessment order.
+        ao_val = ao_lbl = wo_val = wo_lbl = ov_val = ov_lbl = ""
+        if case_service_domain(c) == "housing" and is_governing:
+            ao_val, ao_lbl = _housing_assessment_phase(client, c)
+            wo_val, wo_lbl = _housing_work_orders_phase(client)
+            ov_val, ov_lbl = _housing_overall_phase(client, c)
+
         tracks.append({
             "category": category,
             "service_type": service_type,
@@ -1905,6 +2080,36 @@ def program_tracks(client):
             "verification": {"value": v_val, "label": v_lbl},
             "nutritionist": {"value": n_val, "label": n_lbl},
             "service": {"value": s_val, "label": s_lbl},
+            # HOUSING-only phases, named for what they are rather than reusing the
+            # food slots -- putting the assessment order in "verification" would
+            # make the payload lie about what it holds. Blank for food, so the
+            # frontend picks by DOMAIN rather than by which keys happen to be set.
+            # The LABEL is the node's NAME and the VALUE drives its colour --
+            # these read as a stepper ("EEA", "Work Orders"), not as states like
+            # the food chips. "Ordered" as a label was confusing: the chip is the
+            # node, and whether it is green is the answer.
+            #
+            # `detail` carries the state for the tooltip, so the glance stays clean
+            # while the specifics are still one hover away rather than only on the
+            # Programs tab.
+            "assessment_order": {
+                "value": ao_val, "label": "EEA" if ao_lbl else "", "detail": ao_lbl,
+            },
+            "work_orders": {
+                "value": wo_val,
+                "label": "Work Orders" if wo_lbl else "", "detail": wo_lbl,
+            },
+            # Unlike the two above, this chip's LABEL IS the state: it answers
+            # "where does housing stand overall" rather than marking a waypoint.
+            "housing_overall": {
+                "value": ov_val,
+                "label": {
+                    "open": "Open", "expired": "Expired",
+                    "completed": "Completed", "closed": "Closed",
+                    "out_of_range": "Out of Range",
+                }.get(ov_val, ""),
+                "detail": ov_lbl,
+            },
         })
     # Governing first, then FOOD before other types -- food is the primary
     # service and should lead the bar -- then by service-type label + case id (a

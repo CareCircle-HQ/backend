@@ -24,6 +24,8 @@ from api.services.lifecycle import (
 )
 
 from ..models import (
+    BillableItem,
+    BillingSettings,
     Vendor,
     VendorUser,
     ActiveProgram,
@@ -2140,13 +2142,17 @@ class PortalActiveProgramSerializer(serializers.ModelSerializer):
             "case_type_label",
             "service_type",
             "service_type_label",
+            # DECODED from the programme name by migration 0282, not typed. Read
+            # only: editing it here would let it disagree with the name it came
+            # from, and the name is what Unite Us sends us.
+            "borough",
             "is_for_household",
             "to_extend",
             "updated_at",
         ]
         read_only_fields = [
             "id", "case_type_label", "service_type_label", "is_for_household",
-            "updated_at",
+            "updated_at", "borough",
         ]
 
 
@@ -3002,9 +3008,23 @@ class PortalVendorSerializer(serializers.ModelSerializer):
         fields = [
             "vendor_id", "name", "contact_name", "contact_email", "contact_phone",
             "address", "website", "notes", "is_active", "created_at",
+            # NULL means "use the house rate", which is not the same as 0. Writable
+            # here so the Vendors list can set it without a second endpoint.
+            "admin_fee_percent",
             "users", "admin_user", "open_order_count",
         ]
         read_only_fields = ["vendor_id", "created_at"]
+
+    def validate_admin_fee_percent(self, value):
+        # None is legitimate: it clears the override and returns the vendor to the
+        # house rate. 0 is also legitimate -- billing at cost.
+        if value is None:
+            return None
+        if value < 0 or value > 100:
+            raise serializers.ValidationError(
+                "The admin fee must be between 0 and 100 percent.",
+            )
+        return value
 
     def get_admin_user(self, obj):
         admin = next((u for u in obj.users.all() if u.is_admin), None)
@@ -3037,3 +3057,55 @@ def _can_create_assessment_order(client):
         ).exists()
     except Exception:  # noqa: BLE001 - a button must never break the profile
         return False
+
+
+class BillableItemSerializer(serializers.ModelSerializer):
+    """A price-list row, with the derived billed price.
+
+    ``admin_fee`` and ``billed_price`` are READ-ONLY and computed from the current
+    admin-fee setting. Storing them would leave stale totals behind the moment
+    anyone changed the fee -- and an invoice, when it exists, will need to snapshot
+    them for the opposite reason: a bill already sent must not move.
+    """
+
+    admin_fee = serializers.SerializerMethodField()
+    billed_price = serializers.SerializerMethodField()
+    admin_fee_percent = serializers.SerializerMethodField()
+
+    class Meta:
+        model = BillableItem
+        fields = [
+            "billable_item_id", "item", "option_code", "billing_category",
+            "main_category", "hcpcs_code", "modifiers", "vendor_price",
+            "admin_fee", "admin_fee_percent", "billed_price",
+            "sort_order", "is_active", "updated_at",
+        ]
+        # Only the price and the active flag are editable. The item, its category
+        # and its billing codes come from the waiver's own sheet; an agent editing
+        # those would silently break the join to the assessment form's
+        # intervention options.
+        read_only_fields = [
+            "billable_item_id", "item", "option_code", "billing_category",
+            "main_category", "hcpcs_code", "modifiers", "updated_at",
+        ]
+
+    def _percent(self):
+        if not hasattr(self, "_cached_percent"):
+            # Read ONCE per serialization rather than per row: the fee is a
+            # singleton, and 27 rows would otherwise be 27 identical queries.
+            self._cached_percent = BillingSettings.get().admin_fee_percent
+        return self._cached_percent
+
+    def get_admin_fee_percent(self, obj):
+        return str(self._percent())
+
+    def get_admin_fee(self, obj):
+        return str(obj.admin_fee(self._percent()))
+
+    def get_billed_price(self, obj):
+        return str(obj.billed_price(self._percent()))
+
+    def validate_vendor_price(self, value):
+        if value is None or value < 0:
+            raise serializers.ValidationError("A price cannot be negative.")
+        return value

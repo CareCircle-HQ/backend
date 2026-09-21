@@ -552,12 +552,111 @@ class VendorViewSet(viewsets.ModelViewSet):
         payload["password_was_supplied"] = bool(supplied)
         return Response(payload, status=http.HTTP_201_CREATED)
 
+    @action(detail=True, methods=["get", "patch"], url_path="pricing")
+    def pricing(self, request, pk=None):
+        """This vendor's price list, resolved against the base.
+
+        GET returns EVERY billable item with the price in force for this vendor and
+        whether it was negotiated or inherited -- so the table shows the full
+        catalogue rather than only what someone has already touched.
+
+        PATCH sets or clears ONE item's price:
+
+            {"billable_item_id": "...", "price": "480.00"}   set an override
+            {"billable_item_id": "...", "price": null}       fall back to the base
+
+        Clearing is a real operation, not a matter of typing the base price back in:
+        a row that happens to equal the base still means "negotiated", and the
+        distinction is what makes the list readable.
+        """
+        from decimal import Decimal, InvalidOperation
+
+        from ..models import BillableItem, VendorPrice
+        from ..services import pricing
+
+        vendor = self.get_object()
+
+        if request.method.lower() == "patch":
+            item_id = (request.data.get("billable_item_id") or "").strip()
+            item = BillableItem.objects.filter(pk=item_id).first() if item_id else None
+            if item is None:
+                return Response(
+                    {"error": "billable_item_id is required and must exist."},
+                    status=http.HTTP_400_BAD_REQUEST,
+                )
+
+            raw = request.data.get("price", "__missing__")
+            agent = current_agent(request)
+            agent_obj = agent if isinstance(agent, Agent) else None
+
+            if raw is None:
+                deleted, _ = VendorPrice.objects.filter(
+                    vendor=vendor, billable_item=item,
+                ).delete()
+                if deleted:
+                    logger.warning(
+                        "vendor pricing: %s CLEARED %s for %s (back to base %s)",
+                        getattr(agent, "name", "?"), item.item, vendor.name,
+                        item.vendor_price,
+                    )
+            else:
+                try:
+                    price = Decimal(str(raw))
+                except (InvalidOperation, TypeError):
+                    return Response(
+                        {"error": "price must be a number, or null to clear it."},
+                        status=http.HTTP_400_BAD_REQUEST,
+                    )
+                if price < 0:
+                    return Response(
+                        {"error": "A price cannot be negative."},
+                        status=http.HTTP_400_BAD_REQUEST,
+                    )
+                existing = VendorPrice.objects.filter(
+                    vendor=vendor, billable_item=item,
+                ).first()
+                before = existing.price if existing else None
+                VendorPrice.objects.update_or_create(
+                    vendor=vendor, billable_item=item,
+                    defaults={
+                        "price": price,
+                        "note": (request.data.get("note") or "").strip(),
+                        "updated_by": agent_obj,
+                    },
+                )
+                # Money, so the old value is recorded -- "what did we agree before?"
+                # is the first question about a disputed invoice.
+                logger.warning(
+                    "vendor pricing: %s set %s for %s to %s (was %s)",
+                    getattr(agent, "name", "?"), item.item, vendor.name, price,
+                    before if before is not None else f"base {item.vendor_price}",
+                )
+
+        return Response({
+            "vendor": {
+                "vendor_id": str(vendor.vendor_id),
+                "name": vendor.name,
+                # NULL means inherit; the effective value is on each row.
+                "admin_fee_percent": (
+                    str(vendor.admin_fee_percent)
+                    if vendor.admin_fee_percent is not None else None
+                ),
+                "default_admin_fee_percent": str(pricing.default_fee_percent()),
+            },
+            "items": pricing.price_list_for(vendor),
+        })
+
     @action(detail=True, methods=["post"], url_path="reset-admin-password")
     def reset_admin_password(self, request, pk=None):
-        """Issue a new temporary password for the vendor's admin user.
+        """Reset the vendor admin's password.
 
-        Returned once. This is a privileged action on an EXTERNAL account, so it is
-        recorded -- who reset it and when.
+        An agent may SUPPLY one -- they are usually reading it down the phone --
+        or leave it blank to have one generated. Same rule as provisioning, which
+        is the point: being able to type a password when creating an account but
+        not when resetting it is a surprise with no reason behind it.
+
+        A privileged action on an EXTERNAL account, so it is recorded: who reset
+        it and when.
         """
         vendor = self.get_object()
         admin = vendor.users.filter(is_admin=True).first()
@@ -570,16 +669,30 @@ class VendorViewSet(viewsets.ModelViewSet):
         from django.contrib.auth.hashers import make_password
         from django.utils.crypto import get_random_string
 
-        temp_password = get_random_string(14)
+        supplied = (request.data.get("password") or "").strip()
+        if supplied and len(supplied) < 8:
+            return Response(
+                {"error": "Password must be at least 8 characters."},
+                status=http.HTTP_400_BAD_REQUEST,
+            )
+        temp_password = supplied or get_random_string(14)
         admin.password = make_password(temp_password)
         admin.save(update_fields=["password", "updated_at"])
         _log_vendor_action(
-            request, vendor, "admin password reset", {"email": admin.email},
+            request, vendor, "admin password reset", {
+                "email": admin.email,
+                # Whether it was chosen or generated, never the value itself.
+                "supplied": bool(supplied),
+            },
         )
         return Response({
             "vendor_user_id": str(admin.vendor_user_id),
             "email": admin.email,
-            "temporary_password": temp_password,
+            # Echoed only when WE generated it. An agent who typed the password
+            # already has it, and repeating it back puts a secret they chose into
+            # a response body and any log that captures one.
+            "temporary_password": "" if supplied else temp_password,
+            "password_was_supplied": bool(supplied),
         })
 
 
@@ -598,3 +711,84 @@ def _log_vendor_action(request, vendor, what, extra=None):
         getattr(agent, "name", "?"), getattr(agent, "agent_code", "?"),
         extra or {},
     )
+
+
+class BillableItemViewSet(viewsets.ModelViewSet):
+    """Settings > Pricing: the housing price list.
+
+    ``vendor_price`` is what we RECOMMEND a vendor charge us; the billed price is
+    that plus the adjustable admin fee, and is DERIVED on every read rather than
+    stored -- so changing the fee reprices the whole list at once, which is what
+    makes it adjustable in any useful sense.
+
+    Per-vendor pricing comes later. This is the base every vendor starts from.
+    """
+
+    serializer_class = s.BillableItemSerializer
+    permission_classes = [IsPortalAgent]
+
+    def get_queryset(self):
+        from ..models import BillableItem
+
+        qs = BillableItem.objects.all()
+        if (self.request.query_params.get("active_only") or "").lower() in (
+            "1", "true", "yes",
+        ):
+            qs = qs.filter(is_active=True)
+        return qs
+
+    def perform_update(self, serializer):
+        from ..models import BillableItem
+
+        before = BillableItem.objects.get(pk=serializer.instance.pk)
+        item = serializer.save()
+        # A price change is a money change, so it is recorded with the old value.
+        # "What did we charge before?" is the first question anyone asks about a
+        # disputed invoice.
+        if before.vendor_price != item.vendor_price:
+            agent = current_agent(self.request)
+            logger.warning(
+                "pricing: %s changed %s from %s to %s | agent=%s",
+                "agent", item.item, before.vendor_price, item.vendor_price,
+                getattr(agent, "name", "?"),
+            )
+
+    @action(detail=False, methods=["get", "patch"], url_path="billing-settings")
+    def billing_settings(self, request):
+        """The admin fee, as a percentage. One row, so no id in the path."""
+        from decimal import Decimal, InvalidOperation
+
+        from ..models import BillingSettings
+
+        settings_row = BillingSettings.get()
+        if request.method.lower() == "patch":
+            raw = request.data.get("admin_fee_percent")
+            try:
+                pct = Decimal(str(raw))
+            except (InvalidOperation, TypeError):
+                return Response(
+                    {"error": "admin_fee_percent must be a number."},
+                    status=http.HTTP_400_BAD_REQUEST,
+                )
+            # 0 is legitimate -- billing at cost. Above 100 is not: it would mean
+            # charging more than double, which is a typo rather than a policy.
+            if pct < 0 or pct > 100:
+                return Response(
+                    {"error": "The admin fee must be between 0 and 100 percent."},
+                    status=http.HTTP_400_BAD_REQUEST,
+                )
+            if settings_row.admin_fee_percent != pct:
+                logger.warning(
+                    "pricing: admin fee changed from %s%% to %s%% | agent=%s",
+                    settings_row.admin_fee_percent, pct,
+                    getattr(current_agent(request), "name", "?"),
+                )
+                settings_row.admin_fee_percent = pct
+                settings_row.updated_by = current_agent(request) if isinstance(
+                    current_agent(request), Agent,
+                ) else None
+                settings_row.save()
+        return Response({
+            "admin_fee_percent": str(settings_row.admin_fee_percent),
+            "updated_at": settings_row.updated_at,
+        })

@@ -23,6 +23,7 @@ from ..models import (
     StageEventSource, Vendor,
 )
 from ..services import dispatch as dispatch_svc
+from ..services import service_area
 from .base import PortalAPIView, current_agent
 
 logger = logging.getLogger(__name__)
@@ -100,6 +101,14 @@ def _serialize_order(order):
         # pastes it into Unite Us and a truncated one cannot be searched with. The
         # labelled dwellings are exposed too: "primary" is this case, and a
         # "secondary" appears when the member is reassessed at another address.
+        # DERIVED from the client rather than stored on the order. A snapshot would
+        # be a second copy of the member's name that can drift from the record, and
+        # the PDF is rendered server-side from the client anyway -- so there is
+        # nothing a stored copy would make correct that this does not.
+        "member_name": (
+            f"{(order.client.first_name or '').strip()} "
+            f"{(order.client.last_name or '').strip()}"
+        ).strip(),
         "dwelling_case_id": str(order.case_id) if order.case_id else "",
         "dwellings": order.dwellings or {},
         # The ORDER's own authorization -- the Dwelling Assessment case's window.
@@ -108,6 +117,11 @@ def _serialize_order(order):
         # any individual item says. Uses effective_authorization_window() so it
         # inherits the request-window fallback.
         "authorization": _authorization_block(order.case if order.case_id else None),
+        # Whether we serve this dwelling, and which borough it is in. Derived from
+        # the ZIP on every read rather than stored: a ZIP removed from the service
+        # table means we no longer serve there, and an order holding its old answer
+        # would send a vendor somewhere we cannot bill for.
+        "service_area": service_area.order_service_area(order),
         # The ITEMS. On an assessment these are every item found; on a work order,
         # the ones that work order covers. An item is not a status -- it is a thing
         # to install -- so it carries its case's AUTHORIZATION rather than a
@@ -758,56 +772,75 @@ class MemberAssessmentFormView(PortalAPIView):
             schema = build_schema(modules_for_referral(order.referral_type))
             answers, others, chosen = {}, {}, {}
 
-        modules = []
-        for module in schema.get("modules", []):
-            sections = []
-            for section in module["sections"]:
-                sections.append({
-                    "code": section["code"],
-                    "title": section["title"],
-                    "allows_other": section.get("allows_other", False),
-                    "other": others.get(section["code"], ""),
-                    "groups": [
-                        {
-                            "code": g["code"],
-                            "label": g["label"],
-                            "questions": [
-                                {
-                                    "code": q["code"],
-                                    "label": q["label"],
-                                    "checked": bool(answers.get(q["code"])),
-                                }
-                                for q in g["questions"]
-                            ],
-                        }
-                        for g in section["groups"]
-                    ],
-                })
-            groups = []
-            for g in module["intervention_groups"]:
-                groups.append({
-                    "code": g["code"],
-                    "label": g["label"],
-                    "program_item": g.get("program_item") or "",
-                    "options": [
-                        {
-                            "code": o["code"],
-                            "label": o["label"],
-                            # qty 0 renders as "Not added", matching the vendor's
-                            # own form rather than hiding unchosen options -- the
-                            # full catalogue is what shows an agent what COULD have
-                            # been recommended.
-                            "qty": chosen.get(o["code"], 0),
-                        }
-                        for o in g["options"]
-                    ],
-                })
-            modules.append({
-                "code": module["code"],
-                "label": module["label"],
-                "service_code": module["service_code"],
-                "sections": sections,
-                "intervention_groups": groups,
+        # ONE form now, not a list of modules. Combined is its own document
+        # rather than the two others concatenated, so the response mirrors that.
+        sections = []
+        for section in schema.get("sections", []):
+            sections.append({
+                "code": section["code"],
+                "title": section["title"],
+                "allows_other": section.get("allows_other", False),
+                "other": others.get(section["code"], ""),
+                "groups": [
+                    {
+                        "code": g["code"],
+                        "label": g["label"],
+                        # What the group points at, so the CRM can show WHY a
+                        # category of products was offered -- and which sections
+                        # owed a photo.
+                        "category": g.get("category") or "",
+                        "requires_photo": bool(g.get("requires_photo")),
+                        "questions": [
+                            {
+                                "code": q["code"],
+                                "label": q["label"],
+                                "checked": bool(answers.get(q["code"])),
+                            }
+                            for q in g["questions"]
+                        ],
+                    }
+                    for g in section["groups"]
+                ],
+            })
+
+        photos_by_group = {}
+        for proof in order.proofs.all():
+            photos_by_group.setdefault(proof.intervention_group or "", 0)
+            photos_by_group[proof.intervention_group or ""] += 1
+
+        # Resolved ONCE for the whole catalogue rather than per row: every option
+        # needs the same programme table and the same borough.
+        from ..services import case_recommendations as recs
+        from ..services import pricing
+
+        borough = recs.member_borough(client, order)
+        programmes = recs.programme_index()
+        already = recs.existing_case_index(client)
+        prices = {
+            r["option_code"]: r
+            for r in pricing.price_list_for(order.vendor) if r["option_code"]
+        } if order.vendor_id else {}
+
+        categories = []
+        for category in schema.get("categories", []):
+            categories.append({
+                "code": category["code"],
+                "label": category["label"],
+                "groups": [
+                    {
+                        "code": g["code"],
+                        "label": g["label"],
+                        "program_item": g.get("program_item") or "",
+                        "options": [
+                            _assessment_line(
+                                o, chosen.get(o["code"], 0), borough,
+                                prices.get(o["code"]), programmes, already,
+                            )
+                            for o in g["options"]
+                        ],
+                    }
+                    for g in category["groups"]
+                ],
             })
 
         active = dispatch_svc.active_submission(order)
@@ -819,7 +852,14 @@ class MemberAssessmentFormView(PortalAPIView):
             "template_version": (
                 form.template_version if form else schema.get("version")
             ),
-            "modules": modules,
+            "form": schema.get("form") or "",
+            "form_label": schema.get("label") or "",
+            "service_code": schema.get("service_code") or "",
+            "sections": sections,
+            "categories": categories,
+            # Photos by the SECTION they evidence, so the CRM can show the
+            # assessment's evidence against the findings rather than as a pile.
+            "photos_by_group": photos_by_group,
             "justification": form.justification if form else "",
             "assessor_notes": form.assessor_notes if form else "",
             # The wrapper the form shares across modules: photos and the two
@@ -832,3 +872,105 @@ class MemberAssessmentFormView(PortalAPIView):
                 for sig in (active.signatures.all() if active else [])
             ],
         })
+
+
+class MemberCaseRecommendationsView(PortalAPIView):
+    """GET: the Unite Us cases to open after the vendor's assessment.
+
+    MANY PRODUCTS COLLAPSE INTO ONE CASE. Four grab bars are not four cases; they
+    are one "Grab Bars - <borough>" case with four items on it. Opening one per
+    product would create duplicates in Unite Us.
+
+    Read-only, and deliberately so: a case is opened in Unite Us, and the CRM only
+    learns about it on the next import. This tells an agent what to create.
+    """
+
+    def get(self, request, client_id):
+        from ..models import DispatchQuestionnaire
+        from ..services import case_recommendations as recs
+
+        client = get_object_or_404(Client, pk=client_id)
+        order = dispatch_svc.assessment_order_for(client)
+        if order is None:
+            return Response({
+                "state": "no_order", "borough": "", "cases": [],
+                "detail": "This member has no assessment order.",
+            })
+
+        form = DispatchQuestionnaire.objects.filter(dispatch_order=order).first()
+        if form is None or not form.is_submitted:
+            # Reported rather than 404'd: "the vendor has not submitted yet" is the
+            # answer to the question, not an error.
+            return Response({
+                "state": form.state if form else "not_started",
+                "borough": recs.member_borough(client),
+                "cases": [],
+                "detail": "The vendor has not submitted the assessment yet.",
+            })
+
+        cases = recs.recommended_cases(form)
+        return Response({
+            "state": "submitted",
+            "submitted_at": form.submitted_at,
+            "borough": recs.member_borough(client, order),
+            "service_area": service_area.order_service_area(order),
+            # Reported when the dwelling's ZIP and the governing case disagree: a
+            # member who has moved needs cases in the NEW borough, but an agent
+            # should be told the records differ rather than find out on an invoice.
+            "borough_conflict": recs.borough_conflict(client, order),
+            "cases": cases,
+            # Counted here so the UI does not have to re-derive the rules it is
+            # about to explain.
+            "summary": {
+                "cases": len(cases),
+                "products": sum(len(c["products"]) for c in cases),
+                "blocked": sum(
+                    1 for c in cases if not (c["exists"] and c["is_internal"])
+                ),
+                "already_open": sum(1 for c in cases if c["already_open"]),
+            },
+        })
+
+
+def _assessment_line(option, qty, borough, price_row, programmes, already):
+    """One line of the recommended-interventions table: a quote line plus the case.
+
+    Reads like an invoice because that is what it becomes -- product, quantity,
+    unit price, line total -- with the Unite Us case an agent must open beside it.
+    Many products share one case (every grab bar is one "Grab Bars" case), which is
+    the point: the same case shows against each line and the agent opens it once.
+
+    qty 0 still renders, because the full catalogue is what shows an agent what
+    COULD have been recommended rather than only what was.
+    """
+    from decimal import Decimal
+
+    from ..services import case_recommendations as recs
+
+    case = recs.case_for_option(
+        option["code"], borough, programmes=programmes, existing=already,
+    )
+    unit = Decimal(price_row["price"]) if price_row else None
+    return {
+        "code": option["code"],
+        "label": option["label"],
+        "qty": qty,
+        "unit_price": str(unit) if unit is not None else None,
+        "line_total": str(unit * qty) if unit is not None and qty else None,
+        # What we would bill Unite Us for this line. CRM only -- the vendor's own
+        # screen never shows the fee or the billed price.
+        "billed_total": (
+            str(
+                (unit * qty)
+                + pricing_admin_fee(unit * qty, price_row["admin_fee_percent"])
+            )
+            if unit is not None and qty else None
+        ),
+        "case": case,
+    }
+
+
+def pricing_admin_fee(amount, percent):
+    from ..services import pricing
+
+    return pricing.admin_fee(amount, percent)

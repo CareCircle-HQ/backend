@@ -25,6 +25,20 @@ logger = logging.getLogger(__name__)
 
 _INTERNAL_SERVICE = "internal_service"
 
+# The Data page's domain selector. Housing has no rows in this read model yet --
+# see the note in filter_analytics.
+FOOD_DOMAIN = "food"
+HOUSING_DOMAIN = "housing"
+
+
+def domain_is_available(domain):
+    """Whether this read model can answer for a domain at all.
+
+    Exposed so the page can say "not yet" instead of rendering an empty table,
+    which is indistinguishable from a filter combination that matches nothing.
+    """
+    return (domain or FOOD_DOMAIN).lower() != HOUSING_DOMAIN
+
 # Data page Team filter sentinel for the "No Team / Unassigned" bucket (blank
 # team). The frontend sends this value; filter_analytics maps it to team="".
 UNASSIGNED_TEAM = "__unassigned__"
@@ -940,6 +954,25 @@ def filter_analytics(params):
 
     qs = EnrollmentAnalytics.objects.all()
     g = lambda k: (params.get(k) or "").strip()  # noqa: E731
+
+    # ── domain: food or housing ──────────────────────────────────────────────
+    # Every filter on this page was built for FOOD, before housing existed, and
+    # this read model is food-only BY CONSTRUCTION rather than by omission: each
+    # row hangs off serializers.internal_service_case, which is documented FOOD
+    # ONLY because a freshly approved housing assessment would otherwise outrank
+    # an older approved meals case and take over the member's food service.
+    #
+    # So:
+    #   food (default)  the whole read model, exactly as before. NOT filtered to
+    #                   service_type in (meals, boxes) -- that would drop the
+    #                   53,875 rows for members with no governing food case, who
+    #                   are most of the page.
+    #   housing         nothing, yet. Answered honestly with an empty queryset and
+    #                   a flag the page can explain, rather than filtering on a
+    #                   column that would silently match nothing and look broken.
+    domain = (g("domain") or FOOD_DOMAIN).lower()
+    if domain == HOUSING_DOMAIN:
+        qs = qs.none()
 
     search = g("search")
     if search:

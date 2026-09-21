@@ -1,5 +1,6 @@
 import secrets
 import uuid
+from decimal import Decimal
 from datetime import timedelta
 
 from django.conf import settings
@@ -3333,6 +3334,12 @@ class ActiveProgram(models.Model):
     # for internal-service "Reauthorization: ..." programs by data migration.
     # ``db_default`` guards against an omitted-column insert during a deploy window
     # (see Case.is_extension).
+    # DECODED from the programme name, whose last part is the borough
+    # ("Home Remediation - Air Conditioner - Queens"). Stored rather than parsed on
+    # every read so it can be filtered and grouped in SQL -- and backfilled by
+    # migration, so it cannot drift from the name it came from without someone
+    # editing the name.
+    borough = models.CharField(max_length=40, blank=True, db_index=True)
     to_extend = models.BooleanField(default=False, db_default=False)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -4760,6 +4767,19 @@ class PurchaseOrder(models.Model):
         return f"PO {self.purchase_order_id} ({self.get_status_display()})"
 
 
+class DeliveryStatusSource(models.TextChoices):
+    """How a delivery's outcome reached us.
+
+    Worth recording because the two channels have different reliability: a CSV is a
+    file someone uploaded, possibly days late and possibly the wrong week, while the
+    API is the courier's own system reporting as it happens. "Where did this status
+    come from?" is the first question when a delivery looks wrong.
+    """
+
+    CSV = "csv", "CSV import"
+    API = "api", "Partner API"
+
+
 class DeliveryOrder(models.Model):
     """A single member's delivery within a PurchaseOrder."""
 
@@ -4815,6 +4835,28 @@ class DeliveryOrder(models.Model):
     )
     # True when ``kitchen`` differs from ``default_kitchen`` (load-balanced to a
     # different capable kitchen for this delivery).
+    # Where the CURRENT status came from. Set alongside the status itself, so a
+    # delivery whose outcome arrived by CSV can be told from one the courier's API
+    # reported -- including for a status-only report that carries no photo, which a
+    # field on the proof could never answer.
+    status_source = models.CharField(
+        max_length=8, choices=DeliveryStatusSource.choices, blank=True,
+    )
+
+    # WHO DELIVERED IT, BY WHICH ROUTE, AND WHAT THEY SAID.
+    #
+    # These live here as well as on DeliveryOrderProof, and that duplication is the
+    # fix for a real defect rather than an oversight: they were proof-ONLY fields,
+    # and a proof row exists only when a photo does. A report with no photos --
+    # which is most of them; one real USP file updated 184 orders and created ZERO
+    # proofs -- parsed the driver and route and then discarded both.
+    #
+    # They are facts about the DELIVERY, not about a photograph of it, so the order
+    # is where they belong. The proof keeps its own copies, because a specific photo
+    # can legitimately come from a different driver on a redelivery.
+    delivery_driver = models.CharField(max_length=255, blank=True)
+    delivery_route = models.CharField(max_length=255, blank=True)
+    delivery_note = models.TextField(blank=True)
     rerouted = models.BooleanField(default=False)
     menu_type = models.ForeignKey(
         MenuType,
@@ -4894,6 +4936,12 @@ class DeliveryOrderProof(models.Model):
     delivered_at = models.DateTimeField(null=True, blank=True)
     # The source report filename / import identifier this image came from.
     source_report = models.CharField(max_length=255, blank=True)
+    # Which channel delivered this proof. source_report names the FILE for a CSV;
+    # this names the CHANNEL, which is the part that is comparable across the two.
+    status_source = models.CharField(
+        max_length=8, choices=DeliveryStatusSource.choices, blank=True,
+        db_index=True,
+    )
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
@@ -5375,6 +5423,13 @@ class Vendor(models.Model):
     contact_phone = models.CharField(max_length=40, blank=True)
     address = models.CharField(max_length=255, blank=True)
     website = models.URLField(max_length=255, blank=True)
+    # The mark-up we add to THIS vendor's prices when billing Unite Us. NULL means
+    # "use the global default" rather than 0 -- so a vendor nobody has set a fee for
+    # inherits the house rate, and changing that rate moves them with it. Storing a
+    # copy of the default would leave every vendor stale the day it changed.
+    admin_fee_percent = models.DecimalField(
+        max_digits=5, decimal_places=2, null=True, blank=True,
+    )
     notes = models.TextField(blank=True)
     is_active = models.BooleanField(default=True, db_index=True)
     created_at = models.DateTimeField(auto_now_add=True)
@@ -5650,10 +5705,28 @@ class DispatchOrder(models.Model):
         number to ring -- which is exactly what the first live vendor-API call
         showed.
         """
-        source = self
-        if self.kind == DispatchKind.REMEDIATION and self.parent_id:
-            source = self.parent
+        source = self._contact_source()
         return source.contact_phone, source.contact_phone_type, source.address_notes
+
+    def _contact_source(self):
+        """The order the member's contact details and consent actually live on."""
+        if self.kind == DispatchKind.REMEDIATION and self.parent_id:
+            return self.parent
+        return self
+
+    @property
+    def service_consent(self):
+        """``(consent_to_call, consent_to_text)`` for messaging about this order.
+
+        INHERITED by a work order for the same reason as the phone number: the
+        wizard records consent once, on the assessment, so a work order's own flags
+        are always False. Without this, every text about an installation was
+        blocked as "no consent" while the member had in fact consented -- which is
+        what the first end-to-end reminder run showed, two messages blocked with the
+        member's consent sitting on the parent order.
+        """
+        source = self._contact_source()
+        return source.consent_to_call, source.consent_to_text
 
 
 class DispatchItem(models.Model):
@@ -5872,6 +5945,17 @@ class DispatchProof(models.Model):
     s3_key = models.CharField(max_length=500)
     file_url = models.URLField(max_length=1000, blank=True)
     content_hash = models.CharField(max_length=64, db_index=True)
+    # Which identified problem this photo evidences: an intervention GROUP code
+    # ("grab_bars", "air_filtration"). Blank means a general photo of the dwelling.
+    #
+    # The group, not the question. Three separate questions point at grab bars, and
+    # a photo per question would ask for the same photo three times; the problem
+    # being evidenced is "no grab bars", however many questions surfaced it.
+    #
+    # A plain code rather than a FK: it names a row in the form TEMPLATE, which is
+    # versioned data rather than a table, and a submitted form keeps its own frozen
+    # copy of that template.
+    intervention_group = models.CharField(max_length=40, blank=True, db_index=True)
     caption = models.CharField(max_length=255, blank=True)
     # Device time vs server time. The vendor signs at 14:02 in a basement and syncs
     # at 18:30; the device clock is UNTRUSTED, so both are kept.
@@ -5917,6 +6001,336 @@ class DispatchDocument(models.Model):
 
     def __str__(self):
         return self.filename or f"Document {self.content_hash[:12]}"
+
+
+class BillableItem(models.Model):
+    """The price list: what a vendor charges us, and what we bill Unite Us.
+
+    Transcribed from Simplified_Billable_Items_Pricing. Every one of the 26
+    physical items matches an intervention option in
+    ``api/services/assessment_forms.py`` EXACTLY, in both directions -- the pricing
+    sheet and the assessment form are the same catalogue seen from two angles. So
+    ``option_code`` is a real join rather than a label match: it is what lets a
+    recommended intervention become a priced line.
+
+    ``billing_category`` is the housing programme item ("Grab Bars"), which is also
+    the intervention GROUP on the form. ``main_category`` is the sheet's own
+    grouping (Bathroom, Air Quality...) and exists for display order only.
+
+    THE BILLED PRICE IS NOT STORED. It is ``vendor_price`` plus the admin fee, and
+    the fee is adjustable -- so storing the total would leave stale numbers behind
+    the moment anyone changed it. An INVOICE will need to snapshot both, because a
+    bill already sent must not move; that belongs with the invoicing work.
+    """
+
+    billable_item_id = models.UUIDField(
+        primary_key=True, default=uuid.uuid4, editable=False
+    )
+    # "Shower chair". The form's option label.
+    item = models.CharField(max_length=120)
+    # The intervention option this prices, e.g. "shower_chair". Blank only for a
+    # priced line that is not an installable item -- the dwelling assessment
+    # itself.
+    option_code = models.CharField(max_length=60, blank=True, db_index=True)
+    # "Grab Bars" -- the housing programme item, and the form's group label.
+    billing_category = models.CharField(max_length=120, db_index=True)
+    # The sheet's own section: Bathroom / Air Quality / Temperature Control...
+    main_category = models.CharField(max_length=120, blank=True)
+
+    # HCPCS code and modifiers, from the 1115 waiver's billing rules. Every row is
+    # S5165 today; kept per row because that is a billing fact, not a constant we
+    # should bake in.
+    hcpcs_code = models.CharField(max_length=20, blank=True)
+    modifiers = models.CharField(max_length=40, blank=True)
+
+    # What we RECOMMEND the vendor charge us. Per-vendor pricing comes later; this
+    # is the base every vendor starts from.
+    vendor_price = models.DecimalField(max_digits=10, decimal_places=2)
+
+    sort_order = models.PositiveIntegerField(default=0)
+    is_active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["sort_order", "billing_category", "item"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["item", "billing_category"],
+                name="uniq_billable_item_per_category",
+            ),
+        ]
+        indexes = [models.Index(fields=["is_active", "billing_category"])]
+
+    def __str__(self):
+        return f"{self.item} ({self.billing_category}) ${self.vendor_price}"
+
+    def admin_fee(self, percent=None):
+        """The mark-up, rounded to the cent."""
+        from decimal import ROUND_HALF_UP, Decimal
+
+        pct = BillingSettings.get().admin_fee_percent if percent is None else percent
+        raw = self.vendor_price * (Decimal(pct) / Decimal("100"))
+        return raw.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+    def billed_price(self, percent=None):
+        """What we bill Unite Us: the vendor price plus the admin fee."""
+        return self.vendor_price + self.admin_fee(percent)
+
+
+class BillingSettings(models.Model):
+    """Singleton settings for housing billing.
+
+    A row rather than a Django setting, because the operator has to be able to
+    change the admin fee from the CRM without a deploy -- which is the whole point
+    of "make the 10% adjustable".
+    """
+
+    singleton_id = models.PositiveSmallIntegerField(primary_key=True, default=1)
+    # The mark-up on a vendor's price, as a percentage. 10% today.
+    admin_fee_percent = models.DecimalField(
+        max_digits=5, decimal_places=2, default=Decimal("10.00"),
+    )
+    # The most a vendor may recommend on one assessment, INCLUDING the assessment's
+    # own fee. Unite Us authorises up to $10,000 for this service and our admin fee
+    # comes out of that, leaving $9,000 of vendor spend.
+    #
+    # Stored rather than derived from admin_fee_percent, because the two are not the
+    # same arithmetic: 10% treated as a SHARE of the $10,000 gives $9,000 (billing
+    # $9,900), while 10% as a MARKUP on the vendor price would allow $9,090.91
+    # (billing exactly $10,000). $9,000 is the figure the business states and it is
+    # the conservative one; deriving it would quietly change the cap whenever
+    # somebody edited the fee.
+    vendor_spend_cap = models.DecimalField(
+        max_digits=10, decimal_places=2, default=Decimal("9000.00"),
+    )
+    updated_at = models.DateTimeField(auto_now=True)
+    updated_by = models.ForeignKey(
+        "Agent", on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="billing_settings_updates",
+    )
+
+    class Meta:
+        verbose_name_plural = "Billing settings"
+
+    def __str__(self):
+        return f"Admin fee {self.admin_fee_percent}%"
+
+    def save(self, *args, **kwargs):
+        # One row, always. A second would make "what is the fee?" ambiguous.
+        self.singleton_id = 1
+        super().save(*args, **kwargs)
+
+    @classmethod
+    def get(cls):
+        obj, _created = cls.objects.get_or_create(singleton_id=1)
+        return obj
+
+
+class VendorPrice(models.Model):
+    """One vendor's price for one billable item -- an OVERRIDE, not a copy.
+
+    Absent means "use the base price". That is deliberately not the same as copying
+    all 27 rows to every vendor:
+
+    * a new item added to the base list is immediately available to every vendor,
+      rather than needing 27 inserts per vendor and being silently missing until
+      someone remembers;
+    * changing a base price updates every vendor who has not negotiated their own;
+    * "which prices did we actually agree with this vendor?" is answerable by
+      looking at which rows exist.
+
+    THE INVOICE MUST SNAPSHOT THIS. A bill already sent must not move when a price
+    is renegotiated, so an invoice line will store the price and fee it used rather
+    than pointing here. This table is what the NEXT invoice will be built from.
+    """
+
+    vendor_price_id = models.UUIDField(
+        primary_key=True, default=uuid.uuid4, editable=False
+    )
+    vendor = models.ForeignKey(
+        "Vendor", on_delete=models.CASCADE, related_name="prices",
+    )
+    billable_item = models.ForeignKey(
+        BillableItem, on_delete=models.CASCADE, related_name="vendor_prices",
+    )
+    # What THIS vendor charges us for this item.
+    price = models.DecimalField(max_digits=10, decimal_places=2)
+    note = models.CharField(max_length=200, blank=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    updated_by = models.ForeignKey(
+        "Agent", on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="vendor_price_updates",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["billable_item__sort_order"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["vendor", "billable_item"],
+                name="uniq_vendor_price_per_item",
+            ),
+        ]
+
+    def __str__(self):
+        return f"{self.vendor_id} {self.billable_item_id} ${self.price}"
+
+
+class MessageDirection(models.TextChoices):
+    OUTBOUND = "outbound", "Outbound"
+    INBOUND = "inbound", "Inbound"
+
+
+class MessageStatus(models.TextChoices):
+    # Outbound lifecycle. QUEUED means stored but not yet handed to a provider,
+    # which is every message until Twilio is wired up.
+    QUEUED = "queued", "Queued"
+    SENT = "sent", "Sent"
+    DELIVERED = "delivered", "Delivered"
+    FAILED = "failed", "Failed"
+    # Never handed to a provider at all, and why. Kept as a real status rather
+    # than a silent no-op: "we did not text the member" is something an agent has
+    # to be able to SEE, not infer from an absence.
+    BLOCKED = "blocked", "Blocked"
+    # Inbound.
+    RECEIVED = "received", "Received"
+
+
+class MessageKind(models.TextChoices):
+    APPOINTMENT_SCHEDULED = "appointment_scheduled", "Appointment scheduled"
+    APPOINTMENT_REMINDER = "appointment_reminder", "Appointment reminder"
+    APPOINTMENT_CHANGED = "appointment_changed", "Appointment changed"
+    FREEFORM = "freeform", "Free text"
+    INBOUND_REPLY = "inbound_reply", "Inbound reply"
+
+
+class MemberMessage(models.Model):
+    """Every SMS to or from a member. One row per message, both directions.
+
+    Stored BEFORE any provider is called, and stored even when we decline to send,
+    because the requirement is a complete record of communication with the member
+    -- and a log that only contains successes cannot answer "did anyone tell her?".
+
+    Twilio is not wired up yet (see ``api/services/messaging.py``). Until it is,
+    outbound rows are created with status QUEUED and no provider id, which is
+    exactly what they will look like in the instant before a real send anyway.
+    """
+
+    message_id = models.UUIDField(
+        primary_key=True, default=uuid.uuid4, editable=False
+    )
+    # Nullable: an inbound text can arrive from a number we cannot match to a
+    # member, and dropping it would lose the one thing that might identify them.
+    client = models.ForeignKey(
+        Client, on_delete=models.CASCADE, related_name="messages",
+        null=True, blank=True,
+    )
+    direction = models.CharField(max_length=10, choices=MessageDirection.choices)
+    kind = models.CharField(
+        max_length=32, choices=MessageKind.choices, default=MessageKind.FREEFORM,
+    )
+    status = models.CharField(
+        max_length=12, choices=MessageStatus.choices,
+        default=MessageStatus.QUEUED, db_index=True,
+    )
+
+    to_number = models.CharField(max_length=32, blank=True)
+    from_number = models.CharField(max_length=32, blank=True)
+    body = models.TextField()
+
+    # What this message was ABOUT, so a member's log reads as a story rather than a
+    # pile of texts.
+    dispatch_order = models.ForeignKey(
+        "DispatchOrder", on_delete=models.SET_NULL, related_name="messages",
+        null=True, blank=True,
+    )
+
+    provider = models.CharField(max_length=20, blank=True)
+    provider_message_id = models.CharField(max_length=64, blank=True, db_index=True)
+    error_code = models.CharField(max_length=40, blank=True)
+    error_detail = models.TextField(blank=True)
+
+    # Who caused it. Both null = the system did it (a reminder). SET_NULL on both,
+    # because a message is history and must outlive the account that sent it.
+    sent_by_vendor_user = models.ForeignKey(
+        "VendorUser", on_delete=models.SET_NULL, related_name="messages_sent",
+        null=True, blank=True,
+    )
+    sent_by_agent = models.ForeignKey(
+        "Agent", on_delete=models.SET_NULL, related_name="member_messages_sent",
+        null=True, blank=True,
+    )
+
+    sent_at = models.DateTimeField(null=True, blank=True)
+    delivered_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["client", "-created_at"]),
+            models.Index(fields=["direction", "status"]),
+        ]
+
+    def __str__(self):
+        who = self.client_id or self.from_number or "unknown"
+        return f"{self.direction} {self.kind} {who}"
+
+
+class ReminderKind(models.TextChoices):
+    DAY_BEFORE = "day_before", "Day before"
+    THIRTY_MIN = "thirty_min", "30 minutes before"
+
+
+class ReminderAudience(models.TextChoices):
+    VENDOR = "vendor", "Vendor"
+    MEMBER = "member", "Member"
+
+
+class DispatchReminder(models.Model):
+    """A reminder to fire for a scheduled visit.
+
+    Rows in a table rather than a per-vendor calendar integration: the requirement
+    is "remind them the day before and 30 minutes before", and a row with a
+    ``send_at`` is something we can inspect, re-run and prove. A Google/Outlook
+    calendar would move that state somewhere we cannot query when a vendor says
+    they were never told.
+
+    ``calendar_event_ref`` on DispatchVisit stays available for a real calendar
+    integration later; these reminders do not depend on it.
+    """
+
+    reminder_id = models.UUIDField(
+        primary_key=True, default=uuid.uuid4, editable=False
+    )
+    visit = models.ForeignKey(
+        DispatchVisit, on_delete=models.CASCADE, related_name="reminders",
+    )
+    kind = models.CharField(max_length=16, choices=ReminderKind.choices)
+    audience = models.CharField(
+        max_length=10, choices=ReminderAudience.choices,
+        default=ReminderAudience.VENDOR,
+    )
+    send_at = models.DateTimeField(db_index=True)
+    sent_at = models.DateTimeField(null=True, blank=True)
+    # A reschedule cancels the unsent reminders for the old time rather than
+    # editing them, so the record shows that a reminder for the old slot existed
+    # and was stood down.
+    cancelled_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["send_at"]
+        indexes = [models.Index(fields=["send_at", "sent_at"])]
+
+    def __str__(self):
+        return f"{self.audience} {self.kind} at {self.send_at:%Y-%m-%d %H:%M}"
+
+    @property
+    def is_pending(self):
+        return self.sent_at is None and self.cancelled_at is None
 
 
 class DispatchQuestionnaireState(models.TextChoices):

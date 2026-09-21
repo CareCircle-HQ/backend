@@ -1942,9 +1942,17 @@ class MembersListView(PortalGenericAPIView):
                 # On Hold is a PROGRAM (enrollment) state -- scope to the member's
                 # GOVERNING enrollment (not "any enrollment"), so a stray On Hold
                 # enrollment alongside a newer live one doesn't misfile them.
+                #
+                # SERVICE_INACTIVE is excluded so the filter agrees with the column
+                # it filters on. serializers.verification_status shows "On Hold"
+                # only when the stage is not SERVICE_INACTIVE -- a closed programme
+                # parks the client there with the enrollment still held, and that is
+                # a finished programme rather than a manual hold. Without this,
+                # 617 of the 4,121 matches on the production snapshot came back
+                # reading "Inactive" under an On Hold filter.
                 qs = qs.annotate(_gov_stage=governing_enrollment_stage()).filter(
                     _gov_stage=EnrollmentStage.ON_HOLD
-                )
+                ).exclude(lifecycle_stage=ClientStage.SERVICE_INACTIVE)
             elif sv == "out_of_range":
                 qs = qs.filter(current_member_status_exists(MemberStatus.OUT_OF_RANGE))
             # ── Terminal axis (program / enrollment stage) ── all keyed off the
@@ -3167,11 +3175,22 @@ class DataListView(PortalGenericAPIView):
     serializer_class = s.EnrollmentAnalyticsSerializer
 
     def get(self, request):
-        from ..services.enrollment_analytics import filter_analytics
+        from ..services.enrollment_analytics import (
+            domain_is_available, filter_analytics,
+        )
 
         qs = filter_analytics(request.query_params)
         page = self.paginate_queryset(qs)
-        return self.get_paginated_response(self.get_serializer(page, many=True).data)
+        response = self.get_paginated_response(
+            self.get_serializer(page, many=True).data
+        )
+        # An empty page because a domain has no data at all is a DIFFERENT answer
+        # from an empty page because the filters matched nothing, and the two look
+        # identical on screen. Say which it is.
+        domain = (request.query_params.get("domain") or "food").lower()
+        response.data["domain"] = domain
+        response.data["domain_available"] = domain_is_available(domain)
+        return response
 
 
 class DataProgramsView(PortalAPIView):
