@@ -5436,6 +5436,11 @@ class Vendor(models.Model):
     # would leave a dead link in every document that had been generated with it.
     logo_s3_key = models.CharField(max_length=500, blank=True)
     logo_updated_at = models.DateTimeField(null=True, blank=True)
+    # The NORMALISED logo's pixel dimensions, so document layout can reserve the
+    # right box from its aspect ratio without fetching and decoding the image for
+    # every invoice.
+    logo_width = models.PositiveIntegerField(null=True, blank=True)
+    logo_height = models.PositiveIntegerField(null=True, blank=True)
     notes = models.TextField(blank=True)
     is_active = models.BooleanField(default=True, db_index=True)
     created_at = models.DateTimeField(auto_now_add=True)

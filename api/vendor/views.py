@@ -1310,6 +1310,8 @@ def _company_payload(vendor):
         "website": vendor.website,
         "logo_url": logo_url,
         "logo_updated_at": vendor.logo_updated_at,
+        "logo_width": vendor.logo_width,
+        "logo_height": vendor.logo_height,
     }
 
 
@@ -1366,9 +1368,11 @@ class VendorLogoView(VendorAdminAPIView):
     """
 
     parser_classes = [MultiPartParser, FormParser]
-    # A logo is a logo. The ceiling is low on purpose: it stops someone uploading a
-    # 12 MP photograph that then has to be scaled down in every PDF.
+    # A ceiling on the UPLOAD, low on purpose -- what gets stored is normalised to
+    # about 600px regardless, so a 12 MP original is bytes nobody will ever see.
     MAX_BYTES = 4 * 1024 * 1024
+    # Accepted as INPUT. All three are converted to PNG before storage, because
+    # that is what embeds reliably in a PDF -- see services/logo_image.py.
     ALLOWED = {"image/png", "image/jpeg", "image/jpg", "image/webp"}
 
     def post(self, request):
@@ -1389,22 +1393,47 @@ class VendorLogoView(VendorAdminAPIView):
                 "bad_type", "The logo must be a PNG, JPEG or WebP image.",
             )
 
+        from ..services import logo_image
+
         vendor = request.user.vendor
         raw = upload.read()
-        digest = hashlib.sha256(raw).hexdigest()
-        key = import_storage.build_key(
-            f"vendor-logos/{vendor.pk}/{digest[:16]}-{upload.name}"
-        )
-        import_storage.upload_bytes(key, raw, content_type=content_type)
+
+        # NORMALISED BEFORE STORING, not on the way out. A logo is embedded in
+        # invoices and quotes, so it is processed once here rather than on every
+        # document -- and what is stored is then exactly what prints, which makes
+        # "why does it look wrong on the PDF?" answerable by looking at one file.
+        try:
+            png, info = logo_image.optimise(raw)
+        except logo_image.LogoError as exc:
+            return error("bad_image", str(exc))
+
+        digest = hashlib.sha256(png).hexdigest()
+        # The key names the PROCESSED bytes, so re-uploading the same artwork is
+        # idempotent even if it arrived as a JPEG one time and a PNG the next.
+        key = import_storage.build_key(f"vendor-logos/{vendor.pk}/{digest[:16]}.png")
+        import_storage.upload_bytes(key, png, content_type="image/png")
 
         vendor.logo_s3_key = key
         vendor.logo_updated_at = timezone.now()
-        vendor.save(update_fields=["logo_s3_key", "logo_updated_at", "updated_at"])
+        vendor.logo_width = info["width"]
+        vendor.logo_height = info["height"]
+        vendor.save(update_fields=[
+            "logo_s3_key", "logo_updated_at", "logo_width", "logo_height",
+            "updated_at",
+        ])
         logger.info(
-            "vendor logo uploaded: %s by=%s", vendor.name,
-            request.user.vendor_user.email,
+            "vendor logo uploaded: %s %sx%s by=%s", vendor.name,
+            info["width"], info["height"], request.user.vendor_user.email,
         )
-        return Response(_company_payload(vendor), status=http.HTTP_201_CREATED)
+        return Response(
+            {
+                **_company_payload(vendor),
+                # Surfaced rather than logged: only the admin can fix a logo that
+                # is too small to print well, and they will never read our logs.
+                "warning": info["warning"],
+            },
+            status=http.HTTP_201_CREATED,
+        )
 
     def delete(self, request):
         vendor = request.user.vendor
@@ -1415,5 +1444,10 @@ class VendorLogoView(VendorAdminAPIView):
         # changed the current one.
         vendor.logo_s3_key = ""
         vendor.logo_updated_at = None
-        vendor.save(update_fields=["logo_s3_key", "logo_updated_at", "updated_at"])
+        vendor.logo_width = None
+        vendor.logo_height = None
+        vendor.save(update_fields=[
+            "logo_s3_key", "logo_updated_at", "logo_width", "logo_height",
+            "updated_at",
+        ])
         return Response(_company_payload(vendor))

@@ -34188,3 +34188,158 @@ class VendorCompanyProfileTest(TestCase):
         field_names = {f.name for f in Vendor._meta.fields}
         self.assertIn("logo_s3_key", field_names)
         self.assertNotIn("logo_url", field_names)
+
+
+class LogoOptimisationTest(TestCase):
+    """Normalising a vendor logo for PDF output.
+
+    The target is PRINT, not screen: these logos only ever appear on invoices and
+    quotes.
+    """
+
+    def _image(self, size, *, mode="RGBA", fmt="PNG", pad=0):
+        import io
+
+        from PIL import Image, ImageDraw
+
+        img = Image.new(mode, size, (0, 0, 0, 0) if mode == "RGBA" else (255, 255, 255))
+        ImageDraw.Draw(img).rectangle(
+            [pad, pad, size[0] - 1 - pad, size[1] - 1 - pad], fill=(200, 30, 30, 255),
+        )
+        buf = io.BytesIO()
+        img.save(buf, format=fmt)
+        return buf.getvalue()
+
+    def _out(self, raw):
+        import io
+
+        from PIL import Image
+
+        from .services.logo_image import optimise
+
+        png, info = optimise(raw)
+        return Image.open(io.BytesIO(png)), info
+
+    def test_a_large_logo_is_scaled_to_the_print_target(self):
+        """600px on the long edge is roughly 50mm at 300 DPI -- an invoice header at
+        a resolution that does not look fuzzy on paper."""
+        from .services.logo_image import TARGET_LONG_EDGE
+
+        img, _info = self._out(self._image((2400, 2400)))
+        self.assertEqual(max(img.size), TARGET_LONG_EDGE)
+
+    def test_the_ASPECT_RATIO_is_preserved(self):
+        img, _info = self._out(self._image((3000, 500)))
+        self.assertEqual(img.size, (600, 100))
+
+    def test_a_SMALL_logo_is_never_upscaled(self):
+        """Enlarging adds no detail and makes it look worse -- blurry at a size that
+        invites scrutiny, rather than small and sharp."""
+        img, _info = self._out(self._image((240, 240)))
+        self.assertEqual(img.size, (240, 240))
+
+    def test_a_logo_too_small_to_print_well_WARNS_but_is_accepted(self):
+        """A small logo is the only one some companies have; refusing it leaves them
+        with none at all. The admin is the only person who can fix it, so the
+        warning goes to them rather than into our logs."""
+        _img, info = self._out(self._image((240, 240)))
+        self.assertIn("240x240", info["warning"])
+        self.assertIn("soft when printed", info["warning"])
+
+    def test_a_big_enough_logo_warns_about_nothing(self):
+        _img, info = self._out(self._image((1200, 400)))
+        self.assertEqual(info["warning"], "")
+
+    def test_EVERY_format_comes_out_as_PNG(self):
+        """JPEG artefacts cluster on the hard edges and small text a logo is made
+        of, and WebP is patchily supported by PDF toolchains -- a logo that silently
+        fails to embed is worse than one that looks soft."""
+        for fmt, mode in (("PNG", "RGBA"), ("JPEG", "RGB"), ("WEBP", "RGBA")):
+            img, _info = self._out(self._image((900, 900), mode=mode, fmt=fmt))
+            self.assertEqual(img.format, "PNG", fmt)
+
+    def test_TRANSPARENCY_is_preserved_not_flattened(self):
+        """Flattening onto white looks identical on a white invoice and wrong the
+        first time a logo lands on a coloured header -- a change nobody would think
+        to re-test.
+
+        The hole is INSIDE the artwork. My first version of this test used a
+        transparent margin, which the trimming step removes -- so it asserted the
+        absence of the thing it had just cut off, and failed for the right reason.
+        """
+        import io
+
+        from PIL import Image, ImageDraw
+
+        img = Image.new("RGBA", (800, 800), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(img)
+        draw.rectangle([0, 0, 799, 799], fill=(200, 30, 30, 255))
+        # A see-through window in the middle, as a ring-shaped logo would have.
+        draw.rectangle([300, 300, 499, 499], fill=(0, 0, 0, 0))
+        buf = io.BytesIO(); img.save(buf, format="PNG")
+
+        out, _info = self._out(buf.getvalue())
+        self.assertEqual(out.mode, "RGBA")
+        self.assertEqual(out.getchannel("A").getextrema()[0], 0)
+
+    def test_TRANSPARENT_PADDING_is_trimmed(self):
+        """Logos arrive with a big empty border baked in, and since a document sizes
+        the image to a fixed box, that border renders the artwork small and
+        off-centre for reasons the admin cannot see."""
+        # 1200x1200 with a 300px margin: the artwork itself is 600x600.
+        img, _info = self._out(self._image((1200, 1200), pad=300))
+        self.assertEqual(img.size, (600, 600))
+
+    def test_an_OPAQUE_logo_is_not_trimmed(self):
+        img, _info = self._out(self._image((800, 800), mode="RGB", fmt="JPEG"))
+        self.assertEqual(img.size, (600, 600))
+
+    def test_a_fully_transparent_image_is_refused(self):
+        import io
+
+        from PIL import Image
+
+        from .services.logo_image import LogoError, optimise
+
+        buf = io.BytesIO()
+        Image.new("RGBA", (500, 500), (0, 0, 0, 0)).save(buf, format="PNG")
+        with self.assertRaises(LogoError) as ctx:
+            optimise(buf.getvalue())
+        self.assertIn("completely transparent", str(ctx.exception))
+
+    def test_a_non_image_is_refused_with_a_usable_message(self):
+        from .services.logo_image import LogoError, optimise
+
+        with self.assertRaises(LogoError) as ctx:
+            optimise(b"this is not an image")
+        # Tells them what to DO, not just that it failed.
+        self.assertIn("PNG", str(ctx.exception))
+
+    def test_the_dimensions_are_reported_for_document_layout(self):
+        _img, info = self._out(self._image((3000, 500)))
+        self.assertEqual((info["width"], info["height"]), (600, 100))
+
+    def test_a_JPEG_with_EXIF_orientation_is_rotated(self):
+        """Some export tools record orientation in EXIF rather than rotating the
+        pixels, and without this the logo embeds sideways."""
+        import io
+
+        from PIL import Image
+
+        from .services.logo_image import optimise
+
+        img = Image.new("RGB", (400, 200), (255, 255, 255))
+        buf = io.BytesIO()
+        exif = img.getexif()
+        exif[274] = 6  # Orientation: rotate 90
+        img.save(buf, format="JPEG", exif=exif)
+        out, info = optimise(buf.getvalue())
+        # 400x200 rotated becomes 200x400.
+        self.assertEqual((info["width"], info["height"]), (200, 400))
+
+    def test_the_stored_bytes_are_SMALLER_than_a_large_original(self):
+        from .services.logo_image import optimise
+
+        raw = self._image((2400, 2400))
+        png, _info = optimise(raw)
+        self.assertLess(len(png), len(raw))
