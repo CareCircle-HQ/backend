@@ -1278,3 +1278,142 @@ class VendorSubmitAssessmentView(VendorAPIView):
             "order_status_label": order.get_status_display(),
             "already": False,
         }, status=http.HTTP_201_CREATED)
+
+
+# ── the company's own profile ────────────────────────────────────────────────
+
+def _company_payload(vendor):
+    """The company as its administrator sees it.
+
+    Deliberately omits admin_fee_percent and anything else about what we pay them:
+    those are OUR commercial terms, editable in the CRM, and a vendor reading their
+    own profile has no business seeing the mark-up we add.
+    """
+    from ..services import import_storage
+
+    logo_url = ""
+    if vendor.logo_s3_key:
+        try:
+            # Presigned on read, never stored. A stored URL expires and leaves a
+            # dead link in every PDF generated with it.
+            logo_url = import_storage.presign_get(
+                vendor.logo_s3_key, expires=3600, inline=True,
+            )
+        except Exception:  # noqa: BLE001 - a missing logo must not break the page
+            logger.warning("vendor logo presign failed: %s", vendor.logo_s3_key)
+    return {
+        "name": vendor.name,
+        "address": vendor.address,
+        "contact_phone": vendor.contact_phone,
+        "contact_name": vendor.contact_name,
+        "contact_email": vendor.contact_email,
+        "website": vendor.website,
+        "logo_url": logo_url,
+        "logo_updated_at": vendor.logo_updated_at,
+    }
+
+
+class VendorCompanyView(VendorAdminAPIView):
+    """GET / PATCH /v1/company/ -- the company's address, phone and contact.
+
+    ADMIN ONLY, via VendorAdminAPIView. A staff user can read their assignments but
+    must not be able to change where the company says it is.
+
+    The NAME is read-only here. It is how CareCircle and Unite Us identify the
+    company, it appears on authorizations and invoices already issued, and letting a
+    vendor rename themselves would silently break the match. Renaming stays a CRM
+    action.
+    """
+
+    EDITABLE = ("address", "contact_phone", "contact_name", "contact_email", "website")
+
+    def get(self, request):
+        return Response(_company_payload(request.user.vendor))
+
+    def patch(self, request):
+        vendor = request.user.vendor
+        data = request.data or {}
+        changed = []
+        for field in self.EDITABLE:
+            if field not in data:
+                continue
+            value = (data.get(field) or "").strip()[:255]
+            if getattr(vendor, field) != value:
+                setattr(vendor, field, value)
+                changed.append(field)
+
+        if "name" in data and (data.get("name") or "").strip() != vendor.name:
+            # Reported rather than ignored: silently dropping an edit someone typed
+            # is how they conclude the save is broken.
+            return error(
+                "name_read_only",
+                "The company name is set by CareCircle. Ask us to change it.",
+            )
+
+        if changed:
+            vendor.save(update_fields=[*changed, "updated_at"])
+            logger.info(
+                "vendor company updated: %s fields=%s by=%s",
+                vendor.name, changed, request.user.vendor_user.email,
+            )
+        return Response({**_company_payload(vendor), "changed_fields": changed})
+
+
+class VendorLogoView(VendorAdminAPIView):
+    """POST /v1/company/logo/ -- upload the company logo. DELETE removes it.
+
+    Admin only, same reasoning as the profile.
+    """
+
+    parser_classes = [MultiPartParser, FormParser]
+    # A logo is a logo. The ceiling is low on purpose: it stops someone uploading a
+    # 12 MP photograph that then has to be scaled down in every PDF.
+    MAX_BYTES = 4 * 1024 * 1024
+    ALLOWED = {"image/png", "image/jpeg", "image/jpg", "image/webp"}
+
+    def post(self, request):
+        import hashlib
+
+        from ..services import import_storage
+
+        upload = request.FILES.get("file") or request.FILES.get("logo")
+        if upload is None:
+            return error("no_file", "Attach an image as 'file'.")
+        if upload.size > self.MAX_BYTES:
+            return error("too_large", "The logo must be under 4 MB.")
+        content_type = (upload.content_type or "").lower()
+        if content_type not in self.ALLOWED:
+            # Named explicitly: "invalid file" leaves someone guessing whether the
+            # problem is the size, the format or the name.
+            return error(
+                "bad_type", "The logo must be a PNG, JPEG or WebP image.",
+            )
+
+        vendor = request.user.vendor
+        raw = upload.read()
+        digest = hashlib.sha256(raw).hexdigest()
+        key = import_storage.build_key(
+            f"vendor-logos/{vendor.pk}/{digest[:16]}-{upload.name}"
+        )
+        import_storage.upload_bytes(key, raw, content_type=content_type)
+
+        vendor.logo_s3_key = key
+        vendor.logo_updated_at = timezone.now()
+        vendor.save(update_fields=["logo_s3_key", "logo_updated_at", "updated_at"])
+        logger.info(
+            "vendor logo uploaded: %s by=%s", vendor.name,
+            request.user.vendor_user.email,
+        )
+        return Response(_company_payload(vendor), status=http.HTTP_201_CREATED)
+
+    def delete(self, request):
+        vendor = request.user.vendor
+        if not vendor.logo_s3_key:
+            return Response(_company_payload(vendor))
+        # The KEY is cleared; the object is left in S3. A logo that appears on
+        # already-issued documents must not vanish from them because someone
+        # changed the current one.
+        vendor.logo_s3_key = ""
+        vendor.logo_updated_at = None
+        vendor.save(update_fields=["logo_s3_key", "logo_updated_at", "updated_at"])
+        return Response(_company_payload(vendor))

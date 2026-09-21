@@ -10,9 +10,11 @@ from django.urls import path
 
 from .views import (
     VendorAssessmentSaveView,
+    VendorCompanyView,
     VendorDashboardView,
     VendorPhotoView,
     VendorLoginView,
+    VendorLogoView,
     VendorLogoutView,
     VendorMeView,
     VendorWorkDetailView,
@@ -28,6 +30,12 @@ from .views import (
 urlpatterns = [
     path("v1/auth/login/", VendorLoginView.as_view(), name="vendor-login"),
     path("v1/auth/logout/", VendorLogoutView.as_view(), name="vendor-logout"),
+    path(
+        "v1/company/", VendorCompanyView.as_view(), name="vendor-company",
+    ),
+    path(
+        "v1/company/logo/", VendorLogoView.as_view(), name="vendor-company-logo",
+    ),
     path("v1/me/", VendorMeView.as_view(), name="vendor-me"),
     path("v1/dashboard/", VendorDashboardView.as_view(), name="vendor-dashboard"),
     path("v1/team/", VendorTeamListView.as_view(), name="vendor-team-list"),

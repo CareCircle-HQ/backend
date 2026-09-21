@@ -34008,3 +34008,183 @@ class DataPageDomainFilterTest(TestCase):
         self.assertEqual(housing.data["domain"], "housing")
         self.assertFalse(housing.data["domain_available"])
         self.assertEqual(housing.data["count"], 0)
+
+
+@override_settings(VENDOR_API_HOST=VENDOR_HOST, ALLOWED_HOSTS=["*"])
+class VendorCompanyProfileTest(TestCase):
+    """The company's own address, phone and logo. ADMIN ONLY."""
+
+    def setUp(self):
+        from django.contrib.auth.hashers import make_password
+
+        from .models import Vendor, VendorUser
+
+        self.vendor = Vendor.objects.create(
+            name="Acme Repairs", address="1 Old Road", contact_phone="(212) 555-0100",
+        )
+        self.admin = VendorUser.objects.create(
+            vendor=self.vendor, email="boss@acme.test", name="Ada Boss",
+            is_admin=True, password=make_password("pw-acme-1234"),
+        )
+        self.staff = VendorUser.objects.create(
+            vendor=self.vendor, email="tom@acme.test", name="Tom Staff",
+            is_admin=False, password=make_password("pw-tom-1234"),
+        )
+
+    def _api(self, email, password):
+        resp = APIClient().post(
+            "/v1/auth/login/", {"email": email, "password": password},
+            format="json", HTTP_HOST=VENDOR_HOST,
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        api = APIClient()
+        api.credentials(HTTP_AUTHORIZATION=f"Bearer {resp.data['access_token']}")
+        return api
+
+    def _as_admin(self):
+        return self._api("boss@acme.test", "pw-acme-1234")
+
+    def _as_staff(self):
+        return self._api("tom@acme.test", "pw-tom-1234")
+
+    PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 64
+
+    # ── admin only ──────────────────────────────────────────────────────────
+    def test_a_STAFF_user_cannot_read_the_company_profile(self):
+        resp = self._as_staff().get("/v1/company/", HTTP_HOST=VENDOR_HOST)
+        self.assertEqual(resp.status_code, 403)
+
+    def test_a_STAFF_user_cannot_change_the_address(self):
+        """They can read their assignments, but must not be able to change where
+        the company says it is."""
+        resp = self._as_staff().patch(
+            "/v1/company/", {"address": "somewhere else"}, format="json",
+            HTTP_HOST=VENDOR_HOST,
+        )
+        self.assertEqual(resp.status_code, 403)
+        self.vendor.refresh_from_db()
+        self.assertEqual(self.vendor.address, "1 Old Road")
+
+    def test_a_STAFF_user_cannot_upload_a_logo(self):
+        from django.core.files.uploadedfile import SimpleUploadedFile
+
+        resp = self._as_staff().post(
+            "/v1/company/logo/",
+            {"file": SimpleUploadedFile("l.png", self.PNG, content_type="image/png")},
+            format="multipart", HTTP_HOST=VENDOR_HOST,
+        )
+        self.assertEqual(resp.status_code, 403)
+
+    # ── the profile ─────────────────────────────────────────────────────────
+    def test_an_admin_updates_the_address_and_phone(self):
+        resp = self._as_admin().patch(
+            "/v1/company/",
+            {"address": "88 Vendor Way", "contact_phone": "(718) 555-0142"},
+            format="json", HTTP_HOST=VENDOR_HOST,
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        self.assertEqual(
+            sorted(resp.data["changed_fields"]), ["address", "contact_phone"],
+        )
+        self.vendor.refresh_from_db()
+        self.assertEqual(self.vendor.address, "88 Vendor Way")
+
+    def test_the_NAME_is_read_only_and_says_so(self):
+        """It is how CareCircle and Unite Us identify the company, and it appears on
+        authorizations already issued. Reported rather than silently dropped --
+        ignoring an edit someone typed is how they conclude the save is broken."""
+        resp = self._as_admin().patch(
+            "/v1/company/", {"name": "Renamed Ltd"}, format="json",
+            HTTP_HOST=VENDOR_HOST,
+        )
+        self.assertEqual(resp.status_code, 400)
+        self.assertEqual(resp.data["error"], "name_read_only")
+        self.vendor.refresh_from_db()
+        self.assertEqual(self.vendor.name, "Acme Repairs")
+
+    def test_an_unchanged_field_is_not_reported_as_changed(self):
+        resp = self._as_admin().patch(
+            "/v1/company/", {"address": "1 Old Road"}, format="json",
+            HTTP_HOST=VENDOR_HOST,
+        )
+        self.assertEqual(resp.data["changed_fields"], [])
+
+    def test_OUR_commercial_terms_are_not_in_the_payload(self):
+        """A vendor reading their own profile has no business seeing the mark-up we
+        add, or the internal notes we keep about them."""
+        from decimal import Decimal
+
+        self.vendor.admin_fee_percent = Decimal("15.00")
+        self.vendor.notes = "slow to invoice"
+        self.vendor.save(update_fields=["admin_fee_percent", "notes"])
+
+        body = json.dumps(
+            self._as_admin().get("/v1/company/", HTTP_HOST=VENDOR_HOST).data,
+            default=str,
+        )
+        for forbidden in ("admin_fee", "15.00", "notes", "slow to invoice"):
+            self.assertNotIn(forbidden, body)
+
+    def test_ANOTHER_companys_admin_sees_only_their_own(self):
+        from django.contrib.auth.hashers import make_password
+
+        from .models import Vendor, VendorUser
+
+        rival = Vendor.objects.create(name="Rival Repairs", address="9 Rival St")
+        VendorUser.objects.create(
+            vendor=rival, email="boss@rival.test", name="Rita",
+            is_admin=True, password=make_password("pw-rival-1234"),
+        )
+        resp = self._api("boss@rival.test", "pw-rival-1234").get(
+            "/v1/company/", HTTP_HOST=VENDOR_HOST,
+        )
+        self.assertEqual(resp.data["name"], "Rival Repairs")
+        self.assertEqual(resp.data["address"], "9 Rival St")
+
+    # ── the logo ────────────────────────────────────────────────────────────
+    def test_a_NON_IMAGE_is_refused_by_type(self):
+        """Named explicitly: "invalid file" leaves someone guessing whether the
+        problem is the size, the format or the name."""
+        from django.core.files.uploadedfile import SimpleUploadedFile
+
+        resp = self._as_admin().post(
+            "/v1/company/logo/",
+            {"file": SimpleUploadedFile("x.txt", b"nope", content_type="text/plain")},
+            format="multipart", HTTP_HOST=VENDOR_HOST,
+        )
+        self.assertEqual(resp.status_code, 400)
+        self.assertEqual(resp.data["error"], "bad_type")
+
+    def test_an_oversized_logo_is_refused(self):
+        from django.core.files.uploadedfile import SimpleUploadedFile
+
+        big = b"\x89PNG\r\n\x1a\n" + b"\x00" * (5 * 1024 * 1024)
+        resp = self._as_admin().post(
+            "/v1/company/logo/",
+            {"file": SimpleUploadedFile("big.png", big, content_type="image/png")},
+            format="multipart", HTTP_HOST=VENDOR_HOST,
+        )
+        self.assertEqual(resp.status_code, 400)
+        self.assertEqual(resp.data["error"], "too_large")
+
+    def test_removing_the_logo_clears_the_KEY_but_not_the_object(self):
+        """A logo that appears on already-issued documents must not vanish from them
+        because someone changed the current one."""
+        self.vendor.logo_s3_key = "vendor-logos/x/abc-logo.png"
+        self.vendor.logo_updated_at = timezone.now()
+        self.vendor.save(update_fields=["logo_s3_key", "logo_updated_at"])
+
+        resp = self._as_admin().delete("/v1/company/logo/", HTTP_HOST=VENDOR_HOST)
+        self.assertEqual(resp.status_code, 200)
+        self.vendor.refresh_from_db()
+        self.assertEqual(self.vendor.logo_s3_key, "")
+        self.assertIsNone(self.vendor.logo_updated_at)
+
+    def test_the_logo_is_returned_as_a_PRESIGNED_url_not_a_stored_one(self):
+        """Storing a URL would leave a dead link in every document generated with
+        it, because presigned URLs expire."""
+        from .models import Vendor
+
+        field_names = {f.name for f in Vendor._meta.fields}
+        self.assertIn("logo_s3_key", field_names)
+        self.assertNotIn("logo_url", field_names)

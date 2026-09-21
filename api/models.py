@@ -5430,6 +5430,12 @@ class Vendor(models.Model):
     admin_fee_percent = models.DecimalField(
         max_digits=5, decimal_places=2, null=True, blank=True,
     )
+
+    # The company's logo, for their own portal and for the assessment PDFs they
+    # produce. An S3 KEY, not a URL: URLs are presigned and expire, so storing one
+    # would leave a dead link in every document that had been generated with it.
+    logo_s3_key = models.CharField(max_length=500, blank=True)
+    logo_updated_at = models.DateTimeField(null=True, blank=True)
     notes = models.TextField(blank=True)
     is_active = models.BooleanField(default=True, db_index=True)
     created_at = models.DateTimeField(auto_now_add=True)
