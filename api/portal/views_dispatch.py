@@ -976,6 +976,32 @@ def pricing_admin_fee(amount, percent):
     return pricing.admin_fee(amount, percent)
 
 
+def _view_and_download_urls(key, filename, *, content_type=""):
+    """``(view_url, download_url)`` for a stored object, or ``("", "")``.
+
+    Two urls because the intent differs: View opens it in the browser to look at,
+    Download saves it under a readable filename rather than the hash the S3 key
+    uses.
+
+    ``download_name`` is passed for BOTH -- presign_get only sets a
+    Content-Disposition when it has a filename, so ``inline=True`` on its own is
+    silently a no-op.
+    """
+    from ..services import import_storage
+
+    try:
+        return (
+            import_storage.presign_get(
+                key, expires=900, inline=True, download_name=filename,
+                content_type=content_type,
+            ),
+            import_storage.presign_get(key, expires=900, download_name=filename),
+        )
+    except Exception:  # noqa: BLE001 - one bad key must not hide the whole list
+        logger.warning("presign failed: %s", key)
+        return "", ""
+
+
 class MemberDispatchDocumentsView(PortalAPIView):
     """GET: the documents on a member's housing orders, newest first.
 
@@ -1032,3 +1058,67 @@ class MemberDispatchDocumentsView(PortalAPIView):
                 "download_url": download_url,
             })
         return Response({"documents": out})
+
+
+class MemberDispatchPhotosView(PortalAPIView):
+    """GET: the photographs a vendor took on a member's housing orders.
+
+    Same shape and same two urls as the documents list, so the Evidence tab can
+    present them identically -- an agent should not have to learn two idioms for
+    "look at the thing the vendor sent us".
+
+    Each photo is labelled with the QUESTION GROUP it evidences ("Bathroom",
+    "Temperature Control"), resolved from the form's frozen snapshot rather than
+    the live template: the label should say what the assessor was answering when
+    they took it.
+    """
+
+    def get(self, request, client_id):
+        from ..models import DispatchProof
+        from ..services.assessment_forms import CATEGORY_LABELS
+
+        client = get_object_or_404(Client, pk=client_id)
+        proofs = (
+            DispatchProof.objects
+            .filter(dispatch_order__client=client)
+            .select_related("dispatch_order", "dispatch_order__questionnaire")
+            .order_by("-received_at")
+        )
+
+        out = []
+        for proof in proofs:
+            filename = (proof.s3_key or "").rsplit("/", 1)[-1] or "photo"
+            view_url, download_url = _view_and_download_urls(proof.s3_key, filename)
+            form = getattr(proof.dispatch_order, "questionnaire", None)
+            labels = _photo_group_labels(form)
+            out.append({
+                "id": proof.pk,
+                "group": proof.intervention_group,
+                # Falls back to the product-category label, then to "Dwelling":
+                # a general photo has no group, and "" would render as a blank row
+                # that looks like a fault.
+                "label": (
+                    labels.get(proof.intervention_group)
+                    or CATEGORY_LABELS.get(proof.intervention_group)
+                    or "Dwelling"
+                ),
+                "caption": proof.caption,
+                "filename": filename,
+                "captured_at": proof.captured_at,
+                "received_at": proof.received_at,
+                "order_id": str(proof.dispatch_order_id),
+                "view_url": view_url,
+                "download_url": download_url,
+            })
+        return Response({"photos": out})
+
+
+def _photo_group_labels(form):
+    """Question-group code -> its heading, from the form's FROZEN snapshot."""
+    if form is None:
+        return {}
+    out = {}
+    for section in (form.schema() or {}).get("sections", []):
+        for group in section["groups"]:
+            out[group["code"]] = group.get("label") or section["title"]
+    return out

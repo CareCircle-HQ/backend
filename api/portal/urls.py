@@ -197,6 +197,7 @@ from .views_dispatch import (
     MemberAssessmentFormView,
     MemberCaseRecommendationsView,
     MemberDispatchDocumentsView,
+    MemberDispatchPhotosView,
     MemberAssessmentOrderCreateView,
     MemberAssessmentOrderUpdateView,
     MemberWorkOrderCreateView,
@@ -307,6 +308,11 @@ urlpatterns = [
         "members/<uuid:client_id>/dispatch-documents/",
         MemberDispatchDocumentsView.as_view(),
         name="portal-member-dispatch-documents",
+    ),
+    path(
+        "members/<uuid:client_id>/dispatch-photos/",
+        MemberDispatchPhotosView.as_view(),
+        name="portal-member-dispatch-photos",
     ),
     path(
         "members/<uuid:client_id>/case-recommendations/",

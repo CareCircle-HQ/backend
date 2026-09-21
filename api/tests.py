@@ -34753,3 +34753,114 @@ class SubmissionDocumentImagesTest(TestCase):
         source = inspect.getsource(dispatch_pdf)
         # The comment explaining the trap is allowed; a CALL is not.
         self.assertNotIn("import_storage.download_to_temp(", source)
+
+
+class MemberDispatchPhotosViewTest(TestCase):
+    """The Evidence tab's photograph list -- same shape as the documents list."""
+
+    def setUp(self):
+        from rest_framework_simplejwt.tokens import AccessToken
+
+        from .models import (
+            Agent, Client, DispatchKind, DispatchOrder, DispatchProof,
+            DispatchQuestionnaire, Vendor,
+        )
+        from .services.assessment_forms import build_schema
+
+        agent = Agent.objects.create(
+            name="Photo Agent", agent_code="784", group="Management",
+        )
+        acc = AccessToken()
+        acc["agent_id"] = str(agent.id)
+        acc["agent_code"] = agent.agent_code
+        acc["agent_name"] = agent.name
+        acc["agent_group"] = agent.group
+        self.api = APIClient()
+        self.api.credentials(HTTP_AUTHORIZATION=f"Bearer {acc}")
+
+        self.member = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Ph", last_name="Member",
+            client_added_at=timezone.now(),
+        )
+        self.order = DispatchOrder.objects.create(
+            kind=DispatchKind.ASSESSMENT, client=self.member,
+            vendor=Vendor.objects.create(name="Snap Ltd"), referral_type="combined",
+        )
+        DispatchQuestionnaire.objects.create(
+            dispatch_order=self.order, modules=["combined"],
+            schema_snapshot=build_schema(["combined"]),
+        )
+        self.bathroom = DispatchProof.objects.create(
+            dispatch_order=self.order, s3_key="proofs/abc123-bath.jpg",
+            content_hash="h1", intervention_group="mob.risk.bathroom",
+            caption="Tub with no bars",
+        )
+        self.general = DispatchProof.objects.create(
+            dispatch_order=self.order, s3_key="proofs/def456-front.jpg",
+            content_hash="h2", intervention_group="",
+        )
+
+    def _photos(self):
+        resp = self.api.get(
+            f"/api/portal/members/{self.member.pk}/dispatch-photos/",
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        return {p["id"]: p for p in resp.data["photos"]}
+
+    def test_a_photo_is_labelled_with_the_SECTION_it_evidences(self):
+        """Resolved from the form's frozen snapshot, so the label says what the
+        assessor was answering when they took it."""
+        self.assertEqual(self._photos()[self.bathroom.pk]["label"], "Bathroom")
+
+    def test_a_GENERAL_photo_falls_back_to_Dwelling(self):
+        """It has no group, and "" would render as a blank row that looks like a
+        fault."""
+        self.assertEqual(self._photos()[self.general.pk]["label"], "Dwelling")
+
+    def test_the_caption_is_carried_through(self):
+        self.assertEqual(
+            self._photos()[self.bathroom.pk]["caption"], "Tub with no bars",
+        )
+
+    def test_the_filename_comes_from_the_key(self):
+        self.assertEqual(
+            self._photos()[self.bathroom.pk]["filename"], "abc123-bath.jpg",
+        )
+
+    def test_another_members_photos_are_not_returned(self):
+        from .models import Client, DispatchKind, DispatchOrder, DispatchProof
+
+        other = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Other", last_name="One",
+            client_added_at=timezone.now(),
+        )
+        DispatchProof.objects.create(
+            dispatch_order=DispatchOrder.objects.create(
+                kind=DispatchKind.ASSESSMENT, client=other,
+            ),
+            s3_key="proofs/theirs.jpg", content_hash="h3",
+        )
+        self.assertEqual(len(self._photos()), 2)
+
+    def test_a_failed_presign_leaves_the_urls_EMPTY_not_broken(self):
+        """The row still lists the photo -- an agent should know it exists -- but a
+        link that cannot work is worse than none, so the UI omits the button."""
+        with mock.patch(
+            "api.services.import_storage.presign_get", side_effect=OSError("no s3"),
+        ):
+            photos = self._photos()
+        self.assertEqual(len(photos), 2)
+        self.assertEqual(photos[self.bathroom.pk]["view_url"], "")
+        self.assertEqual(photos[self.bathroom.pk]["download_url"], "")
+
+    def test_the_view_url_asks_for_INLINE_with_a_filename(self):
+        """presign_get only sets a Content-Disposition when it also has a
+        filename, so inline=True on its own is silently a no-op."""
+        with mock.patch(
+            "api.services.import_storage.presign_get", return_value="https://x/",
+        ) as presign:
+            self._photos()
+        inline_calls = [c for c in presign.call_args_list if c.kwargs.get("inline")]
+        self.assertTrue(inline_calls)
+        for call in inline_calls:
+            self.assertTrue(call.kwargs.get("download_name"))
