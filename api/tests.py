@@ -33179,3 +33179,175 @@ class PhotoPerAnsweredSectionTest(TestCase):
                     content_hash="hmob.risk.bathroomx",
                     intervention_group="vent.temp",
                 )
+
+
+class AssessmentQuoteLinesTest(TestCase):
+    """The recommended-interventions table: a quote line plus the case to open."""
+
+    EEA = (
+        "Dwelling Assessment & Statement of Work (SOW) Development - "
+        "Modifications and Remediation Service - Queens"
+    )
+
+    def setUp(self):
+        from decimal import Decimal
+
+        from .models import (
+            ActiveProgram, BillableItem, BillingSettings, Case, CaseStatus,
+            CaseType, Client, DispatchKind, DispatchOrder, DispatchQuestionnaire,
+            Vendor,
+        )
+        from .services.assessment_forms import build_schema
+        from .services.catalog import clear_program_domain_cache
+
+        BillingSettings.objects.update_or_create(
+            singleton_id=1, defaults={"admin_fee_percent": Decimal("10.00")},
+        )
+        ActiveProgram.objects.create(
+            program_name=self.EEA, case_category="Internal Services",
+            case_type=ActiveProgram.CaseType.HOUSING,
+            service_type=ActiveProgram.ServiceType.ENVIRONMENTAL_EXPOSURE_ASSESSMENT,
+        )
+        # Grab Bars internal, Air Conditioner internal, Handrails EXTERNAL.
+        for name, category in (
+            ("Home Accessibility and Safety Modification - Grab Bars - Queens",
+             "Internal Services"),
+            ("Home Accessibility and Safety Modification - Hand Rails - Queens",
+             "External Services"),
+            ("Home Remediation - Air Conditioner - Queens", "Internal Services"),
+        ):
+            ActiveProgram.objects.create(
+                program_name=name, case_category=category,
+                case_type=ActiveProgram.CaseType.HOUSING,
+            )
+        clear_program_domain_cache()
+
+        for code, item, cat, main, price in (
+            ("grab_bar_tub", "Grab bar at tub", "Grab Bars", "Bathroom", "498.75"),
+            ("window_ac", "Window air conditioner", "Air Conditioner",
+             "Temperature Control", "1323.00"),
+            ("hallway_handrail", "Hallway handrail", "Handrails",
+             "Mobility & Access", "666.75"),
+        ):
+            BillableItem.objects.create(
+                item=item, option_code=code, billing_category=cat,
+                main_category=main, vendor_price=Decimal(price),
+            )
+
+        self.member = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Quote", last_name="Member",
+            client_added_at=timezone.now(),
+        )
+        Case.objects.create(
+            case_id=uuid.uuid4(), client=self.member,
+            case_type=CaseType.INTERNAL_SERVICE, case_status=CaseStatus.MANAGED,
+            program_name=self.EEA, case_created_at=timezone.now(),
+        )
+        self.order = DispatchOrder.objects.create(
+            kind=DispatchKind.ASSESSMENT, client=self.member,
+            vendor=Vendor.objects.create(name="Acme"), referral_type="combined",
+        )
+        self.form = DispatchQuestionnaire.objects.create(
+            dispatch_order=self.order, modules=["combined"],
+            schema_snapshot=build_schema(["combined"]),
+            interventions=[
+                {"option": "grab_bar_tub", "qty": 2},
+                {"option": "window_ac", "qty": 1},
+                {"option": "hallway_handrail", "qty": 1},
+            ],
+            state="submitted", submitted_at=timezone.now(),
+        )
+
+    def _lines(self):
+        from rest_framework_simplejwt.tokens import AccessToken
+
+        from .models import Agent
+
+        agent = Agent.objects.create(
+            name="Quote Agent", agent_code="781", group="Management",
+        )
+        acc = AccessToken()
+        acc["agent_id"] = str(agent.id)
+        acc["agent_code"] = agent.agent_code
+        acc["agent_name"] = agent.name
+        acc["agent_group"] = agent.group
+        api = APIClient(); api.credentials(HTTP_AUTHORIZATION=f"Bearer {acc}")
+        data = api.get(
+            f"/api/portal/members/{self.member.pk}/assessment-form/",
+        ).data
+        return {
+            o["code"]: o
+            for c in data["categories"] for g in c["groups"] for o in g["options"]
+        }
+
+    def test_a_line_carries_qty_unit_price_and_totals(self):
+        line = self._lines()["grab_bar_tub"]
+        self.assertEqual(line["qty"], 2)
+        self.assertEqual(line["unit_price"], "498.75")
+        self.assertEqual(line["line_total"], "997.50")
+        # 997.50 + 10%
+        self.assertEqual(line["billed_total"], "1097.25")
+
+    def test_a_line_names_the_CASE_an_agent_must_open(self):
+        case = self._lines()["window_ac"]["case"]
+        self.assertEqual(
+            case["program_name"], "Home Remediation - Air Conditioner - Queens",
+        )
+        self.assertTrue(case["exists"])
+        self.assertTrue(case["is_internal"])
+
+    def test_the_borough_comes_from_the_members_governing_case(self):
+        for line in self._lines().values():
+            if line["case"]["program_item"]:
+                self.assertEqual(line["case"]["borough"], "Queens")
+
+    def test_MANY_products_share_ONE_case(self):
+        """Every grab bar is one "Grab Bars" case. The name repeating down the
+        column is the point -- the agent opens it once."""
+        lines = self._lines()
+        names = {
+            lines[code]["case"]["program_name"]
+            for code in lines
+            if lines[code]["case"]["program_item"] == "Grab Bars"
+        }
+        self.assertEqual(
+            names,
+            {"Home Accessibility and Safety Modification - Grab Bars - Queens"},
+        )
+
+    def test_an_EXTERNAL_programme_is_flagged_on_the_line(self):
+        """So an agent sees why a recommended product cannot become a case."""
+        case = self._lines()["hallway_handrail"]["case"]
+        self.assertTrue(case["exists"])
+        self.assertFalse(case["is_internal"])
+
+    def test_a_product_with_NO_programme_item_says_so(self):
+        """Accessibility Ramps and Pathways have no programme item at all."""
+        case = self._lines()["modular_portable_ramp"]["case"]
+        self.assertEqual(case["program_item"], "")
+        self.assertEqual(case["program_name"], "")
+
+    def test_an_UNCHOSEN_product_still_renders_with_no_totals(self):
+        """The full catalogue is what shows an agent what COULD have been
+        recommended; a zero line must not invent a total."""
+        line = self._lines()["shower_chair"]
+        self.assertEqual(line["qty"], 0)
+        self.assertIsNone(line["line_total"])
+        self.assertIsNone(line["billed_total"])
+
+    def test_an_UNPRICED_product_has_no_unit_price(self):
+        """Absent rather than zero: a missing price is a question to ask, and 0.00
+        reads as free."""
+        line = self._lines()["threshold_reducer"]
+        self.assertIsNone(line["unit_price"])
+
+    def test_a_case_the_member_ALREADY_has_is_flagged(self):
+        from .models import Case, CaseStatus, CaseType
+
+        Case.objects.create(
+            case_id=uuid.uuid4(), client=self.member,
+            case_type=CaseType.INTERNAL_SERVICE, case_status=CaseStatus.MANAGED,
+            program_name="Home Remediation - Air Conditioner - Queens",
+            case_created_at=timezone.now(),
+        )
+        self.assertTrue(self._lines()["window_ac"]["case"]["already_open"])

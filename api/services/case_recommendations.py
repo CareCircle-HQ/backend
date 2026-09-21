@@ -240,3 +240,64 @@ def recommended_cases(questionnaire):
         entry["admin_fee_percent"] = str(percent)
         out.append(entry)
     return out
+
+
+def case_for_option(option_code, borough, *, programmes=None, existing=None):
+    """The Unite Us case an agent must open for one recommended product.
+
+    Returns ``{program_name, program_item, family, exists, is_internal,
+    already_open}``. Many products share one case -- every grab bar maps to
+    "... - Grab Bars - <borough>" -- which is the point: the CRM can show the same
+    case beside each line and an agent opens it once.
+
+    ``programmes`` and ``existing`` are accepted so a caller rendering a whole
+    catalogue resolves them once instead of per row.
+    """
+    from .assessment_forms import CATEGORY_FAMILY, category_of_option, group_of_option
+
+    group = group_of_option(option_code)
+    category = category_of_option(option_code)
+    program_item = (group or {}).get("program_item") or ""
+    family = CATEGORY_FAMILY.get(category, "")
+
+    if programmes is None:
+        programmes = {
+            p.program_name: "internal" in (p.case_category or "").lower()
+            for p in ActiveProgram.objects.filter(
+                program_name__iregex=r"^(Home Remediation|Home Accessibility)",
+            )
+        }
+
+    name = (
+        f"{family} - {program_item} - {borough}"
+        if program_item and family and borough else ""
+    )
+    return {
+        "program_name": name,
+        "program_item": program_item,
+        "family": family,
+        "borough": borough,
+        # Reported separately because they need different fixes: a programme that
+        # does not exist must be created, one marked External reclassified.
+        "exists": bool(name) and name in programmes,
+        "is_internal": programmes.get(name, False),
+        "already_open": (
+            (program_item, borough) in existing if existing is not None else False
+        ),
+    }
+
+
+def programme_index():
+    """``{program_name: is_internal}`` for every housing programme. Resolved once
+    by callers that render a catalogue."""
+    return {
+        p.program_name: "internal" in (p.case_category or "").lower()
+        for p in ActiveProgram.objects.filter(
+            program_name__iregex=r"^(Home Remediation|Home Accessibility)",
+        )
+    }
+
+
+def existing_case_index(client):
+    """Programme items the member already has a housing case for, by borough."""
+    return _existing_housing_cases(client)

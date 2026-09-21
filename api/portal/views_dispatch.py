@@ -808,6 +808,19 @@ class MemberAssessmentFormView(PortalAPIView):
             photos_by_group.setdefault(proof.intervention_group or "", 0)
             photos_by_group[proof.intervention_group or ""] += 1
 
+        # Resolved ONCE for the whole catalogue rather than per row: every option
+        # needs the same programme table and the same borough.
+        from ..services import case_recommendations as recs
+        from ..services import pricing
+
+        borough = recs.member_borough(client, order)
+        programmes = recs.programme_index()
+        already = recs.existing_case_index(client)
+        prices = {
+            r["option_code"]: r
+            for r in pricing.price_list_for(order.vendor) if r["option_code"]
+        } if order.vendor_id else {}
+
         categories = []
         for category in schema.get("categories", []):
             categories.append({
@@ -819,15 +832,10 @@ class MemberAssessmentFormView(PortalAPIView):
                         "label": g["label"],
                         "program_item": g.get("program_item") or "",
                         "options": [
-                            {
-                                "code": o["code"],
-                                "label": o["label"],
-                                # qty 0 renders as "Not added", matching the
-                                # vendor's own form rather than hiding unchosen
-                                # options -- the full catalogue is what shows an
-                                # agent what COULD have been recommended.
-                                "qty": chosen.get(o["code"], 0),
-                            }
+                            _assessment_line(
+                                o, chosen.get(o["code"], 0), borough,
+                                prices.get(o["code"]), programmes, already,
+                            )
                             for o in g["options"]
                         ],
                     }
@@ -922,3 +930,47 @@ class MemberCaseRecommendationsView(PortalAPIView):
                 "already_open": sum(1 for c in cases if c["already_open"]),
             },
         })
+
+
+def _assessment_line(option, qty, borough, price_row, programmes, already):
+    """One line of the recommended-interventions table: a quote line plus the case.
+
+    Reads like an invoice because that is what it becomes -- product, quantity,
+    unit price, line total -- with the Unite Us case an agent must open beside it.
+    Many products share one case (every grab bar is one "Grab Bars" case), which is
+    the point: the same case shows against each line and the agent opens it once.
+
+    qty 0 still renders, because the full catalogue is what shows an agent what
+    COULD have been recommended rather than only what was.
+    """
+    from decimal import Decimal
+
+    from ..services import case_recommendations as recs
+
+    case = recs.case_for_option(
+        option["code"], borough, programmes=programmes, existing=already,
+    )
+    unit = Decimal(price_row["price"]) if price_row else None
+    return {
+        "code": option["code"],
+        "label": option["label"],
+        "qty": qty,
+        "unit_price": str(unit) if unit is not None else None,
+        "line_total": str(unit * qty) if unit is not None and qty else None,
+        # What we would bill Unite Us for this line. CRM only -- the vendor's own
+        # screen never shows the fee or the billed price.
+        "billed_total": (
+            str(
+                (unit * qty)
+                + pricing_admin_fee(unit * qty, price_row["admin_fee_percent"])
+            )
+            if unit is not None and qty else None
+        ),
+        "case": case,
+    }
+
+
+def pricing_admin_fee(amount, percent):
+    from ..services import pricing
+
+    return pricing.admin_fee(amount, percent)

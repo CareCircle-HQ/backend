@@ -106,6 +106,36 @@ CATEGORY_LABELS = {
     TEMPERATURE: "Temperature Control",
 }
 
+# Which programme family a category's cases belong to. The three mobility-side
+# categories are 2.1 Home Accessibility and Safety Modification; the two
+# ventilation-side ones are Home Remediation. This is what turns a recommended
+# product into the name of a case an agent has to open.
+CATEGORY_FAMILY = {
+    BATHROOM: "Home Accessibility and Safety Modification",
+    DOORS: "Home Accessibility and Safety Modification",
+    MOBILITY_ACCESS: "Home Accessibility and Safety Modification",
+    AIR_QUALITY: "Home Remediation",
+    TEMPERATURE: "Home Remediation",
+}
+
+
+def category_of_option(option_code):
+    """The main category an intervention option belongs to, or ""."""
+    for category, groups in INTERVENTIONS.items():
+        for group in groups:
+            if any(o["code"] == option_code for o in group["options"]):
+                return category
+    return ""
+
+
+def group_of_option(option_code):
+    """The intervention GROUP an option belongs to, or None."""
+    for groups in INTERVENTIONS.values():
+        for group in groups:
+            if any(o["code"] == option_code for o in group["options"]):
+                return group
+    return None
+
 
 # ── questions ────────────────────────────────────────────────────────────────
 # Transcribed from tmp/import/{Mobility,Ventilation,Combined}Questionnaire.txt.
