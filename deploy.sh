@@ -72,4 +72,26 @@ if systemctl list-unit-files | grep -q '^celery-worker\.service'; then
 fi
 
 echo "==> Done. Quick health check:"
-curl -fsS https://www.carecircleinternal.com/ && echo
+# RETRIED, because `systemctl reload gunicorn` returns once systemd has DELIVERED
+# the HUP -- not once the new workers are answering. Re-importing this Django app
+# takes a second or two, and the old workers drain in parallel, so a single curl
+# fired on the next line can legitimately hit a moment where the socket answers
+# nothing. That printed a bare "502" at the end of an otherwise perfect deploy,
+# which is worse than no check: it teaches you to ignore the one that matters.
+#
+# Prints the status code rather than the homepage HTML, which the previous -fsS
+# dumped to the terminal on success.
+for attempt in 1 2 3 4 5 6 7 8 9 10; do
+  code=$(curl -o /dev/null -s -w '%{http_code}' https://www.carecircleinternal.com/ || echo 000)
+  if [ "$code" = "200" ]; then
+    echo "    HTTP $code (attempt $attempt)"
+    break
+  fi
+  if [ "$attempt" = "10" ]; then
+    echo "    STILL FAILING after 10 attempts: HTTP $code"
+    echo "    sudo systemctl status gunicorn --no-pager -l | tail -20"
+    echo "    sudo journalctl -u gunicorn -n 60 --no-pager"
+    exit 1
+  fi
+  sleep 2
+done
