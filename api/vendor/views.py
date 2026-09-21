@@ -983,16 +983,22 @@ class VendorPhotoView(VendorAPIView):
         # the dwelling has no category -- but a WRONG one is refused rather than
         # stored, because a typo would leave the gate permanently unsatisfiable and
         # the vendor unable to submit with no way to see why.
-        from ..services.assessment_forms import INTERVENTIONS
+        from ..services.assessment_forms import FORMS
 
         group = (request.data.get("intervention_group") or "").strip()
         if group:
+            # A QUESTION group code ("mob.risk.bathroom"), because the
+            # questionnaires attach the photo requirement to the question group the
+            # vendor just answered under -- not to a product category.
             valid = {
-                g["code"] for groups in INTERVENTIONS.values() for g in groups
+                g["code"] for sections in FORMS.values()
+                for sec in sections for g in sec["groups"]
+                if g.get("requires_photo")
             }
             if group not in valid:
                 return error(
-                    "bad_group", f"'{group}' is not an intervention category.",
+                    "bad_group",
+                    f"'{group}' is not a section that requires a photo.",
                 )
 
         created = []
@@ -1026,8 +1032,9 @@ class VendorPhotoView(VendorAPIView):
                 # because the alternative is a database error the vendor cannot act
                 # on.
                 labels = {
-                    g["code"]: g["label"]
-                    for groups in INTERVENTIONS.values() for g in groups
+                    g["code"]: (g["label"] or sec["title"])
+                    for sections in FORMS.values()
+                    for sec in sections for g in sec["groups"]
                 }
                 where = labels.get(
                     existing.intervention_group, "the general photos",

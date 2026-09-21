@@ -29280,15 +29280,11 @@ class DispatchHistoryApiTest(TestCase):
 
 
 class AssessmentFormTest(TestCase):
-    """The Dwelling Assessment form: the template, and the CRM's read-only view.
-
-    Transcribed from the three real forms, so the counts here are assertions about
-    the actual documents rather than about my transcription of them.
-    """
+    """The CRM's read-only view of the Dwelling Assessment form."""
 
     EEA = (
         "Dwelling Assessment & Statement of Work (SOW) Development - "
-        "Modifications and Remediation Service - Manhattan"
+        "Modifications and Remediation Service - Queens"
     )
 
     def setUp(self):
@@ -29315,8 +29311,7 @@ class AssessmentFormTest(TestCase):
         )
         self.order = DispatchOrder.objects.create(
             kind=DispatchKind.ASSESSMENT, client=self.member,
-            vendor=Vendor.objects.create(name="Acme"),
-            referral_type="combined",
+            vendor=Vendor.objects.create(name="Acme"), referral_type="combined",
         )
 
     def _api(self):
@@ -29324,1491 +29319,180 @@ class AssessmentFormTest(TestCase):
 
         from .models import Agent
 
-        if not hasattr(self, "_agent"):
-            self._agent = Agent.objects.create(
-                name="F", agent_code="888", group="Management",
+        # Cached: agent_code is unique, and two calls in one test would collide.
+        agent = getattr(self, "_agent", None)
+        if agent is None:
+            agent = Agent.objects.create(
+                name="Form Agent", agent_code="780", group="Management",
             )
+            self._agent = agent
         acc = AccessToken()
-        acc["agent_id"] = str(self._agent.id)
-        acc["agent_code"] = self._agent.agent_code
-        acc["agent_name"] = self._agent.name
-        acc["agent_group"] = self._agent.group
+        acc["agent_id"] = str(agent.id)
+        acc["agent_code"] = agent.agent_code
+        acc["agent_name"] = agent.name
+        acc["agent_group"] = agent.group
         api = APIClient(); api.credentials(HTTP_AUTHORIZATION=f"Bearer {acc}")
         return api
 
     def _get(self):
-        resp = self._api().get(
+        return self._api().get(
             f"/api/portal/members/{self.member.pk}/assessment-form/",
         )
-        self.assertEqual(resp.status_code, 200, resp.content)
-        return resp.data
 
-    # ── the template ─────────────────────────────────────────────────────────
-    def test_the_question_counts_match_the_real_forms(self):
-        from .services.assessment_forms import all_question_codes
-
-        self.assertEqual(len(all_question_codes(["mobility"])), 17)
-        self.assertEqual(len(all_question_codes(["ventilation"])), 16)
-        self.assertEqual(len(all_question_codes()), 33)
-
-    def test_the_intervention_counts_match_the_real_forms(self):
-        from .services.assessment_forms import INTERVENTIONS, all_option_codes
-
-        self.assertEqual(len(INTERVENTIONS["mobility"]), 7)
-        self.assertEqual(len(INTERVENTIONS["ventilation"]), 5)
-        self.assertEqual(len(all_option_codes(["mobility"])), 18)
-        self.assertEqual(len(all_option_codes(["ventilation"])), 8)
-
-    def test_every_code_is_UNIQUE(self):
-        """Answers are keyed by code, so a duplicate would silently merge two
-        different questions into one answer."""
-        from .services.assessment_forms import all_option_codes, all_question_codes
-
-        for codes in (all_question_codes(), all_option_codes()):
-            self.assertEqual(len(codes), len(set(codes)))
-
-    def test_a_referral_type_selects_its_modules(self):
-        from .services.assessment_forms import modules_for_referral
-
-        self.assertEqual(modules_for_referral("mobility"), ["mobility"])
-        self.assertEqual(modules_for_referral("ventilation"), ["ventilation"])
-        self.assertEqual(
-            modules_for_referral("combined"), ["mobility", "ventilation"],
-        )
-
-    def test_an_UNKNOWN_referral_type_selects_NO_module(self):
-        """Rendering a Mobility assessment for a referral nobody classified would
-        put questions in front of a vendor that no authorization covers."""
-        from .services.assessment_forms import modules_for_referral
-
-        for junk in ("", None, "plumbing"):
-            self.assertEqual(modules_for_referral(junk), [])
-
-    # ── the read-only view ───────────────────────────────────────────────────
-    def test_the_blank_form_still_shows_EVERY_question(self):
-        """An unanswered form is not an empty screen -- it is the form with nothing
-        ticked, which is what tells an agent what the vendor will be asked."""
-        data = self._get()
+    def test_the_blank_form_shows_EVERY_question(self):
+        """An unanswered form is not an empty response; it is the form with nothing
+        ticked, which is what tells an agent what will be asked."""
+        data = self._get().data
         self.assertEqual(data["state"], "not_started")
-        self.assertEqual(len(data["modules"]), 2)
-        total = sum(
-            len(g["questions"])
-            for m in data["modules"] for s in m["sections"] for g in s["groups"]
-        )
-        self.assertEqual(total, 33)
-        self.assertFalse(any(
-            q["checked"]
-            for m in data["modules"] for s in m["sections"]
-            for g in s["groups"] for q in g["questions"]
-        ))
+        questions = [
+            q for s in data["sections"] for g in s["groups"] for q in g["questions"]
+        ]
+        self.assertEqual(len(questions), 29)
+        self.assertTrue(all(q["checked"] is False for q in questions))
 
-    def test_a_MOBILITY_only_referral_renders_one_module(self):
+    def test_a_referral_type_selects_its_FORM(self):
+        self.assertEqual(self._get().data["form"], "combined")
         self.order.referral_type = "mobility"
         self.order.save(update_fields=["referral_type"])
-        data = self._get()
-        self.assertEqual([m["code"] for m in data["modules"]], ["mobility"])
+        data = self._get().data
+        self.assertEqual(data["form"], "mobility")
         self.assertEqual(
-            sum(len(g["questions"])
-                for m in data["modules"] for s in m["sections"] for g in s["groups"]),
-            17,
+            [s["code"] for s in data["sections"]], ["reason", "functional", "risks"],
         )
 
-    def test_REASON_FOR_ASSESSMENT_appears_in_BOTH_modules(self):
-        """The combined form genuinely repeats it -- the real PDF shows it twice --
-        so the renderer must key on module AND section, not section alone."""
-        data = self._get()
-        titles = [
-            s["title"] for m in data["modules"] for s in m["sections"]
-        ]
-        self.assertEqual(titles.count("Reason for Assessment"), 2)
-
-    def test_only_REASON_sections_offer_an_Other_box(self):
-        data = self._get()
-        for m in data["modules"]:
-            for s in m["sections"]:
-                self.assertEqual(
-                    s["allows_other"], s["title"] == "Reason for Assessment",
-                    f"{m['code']}.{s['code']}",
-                )
-
-    def test_a_submitted_form_renders_the_ANSWERS(self):
-        from .models import DispatchQuestionnaire
-        from .services.assessment_forms import build_schema
-
-        DispatchQuestionnaire.objects.create(
-            dispatch_order=self.order, modules=["mobility", "ventilation"],
-            schema_snapshot=build_schema(["mobility", "ventilation"]),
-            answers={"mob.reason.fall_risk": True, "vent.air.excessive_dust": True},
-            section_other={"mob.reason": "reported by daughter"},
-            interventions=[{"option": "window_ac", "qty": 2}],
-            justification="too hot", state="submitted",
-            submitted_at=timezone.now(),
+    def test_a_VENTILATION_referral_keeps_its_member_reported_section(self):
+        """Which combined does not have -- the documents differ, and the CRM must
+        show whichever was actually used."""
+        self.order.referral_type = "ventilation"
+        self.order.save(update_fields=["referral_type"])
+        self.assertIn(
+            "reported", [s["code"] for s in self._get().data["sections"]],
         )
-        data = self._get()
-        self.assertEqual(data["state"], "submitted")
 
-        ticked = {
-            q["code"]
-            for m in data["modules"] for s in m["sections"]
-            for g in s["groups"] for q in g["questions"] if q["checked"]
+    def test_COMBINED_merges_the_two_reason_sections_into_one(self):
+        data = self._get().data
+        reason = [s for s in data["sections"] if s["code"] == "reason"][0]
+        self.assertEqual(
+            [g["label"] for g in reason["groups"]], ["Mobility", "Ventilation"],
+        )
+
+    def test_each_group_reports_its_CATEGORY_and_photo_rule(self):
+        """So the CRM can show why a category of products was offered, and which
+        sections owed a photo."""
+        data = self._get().data
+        groups = {
+            g["code"]: g for s in data["sections"] for g in s["groups"]
         }
-        self.assertEqual(ticked, {"mob.reason.fall_risk", "vent.air.excessive_dust"})
-        self.assertEqual(data["justification"], "too hot")
+        self.assertEqual(groups["mob.risk.bathroom"]["category"], "bathroom")
+        self.assertTrue(groups["mob.risk.bathroom"]["requires_photo"])
+        self.assertEqual(groups["comb.reason.mob"]["category"], "")
+        self.assertFalse(groups["comb.reason.mob"]["requires_photo"])
 
-        other = [
-            s["other"] for m in data["modules"] for s in m["sections"]
-            if s["code"] == "mob.reason"
-        ]
-        self.assertEqual(other, ["reported by daughter"])
+    def test_the_CATEGORIES_carry_the_whole_product_catalogue(self):
+        data = self._get().data
+        labels = {c["label"] for c in data["categories"]}
+        self.assertEqual(labels, {
+            "Mobility & Access", "Bathroom", "Air Quality", "Temperature Control",
+        })
 
-    def test_an_intervention_carries_its_QUANTITY(self):
-        """The form has a -/+ stepper, not a checkbox: a member can need two air
-        conditioners, and "x2" is what the vendor is being asked to fit."""
+    def test_a_submitted_form_renders_the_ANSWERS_and_quantities(self):
         from .models import DispatchQuestionnaire
         from .services.assessment_forms import build_schema
 
         DispatchQuestionnaire.objects.create(
-            dispatch_order=self.order, modules=["ventilation"],
-            schema_snapshot=build_schema(["ventilation"]),
-            interventions=[{"option": "window_ac", "qty": 2}],
+            dispatch_order=self.order, modules=["combined"],
+            schema_snapshot=build_schema(["combined"]),
+            answers={"mob.risk.slippery_tub": True},
+            section_other={"reason": "referred by the care manager"},
+            interventions=[{"option": "grab_bar_tub", "qty": 2}],
             state="submitted", submitted_at=timezone.now(),
         )
-        data = self._get()
-        opts = {
-            o["code"]: o["qty"]
-            for m in data["modules"] for g in m["intervention_groups"]
-            for o in g["options"]
+        data = self._get().data
+        self.assertEqual(data["state"], "submitted")
+        ticked = [
+            q["code"] for s in data["sections"] for g in s["groups"]
+            for q in g["questions"] if q["checked"]
+        ]
+        self.assertEqual(ticked, ["mob.risk.slippery_tub"])
+        qty = {
+            o["code"]: o["qty"] for c in data["categories"]
+            for g in c["groups"] for o in g["options"]
         }
-        self.assertEqual(opts["window_ac"], 2)
-        # Unchosen options are still listed, at qty 0 -- the full catalogue shows
-        # what COULD have been recommended.
-        self.assertEqual(opts["portable_ac"], 0)
-        self.assertIn("hepa_purifier", opts)
+        self.assertEqual(qty["grab_bar_tub"], 2)
+        # Unchosen options still render, at 0 -- the full catalogue is what shows
+        # an agent what COULD have been recommended.
+        self.assertEqual(qty["shower_chair"], 0)
+        reason = [s for s in data["sections"] if s["code"] == "reason"][0]
+        self.assertEqual(reason["other"], "referred by the care manager")
 
     def test_a_SUBMITTED_form_renders_from_its_FROZEN_snapshot(self):
-        """The reason the snapshot exists. A signed form must render years later
-        exactly as signed, not acquire blank questions from a later template."""
+        """A signed form must render as it was signed, not acquire later
+        questions."""
         from .models import DispatchQuestionnaire
-        from .services.assessment_forms import build_schema
 
-        snapshot = build_schema(["ventilation"])
-        # Simulate a later template revision by removing a section from the copy
-        # the questionnaire froze.
-        snapshot["modules"][0]["sections"] = snapshot["modules"][0]["sections"][:1]
+        frozen = {
+            "version": 1, "form": "mobility", "label": "Mobility",
+            "service_code": "2.1",
+            "sections": [{
+                "code": "reason", "title": "Reason for Assessment",
+                "allows_other": True,
+                "groups": [{
+                    "code": "old", "label": "", "category": None,
+                    "requires_photo": False,
+                    "questions": [
+                        {"code": "retired.question", "label": "A retired question"},
+                    ],
+                }],
+            }],
+            "categories": [],
+        }
         DispatchQuestionnaire.objects.create(
-            dispatch_order=self.order, modules=["ventilation"],
-            schema_snapshot=snapshot, state="submitted",
-            submitted_at=timezone.now(),
+            dispatch_order=self.order, modules=["mobility"],
+            schema_snapshot=frozen, answers={"retired.question": True},
+            state="submitted", submitted_at=timezone.now(),
         )
-        data = self._get()
-        self.assertEqual(len(data["modules"][0]["sections"]), 1)
+        data = self._get().data
+        labels = [
+            q["label"] for s in data["sections"] for g in s["groups"]
+            for q in g["questions"]
+        ]
+        self.assertEqual(labels, ["A retired question"])
 
     def test_a_DRAFT_renders_against_the_LIVE_template(self):
-        """The mirror image: an unfinished form should pick up template fixes."""
+        """A draft is not evidence yet, so it follows the current form."""
         from .models import DispatchQuestionnaire
 
         DispatchQuestionnaire.objects.create(
-            dispatch_order=self.order, modules=["ventilation"],
-            schema_snapshot={}, state="draft",
+            dispatch_order=self.order, modules=["combined"], state="draft",
         )
-        data = self._get()
-        self.assertEqual(data["state"], "draft")
-        self.assertEqual(len(data["modules"][0]["sections"]), 3)
+        questions = [
+            q for s in self._get().data["sections"] for g in s["groups"]
+            for q in g["questions"]
+        ]
+        self.assertEqual(len(questions), 29)
 
-    def test_there_is_NO_way_for_the_CRM_to_write_the_form(self):
+    def test_photos_are_reported_by_the_SECTION_they_evidence(self):
+        from .models import DispatchProof
+
+        DispatchProof.objects.create(
+            dispatch_order=self.order, s3_key="a", content_hash="a",
+            intervention_group="mob.risk.bathroom",
+        )
+        DispatchProof.objects.create(
+            dispatch_order=self.order, s3_key="b", content_hash="b",
+        )
+        data = self._get().data
+        self.assertEqual(data["photos_by_group"]["mob.risk.bathroom"], 1)
+        self.assertEqual(data["photos_by_group"][""], 1)
+        self.assertEqual(data["photo_count"], 2)
+
+    def test_there_is_NO_write_route(self):
         """Only the vendor completes an assessment, enforced by the absence of a
-        route rather than a permission check someone can widen."""
+        route rather than a permission check."""
         url = f"/api/portal/members/{self.member.pk}/assessment-form/"
-        for method in ("post", "patch", "put", "delete"):
-            resp = getattr(self._api(), method)(url, {}, format="json")
-            self.assertEqual(
-                resp.status_code, 405, f"{method.upper()} must not be allowed",
-            )
-
-    def test_a_member_with_no_order_gets_a_404_not_a_blank_form(self):
-        from .models import Client
-
-        other = Client.objects.create(
-            client_id=str(uuid.uuid4()), first_name="No", last_name="Order",
-            client_added_at=timezone.now(),
-        )
-        resp = self._api().get(
-            f"/api/portal/members/{other.pk}/assessment-form/",
-        )
-        self.assertEqual(resp.status_code, 404)
-
-
-VENDOR_HOST = "vendor.test"
-
-
-@override_settings(VENDOR_API_HOST=VENDOR_HOST, ALLOWED_HOSTS=["*"])
-class VendorApiAuthTest(TestCase):
-    """The vendor API's isolation and scoping.
-
-    These are the tests that matter most on this surface: the requirement is that
-    vendor users reach neither the CRM nor any CRM API, and that one vendor never
-    sees another's work.
-    """
-
-    def setUp(self):
-        from django.contrib.auth.hashers import make_password
-
-        from .models import Vendor, VendorUser
-
-        self.vendor = Vendor.objects.create(name="Acme Remediation")
-        self.other_vendor = Vendor.objects.create(name="Beta Repairs")
-        self.user = VendorUser.objects.create(
-            vendor=self.vendor, email="boss@acme.test", name="Ada Boss",
-            password=make_password("vendor-pass-1"), is_admin=True,
-        )
-        self.other_user = VendorUser.objects.create(
-            vendor=self.other_vendor, email="rival@beta.test", name="Rival",
-            password=make_password("vendor-pass-2"),
-        )
-
-    def _client(self):
-        return APIClient()
-
-    def _login(self, email="boss@acme.test", password="vendor-pass-1"):
-        return self._client().post(
-            "/v1/auth/login/", {"email": email, "password": password},
-            format="json", HTTP_HOST=VENDOR_HOST,
-        )
-
-    def _token(self, **kw):
-        resp = self._login(**kw)
-        self.assertEqual(resp.status_code, 200, resp.content)
-        return resp.data["access_token"]
-
-    def _as(self, token):
-        api = APIClient()
-        api.credentials(HTTP_AUTHORIZATION=f"Bearer {token}")
-        return api
-
-    # ── login ────────────────────────────────────────────────────────────────
-    def test_a_vendor_user_can_log_in_and_gets_an_opaque_token(self):
-        resp = self._login()
-        self.assertEqual(resp.status_code, 200, resp.content)
-        token = resp.data["access_token"]
-        self.assertTrue(token.startswith("ccvt_"))
-        # Opaque, NOT a JWT. A JWT signed with the shared key would authenticate
-        # against the whole CRM -- the single most important property here.
-        self.assertNotIn(".", token.replace("ccvt_", ""))
-        self.assertEqual(resp.data["vendor"]["name"], "Acme Remediation")
-
-    def test_the_raw_token_is_never_stored(self):
-        from .models import VendorAccessToken
-
-        token = self._token()
-        stored = VendorAccessToken.objects.get()
-        self.assertNotEqual(stored.token_hash, token)
-        self.assertEqual(len(stored.token_hash), 64)  # sha256 hex
-
-    def test_a_wrong_password_and_a_missing_user_give_the_SAME_answer(self):
-        """A different message for each would let anyone enumerate vendor staff
-        against an endpoint on the public internet."""
-        wrong = self._login(password="nope")
-        missing = self._login(email="nobody@acme.test", password="nope")
-        self.assertEqual(wrong.status_code, 401)
-        self.assertEqual(missing.status_code, 401)
-        self.assertEqual(wrong.data["error"], missing.data["error"])
-        self.assertEqual(wrong.data["detail"], missing.data["detail"])
-
-    def test_a_DEACTIVATED_user_cannot_log_in(self):
-        self.user.is_active = False
-        self.user.save(update_fields=["is_active"])
-        self.assertEqual(self._login().status_code, 401)
-
-    def test_a_deactivated_VENDOR_locks_out_its_staff(self):
-        self.vendor.is_active = False
-        self.vendor.save(update_fields=["is_active"])
-        self.assertEqual(self._login().status_code, 401)
-
-    def test_deactivation_takes_effect_IMMEDIATELY_on_an_existing_token(self):
-        """Re-checked every request, not only at login: deactivating someone must
-        not wait for their token to expire."""
-        token = self._token()
-        self.assertEqual(
-            self._as(token).get("/v1/me/", HTTP_HOST=VENDOR_HOST).status_code, 200,
-        )
-        self.user.is_active = False
-        self.user.save(update_fields=["is_active"])
-        self.assertEqual(
-            self._as(token).get("/v1/me/", HTTP_HOST=VENDOR_HOST).status_code, 401,
-        )
-
-    def test_logout_revokes_the_token(self):
-        token = self._token()
-        api = self._as(token)
-        self.assertEqual(
-            api.post("/v1/auth/logout/", {}, format="json",
-                     HTTP_HOST=VENDOR_HOST).status_code, 200,
-        )
-        self.assertEqual(
-            api.get("/v1/me/", HTTP_HOST=VENDOR_HOST).status_code, 401,
-        )
-
-    def test_an_EXPIRED_token_is_refused(self):
-        from .models import VendorAccessToken
-
-        token = self._token()
-        VendorAccessToken.objects.update(
-            expires_at=timezone.now() - timezone.timedelta(minutes=1),
-        )
-        self.assertEqual(
-            self._as(token).get("/v1/me/", HTTP_HOST=VENDOR_HOST).status_code, 401,
-        )
-
-    # ── isolation ────────────────────────────────────────────────────────────
-    def test_the_CRM_ROUTES_DO_NOT_EXIST_on_the_vendor_host(self):
-        """404, not 403. The urlconf is swapped, so they are absent rather than
-        forbidden -- which is what lets a vendor be handed this URL at all."""
-        api = self._as(self._token())
-        for path in ("/api/clients/", "/api/portal/dashboard/", "/api/cases/"):
-            resp = api.get(path, HTTP_HOST=VENDOR_HOST)
-            self.assertEqual(resp.status_code, 404, f"{path} -> {resp.status_code}")
-
-    def test_the_VENDOR_ROUTES_DO_NOT_EXIST_on_the_main_host(self):
-        """The reverse direction: api.vendor.urls is never included by
-        backend/urls.py, so the surface is absent from the CRM's own hostname."""
-        api = self._as(self._token())
-        for path in ("/v1/me/", "/v1/work/", "/v1/auth/login/"):
-            resp = api.get(path, HTTP_HOST="localhost")
-            self.assertEqual(resp.status_code, 404, f"{path} -> {resp.status_code}")
-
-    def test_a_vendor_token_is_UNRECOGNISED_by_the_CRM(self):
-        """Not merely unauthorised. The auth class is deliberately absent from
-        DEFAULT_AUTHENTICATION_CLASSES, so a CRM endpoint cannot even parse it."""
-        from .models import Client
-
-        Client.objects.create(
-            client_id=str(uuid.uuid4()), first_name="A", last_name="B",
-            client_added_at=timezone.now(),
-        )
-        resp = self._as(self._token()).get(
-            "/api/portal/members/", HTTP_HOST="localhost",
-        )
-        self.assertIn(resp.status_code, (401, 403, 404))
-        self.assertNotEqual(resp.status_code, 200)
-
-    def test_an_AGENT_JWT_is_unrecognised_by_the_vendor_API(self):
-        from rest_framework_simplejwt.tokens import AccessToken
-
-        from .models import Agent
-
-        agent = Agent.objects.create(
-            name="Agent", agent_code="991", group="Management",
-        )
-        acc = AccessToken()
-        acc["agent_id"] = str(agent.id); acc["agent_code"] = agent.agent_code
-        acc["agent_name"] = agent.name; acc["agent_group"] = agent.group
-
-        api = APIClient()
-        api.credentials(HTTP_AUTHORIZATION=f"Bearer {acc}")
-        resp = api.get("/v1/work/", HTTP_HOST=VENDOR_HOST)
-        self.assertEqual(resp.status_code, 401)
-
-    def test_a_PARTNER_token_is_unrecognised_by_the_vendor_API(self):
-        """The two external surfaces must not accept each other's credentials."""
-        from .models import DeliveryCompany, DeliveryCompanyApiClient
-        from .partner.auth import generate_client_id, generate_secret, hash_secret, issue_token
-
-        company = DeliveryCompany.objects.create(name="Couriers Ltd")
-        secret = generate_secret()
-        api_client = DeliveryCompanyApiClient.objects.create(
-            delivery_company=company, client_id=generate_client_id("couriers"),
-            secret_hash=hash_secret(secret), scopes=["pod:write"],
-        )
-        raw, _tok = issue_token(api_client)
-
-        api = APIClient()
-        api.credentials(HTTP_AUTHORIZATION=f"Bearer {raw}")
-        self.assertEqual(
-            api.get("/v1/work/", HTTP_HOST=VENDOR_HOST).status_code, 401,
-        )
-
-    def test_no_credentials_is_401(self):
-        self.assertEqual(
-            self._client().get("/v1/work/", HTTP_HOST=VENDOR_HOST).status_code, 401,
-        )
-
-
-@override_settings(VENDOR_API_HOST=VENDOR_HOST, ALLOWED_HOSTS=["*"])
-class VendorWorkScopingTest(TestCase):
-    """A vendor sees only their own work, and only the member fields agreed."""
-
-    def setUp(self):
-        from django.contrib.auth.hashers import make_password
-
-        from .models import (
-            Client, DispatchKind, DispatchOrder, DispatchStatus, Vendor, VendorUser,
-        )
-
-        self.vendor = Vendor.objects.create(name="Acme")
-        self.rival = Vendor.objects.create(name="Beta")
-        VendorUser.objects.create(
-            vendor=self.vendor, email="a@acme.test", name="Ada",
-            password=make_password("pw-acme-123"),
-        )
-        # medicaid_id lives on Lead/EnrollmentAnalytics rather than Client, so the
-        # DOB is the sensitive field actually reachable from here -- and the leak
-        # assertion below checks for both it and the word "medicaid" anyway.
-        self.member = Client.objects.create(
-            client_id=str(uuid.uuid4()), first_name="Tracey", last_name="Johnson",
-            date_of_birth="1975-01-31", client_added_at=timezone.now(),
-        )
-        self.mine = DispatchOrder.objects.create(
-            kind=DispatchKind.ASSESSMENT, client=self.member, vendor=self.vendor,
-            referral_type="combined", contact_phone="(347) 394-6843",
-            address_formatted="1550 E 102ND ST 3E BROOKLYN, NY 11236",
-            address_notes="Buzzer 3E",
-        )
-        self.theirs = DispatchOrder.objects.create(
-            kind=DispatchKind.ASSESSMENT, client=Client.objects.create(
-                client_id=str(uuid.uuid4()), first_name="Someone", last_name="Else",
-                client_added_at=timezone.now(),
-            ),
-            vendor=self.rival,
-        )
-        self.done = DispatchOrder.objects.create(
-            kind=DispatchKind.REMEDIATION, client=self.member, vendor=self.vendor,
-            status=DispatchStatus.UPLOADED,
-        )
-
-    def _api(self):
-        resp = APIClient().post(
-            "/v1/auth/login/", {"email": "a@acme.test", "password": "pw-acme-123"},
-            format="json", HTTP_HOST=VENDOR_HOST,
-        )
-        self.assertEqual(resp.status_code, 200, resp.content)
-        api = APIClient()
-        api.credentials(HTTP_AUTHORIZATION=f"Bearer {resp.data['access_token']}")
-        return api
-
-    def test_the_work_list_shows_only_THIS_vendors_orders(self):
-        resp = self._api().get("/v1/work/", HTTP_HOST=VENDOR_HOST)
-        self.assertEqual(resp.status_code, 200)
-        ids = {o["id"] for o in resp.data}
-        self.assertIn(str(self.mine.pk), ids)
-        self.assertNotIn(str(self.theirs.pk), ids)
-
-    def test_terminal_orders_are_excluded_unless_asked_for(self):
-        """An installer opens this to find what to do next, not to browse."""
-        api = self._api()
-        ids = {o["id"] for o in api.get("/v1/work/", HTTP_HOST=VENDOR_HOST).data}
-        self.assertNotIn(str(self.done.pk), ids)
-
-        all_ids = {
-            o["id"] for o in
-            api.get("/v1/work/?include_done=1", HTTP_HOST=VENDOR_HOST).data
-        }
-        self.assertIn(str(self.done.pk), all_ids)
-
-    def test_another_vendors_order_is_a_404_NOT_a_403(self):
-        """A 403 would confirm the id exists."""
-        resp = self._api().get(
-            f"/v1/work/{self.theirs.pk}/", HTTP_HOST=VENDOR_HOST,
-        )
-        self.assertEqual(resp.status_code, 404)
-
-    def test_the_device_gets_ONLY_name_phone_address_and_notes(self):
-        """PII minimisation, enforced server-side. The device is unmanaged and
-        holds data offline, so it must never receive the most sensitive fields --
-        the PDF still prints them because the SERVER renders it."""
-        resp = self._api().get(f"/v1/work/{self.mine.pk}/", HTTP_HOST=VENDOR_HOST)
-        self.assertEqual(resp.status_code, 200)
-        member = resp.data["member"]
-        # The phone is MASKED now, so the key set changed with it.
-        self.assertEqual(set(member), {
-            "name", "phone_masked", "phone_last4", "has_phone", "phone_type",
-            "address", "address_notes",
-        })
-        self.assertEqual(member["name"], "Tracey Johnson")
-
-        body = json.dumps(resp.data, default=str)
-        for forbidden in ("1975-01-31", "medicaid", "date_of_birth"):
-            self.assertNotIn(
-                forbidden.lower(), body.lower(),
-                f"{forbidden} must never reach a vendor device",
-            )
-
-    def test_a_WORK_ORDER_inherits_the_members_contact_details(self):
-        """Found by the first live call against real data: the work order showed no
-        phone at all. The wizard collects contact details ONCE, on the assessment,
-        so a work order carries none of its own -- and an installer opening their
-        job with no number to ring is useless."""
-        from .models import DispatchKind, DispatchOrder
-
-        child = DispatchOrder.objects.create(
-            kind=DispatchKind.REMEDIATION, client=self.member, vendor=self.vendor,
-            parent=self.mine,
-        )
-        resp = self._api().get(f"/v1/work/{child.pk}/", HTTP_HOST=VENDOR_HOST)
-        self.assertEqual(resp.status_code, 200)
-        member = resp.data["member"]
-        self.assertEqual(member["phone_masked"], "(•••) •••-6843")
-        self.assertTrue(member["has_phone"])
-        self.assertEqual(member["address_notes"], "Buzzer 3E")
-        self.assertEqual(
-            member["address"], "1550 E 102ND ST 3E BROOKLYN, NY 11236",
-        )
-
-    def test_an_orphan_work_order_does_not_crash_on_contact(self):
-        """A work order with no parent has nothing to inherit; it must render blank
-        rather than raise."""
-        from .models import DispatchKind, DispatchOrder
-
-        orphan = DispatchOrder.objects.create(
-            kind=DispatchKind.REMEDIATION, client=self.member, vendor=self.vendor,
-        )
-        resp = self._api().get(f"/v1/work/{orphan.pk}/", HTTP_HOST=VENDOR_HOST)
-        self.assertEqual(resp.status_code, 200)
-        self.assertEqual(resp.data["member"]["phone_masked"], "")
-        self.assertFalse(resp.data["member"]["has_phone"])
-
-    def test_the_phone_is_MASKED_by_default(self):
-        """The device is unmanaged and the number is the most directly identifying
-        thing a vendor handles. The last four stay visible so they can confirm they
-        have the right member before asking to see the rest."""
-        resp = self._api().get(f"/v1/work/{self.mine.pk}/", HTTP_HOST=VENDOR_HOST)
-        member = resp.data["member"]
-        self.assertEqual(member["phone_masked"], "(•••) •••-6843")
-        self.assertEqual(member["phone_last4"], "6843")
-        self.assertTrue(member["has_phone"])
-        # The full number must not be anywhere in the payload.
-        self.assertNotIn("394-6843", json.dumps(resp.data, default=str))
-
-    def test_revealing_the_phone_returns_it_and_RECORDS_the_lookup(self):
-        from .models import StageEntityType, StageEvent
-
-        resp = self._api().post(
-            f"/v1/work/{self.mine.pk}/reveal-phone/", {}, format="json",
-            HTTP_HOST=VENDOR_HOST,
-        )
-        self.assertEqual(resp.status_code, 200, resp.content)
-        self.assertEqual(resp.data["phone"], "(347) 394-6843")
-
-        event = StageEvent.objects.filter(
-            entity_type=StageEntityType.DISPATCH_ORDER,
-            dispatch_order=self.mine,
-            note="vendor viewed the member's phone number",
-        ).get()
-        self.assertEqual(event.metadata["vendor_user"], "a@acme.test")
-        # The NUMBER itself is not recorded: logging it to prove someone looked at
-        # it would spread it further than the lookup did.
-        self.assertNotIn("6843", json.dumps(event.metadata))
-
-    def test_the_reveal_is_NOT_written_to_the_members_timeline(self):
-        """The member did nothing. Filling their history with vendor lookups would
-        bury the events that describe their care."""
-        from .models import TimelineEvent
-
-        before = TimelineEvent.objects.filter(client=self.member).count()
-        self._api().post(
-            f"/v1/work/{self.mine.pk}/reveal-phone/", {}, format="json",
-            HTTP_HOST=VENDOR_HOST,
-        )
-        self.assertEqual(
-            TimelineEvent.objects.filter(client=self.member).count(), before,
-        )
-
-    def test_another_vendor_cannot_reveal_a_phone(self):
-        resp = self._api().post(
-            f"/v1/work/{self.theirs.pk}/reveal-phone/", {}, format="json",
-            HTTP_HOST=VENDOR_HOST,
-        )
-        self.assertEqual(resp.status_code, 404)
-
-    def test_the_detail_carries_the_dwelling_case_id_and_programme(self):
-        from .models import ActiveProgram, Case, CaseStatus, CaseType
-        from .services.catalog import clear_program_domain_cache
-
-        name = (
-            "Dwelling Assessment & Statement of Work (SOW) Development - "
-            "Modifications and Remediation Service - Manhattan"
-        )
-        ActiveProgram.objects.create(
-            program_name=name, case_category="Internal Services",
-            case_type=ActiveProgram.CaseType.HOUSING,
-            service_type=ActiveProgram.ServiceType.ENVIRONMENTAL_EXPOSURE_ASSESSMENT,
-        )
-        clear_program_domain_cache()
-        case = Case.objects.create(
-            case_id=uuid.uuid4(), client=self.member,
-            case_type=CaseType.INTERNAL_SERVICE, case_status=CaseStatus.MANAGED,
-            program_name=name, case_created_at=timezone.now(),
-        )
-        self.mine.case = case
-        self.mine.save(update_fields=["case"])
-
-        resp = self._api().get(f"/v1/work/{self.mine.pk}/", HTTP_HOST=VENDOR_HOST)
-        self.assertEqual(resp.data["dwelling_case_id"], str(case.case_id))
-        self.assertEqual(resp.data["program_name"], name)
-
-    def test_a_WORK_ORDER_inherits_the_dwelling_case_id(self):
-        """A vendor quotes that number on paperwork for the installation too."""
-        from .models import ActiveProgram, Case, CaseStatus, CaseType, DispatchKind
-        from .models import DispatchOrder
-        from .services.catalog import clear_program_domain_cache
-
-        name = (
-            "Dwelling Assessment & Statement of Work (SOW) Development - "
-            "Modifications and Remediation Service - Brooklyn"
-        )
-        ActiveProgram.objects.create(
-            program_name=name, case_category="Internal Services",
-            case_type=ActiveProgram.CaseType.HOUSING,
-            service_type=ActiveProgram.ServiceType.ENVIRONMENTAL_EXPOSURE_ASSESSMENT,
-        )
-        clear_program_domain_cache()
-        case = Case.objects.create(
-            case_id=uuid.uuid4(), client=self.member,
-            case_type=CaseType.INTERNAL_SERVICE, case_status=CaseStatus.MANAGED,
-            program_name=name, case_created_at=timezone.now(),
-        )
-        self.mine.case = case
-        self.mine.save(update_fields=["case"])
-        child = DispatchOrder.objects.create(
-            kind=DispatchKind.REMEDIATION, client=self.member, vendor=self.vendor,
-            parent=self.mine,
-        )
-        resp = self._api().get(f"/v1/work/{child.pk}/", HTTP_HOST=VENDOR_HOST)
-        self.assertEqual(resp.data["dwelling_case_id"], str(case.case_id))
-
-    def test_an_assessment_detail_carries_the_FORM(self):
-        resp = self._api().get(f"/v1/work/{self.mine.pk}/", HTTP_HOST=VENDOR_HOST)
-        form = resp.data["form"]
-        self.assertEqual(form["state"], "not_started")
-        # Combined referral -> both modules, the same schema the CRM renders.
-        self.assertEqual(
-            [m["code"] for m in form["schema"]["modules"]],
-            ["mobility", "ventilation"],
-        )
-
-
-@override_settings(VENDOR_API_HOST=VENDOR_HOST, ALLOWED_HOSTS=["*"])
-class VendorDashboardTest(TestCase):
-    """The dashboard counts, and status filtering on the work list."""
-
-    def setUp(self):
-        from django.contrib.auth.hashers import make_password
-
-        from .models import (
-            Client, DispatchKind, DispatchOrder, DispatchStatus, DispatchVisit,
-            Vendor, VendorUser,
-        )
-
-        self.vendor = Vendor.objects.create(name="Acme")
-        self.rival = Vendor.objects.create(name="Beta")
-        VendorUser.objects.create(
-            vendor=self.vendor, email="a@acme.test", name="Ada",
-            password=make_password("pw-acme-123"),
-        )
-        self.member = Client.objects.create(
-            client_id=str(uuid.uuid4()), first_name="Tracey", last_name="Johnson",
-            client_added_at=timezone.now(),
-        )
-
-        def order(kind, status, vendor=None, client=None):
-            return DispatchOrder.objects.create(
-                kind=kind, client=client or self.member,
-                vendor=vendor or self.vendor, status=status,
-            )
-
-        self.pending = order(DispatchKind.ASSESSMENT, DispatchStatus.PENDING_SCHEDULE)
-        self.confirmed = order(DispatchKind.REMEDIATION, DispatchStatus.CONFIRMED)
-        self.awaiting = order(
-            DispatchKind.REMEDIATION, DispatchStatus.PENDING_SUBMISSION,
-        )
-        self.uploaded = order(DispatchKind.REMEDIATION, DispatchStatus.UPLOADED)
-        # Another vendor's work, which must never appear in any count. A DIFFERENT
-        # member, because one_assessment_order_per_client is per MEMBER regardless
-        # of vendor -- the constraint caught this fixture, which is the constraint
-        # doing its job.
-        order(
-            DispatchKind.ASSESSMENT, DispatchStatus.CONFIRMED, vendor=self.rival,
-            client=Client.objects.create(
-                client_id=str(uuid.uuid4()), first_name="Rival", last_name="Member",
-                client_added_at=timezone.now(),
-            ),
-        )
-
-        today = timezone.now()
-        DispatchVisit.objects.create(
-            dispatch_order=self.confirmed, scheduled_for=today,
-        )
-        DispatchVisit.objects.create(
-            dispatch_order=self.confirmed,
-            scheduled_for=today + timezone.timedelta(days=3),
-        )
-        # Scheduled in the past and never started -- the queue that quietly rots.
-        DispatchVisit.objects.create(
-            dispatch_order=self.awaiting,
-            scheduled_for=today - timezone.timedelta(days=2),
-        )
-
-    def _api(self):
-        resp = APIClient().post(
-            "/v1/auth/login/", {"email": "a@acme.test", "password": "pw-acme-123"},
-            format="json", HTTP_HOST=VENDOR_HOST,
-        )
-        self.assertEqual(resp.status_code, 200, resp.content)
-        api = APIClient()
-        api.credentials(HTTP_AUTHORIZATION=f"Bearer {resp.data['access_token']}")
-        return api
-
-    def _dash(self):
-        resp = self._api().get("/v1/dashboard/", HTTP_HOST=VENDOR_HOST)
-        self.assertEqual(resp.status_code, 200, resp.content)
-        return resp.data
-
-    # ── counts ───────────────────────────────────────────────────────────────
-    def test_the_open_counts_are_named_for_what_to_DO(self):
-        d = self._dash()
-        self.assertEqual(d["open"]["needs_scheduling"], 1)
-        self.assertEqual(d["open"]["confirmed"], 1)
-        self.assertEqual(d["open"]["awaiting_submission"], 1)
-        self.assertEqual(d["done"]["uploaded"], 1)
-
-    def test_ANOTHER_vendors_work_is_in_no_count(self):
-        """The rival has a CONFIRMED order; ours must still read 1."""
-        d = self._dash()
-        self.assertEqual(d["open"]["confirmed"], 1)
-        self.assertEqual(d["vendor"]["name"], "Acme")
-
-    def test_open_by_kind_excludes_terminal_orders(self):
-        """A dashboard that counts finished work as outstanding is worse than no
-        dashboard."""
-        d = self._dash()
-        self.assertEqual(d["open_by_kind"]["assessment"], 1)
-        # confirmed + awaiting, NOT the uploaded one
-        self.assertEqual(d["open_by_kind"]["remediation"], 2)
-
-    def test_visits_are_counted_by_WHEN_not_by_status(self):
-        """An order's status says nothing about when someone must travel."""
-        d = self._dash()
-        self.assertEqual(d["visits"]["today"], 1)
-        self.assertEqual(d["visits"]["next_7_days"], 1)
-        self.assertEqual(d["visits"]["overdue"], 1)
-
-    def test_a_COMPLETED_visit_is_not_counted_as_upcoming(self):
-        from .models import DispatchVisit
-
-        DispatchVisit.objects.filter(
-            dispatch_order=self.confirmed,
-        ).update(completed_at=timezone.now())
-        d = self._dash()
-        self.assertEqual(d["visits"]["today"], 0)
-        self.assertEqual(d["visits"]["next_7_days"], 0)
-
-    def test_the_next_visit_is_the_soonest_FUTURE_one(self):
-        d = self._dash()
-        self.assertIsNotNone(d["next_visit"])
-        self.assertEqual(d["next_visit"]["member_name"], "Tracey Johnson")
-        self.assertEqual(d["next_visit"]["order_id"], str(self.confirmed.pk))
-
-    def test_a_vendor_with_nothing_gets_zeroes_not_an_error(self):
-        from django.contrib.auth.hashers import make_password
-
-        from .models import VendorUser
-
-        VendorUser.objects.create(
-            vendor=self.rival, email="b@beta.test", name="Bea",
-            password=make_password("pw-beta-123"),
-        )
-        resp = APIClient().post(
-            "/v1/auth/login/", {"email": "b@beta.test", "password": "pw-beta-123"},
-            format="json", HTTP_HOST=VENDOR_HOST,
-        )
-        api = APIClient()
-        api.credentials(HTTP_AUTHORIZATION=f"Bearer {resp.data['access_token']}")
-        d = api.get("/v1/dashboard/", HTTP_HOST=VENDOR_HOST).data
-        self.assertEqual(d["open"]["needs_scheduling"], 0)
-        self.assertEqual(d["visits"]["today"], 0)
-        self.assertIsNone(d["next_visit"])
-
-    # ── filtering ────────────────────────────────────────────────────────────
-    def test_status_filters_are_REPEATABLE_for_multi_select(self):
-        resp = self._api().get(
-            "/v1/work/?status=confirmed&status=pending_submission",
-            HTTP_HOST=VENDOR_HOST,
-        )
-        self.assertEqual(resp.status_code, 200)
-        self.assertEqual(
-            {o["status"] for o in resp.data},
-            {"confirmed", "pending_submission"},
-        )
-
-    def test_an_explicit_status_filter_can_reach_TERMINAL_orders(self):
-        """Otherwise "show me what I finished" would be impossible."""
-        resp = self._api().get("/v1/work/?status=uploaded", HTTP_HOST=VENDOR_HOST)
-        self.assertEqual([o["id"] for o in resp.data], [str(self.uploaded.pk)])
-
-    def test_an_UNKNOWN_status_is_ignored_rather_than_rejected(self):
-        """A stale app version sending a status we have retired should show
-        everything, not fail."""
-        resp = self._api().get("/v1/work/?status=nonsense", HTTP_HOST=VENDOR_HOST)
-        self.assertEqual(resp.status_code, 200)
-        self.assertEqual(len(resp.data), 3)  # the default open set
-
-    def test_kind_filters_assessments_from_work_orders(self):
-        resp = self._api().get("/v1/work/?kind=assessment", HTTP_HOST=VENDOR_HOST)
-        self.assertEqual([o["id"] for o in resp.data], [str(self.pending.pk)])
-
-    def test_filtering_still_cannot_reach_another_vendor(self):
-        resp = self._api().get(
-            "/v1/work/?status=confirmed", HTTP_HOST=VENDOR_HOST,
-        )
-        self.assertEqual([o["id"] for o in resp.data], [str(self.confirmed.pk)])
-
-
-@override_settings(VENDOR_API_HOST=VENDOR_HOST, ALLOWED_HOSTS=["*"])
-class VendorTeamTest(TestCase):
-    """A vendor admin manages their own staff. Only the admin, only their own."""
-
-    def setUp(self):
-        from django.contrib.auth.hashers import make_password
-
-        from .models import Vendor, VendorUser
-
-        self.vendor = Vendor.objects.create(name="Acme")
-        self.rival = Vendor.objects.create(name="Beta")
-        self.admin = VendorUser.objects.create(
-            vendor=self.vendor, email="admin@acme.test", name="Ada Admin",
-            password=make_password("pw-admin-123"), is_admin=True,
-        )
-        self.staff = VendorUser.objects.create(
-            vendor=self.vendor, email="staff@acme.test", name="Sam Staff",
-            password=make_password("pw-staff-123"),
-        )
-        self.rival_admin = VendorUser.objects.create(
-            vendor=self.rival, email="admin@beta.test", name="Bea Admin",
-            password=make_password("pw-beta-1234"), is_admin=True,
-        )
-
-    def _as(self, email, password):
-        resp = APIClient().post(
-            "/v1/auth/login/", {"email": email, "password": password},
-            format="json", HTTP_HOST=VENDOR_HOST,
-        )
-        self.assertEqual(resp.status_code, 200, resp.content)
-        api = APIClient()
-        api.credentials(HTTP_AUTHORIZATION=f"Bearer {resp.data['access_token']}")
-        return api
-
-    def _admin(self):
-        return self._as("admin@acme.test", "pw-admin-123")
-
-    def _staff(self):
-        return self._as("staff@acme.test", "pw-staff-123")
-
-    # ── who may ──────────────────────────────────────────────────────────────
-    def test_the_admin_sees_their_team_admin_first(self):
-        resp = self._admin().get("/v1/team/", HTTP_HOST=VENDOR_HOST)
-        self.assertEqual(resp.status_code, 200)
-        self.assertEqual([u["email"] for u in resp.data],
-                         ["admin@acme.test", "staff@acme.test"])
-
-    def test_a_NON_ADMIN_cannot_list_or_add(self):
-        staff = self._staff()
-        self.assertEqual(
-            staff.get("/v1/team/", HTTP_HOST=VENDOR_HOST).status_code, 403,
-        )
-        self.assertEqual(
-            staff.post("/v1/team/", {"name": "X", "email": "x@acme.test"},
-                       format="json", HTTP_HOST=VENDOR_HOST).status_code, 403,
-        )
-
-    def test_a_non_admin_cannot_remove_anyone(self):
-        resp = self._staff().delete(
-            f"/v1/team/{self.staff.pk}/", HTTP_HOST=VENDOR_HOST,
-        )
-        self.assertEqual(resp.status_code, 403)
-
-    def test_an_admin_cannot_touch_ANOTHER_companys_staff(self):
-        """404, not 403 -- a 403 would confirm the id exists."""
-        api = self._admin()
-        self.assertEqual(
-            api.patch(f"/v1/team/{self.rival_admin.pk}/", {"name": "hax"},
-                      format="json", HTTP_HOST=VENDOR_HOST).status_code, 404,
-        )
-        self.assertEqual(
-            api.delete(f"/v1/team/{self.rival_admin.pk}/",
-                       HTTP_HOST=VENDOR_HOST).status_code, 404,
-        )
-
-    def test_the_team_list_shows_only_THIS_company(self):
-        emails = {
-            u["email"] for u in
-            self._admin().get("/v1/team/", HTTP_HOST=VENDOR_HOST).data
-        }
-        self.assertNotIn("admin@beta.test", emails)
-
-    # ── adding ───────────────────────────────────────────────────────────────
-    def test_the_admin_can_add_a_colleague_who_can_then_log_in(self):
-        resp = self._admin().post(
-            "/v1/team/",
-            {"name": "New Hire", "email": "new@acme.test",
-             "password": "their-own-pw-1"},
-            format="json", HTTP_HOST=VENDOR_HOST,
-        )
-        self.assertEqual(resp.status_code, 201, resp.content)
-        self.assertFalse(resp.data["is_admin"])
-        # Supplied, so not echoed.
-        self.assertEqual(resp.data["temporary_password"], "")
-
-        api = self._as("new@acme.test", "their-own-pw-1")
-        self.assertEqual(api.get("/v1/me/", HTTP_HOST=VENDOR_HOST).status_code, 200)
-
-    def test_a_generated_password_is_returned_once(self):
-        resp = self._admin().post(
-            "/v1/team/", {"name": "Gen", "email": "gen@acme.test"},
-            format="json", HTTP_HOST=VENDOR_HOST,
-        )
-        self.assertEqual(resp.status_code, 201)
-        pw = resp.data["temporary_password"]
-        self.assertTrue(pw)
-        self._as("gen@acme.test", pw)  # it works
-
-    def test_an_added_user_is_NEVER_an_admin(self):
-        """The admin slot is CRM-provisioned and constrained to one per vendor, so
-        a company cannot grow a second administrator."""
-        from .models import VendorUser
-
-        self._admin().post(
-            "/v1/team/",
-            {"name": "Sneaky", "email": "sneaky@acme.test", "is_admin": True},
-            format="json", HTTP_HOST=VENDOR_HOST,
-        )
-        self.assertFalse(VendorUser.objects.get(email="sneaky@acme.test").is_admin)
-
-    def test_a_duplicate_email_is_refused_the_same_way_across_companies(self):
-        """"Already used by another company" would leak that a person works for a
-        competitor."""
-        api = self._admin()
-        inside = api.post(
-            "/v1/team/", {"name": "Dup", "email": "staff@acme.test"},
-            format="json", HTTP_HOST=VENDOR_HOST,
-        )
-        outside = api.post(
-            "/v1/team/", {"name": "Dup", "email": "admin@beta.test"},
-            format="json", HTTP_HOST=VENDOR_HOST,
-        )
-        self.assertEqual(inside.status_code, 409)
-        self.assertEqual(outside.status_code, 409)
-        self.assertEqual(inside.data["detail"], outside.data["detail"])
-
-    def test_a_short_password_is_refused(self):
-        resp = self._admin().post(
-            "/v1/team/",
-            {"name": "Short", "email": "short@acme.test", "password": "abc"},
-            format="json", HTTP_HOST=VENDOR_HOST,
-        )
-        self.assertEqual(resp.status_code, 400)
-
-    # ── changing and removing ────────────────────────────────────────────────
-    def test_deactivating_a_colleague_takes_effect_IMMEDIATELY(self):
-        """The authenticator re-checks is_active on every request, so an existing
-        token must stop working at once rather than lasting until it expires."""
-        staff_api = self._staff()
-        self.assertEqual(
-            staff_api.get("/v1/work/", HTTP_HOST=VENDOR_HOST).status_code, 200,
-        )
-        self._admin().patch(
-            f"/v1/team/{self.staff.pk}/", {"is_active": False},
-            format="json", HTTP_HOST=VENDOR_HOST,
-        )
-        self.assertEqual(
-            staff_api.get("/v1/work/", HTTP_HOST=VENDOR_HOST).status_code, 401,
-        )
-
-    def test_an_unchanged_patch_reports_nothing_changed(self):
-        resp = self._admin().patch(
-            f"/v1/team/{self.staff.pk}/", {"name": "Sam Staff"},
-            format="json", HTTP_HOST=VENDOR_HOST,
-        )
-        self.assertEqual(resp.status_code, 200)
-        self.assertEqual(resp.data["changed_fields"], [])
-
-    def test_a_user_with_NO_history_is_deleted_outright(self):
-        """An email typed wrong five minutes ago should not be permanent."""
-        from .models import VendorUser
-
-        resp = self._admin().delete(
-            f"/v1/team/{self.staff.pk}/", HTTP_HOST=VENDOR_HOST,
-        )
-        self.assertEqual(resp.status_code, 200, resp.content)
-        self.assertTrue(resp.data["removed"])
-        self.assertFalse(VendorUser.objects.filter(pk=self.staff.pk).exists())
-
-    def test_a_user_WITH_history_is_deactivated_not_deleted(self):
-        """Submissions point at them, and the record of who assessed a member's
-        home has to survive."""
-        from .models import (
-            Client, DispatchKind, DispatchOrder, DispatchSubmission, VendorUser,
-        )
-
-        member = Client.objects.create(
-            client_id=str(uuid.uuid4()), first_name="H", last_name="M",
-            client_added_at=timezone.now(),
-        )
-        order = DispatchOrder.objects.create(
-            kind=DispatchKind.ASSESSMENT, client=member, vendor=self.vendor,
-        )
-        DispatchSubmission.objects.create(
-            dispatch_order=order, sequence=1, submitted_by=self.staff,
-            submitted_at=timezone.now(),
-        )
-
-        resp = self._admin().delete(
-            f"/v1/team/{self.staff.pk}/", HTTP_HOST=VENDOR_HOST,
-        )
-        self.assertEqual(resp.status_code, 200)
-        self.assertFalse(resp.data["removed"])
-        self.assertTrue(resp.data["deactivated"])
-
-        still_there = VendorUser.objects.get(pk=self.staff.pk)
-        self.assertFalse(still_there.is_active)
-
-    def test_the_ADMIN_cannot_be_removed_or_deactivated_here(self):
-        """Either would lock the company out of its own account, and only the CRM
-        could undo it."""
-        api = self._admin()
-        self.assertEqual(
-            api.delete(f"/v1/team/{self.admin.pk}/",
-                       HTTP_HOST=VENDOR_HOST).status_code, 400,
-        )
-        resp = api.patch(
-            f"/v1/team/{self.admin.pk}/", {"is_active": False},
-            format="json", HTTP_HOST=VENDOR_HOST,
-        )
-        self.assertEqual(resp.status_code, 400)
-        self.admin.refresh_from_db()
-        self.assertTrue(self.admin.is_active)
-
-    def test_the_admin_can_reset_a_colleagues_password(self):
-        from django.contrib.auth.hashers import check_password
-
-        from .models import VendorUser
-
-        resp = self._admin().patch(
-            f"/v1/team/{self.staff.pk}/", {"password": "reset-by-admin-1"},
-            format="json", HTTP_HOST=VENDOR_HOST,
-        )
-        self.assertEqual(resp.status_code, 200)
-        self.assertIn("password", resp.data["changed_fields"])
-        self.assertTrue(check_password(
-            "reset-by-admin-1", VendorUser.objects.get(pk=self.staff.pk).password,
-        ))
-
-
-@override_settings(VENDOR_API_HOST=VENDOR_HOST, ALLOWED_HOSTS=["*"])
-class VendorSchedulingTest(TestCase):
-    """Booking a visit: overlap, timezone, the member's text and the reminders."""
-
-    def setUp(self):
-        from django.contrib.auth.hashers import make_password
-
-        from .models import (
-            Client, DispatchAvailabilityWindow, DispatchKind, DispatchOrder,
-            DispatchStatus, Vendor, VendorUser,
-        )
-
-        self.vendor = Vendor.objects.create(name="X-Man Home Repair")
-        self.user = VendorUser.objects.create(
-            vendor=self.vendor, email="a@xman.test", name="Ada",
-            password=make_password("pw-xman-1234"),
-        )
-        self.member = Client.objects.create(
-            client_id=str(uuid.uuid4()), first_name="miriam", last_name="Israel",
-            client_added_at=timezone.now(),
-        )
-        self.order = DispatchOrder.objects.create(
-            kind=DispatchKind.ASSESSMENT, client=self.member, vendor=self.vendor,
-            status=DispatchStatus.PENDING_SCHEDULE, referral_type="combined",
-            contact_phone="(305) 781-3277", contact_phone_type="mobile",
-            consent_to_text=True, consent_to_call=True,
-            address_formatted="1 Test St, Brooklyn NY",
-        )
-        # Three offered windows, starting comfortably in the future so the tests do
-        # not depend on the hour they run at.
-        self.day = timezone.localdate() + timezone.timedelta(days=10)
-        for offset in range(3):
-            DispatchAvailabilityWindow.objects.create(
-                dispatch_order=self.order,
-                date=self.day + timezone.timedelta(days=offset),
-                start_time="09:00", end_time="12:00",
-            )
-
-    def _api(self):
-        resp = APIClient().post(
-            "/v1/auth/login/", {"email": "a@xman.test", "password": "pw-xman-1234"},
-            format="json", HTTP_HOST=VENDOR_HOST,
-        )
-        self.assertEqual(resp.status_code, 200, resp.content)
-        api = APIClient()
-        api.credentials(HTTP_AUTHORIZATION=f"Bearer {resp.data['access_token']}")
-        return api
-
-    def _book(self, *, date_value=None, arrival="09:00", duration=60, api=None):
-        return (api or self._api()).post(
-            f"/v1/work/{self.order.pk}/schedule/",
-            {
-                "date": (date_value or self.day).isoformat(),
-                "arrival_time": arrival,
-                "duration_minutes": duration,
-            },
-            format="json", HTTP_HOST=VENDOR_HOST,
-        )
-
-    # ── the choosing screen ──────────────────────────────────────────────────
-    def test_the_GET_returns_the_offered_windows_and_the_vendors_own_day(self):
-        resp = self._api().get(
-            f"/v1/work/{self.order.pk}/schedule/", HTTP_HOST=VENDOR_HOST,
-        )
-        self.assertEqual(resp.status_code, 200, resp.content)
-        self.assertEqual(len(resp.data["availability"]), 3)
-        self.assertEqual(resp.data["timezone"], "America/New_York")
-        self.assertTrue(resp.data["consent_to_text"])
-        # A key per offered day, so the app can warn BEFORE the vendor picks.
-        self.assertEqual(len(resp.data["appointments_by_date"]), 3)
-
-    def test_the_GET_is_404_for_another_vendors_order(self):
-        from .models import Client, DispatchKind, DispatchOrder, Vendor
-
-        other = DispatchOrder.objects.create(
-            kind=DispatchKind.ASSESSMENT,
-            client=Client.objects.create(
-                client_id=str(uuid.uuid4()), first_name="X", last_name="Y",
-                client_added_at=timezone.now(),
-            ),
-            vendor=Vendor.objects.create(name="Rival"),
-        )
-        resp = self._api().get(
-            f"/v1/work/{other.pk}/schedule/", HTTP_HOST=VENDOR_HOST,
-        )
-        self.assertEqual(resp.status_code, 404)
-
-    # ── booking ─────────────────────────────────────────────────────────────
-    def test_booking_confirms_the_order_and_stores_the_local_time(self):
-        """The vendor picks 9am meaning nine o'clock at the member's door, so the
-        stored instant must be 9am EASTERN, not 9am UTC."""
-        from .models import DispatchStatus
-
-        resp = self._book()
-        self.assertEqual(resp.status_code, 201, resp.content)
-        self.assertEqual(resp.data["status"], DispatchStatus.CONFIRMED)
-
-        self.order.refresh_from_db()
-        visit = self.order.visits.get()
-        local = timezone.localtime(visit.scheduled_for)
-        self.assertEqual(local.hour, 9)
-        self.assertEqual(local.minute, 0)
-        self.assertEqual(local.date(), self.day)
-        # 60 minutes, which is what the member is told to expect.
-        self.assertEqual(
-            (visit.scheduled_end - visit.scheduled_for).total_seconds() / 60, 60,
-        )
-
-    def test_an_OVERLAPPING_time_is_refused_with_the_designs_wording(self):
-        from .models import Client, DispatchKind, DispatchOrder, DispatchVisit
-
-        # An existing 9:00-10:00 for this vendor, another member.
-        other = DispatchOrder.objects.create(
-            kind=DispatchKind.REMEDIATION, vendor=self.vendor,
-            client=Client.objects.create(
-                client_id=str(uuid.uuid4()), first_name="Other", last_name="Member",
-                client_added_at=timezone.now(),
-            ),
-        )
-        from .services.scheduling import combine_local
-        from datetime import time
-
-        start = combine_local(self.day, time(9, 0))
-        DispatchVisit.objects.create(
-            dispatch_order=other, scheduled_for=start,
-            scheduled_end=start + timezone.timedelta(minutes=60),
-        )
-
-        resp = self._book(arrival="09:30")
-        self.assertEqual(resp.status_code, 400)
-        self.assertEqual(resp.data["error"], "overlap")
-        self.assertIn("overlaps one of your existing appointments", resp.data["detail"])
-
-    def test_a_TOUCHING_appointment_is_allowed(self):
-        """A visit ending at 10:00 does not clash with one starting at 10:00 --
-        treating that as a conflict would block the back-to-back bookings that make
-        a day's route workable."""
-        from datetime import time
-
-        from .models import Client, DispatchKind, DispatchOrder, DispatchVisit
-        from .services.scheduling import combine_local
-
-        other = DispatchOrder.objects.create(
-            kind=DispatchKind.REMEDIATION, vendor=self.vendor,
-            client=Client.objects.create(
-                client_id=str(uuid.uuid4()), first_name="Back", last_name="ToBack",
-                client_added_at=timezone.now(),
-            ),
-        )
-        start = combine_local(self.day, time(9, 0))
-        DispatchVisit.objects.create(
-            dispatch_order=other, scheduled_for=start,
-            scheduled_end=start + timezone.timedelta(minutes=60),
-        )
-        self.assertEqual(self._book(arrival="10:00").status_code, 201)
-
-    def test_ANOTHER_vendors_appointment_does_not_block_this_one(self):
-        from datetime import time
-
-        from .models import Client, DispatchKind, DispatchOrder, DispatchVisit, Vendor
-        from .services.scheduling import combine_local
-
-        rival_order = DispatchOrder.objects.create(
-            kind=DispatchKind.REMEDIATION,
-            vendor=Vendor.objects.create(name="Rival Co"),
-            client=Client.objects.create(
-                client_id=str(uuid.uuid4()), first_name="R", last_name="M",
-                client_added_at=timezone.now(),
-            ),
-        )
-        start = combine_local(self.day, time(9, 0))
-        DispatchVisit.objects.create(
-            dispatch_order=rival_order, scheduled_for=start,
-            scheduled_end=start + timezone.timedelta(minutes=60),
-        )
-        self.assertEqual(self._book(arrival="09:00").status_code, 201)
-
-    def test_a_time_in_the_past_is_refused(self):
-        past = timezone.localdate() - timezone.timedelta(days=1)
-        resp = self._book(date_value=past)
-        self.assertEqual(resp.status_code, 400)
-        self.assertEqual(resp.data["error"], "in_the_past")
-
-    def test_an_unsupported_session_length_is_refused(self):
-        resp = self._book(duration=37)
-        self.assertEqual(resp.status_code, 400)
-        self.assertEqual(resp.data["error"], "bad_duration")
-
-    def test_a_RESCHEDULE_updates_the_same_visit_rather_than_adding_one(self):
-        """A second row would make "when is this appointment?" ambiguous."""
-        self.assertEqual(self._book(arrival="09:00").status_code, 201)
-        self.assertEqual(self._book(arrival="11:00").status_code, 201)
-        self.assertEqual(self.order.visits.count(), 1)
-        local = timezone.localtime(self.order.visits.get().scheduled_for)
-        self.assertEqual(local.hour, 11)
-
-    def test_a_reschedule_does_not_clash_with_ITSELF(self):
-        """The order's own existing visit must be excluded from the overlap check,
-        or moving an appointment by 15 minutes would be impossible."""
-        self._book(arrival="09:00")
-        resp = self._book(arrival="09:15")
-        self.assertEqual(resp.status_code, 201, resp.content)
-
-    # ── the member's text ───────────────────────────────────────────────────
-    def test_booking_STORES_the_members_sms(self):
-        from .models import MemberMessage, MessageDirection, MessageKind
-
-        resp = self._book()
-        self.assertTrue(resp.data["member_notified"])
-
-        msg = MemberMessage.objects.get()
-        self.assertEqual(msg.direction, MessageDirection.OUTBOUND)
-        self.assertEqual(msg.kind, MessageKind.APPOINTMENT_SCHEDULED)
-        # QUEUED, not "sent": no provider exists yet, and claiming a text went out
-        # would make the log lie.
-        self.assertEqual(msg.status, "queued")
-        self.assertEqual(msg.to_number, "(305) 781-3277")
-        self.assertEqual(msg.dispatch_order_id, self.order.pk)
-        self.assertEqual(msg.sent_by_vendor_user_id, self.user.pk)
-        # Named properly, and in the member's own timezone.
-        self.assertIn("Miriam", msg.body)
-        self.assertIn("X-Man Home Repair", msg.body)
-        self.assertIn("ET", msg.body)
-
-    def test_NO_TEXT_CONSENT_blocks_the_sms_but_NOT_the_booking(self):
-        """The appointment matters more than the text. A blocked row records that
-        the member was not told, which the vendor is shown."""
-        from .models import MemberMessage
-
-        self.order.consent_to_text = False
-        self.order.save(update_fields=["consent_to_text"])
-
-        resp = self._book()
-        self.assertEqual(resp.status_code, 201)
-        self.assertFalse(resp.data["member_notified"])
-        self.assertEqual(resp.data["message"]["reason"], "no_text_consent")
-
-        msg = MemberMessage.objects.get()
-        self.assertEqual(msg.status, "blocked")
-        self.assertEqual(msg.error_code, "no_text_consent")
-
-    def test_a_WORK_ORDER_inherits_the_members_text_consent(self):
-        """Found by the first end-to-end reminder run: every text about an
-        installation was blocked as "no consent" while the member had consented --
-        the wizard records consent ONCE, on the assessment, so a work order's own
-        flag is always False. Same bug class as the phone number."""
-        from .models import DispatchKind, DispatchOrder, MemberMessage
-
-        child = DispatchOrder.objects.create(
-            kind=DispatchKind.REMEDIATION, client=self.member, vendor=self.vendor,
-            parent=self.order,
-        )
-        self.assertFalse(child.consent_to_text)          # its own flag
-        self.assertTrue(child.service_consent[1])        # inherited
-
-        resp = self._api().post(
-            f"/v1/work/{child.pk}/schedule/",
-            {
-                "date": self.day.isoformat(),
-                "arrival_time": "14:00", "duration_minutes": 60,
-            },
-            format="json", HTTP_HOST=VENDOR_HOST,
-        )
-        self.assertEqual(resp.status_code, 201, resp.content)
-        self.assertTrue(
-            resp.data["member_notified"],
-            "a work order must inherit consent from its assessment",
-        )
-        self.assertEqual(
-            MemberMessage.objects.filter(dispatch_order=child).get().status,
-            "queued",
-        )
-
-    def test_no_phone_number_blocks_the_sms_but_NOT_the_booking(self):
-        from .models import MemberMessage
-
-        self.order.contact_phone = ""
-        self.order.save(update_fields=["contact_phone"])
-        resp = self._book()
-        self.assertEqual(resp.status_code, 201)
-        self.assertEqual(MemberMessage.objects.get().error_code, "no_phone_number")
-
-    def test_a_RESCHEDULE_sends_the_CHANGED_wording(self):
-        from .models import MemberMessage, MessageKind
-
-        self._book(arrival="09:00")
-        self._book(arrival="11:00")
-        kinds = list(MemberMessage.objects.order_by("created_at").values_list(
-            "kind", flat=True,
-        ))
-        self.assertEqual(kinds, [
-            MessageKind.APPOINTMENT_SCHEDULED, MessageKind.APPOINTMENT_CHANGED,
-        ])
-
-    # ── reminders ───────────────────────────────────────────────────────────
-    def test_booking_creates_the_day_before_and_30_minute_reminders(self):
-        from .models import DispatchReminder, ReminderAudience, ReminderKind
-
-        resp = self._book()
-        self.assertEqual(len(resp.data["reminders"]), 3)
-
-        rems = DispatchReminder.objects.filter(visit__dispatch_order=self.order)
-        vendor_kinds = set(
-            rems.filter(audience=ReminderAudience.VENDOR)
-            .values_list("kind", flat=True)
-        )
-        self.assertEqual(
-            vendor_kinds, {ReminderKind.DAY_BEFORE, ReminderKind.THIRTY_MIN},
-        )
-        # The member gets a day-before nudge too.
-        self.assertTrue(
-            rems.filter(
-                audience=ReminderAudience.MEMBER, kind=ReminderKind.DAY_BEFORE,
-            ).exists()
-        )
-
-    def test_the_reminder_times_are_relative_to_the_visit(self):
-        from .models import DispatchReminder, ReminderAudience, ReminderKind
-
-        self._book()
-        visit = self.order.visits.get()
-        day_before = DispatchReminder.objects.get(
-            visit=visit, kind=ReminderKind.DAY_BEFORE,
-            audience=ReminderAudience.VENDOR,
-        )
-        thirty = DispatchReminder.objects.get(
-            visit=visit, kind=ReminderKind.THIRTY_MIN,
-        )
-        self.assertEqual(
-            (visit.scheduled_for - day_before.send_at).total_seconds(), 86400,
-        )
-        self.assertEqual(
-            (visit.scheduled_for - thirty.send_at).total_seconds(), 1800,
-        )
-
-    def test_a_reschedule_CANCELS_the_old_reminders_rather_than_duplicating(self):
-        from .models import DispatchReminder
-
-        self._book(arrival="09:00")
-        self._book(arrival="11:00")
-        rems = DispatchReminder.objects.filter(visit__dispatch_order=self.order)
-        self.assertEqual(rems.filter(cancelled_at__isnull=True).count(), 3)
-        # Cancelled, not deleted: the record shows a reminder for the old slot
-        # existed and was stood down.
-        self.assertEqual(rems.filter(cancelled_at__isnull=False).count(), 3)
-
-    def test_a_reminder_whose_time_has_PASSED_is_not_created(self):
-        """Booking something for this afternoon must not fire a "day before" notice
-        immediately -- that is noise that teaches people to ignore reminders."""
-        from datetime import time
-
-        from .models import DispatchAvailabilityWindow, DispatchReminder, ReminderKind
-
-        soon = timezone.localtime(timezone.now() + timezone.timedelta(hours=2))
-        DispatchAvailabilityWindow.objects.create(
-            dispatch_order=self.order, date=soon.date(),
-            start_time="00:00", end_time="23:59",
-        )
-        resp = self._book(
-            date_value=soon.date(), arrival=soon.strftime("%H:%M"),
-        )
-        self.assertEqual(resp.status_code, 201, resp.content)
-        kinds = set(
-            DispatchReminder.objects
-            .filter(visit__dispatch_order=self.order, cancelled_at__isnull=True)
-            .values_list("kind", flat=True)
-        )
-        self.assertNotIn(ReminderKind.DAY_BEFORE, kinds)
-        self.assertIn(ReminderKind.THIRTY_MIN, kinds)
-
-    def test_firing_a_MEMBER_reminder_stores_another_sms(self):
-        from .models import (
-            DispatchReminder, MemberMessage, MessageKind, ReminderAudience,
-        )
-        from .services import scheduling
-
-        self._book()
-        reminder = DispatchReminder.objects.get(
-            visit__dispatch_order=self.order, audience=ReminderAudience.MEMBER,
-        )
-        scheduling.fire_reminder(reminder)
-
-        reminder.refresh_from_db()
-        self.assertIsNotNone(reminder.sent_at)
-        self.assertTrue(
-            MemberMessage.objects.filter(
-                kind=MessageKind.APPOINTMENT_REMINDER,
-            ).exists()
-        )
-
-    def test_due_reminders_excludes_sent_and_cancelled_ones(self):
-        from .models import DispatchReminder
-        from .services import scheduling
-
-        self._book()
-        # Nothing is due yet -- the visit is ten days out.
-        self.assertEqual(scheduling.due_reminders().count(), 0)
-
-        DispatchReminder.objects.filter(
-            visit__dispatch_order=self.order,
-        ).update(send_at=timezone.now() - timezone.timedelta(minutes=1))
-        self.assertEqual(scheduling.due_reminders().count(), 3)
-
-        DispatchReminder.objects.filter(
-            visit__dispatch_order=self.order,
-        ).update(cancelled_at=timezone.now())
-        self.assertEqual(scheduling.due_reminders().count(), 0)
+        for verb in ("post", "patch", "put", "delete"):
+            resp = getattr(self._api(), verb)(url, {}, format="json")
+            self.assertEqual(resp.status_code, 405, verb)
 
 
 class MemberMessageLogTest(TestCase):
@@ -32108,6 +30792,1691 @@ class ProgramBoroughColumnTest(TestCase):
             self.assertEqual(candidate if candidate in known else "", expected, name)
 
 
+VENDOR_HOST = "vendor.test"
+
+
+@override_settings(VENDOR_API_HOST=VENDOR_HOST, ALLOWED_HOSTS=["*"])
+class VendorApiAuthTest(TestCase):
+    """The vendor API's isolation and scoping.
+
+    These are the tests that matter most on this surface: the requirement is that
+    vendor users reach neither the CRM nor any CRM API, and that one vendor never
+    sees another's work.
+    """
+
+    def setUp(self):
+        from django.contrib.auth.hashers import make_password
+
+        from .models import Vendor, VendorUser
+
+        self.vendor = Vendor.objects.create(name="Acme Remediation")
+        self.other_vendor = Vendor.objects.create(name="Beta Repairs")
+        self.user = VendorUser.objects.create(
+            vendor=self.vendor, email="boss@acme.test", name="Ada Boss",
+            password=make_password("vendor-pass-1"), is_admin=True,
+        )
+        self.other_user = VendorUser.objects.create(
+            vendor=self.other_vendor, email="rival@beta.test", name="Rival",
+            password=make_password("vendor-pass-2"),
+        )
+
+    def _client(self):
+        return APIClient()
+
+    def _login(self, email="boss@acme.test", password="vendor-pass-1"):
+        return self._client().post(
+            "/v1/auth/login/", {"email": email, "password": password},
+            format="json", HTTP_HOST=VENDOR_HOST,
+        )
+
+    def _token(self, **kw):
+        resp = self._login(**kw)
+        self.assertEqual(resp.status_code, 200, resp.content)
+        return resp.data["access_token"]
+
+    def _as(self, token):
+        api = APIClient()
+        api.credentials(HTTP_AUTHORIZATION=f"Bearer {token}")
+        return api
+
+    # ── login ────────────────────────────────────────────────────────────────
+    def test_a_vendor_user_can_log_in_and_gets_an_opaque_token(self):
+        resp = self._login()
+        self.assertEqual(resp.status_code, 200, resp.content)
+        token = resp.data["access_token"]
+        self.assertTrue(token.startswith("ccvt_"))
+        # Opaque, NOT a JWT. A JWT signed with the shared key would authenticate
+        # against the whole CRM -- the single most important property here.
+        self.assertNotIn(".", token.replace("ccvt_", ""))
+        self.assertEqual(resp.data["vendor"]["name"], "Acme Remediation")
+
+    def test_the_raw_token_is_never_stored(self):
+        from .models import VendorAccessToken
+
+        token = self._token()
+        stored = VendorAccessToken.objects.get()
+        self.assertNotEqual(stored.token_hash, token)
+        self.assertEqual(len(stored.token_hash), 64)  # sha256 hex
+
+    def test_a_wrong_password_and_a_missing_user_give_the_SAME_answer(self):
+        """A different message for each would let anyone enumerate vendor staff
+        against an endpoint on the public internet."""
+        wrong = self._login(password="nope")
+        missing = self._login(email="nobody@acme.test", password="nope")
+        self.assertEqual(wrong.status_code, 401)
+        self.assertEqual(missing.status_code, 401)
+        self.assertEqual(wrong.data["error"], missing.data["error"])
+        self.assertEqual(wrong.data["detail"], missing.data["detail"])
+
+    def test_a_DEACTIVATED_user_cannot_log_in(self):
+        self.user.is_active = False
+        self.user.save(update_fields=["is_active"])
+        self.assertEqual(self._login().status_code, 401)
+
+    def test_a_deactivated_VENDOR_locks_out_its_staff(self):
+        self.vendor.is_active = False
+        self.vendor.save(update_fields=["is_active"])
+        self.assertEqual(self._login().status_code, 401)
+
+    def test_deactivation_takes_effect_IMMEDIATELY_on_an_existing_token(self):
+        """Re-checked every request, not only at login: deactivating someone must
+        not wait for their token to expire."""
+        token = self._token()
+        self.assertEqual(
+            self._as(token).get("/v1/me/", HTTP_HOST=VENDOR_HOST).status_code, 200,
+        )
+        self.user.is_active = False
+        self.user.save(update_fields=["is_active"])
+        self.assertEqual(
+            self._as(token).get("/v1/me/", HTTP_HOST=VENDOR_HOST).status_code, 401,
+        )
+
+    def test_logout_revokes_the_token(self):
+        token = self._token()
+        api = self._as(token)
+        self.assertEqual(
+            api.post("/v1/auth/logout/", {}, format="json",
+                     HTTP_HOST=VENDOR_HOST).status_code, 200,
+        )
+        self.assertEqual(
+            api.get("/v1/me/", HTTP_HOST=VENDOR_HOST).status_code, 401,
+        )
+
+    def test_an_EXPIRED_token_is_refused(self):
+        from .models import VendorAccessToken
+
+        token = self._token()
+        VendorAccessToken.objects.update(
+            expires_at=timezone.now() - timezone.timedelta(minutes=1),
+        )
+        self.assertEqual(
+            self._as(token).get("/v1/me/", HTTP_HOST=VENDOR_HOST).status_code, 401,
+        )
+
+    # ── isolation ────────────────────────────────────────────────────────────
+    def test_the_CRM_ROUTES_DO_NOT_EXIST_on_the_vendor_host(self):
+        """404, not 403. The urlconf is swapped, so they are absent rather than
+        forbidden -- which is what lets a vendor be handed this URL at all."""
+        api = self._as(self._token())
+        for path in ("/api/clients/", "/api/portal/dashboard/", "/api/cases/"):
+            resp = api.get(path, HTTP_HOST=VENDOR_HOST)
+            self.assertEqual(resp.status_code, 404, f"{path} -> {resp.status_code}")
+
+    def test_the_VENDOR_ROUTES_DO_NOT_EXIST_on_the_main_host(self):
+        """The reverse direction: api.vendor.urls is never included by
+        backend/urls.py, so the surface is absent from the CRM's own hostname."""
+        api = self._as(self._token())
+        for path in ("/v1/me/", "/v1/work/", "/v1/auth/login/"):
+            resp = api.get(path, HTTP_HOST="localhost")
+            self.assertEqual(resp.status_code, 404, f"{path} -> {resp.status_code}")
+
+    def test_a_vendor_token_is_UNRECOGNISED_by_the_CRM(self):
+        """Not merely unauthorised. The auth class is deliberately absent from
+        DEFAULT_AUTHENTICATION_CLASSES, so a CRM endpoint cannot even parse it."""
+        from .models import Client
+
+        Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="A", last_name="B",
+            client_added_at=timezone.now(),
+        )
+        resp = self._as(self._token()).get(
+            "/api/portal/members/", HTTP_HOST="localhost",
+        )
+        self.assertIn(resp.status_code, (401, 403, 404))
+        self.assertNotEqual(resp.status_code, 200)
+
+    def test_an_AGENT_JWT_is_unrecognised_by_the_vendor_API(self):
+        from rest_framework_simplejwt.tokens import AccessToken
+
+        from .models import Agent
+
+        agent = Agent.objects.create(
+            name="Agent", agent_code="991", group="Management",
+        )
+        acc = AccessToken()
+        acc["agent_id"] = str(agent.id); acc["agent_code"] = agent.agent_code
+        acc["agent_name"] = agent.name; acc["agent_group"] = agent.group
+
+        api = APIClient()
+        api.credentials(HTTP_AUTHORIZATION=f"Bearer {acc}")
+        resp = api.get("/v1/work/", HTTP_HOST=VENDOR_HOST)
+        self.assertEqual(resp.status_code, 401)
+
+    def test_a_PARTNER_token_is_unrecognised_by_the_vendor_API(self):
+        """The two external surfaces must not accept each other's credentials."""
+        from .models import DeliveryCompany, DeliveryCompanyApiClient
+        from .partner.auth import generate_client_id, generate_secret, hash_secret, issue_token
+
+        company = DeliveryCompany.objects.create(name="Couriers Ltd")
+        secret = generate_secret()
+        api_client = DeliveryCompanyApiClient.objects.create(
+            delivery_company=company, client_id=generate_client_id("couriers"),
+            secret_hash=hash_secret(secret), scopes=["pod:write"],
+        )
+        raw, _tok = issue_token(api_client)
+
+        api = APIClient()
+        api.credentials(HTTP_AUTHORIZATION=f"Bearer {raw}")
+        self.assertEqual(
+            api.get("/v1/work/", HTTP_HOST=VENDOR_HOST).status_code, 401,
+        )
+
+    def test_no_credentials_is_401(self):
+        self.assertEqual(
+            self._client().get("/v1/work/", HTTP_HOST=VENDOR_HOST).status_code, 401,
+        )
+
+
+@override_settings(VENDOR_API_HOST=VENDOR_HOST, ALLOWED_HOSTS=["*"])
+class VendorWorkScopingTest(TestCase):
+    """A vendor sees only their own work, and only the member fields agreed."""
+
+    def setUp(self):
+        from django.contrib.auth.hashers import make_password
+
+        from .models import (
+            Client, DispatchKind, DispatchOrder, DispatchStatus, Vendor, VendorUser,
+        )
+
+        self.vendor = Vendor.objects.create(name="Acme")
+        self.rival = Vendor.objects.create(name="Beta")
+        VendorUser.objects.create(
+            vendor=self.vendor, email="a@acme.test", name="Ada",
+            password=make_password("pw-acme-123"),
+        )
+        # medicaid_id lives on Lead/EnrollmentAnalytics rather than Client, so the
+        # DOB is the sensitive field actually reachable from here -- and the leak
+        # assertion below checks for both it and the word "medicaid" anyway.
+        self.member = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Tracey", last_name="Johnson",
+            date_of_birth="1975-01-31", client_added_at=timezone.now(),
+        )
+        self.mine = DispatchOrder.objects.create(
+            kind=DispatchKind.ASSESSMENT, client=self.member, vendor=self.vendor,
+            referral_type="combined", contact_phone="(347) 394-6843",
+            address_formatted="1550 E 102ND ST 3E BROOKLYN, NY 11236",
+            address_notes="Buzzer 3E",
+        )
+        self.theirs = DispatchOrder.objects.create(
+            kind=DispatchKind.ASSESSMENT, client=Client.objects.create(
+                client_id=str(uuid.uuid4()), first_name="Someone", last_name="Else",
+                client_added_at=timezone.now(),
+            ),
+            vendor=self.rival,
+        )
+        self.done = DispatchOrder.objects.create(
+            kind=DispatchKind.REMEDIATION, client=self.member, vendor=self.vendor,
+            status=DispatchStatus.UPLOADED,
+        )
+
+    def _api(self):
+        resp = APIClient().post(
+            "/v1/auth/login/", {"email": "a@acme.test", "password": "pw-acme-123"},
+            format="json", HTTP_HOST=VENDOR_HOST,
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        api = APIClient()
+        api.credentials(HTTP_AUTHORIZATION=f"Bearer {resp.data['access_token']}")
+        return api
+
+    def test_the_work_list_shows_only_THIS_vendors_orders(self):
+        resp = self._api().get("/v1/work/", HTTP_HOST=VENDOR_HOST)
+        self.assertEqual(resp.status_code, 200)
+        ids = {o["id"] for o in resp.data}
+        self.assertIn(str(self.mine.pk), ids)
+        self.assertNotIn(str(self.theirs.pk), ids)
+
+    def test_terminal_orders_are_excluded_unless_asked_for(self):
+        """An installer opens this to find what to do next, not to browse."""
+        api = self._api()
+        ids = {o["id"] for o in api.get("/v1/work/", HTTP_HOST=VENDOR_HOST).data}
+        self.assertNotIn(str(self.done.pk), ids)
+
+        all_ids = {
+            o["id"] for o in
+            api.get("/v1/work/?include_done=1", HTTP_HOST=VENDOR_HOST).data
+        }
+        self.assertIn(str(self.done.pk), all_ids)
+
+    def test_another_vendors_order_is_a_404_NOT_a_403(self):
+        """A 403 would confirm the id exists."""
+        resp = self._api().get(
+            f"/v1/work/{self.theirs.pk}/", HTTP_HOST=VENDOR_HOST,
+        )
+        self.assertEqual(resp.status_code, 404)
+
+    def test_the_device_gets_ONLY_name_phone_address_and_notes(self):
+        """PII minimisation, enforced server-side. The device is unmanaged and
+        holds data offline, so it must never receive the most sensitive fields --
+        the PDF still prints them because the SERVER renders it."""
+        resp = self._api().get(f"/v1/work/{self.mine.pk}/", HTTP_HOST=VENDOR_HOST)
+        self.assertEqual(resp.status_code, 200)
+        member = resp.data["member"]
+        # The phone is MASKED now, so the key set changed with it.
+        self.assertEqual(set(member), {
+            "name", "phone_masked", "phone_last4", "has_phone", "phone_type",
+            "address", "address_notes",
+        })
+        self.assertEqual(member["name"], "Tracey Johnson")
+
+        body = json.dumps(resp.data, default=str)
+        for forbidden in ("1975-01-31", "medicaid", "date_of_birth"):
+            self.assertNotIn(
+                forbidden.lower(), body.lower(),
+                f"{forbidden} must never reach a vendor device",
+            )
+
+    def test_a_WORK_ORDER_inherits_the_members_contact_details(self):
+        """Found by the first live call against real data: the work order showed no
+        phone at all. The wizard collects contact details ONCE, on the assessment,
+        so a work order carries none of its own -- and an installer opening their
+        job with no number to ring is useless."""
+        from .models import DispatchKind, DispatchOrder
+
+        child = DispatchOrder.objects.create(
+            kind=DispatchKind.REMEDIATION, client=self.member, vendor=self.vendor,
+            parent=self.mine,
+        )
+        resp = self._api().get(f"/v1/work/{child.pk}/", HTTP_HOST=VENDOR_HOST)
+        self.assertEqual(resp.status_code, 200)
+        member = resp.data["member"]
+        self.assertEqual(member["phone_masked"], "(•••) •••-6843")
+        self.assertTrue(member["has_phone"])
+        self.assertEqual(member["address_notes"], "Buzzer 3E")
+        self.assertEqual(
+            member["address"], "1550 E 102ND ST 3E BROOKLYN, NY 11236",
+        )
+
+    def test_an_orphan_work_order_does_not_crash_on_contact(self):
+        """A work order with no parent has nothing to inherit; it must render blank
+        rather than raise."""
+        from .models import DispatchKind, DispatchOrder
+
+        orphan = DispatchOrder.objects.create(
+            kind=DispatchKind.REMEDIATION, client=self.member, vendor=self.vendor,
+        )
+        resp = self._api().get(f"/v1/work/{orphan.pk}/", HTTP_HOST=VENDOR_HOST)
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.data["member"]["phone_masked"], "")
+        self.assertFalse(resp.data["member"]["has_phone"])
+
+    def test_the_phone_is_MASKED_by_default(self):
+        """The device is unmanaged and the number is the most directly identifying
+        thing a vendor handles. The last four stay visible so they can confirm they
+        have the right member before asking to see the rest."""
+        resp = self._api().get(f"/v1/work/{self.mine.pk}/", HTTP_HOST=VENDOR_HOST)
+        member = resp.data["member"]
+        self.assertEqual(member["phone_masked"], "(•••) •••-6843")
+        self.assertEqual(member["phone_last4"], "6843")
+        self.assertTrue(member["has_phone"])
+        # The full number must not be anywhere in the payload.
+        self.assertNotIn("394-6843", json.dumps(resp.data, default=str))
+
+    def test_revealing_the_phone_returns_it_and_RECORDS_the_lookup(self):
+        from .models import StageEntityType, StageEvent
+
+        resp = self._api().post(
+            f"/v1/work/{self.mine.pk}/reveal-phone/", {}, format="json",
+            HTTP_HOST=VENDOR_HOST,
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        self.assertEqual(resp.data["phone"], "(347) 394-6843")
+
+        event = StageEvent.objects.filter(
+            entity_type=StageEntityType.DISPATCH_ORDER,
+            dispatch_order=self.mine,
+            note="vendor viewed the member's phone number",
+        ).get()
+        self.assertEqual(event.metadata["vendor_user"], "a@acme.test")
+        # The NUMBER itself is not recorded: logging it to prove someone looked at
+        # it would spread it further than the lookup did.
+        self.assertNotIn("6843", json.dumps(event.metadata))
+
+    def test_the_reveal_is_NOT_written_to_the_members_timeline(self):
+        """The member did nothing. Filling their history with vendor lookups would
+        bury the events that describe their care."""
+        from .models import TimelineEvent
+
+        before = TimelineEvent.objects.filter(client=self.member).count()
+        self._api().post(
+            f"/v1/work/{self.mine.pk}/reveal-phone/", {}, format="json",
+            HTTP_HOST=VENDOR_HOST,
+        )
+        self.assertEqual(
+            TimelineEvent.objects.filter(client=self.member).count(), before,
+        )
+
+    def test_another_vendor_cannot_reveal_a_phone(self):
+        resp = self._api().post(
+            f"/v1/work/{self.theirs.pk}/reveal-phone/", {}, format="json",
+            HTTP_HOST=VENDOR_HOST,
+        )
+        self.assertEqual(resp.status_code, 404)
+
+    def test_the_detail_carries_the_dwelling_case_id_and_programme(self):
+        from .models import ActiveProgram, Case, CaseStatus, CaseType
+        from .services.catalog import clear_program_domain_cache
+
+        name = (
+            "Dwelling Assessment & Statement of Work (SOW) Development - "
+            "Modifications and Remediation Service - Manhattan"
+        )
+        ActiveProgram.objects.create(
+            program_name=name, case_category="Internal Services",
+            case_type=ActiveProgram.CaseType.HOUSING,
+            service_type=ActiveProgram.ServiceType.ENVIRONMENTAL_EXPOSURE_ASSESSMENT,
+        )
+        clear_program_domain_cache()
+        case = Case.objects.create(
+            case_id=uuid.uuid4(), client=self.member,
+            case_type=CaseType.INTERNAL_SERVICE, case_status=CaseStatus.MANAGED,
+            program_name=name, case_created_at=timezone.now(),
+        )
+        self.mine.case = case
+        self.mine.save(update_fields=["case"])
+
+        resp = self._api().get(f"/v1/work/{self.mine.pk}/", HTTP_HOST=VENDOR_HOST)
+        self.assertEqual(resp.data["dwelling_case_id"], str(case.case_id))
+        self.assertEqual(resp.data["program_name"], name)
+
+    def test_a_WORK_ORDER_inherits_the_dwelling_case_id(self):
+        """A vendor quotes that number on paperwork for the installation too."""
+        from .models import ActiveProgram, Case, CaseStatus, CaseType, DispatchKind
+        from .models import DispatchOrder
+        from .services.catalog import clear_program_domain_cache
+
+        name = (
+            "Dwelling Assessment & Statement of Work (SOW) Development - "
+            "Modifications and Remediation Service - Brooklyn"
+        )
+        ActiveProgram.objects.create(
+            program_name=name, case_category="Internal Services",
+            case_type=ActiveProgram.CaseType.HOUSING,
+            service_type=ActiveProgram.ServiceType.ENVIRONMENTAL_EXPOSURE_ASSESSMENT,
+        )
+        clear_program_domain_cache()
+        case = Case.objects.create(
+            case_id=uuid.uuid4(), client=self.member,
+            case_type=CaseType.INTERNAL_SERVICE, case_status=CaseStatus.MANAGED,
+            program_name=name, case_created_at=timezone.now(),
+        )
+        self.mine.case = case
+        self.mine.save(update_fields=["case"])
+        child = DispatchOrder.objects.create(
+            kind=DispatchKind.REMEDIATION, client=self.member, vendor=self.vendor,
+            parent=self.mine,
+        )
+        resp = self._api().get(f"/v1/work/{child.pk}/", HTTP_HOST=VENDOR_HOST)
+        self.assertEqual(resp.data["dwelling_case_id"], str(case.case_id))
+
+    def test_an_assessment_detail_carries_the_FORM(self):
+        resp = self._api().get(f"/v1/work/{self.mine.pk}/", HTTP_HOST=VENDOR_HOST)
+        form = resp.data["form"]
+        self.assertEqual(form["state"], "not_started")
+        # A combined referral is ONE form now -- its own document, not the two
+        # others concatenated -- and it is the same schema the CRM renders.
+        schema = form["schema"]
+        self.assertEqual(schema["form"], "combined")
+        self.assertEqual(
+            [s["code"] for s in schema["sections"]],
+            ["reason", "functional", "risks", "conditions"],
+        )
+        # The categories carry the products, so the app can offer a whole category
+        # once an answer points at it.
+        self.assertEqual(
+            {c["code"] for c in schema["categories"]},
+            {"mobility_access", "bathroom", "air_quality", "temperature"},
+        )
+
+
+@override_settings(VENDOR_API_HOST=VENDOR_HOST, ALLOWED_HOSTS=["*"])
+class VendorDashboardTest(TestCase):
+    """The dashboard counts, and status filtering on the work list."""
+
+    def setUp(self):
+        from django.contrib.auth.hashers import make_password
+
+        from .models import (
+            Client, DispatchKind, DispatchOrder, DispatchStatus, DispatchVisit,
+            Vendor, VendorUser,
+        )
+
+        self.vendor = Vendor.objects.create(name="Acme")
+        self.rival = Vendor.objects.create(name="Beta")
+        VendorUser.objects.create(
+            vendor=self.vendor, email="a@acme.test", name="Ada",
+            password=make_password("pw-acme-123"),
+        )
+        self.member = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Tracey", last_name="Johnson",
+            client_added_at=timezone.now(),
+        )
+
+        def order(kind, status, vendor=None, client=None):
+            return DispatchOrder.objects.create(
+                kind=kind, client=client or self.member,
+                vendor=vendor or self.vendor, status=status,
+            )
+
+        self.pending = order(DispatchKind.ASSESSMENT, DispatchStatus.PENDING_SCHEDULE)
+        self.confirmed = order(DispatchKind.REMEDIATION, DispatchStatus.CONFIRMED)
+        self.awaiting = order(
+            DispatchKind.REMEDIATION, DispatchStatus.PENDING_SUBMISSION,
+        )
+        self.uploaded = order(DispatchKind.REMEDIATION, DispatchStatus.UPLOADED)
+        # Another vendor's work, which must never appear in any count. A DIFFERENT
+        # member, because one_assessment_order_per_client is per MEMBER regardless
+        # of vendor -- the constraint caught this fixture, which is the constraint
+        # doing its job.
+        order(
+            DispatchKind.ASSESSMENT, DispatchStatus.CONFIRMED, vendor=self.rival,
+            client=Client.objects.create(
+                client_id=str(uuid.uuid4()), first_name="Rival", last_name="Member",
+                client_added_at=timezone.now(),
+            ),
+        )
+
+        today = timezone.now()
+        DispatchVisit.objects.create(
+            dispatch_order=self.confirmed, scheduled_for=today,
+        )
+        DispatchVisit.objects.create(
+            dispatch_order=self.confirmed,
+            scheduled_for=today + timezone.timedelta(days=3),
+        )
+        # Scheduled in the past and never started -- the queue that quietly rots.
+        DispatchVisit.objects.create(
+            dispatch_order=self.awaiting,
+            scheduled_for=today - timezone.timedelta(days=2),
+        )
+
+    def _api(self):
+        resp = APIClient().post(
+            "/v1/auth/login/", {"email": "a@acme.test", "password": "pw-acme-123"},
+            format="json", HTTP_HOST=VENDOR_HOST,
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        api = APIClient()
+        api.credentials(HTTP_AUTHORIZATION=f"Bearer {resp.data['access_token']}")
+        return api
+
+    def _dash(self):
+        resp = self._api().get("/v1/dashboard/", HTTP_HOST=VENDOR_HOST)
+        self.assertEqual(resp.status_code, 200, resp.content)
+        return resp.data
+
+    # ── counts ───────────────────────────────────────────────────────────────
+    def test_the_open_counts_are_named_for_what_to_DO(self):
+        d = self._dash()
+        self.assertEqual(d["open"]["needs_scheduling"], 1)
+        self.assertEqual(d["open"]["confirmed"], 1)
+        self.assertEqual(d["open"]["awaiting_submission"], 1)
+        self.assertEqual(d["done"]["uploaded"], 1)
+
+    def test_ANOTHER_vendors_work_is_in_no_count(self):
+        """The rival has a CONFIRMED order; ours must still read 1."""
+        d = self._dash()
+        self.assertEqual(d["open"]["confirmed"], 1)
+        self.assertEqual(d["vendor"]["name"], "Acme")
+
+    def test_open_by_kind_excludes_terminal_orders(self):
+        """A dashboard that counts finished work as outstanding is worse than no
+        dashboard."""
+        d = self._dash()
+        self.assertEqual(d["open_by_kind"]["assessment"], 1)
+        # confirmed + awaiting, NOT the uploaded one
+        self.assertEqual(d["open_by_kind"]["remediation"], 2)
+
+    def test_visits_are_counted_by_WHEN_not_by_status(self):
+        """An order's status says nothing about when someone must travel."""
+        d = self._dash()
+        self.assertEqual(d["visits"]["today"], 1)
+        self.assertEqual(d["visits"]["next_7_days"], 1)
+        self.assertEqual(d["visits"]["overdue"], 1)
+
+    def test_a_COMPLETED_visit_is_not_counted_as_upcoming(self):
+        from .models import DispatchVisit
+
+        DispatchVisit.objects.filter(
+            dispatch_order=self.confirmed,
+        ).update(completed_at=timezone.now())
+        d = self._dash()
+        self.assertEqual(d["visits"]["today"], 0)
+        self.assertEqual(d["visits"]["next_7_days"], 0)
+
+    def test_the_next_visit_is_the_soonest_FUTURE_one(self):
+        d = self._dash()
+        self.assertIsNotNone(d["next_visit"])
+        self.assertEqual(d["next_visit"]["member_name"], "Tracey Johnson")
+        self.assertEqual(d["next_visit"]["order_id"], str(self.confirmed.pk))
+
+    def test_a_vendor_with_nothing_gets_zeroes_not_an_error(self):
+        from django.contrib.auth.hashers import make_password
+
+        from .models import VendorUser
+
+        VendorUser.objects.create(
+            vendor=self.rival, email="b@beta.test", name="Bea",
+            password=make_password("pw-beta-123"),
+        )
+        resp = APIClient().post(
+            "/v1/auth/login/", {"email": "b@beta.test", "password": "pw-beta-123"},
+            format="json", HTTP_HOST=VENDOR_HOST,
+        )
+        api = APIClient()
+        api.credentials(HTTP_AUTHORIZATION=f"Bearer {resp.data['access_token']}")
+        d = api.get("/v1/dashboard/", HTTP_HOST=VENDOR_HOST).data
+        self.assertEqual(d["open"]["needs_scheduling"], 0)
+        self.assertEqual(d["visits"]["today"], 0)
+        self.assertIsNone(d["next_visit"])
+
+    # ── filtering ────────────────────────────────────────────────────────────
+    def test_status_filters_are_REPEATABLE_for_multi_select(self):
+        resp = self._api().get(
+            "/v1/work/?status=confirmed&status=pending_submission",
+            HTTP_HOST=VENDOR_HOST,
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(
+            {o["status"] for o in resp.data},
+            {"confirmed", "pending_submission"},
+        )
+
+    def test_an_explicit_status_filter_can_reach_TERMINAL_orders(self):
+        """Otherwise "show me what I finished" would be impossible."""
+        resp = self._api().get("/v1/work/?status=uploaded", HTTP_HOST=VENDOR_HOST)
+        self.assertEqual([o["id"] for o in resp.data], [str(self.uploaded.pk)])
+
+    def test_an_UNKNOWN_status_is_ignored_rather_than_rejected(self):
+        """A stale app version sending a status we have retired should show
+        everything, not fail."""
+        resp = self._api().get("/v1/work/?status=nonsense", HTTP_HOST=VENDOR_HOST)
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(len(resp.data), 3)  # the default open set
+
+    def test_kind_filters_assessments_from_work_orders(self):
+        resp = self._api().get("/v1/work/?kind=assessment", HTTP_HOST=VENDOR_HOST)
+        self.assertEqual([o["id"] for o in resp.data], [str(self.pending.pk)])
+
+    def test_filtering_still_cannot_reach_another_vendor(self):
+        resp = self._api().get(
+            "/v1/work/?status=confirmed", HTTP_HOST=VENDOR_HOST,
+        )
+        self.assertEqual([o["id"] for o in resp.data], [str(self.confirmed.pk)])
+
+
+@override_settings(VENDOR_API_HOST=VENDOR_HOST, ALLOWED_HOSTS=["*"])
+class VendorTeamTest(TestCase):
+    """A vendor admin manages their own staff. Only the admin, only their own."""
+
+    def setUp(self):
+        from django.contrib.auth.hashers import make_password
+
+        from .models import Vendor, VendorUser
+
+        self.vendor = Vendor.objects.create(name="Acme")
+        self.rival = Vendor.objects.create(name="Beta")
+        self.admin = VendorUser.objects.create(
+            vendor=self.vendor, email="admin@acme.test", name="Ada Admin",
+            password=make_password("pw-admin-123"), is_admin=True,
+        )
+        self.staff = VendorUser.objects.create(
+            vendor=self.vendor, email="staff@acme.test", name="Sam Staff",
+            password=make_password("pw-staff-123"),
+        )
+        self.rival_admin = VendorUser.objects.create(
+            vendor=self.rival, email="admin@beta.test", name="Bea Admin",
+            password=make_password("pw-beta-1234"), is_admin=True,
+        )
+
+    def _as(self, email, password):
+        resp = APIClient().post(
+            "/v1/auth/login/", {"email": email, "password": password},
+            format="json", HTTP_HOST=VENDOR_HOST,
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        api = APIClient()
+        api.credentials(HTTP_AUTHORIZATION=f"Bearer {resp.data['access_token']}")
+        return api
+
+    def _admin(self):
+        return self._as("admin@acme.test", "pw-admin-123")
+
+    def _staff(self):
+        return self._as("staff@acme.test", "pw-staff-123")
+
+    # ── who may ──────────────────────────────────────────────────────────────
+    def test_the_admin_sees_their_team_admin_first(self):
+        resp = self._admin().get("/v1/team/", HTTP_HOST=VENDOR_HOST)
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual([u["email"] for u in resp.data],
+                         ["admin@acme.test", "staff@acme.test"])
+
+    def test_a_NON_ADMIN_cannot_list_or_add(self):
+        staff = self._staff()
+        self.assertEqual(
+            staff.get("/v1/team/", HTTP_HOST=VENDOR_HOST).status_code, 403,
+        )
+        self.assertEqual(
+            staff.post("/v1/team/", {"name": "X", "email": "x@acme.test"},
+                       format="json", HTTP_HOST=VENDOR_HOST).status_code, 403,
+        )
+
+    def test_a_non_admin_cannot_remove_anyone(self):
+        resp = self._staff().delete(
+            f"/v1/team/{self.staff.pk}/", HTTP_HOST=VENDOR_HOST,
+        )
+        self.assertEqual(resp.status_code, 403)
+
+    def test_an_admin_cannot_touch_ANOTHER_companys_staff(self):
+        """404, not 403 -- a 403 would confirm the id exists."""
+        api = self._admin()
+        self.assertEqual(
+            api.patch(f"/v1/team/{self.rival_admin.pk}/", {"name": "hax"},
+                      format="json", HTTP_HOST=VENDOR_HOST).status_code, 404,
+        )
+        self.assertEqual(
+            api.delete(f"/v1/team/{self.rival_admin.pk}/",
+                       HTTP_HOST=VENDOR_HOST).status_code, 404,
+        )
+
+    def test_the_team_list_shows_only_THIS_company(self):
+        emails = {
+            u["email"] for u in
+            self._admin().get("/v1/team/", HTTP_HOST=VENDOR_HOST).data
+        }
+        self.assertNotIn("admin@beta.test", emails)
+
+    # ── adding ───────────────────────────────────────────────────────────────
+    def test_the_admin_can_add_a_colleague_who_can_then_log_in(self):
+        resp = self._admin().post(
+            "/v1/team/",
+            {"name": "New Hire", "email": "new@acme.test",
+             "password": "their-own-pw-1"},
+            format="json", HTTP_HOST=VENDOR_HOST,
+        )
+        self.assertEqual(resp.status_code, 201, resp.content)
+        self.assertFalse(resp.data["is_admin"])
+        # Supplied, so not echoed.
+        self.assertEqual(resp.data["temporary_password"], "")
+
+        api = self._as("new@acme.test", "their-own-pw-1")
+        self.assertEqual(api.get("/v1/me/", HTTP_HOST=VENDOR_HOST).status_code, 200)
+
+    def test_a_generated_password_is_returned_once(self):
+        resp = self._admin().post(
+            "/v1/team/", {"name": "Gen", "email": "gen@acme.test"},
+            format="json", HTTP_HOST=VENDOR_HOST,
+        )
+        self.assertEqual(resp.status_code, 201)
+        pw = resp.data["temporary_password"]
+        self.assertTrue(pw)
+        self._as("gen@acme.test", pw)  # it works
+
+    def test_an_added_user_is_NEVER_an_admin(self):
+        """The admin slot is CRM-provisioned and constrained to one per vendor, so
+        a company cannot grow a second administrator."""
+        from .models import VendorUser
+
+        self._admin().post(
+            "/v1/team/",
+            {"name": "Sneaky", "email": "sneaky@acme.test", "is_admin": True},
+            format="json", HTTP_HOST=VENDOR_HOST,
+        )
+        self.assertFalse(VendorUser.objects.get(email="sneaky@acme.test").is_admin)
+
+    def test_a_duplicate_email_is_refused_the_same_way_across_companies(self):
+        """"Already used by another company" would leak that a person works for a
+        competitor."""
+        api = self._admin()
+        inside = api.post(
+            "/v1/team/", {"name": "Dup", "email": "staff@acme.test"},
+            format="json", HTTP_HOST=VENDOR_HOST,
+        )
+        outside = api.post(
+            "/v1/team/", {"name": "Dup", "email": "admin@beta.test"},
+            format="json", HTTP_HOST=VENDOR_HOST,
+        )
+        self.assertEqual(inside.status_code, 409)
+        self.assertEqual(outside.status_code, 409)
+        self.assertEqual(inside.data["detail"], outside.data["detail"])
+
+    def test_a_short_password_is_refused(self):
+        resp = self._admin().post(
+            "/v1/team/",
+            {"name": "Short", "email": "short@acme.test", "password": "abc"},
+            format="json", HTTP_HOST=VENDOR_HOST,
+        )
+        self.assertEqual(resp.status_code, 400)
+
+    # ── changing and removing ────────────────────────────────────────────────
+    def test_deactivating_a_colleague_takes_effect_IMMEDIATELY(self):
+        """The authenticator re-checks is_active on every request, so an existing
+        token must stop working at once rather than lasting until it expires."""
+        staff_api = self._staff()
+        self.assertEqual(
+            staff_api.get("/v1/work/", HTTP_HOST=VENDOR_HOST).status_code, 200,
+        )
+        self._admin().patch(
+            f"/v1/team/{self.staff.pk}/", {"is_active": False},
+            format="json", HTTP_HOST=VENDOR_HOST,
+        )
+        self.assertEqual(
+            staff_api.get("/v1/work/", HTTP_HOST=VENDOR_HOST).status_code, 401,
+        )
+
+    def test_an_unchanged_patch_reports_nothing_changed(self):
+        resp = self._admin().patch(
+            f"/v1/team/{self.staff.pk}/", {"name": "Sam Staff"},
+            format="json", HTTP_HOST=VENDOR_HOST,
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.data["changed_fields"], [])
+
+    def test_a_user_with_NO_history_is_deleted_outright(self):
+        """An email typed wrong five minutes ago should not be permanent."""
+        from .models import VendorUser
+
+        resp = self._admin().delete(
+            f"/v1/team/{self.staff.pk}/", HTTP_HOST=VENDOR_HOST,
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        self.assertTrue(resp.data["removed"])
+        self.assertFalse(VendorUser.objects.filter(pk=self.staff.pk).exists())
+
+    def test_a_user_WITH_history_is_deactivated_not_deleted(self):
+        """Submissions point at them, and the record of who assessed a member's
+        home has to survive."""
+        from .models import (
+            Client, DispatchKind, DispatchOrder, DispatchSubmission, VendorUser,
+        )
+
+        member = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="H", last_name="M",
+            client_added_at=timezone.now(),
+        )
+        order = DispatchOrder.objects.create(
+            kind=DispatchKind.ASSESSMENT, client=member, vendor=self.vendor,
+        )
+        DispatchSubmission.objects.create(
+            dispatch_order=order, sequence=1, submitted_by=self.staff,
+            submitted_at=timezone.now(),
+        )
+
+        resp = self._admin().delete(
+            f"/v1/team/{self.staff.pk}/", HTTP_HOST=VENDOR_HOST,
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertFalse(resp.data["removed"])
+        self.assertTrue(resp.data["deactivated"])
+
+        still_there = VendorUser.objects.get(pk=self.staff.pk)
+        self.assertFalse(still_there.is_active)
+
+    def test_the_ADMIN_cannot_be_removed_or_deactivated_here(self):
+        """Either would lock the company out of its own account, and only the CRM
+        could undo it."""
+        api = self._admin()
+        self.assertEqual(
+            api.delete(f"/v1/team/{self.admin.pk}/",
+                       HTTP_HOST=VENDOR_HOST).status_code, 400,
+        )
+        resp = api.patch(
+            f"/v1/team/{self.admin.pk}/", {"is_active": False},
+            format="json", HTTP_HOST=VENDOR_HOST,
+        )
+        self.assertEqual(resp.status_code, 400)
+        self.admin.refresh_from_db()
+        self.assertTrue(self.admin.is_active)
+
+    def test_the_admin_can_reset_a_colleagues_password(self):
+        from django.contrib.auth.hashers import check_password
+
+        from .models import VendorUser
+
+        resp = self._admin().patch(
+            f"/v1/team/{self.staff.pk}/", {"password": "reset-by-admin-1"},
+            format="json", HTTP_HOST=VENDOR_HOST,
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn("password", resp.data["changed_fields"])
+        self.assertTrue(check_password(
+            "reset-by-admin-1", VendorUser.objects.get(pk=self.staff.pk).password,
+        ))
+
+
+@override_settings(VENDOR_API_HOST=VENDOR_HOST, ALLOWED_HOSTS=["*"])
+class VendorSchedulingTest(TestCase):
+    """Booking a visit: overlap, timezone, the member's text and the reminders."""
+
+    def setUp(self):
+        from django.contrib.auth.hashers import make_password
+
+        from .models import (
+            Client, DispatchAvailabilityWindow, DispatchKind, DispatchOrder,
+            DispatchStatus, Vendor, VendorUser,
+        )
+
+        self.vendor = Vendor.objects.create(name="X-Man Home Repair")
+        self.user = VendorUser.objects.create(
+            vendor=self.vendor, email="a@xman.test", name="Ada",
+            password=make_password("pw-xman-1234"),
+        )
+        self.member = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="miriam", last_name="Israel",
+            client_added_at=timezone.now(),
+        )
+        self.order = DispatchOrder.objects.create(
+            kind=DispatchKind.ASSESSMENT, client=self.member, vendor=self.vendor,
+            status=DispatchStatus.PENDING_SCHEDULE, referral_type="combined",
+            contact_phone="(305) 781-3277", contact_phone_type="mobile",
+            consent_to_text=True, consent_to_call=True,
+            address_formatted="1 Test St, Brooklyn NY",
+        )
+        # Three offered windows, starting comfortably in the future so the tests do
+        # not depend on the hour they run at.
+        self.day = timezone.localdate() + timezone.timedelta(days=10)
+        for offset in range(3):
+            DispatchAvailabilityWindow.objects.create(
+                dispatch_order=self.order,
+                date=self.day + timezone.timedelta(days=offset),
+                start_time="09:00", end_time="12:00",
+            )
+
+    def _api(self):
+        resp = APIClient().post(
+            "/v1/auth/login/", {"email": "a@xman.test", "password": "pw-xman-1234"},
+            format="json", HTTP_HOST=VENDOR_HOST,
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        api = APIClient()
+        api.credentials(HTTP_AUTHORIZATION=f"Bearer {resp.data['access_token']}")
+        return api
+
+    def _book(self, *, date_value=None, arrival="09:00", duration=60, api=None):
+        return (api or self._api()).post(
+            f"/v1/work/{self.order.pk}/schedule/",
+            {
+                "date": (date_value or self.day).isoformat(),
+                "arrival_time": arrival,
+                "duration_minutes": duration,
+            },
+            format="json", HTTP_HOST=VENDOR_HOST,
+        )
+
+    # ── the choosing screen ──────────────────────────────────────────────────
+    def test_the_GET_returns_the_offered_windows_and_the_vendors_own_day(self):
+        resp = self._api().get(
+            f"/v1/work/{self.order.pk}/schedule/", HTTP_HOST=VENDOR_HOST,
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        self.assertEqual(len(resp.data["availability"]), 3)
+        self.assertEqual(resp.data["timezone"], "America/New_York")
+        self.assertTrue(resp.data["consent_to_text"])
+        # A key per offered day, so the app can warn BEFORE the vendor picks.
+        self.assertEqual(len(resp.data["appointments_by_date"]), 3)
+
+    def test_the_GET_is_404_for_another_vendors_order(self):
+        from .models import Client, DispatchKind, DispatchOrder, Vendor
+
+        other = DispatchOrder.objects.create(
+            kind=DispatchKind.ASSESSMENT,
+            client=Client.objects.create(
+                client_id=str(uuid.uuid4()), first_name="X", last_name="Y",
+                client_added_at=timezone.now(),
+            ),
+            vendor=Vendor.objects.create(name="Rival"),
+        )
+        resp = self._api().get(
+            f"/v1/work/{other.pk}/schedule/", HTTP_HOST=VENDOR_HOST,
+        )
+        self.assertEqual(resp.status_code, 404)
+
+    # ── booking ─────────────────────────────────────────────────────────────
+    def test_booking_confirms_the_order_and_stores_the_local_time(self):
+        """The vendor picks 9am meaning nine o'clock at the member's door, so the
+        stored instant must be 9am EASTERN, not 9am UTC."""
+        from .models import DispatchStatus
+
+        resp = self._book()
+        self.assertEqual(resp.status_code, 201, resp.content)
+        self.assertEqual(resp.data["status"], DispatchStatus.CONFIRMED)
+
+        self.order.refresh_from_db()
+        visit = self.order.visits.get()
+        local = timezone.localtime(visit.scheduled_for)
+        self.assertEqual(local.hour, 9)
+        self.assertEqual(local.minute, 0)
+        self.assertEqual(local.date(), self.day)
+        # 60 minutes, which is what the member is told to expect.
+        self.assertEqual(
+            (visit.scheduled_end - visit.scheduled_for).total_seconds() / 60, 60,
+        )
+
+    def test_an_OVERLAPPING_time_is_refused_with_the_designs_wording(self):
+        from .models import Client, DispatchKind, DispatchOrder, DispatchVisit
+
+        # An existing 9:00-10:00 for this vendor, another member.
+        other = DispatchOrder.objects.create(
+            kind=DispatchKind.REMEDIATION, vendor=self.vendor,
+            client=Client.objects.create(
+                client_id=str(uuid.uuid4()), first_name="Other", last_name="Member",
+                client_added_at=timezone.now(),
+            ),
+        )
+        from .services.scheduling import combine_local
+        from datetime import time
+
+        start = combine_local(self.day, time(9, 0))
+        DispatchVisit.objects.create(
+            dispatch_order=other, scheduled_for=start,
+            scheduled_end=start + timezone.timedelta(minutes=60),
+        )
+
+        resp = self._book(arrival="09:30")
+        self.assertEqual(resp.status_code, 400)
+        self.assertEqual(resp.data["error"], "overlap")
+        self.assertIn("overlaps one of your existing appointments", resp.data["detail"])
+
+    def test_a_TOUCHING_appointment_is_allowed(self):
+        """A visit ending at 10:00 does not clash with one starting at 10:00 --
+        treating that as a conflict would block the back-to-back bookings that make
+        a day's route workable."""
+        from datetime import time
+
+        from .models import Client, DispatchKind, DispatchOrder, DispatchVisit
+        from .services.scheduling import combine_local
+
+        other = DispatchOrder.objects.create(
+            kind=DispatchKind.REMEDIATION, vendor=self.vendor,
+            client=Client.objects.create(
+                client_id=str(uuid.uuid4()), first_name="Back", last_name="ToBack",
+                client_added_at=timezone.now(),
+            ),
+        )
+        start = combine_local(self.day, time(9, 0))
+        DispatchVisit.objects.create(
+            dispatch_order=other, scheduled_for=start,
+            scheduled_end=start + timezone.timedelta(minutes=60),
+        )
+        self.assertEqual(self._book(arrival="10:00").status_code, 201)
+
+    def test_ANOTHER_vendors_appointment_does_not_block_this_one(self):
+        from datetime import time
+
+        from .models import Client, DispatchKind, DispatchOrder, DispatchVisit, Vendor
+        from .services.scheduling import combine_local
+
+        rival_order = DispatchOrder.objects.create(
+            kind=DispatchKind.REMEDIATION,
+            vendor=Vendor.objects.create(name="Rival Co"),
+            client=Client.objects.create(
+                client_id=str(uuid.uuid4()), first_name="R", last_name="M",
+                client_added_at=timezone.now(),
+            ),
+        )
+        start = combine_local(self.day, time(9, 0))
+        DispatchVisit.objects.create(
+            dispatch_order=rival_order, scheduled_for=start,
+            scheduled_end=start + timezone.timedelta(minutes=60),
+        )
+        self.assertEqual(self._book(arrival="09:00").status_code, 201)
+
+    def test_a_time_in_the_past_is_refused(self):
+        past = timezone.localdate() - timezone.timedelta(days=1)
+        resp = self._book(date_value=past)
+        self.assertEqual(resp.status_code, 400)
+        self.assertEqual(resp.data["error"], "in_the_past")
+
+    def test_an_unsupported_session_length_is_refused(self):
+        resp = self._book(duration=37)
+        self.assertEqual(resp.status_code, 400)
+        self.assertEqual(resp.data["error"], "bad_duration")
+
+    def test_a_RESCHEDULE_updates_the_same_visit_rather_than_adding_one(self):
+        """A second row would make "when is this appointment?" ambiguous."""
+        self.assertEqual(self._book(arrival="09:00").status_code, 201)
+        self.assertEqual(self._book(arrival="11:00").status_code, 201)
+        self.assertEqual(self.order.visits.count(), 1)
+        local = timezone.localtime(self.order.visits.get().scheduled_for)
+        self.assertEqual(local.hour, 11)
+
+    def test_a_reschedule_does_not_clash_with_ITSELF(self):
+        """The order's own existing visit must be excluded from the overlap check,
+        or moving an appointment by 15 minutes would be impossible."""
+        self._book(arrival="09:00")
+        resp = self._book(arrival="09:15")
+        self.assertEqual(resp.status_code, 201, resp.content)
+
+    # ── the member's text ───────────────────────────────────────────────────
+    def test_booking_STORES_the_members_sms(self):
+        from .models import MemberMessage, MessageDirection, MessageKind
+
+        resp = self._book()
+        self.assertTrue(resp.data["member_notified"])
+
+        msg = MemberMessage.objects.get()
+        self.assertEqual(msg.direction, MessageDirection.OUTBOUND)
+        self.assertEqual(msg.kind, MessageKind.APPOINTMENT_SCHEDULED)
+        # QUEUED, not "sent": no provider exists yet, and claiming a text went out
+        # would make the log lie.
+        self.assertEqual(msg.status, "queued")
+        self.assertEqual(msg.to_number, "(305) 781-3277")
+        self.assertEqual(msg.dispatch_order_id, self.order.pk)
+        self.assertEqual(msg.sent_by_vendor_user_id, self.user.pk)
+        # Named properly, and in the member's own timezone.
+        self.assertIn("Miriam", msg.body)
+        self.assertIn("X-Man Home Repair", msg.body)
+        self.assertIn("ET", msg.body)
+
+    def test_NO_TEXT_CONSENT_blocks_the_sms_but_NOT_the_booking(self):
+        """The appointment matters more than the text. A blocked row records that
+        the member was not told, which the vendor is shown."""
+        from .models import MemberMessage
+
+        self.order.consent_to_text = False
+        self.order.save(update_fields=["consent_to_text"])
+
+        resp = self._book()
+        self.assertEqual(resp.status_code, 201)
+        self.assertFalse(resp.data["member_notified"])
+        self.assertEqual(resp.data["message"]["reason"], "no_text_consent")
+
+        msg = MemberMessage.objects.get()
+        self.assertEqual(msg.status, "blocked")
+        self.assertEqual(msg.error_code, "no_text_consent")
+
+    def test_a_WORK_ORDER_inherits_the_members_text_consent(self):
+        """Found by the first end-to-end reminder run: every text about an
+        installation was blocked as "no consent" while the member had consented --
+        the wizard records consent ONCE, on the assessment, so a work order's own
+        flag is always False. Same bug class as the phone number."""
+        from .models import DispatchKind, DispatchOrder, MemberMessage
+
+        child = DispatchOrder.objects.create(
+            kind=DispatchKind.REMEDIATION, client=self.member, vendor=self.vendor,
+            parent=self.order,
+        )
+        self.assertFalse(child.consent_to_text)          # its own flag
+        self.assertTrue(child.service_consent[1])        # inherited
+
+        resp = self._api().post(
+            f"/v1/work/{child.pk}/schedule/",
+            {
+                "date": self.day.isoformat(),
+                "arrival_time": "14:00", "duration_minutes": 60,
+            },
+            format="json", HTTP_HOST=VENDOR_HOST,
+        )
+        self.assertEqual(resp.status_code, 201, resp.content)
+        self.assertTrue(
+            resp.data["member_notified"],
+            "a work order must inherit consent from its assessment",
+        )
+        self.assertEqual(
+            MemberMessage.objects.filter(dispatch_order=child).get().status,
+            "queued",
+        )
+
+    def test_no_phone_number_blocks_the_sms_but_NOT_the_booking(self):
+        from .models import MemberMessage
+
+        self.order.contact_phone = ""
+        self.order.save(update_fields=["contact_phone"])
+        resp = self._book()
+        self.assertEqual(resp.status_code, 201)
+        self.assertEqual(MemberMessage.objects.get().error_code, "no_phone_number")
+
+    def test_a_RESCHEDULE_sends_the_CHANGED_wording(self):
+        from .models import MemberMessage, MessageKind
+
+        self._book(arrival="09:00")
+        self._book(arrival="11:00")
+        kinds = list(MemberMessage.objects.order_by("created_at").values_list(
+            "kind", flat=True,
+        ))
+        self.assertEqual(kinds, [
+            MessageKind.APPOINTMENT_SCHEDULED, MessageKind.APPOINTMENT_CHANGED,
+        ])
+
+    # ── reminders ───────────────────────────────────────────────────────────
+    def test_booking_creates_the_day_before_and_30_minute_reminders(self):
+        from .models import DispatchReminder, ReminderAudience, ReminderKind
+
+        resp = self._book()
+        self.assertEqual(len(resp.data["reminders"]), 3)
+
+        rems = DispatchReminder.objects.filter(visit__dispatch_order=self.order)
+        vendor_kinds = set(
+            rems.filter(audience=ReminderAudience.VENDOR)
+            .values_list("kind", flat=True)
+        )
+        self.assertEqual(
+            vendor_kinds, {ReminderKind.DAY_BEFORE, ReminderKind.THIRTY_MIN},
+        )
+        # The member gets a day-before nudge too.
+        self.assertTrue(
+            rems.filter(
+                audience=ReminderAudience.MEMBER, kind=ReminderKind.DAY_BEFORE,
+            ).exists()
+        )
+
+    def test_the_reminder_times_are_relative_to_the_visit(self):
+        from .models import DispatchReminder, ReminderAudience, ReminderKind
+
+        self._book()
+        visit = self.order.visits.get()
+        day_before = DispatchReminder.objects.get(
+            visit=visit, kind=ReminderKind.DAY_BEFORE,
+            audience=ReminderAudience.VENDOR,
+        )
+        thirty = DispatchReminder.objects.get(
+            visit=visit, kind=ReminderKind.THIRTY_MIN,
+        )
+        self.assertEqual(
+            (visit.scheduled_for - day_before.send_at).total_seconds(), 86400,
+        )
+        self.assertEqual(
+            (visit.scheduled_for - thirty.send_at).total_seconds(), 1800,
+        )
+
+    def test_a_reschedule_CANCELS_the_old_reminders_rather_than_duplicating(self):
+        from .models import DispatchReminder
+
+        self._book(arrival="09:00")
+        self._book(arrival="11:00")
+        rems = DispatchReminder.objects.filter(visit__dispatch_order=self.order)
+        self.assertEqual(rems.filter(cancelled_at__isnull=True).count(), 3)
+        # Cancelled, not deleted: the record shows a reminder for the old slot
+        # existed and was stood down.
+        self.assertEqual(rems.filter(cancelled_at__isnull=False).count(), 3)
+
+    def test_a_reminder_whose_time_has_PASSED_is_not_created(self):
+        """Booking something for this afternoon must not fire a "day before" notice
+        immediately -- that is noise that teaches people to ignore reminders."""
+        from datetime import time
+
+        from .models import DispatchAvailabilityWindow, DispatchReminder, ReminderKind
+
+        soon = timezone.localtime(timezone.now() + timezone.timedelta(hours=2))
+        DispatchAvailabilityWindow.objects.create(
+            dispatch_order=self.order, date=soon.date(),
+            start_time="00:00", end_time="23:59",
+        )
+        resp = self._book(
+            date_value=soon.date(), arrival=soon.strftime("%H:%M"),
+        )
+        self.assertEqual(resp.status_code, 201, resp.content)
+        kinds = set(
+            DispatchReminder.objects
+            .filter(visit__dispatch_order=self.order, cancelled_at__isnull=True)
+            .values_list("kind", flat=True)
+        )
+        self.assertNotIn(ReminderKind.DAY_BEFORE, kinds)
+        self.assertIn(ReminderKind.THIRTY_MIN, kinds)
+
+    def test_firing_a_MEMBER_reminder_stores_another_sms(self):
+        from .models import (
+            DispatchReminder, MemberMessage, MessageKind, ReminderAudience,
+        )
+        from .services import scheduling
+
+        self._book()
+        reminder = DispatchReminder.objects.get(
+            visit__dispatch_order=self.order, audience=ReminderAudience.MEMBER,
+        )
+        scheduling.fire_reminder(reminder)
+
+        reminder.refresh_from_db()
+        self.assertIsNotNone(reminder.sent_at)
+        self.assertTrue(
+            MemberMessage.objects.filter(
+                kind=MessageKind.APPOINTMENT_REMINDER,
+            ).exists()
+        )
+
+    def test_due_reminders_excludes_sent_and_cancelled_ones(self):
+        from .models import DispatchReminder
+        from .services import scheduling
+
+        self._book()
+        # Nothing is due yet -- the visit is ten days out.
+        self.assertEqual(scheduling.due_reminders().count(), 0)
+
+        DispatchReminder.objects.filter(
+            visit__dispatch_order=self.order,
+        ).update(send_at=timezone.now() - timezone.timedelta(minutes=1))
+        self.assertEqual(scheduling.due_reminders().count(), 3)
+
+        DispatchReminder.objects.filter(
+            visit__dispatch_order=self.order,
+        ).update(cancelled_at=timezone.now())
+        self.assertEqual(scheduling.due_reminders().count(), 0)
+
+
+class MemberMessageLogTest(TestCase):
+    """The message log itself, independent of scheduling."""
+
+    def setUp(self):
+        from .models import Client
+
+        self.member = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Ann", last_name="Reply",
+            client_phone_number="(347) 555-0199", client_added_at=timezone.now(),
+        )
+
+    def test_an_inbound_text_is_matched_to_a_member_by_number(self):
+        from .models import MessageDirection
+        from .services import messaging
+
+        msg = messaging.record_inbound("+13475550199", "Yes that works")
+        # str() on both sides: the FK reads back as a UUID while the fixture set the
+        # pk from a string.
+        self.assertEqual(str(msg.client_id), str(self.member.pk))
+        self.assertEqual(msg.direction, MessageDirection.INBOUND)
+        self.assertEqual(msg.status, "received")
+
+    def test_an_UNMATCHED_inbound_text_is_still_stored(self):
+        """An unmatched reply is the only evidence someone tried to reach us.
+        Discarding it is the one unrecoverable option."""
+        from .services import messaging
+
+        msg = messaging.record_inbound("+15550000000", "who is this")
+        self.assertIsNone(msg.client_id)
+        self.assertEqual(msg.body, "who is this")
+
+    def test_the_whole_conversation_reads_in_order(self):
+        from .services import messaging
+
+        messaging.send_to_member(
+            self.member, "First", to_number="(347) 555-0199",
+            require_consent=False,
+        )
+        messaging.record_inbound("+13475550199", "Reply")
+        log = list(
+            self.member.messages.order_by("created_at").values_list(
+                "direction", "body",
+            )
+        )
+        self.assertEqual(log, [("outbound", "First"), ("inbound", "Reply")])
+
+
+class HousingStageBarTest(TestCase):
+    """The housing row on the member stage bar: Authorization -> Assessment -> WOs.
+
+    Near-binary on purpose. The detailed dispatch lifecycle lives on the Programs >
+    Housing accordion; this bar answers "where is this member" at a glance.
+    """
+
+    EEA = (
+        "Dwelling Assessment & Statement of Work (SOW) Development - "
+        "Modifications and Remediation Service - Manhattan"
+    )
+    HEAR = "Home Remediation - Air Conditioner - Manhattan"
+
+    def setUp(self):
+        from .models import ActiveProgram, Client, Vendor
+        from .services.catalog import clear_program_domain_cache
+
+        for name, stype in (
+            (self.EEA, ActiveProgram.ServiceType.ENVIRONMENTAL_EXPOSURE_ASSESSMENT),
+            (self.HEAR, ActiveProgram.ServiceType.HOME_EXPENSE_ASSISTANCE_REPAIRS),
+        ):
+            ActiveProgram.objects.create(
+                program_name=name, case_category="Internal Services",
+                case_type=ActiveProgram.CaseType.HOUSING, service_type=stype,
+            )
+        clear_program_domain_cache()
+        self.vendor = Vendor.objects.create(name="Acme")
+        self.member = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Bar", last_name="Member",
+            client_added_at=timezone.now(),
+        )
+
+    def _case(self, program, *, auth="approved", starts=None, ends=None):
+        from .models import Case, CaseStatus, CaseType
+
+        return Case.objects.create(
+            case_id=uuid.uuid4(), client=self.member,
+            case_type=CaseType.INTERNAL_SERVICE, case_status=CaseStatus.MANAGED,
+            program_name=program, service_authorization_status=auth,
+            service_authorization_approval_starts_at=starts,
+            service_authorization_approval_ends_at=ends,
+            case_created_at=timezone.now(),
+        )
+
+    def _housing_track(self):
+        from .services.lifecycle import program_tracks
+
+        tracks = [
+            t for t in program_tracks(self.member) if t["domain"] == "housing"
+        ]
+        return tracks[0] if tracks else None
+
+    # ── the row exists when the dwelling case does ───────────────────────────
+    def test_no_dwelling_case_means_NO_housing_row(self):
+        self.assertIsNone(self._housing_track())
+
+    def test_a_dwelling_case_alone_creates_the_row(self):
+        self._case(self.EEA)
+        track = self._housing_track()
+        self.assertIsNotNone(track)
+        self.assertEqual(track["authorization"]["label"], "Approved")
+
+    # ── the assessment node ──────────────────────────────────────────────────
+    def test_approved_with_no_order_reads_READY_TO_ORDER(self):
+        self._case(self.EEA)
+        t = self._housing_track()
+        self.assertEqual(t["assessment_order"]["value"], "ready")
+        # The LABEL is the node's name; the state is the colour (value) plus the
+        # tooltip. "Ordered" as a label read as confusing on screen.
+        self.assertEqual(t["assessment_order"]["label"], "EEA")
+        self.assertIn("ready to create", t["assessment_order"]["detail"])
+
+    def test_an_EXPIRED_window_reads_EXPIRED_even_though_auth_says_approved(self):
+        """Housing's expiry has nowhere else to surface. _authorization_phase
+        deliberately still reads "Approved" for a lapsed authorization -- food shows
+        it in the Service phase, and housing has no Service phase."""
+        self._case(
+            self.EEA,
+            starts=timezone.now() - timezone.timedelta(days=40),
+            ends=timezone.now() - timezone.timedelta(days=5),
+        )
+        t = self._housing_track()
+        self.assertEqual(t["authorization"]["label"], "Approved")
+        self.assertEqual(t["assessment_order"]["value"], "expired")
+
+    def test_a_REQUESTED_authorization_leaves_the_assessment_node_BLANK(self):
+        """Nothing to order yet, and the Authorization chip already says so --
+        "Ready to Order" beside "Requested" would be a contradiction."""
+        self._case(self.EEA, auth="pending")
+        t = self._housing_track()
+        self.assertEqual(t["assessment_order"]["value"], "")
+
+    def test_a_DENIED_authorization_leaves_it_blank_too(self):
+        self._case(self.EEA, auth="denied")
+        t = self._housing_track()
+        self.assertEqual(t["assessment_order"]["value"], "")
+
+    def test_an_existing_order_reads_ORDERED(self):
+        from .models import DispatchKind, DispatchOrder
+
+        self._case(self.EEA)
+        DispatchOrder.objects.create(
+            kind=DispatchKind.ASSESSMENT, client=self.member, vendor=self.vendor,
+        )
+        t = self._housing_track()
+        self.assertEqual(t["assessment_order"]["value"], "ordered")
+
+    def test_a_CANCELLED_order_does_NOT_count_as_existing(self):
+        """Green for a dead order is the worst possible failure for a glance-level
+        indicator."""
+        from .models import DispatchKind, DispatchOrder, DispatchStatus
+
+        self._case(self.EEA)
+        DispatchOrder.objects.create(
+            kind=DispatchKind.ASSESSMENT, client=self.member, vendor=self.vendor,
+            status=DispatchStatus.CANCELLED,
+        )
+        t = self._housing_track()
+        self.assertEqual(t["assessment_order"]["value"], "cancelled")
+
+    # ── the work-orders node ─────────────────────────────────────────────────
+    def test_no_items_leaves_the_work_orders_node_BLANK(self):
+        self._case(self.EEA)
+        self.assertEqual(self._housing_track()["work_orders"]["value"], "")
+
+    def test_items_with_NO_batch_read_AMBER_with_a_count(self):
+        """The state that matters. A binary green would say "work orders: done"
+        while approved, authorized items sat unbatched."""
+        from .models import DispatchKind, DispatchOrder
+        from .services import dispatch
+
+        self._case(self.EEA)
+        self._case(self.HEAR)
+        assessment = DispatchOrder.objects.create(
+            kind=DispatchKind.ASSESSMENT, client=self.member, vendor=self.vendor,
+        )
+        dispatch.sync_dispatch_items(assessment)
+
+        t = self._housing_track()
+        self.assertEqual(t["work_orders"]["value"], "waiting")
+        self.assertEqual(t["work_orders"]["label"], "Work Orders")
+        self.assertIn("1 item waiting", t["work_orders"]["detail"])
+
+    def test_a_batch_reads_GREEN_and_names_whats_left(self):
+        """Still green -- work IS being done -- but the count says what remains, so
+        "1 order" cannot be mistaken for "everything is handled"."""
+        from .models import DispatchItem, DispatchKind, DispatchOrder
+        from .services import dispatch
+
+        self._case(self.EEA)
+        self._case(self.HEAR)
+        second = self._case("Home Remediation - Heater - Manhattan")
+        from .models import ActiveProgram
+        ActiveProgram.objects.create(
+            program_name="Home Remediation - Heater - Manhattan",
+            case_category="Internal Services",
+            case_type=ActiveProgram.CaseType.HOUSING,
+            service_type=ActiveProgram.ServiceType.HOME_EXPENSE_ASSISTANCE_REPAIRS,
+        )
+        from .services.catalog import clear_program_domain_cache
+        clear_program_domain_cache()
+
+        assessment = DispatchOrder.objects.create(
+            kind=DispatchKind.ASSESSMENT, client=self.member, vendor=self.vendor,
+        )
+        dispatch.sync_dispatch_items(assessment)
+        items = list(DispatchItem.objects.filter(assessment=assessment))
+        self.assertGreaterEqual(len(items), 2)
+
+        dispatch.create_work_order(
+            assessment, [items[0].dispatch_item_id], vendor=self.vendor,
+        )
+        t = self._housing_track()
+        self.assertEqual(t["work_orders"]["value"], "created")
+        self.assertEqual(t["work_orders"]["label"], "Work Orders")
+        # Green, but the detail still names what is left, so it cannot be read as
+        # "everything is handled".
+        self.assertIn("1 work order", t["work_orders"]["detail"])
+        self.assertIn("not yet batched", t["work_orders"]["detail"])
+
+    def test_the_node_LABELS_are_constant_and_the_colour_carries_the_state(self):
+        """These two read as a stepper: the chip is the node, and whether it is
+        green is the answer. A label that changed with the state ("Ordered") was
+        confusing on screen."""
+        from .models import DispatchKind, DispatchOrder
+
+        self._case(self.EEA)
+        before = self._housing_track()
+        DispatchOrder.objects.create(
+            kind=DispatchKind.ASSESSMENT, client=self.member, vendor=self.vendor,
+        )
+        after = self._housing_track()
+
+        self.assertEqual(before["assessment_order"]["label"], "EEA")
+        self.assertEqual(after["assessment_order"]["label"], "EEA")
+        # Only the value (colour) and the tooltip moved.
+        self.assertNotEqual(
+            before["assessment_order"]["value"], after["assessment_order"]["value"],
+        )
+        self.assertNotEqual(
+            before["assessment_order"]["detail"],
+            after["assessment_order"]["detail"],
+        )
+
+    # ── the overall chip ────────────────────────────────────────────────────
+    def test_an_open_dwelling_case_reads_OPEN(self):
+        self._case(self.EEA)
+        self.assertEqual(self._housing_track()["housing_overall"]["label"], "Open")
+
+    def test_a_CLOSED_dwelling_case_reads_CLOSED(self):
+        from .models import CaseStatus
+
+        case = self._case(self.EEA)
+        case.case_status = CaseStatus.CLOSED
+        case.save(update_fields=["case_status"])
+        self.assertEqual(self._housing_track()["housing_overall"]["label"], "Closed")
+
+    def test_an_EXPIRED_window_reads_EXPIRED(self):
+        self._case(
+            self.EEA,
+            starts=timezone.now() - timezone.timedelta(days=40),
+            ends=timezone.now() - timezone.timedelta(days=5),
+        )
+        self.assertEqual(
+            self._housing_track()["housing_overall"]["label"], "Expired",
+        )
+
+    def test_CLOSED_beats_EXPIRED(self):
+        """Terminal and factual wins: "Expired" on a closed case would send an
+        agent looking for something to fix."""
+        from .models import CaseStatus
+
+        case = self._case(
+            self.EEA,
+            starts=timezone.now() - timezone.timedelta(days=40),
+            ends=timezone.now() - timezone.timedelta(days=5),
+        )
+        case.case_status = CaseStatus.CLOSED
+        case.save(update_fields=["case_status"])
+        self.assertEqual(self._housing_track()["housing_overall"]["label"], "Closed")
+
+    def test_all_orders_UPLOADED_reads_COMPLETED(self):
+        from .models import DispatchKind, DispatchOrder, DispatchStatus
+
+        self._case(self.EEA)
+        DispatchOrder.objects.create(
+            kind=DispatchKind.ASSESSMENT, client=self.member, vendor=self.vendor,
+            status=DispatchStatus.UPLOADED,
+        )
+        self.assertEqual(
+            self._housing_track()["housing_overall"]["label"], "Completed",
+        )
+
+    def test_COMPLETED_beats_EXPIRED(self):
+        """If the work got done, a window that has since lapsed is history rather
+        than a problem."""
+        from .models import DispatchKind, DispatchOrder, DispatchStatus
+
+        self._case(
+            self.EEA,
+            starts=timezone.now() - timezone.timedelta(days=40),
+            ends=timezone.now() - timezone.timedelta(days=5),
+        )
+        DispatchOrder.objects.create(
+            kind=DispatchKind.ASSESSMENT, client=self.member, vendor=self.vendor,
+            status=DispatchStatus.UPLOADED,
+        )
+        self.assertEqual(
+            self._housing_track()["housing_overall"]["label"], "Completed",
+        )
+
+    def test_one_order_still_in_flight_is_NOT_completed(self):
+        from .models import DispatchKind, DispatchOrder, DispatchStatus
+
+        self._case(self.EEA)
+        DispatchOrder.objects.create(
+            kind=DispatchKind.ASSESSMENT, client=self.member, vendor=self.vendor,
+            status=DispatchStatus.UPLOADED,
+        )
+        DispatchOrder.objects.create(
+            kind=DispatchKind.REMEDIATION, client=self.member, vendor=self.vendor,
+            status=DispatchStatus.CONFIRMED,
+        )
+        self.assertEqual(self._housing_track()["housing_overall"]["label"], "Open")
+
+    def test_UNBATCHED_items_prevent_COMPLETED(self):
+        """Uploaded orders with items still waiting is not complete -- that is the
+        gap the amber Work Orders node exists to show."""
+        from .models import DispatchItem, DispatchKind, DispatchOrder, DispatchStatus
+        from .services import dispatch
+
+        self._case(self.EEA)
+        self._case(self.HEAR)
+        assessment = DispatchOrder.objects.create(
+            kind=DispatchKind.ASSESSMENT, client=self.member, vendor=self.vendor,
+            status=DispatchStatus.UPLOADED,
+        )
+        dispatch.sync_dispatch_items(assessment)
+        self.assertTrue(
+            DispatchItem.objects.filter(
+                assessment=assessment, dispatch_order__isnull=True,
+            ).exists()
+        )
+        self.assertEqual(self._housing_track()["housing_overall"]["label"], "Open")
+
+    def test_a_member_with_NO_orders_is_not_COMPLETED(self):
+        """"All orders are done" requires there to BE orders, or a member who has
+        never been assessed would read as Completed."""
+        self._case(self.EEA)
+        self.assertEqual(self._housing_track()["housing_overall"]["label"], "Open")
+
+    def test_a_CANCELLED_order_does_not_block_COMPLETED(self):
+        from .models import DispatchKind, DispatchOrder, DispatchStatus
+
+        self._case(self.EEA)
+        DispatchOrder.objects.create(
+            kind=DispatchKind.ASSESSMENT, client=self.member, vendor=self.vendor,
+            status=DispatchStatus.UPLOADED,
+        )
+        DispatchOrder.objects.create(
+            kind=DispatchKind.REMEDIATION, client=self.member, vendor=self.vendor,
+            status=DispatchStatus.CANCELLED,
+        )
+        self.assertEqual(
+            self._housing_track()["housing_overall"]["label"], "Completed",
+        )
+
+    # ── food is untouched ───────────────────────────────────────────────────
+    def test_a_FOOD_track_carries_no_housing_phases(self):
+        """Blank on food, so the frontend picks by domain rather than by which keys
+        happen to be set."""
+        from .models import ActiveProgram, Case, CaseStatus, CaseType
+        from .services.catalog import clear_program_domain_cache
+
+        ActiveProgram.objects.create(
+            program_name="Meals - Individual - Manhattan",
+            case_category="Internal Services",
+            case_type=ActiveProgram.CaseType.FOOD,
+            service_type=ActiveProgram.ServiceType.MEDICALLY_TAILORED_MEALS,
+        )
+        clear_program_domain_cache()
+        Case.objects.create(
+            case_id=uuid.uuid4(), client=self.member,
+            case_type=CaseType.INTERNAL_SERVICE, case_status=CaseStatus.MANAGED,
+            program_name="Meals - Individual - Manhattan",
+            service_authorization_status="approved",
+            case_created_at=timezone.now(),
+        )
+        from .services.lifecycle import program_tracks
+
+        food = [t for t in program_tracks(self.member) if t["domain"] == "food"]
+        self.assertTrue(food)
+        self.assertEqual(food[0]["assessment_order"]["value"], "")
+        self.assertEqual(food[0]["work_orders"]["value"], "")
+
+
 @override_settings(VENDOR_API_HOST=VENDOR_HOST, ALLOWED_HOSTS=["*"])
 class VendorSubmitAssessmentTest(TestCase):
     """Saving a draft, photos, signatures, and the submit gate."""
@@ -32322,18 +32691,19 @@ class VendorSubmitAssessmentTest(TestCase):
         made the step-packing tests brittle three times.
         """
         from .models import DispatchProof, DispatchQuestionnaire
-        from .services.assessment_forms import suggested_groups
+        from .services.assessment_forms import photo_groups_required
 
         form = DispatchQuestionnaire.objects.filter(
             dispatch_order=self.order,
         ).first()
-        needed = suggested_groups(
-            form.answers if form else {},
-            modules=form.modules if form else None,
-        )
-        # One uncategorised photo covers the "nothing identified" case; a distinct
-        # image per category covers the rest, since one_proof_per_hash_per_order
-        # allows each image to evidence exactly one problem.
+        needed = [
+            code for code, _label in photo_groups_required(
+                form.answers if form else {}, form.modules if form else None,
+            )
+        ]
+        # One uncategorised photo covers the "nothing answered" case; a distinct
+        # image per answered SECTION covers the rest, since
+        # one_proof_per_hash_per_order allows each image to evidence one thing.
         DispatchProof.objects.create(
             dispatch_order=self.order, s3_key="k-general", content_hash="h-general",
         )
@@ -32367,9 +32737,10 @@ class VendorSubmitAssessmentTest(TestCase):
         # The snapshot is what lets a signed form render years later exactly as it
         # was signed.
         self.assertTrue(form.schema_snapshot)
+        self.assertEqual(form.schema_snapshot["form"], "combined")
         self.assertEqual(
-            [m["code"] for m in form.schema_snapshot["modules"]],
-            ["mobility", "ventilation"],
+            [s["code"] for s in form.schema_snapshot["sections"]],
+            ["reason", "functional", "risks", "conditions"],
         )
 
     def test_submitting_TWICE_is_idempotent(self):
@@ -32463,16 +32834,22 @@ class VoidReopensTheQuestionnaireTest(TestCase):
             interventions=[{"option": "grab_bar_tub", "qty": 2}],
             state="submitted", submitted_at=timezone.now(),
         )
-        # A photo per identified problem, DERIVED from the answers above -- the gate
-        # demands one per category, so a fixed list would need editing whenever the
-        # question/intervention mapping changed.
-        from .services.assessment_forms import suggested_groups
+        # A photo per answered section, DERIVED from the answers above -- the gate
+        # demands one per section, so a fixed list would need editing whenever the
+        # questionnaire changed.
+        from .services.assessment_forms import photo_groups_required
 
-        for code in sorted(suggested_groups(self.form.answers, modules=["mobility"])):
+        for code, _label in photo_groups_required(self.form.answers, ["mobility"]):
             DispatchProof.objects.create(
                 dispatch_order=self.order, s3_key=f"k-{code}",
                 content_hash=f"h-{code}", intervention_group=code,
             )
+        # Plus a general one: these answers are in Reason for Assessment, which owes
+        # no section photo, so the dwelling minimum is what applies.
+        DispatchProof.objects.create(
+            dispatch_order=self.order, s3_key="k-general",
+            content_hash="h-general",
+        )
         self.submission = dispatch.open_submission(self.order)
         for role in ("vendor", "member"):
             DispatchSignature.objects.create(
@@ -32531,123 +32908,129 @@ class VoidReopensTheQuestionnaireTest(TestCase):
         )
 
 
-class QuestionSuggestsInterventionsTest(TestCase):
-    """Which intervention categories a ticked finding points at.
+class QuestionCategoryTest(TestCase):
+    """A question GROUP points at a product category.
 
-    The point is fewer products on screen: a bathroom fall risk narrows 12
-    categories to 3, so the vendor picks quantities from a short list instead of
-    scrolling 26 options in someone's hallway.
+    Per the questionnaires: "if any question is selected then we show the whole
+    list of products under that category". The unit is the group, not the
+    question -- which is why this replaced a per-question mapping.
     """
 
-    def test_every_mapped_key_is_a_REAL_question(self):
-        """A typo would silently suggest nothing, which looks like a deliberate
-        "no product answers this" rather than a mistake."""
-        from .services.assessment_forms import QUESTION_SUGGESTS, all_question_codes
-
-        self.assertEqual(set(QUESTION_SUGGESTS) - set(all_question_codes()), set())
-
-    def test_EVERY_question_is_mapped(self):
-        """Including the ones that map to nothing -- an unmapped question and a
-        question that indicates no product are indistinguishable at runtime, so the
-        empty list has to be written down deliberately."""
-        from .services.assessment_forms import QUESTION_SUGGESTS, all_question_codes
-
-        self.assertEqual(set(all_question_codes()) - set(QUESTION_SUGGESTS), set())
-
-    def test_every_suggested_group_code_EXISTS(self):
-        from .services.assessment_forms import INTERVENTIONS, QUESTION_SUGGESTS
-
-        real = {g["code"] for gs in INTERVENTIONS.values() for g in gs}
-        used = {c for codes in QUESTION_SUGGESTS.values() for c in codes}
-        self.assertEqual(used - real, set())
-
-    def test_every_category_is_REACHABLE_from_some_question(self):
-        """A category no finding points at is invisible unless the vendor taps
-        "Show all" -- effectively removed from the form by accident."""
-        from .services.assessment_forms import INTERVENTIONS, QUESTION_SUGGESTS
-
-        real = {g["code"] for gs in INTERVENTIONS.values() for g in gs}
-        used = {c for codes in QUESTION_SUGGESTS.values() for c in codes}
-        self.assertEqual(real - used, set())
-
-    def test_a_bathroom_fall_risk_narrows_twelve_categories_to_three(self):
-        from .services.assessment_forms import suggested_groups
-
-        got = suggested_groups({
-            "mob.reason.bathroom_safety": True,
-            "mob.risk.grab_bars_absent": True,
-            "mob.risk.slippery_tub": True,
-        })
-        self.assertEqual(got, {"bathroom", "grab_bars", "non_skid"})
-
-    def test_poor_lighting_suggests_NOTHING_and_that_is_correct(self):
-        """A real fall risk with no product in the catalogue to answer it. It stays
-        on the form as evidence for the justification, but must not conjure a
-        category."""
-        from .services.assessment_forms import suggested_groups
-
-        self.assertEqual(suggested_groups({"mob.risk.poor_lighting": True}), set())
-
-    def test_an_UNTICKED_answer_suggests_nothing(self):
+    def test_a_group_offers_its_WHOLE_category(self):
+        """Ticking one bathroom risk offers Bathroom Facilities, Grab Bars AND
+        Non-skid Surfaces -- the document asks for the whole list."""
         from .services.assessment_forms import suggested_groups
 
         self.assertEqual(
-            suggested_groups({"mob.risk.grab_bars_absent": False}), set(),
+            suggested_groups({"mob.risk.slippery_tub": True}, ["combined"]),
+            {"bathroom", "grab_bars", "non_skid"},
         )
 
-    def test_an_unknown_code_is_ignored_rather_than_raising(self):
+    def test_temperature_questions_offer_temperature_products(self):
         from .services.assessment_forms import suggested_groups
 
-        self.assertEqual(suggested_groups({"made.up": True}), set())
-
-    def test_a_category_reached_twice_appears_ONCE(self):
-        from .services.assessment_forms import suggested_groups
-
-        got = suggested_groups({
-            "mob.risk.handrail_absent": True,   # handrails
-            "mob.physical.stairs": True,        # handrails again
-        })
-        self.assertEqual(got, {"handrails"})
-
-    def test_suggestions_are_limited_to_the_MODULES_in_play(self):
-        """A ventilation-only referral must not be offered grab bars because a
-        mobility answer was somehow present."""
-        from .services.assessment_forms import suggested_groups
-
-        got = suggested_groups(
-            {"mob.risk.grab_bars_absent": True, "vent.temp.excessive_heat": True},
-            modules=["ventilation"],
+        self.assertEqual(
+            suggested_groups({"vent.temp.excessive_heat": True}, ["combined"]),
+            {"air_conditioner", "heater"},
         )
-        self.assertEqual(got, {"air_conditioner"})
 
-    def test_the_schema_carries_suggests_on_every_question(self):
+    def test_REASON_FOR_ASSESSMENT_offers_nothing(self):
+        """Marked "No recommend any product" on all three documents."""
+        from .services.assessment_forms import suggested_categories
+
+        self.assertEqual(
+            suggested_categories({"mob.reason.fall_risk": True}, ["combined"]), set(),
+        )
+
+    def test_MEMBER_REPORTED_CONCERNS_offers_nothing(self):
+        from .services.assessment_forms import suggested_categories
+
+        self.assertEqual(
+            suggested_categories({"vent.reported.breathing": True}, ["ventilation"]),
+            set(),
+        )
+
+    def test_two_questions_in_one_group_offer_that_category_ONCE(self):
+        from .services.assessment_forms import suggested_categories
+
+        self.assertEqual(
+            suggested_categories({
+                "mob.risk.slippery_tub": True,
+                "mob.risk.grab_bars_absent": True,
+            }, ["combined"]),
+            {"bathroom"},
+        )
+
+    def test_a_MOBILITY_form_never_offers_ventilation_products(self):
+        """The answers cannot reach a group the form does not contain."""
+        from .services.assessment_forms import suggested_categories
+
+        self.assertEqual(
+            suggested_categories({"vent.temp.excessive_heat": True}, ["mobility"]),
+            set(),
+        )
+
+    def test_the_OLD_stored_module_shape_still_resolves(self):
+        """Rows already in the database hold ["mobility", "ventilation"], which is
+        how combined used to be stored."""
+        from .services.assessment_forms import suggested_categories
+
+        self.assertEqual(
+            suggested_categories(
+                {"vent.air.mold_odor": True}, ["mobility", "ventilation"],
+            ),
+            {"air_quality"},
+        )
+
+    def test_every_question_belongs_to_a_group_with_a_known_category_or_none(self):
+        from .services.assessment_forms import CATEGORY_LABELS, FORMS
+
+        for form, sections in FORMS.items():
+            for section in sections:
+                for group in section["groups"]:
+                    category = group.get("category")
+                    if category is not None:
+                        self.assertIn(category, CATEGORY_LABELS, f"{form}/{group['code']}")
+
+    def test_every_PRODUCT_category_has_products(self):
+        from .services.assessment_forms import CATEGORY_LABELS, INTERVENTIONS
+
+        for code in CATEGORY_LABELS:
+            self.assertTrue(INTERVENTIONS.get(code), code)
+
+    def test_DOORS_has_products_but_no_question_reaches_it(self):
+        """Recorded, not asserted away. "Doors, Handles & Access" holds three priced
+        products and NONE of the three questionnaires asks anything that points at
+        it -- so a vendor can only reach lever handles and cabinet pulls through
+        "Show all". Worth a question to the operator rather than a silent gap.
+        """
+        from .services.assessment_forms import FORMS, INTERVENTIONS
+
+        reached = {
+            g["category"] for sections in FORMS.values()
+            for sec in sections for g in sec["groups"] if g.get("category")
+        }
+        self.assertNotIn("doors", reached)
+        self.assertTrue(INTERVENTIONS["doors"])
+
+    def test_the_schema_carries_the_categories_and_their_products(self):
         from .services.assessment_forms import build_schema
 
-        schema = build_schema(["mobility", "ventilation"])
-        for module in schema["modules"]:
-            for section in module["sections"]:
-                for group in section["groups"]:
-                    for question in group["questions"]:
-                        self.assertIn("suggests", question, question["code"])
-
-    def test_building_the_schema_does_NOT_mutate_the_shared_constant(self):
-        """QUESTIONS is module-level and shared across requests. Annotating it in
-        place would leak into every later schema and into the snapshots frozen onto
-        submitted forms."""
-        from .services.assessment_forms import QUESTIONS, build_schema
-
-        build_schema(["mobility"])
-        for section in QUESTIONS["mobility"]:
-            for group in section["groups"]:
-                for question in group["questions"]:
-                    self.assertNotIn("suggests", question)
+        schema = build_schema(["combined"])
+        codes = {c["code"] for c in schema["categories"]}
+        self.assertEqual(
+            codes, {"mobility_access", "bathroom", "air_quality", "temperature"},
+        )
+        for category in schema["categories"]:
+            self.assertTrue(category["groups"])
 
 
-class PhotoPerIdentifiedProblemTest(TestCase):
-    """A photo is required for each problem the answers identified.
+class PhotoPerAnsweredSectionTest(TestCase):
+    """A photo is owed for each SECTION GROUP that has an answer.
 
-    Per CATEGORY, not per question: three questions point at grab bars, and a photo
-    each would ask for the same photo three times.
+    Per the questionnaires: "Required photo if any is selected", written against
+    the question group -- Bathroom, Mobility & Access, Air Quality, Temperature
+    Control. The Reason and Member-Reported sections say "Doesn't required photo".
     """
 
     def setUp(self):
@@ -32665,7 +33048,7 @@ class PhotoPerIdentifiedProblemTest(TestCase):
             referral_type="combined",
         )
         self.form = DispatchQuestionnaire.objects.create(
-            dispatch_order=self.order, modules=["mobility", "ventilation"],
+            dispatch_order=self.order, modules=["combined"],
         )
 
     def _answer(self, **answers):
@@ -32680,93 +33063,91 @@ class PhotoPerIdentifiedProblemTest(TestCase):
             content_hash=f"h{group}{suffix}", intervention_group=group,
         )
 
-    def _photo_gaps(self):
+    def _gaps(self):
         from .services import dispatch
 
         return [
-            m for m in dispatch.missing_for_submission(self.order)
-            if m.startswith("photo")
-        ] + [
-            m for m in dispatch.missing_for_submission(self.order)
-            if m.startswith("at least one")
+            m for m in dispatch.missing_for_submission(self.order) if "photo" in m
         ]
 
-    def test_each_identified_CATEGORY_needs_its_own_photo(self):
+    def test_each_answered_SECTION_needs_its_own_photo(self):
         self._answer(**{
-            "mob.risk.grab_bars_absent": True,      # grab_bars
-            "mob.risk.handrail_absent": True,       # handrails
+            "mob.risk.slippery_tub": True,        # Bathroom
+            "mob.risk.handrail_absent": True,     # Mobility & Access
+            "vent.temp.excessive_heat": True,     # Temperature Control
         })
-        gaps = self._photo_gaps()
-        self.assertIn("photo of: Grab Bars", gaps)
-        self.assertIn("photo of: Handrails", gaps)
+        gaps = self._gaps()
+        self.assertIn("photo of: Bathroom", gaps)
+        self.assertIn("photo of: Mobility & Access", gaps)
+        self.assertIn("photo of: Temperature Control", gaps)
 
-    def test_the_gap_names_the_category_in_WORDS(self):
-        """"photo of: Grab Bars", not "photo of: grab_bars" -- the gate exists to be
-        actionable at the end of a home visit."""
-        self._answer(**{"mob.risk.grab_bars_absent": True})
-        self.assertIn("photo of: Grab Bars", self._photo_gaps())
+    def test_the_gap_names_the_HEADING_the_vendor_just_answered_under(self):
+        self._answer(**{"mob.risk.slippery_tub": True})
+        self.assertEqual(self._gaps(), ["photo of: Bathroom"])
 
-    def test_a_photo_in_that_category_SATISFIES_it(self):
-        self._answer(**{"mob.risk.grab_bars_absent": True})
-        self._photo("grab_bars")
-        self.assertEqual(self._photo_gaps(), [])
-
-    def test_THREE_questions_pointing_at_one_category_need_ONE_photo(self):
-        """The problem evidenced is "no grab bars", however many questions surfaced
-        it."""
+    def test_THREE_answers_in_ONE_section_need_ONE_photo(self):
         self._answer(**{
+            "mob.risk.slippery_tub": True,
             "mob.risk.grab_bars_absent": True,
-            "mob.physical.bathing_transfer": True,
-            "mob.risk.unsafe_transfers": True,
+            "mob.risk.wet_floor": True,
         })
-        self._photo("grab_bars")
-        self._photo("bathroom")
-        self.assertEqual(self._photo_gaps(), [])
+        self._photo("mob.risk.bathroom")
+        self.assertEqual(self._gaps(), [])
 
-    def test_a_GENERAL_photo_does_not_satisfy_a_category(self):
-        """Otherwise one photo of the front door would clear every problem."""
-        self._answer(**{"mob.risk.grab_bars_absent": True})
+    def test_a_GENERAL_photo_does_not_satisfy_a_section(self):
+        """Otherwise one shot of the front door would clear every requirement."""
+        self._answer(**{"mob.risk.slippery_tub": True})
         self._photo("")
-        self.assertIn("photo of: Grab Bars", self._photo_gaps())
+        self.assertIn("photo of: Bathroom", self._gaps())
 
-    def test_a_photo_in_ANOTHER_category_does_not_satisfy_this_one(self):
+    def test_a_photo_for_ANOTHER_section_does_not_satisfy_this_one(self):
         self._answer(**{
-            "mob.risk.grab_bars_absent": True,
-            "mob.risk.handrail_absent": True,
-        })
-        self._photo("grab_bars")
-        gaps = self._photo_gaps()
-        self.assertIn("photo of: Handrails", gaps)
-        self.assertNotIn("photo of: Grab Bars", gaps)
-
-    def test_with_NOTHING_identified_the_printed_minimum_still_applies(self):
-        """A visit that found no problems is still evidenced."""
-        self._answer()
-        self.assertIn("at least one photo of the dwelling", self._photo_gaps())
-        self._photo("")
-        self.assertEqual(self._photo_gaps(), [])
-
-    def test_a_question_that_suggests_NOTHING_demands_no_category_photo(self):
-        """Poor lighting has no product, so it cannot demand a product photo -- but
-        the dwelling minimum still applies."""
-        self._answer(**{"mob.risk.poor_lighting": True})
-        gaps = self._photo_gaps()
-        self.assertEqual(gaps, ["at least one photo of the dwelling"])
-
-    def test_categories_outside_the_MODULES_in_play_are_not_demanded(self):
-        """A ventilation-only referral must not ask for a grab-bar photo."""
-        self.form.modules = ["ventilation"]
-        self.form.save(update_fields=["modules", "updated_at"])
-        self._answer(**{
-            "mob.risk.grab_bars_absent": True,
+            "mob.risk.slippery_tub": True,
             "vent.temp.excessive_heat": True,
         })
-        gaps = self._photo_gaps()
-        self.assertIn("photo of: Air Conditioner", gaps)
-        self.assertNotIn("photo of: Grab Bars", gaps)
+        self._photo("mob.risk.bathroom")
+        gaps = self._gaps()
+        self.assertIn("photo of: Temperature Control", gaps)
+        self.assertNotIn("photo of: Bathroom", gaps)
+
+    def test_REASON_FOR_ASSESSMENT_alone_needs_no_section_photo(self):
+        """Marked "Doesn't required photo" -- the dwelling minimum still applies."""
+        self._answer(**{"mob.reason.fall_risk": True})
+        self.assertEqual(self._gaps(), ["at least one photo of the dwelling"])
+
+    def test_MEMBER_REPORTED_alone_needs_no_section_photo(self):
+        from .models import DispatchQuestionnaire
+
+        DispatchQuestionnaire.objects.filter(pk=self.form.pk).update(
+            modules=["ventilation"],
+        )
+        self.form.refresh_from_db()
+        self._answer(**{"vent.reported.breathing": True})
+        self.assertEqual(self._gaps(), ["at least one photo of the dwelling"])
+
+    def test_with_NOTHING_answered_the_printed_minimum_applies(self):
+        self._answer()
+        self.assertIn("at least one photo of the dwelling", self._gaps())
+        self._photo("")
+        self.assertEqual(self._gaps(), [])
+
+    def test_sections_outside_the_FORM_in_play_are_not_demanded(self):
+        """A ventilation-only form must not ask for a bathroom photo."""
+        from .models import DispatchQuestionnaire
+
+        DispatchQuestionnaire.objects.filter(pk=self.form.pk).update(
+            modules=["ventilation"],
+        )
+        self.form.refresh_from_db()
+        self._answer(**{
+            "mob.risk.slippery_tub": True,
+            "vent.temp.excessive_heat": True,
+        })
+        gaps = self._gaps()
+        self.assertIn("photo of: Temperature Control", gaps)
+        self.assertNotIn("photo of: Bathroom", gaps)
 
     def test_an_order_with_no_questionnaire_falls_back_to_the_minimum(self):
-        """A remediation work order has no questionnaire at all."""
         from .models import Client, DispatchKind, DispatchOrder
         from .services import dispatch
 
@@ -32782,26 +33163,19 @@ class PhotoPerIdentifiedProblemTest(TestCase):
             dispatch.missing_for_submission(bare),
         )
 
-    def test_the_same_image_cannot_evidence_TWO_problems(self):
+    def test_the_same_image_cannot_evidence_TWO_sections(self):
         """one_proof_per_hash_per_order enforces one image per order, and that is
-        the stronger rule: if a single photo could clear every category, the
-        per-problem requirement would be theatre.
-
-        I wrote the de-duplication keyed on (hash, category) first and the database
-        refused it. The vendor now gets a sentence they can act on rather than a
-        500.
-        """
-        from .models import DispatchProof
-
-        DispatchProof.objects.create(
-            dispatch_order=self.order, s3_key="k", content_hash="same",
-            intervention_group="grab_bars",
-        )
+        the stronger rule: if a single photo could clear every section, the
+        per-problem requirement would be theatre."""
         from django.db import IntegrityError, transaction
 
+        from .models import DispatchProof
+
+        self._photo("mob.risk.bathroom")
         with self.assertRaises(IntegrityError):
             with transaction.atomic():
                 DispatchProof.objects.create(
-                    dispatch_order=self.order, s3_key="k2", content_hash="same",
-                    intervention_group="handrails",
+                    dispatch_order=self.order, s3_key="other",
+                    content_hash="hmob.risk.bathroomx",
+                    intervention_group="vent.temp",
                 )

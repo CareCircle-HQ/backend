@@ -772,56 +772,67 @@ class MemberAssessmentFormView(PortalAPIView):
             schema = build_schema(modules_for_referral(order.referral_type))
             answers, others, chosen = {}, {}, {}
 
-        modules = []
-        for module in schema.get("modules", []):
-            sections = []
-            for section in module["sections"]:
-                sections.append({
-                    "code": section["code"],
-                    "title": section["title"],
-                    "allows_other": section.get("allows_other", False),
-                    "other": others.get(section["code"], ""),
-                    "groups": [
-                        {
-                            "code": g["code"],
-                            "label": g["label"],
-                            "questions": [
-                                {
-                                    "code": q["code"],
-                                    "label": q["label"],
-                                    "checked": bool(answers.get(q["code"])),
-                                }
-                                for q in g["questions"]
-                            ],
-                        }
-                        for g in section["groups"]
-                    ],
-                })
-            groups = []
-            for g in module["intervention_groups"]:
-                groups.append({
-                    "code": g["code"],
-                    "label": g["label"],
-                    "program_item": g.get("program_item") or "",
-                    "options": [
-                        {
-                            "code": o["code"],
-                            "label": o["label"],
-                            # qty 0 renders as "Not added", matching the vendor's
-                            # own form rather than hiding unchosen options -- the
-                            # full catalogue is what shows an agent what COULD have
-                            # been recommended.
-                            "qty": chosen.get(o["code"], 0),
-                        }
-                        for o in g["options"]
-                    ],
-                })
-            modules.append({
-                "code": module["code"],
-                "label": module["label"],
-                "service_code": module["service_code"],
-                "sections": sections,
-                "intervention_groups": groups,
+        # ONE form now, not a list of modules. Combined is its own document
+        # rather than the two others concatenated, so the response mirrors that.
+        sections = []
+        for section in schema.get("sections", []):
+            sections.append({
+                "code": section["code"],
+                "title": section["title"],
+                "allows_other": section.get("allows_other", False),
+                "other": others.get(section["code"], ""),
+                "groups": [
+                    {
+                        "code": g["code"],
+                        "label": g["label"],
+                        # What the group points at, so the CRM can show WHY a
+                        # category of products was offered -- and which sections
+                        # owed a photo.
+                        "category": g.get("category") or "",
+                        "requires_photo": bool(g.get("requires_photo")),
+                        "questions": [
+                            {
+                                "code": q["code"],
+                                "label": q["label"],
+                                "checked": bool(answers.get(q["code"])),
+                            }
+                            for q in g["questions"]
+                        ],
+                    }
+                    for g in section["groups"]
+                ],
+            })
+
+        photos_by_group = {}
+        for proof in order.proofs.all():
+            photos_by_group.setdefault(proof.intervention_group or "", 0)
+            photos_by_group[proof.intervention_group or ""] += 1
+
+        categories = []
+        for category in schema.get("categories", []):
+            categories.append({
+                "code": category["code"],
+                "label": category["label"],
+                "groups": [
+                    {
+                        "code": g["code"],
+                        "label": g["label"],
+                        "program_item": g.get("program_item") or "",
+                        "options": [
+                            {
+                                "code": o["code"],
+                                "label": o["label"],
+                                # qty 0 renders as "Not added", matching the
+                                # vendor's own form rather than hiding unchosen
+                                # options -- the full catalogue is what shows an
+                                # agent what COULD have been recommended.
+                                "qty": chosen.get(o["code"], 0),
+                            }
+                            for o in g["options"]
+                        ],
+                    }
+                    for g in category["groups"]
+                ],
             })
 
         active = dispatch_svc.active_submission(order)
@@ -833,7 +844,14 @@ class MemberAssessmentFormView(PortalAPIView):
             "template_version": (
                 form.template_version if form else schema.get("version")
             ),
-            "modules": modules,
+            "form": schema.get("form") or "",
+            "form_label": schema.get("label") or "",
+            "service_code": schema.get("service_code") or "",
+            "sections": sections,
+            "categories": categories,
+            # Photos by the SECTION they evidence, so the CRM can show the
+            # assessment's evidence against the findings rather than as a pile.
+            "photos_by_group": photos_by_group,
             "justification": form.justification if form else "",
             "assessor_notes": form.assessor_notes if form else "",
             # The wrapper the form shares across modules: photos and the two

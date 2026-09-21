@@ -134,35 +134,37 @@ def missing_for_submission(order):
     # It is NOT the old per-FINDING rule that shipped here and that every real
     # submission would have failed; findings are a different concept, and a photo
     # per item belongs to work orders as proof of service.
-    from .assessment_forms import suggested_groups
+    from .assessment_forms import photo_groups_required
 
     questionnaire = getattr(order, "questionnaire", None)
-    categories = (
-        suggested_groups(questionnaire.answers, modules=questionnaire.modules)
-        if questionnaire is not None else set()
+    needed = (
+        photo_groups_required(questionnaire.answers, questionnaire.modules)
+        if questionnaire is not None else []
     )
 
-    if categories:
-        labels = _intervention_group_labels()
+    if needed:
         have = set(
             order.proofs.exclude(intervention_group="")
             .values_list("intervention_group", flat=True)
         )
-        for code in sorted(categories - have):
-            missing.append(f"photo of: {labels.get(code, code)}")
+        for code, label in needed:
+            if code not in have:
+                missing.append(f"photo of: {label}")
     elif not order.proofs.exists():
-        # Nothing identified -- the printed minimum still applies, so a visit that
-        # found no problems is still evidenced.
+        # Nothing that needs evidencing was ticked -- the printed minimum still
+        # applies, so a visit that found no problems is still evidenced.
         missing.append("at least one photo of the dwelling")
 
     return missing
 
 
 def _intervention_group_labels():
-    """Group code -> human label, for naming what is missing.
+    """Product group code -> human label. Used when naming a product, not the gate.
 
-    A vendor is told "photo of: Grab Bars", not "photo of: grab_bars" -- the gate's
-    whole purpose is to be actionable at the end of a home visit.
+    The gate now names the QUESTION group a photo is owed for ("photo of:
+    Bathroom"), because that is the heading the vendor just answered under -- the
+    questionnaires attach the photo requirement to the question group, not to a
+    product category.
     """
     from .assessment_forms import INTERVENTIONS
 
