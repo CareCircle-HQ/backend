@@ -974,3 +974,58 @@ def pricing_admin_fee(amount, percent):
     from ..services import pricing
 
     return pricing.admin_fee(amount, percent)
+
+
+class MemberDispatchDocumentsView(PortalAPIView):
+    """GET: the documents on a member's housing orders, newest first.
+
+    Each carries a PRESIGNED url for viewing and a separate one for download. Two
+    urls rather than one because the Content-Disposition differs: a PDF an agent
+    wants to read should open in the browser, and one they want to keep should
+    save with a sensible filename rather than a hash.
+    """
+
+    def get(self, request, client_id):
+        from ..models import DispatchDocument
+        from ..services import import_storage
+        from ..services.dispatch_pdf import DOC_LABELS
+
+        client = get_object_or_404(Client, pk=client_id)
+        docs = (
+            DispatchDocument.objects
+            .filter(dispatch_order__client=client)
+            .select_related("dispatch_order", "uploaded_by_vendor_user")
+            .order_by("-created_at")
+        )
+
+        out = []
+        for doc in docs:
+            view_url = download_url = ""
+            try:
+                view_url = import_storage.presign_get(
+                    doc.s3_key, expires=900, inline=True,
+                    content_type="application/pdf",
+                )
+                download_url = import_storage.presign_get(
+                    doc.s3_key, expires=900, download_name=doc.filename,
+                )
+            except Exception:  # noqa: BLE001 - one bad key must not hide the list
+                logger.warning("document presign failed: %s", doc.s3_key)
+            out.append({
+                "id": doc.pk,
+                "doc_type": doc.doc_type,
+                # The stored doc_type is a stable key, not a display string, so the
+                # label is resolved here rather than in the UI.
+                "label": DOC_LABELS.get(doc.doc_type) or doc.doc_type or "Document",
+                "filename": doc.filename,
+                "created_at": doc.created_at,
+                "order_id": str(doc.dispatch_order_id),
+                "order_kind": doc.dispatch_order.kind,
+                "uploaded_by": (
+                    doc.uploaded_by_vendor_user.name
+                    if doc.uploaded_by_vendor_user_id else ""
+                ),
+                "view_url": view_url,
+                "download_url": download_url,
+            })
+        return Response({"documents": out})

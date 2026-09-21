@@ -1270,12 +1270,30 @@ class VendorSubmitAssessmentView(VendorAPIView):
         # vendor_user, not a bare call: the record has to say WHO submitted, and
         # "the assessor who signed it" is the answer.
         dispatch_svc.submit(order, vendor_user=request.user.vendor_user)
+
+        # The three documents, generated AFTER the submission succeeds and wrapped
+        # so a rendering fault cannot undo it. The assessment is the record; the
+        # PDFs are derived from it, and losing a submission because a photograph
+        # would not decode would be the wrong way round.
+        from ..services import dispatch_pdf
+
+        documents = []
+        try:
+            documents = dispatch_pdf.generate_submission_documents(
+                order, vendor_user=request.user.vendor_user,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("submission documents failed for order %s", order.pk)
+
         order.refresh_from_db()
         return Response({
             "state": form.state,
             "submitted_at": form.submitted_at,
             "order_status": order.status,
             "order_status_label": order.get_status_display(),
+            "documents": [
+                {"doc_type": d.doc_type, "filename": d.filename} for d in documents
+            ],
             "already": False,
         }, status=http.HTTP_201_CREATED)
 

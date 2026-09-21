@@ -1,4 +1,5 @@
 import base64
+import io
 import uuid
 from datetime import date, datetime, timedelta, timezone as dt_timezone
 from types import SimpleNamespace
@@ -34343,3 +34344,277 @@ class LogoOptimisationTest(TestCase):
         raw = self._image((2400, 2400))
         png, _info = optimise(raw)
         self.assertLess(len(png), len(raw))
+
+
+class SubmissionDocumentsTest(TestCase):
+    """The three PDFs produced when an assessment is submitted.
+
+    The rule running through all of them: VENDOR PRICES ONLY. The vendor receives
+    the invoice and the quote and the member can be shown the assessment, so our
+    admin fee or billed total appearing on any of them would hand out our
+    commercial position.
+    """
+
+    EEA = (
+        "Dwelling Assessment & Statement of Work (SOW) Development - "
+        "Modifications and Remediation Service - Queens"
+    )
+
+    def setUp(self):
+        from decimal import Decimal
+
+        from .models import (
+            ActiveProgram, BillableItem, BillingSettings, Case, CaseStatus,
+            CaseType, Client, DispatchKind, DispatchOrder, DispatchQuestionnaire,
+            DispatchSignature, Vendor, VendorUser,
+        )
+        from .services import dispatch as dispatch_svc
+        from .services.assessment_forms import build_schema
+        from .services.catalog import clear_program_domain_cache
+
+        BillingSettings.objects.update_or_create(
+            singleton_id=1, defaults={"admin_fee_percent": Decimal("10.00")},
+        )
+        ActiveProgram.objects.create(
+            program_name=self.EEA, case_category="Internal Services",
+            case_type=ActiveProgram.CaseType.HOUSING,
+            service_type=ActiveProgram.ServiceType.ENVIRONMENTAL_EXPOSURE_ASSESSMENT,
+        )
+        clear_program_domain_cache()
+
+        BillableItem.objects.create(
+            item="Dwelling assessment", option_code="",
+            billing_category="Dwelling Assessment & SOW Development",
+            vendor_price=Decimal("750.00"),
+        )
+        BillableItem.objects.create(
+            item="Grab bar at tub", option_code="grab_bar_tub",
+            billing_category="Grab Bars", main_category="Bathroom",
+            vendor_price=Decimal("498.75"),
+        )
+
+        self.vendor = Vendor.objects.create(
+            name="Acme Repairs", address="88 Vendor Way, Queens NY",
+            contact_phone="(718) 555-0142", contact_email="office@acme.test",
+        )
+        self.vendor_user = VendorUser.objects.create(
+            vendor=self.vendor, email="ada@acme.test", name="Ada Assessor",
+        )
+        self.member = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Pdf", last_name="Member",
+            client_added_at=timezone.now(),
+        )
+        self.case = Case.objects.create(
+            case_id=uuid.uuid4(), client=self.member,
+            case_type=CaseType.INTERNAL_SERVICE, case_status=CaseStatus.MANAGED,
+            program_name=self.EEA, case_created_at=timezone.now(),
+        )
+        self.order = DispatchOrder.objects.create(
+            kind=DispatchKind.ASSESSMENT, client=self.member, vendor=self.vendor,
+            referral_type="combined", case=self.case,
+            address_line1="1 Member Road", address_city="Queens",
+        )
+        self.form = DispatchQuestionnaire.objects.create(
+            dispatch_order=self.order, modules=["combined"],
+            schema_snapshot=build_schema(["combined"]),
+            answers={"mob.risk.slippery_tub": True, "mob.risk.grab_bars_absent": True},
+            interventions=[{"option": "grab_bar_tub", "qty": 2}],
+            justification="On blood thinners.", assessor_notes="Tub worn smooth.",
+            state="submitted", submitted_at=timezone.now(),
+        )
+        submission = dispatch_svc.open_submission(self.order)
+        for role, name in (("member", "Pdf Member"), ("vendor", "Ada Assessor")):
+            DispatchSignature.objects.create(
+                dispatch_submission=submission, signer_role=role, signer_name=name,
+                s3_key="", content_hash=f"h-{role}", signed_at=timezone.now(),
+            )
+
+    def _text(self, pdf_bytes):
+        from pypdf import PdfReader
+
+        reader = PdfReader(io.BytesIO(pdf_bytes))
+        return "".join(page.extract_text() or "" for page in reader.pages)
+
+    # ── the invoice ─────────────────────────────────────────────────────────
+    def test_the_invoice_bills_the_ASSESSMENT_ONLY(self):
+        """The recommended items have not been authorised, ordered or installed --
+        invoicing them would be billing for work nobody has approved."""
+        from .services.dispatch_pdf import render_invoice
+
+        text = self._text(render_invoice(self.order))
+        self.assertIn("$750.00", text)
+        self.assertNotIn("Grab bar", text)
+
+    def test_the_invoice_carries_the_vendors_own_details(self):
+        from .services.dispatch_pdf import render_invoice
+
+        text = self._text(render_invoice(self.order))
+        self.assertIn("Acme Repairs", text)
+        self.assertIn("88 Vendor Way", text)
+        self.assertIn("(718) 555-0142", text)
+
+    # ── the quote ───────────────────────────────────────────────────────────
+    def test_the_quote_totals_the_recommended_items_at_VENDOR_prices(self):
+        from .services.dispatch_pdf import render_quote
+
+        text = self._text(render_quote(self.order))
+        self.assertIn("Grab bar at tub", text)
+        # 2 x 498.75, with no fee added.
+        self.assertIn("$997.50", text)
+
+    def test_the_quote_carries_BOTH_signatures(self):
+        """The member signs because it records what they were told would be
+        requested on their behalf -- the thing most likely to be disputed."""
+        from .services.dispatch_pdf import render_quote
+
+        text = self._text(render_quote(self.order))
+        self.assertIn("Member signature", text)
+        self.assertIn("Assessor signature", text)
+        self.assertIn("Pdf Member", text)
+
+    def test_a_quote_with_NOTHING_recommended_says_so(self):
+        """An empty table and a $0.00 total looks like a rendering fault rather
+        than a finding."""
+        from .services.dispatch_pdf import render_quote
+
+        self.form.interventions = []
+        self.form.save(update_fields=["interventions"])
+        text = self._text(render_quote(self.order))
+        self.assertIn("No interventions were recommended", text)
+
+    # ── the report ──────────────────────────────────────────────────────────
+    def test_the_report_shows_every_question_answered_or_not(self):
+        """A report that silently omits what was NOT found cannot be checked
+        against the form."""
+        from .services.dispatch_pdf import render_assessment_report
+
+        text = self._text(render_assessment_report(self.order))
+        self.assertIn("Slippery tub or shower surface present", text)
+        # An unanswered one is still listed.
+        self.assertIn("Poor lighting present", text)
+
+    def test_the_report_includes_the_justification_and_notes(self):
+        from .services.dispatch_pdf import render_assessment_report
+
+        text = self._text(render_assessment_report(self.order))
+        self.assertIn("On blood thinners", text)
+        self.assertIn("Tub worn smooth", text)
+
+    def test_the_report_renders_from_the_FROZEN_snapshot(self):
+        """A form signed against one template version must not acquire the next
+        one's wording."""
+        from .services.dispatch_pdf import render_assessment_report
+
+        self.form.schema_snapshot = {
+            "version": 1, "form": "mobility", "label": "Mobility",
+            "service_code": "2.1", "categories": [],
+            "sections": [{
+                "code": "old", "title": "A Retired Section", "allows_other": False,
+                "groups": [{
+                    "code": "g", "label": "", "category": None,
+                    "requires_photo": False,
+                    "questions": [
+                        {"code": "retired.q", "label": "A question we removed"},
+                    ],
+                }],
+            }],
+        }
+        self.form.save(update_fields=["schema_snapshot"])
+        text = self._text(render_assessment_report(self.order))
+        self.assertIn("A Retired Section", text)
+        self.assertIn("A question we removed", text)
+        self.assertNotIn("Slippery tub", text)
+
+    def test_the_photographs_come_LAST(self):
+        from .models import DispatchProof
+        from .services.dispatch_pdf import render_assessment_report
+
+        DispatchProof.objects.create(
+            dispatch_order=self.order, s3_key="", content_hash="p1",
+            intervention_group="mob.risk.bathroom",
+        )
+        text = self._text(render_assessment_report(self.order))
+        self.assertIn("Photographs", text)
+        self.assertGreater(text.index("Photographs"), text.index("Assessor Notes"))
+
+    # ── OUR pricing must appear nowhere ─────────────────────────────────────
+    def test_NONE_of_the_three_mentions_our_fee_or_billed_total(self):
+        from decimal import Decimal
+
+        from .services.dispatch_pdf import (
+            render_assessment_report, render_invoice, render_quote,
+        )
+
+        # 2 x 498.75 = 997.50; ours would bill 1097.25. And 750 -> 825.
+        forbidden = ("admin fee", "Admin Fee", "1,097.25", "825.00", "we bill")
+        for renderer in (render_invoice, render_quote, render_assessment_report):
+            text = self._text(renderer(self.order))
+            for token in forbidden:
+                self.assertNotIn(token, text, f"{renderer.__name__}: {token}")
+
+    def test_a_negotiated_vendor_price_is_the_one_that_appears(self):
+        """The documents are the vendor's, so they show what THEY charge."""
+        from decimal import Decimal
+
+        from .models import BillableItem, VendorPrice
+        from .services.dispatch_pdf import render_quote
+
+        VendorPrice.objects.create(
+            vendor=self.vendor,
+            billable_item=BillableItem.objects.get(option_code="grab_bar_tub"),
+            price=Decimal("400.00"),
+        )
+        text = self._text(render_quote(self.order))
+        self.assertIn("$800.00", text)
+        self.assertNotIn("$997.50", text)
+
+    # ── storing them ────────────────────────────────────────────────────────
+    def test_all_three_are_attached_to_the_order(self):
+        from .services.dispatch_pdf import (
+            DOC_ASSESSMENT, DOC_INVOICE, DOC_QUOTE,
+            generate_submission_documents,
+        )
+
+        docs = generate_submission_documents(
+            self.order, vendor_user=self.vendor_user,
+        )
+        self.assertEqual(
+            {d.doc_type for d in docs}, {DOC_INVOICE, DOC_QUOTE, DOC_ASSESSMENT},
+        )
+        self.assertEqual(self.order.documents.count(), 3)
+        for doc in docs:
+            self.assertTrue(doc.filename.endswith(".pdf"))
+            self.assertEqual(doc.uploaded_by_vendor_user_id, self.vendor_user.pk)
+
+    def test_the_same_assessment_renders_to_the_SAME_BYTES(self):
+        """Which is what makes content de-duplication possible. reportlab stamps a
+        creation time and a random document id by default, so the first version of
+        this left two identical invoices on the order after a resubmission."""
+        import hashlib
+
+        from .services.dispatch_pdf import render_quote
+
+        self.assertEqual(
+            hashlib.sha256(render_quote(self.order)).hexdigest(),
+            hashlib.sha256(render_quote(self.order)).hexdigest(),
+        )
+
+    def test_regenerating_IDENTICAL_documents_does_not_duplicate_them(self):
+        """A resubmission after a void must not leave two identical invoices."""
+        from .services.dispatch_pdf import generate_submission_documents
+
+        generate_submission_documents(self.order)
+        generate_submission_documents(self.order)
+        self.assertEqual(self.order.documents.count(), 3)
+
+    def test_a_CHANGED_assessment_produces_a_new_document(self):
+        """The de-duplication is on CONTENT, so a genuine correction still lands."""
+        from .services.dispatch_pdf import DOC_QUOTE, generate_submission_documents
+
+        generate_submission_documents(self.order)
+        self.form.interventions = [{"option": "grab_bar_tub", "qty": 5}]
+        self.form.save(update_fields=["interventions"])
+        generate_submission_documents(self.order)
+        self.assertEqual(
+            self.order.documents.filter(doc_type=DOC_QUOTE).count(), 2,
+        )
