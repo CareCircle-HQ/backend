@@ -82,11 +82,14 @@ def _logo_flowable(vendor, max_width_inch=1.6):
     try:
         from . import import_storage
 
-        path = import_storage.download_to_temp(vendor.logo_s3_key)
+        # read_bytes, NOT download_to_temp: the latter returns an OPEN FILE the
+        # caller must close and unlink, and names it ".csv". read_bytes exists for
+        # exactly this -- "objects known to be small (single images)".
+        raw, _content_type = import_storage.read_bytes(vendor.logo_s3_key)
         width = vendor.logo_width or 600
         height = vendor.logo_height or 600
         scale = min((max_width_inch * inch) / width, (0.7 * inch) / height)
-        return Image(path, width=width * scale, height=height * scale)
+        return Image(BytesIO(raw), width=width * scale, height=height * scale)
     except Exception:  # noqa: BLE001 - a logo is decoration, not a dependency
         logger.warning(
             "dispatch_pdf: logo unavailable for vendor %s", getattr(vendor, "pk", "?"),
@@ -309,8 +312,7 @@ def _context(order):
                 try:
                     from . import import_storage
 
-                    with open(import_storage.download_to_temp(sig.s3_key), "rb") as fh:
-                        image = fh.read()
+                    image, _ct = import_storage.read_bytes(sig.s3_key)
                 except Exception:  # noqa: BLE001 - the FACT of signing still counts
                     logger.warning("dispatch_pdf: signature unavailable %s", sig.s3_key)
             signatures[sig.signer_role] = {
@@ -556,13 +558,16 @@ def _proof_flowable(proof, *, max_width_inch=6.0, max_height_inch=7.0):
     try:
         from . import import_storage
 
-        path = import_storage.download_to_temp(proof.s3_key)
-        with PILImage.open(path) as probe:
+        raw, _content_type = import_storage.read_bytes(proof.s3_key)
+        # TWO separate streams over the same bytes. Handing one file object to PIL
+        # and then to reportlab leaves the second reading from EOF, which is how
+        # every photograph ended up as "(image unavailable)".
+        with PILImage.open(BytesIO(raw)) as probe:
             width, height = probe.size
         scale = min(
             (max_width_inch * inch) / width, (max_height_inch * inch) / height, 1.0,
         )
-        return Image(path, width=width * scale, height=height * scale)
+        return Image(BytesIO(raw), width=width * scale, height=height * scale)
     except Exception:  # noqa: BLE001 - one bad photo must not lose the report
         logger.warning("dispatch_pdf: proof unavailable %s", proof.s3_key)
         return None

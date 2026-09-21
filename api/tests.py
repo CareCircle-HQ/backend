@@ -34618,3 +34618,138 @@ class SubmissionDocumentsTest(TestCase):
         self.assertEqual(
             self.order.documents.filter(doc_type=DOC_QUOTE).count(), 2,
         )
+
+
+class SubmissionDocumentImagesTest(TestCase):
+    """The logo, signatures and photographs must actually EMBED.
+
+    They did not. All three helpers called ``import_storage.download_to_temp``,
+    which returns an OPEN FILE OBJECT the caller must close and unlink -- not a
+    path. Every failure landed in a broad ``except`` and degraded to "(image
+    unavailable)", so three defective documents generated, stored and listed
+    without a single error surfacing. These tests assert on the EMBEDDED IMAGE
+    COUNT, which is the only thing that would have caught it.
+    """
+
+    def setUp(self):
+        from decimal import Decimal
+
+        from .models import (
+            BillableItem, Client, DispatchKind, DispatchOrder, DispatchProof,
+            DispatchQuestionnaire, DispatchSignature, Vendor,
+        )
+        from .services import dispatch as dispatch_svc
+        from .services.assessment_forms import build_schema
+
+        BillableItem.objects.create(
+            item="Dwelling assessment", option_code="",
+            billing_category="Dwelling Assessment & SOW Development",
+            vendor_price=Decimal("750.00"),
+        )
+        self.vendor = Vendor.objects.create(
+            name="Imagery Ltd", logo_s3_key="vendor-logos/x/logo.png",
+            logo_width=600, logo_height=200,
+        )
+        member = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Img", last_name="Member",
+            client_added_at=timezone.now(),
+        )
+        self.order = DispatchOrder.objects.create(
+            kind=DispatchKind.ASSESSMENT, client=member, vendor=self.vendor,
+            referral_type="combined",
+        )
+        DispatchQuestionnaire.objects.create(
+            dispatch_order=self.order, modules=["combined"],
+            schema_snapshot=build_schema(["combined"]),
+            answers={"mob.risk.slippery_tub": True}, interventions=[],
+            state="submitted", submitted_at=timezone.now(),
+        )
+        submission = dispatch_svc.open_submission(self.order)
+        for role in ("member", "vendor"):
+            DispatchSignature.objects.create(
+                dispatch_submission=submission, signer_role=role,
+                signer_name=f"{role} name", s3_key=f"sig/{role}.png",
+                content_hash=f"h-{role}", signed_at=timezone.now(),
+            )
+        DispatchProof.objects.create(
+            dispatch_order=self.order, s3_key="proofs/one.png", content_hash="p1",
+            intervention_group="mob.risk.bathroom",
+        )
+
+    def _png(self, seed):
+        import io
+
+        from PIL import Image
+
+        buf = io.BytesIO()
+        # A DISTINCT image per key. Handing back identical bytes made reportlab
+        # share one XObject between the logo, both signatures and the photograph,
+        # so the embedded-image count read 1 when four images were present -- the
+        # test was measuring de-duplication, not embedding.
+        Image.new("RGB", (40 + seed, 20 + seed), (seed * 30 % 255, 90, 160)).save(
+            buf, format="PNG",
+        )
+        return buf.getvalue()
+
+    def _patched(self):
+        """Every S3 read returns a real, DISTINCT PNG, so the only thing under test
+        is whether the rendering code embeds it."""
+        keys = {}
+
+        def fake_read(key):
+            keys.setdefault(key, len(keys) + 1)
+            return self._png(keys[key]), "image/png"
+
+        return mock.patch(
+            "api.services.import_storage.read_bytes", side_effect=fake_read,
+        )
+
+    def _images(self, pdf_bytes):
+        import io
+
+        from pypdf import PdfReader
+
+        reader = PdfReader(io.BytesIO(pdf_bytes))
+        return sum(len(list(page.images)) for page in reader.pages)
+
+    def test_the_invoice_embeds_the_LOGO(self):
+        from .services.dispatch_pdf import render_invoice
+
+        with self._patched():
+            self.assertEqual(self._images(render_invoice(self.order)), 1)
+
+    def test_the_quote_embeds_the_logo_AND_both_signatures(self):
+        from .services.dispatch_pdf import render_quote
+
+        with self._patched():
+            self.assertEqual(self._images(render_quote(self.order)), 3)
+
+    def test_the_report_embeds_the_logo_signatures_AND_photographs(self):
+        from .services.dispatch_pdf import render_assessment_report
+
+        with self._patched():
+            # logo + 2 signatures + 1 photograph
+            self.assertEqual(self._images(render_assessment_report(self.order)), 4)
+
+    def test_a_MISSING_image_degrades_rather_than_failing_the_document(self):
+        """The fallback is right -- it was the silence that was wrong. A document
+        must still be produced when an object has gone."""
+        from .services.dispatch_pdf import render_assessment_report
+
+        with mock.patch(
+            "api.services.import_storage.read_bytes", side_effect=OSError("gone"),
+        ):
+            pdf = render_assessment_report(self.order)
+        self.assertTrue(pdf.startswith(b"%PDF"))
+        self.assertEqual(self._images(pdf), 0)
+
+    def test_nothing_in_the_pdf_path_uses_download_to_temp(self):
+        """It returns an open file the caller must close and unlink, and names it
+        '.csv'. read_bytes is the documented choice for single images."""
+        import inspect
+
+        from .services import dispatch_pdf
+
+        source = inspect.getsource(dispatch_pdf)
+        # The comment explaining the trap is allowed; a CALL is not.
+        self.assertNotIn("import_storage.download_to_temp(", source)

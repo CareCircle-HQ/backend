@@ -1002,9 +1002,12 @@ class MemberDispatchDocumentsView(PortalAPIView):
         for doc in docs:
             view_url = download_url = ""
             try:
+                # download_name is required for `inline` to do anything:
+                # presign_get only sets a Content-Disposition when it has a
+                # filename, so inline=True alone was silently a no-op.
                 view_url = import_storage.presign_get(
                     doc.s3_key, expires=900, inline=True,
-                    content_type="application/pdf",
+                    download_name=doc.filename, content_type="application/pdf",
                 )
                 download_url = import_storage.presign_get(
                     doc.s3_key, expires=900, download_name=doc.filename,
