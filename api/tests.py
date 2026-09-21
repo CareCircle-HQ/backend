@@ -33852,3 +33852,159 @@ class OnHoldFilterTest(TestCase):
             "/api/portal/members/?status=on_hold&scope=verification",
         )
         self.assertEqual(resp.status_code, 200, resp.content)
+
+
+class DataPageDomainFilterTest(TestCase):
+    """The Data page's food/housing selector.
+
+    The point of these tests is the operator's actual request: every filter that
+    page already had was written for FOOD, before housing existed, so passing the
+    new parameter must not change a single one of their answers.
+    """
+
+    def setUp(self):
+        from rest_framework_simplejwt.tokens import AccessToken
+
+        from .models import Agent
+
+        agent = Agent.objects.create(
+            name="Data Agent", agent_code="783", group="Management",
+        )
+        acc = AccessToken()
+        acc["agent_id"] = str(agent.id)
+        acc["agent_code"] = agent.agent_code
+        acc["agent_name"] = agent.name
+        acc["agent_group"] = agent.group
+        self.api = APIClient()
+        self.api.credentials(HTTP_AUTHORIZATION=f"Bearer {acc}")
+
+    # Every filter the page sends, with a value that exercises it. Kept as data so
+    # a new filter can be added to the page and to this list together.
+    # Some filters take UUIDs rather than names; the values only have to be VALID,
+    # since what is being compared is the SQL each produces with and without the
+    # domain parameter.
+    FILTERS = [
+        {"search": "smith"},
+        {"has_internal_service": "yes"},
+        {"internal_status": "open"},
+        {"internal_status": "closed"},
+        {"company_status": "active"},
+        {"age_min": "18"},
+        {"age_max": "65"},
+        {"age_min": "18", "age_max": "65"},
+        {"eligibility": "yes"},
+        {"insurance_status": "active"},
+        {"auth_status": "approved"},
+        {"allergies": "nuts"},
+        {"medical_conditions": "diabetes"},
+        {"medications": "metformin"},
+        {"program": "Clinically Appropriate Meals"},
+        {"program_status": "open"},
+        {"program_type": "household"},
+        {"service_type": "meals"},
+        {"service_type": "boxes"},
+        {"case_status": "managed"},
+        {"verification_state": "verified"},
+        {"nutritionist_status": "approved"},
+        {"attestation_status": "yes"},
+        {"stage": "active"},
+        {"primary_member": "yes"},
+        {"kitchen": "11111111-1111-1111-1111-111111111111"},
+        {"menu_type": "regular"},
+        {"cadence": "weekly"},
+        {"delivery_company": "22222222-2222-2222-2222-222222222222"},
+        {"delivered": "yes"},
+        {"current_delivery_status": "delivered"},
+        {"last_po_delivery_status": "delivered"},
+        {"team": "PHS"},  # a name, not an id
+        {"screening_agent": "33333333-3333-3333-3333-333333333333"},
+        {"verified_by": "44444444-4444-4444-4444-444444444444"},
+        {"lead_source": "referral"},
+        {"care_coordinator": "someone"},
+        {"primary_care_coordinator": "someone"},
+        {"tags": "vip"},
+        {"ticket_types": "complaint"},
+        {"eligible_services": "meals"},
+        {"pause_type": "paused"},
+        {"has_screening": "yes"},
+        {"has_eligibility_assessment": "yes"},
+        {"social_status": "active"},
+        {"case_opened": "2026-01-01"},
+        {"auth_start": "2026-01-01"},
+        {"auth_end": "2026-12-31"},
+        {"insurance_exp": "2026-12-31"},
+        {"social_exp": "2026-12-31"},
+        {"pause_date": "2026-01-01"},
+        {"requested": "2026-01-01"},
+        {"verified": "2026-01-01"},
+        {"screening": "2026-01-01"},
+        {"assessment": "2026-01-01"},
+        {"member_added_at": "2026-01-01"},
+        {"last_po_delivered": "2026-01-01"},
+        {"sort": "name", "dir": "asc"},
+        {"sort": "case_opened", "dir": "desc"},
+    ]
+
+    def test_EVERY_filter_gives_the_same_answer_with_domain_food(self):
+        """The operator's ask, stated as a test: the new parameter must not change
+        any filter that already worked. Compared as SQL, so it holds for an empty
+        test database as well as a populated one."""
+        from .services.enrollment_analytics import filter_analytics
+
+        for params in self.FILTERS:
+            without = str(filter_analytics(dict(params)).query)
+            with_food = str(filter_analytics({**params, "domain": "food"}).query)
+            self.assertEqual(without, with_food, f"changed by domain=food: {params}")
+
+    def test_every_filter_returns_NOTHING_for_housing(self):
+        """Not because the filters fail, but because this read model has no housing
+        rows at all -- it is built from the FOOD governing case by design."""
+        from .services.enrollment_analytics import filter_analytics
+
+        for params in self.FILTERS:
+            self.assertEqual(
+                filter_analytics({**params, "domain": "housing"}).count(), 0, params,
+            )
+
+    def test_the_default_is_FOOD(self):
+        from .services.enrollment_analytics import filter_analytics
+
+        self.assertEqual(
+            str(filter_analytics({}).query),
+            str(filter_analytics({"domain": "food"}).query),
+        )
+
+    def test_an_UNKNOWN_domain_falls_back_to_food_rather_than_erroring(self):
+        """A stale page sending a retired value should show the food data, not a
+        500 or a blank screen."""
+        from .services.enrollment_analytics import filter_analytics
+
+        self.assertEqual(
+            str(filter_analytics({"domain": "nonsense"}).query),
+            str(filter_analytics({"domain": "food"}).query),
+        )
+
+    def test_domain_food_does_NOT_filter_on_service_type(self):
+        """Filtering food to service_type in (meals, boxes) would drop every member
+        with no governing food case -- 53,875 rows on the production snapshot, most
+        of the page."""
+        from .services.enrollment_analytics import filter_analytics
+
+        sql = str(filter_analytics({"domain": "food"}).query)
+        # Checked against the WHERE clause, not the whole statement -- every column
+        # appears in the SELECT list, so a naive substring test always "passes".
+        where = sql.split(" WHERE ")[1] if " WHERE " in sql else ""
+        self.assertEqual(where, "", f"domain=food added a filter: {where}")
+
+    def test_the_endpoint_reports_whether_the_domain_has_data(self):
+        """An empty page because a domain is not ready is a different answer from
+        an empty page because the filters matched nothing, and they look the same
+        on screen."""
+        food = self.api.get("/api/portal/data/?domain=food")
+        self.assertEqual(food.data["domain"], "food")
+        self.assertTrue(food.data["domain_available"])
+
+        housing = self.api.get("/api/portal/data/?domain=housing")
+        self.assertEqual(housing.data["domain"], "housing")
+        self.assertFalse(housing.data["domain_available"])
+        self.assertEqual(housing.data["count"], 0)

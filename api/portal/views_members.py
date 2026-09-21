@@ -3175,11 +3175,22 @@ class DataListView(PortalGenericAPIView):
     serializer_class = s.EnrollmentAnalyticsSerializer
 
     def get(self, request):
-        from ..services.enrollment_analytics import filter_analytics
+        from ..services.enrollment_analytics import (
+            domain_is_available, filter_analytics,
+        )
 
         qs = filter_analytics(request.query_params)
         page = self.paginate_queryset(qs)
-        return self.get_paginated_response(self.get_serializer(page, many=True).data)
+        response = self.get_paginated_response(
+            self.get_serializer(page, many=True).data
+        )
+        # An empty page because a domain has no data at all is a DIFFERENT answer
+        # from an empty page because the filters matched nothing, and the two look
+        # identical on screen. Say which it is.
+        domain = (request.query_params.get("domain") or "food").lower()
+        response.data["domain"] = domain
+        response.data["domain_available"] = domain_is_available(domain)
+        return response
 
 
 class DataProgramsView(PortalAPIView):
