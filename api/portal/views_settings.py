@@ -34,7 +34,14 @@ logger = logging.getLogger(__name__)
 
 # Service types that still exist on the model but must not be offered to an agent.
 # See the note where service_types is built.
-RETIRED_SERVICE_TYPES = {"food_prescriptions"}
+RETIRED_SERVICE_TYPES = {
+    # Our own name for what Unite Us calls "Produce Prescription/Voucher".
+    "food_prescriptions",
+    # A distinction the case data does not make: every case on a Clinically
+    # Appropriate Meals programme is filed as "Medically Tailored Meals". The
+    # programmes keep their names; migration 0297 moved their service type.
+    "clinically_appropriate_meals",
+}
 from .permissions import IsPortalAgent
 from . import serializers as s
 

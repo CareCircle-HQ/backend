@@ -34904,13 +34904,16 @@ class ProgramParentProgramTest(TestCase):
             service_type=ActiveProgram.ServiceType.PRODUCE_PRESCRIPTION,
             parent_program="boxes",
         )
-        # CAM is a meal service too (migration 0291). Kept in the fixture with a
-        # parent so the "meals" filter test exercises more than one service type.
+        # A Clinically Appropriate Meals programme AS IT NOW EXISTS: the name says
+        # CAM, the service type says MTM. Migration 0297 merged them because the
+        # case data has no CAM service type -- all 3,893 cases on a CAM programme
+        # are filed as "Medically Tailored Meals". The name and parent_program are
+        # what keep the distinction.
         self.cam = ActiveProgram.objects.create(
             program_name="Clinically Appropriate Meals - Test",
             case_category="Internal Services",
             case_type=ActiveProgram.CaseType.FOOD,
-            service_type=ActiveProgram.ServiceType.CLINICALLY_APPROPRIATE_MEALS,
+            service_type=ActiveProgram.ServiceType.MEDICALLY_TAILORED_MEALS,
             parent_program="meals",
         )
         # Something genuinely unclassified, for the "none" filter -- navigation and
@@ -35275,6 +35278,11 @@ class RetiredServiceTypeTest(TestCase):
 
     def test_food_prescriptions_is_NOT_offered(self):
         self.assertNotIn("food_prescriptions", self._options())
+
+    def test_clinically_appropriate_meals_is_NOT_offered(self):
+        """The case data has no such service type -- every case on a CAM programme
+        is filed as Medically Tailored Meals."""
+        self.assertNotIn("clinically_appropriate_meals", self._options())
 
     def test_its_replacement_IS_offered(self):
         self.assertIn("produce_prescription", self._options())
