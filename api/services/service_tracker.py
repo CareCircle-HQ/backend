@@ -77,33 +77,25 @@ def domains_of(services):
 # ── the records the rules read ───────────────────────────────────────────────
 
 def _latest_with_services(rows):
-    """The most recent record that actually lists services, plus whether an older
-    one listed something different.
+    """The most recent record that actually lists services, or None.
 
-    "Most recent" rather than every record ever: the latest reflects what the
-    member is eligible for NOW. It costs a little -- 229 of 53,678 members have an
-    older screening naming a domain the newest does not -- so the difference is
-    REPORTED rather than hidden.
+    "Most recent" rather than every record ever: the latest reflects what the member
+    is eligible for NOW. It has a cost -- 229 of 53,678 members have an OLDER
+    screening naming a domain the newest does not, so those members show one fewer
+    track than the union of their history would give. That is the intended reading;
+    the tracker works from the most recent record only.
     """
     dated = [r for r in rows if r.eligible_services]
     if not dated:
-        return None, set()
+        return None
     dated.sort(key=lambda r: (r.screen_created_at is None, r.screen_created_at))
-    latest = dated[-1]
-    earlier = set()
-    for row in dated[:-1]:
-        earlier |= set(row.eligible_services or [])
-    return latest, earlier - set(latest.eligible_services or [])
+    return dated[-1]
 
 
 def gather(client):
     """Everything the rules need, read once."""
-    screening, screening_dropped = _latest_with_services(
-        list(client.screenings.all())
-    )
-    assessment, assessment_dropped = _latest_with_services(
-        list(client.assessments.all())
-    )
+    screening = _latest_with_services(list(client.screenings.all()))
+    assessment = _latest_with_services(list(client.assessments.all()))
     screened = list((screening.eligible_services if screening else []) or [])
     eligible = list((assessment.eligible_services if assessment else []) or [])
 
@@ -117,8 +109,6 @@ def gather(client):
         "screened": screened,
         "eligible": eligible,
         "screened_domains": domains_of(screened),
-        "dropped_from_older_screening": sorted(domains_of(screening_dropped)),
-        "dropped_from_older_assessment": sorted(assessment_dropped),
         "live_cases": cases,
         # ALL of them, not just the live ones: a scheduled reauthorization is not
         # yet serving, which is the whole point of it.
@@ -467,13 +457,6 @@ def tracker_for(client):
                 "label": "Qualified: ECM Level 2" if ctx["ecm"]
                          else "Not qualified for ECM Level 2",
             },
-        },
-        # Surfaced rather than dropped: the rules read the LATEST record, and for
-        # 229 of 53,678 members an older screening named a domain the newest does
-        # not. Silence would make the tracker look wrong to whoever remembers.
-        "superseded": {
-            "screening_domains": ctx["dropped_from_older_screening"],
-            "assessment_services": ctx["dropped_from_older_assessment"],
         },
         # So the UI can name the borough it is comparing against, rather than
         # showing a red chip with nothing to compare it to.

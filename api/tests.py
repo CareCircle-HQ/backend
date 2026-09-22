@@ -35908,9 +35908,11 @@ class ServiceTrackerTest(TestCase):
         self.assertIsNone(self._track("housing"))
         self.assertIsNotNone(self._track("food"))
 
-    def test_a_SUPERSEDED_domain_is_reported_not_hidden(self):
-        """229 of 53,678 members have an older screening naming a domain the newest
-        does not. Silence would make the tracker look wrong to whoever remembers."""
+    def test_an_older_screening_is_IGNORED_entirely(self):
+        """The tracker works from the most recent record only -- it does not report
+        what an earlier one said. 229 of 53,678 members have an older screening
+        naming a domain the newest does not, and those members show one fewer track
+        than the union of their history would give. That is the intended reading."""
         from datetime import timedelta
 
         self._screen(
@@ -35919,9 +35921,10 @@ class ServiceTrackerTest(TestCase):
         )
         self._screen(["Clinically Appropriate Meals (Food)"])
         self._assess([self.ECM])
-        self.assertEqual(
-            self._tracker()["superseded"]["screening_domains"], ["Housing"],
-        )
+        tracker = self._tracker()
+        self.assertNotIn("superseded", tracker)
+        self.assertEqual(tracker["phase1"]["screening"]["domains"], ["Food"])
+        self.assertIsNone(self._track("housing"))
 
     def test_a_member_with_NOTHING_gets_no_tracks_and_no_error(self):
         self.assertEqual(self._tracker()["tracks"], [])
