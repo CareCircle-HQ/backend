@@ -35319,3 +35319,110 @@ class RetiredServiceTypeTest(TestCase):
         self.assertEqual(
             resp.data["service_type_label"], "Food Prescriptions (Voucher / Boxes)",
         )
+
+
+class TagVoucherCasesCommandTest(TestCase):
+    """The tag_voucher_cases management command."""
+
+    NAME = (
+        "Medically Tailored or Nutritionally Appropriate Food Prescriptions: "
+        "Voucher - Other Eligible Populations - Brooklyn"
+    )
+
+    def setUp(self):
+        from .models import (
+            Case, CaseStatus, CaseType, Client, ClientTag,
+        )
+
+        self.tag = ClientTag.objects.create(name="Voucher Case tag")
+        self.holder = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Voucher", last_name="Holder",
+            client_added_at=timezone.now(),
+        )
+        Case.objects.create(
+            case_id=uuid.uuid4(), client=self.holder,
+            case_type=CaseType.INTERNAL_SERVICE, case_status=CaseStatus.MANAGED,
+            program_name=self.NAME, case_created_at=timezone.now(),
+        )
+        self.other = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Other", last_name="Member",
+            client_added_at=timezone.now(),
+        )
+        Case.objects.create(
+            case_id=uuid.uuid4(), client=self.other,
+            case_type=CaseType.INTERNAL_SERVICE, case_status=CaseStatus.MANAGED,
+            program_name="Medically Tailored Meals (MTM) - Other - Brooklyn",
+            case_created_at=timezone.now(),
+        )
+
+    def _run(self, *args):
+        from io import StringIO
+
+        from django.core.management import call_command
+
+        out = StringIO()
+        call_command("tag_voucher_cases", *args, stdout=out, stderr=out)
+        return out.getvalue()
+
+    def test_a_DRY_RUN_changes_nothing(self):
+        """Without --apply it reports and stops. A tagging script that writes by
+        default is one you cannot safely run to see what it would do."""
+        output = self._run()
+        self.assertIn("Dry run", output)
+        self.assertEqual(self.tag.clients.count(), 0)
+
+    def _tagged_ids(self):
+        # Compared as STRINGS: Client.pk is a UUIDField, and creating a row with a
+        # str pk leaves the in-memory instance holding a str while a reloaded one
+        # holds a UUID -- so model equality fails on the same row.
+        return {str(pk) for pk in self.tag.clients.values_list("client_id", flat=True)}
+
+    def test_apply_tags_the_member_holding_the_case(self):
+        self._run("--apply")
+        self.assertIn(str(self.holder.pk), self._tagged_ids())
+
+    def test_a_member_WITHOUT_a_voucher_case_is_untouched(self):
+        self._run("--apply")
+        self.assertNotIn(str(self.other.pk), self._tagged_ids())
+
+    def test_running_it_TWICE_changes_nothing_the_second_time(self):
+        self._run("--apply")
+        output = self._run("--apply")
+        self.assertIn("Nothing to do", output)
+        self.assertEqual(self.tag.clients.count(), 1)
+
+    def test_it_does_not_disturb_the_members_OTHER_tags(self):
+        from .models import ClientTag
+
+        other_tag = ClientTag.objects.create(name="Need Review")
+        self.holder.tags.add(other_tag)
+        self._run("--apply")
+        self.assertEqual(
+            set(self.holder.tags.values_list("name", flat=True)),
+            {"Need Review", "Voucher Case tag"},
+        )
+
+    def test_a_MISSING_tag_is_reported_rather_than_created(self):
+        """The tag carries a colour and is managed in Settings. Inventing one would
+        give production a tag that does not match the one an agent made."""
+        from .models import ClientTag
+
+        ClientTag.objects.filter(name="Voucher Case tag").delete()
+        output = self._run("--apply")
+        self.assertIn("No tag named", output)
+        self.assertEqual(ClientTag.objects.filter(name="Voucher Case tag").count(), 0)
+
+    def test_a_renamed_programme_is_reported_as_matching_NOTHING(self):
+        """So a rename shows up loudly instead of quietly shrinking the total."""
+        output = self._run()
+        self.assertIn("matched NOTHING", output)
+
+    def test_the_programme_list_is_EXPLICIT_not_a_wildcard(self):
+        """A "Voucher" pattern would also sweep in the 12 "Reauthorization: …
+        Voucher" programmes, which were not asked for."""
+        from api.management.commands.tag_voucher_cases import PROGRAM_NAMES
+
+        self.assertEqual(len(PROGRAM_NAMES), 8)
+        self.assertFalse(
+            any(n.startswith("Reauthorization") for n in PROGRAM_NAMES),
+        )
