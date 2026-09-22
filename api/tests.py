@@ -35787,6 +35787,116 @@ class ServiceTrackerTest(TestCase):
         self._assess([self.ECM, "Asthma Remediation (Housing)"])
         self.assertIsNone(self._track("food"))
 
+    # ── a scheduled reauthorization ─────────────────────────────────────────
+    def _food_setup(self):
+        self._screen(["Clinically Appropriate Meals (Food)"])
+        self._assess([self.ECM, "Medically Tailored Meals (MTM) (Food)"])
+
+    def _reauth(self, *, service_type="Medically Tailored Meals", days=30,
+                status="approved", is_extension=True, case_status="open"):
+        from datetime import timedelta
+
+        from .models import Case, CaseType
+
+        start = timezone.localdate() + timedelta(days=days)
+        return Case.objects.create(
+            case_id=uuid.uuid4(), client=self.member,
+            case_type=CaseType.INTERNAL_SERVICE, case_status=case_status,
+            service_type=service_type, is_extension=is_extension,
+            service_authorization_status=status,
+            service_authorization_approval_starts_at=start,
+            service_authorization_approval_ends_at=start + timedelta(days=180),
+            case_created_at=timezone.now(),
+        )
+
+    def _serving(self, service_type="Medically Tailored Meals"):
+        """The case being extended. deferred_extension_case_ids requires one of the
+        SAME kind and scope, or the extension is not deferred at all."""
+        from datetime import timedelta
+
+        from .models import Case, CaseType
+
+        today = timezone.localdate()
+        return Case.objects.create(
+            case_id=uuid.uuid4(), client=self.member,
+            case_type=CaseType.INTERNAL_SERVICE, case_status="managed",
+            service_type=service_type,
+            service_authorization_status="approved",
+            service_authorization_approval_starts_at=today - timedelta(days=150),
+            service_authorization_approval_ends_at=today + timedelta(days=30),
+            case_created_at=timezone.now(),
+        )
+
+    def _food_labels(self):
+        return [i["label"] for i in self._track("food")["items"]]
+
+    def test_a_SCHEDULED_reauthorization_appears_below_its_service(self):
+        """It is the same service continuing, not a second one -- and without the row
+        an agent sees a window about to end with no sign the next is approved, which
+        is exactly when somebody opens a duplicate."""
+        self._food_setup()
+        self._serving()
+        self._reauth()
+        labels = self._food_labels()
+        self.assertEqual(labels[0], "Medically Tailored Meals (MTM)")
+        self.assertEqual(labels[1], "Reauthorization scheduled")
+
+    def test_it_is_WAITING_not_outstanding(self):
+        """It is approved and activates on its own date. Marking it to-do would have
+        an agent chasing work that is already done."""
+        self._food_setup()
+        self._serving()
+        self._reauth()
+        row = self._track("food")["items"][1]
+        self.assertEqual(row["state"], "waiting")
+
+    def test_the_start_date_is_shown_with_the_month_readable(self):
+        """str.capitalize() lower-cased the rest and turned "25 Oct" into "25 oct"."""
+        self._food_setup()
+        self._serving()
+        self._reauth(days=33)
+        detail = self._track("food")["items"][1]["detail"]
+        self.assertTrue(detail.startswith("Starts "))
+        self.assertNotEqual(detail, detail.lower())
+
+    def test_a_reauth_for_a_DIFFERENT_service_does_not_appear_here(self):
+        """A voucher reauthorization belongs under the voucher row, not the meals
+        one."""
+        self._food_setup()
+        self._serving()
+        self._reauth(service_type="Produce Prescription/Voucher")
+        self.assertNotIn("Reauthorization scheduled", self._food_labels())
+
+    def test_a_CLOSED_reauth_case_never_appears(self):
+        """It will never activate, so it is not scheduled."""
+        self._food_setup()
+        self._serving()
+        self._reauth(case_status="closed")
+        self.assertNotIn("Reauthorization scheduled", self._food_labels())
+
+    def test_an_UNAPPROVED_reauth_does_not_count_as_scheduled(self):
+        self._food_setup()
+        self._serving()
+        self._reauth(status="pending")
+        self.assertNotIn("Reauthorization scheduled", self._food_labels())
+
+    def test_a_non_extension_case_is_not_a_reauthorization(self):
+        self._food_setup()
+        self._serving()
+        self._reauth(is_extension=False)
+        self.assertNotIn("Reauthorization scheduled", self._food_labels())
+
+    def test_it_defers_to_the_LIFECYCLE_helper(self):
+        """Recomputing "is it scheduled?" here would be a second opinion on a rule
+        with a design document behind it."""
+        import inspect
+
+        from .services import service_tracker
+
+        self.assertIn(
+            "deferred_extension_case_ids", inspect.getsource(service_tracker),
+        )
+
     # ── which record the rules read ─────────────────────────────────────────
     def test_the_LATEST_screening_wins(self):
         from datetime import timedelta

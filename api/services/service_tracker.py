@@ -120,6 +120,9 @@ def gather(client):
         "dropped_from_older_screening": sorted(domains_of(screening_dropped)),
         "dropped_from_older_assessment": sorted(assessment_dropped),
         "live_cases": cases,
+        # ALL of them, not just the live ones: a scheduled reauthorization is not
+        # yet serving, which is the whole point of it.
+        "all_cases": list(client.cases.all()),
         "ecm": ECM in eligible,
     }
 
@@ -315,6 +318,7 @@ def rule_2_and_3_food(ctx):
             **_item("Produce Prescription / Voucher", case is not None, case=case),
             "rule": "Rule 2",
         })
+        items += _scheduled_reauth_rows(ctx, "Produce Prescription/Voucher")
 
     if eligible & set(MEALS):
         case = _find_case(ctx["live_cases"], "Medically Tailored Meals")
@@ -328,6 +332,7 @@ def rule_2_and_3_food(ctx):
             ),
             "rule": "Rule 3",
         })
+        items += _scheduled_reauth_rows(ctx, "Medically Tailored Meals")
 
     if not items:
         return None
@@ -439,3 +444,47 @@ def _assessment_progress(order, dwelling_case, dispatch_svc):
     if dwelling_case is None:
         return (None, f"Assessment {label.lower()} — the case still needs opening")
     return (None, f"Assessment {label.lower()}")
+
+
+def _scheduled_reauth_rows(ctx, service_type):
+    """A row for a REAUTHORIZATION that is approved but has not started yet.
+
+    Shown BELOW the governing case it extends, because that is what it is -- the
+    same service continuing, not a second service. Without it an agent sees a case
+    whose window is about to end and no sign that the next one is already approved,
+    which is exactly when somebody opens a duplicate.
+
+    Defers to ``lifecycle.deferred_extension_case_ids``, the same helper that stops
+    a future-dated extension supplanting the serving case. Recomputing "is it
+    scheduled?" here would be a second opinion on a rule with a whole design
+    document behind it.
+    """
+    from .lifecycle import deferred_extension_case_ids
+
+    cases = ctx["all_cases"]
+    try:
+        deferred = deferred_extension_case_ids(cases)
+    except Exception:  # noqa: BLE001 - the track must still render
+        logger.warning("service_tracker: deferred extensions failed")
+        return []
+
+    rows = []
+    for case in cases:
+        if case.case_id not in deferred:
+            continue
+        if (case.service_type or "") != service_type:
+            continue
+        start = case.service_authorization_approval_starts_at
+        when = f"starts {start:%d %b %Y}" if start else "start date not set"
+        rows.append(_item(
+            "Reauthorization scheduled",
+            False,
+            # "waiting", not to-do: it is approved and activates on its own date.
+            # Marking it outstanding would have an agent chasing work that is done.
+            state="waiting",
+            case=case,
+            # Only the FIRST letter: str.capitalize() lower-cases the rest and
+            # turned "starts 25 Oct 2026" into "Starts 25 oct 2026".
+            detail=when[:1].upper() + when[1:],
+        ))
+    return rows
