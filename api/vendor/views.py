@@ -238,6 +238,7 @@ class VendorWorkListView(VendorAPIView):
             .prefetch_related("availability_windows", "visits", "line_items")
         )
 
+
         # ?status=confirmed&status=submitted -- repeatable, so the app's filter
         # chips are multi-select without inventing a comma syntax. An unknown
         # value is IGNORED rather than 400: a stale app version sending a status
@@ -263,7 +264,25 @@ class VendorWorkListView(VendorAPIView):
         # that justified it -- then oldest first, because the longest-waiting
         # member should be visited soonest.
         qs = qs.order_by("kind", "created_at")
-        return Response([_order_block(o) for o in qs])
+
+        # WITHHELD, LAST: an order whose dwelling is outside our service area is not
+        # sent, however it got created. A vendor cannot service an address we do not
+        # cover, and the trip is billable whether or not the visit was possible.
+        #
+        # Applied here rather than at creation, because the address can be CORRECTED
+        # afterwards -- a withheld order appears the moment an agent fixes the ZIP,
+        # with no second action needed. And applied after the queryset is complete,
+        # because it returns a list: doing it earlier broke the status filters that
+        # follow.
+        #
+        # In Python, not SQL: the answer depends on the ServiceZipCode whitelist and,
+        # for a work order, on its PARENT's address. An open list is a handful of
+        # rows, which is cheaper than making the rule expressible twice.
+        from ..services import dispatch as dispatch_svc
+
+        return Response([
+            _order_block(o) for o in qs if dispatch_svc.is_dispatchable(o)
+        ])
 
 
 class VendorWorkDetailView(VendorAPIView):
@@ -282,6 +301,20 @@ class VendorWorkDetailView(VendorAPIView):
             .first()
         )
         if order is None:
+            return error("not_found", "No such assignment.", http.HTTP_404_NOT_FOUND)
+
+        # A WITHHELD order answers 404 as well, for the same reason the list omits
+        # it: it was never sent. 404 rather than an explanation, because the vendor
+        # is not the person who can fix a service-area problem and the dwelling's
+        # ZIP is not theirs to know. Logged so WE can see what was withheld.
+        from ..services import dispatch as dispatch_svc
+
+        if not dispatch_svc.is_dispatchable(order):
+            logger.info(
+                "withheld order %s from vendor %s: %s",
+                order.pk, request.user.vendor_id,
+                dispatch_svc.not_dispatchable_reason(order),
+            )
             return error("not_found", "No such assignment.", http.HTTP_404_NOT_FOUND)
 
         payload = _order_block(order)

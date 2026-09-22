@@ -122,6 +122,12 @@ def _serialize_order(order):
         # table means we no longer serve there, and an order holding its old answer
         # would send a vendor somewhere we cannot bill for.
         "service_area": service_area.order_service_area(order),
+        # WHY THE VENDOR CANNOT SEE THIS ORDER, when they cannot. The vendor API
+        # withholds an out-of-area order, so without this the CRM would show it
+        # sitting in Pending Schedule with no hint that nothing was ever sent --
+        # which is exactly how an out-of-range assessment reached a vendor
+        # unnoticed in the first place.
+        "withheld_reason": dispatch_svc.not_dispatchable_reason(order),
         # The ITEMS. On an assessment these are every item found; on a work order,
         # the ones that work order covers. An item is not a status -- it is a thing
         # to install -- so it carries its case's AUTHORIZATION rather than a

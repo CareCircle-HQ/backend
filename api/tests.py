@@ -35796,3 +35796,132 @@ class VendorPasswordWhitespaceTest(TestCase):
                 'password") or "").strip()', source, module.__name__,
             )
             self.assertIn('if _raw.strip() else ""', source, module.__name__)
+
+
+@override_settings(VENDOR_API_HOST=VENDOR_HOST, ALLOWED_HOSTS=["*"])
+class OutOfServiceAreaNotDispatchedTest(TestCase):
+    """An order outside the service area is NEVER sent to the vendor.
+
+    One reached a vendor's work list at ZIP 33314 (Florida). A vendor cannot service
+    an address we do not cover, and the trip is billable whether or not the visit
+    was ever possible.
+    """
+
+    def setUp(self):
+        from django.contrib.auth.hashers import make_password
+
+        from .models import (
+            Client, DispatchKind, DispatchOrder, DispatchStatus, ServiceZipCode,
+            Vendor, VendorUser,
+        )
+
+        # A whitelist with something in it: an EMPTY table is inert by design, so a
+        # test that forgot this would pass for the wrong reason.
+        ServiceZipCode.objects.create(zip="11236", borough="Brooklyn", is_active=True)
+
+        self.vendor = Vendor.objects.create(name="Area Co")
+        VendorUser.objects.create(
+            vendor=self.vendor, email="tom@area.test", name="Tom",
+            password=make_password("area-pass-1234"),
+        )
+        member = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Area", last_name="Member",
+            client_added_at=timezone.now(),
+        )
+        self.order = DispatchOrder.objects.create(
+            kind=DispatchKind.ASSESSMENT, client=member, vendor=self.vendor,
+            status=DispatchStatus.PENDING_SCHEDULE, address_zip="33314",
+        )
+
+    def _api(self):
+        resp = APIClient().post(
+            "/v1/auth/login/",
+            {"email": "tom@area.test", "password": "area-pass-1234"},
+            format="json", HTTP_HOST=VENDOR_HOST,
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        api = APIClient()
+        api.credentials(HTTP_AUTHORIZATION=f"Bearer {resp.data['access_token']}")
+        return api
+
+    def test_an_out_of_area_order_is_ABSENT_from_the_work_list(self):
+        resp = self._api().get("/v1/work/", HTTP_HOST=VENDOR_HOST)
+        self.assertEqual(resp.data, [])
+
+    def test_it_cannot_be_opened_by_ID_either(self):
+        """404, not a message about the service area: the vendor cannot fix it and
+        the dwelling's ZIP is not theirs to know."""
+        resp = self._api().get(
+            f"/v1/work/{self.order.pk}/", HTTP_HOST=VENDOR_HOST,
+        )
+        self.assertEqual(resp.status_code, 404)
+
+    def test_correcting_the_ADDRESS_sends_it_with_no_other_action(self):
+        """The reason the rule is a filter and not a creation error: the order has
+        to exist for the address to be editable."""
+        self.order.address_zip = "11236"
+        self.order.save(update_fields=["address_zip"])
+
+        resp = self._api().get("/v1/work/", HTTP_HOST=VENDOR_HOST)
+        self.assertEqual(len(resp.data), 1)
+        detail = self._api().get(
+            f"/v1/work/{self.order.pk}/", HTTP_HOST=VENDOR_HOST,
+        )
+        self.assertEqual(detail.status_code, 200)
+
+    def test_an_IN_AREA_order_is_unaffected(self):
+        from .models import Client, DispatchKind, DispatchOrder, DispatchStatus
+
+        good = DispatchOrder.objects.create(
+            kind=DispatchKind.ASSESSMENT, vendor=self.vendor,
+            client=Client.objects.create(
+                client_id=str(uuid.uuid4()), first_name="Good", last_name="Member",
+                client_added_at=timezone.now(),
+            ),
+            status=DispatchStatus.PENDING_SCHEDULE, address_zip="11236",
+        )
+        ids = {o["id"] for o in self._api().get("/v1/work/", HTTP_HOST=VENDOR_HOST).data}
+        self.assertIn(str(good.pk), ids)
+        self.assertNotIn(str(self.order.pk), ids)
+
+    def test_a_WORK_ORDER_inherits_its_parents_address(self):
+        """It is the same dwelling, so it is withheld for the same reason -- and a
+        work order carries no address of its own to check."""
+        from .models import DispatchKind, DispatchOrder, DispatchStatus
+        from .services import dispatch as dispatch_svc
+
+        child = DispatchOrder.objects.create(
+            kind=DispatchKind.REMEDIATION, parent=self.order,
+            client=self.order.client, vendor=self.vendor,
+            status=DispatchStatus.PENDING_SCHEDULE,
+        )
+        self.assertFalse(dispatch_svc.is_dispatchable(child))
+
+    def test_an_order_with_NO_ZIP_is_NOT_withheld(self):
+        """Not knowing where a dwelling is differs from knowing we do not cover it.
+        An order can carry a full street address with the ZIP blank and still be a
+        serviceable visit -- and withholding these broke 14 existing vendor tests
+        whose fixtures are ordinary orders with no address at all."""
+        from .services import dispatch as dispatch_svc
+
+        self.order.address_zip = ""
+        self.order.save(update_fields=["address_zip"])
+        self.assertTrue(dispatch_svc.is_dispatchable(self.order))
+
+    def test_an_UNCONFIGURED_whitelist_withholds_NOTHING(self):
+        """An empty ZIP table is inert everywhere else, and a gate that withheld
+        every order on a fresh database would be this bug's twin."""
+        from .models import ServiceZipCode
+        from .services import dispatch as dispatch_svc
+
+        ServiceZipCode.objects.all().delete()
+        self.assertTrue(dispatch_svc.is_dispatchable(self.order))
+
+    def test_the_CRM_is_told_the_reason(self):
+        """Otherwise the panel shows Pending Schedule with no hint that nothing was
+        sent -- which is how this went unnoticed."""
+        from .services import dispatch as dispatch_svc
+
+        self.assertIn(
+            "33314", dispatch_svc.not_dispatchable_reason(self.order),
+        )
