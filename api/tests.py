@@ -35701,3 +35701,98 @@ class ServiceTrackerTest(TestCase):
         phase1 = self._tracker()["phase1"]["screening"]
         self.assertEqual(phase1["domains"], ["Food"])
         self.assertEqual(phase1["other_domains"], ["Transportation"])
+
+
+@override_settings(VENDOR_API_HOST=VENDOR_HOST, ALLOWED_HOSTS=["*"])
+class VendorPasswordWhitespaceTest(TestCase):
+    """A password is OPAQUE -- it is stored exactly as supplied.
+
+    Provisioning used to `.strip()` the password while the login endpoint did not,
+    so a pasted password with a leading or trailing space was stored without it and
+    then rejected with it. That is why the first real vendor admin could not log in,
+    and the symptom is the worst kind: correct credentials, "Email or password is
+    incorrect."
+    """
+
+    PASSWORD = "probe-pass-9876 "   # note the trailing space
+
+    def setUp(self):
+        from rest_framework_simplejwt.tokens import AccessToken
+
+        from .models import Agent, Vendor
+
+        agent = Agent.objects.create(
+            name="Pw Agent", agent_code="788", group="Management",
+        )
+        acc = AccessToken()
+        acc["agent_id"] = str(agent.id)
+        acc["agent_code"] = agent.agent_code
+        acc["agent_name"] = agent.name
+        acc["agent_group"] = agent.group
+        self.api = APIClient()
+        self.api.credentials(HTTP_AUTHORIZATION=f"Bearer {acc}")
+        self.vendor = Vendor.objects.create(name="Whitespace Co")
+
+    def _provision(self, password):
+        return self.api.post(
+            f"/api/portal/settings/vendors/{self.vendor.pk}/admin-user/",
+            {"name": "Ada", "email": "ada@whitespace.test", "password": password},
+            format="json",
+        )
+
+    def _login(self, password):
+        return APIClient().post(
+            "/v1/auth/login/",
+            {"email": "ada@whitespace.test", "password": password},
+            format="json", HTTP_HOST=VENDOR_HOST,
+        )
+
+    def test_a_password_with_a_TRAILING_SPACE_works_as_typed(self):
+        self.assertEqual(self._provision(self.PASSWORD).status_code, 201)
+        self.assertEqual(self._login(self.PASSWORD).status_code, 200)
+
+    def test_the_STRIPPED_version_is_a_different_password_and_is_refused(self):
+        """The other half of the same claim: it is stored as supplied, so trimming
+        it must NOT let you in."""
+        self._provision(self.PASSWORD)
+        self.assertEqual(self._login(self.PASSWORD.strip()).status_code, 401)
+
+    def test_a_LEADING_space_works_too(self):
+        self.assertEqual(self._provision(" leading-space-pw").status_code, 201)
+        self.assertEqual(self._login(" leading-space-pw").status_code, 200)
+
+    def test_an_ordinary_password_is_unaffected(self):
+        self.assertEqual(self._provision("ordinary-pass-1").status_code, 201)
+        self.assertEqual(self._login("ordinary-pass-1").status_code, 200)
+
+    def test_the_length_check_still_applies(self):
+        resp = self._provision("short")
+        self.assertEqual(resp.status_code, 400)
+
+    def test_a_WHITESPACE_ONLY_password_still_means_generate_one(self):
+        """The distinction my first attempt at this fix broke. Not stripping at all
+        turned "   " into a 3-character password and a 400, when it has always meant
+        "generate one for me" -- caught by an existing test, which is the only reason
+        it did not ship."""
+        resp = self._provision("   ")
+        self.assertEqual(resp.status_code, 201, resp.content)
+        self.assertTrue(resp.data["temporary_password"])
+        self.assertFalse(resp.data["password_was_supplied"])
+
+    def test_NO_code_path_strips_a_password_on_the_way_in(self):
+        """Asserted against the source, because the bug was one `.strip()` in four
+        similar places and fixing three of them would look identical from outside.
+        """
+        import inspect
+
+        from .portal import views_settings
+        from .vendor import views as vendor_views
+
+        for module in (views_settings, vendor_views):
+            source = inspect.getsource(module)
+            # The banned shape assigns the STRIPPED value. Trimming only to DECIDE
+            # whether anything was supplied is fine, and is what replaced it.
+            self.assertNotIn(
+                'password") or "").strip()', source, module.__name__,
+            )
+            self.assertIn('if _raw.strip() else ""', source, module.__name__)

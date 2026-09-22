@@ -566,7 +566,18 @@ class VendorViewSet(viewsets.ModelViewSet):
         # person); otherwise one is generated. Either way it is stored hashed and
         # returned ONCE -- there is no path that reads it back, and a lost password
         # is replaced by a reset rather than looked up.
-        supplied = (request.data.get("password") or "").strip()
+        # A password is OPAQUE: whatever the agent typed or pasted is what the
+        # vendor will type back. Stripping it here while the login endpoint does not
+        # made a password with a leading or trailing space impossible to use -- it
+        # was stored without the space and rejected with it, which is why the first
+        # real vendor admin could not log in.
+        #
+        # But a WHITESPACE-ONLY value still means "generate one for me", which is
+        # the documented behaviour and has its own test. So the value is used
+        # verbatim unless it is blank once trimmed -- trimming DECIDES, it never
+        # alters what gets stored.
+        _raw = request.data.get("password") or ""
+        supplied = _raw if _raw.strip() else ""
         if supplied and len(supplied) < 8:
             return Response(
                 {"error": "Password must be at least 8 characters."},
@@ -707,7 +718,18 @@ class VendorViewSet(viewsets.ModelViewSet):
         from django.contrib.auth.hashers import make_password
         from django.utils.crypto import get_random_string
 
-        supplied = (request.data.get("password") or "").strip()
+        # A password is OPAQUE: whatever the agent typed or pasted is what the
+        # vendor will type back. Stripping it here while the login endpoint does not
+        # made a password with a leading or trailing space impossible to use -- it
+        # was stored without the space and rejected with it, which is why the first
+        # real vendor admin could not log in.
+        #
+        # But a WHITESPACE-ONLY value still means "generate one for me", which is
+        # the documented behaviour and has its own test. So the value is used
+        # verbatim unless it is blank once trimmed -- trimming DECIDES, it never
+        # alters what gets stored.
+        _raw = request.data.get("password") or ""
+        supplied = _raw if _raw.strip() else ""
         if supplied and len(supplied) < 8:
             return Response(
                 {"error": "Password must be at least 8 characters."},

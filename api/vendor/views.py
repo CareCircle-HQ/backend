@@ -500,7 +500,10 @@ class VendorTeamListView(VendorAdminAPIView):
                 http.HTTP_409_CONFLICT,
             )
 
-        supplied = (data.get("password") or "").strip()
+        # Opaque, but blank-after-trim still means "generate one" -- see the note
+        # in portal/views_settings.py admin_user.
+        _raw = data.get("password") or ""
+        supplied = _raw if _raw.strip() else ""
         if supplied and len(supplied) < 8:
             return error(
                 "password_too_short", "Password must be at least 8 characters.",
@@ -573,7 +576,10 @@ class VendorTeamDetailView(VendorAdminAPIView):
         if "password" in data:
             from django.contrib.auth.hashers import make_password
 
-            supplied = (data.get("password") or "").strip()
+            # Opaque, but blank-after-trim still means "generate one" -- see the
+            # note in portal/views_settings.py admin_user.
+            _raw = data.get("password") or ""
+            supplied = _raw if _raw.strip() else ""
             if len(supplied) < 8:
                 return error(
                     "password_too_short",
