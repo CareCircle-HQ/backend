@@ -2126,6 +2126,9 @@ class PortalActiveProgramSerializer(serializers.ModelSerializer):
     case_type_label = serializers.CharField(
         source="get_case_type_display", read_only=True
     )
+    parent_program_label = serializers.CharField(
+        source="get_parent_program_display", read_only=True,
+    )
     service_type_label = serializers.CharField(
         source="get_service_type_display", read_only=True
     )
@@ -2146,13 +2149,19 @@ class PortalActiveProgramSerializer(serializers.ModelSerializer):
             # only: editing it here would let it disagree with the name it came
             # from, and the name is what Unite Us sends us.
             "borough",
+            # Which product the service delivers, meals or boxes. EDITABLE, unlike
+            # borough: borough is decoded from the programme name, whereas the
+            # parent product is a classification only a person can make -- nothing
+            # in the name distinguishes a meal programme from a box one.
+            "parent_program",
+            "parent_program_label",
             "is_for_household",
             "to_extend",
             "updated_at",
         ]
         read_only_fields = [
             "id", "case_type_label", "service_type_label", "is_for_household",
-            "updated_at", "borough",
+            "updated_at", "borough", "parent_program_label",
         ]
 
 

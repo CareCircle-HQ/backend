@@ -3280,6 +3280,13 @@ class ActiveProgram(models.Model):
         FOOD_PRESCRIPTIONS = (
             "food_prescriptions", "Food Prescriptions (Voucher / Boxes)",
         )
+        # Replaces FOOD_PRESCRIPTIONS for the INTERNAL programmes we deliver
+        # ourselves. Both values remain because only the internal rows moved: the
+        # external ones are other providers' programmes, named by Unite Us, and
+        # renaming those would stop them matching what Unite Us sends us.
+        PRODUCE_PRESCRIPTION = (
+            "produce_prescription", "Produce Prescription/Voucher",
+        )
         SOCIAL_SERVICE_CASE_MANAGEMENT = (
             "social_service_case_management", "Social Service Case Management",
         )
@@ -3329,6 +3336,26 @@ class ActiveProgram(models.Model):
         max_length=64, choices=ServiceType.choices, blank=True,
         default="", db_default="",
     )
+
+    # THE PARENT PROGRAM: which product this service ultimately delivers, meals or
+    # boxes. Reuses ProductTypeKind rather than inventing a parallel vocabulary --
+    # it is already "the kind of product an Internal Service program delivers", and
+    # two enums meaning the same thing is how they end up disagreeing.
+    #
+    # It exists so a programme can be matched to the eligibility assessment's
+    # result: the assessment says a member is eligible for Medically Tailored Meals
+    # or a Produce Prescription, and this is what connects that answer to the
+    # programmes that can serve it.
+    #
+    # BLANK IS MEANINGFUL and common. Only the programmes we deliver a product for
+    # carry a value: navigation, case management, housing and every external
+    # programme have no parent product, and guessing one would file a housing
+    # assessment under "meals".
+    parent_program = models.CharField(
+        max_length=16, choices=ProductTypeKind.choices, blank=True,
+        default="", db_default="", db_index=True,
+    )
+
     # Opt-in flag (managed from Settings > Programs): this program should be
     # treated as an extension/reauthorization of an existing service. Seeded True
     # for internal-service "Reauthorization: ..." programs by data migration.

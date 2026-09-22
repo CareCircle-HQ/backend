@@ -34864,3 +34864,155 @@ class MemberDispatchPhotosViewTest(TestCase):
         self.assertTrue(inline_calls)
         for call in inline_calls:
             self.assertTrue(call.kwargs.get("download_name"))
+
+
+class ProgramParentProgramTest(TestCase):
+    """The parent product on a programme: meals or boxes.
+
+    Migrations are DISABLED under the test runner (see AGENTS.md), so the data
+    migration that classifies the real 24/24/24 is verified against the clone by
+    hand. What is tested here is the FIELD and the rules it has to obey.
+    """
+
+    def setUp(self):
+        from rest_framework_simplejwt.tokens import AccessToken
+
+        from .models import ActiveProgram, Agent
+
+        agent = Agent.objects.create(
+            name="Prog Agent", agent_code="785", group="Management",
+        )
+        acc = AccessToken()
+        acc["agent_id"] = str(agent.id)
+        acc["agent_code"] = agent.agent_code
+        acc["agent_name"] = agent.name
+        acc["agent_group"] = agent.group
+        self.api = APIClient()
+        self.api.credentials(HTTP_AUTHORIZATION=f"Bearer {acc}")
+
+        self.mtm = ActiveProgram.objects.create(
+            program_name="Medically Tailored Meals (MTM) - Test",
+            case_category="Internal Services",
+            case_type=ActiveProgram.CaseType.FOOD,
+            service_type=ActiveProgram.ServiceType.MEDICALLY_TAILORED_MEALS,
+            parent_program="meals",
+        )
+        self.produce = ActiveProgram.objects.create(
+            program_name="Produce Prescription - Test",
+            case_category="Internal Services",
+            case_type=ActiveProgram.CaseType.FOOD,
+            service_type=ActiveProgram.ServiceType.PRODUCE_PRESCRIPTION,
+            parent_program="boxes",
+        )
+        self.cam = ActiveProgram.objects.create(
+            program_name="Clinically Appropriate Meals - Test",
+            case_category="Internal Services",
+            case_type=ActiveProgram.CaseType.FOOD,
+            service_type=ActiveProgram.ServiceType.CLINICALLY_APPROPRIATE_MEALS,
+        )
+
+    def test_the_new_service_type_exists_with_the_right_label(self):
+        from .models import ActiveProgram
+
+        self.assertEqual(
+            ActiveProgram.ServiceType.PRODUCE_PRESCRIPTION.label,
+            "Produce Prescription/Voucher",
+        )
+
+    def test_the_OLD_service_type_is_kept(self):
+        """Only the internal programmes moved. The external ones are other
+        providers' programmes whose service type is what Unite Us sends us, and
+        renaming those would stop them matching."""
+        from .models import ActiveProgram
+
+        self.assertEqual(
+            ActiveProgram.ServiceType.FOOD_PRESCRIPTIONS.label,
+            "Food Prescriptions (Voucher / Boxes)",
+        )
+
+    def test_parent_program_reuses_the_existing_product_enum(self):
+        """Rather than a parallel vocabulary -- two enums meaning the same thing is
+        how they end up disagreeing."""
+        from .models import ActiveProgram, ProductTypeKind
+
+        field = ActiveProgram._meta.get_field("parent_program")
+        self.assertEqual(list(field.choices), list(ProductTypeKind.choices))
+
+    def test_BLANK_is_allowed_and_is_the_default(self):
+        """Navigation, case management, housing and every external programme have
+        no parent product; guessing one would file a housing assessment under
+        meals."""
+        from .models import ActiveProgram
+
+        program = ActiveProgram.objects.create(
+            program_name="Navigation Services - Test",
+            case_category="Internal Services",
+            # CaseType only covers food/housing/transportation; a navigation
+            # programme simply has none, which is itself the case being tested.
+            case_type="",
+        )
+        self.assertEqual(program.parent_program, "")
+
+    def test_the_api_exposes_the_value_and_a_label(self):
+        resp = self.api.get(f"/api/portal/settings/programs/{self.mtm.id}/")
+        self.assertEqual(resp.data["parent_program"], "meals")
+        self.assertEqual(resp.data["parent_program_label"], "Meals")
+
+    def test_an_agent_can_SET_it(self):
+        """Unlike borough, which is decoded from the name: nothing in a programme's
+        name distinguishes a meal programme from a box one, so this is a judgement
+        only a person can make."""
+        resp = self.api.patch(
+            f"/api/portal/settings/programs/{self.cam.id}/",
+            {"parent_program": "meals"}, format="json",
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        self.cam.refresh_from_db()
+        self.assertEqual(self.cam.parent_program, "meals")
+
+    def test_it_can_be_CLEARED(self):
+        resp = self.api.patch(
+            f"/api/portal/settings/programs/{self.mtm.id}/",
+            {"parent_program": ""}, format="json",
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        self.mtm.refresh_from_db()
+        self.assertEqual(self.mtm.parent_program, "")
+
+    def test_an_INVALID_value_is_refused(self):
+        resp = self.api.patch(
+            f"/api/portal/settings/programs/{self.mtm.id}/",
+            {"parent_program": "sandwiches"}, format="json",
+        )
+        self.assertEqual(resp.status_code, 400)
+        self.mtm.refresh_from_db()
+        self.assertEqual(self.mtm.parent_program, "meals")
+
+    def test_the_label_is_READ_ONLY(self):
+        """It is derived from the value; accepting it would let the two disagree."""
+        resp = self.api.patch(
+            f"/api/portal/settings/programs/{self.mtm.id}/",
+            {"parent_program_label": "Sandwiches"}, format="json",
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.mtm.refresh_from_db()
+        self.assertEqual(self.mtm.get_parent_program_display(), "Meals")
+
+    def test_the_migration_logic_classifies_only_INTERNAL_food(self):
+        """Mirrors migration 0290's filters, since the migration itself cannot run
+        under the test runner."""
+        from .models import ActiveProgram
+
+        external = ActiveProgram.objects.create(
+            program_name="Someone Else's Food Prescriptions",
+            case_category="External Services",
+            case_type=ActiveProgram.CaseType.FOOD,
+            service_type=ActiveProgram.ServiceType.FOOD_PRESCRIPTIONS,
+        )
+        internal_food = ActiveProgram.objects.filter(
+            case_type="food", case_category__icontains="internal",
+        )
+        self.assertNotIn(external, internal_food)
+        self.assertEqual(
+            internal_food.filter(service_type="food_prescriptions").count(), 0,
+        )
