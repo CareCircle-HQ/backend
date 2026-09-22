@@ -35047,9 +35047,16 @@ class ProgramParentProgramTest(TestCase):
         self.assertIn(self.mtm.program_name, names)
         self.assertEqual(self._filter("?parent_program=meals&case_type=housing"), set())
 
-    def test_the_migration_logic_classifies_only_INTERNAL_food(self):
-        """Mirrors migration 0290's filters, since the migration itself cannot run
-        under the test runner."""
+    def test_the_PARENT_classification_covers_only_internal_food(self):
+        """Mirrors migration 0290's filters, since migrations cannot run under the
+        test runner.
+
+        Note what did NOT stay internal-only: 0292 later moved EVERY remaining row
+        off ``food_prescriptions``, external ones included, because no case in the
+        database has ever used that label -- Unite Us has always sent "Produce
+        Prescription/Voucher". The PARENT PRODUCT is still internal-only, which is
+        the distinction this test holds.
+        """
         from .models import ActiveProgram
 
         external = ActiveProgram.objects.create(
@@ -35062,6 +35069,6 @@ class ProgramParentProgramTest(TestCase):
             case_type="food", case_category__icontains="internal",
         )
         self.assertNotIn(external, internal_food)
-        self.assertEqual(
-            internal_food.filter(service_type="food_prescriptions").count(), 0,
-        )
+        # An external programme gets no parent product: it is another provider's,
+        # and we deliver nothing for it.
+        self.assertEqual(external.parent_program, "")
