@@ -34998,6 +34998,40 @@ class ProgramParentProgramTest(TestCase):
         self.mtm.refresh_from_db()
         self.assertEqual(self.mtm.get_parent_program_display(), "Meals")
 
+    def _filter(self, query):
+        resp = self.api.get(f"/api/portal/settings/programs/{query}")
+        self.assertEqual(resp.status_code, 200, resp.content)
+        return {r["program_name"] for r in resp.data["results"]}
+
+    def test_filtering_by_MEALS(self):
+        names = self._filter("?parent_program=meals")
+        self.assertIn(self.mtm.program_name, names)
+        self.assertNotIn(self.produce.program_name, names)
+
+    def test_filtering_by_BOXES(self):
+        names = self._filter("?parent_program=boxes")
+        self.assertIn(self.produce.program_name, names)
+        self.assertNotIn(self.mtm.program_name, names)
+
+    def test_filtering_by_NONE_finds_the_unclassified(self):
+        """The question the column was added to answer: which programmes still have
+        no product?"""
+        names = self._filter("?parent_program=none")
+        self.assertIn(self.cam.program_name, names)
+        self.assertNotIn(self.mtm.program_name, names)
+
+    def test_an_unknown_filter_value_is_IGNORED_not_an_error(self):
+        """Matching the existing service_type filter's behaviour: a stale bookmark
+        should show the list, not a 400."""
+        self.assertEqual(
+            self._filter("?parent_program=sandwiches"), self._filter(""),
+        )
+
+    def test_it_COMBINES_with_the_other_filters(self):
+        names = self._filter("?parent_program=meals&case_type=food")
+        self.assertIn(self.mtm.program_name, names)
+        self.assertEqual(self._filter("?parent_program=meals&case_type=housing"), set())
+
     def test_the_migration_logic_classifies_only_INTERNAL_food(self):
         """Mirrors migration 0290's filters, since the migration itself cannot run
         under the test runner."""

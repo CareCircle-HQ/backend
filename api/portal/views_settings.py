@@ -26,6 +26,7 @@ from ..models import (
     MenuTypeTag,
     ProductType,
     ProgramMainCategory,
+    ProductTypeKind,
 )
 from .base import PortalAPIView, current_agent
 
@@ -372,7 +373,8 @@ class ActiveProgramViewSet(viewsets.ModelViewSet):
     and ``case_type`` (Food/Transportation). ``is_for_household`` is auto-derived
     from the name on save. Full list (no pagination for client-side search) with
     optional ``?search=`` (program name), ``?category=`` (case_category),
-    ``?case_type=food|transportation`` and ``?service_type=<code>|none``.
+    ``?case_type=food|transportation``, ``?service_type=<code>|none`` and
+    ``?parent_program=meals|boxes|none``.
     """
 
     permission_classes = [IsPortalAgent]
@@ -399,6 +401,14 @@ class ActiveProgramViewSet(viewsets.ModelViewSet):
             qs = qs.filter(service_type="")
         elif service_type in ActiveProgram.ServiceType.values:
             qs = qs.filter(service_type=service_type)
+        # Parent program: meals, boxes, or "none" for the ones with no product --
+        # which is the filter that matters most here, since "which programmes have
+        # I not classified yet?" is the question the column was added to answer.
+        parent = (params.get("parent_program") or "").strip().lower()
+        if parent == "none":
+            qs = qs.filter(parent_program="")
+        elif parent in ProductTypeKind.values:
+            qs = qs.filter(parent_program=parent)
         return qs
 
     def list(self, request, *args, **kwargs):
