@@ -34904,11 +34904,22 @@ class ProgramParentProgramTest(TestCase):
             service_type=ActiveProgram.ServiceType.PRODUCE_PRESCRIPTION,
             parent_program="boxes",
         )
+        # CAM is a meal service too (migration 0291). Kept in the fixture with a
+        # parent so the "meals" filter test exercises more than one service type.
         self.cam = ActiveProgram.objects.create(
             program_name="Clinically Appropriate Meals - Test",
             case_category="Internal Services",
             case_type=ActiveProgram.CaseType.FOOD,
             service_type=ActiveProgram.ServiceType.CLINICALLY_APPROPRIATE_MEALS,
+            parent_program="meals",
+        )
+        # Something genuinely unclassified, for the "none" filter -- navigation and
+        # case management deliver no product at all.
+        self.unclassified = ActiveProgram.objects.create(
+            program_name="Social Service Case Management - Test",
+            case_category="Internal Services",
+            case_type=ActiveProgram.CaseType.FOOD,
+            service_type=ActiveProgram.ServiceType.SOCIAL_SERVICE_CASE_MANAGEMENT,
         )
 
     def test_the_new_service_type_exists_with_the_right_label(self):
@@ -34963,12 +34974,12 @@ class ProgramParentProgramTest(TestCase):
         name distinguishes a meal programme from a box one, so this is a judgement
         only a person can make."""
         resp = self.api.patch(
-            f"/api/portal/settings/programs/{self.cam.id}/",
+            f"/api/portal/settings/programs/{self.unclassified.id}/",
             {"parent_program": "meals"}, format="json",
         )
         self.assertEqual(resp.status_code, 200, resp.content)
-        self.cam.refresh_from_db()
-        self.assertEqual(self.cam.parent_program, "meals")
+        self.unclassified.refresh_from_db()
+        self.assertEqual(self.unclassified.parent_program, "meals")
 
     def test_it_can_be_CLEARED(self):
         resp = self.api.patch(
@@ -35005,7 +35016,10 @@ class ProgramParentProgramTest(TestCase):
 
     def test_filtering_by_MEALS(self):
         names = self._filter("?parent_program=meals")
+        # BOTH meal services, which is the point of the classification: MTM and CAM
+        # are different services delivering the same product.
         self.assertIn(self.mtm.program_name, names)
+        self.assertIn(self.cam.program_name, names)
         self.assertNotIn(self.produce.program_name, names)
 
     def test_filtering_by_BOXES(self):
@@ -35017,8 +35031,9 @@ class ProgramParentProgramTest(TestCase):
         """The question the column was added to answer: which programmes still have
         no product?"""
         names = self._filter("?parent_program=none")
-        self.assertIn(self.cam.program_name, names)
+        self.assertIn(self.unclassified.program_name, names)
         self.assertNotIn(self.mtm.program_name, names)
+        self.assertNotIn(self.cam.program_name, names)
 
     def test_an_unknown_filter_value_is_IGNORED_not_an_error(self):
         """Matching the existing service_type filter's behaviour: a stale bookmark
