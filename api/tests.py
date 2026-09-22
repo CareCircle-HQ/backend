@@ -35191,3 +35191,67 @@ class ProgramIsActiveTest(TestCase):
                 "program_name", flat=True,
             )),
         )
+
+
+class RetiredServiceTypeTest(TestCase):
+    """A retired service type is hidden from the dropdown but stays valid."""
+
+    def setUp(self):
+        from rest_framework_simplejwt.tokens import AccessToken
+
+        from .models import Agent
+
+        agent = Agent.objects.create(
+            name="Retire Agent", agent_code="787", group="Management",
+        )
+        acc = AccessToken()
+        acc["agent_id"] = str(agent.id)
+        acc["agent_code"] = agent.agent_code
+        acc["agent_name"] = agent.name
+        acc["agent_group"] = agent.group
+        self.api = APIClient()
+        self.api.credentials(HTTP_AUTHORIZATION=f"Bearer {acc}")
+
+    def _options(self):
+        resp = self.api.get("/api/portal/settings/programs/")
+        self.assertEqual(resp.status_code, 200, resp.content)
+        return {t["value"] for t in resp.data["service_types"]}
+
+    def test_food_prescriptions_is_NOT_offered(self):
+        self.assertNotIn("food_prescriptions", self._options())
+
+    def test_its_replacement_IS_offered(self):
+        self.assertIn("produce_prescription", self._options())
+
+    def test_every_other_service_type_is_still_offered(self):
+        from .models import ActiveProgram
+        from .portal.views_settings import RETIRED_SERVICE_TYPES
+
+        expected = set(ActiveProgram.ServiceType.values) - RETIRED_SERVICE_TYPES
+        self.assertEqual(self._options(), expected)
+
+    def test_the_choice_REMAINS_valid_on_the_model(self):
+        """Deleting it would break historical migrations and orphan any row another
+        environment still holds. It simply stops being offerable."""
+        from .models import ActiveProgram
+
+        self.assertIn("food_prescriptions", ActiveProgram.ServiceType.values)
+        program = ActiveProgram.objects.create(
+            program_name="Legacy row", service_type="food_prescriptions",
+        )
+        program.full_clean()  # would raise if the choice had been removed
+
+    def test_a_row_ALREADY_on_it_still_serialises(self):
+        """An agent must be able to see and fix such a row, not have it render
+        blank because the option went away."""
+        from .models import ActiveProgram
+
+        program = ActiveProgram.objects.create(
+            program_name="Legacy row", case_category="External Services",
+            service_type="food_prescriptions",
+        )
+        resp = self.api.get(f"/api/portal/settings/programs/{program.id}/")
+        self.assertEqual(resp.data["service_type"], "food_prescriptions")
+        self.assertEqual(
+            resp.data["service_type_label"], "Food Prescriptions (Voucher / Boxes)",
+        )

@@ -31,6 +31,10 @@ from ..models import (
 from .base import PortalAPIView, current_agent
 
 logger = logging.getLogger(__name__)
+
+# Service types that still exist on the model but must not be offered to an agent.
+# See the note where service_types is built.
+RETIRED_SERVICE_TYPES = {"food_prescriptions"}
 from .permissions import IsPortalAgent
 from . import serializers as s
 
@@ -440,9 +444,18 @@ class ActiveProgramViewSet(viewsets.ModelViewSet):
                 ],
                 # Service the program delivers; blank ("—") is a valid choice for
                 # programs that aren't one of the services we deliver.
+                #
+                # RETIRED values are hidden from the dropdown but remain valid on
+                # the model: "Food Prescriptions (Voucher / Boxes)" was our own
+                # name for what Unite Us calls "Produce Prescription/Voucher", no
+                # case has ever used it, and migration 0292 moved every programme
+                # off it. Deleting the choice would break historical migrations
+                # and orphan any row another environment still holds -- so it
+                # simply stops being offerable.
                 "service_types": [
                     {"value": v, "label": label}
                     for v, label in ActiveProgram.ServiceType.choices
+                    if v not in RETIRED_SERVICE_TYPES
                 ],
                 "results": data,
             }
