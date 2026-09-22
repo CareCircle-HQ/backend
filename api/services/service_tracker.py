@@ -331,7 +331,7 @@ def rule_2_and_3_food(ctx):
         return None
     return {
         "code": "food",
-        "label": "Food Services",
+        "label": "Food Program",
         "rule": "Rules 2 & 3",
         "items": items,
     }

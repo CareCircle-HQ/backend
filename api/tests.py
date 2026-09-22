@@ -35547,7 +35547,7 @@ class ServiceTrackerTest(TestCase):
         self.assertEqual(labels, {
             "core": "Care Management Case",
             "housing": "Housing Program Progress",
-            "food": "Food Services",
+            "food": "Food Program",
         })
 
     def test_rule_0_does_not_fire_without_ECM(self):
